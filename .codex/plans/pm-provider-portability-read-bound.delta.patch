@@ -1,0 +1,26 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/portability.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/portability.rs
+@@ -1180,11 +1180,23 @@
+         );
+     }
+     let preparation = async {
++        dispatched
++            .reply
++            .validate(
++                dispatched
++                    .readiness_evidence
++                    .effective_limits()
++                    .response_bytes,
++            )
++            .map_err(|_| PortabilityErrorV1::Corrupt("snapshot response bound or digest"))?;
+         let reply = dispatched
+             .reply
+             .payload
+             .as_ref()
+             .ok_or(PortabilityErrorV1::Corrupt("snapshot reply missing"))?;
++        if reply.bytes.len() > MAX_ARTIFACT_BYTES {
++            return Err(PortabilityErrorV1::CapacityExceeded);
++        }
+         let response: Value = decode(&reply.bytes, "snapshot reply")?;
+         let value = response.get("snapshot").ok_or(PortabilityErrorV1::Corrupt(
+             "actual snapshot carrier missing",

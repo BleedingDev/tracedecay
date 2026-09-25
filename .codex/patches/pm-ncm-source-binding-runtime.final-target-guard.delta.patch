@@ -1,0 +1,83 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
+@@ -565,9 +565,13 @@
+             }
+             let binding = crate::source_binding::read(namespace, &capsule.source_id, &provenance)
+                 .map_err(|reason| invalid(&reason, handle.commit_seq))?;
+-            if target.get("legacy_source").is_some()
+-                && let Some(binding) = binding
+-            {
++            if target.get("legacy_source").is_some() {
++                let binding = binding.ok_or_else(|| {
++                    invalid(
++                        "source target lacks verified original binding",
++                        handle.commit_seq,
++                    )
++                })?;
+                 if binding
+                     .full_source_id
+                     .as_ref()
+--- a/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
+@@ -782,6 +782,61 @@
+ }
+ 
+ #[test]
++fn aliased_control_target_requires_original_binding_while_old_raw_target_remains_valid() {
++    let directory = TempDir::new().unwrap();
++    let live = engine(&directory);
++    let mut raw = A.observation("unattributed-raw", "retained raw content", false);
++    // Older raw clients may retain a valid opaque capsule without attribution.
++    raw.provenance["common_capsule"] = encoded(&json!({}));
++    raw.payload_sha256 = raw.canonical_payload_sha256().unwrap();
++    observe(&live, raw);
++    let before = inspect(&live);
++    let before_bytes = export(&live);
++    let influence = live.common_control(
++        &namespace(),
++        json!({
++            "action": "inspection", "view": "source_influence",
++            "expected_generation": before.state_generation, "source": A.legacy_id().0,
++            "maximum_items": 1, "maximum_bytes": 131_072, "after": 0
++        }),
++        DEADLINE,
++    );
++    assert_eq!(influence.outcome, Outcome::Success, "{influence:?}");
++    assert_eq!(influence.payload["items"].as_array().unwrap().len(), 1);
++    let row = &influence.payload["items"][0];
++    let mut control = json!({
++        "action": "feedback", "idempotency_key": digest(b"aliased-unattributed-control"),
++        "expected_generation": before.state_generation, "signal": "ignored", "weight": 0.0,
++        "target_digest": digest(b"unattributed-target"),
++        "target": {
++            "stable_memory_ref": row["stable_memory_ref"], "source": A.full_id().0,
++            "legacy_source": A.legacy_id().0,
++            "source_identity_sha256": row["provenance"]["selection"]["source_identity_sha256"]
++        }
++    });
++    let rejected = live.common_control(&namespace(), control.clone(), DEADLINE);
++    assert_eq!(
++        rejected.outcome,
++        Outcome::Rejected(RejectReason::InvalidRequest(
++            "source target lacks verified original binding".to_owned()
++        ))
++    );
++    assert_eq!(rejected.state_generation, before.state_generation);
++    assert_eq!(inspect(&live), before);
++    assert_eq!(export(&live), before_bytes);
++
++    control["idempotency_key"] = json!(digest(b"old-raw-control"));
++    control["target"]["source"] = json!(A.legacy_id().0);
++    control["target"]
++        .as_object_mut()
++        .unwrap()
++        .remove("legacy_source");
++    let accepted = live.common_control(&namespace(), control, DEADLINE);
++    assert_eq!(accepted.outcome, Outcome::Success, "{accepted:?}");
++    assert_eq!(accepted.state_generation, before.state_generation + 1);
++}
++
++#[test]
+ fn upgraded_observe_retry_returns_old_receipt_and_record_while_changed_content_conflicts() {
+     let directory = TempDir::new().unwrap();
+     let live = engine(&directory);

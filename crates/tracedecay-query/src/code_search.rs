@@ -25,6 +25,8 @@ pub struct CodeIndexSearchAuthorityV1 {
 pub struct CodeIndexSearchRequestV1 {
     pub project_root: PathBuf,
     pub query: String,
+    /// No semantic work is admitted unless the caller explicitly opts in.
+    pub semantic_mode: Option<crate::retrieval::SemanticQueryModeV1>,
     /// Exact Git commit whose published code generation must answer. `None`
     /// selects the current admitted generation.
     pub source_revision: Option<tracedecay_domain::GitOidV1>,
@@ -47,6 +49,7 @@ pub struct CodeIndexSearchRequestV1 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodeIndexSearchUnavailableReasonV1 {
     CapabilityUnavailable,
+    SemanticUnavailable,
     AuthorityUnavailable,
     LinkedWorktreeDisabled,
     Cancelled,
@@ -64,6 +67,7 @@ impl CodeIndexSearchUnavailableReasonV1 {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::CapabilityUnavailable => "code_index_unavailable",
+            Self::SemanticUnavailable => "semantic_unavailable",
             Self::AuthorityUnavailable => "authority_unavailable",
             Self::LinkedWorktreeDisabled => "linked_worktree_disabled",
             Self::Cancelled => "cancelled",
@@ -94,7 +98,8 @@ impl CodeIndexSearchUnavailableReasonV1 {
             | Self::CapacityUnavailable
             | Self::GenerationUnavailable
             | Self::GenerationUnverified => true,
-            Self::CapabilityUnavailable
+            Self::SemanticUnavailable
+            | Self::CapabilityUnavailable
             | Self::AuthorityUnavailable
             | Self::LinkedWorktreeDisabled
             | Self::InvalidRequest
@@ -217,6 +222,7 @@ pub struct CodeIndexSearchCoverageV1 {
     pub exact: CodeIndexLaneStatusV1,
     pub lexical: CodeIndexLaneStatusV1,
     pub graph: CodeIndexLaneStatusV1,
+    pub semantic: Option<CodeIndexLaneStatusV1>,
 }
 
 impl CodeIndexSearchCoverageV1 {
@@ -227,6 +233,7 @@ impl CodeIndexSearchCoverageV1 {
             exact: CodeIndexLaneStatusV1::Complete,
             lexical: CodeIndexLaneStatusV1::Complete,
             graph: CodeIndexLaneStatusV1::Complete,
+            semantic: None,
         }
     }
 
@@ -239,6 +246,7 @@ impl CodeIndexSearchCoverageV1 {
             exact: stale.clone(),
             lexical: stale.clone(),
             graph: stale,
+            semantic: None,
         }
     }
 
@@ -328,6 +336,7 @@ impl CodeIndexSearchCoverageV1 {
                 generation,
                 served_stale,
             ),
+            semantic: None,
         }
     }
 
@@ -338,6 +347,7 @@ impl CodeIndexSearchCoverageV1 {
             exact: CodeIndexLaneStatusV1::Unavailable { reason },
             lexical: CodeIndexLaneStatusV1::Unavailable { reason },
             graph: CodeIndexLaneStatusV1::Unavailable { reason },
+            semantic: None,
         }
     }
 
@@ -349,6 +359,10 @@ impl CodeIndexSearchCoverageV1 {
     /// At least one lane produced results, so the response is worth returning.
     pub fn any_servable(&self) -> bool {
         self.lanes().iter().any(|lane| lane.is_servable())
+            || self
+                .semantic
+                .as_ref()
+                .is_some_and(CodeIndexLaneStatusV1::is_servable)
     }
 
     /// Some lane is missing, so recall is partial and callers must be told.
@@ -357,6 +371,10 @@ impl CodeIndexSearchCoverageV1 {
             .lanes()
             .iter()
             .all(|lane| **lane == CodeIndexLaneStatusV1::Complete)
+            || self
+                .semantic
+                .as_ref()
+                .is_some_and(|lane| *lane != CodeIndexLaneStatusV1::Complete)
     }
 
     /// The progressive-degradation gate in one place: keep serving while any

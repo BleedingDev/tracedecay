@@ -1104,15 +1104,25 @@ mod tests {
         let authorities = SessionAuthorities::new(Some(&project_db), None)
             .with_profile_identity(Some(profile))
             .with_background_cpu(Some(runtime.background_cpu()));
+        let hook_runtime = tracedecay_project::runtime_ports::hook_runtime().unwrap();
+        let worktree_id = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
+            &hook_runtime,
+            cg.hook_store_layout(),
+        )
+        .unwrap();
         tracedecay_agent_hosts::hooks::publish_hook_bindings(
-            &tracedecay_project::runtime_ports::hook_runtime(),
+            &hook_runtime,
             cg.hook_store_layout(),
         )
         .unwrap();
         let host = tracedecay_hooks::HookHostV1::ClaudeCode;
         let subscriber = tracedecay_hooks::HookConfigurationSubscriberV1::new(
             tracedecay_hooks::HookConfigurationFileReaderV1::new(
-                tracedecay_hooks::hook_configuration_path(&cg.hook_store_layout().data_root, host),
+                tracedecay_hooks::hook_configuration_path(
+                    &cg.hook_store_layout().data_root,
+                    worktree_id,
+                    host,
+                ),
             ),
         );
         let tracedecay_hooks::HookConfigurationReadOutcomeV1::Bound(snapshot) =
@@ -1204,7 +1214,11 @@ mod tests {
             let codex_host = tracedecay_hooks::HookHostV1::Codex;
             let codex_subscriber = tracedecay_hooks::HookConfigurationSubscriberV1::new(
                 tracedecay_hooks::HookConfigurationFileReaderV1::new(
-                    tracedecay_hooks::hook_configuration_path(&cg.hook_store_layout().data_root, codex_host),
+                    tracedecay_hooks::hook_configuration_path(
+                        &cg.hook_store_layout().data_root,
+                        worktree_id,
+                        codex_host,
+                    ),
                 ),
             );
             let tracedecay_hooks::HookConfigurationReadOutcomeV1::Bound(codex_snapshot) =

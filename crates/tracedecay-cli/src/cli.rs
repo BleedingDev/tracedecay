@@ -733,6 +733,11 @@ pub enum Commands {
         #[command(subcommand)]
         action: MemoryAction,
     },
+    /// Configure and manage the optional exact-flat CPU semantic runtime.
+    Semantic {
+        #[command(subcommand)]
+        action: SemanticAction,
+    },
     /// Install, update, inspect, recover, or uninstall the opt-in NCM worker.
     Ncm {
         #[command(subcommand)]
@@ -1313,6 +1318,72 @@ pub enum MemoryAction {
         /// Registered project root path or alias to inspect instead of discovering from cwd
         #[arg(long, conflicts_with_all = ["path", "project_id"])]
         project_path: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct SemanticProjectArgs {
+    /// Project path (default: current directory, with discovery)
+    #[arg(short, long)]
+    pub path: Option<String>,
+    /// Registered project id to operate on instead of discovering from cwd
+    #[arg(long, conflicts_with = "path")]
+    pub project_id: Option<String>,
+    /// Registered project root path or alias to operate on instead of discovering from cwd
+    #[arg(long, conflicts_with_all = ["path", "project_id"])]
+    pub project_path: Option<String>,
+}
+
+#[derive(Subcommand)]
+pub enum SemanticAction {
+    /// Show semantic configuration and mounted model lifecycle status.
+    Status {
+        #[command(flatten)]
+        project: SemanticProjectArgs,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable exact-flat CPU Jina retrieval; restart the daemon to apply it.
+    Enable {
+        #[command(flatten)]
+        project: SemanticProjectArgs,
+        /// Permit project open to queue model acquisition in the background.
+        #[arg(long)]
+        auto_download: bool,
+        /// Output the resulting configuration as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable semantic retrieval; restart the daemon to retire its runtime.
+    Disable {
+        #[command(flatten)]
+        project: SemanticProjectArgs,
+        /// Output the resulting configuration as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly queue acquisition of the configured CPU Jina artifact.
+    Acquire {
+        #[command(flatten)]
+        project: SemanticProjectArgs,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import and verify a complete local CPU Jina artifact package.
+    Import {
+        #[command(flatten)]
+        project: SemanticProjectArgs,
+        /// Canonical model artifact manifest JSON.
+        #[arg(long, value_name = "FILE")]
+        manifest: PathBuf,
+        /// Directory containing every manifest-declared package member.
+        #[arg(long, value_name = "DIR")]
+        source: PathBuf,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -1,0 +1,865 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_history.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_history.rs
+@@ -451,6 +451,27 @@
+     pub(crate) fn destination(&self, canonical_session_id: &str) -> HistoryResult<OwnedExactScope> {
+         exact_scope_for_session(&self.profile_id, &self.scope, canonical_session_id)
+             .map_err(|_| ProviderHistoryErrorV1::Ineligible("destination scope"))
++    }
++
++    /// Freshly checks the retained namespace against actual mounted identities.
++    /// The caller keeps the original agent-session identity carried by the trace.
++    pub(crate) fn authorize_control_scope(
++        &self,
++        destination: &OwnedExactScope,
++        control: &tracedecay_memory_provider_registry::OperationControl,
++    ) -> HistoryResult<()> {
++        control
++            .snapshot()
++            .map_err(ProviderHistoryErrorV1::Control)?;
++        self.revalidate()?;
++        control
++            .snapshot()
++            .map_err(ProviderHistoryErrorV1::Control)?;
++        self.validate_destination(destination)?;
++        control
++            .snapshot()
++            .map_err(ProviderHistoryErrorV1::Control)?;
++        Ok(())
+     }
+ 
+     fn validate_destination(&self, destination: &OwnedExactScope) -> HistoryResult<()> {
+@@ -1259,6 +1280,51 @@
+         Ok(result)
+     }
+ 
++    /// Directly authorizes one retained source by its canonical key. No claimed
++    /// grant is constructed from ledger data to bootstrap this authority.
++    pub(crate) async fn authorize_retained_source(
++        &self,
++        destination: &OwnedExactScope,
++        expected: &SourceAttribution,
++        control: &tracedecay_memory_provider_registry::OperationControl,
++        include_unavailable: bool,
++    ) -> HistoryResult<HistoryGrant> {
++        self.check_control(control)?;
++        if self.policy_revision == 0 {
++            return Err(ProviderHistoryErrorV1::ClaimMismatch(
++                "history policy revision",
++            ));
++        }
++        expected
++            .validate()
++            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained source attribution"))?;
++        self.bridge.authorize_control_scope(destination, control)?;
++        let id = CanonicalObservationIdV1::new(expected.source.observation_id.clone())
++            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("canonical observation id"))?;
++        let stored = bounded_read(
++            control,
++            self.observations.read_admitted_observation(&id),
++            "canonical observation",
++        )
++        .await?
++        .ok_or(ProviderHistoryErrorV1::Ineligible(
++            "canonical observation missing",
++        ))?;
++        let actual = self.project_source(&stored, destination, control).await?;
++        if actual.attribution != *expected {
++            return Err(ProviderHistoryErrorV1::ClaimMismatch(
++                "original source attribution",
++            ));
++        }
++        if !include_unavailable && !retained_history_source(actual.current_disposition.state) {
++            return Err(ProviderHistoryErrorV1::Ineligible(
++                "current source disposition",
++            ));
++        }
++        self.bridge.authorize_control_scope(destination, control)?;
++        self.grant(destination, vec![actual])
++    }
++
+     /// Reads every actual source again at dispatch/recall/restore. Provider
+     /// generation and disposition revision are never compared here.
+     pub(crate) async fn revalidate_grant(
+@@ -1440,10 +1506,34 @@
+             }
+         };
+         let key = original_source_fence_digest(&attribution)?;
++        let fence_control = control
++            .snapshot()
++            .map_err(ProviderHistoryErrorV1::Control)?;
+         if let Some(fence) = self
+             .journal
+-            .read_provider_source_fence(self.provider_id.as_str(), &key)
+-            .map_err(|_| ProviderHistoryErrorV1::Unavailable("provider source fence"))?
++            .read_provider_source_fence_bounded(
++                self.provider_id.as_str(),
++                &key,
++                tracedecay_memory_observation::RecoveryTimeBudgetV1 {
++                    remaining_micros: i64::try_from(fence_control.remaining_millis)
++                        .unwrap_or(i64::MAX)
++                        .saturating_mul(1_000),
++                },
++                &control.cancellation(),
++            )
++            .map_err(|error| match error {
++                tracedecay_memory_observation::ObservationJournalError::OperationCancelled {
++                    ..
++                } => ProviderHistoryErrorV1::Control(
++                    tracedecay_memory_provider_registry::TerminalCode::Cancelled,
++                ),
++                tracedecay_memory_observation::ObservationJournalError::BudgetExhausted {
++                    ..
++                } => ProviderHistoryErrorV1::Control(
++                    tracedecay_memory_provider_registry::TerminalCode::DeadlineExceeded,
++                ),
++                _ => ProviderHistoryErrorV1::Unavailable("provider source fence"),
++            })?
+         {
+             if fence.blocks_revision(attribution.source.source_revision.as_deref()) {
+                 state = SourceDisposition::Deleted;
+@@ -1813,7 +1903,7 @@
+     Ok(attribution)
+ }
+ 
+-async fn bounded_read<T, E>(
++pub(crate) async fn bounded_read<T, E>(
+     control: &tracedecay_memory_provider_registry::OperationControl,
+     future: impl std::future::Future<Output = Result<T, E>>,
+     authority: &'static str,
+--- a/crates/tracedecay-memory-observation/src/sqlite/retention.rs
++++ b/crates/tracedecay-memory-observation/src/sqlite/retention.rs
+@@ -139,16 +139,21 @@
+     provider_id: &str,
+     source: &str,
+ ) -> Result<Option<ProviderSourceFenceV1>, ObservationJournalError> {
+-    let row: Option<(i64, String)> = connection
++    let row: Option<(i64, Vec<u8>)> = connection
+         .query_row(
+-            "SELECT revision, fence_json FROM tdmem_provider_source_fence_v1
++            "SELECT revision, substr(CAST(fence_json AS BLOB), 1, 16385) FROM tdmem_provider_source_fence_v1
+          WHERE provider_id = ?1 AND original_source_sha256 = ?2",
+             params![provider_id, source],
+             |row| Ok((row.get(0)?, row.get(1)?)),
+         )
+         .optional()?;
+     row.map(|(revision, json)| {
+-        let fence: ProviderSourceFenceV1 = serde_json::from_str(&json).map_err(|error| {
++        if json.len() > 16_384 {
++            return Err(ObservationJournalError::ValueOutOfRange {
++                field: "provider_source_fence_json",
++            });
++        }
++        let fence: ProviderSourceFenceV1 = serde_json::from_slice(&json).map_err(|error| {
+             ObservationJournalError::serialization("provider_source_fence", &error)
+         })?;
+         if fence.provider_id != provider_id
+@@ -179,17 +184,72 @@
+ }
+ 
+ impl SqliteObservationJournal {
+-    /// Bounded current read. This performs no migration, repair or provider call.
++    /// Existing callers keep the established five-second SQLite allowance;
++    /// callers with an operation control must use the explicitly bounded method.
+     pub fn read_provider_source_fence(
+         &self,
+         provider_id: &str,
+         original_source_sha256: &str,
+     ) -> Result<Option<ProviderSourceFenceV1>, ObservationJournalError> {
++        self.read_provider_source_fence_bounded(
++            provider_id,
++            original_source_sha256,
++            crate::RecoveryTimeBudgetV1 {
++                remaining_micros: i64::try_from(super::schema::BUSY_TIMEOUT_MILLIS)
++                    .unwrap_or(i64::MAX)
++                    .saturating_mul(1_000),
++            },
++            &tracedecay_memory_provider_api::CancellationToken::new(),
++        )
++    }
++
++    /// One exact fence read under the caller's original remaining budget.
++    /// This never migrates a schema, repairs a journal, or calls a provider.
++    pub fn read_provider_source_fence_bounded(
++        &self,
++        provider_id: &str,
++        original_source_sha256: &str,
++        budget: crate::RecoveryTimeBudgetV1,
++        cancellation: &tracedecay_memory_provider_api::CancellationToken,
++    ) -> Result<Option<ProviderSourceFenceV1>, ObservationJournalError> {
++        const OPERATION: &str = "read_provider_source_fence";
++        let started = std::time::Instant::now();
++        let check = || {
++            if cancellation.is_cancelled() {
++                return Err(ObservationJournalError::OperationCancelled {
++                    operation: OPERATION,
++                });
++            }
++            if budget.remaining_micros
++                <= i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX)
++            {
++                return Err(ObservationJournalError::BudgetExhausted {
++                    operation: OPERATION,
++                });
++            }
++            Ok(())
++        };
++        check()?;
+         validate_fence_label(provider_id, "provider_id")?;
+         crate::identity::require_sha256(original_source_sha256, "original_source_sha256")?;
+-        self.with_connection(|connection| {
+-            read_source_fence(connection, provider_id, original_source_sha256)
+-        })
++        let remaining = crate::RecoveryTimeBudgetV1 {
++            remaining_micros: budget
++                .remaining_micros
++                .saturating_sub(i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX)),
++        };
++        let result = self.with_cancellable_bounded_connection(
++            OPERATION,
++            remaining,
++            cancellation,
++            |connection| {
++                check()?;
++                let fence = read_source_fence(connection, provider_id, original_source_sha256)?;
++                check()?;
++                Ok(fence)
++            },
++        );
++        check()?;
++        result
+     }
+ 
+     /// Records provider-specific deletion intent even while that provider is offline.
+@@ -755,3 +815,92 @@
+         .saturating_add(read_u64(deletable, "deletable")?)
+         .saturating_add(read_u64(withheld, "withheld")?))
+ }
++
++#[cfg(test)]
++mod bounded_source_fence_tests {
++    use super::*;
++    use crate::RecoveryTimeBudgetV1;
++    use std::time::{Duration, Instant};
++    use tracedecay_memory_provider_api::CancellationToken;
++
++    #[test]
++    fn provider_source_fence_read_respects_mutex_deadline_and_cancellation()
++    -> Result<(), ObservationJournalError> {
++        let journal = SqliteObservationJournal::open_in_memory(RetentionPolicyV1 {
++            ephemeral_max_age_micros: 1_000_000,
++            session_max_age_micros: 1_000_000,
++            project_max_age_micros: 1_000_000,
++            profile_max_age_micros: 1_000_000,
++            receipt_retention_micros: 1_000_000,
++            max_queue_items: 256,
++            max_queue_bytes: 1_000_000,
++            max_attempts: 3,
++            backoff_base_micros: 1_000,
++            backoff_max_micros: 10_000,
++            sweep_batch_rows: 256,
++        })?;
++        let source = "a".repeat(64);
++        let token = CancellationToken::new();
++        assert!(
++            journal
++                .read_provider_source_fence_bounded(
++                    "ncm",
++                    &source,
++                    RecoveryTimeBudgetV1 {
++                        remaining_micros: 1_000_000
++                    },
++                    &token,
++                )?
++                .is_none()
++        );
++        let held = journal
++            .connection
++            .lock()
++            .map_err(|_| ObservationJournalError::LockPoisoned)?;
++        let started = Instant::now();
++        assert!(matches!(
++            journal.read_provider_source_fence_bounded(
++                "ncm",
++                &source,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 10_000
++                },
++                &token,
++            ),
++            Err(ObservationJournalError::BudgetExhausted { .. })
++        ));
++        assert!(started.elapsed() < Duration::from_secs(1));
++        std::thread::scope(|threads| {
++            threads.spawn(|| {
++                std::thread::sleep(Duration::from_millis(5));
++                token.cancel();
++            });
++            let started = Instant::now();
++            assert!(matches!(
++                journal.read_provider_source_fence_bounded(
++                    "ncm",
++                    &source,
++                    RecoveryTimeBudgetV1 {
++                        remaining_micros: 5_000_000
++                    },
++                    &token,
++                ),
++                Err(ObservationJournalError::OperationCancelled { .. })
++            ));
++            assert!(started.elapsed() < Duration::from_secs(1));
++        });
++        drop(held);
++        assert!(matches!(
++            journal.read_provider_source_fence_bounded(
++                "ncm",
++                &source,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 1_000_000
++                },
++                &token,
++            ),
++            Err(ObservationJournalError::OperationCancelled { .. })
++        ));
++        Ok(())
++    }
++}
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -75,7 +75,7 @@
+ 
+ /// File name of the project-owned recall admission ledger inside the
+ /// canonical store layout. Placement only; never an identity input.
+-const LEDGER_FILE_NAME: &str = "memory-recall-admission-ledger-v1.sqlite3";
++pub(crate) const LEDGER_FILE_NAME: &str = "memory-recall-admission-ledger-v1.sqlite3";
+ 
+ /// Pinned recall policy revision carried in every request.
+ const PROJECT_RECALL_POLICY_REVISION: u64 = 1;
+@@ -284,11 +284,27 @@
+ 
+ impl RecallAdmissionLedgerV1 {
+     fn open(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
+-        let connection =
+-            Connection::open(&path).map_err(|source| CognitiveRecallMountError::LedgerOpen {
++        Self::open_with_flags(path, rusqlite::OpenFlags::default())
++    }
++
++    /// Opens an existing host-owned ledger without creating a missing target.
++    pub(crate) fn open_existing(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
++        Self::open_with_flags(
++            path,
++            rusqlite::OpenFlags::default() & !rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
++        )
++    }
++
++    fn open_with_flags(
++        path: PathBuf,
++        flags: rusqlite::OpenFlags,
++    ) -> Result<Self, CognitiveRecallMountError> {
++        let connection = Connection::open_with_flags(&path, flags).map_err(|source| {
++            CognitiveRecallMountError::LedgerOpen {
+                 path: path.clone(),
+                 source,
+-            })?;
++            }
++        })?;
+         connection
+             .execute_batch(
+                 "PRAGMA journal_mode = WAL;
+@@ -1444,6 +1460,11 @@
+         self.ledger.path()
+     }
+ 
++    /// Shares the existing project ledger with retained control composition.
++    pub(crate) fn control_ledger(&self) -> Arc<RecallAdmissionLedgerV1> {
++        Arc::clone(&self.ledger)
++    }
++
+     /// The host-pinned routing policy every session port routes under.
+     #[must_use]
+     pub fn routing(&self) -> &ActiveRoutingPolicy {
+--- /dev/null
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
+@@ -0,0 +1,317 @@
++//! Fresh host authority for retained controls, independent of provider activation.
++//!
++//! Composition supplies the existing canonical ports and opens host-owned data
++//! files under its own project-open budget. This module never starts a provider,
++//! creates a missing retained store, dispatches a control, or records deletion.
++
++use std::collections::BTreeMap;
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++
++use tracedecay_contracts::ResolvedScope;
++use tracedecay_domain::UserProfileId;
++use tracedecay_global_db::{GlobalDbObservationStore, RegisteredGlobalDbLeaseV1};
++use tracedecay_memory_observation::SqliteObservationJournal;
++use tracedecay_memory_provider_registry::{
++    HistoryGrant, NATIVE_PROVIDER_ID, OperationControl, OwnedProviderId,
++};
++use tracedecay_runtime_core::db::Database;
++
++use super::super::cognitive_recall::{
++    LEDGER_FILE_NAME, RecallAdmissionLedgerV1,
++    control_attribution::{RetainedRecallControlScopeV1, RetainedRecallControlSourceV1},
++};
++use super::super::observation_journey::ObservationJourneyPolicyV1;
++use super::super::provider_history::{
++    HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
++    ProviderHistoryErrorV1, ProviderHistoryReaderV1, bounded_read,
++};
++
++type Result<T> = std::result::Result<T, ProviderHistoryErrorV1>;
++
++/// Host composition inputs. None of these paths or ports comes from a control request.
++pub(crate) struct ProviderControlAuthorityInputsV1 {
++    pub(crate) canonical_project_path: PathBuf,
++    pub(crate) profile_id: UserProfileId,
++    pub(crate) mounted_scope: ResolvedScope,
++    pub(crate) session_db: RegisteredGlobalDbLeaseV1,
++    pub(crate) dispositions: Arc<Database>,
++    pub(crate) hook_origin_reader: Arc<HookOriginReaderV1>,
++    pub(crate) store_data_root: PathBuf,
++    pub(crate) live_ledger: Option<Arc<RecallAdmissionLedgerV1>>,
++    pub(crate) live_journals: Vec<(OwnedProviderId, Arc<SqliteObservationJournal>)>,
++    pub(crate) runtime: tokio::runtime::Handle,
++}
++
++/// Canonical data authority, with no registry, selected provider, or worker owner.
++pub(crate) struct ProviderControlAuthorityV1 {
++    observations: Arc<GlobalDbObservationStore>,
++    dispositions: Arc<Database>,
++    original_authority: Arc<MountedOriginalObservationAuthorityV1>,
++    ledger: Option<Arc<RecallAdmissionLedgerV1>>,
++    journals: BTreeMap<OwnedProviderId, Arc<SqliteObservationJournal>>,
++    runtime: tokio::runtime::Handle,
++}
++
++/// Exact retained producing identity together with a fresh canonical source grant.
++pub(crate) struct AuthorizedRetainedControlSourceV1 {
++    pub(crate) retained: RetainedRecallControlSourceV1,
++    pub(crate) grant: HistoryGrant,
++    pub(crate) journal: Arc<SqliteObservationJournal>,
++}
++
++impl ProviderControlAuthorityV1 {
++    /// Call once from existing composition blocking work, under project-open control.
++    /// Existing normal open/migration is reused, even when the provider is disabled.
++    pub(crate) fn from_mounted_data(
++        inputs: ProviderControlAuthorityInputsV1,
++        control: &OperationControl,
++    ) -> Result<Self> {
++        check(control)?;
++        if inputs.live_journals.len() > 2 {
++            return Err(ProviderHistoryErrorV1::ClaimMismatch(
++                "retained journal count",
++            ));
++        }
++        let bridge = HistoryIdentityBridgeV1::admit(
++            &inputs.canonical_project_path,
++            &inputs.profile_id,
++            &inputs.mounted_scope,
++            &inputs.session_db.binding().shard_id,
++        )?;
++        check(control)?;
++        let original_authority = Arc::new(MountedOriginalObservationAuthorityV1 {
++            reader: inputs.hook_origin_reader,
++            bridge: Arc::new(bridge),
++        });
++        let ledger_path = inputs.store_data_root.join(LEDGER_FILE_NAME);
++        let ledger = match inputs.live_ledger {
++            Some(ledger) => {
++                if ledger.path() != ledger_path {
++                    return Err(ProviderHistoryErrorV1::ClaimMismatch(
++                        "live retained ledger placement",
++                    ));
++                }
++                Some(ledger)
++            }
++            None if existing_regular_file(&ledger_path)? => Some(Arc::new(
++                RecallAdmissionLedgerV1::open_existing(ledger_path).map_err(|_| {
++                    ProviderHistoryErrorV1::Unavailable("existing retained recall ledger")
++                })?,
++            )),
++            None => None,
++        };
++        let mut journals = BTreeMap::new();
++        for (provider, journal) in inputs.live_journals {
++            if journal_file_name(&provider).is_none()
++                || journals.insert(provider, journal).is_some()
++            {
++                return Err(ProviderHistoryErrorV1::ClaimMismatch(
++                    "live retained journal identity",
++                ));
++            }
++        }
++        // Fixed host-owned names match Native and NCM observation composition.
++        // The NCM spelling is retained here even in a build without its adapter.
++        for provider in [NATIVE_PROVIDER_ID, "ncm"] {
++            check(control)?;
++            let provider = OwnedProviderId::new(provider)
++                .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("host provider identity"))?;
++            if journals.contains_key(&provider) {
++                continue;
++            }
++            let name = journal_file_name(&provider).ok_or(
++                ProviderHistoryErrorV1::ClaimMismatch("host journal mapping"),
++            )?;
++            let path = inputs.store_data_root.join(name);
++            if existing_regular_file(&path)? {
++                let journal = SqliteObservationJournal::open_existing(
++                    path,
++                    ObservationJourneyPolicyV1::project_default().retention,
++                )
++                .map_err(|_| ProviderHistoryErrorV1::Unavailable("existing provider journal"))?;
++                journals.insert(provider, Arc::new(journal));
++            }
++        }
++        check(control)?;
++        original_authority.bridge.revalidate()?;
++        check(control)?;
++        Ok(Self {
++            observations: Arc::new(inputs.session_db.observation_store()),
++            dispositions: inputs.dispositions,
++            original_authority,
++            ledger,
++            journals,
++            runtime: inputs.runtime,
++        })
++    }
++
++    /// Use the ledger's bounded composite-key reads on the existing blocking pool.
++    pub(crate) fn ledger(&self) -> Option<Arc<RecallAdmissionLedgerV1>> {
++        self.ledger.as_ref().map(Arc::clone)
++    }
++
++    /// A retained namespace keeps its original agent session. It is checked
++    /// against the mounted profile/checkout instead of being relabeled for a caller.
++    pub(crate) async fn authorize_scope(
++        self: &Arc<Self>,
++        retained: &RetainedRecallControlScopeV1,
++        control: &OperationControl,
++    ) -> Result<RetainedRecallControlScopeV1> {
++        check(control)?;
++        let authority = Arc::clone(self);
++        let retained = retained.clone();
++        let operation = control.clone();
++        let work = tokio::task::spawn_blocking(move || {
++            validate_retained_scope_identity(&retained)?;
++            // Scope checks do not need to open or select a provider journal.
++            authority
++                .original_authority
++                .bridge
++                .authorize_control_scope(&retained.delivery_scope, &operation)?;
++            Ok(retained)
++        });
++        bounded_read(control, work, "retained control scope worker").await?
++    }
++
++    /// Re-resolves the exact canonical source; retained checksums are never authority.
++    /// Only a host-selected cleanup operation may request unavailable dispositions.
++    pub(crate) async fn authorize_source(
++        self: &Arc<Self>,
++        retained: &RetainedRecallControlSourceV1,
++        include_unavailable: bool,
++        control: &OperationControl,
++    ) -> Result<AuthorizedRetainedControlSourceV1> {
++        check(control)?;
++        let authority = Arc::clone(self);
++        let retained = retained.clone();
++        let operation = control.clone();
++        let work = tokio::task::spawn_blocking(move || {
++            validate_retained_scope_identity(&retained.scope)?;
++            let expected = retained
++                .original_source
++                .to_owned_attribution()
++                .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained original source"))?;
++            let journal = authority
++                .journals
++                .get(&retained.scope.provider_id)
++                .map(Arc::clone)
++                .ok_or(ProviderHistoryErrorV1::Ineligible(
++                    "original provider journal missing",
++                ))?;
++            let reader = ProviderHistoryReaderV1 {
++                bridge: authority.original_authority.bridge.as_ref(),
++                observations: authority.observations.as_ref(),
++                dispositions: authority.dispositions.as_ref(),
++                original_authority: authority.original_authority.as_ref(),
++                journal: journal.as_ref(),
++                provider_id: &retained.scope.provider_id,
++                policy_revision: 1,
++            };
++            let grant = authority
++                .runtime
++                .block_on(reader.authorize_retained_source(
++                    &retained.scope.delivery_scope,
++                    &expected,
++                    &operation,
++                    include_unavailable,
++                ))?;
++            check(&operation)?;
++            Ok(AuthorizedRetainedControlSourceV1 {
++                retained,
++                grant,
++                journal,
++            })
++        });
++        bounded_read(control, work, "retained control source worker").await?
++    }
++}
++
++fn validate_retained_scope_identity(scope: &RetainedRecallControlScopeV1) -> Result<()> {
++    OwnedProviderId::new(scope.provider_id.as_str())
++        .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained producing provider"))?;
++    if scope.registration_revision == 0 || scope.registration_revision > i64::MAX as u64 {
++        return Err(ProviderHistoryErrorV1::ClaimMismatch(
++            "retained registration revision",
++        ));
++    }
++    scope
++        .delivery_scope
++        .validate()
++        .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained delivery scope"))
++}
++
++fn check(control: &OperationControl) -> Result<()> {
++    control
++        .snapshot()
++        .map(|_| ())
++        .map_err(ProviderHistoryErrorV1::Control)
++}
++
++fn journal_file_name(provider: &OwnedProviderId) -> Option<&'static str> {
++    match provider.as_str() {
++        NATIVE_PROVIDER_ID => Some("memory-observation-journal-v1.sqlite3"),
++        "ncm" => Some("memory-observation-ncm-journal-v1.sqlite3"),
++        _ => None,
++    }
++}
++
++fn existing_regular_file(path: &Path) -> Result<bool> {
++    match std::fs::symlink_metadata(path) {
++        Ok(metadata) if metadata.file_type().is_file() => Ok(true),
++        Ok(_) => Err(ProviderHistoryErrorV1::Unavailable(
++            "retained data file is not regular",
++        )),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
++        Err(_) => Err(ProviderHistoryErrorV1::Unavailable(
++            "retained data file metadata",
++        )),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn existing_store_constructors_fail_without_creating_missing_files() {
++        let temporary = tempfile::tempdir().unwrap();
++        let ledger = temporary.path().join(LEDGER_FILE_NAME);
++        let journal = temporary
++            .path()
++            .join("memory-observation-ncm-journal-v1.sqlite3");
++        assert!(!ledger.exists());
++        assert!(!journal.exists());
++        assert!(RecallAdmissionLedgerV1::open_existing(ledger.clone()).is_err());
++        assert!(
++            SqliteObservationJournal::open_existing(
++                &journal,
++                ObservationJourneyPolicyV1::project_default().retention,
++            )
++            .is_err()
++        );
++        assert!(!ledger.exists());
++        assert!(!journal.exists());
++    }
++
++    #[test]
++    fn host_journal_names_are_fixed_and_missing_files_are_not_created() {
++        assert_eq!(
++            journal_file_name(&OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap()),
++            Some("memory-observation-journal-v1.sqlite3")
++        );
++        assert_eq!(
++            journal_file_name(&OwnedProviderId::new("ncm").unwrap()),
++            Some("memory-observation-ncm-journal-v1.sqlite3")
++        );
++        assert_eq!(
++            journal_file_name(&OwnedProviderId::new("other.provider").unwrap()),
++            None
++        );
++        let temporary = tempfile::tempdir().unwrap();
++        let missing = temporary.path().join(LEDGER_FILE_NAME);
++        assert!(!existing_regular_file(&missing).unwrap());
++        assert!(!missing.exists());
++        assert!(existing_regular_file(temporary.path()).is_err());
++    }
++}
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/provider_history.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/provider_history.rs
+@@ -1431,3 +1431,120 @@
+             .is_empty()
+     );
+ }
++
++#[tokio::test]
++async fn keyed_control_authorization_rechecks_source_and_allows_only_fresh_cleanup() {
++    use tracedecay_memory_observation::ProviderSourceDeletionIntentV1;
++    use tracedecay_memory_provider_registry::{DeletionMode, SourceDisposition};
++
++    let fixture = RepositoryFixture::new();
++    let bridge = fixture.bridge();
++    let records = SettledRecordsPort::single(fixture.record("session.source", 1, true));
++    let journal = fixture.journal();
++    let original = OriginalReceipts::new();
++    // No NCM provider, registration, readiness owner or delivery worker exists.
++    let provider = OwnedProviderId::new("ncm").unwrap();
++    let reader = ProviderHistoryReaderV1 {
++        bridge: &bridge,
++        observations: &records,
++        dispositions: &ActiveDispositions,
++        original_authority: &original,
++        journal: &journal,
++        provider_id: &provider,
++        policy_revision: 1,
++    };
++    let destination = bridge.destination("session.destination").unwrap();
++    let selected = reader
++        .select_recent_page(&destination, 1, &control())
++        .await
++        .unwrap();
++    let expected = selected.grant.unwrap().sources.remove(0).attribution;
++    let current = reader
++        .authorize_retained_source(&destination, &expected, &control(), false)
++        .await
++        .unwrap();
++    assert_eq!(current.sources.len(), 1);
++    assert_eq!(current.sources[0].attribution, expected);
++    assert_eq!(
++        current.sources[0].current_disposition.state,
++        SourceDisposition::Available
++    );
++
++    let key = original_source_fence_digest(&expected).unwrap();
++    journal
++        .record_provider_source_deletion_intent(&ProviderSourceDeletionIntentV1 {
++            operation_id: "test.offline-existing-fence",
++            provider_id: provider.as_str(),
++            original_source_sha256: &key,
++            expected_fence_revision: 0,
++            mode: DeletionMode::HardDelete,
++            source_revision: expected.source.source_revision.as_deref(),
++            authority_ref: "test.original-host-intent",
++            accepted_at_utc_micros: tracedecay_contracts::now_micros().0,
++        })
++        .unwrap();
++    assert!(matches!(
++        reader
++            .authorize_retained_source(&destination, &expected, &control(), false)
++            .await,
++        Err(ProviderHistoryErrorV1::Ineligible(
++            "current source disposition"
++        ))
++    ));
++    let cleanup = reader
++        .authorize_retained_source(&destination, &expected, &control(), true)
++        .await
++        .unwrap();
++    assert_eq!(
++        cleanup.sources[0].current_disposition.state,
++        SourceDisposition::Deleted
++    );
++    assert_eq!(cleanup.sources[0].attribution, expected);
++    assert_eq!(cleanup.destination_scope, destination);
++
++    let mut wrong = expected.clone();
++    wrong.source.content_sha256 = "f".repeat(64);
++    assert!(matches!(
++        reader
++            .authorize_retained_source(&destination, &wrong, &control(), true)
++            .await,
++        Err(ProviderHistoryErrorV1::ClaimMismatch(
++            "original source attribution"
++        ))
++    ));
++    wrong = expected.clone();
++    wrong.source.observation_id = "observation.missing".to_owned();
++    assert!(matches!(
++        reader
++            .authorize_retained_source(&destination, &wrong, &control(), true)
++            .await,
++        Err(ProviderHistoryErrorV1::Ineligible(
++            "canonical observation missing"
++        ))
++    ));
++    for field in 0..6 {
++        let mut changed = destination.clone();
++        match field {
++            0 => changed.profile_id = "profile.other".to_owned(),
++            1 => changed.project_id = "project.other".to_owned(),
++            2 => changed.repository_identity = "repository.other".to_owned(),
++            3 => changed.worktree_identity = "worktree.other".to_owned(),
++            4 => changed.branch_identity = "branch.other".to_owned(),
++            5 => changed.resolved_scope_digest = format!("sha256:{}", "f".repeat(64)),
++            _ => unreachable!(),
++        }
++        assert!(
++            bridge
++                .authorize_control_scope(&changed, &control())
++                .is_err(),
++            "{field}"
++        );
++    }
++    original.active.store(false, Ordering::SeqCst);
++    assert!(
++        reader
++            .authorize_retained_source(&destination, &expected, &control(), true)
++            .await
++            .is_err()
++    );
++}
+--- a/crates/tracedecay-memory-observation/src/sqlite/mod.rs
++++ b/crates/tracedecay-memory-observation/src/sqlite/mod.rs
+@@ -130,14 +130,37 @@
+         path: impl AsRef<Path>,
+         policy: RetentionPolicyV1,
+     ) -> Result<Self, ObservationJournalError> {
+-        policy.validate()?;
+-        let mut connection = Connection::open_with_flags(
++        Self::open_with_flags(
+             path,
++            policy,
+             OpenFlags::SQLITE_OPEN_READ_WRITE
+                 | OpenFlags::SQLITE_OPEN_CREATE
+                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                 | OpenFlags::SQLITE_OPEN_URI,
+-        )?;
++        )
++    }
++
++    /// Opens and migrates an existing host journal without creating a missing file.
++    pub fn open_existing(
++        path: impl AsRef<Path>,
++        policy: RetentionPolicyV1,
++    ) -> Result<Self, ObservationJournalError> {
++        Self::open_with_flags(
++            path,
++            policy,
++            OpenFlags::SQLITE_OPEN_READ_WRITE
++                | OpenFlags::SQLITE_OPEN_NO_MUTEX
++                | OpenFlags::SQLITE_OPEN_URI,
++        )
++    }
++
++    fn open_with_flags(
++        path: impl AsRef<Path>,
++        policy: RetentionPolicyV1,
++        flags: OpenFlags,
++    ) -> Result<Self, ObservationJournalError> {
++        policy.validate()?;
++        let mut connection = Connection::open_with_flags(path, flags)?;
+         let resume_after = schema::initialize(&mut connection)?;
+         Ok(Self::mounted(connection, policy, resume_after))
+     }

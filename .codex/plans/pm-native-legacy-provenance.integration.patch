@@ -1,0 +1,154 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+@@ -2297,6 +2297,11 @@
+             continue;
+         }
+         if common_recall(request) {
++            if row.original_source.is_none() {
++                excluded_items += 1;
++                push_reason(&mut reasons, "source_attribution_unavailable");
++                continue;
++            }
+             if !history_permits(row, call, request) {
+                 excluded_items += 1;
+                 push_reason(&mut reasons, "source_history_not_granted");
+@@ -2660,7 +2665,7 @@
+     if truncated {
+         limitations.push("content truncated to the staged candidate byte cap".to_owned());
+     }
+-    Ok(serde_json::json!({
++    let mut candidate = serde_json::json!({
+         "candidate_id": format!("{}:{}", call.request_id, row.provider_reference),
+         "stable_memory_ref": row.provider_reference,
+         "content": content,
+@@ -2703,7 +2708,6 @@
+                 format!("operation:{}", row.operation_id),
+                 format!("request:{}", row.request_identity),
+             ],
+-            "original_sources": row.original_source.iter().collect::<Vec<_>>(),
+             "observation_refs": staged_source_values(row,"observation_id"),
+             "source_refs": staged_source_values(row,"source_key"),
+             "native_linkage": {
+@@ -2744,7 +2748,11 @@
+         "memory_class": "session_observation",
+         "warnings": [],
+         "extensions": [],
+-    }))
++    });
++    if let Some(original_source) = &row.original_source {
++        candidate["provenance"]["original_sources"] = serde_json::json!([original_source]);
++    }
++    Ok(candidate)
+ }
+ 
+ /// The checkout claim binds the stored origin's five checkout fields.
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
+@@ -642,6 +642,105 @@
+     let mut changed = request;
+     changed.challenge_nonce[0] ^= 0xff;
+     assert_ne!(first, ready_receipt(&changed, limits));
++}
++
++#[test]
++fn staged_candidate_omits_missing_legacy_sources_and_preserves_recorded_attribution() {
++    let root = tempfile::tempdir().expect("staged candidate fixture");
++    let staged = StagedObservationStore::open(root.path()).expect("real staged store");
++    let project_id = "project.staged-provenance";
++    let call = valid_recall_call(project_id, recall_request_value(project_id));
++    let mut request = parse_native_recall_request(&call).expect("recall request");
++    let canonical = session_message_payload("record.legacy", "session.legacy", "legacy beacon");
++    let observation = staged_session_call(project_id, &canonical, "key.legacy", "operation.legacy");
++    staged
++        .stage_or_duplicate(StagedObservationRecord {
++            scope: call.exact_scope.clone(),
++            idempotency_key: "key.legacy".into(),
++            source_authority: "host_session".into(),
++            source_event_id: "record.legacy".into(),
++            source_revision: None,
++            observation_kind: NATIVE_STAGED_SESSION_OBSERVATION_KIND.into(),
++            payload_contract: NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID.into(),
++            sanitized_payload: observation.payload.bytes,
++            operation_id: "operation.legacy".into(),
++            request_identity: "request.legacy".into(),
++            admitted_at_unix_ms: 1_750_000_000_000,
++        })
++        .expect("stage legacy observation");
++    let mut rows = staged
++        .recall(&call.exact_scope, "legacy", 1)
++        .expect("legacy recall");
++    assert_eq!(rows.len(), 1);
++    let row = rows.pop().expect("legacy row");
++    assert!(row.original_source.is_none());
++    let observed_micros = row.admitted_at_unix_ms * 1000;
++    let legacy = native_staged_recall_candidate(
++        &call,
++        &row,
++        &row.message_text,
++        false,
++        observed_micros,
++        &request,
++    )
++    .expect("legacy projection");
++    assert!(legacy["provenance"].get("original_sources").is_none());
++    assert_eq!(legacy["content"], "legacy beacon");
++
++    let original = tracedecay_memory_conformance::compatibility::common_observation(
++        &row.scope,
++        1,
++        Some("r1"),
++        &row.message_text,
++        Some("2025-01-01T00:00:00Z"),
++        None,
++    )["source_identity"]["original_source"]
++        .clone();
++    let mut recorded = row.clone();
++    recorded.original_source = Some(original.clone());
++    let projected = native_staged_recall_candidate(
++        &call,
++        &recorded,
++        &recorded.message_text,
++        false,
++        observed_micros,
++        &request,
++    )
++    .expect("recorded projection");
++    assert_eq!(
++        projected["provenance"]["original_sources"],
++        json!([original])
++    );
++
++    // Allowing unknown validity cannot grant missing source attribution to
++    // the common profile; legacy content remains eligible only in its lane.
++    request.common_profile = true;
++    request.temporal_query.unknown_validity_policy = "allow_with_warning".into();
++    let page = ProjectMemoryFactSearchPageV1::new(
++        FactOwnerV1::Project {
++            project_id: ProjectId::new(project_id).expect("project identity"),
++        },
++        Vec::new(),
++        None,
++        tracedecay_store::ProjectMemoryFactSearchGraphCoverageV1::NotApplicable,
++    )
++    .expect("empty fact page");
++    let reply = build_native_recall_reply(&call, &request, &test_profile_id(), &page, &[row])
++        .expect("bounded common recall");
++    let response = recall_payload(&reply);
++    assert!(
++        response["candidates"]
++            .as_array()
++            .expect("candidates")
++            .is_empty()
++    );
++    assert_eq!(response["coverage"]["excluded_items"], 1);
++    assert!(
++        response["coverage"]["reasons"]
++            .as_array()
++            .expect("coverage reasons")
++            .contains(&json!("source_attribution_unavailable"))
++    );
+ }
+ 
+ #[test]

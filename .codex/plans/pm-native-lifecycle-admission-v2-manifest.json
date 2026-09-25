@@ -1,0 +1,9 @@
+{
+  "patch": ".codex/plans/pm-native-lifecycle-admission-v2.patch",
+  "patch_sha256": "687fd8698d0b0225b3822794eca620a47e31fb0adb7f16719ea34dae33247592",
+  "files": {
+    "crates/tracedecay-agent-hosts/src/hooks/dispatch.rs": "be3b54581c42ced9b816e2768b9dcb44fdfd90644be1e7b7c5ade1ba3e3ef59b",
+    "crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs": "e55e58bbffe9f51df78605a0624ad830a3bd039d395eaf74ad9995d219395060",
+    "crates/tracedecay-agent-hosts/src/hooks/codex.rs": "3b291e95fee1445d9a6f672711e7de38c628c4a0fa8de0a3b79ecc1afda7fe0d"
+  }
+}

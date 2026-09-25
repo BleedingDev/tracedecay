@@ -1,0 +1,90 @@
+--- a/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
+@@ -213,6 +213,24 @@
+     reply
+ }
+ 
++fn assert_same_durable_inspection(mut actual: EngineReply, expected: &EngineReply) {
++    let mut expected = expected.clone();
++    // Reopening can checkpoint the WAL into the database without changing any
++    // durable state. Exclude only those two physical file measurements.
++    for reply in [&mut actual, &mut expected] {
++        let usage = reply.payload["quota_usage"].as_object_mut().unwrap();
++        for key in ["db_bytes", "wal_bytes"] {
++            assert!(
++                usage
++                    .remove(key)
++                    .is_some_and(|bytes| bytes.as_u64().is_some()),
++                "inspection must retain the numeric {key} measurement"
++            );
++        }
++    }
++    assert_eq!(actual, expected);
++}
++
+ fn observe(engine: &NcmEngine, request: ObserveRequest) -> EngineReply {
+     let reply = engine.observe(&namespace(), request);
+     assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
+@@ -553,7 +571,7 @@
+     drop(live);
+ 
+     let reopened = engine(&directory);
+-    assert_eq!(inspect(&reopened), before);
++    assert_same_durable_inspection(inspect(&reopened), &before);
+     assert_eq!(delete(&reopened, A, "same-delete-key", true), rejected);
+     assert!(reopened.revoked_sources(&namespace()).unwrap().is_empty());
+     // Reusing the attempted key for a different valid effect proves the
+@@ -865,7 +883,7 @@
+         repeated, expected,
+         "retry must return the retained receipt and raw record identity"
+     );
+-    assert_eq!(inspect(&reopened), before);
++    assert_same_durable_inspection(inspect(&reopened), &before);
+     assert_eq!(export(&reopened), before_bytes);
+     assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
+ 
+@@ -877,7 +895,7 @@
+         changed.outcome,
+         Outcome::Rejected(RejectReason::IdempotencyConflict)
+     );
+-    assert_eq!(inspect(&reopened), before);
++    assert_same_durable_inspection(inspect(&reopened), &before);
+     assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
+ 
+     // A new delivery of the old observation through replay must recognize the
+@@ -953,7 +971,7 @@
+         repeated, expected,
+         "retry must return the original page, item receipts, and delivery identity"
+     );
+-    assert_eq!(inspect(&reopened), before);
++    assert_same_durable_inspection(inspect(&reopened), &before);
+     assert_eq!(export(&reopened), before_bytes);
+     assert_eq!(record_ids(&reopened), vec![1]);
+     assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
+@@ -967,7 +985,7 @@
+         changed.outcome,
+         Outcome::Rejected(RejectReason::IdempotencyConflict)
+     );
+-    assert_eq!(inspect(&reopened), before);
++    assert_same_durable_inspection(inspect(&reopened), &before);
+     assert_eq!(export(&reopened), before_bytes);
+     assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
+ }
+@@ -1022,7 +1040,7 @@
+             let reopened = engine(&directory);
+             let retried = reopened.common_portability(&namespace(), page, DEADLINE);
+             assert_eq!(retried, reply);
+-            assert_eq!(inspect(&reopened), before);
++            assert_same_durable_inspection(inspect(&reopened), &before);
+             assert_eq!(export(&reopened), before_bytes);
+             assert!(reopened.revoked_sources(&namespace()).unwrap().is_empty());
+         } else {
+@@ -1098,7 +1116,7 @@
+         rejected.outcome,
+         Outcome::Rejected(RejectReason::IdempotencyConflict)
+     );
+-    assert_eq!(inspect(&reopened), before);
++    assert_same_durable_inspection(inspect(&reopened), &before);
+     assert_eq!(export(&reopened), before_bytes);
+     assert_eq!(
+         reopened.revoked_sources(&namespace()).unwrap(),

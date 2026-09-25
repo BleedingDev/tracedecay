@@ -1,0 +1,146 @@
+--- a/crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs
+@@ -382,6 +382,7 @@
+                     request,
+                     code,
+                     "ncm.rust.control_terminal",
++                    None,
+                 );
+             }
+         };
+@@ -414,6 +415,7 @@
+                     request,
+                     client_terminal_code(&error),
+                     client_diagnostic(&error),
++                    None,
+                 );
+             }
+         };
+@@ -423,6 +425,7 @@
+                 request,
+                 outcome_terminal_code(&reply.outcome),
+                 outcome_diagnostic(&reply.outcome),
++                Some(reply.state_generation),
+             );
+         }
+         let identity = match parse_runtime_identity(&reply) {
+@@ -433,6 +436,7 @@
+                     request,
+                     TerminalCode::StateIncompatible,
+                     error_diagnostic(&error),
++                    Some(reply.state_generation),
+                 );
+             }
+         };
+@@ -444,6 +448,7 @@
+                     request,
+                     TerminalCode::StateIncompatible,
+                     error_diagnostic(&error),
++                    Some(reply.state_generation),
+                 );
+             }
+         };
+@@ -454,6 +459,7 @@
+                 request,
+                 TerminalCode::StateIncompatible,
+                 "ncm.rust.handshake_immutable_identity_mismatch",
++                Some(reply.state_generation),
+             );
+         }
+         if current.state_generation != candidate.state_generation {
+@@ -463,6 +469,7 @@
+                 request,
+                 TerminalCode::StaleIdentity,
+                 "ncm.rust.handshake_identity_refresh_required",
++                Some(reply.state_generation),
+             );
+         }
+         if self
+@@ -474,6 +481,7 @@
+                 request,
+                 TerminalCode::ProviderUnavailable,
+                 "ncm.rust.surface_state_unavailable",
++                Some(reply.state_generation),
+             );
+         }
+         let descriptor = self.descriptor_snapshot();
+@@ -747,6 +755,7 @@
+     request: &NcmSurfaceHandshakeRequest,
+     code: TerminalCode,
+     diagnostic: &'static str,
++    observed_generation: Option<u64>,
+ ) -> NcmSurfaceHandshakeResponse {
+     NcmSurfaceHandshakeResponse {
+         terminal: surface_terminal(
+@@ -755,7 +764,7 @@
+             &request.request_id,
+             request.namespace.as_str(),
+             code,
+-            CommittedEffectEvidence::none(None),
++            CommittedEffectEvidence::none(observed_generation),
+             Some(diagnostic),
+         ),
+         descriptor: None,
+@@ -1509,3 +1518,62 @@
+     }
+     output
+ }
++
++#[cfg(test)]
++#[allow(clippy::unwrap_used)]
++mod failed_handshake_generation_tests {
++    use super::*;
++
++    #[test]
++    fn refusal_preserves_only_observed_generation_and_never_readiness() {
++        let request = NcmSurfaceHandshakeRequest {
++            registration_revision: 1,
++            namespace: NcmNamespace("a1".repeat(32)),
++            request_id: "request".into(),
++            required_capabilities: BTreeSet::new(),
++            host_limits: ProviderLimits {
++                request_bytes: 4096,
++                response_bytes: 4096,
++                observation_batch_items: 1,
++                recall_candidates: 1,
++                concurrent_operations: 1,
++                operation_millis: 1000,
++                snapshot_bytes: 4096,
++                inspection_items: 1,
++            },
++            control: tracedecay_memory_provider_api::OperationControl::new(
++                i64::MAX,
++                1000,
++                CancellationToken::default(),
++            ),
++            challenge_nonce: [0; 32],
++        };
++        for observed in [None, Some(0), Some(1), Some(9)] {
++            let response = handshake_failure(
++                &OwnedProviderId::new(NCM_PROVIDER_ID).unwrap(),
++                &request,
++                TerminalCode::ResetRequired,
++                "ncm.rust.state_corrupt",
++                observed,
++            );
++            assert_eq!(
++                response.terminal.terminal_code(),
++                TerminalCode::ResetRequired
++            );
++            let effect = response.terminal.committed_effect();
++            assert_eq!(
++                effect.state(),
++                tracedecay_memory_provider_api::CommittedEffectState::None
++            );
++            assert_eq!(effect.state_generation_before(), observed);
++            assert_eq!(effect.state_generation_after(), observed);
++            assert!(effect.provider_receipt_sha256().is_none());
++            assert!(response.descriptor.is_none());
++            assert!(response.provider_instance_id.is_none());
++            assert!(response.namespace.is_none());
++            assert!(response.effective_limits.is_none());
++            assert!(response.ready_receipt_sha256.is_none());
++            assert!(response.challenge_response_sha256.is_none());
++        }
++    }
++}

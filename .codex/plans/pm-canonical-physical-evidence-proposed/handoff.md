@@ -1,0 +1,23 @@
+# Physical canonical evidence draft
+
+Frozen integration SHA-256: `5ab711fd99926d61683eba6e17b0f5bea8095cbe14a17bf856dff185e5ae5be5`.
+
+Two existing files only. `baseline/` contains exact live snapshots; `candidate/` contains the draft. No live apply, Cargo, model execution, daemon/provider requests, or additional dependencies.
+
+The public facade is `tracedecay::daemon::test_context_evidence::read_observed_canonical_session_for_test(&ObservedCanonicalSessionInputForTestV1, &OperationControl)`. Input references actual registered session_store_path, store_data_root, project_root, profile_root, profile_id, mounted_scope, expected_delivery_scope, canonical_provider_id and canonical_session_id. The comparison fixture must retain the projects-context evidence that established the registered path; this helper does not itself create registry authority.
+
+Output `ObservedCanonicalSessionEvidenceForTestV1` carries `session_store_path`, `row`, independently derived `delivery_scope`, exact `live_origin_boundaries`, and `cross_store_snapshot: false`. Row fields are provider, session_id, opaque project_key, project_path, optional transcript_path and indexed has_messages. It contains no message body, runtime binding, authority epoch, active-owner claim, recall grant or mutation authorization.
+
+The helper reloads existing durable profile identity, validates normalized canonical paths against the production profile-sharded layout and sessions filename, rejects symlinks, and compares device/inode evidence before publication. It opens READ_ONLY | NO_MUTEX | PRIVATE_CACHE | NOFOLLOW and verifies SQLite reports readonly. A clone of the original OperationControl preserves its original monotonic start, wall deadline and shared cancellation token in the SQLite progress callback. Busy timeout is at most 5 ms. All filesystem and SQL boundaries check the same control; progress checks interrupt executing SQL. No monitor or detached worker is introduced.
+
+The fixed query limits provider/session fields to 1024 bytes and project/path fields to 4096 bytes, reads at most two exact composite-key rows, and rejects overflow/duplicates. An indexed EXISTS checks session_messages without reading bodies. Two fresh deferred read transactions must yield the same row. Existing HookOriginReader retention validation and the existing canonical-to-daemon identity bridge must independently return the same full-scope correspondence twice. All copies are factual observations: repeated agreement cannot establish an atomic instant across SQLite, profile/checkout metadata and the hook ledger, or rule out unseen intervening changes.
+
+provider_history.rs factors the original registered bridge constructor after its unchanged registered-shard check, and extracts the original live-session correspondence method for shared use. Production authorize_live_canonical_session delegates to the same checks and discards the factual matched-boundary vector. Existing uncontrolled live_boundaries callers remain unchanged; the new optional-controlled reader checks the original control around each bounded ledger lookup. The test-only origin entry constructs no provider owner or registered shard.
+
+Focused regressions (not executed):
+- physical_canonical_evidence_reads_empty_wal_session_and_real_start_without_writing: existing HostAdmissionTestRuntime owns the real canonical writer; production native-source/Git capture and retained Start admission plus production register_live_session_locator create an actual empty row. DB/WAL/transcript/ledger bytes remain identical after reading; adding a real canonical message then yields has_messages without exposing its body.
+- physical_canonical_evidence_rejects_unknown_or_changed_scope_and_missing_ledger: unknown native provider/session, wrong full scope, changed actual branch, missing and malformed retained ledger remain errors, without creating or repairing files.
+- physical_canonical_readback_rejects_real_row_change_and_overlarge_column: an actual registered writer changes the row between captured and repeated reads; the shared finish operation rejects the drift. A 4097-byte physical column fails instead of truncating.
+- physical_canonical_read_uses_original_cancellation_and_inflight_sql_deadline: cancelled original control fails; the real readonly connection running a recursive read returns SQLITE_INTERRUPT under the original deadline and shared token.
+
+Static validation: rustfmt --check passes; git apply --check --whitespace=error passes against both baseline and unchanged live tree; diff whitespace check has no diagnostics. `manifest.json` records all file hashes and `validation.json` the exact static outcomes. Parent owns integrated Cargo verification.

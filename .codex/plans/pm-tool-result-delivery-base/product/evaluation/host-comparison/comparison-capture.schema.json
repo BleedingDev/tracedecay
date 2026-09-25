@@ -1,0 +1,359 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tracedecay.host-comparison.capture.v1",
+  "title": "Trusted host fixture case capture; serialization supplies no host authority",
+  "type": "object",
+  "required": [
+    "case_trial_id",
+    "status"
+  ],
+  "properties": {
+    "case_trial_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "completed",
+        "unexecuted"
+      ]
+    },
+    "mode": {
+      "enum": [
+        "controlled_preparation",
+        "production_host"
+      ]
+    },
+    "consumed_case": {
+      "type": "object"
+    },
+    "budgets": {
+      "type": "object"
+    },
+    "selected_provider": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "projection_sha256": {
+      "type": "string"
+    },
+    "canonical_start_sha256": {
+      "type": "string"
+    },
+    "observer_enabled": {
+      "const": false
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "input",
+          "status",
+          "terminal",
+          "provider_contacted",
+          "selected_provider",
+          "phase",
+          "timing",
+          "delivery"
+        ],
+        "properties": {
+          "input": {
+            "type": "object",
+            "required": [
+              "action_id",
+              "step",
+              "source",
+              "query"
+            ],
+            "properties": {
+              "action_id": {
+                "type": "string"
+              },
+              "step": {
+                "type": "object"
+              },
+              "source": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "query": {
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            }
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "censored",
+              "unexecuted"
+            ]
+          },
+          "terminal": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_contacted": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "selected_provider": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "phase": {
+            "type": "string"
+          },
+          "timing": {
+            "type": "object"
+          },
+          "delivery": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "required": [
+              "final_text",
+              "final_sha256",
+              "tokenizer",
+              "final_tokens",
+              "canonical_tokens",
+              "advisory_tokens",
+              "candidate_body_tokens",
+              "sections",
+              "candidates"
+            ],
+            "properties": {
+              "final_text": {
+                "type": "string"
+              },
+              "final_sha256": {
+                "type": "string"
+              },
+              "tokenizer": {
+                "const": {
+                  "identity": "tiktoken.o200k_base",
+                  "revision": "tiktoken-rs-0.12"
+                }
+              },
+              "final_tokens": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "canonical_tokens": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "advisory_tokens": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "candidate_body_tokens": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "sections": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "text"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "canonical",
+                        "advisory",
+                        "framing"
+                      ]
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "candidate_ref": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "source_refs": {
+                      "type": "array"
+                    }
+                  },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "kind": {
+                            "const": "framing"
+                          }
+                        }
+                      },
+                      "then": {
+                        "properties": {
+                          "text": {
+                            "type": "string",
+                            "pattern": "^[\\t\\n\\f\\r ]*$"
+                          },
+                          "candidate_ref": {
+                            "type": "null"
+                          }
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "candidates": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "candidate_ref",
+                    "sources",
+                    "returned",
+                    "admitted",
+                    "selected",
+                    "packed",
+                    "delivered",
+                    "withholding_reason"
+                  ],
+                  "properties": {
+                    "candidate_ref": {
+                      "type": "string"
+                    },
+                    "content": {
+                      "type": "string"
+                    },
+                    "content_sha256": {
+                      "type": "string"
+                    },
+                    "sources": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "source_id",
+                          "revision",
+                          "lineage_id",
+                          "origin",
+                          "content_sha256"
+                        ],
+                        "properties": {
+                          "source_id": {
+                            "type": "string"
+                          },
+                          "revision": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          },
+                          "lineage_id": {
+                            "type": "string"
+                          },
+                          "origin": {
+                            "type": "object"
+                          },
+                          "content_sha256": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "withholding_reason": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "returned": {
+                      "type": "boolean"
+                    },
+                    "admitted": {
+                      "type": "boolean"
+                    },
+                    "selected": {
+                      "type": "boolean"
+                    },
+                    "packed": {
+                      "type": "boolean"
+                    },
+                    "delivered": {
+                      "type": "boolean"
+                    },
+                    "scope_match": {
+                      "type": "boolean"
+                    },
+                    "from_corrupt_state": {
+                      "type": "boolean"
+                    },
+                    "provenance": {
+                      "enum": [
+                        "available",
+                        "redacted",
+                        "unavailable",
+                        "missing"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "resources": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "control_evidence": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object"
+    },
+    "reason": {
+      "type": "string"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "completed"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "mode",
+          "consumed_case",
+          "budgets",
+          "selected_provider",
+          "projection_sha256",
+          "canonical_start_sha256",
+          "observer_enabled",
+          "actions"
+        ]
+      }
+    }
+  ]
+}

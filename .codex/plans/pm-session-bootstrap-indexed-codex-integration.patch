@@ -1,0 +1,176 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -276,9 +276,29 @@
+             return None;
+         }
+         let register = self.source_path.is_none();
+-        let mut codex_guard = None;
++        // An indexed locator does not establish the current rollout's native
++        // identity or uniqueness. Every Codex Start revalidates the same
++        // complete native lookup, and carries its guard through capture.
++        let codex_guard = if is_start && self.producer == HookHostV1::Codex {
++            Some(
++                tracedecay_sessions::runtime::codex::CodexSource::with_home(home?)
++                    .find_live_session_transcript(
++                        self.native_session.as_str(),
++                        &project_root,
++                        deadline,
++                    )
++                    .ok()??,
++            )
++        } else {
++            None
++        };
+         let source_path = match self.source_path {
+             Some(path) => {
++                if let Some(guard) = &codex_guard
++                    && fs::canonicalize(&path).ok()? != guard.path()
++                {
++                    return None;
++                }
+                 if is_start && self.producer == HookHostV1::ClaudeCode {
+                     // A new native Start cannot silently reuse an indexed
+                     // locator after the host named a different physical file.
+@@ -311,18 +331,7 @@
+                         deadline,
+                     )?
+                 }
+-                HookHostV1::Codex => {
+-                    let guard = tracedecay_sessions::runtime::codex::CodexSource::with_home(home?)
+-                        .find_live_session_transcript(
+-                            self.native_session.as_str(),
+-                            &project_root,
+-                            deadline,
+-                        )
+-                        .ok()??;
+-                    let path = guard.path().to_path_buf();
+-                    codex_guard = Some(guard);
+-                    path
+-                }
++                HookHostV1::Codex => codex_guard.as_ref()?.path().to_path_buf(),
+                 _ => return None,
+             },
+             None => return None,
+@@ -874,6 +883,122 @@
+             .resolve_source(true, Some(&locator), Some(home.path()), deadline())
+             .unwrap();
+         assert!(!register, "a matching indexed source needs no new row");
++    }
++
++    fn indexed_codex_session(project: &Path, path: &Path) -> super::LiveOriginSession {
++        use tracedecay_domain::{BrainId, ProjectId, SessionId, UserProfileId};
++        super::LiveOriginSession {
++            project_root: project.to_path_buf(),
++            project_id: ProjectId::new("project.indexed-codex").unwrap(),
++            brain_id: BrainId::new("brain.indexed-codex").unwrap(),
++            profile_id: UserProfileId::new("profile.indexed-codex").unwrap(),
++            producer: tracedecay_hooks::HookHostV1::Codex,
++            native_session: SessionId::new("session-one").unwrap(),
++            recorded_project_path: Some(project.to_path_buf()),
++            source_path: Some(path.to_path_buf()),
++        }
++    }
++
++    fn write_codex_header(path: &Path, session: &str, cwd: &Path) {
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        let header = serde_json::json!({
++            "type": "session_meta", "timestamp": "2026-02-01T00:00:00Z",
++            "payload": {"id": session, "cwd": cwd},
++        });
++        fs::write(path, format!("{header}\n")).unwrap();
++    }
++
++    #[test]
++    fn indexed_codex_start_revalidates_header_and_preserves_capture_guard() {
++        let home = tempfile::tempdir().unwrap();
++        let project = tempfile::tempdir().unwrap();
++        let path = home
++            .path()
++            .join(".codex/sessions/rollout-session-one.jsonl");
++        write_codex_header(&path, "session-one", project.path());
++        let (source, register, guard) = indexed_codex_session(project.path(), &path)
++            .resolve_source(true, None, Some(home.path()), deadline())
++            .unwrap();
++        assert!(
++            !register,
++            "a validated indexed source must not replace its row"
++        );
++        assert_eq!(source.source.session_id().as_str(), "session-one");
++        let guard = guard.expect("indexed Start must retain the post-capture guard");
++        assert_eq!(guard.path(), fs::canonicalize(&path).unwrap());
++        assert!(guard.matches_current_source(deadline()).unwrap());
++        write_codex_header(&path, "session-other", project.path());
++        assert!(
++            !guard.matches_current_source(deadline()).unwrap(),
++            "a changed header cannot pass the retained capture guard"
++        );
++    }
++
++    #[test]
++    fn indexed_codex_start_rejects_rewritten_native_id_or_checkout() {
++        let home = tempfile::tempdir().unwrap();
++        let project = tempfile::tempdir().unwrap();
++        let foreign_project = tempfile::tempdir().unwrap();
++        let path = home
++            .path()
++            .join(".codex/sessions/rollout-session-one.jsonl");
++        write_codex_header(&path, "session-one", project.path());
++        for (native_id, cwd) in [
++            ("session-other", project.path()),
++            ("session-one", foreign_project.path()),
++        ] {
++            write_codex_header(&path, native_id, cwd);
++            assert!(
++                indexed_codex_session(project.path(), &path)
++                    .resolve_source(true, None, Some(home.path()), deadline())
++                    .is_none(),
++                "the indexed row cannot authorize changed native metadata: {native_id} {}",
++                cwd.display(),
++            );
++        }
++    }
++
++    #[test]
++    fn indexed_codex_start_rejects_duplicate_supported_native_candidates() {
++        let home = tempfile::tempdir().unwrap();
++        let project = tempfile::tempdir().unwrap();
++        let indexed = home
++            .path()
++            .join(".codex/sessions/rollout-session-one.jsonl");
++        let duplicate = home
++            .path()
++            .join(".codex/archived_sessions/rollout-2026-02-01-session-one.jsonl");
++        write_codex_header(&indexed, "session-one", project.path());
++        write_codex_header(&duplicate, "session-one", project.path());
++        assert!(
++            indexed_codex_session(project.path(), &indexed)
++                .resolve_source(true, None, Some(home.path()), deadline())
++                .is_none(),
++            "an indexed hit cannot bypass complete native-candidate enumeration",
++        );
++    }
++
++    #[test]
++    fn indexed_codex_start_rejects_a_different_valid_discovered_path() {
++        let home = tempfile::tempdir().unwrap();
++        let project = tempfile::tempdir().unwrap();
++        let indexed = home.path().join(".codex/sessions/imported-history.jsonl");
++        let actual = home
++            .path()
++            .join(".codex/sessions/rollout-session-one.jsonl");
++        write_codex_header(&indexed, "session-one", project.path());
++        write_codex_header(&actual, "session-one", project.path());
++        let guard = tracedecay_sessions::runtime::codex::CodexSource::with_home(home.path())
++            .find_live_session_transcript("session-one", project.path(), deadline())
++            .unwrap()
++            .expect("exactly one supported native candidate must be valid");
++        assert_eq!(guard.path(), fs::canonicalize(&actual).unwrap());
++        assert!(
++            indexed_codex_session(project.path(), &indexed)
++                .resolve_source(true, None, Some(home.path()), deadline())
++                .is_none(),
++            "an imported locator must not silently switch to the discovered file",
++        );
+     }
+ 
+     fn native_hook_request(

@@ -1,0 +1,3346 @@
+diff --git a/crates/tracedecay-memory-evaluation/src/host_retrieval.rs b/crates/tracedecay-memory-evaluation/src/host_retrieval.rs
+--- a/crates/tracedecay-memory-evaluation/src/host_retrieval.rs
++++ b/crates/tracedecay-memory-evaluation/src/host_retrieval.rs
+@@ -6,6 +6,8 @@
+ //! never interprets a retrieval-rubric outcome as downstream agent success.
+ 
+ use std::collections::{BTreeMap, BTreeSet};
++
++mod tool_result;
+ 
+ use serde::{Deserialize, Serialize};
+ use sha2::{Digest, Sha256};
+@@ -62,15 +64,24 @@
+ /// Exact final rendered context and its complete candidate stage ledger.
+ #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+ pub struct HostDeliveredContext {
++    /// Absent/`rendered_text_v1` for legacy text; `tool_result_v1` for raw blocks.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub representation: Option<String>,
++    /// Versioned raw carrier, lexical projections, and observed final joins.
++    /// This branch requires empty legacy text/sections/candidates.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub tool_result: Option<serde_json::Value>,
+     /// Actual host response text, after the final merge.
++    #[serde(default)]
+     pub final_text: String,
+     /// SHA-256 of the final response UTF-8 bytes.
++    #[serde(default)]
+     pub final_sha256: String,
+     /// Must be `tiktoken.o200k_base`.
+     pub tokenizer_identity: String,
+     /// Must be `tiktoken-rs-0.12`.
+     pub tokenizer_revision: String,
+-    /// Exact count from the pinned tokenizer, independently recounted at capture.
++    /// Exact rendered-text count, or sum of independently counted decoded blocks.
+     pub final_tokens: u64,
+     /// Exact canonical-section count, separate from joined-context count.
+     pub canonical_tokens: u64,
+@@ -79,6 +90,7 @@
+     /// Sum of individual exact candidate-body counts, separate from joined text.
+     pub candidate_body_tokens: u64,
+     /// Ordered sections which reconstruct the final bytes.
++    #[serde(default)]
+     pub sections: Vec<HostContextSection>,
+     /// Complete returned-to-delivered ledger, including withheld candidates.
+     pub candidates: Vec<HostCandidateEvidence>,
+@@ -115,6 +127,8 @@
+     pub task_benefit: &'static str,
+     /// Meaning of the inherited task/rubric score.
+     pub task_outcome_semantics: &'static str,
++    /// Token metric boundary; no claim of complete model input is made.
++    pub context_token_semantics: &'static str,
+     /// The unchanged metric framework's report.
+     pub metrics: MetricReport,
+ }
+@@ -139,7 +153,18 @@
+ fn delivered_candidates(
+     recall: &HostRecallEvidence,
+     delivery: &HostDeliveredContext,
++    lane: &str,
+ ) -> Result<Vec<AdmittedCandidate>, HostRetrievalError> {
++    if delivery.representation.as_deref() == Some("tool_result_v1") {
++        return tool_result::validate(recall, delivery, lane);
++    }
++    if !matches!(
++        delivery.representation.as_deref(),
++        None | Some("rendered_text_v1")
++    ) || delivery.tool_result.is_some()
++    {
++        return Err(invalid("unknown or mixed delivery representation"));
++    }
+     let section_text = |kind: &str| {
+         delivery
+             .sections
+@@ -271,13 +296,19 @@
+         let mut tokens = Some(0_u64);
+         let mut latency = Vec::new();
+         let mut missing_delivery = false;
++        let mut unresolved_delivery = false;
+         for recall in evidence {
+             if let Measured::Value { value } = recall.host_latency_micros {
+                 latency.push(value);
+             }
+             if let Some(delivery) = &recall.delivery {
+-                candidates.extend(delivered_candidates(recall, delivery)?);
++                candidates.extend(delivered_candidates(
++                    recall,
++                    delivery,
++                    &run.record.provider.lane_id,
++                )?);
+                 tokens = tokens.and_then(|value| value.checked_add(delivery.final_tokens));
++                unresolved_delivery |= tool_result::unresolved(delivery);
+             } else {
+                 missing_delivery = true;
+                 tokens = None;
+@@ -297,9 +328,9 @@
+                 ));
+             }
+         }
+-        if missing_delivery && scenario.task_outcome == TaskOutcome::Pass {
+-            return Err(invalid(
+-                "missing delivered response cannot pass retrieval rubric",
++        if (missing_delivery || unresolved_delivery) && scenario.task_outcome == TaskOutcome::Pass {
++            return Err(invalid(
++                "missing delivery or unresolved final join cannot pass retrieval rubric",
+             ));
+         }
+         if run.record.provider.lane_id == "no_memory" && !candidates.is_empty() {
+@@ -320,6 +351,7 @@
+         assessment: "host_retrieval_assessment",
+         task_benefit: "unmeasured",
+         task_outcome_semantics: "frozen source-grounded retrieval rubric; downstream agent success unmeasured",
++        context_token_semantics: "rendered_text_v1: exact joined text; tool_result_v1: sum of independently counted ordered decoded text blocks; complete model input unmeasured",
+         metrics: evaluate(catalog, &run.record)?,
+     })
+ }
+diff --git a/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs b/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs
+@@ -0,0 +1,922 @@
++//! Independently verified original JSON spans and complete decoded-block counts.
++
++use std::collections::{BTreeMap, BTreeSet};
++
++use serde_json::{Map, Value};
++use sha2::{Digest, Sha256};
++
++use super::{
++    AdmittedCandidate, CandidateLabel, HostDeliveredContext, HostRecallEvidence,
++    HostRetrievalError, bytes_digest, exact_tokens, invalid,
++};
++
++type Result<T> = std::result::Result<T, HostRetrievalError>;
++
++fn check(condition: bool, reason: &str) -> Result<()> {
++    if condition {
++        Ok(())
++    } else {
++        Err(invalid(reason))
++    }
++}
++
++fn string(value: &Value) -> Result<&str> {
++    value
++        .as_str()
++        .ok_or_else(|| invalid("missing evidence string"))
++}
++
++fn number(value: &Value) -> Result<u64> {
++    value
++        .as_u64()
++        .ok_or_else(|| invalid("missing evidence integer"))
++}
++
++fn array(value: &Value) -> Result<&[Value]> {
++    value
++        .as_array()
++        .map(Vec::as_slice)
++        .ok_or_else(|| invalid("missing evidence array"))
++}
++
++fn sum(mut values: impl Iterator<Item = Result<u64>>) -> Result<u64> {
++    values.try_fold(0_u64, |total, value| {
++        total
++            .checked_add(value?)
++            .ok_or_else(|| invalid("token sum overflow"))
++    })
++}
++
++#[derive(Debug)]
++struct Node {
++    start: usize,
++    end: usize,
++}
++
++/// Positions are bytes in the original, already UTF-8 checked input. Value and
++/// member spans are retained separately: member spans include original keys.
++struct JsonSpans<'a> {
++    text: &'a str,
++    at: usize,
++    value: Value,
++    nodes: BTreeMap<String, Node>,
++    members: Vec<(String, usize, usize)>,
++}
++
++impl<'a> JsonSpans<'a> {
++    fn parse(text: &'a str) -> Result<Self> {
++        check(
++            text.len() <= 16 * 1024 * 1024,
++            "JSON evidence exceeds byte bound",
++        )?;
++        let mut parser = Self {
++            text,
++            at: 0,
++            value: Value::Null,
++            nodes: BTreeMap::new(),
++            members: Vec::new(),
++        };
++        parser.value = parser.read_value("", 0)?;
++        parser.space();
++        check(parser.at == text.len(), "trailing JSON evidence bytes")?;
++        Ok(parser)
++    }
++
++    fn byte(&self) -> Option<u8> {
++        self.text.as_bytes().get(self.at).copied()
++    }
++
++    fn space(&mut self) {
++        while self
++            .byte()
++            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
++        {
++            self.at += 1;
++        }
++    }
++
++    fn read_string(&mut self) -> Result<String> {
++        let start = self.at;
++        check(self.byte() == Some(b'"'), "JSON string expected")?;
++        self.at += 1;
++        while let Some(byte) = self.byte() {
++            self.at += 1;
++            if byte == b'\\' {
++                self.at += 1;
++            } else if byte == b'"' {
++                return serde_json::from_slice(&self.text.as_bytes()[start..self.at])
++                    .map_err(|e| invalid(e.to_string()));
++            }
++        }
++        Err(invalid("unterminated JSON string"))
++    }
++
++    fn read_value(&mut self, pointer: &str, depth: usize) -> Result<Value> {
++        check(depth <= 128, "JSON evidence exceeds depth bound")?;
++        self.space();
++        let start = self.at;
++        let value = match self.byte() {
++            Some(b'{') => {
++                self.at += 1;
++                let mut object = Map::new();
++                self.space();
++                if self.byte() != Some(b'}') {
++                    loop {
++                        self.space();
++                        let member_start = self.at;
++                        let key = self.read_string()?;
++                        check(!object.contains_key(&key), "duplicate JSON key")?;
++                        self.space();
++                        check(self.byte() == Some(b':'), "JSON colon expected")?;
++                        self.at += 1;
++                        let child =
++                            format!("{pointer}/{}", key.replace('~', "~0").replace('/', "~1"));
++                        object.insert(key, self.read_value(&child, depth + 1)?);
++                        self.members.push((child, member_start, self.at));
++                        self.space();
++                        if self.byte() != Some(b',') {
++                            break;
++                        }
++                        self.at += 1;
++                    }
++                }
++                check(self.byte() == Some(b'}'), "JSON object end expected")?;
++                self.at += 1;
++                Value::Object(object)
++            }
++            Some(b'[') => {
++                self.at += 1;
++                let mut values = Vec::new();
++                self.space();
++                if self.byte() != Some(b']') {
++                    loop {
++                        values.push(
++                            self.read_value(&format!("{pointer}/{}", values.len()), depth + 1)?,
++                        );
++                        self.space();
++                        if self.byte() != Some(b',') {
++                            break;
++                        }
++                        self.at += 1;
++                    }
++                }
++                check(self.byte() == Some(b']'), "JSON array end expected")?;
++                self.at += 1;
++                Value::Array(values)
++            }
++            Some(b'"') => Value::String(self.read_string()?),
++            Some(_) => {
++                while self.byte().is_some_and(|b| {
++                    !matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b',' | b']' | b'}')
++                }) {
++                    self.at += 1;
++                }
++                serde_json::from_slice(&self.text.as_bytes()[start..self.at])
++                    .map_err(|e| invalid(e.to_string()))?
++            }
++            None => return Err(invalid("missing JSON value")),
++        };
++        self.nodes.insert(
++            pointer.to_owned(),
++            Node {
++                start,
++                end: self.at,
++            },
++        );
++        Ok(value)
++    }
++
++    fn verify(&self, span: &Value, member: bool) -> Result<&'a str> {
++        let pointer = string(&span["pointer"])?;
++        let node = self
++            .nodes
++            .get(pointer)
++            .ok_or_else(|| invalid("unknown JSON pointer"))?;
++        let (start, end) = if member {
++            let (_, start, end) = self
++                .members
++                .iter()
++                .find(|(key, _, _)| key == pointer)
++                .ok_or_else(|| invalid("unknown JSON member"))?;
++            (*start, *end)
++        } else {
++            (node.start, node.end)
++        };
++        let text = self
++            .text
++            .get(start..end)
++            .ok_or_else(|| invalid("non-UTF8 JSON span boundary"))?;
++        check(
++            number(&span["start"])? == start as u64
++                && number(&span["end"])? == end as u64
++                && string(&span["sha256"])? == bytes_digest(text)
++                && self.value.pointer(pointer) == Some(&span["value"]),
++            "original JSON span, digest, or pointer mismatch",
++        )?;
++        Ok(text)
++    }
++
++    fn top_members(&self) -> Vec<&str> {
++        self.members
++            .iter()
++            .filter_map(|(pointer, _, _)| {
++                pointer
++                    .strip_prefix('/')
++                    .filter(|rest| !rest.contains('/'))
++                    .map(|_| pointer.as_str())
++            })
++            .collect()
++    }
++}
++
++fn artifact(value: &Value) -> Result<JsonSpans<'_>> {
++    let text = string(&value["utf8"])?;
++    check(
++        !string(&value["artifact_path"])?.is_empty()
++            && number(&value["byte_length"])? == text.len() as u64
++            && string(&value["sha256"])? == bytes_digest(text),
++        "raw artifact bytes/digest mismatch",
++    )?;
++    JsonSpans::parse(text)
++}
++
++fn block_index(value: &Value) -> Result<usize> {
++    usize::try_from(number(&value["content_index"])?).map_err(|_| invalid("content index overflow"))
++}
++
++fn unresolved_label(label: CandidateLabel) -> bool {
++    matches!(
++        label,
++        CandidateLabel::Missing | CandidateLabel::Indeterminate | CandidateLabel::Unverifiable
++    )
++}
++
++pub(super) fn unresolved(delivery: &HostDeliveredContext) -> bool {
++    delivery.tool_result.as_ref().is_some_and(|data| {
++        data["candidates"].as_array().is_some_and(|candidates| {
++            candidates.iter().any(|c| {
++                c["final_join"]["status"] != "bound"
++                    || c["annotation_presentation_sha256"].is_null()
++                    || c["annotation_advisory_review_sha256"].is_null()
++            }) || (candidates.is_empty()
++                && data["advisory_blocks"].as_array().is_some_and(|blocks| {
++                    blocks
++                        .iter()
++                        .any(|b| b["text"].as_str().is_some_and(|text| !text.is_empty()))
++                }))
++        })
++    })
++}
++
++pub(super) fn validate(
++    recall: &HostRecallEvidence,
++    delivery: &HostDeliveredContext,
++    lane: &str,
++) -> Result<Vec<AdmittedCandidate>> {
++    let data = delivery
++        .tool_result
++        .as_ref()
++        .ok_or_else(|| invalid("missing ToolResult evidence"))?;
++    check(
++        delivery.final_text.is_empty()
++            && delivery.final_sha256.is_empty()
++            && delivery.sections.is_empty()
++            && delivery.candidates.is_empty()
++            && data["representation"] == "tool_result_v1"
++            && data.get("final_text").is_none()
++            && data.get("final_sha256").is_none()
++            && data.get("sections").is_none(),
++        "mixed delivery representations",
++    )?;
++    check(
++        delivery.tokenizer_identity == "tiktoken.o200k_base"
++            && delivery.tokenizer_revision == "tiktoken-rs-0.12"
++            && data["tokenizer"]["identity"] == delivery.tokenizer_identity
++            && data["tokenizer"]["revision"] == delivery.tokenizer_revision,
++        "ToolResult tokenizer mismatch",
++    )?;
++    check(
++        data["model_input_tokens"]["status"] == "unmeasured"
++            && !string(&data["model_input_tokens"]["reason"])?.is_empty(),
++        "complete model input remains unmeasured",
++    )?;
++    let carrier = artifact(&data["raw_carrier"])?;
++    let projection = &data["projection"];
++    check(
++        carrier.value == projection["result"],
++        "raw ToolResult/projection disagreement",
++    )?;
++    let content = array(&carrier.value["content"])?;
++    let blocks = array(&data["text_blocks"])?;
++    let projected_blocks = array(&projection["text_blocks"])?;
++    let actual_text = content
++        .iter()
++        .enumerate()
++        .filter(|(_, b)| b["type"] == "text")
++        .collect::<Vec<_>>();
++    check(
++        blocks.len() == actual_text.len() && blocks.len() == projected_blocks.len(),
++        "missing decoded blocks",
++    )?;
++    let mut total_tokens = 0_u64;
++    for (((index, actual), block), projected) in
++        actual_text.iter().zip(blocks).zip(projected_blocks)
++    {
++        let text = string(&block["text"])?;
++        check(
++            block_index(block)? == *index
++                && block_index(projected)? == *index
++                && actual["text"] == text
++                && projected["text"] == text
++                && number(&block["utf8_bytes"])? == text.len() as u64
++                && string(&block["sha256"])? == bytes_digest(text),
++            "reordered or rewritten decoded block",
++        )?;
++        let tokens = exact_tokens(text)?;
++        check(
++            number(&block["tokens"])? == tokens,
++            "decoded block tokenizer recount mismatch",
++        )?;
++        total_tokens = total_tokens
++            .checked_add(tokens)
++            .ok_or_else(|| invalid("full block count overflow"))?;
++    }
++    check(
++        total_tokens == delivery.final_tokens
++            && number(&data["final_tokens"])? == total_tokens
++            && total_tokens <= 128_000,
++        "full decoded block token sum exceeds quota or disagrees",
++    )?;
++    let payload_index = usize::try_from(number(&projection["payload_content_index"])?)
++        .map_err(|_| invalid("payload index overflow"))?;
++    let payload = blocks
++        .iter()
++        .find(|b| b["content_index"].as_u64() == Some(payload_index as u64))
++        .ok_or_else(|| invalid("missing payload block"))?;
++    let parser = JsonSpans::parse(string(&payload["text"])?)?;
++    check(
++        parser.value.is_object(),
++        "ToolResult v1 requires an object JSON payload",
++    )?;
++    let canonical = array(&data["canonical_spans"])?;
++    let observed = array(&projection["host_evidence"])?;
++    let expected = parser
++        .top_members()
++        .into_iter()
++        .filter(|p| *p != "/advisory_provider_memory")
++        .collect::<Vec<_>>();
++    check(
++        canonical.len() == expected.len() && canonical.len() == observed.len(),
++        "canonical coverage mismatch",
++    )?;
++    let mut observed_by_pointer = BTreeMap::new();
++    for projected in observed {
++        check(
++            observed_by_pointer
++                .insert(string(&projected["pointer"])?, projected)
++                .is_none(),
++            "duplicate canonical projection",
++        )?;
++    }
++    let mut canonical_text = String::new();
++    for (span, expected) in canonical.iter().zip(expected) {
++        check(
++            string(&span["pointer"])? == expected,
++            "canonical member order mismatch",
++        )?;
++        let projected = observed_by_pointer
++            .get(expected)
++            .ok_or_else(|| invalid("canonical projection missing"))?;
++        let text = parser.verify(span, true)?;
++        check(
++            span["text"] == text
++                && block_index(span)? == payload_index
++                && projected["kind"] == "json_member"
++                && projected["value"] == span["value"]
++                && projected["authority"] == span["authority"]
++                && projected["section"] == span["section"]
++                && span["source_refs"].is_array(),
++            "canonical source/projection mismatch",
++        )?;
++        canonical_text.push_str(text);
++    }
++    check(
++        string(&data["canonical_sha256"])? == bytes_digest(&canonical_text)
++            && number(&data["canonical_tokens"])? == exact_tokens(&canonical_text)?
++            && number(&data["canonical_tokens"])? == delivery.canonical_tokens,
++        "canonical byte/token mismatch",
++    )?;
++    let mut syntax = Vec::new();
++    let mut cursor = 0;
++    let mut ranges = Vec::new();
++    for pointer in parser.top_members() {
++        let (_, start, end) = parser
++            .members
++            .iter()
++            .find(|(key, _, _)| key == pointer)
++            .ok_or_else(|| invalid("top-level member missing"))?;
++        ranges.push((*start, *end));
++    }
++    ranges.push((parser.text.len(), parser.text.len()));
++    for (start, end) in ranges {
++        if start > cursor {
++            let text = parser
++                .text
++                .get(cursor..start)
++                .ok_or_else(|| invalid("non-UTF8 syntax boundary"))?;
++            check(
++                text.bytes()
++                    .all(|b| matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'{' | b'}' | b',')),
++                "unattributed substantive payload bytes",
++            )?;
++            syntax.push(serde_json::json!({"content_index":payload_index,"start":cursor,"end":start,"text":text,"sha256":bytes_digest(text)}));
++        }
++        cursor = end;
++    }
++    check(
++        data["payload_syntax_spans"] == Value::Array(syntax),
++        "payload delimiter partition mismatch",
++    )?;
++    let advisory_value = parser.value.get("advisory_provider_memory");
++    if let Some(value) = advisory_value {
++        check(value.is_object(), "invalid advisory object")?;
++        check(
++            projection["advisory"]["kind"] == "json_member"
++                && projection["advisory"]["pointer"] == "/advisory_provider_memory"
++                && projection["advisory"]["value"] == *value,
++            "advisory projection mismatch",
++        )?;
++    } else {
++        check(
++            projection["advisory"].is_null(),
++            "unexpected advisory projection",
++        )?;
++    }
++    let spans = array(&data["advisory_spans"])?;
++    check(
++        spans.len() == blocks.len().saturating_sub(1) + usize::from(advisory_value.is_some()),
++        "advisory span coverage mismatch",
++    )?;
++    let advisory_blocks = array(&data["advisory_blocks"])?;
++    check(
++        advisory_blocks.len() == blocks.len(),
++        "advisory block coverage mismatch",
++    )?;
++    let mut expected_order = Vec::new();
++    let mut advisory_tokens = 0_u64;
++    let mut review = Sha256::new();
++    for (block, projected) in blocks.iter().zip(advisory_blocks) {
++        let index = block_index(block)?;
++        let matching = spans
++            .iter()
++            .filter(|s| s["content_index"].as_u64() == Some(index as u64))
++            .collect::<Vec<_>>();
++        let mut text = String::new();
++        if index == payload_index {
++            if advisory_value.is_some() {
++                check(
++                    matching.len() == 1
++                        && matching[0]["pointer"] == "/advisory_provider_memory"
++                        && matching[0]["attribution"] == "observed_advisory_member",
++                    "missing full advisory member",
++                )?;
++                text.push_str(parser.verify(matching[0], true)?);
++            } else {
++                check(matching.is_empty(), "unexpected advisory span")?;
++            }
++        } else {
++            check(matching.len() == 1, "missing conservative notice span")?;
++            let span = matching[0];
++            let original = string(&block["text"])?;
++            check(
++                span["attribution"] == "unclassified_text"
++                    && span["pointer"].is_null()
++                    && number(&span["start"])? == 0
++                    && number(&span["end"])? == original.len() as u64
++                    && span["sha256"] == block["sha256"]
++                    && span["value"] == original,
++                "notice original span mismatch",
++            )?;
++            text.push_str(original);
++        }
++        for span in matching {
++            expected_order.push(span);
++        }
++        check(
++            block_index(projected)? == index
++                && projected["text"] == text
++                && string(&projected["sha256"])? == bytes_digest(&text),
++            "advisory per-block projection mismatch",
++        )?;
++        let tokens = exact_tokens(&text)?;
++        check(
++            number(&projected["tokens"])? == tokens,
++            "advisory tokenizer recount mismatch",
++        )?;
++        advisory_tokens = advisory_tokens
++            .checked_add(tokens)
++            .ok_or_else(|| invalid("advisory count overflow"))?;
++        review.update((text.len() as u64).to_be_bytes());
++        review.update(text.as_bytes());
++    }
++    check(
++        expected_order.into_iter().eq(spans.iter()),
++        "advisory span block order mismatch",
++    )?;
++    let review_sha256 = review
++        .finalize()
++        .iter()
++        .map(|b| format!("{b:02x}"))
++        .collect::<String>();
++    check(
++        data["advisory_review_sha256"] == review_sha256
++            && advisory_tokens == delivery.advisory_tokens
++            && number(&data["advisory_tokens"])? == advisory_tokens
++            && advisory_tokens <= 1_024,
++        "advisory review digest/count/quota mismatch",
++    )?;
++    let emitted = match advisory_value.and_then(|v| v.get("candidates")) {
++        Some(v) => array(v)?,
++        None => &[],
++    };
++    let candidates = array(&data["candidates"])?;
++    check(
++        candidates.len() == emitted.len(),
++        "emitted candidate coverage mismatch",
++    )?;
++    let mut result = Vec::new();
++    let mut seen = BTreeSet::new();
++    for (position, (evidence, emitted)) in candidates.iter().zip(emitted).enumerate() {
++        let candidate: AdmittedCandidate = serde_json::from_value(evidence["candidate"].clone())
++            .map_err(|e| invalid(e.to_string()))?;
++        check(
++            candidate.request_id == recall.request_id
++                && evidence["candidate_ref"] == candidate.candidate_ref
++                && seen.insert(candidate.candidate_ref.clone()),
++            "candidate request/reference/uniqueness mismatch",
++        )?;
++        let span = &evidence["presentation_span"];
++        check(
++            span["pointer"] == format!("/advisory_provider_memory/candidates/{position}"),
++            "candidate presentation order mismatch",
++        )?;
++        parser.verify(span, false)?;
++        let body = string(&evidence["content"])?;
++        check(
++            emitted["content"] == body
++                && evidence["content_sha256"] == bytes_digest(body)
++                && evidence["presentation_sha256"] == span["sha256"]
++                && evidence["sources"].is_array()
++                && !string(&evidence["annotation_reason"])?.is_empty(),
++            "candidate body/presentation/annotation mismatch",
++        )?;
++        let has_annotation = !evidence["annotation_presentation_sha256"].is_null()
++            || !evidence["annotation_advisory_review_sha256"].is_null();
++        if has_annotation {
++            check(
++                evidence["presentation_review"]
++                    == serde_json::json!({"candidate_metadata":true,"shared_text":true,"source_attribution":true,"prohibited_claims":true})
++                    && evidence["prohibited_claims_absent"].is_boolean(),
++                "missing explicit full presentation assessment",
++            )?;
++            if candidate.label == CandidateLabel::Useful {
++                check(
++                    evidence["prohibited_claims_absent"] == true,
++                    "useful presentation contains prohibited claims",
++                )?;
++            }
++            check(
++                evidence["annotation_presentation_sha256"] == evidence["presentation_sha256"]
++                    && evidence["annotation_advisory_review_sha256"]
++                        == data["advisory_review_sha256"],
++                "full presentation annotation digest mismatch",
++            )?;
++        } else {
++            check(
++                candidate.label == CandidateLabel::Missing,
++                "reviewed label lacks full presentation digests",
++            )?;
++        }
++        match string(&evidence["final_join"]["status"])? {
++            "bound" => validate_bound_join(data, evidence, emitted)?,
++            "unresolved" => check(
++                unresolved_label(candidate.label)
++                    && !string(&evidence["final_join"]["reason"])?.is_empty(),
++                "unresolved join carries a determinate label or no reason",
++            )?,
++            _ => return Err(invalid("unknown final-output join")),
++        }
++        if candidate.label == CandidateLabel::Useful {
++            check(
++                !array(&evidence["source_ids"])?.is_empty()
++                    && !array(&evidence["required_fact_refs"])?.is_empty()
++                    && !body.is_empty(),
++                "useful presentation lacks source-grounded body evidence",
++            )?;
++        }
++        result.push(candidate);
++    }
++    let body_tokens = sum(candidates
++        .iter()
++        .map(|c| exact_tokens(string(&c["content"])?)))?;
++    check(
++        number(&data["candidate_body_tokens"])? == body_tokens
++            && delivery.candidate_body_tokens == body_tokens,
++        "candidate body tokenizer recount mismatch",
++    )?;
++    if lane == "no_memory" || lane == "explicit_documentation" {
++        check(
++            advisory_value.is_none() && emitted.is_empty(),
++            "control lane carries provider advisory evidence",
++        )?;
++    }
++    Ok(result)
++}
++
++fn validate_bound_join(data: &Value, evidence: &Value, emitted: &Value) -> Result<()> {
++    let observed = &emitted["provenance_evidence"]["recall"];
++    let retained = &data["retained_trace"];
++    check(
++        retained["status"] == "observed",
++        "retained trace unavailable",
++    )?;
++    let artifact = artifact(&retained["artifact"])?;
++    let trace = &artifact.value;
++    let advisory = &data["projection"]["advisory"]["value"];
++    let correlation = &advisory["recall_trace"];
++    check(
++        retained["correlation"] == *correlation
++            && observed["trace_ref"] == correlation["trace_ref"]
++            && trace["request_id"] == correlation["request_id"]
++            && trace["provider_id"] == retained["provider_id"]
++            && trace["provider_id"] == advisory["provider_id"]
++            && number(&trace["registration_revision"])?
++                == number(&retained["registration_revision"])?
++            && trace["registration_revision"] == advisory["registration_revision"]
++            && retained["delivery_scope"] == advisory["canonical_history_replay"]["delivery_scope"]
++            && retained["store_evidence"].is_object()
++            && retained["daemon_identity"].is_object(),
++        "retained request/provider/revision/scope mismatch",
++    )?;
++    let trace_ref = string(&observed["trace_ref"])?;
++    let (scope, trace_id) = trace_ref
++        .strip_prefix("recall-trace-v1:")
++        .and_then(|s| s.split_once(':'))
++        .ok_or_else(|| invalid("invalid trace locator"))?;
++    let is_sha = |s: &str| {
++        s.len() == 64
++            && s.bytes()
++                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++    };
++    check(
++        is_sha(scope) && is_sha(trace_id) && trace["trace_id"] == trace_id,
++        "retained trace identity mismatch",
++    )?;
++    let item_ref = string(&observed["item_ref"])?;
++    let decimal = item_ref
++        .strip_prefix("recall-item-v1:")
++        .ok_or_else(|| invalid("invalid item locator"))?;
++    let rank = decimal
++        .parse::<usize>()
++        .map_err(|_| invalid("invalid item rank"))?;
++    check(decimal == rank.to_string(), "noncanonical item locator")?;
++    let items = array(&trace["items"])?;
++    check(
++        number(&trace["requested_count"])? == items.len() as u64 && rank < items.len(),
++        "retained trace partition mismatch",
++    )?;
++    const STAGES: &[&str] = &[
++        "denied",
++        "normalization_unavailable",
++        "selection_unavailable",
++        "deduplicated",
++        "budget_excluded",
++        "host_withheld",
++        "selected",
++        "pack_excluded",
++        "injected",
++    ];
++    for (position, item) in items.iter().enumerate() {
++        check(
++            number(&item["provider_rank"])? == position as u64
++                && STAGES.contains(&string(&item["stage"])?),
++            "retained trace stage/rank mismatch",
++        )?;
++    }
++    let row = &items[rank];
++    let join = &evidence["final_join"];
++    check(
++        join["trace_ref"] == observed["trace_ref"]
++            && join["item_ref"] == observed["item_ref"]
++            && number(&join["provider_rank"])? == rank as u64
++            && join["retained_candidate_id"] == row["candidate_id"]
++            && evidence["candidate_ref"] == row["candidate_id"]
++            && join["compiled_stage"] == row["stage"]
++            && row["stage"] == "injected",
++        "final output/compiled retained item join mismatch",
++    )
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::Measured;
++    use serde_json::json;
++
++    fn fixture() -> Result<HostDeliveredContext> {
++        // This is development-only text. Its stored counts are placeholders;
++        // every test independently replaces them with the pinned tokenizer.
++        let mut delivery: HostDeliveredContext =
++            serde_json::from_str(include_str!("../../tests/fixtures/tool_result_v1.json"))
++                .map_err(|e| invalid(e.to_string()))?;
++        let data = delivery
++            .tool_result
++            .as_mut()
++            .ok_or_else(|| invalid("test fixture missing tool result"))?;
++        let blocks = data["text_blocks"]
++            .as_array_mut()
++            .ok_or_else(|| invalid("test blocks"))?;
++        for block in blocks.iter_mut() {
++            block["tokens"] = json!(exact_tokens(string(&block["text"])?)?);
++        }
++        delivery.final_tokens = sum(blocks.iter().map(|b| number(&b["tokens"])))?;
++        data["final_tokens"] = json!(delivery.final_tokens);
++        let blocks = data["advisory_blocks"]
++            .as_array_mut()
++            .ok_or_else(|| invalid("test advisory blocks"))?;
++        for block in blocks.iter_mut() {
++            block["tokens"] = json!(exact_tokens(string(&block["text"])?)?);
++        }
++        delivery.advisory_tokens = sum(blocks.iter().map(|b| number(&b["tokens"])))?;
++        data["advisory_tokens"] = json!(delivery.advisory_tokens);
++        let canonical = array(&data["canonical_spans"])?
++            .iter()
++            .map(|s| string(&s["text"]))
++            .collect::<Result<Vec<_>>>()?
++            .join("");
++        delivery.canonical_tokens = exact_tokens(&canonical)?;
++        data["canonical_tokens"] = json!(delivery.canonical_tokens);
++        delivery.candidate_body_tokens = sum(array(&data["candidates"])?
++            .iter()
++            .map(|c| exact_tokens(string(&c["content"])?)))?;
++        data["candidate_body_tokens"] = json!(delivery.candidate_body_tokens);
++        Ok(delivery)
++    }
++
++    fn recall() -> HostRecallEvidence {
++        HostRecallEvidence {
++            scenario_id: "development".into(),
++            request_id: "q".into(),
++            delivery: None,
++            host_latency_micros: Measured::Unmeasured {
++                reason: "no host was executed".into(),
++            },
++        }
++    }
++
++    #[test]
++    fn strict_parser_preserves_escaped_utf8_and_member_bytes() -> Result<()> {
++        let parser = JsonSpans::parse(r#"{ "é/~": ["café", "\uD83D\uDE00"], "b" : true }"#)?;
++        let node = parser
++            .nodes
++            .get("/é~1~0/1")
++            .ok_or_else(|| invalid("test pointer missing"))?;
++        let text = parser
++            .text
++            .get(node.start..node.end)
++            .ok_or_else(|| invalid("test boundary"))?;
++        let span = json!({"pointer":"/é~1~0/1", "start":node.start, "end":node.end,
++            "sha256":bytes_digest(text), "value":"😀"});
++        assert_eq!(r#""\uD83D\uDE00""#, parser.verify(&span, false)?);
++        assert_eq!(vec!["/é~1~0", "/b"], parser.top_members());
++        Ok(())
++    }
++
++    #[test]
++    fn strict_parser_rejects_duplicate_decoded_keys_and_invalid_json() {
++        for text in [
++            r#"{"a":1,"\u0061":2}"#,
++            r#"{"a":NaN}"#,
++            "1e9999",
++            r#""\ud800""#,
++            "01",
++            "true false",
++            "[1,]",
++            "{\"a\":1,}",
++        ] {
++            assert!(
++                JsonSpans::parse(text).is_err(),
++                "invalid text accepted: {text}"
++            );
++        }
++    }
++
++    #[test]
++    fn same_value_at_another_pointer_is_not_original_span_evidence() -> Result<()> {
++        let parser = JsonSpans::parse(r#"{"a":"same","b":"same"}"#)?;
++        let node = parser
++            .nodes
++            .get("/b")
++            .ok_or_else(|| invalid("test pointer"))?;
++        let span = json!({"pointer":"/a","start":node.start,"end":node.end,
++            "sha256":bytes_digest(r#""same""#),"value":"same"});
++        assert!(parser.verify(&span, false).is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn tool_result_recounts_full_blocks_and_binds_original_rank_after_aliasing() -> Result<()> {
++        let delivery = fixture()?;
++        let candidates = validate(&recall(), &delivery, "provider:development.provider")?;
++        assert_eq!("original-provider-id", candidates[0].candidate_ref);
++        assert!(!unresolved(&delivery));
++        // Decoded blocks are separate observations; merging them can alter BPE.
++        assert_ne!(exact_tokens("a")? + exact_tokens("b")?, exact_tokens("ab")?);
++        Ok(())
++    }
++
++    #[test]
++    fn self_consistent_producer_counts_cannot_replace_independent_recount() -> Result<()> {
++        for advisory in [false, true] {
++            let mut delivery = fixture()?;
++            let data = delivery
++                .tool_result
++                .as_mut()
++                .ok_or_else(|| invalid("test tool result"))?;
++            if advisory {
++                data["advisory_blocks"][0]["tokens"] = json!(0);
++                delivery.advisory_tokens -= 1;
++                data["advisory_tokens"] = json!(delivery.advisory_tokens);
++            } else {
++                data["text_blocks"][0]["tokens"] = json!(0);
++                delivery.final_tokens -= 1;
++                data["final_tokens"] = json!(delivery.final_tokens);
++            }
++            assert!(validate(&recall(), &delivery, "provider:development.provider").is_err());
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn body_digest_does_not_authorize_unreviewed_candidate_metadata() -> Result<()> {
++        let mut delivery = fixture()?;
++        let data = delivery
++            .tool_result
++            .as_mut()
++            .ok_or_else(|| invalid("test tool result"))?;
++        data["candidates"][0]["annotation_presentation_sha256"] =
++            data["candidates"][0]["content_sha256"].clone();
++        assert!(validate(&recall(), &delivery, "provider:development.provider").is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn absent_final_binding_is_unresolved_even_when_body_matches() -> Result<()> {
++        let mut delivery = fixture()?;
++        let data = delivery
++            .tool_result
++            .as_mut()
++            .ok_or_else(|| invalid("test tool result"))?;
++        data["candidates"][0]["final_join"] =
++            json!({"status":"unresolved","reason":"no actual retained locator"});
++        assert!(validate(&recall(), &delivery, "provider:development.provider").is_err());
++        let data = delivery
++            .tool_result
++            .as_mut()
++            .ok_or_else(|| invalid("test tool result"))?;
++        data["candidates"][0]["candidate"]["label"] = json!("indeterminate");
++        assert_eq!(
++            CandidateLabel::Indeterminate,
++            validate(&recall(), &delivery, "provider:development.provider")?[0].label
++        );
++        assert!(unresolved(&delivery));
++        Ok(())
++    }
++
++    #[test]
++    fn compiled_stage_and_control_rank_are_separate_from_final_bytes() -> Result<()> {
++        for (field, value) in [
++            ("compiled_stage", json!("selected")),
++            ("provider_rank", json!(1)),
++            ("item_ref", json!("recall-item-v1:00")),
++        ] {
++            let mut delivery = fixture()?;
++            let data = delivery
++                .tool_result
++                .as_mut()
++                .ok_or_else(|| invalid("test tool result"))?;
++            data["candidates"][0]["final_join"][field] = value;
++            assert!(validate(&recall(), &delivery, "provider:development.provider").is_err());
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn controls_cannot_claim_provider_json_as_documentation_or_no_memory() -> Result<()> {
++        let delivery = fixture()?;
++        for lane in ["no_memory", "explicit_documentation"] {
++            assert!(validate(&recall(), &delivery, lane).is_err());
++        }
++        Ok(())
++    }
++}
+diff --git a/crates/tracedecay-memory-evaluation/tests/fixtures/tool_result_v1.json b/crates/tracedecay-memory-evaluation/tests/fixtures/tool_result_v1.json
+new file mode 100644
+--- /dev/null
++++ b/crates/tracedecay-memory-evaluation/tests/fixtures/tool_result_v1.json
+@@ -0,0 +1,387 @@
++{
++  "final_tokens": 75,
++  "canonical_tokens": 3,
++  "advisory_tokens": 72,
++  "candidate_body_tokens": 1,
++  "representation": "tool_result_v1",
++  "tokenizer_identity": "tiktoken.o200k_base",
++  "tokenizer_revision": "tiktoken-rs-0.12",
++  "candidates": [],
++  "tool_result": {
++    "representation": "tool_result_v1",
++    "tokenizer": {
++      "identity": "tiktoken.o200k_base",
++      "revision": "tiktoken-rs-0.12"
++    },
++    "payload_syntax_spans": [
++      {
++        "content_index": 1,
++        "start": 0,
++        "end": 2,
++        "text": "{ ",
++        "sha256": "e2200f74356624e2e0b2a6e149922e8fd77b57481b1f6511c5f925f2c99d0821"
++      },
++      {
++        "content_index": 1,
++        "start": 42,
++        "end": 45,
++        "text": ",\n ",
++        "sha256": "808b0d30b6af60f0a662ded570086cdfd11a84ae1ceb58c226aa1ab8ec32402b"
++      },
++      {
++        "content_index": 1,
++        "start": 1152,
++        "end": 1154,
++        "text": " }",
++        "sha256": "15715d5ca91fe9c1de7947083abca074bb304712ebf119996712abf31472579f"
++      }
++    ],
++    "raw_carrier": {
++      "artifact_path": "development-only/stdout",
++      "utf8": "{\n \"content\": [\n  {\n   \"type\": \"text\",\n   \"text\": \"warning\"\n  },\n  {\n   \"type\": \"text\",\n   \"text\": \"{ \\\"canonical\\\" : {\\\"note\\\":\\\"caf\\u00e9\\\\u0020safe\\\"},\\n \\\"advisory_provider_memory\\\" : {\\\"provider_id\\\": \\\"development.provider\\\", \\\"registration_revision\\\": 1, \\\"recall_trace\\\": {\\\"trace_ref\\\": \\\"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\", \\\"request_id\\\": \\\"actual-host-request\\\"}, \\\"canonical_history_replay\\\": {\\\"delivery_scope\\\": {\\\"project\\\": \\\"development\\\", \\\"session\\\": \\\"s\\\"}}, \\\"lane_notice\\\": \\\"Provider words remain inside the charged presentation.\\\", \\\"candidates\\\": [{\\\"candidate_id\\\": \\\"host.alias.survivor\\\", \\\"content\\\": \\\"Use caf\\u00e9 mode.\\\", \\\"provenance\\\": \\\"Canonical observer source\\\", \\\"explanation\\\": \\\"Use caf\\u00e9 mode. Metadata must also be reviewed.\\\", \\\"provenance_evidence\\\": {\\\"sources\\\": [{\\\"source_id\\\": \\\"source\\\", \\\"revision\\\": \\\"r1\\\", \\\"lineage_id\\\": \\\"lineage\\\", \\\"origin\\\": {\\\"kind\\\": \\\"development\\\"}, \\\"content_sha256\\\": \\\"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\\\"}], \\\"recall\\\": {\\\"trace_ref\\\": \\\"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\", \\\"item_ref\\\": \\\"recall-item-v1:0\\\"}}}]} }\"\n  },\n  {\n   \"type\": \"text\",\n   \"text\": \"metrics\"\n  },\n  {\n   \"type\": \"image\",\n   \"data\": \"development-only\",\n   \"mimeType\": \"image/png\"\n  }\n ],\n \"isError\": false\n}\n",
++      "byte_length": 1528,
++      "sha256": "ccf4cfeb3475acc96b6d165b2a415929f99d8edf87373b9451d70eecf391b868"
++    },
++    "projection": {
++      "result": {
++        "content": [
++          {
++            "type": "text",
++            "text": "warning"
++          },
++          {
++            "type": "text",
++            "text": "{ \"canonical\" : {\"note\":\"café\\u0020safe\"},\n \"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]} }"
++          },
++          {
++            "type": "text",
++            "text": "metrics"
++          },
++          {
++            "type": "image",
++            "data": "development-only",
++            "mimeType": "image/png"
++          }
++        ],
++        "isError": false
++      },
++      "text_blocks": [
++        {
++          "content_index": 0,
++          "text": "warning"
++        },
++        {
++          "content_index": 1,
++          "text": "{ \"canonical\" : {\"note\":\"café\\u0020safe\"},\n \"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]} }"
++        },
++        {
++          "content_index": 2,
++          "text": "metrics"
++        }
++      ],
++      "payload_content_index": 1,
++      "host_evidence": [
++        {
++          "kind": "json_member",
++          "pointer": "/canonical",
++          "value": {
++            "note": "café safe"
++          },
++          "authority": "canonical",
++          "section": "canonical_facts"
++        }
++      ],
++      "advisory": {
++        "kind": "json_member",
++        "pointer": "/advisory_provider_memory",
++        "value": {
++          "provider_id": "development.provider",
++          "registration_revision": 1,
++          "recall_trace": {
++            "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++            "request_id": "actual-host-request"
++          },
++          "canonical_history_replay": {
++            "delivery_scope": {
++              "project": "development",
++              "session": "s"
++            }
++          },
++          "lane_notice": "Provider words remain inside the charged presentation.",
++          "candidates": [
++            {
++              "candidate_id": "host.alias.survivor",
++              "content": "Use café mode.",
++              "provenance": "Canonical observer source",
++              "explanation": "Use café mode. Metadata must also be reviewed.",
++              "provenance_evidence": {
++                "sources": [
++                  {
++                    "source_id": "source",
++                    "revision": "r1",
++                    "lineage_id": "lineage",
++                    "origin": {
++                      "kind": "development"
++                    },
++                    "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
++                  }
++                ],
++                "recall": {
++                  "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++                  "item_ref": "recall-item-v1:0"
++                }
++              }
++            }
++          ]
++        }
++      }
++    },
++    "text_blocks": [
++      {
++        "content_index": 0,
++        "text": "warning",
++        "sha256": "4bd9354bb652233497a0f42647464b81b83a83654fcf1511263a5d0120d74c91",
++        "utf8_bytes": 7,
++        "tokens": 1
++      },
++      {
++        "content_index": 1,
++        "text": "{ \"canonical\" : {\"note\":\"café\\u0020safe\"},\n \"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]} }",
++        "sha256": "3587b8b0ec2ac52344945d79d21e787baebc6a0229219051c0f96ca2a82679b6",
++        "utf8_bytes": 1154,
++        "tokens": 73
++      },
++      {
++        "content_index": 2,
++        "text": "metrics",
++        "sha256": "177a7ea3611fe6b138557deaf44941614b66c0ece1766308044c8b65c8ba2123",
++        "utf8_bytes": 7,
++        "tokens": 1
++      }
++    ],
++    "canonical_spans": [
++      {
++        "content_index": 1,
++        "pointer": "/canonical",
++        "start": 2,
++        "end": 42,
++        "sha256": "37352e8553f742d022e9d73de5d50b43d107f8073d7014834210d63631069a47",
++        "value": {
++          "note": "café safe"
++        },
++        "source_refs": [
++          "canonical-source"
++        ],
++        "authority": "canonical",
++        "section": "canonical_facts",
++        "text": "\"canonical\" : {\"note\":\"café\\u0020safe\"}"
++      }
++    ],
++    "canonical_sha256": "37352e8553f742d022e9d73de5d50b43d107f8073d7014834210d63631069a47",
++    "advisory_spans": [
++      {
++        "content_index": 0,
++        "attribution": "unclassified_text",
++        "pointer": null,
++        "start": 0,
++        "end": 7,
++        "sha256": "4bd9354bb652233497a0f42647464b81b83a83654fcf1511263a5d0120d74c91",
++        "value": "warning"
++      },
++      {
++        "content_index": 1,
++        "attribution": "observed_advisory_member",
++        "pointer": "/advisory_provider_memory",
++        "start": 45,
++        "end": 1152,
++        "sha256": "162d1a4c4c482a7b0ed7d88a3d75ec6f0b2d2811be0c0e5bd3fbd9b024527230",
++        "value": {
++          "provider_id": "development.provider",
++          "registration_revision": 1,
++          "recall_trace": {
++            "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++            "request_id": "actual-host-request"
++          },
++          "canonical_history_replay": {
++            "delivery_scope": {
++              "project": "development",
++              "session": "s"
++            }
++          },
++          "lane_notice": "Provider words remain inside the charged presentation.",
++          "candidates": [
++            {
++              "candidate_id": "host.alias.survivor",
++              "content": "Use café mode.",
++              "provenance": "Canonical observer source",
++              "explanation": "Use café mode. Metadata must also be reviewed.",
++              "provenance_evidence": {
++                "sources": [
++                  {
++                    "source_id": "source",
++                    "revision": "r1",
++                    "lineage_id": "lineage",
++                    "origin": {
++                      "kind": "development"
++                    },
++                    "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
++                  }
++                ],
++                "recall": {
++                  "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++                  "item_ref": "recall-item-v1:0"
++                }
++              }
++            }
++          ]
++        }
++      },
++      {
++        "content_index": 2,
++        "attribution": "unclassified_text",
++        "pointer": null,
++        "start": 0,
++        "end": 7,
++        "sha256": "177a7ea3611fe6b138557deaf44941614b66c0ece1766308044c8b65c8ba2123",
++        "value": "metrics"
++      }
++    ],
++    "advisory_blocks": [
++      {
++        "content_index": 0,
++        "text": "warning",
++        "sha256": "4bd9354bb652233497a0f42647464b81b83a83654fcf1511263a5d0120d74c91",
++        "tokens": 1
++      },
++      {
++        "content_index": 1,
++        "text": "\"advisory_provider_memory\" : {\"provider_id\": \"development.provider\", \"registration_revision\": 1, \"recall_trace\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\"}, \"canonical_history_replay\": {\"delivery_scope\": {\"project\": \"development\", \"session\": \"s\"}}, \"lane_notice\": \"Provider words remain inside the charged presentation.\", \"candidates\": [{\"candidate_id\": \"host.alias.survivor\", \"content\": \"Use café mode.\", \"provenance\": \"Canonical observer source\", \"explanation\": \"Use café mode. Metadata must also be reviewed.\", \"provenance_evidence\": {\"sources\": [{\"source_id\": \"source\", \"revision\": \"r1\", \"lineage_id\": \"lineage\", \"origin\": {\"kind\": \"development\"}, \"content_sha256\": \"2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace\"}], \"recall\": {\"trace_ref\": \"recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"item_ref\": \"recall-item-v1:0\"}}}]}",
++        "sha256": "162d1a4c4c482a7b0ed7d88a3d75ec6f0b2d2811be0c0e5bd3fbd9b024527230",
++        "tokens": 70
++      },
++      {
++        "content_index": 2,
++        "text": "metrics",
++        "sha256": "177a7ea3611fe6b138557deaf44941614b66c0ece1766308044c8b65c8ba2123",
++        "tokens": 1
++      }
++    ],
++    "advisory_review_sha256": "8f57aec11166485db4ede803a3881734e911a7ac2b0e88714ba76d9f8156edf9",
++    "final_tokens": 75,
++    "canonical_tokens": 3,
++    "advisory_tokens": 72,
++    "candidate_body_tokens": 1,
++    "candidates": [
++      {
++        "candidate_ref": "original-provider-id",
++        "content": "Use café mode.",
++        "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace",
++        "sources": [
++          {
++            "source_id": "source",
++            "revision": "r1",
++            "lineage_id": "lineage",
++            "origin": {
++              "kind": "development"
++            },
++            "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
++          }
++        ],
++        "scope_match": true,
++        "provenance": "available",
++        "presentation_span": {
++          "pointer": "/advisory_provider_memory/candidates/0",
++          "start": 539,
++          "end": 1150,
++          "sha256": "02db1f960c1a3a1c9681210ad450fdcc579ed2b6279c1758aecbed985b01d1c3",
++          "value": {
++            "candidate_id": "host.alias.survivor",
++            "content": "Use café mode.",
++            "provenance": "Canonical observer source",
++            "explanation": "Use café mode. Metadata must also be reviewed.",
++            "provenance_evidence": {
++              "sources": [
++                {
++                  "source_id": "source",
++                  "revision": "r1",
++                  "lineage_id": "lineage",
++                  "origin": {
++                    "kind": "development"
++                  },
++                  "content_sha256": "2efee32c38ef260eb3666a7557b378937848d9fad22c17306154f154b8c3bace"
++                }
++              ],
++              "recall": {
++                "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++                "item_ref": "recall-item-v1:0"
++              }
++            }
++          }
++        },
++        "presentation_sha256": "02db1f960c1a3a1c9681210ad450fdcc579ed2b6279c1758aecbed985b01d1c3",
++        "final_join": {
++          "status": "bound",
++          "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++          "item_ref": "recall-item-v1:0",
++          "provider_rank": 0,
++          "retained_candidate_id": "original-provider-id",
++          "compiled_stage": "injected"
++        },
++        "candidate": {
++          "request_id": "q",
++          "candidate_ref": "original-provider-id",
++          "label": "useful",
++          "provenance": "available",
++          "scope_match": true,
++          "contains_forgotten_source": false
++        },
++        "source_ids": [
++          "source"
++        ],
++        "required_fact_refs": [
++          "q/required_facts/0"
++        ],
++        "annotation_reason": "development source-grounded review",
++        "annotation_presentation_sha256": "02db1f960c1a3a1c9681210ad450fdcc579ed2b6279c1758aecbed985b01d1c3",
++        "annotation_advisory_review_sha256": "8f57aec11166485db4ede803a3881734e911a7ac2b0e88714ba76d9f8156edf9",
++        "presentation_review": {
++          "candidate_metadata": true,
++          "shared_text": true,
++          "source_attribution": true,
++          "prohibited_claims": true
++        },
++        "prohibited_claims_absent": true
++      }
++    ],
++    "retained_trace": {
++      "status": "observed",
++      "artifact": {
++        "artifact_path": "development-only/trace",
++        "utf8": "{\"trace_id\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", \"request_id\": \"actual-host-request\", \"provider_id\": \"development.provider\", \"registration_revision\": 1, \"requested_count\": 1, \"degraded\": false, \"items\": [{\"candidate_id\": \"original-provider-id\", \"provider_rank\": 0, \"stage\": \"injected\", \"host_reason_code\": \"injected\", \"host_decision\": {\"decision\": \"injected\"}, \"tokens\": 5}], \"token_summary\": null}",
++        "byte_length": 430,
++        "sha256": "190aae79f55b677bfe77c6a24d75020e704fb9c73bf83c568c458e158af83445"
++      },
++      "correlation": {
++        "trace_ref": "recall-trace-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++        "request_id": "actual-host-request"
++      },
++      "provider_id": "development.provider",
++      "registration_revision": 1,
++      "delivery_scope": {
++        "project": "development",
++        "session": "s"
++      },
++      "store_evidence": {
++        "id": "observed"
++      },
++      "daemon_identity": {
++        "pid": 101,
++        "process_run_id": "development"
++      }
++    },
++    "model_input_tokens": {
++      "status": "unmeasured",
++      "reason": "No complete model API boundary observed."
++    }
++  }
++}
+diff --git a/crates/tracedecay-memory-evaluation/tests/host_retrieval.rs b/crates/tracedecay-memory-evaluation/tests/host_retrieval.rs
+--- a/crates/tracedecay-memory-evaluation/tests/host_retrieval.rs
++++ b/crates/tracedecay-memory-evaluation/tests/host_retrieval.rs
+@@ -24,6 +24,8 @@
+         contains_forgotten_source: false,
+     };
+     let delivery = HostDeliveredContext {
++        representation: None,
++        tool_result: None,
+         final_text: text.into(),
+         final_sha256: Sha256::digest(text.as_bytes())
+             .iter()
+diff --git a/product/evaluation/host-comparison/comparison-capture.schema.json b/product/evaluation/host-comparison/comparison-capture.schema.json
+--- a/product/evaluation/host-comparison/comparison-capture.schema.json
++++ b/product/evaluation/host-comparison/comparison-capture.schema.json
+@@ -120,199 +120,17 @@
+             "type": "object"
+           },
+           "delivery": {
+-            "type": [
+-              "object",
+-              "null"
+-            ],
+-            "required": [
+-              "final_text",
+-              "final_sha256",
+-              "tokenizer",
+-              "final_tokens",
+-              "canonical_tokens",
+-              "advisory_tokens",
+-              "candidate_body_tokens",
+-              "sections",
+-              "candidates"
+-            ],
+-            "properties": {
+-              "final_text": {
+-                "type": "string"
+-              },
+-              "final_sha256": {
+-                "type": "string"
+-              },
+-              "tokenizer": {
+-                "const": {
+-                  "identity": "tiktoken.o200k_base",
+-                  "revision": "tiktoken-rs-0.12"
+-                }
+-              },
+-              "final_tokens": {
+-                "type": "integer",
+-                "minimum": 0
+-              },
+-              "canonical_tokens": {
+-                "type": "integer",
+-                "minimum": 0
+-              },
+-              "advisory_tokens": {
+-                "type": "integer",
+-                "minimum": 0
+-              },
+-              "candidate_body_tokens": {
+-                "type": "integer",
+-                "minimum": 0
+-              },
+-              "sections": {
+-                "type": "array",
+-                "items": {
+-                  "type": "object",
+-                  "required": [
+-                    "kind",
+-                    "text"
+-                  ],
+-                  "properties": {
+-                    "kind": {
+-                      "enum": [
+-                        "canonical",
+-                        "advisory",
+-                        "framing"
+-                      ]
+-                    },
+-                    "text": {
+-                      "type": "string"
+-                    },
+-                    "candidate_ref": {
+-                      "type": [
+-                        "string",
+-                        "null"
+-                      ]
+-                    },
+-                    "source_refs": {
+-                      "type": "array"
+-                    }
+-                  },
+-                  "allOf": [
+-                    {
+-                      "if": {
+-                        "properties": {
+-                          "kind": {
+-                            "const": "framing"
+-                          }
+-                        }
+-                      },
+-                      "then": {
+-                        "properties": {
+-                          "text": {
+-                            "type": "string",
+-                            "pattern": "^[\\t\\n\\f\\r ]*$"
+-                          },
+-                          "candidate_ref": {
+-                            "type": "null"
+-                          }
+-                        }
+-                      }
+-                    }
+-                  ]
+-                }
+-              },
+-              "candidates": {
+-                "type": "array",
+-                "items": {
+-                  "type": "object",
+-                  "required": [
+-                    "candidate_ref",
+-                    "sources",
+-                    "returned",
+-                    "admitted",
+-                    "selected",
+-                    "packed",
+-                    "delivered",
+-                    "withholding_reason"
+-                  ],
+-                  "properties": {
+-                    "candidate_ref": {
+-                      "type": "string"
+-                    },
+-                    "content": {
+-                      "type": "string"
+-                    },
+-                    "content_sha256": {
+-                      "type": "string"
+-                    },
+-                    "sources": {
+-                      "type": "array",
+-                      "items": {
+-                        "type": "object",
+-                        "required": [
+-                          "source_id",
+-                          "revision",
+-                          "lineage_id",
+-                          "origin",
+-                          "content_sha256"
+-                        ],
+-                        "properties": {
+-                          "source_id": {
+-                            "type": "string"
+-                          },
+-                          "revision": {
+-                            "type": [
+-                              "string",
+-                              "null"
+-                            ]
+-                          },
+-                          "lineage_id": {
+-                            "type": "string"
+-                          },
+-                          "origin": {
+-                            "type": "object"
+-                          },
+-                          "content_sha256": {
+-                            "type": "string"
+-                          }
+-                        }
+-                      }
+-                    },
+-                    "withholding_reason": {
+-                      "type": [
+-                        "string",
+-                        "null"
+-                      ]
+-                    },
+-                    "returned": {
+-                      "type": "boolean"
+-                    },
+-                    "admitted": {
+-                      "type": "boolean"
+-                    },
+-                    "selected": {
+-                      "type": "boolean"
+-                    },
+-                    "packed": {
+-                      "type": "boolean"
+-                    },
+-                    "delivered": {
+-                      "type": "boolean"
+-                    },
+-                    "scope_match": {
+-                      "type": "boolean"
+-                    },
+-                    "from_corrupt_state": {
+-                      "type": "boolean"
+-                    },
+-                    "provenance": {
+-                      "enum": [
+-                        "available",
+-                        "redacted",
+-                        "unavailable",
+-                        "missing"
+-                      ]
+-                    }
+-                  }
+-                }
+-              }
+-            }
++            "oneOf": [
++              {
++                "type": "null"
++              },
++              {
++                "$ref": "#/$defs/rendered_text_v1"
++              },
++              {
++                "$ref": "#/$defs/tool_result_v1"
++              }
++            ]
+           },
+           "resources": {
+             "type": [
+@@ -355,5 +173,878 @@
+         ]
+       }
+     }
+-  ]
++  ],
++  "$defs": {
++    "rendered_text_v1": {
++      "type": "object",
++      "required": [
++        "final_text",
++        "final_sha256",
++        "tokenizer",
++        "final_tokens",
++        "canonical_tokens",
++        "advisory_tokens",
++        "candidate_body_tokens",
++        "sections",
++        "candidates"
++      ],
++      "properties": {
++        "final_text": {
++          "type": "string"
++        },
++        "final_sha256": {
++          "type": "string"
++        },
++        "tokenizer": {
++          "const": {
++            "identity": "tiktoken.o200k_base",
++            "revision": "tiktoken-rs-0.12"
++          }
++        },
++        "final_tokens": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "canonical_tokens": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "advisory_tokens": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "candidate_body_tokens": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "sections": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "kind",
++              "text"
++            ],
++            "properties": {
++              "kind": {
++                "enum": [
++                  "canonical",
++                  "advisory",
++                  "framing"
++                ]
++              },
++              "text": {
++                "type": "string"
++              },
++              "candidate_ref": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "source_refs": {
++                "type": "array"
++              }
++            },
++            "allOf": [
++              {
++                "if": {
++                  "properties": {
++                    "kind": {
++                      "const": "framing"
++                    }
++                  }
++                },
++                "then": {
++                  "properties": {
++                    "text": {
++                      "type": "string",
++                      "pattern": "^[\\t\\n\\f\\r ]*$"
++                    },
++                    "candidate_ref": {
++                      "type": "null"
++                    }
++                  }
++                }
++              }
++            ]
++          }
++        },
++        "candidates": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "candidate_ref",
++              "sources",
++              "returned",
++              "admitted",
++              "selected",
++              "packed",
++              "delivered",
++              "withholding_reason"
++            ],
++            "properties": {
++              "candidate_ref": {
++                "type": "string"
++              },
++              "content": {
++                "type": "string"
++              },
++              "content_sha256": {
++                "type": "string"
++              },
++              "sources": {
++                "type": "array",
++                "items": {
++                  "type": "object",
++                  "required": [
++                    "source_id",
++                    "revision",
++                    "lineage_id",
++                    "origin",
++                    "content_sha256"
++                  ],
++                  "properties": {
++                    "source_id": {
++                      "type": "string"
++                    },
++                    "revision": {
++                      "type": [
++                        "string",
++                        "null"
++                      ]
++                    },
++                    "lineage_id": {
++                      "type": "string"
++                    },
++                    "origin": {
++                      "type": "object"
++                    },
++                    "content_sha256": {
++                      "type": "string"
++                    }
++                  }
++                }
++              },
++              "withholding_reason": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "returned": {
++                "type": "boolean"
++              },
++              "admitted": {
++                "type": "boolean"
++              },
++              "selected": {
++                "type": "boolean"
++              },
++              "packed": {
++                "type": "boolean"
++              },
++              "delivered": {
++                "type": "boolean"
++              },
++              "scope_match": {
++                "type": "boolean"
++              },
++              "from_corrupt_state": {
++                "type": "boolean"
++              },
++              "provenance": {
++                "enum": [
++                  "available",
++                  "redacted",
++                  "unavailable",
++                  "missing"
++                ]
++              }
++            }
++          }
++        },
++        "representation": {
++          "const": "rendered_text_v1"
++        }
++      },
++      "not": {
++        "required": [
++          "tool_result"
++        ]
++      }
++    },
++    "tool_result_v1": {
++      "type": "object",
++      "required": [
++        "representation",
++        "tokenizer",
++        "raw_carrier",
++        "projection",
++        "text_blocks",
++        "canonical_spans",
++        "canonical_sha256",
++        "advisory_spans",
++        "advisory_blocks",
++        "advisory_review_sha256",
++        "final_tokens",
++        "canonical_tokens",
++        "advisory_tokens",
++        "candidate_body_tokens",
++        "candidates",
++        "retained_trace",
++        "model_input_tokens",
++        "payload_syntax_spans"
++      ],
++      "properties": {
++        "representation": {
++          "const": "tool_result_v1"
++        },
++        "tokenizer": {
++          "const": {
++            "identity": "tiktoken.o200k_base",
++            "revision": "tiktoken-rs-0.12"
++          }
++        },
++        "raw_carrier": {
++          "type": "object",
++          "required": [
++            "artifact_path",
++            "utf8",
++            "byte_length",
++            "sha256"
++          ],
++          "properties": {
++            "artifact_path": {
++              "type": "string",
++              "minLength": 1
++            },
++            "utf8": {
++              "type": "string"
++            },
++            "byte_length": {
++              "type": "integer",
++              "minimum": 0
++            },
++            "sha256": {
++              "type": "string",
++              "pattern": "^[0-9a-f]{64}$"
++            }
++          }
++        },
++        "projection": {
++          "type": "object",
++          "required": [
++            "result",
++            "text_blocks",
++            "payload_content_index",
++            "host_evidence",
++            "advisory"
++          ],
++          "properties": {
++            "result": {
++              "type": "object"
++            },
++            "text_blocks": {
++              "type": "array",
++              "items": {
++                "type": "object",
++                "required": [
++                  "content_index",
++                  "text"
++                ],
++                "properties": {
++                  "content_index": {
++                    "type": "integer",
++                    "minimum": 0
++                  },
++                  "text": {
++                    "type": "string"
++                  }
++                }
++              }
++            },
++            "payload_content_index": {
++              "type": "integer",
++              "minimum": 0
++            },
++            "host_evidence": {
++              "type": "array",
++              "items": {
++                "type": "object",
++                "required": [
++                  "kind",
++                  "pointer",
++                  "value",
++                  "authority",
++                  "section"
++                ],
++                "properties": {
++                  "kind": {
++                    "const": "json_member"
++                  },
++                  "pointer": {
++                    "type": "string"
++                  },
++                  "value": {},
++                  "authority": {
++                    "type": "string"
++                  },
++                  "section": {
++                    "type": "string"
++                  }
++                }
++              }
++            },
++            "advisory": {
++              "oneOf": [
++                {
++                  "type": "null"
++                },
++                {
++                  "type": "object",
++                  "required": [
++                    "kind",
++                    "pointer",
++                    "value"
++                  ],
++                  "properties": {
++                    "kind": {
++                      "const": "json_member"
++                    },
++                    "pointer": {
++                      "type": "string"
++                    },
++                    "value": {}
++                  }
++                }
++              ]
++            }
++          }
++        },
++        "text_blocks": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "content_index",
++              "text",
++              "sha256",
++              "utf8_bytes",
++              "tokens"
++            ],
++            "properties": {
++              "content_index": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "text": {
++                "type": "string"
++              },
++              "sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              },
++              "utf8_bytes": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "tokens": {
++                "type": "integer",
++                "minimum": 0
++              }
++            }
++          }
++        },
++        "canonical_spans": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "pointer",
++              "start",
++              "end",
++              "sha256",
++              "value",
++              "content_index",
++              "text",
++              "source_refs",
++              "authority",
++              "section"
++            ],
++            "properties": {
++              "pointer": {
++                "type": "string"
++              },
++              "start": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "end": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              },
++              "value": {},
++              "content_index": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "text": {
++                "type": "string"
++              },
++              "source_refs": {
++                "type": "array"
++              },
++              "authority": {
++                "type": "string"
++              },
++              "section": {
++                "type": "string"
++              }
++            }
++          }
++        },
++        "canonical_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "advisory_spans": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "pointer",
++              "start",
++              "end",
++              "sha256",
++              "value",
++              "content_index",
++              "attribution"
++            ],
++            "properties": {
++              "pointer": {
++                "type": [
++                  "string",
++                  "null"
++                ]
++              },
++              "start": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "end": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              },
++              "value": {},
++              "content_index": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "attribution": {
++                "enum": [
++                  "observed_advisory_member",
++                  "unclassified_text"
++                ]
++              }
++            }
++          }
++        },
++        "advisory_blocks": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "content_index",
++              "text",
++              "sha256",
++              "tokens"
++            ],
++            "properties": {
++              "content_index": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "text": {
++                "type": "string"
++              },
++              "sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              },
++              "tokens": {
++                "type": "integer",
++                "minimum": 0
++              }
++            }
++          }
++        },
++        "advisory_review_sha256": {
++          "type": "string",
++          "pattern": "^[0-9a-f]{64}$"
++        },
++        "final_tokens": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 128000
++        },
++        "canonical_tokens": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "advisory_tokens": {
++          "type": "integer",
++          "minimum": 0,
++          "maximum": 1024
++        },
++        "candidate_body_tokens": {
++          "type": "integer",
++          "minimum": 0
++        },
++        "candidates": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "candidate_ref",
++              "content",
++              "content_sha256",
++              "sources",
++              "presentation_span",
++              "presentation_sha256",
++              "final_join"
++            ],
++            "properties": {
++              "candidate_ref": {
++                "type": "string"
++              },
++              "content": {
++                "type": "string"
++              },
++              "content_sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              },
++              "sources": {
++                "type": "array",
++                "items": {
++                  "type": "object",
++                  "required": [
++                    "source_id",
++                    "revision",
++                    "lineage_id",
++                    "origin",
++                    "content_sha256"
++                  ],
++                  "properties": {
++                    "source_id": {
++                      "type": "string"
++                    },
++                    "revision": {
++                      "type": [
++                        "string",
++                        "null"
++                      ]
++                    },
++                    "lineage_id": {
++                      "type": "string"
++                    },
++                    "origin": {
++                      "type": "object"
++                    },
++                    "content_sha256": {
++                      "type": "string"
++                    }
++                  }
++                }
++              },
++              "presentation_span": {
++                "type": "object",
++                "required": [
++                  "pointer",
++                  "start",
++                  "end",
++                  "sha256",
++                  "value"
++                ],
++                "properties": {
++                  "pointer": {
++                    "type": "string"
++                  },
++                  "start": {
++                    "type": "integer",
++                    "minimum": 0
++                  },
++                  "end": {
++                    "type": "integer",
++                    "minimum": 0
++                  },
++                  "sha256": {
++                    "type": "string",
++                    "pattern": "^[0-9a-f]{64}$"
++                  },
++                  "value": {}
++                }
++              },
++              "presentation_sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              },
++              "final_join": {
++                "oneOf": [
++                  {
++                    "type": "object",
++                    "required": [
++                      "status",
++                      "reason"
++                    ],
++                    "properties": {
++                      "status": {
++                        "const": "unresolved"
++                      },
++                      "reason": {
++                        "type": "string",
++                        "minLength": 1
++                      }
++                    }
++                  },
++                  {
++                    "type": "object",
++                    "required": [
++                      "status",
++                      "trace_ref",
++                      "item_ref",
++                      "provider_rank",
++                      "retained_candidate_id",
++                      "compiled_stage"
++                    ],
++                    "properties": {
++                      "status": {
++                        "const": "bound"
++                      },
++                      "trace_ref": {
++                        "type": "string",
++                        "pattern": "^recall-trace-v1:[0-9a-f]{64}:[0-9a-f]{64}$"
++                      },
++                      "item_ref": {
++                        "type": "string",
++                        "pattern": "^recall-item-v1:(0|[1-9][0-9]*)$"
++                      },
++                      "provider_rank": {
++                        "type": "integer",
++                        "minimum": 0
++                      },
++                      "retained_candidate_id": {
++                        "type": "string"
++                      },
++                      "compiled_stage": {
++                        "const": "injected"
++                      }
++                    }
++                  }
++                ]
++              },
++              "scope_match": {
++                "type": "boolean"
++              },
++              "provenance": {
++                "enum": [
++                  "available",
++                  "redacted",
++                  "unavailable",
++                  "missing"
++                ]
++              },
++              "from_corrupt_state": {
++                "type": "boolean"
++              }
++            }
++          }
++        },
++        "retained_trace": {
++          "oneOf": [
++            {
++              "type": "null"
++            },
++            {
++              "type": "object",
++              "required": [
++                "status",
++                "reason"
++              ],
++              "properties": {
++                "status": {
++                  "const": "unavailable"
++                },
++                "reason": {
++                  "type": "string",
++                  "minLength": 1
++                }
++              }
++            },
++            {
++              "type": "object",
++              "required": [
++                "status",
++                "artifact",
++                "correlation",
++                "provider_id",
++                "registration_revision",
++                "delivery_scope",
++                "store_evidence",
++                "daemon_identity"
++              ],
++              "properties": {
++                "status": {
++                  "const": "observed"
++                },
++                "artifact": {
++                  "type": "object",
++                  "required": [
++                    "artifact_path",
++                    "utf8",
++                    "byte_length",
++                    "sha256"
++                  ],
++                  "properties": {
++                    "artifact_path": {
++                      "type": "string",
++                      "minLength": 1
++                    },
++                    "utf8": {
++                      "type": "string"
++                    },
++                    "byte_length": {
++                      "type": "integer",
++                      "minimum": 0
++                    },
++                    "sha256": {
++                      "type": "string",
++                      "pattern": "^[0-9a-f]{64}$"
++                    }
++                  }
++                },
++                "correlation": {
++                  "type": "object",
++                  "required": [
++                    "trace_ref",
++                    "request_id"
++                  ],
++                  "properties": {
++                    "trace_ref": {
++                      "type": "string"
++                    },
++                    "request_id": {
++                      "type": "string"
++                    }
++                  }
++                },
++                "provider_id": {
++                  "type": "string"
++                },
++                "registration_revision": {
++                  "type": "integer",
++                  "minimum": 1
++                },
++                "delivery_scope": {
++                  "type": "object"
++                },
++                "store_evidence": {
++                  "type": "object"
++                },
++                "daemon_identity": {
++                  "type": "object"
++                }
++              }
++            }
++          ]
++        },
++        "model_input_tokens": {
++          "type": "object",
++          "required": [
++            "status",
++            "reason"
++          ],
++          "properties": {
++            "status": {
++              "const": "unmeasured"
++            },
++            "reason": {
++              "type": "string",
++              "minLength": 1
++            }
++          }
++        },
++        "payload_syntax_spans": {
++          "type": "array",
++          "items": {
++            "type": "object",
++            "required": [
++              "content_index",
++              "start",
++              "end",
++              "text",
++              "sha256"
++            ],
++            "properties": {
++              "content_index": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "start": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "end": {
++                "type": "integer",
++                "minimum": 0
++              },
++              "text": {
++                "type": "string",
++                "pattern": "^[ \\t\\r\\n{},]*$"
++              },
++              "sha256": {
++                "type": "string",
++                "pattern": "^[0-9a-f]{64}$"
++              }
++            }
++          }
++        }
++      },
++      "not": {
++        "anyOf": [
++          {
++            "required": [
++              "final_text"
++            ]
++          },
++          {
++            "required": [
++              "final_sha256"
++            ]
++          },
++          {
++            "required": [
++              "sections"
++            ]
++          },
++          {
++            "required": [
++              "tool_result"
++            ]
++          }
++        ]
++      },
++      "description": "Original CLI UTF-8 carrier plus every decoded text block. Byte spans are independently parsed JSON member/value boundaries and semantically checked against the observed production projection. Full token cost is the sum of independently recounted text blocks, capped at 128000. Advisory cost conservatively includes the entire advisory_provider_memory member and every other text block, concatenating spans only within each original block and summing its independent counts, capped at 1024. No complete model-input token count is claimed. Every candidate annotation must bind both its full original presentation SHA-256 and the length-prefixed ordered advisory-block review digest. Unknown final joins and unreviewed notices remain unresolved. Other text blocks are unclassified_text, conservatively charged without asserting provider authorship. Original payload delimiter gaps are retained and remain total-charged. Annotation presentation_review explicitly covers candidate_metadata, shared_text, source_attribution, and prohibited_claims; digest equality alone is insufficient."
++    }
++  }
+ }
+diff --git a/product/evaluation/host-comparison/comparison-report.schema.json b/product/evaluation/host-comparison/comparison-report.schema.json
+--- a/product/evaluation/host-comparison/comparison-report.schema.json
++++ b/product/evaluation/host-comparison/comparison-report.schema.json
+@@ -67,5 +67,6 @@
+     "performance": {
+       "type": "object"
+     }
+-  }
++  },
++  "$comment": "Delivery representation preserves metric definitions and frozen denominators. rendered_text_v1 counts the exact joined delivered text; tool_result_v1 counts the sum of independently recounted ordered decoded text blocks, with original lexical advisory spans counted separately per block. Neither ToolResult carrier serialization size nor producer compiled-pack counters substitute for complete model input; that boundary and downstream task benefit remain unmeasured. Unknown final-output joins and unreviewed presentation prose remain unresolved."
+ }
+diff --git a/scripts/product/memory-comparison/adjudicate.py b/scripts/product/memory-comparison/adjudicate.py
+--- a/scripts/product/memory-comparison/adjudicate.py
++++ b/scripts/product/memory-comparison/adjudicate.py
+@@ -9,6 +9,7 @@
+ from pathlib import Path
+ 
+ from runner import LABELS, ROOT, TOKENIZER, digest, require, text_digest
++from delivery_evidence import PRESENTATION_REVIEW, finally_emitted, is_tool_result
+ 
+ CHECKS = ("source_fidelity", "query_expectations", "nonvacuous_safety", "challenge_evidence")
+ 
+@@ -31,7 +32,7 @@
+     return {"kind": "unmeasured", "reason": reason}
+ 
+ 
+-def evidence_for(candidate, query, case, annotation):
++def evidence_for(candidate, query, case, annotation, delivery=None):
+     """Verify annotation refers to frozen truth and an actually delivered body."""
+     label = annotation.get("label", "missing") if annotation else "missing"
+     reason = annotation.get("reason") if annotation else "no blinded source-grounded annotation supplied"
+@@ -48,6 +49,15 @@
+         faithful &= captured.get("content_sha256") == text_digest(source["content"])
+     facts = []
+     if annotation:
++        if delivery and is_tool_result(delivery):
++            require(annotation.get("presentation_sha256") == candidate["presentation_sha256"] and
++                    annotation.get("advisory_review_sha256") == delivery["advisory_review_sha256"],
++                    "annotation does not bind the full candidate presentation and advisory notices")
++            require(annotation.get("presentation_review") == PRESENTATION_REVIEW and
++                    type(annotation.get("prohibited_claims_absent")) is bool,
++                    "annotation did not assess full candidate metadata, shared text, source attribution, and prohibited claims")
++            require(candidate["final_join"]["status"] == "bound" or label in
++                    ("missing", "indeterminate", "unverifiable"), "unresolved final-output join cannot receive a determinate label")
+         require(annotation.get("reviewer_id") and annotation.get("provider_blinded") is True,
+                 "retrieval label lacks blinded reviewer identity")
+         for proof in annotation.get("fact_evidence", []):
+@@ -194,18 +204,27 @@
+                         metric_delivery = None
+                         covered, forbidden, unknown, query_useful_sources = set(), False, False, set()
+                         if delivery:
+-                            metric_delivery = {k: delivery[k] for k in ("final_text", "final_sha256", "final_tokens",
+-                                                "canonical_tokens", "advisory_tokens", "candidate_body_tokens")}
+-                            metric_delivery.update({"tokenizer_identity": TOKENIZER["identity"], "tokenizer_revision": TOKENIZER["revision"],
+-                                                    "sections": [{"kind": s["kind"], "text": s["text"], "candidate_ref": s.get("candidate_ref")}
+-                                                                 for s in delivery["sections"]], "candidates": []})
++                            tool_result = is_tool_result(delivery)
++                            metric_delivery = {k: delivery[k] for k in ("final_tokens", "canonical_tokens", "advisory_tokens", "candidate_body_tokens")}
++                            metric_delivery.update({"tokenizer_identity": TOKENIZER["identity"], "tokenizer_revision": TOKENIZER["revision"]})
++                            if tool_result:
++                                # Preserve original artifact bytes, lexical spans, complete trace
++                                # and block boundaries in the evaluator input, without rendering.
++                                metric_delivery.update({"representation": "tool_result_v1", "tool_result": {
++                                    k: v for k, v in delivery.items() if k != "candidates"}, "candidates": []})
++                                metric_delivery["tool_result"]["candidates"] = []
++                            else:
++                                metric_delivery.update({k: delivery[k] for k in ("final_text", "final_sha256")})
++                                metric_delivery.update({"sections": [{"kind": s["kind"], "text": s["text"], "candidate_ref": s.get("candidate_ref")}
++                                                                     for s in delivery["sections"]], "candidates": []})
+                             for captured in delivery["candidates"]:
+                                 key = (row["case_trial_id"], row["request_id"], captured["candidate_ref"])
+-                                annotation = by_key.get(key) if captured["delivered"] else None
++                                emitted = finally_emitted(captured, delivery)
++                                annotation = by_key.get(key) if emitted else None
+                                 if annotation:
+                                     used.add(key)
+-                                label, reason, source_ids, facts, faithful = evidence_for(captured, query, case, annotation)
+-                                if captured["delivered"]:
++                                label, reason, source_ids, facts, faithful = evidence_for(captured, query, case, annotation, delivery)
++                                if emitted:
+                                     forbidden |= bool(set(source_ids) & set(query["forbidden_source_ids"]))
+                                     unknown |= label in ("missing", "indeterminate", "unverifiable")
+                                     fidelity = "fail" if not faithful else fidelity
+@@ -214,15 +233,29 @@
+                                              "label": label, "provenance": captured.get("provenance", "missing"),
+                                              "scope_match": captured.get("scope_match") is True,
+                                              "contains_forgotten_source": forgotten}
+-                                metric_delivery["candidates"].append({"candidate": candidate, "content": captured.get("content", ""),
+-                                    "content_sha256": captured.get("content_sha256", ""),
+-                                    "stages": [captured[s] for s in ("returned", "admitted", "selected", "packed", "delivered")],
+-                                    "withholding_reason": captured.get("withholding_reason"), "source_ids": source_ids,
+-                                    "required_fact_refs": facts, "annotation_reason": reason})
+-                                if captured["delivered"]:
++                                annotated = {"candidate": candidate, "content": captured.get("content", ""),
++                                    "content_sha256": captured.get("content_sha256", ""), "source_ids": source_ids,
++                                    "required_fact_refs": facts, "annotation_reason": reason}
++                                if tool_result:
++                                    annotated.update({k: v for k, v in captured.items() if k not in annotated})
++                                    annotated["annotation_presentation_sha256"] = annotation.get("presentation_sha256") if annotation else None
++                                    annotated["annotation_advisory_review_sha256"] = annotation.get("advisory_review_sha256") if annotation else None
++                                    annotated["presentation_review"] = annotation.get("presentation_review") if annotation else None
++                                    annotated["prohibited_claims_absent"] = annotation.get("prohibited_claims_absent") if annotation else None
++                                    forbidden |= bool(annotation) and annotation.get("prohibited_claims_absent") is False
++                                    metric_delivery["tool_result"]["candidates"].append(annotated)
++                                    unknown |= captured["final_join"]["status"] != "bound"
++                                else:
++                                    annotated.update({"stages": [captured[s] for s in ("returned", "admitted", "selected", "packed", "delivered")],
++                                                      "withholding_reason": captured.get("withholding_reason")})
++                                    metric_delivery["candidates"].append(annotated)
++                                if emitted:
+                                     candidates.append(candidate)
+-                                    forbidden |= forgotten or not candidate["scope_match"] or label in ("harmful", "stale")
++                                    forbidden |= forgotten or label in ("harmful", "stale") or (
++                                        not candidate["scope_match"] and
++                                        (not tool_result or captured["final_join"]["status"] == "bound"))
+                                     if (label == "useful" and faithful and not forgotten and candidate["scope_match"]
++                                            and (not tool_result or captured["final_join"]["status"] == "bound")
+                                             and candidate["provenance"] in ("available", "redacted")
+                                             and not set(source_ids) & set(query["forbidden_source_ids"])):
+                                         covered.update(facts)
+@@ -232,6 +265,8 @@
+                                             corrupt_unknown = True
+                                         else:
+                                             corrupt_count += captured["from_corrupt_state"]
++                            if tool_result and not delivery["candidates"]:
++                                unknown |= any(b["text"] for b in delivery["advisory_blocks"])
+                             token_sum = token_sum + delivery["final_tokens"] if token_sum is not None else None
+                         else:
+                             token_sum = None
+@@ -242,6 +277,8 @@
+                             outcome = "fail" if row["terminal"] != query["expected_terminal"] or forbidden else "pass"
+                             if query["expected_useful_source_ids"] and (not delivery or len(covered) < len(query["required_facts"])):
+                                 outcome = "indeterminate" if unknown or not delivery else "fail"
++                        if delivery and is_tool_result(delivery) and unknown and outcome == "pass":
++                            outcome = "indeterminate"
+                         if row.get("comparison_valid") is False:
+                             outcome, fidelity = "indeterminate", "indeterminate"
+                         if row["status"] == "completed" and row.get("comparison_valid") is True and outcome == "pass":
+diff --git a/scripts/product/memory-comparison/delivery_evidence.py b/scripts/product/memory-comparison/delivery_evidence.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/product/memory-comparison/delivery_evidence.py
+@@ -0,0 +1,317 @@
++"""Versioned, lossless ToolResult evidence. No host decisions are reconstructed.
++
++Offsets name original UTF-8 bytes in one decoded text block. JSON member spans
++include the original key/colon/value, never bytes from a reserialization. The
++Rust evaluator independently recounts all recorded o200k observations.
++"""
++
++import hashlib
++import json
++import re
++
++TOKENIZER = {"identity": "tiktoken.o200k_base", "revision": "tiktoken-rs-0.12"}
++NUMBER = re.compile(rb"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
++PRESENTATION_REVIEW = {"candidate_metadata": True, "shared_text": True, "source_attribution": True, "prohibited_claims": True}
++STAGES = {"denied", "normalization_unavailable", "selection_unavailable", "deduplicated",
++          "budget_excluded", "host_withheld", "selected", "pack_excluded", "injected"}
++
++
++def check(condition, reason):
++    if not condition:
++        raise ValueError(reason)
++
++
++def sha(text):
++    return hashlib.sha256(text.encode("utf-8", errors="strict")).hexdigest()
++
++
++def same(left, right):
++    if type(left) is not type(right):
++        return False
++    if isinstance(left, dict):
++        return left.keys() == right.keys() and all(same(left[k], right[k]) for k in left)
++    if isinstance(left, list):
++        return len(left) == len(right) and all(same(a, b) for a, b in zip(left, right))
++    return left == right
++
++
++class LexicalJson:
++    """Strict JSON parser retaining value and member spans by RFC 6901 pointer."""
++    def __init__(self, text):
++        self.data = text.encode("utf-8", errors="strict")
++        check(len(self.data) <= 16 * 1024 * 1024, "JSON evidence exceeds byte bound")
++        self.at, self.nodes, self.members = 0, {}, {}
++        self.value = self._value("", 0)
++        self._space()
++        check(self.at == len(self.data), "trailing JSON bytes")
++
++    def _space(self):
++        while self.at < len(self.data) and self.data[self.at] in b" \t\r\n":
++            self.at += 1
++
++    def _string(self):
++        start = self.at
++        check(self.data[self.at:self.at + 1] == b'"', "JSON key/string expected")
++        self.at += 1
++        while self.at < len(self.data):
++            byte = self.data[self.at]
++            self.at += 1
++            if byte == 92:
++                self.at += 1
++            elif byte == 34:
++                value = json.loads(self.data[start:self.at])
++                value.encode("utf-8", errors="strict")
++                return value
++        raise ValueError("unterminated JSON string")
++
++    def _value(self, pointer, depth):
++        check(depth <= 128, "JSON evidence exceeds depth bound")
++        self._space()
++        start, tag = self.at, self.data[self.at:self.at + 1]
++        if tag == b'{':
++            self.at += 1
++            value = {}
++            self._space()
++            if self.data[self.at:self.at + 1] != b'}':
++                while True:
++                    self._space()
++                    member_start = self.at
++                    key = self._string()
++                    check(key not in value, "duplicate JSON key")
++                    child = pointer + "/" + key.replace("~", "~0").replace("/", "~1")
++                    self._space()
++                    check(self.data[self.at:self.at + 1] == b':', "JSON colon expected")
++                    self.at += 1
++                    value[key] = self._value(child, depth + 1)
++                    self.members[child] = (member_start, self.at)
++                    self._space()
++                    if self.data[self.at:self.at + 1] != b',':
++                        break
++                    self.at += 1
++            check(self.data[self.at:self.at + 1] == b'}', "JSON object end expected")
++            self.at += 1
++        elif tag == b'[':
++            self.at += 1
++            value = []
++            self._space()
++            if self.data[self.at:self.at + 1] != b']':
++                while True:
++                    value.append(self._value(pointer + "/" + str(len(value)), depth + 1))
++                    self._space()
++                    if self.data[self.at:self.at + 1] != b',':
++                        break
++                    self.at += 1
++            check(self.data[self.at:self.at + 1] == b']', "JSON array end expected")
++            self.at += 1
++        elif tag == b'"':
++            value = self._string()
++        else:
++            literal = next((word for word in (b'true', b'false', b'null')
++                            if self.data.startswith(word, self.at)), None)
++            if literal is not None:
++                self.at += len(literal)
++            else:
++                match = NUMBER.match(self.data, self.at)
++                check(match is not None, "invalid JSON value")
++                self.at = match.end()
++            value = json.loads(self.data[start:self.at])
++            check(not isinstance(value, float) or abs(value) != float("inf"), "nonfinite JSON number")
++        self.nodes[pointer] = (start, self.at, value)
++        return value
++
++    def span(self, pointer, member=False):
++        start, end = self.members[pointer] if member else self.nodes[pointer][:2]
++        return {"pointer": pointer, "start": start, "end": end,
++                "sha256": sha(self.data[start:end].decode("utf-8")), "value": self.nodes[pointer][2]}
++
++    def verify(self, span, member=False):
++        expected = self.span(span["pointer"], member)
++        check(all(type(span.get(k)) is type(v) and same(span[k], v) for k, v in expected.items()),
++              "original JSON span, digest, or semantic pointer mismatch")
++        return self.data[span["start"]:span["end"]].decode("utf-8")
++
++
++def artifact(value):
++    text = value["utf8"]
++    check(isinstance(value.get("artifact_path"), str) and bool(value["artifact_path"]), "missing raw artifact reference")
++    check(type(value.get("byte_length")) is int and value["byte_length"] == len(text.encode("utf-8"))
++          and value.get("sha256") == sha(text), "raw artifact byte/digest mismatch")
++    # Embedded exact bytes make metric bundles portable; the retained path is an
++    # attribution reference. This verifier cannot authenticate the fixture.
++    return LexicalJson(text)
++
++
++def count(value):
++    check(type(value) is int and value >= 0, "missing exact nonnegative token observation")
++    return value
++
++
++def is_tool_result(delivery):
++    return delivery.get("representation") == "tool_result_v1"
++
++
++def finally_emitted(candidate, delivery):
++    return True if is_tool_result(delivery) else candidate["delivered"]
++
++
++def canonical_sections(delivery):
++    if not is_tool_result(delivery):
++        return [s for s in delivery["sections"] if s["kind"] == "canonical"]
++    # Exclude output offsets and advisory-dependent block positions from pairing;
++    # compare each exact original canonical member plus source classification.
++    return [{"pointer": s["pointer"], "sha256": s["sha256"], "text": s["text"],
++             "source_refs": s["source_refs"], "authority": s["authority"], "section": s["section"]}
++            for s in delivery["canonical_spans"]]
++
++
++def validate_tool_result(delivery, lane):
++    check(delivery["representation"] == "tool_result_v1", "unknown delivery representation")
++    check(delivery["tokenizer"] == TOKENIZER, "tokenizer mismatch")
++    check(not any(k in delivery for k in ("final_text", "final_sha256", "sections")), "mixed delivery representations")
++    check(delivery["model_input_tokens"]["status"] == "unmeasured" and
++          bool(delivery["model_input_tokens"]["reason"]), "model input boundary is unmeasured")
++    carrier = artifact(delivery["raw_carrier"])
++    projection = delivery["projection"]
++    check(same(carrier.value, projection["result"]), "raw ToolResult/projection disagreement")
++    content = carrier.value["content"]
++    check(isinstance(content, list), "ToolResult content is not an array")
++    expected = [{"content_index": i, "text": block["text"]} for i, block in enumerate(content)
++                if block.get("type") == "text"]
++    blocks = delivery["text_blocks"]
++    check(same(expected, [{"content_index": b["content_index"], "text": b["text"]} for b in blocks])
++          and same(expected, projection["text_blocks"]), "missing, reordered, or rewritten decoded text block")
++    for block in blocks:
++        check(block["sha256"] == sha(block["text"]) and type(block["utf8_bytes"]) is int
++              and block["utf8_bytes"] == len(block["text"].encode()), "decoded text block bytes mismatch")
++        count(block["tokens"])
++    check(count(delivery["final_tokens"]) == sum(b["tokens"] for b in blocks) <= 128000,
++          "full decoded block token sum exceeds quota or disagrees")
++    index = projection["payload_content_index"]
++    check(type(index) is int, "invalid payload content index")
++    payload = next((b for b in blocks if b["content_index"] == index), None)
++    check(payload is not None, "payload block missing")
++    parser = LexicalJson(payload["text"])
++    check(isinstance(parser.value, dict), "ToolResult v1 requires an object JSON payload")
++    canonical = delivery["canonical_spans"]
++    observed = projection["host_evidence"]
++    check(len(canonical) == len(observed), "canonical projection coverage mismatch")
++    expected_pointers = ["/" + k.replace("~", "~0").replace("/", "~1") for k in parser.value
++                         if k != "advisory_provider_memory"]
++    check([s["pointer"] for s in canonical] == expected_pointers, "canonical original member order/coverage mismatch")
++    by_pointer = {s["pointer"]: s for s in observed}
++    check(len(by_pointer) == len(observed), "duplicate canonical projection")
++    canonical_text = ""
++    for span in canonical:
++        projected = by_pointer[span["pointer"]]
++        text = parser.verify(span, member=True)
++        check(span["text"] == text and span["content_index"] == index and
++              projected["kind"] == "json_member" and same(projected["value"], span["value"])
++              and span["authority"] == projected["authority"] and span["section"] == projected["section"]
++              and isinstance(span["source_refs"], list), "canonical source/projection mismatch")
++        canonical_text += text
++    check(sha(canonical_text) == delivery["canonical_sha256"], "canonical original bytes digest mismatch")
++    count(delivery["canonical_tokens"])
++    # Every byte outside a complete top-level member is original JSON syntax.
++    # Retain these gaps explicitly; full-block accounting charges them once.
++    syntax, cursor = [], 0
++    top = [parser.members["/" + k.replace("~", "~0").replace("/", "~1")] for k in parser.value]
++    for start, end in [*top, (len(parser.data), len(parser.data))]:
++        if start > cursor:
++            text = parser.data[cursor:start].decode("utf-8")
++            check(all(c in " \t\r\n{}," for c in text), "unattributed substantive payload bytes")
++            syntax.append({"content_index": index, "start": cursor, "end": start, "text": text, "sha256": sha(text)})
++        cursor = end
++    check(same(syntax, delivery["payload_syntax_spans"]), "payload delimiter partition mismatch")
++    advisory = parser.value.get("advisory_provider_memory")
++    check("advisory_provider_memory" not in parser.value or isinstance(advisory, dict), "invalid advisory object")
++    expected_advisory = []
++    if advisory is not None:
++        projected = projection["advisory"]
++        check(projected["kind"] == "json_member" and projected["pointer"] == "/advisory_provider_memory"
++              and same(projected["value"], advisory), "advisory projection mismatch")
++        expected_advisory.append({"content_index": index, "attribution": "observed_advisory_member", **parser.span("/advisory_provider_memory", member=True)})
++    else:
++        check(projection["advisory"] is None, "missing observed advisory projection")
++    # Every extra block is unclassified text, conservatively advisory-charged.
++    # This cost classification does not assert provider authorship.
++    for block in blocks:
++        if block["content_index"] != index:
++            expected_advisory.append({"content_index": block["content_index"], "attribution": "unclassified_text", "pointer": None, "start": 0,
++                                      "end": block["utf8_bytes"], "sha256": block["sha256"], "value": block["text"]})
++    expected_advisory.sort(key=lambda s: (s["content_index"], s["start"]))
++    check(same(expected_advisory, delivery["advisory_spans"]), "advisory original span coverage mismatch")
++    per_block = []
++    for block in blocks:
++        raw = block["text"].encode()
++        text = b"".join(raw[s["start"]:s["end"]] for s in expected_advisory
++                        if s["content_index"] == block["content_index"]).decode()
++        per_block.append({"content_index": block["content_index"], "text": text, "sha256": sha(text)})
++    check(same(per_block, [{k: b[k] for k in ("content_index", "text", "sha256")}
++                          for b in delivery["advisory_blocks"]]), "advisory per-block projection mismatch")
++    check(count(delivery["advisory_tokens"]) == sum(count(b["tokens"]) for b in delivery["advisory_blocks"]) <= 1024,
++          "advisory per-block token sum exceeds quota or disagrees")
++    # Length-prefixing binds the ordered block boundaries of a review document.
++    review = b"".join(len(b["text"].encode()).to_bytes(8, "big") + b["text"].encode() for b in per_block)
++    check(hashlib.sha256(review).hexdigest() == delivery["advisory_review_sha256"], "advisory review digest mismatch")
++    emitted = advisory.get("candidates", []) if isinstance(advisory, dict) else []
++    check(isinstance(emitted, list) and len(emitted) == len(delivery["candidates"]), "emitted candidate coverage mismatch")
++    check(len({c["candidate_ref"] for c in delivery["candidates"]}) == len(emitted), "duplicate candidate ledger entry")
++    for position, candidate in enumerate(delivery["candidates"]):
++        pointer = f"/advisory_provider_memory/candidates/{position}"
++        presentation = candidate["presentation_span"]
++        check(presentation["pointer"] == pointer, "candidate order/presentation pointer mismatch")
++        parser.verify(presentation)
++        check(candidate["presentation_sha256"] == presentation["sha256"], "full candidate presentation digest mismatch")
++        check(candidate["content"] == emitted[position]["content"] and sha(candidate["content"]) == candidate["content_sha256"],
++              "finally emitted body mismatch")
++        check(isinstance(candidate["sources"], list), "missing source attribution state")
++        join = candidate["final_join"]
++        check(join["status"] in ("bound", "unresolved"), "invalid final-output join")
++        if join["status"] == "unresolved":
++            check(bool(join.get("reason")), "unresolved final-output join lacks reason")
++        else:
++            # A host-authenticated retained-item binding is required. This draft
++            # deliberately cannot derive it from a hardened candidate ID.
++            validate_bound_join(delivery, candidate, emitted[position])
++    count(delivery["candidate_body_tokens"])
++    if lane == "no_memory":
++        check(not emitted and advisory is None, "no-memory lane delivered provider advisory")
++    if lane == "explicit_documentation":
++        check(advisory is None, "documentation ToolResult assembly is not bound by provider JSON evidence")
++    return canonical_sections(delivery)
++
++
++def validate_bound_join(delivery, candidate, emitted):
++    observed = emitted.get("provenance_evidence", {}).get("recall")
++    check(isinstance(observed, dict), "missing observed candidate control locator")
++    retained = delivery["retained_trace"]
++    check(retained["status"] == "observed", "retained trace unavailable")
++    trace = artifact(retained["artifact"]).value
++    advisory = delivery["projection"]["advisory"]["value"]
++    correlation = advisory["recall_trace"]
++    check(same(retained["correlation"], correlation) and observed["trace_ref"] == correlation["trace_ref"],
++          "candidate/retained trace correlation mismatch")
++    check(trace["request_id"] == correlation["request_id"] and
++          trace["provider_id"] == retained["provider_id"] == advisory["provider_id"] and
++          type(trace["registration_revision"]) is int and
++          same(trace["registration_revision"], retained["registration_revision"]) and
++          same(trace["registration_revision"], advisory["registration_revision"]) and
++          same(retained["delivery_scope"], advisory["canonical_history_replay"]["delivery_scope"]),
++          "retained request/provider/revision/scope mismatch")
++    check(retained.get("store_evidence") and retained.get("daemon_identity"), "missing retained host-read attribution")
++    match = re.fullmatch(r"recall-trace-v1:([0-9a-f]{64}):([0-9a-f]{64})", observed["trace_ref"])
++    check(match is not None and match.group(2) == trace["trace_id"], "retained trace identity mismatch")
++    item = re.fullmatch(r"recall-item-v1:(0|[1-9][0-9]*)", observed["item_ref"])
++    check(item is not None, "noncanonical retained item locator")
++    rank = int(item.group(1))
++    check(rank < len(trace["items"]) and type(trace["items"][rank]["provider_rank"]) is int
++          and trace["items"][rank]["provider_rank"] == rank, "retained item rank mismatch")
++    check(type(trace["requested_count"]) is int and trace["requested_count"] == len(trace["items"])
++          and [i["provider_rank"] for i in trace["items"]] == list(range(len(trace["items"])))
++          and all(i["stage"] in STAGES for i in trace["items"]), "retained trace partition mismatch")
++    row = trace["items"][rank]
++    join = candidate["final_join"]
++    check(join["trace_ref"] == observed["trace_ref"] and join["item_ref"] == observed["item_ref"] and
++          same(join["provider_rank"], rank) and join["retained_candidate_id"] == row["candidate_id"] and
++          candidate["candidate_ref"] == row["candidate_id"] and join["compiled_stage"] == row["stage"] == "injected",
++          "final output/compiled retained item join mismatch")
+diff --git a/scripts/product/memory-comparison/runner.py b/scripts/product/memory-comparison/runner.py
+--- a/scripts/product/memory-comparison/runner.py
++++ b/scripts/product/memory-comparison/runner.py
+@@ -19,6 +19,7 @@
+ from measurements import populations, summarize_measurements
+ from performance_fixture import fixed_fixtures
+ from event_log import JsonlEventSink, event, read_captures
++from delivery_evidence import canonical_sections, is_tool_result, validate_tool_result
+ 
+ ROOT = Path(__file__).resolve().parents[3]
+ ARTIFACTS = ROOT / "product/evaluation/host-comparison"
+@@ -229,6 +230,9 @@
+ 
+ def validate_delivery(delivery, lane):
+     """Reconcile each actual delivered byte with final sections and stage ledger."""
++    if is_tool_result(delivery):
++        return validate_tool_result(delivery, lane)
++    require(delivery.get("representation") in (None, "rendered_text_v1"), "unknown delivery representation")
+     require(delivery["tokenizer"] == TOKENIZER, "tokenizer mismatch")
+     final = delivery["final_text"]
+     require(text_digest(final) == delivery["final_sha256"], "final delivered bytes digest mismatch")
+@@ -381,7 +385,7 @@
+             for row in trial_rows:
+                 if row["action"] == "recall" and row["delivery"]:
+                     canonical_by_request.setdefault(row["request_id"], set()).add(digest(
+-                        [s for s in row["delivery"]["sections"] if s["kind"] == "canonical"]))
++                        canonical_sections(row["delivery"])))
+         if len(set(signatures)) != 1 or any(len(values) > 1 for values in canonical_by_request.values()):
+             for scheduled, _, trial_rows in group:
+                 invalid.append({"case_trial_id": scheduled["case_trial_id"], "reason": "canonical input/output drift"})
+diff --git a/scripts/product/memory-comparison/test_delivery_evidence.py b/scripts/product/memory-comparison/test_delivery_evidence.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/product/memory-comparison/test_delivery_evidence.py
+@@ -0,0 +1,310 @@
++"""Development-only JSON evidence regressions; no frozen corpus or real host."""
++
++import copy
++import hashlib
++import importlib.util
++import json
++from pathlib import Path
++import sys
++import unittest
++
++HERE = Path(__file__).resolve().parent
++LIVE = next(p for p in HERE.parents if (p / 'scripts/product/memory-comparison/event_log.py').is_file()) / 'scripts/product/memory-comparison'
++# Draft imports use its modified files and the unchanged live utility modules.
++sys.path.insert(0, str(LIVE))
++sys.path.insert(0, str(HERE))
++from delivery_evidence import LexicalJson, PRESENTATION_REVIEW, TOKENIZER, sha, validate_tool_result
++import adjudicate
++import runner
++
++
++def artifact(text, name):
++    return {"artifact_path": f"development-only/{name}", "utf8": text,
++            "byte_length": len(text.encode()), "sha256": sha(text)}
++
++
++def fixture(bound=True, notices=True):
++    trace_ref = 'recall-trace-v1:' + 'b' * 64 + ':' + 'a' * 64
++    control = {"trace_ref": trace_ref, "item_ref": "recall-item-v1:0"}
++    source = {"source_id": "source", "revision": "r1", "lineage_id": "lineage",
++              "origin": {"kind": "development"}, "content_sha256": sha("Use café mode.")}
++    candidate = {"candidate_id": "host.alias.survivor", "content": "Use café mode.",
++                 "provenance": "Canonical observer source", "explanation": "Use café mode. Metadata must also be reviewed.",
++                 "provenance_evidence": {"sources": [source], "recall": control}}
++    advisory = {"provider_id": "development.provider", "registration_revision": 1,
++                "recall_trace": {"trace_ref": trace_ref, "request_id": "actual-host-request"},
++                "canonical_history_replay": {"delivery_scope": {"project": "development", "session": "s"}},
++                "lane_notice": "Provider words remain inside the charged presentation.", "candidates": [candidate]}
++    payload = '{ "canonical" : {"note":"café\\u0020safe"},\n "advisory_provider_memory" : ' + json.dumps(advisory, ensure_ascii=False) + ' }'
++    parsed = LexicalJson(payload)
++    texts = ['warning'] + [payload, 'metrics'] if notices else [payload]
++    content = [{"type": "text", "text": t} for t in texts]
++    content.append({"type": "image", "data": "development-only", "mimeType": "image/png"})
++    carrier = {"content": content, "isError": False}
++    index = 1 if notices else 0
++    # Python checks structure/arithmetic only. These synthetic observations are
++    # replaced by the pinned Rust tokenizer in the Rust verifier regressions.
++    fake_count = lambda text: len(text.encode()) // 16 + bool(text)
++    blocks = [{"content_index": i, "text": t, "sha256": sha(t), "utf8_bytes": len(t.encode()), "tokens": fake_count(t)} for i, t in enumerate(texts)]
++    canonical = {"content_index": index, **parsed.span('/canonical', member=True), "source_refs": ["canonical-source"],
++                 "authority": "canonical", "section": "canonical_facts"}
++    canonical['text'] = parsed.verify(canonical, member=True)
++    spans = [{"content_index": index, "attribution": "observed_advisory_member", **parsed.span('/advisory_provider_memory', member=True)}]
++    for b in blocks:
++        if b['content_index'] != index:
++            spans.append({"content_index": b['content_index'], "attribution": "unclassified_text", "pointer": None, "start": 0, "end": b['utf8_bytes'], "sha256": b['sha256'], "value": b['text']})
++    spans.sort(key=lambda s: (s['content_index'], s['start']))
++    advisory_blocks = []
++    for b in blocks:
++        raw = b['text'].encode()
++        t = b''.join(raw[s['start']:s['end']] for s in spans if s['content_index'] == b['content_index']).decode()
++        advisory_blocks.append({"content_index": b['content_index'], "text": t, "sha256": sha(t), "tokens": fake_count(t)})
++    review = b''.join(len(b['text'].encode()).to_bytes(8, 'big') + b['text'].encode() for b in advisory_blocks)
++    trace = {"trace_id": 'a' * 64, "request_id": "actual-host-request", "provider_id": "development.provider",
++             "registration_revision": 1, "requested_count": 1, "degraded": False,
++             "items": [{"candidate_id": "original-provider-id", "provider_rank": 0, "stage": "injected",
++                        "host_reason_code": "injected", "host_decision": {"decision": "injected"}, "tokens": 5}], "token_summary": None}
++    presentation = parsed.span('/advisory_provider_memory/candidates/0')
++    row = {"candidate_ref": "original-provider-id", "content": candidate['content'], "content_sha256": sha(candidate['content']),
++           "sources": [source], "scope_match": True, "provenance": "available", "presentation_span": presentation,
++           "presentation_sha256": presentation['sha256'], "final_join": {
++               "status": "bound", **control, "provider_rank": 0, "retained_candidate_id": "original-provider-id", "compiled_stage": "injected"}
++           if bound else {"status": "unresolved", "reason": "development missing retained binding"}}
++    syntax, cursor = [], 0
++    top = [parsed.members["/" + k] for k in parsed.value]
++    for start, end in [*top, (len(parsed.data), len(parsed.data))]:
++        if start > cursor:
++            text = parsed.data[cursor:start].decode()
++            syntax.append({"content_index": index, "start": cursor, "end": start, "text": text, "sha256": sha(text)})
++        cursor = end
++    return {"representation": "tool_result_v1", "tokenizer": TOKENIZER, "payload_syntax_spans": syntax,
++            "raw_carrier": artifact(json.dumps(carrier, ensure_ascii=True, indent=1) + '\n', 'stdout'),
++            "projection": {"result": carrier, "text_blocks": [{"content_index": b['content_index'], "text": b['text']} for b in blocks],
++                           "payload_content_index": index, "host_evidence": [{"kind": "json_member", "pointer": '/canonical', "value": parsed.value['canonical'],
++                                                                              "authority": 'canonical', "section": 'canonical_facts'}],
++                           "advisory": {"kind": "json_member", "pointer": '/advisory_provider_memory', "value": advisory}},
++            "text_blocks": blocks, "canonical_spans": [canonical], "canonical_sha256": sha(canonical['text']),
++            "advisory_spans": spans, "advisory_blocks": advisory_blocks, "advisory_review_sha256": hashlib.sha256(review).hexdigest(),
++            "final_tokens": sum(b['tokens'] for b in blocks), "canonical_tokens": fake_count(canonical['text']),
++            "advisory_tokens": sum(b['tokens'] for b in advisory_blocks), "candidate_body_tokens": fake_count(candidate['content']),
++            "candidates": [row], "retained_trace": {"status": "observed", "artifact": artifact(json.dumps(trace), 'trace'),
++                "correlation": advisory['recall_trace'], "provider_id": advisory['provider_id'], "registration_revision": 1,
++                "delivery_scope": advisory['canonical_history_replay']['delivery_scope'], "store_evidence": {"id": "observed"},
++                "daemon_identity": {"pid": 101, "process_run_id": "development"}},
++            "model_input_tokens": {"status": "unmeasured", "reason": "No complete model API boundary observed."}}
++
++
++def annotation(delivery, label='useful'):
++    return {"label": label, "reason": "development source-grounded review", "reviewer_id": "development", "provider_blinded": True,
++            "presentation_sha256": delivery['candidates'][0]['presentation_sha256'], "advisory_review_sha256": delivery['advisory_review_sha256'],
++            "fact_evidence": [{"fact_index": 0, "source_id": "source", "source_quote": "Use café mode.", "delivered_quote": "Use café mode."}],
++            "prohibited_claims_absent": True, "presentation_review": PRESENTATION_REVIEW}
++
++
++def truth():
++    return ({"id": "q", "required_facts": ["Use café mode."], "expected_useful_source_ids": ["source"]},
++            {"sources": [{"id": "source", "revision": "r1", "lineage_id": "lineage", "origin": {"kind": "development"}, "content": "Use café mode."}]})
++
++
++class OriginalJsonTests(unittest.TestCase):
++    def test_unicode_escapes_key_escaping_nested_arrays_and_original_member_bytes(self):
++        raw = '{ "é/~" : ["café", "\\uD83D\\uDE00", {"a": 1e2}], "last" : true }'
++        parser = LexicalJson(raw)
++        span = parser.span('/é~1~0/1')
++        self.assertEqual('"\\uD83D\\uDE00"', parser.verify(span))
++        self.assertEqual('😀', span['value'])
++        member = parser.span('/last', member=True)
++        self.assertEqual('"last" : true', parser.verify(member, member=True))
++        self.assertEqual(raw.encode().index(b'"last"'), member['start'])
++
++    def test_duplicate_decoded_keys_nonfinite_bad_unicode_and_trailing_values_rejected(self):
++        for raw in ('{"a":1,"\\u0061":2}', '{"a":NaN}', '[Infinity]', '1e9999', '"\\ud800"', '"x\ny"', '01', 'true false', '{"a":1,}', '[1,]'):
++            with self.subTest(raw=raw), self.assertRaises((ValueError, UnicodeError)):
++                LexicalJson(raw)
++
++    def test_repeated_identical_values_do_not_authorize_a_different_pointer_or_offset(self):
++        parser = LexicalJson('{"a":"same","b":"same"}')
++        wrong = parser.span('/b')
++        wrong['pointer'] = '/a'
++        with self.assertRaisesRegex(ValueError, 'span'):
++            parser.verify(wrong)
++
++    def test_byte_offsets_are_not_character_offsets_and_bool_is_not_integer(self):
++        parser = LexicalJson('{"é":"é", "b":2}')
++        span = parser.span('/b')
++        span['start'] -= 2
++        with self.assertRaises(ValueError): parser.verify(span)
++        span = parser.span('/b'); span['end'] = True
++        with self.assertRaises(ValueError): parser.verify(span)
++
++
++class DeliveryTests(unittest.TestCase):
++    def test_complete_wrapper_metadata_and_unknown_nontext_blocks_are_retained(self):
++        d = fixture()
++        self.assertEqual(1, len(runner.validate_delivery(d, 'provider:development.provider')))
++        self.assertEqual('image', d['projection']['result']['content'][-1]['type'])
++        self.assertNotEqual(d['candidates'][0]['candidate_ref'], d['candidates'][0]['presentation_span']['value']['candidate_id'])
++
++    def test_carrier_or_semantic_projection_substitution_fails(self):
++        for field in ('carrier', 'projection', 'span'):
++            d = fixture()
++            if field == 'carrier': d['raw_carrier']['utf8'] += ' '
++            elif field == 'projection': d['projection']['result']['isError'] = True
++            else: d['canonical_spans'][0]['value'] = {'note': 'different'}
++            with self.subTest(field=field), self.assertRaises(ValueError): validate_tool_result(d, 'provider:development.provider')
++
++    def test_omitted_reordered_and_changed_warning_blocks_fail(self):
++        for change in ('omit', 'reorder', 'rewrite'):
++            d = fixture()
++            if change == 'omit': d['text_blocks'].pop()
++            elif change == 'reorder': d['text_blocks'].reverse()
++            else: d['text_blocks'][0]['text'] = 'rewritten'
++            with self.subTest(change=change), self.assertRaises(ValueError): validate_tool_result(d, 'provider:development.provider')
++
++    def test_partial_advisory_subtree_and_unreviewed_explanation_span_fail(self):
++        d = fixture()
++        d['advisory_spans'] = d['advisory_spans'][:1]
++        with self.assertRaisesRegex(ValueError, 'coverage'): validate_tool_result(d, 'provider:development.provider')
++        d = fixture()
++        parser = LexicalJson(d['text_blocks'][1]['text'])
++        d['candidates'][0]['presentation_span'] = parser.span('/advisory_provider_memory/candidates/0/content')
++        with self.assertRaisesRegex(ValueError, 'presentation'): validate_tool_result(d, 'provider:development.provider')
++
++    def test_canonical_original_bytes_and_source_projection_must_agree(self):
++        for field in ('text', 'authority', 'source_refs'):
++            d = fixture(); d['canonical_spans'][0][field] = None
++            with self.subTest(field=field), self.assertRaises((ValueError, TypeError)):
++                validate_tool_result(d, 'provider:development.provider')
++
++    def test_unknown_final_join_stays_unresolved_and_compiled_stage_is_not_delivery(self):
++        d = fixture(bound=False)
++        validate_tool_result(d, 'provider:development.provider')
++        d['candidates'][0]['final_join'] = {'status': 'unresolved'}
++        with self.assertRaisesRegex(ValueError, 'reason'): validate_tool_result(d, 'provider:development.provider')
++        d = fixture(); d['candidates'][0]['final_join']['compiled_stage'] = 'selected'
++        with self.assertRaisesRegex(ValueError, 'join mismatch'): validate_tool_result(d, 'provider:development.provider')
++
++    def test_trace_rank_provider_and_scope_substitution_fail(self):
++        for mutate in (lambda d: d['candidates'][0]['final_join'].update(provider_rank=1),
++                       lambda d: d['retained_trace'].update(provider_id='other'),
++                       lambda d: d['retained_trace'].update(delivery_scope={'project': 'other'}),
++                       lambda d: d['retained_trace']['artifact'].update(sha256='wrong')):
++            d = fixture(); mutate(d)
++            with self.assertRaises(ValueError): validate_tool_result(d, 'provider:development.provider')
++
++    def test_full_block_and_advisory_budgets_have_fixed_ceilings(self):
++        for token_field, block_field, limit in (('final_tokens','text_blocks',128000), ('advisory_tokens','advisory_blocks',1024)):
++            d = fixture(); delta = limit + 1 - d[token_field]
++            d[token_field] += delta; d[block_field][0]['tokens'] += delta
++            with self.subTest(field=token_field), self.assertRaisesRegex(ValueError, 'quota'):
++                validate_tool_result(d, 'provider:development.provider')
++
++    def test_no_memory_and_docs_cannot_claim_provider_candidate_delivery(self):
++        for lane in ('no_memory', 'explicit_documentation'):
++            with self.subTest(lane=lane), self.assertRaises(ValueError): validate_tool_result(fixture(), lane)
++
++    def test_unrecognized_tag_and_mixed_legacy_fields_fail(self):
++        d = fixture(); d['representation'] = 'tool_result_v2'
++        with self.assertRaisesRegex(ValueError, 'unknown'): runner.validate_delivery(d, 'provider:development.provider')
++        d = fixture(); d['final_text'] = ''
++        with self.assertRaisesRegex(ValueError, 'mixed'): runner.validate_delivery(d, 'provider:development.provider')
++
++    def test_candidate_body_label_must_bind_full_presentation_and_all_notices(self):
++        d = fixture(); q, c = truth()
++        self.assertEqual('useful', adjudicate.evidence_for(d['candidates'][0], q, c, annotation(d), d)[0])
++        for field in ('presentation_sha256', 'advisory_review_sha256'):
++            a = annotation(d); a[field] = d['candidates'][0]['content_sha256']
++            with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'full candidate presentation'):
++                adjudicate.evidence_for(d['candidates'][0], q, c, a, d)
++
++    def test_hash_match_without_explicit_presentation_assessment_does_not_admit(self):
++        d = fixture(); q, c = truth(); a = annotation(d); a.pop('presentation_review')
++        with self.assertRaisesRegex(ValueError, 'did not assess'):
++            adjudicate.evidence_for(d['candidates'][0], q, c, a, d)
++
++    def test_payload_delimiters_cannot_be_omitted_from_original_partition(self):
++        d = fixture(); d['payload_syntax_spans'].pop()
++        with self.assertRaisesRegex(ValueError, 'delimiter partition'):
++            validate_tool_result(d, 'provider:development.provider')
++
++    def test_unresolved_join_cannot_gain_useful_label_from_body_match(self):
++        d = fixture(bound=False); q,c = truth()
++        with self.assertRaisesRegex(ValueError, 'unresolved'):
++            adjudicate.evidence_for(d['candidates'][0], q, c, annotation(d), d)
++        self.assertEqual('indeterminate', adjudicate.evidence_for(d['candidates'][0], q, c, annotation(d, 'indeterminate'), d)[0])
++
++    def test_legacy_substantive_framing_is_still_rejected(self):
++        text = 'body'
++        d = {'final_text': text + ' warning', 'final_sha256': sha(text + ' warning'), 'tokenizer': TOKENIZER,
++             'final_tokens': 2, 'canonical_tokens': 0, 'advisory_tokens': 1, 'candidate_body_tokens': 1,
++             'sections': [{'kind':'advisory','candidate_ref':'c','text':text},{'kind':'framing','text':' warning'}],
++             'candidates': [{'candidate_ref':'c','content':text,'content_sha256':sha(text),'sources':[{'source_id':'s'}],
++                             **{s: True for s in ('returned','admitted','selected','packed','delivered')}}]}
++        with self.assertRaisesRegex(ValueError, 'substantive framing'): runner.validate_delivery(d, 'provider:development.provider')
++
++
++def report_fixture(delivery, expected_positive=True):
++    query, case = truth()
++    query.update(forbidden_source_ids=[], expected_terminal="success")
++    if not expected_positive:
++        query.update(required_facts=[], expected_useful_source_ids=[])
++    case.update(id="development", queries=[query], steps=[{"action":"recall", "query_id":"q"}])
++    schedule, rows = [], []
++    for host in runner.HOSTS:
++        for lane in runner.LANES:
++            for trial in range(3):
++                key = f"{host}/{trial}/development/{lane}"
++                scheduled = {"case_trial_id":key,"host":host,"lane":lane,"trial":trial,"case_id":"development"}
++                schedule.append(scheduled)
++                first = host == "claude" and lane == runner.LANES[0] and trial == 0
++                rows.append({**scheduled,"request_id":"q","action_id":"development/0","action":"recall",
++                             "status":"completed" if first else "unexecuted","terminal":"success" if first else None,
++                             "delivery":delivery if first else None,"phase":"host_request","timing":{"status":"unmeasured","reason":"no host"},
++                             "comparison_valid":True})
++    return {"format":"tracedecay.host-comparison.capture.v1", "metadata":{}, "raw_case_captures":[],
++            "plan":{"cases":[case],"schedule":schedule,"freeze":{}},"measurements":rows}
++
++
++class ExporterTests(unittest.TestCase):
++    def test_export_keeps_all_raw_bytes_and_separate_final_binding(self):
++        d = fixture(); report = report_fixture(d); a = annotation(d)
++        a.update(case_trial_id=report['plan']['schedule'][0]['case_trial_id'], request_id='q', candidate_ref='original-provider-id')
++        bundles = adjudicate.metric_inputs(report, [a])
++        self.assertEqual(24, len(bundles))
++        metric = bundles[0]['input']['recalls'][0]['delivery']
++        self.assertEqual('tool_result_v1', metric['representation'])
++        self.assertNotIn('final_text', metric)
++        self.assertEqual([], metric['candidates'])
++        self.assertEqual(d['raw_carrier'], metric['tool_result']['raw_carrier'])
++        self.assertEqual(d['retained_trace'], metric['tool_result']['retained_trace'])
++        self.assertEqual(a['presentation_sha256'], metric['tool_result']['candidates'][0]['annotation_presentation_sha256'])
++        self.assertEqual('pass', bundles[0]['query_assessments'][0]['outcome'])
++        self.assertEqual(d['final_tokens'], bundles[0]['input']['record']['scenarios'][0]['context_tokens']['value'])
++
++    def test_unjoined_scope_is_unresolved_and_cannot_pass_empty_expected_query(self):
++        d = fixture(bound=False); d['candidates'][0]['scope_match'] = False
++        report = report_fixture(d, expected_positive=False)
++        bundles = adjudicate.metric_inputs(report, [])
++        self.assertEqual('indeterminate', bundles[0]['query_assessments'][0]['outcome'])
++        candidate = bundles[0]['input']['record']['scenarios'][0]['candidates'][0]
++        self.assertEqual('missing', candidate['label'])
++        self.assertFalse(candidate['scope_match'])
++
++    def test_zero_candidates_do_not_silently_exempt_unreviewed_lane_notices(self):
++        d = fixture(); d['candidates'] = []
++        # Structural validation would reject this changed coverage; this unit
++        # isolates the exporter's treatment of a zero-candidate notice surface.
++        report = report_fixture(d, expected_positive=False)
++        self.assertEqual('indeterminate', adjudicate.metric_inputs(report, [])[0]['query_assessments'][0]['outcome'])
++
++    def test_run_identity_binds_original_presentation_and_annotation(self):
++        d = fixture(); report = report_fixture(d); a = annotation(d)
++        a.update(case_trial_id=report['plan']['schedule'][0]['case_trial_id'],request_id='q',candidate_ref='original-provider-id')
++        first = adjudicate.metric_inputs(report,[a])[0]['input']['record']['provider']['run_identity_sha256']
++        a['reason'] += ' second review'
++        second = adjudicate.metric_inputs(report,[a])[0]['input']['record']['provider']['run_identity_sha256']
++        self.assertNotEqual(first,second)
++
++
++if __name__ == '__main__':
++    unittest.main()

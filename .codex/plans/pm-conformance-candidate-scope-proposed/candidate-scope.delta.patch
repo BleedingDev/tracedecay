@@ -1,0 +1,120 @@
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -1803,11 +1803,13 @@
+     scope: &OwnedExactScope,
+     previous: &BTreeMap<String, ProviderReply>,
+ ) -> bool {
++    let mut candidate_scope = scope_json(scope);
++    candidate_scope["scope_binding"] = json!("exact_coding_scope");
+     candidate
+         .get("content")
+         .and_then(Value::as_str)
+         .is_some_and(|content| content.contains(&expected.content))
+-        && candidate.get("exact_scope_identity") == Some(&scope_json(scope))
++        && candidate.get("exact_scope_identity") == Some(&candidate_scope)
+         && candidate
+             .pointer("/provenance/original_sources")
+             .and_then(Value::as_array)
+--- a/crates/tracedecay-memory-conformance/tests/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/tests/compatibility.rs
+@@ -58,6 +58,8 @@
+ 
+ fn candidate(observation: &Value, scope: &OwnedExactScope, stable: &str) -> Value {
+     let original = observation["source_identity"]["original_source"].clone();
++    let mut candidate_scope = scope_json(scope);
++    candidate_scope["scope_binding"] = json!("exact_coding_scope");
+     let mut validity = original["validity"].clone();
+     validity["source_revision"] = original["source"]["source_revision"].clone();
+     validity["temporal_state"] = json!(if validity["valid_from"].is_null() {
+@@ -68,7 +70,7 @@
+     json!({ "candidate_id": format!("candidate.{stable}"), "stable_memory_ref": stable,
+         "content": observation["canonical_payload"]["content"], "content_ref": null,
+         "content_sha256": digest(observation["canonical_payload"]["content"].as_str().unwrap_or_default().as_bytes()), "native_score": 1,
+-        "confidence": null, "exact_scope_identity": scope_json(scope), "validity": validity,
++        "confidence": null, "exact_scope_identity": candidate_scope, "validity": validity,
+         "provenance": { "state": "available", "original_sources": [original],
+             "observation_refs": [observation["observation_id"]] },
+         "source_refs": [observation["source_identity"]["original_source"]["source"]["source_key"]],
+@@ -167,6 +169,82 @@
+         .ok_or_else(|| io::Error::other("payload"))?
+         .sha256 = "a".repeat(64);
+     assert!(!assertion_errors(&assertions, &wrong_digest, &BTreeMap::new(), &scope).is_empty());
++    Ok(())
++}
++
++#[test]
++fn candidate_scope_requires_exact_binding_and_all_seven_identity_fields()
++-> Result<(), Box<dyn Error>> {
++    let scope = scope()?;
++    let source = common_observation(
++        &scope,
++        1,
++        Some("opaque_revision"),
++        "compatibility beacon",
++        Some(T1),
++        None,
++    );
++    let good = recall_value(vec![candidate(&source, &scope, "stable.exact-scope")]);
++    let assertions = [CompatibilityAssertion::RecallSources(vec![expected(
++        &source,
++    )])];
++    assert!(
++        assertion_errors(
++            &assertions,
++            &reply(&scope, good.clone())?,
++            &BTreeMap::new(),
++            &scope
++        )
++        .is_empty()
++    );
++    for field in [
++        "scope_binding",
++        "profile_id",
++        "project_id",
++        "repository_identity",
++        "worktree_identity",
++        "branch_identity",
++        "agent_session_id",
++        "resolved_scope_digest",
++    ] {
++        let mut bad = good.clone();
++        bad["candidates"][0]["exact_scope_identity"][field] = json!(if field == "scope_binding" {
++            "checkout_observations"
++        } else {
++            "different-identity"
++        });
++        assert!(
++            !assertion_errors(&assertions, &reply(&scope, bad)?, &BTreeMap::new(), &scope)
++                .is_empty(),
++            "{field}"
++        );
++    }
++    let mut missing_binding = good.clone();
++    missing_binding["candidates"][0]["exact_scope_identity"]
++        .as_object_mut()
++        .ok_or_else(|| io::Error::other("candidate scope"))?
++        .remove("scope_binding");
++    assert!(
++        !assertion_errors(
++            &assertions,
++            &reply(&scope, missing_binding)?,
++            &BTreeMap::new(),
++            &scope
++        )
++        .is_empty()
++    );
++    let mut extra_field = good;
++    extra_field["candidates"][0]["exact_scope_identity"]["unexpected_scope_field"] =
++        json!("not-authorized");
++    assert!(
++        !assertion_errors(
++            &assertions,
++            &reply(&scope, extra_field)?,
++            &BTreeMap::new(),
++            &scope
++        )
++        .is_empty()
++    );
+     Ok(())
+ }
+ 

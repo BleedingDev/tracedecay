@@ -1,0 +1,159 @@
+{
+  "generated_at": "2026-09-10T22:39:19.009608+00:00",
+  "graph_id": "native-original-plan-review-20260911",
+  "plan_set_hash": "85d02746df",
+  "selection_hash": "0f7cdb3cf4",
+  "plan_count": 4,
+  "edge_count": 4,
+  "plans_root": ".codex/plans/native-original/plan-review",
+  "selected_globs": [
+    "*.plan.md"
+  ],
+  "selected_plan_paths": [
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-close.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-draft.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-fidelity.plan.md",
+    "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-graph.plan.md"
+  ],
+  "edges": [
+    {
+      "source": "rnp-draft",
+      "target": "rnp-fidelity"
+    },
+    {
+      "source": "rnp-draft",
+      "target": "rnp-graph"
+    },
+    {
+      "source": "rnp-fidelity",
+      "target": "rnp-close"
+    },
+    {
+      "source": "rnp-graph",
+      "target": "rnp-close"
+    }
+  ],
+  "plans": [
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-close.plan.md",
+      "slug": "rnp-close",
+      "name": "rnp-close",
+      "overview": "Root reviews both draft reviews and completes the final plan bundle.",
+      "todos": [
+        {
+          "id": "rnp-close-done",
+          "content": "Root reviews both draft reviews and completes the final plan bundle.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-draft.plan.md",
+      "slug": "rnp-draft",
+      "name": "rnp-draft",
+      "overview": "Root authored and strictly validated the 28-node execution draft.",
+      "todos": [
+        {
+          "id": "rnp-draft-done",
+          "content": "Root authored and strictly validated the 28-node execution draft.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-fidelity.plan.md",
+      "slug": "rnp-fidelity",
+      "name": "rnp-fidelity",
+      "overview": "Review the draft for loss of complete original Native behavior and concrete ownership violations.",
+      "todos": [
+        {
+          "id": "rnp-fidelity-done",
+          "content": "Review the draft for loss of complete original Native behavior and concrete ownership violations.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    },
+    {
+      "path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-graph.plan.md",
+      "slug": "rnp-graph",
+      "name": "rnp-graph",
+      "overview": "Review the draft DAG, file ownership, handoffs and execution completeness.",
+      "todos": [
+        {
+          "id": "rnp-graph-done",
+          "content": "Review the draft DAG, file ownership, handoffs and execution completeness.",
+          "status": "completed",
+          "ordinal": 1
+        }
+      ],
+      "is_project": false,
+      "errors": [],
+      "warnings": []
+    }
+  ],
+  "frontier": [
+    {
+      "plan_slug": "rnp-close",
+      "plan_name": "rnp-close",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-close.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "rnp-draft",
+      "plan_name": "rnp-draft",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-draft.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "rnp-fidelity",
+      "plan_name": "rnp-fidelity",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-fidelity.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    },
+    {
+      "plan_slug": "rnp-graph",
+      "plan_name": "rnp-graph",
+      "plan_path": "/Users/satan/side/experiments/tracedecay/.worktrees/pluggable-memory-providers-v2/.codex/plans/native-original/plan-review/rnp-graph.plan.md",
+      "plan_status": "completed",
+      "state": "done",
+      "blocked_by": [],
+      "active": [],
+      "upcoming": [],
+      "completed": 1,
+      "total": 1
+    }
+  ],
+  "errors": [],
+  "warnings": [],
+  "graph_source": "explicit"
+}

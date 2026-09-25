@@ -15,24 +15,25 @@ use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
     MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
     MemoryProviderRecallRoutingV1, MemoryProviderSelectionErrorV1, MemoryProviderSelectionV1,
-    PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY, RestartRequirementV1, SOURCE_BINDINGS_SETTING_KEY,
-    SYNC_AUTO_INIT_SETTING_KEY, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
-    SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY,
-    SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY, SYNC_BRANCH_GC_DAYS_SETTING_KEY,
-    SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY, SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY,
-    SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
-    SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
-    SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
-    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
-    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1, SettingKey, SettingScopeV1,
-    SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY, USER_CODE_INDEX_WORKERS_SETTING_KEY,
-    USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY, USER_UPLOAD_ENABLED_SETTING_KEY,
-    USER_WATCHER_DEBOUNCE_MS_SETTING_KEY, USER_WORK_EXPERTISE_CONSENT_SETTING_KEY,
-    WORK_EXECUTABLE_BINDINGS_SETTING_KEY, WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExpertiseConsentV1,
-    safe_work_topology_policy_v1,
+    PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY, RestartRequirementV1,
+    SEMANTIC_RUNTIME_SETTING_KEY_V2, SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
+    SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
+    SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
+    SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
+    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY,
+    SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
+    SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
+    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
+    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, SettingDefinitionV1,
+    SettingKey, SettingScopeV1, SettingSensitivityV1, TELEMETRY_TIMINGS_SETTING_KEY,
+    USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
+    USER_UPLOAD_ENABLED_SETTING_KEY, USER_WATCHER_DEBOUNCE_MS_SETTING_KEY,
+    USER_WORK_EXPERTISE_CONSENT_SETTING_KEY, WORK_EXECUTABLE_BINDINGS_SETTING_KEY,
+    WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExpertiseConsentV1, safe_work_topology_policy_v1,
 };
 use tracedecay_domain::feedback::PROXIMITY_RISK_THRESHOLD_SETTING_KEY_V1;
 use tracedecay_domain::{DomainError, canonical_json_bytes};
+use tracedecay_semantic_contracts::SemanticConfig;
 
 /// Canonical default for configured-tier proximity warnings.
 pub const DEFAULT_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 7_000;
@@ -40,7 +41,7 @@ pub const MAX_PROXIMITY_RISK_THRESHOLD_BASIS_POINTS_V1: u64 = 10_000;
 
 /// Registry schema revision. Increment only when setting-definition semantics
 /// change, not when a setting value changes.
-pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 7;
+pub const CONFIGURATION_REGISTRY_SCHEMA_REVISION: u16 = 8;
 
 #[derive(Debug, Error)]
 pub enum ConfigurationRegistryError {
@@ -193,6 +194,27 @@ impl ConfigurationRegistry {
             restart_requirement: RestartRequirementV1::None,
             deprecation: DeprecationStateV1::Active,
         })?;
+        let semantic_default = SemanticConfig::default();
+        semantic_default.validate().map_err(|_| {
+            ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
+                field: "semantic runtime default",
+            })
+        })?;
+        let semantic_default = canonical_json_text(&semantic_default, || {
+            ConfigurationRegistryError::InvalidDefinition(DomainError::NonCanonical {
+                field: "semantic runtime default encoding",
+            })
+        })?;
+        registry.register(SettingDefinitionV1 {
+            key: setting_key(SEMANTIC_RUNTIME_SETTING_KEY_V2)?,
+            schema_revision: CONFIGURATION_REGISTRY_SCHEMA_REVISION,
+            value_kind: ConfigurationValueKindV1::Text,
+            default_value: ConfigurationValueV1::Text(semantic_default),
+            sensitivity: SettingSensitivityV1::Public,
+            scope: SettingScopeV1::Project,
+            restart_requirement: RestartRequirementV1::DaemonRestart,
+            deprecation: DeprecationStateV1::Active,
+        })?;
         register_project_settings(&mut registry)?;
         let expected = CONFIGURATION_SETTING_KEYS_V1
             .iter()
@@ -327,6 +349,13 @@ impl ConfigurationRegistry {
                     decode_structured_value(key, value, "recall routing configuration")?;
                 document.validate().map_err(|error| {
                     invalid_structured_value(key, "recall routing configuration", error)
+                })?;
+            }
+            SEMANTIC_RUNTIME_SETTING_KEY_V2 => {
+                let document: SemanticConfig =
+                    decode_structured_value(key, value, "semantic runtime configuration")?;
+                document.validate().map_err(|error| {
+                    invalid_structured_value(key, "semantic runtime configuration", error)
                 })?;
             }
             _ => {}
@@ -885,6 +914,58 @@ mod proximity_threshold_tests {
 }
 
 #[cfg(test)]
+mod semantic_runtime_registration_tests {
+    use super::*;
+
+    #[test]
+    fn semantic_runtime_v2_is_project_scoped_and_disabled_by_default() {
+        let registry = ConfigurationRegistry::core().expect("registry");
+        let key = SettingKey::new(SEMANTIC_RUNTIME_SETTING_KEY_V2).expect("semantic key");
+        let definition = registry.definition(&key).expect("semantic definition");
+        let ConfigurationValueV1::Text(document) = &definition.default_value else {
+            panic!("semantic runtime default must be canonical JSON text");
+        };
+        let default: SemanticConfig =
+            serde_json::from_str(document).expect("semantic runtime default");
+
+        assert_eq!(default, SemanticConfig::default());
+        assert!(!default.enabled);
+        assert!(!default.auto_download);
+        assert_eq!(default.effective_model_id(), None);
+        assert_eq!(definition.scope, SettingScopeV1::Project);
+        assert_eq!(
+            definition.restart_requirement,
+            RestartRequirementV1::DaemonRestart
+        );
+    }
+
+    #[test]
+    fn semantic_runtime_v2_requires_its_exact_canonical_shape() {
+        let registry = ConfigurationRegistry::core().expect("registry");
+        let key = SettingKey::new(SEMANTIC_RUNTIME_SETTING_KEY_V2).expect("semantic key");
+        let enabled = SemanticConfig {
+            enabled: true,
+            ..SemanticConfig::default()
+        };
+        let canonical = String::from_utf8(canonical_json_bytes(&enabled).expect("canonical JSON"))
+            .expect("UTF-8 JSON");
+
+        registry
+            .validate_value(&key, &ConfigurationValueV1::Text(canonical))
+            .expect("canonical enabled semantic configuration");
+        for invalid in [
+            r#"{ "enabled": true }"#,
+            r#"{"enabled":true,"selected_model":"JinaEmbeddingsV2BaseCode"}"#,
+        ] {
+            assert!(matches!(
+                registry.validate_value(&key, &ConfigurationValueV1::Text(invalid.to_owned())),
+                Err(ConfigurationRegistryError::InvalidStructuredValue { .. })
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod user_profile_settings_tests {
     use super::*;
 
@@ -939,7 +1020,10 @@ mod user_profile_settings_tests {
         assert_eq!(registry.definitions().count(), 1);
         let definition = registry.definition(&key).expect("definition");
 
-        assert_eq!(definition.schema_revision, 7);
+        assert_eq!(
+            definition.schema_revision,
+            CONFIGURATION_REGISTRY_SCHEMA_REVISION
+        );
         assert_eq!(definition.scope, SettingScopeV1::UserProfile);
         assert_eq!(
             definition.value_kind,

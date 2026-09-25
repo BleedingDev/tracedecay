@@ -20,12 +20,7 @@ use super::{
 };
 use crate::retrieval::fusion::{CompositionLaneInput, FusionStageError};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SemanticQueryModeV1 {
-    FallbackAllowed,
-    StrictSemantic,
-}
+pub use tracedecay_contracts::retrieval::SemanticQueryModeV1;
 
 /// Policy-owned decision injected into semantic query execution.
 ///
@@ -149,7 +144,8 @@ impl CompleteSemanticGenerationV1 {
     }
 }
 
-/// Accepted, versioned calibration bound to one immutable semantic cohort.
+/// Versioned distance and margin policy bound to one immutable semantic cohort.
+/// The identity records the policy used; it does not attest retrieval quality.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticCalibrationProfileV1 {
@@ -163,6 +159,44 @@ pub struct SemanticCalibrationProfileV1 {
 }
 
 impl SemanticCalibrationProfileV1 {
+    /// Bind the checked-in Jina distance policy to the published population.
+    /// This initial policy admits the full cosine range; it makes no claim
+    /// that an admitted result is relevant to the user's intent.
+    pub fn jina_exact_flat_v1(
+        projection_key: ProjectionKeyV1,
+        vector_generation: VectorGenerationIdV1,
+        capability_manifest_digest: ManifestDigest,
+    ) -> Result<Self, SemanticAbstentionV1> {
+        let calibration_profile_id = CalibrationProfileId::try_from(
+            crate::retrieval::query_authority::CANONICAL_SEMANTIC_CALIBRATION_PROFILE_ID_V1
+                .to_owned(),
+        )
+        .map_err(|_| SemanticAbstentionV1::CalibrationInvalid)?;
+        let maximum_distance_micros = 2_000_000_000;
+        let minimum_margin_micros = 0;
+        let cohort_digest = canonical_sha256(&(
+            "tracedecay.semantic-distance-policy-cohort.v1",
+            &calibration_profile_id,
+            &projection_key,
+            &vector_generation,
+            &capability_manifest_digest,
+            maximum_distance_micros,
+            minimum_margin_micros,
+        ))
+        .map_err(|_| SemanticAbstentionV1::CalibrationInvalid)?;
+        let policy = Self {
+            calibration_profile_id,
+            cohort_digest,
+            projection_key,
+            vector_generation,
+            capability_manifest_digest,
+            maximum_distance_micros,
+            minimum_margin_micros,
+        };
+        policy.validate()?;
+        Ok(policy)
+    }
+
     pub fn validate(&self) -> Result<(), SemanticAbstentionV1> {
         self.cohort_digest
             .validate()
@@ -441,7 +475,16 @@ where
         mode: SemanticQueryModeV1,
         fallback: Arc<QueryFallbackSubpayload>,
     ) -> Result<SemanticQueryServiceOutcomeV1, SemanticQueryServiceError> {
-        self.execute(readiness, mode.into(), fallback)
+        let decision = match (&readiness, mode) {
+            (SemanticLaneReadinessV1::Unavailable(_), SemanticQueryModeV1::FallbackAllowed) => {
+                SemanticQueryDecisionV1::UseFallback
+            }
+            (SemanticLaneReadinessV1::Unavailable(_), SemanticQueryModeV1::StrictSemantic) => {
+                SemanticQueryDecisionV1::RejectUnavailable
+            }
+            (SemanticLaneReadinessV1::Ready { .. }, mode) => mode.into(),
+        };
+        self.execute(readiness, decision, fallback)
     }
 }
 

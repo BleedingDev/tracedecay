@@ -535,6 +535,16 @@ fn native_descriptor() -> Result<ProviderDescriptor, ApiError> {
     )
 }
 
+/// Copies the production declaration without constructing a provider or state.
+/// The limits remain declared ceilings until a caller matches actual health.
+#[cfg(feature = "test-helpers")]
+pub(crate) fn production_provider_declaration_for_test()
+-> Result<(ProviderDescriptor, String, String), ApiError> {
+    let descriptor = native_descriptor()?;
+    let limits_digest = native_limits_digest(descriptor.limits);
+    Ok((descriptor, PROVIDER_INSTANCE_ID.to_owned(), limits_digest))
+}
+
 pub(crate) fn native_provider_limits() -> ProviderLimits {
     ProviderLimits {
         request_bytes: 4_096,
@@ -1646,14 +1656,14 @@ async fn recall_canonical_session(
         Ok(grant) => grant,
         Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
     };
-    // The mounted application port exposes a checkout-wide query because the
-    // provider call does not carry the canonical session id. A host history
-    // grant is therefore required to bind every returned source observation
-    // back to the caller. The dormant direct constructor deliberately remains
-    // unavailable, preserving its typed service-not-configured result.
-    if session_retrieval.host_profile_id().is_some() && history_grant.is_none() {
-        return NativeRecallOutcome::Failed(NativeReadFailure::RecallNotAuthorized);
-    }
+    let retrieval_scope = match native_recall_retrieval_scope(
+        session_retrieval,
+        &call.exact_scope,
+        history_grant.is_some(),
+    ) {
+        Ok(scope) => scope,
+        Err(failure) => return NativeRecallOutcome::Failed(failure),
+    };
 
     let (temporal_mode, native_temporal, evaluation_time_micros) =
         match native_session_temporal(&request.temporal_query) {
@@ -1689,11 +1699,11 @@ async fn recall_canonical_session(
         },
     ) {
         Ok(query) => query
-            .with_retrieval_scope(SessionRetrievalScope::AllSessionsInAuthorizedRoot)
+            .with_retrieval_scope(retrieval_scope)
             .with_execution_limits(
                 tracedecay_session_runtime::session_retrieval::admitted_execution_limits(limit),
             ),
-        Err(failure) => return NativeRecallOutcome::Failed(failure),
+        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
     };
     let options =
         match native_session_recall_options(request, evaluation_time_micros, native_temporal) {
@@ -1736,6 +1746,27 @@ async fn recall_canonical_session(
         Ok(reply) => NativeRecallOutcome::Reply(reply),
         Err(failure) => NativeRecallOutcome::Failed(failure),
     }
+}
+
+fn native_recall_retrieval_scope(
+    session_retrieval: &NativeSessionRetrievalMountV1,
+    exact_scope: &OwnedExactScope,
+    history_authorized: bool,
+) -> Result<SessionRetrievalScope, NativeReadFailure> {
+    if history_authorized {
+        return Ok(SessionRetrievalScope::AllSessionsInAuthorizedRoot);
+    }
+    if session_retrieval.host_profile_id().is_some() {
+        return match session_retrieval.canonical_session_id(&exact_scope.agent_session_id) {
+            Ok(Some(session_id)) => Ok(SessionRetrievalScope::Session(session_id)),
+            Ok(None) => Err(NativeReadFailure::RecallNotAuthorized),
+            Err(_) => Err(NativeReadFailure::ProviderUnavailable),
+        };
+    }
+    // Direct test-only construction has no mounted project/session authority.
+    // Preserve its existing retrieval behavior; the unbound proxy still
+    // answers with service-not-configured.
+    Ok(SessionRetrievalScope::AllSessionsInAuthorizedRoot)
 }
 
 fn native_session_temporal(
@@ -2253,12 +2284,10 @@ fn native_history_source_attribution(
         // repository/worktree reuse the same project observation anchor.
         if origin.profile_id.as_str() != request.exact_scope_identity.profile_id
             || origin.project_id.as_str() != request.exact_scope_identity.project_id
-            || origin.repository_id.as_str() != request.exact_scope_identity.repository_identity
-            || origin.worktree_id.as_str() != request.exact_scope_identity.worktree_identity
-            || origin.reference.as_ref().is_none_or(|reference| {
-                reference.as_str() != request.exact_scope_identity.branch_identity
-            })
-            || origin.scope_digest.as_str() != request.exact_scope_identity.resolved_scope_digest
+            || origin.repository_identity != request.exact_scope_identity.repository_identity
+            || origin.worktree_identity != request.exact_scope_identity.worktree_identity
+            || origin.branch_identity != request.exact_scope_identity.branch_identity
+            || origin.resolved_scope_digest != request.exact_scope_identity.resolved_scope_digest
         {
             continue;
         }

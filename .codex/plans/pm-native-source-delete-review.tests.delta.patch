@@ -1,0 +1,695 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs b/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
+@@ -892,16 +892,90 @@
+         })).collect::<Vec<_>>()})
+ }
+ 
++// Per-source dispositions are fixed by test arrangement. This authority never
++// derives its source inventory or current state from a restore request/snapshot.
++struct FixtureRestoreDispositionAuthority {
++    scope: OwnedExactScope,
++    sources: Vec<(
++        tracedecay_memory_provider_registry::SourceAttribution,
++        tracedecay_memory_provider_registry::SourceDisposition,
++    )>,
++}
++
++impl tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority
++    for FixtureRestoreDispositionAuthority
++{
++    fn admit(
++        &self,
++        call: &ProviderCall,
++    ) -> Result<
++        tracedecay_memory_provider_registry::CurrentAdvisoryAdmission,
++        tracedecay_memory_provider_registry::AdvisoryAdmissionError,
++    > {
++        use tracedecay_memory_provider_registry::{
++            AdvisoryAdmissionError, CurrentAdvisoryAdmission, CurrentRestoreAdmission,
++            CurrentSourceDisposition, GrantedHistorySource, RestoreDispositionCheckpoint,
++        };
++        if call.exact_scope != self.scope || call.operation != ProviderOperation::SnapshotRestore {
++            return Err(AdvisoryAdmissionError::Denied(
++                "fixture restore scope/operation",
++            ));
++        }
++        let history: Vec<_> = self
++            .sources
++            .iter()
++            .map(|(source, state)| GrantedHistorySource {
++                attribution: source.clone(),
++                current_disposition: CurrentSourceDisposition {
++                    state: *state,
++                    authority_ref: "fixture.live.per-source-disposition".into(),
++                    authority_revision: Some(9),
++                    checked_at_utc_nanos: parse_rfc3339_nanos(T4).unwrap() + 9,
++                },
++            })
++            .collect();
++        let restore = CurrentRestoreAdmission::new(
++            RestoreDispositionCheckpoint {
++                exact_scope: self.scope.clone(),
++                authority_ref: "fixture.live.per-source-checkpoint".into(),
++                authority_revision: Some(9),
++                checked_at_utc_nanos: parse_rfc3339_nanos(T4).unwrap() + 9,
++            },
++            history
++                .iter()
++                .map(|source| {
++                    (
++                        source.attribution.source.clone(),
++                        source.current_disposition.clone(),
++                    )
++                })
++                .collect(),
++        )?;
++        CurrentAdvisoryAdmission::new(call, history, Some(restore))
++    }
++}
++
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn common_advisory_claimed_source_delete_preserves_other_origin_and_fences_reopen() {
++    // Each canonical identity component independently protects the survivor.
++    for (b_provider, b_session) in [
++        ("claude", "session.canonical.b"),
++        ("codex", "session.canonical.b"),
++        ("claude", "session.canonical.a"),
++    ] {
++        assert_claimed_source_identity_survives_reopen(b_provider, b_session).await;
++    }
++}
++
++async fn assert_claimed_source_identity_survives_reopen(b_provider: &str, b_session: &str) {
+     use tracedecay_memory_provider_registry::SourceDisposition;
+     let (_temp, root, graph, _owner, project) = real_project_fixture().await;
+     let scope = recall_exact_scope(project.as_str());
+     let key = "common-advisory/source/shared";
+     let source_a = deletion_source_fixture(&scope, 1, "codex", "session.canonical.a", key);
+-    let source_b = deletion_source_fixture(&scope, 2, "claude", "session.canonical.b", key);
++    let source_b = deletion_source_fixture(&scope, 2, b_provider, b_session, key);
+     let later_a = deletion_source_fixture(&scope, 3, "codex", "session.canonical.a", key);
+-    let later_b = deletion_source_fixture(&scope, 4, "claude", "session.canonical.b", key);
++    let later_b = deletion_source_fixture(&scope, 4, b_provider, b_session, key);
+     let port = new_authorized_port(
+         &graph,
+         &root,
+@@ -931,16 +1005,16 @@
+         .unwrap()
+         .iter()
+         .find(|candidate| {
+-            candidate["provenance"]["original_sources"][0]["source"]["canonical_provider_id"]
+-                == "claude"
++            candidate["provenance"]["original_sources"][0]
++                == source_b["source_identity"]["original_source"]
+         })
+         .unwrap()["stable_memory_ref"]
+         .as_str()
+         .unwrap()
+         .to_owned();
+     let feedback = json!({"target":lifecycle_target(&scope,&source_b,&b_ref),
+-        "signal":"helpful","weight":"0.5","occurred_at":T2,
+-        "canonical_outcome_receipt":"fixture.settled.b-before-delete"});
++    "signal":"helpful","weight":"0.5","occurred_at":T2,
++    "canonical_outcome_receipt":"fixture.settled.b-before-delete"});
+     let settled = body(&provider.invoke(&common_call(
+         &provider,
+         &scope,
+@@ -1075,8 +1149,9 @@
+             .unwrap()
+             .iter()
+             .all(|candidate| {
+-                candidate["provenance"]["original_sources"][0]["source"]["canonical_provider_id"]
+-                    == "claude"
++                let source = &candidate["provenance"]["original_sources"][0]["source"];
++                source["canonical_provider_id"] == b_provider
++                    && source["canonical_session_id"] == b_session
+             })
+     );
+     assert!(
+@@ -1200,6 +1275,31 @@
+     drop(provider);
+ 
+     let fresh_state = root.join("typed-source-fence-import-state");
++    // Reserve the snapshot's actual references and globally unique sequences in
++    // their original scope before assigning sequences to other-delivery copies.
++    let seed = NativeProvider::new(Arc::new(
++        ProjectNativeMemoryApplicationPort::new(
++            Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
++            root.clone(),
++            test_profile_id(),
++            &fresh_state,
++        )
++        .unwrap()
++        .with_admission_authority(Arc::new(FixtureAuthority {
++            scope: scope.clone(),
++            sources: inventory.iter().map(fixture_source).collect(),
++            state: SourceDisposition::Available,
++        })),
++    ))
++    .unwrap();
++    body(&seed.invoke(&common_call(
++        &seed,
++        &scope,
++        ProviderOperation::SnapshotRestore,
++        "typed-import-predelete-seed",
++        fixture_restore_request(&scope, &predelete, &inventory),
++    )));
++    drop(seed);
+     let mut other_scope = scope.clone();
+     other_scope.agent_session_id = "session.typed-fence-other-delivery".into();
+     let other_port = Arc::new(
+@@ -1345,6 +1445,533 @@
+         imported["deletion_fences"][0]["kind"],
+         "canonical_source_v1"
+     );
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn common_advisory_fresh_deleted_restore_preserves_same_key_other_origin_across_deliveries() {
++    use tracedecay_memory_provider_registry::SourceDisposition;
++    let (_temp, root, graph, _owner, project) = real_project_fixture().await;
++    let scope = recall_exact_scope(project.as_str());
++    let mut other_scope = scope.clone();
++    other_scope.agent_session_id = "session.fresh-deleted-other-delivery".into();
++    let key = "common-advisory/source/fresh-deleted-shared";
++    let source_a = deletion_source_fixture(&scope, 1, "codex", "session.canonical.a", key);
++    let source_b = deletion_source_fixture(&scope, 2, "claude", "session.canonical.b", key);
++    let inventory = vec![source_a.clone(), source_b.clone()];
++    let provider = NativeProvider::new(new_port(&graph, &root)).unwrap();
++    for (label, observation) in [
++        ("fresh-deleted-a", &source_a),
++        ("fresh-deleted-b", &source_b),
++    ] {
++        body(&provider.invoke(&common_call(
++            &provider,
++            &scope,
++            ProviderOperation::Observe,
++            label,
++            observation.clone(),
++        )));
++    }
++    let original = recall_common(
++        &provider,
++        &scope,
++        "fresh-deleted-original-before",
++        common_query("history", T4),
++    );
++    let reference_for = |recalled: &Value, observation: &Value| {
++        recalled["candidates"]
++            .as_array()
++            .unwrap()
++            .iter()
++            .find(|candidate| {
++                candidate["provenance"]["original_sources"][0]
++                    == observation["source_identity"]["original_source"]
++            })
++            .unwrap()["stable_memory_ref"]
++            .as_str()
++            .unwrap()
++            .to_owned()
++    };
++    let original_a_ref = reference_for(&original, &source_a);
++    let original_b_ref = reference_for(&original, &source_b);
++    let settled = body(&provider.invoke(&common_call(
++        &provider,
++        &scope,
++        ProviderOperation::Feedback,
++        "fresh-deleted-b-feedback",
++        json!({"target":lifecycle_target(&scope,&source_b,&original_b_ref),
++            "signal":"helpful","weight":"0.5","occurred_at":T2,
++            "canonical_outcome_receipt":"fixture.fresh-deleted-b-settled"}),
++    )));
++    let predelete = body(&provider.invoke(&common_call(
++        &provider,
++        &scope,
++        ProviderOperation::SnapshotExport,
++        "fresh-deleted-predelete",
++        json!({}),
++    )))["snapshot"]
++        .clone();
++    assert!(
++        exported_snapshot_body(&predelete)["deletion_fences"]
++            .as_array()
++            .unwrap()
++            .is_empty()
++    );
++    drop(provider);
++
++    let other = NativeProvider::new(new_authorized_port(
++        &graph,
++        &root,
++        &other_scope,
++        &inventory,
++        SourceDisposition::Available,
++    ))
++    .unwrap();
++    for (label, observation) in [
++        ("fresh-deleted-other-a", &source_a),
++        ("fresh-deleted-other-b", &source_b),
++    ] {
++        body(&other.invoke(&common_call(
++            &other,
++            &other_scope,
++            ProviderOperation::Observe,
++            label,
++            observation.clone(),
++        )));
++    }
++    let other_before = recall_common(
++        &other,
++        &other_scope,
++        "fresh-deleted-other-before",
++        common_query("history", T4),
++    );
++    assert_eq!(other_before["candidates"].as_array().unwrap().len(), 2);
++    let other_a_ref = reference_for(&other_before, &source_a);
++    let other_b_ref = reference_for(&other_before, &source_b);
++    let other_settled = body(&other.invoke(&common_call(
++        &other,
++        &other_scope,
++        ProviderOperation::Feedback,
++        "fresh-deleted-other-b-feedback",
++        json!({"target":lifecycle_target(&other_scope,&source_b,&other_b_ref),
++            "signal":"helpful","weight":"0.5","occurred_at":T2,
++            "canonical_outcome_receipt":"fixture.fresh-deleted-other-b-settled"}),
++    )));
++    drop(other);
++
++    let restored = NativeProvider::new(Arc::new(
++        ProjectNativeMemoryApplicationPort::new(
++            Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
++            root.clone(),
++            test_profile_id(),
++            &test_provider_state_root(&root),
++        )
++        .unwrap()
++        .with_admission_authority(Arc::new(FixtureRestoreDispositionAuthority {
++            scope: scope.clone(),
++            sources: vec![
++                (fixture_source(&source_a), SourceDisposition::Deleted),
++                (fixture_source(&source_b), SourceDisposition::Available),
++            ],
++        })),
++    ))
++    .unwrap();
++    let before_restore = body(&restored.invoke(&common_call(
++        &restored,
++        &scope,
++        ProviderOperation::SnapshotExport,
++        "fresh-deleted-no-local-fence",
++        json!({}),
++    )));
++    assert!(
++        exported_snapshot_body(&before_restore["snapshot"])["deletion_fences"]
++            .as_array()
++            .unwrap()
++            .is_empty()
++    );
++    let request = fixture_restore_request(&scope, &predelete, &inventory);
++    assert_eq!(
++        request["source_dispositions"][0]["current_disposition"]["state"],
++        "available"
++    );
++    body(&restored.invoke(&common_call(
++        &restored,
++        &scope,
++        ProviderOperation::SnapshotRestore,
++        "fresh-deleted-restore",
++        request,
++    )));
++    for (delivery, a_ref, b_ref, receipt) in [
++        (
++            &scope,
++            &original_a_ref,
++            &original_b_ref,
++            &settled["provider_receipt_digest"],
++        ),
++        (
++            &other_scope,
++            &other_a_ref,
++            &other_b_ref,
++            &other_settled["provider_receipt_digest"],
++        ),
++    ] {
++        for mode in ["current", "as_of", "interval", "history"] {
++            let mut query = common_query(mode, T1);
++            query["temporal_query"]["include_revoked"] = true.into();
++            query["temporal_query"]["include_superseded"] = true.into();
++            let visible = recall_common(
++                &restored,
++                delivery,
++                &format!("fresh-deleted-visible-{}-{mode}", delivery.agent_session_id),
++                query,
++            );
++            assert_eq!(visible["candidates"].as_array().unwrap().len(), 1);
++            assert_eq!(
++                visible["candidates"][0]["stable_memory_ref"],
++                b_ref.as_str()
++            );
++            assert_eq!(
++                visible["candidates"][0]["content"],
++                source_b["canonical_payload"]["content"]
++            );
++            assert_eq!(
++                visible["candidates"][0]["provenance"]["original_sources"][0],
++                source_b["source_identity"]["original_source"]
++            );
++        }
++        let influence = body(&restored.invoke(&common_call(
++            &restored,
++            delivery,
++            ProviderOperation::Inspection,
++            &format!("fresh-deleted-influence-{}", delivery.agent_session_id),
++            inspection("source_influence", json!({"source_key":key})),
++        )));
++        assert_eq!(influence["items"].as_array().unwrap().len(), 1);
++        assert_eq!(
++            influence["items"][0]["source"],
++            source_b["source_identity"]["original_source"]["source"]
++        );
++        assert_eq!(influence["items"][0]["settled_feedback"]["helpful"], 1);
++        assert_eq!(&influence["items"][0]["last_feedback_receipt"], receipt);
++        let scrubbed = body(&restored.invoke(&common_call(
++            &restored,
++            delivery,
++            ProviderOperation::Inspection,
++            &format!("fresh-deleted-a-scrubbed-{}", delivery.agent_session_id),
++            inspection("trace", json!({"stable_memory_ref":a_ref})),
++        )));
++        assert_eq!(scrubbed["items"].as_array().unwrap().len(), 1);
++        assert!(scrubbed["items"][0]["content"].is_null());
++        assert!(scrubbed["items"][0]["original_source"].is_null());
++    }
++    let after_restore = body(&restored.invoke(&common_call(
++        &restored,
++        &scope,
++        ProviderOperation::SnapshotExport,
++        "fresh-deleted-fence-created",
++        json!({}),
++    )));
++    let after_body = exported_snapshot_body(&after_restore["snapshot"]);
++    assert_eq!(after_body["deletion_fences"].as_array().unwrap().len(), 1);
++    assert_eq!(
++        after_body["deletion_fences"][0]["kind"],
++        "canonical_source_v1"
++    );
++    drop(restored);
++    let reopened = NativeProvider::new(new_port(&graph, &root)).unwrap();
++    for delivery in [&scope, &other_scope] {
++        let visible = recall_common(
++            &reopened,
++            delivery,
++            &format!("fresh-deleted-reopened-{}", delivery.agent_session_id),
++            common_query("history", T4),
++        );
++        assert_eq!(visible["candidates"].as_array().unwrap().len(), 1);
++        assert_eq!(
++            visible["candidates"][0]["provenance"]["original_sources"][0],
++            source_b["source_identity"]["original_source"]
++        );
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn common_advisory_restore_refuses_other_delivery_legacy_ambiguity_atomically() {
++    use tracedecay_memory_provider_registry::SourceDisposition;
++    for import_typed_fence in [false, true] {
++        let (_temp, root, graph, _owner, project) = real_project_fixture().await;
++        let scope = recall_exact_scope(project.as_str());
++        let mut other_scope = scope.clone();
++        other_scope.agent_session_id = "session.restore-ambiguous-other-delivery".into();
++        let key = "common-advisory/source/restore-ambiguous";
++        let source_a = deletion_source_fixture(&scope, 1, "codex", "session.canonical.a", key);
++        let source_b = deletion_source_fixture(&scope, 2, "claude", "session.canonical.b", key);
++        let inventory = vec![source_a.clone(), source_b.clone()];
++        let source = NativeProvider::new(new_authorized_port(
++            &graph,
++            &root,
++            &scope,
++            std::slice::from_ref(&source_a),
++            SourceDisposition::Available,
++        ))
++        .unwrap();
++        for (label, observation) in [
++            ("ambiguous-snapshot-a", &source_a),
++            ("ambiguous-snapshot-b", &source_b),
++        ] {
++            body(&source.invoke(&common_call(
++                &source,
++                &scope,
++                ProviderOperation::Observe,
++                label,
++                observation.clone(),
++            )));
++        }
++        let predelete = body(&source.invoke(&common_call(
++            &source,
++            &scope,
++            ProviderOperation::SnapshotExport,
++            "ambiguous-predelete",
++            json!({}),
++        )))["snapshot"]
++            .clone();
++        let snapshot = if import_typed_fence {
++            body(
++                &source.invoke(
++                    &common_call(
++                        &source,
++                        &scope,
++                        ProviderOperation::DeleteBySource,
++                        "ambiguous-source-delete",
++                        source_deletion_request(&[key]),
++                    )
++                    .with_history_grant(fixture_private_history(
++                        &scope,
++                        std::slice::from_ref(&source_a),
++                    )),
++                ),
++            );
++            body(&source.invoke(&common_call(
++                &source,
++                &scope,
++                ProviderOperation::SnapshotExport,
++                "ambiguous-postdelete",
++                json!({}),
++            )))["snapshot"]
++                .clone()
++        } else {
++            predelete.clone()
++        };
++        drop(source);
++
++        let state_root = root.join("restore-ambiguity-destination-state");
++        // Seed the original snapshot first so later copies use actual new global
++        // sequences; this test changes privacy evidence, never snapshot identity.
++        let seed = NativeProvider::new(Arc::new(
++            ProjectNativeMemoryApplicationPort::new(
++                Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
++                root.clone(),
++                test_profile_id(),
++                &state_root,
++            )
++            .unwrap()
++            .with_admission_authority(Arc::new(FixtureAuthority {
++                scope: scope.clone(),
++                sources: inventory.iter().map(fixture_source).collect(),
++                state: SourceDisposition::Available,
++            })),
++        ))
++        .unwrap();
++        body(&seed.invoke(&common_call(
++            &seed,
++            &scope,
++            ProviderOperation::SnapshotRestore,
++            "ambiguous-destination-seed",
++            fixture_restore_request(&scope, &predelete, &inventory),
++        )));
++        drop(seed);
++
++        let other = NativeProvider::new(Arc::new(
++            ProjectNativeMemoryApplicationPort::new(
++                Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
++                root.clone(),
++                test_profile_id(),
++                &state_root,
++            )
++            .unwrap()
++            .with_admission_authority(Arc::new(FixtureAuthority {
++                scope: other_scope.clone(),
++                sources: inventory.iter().map(fixture_source).collect(),
++                state: SourceDisposition::Available,
++            })),
++        ))
++        .unwrap();
++        for (label, observation) in [
++            ("ambiguous-other-a", &source_a),
++            ("ambiguous-other-b", &source_b),
++        ] {
++            body(&other.invoke(&common_call(
++                &other,
++                &other_scope,
++                ProviderOperation::Observe,
++                label,
++                observation.clone(),
++            )));
++        }
++        // A fresh Deleted source has a known key. An imported digest has no
++        // preimage for any unattributed row, even one with an unrelated raw key.
++        let legacy_key = if import_typed_fence {
++            "common-advisory/source/unattributed-unrelated"
++        } else {
++            key
++        };
++        body(&other.invoke(&common_call(
++            &other, &other_scope, ProviderOperation::Observe, "ambiguous-other-legacy",
++            json!({"canonical_payload":session_message_payload(legacy_key, &other_scope.agent_session_id, "compatibility beacon retained legacy"),
++                "observation_kind":NATIVE_STAGED_SESSION_OBSERVATION_KIND,
++                "payload_contract":NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID}),
++        )));
++        let legacy_receipt = body(&other.invoke(&common_call(
++            &other,
++            &other_scope,
++            ProviderOperation::Inspection,
++            "ambiguous-legacy-receipt",
++            inspection(
++                "delivery_receipt",
++                json!({"idempotency_key":sha256_hex(b"ambiguous-other-legacy")}),
++            ),
++        )));
++        let legacy_ref = legacy_receipt["items"][0]["stable_memory_ref"]
++            .as_str()
++            .unwrap()
++            .to_owned();
++        drop(other);
++
++        let declared = if import_typed_fence {
++            vec![source_b.clone()]
++        } else {
++            inventory.clone()
++        };
++        let dispositions = if import_typed_fence {
++            vec![(fixture_source(&source_b), SourceDisposition::Available)]
++        } else {
++            vec![
++                (fixture_source(&source_a), SourceDisposition::Deleted),
++                (fixture_source(&source_b), SourceDisposition::Available),
++            ]
++        };
++        let provider = NativeProvider::new(Arc::new(
++            ProjectNativeMemoryApplicationPort::new(
++                Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
++                root.clone(),
++                test_profile_id(),
++                &state_root,
++            )
++            .unwrap()
++            .with_admission_authority(Arc::new(FixtureRestoreDispositionAuthority {
++                scope: scope.clone(),
++                sources: dispositions,
++            })),
++        ))
++        .unwrap();
++        let inspect_state = |provider: &NativeProvider, delivery: &OwnedExactScope, label: &str| {
++            body(&provider.invoke(&common_call(
++                provider,
++                delivery,
++                ProviderOperation::Inspection,
++                label,
++                inspection("state_summary", json!({})),
++            )))["items"]
++                .clone()
++        };
++        let export_state = |provider: &NativeProvider, label: &str| {
++            exported_snapshot_body(
++                &body(&provider.invoke(&common_call(
++                    provider,
++                    &scope,
++                    ProviderOperation::SnapshotExport,
++                    label,
++                    json!({}),
++                )))["snapshot"],
++            )
++        };
++        let original_before = inspect_state(&provider, &scope, "ambiguous-original-before");
++        let other_before = inspect_state(&provider, &other_scope, "ambiguous-other-before");
++        assert_eq!(original_before.as_array().unwrap().len(), 2);
++        assert_eq!(other_before.as_array().unwrap().len(), 3);
++        let export_before = export_state(&provider, "ambiguous-fences-before");
++        assert!(
++            export_before["deletion_fences"]
++                .as_array()
++                .unwrap()
++                .is_empty()
++        );
++        let generation = provider.descriptor().state_generation;
++        let reply = provider.invoke(&common_call(
++            &provider,
++            &scope,
++            ProviderOperation::SnapshotRestore,
++            "ambiguous-restore-refused",
++            fixture_restore_request(&scope, &snapshot, &declared),
++        ));
++        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Conflict);
++        assert_eq!(provider.descriptor().state_generation, generation);
++        assert_eq!(
++            inspect_state(&provider, &scope, "ambiguous-original-after"),
++            original_before
++        );
++        assert_eq!(
++            inspect_state(&provider, &other_scope, "ambiguous-other-after"),
++            other_before
++        );
++        assert_eq!(
++            export_state(&provider, "ambiguous-fences-after"),
++            export_before
++        );
++        let legacy = body(&provider.invoke(&common_call(
++            &provider,
++            &other_scope,
++            ProviderOperation::Inspection,
++            "ambiguous-legacy-preserved",
++            inspection("trace", json!({"stable_memory_ref":legacy_ref})),
++        )));
++        assert_eq!(
++            legacy["items"][0]["content"],
++            "compatibility beacon retained legacy"
++        );
++        assert!(legacy["items"][0]["original_source"].is_null());
++        drop(provider);
++
++        let reopened = NativeProvider::new(Arc::new(
++            ProjectNativeMemoryApplicationPort::new(
++                Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph))),
++                root.clone(),
++                test_profile_id(),
++                &state_root,
++            )
++            .unwrap(),
++        ))
++        .unwrap();
++        assert_eq!(reopened.descriptor().state_generation, generation);
++        assert_eq!(
++            inspect_state(&reopened, &scope, "ambiguous-original-reopened"),
++            original_before
++        );
++        assert_eq!(
++            inspect_state(&reopened, &other_scope, "ambiguous-other-reopened"),
++            other_before
++        );
++        assert_eq!(
++            export_state(&reopened, "ambiguous-fences-reopened"),
++            export_before
++        );
++        // This also detects a typed fence that leaked from a refused restore.
++        body(&reopened.invoke(&common_call(
++            &reopened,
++            &scope,
++            ProviderOperation::Observe,
++            "ambiguous-a-after-refusal",
++            deletion_source_fixture(&scope, 5, "codex", "session.canonical.a", key),
++        )));
++    }
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,0 +1,172 @@
+--- a/crates/tracedecay-privacy/src/detector_kernel.rs
++++ b/crates/tracedecay-privacy/src/detector_kernel.rs
+@@ -245,6 +245,23 @@
+ }
+ 
+ pub fn looks_high_entropy_token(token: &str) -> bool {
++    // A structural digest adds alphabet diversity without making its prefix a
++    // credential. Peel one exact suffix; the prefix still faces the ordinary
++    // entropy predicate, including any earlier digest-shaped suffix.
++    let token = token
++        .rsplit_once("-sha256-")
++        .filter(|(prefix, digest)| {
++            !prefix.is_empty()
++                && digest.len() == 64
++                && digest
++                    .bytes()
++                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
++        })
++        .map_or(token, |(prefix, _)| prefix);
++    looks_high_entropy_token_core(token)
++}
++
++fn looks_high_entropy_token_core(token: &str) -> bool {
+     if token.len() < 36
+         || !token.bytes().all(token_byte)
+         || token.bytes().all(|byte| byte.is_ascii_hexdigit())
+@@ -404,6 +421,50 @@
+     }
+ 
+     #[test]
++    fn entropy_kernel_peels_one_exact_structural_sha256_suffix() {
++        let digest = "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6";
++        let source_id = format!("tracedecay-claude-observation-source-v1-sha256-{digest}");
++        assert!(looks_high_entropy_token_core(&source_id));
++        assert!(!looks_high_entropy_token(&source_id));
++        assert!(high_entropy_ranges(&source_id).is_empty());
++        assert!(
++            looks_high_entropy_token(&format!("{source_id}-sha256-{digest}")),
++            "only one suffix is peeled before the unchanged prefix predicate"
++        );
++    }
++
++    #[test]
++    fn entropy_kernel_keeps_high_entropy_prefixes_with_sha256_suffixes() {
++        let prefix = "Qm9vZ2llV29vZ2llMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A4OTc2NTQzMjE";
++        let token = format!("{prefix}-sha256-{}", "a".repeat(64));
++        assert!(looks_high_entropy_token_core(prefix));
++        assert!(looks_high_entropy_token(&token));
++        assert_eq!(high_entropy_ranges(&token), vec![0..token.len()]);
++    }
++
++    #[test]
++    fn entropy_kernel_keeps_malformed_digest_suffixes_on_the_whole_token_path() {
++        let prefix = "tracedecay-claude-observation-source-v1";
++        let digest = "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6";
++        let malformed = [
++            format!("{prefix}-sha256-{}", &digest[..63]),
++            format!("{prefix}-sha256-{digest}0"),
++            format!("{prefix}-sha256-{}g", &digest[..63]),
++            format!("{prefix}-sha256-{}", digest.to_ascii_uppercase()),
++            format!("{prefix}-sha256-{digest}-tail"),
++            format!("{prefix}-SHA256-{digest}"),
++            format!("-sha256-{digest}"),
++        ];
++        for token in malformed {
++            assert_eq!(
++                looks_high_entropy_token(&token),
++                looks_high_entropy_token_core(&token),
++                "malformed suffix must retain whole-token classification: {token}"
++            );
++        }
++    }
++
++    #[test]
+     fn entropy_kernel_preserves_ordinary_macos_temp_paths() {
+         let path = "/private/var/folders/ab/cd0123456789abcdefghijklmnopqrst/T/";
+         assert!(looks_high_entropy_token(path));
+--- a/crates/tracedecay-memory-hygiene/src/lib.rs
++++ b/crates/tracedecay-memory-hygiene/src/lib.rs
+@@ -984,6 +984,92 @@
+ 
+     use super::*;
+ 
++    fn history_envelope_with_structural_source_id() -> Value {
++        let source_id = concat!(
++            "tracedecay-claude-observation-source-v1-sha256-",
++            "1d49a58eb1d460720a46c5afe048e2cb89856ad8a602b7ebb82eac181a0c54a6"
++        );
++        let source = json!({
++            "provider": "claude",
++            "session_id": "fixture-session",
++            "source_key": source_id,
++            "observation_id": format!("sha256:{}", "1".repeat(64)),
++        });
++        json!({
++            "observation_kind": "session.message_committed.v1",
++            "payload_contract": "tracedecay.session.message.v1",
++            "canonical_payload": {"role": "user", "content": "The retry budget changed."},
++            "source_identity": {"original_source": {"source": source.clone()}},
++            "history_grant": {
++                "policy_revision": 1,
++                "sources": [{"attribution": {"source": source}}],
++            },
++        })
++    }
++
++    #[test]
++    fn structural_digest_source_metadata_is_admitted_with_full_envelope_receipt()
++    -> Result<(), HygieneError> {
++        let envelope = history_envelope_with_structural_source_id();
++        let canonical = canonical_payload_bytes(&envelope)?;
++        let expected = sha256_hex(&canonical);
++        let ObservationAdmission::Admitted { sanitized, receipt } =
++            ObservationSanitizer::new()?.admit_observation(&envelope, &[])?
++        else {
++            panic!("innocent message and structural source metadata must be admitted");
++        };
++        assert_eq!(sanitized, envelope);
++        assert_eq!(canonical_payload_bytes(&sanitized)?, canonical);
++        assert_eq!(receipt.disposition(), SanitizationDisposition::Accepted);
++        assert_eq!(receipt.source_payload_sha256(), expected);
++        assert_eq!(receipt.sanitized_payload_sha256(), expected);
++        assert_ne!(
++            expected,
++            sha256_hex(&canonical_payload_bytes(&envelope["canonical_payload"])?),
++            "the receipt binds the whole delivered envelope, including source metadata"
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn structural_digest_suffixes_do_not_hide_known_credentials_or_payload_secrets()
++    -> Result<(), HygieneError> {
++        // Reuse the inert credential-shaped fixture from the secret-class tests.
++        let secret = concat!("ghp_", "KsY7QwT2mZ4bV9nR6cX1jH8pL3dG5fA0eUwQ");
++        let digest = "a".repeat(64);
++        let sanitizer = ObservationSanitizer::new()?;
++        for (in_payload, value) in [
++            (false, secret.to_owned()),
++            (false, format!("fixture-{secret}")),
++            (false, format!("{secret}-sha256-{digest}")),
++            (false, format!("fixture-{secret}-sha256-{digest}")),
++            (true, secret.to_owned()),
++        ] {
++            let mut envelope = history_envelope_with_structural_source_id();
++            if in_payload {
++                envelope["canonical_payload"]["content"] = json!(value);
++            } else {
++                envelope["source_identity"]["original_source"]["source"]["source_key"] =
++                    json!(value);
++            }
++            assert!(
++                sanitizer
++                    .classify(&envelope)?
++                    .iter()
++                    .any(|finding| { finding.class() == HygieneClass::KnownCredentialPrefix }),
++                "known credential rules must still inspect the complete envelope"
++            );
++            assert!(matches!(
++                sanitizer.admit_observation(&envelope, &[])?,
++                ObservationAdmission::Withheld {
++                    reason: WithheldReason::SecretRejected,
++                    ..
++                }
++            ));
++        }
++        Ok(())
++    }
++
+     /// Every ceiling hygiene enforces as an *error* must dominate the ceiling
+     /// the canonical store enforces on the record it wraps, or a settled
+     /// record could be refused as an admission fault instead of classified.

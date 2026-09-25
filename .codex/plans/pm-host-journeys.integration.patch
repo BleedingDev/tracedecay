@@ -1,0 +1,688 @@
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
+@@ -21,10 +21,10 @@
+ //! settling window before the hook runs. Background history reconciliation
+ //! remains enabled; this is a bounded causal control, not global hook exclusivity.
+ //!
+-//! The ignored real-NCM variants also enable the canonical NCM observer setting
+-//! before restart, then require independent applied receipts in both journals.
+-//! They share only the installed model artifacts; mutable NCM state belongs to
+-//! the same isolated HOME as the daemon. Native remains the active recall route.
++//! The ignored real-NCM variants select NCM independently with Native advisory
++//! disabled, or retain Native as active with NCM observing. Observer variants
++//! require independent applied receipts in both journals. They share only the
++//! installed model artifacts; mutable NCM state belongs to the isolated HOME.
+ //!
+ //! # What this proves about the product
+ //!
+@@ -38,6 +38,7 @@
+ //!   provider-memory lane, bounded and de-duplicated, naming the provider the
+ //!   project's own routing policy pinned.
+ 
++use std::collections::{BTreeMap, BTreeSet};
+ use std::fs;
+ use std::io::{Read, Write};
+ use std::path::{Path, PathBuf};
+@@ -53,7 +54,7 @@
+     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+ };
+ use tracedecay_memory_observation::{
+-    DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
++    AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
+     ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
+     RetentionPolicyV1, SqliteObservationJournal,
+ };
+@@ -87,6 +88,25 @@
+ const NCM_OBSERVER_PROVIDER_ID: &str = "ncm";
+ const NCM_JOURNAL_FILE_NAME: &str = "memory-observation-ncm-journal-v1.sqlite3";
+ 
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum ActiveProvider {
++    Native,
++    RustNcm,
++}
++
++impl ActiveProvider {
++    fn id(self) -> &'static str {
++        match self {
++            Self::Native => CONFIGURED_PROVIDER_ID,
++            Self::RustNcm => NCM_OBSERVER_PROVIDER_ID,
++        }
++    }
++
++    fn is_ncm(self) -> bool {
++        self == Self::RustNcm
++    }
++}
++
+ /// Observation kind the journey admits for host session messages.
+ const SESSION_MESSAGE_OBSERVATION_KIND: &str = "session.message_committed.v1";
+ 
+@@ -137,6 +157,7 @@
+ 
+ struct ClaudeHostJourney {
+     codex: bool,
++    active_provider: ActiveProvider,
+     ncm_observer: bool,
+     daemon: Option<Child>,
+     home: TempDir,
+@@ -154,15 +175,10 @@
+ }
+ 
+ impl ClaudeHostJourney {
+-    /// A registered git project under a throwaway profile, with the daemon
+-    /// running and both memory-provider gates committed. Both settings are
+-    /// `DaemonRestart`, so the daemon is restarted before the journey begins:
+-    /// a composition that is already open keeps the mounts it opened with.
+-    fn start(codex: bool) -> Self {
+-        Self::start_with_observer(codex, false)
+-    }
+-
+-    fn start_with_observer(codex: bool, ncm_observer: bool) -> Self {
++    /// A registered project with the selected advisory provider configured.
++    /// Provider settings are `DaemonRestart`, so restart publishes the chosen
++    /// composition before the journey begins.
++    fn start(codex: bool, active_provider: ActiveProvider, ncm_observer: bool) -> Self {
+         let home = TempDir::new().expect("isolated home");
+         let root = home.path().to_path_buf();
+         let profile = root.join(".tracedecay");
+@@ -175,6 +191,7 @@
+ 
+         let mut journey = Self {
+             codex,
++            active_provider,
+             ncm_observer,
+             daemon: None,
+             home,
+@@ -188,8 +205,8 @@
+         journey.initialize_registered_project();
+         let project_id = journey.project_id();
+         journey.commit_provider_gates(&project_id);
+-        if ncm_observer {
+-            journey.commit_real_ncm_observer(&project_id);
++        if active_provider.is_ncm() || ncm_observer {
++            journey.commit_real_ncm(&project_id);
+         }
+         // All provider gates are DaemonRestart settings: restart is what makes the
+         // provider host mount.
+@@ -593,7 +610,7 @@
+         self.configuration_set(
+             project_id,
+             MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+-            json!({ "kind": "boolean", "value": true }),
++            json!({ "kind": "boolean", "value": self.active_provider == ActiveProvider::Native }),
+             "configuration.idempotency.claude-cli-journey-host",
+         );
+         self.configuration_set(
+@@ -601,7 +618,7 @@
+             MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+             json!({
+                 "kind": "text",
+-                "value": json!({ "active_provider": CONFIGURED_PROVIDER_ID }).to_string(),
++                "value": json!({ "active_provider": self.active_provider.id() }).to_string(),
+             }),
+             "configuration.idempotency.claude-cli-journey-routing",
+         );
+@@ -610,7 +627,7 @@
+     /// Only the opt-in real-worker tests call this. The existing TempDir owns
+     /// every mutable NCM namespace; only installed model artifacts are shared.
+     #[cfg(unix)]
+-    fn commit_real_ncm_observer(&self, project_id: &str) {
++    fn commit_real_ncm(&self, project_id: &str) {
+         let worker = PathBuf::from(
+             std::env::var_os("TRACEDECAY_NCM_WORKER").expect("real NCM worker binary is required"),
+         );
+@@ -648,7 +665,7 @@
+     }
+ 
+     #[cfg(not(unix))]
+-    fn commit_real_ncm_observer(&self, _project_id: &str) {
++    fn commit_real_ncm(&self, _project_id: &str) {
+         panic!("the opt-in real NCM model fixture requires Unix");
+     }
+ 
+@@ -907,7 +924,14 @@
+     /// The durable observation journal the mounted journey owns, located under
+     /// this profile's own store layout rather than guessed at.
+     fn journal_path(&self) -> Option<PathBuf> {
+-        find_file(&self.profile, JOURNAL_FILE_NAME)
++        find_file(
++            &self.profile,
++            if self.active_provider.is_ncm() {
++                NCM_JOURNAL_FILE_NAME
++            } else {
++                JOURNAL_FILE_NAME
++            },
++        )
+     }
+ 
+     /// The read handle on the durable journal, opened the first time the store
+@@ -925,21 +949,16 @@
+         if let Some(journal) = slot.get() {
+             return Some(journal);
+         }
+-        let native_path = self.journal_path()?;
+-        // The observer must be mounted beside Native in the canonical store,
+-        // never discovered under its own provider state or another project.
+-        let path = if ncm {
+-            let path = native_path
+-                .parent()
+-                .expect("canonical store root")
+-                .join(NCM_JOURNAL_FILE_NAME);
+-            if !path.is_file() {
+-                return None;
+-            }
+-            path
+-        } else {
+-            native_path
+-        };
++        // Both are host-owned journals under this isolated canonical profile.
++        // An independently active NCM mount does not require a Native journal.
++        let path = find_file(
++            &self.profile,
++            if ncm {
++                NCM_JOURNAL_FILE_NAME
++            } else {
++                JOURNAL_FILE_NAME
++            },
++        )?;
+         let journal = SqliteObservationJournal::open(&path, inspection_retention_policy())
+             .expect("the durable observation journal must open through its own store API");
+         let _ = slot.set(journal);
+@@ -956,10 +975,28 @@
+     /// rows"; every other failure — the store will not open, the inspection is
+     /// refused, the page did not fit — fails the test loudly.
+     fn journal_rows(&self) -> Vec<JournalInspectionRowV1> {
+-        self.journal_rows_for(false)
++        self.journal_rows_for(self.active_provider.is_ncm())
+     }
+ 
+     fn journal_rows_for(&self, ncm: bool) -> Vec<JournalInspectionRowV1> {
++        self.all_journal_rows_for(ncm)
++            .into_iter()
++            .filter(|row| {
++                if row.source_stream == "session_observation_store" {
++                    return true;
++                }
++                let journal = self.journal_for(ncm).expect("mounted journal");
++                let admitted = journal
++                    .read_admitted_observation_by_idempotency(&row.idempotency_key)
++                    .expect("retained history admission read")
++                    .expect("history content remains retained");
++                assert_history_stream(row, &admitted);
++                false
++            })
++            .collect()
++    }
++
++    fn all_journal_rows_for(&self, ncm: bool) -> Vec<JournalInspectionRowV1> {
+         let Some(journal) = self.journal_for(ncm) else {
+             return Vec::new();
+         };
+@@ -983,7 +1020,7 @@
+     /// moment it does. A deadline is a failure that reports what it last saw,
+     /// never a half-settled journal handed back to be asserted against.
+     fn await_settled_journal(&self, minimum_rows: usize) -> Vec<JournalInspectionRowV1> {
+-        self.await_settled_journal_for(false, minimum_rows)
++        self.await_settled_journal_for(self.active_provider.is_ncm(), minimum_rows)
+     }
+ 
+     fn await_settled_journal_for(
+@@ -1535,16 +1572,36 @@
+     assert_host_memory_journey_with_observer(true, true);
+ }
+ 
++/// NCM must independently answer the same real host journey with Native
++/// advisory disabled; the canonical history and host admission remain shared.
++#[cfg(unix)]
++#[test]
++#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
++fn real_ncm_active_recalls_shipped_claude_session_history_with_native_disabled() {
++    assert_host_memory_journey_with_provider(false, ActiveProvider::RustNcm, false);
++}
++
++#[cfg(unix)]
++#[test]
++#[ignore = "requires TRACEDECAY_NCM_WORKER and TRACEDECAY_NCM_REAL_MODEL_ROOT with pinned offline model"]
++fn real_ncm_active_recalls_shipped_codex_session_history_with_native_disabled() {
++    assert_host_memory_journey_with_provider(true, ActiveProvider::RustNcm, false);
++}
++
+ fn assert_host_memory_journey(codex: bool) {
+-    assert_host_memory_journey_with_observer(codex, false);
++    assert_host_memory_journey_with_provider(codex, ActiveProvider::Native, false);
+ }
+ 
+ fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
+-    let mut journey = if ncm_observer {
+-        ClaudeHostJourney::start_with_observer(codex, true)
+-    } else {
+-        ClaudeHostJourney::start(codex)
+-    };
++    assert_host_memory_journey_with_provider(codex, ActiveProvider::Native, ncm_observer);
++}
++
++fn assert_host_memory_journey_with_provider(
++    codex: bool,
++    active_provider: ActiveProvider,
++    ncm_observer: bool,
++) {
++    let mut journey = ClaudeHostJourney::start(codex, active_provider, ncm_observer);
+ 
+     // 1. The project is mounted and the provider host is live *before* the
+     //    transcript exists. Baseline context forces project open; the explicit
+@@ -1555,10 +1612,11 @@
+         &json!({ "task": task, "format": "json" }),
+     );
+     let baseline_lane = advisory_lane(&baseline).unwrap_or_else(|| {
+-        panic!("a composition with both gates committed must mount the advisory lane: {baseline}")
++        panic!("the selected provider must mount the advisory lane: {baseline}")
+     });
+     assert_eq!(
+-        baseline_lane["provider_id"], CONFIGURED_PROVIDER_ID,
++        baseline_lane["provider_id"],
++        active_provider.id(),
+         "the lane must name the provider this project's routing policy pinned: {baseline_lane}"
+     );
+     let _journal = journey
+@@ -1687,8 +1745,13 @@
+         journey.assert_observer_settled(&journey.journal_rows(), &observer_final);
+     }
+ 
++    // Capture canonical source identities and the actual A scope before any
++    // recall can add provider-addressed history deliveries to this journal.
++    let original_sources = capture_original_hook_sources(&journey, &mid_session_replayed);
++
+     // 9. The originating session can recall exactly what its hooks observed.
+-    let original = assert_recalled_session_messages(&journey, journey.session_id());
++    let original =
++        assert_recalled_session_messages(&journey, journey.session_id(), &original_sources);
+ 
+     // 10. A fresh daemon and a different agent session must recall those same
+     //     durable messages. B starts through the shipped lifecycle with an
+@@ -1715,26 +1778,26 @@
+         "starting an empty session must preserve the original deliveries"
+     );
+     assert_settled_session_messages(&after_start, 2 * ROWS_PER_TURN);
+-    let native_journal = journey
+-        .journal_for(false)
+-        .expect("Native journal after bootstrap");
++    let selected_journal = journey
++        .journal_for(active_provider.is_ncm())
++        .expect("selected provider journal after bootstrap");
+     for row in &after_start {
+         assert_eq!(
+-            native_journal
++            selected_journal
+                 .receipts_for(&row.observation_id)
+-                .expect("Native receipts")
++                .expect("selected provider receipts")
+                 .len(),
+             1,
+             "empty SessionStart must not add another delivery receipt"
+         );
+     }
+     journey.assert_observer_settled(&after_start, &observer_final);
+-    let recalled = assert_recalled_session_messages(&journey, next_session);
++    let recalled = assert_recalled_session_messages(&journey, next_session, &original_sources);
+     assert_eq!(
+         recalled, original,
+         "restart and session change must preserve the same four messages and their provenance"
+     );
+-    if !ncm_observer {
++    if active_provider == ActiveProvider::Native && !ncm_observer {
+         assert_canonical_fact_feedback_journey(&mut journey, next_session);
+     }
+ }
+@@ -1913,12 +1976,278 @@
+     assert_eq!(recalled_provenance(journey), selected_provenance);
+ }
+ 
++/// Exact scope read from an admitted host envelope; session encoding belongs
++/// to the host and is never reconstructed from a canonical session string.
++fn admitted_scope(admitted: &AdmittedObservationV1) -> Value {
++    let scope = &admitted.exact_scope;
++    json!({
++        "profile_id": scope.profile_id, "project_id": scope.project_id,
++        "repository_identity": scope.repository_identity, "worktree_identity": scope.worktree_identity,
++        "branch_identity": scope.branch_identity, "agent_session_id": scope.agent_session_id,
++        "resolved_scope_digest": scope.resolved_scope_digest,
++    })
++}
++
++fn capture_original_hook_sources(
++    journey: &ClaudeHostJourney,
++    rows: &[JournalInspectionRowV1],
++) -> BTreeMap<String, Value> {
++    let journal = journey
++        .journal_for(journey.active_provider.is_ncm())
++        .expect("selected host journal");
++    let mut originals = BTreeMap::new();
++    for row in rows {
++        assert_eq!(row.source_stream, "session_observation_store");
++        let admitted = journal
++            .read_admitted_observation_by_idempotency(&row.idempotency_key)
++            .expect("read original admitted hook evidence")
++            .expect("original content retained");
++        let payload: Value =
++            serde_json::from_slice(&admitted.payload.bytes).expect("canonical admitted payload");
++        let canonical: tracedecay_domain::observation::CanonicalObservationEnvelopeV1 =
++            serde_json::from_value(payload["canonical_payload"].clone())
++                .expect("canonical source envelope");
++        canonical
++            .validate()
++            .expect("valid canonical source envelope");
++        assert_eq!(
++            canonical.provider().as_str(),
++            if journey.codex { "codex" } else { "claude" }
++        );
++        assert_eq!(
++            canonical.relations().session_id().as_str(),
++            journey.session_id()
++        );
++        assert!(
++            payload.get("history_grant").is_none(),
++            "capture must precede provider history replay"
++        );
++        let captured = json!({
++            "canonical_provider_id": canonical.provider().as_str(),
++            "canonical_session_id": canonical.relations().session_id().as_str(),
++            "stable_record_id": canonical.stable_record_id().as_str(),
++            "source_revision": canonical.evidence().revision(),
++            "source_sequence": admitted.source.source_sequence.0,
++            "original_scope": admitted_scope(&admitted),
++        });
++        assert!(
++            originals
++                .insert(admitted.source.source_event_id.clone(), captured)
++                .is_none(),
++            "hook source identities are unique"
++        );
++    }
++    assert_eq!(originals.len(), 2 * ROWS_PER_TURN);
++    originals
++}
++
++/// Only explicitly identified history rows are excluded from hook counts.
++/// The complete source and receipt assertions run immediately after recall.
++fn assert_history_stream(row: &JournalInspectionRowV1, admitted: &AdmittedObservationV1) -> Value {
++    admitted
++        .validate()
++        .expect("valid retained history admission");
++    assert_eq!(admitted.observation_id, row.observation_id);
++    assert_eq!(admitted.idempotency_key, row.idempotency_key);
++    assert_eq!(admitted.payload.sha256, row.payload_sha256);
++    assert_eq!(admitted.extensions_digest, row.extensions_digest);
++    let payload: Value =
++        serde_json::from_slice(&admitted.payload.bytes).expect("retained history payload");
++    let grant = &payload["history_grant"];
++    let revision = grant["policy_revision"]
++        .as_u64()
++        .filter(|value| *value > 0)
++        .expect("history policy revision");
++    assert_eq!(
++        row.source_stream,
++        format!(
++            "host-history.{revision}.{}",
++            admitted.exact_scope.exact_scope_sha256()
++        ),
++        "no unrelated source stream may be hidden by hook counting"
++    );
++    assert_eq!(grant["destination_scope"], admitted_scope(admitted));
++    assert!(
++        payload
++            .pointer("/source_identity/original_source")
++            .is_some(),
++        "history row must retain original evidence"
++    );
++    payload
++}
++
++fn assert_original_source(source: &Value, captured: &Value) {
++    for field in [
++        "canonical_provider_id",
++        "canonical_session_id",
++        "source_revision",
++    ] {
++        assert_eq!(
++            source["source"][field], captured[field],
++            "original {field} must match pre-recall A evidence"
++        );
++    }
++    if !source["source"]["stable_record_id"].is_null() {
++        assert_eq!(
++            source["source"]["stable_record_id"],
++            captured["stable_record_id"]
++        );
++    }
++    assert_eq!(source["source_sequence"], captured["source_sequence"]);
++    assert_eq!(source["origin_scope"]["state"], "recorded");
++    assert_eq!(
++        source["origin_scope"]["exact_scope_identity"], captured["original_scope"],
++        "delivery in B must retain the actual host-authorized A scope"
++    );
++    assert!(
++        source["origin_scope"]["authority_ref"]
++            .as_str()
++            .is_some_and(|value| !value.is_empty())
++    );
++}
++
++fn assert_recalled_history_deliveries(
++    journey: &ClaudeHostJourney,
++    originals: &BTreeMap<String, Value>,
++    previous: &BTreeSet<String>,
++    origin_session: bool,
++) -> BTreeMap<String, Value> {
++    let journal = journey
++        .journal_for(journey.active_provider.is_ncm())
++        .expect("selected host journal");
++    let original_scope = &originals.values().next().expect("captured A sources")["original_scope"];
++    let mut delivered = BTreeMap::new();
++    let mut current_scope = None;
++    for row in journey.all_journal_rows_for(journey.active_provider.is_ncm()) {
++        if row.source_stream == "session_observation_store" {
++            continue;
++        }
++        let admitted = journal
++            .read_admitted_observation_by_idempotency(&row.idempotency_key)
++            .expect("read history admission")
++            .expect("retained history evidence");
++        let payload = assert_history_stream(&row, &admitted);
++        let source = &payload["source_identity"]["original_source"];
++        let id = source["source"]["observation_id"]
++            .as_str()
++            .expect("canonical source identity");
++        assert_original_source(
++            source,
++            originals.get(id).expect("no unrelated canonical sources"),
++        );
++        let grant_sources = payload["history_grant"]["sources"]
++            .as_array()
++            .expect("granted sources");
++        assert_eq!(grant_sources.len(), 1);
++        assert_eq!(grant_sources[0]["attribution"], *source);
++        assert_eq!(row.provider_id, journey.active_provider.id());
++        let receipts = journal
++            .receipts_for(&row.observation_id)
++            .expect("history receipts");
++        let current: Vec<_> = receipts
++            .iter()
++            .filter(|receipt| receipt.attempt_number == row.attempt_number)
++            .collect();
++        assert_eq!(
++            current.len(),
++            1,
++            "history must have one validated current-attempt receipt"
++        );
++        let receipt = current[0];
++        receipt.validate().expect("valid history receipt identity");
++        assert_eq!(receipt.provider_id.as_str(), journey.active_provider.id());
++        assert_eq!(receipt.observation_id, row.observation_id);
++        assert_eq!(receipt.idempotency_key, row.idempotency_key);
++        assert_eq!(receipt.payload_sha256, row.payload_sha256);
++        assert_eq!(receipt.extensions_digest, row.extensions_digest);
++        assert_eq!(receipt.registration_revision, row.registration_revision);
++        assert_eq!(
++            receipt.provider_instance_id.as_ref(),
++            Some(&row.provider_instance_id)
++        );
++        assert_eq!(receipt.attempt_number, row.attempt_number);
++        assert!(
++            receipt
++                .provider_receipt_digest
++                .as_ref()
++                .is_some_and(|digest| digest.len() == 64
++                    && digest.bytes().all(|byte| byte.is_ascii_hexdigit())),
++            "applied history must carry a real provider acknowledgement digest"
++        );
++        let applied = row.state == DeliveryStateV1::Acknowledged
++            && receipt.outcome == ObservationOutcomeV1::Applied
++            && receipt.committed_effect == ObservationCommittedEffectV1::Applied;
++        let duplicate = row.state == DeliveryStateV1::DuplicateAcknowledged
++            && receipt.outcome == ObservationOutcomeV1::DuplicateAcknowledged
++            && receipt.committed_effect == ObservationCommittedEffectV1::Duplicate;
++        assert!(
++            applied || duplicate,
++            "history requires a settled applied or duplicate effect"
++        );
++        let destination = admitted_scope(&admitted);
++        if previous.contains(row.idempotency_key.as_str()) {
++            assert!(!origin_session, "A begins without earlier history delivery");
++            assert_eq!(
++                &destination, original_scope,
++                "only original A history may precede B recall"
++            );
++            continue;
++        }
++        for field in [
++            "profile_id",
++            "project_id",
++            "repository_identity",
++            "worktree_identity",
++            "branch_identity",
++            "resolved_scope_digest",
++        ] {
++            assert_eq!(
++                destination[field], original_scope[field],
++                "history must stay in the authorized checkout"
++            );
++        }
++        if origin_session {
++            assert_eq!(&destination, original_scope);
++        } else {
++            assert_ne!(
++                destination["agent_session_id"], original_scope["agent_session_id"],
++                "B gets a distinct delivery scope without relabeling A evidence"
++            );
++        }
++        if let Some(expected) = &current_scope {
++            assert_eq!(
++                &destination, expected,
++                "one requesting session owns this recall"
++            );
++        } else {
++            current_scope = Some(destination);
++        }
++        assert!(
++            delivered.insert(id.to_owned(), source.clone()).is_none(),
++            "one history delivery per original source and destination"
++        );
++    }
++    assert_eq!(
++        delivered.keys().collect::<Vec<_>>(),
++        originals.keys().collect::<Vec<_>>(),
++        "the real selected provider must settle every original source for this session"
++    );
++    delivered
++}
++
+ /// The existing complete recall assertions, shared by origin and next session.
+ /// Returns content/provenance identities; request-bound candidate IDs may differ.
+ fn assert_recalled_session_messages(
+     journey: &ClaudeHostJourney,
+     recalled_session_id: &str,
++    original_sources: &BTreeMap<String, Value>,
+ ) -> Vec<(String, String)> {
++    let previous_history: BTreeSet<_> = journey
++        .all_journal_rows_for(journey.active_provider.is_ncm())
++        .into_iter()
++        .filter(|row| row.source_stream != "session_observation_store")
++        .map(|row| row.idempotency_key.as_str().to_owned())
++        .collect();
+     let answer = journey.tool(
+         "tracedecay_context",
+         &json!({
+@@ -1942,7 +2271,8 @@
+         "a healthy route reports no degradation: {lane}"
+     );
+     assert_eq!(
+-        lane["provider_id"], CONFIGURED_PROVIDER_ID,
++        lane["provider_id"],
++        journey.active_provider.id(),
+         "the lane must name the provider the routing policy pinned: {lane}"
+     );
+     let candidates = lane["candidates"].as_array().cloned().unwrap_or_default();
+@@ -1950,6 +2280,49 @@
+         candidates.len(),
+         2 * ROWS_PER_TURN,
+         "the healthy journey must recall every admitted Claude message exactly once: {lane}"
++    );
++    let retained_sources = assert_recalled_history_deliveries(
++        journey,
++        original_sources,
++        &previous_history,
++        recalled_session_id == journey.session_id(),
++    );
++    let mut recalled_originals = BTreeSet::new();
++    for candidate in &candidates {
++        let evidence = &candidate["provenance_evidence"];
++        assert_eq!(
++            evidence["kind"], "canonical_observations",
++            "final candidates require host-confirmed original evidence"
++        );
++        let sources = evidence["sources"]
++            .as_array()
++            .expect("typed original sources");
++        assert!(
++            !sources.is_empty(),
++            "admitted content must have original source evidence"
++        );
++        for source in sources {
++            let id = source["source"]["observation_id"]
++                .as_str()
++                .expect("canonical observation id");
++            let expected = retained_sources
++                .get(id)
++                .expect("candidate source was delivered from captured A history");
++            assert_eq!(
++                source, expected,
++                "public evidence must preserve every retained attribution field"
++            );
++            assert_original_source(
++                source,
++                original_sources.get(id).expect("original hook source"),
++            );
++            recalled_originals.insert(id.to_owned());
++        }
++    }
++    assert_eq!(
++        recalled_originals,
++        original_sources.keys().cloned().collect(),
++        "recall must cover the actual original hook sources"
+     );
+     let mut provenance = candidates
+         .iter()
+@@ -1992,7 +2365,11 @@
+                     .as_str()
+                     .expect("verified message content")
+                     .to_owned(),
+-                candidate["provenance"].to_string(),
++                json!({
++                    "label": candidate["provenance"],
++                    "evidence": candidate["provenance_evidence"],
++                })
++                .to_string(),
+             )
+         })
+         .collect::<Vec<_>>();

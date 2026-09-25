@@ -1,0 +1,12 @@
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -1241,6 +1241,9 @@
+                 let identity = self.build_identity()?;
+                 self.scope = destination_scope.clone();
+                 self.host = Some(self.make_host(self.owner()?)?);
++                // Reopening a populated session must refresh the new surface's
++                // declared generation before the suite checks its next handshake.
++                self.reopen_persisted_namespace(deadline)?;
+                 Ok(FixtureEnvironmentEvidence::SessionOpened {
+                     destination_scope: self.scope.clone(),
+                     selected_provider_unchanged: self.build_identity()? == identity,

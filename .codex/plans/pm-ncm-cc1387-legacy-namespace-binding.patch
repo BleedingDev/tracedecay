@@ -1,0 +1,88 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/common_reads.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/common_reads.rs
+@@ -296,6 +296,8 @@
+         .chain(std::iter::once(capsule.value_text.len()))
+         .take_while(|index| *index <= maximum_prefix)
+         .collect::<Vec<_>>();
++    // Bind the selected namespace without returning its forbidden raw surface identity.
++    let legacy_namespace_sha256 = super::util::sha256_hex(namespace.as_bytes());
+     let (mut low, mut high) = (0, boundaries.len());
+     let mut selected = None;
+     while low < high {
+@@ -304,7 +306,7 @@
+         }
+         let middle = low + (high - low) / 2;
+         let content = &capsule.value_text[..boundaries[middle]];
+-        let row = json!({"legacy_record_id":id,"namespace":namespace,"stable_memory_ref":id.to_string(),
++        let row = json!({"legacy_record_id":id,"legacy_namespace_sha256":legacy_namespace_sha256,"stable_memory_ref":id.to_string(),
+             "content":content,"content_sha256":super::util::sha256_hex(content.as_bytes()),"original_source":null});
+         let encoded = match serde_json::to_vec(&row) {
+             Ok(encoded) => encoded,
+--- a/crates/tracedecay-memory-ncm-runtime/tests/legacy_trace.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/legacy_trace.rs
+@@ -102,7 +102,16 @@
+         }
+         assert_eq!(item["legacy_record_id"], id);
+         assert_eq!(item["stable_memory_ref"], "1");
+-        assert_eq!(item["namespace"], namespace());
++        assert_eq!(
++            item["legacy_namespace_sha256"],
++            digest(namespace().as_bytes())
++        );
++        assert!(item.get("namespace").is_none());
++        assert!(
++            !serde_json::to_string(&reply.payload)
++                .unwrap()
++                .contains(&namespace())
++        );
+         assert_eq!(item["original_source"], Value::Null);
+         assert_eq!(item["content_sha256"], digest(content.as_bytes()));
+         assert!(serde_json::to_vec(item).unwrap().len() <= maximum as usize);
+--- a/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
+@@ -61,7 +61,7 @@
+         row,
+         &[
+             "legacy_record_id",
+-            "namespace",
++            "legacy_namespace_sha256",
+             "stable_memory_ref",
+             "content",
+             "content_sha256",
+@@ -71,7 +71,8 @@
+     let id = legacy_record_id(selected)?;
+     let content = row["content"].as_str()?;
+     if row["legacy_record_id"].as_u64()? != id
+-        || row["namespace"] != namespace.as_str()
++        || row["legacy_namespace_sha256"]
++            != hex_digest(&Sha256::digest(namespace.as_str().as_bytes()))
+         || row["stable_memory_ref"] != selected
+         || !row["original_source"].is_null()
+         || row["content_sha256"] != hex_digest(&Sha256::digest(content.as_bytes()))
+@@ -1066,11 +1067,24 @@
+     #[test]
+     fn legacy_trace_requires_exact_namespace_record_and_unknown_attribution() {
+         let namespace = NcmNamespace("ab".repeat(32));
+-        let row = json!({"legacy_record_id":1,"namespace":namespace.as_str(),"stable_memory_ref":"1",
++        let row = json!({"legacy_record_id":1,"legacy_namespace_sha256":hex_digest(&Sha256::digest(namespace.as_str().as_bytes())),"stable_memory_ref":"1",
+             "content":"retained 🦀", "content_sha256":hex_digest(&Sha256::digest("retained 🦀".as_bytes())),"original_source":null});
+         assert!(legacy_trace_item(&namespace, "1", &row).is_some());
++        // This is the same string containment primitive used before reconstruction.
++        assert!(!crate::json_contains_any(&row, &[namespace.as_str()]));
++        let mut plaintext_namespace = row.clone();
++        plaintext_namespace["namespace"] = json!(namespace.as_str());
++        assert!(crate::json_contains_any(
++            &plaintext_namespace,
++            &[namespace.as_str()]
++        ));
++        assert!(legacy_trace_item(&namespace, "1", &plaintext_namespace).is_none());
+         for (field, value) in [
+-            ("namespace", json!("cd".repeat(32))),
++            (
++                "legacy_namespace_sha256",
++                json!(hex_digest(&Sha256::digest("cd".repeat(32).as_bytes()))),
++            ),
++            ("legacy_namespace_sha256", Value::Null),
+             ("legacy_record_id", json!(2)),
+             ("stable_memory_ref", json!("01")),
+             ("content_sha256", json!("00".repeat(32))),

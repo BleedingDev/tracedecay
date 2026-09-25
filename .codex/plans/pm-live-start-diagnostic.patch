@@ -1,0 +1,28 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -1053,6 +1053,10 @@
+ 
+     #[tokio::test]
+     async fn live_start_and_two_real_stop_ingest_cycles_preserve_the_canonical_locator() {
++        let _ = tracing_subscriber::fmt()
++            .with_test_writer()
++            .with_max_level(tracing::Level::DEBUG)
++            .try_init();
+         use super::super::super::SessionAuthorities;
+         use super::super::admission::hook_v2_admit;
+         use super::super::ingest::ingest_transcript;
+@@ -1134,8 +1138,12 @@
+             let (start, _) = native_hook_request(
+                 &snapshot.binding, "session-source", &transcript, &project_root, "SessionStart", 1,
+             );
+-            hook_v2_admit(&cg, &start, "hook_v2_admit", authorities.clone()).await.unwrap();
+-            let session = project_db.get_session_result("claude", "session-source").await.unwrap().unwrap();
++            let start_response = hook_v2_admit(&cg, &start, "hook_v2_admit", authorities.clone()).await.unwrap();
++            assert_eq!(start_response["status"], "accepted", "actual Start admission: {start_response}");
++            let session = project_db.get_session_result("claude", "session-source").await.unwrap().unwrap_or_else(|| {
++                let cpu = runtime.background_cpu();
++                panic!("accepted Start retained no canonical locator: response={start_response}; CPU active={}/{}, waiting={}", cpu.active_units(), cpu.width(), cpu.waiting_work_units());
++            });
+             assert_eq!(session.transcript_path.as_deref(), Some(expected_path.as_str()));
+             assert_eq!(project_db.session_message_count().await.unwrap(), 0);
+             let boundaries = read_hook_live_origin_boundaries(&ledger, host, tracedecay_contracts::now_micros()).unwrap();

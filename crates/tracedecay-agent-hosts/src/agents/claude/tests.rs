@@ -361,7 +361,7 @@ fn old_owned_marketplace_update_and_uninstall_preserve_foreign_files() {
 #[test]
 fn lifecycle_rejects_unowned_marketplace_dir_before_removal() {
     use crate::agents::AgentIntegration;
-    use crate::agents::host_bundle::{HostBundleComponentV1, HostBundleRegistrationStateV1};
+    use crate::agents::host_bundle::{HostBundleRegistrationStateV1, HostComponentV1};
 
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -375,7 +375,7 @@ fn lifecycle_rejects_unowned_marketplace_dir_before_removal() {
     std::fs::write(deploy_dir.join("user-file.txt"), "keep me").unwrap();
 
     let state = ClaudeIntegration.host_component_registration(
-        HostBundleComponentV1::Core,
+        HostComponentV1::Core,
         &HealthcheckContext {
             home: home.path().to_path_buf(),
             project_path: project.path().to_path_buf(),

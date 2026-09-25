@@ -102,7 +102,7 @@ fn deployed_hook_invocation(hooks: &Value, event: &str) -> Option<(String, Vec<S
 #[test]
 fn the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_disturbing_operator_state()
  {
-    use tracedecay_agent_hosts::agents::host_bundle::HostBundleComponentV1;
+    use tracedecay_agent_hosts::agents::host_bundle::HostComponentV1;
     use tracedecay_agent_hosts::agents::{
         AgentIntegration, ClaudeIntegration, InstallContext, NonInteractiveInstallOutcome,
         UpdatePluginOutcome,
@@ -130,7 +130,7 @@ fn the_shipped_claude_bundle_stages_hooks_and_registers_project_rules_without_di
         dashboard: false,
     };
     let integration = ClaudeIntegration;
-    let components: &[HostBundleComponentV1] = &[];
+    let components: &[HostComponentV1] = &[];
 
     // Install stages the bundle that carries the Claude lifecycle hooks.
     let NonInteractiveInstallOutcome::DeferredUserAction(staged) = integration

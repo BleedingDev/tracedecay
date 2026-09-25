@@ -1,0 +1,193 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/provider_history.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/provider_history.rs
+@@ -1244,3 +1244,190 @@
+         assert_eq!(next.last_scanned_sequence, 999);
+     }
+ }
++
++struct FreshSelectedPagesAuthority {
++    provider: OwnedProviderId,
++    grants: Mutex<Vec<HistoryGrant>>,
++}
++
++impl HistoryGrantRevalidationV1 for FreshSelectedPagesAuthority {
++    fn revalidate(
++        &self,
++        provider: &OwnedProviderId,
++        grant: &HistoryGrant,
++        operation: &OperationControl,
++    ) -> Result<(), ProviderHistoryErrorV1> {
++        operation
++            .snapshot()
++            .map_err(ProviderHistoryErrorV1::Control)?;
++        if provider == &self.provider && self.grants.lock().unwrap().contains(grant) {
++            Ok(())
++        } else {
++            Err(ProviderHistoryErrorV1::ClaimMismatch(
++                "fresh selected test page",
++            ))
++        }
++    }
++
++    fn revalidate_async<'a>(
++        &'a self,
++        provider: &'a OwnedProviderId,
++        grant: &'a HistoryGrant,
++        operation: &'a OperationControl,
++    ) -> std::pin::Pin<
++        Box<dyn std::future::Future<Output = Result<(), ProviderHistoryErrorV1>> + Send + 'a>,
++    > {
++        Box::pin(async move { self.revalidate(provider, grant, operation) })
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn independently_selected_fresh_grants_preserve_durable_delivery_identity() {
++    use tracedecay_memory_observation::{
++        ExpectedSourceDeliveryV1, RecoveryTimeBudgetV1, SourceDeliveryEvidenceV1,
++    };
++    let fixture = RepositoryFixture::new();
++    let bridge = fixture.bridge();
++    let records = SettledRecordsPort::single(fixture.record("session.source", 1, true));
++    let original_authority = OriginalReceipts::new();
++    let provider = OwnedProviderId::new("tracedecay.native").unwrap();
++    let destination = bridge.destination("session.destination").unwrap();
++    let journal_root = fixture.temp.path().join("fresh-delivery");
++    std::fs::create_dir_all(&journal_root).unwrap();
++    let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
++        composition: composition(Arc::new(JourneyNativePort::with_state_generation(1))),
++        profile_id: fixture.profile.clone(),
++        scope: fixture.scope.clone(),
++        authoritative_project_id: fixture.project.clone(),
++        provider: crate::daemon::project_composition::native_observation_mount(&journal_root, 1)
++            .unwrap(),
++        store_data_root: journal_root,
++        policy: ObservationJourneyPolicyV1::project_default(),
++    })
++    .unwrap();
++    let journal = journey.history_journal();
++    let reader = ProviderHistoryReaderV1 {
++        bridge: &bridge,
++        observations: &records,
++        dispositions: &ActiveDispositions,
++        original_authority: &original_authority,
++        journal: journal.as_ref(),
++        provider_id: &provider,
++        policy_revision: 1,
++    };
++    let first = reader
++        .select_recent_page(&destination, 1, &control())
++        .await
++        .unwrap();
++    let first_grant = first.grant.clone().unwrap();
++    let selected_authority = Arc::new(FreshSelectedPagesAuthority {
++        provider: provider.clone(),
++        grants: Mutex::new(vec![first_grant.clone()]),
++    });
++    journey
++        .bind_history_authority(selected_authority.clone())
++        .unwrap();
++    assert_eq!(
++        journey
++            .replay_authorized_history_page(first, destination.clone(), 1, open_bounds())
++            .await
++            .unwrap()
++            .admitted,
++        1
++    );
++    journey
++        .await_history_delivery(&first_grant, open_bounds())
++        .await
++        .unwrap();
++
++    let source = &first_grant.sources[0].attribution;
++    let lane = journey.adapter.context.provider_lane.clone();
++    let stream = SourceStreamKeyV1 {
++        source_authority: SourceAuthorityV1::HostSession,
++        exact_scope_sha256: destination.exact_scope_sha256(),
++        source_stream: history_source_stream(&destination, 1).unwrap(),
++    };
++    let expected = [ExpectedSourceDeliveryV1 {
++        source_sequence: SourceSequenceV1(source.source_sequence),
++        source_event_id: source.source.observation_id.clone(),
++    }];
++    let snapshot = || {
++        journal
++            .read_source_deliveries(
++                &lane,
++                &destination,
++                &stream,
++                &expected,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 1_000_000,
++                },
++                &CancellationToken::new(),
++            )
++            .unwrap()
++    };
++    let before = snapshot();
++    let SourceDeliveryEvidenceV1::Retained {
++        admitted,
++        receipt: Some(receipt),
++        ..
++    } = &before[0]
++    else {
++        panic!("history wait returned without a durable admitted delivery receipt");
++    };
++    assert_eq!(receipt.observation_id, admitted.observation_id);
++    assert_eq!(receipt.idempotency_key, admitted.idempotency_key);
++    assert!(!admitted.payload.bytes.is_empty());
++
++    tokio::time::sleep(Duration::from_millis(2)).await;
++    let second = reader
++        .select_recent_page(&destination, 1, &control())
++        .await
++        .unwrap();
++    let fresh_grant = second.grant.clone().unwrap();
++    assert_ne!(
++        first_grant.disposition_checkpoint.checked_at_utc_nanos,
++        fresh_grant.disposition_checkpoint.checked_at_utc_nanos
++    );
++    assert_ne!(
++        first_grant.sources[0]
++            .current_disposition
++            .checked_at_utc_nanos,
++        fresh_grant.sources[0]
++            .current_disposition
++            .checked_at_utc_nanos
++    );
++    assert_eq!(
++        first_grant.sources[0].attribution,
++        fresh_grant.sources[0].attribution
++    );
++    assert_ne!(
++        history_grant_json(&first_grant).unwrap(),
++        history_grant_json(&fresh_grant).unwrap()
++    );
++    selected_authority
++        .grants
++        .lock()
++        .unwrap()
++        .push(fresh_grant.clone());
++    let replay = journey
++        .replay_authorized_history_page(second, destination.clone(), 1, open_bounds())
++        .await
++        .unwrap();
++    assert_eq!(replay.admitted, 0);
++    assert!(replay.halted.is_none());
++    assert!(replay.shed.is_none());
++    journey
++        .await_history_delivery(&fresh_grant, open_bounds())
++        .await
++        .unwrap();
++
++    // The supported strict journal API returns every admitted field and the full
++    // provider receipt: equality includes IDs, keys, payload bytes and attempts.
++    assert_eq!(snapshot(), before);
++    assert!(
++        journey
++            .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
++            .await
++            .is_empty()
++    );
++}

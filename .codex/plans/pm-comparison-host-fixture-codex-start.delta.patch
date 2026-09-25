@@ -1,0 +1,22 @@
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+@@ -1661,11 +1661,14 @@
+         } else {
+             "hook-claude-session-start"
+         };
+-        let raw = self.hook(
+-            command,
+-            &json!({"session_id": session, "transcript_path": path,
+-            "cwd": self.journey.project, "hook_event_name": "SessionStart", "source": "startup"}),
+-        )?;
++        let mut payload = json!({"session_id": session, "cwd": self.journey.project,
++            "hook_event_name": "SessionStart", "source": "startup"});
++        if !self.journey.codex {
++            payload["transcript_path"] = json!(path);
++        }
++        // Codex supplies the session identity; its metadata-only rollout is
++        // discovered through the actual native session reader.
++        let raw = self.hook(command, &payload)?;
+         if !raw.success() {
+             return Err("native SessionStart failed; exact baseline/input/output retained".into());
+         }

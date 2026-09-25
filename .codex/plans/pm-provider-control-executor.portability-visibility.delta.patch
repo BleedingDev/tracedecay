@@ -1,0 +1,12 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+@@ -46,7 +46,7 @@
+ pub(crate) mod authority;
+ mod feedback_receipt;
+ mod outcome;
+-mod portability;
++pub(crate) mod portability;
+ mod projection;
+ mod source_controls;
+ mod state_controls;

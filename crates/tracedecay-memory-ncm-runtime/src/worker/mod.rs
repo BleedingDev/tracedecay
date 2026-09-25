@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracedecay_memory_ncm_core::types::{RecordId, SourceId};
@@ -372,6 +372,8 @@ fn dispatch_handshake(
     }
     if allow_legacy_identity {
         downgrade_ready_identity(&mut reply.payload);
+    } else if let Err(reason) = attach_worker_identity(&mut reply.payload) {
+        return incompatible(&reason);
     }
     if let Some(profile) = expected.algorithm_profile.as_deref()
         && reply
@@ -440,6 +442,33 @@ fn dispatch_handshake(
         }
     }
     reply
+}
+
+fn attach_worker_identity(payload: &mut Value) -> Result<(), String> {
+    static IDENTITY: OnceLock<Result<Value, String>> = OnceLock::new();
+    let identity = IDENTITY.get_or_init(|| {
+        let path = std::env::current_exe()
+            .map_err(|error| format!("resolve executing worker artifact: {error}"))?;
+        let identity = crate::worker_artifact::worker_artifact_identity(&path)
+            .map_err(|error| format!("measure executing worker artifact: {error}"))?;
+        Ok(json!({
+            "sha256": identity.sha256,
+            "bytes": identity.bytes,
+            "target": {
+                "triple": identity.triple,
+                "os": identity.os,
+                "arch": identity.arch,
+                "family": identity.family,
+            }
+        }))
+    });
+    let worker = identity.as_ref().map_err(Clone::clone)?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| "handshake ready payload is not an object".to_owned())?;
+    object.insert("identity_revision".to_owned(), Value::from(2_u64));
+    object.insert("worker".to_owned(), worker.clone());
+    Ok(())
 }
 
 fn downgrade_ready_identity(payload: &mut Value) {
@@ -592,6 +621,11 @@ mod tests {
         assert_eq!(fresh.outcome, Outcome::Success);
         assert_eq!(fresh.payload["empty"].as_bool(), Some(true));
         assert_eq!(fresh.payload["epoch"], 0);
+        let executable = std::env::current_exe().expect("resolve test executable");
+        let executable = crate::worker_artifact::worker_artifact_identity(&executable)
+            .expect("measure test executable");
+        assert_eq!(fresh.payload["worker"]["sha256"], executable.sha256);
+        assert_eq!(fresh.payload["worker"]["bytes"], executable.bytes);
 
         let mut observation = ObserveRequest {
             idempotency_key: "handshake-seed".to_owned(),

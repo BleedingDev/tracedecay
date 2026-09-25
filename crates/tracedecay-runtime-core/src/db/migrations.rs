@@ -223,6 +223,7 @@ async fn create_schema_transaction(conn: &(impl Executor + Sync)) -> Result<()> 
             message: format!("failed to create runtime writer ledger: {e}"),
             operation: "create_schema".to_string(),
         })?;
+    install_vector_authority_schema(conn, "create_schema").await?;
     final_shape::require_exact_final_shape(conn).await?;
     set_version(conn, SCHEMA_VERSION).await?;
     Ok(())
@@ -346,6 +347,42 @@ async fn runtime_writer_ledger_pending(conn: &impl QueryExecutor, operation: &st
         operation,
     )
     .await
+}
+
+/// Reports whether an existing project store still lacks any table owned by
+/// the immutable vector-generation authority.
+async fn vector_authority_schema_pending(
+    conn: &impl QueryExecutor,
+    operation: &str,
+) -> Result<bool> {
+    sqlite_master_probe(
+        conn,
+        "SELECT 1 WHERE (
+             SELECT count(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN (
+                 'vector_authority_heads_v1',
+                 'vector_authority_stages_v1',
+                 'vector_authority_batches_v1',
+                 'vector_authority_generations_v1',
+                 'vector_authority_float_blobs_v1',
+                 'vector_authority_generation_blobs_v1'
+             )
+         ) < 6",
+        operation,
+    )
+    .await
+}
+
+async fn install_vector_authority_schema(
+    conn: &(impl Executor + Sync),
+    operation: &str,
+) -> Result<()> {
+    conn.execute_batch(tracedecay_rusqlite_runtime::repository::VECTOR_AUTHORITY_SCHEMA_V1)
+        .await
+        .map_err(|error| TraceDecayError::Database {
+            message: format!("failed to create vector-authority schema: {error}"),
+            operation: operation.to_owned(),
+        })
 }
 
 /// Reports whether the file already carries user schema objects.
@@ -482,7 +519,10 @@ pub(crate) async fn step_schema_if_pending(conn: &Connection) -> Result<bool> {
         return Ok(true);
     }
     let ledger_installed = install_runtime_writer_ledger_connection(conn).await?;
-    Ok(repair_shipped_v35_alias_trigger_connection(conn).await? || ledger_installed)
+    let vectors_installed = install_vector_authority_schema_connection(conn).await?;
+    Ok(repair_shipped_v35_alias_trigger_connection(conn).await?
+        || ledger_installed
+        || vectors_installed)
 }
 
 async fn ensure_schema_current_engine_connection(
@@ -499,6 +539,7 @@ async fn ensure_schema_current_engine_connection(
         }
     }
     install_runtime_writer_ledger_engine_connection(conn).await?;
+    install_vector_authority_schema_engine_connection(conn).await?;
     repair_shipped_v35_alias_trigger_engine_connection(conn).await?;
     verify_final_schema_connection(conn).await
 }
@@ -609,6 +650,63 @@ fn ledger_install_failure(message: String) -> TraceDecayError {
     TraceDecayError::Database {
         message,
         operation: LEDGER_INSTALL_OPERATION.to_owned(),
+    }
+}
+
+const VECTOR_AUTHORITY_INSTALL_OPERATION: &str = "install vector-authority schema";
+
+async fn install_vector_authority_schema_engine_connection(
+    conn: &DatabaseEngineWriteConnection,
+) -> Result<()> {
+    if get_version(conn).await? != SCHEMA_VERSION
+        || !vector_authority_schema_pending(conn, VECTOR_AUTHORITY_INSTALL_OPERATION).await?
+    {
+        return Ok(());
+    }
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| {
+            vector_authority_install_failure(format!("failed to acquire lock: {error}"))
+        })?;
+    match install_vector_authority_schema(&transaction, VECTOR_AUTHORITY_INSTALL_OPERATION).await {
+        Ok(()) => transaction.commit().await.map_err(|error| {
+            vector_authority_install_failure(format!("failed to commit: {error}"))
+        }),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+async fn install_vector_authority_schema_connection(conn: &Connection) -> Result<bool> {
+    if get_version(conn).await? != SCHEMA_VERSION
+        || !vector_authority_schema_pending(conn, VECTOR_AUTHORITY_INSTALL_OPERATION).await?
+    {
+        return Ok(false);
+    }
+    let transaction = conn
+        .authorized_long_lease_transaction()
+        .await
+        .map_err(|error| {
+            vector_authority_install_failure(format!("failed to acquire lock: {error}"))
+        })?;
+    match install_vector_authority_schema(&transaction, VECTOR_AUTHORITY_INSTALL_OPERATION).await {
+        Ok(()) => transaction.commit().await.map(|()| true).map_err(|error| {
+            vector_authority_install_failure(format!("failed to commit: {error}"))
+        }),
+        Err(error) => match transaction.rollback().await {
+            Ok(()) => Err(error),
+            Err(rollback_error) => Err(trigger_repair_rollback_failure(error, rollback_error)),
+        },
+    }
+}
+
+fn vector_authority_install_failure(message: String) -> TraceDecayError {
+    TraceDecayError::Database {
+        message,
+        operation: VECTOR_AUTHORITY_INSTALL_OPERATION.to_owned(),
     }
 }
 
@@ -889,6 +987,16 @@ pub(crate) async fn verify_final_schema_connection(conn: &impl QueryExecutor) ->
     if current != SCHEMA_VERSION {
         return Err(unsupported_schema_version(current));
     }
+    if vector_authority_schema_pending(conn, "verify_final_schema").await? {
+        return Err(TraceDecayError::Database {
+            message: format!(
+                "database schema v{current} needs convergence to v{SCHEMA_VERSION}: \
+                 the vector-authority schema step is pending and runs the next time a writer \
+                 opens this store; retry after that open instead of resetting the store"
+            ),
+            operation: "verify_final_schema".to_owned(),
+        });
+    }
     final_shape::require_exact_final_shape(conn).await?;
     Ok(())
 }
@@ -905,6 +1013,8 @@ pub(crate) async fn ensure_schema_current_connection(conn: &Connection) -> Resul
             step_payload_digests(conn).await?;
         }
     }
+    install_runtime_writer_ledger_connection(conn).await?;
+    install_vector_authority_schema_connection(conn).await?;
     repair_shipped_v35_alias_trigger_connection(conn).await?;
     verify_final_schema_connection(conn).await
 }

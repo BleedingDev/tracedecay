@@ -1,0 +1,11 @@
+--- a/crates/tracedecay-memory-ncm-runtime/tests/common_portability.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/common_portability.rs
+@@ -58,7 +58,7 @@
+         affect: None,
+         surprise: 0.4,
+         intensity: 1.0,
+-        provenance: json!({"common_capsule":{"version":1,"bytes":[],"sha256":digest(source)},"selection":{"observation_identity":digest(&format!("observation-{source}")),"revision_digest":digest("revision-1")}}),
++        provenance: json!({"common_capsule":{"version":1,"bytes":[],"sha256":digest("")},"selection":{"observation_identity":digest(&format!("observation-{source}")),"revision_digest":digest("revision-1")}}),
+         deadline: DEADLINE,
+     };
+     request.payload_sha256 = request.canonical_payload_sha256().unwrap();

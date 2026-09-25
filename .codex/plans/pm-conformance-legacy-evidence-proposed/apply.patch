@@ -1,0 +1,1323 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/native_common_factory_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_common_factory_tests.rs
+@@ -25,7 +25,8 @@
+ use tracedecay_domain::{FactOwnerV1, UserProfileId};
+ use tracedecay_memory_conformance::compatibility::{
+     CommonAdvisoryFixture, CommonAdvisoryFixtureFactory, CompatibilityScenario, CompatibilityStep,
+-    FixtureEnvironmentAction, FixtureEnvironmentEvidence, FixtureUnavailable, LegacyRecordEvidence,
++    FixtureEnvironmentAction, FixtureEnvironmentEvidence, FixtureUnavailable,
++    LegacyDurableRecordEvidence, LegacyIdentityEvidence, LegacyRecordEvidence,
+     common_advisory_scenarios, run_common_advisory_suite, run_compatibility_program, scope_json,
+ };
+ use tracedecay_memory_conformance::real_fixture::{
+@@ -1206,6 +1207,7 @@
+     current_scope: OwnedExactScope,
+     namespace: u64,
+     root: Option<tempfile::TempDir>,
++    legacy_references: Vec<String>,
+     cleanup: CleanupLedger,
+ }
+ impl NativeCommonFactory {
+@@ -1291,6 +1293,7 @@
+             current_scope: exact_scope.clone(),
+             namespace: 0,
+             root: Some(root),
++            legacy_references: Vec::new(),
+             cleanup: self.cleanup.clone(),
+         };
+         fixture.start().map_err(unavailable)?;
+@@ -1661,12 +1664,42 @@
+                 self.stop()?;
+                 let records =
+                     install_legacy(&self.provider_root()?, &self.current_scope, observations)?;
++                self.legacy_references = records
++                    .iter()
++                    .map(|record| record.stable_memory_ref.clone())
++                    .collect();
+                 // The next Restart action, not this writer, opens/migrates v1.
+                 Ok(FixtureEnvironmentEvidence::LegacyV1Installed {
+                     stored_version: 1,
+                     source_count: u64::try_from(records.len()).map_err(failure)?,
+                     records,
+                 })
++            }
++            FixtureEnvironmentAction::InspectLegacyDurableState { .. } => {
++                // Point-read the owned namespace while the restarted child remains live.
++                self.proxy.descriptor_result()?;
++                if self.legacy_references.is_empty() || self.legacy_references.len() > 64 {
++                    return Err("legacy physical audit has no bounded stored references".into());
++                }
++                let connection = Connection::open_with_flags(
++                    staged_store_path(&self.provider_root()?),
++                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
++                )
++                .map_err(failure)?;
++                connection
++                    .busy_timeout(Duration::from_millis(250))
++                    .map_err(failure)?;
++                let mut statement = connection.prepare(&format!("SELECT {LEGACY_COLUMNS} FROM tdmem_native_staged_observation_v1 WHERE provider_reference=?1 LIMIT 2")).map_err(failure)?;
++                let mut records = Vec::new();
++                for reference in &self.legacy_references {
++                    let rows = statement
++                        .query_map([reference], native_legacy_durable_record)
++                        .map_err(failure)?;
++                    for record in rows {
++                        records.push(record.map_err(failure)?);
++                    }
++                }
++                Ok(FixtureEnvironmentEvidence::LegacyDurableState { records })
+             }
+             FixtureEnvironmentAction::CorruptPayloadPreservingDigest => {
+                 self.proxy.descriptor_result()?;
+@@ -2319,24 +2352,71 @@
+     if version != 1 || columns != 24 {
+         return Err("legacy writer did not produce genuine v1 storage".into());
+     }
+-    let mut statement = connection.prepare("SELECT provider_reference,operation_id,idempotency_key,receipt FROM tdmem_native_staged_observation_v1 ORDER BY admitted_sequence").map_err(failure)?;
+-    let records = statement
+-        .query_map([], |row| {
++    let mut statement = connection.prepare(&format!("SELECT {LEGACY_COLUMNS} FROM tdmem_native_staged_observation_v1 ORDER BY admitted_sequence")).map_err(failure)?;
++    let retained = statement
++        .query_map([], native_legacy_durable_record)
++        .map_err(failure)?
++        .collect::<Result<Vec<_>, _>>()
++        .map_err(failure)?;
++    let records = retained
++        .into_iter()
++        .map(|record| {
+             Ok(LegacyRecordEvidence {
+-                stable_memory_ref: row.get(0)?,
+-                original_operation_id: row.get(1)?,
+-                original_idempotency_key: row.get(2)?,
+-                original_receipt_sha256: row.get(3)?,
++                stable_memory_ref: record.stable_memory_ref,
++                original_operation_id: LegacyIdentityEvidence::Retained {
++                    value: record
++                        .retained_operation_id
++                        .ok_or("legacy stored operation missing")?,
++                },
++                original_idempotency_key: LegacyIdentityEvidence::Retained {
++                    value: record
++                        .retained_idempotency_key
++                        .ok_or("legacy stored key missing")?,
++                },
++                original_receipt_sha256: record.original_receipt_sha256,
++                immutable_record_sha256: record.immutable_record_sha256,
++                stored_receipt_bytes_sha256: record.stored_receipt_bytes_sha256,
+                 retained_source_fields: BTreeMap::new(),
+             })
+         })
+-        .map_err(failure)?
+-        .collect::<Result<Vec<_>, _>>()
+-        .map_err(failure)?;
++        .collect::<Result<Vec<_>, String>>()?;
+     if records.len() != observations.len() {
+         return Err("legacy writer lost a source".into());
+     }
+     Ok(records)
++}
++// Exact 24-column v1 projection in LEGACY_COLUMNS order. Each SQLite value
++// includes its type and exact bytes; added v2 attribution, feedback, validity,
++// projected digest and global generation tables are outside this immutable audit.
++fn native_legacy_durable_record(
++    row: &rusqlite::Row<'_>,
++) -> rusqlite::Result<LegacyDurableRecordEvidence> {
++    use rusqlite::types::ValueRef;
++    let mut projection = Vec::new();
++    for index in 0..24 {
++        let value = match row.get_ref(index)? {
++            ValueRef::Null => json!(["null"]),
++            ValueRef::Integer(value) => json!(["integer", value]),
++            ValueRef::Real(value) => json!(["real_bits", value.to_bits()]),
++            ValueRef::Text(bytes) => json!(["text", bytes]),
++            ValueRef::Blob(bytes) => json!(["blob", bytes]),
++        };
++        projection.push(value);
++    }
++    let receipt_bytes = match row.get_ref(19)? {
++        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes,
++        _ => &[],
++    };
++    Ok(LegacyDurableRecordEvidence {
++        stable_memory_ref: row.get::<_, String>(18).unwrap_or_default(),
++        immutable_record_sha256: sha256_hex(
++            &serde_json::to_vec(&projection).expect("SQLite value projection is serializable"),
++        ),
++        stored_receipt_bytes_sha256: sha256_hex(receipt_bytes),
++        original_receipt_sha256: row.get::<_, String>(19).unwrap_or_default(),
++        retained_operation_id: row.get(16).ok(),
++        retained_idempotency_key: row.get(1).ok(),
++    })
+ }
+ fn corrupt_payload(root: &Path) -> Result<FixtureEnvironmentEvidence, String> {
+     let mut connection = Connection::open(staged_store_path(root)).map_err(failure)?;
+@@ -2731,8 +2811,8 @@
+         .expect("all Native common-suite child owners confirmed reaped");
+     let report = report.expect("unchanged common program");
+     eprintln!(
+-        "real Native common suite denominators: {:?}",
+-        report.denominators
++        "real Native common suite denominators: {:?}; legacy delivery identity: {:?}",
++        report.denominators, report.legacy_delivery_identity
+     );
+     let failures: Vec<_> = report
+         .results
+--- /dev/null
++++ b/crates/tracedecay-memory-conformance/src/compatibility/legacy.rs
+@@ -0,0 +1,567 @@
++//! Independent legacy storage evidence and delivery-identity classification.
++
++use super::*;
++
++/// Proven origin of an original public delivery identifier.
++#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
++#[serde(tag = "retention", rename_all = "snake_case")]
++pub enum LegacyIdentityEvidence {
++    /// Read from the actual old durable representation before migration.
++    Retained {
++        /// Exact old stored value.
++        value: String,
++    },
++    /// Witnessed on the original call/reply and proved absent from old storage.
++    CallerObservedOnly {
++        /// Exact caller value; usable as a selector, never as retained evidence.
++        value: String,
++    },
++    /// Neither durable retention nor proved absence was established.
++    Unverified,
++}
++
++impl LegacyIdentityEvidence {
++    fn valid(&self) -> bool {
++        match self {
++            Self::Retained { value } | Self::CallerObservedOnly { value } => {
++                bounded_opaque_text(value, 256)
++            }
++            Self::Unverified => true,
++        }
++    }
++
++    fn matches_durable(&self, actual: Option<&str>) -> bool {
++        match self {
++            Self::Retained { value } => actual == Some(value),
++            Self::CallerObservedOnly { .. } => actual.is_none(),
++            Self::Unverified => true,
++        }
++    }
++}
++
++/// A fresh physical point read after migration, independent of public inspection.
++#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
++pub struct LegacyDurableRecordEvidence {
++    /// Actual persisted provider reference.
++    pub stable_memory_ref: String,
++    /// SHA-256 over the declared immutable old record projection.
++    pub immutable_record_sha256: String,
++    /// SHA-256 over the exact original stored receipt bytes.
++    pub stored_receipt_bytes_sha256: String,
++    /// Actual retained original public receipt digest, or its verified durable basis.
++    pub original_receipt_sha256: String,
++    /// Actual public operation retained in storage; never filled from caller memory.
++    pub retained_operation_id: Option<String>,
++    /// Actual public key retained in storage; never filled from caller memory.
++    pub retained_idempotency_key: Option<String>,
++}
++
++/// Delivery-identity preservation is distinct from overall expected compatibility.
++#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
++#[serde(rename_all = "snake_case")]
++pub enum LegacyDeliveryIdentityCoverage {
++    /// Both inspections and both physical audits preserved all original identities.
++    Complete,
++    /// Known original identity loss was reported; actual records/receipts survived.
++    Degraded,
++    /// Required identity or independent audit evidence is unavailable.
++    Unknown,
++    /// Observed delivery identity, record or receipt evidence violated an invariant.
++    Failed,
++}
++
++pub(super) fn record_valid(record: &LegacyRecordEvidence) -> bool {
++    bounded_opaque_text(&record.stable_memory_ref, 1024)
++        && record.original_operation_id.valid()
++        && record.original_idempotency_key.valid()
++        && crate::fixture::is_lowercase_sha256(&record.original_receipt_sha256)
++        && crate::fixture::is_lowercase_sha256(&record.immutable_record_sha256)
++        && crate::fixture::is_lowercase_sha256(&record.stored_receipt_bytes_sha256)
++        && legacy_fields_valid(&record.retained_source_fields)
++}
++
++pub(super) fn durable_valid(record: &LegacyDurableRecordEvidence) -> bool {
++    bounded_opaque_text(&record.stable_memory_ref, 1024)
++        && crate::fixture::is_lowercase_sha256(&record.original_receipt_sha256)
++        && crate::fixture::is_lowercase_sha256(&record.immutable_record_sha256)
++        && crate::fixture::is_lowercase_sha256(&record.stored_receipt_bytes_sha256)
++        && record
++            .retained_operation_id
++            .as_ref()
++            .is_none_or(|value| bounded_opaque_text(value, 256))
++        && record
++            .retained_idempotency_key
++            .as_ref()
++            .is_none_or(|value| bounded_opaque_text(value, 256))
++}
++
++pub(super) fn records(
++    values: &BTreeMap<String, Value>,
++    step: &str,
++) -> Option<Vec<LegacyRecordEvidence>> {
++    let records = serde_json::from_value::<Vec<LegacyRecordEvidence>>(
++        values.get(step)?.get("records")?.clone(),
++    )
++    .ok()?;
++    (!records.is_empty() && records.len() <= 64 && records.iter().all(record_valid))
++        .then_some(records)
++}
++
++pub(super) fn durable_errors(
++    expected: &[LegacyRecordEvidence],
++    actual: &[LegacyDurableRecordEvidence],
++) -> Vec<String> {
++    let unique: BTreeSet<_> = actual
++        .iter()
++        .map(|record| &record.stable_memory_ref)
++        .collect();
++    if expected.is_empty()
++        || actual.len() != expected.len()
++        || unique.len() != actual.len()
++        || actual.iter().any(|record| !durable_valid(record))
++    {
++        return vec![
++            "legacy physical audit record count, uniqueness or evidence shape differs".into(),
++        ];
++    }
++    expected.iter().filter_map(|before| {
++        let same = actual.iter().find(|after| after.stable_memory_ref == before.stable_memory_ref).is_some_and(|after| {
++            before.immutable_record_sha256 == after.immutable_record_sha256
++                && before.stored_receipt_bytes_sha256 == after.stored_receipt_bytes_sha256
++                && before.original_receipt_sha256 == after.original_receipt_sha256
++                && before.original_operation_id.matches_durable(after.retained_operation_id.as_deref())
++                && before.original_idempotency_key.matches_durable(after.retained_idempotency_key.as_deref())
++        });
++        (!same).then(|| format!("legacy durable reference, immutable record, original receipt or retained identifier changed: {}", before.stable_memory_ref))
++    }).collect()
++}
++
++pub(super) fn prerequisite(
++    values: &BTreeMap<String, Value>,
++    installed_step: &str,
++    inspected_step: &str,
++) -> Option<String> {
++    let Some(records) = records(values, installed_step) else {
++        return Some("legacy installation evidence unavailable".into());
++    };
++    if records.iter().any(|record| {
++        matches!(
++            record.original_operation_id,
++            LegacyIdentityEvidence::Unverified
++        ) || matches!(
++            record.original_idempotency_key,
++            LegacyIdentityEvidence::Unverified
++        )
++    }) {
++        return Some("original legacy delivery identity retention is unverified".into());
++    }
++    if values
++        .get(inspected_step)
++        .and_then(|value| value.get("verified_installation"))
++        .and_then(Value::as_str)
++        != Some(installed_step)
++    {
++        return Some("independent legacy durable-state audit unavailable".into());
++    }
++    None
++}
++
++pub(super) fn receipt_verdict(
++    records: &[LegacyRecordEvidence],
++    value: &Value,
++    reply: &ProviderReply,
++) -> CompatibilityVerdict {
++    if records.is_empty() || records.iter().any(|record| !record_valid(record)) {
++        return CompatibilityVerdict::Unknown;
++    }
++    if records.iter().any(|record| {
++        matches!(
++            record.original_operation_id,
++            LegacyIdentityEvidence::Unverified
++        ) || matches!(
++            record.original_idempotency_key,
++            LegacyIdentityEvidence::Unverified
++        )
++    }) {
++        return CompatibilityVerdict::Unknown;
++    }
++    let effect = reply.terminal.committed_effect();
++    if effect.state() != CommittedEffectState::None
++        || !matches!((effect.state_generation_before(), effect.state_generation_after()), (Some(before), Some(after)) if before == after && after == reply.state_generation)
++        || reply.terminal.fallback() != &FallbackDirective::forbidden()
++    {
++        return CompatibilityVerdict::Failed;
++    }
++    let expected: Vec<Value> = records
++        .iter()
++        .filter_map(|record| {
++            match (
++                &record.original_operation_id,
++                &record.original_idempotency_key,
++            ) {
++                (
++                    LegacyIdentityEvidence::Retained { value: operation },
++                    LegacyIdentityEvidence::Retained { value: key },
++                ) => Some(json!({
++                    "operation_id": operation, "idempotency_key": key,
++                    "provider_receipt_digest": record.original_receipt_sha256,
++                    "stable_memory_ref": record.stable_memory_ref,
++                })),
++                _ => None,
++            }
++        })
++        .collect();
++    let Some(items) = value.get("items").and_then(Value::as_array) else {
++        return CompatibilityVerdict::Failed;
++    };
++    if items.len() != expected.len()
++        || expected
++            .iter()
++            .any(|item| items.iter().filter(|actual| *actual == item).count() != 1)
++    {
++        return CompatibilityVerdict::Failed;
++    }
++    if expected.len() == records.len() {
++        return if reply.terminal.terminal_code() == TerminalCode::Success {
++            CompatibilityVerdict::Passed
++        } else {
++            CompatibilityVerdict::Failed
++        };
++    }
++    let warnings_reported = |warnings: &[String]| {
++        !warnings.is_empty()
++            && warnings.len() <= 32
++            && warnings
++                .iter()
++                .all(|warning| bounded_opaque_text(warning, 4096))
++            && warnings.iter().map(String::len).sum::<usize>() <= 32 * 1024
++    };
++    let payload_warnings = value
++        .get("warnings")
++        .cloned()
++        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok());
++    let reported = value.get("coverage").and_then(Value::as_str) == Some("partial")
++        || warnings_reported(&reply.warnings)
++        || payload_warnings.as_deref().is_some_and(warnings_reported);
++    if matches!(
++        reply.terminal.terminal_code(),
++        TerminalCode::Success | TerminalCode::Partial
++    ) && reported
++    {
++        CompatibilityVerdict::Degraded
++    } else {
++        CompatibilityVerdict::Failed
++    }
++}
++
++pub(super) fn aggregate(
++    complete_program: bool,
++    verdicts: &[CompatibilityVerdict],
++) -> LegacyDeliveryIdentityCoverage {
++    if verdicts.contains(&CompatibilityVerdict::Failed) {
++        LegacyDeliveryIdentityCoverage::Failed
++    } else if !complete_program
++        || verdicts.len() != 4
++        || verdicts.contains(&CompatibilityVerdict::Unknown)
++    {
++        LegacyDeliveryIdentityCoverage::Unknown
++    } else if verdicts.contains(&CompatibilityVerdict::Degraded) {
++        LegacyDeliveryIdentityCoverage::Degraded
++    } else {
++        LegacyDeliveryIdentityCoverage::Complete
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use tracedecay_memory_provider_api::{
++        CommittedEffectEvidence, OwnedProviderId, TerminalRecord,
++    };
++
++    fn record() -> LegacyRecordEvidence {
++        LegacyRecordEvidence {
++            stable_memory_ref: "original-ref".into(),
++            original_operation_id: LegacyIdentityEvidence::Retained {
++                value: "original-op".into(),
++            },
++            original_idempotency_key: LegacyIdentityEvidence::Retained {
++                value: "original-key".into(),
++            },
++            original_receipt_sha256: "a".repeat(64),
++            immutable_record_sha256: "b".repeat(64),
++            stored_receipt_bytes_sha256: "c".repeat(64),
++            retained_source_fields: BTreeMap::new(),
++        }
++    }
++    fn durable(record: &LegacyRecordEvidence) -> LegacyDurableRecordEvidence {
++        LegacyDurableRecordEvidence {
++            stable_memory_ref: record.stable_memory_ref.clone(),
++            immutable_record_sha256: record.immutable_record_sha256.clone(),
++            stored_receipt_bytes_sha256: record.stored_receipt_bytes_sha256.clone(),
++            original_receipt_sha256: record.original_receipt_sha256.clone(),
++            retained_operation_id: match &record.original_operation_id {
++                LegacyIdentityEvidence::Retained { value } => Some(value.clone()),
++                _ => None,
++            },
++            retained_idempotency_key: match &record.original_idempotency_key {
++                LegacyIdentityEvidence::Retained { value } => Some(value.clone()),
++                _ => None,
++            },
++        }
++    }
++    fn reply(code: TerminalCode) -> Result<ProviderReply, String> {
++        Ok(ProviderReply {
++            terminal: TerminalRecord::new(
++                ProviderOperation::Inspection,
++                OwnedProviderId::new("test.legacy").map_err(|e| e.to_string())?,
++                code,
++                CommittedEffectEvidence::none(Some(7)),
++                FallbackDirective::forbidden(),
++                "inspection-op",
++                "d".repeat(64),
++                None,
++            )
++            .map_err(|e| e.to_string())?,
++            payload: None,
++            warnings: vec![],
++            extensions: vec![],
++            state_generation: 7,
++        })
++    }
++    fn item() -> Value {
++        json!({"operation_id":"original-op","idempotency_key":"original-key", "provider_receipt_digest":"a".repeat(64),"stable_memory_ref":"original-ref"})
++    }
++    fn caller_only() -> LegacyRecordEvidence {
++        let mut record = record();
++        record.original_operation_id = LegacyIdentityEvidence::CallerObservedOnly {
++            value: "original-op".into(),
++        };
++        record.original_idempotency_key = LegacyIdentityEvidence::CallerObservedOnly {
++            value: "original-key".into(),
++        };
++        record
++    }
++
++    #[test]
++    fn retained_identity_still_requires_exact_original_four_field_item() -> Result<(), String> {
++        let record = record();
++        let reply = reply(TerminalCode::Success)?;
++        assert_eq!(
++            receipt_verdict(&[record.clone()], &json!({"items":[item()]}), &reply),
++            CompatibilityVerdict::Passed
++        );
++        assert_eq!(
++            receipt_verdict(
++                &[record.clone()],
++                &json!({"items":[],"coverage":"partial"}),
++                &reply
++            ),
++            CompatibilityVerdict::Failed
++        );
++        for field in [
++            "operation_id",
++            "idempotency_key",
++            "provider_receipt_digest",
++            "stable_memory_ref",
++            "extra",
++        ] {
++            let mut forged = item();
++            forged[field] = json!("forged");
++            assert_eq!(
++                receipt_verdict(&[record.clone()], &json!({"items":[forged]}), &reply),
++                CompatibilityVerdict::Failed,
++                "{field}"
++            );
++        }
++        assert_eq!(
++            receipt_verdict(
++                &[record],
++                &json!({"items":[item()]}),
++                &self::reply(TerminalCode::Partial)?
++            ),
++            CompatibilityVerdict::Failed
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn known_identity_loss_requires_omission_and_reported_degradation() -> Result<(), String> {
++        let record = caller_only();
++        let mut reply = reply(TerminalCode::Success)?;
++        let empty = json!({"items":[],"coverage":"complete","warnings":[]});
++        assert_eq!(
++            receipt_verdict(&[record.clone()], &empty, &reply),
++            CompatibilityVerdict::Failed
++        );
++        for value in [
++            json!({"items":[],"coverage":"partial"}),
++            json!({"items":[],"warnings":["original identifiers unavailable"]}),
++        ] {
++            assert_eq!(
++                receipt_verdict(&[record.clone()], &value, &reply),
++                CompatibilityVerdict::Degraded
++            );
++        }
++        reply
++            .warnings
++            .push("original identifiers unavailable".into());
++        assert_eq!(
++            receipt_verdict(&[record.clone()], &empty, &reply),
++            CompatibilityVerdict::Degraded
++        );
++        for forged in [
++            item(),
++            json!({"operation_id":null,"idempotency_key":null,"provider_receipt_digest":"a".repeat(64),"stable_memory_ref":"original-ref"}),
++        ] {
++            assert_eq!(
++                receipt_verdict(
++                    &[record.clone()],
++                    &json!({"items":[forged],"coverage":"partial"}),
++                    &reply
++                ),
++                CompatibilityVerdict::Failed
++            );
++        }
++        let mut missing = record.clone();
++        missing.stable_memory_ref = "second-ref".into();
++        assert_eq!(
++            receipt_verdict(
++                &[self::record(), missing],
++                &json!({"items":[item()],"coverage":"partial"}),
++                &reply
++            ),
++            CompatibilityVerdict::Degraded
++        );
++        let mut unknown = record;
++        unknown.original_operation_id = LegacyIdentityEvidence::Unverified;
++        assert_eq!(
++            receipt_verdict(&[unknown], &empty, &reply),
++            CompatibilityVerdict::Unknown
++        );
++        reply.state_generation = 8;
++        assert_eq!(
++            receipt_verdict(&[caller_only()], &empty, &reply),
++            CompatibilityVerdict::Failed
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn actual_record_and_receipt_changes_fail_even_when_public_items_are_omitted() {
++        for before in [record(), caller_only()] {
++            let after = durable(&before);
++            assert!(durable_errors(&[before.clone()], &[after.clone()]).is_empty());
++            for field in [
++                "stable_memory_ref",
++                "immutable_record_sha256",
++                "stored_receipt_bytes_sha256",
++                "original_receipt_sha256",
++                "retained_operation_id",
++                "retained_idempotency_key",
++            ] {
++                let mut value = serde_json::to_value(&after).expect("evidence");
++                value[field] = json!(if field.contains("sha256") {
++                    "e".repeat(64)
++                } else {
++                    "forged".into()
++                });
++                let changed = serde_json::from_value(value).expect("typed change");
++                assert!(
++                    !durable_errors(&[before.clone()], &[changed]).is_empty(),
++                    "{field}"
++                );
++            }
++            assert!(!durable_errors(&[before.clone()], &[]).is_empty());
++            assert!(!durable_errors(&[before], &[after.clone(), after]).is_empty());
++        }
++    }
++
++    #[test]
++    fn each_restart_requires_its_own_independent_audit_and_coverage_stays_explicit() {
++        let mut values = BTreeMap::from([("install".into(), json!({"records":[caller_only()]}))]);
++        assert!(prerequisite(&values, "install", "audit_one").is_some());
++        values.insert(
++            "audit_one".into(),
++            json!({"verified_installation":"install"}),
++        );
++        assert!(prerequisite(&values, "install", "audit_one").is_none());
++        assert!(prerequisite(&values, "install", "audit_two").is_some());
++        assert_eq!(
++            aggregate(true, &[CompatibilityVerdict::Passed; 4]),
++            LegacyDeliveryIdentityCoverage::Complete
++        );
++        assert_eq!(
++            aggregate(
++                true,
++                &[
++                    CompatibilityVerdict::Passed,
++                    CompatibilityVerdict::Degraded,
++                    CompatibilityVerdict::Passed,
++                    CompatibilityVerdict::Degraded
++                ]
++            ),
++            LegacyDeliveryIdentityCoverage::Degraded
++        );
++        assert_eq!(
++            aggregate(true, &[CompatibilityVerdict::Unknown]),
++            LegacyDeliveryIdentityCoverage::Unknown
++        );
++        assert_eq!(
++            aggregate(false, &[CompatibilityVerdict::Passed; 4]),
++            LegacyDeliveryIdentityCoverage::Unknown
++        );
++        assert_eq!(
++            aggregate(true, &[CompatibilityVerdict::Failed]),
++            LegacyDeliveryIdentityCoverage::Failed
++        );
++    }
++
++    #[test]
++    fn amended_program_retains_every_old_action_and_adds_two_postrestart_audits()
++    -> Result<(), String> {
++        let scope = OwnedExactScope::new(
++            "profile",
++            "project",
++            "repository",
++            "worktree",
++            "branch",
++            "session",
++            format!("sha256:{}", "1".repeat(64)),
++        )
++        .map_err(|e| e.to_string())?;
++        let scenarios = common_advisory_scenarios(&scope, 1)?;
++        assert_eq!(
++            scenarios
++                .iter()
++                .map(|scenario| scenario.steps.len())
++                .sum::<usize>(),
++            192
++        );
++        let migration = scenarios
++            .iter()
++            .find(|scenario| scenario.case_id == "common.real_v1_migration")
++            .ok_or("migration absent")?;
++        for (restart, audit, receipt) in [
++            (
++                "migration.restart",
++                "migration.audit_durable_state",
++                "migration.original_receipt",
++            ),
++            (
++                "migration.restart_again",
++                "migration.audit_durable_state_again",
++                "migration.original_receipt_after_second_restart",
++            ),
++        ] {
++            let at = migration
++                .steps
++                .iter()
++                .position(|step| step.step_id() == restart)
++                .ok_or("restart absent")?;
++            assert_eq!(migration.steps[at + 1].step_id(), audit);
++            assert_eq!(migration.steps[at + 2].step_id(), receipt);
++        }
++        Ok(())
++    }
++}
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -2,6 +2,11 @@
+ //!
+ //! Factories own processes and persistent test namespaces. Calls, canonical input
+ //! construction, assertions and report denominators remain provider-neutral here.
++
++mod legacy;
++pub use legacy::{
++    LegacyDeliveryIdentityCoverage, LegacyDurableRecordEvidence, LegacyIdentityEvidence,
++};
+ 
+ use std::collections::{BTreeMap, BTreeSet};
+ use std::time::{Duration, Instant};
+@@ -53,6 +58,11 @@
+     InstallLegacyV1 {
+         /// Canonical source observations the old-format writer must retain.
+         observations: Vec<Value>,
++    },
++    /// Independently point-read retained legacy records after a real restart.
++    InspectLegacyDurableState {
++        /// Earlier installation whose immutable physical evidence must still match.
++        installed_step: String,
+     },
+     /// Change stored payload bytes while leaving the stored claimed digest unchanged.
+     CorruptPayloadPreservingDigest,
+@@ -117,6 +127,11 @@
+         source_count: u64,
+         /// Original references/receipts and actual source fields read from the v1 writer.
+         records: Vec<LegacyRecordEvidence>,
++    },
++    /// Fresh physical reads, with no caller-only identity copied into this evidence.
++    LegacyDurableState {
++        /// Actual retained records and original receipt bytes.
++        records: Vec<LegacyDurableRecordEvidence>,
+     },
+     /// Actual stored bytes changed without updating their claimed digest.
+     PayloadCorrupted {
+@@ -171,16 +186,20 @@
+ }
+ 
+ /// Evidence read from an actual legacy writer before migration, never provider self-report.
+-#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
++#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+ pub struct LegacyRecordEvidence {
+     /// Original provider-local public reference stored by v1.
+     pub stable_memory_ref: String,
+-    /// Operation that originally committed the retained record.
+-    pub original_operation_id: String,
+-    /// Original retained delivery idempotency key.
+-    pub original_idempotency_key: String,
++    /// Independently proved retention status of the original public operation.
++    pub original_operation_id: LegacyIdentityEvidence,
++    /// Independently proved retention status of the original public delivery key.
++    pub original_idempotency_key: LegacyIdentityEvidence,
+     /// Original committing receipt digest.
+     pub original_receipt_sha256: String,
++    /// SHA-256 over the declared immutable old record projection, read before migration.
++    pub immutable_record_sha256: String,
++    /// SHA-256 over exact original stored receipt bytes, read before migration.
++    pub stored_receipt_bytes_sha256: String,
+     /// Canonical SourceAttribution pointers mapped to values read before migration,
+     /// including retained nulls. `origin_scope` is one atomic object; all other
+     /// entries use leaf pointers. Numeric envelope versions are not source revisions.
+@@ -326,6 +345,8 @@
+     LegacyReceiptPreserved {
+         /// Earlier genuine v1 installation action.
+         installed_step: String,
++        /// Independent durable audit after this inspection's preceding restart.
++        inspected_step: String,
+     },
+     /// The existing trace view retains original legacy content and honest attribution.
+     LegacyTraceRetained {
+@@ -468,6 +489,8 @@
+ pub struct CommonAdvisoryReport {
+     /// Inputs exactly matched the complete immutable common program.
+     pub common_program_matched: bool,
++    /// Original delivery-identity coverage, independent of expected compatibility.
++    pub legacy_delivery_identity: LegacyDeliveryIdentityCoverage,
+     /// Semantic results, independent of nondeterministic timings.
+     pub results: Vec<CompatibilityResult>,
+     /// Complete denominator partition.
+@@ -524,12 +547,14 @@
+     let mut report = CommonAdvisoryReport {
+         common_program_matched: common_advisory_scenarios(scope, registration_revision)
+             .is_ok_and(|canonical| canonical == scenarios),
++        legacy_delivery_identity: LegacyDeliveryIdentityCoverage::Unknown,
+         results: Vec::new(),
+         denominators: CompatibilityDenominators::default(),
+         reached_operations: BTreeSet::new(),
+         missing_operations: required,
+         timings: Vec::new(),
+     };
++    let mut legacy_identity_verdicts = Vec::new();
+     for scenario in scenarios {
+         let mut environment = factory.create(scenario, scope);
+         let mut current_scope = scope.clone();
+@@ -551,6 +576,23 @@
+             if let Some(reason) = &blocked {
+                 row.details
+                     .push(format!("unresolved prerequisite: {reason}"));
++            } else if let Some(reason) = match step {
++                CompatibilityStep::Call { assertions, .. } => {
++                    assertions.iter().find_map(|assertion| match assertion {
++                        CompatibilityAssertion::LegacyReceiptPreserved {
++                            installed_step,
++                            inspected_step,
++                        } => legacy::prerequisite(
++                            &environment_values,
++                            installed_step,
++                            inspected_step,
++                        ),
++                        _ => None,
++                    })
++                }
++                _ => None,
++            } {
++                row.details.push(reason);
+             } else if let Ok(environment) = environment.as_mut() {
+                 let descriptor = environment.provider().descriptor();
+                 let current_identity = (
+@@ -611,6 +653,27 @@
+                             match environment.apply_environment(action) {
+                                 Ok(evidence) => {
+                                     row.details = environment_errors(action, &evidence);
++                                    if let (
++                                        FixtureEnvironmentAction::InspectLegacyDurableState {
++                                            installed_step,
++                                        },
++                                        FixtureEnvironmentEvidence::LegacyDurableState { records },
++                                    ) = (action, &evidence)
++                                    {
++                                        if let Some(before) =
++                                            legacy::records(&environment_values, installed_step)
++                                        {
++                                            row.details
++                                                .extend(legacy::durable_errors(&before, records));
++                                            if row.details.is_empty() {
++                                                environment_values.insert(step.step_id().into(), json!({ "records": records, "verified_installation": installed_step }));
++                                            }
++                                        } else {
++                                            row.details.push(
++                                                "legacy installation baseline unavailable".into(),
++                                            );
++                                        }
++                                    }
+                                     row.verdict = if row.details.is_empty() {
+                                         CompatibilityVerdict::Passed
+                                     } else {
+@@ -714,7 +777,20 @@
+                                     }
+                                     row.verdict = if !row.details.is_empty() {
+                                         CompatibilityVerdict::Failed
+-                                    } else if assertions
++                                    } else if assertions.iter().any(|assertion| match assertion {
++                                        CompatibilityAssertion::LegacyReceiptPreserved {
++                                            installed_step,
++                                            ..
++                                        } => legacy::records(&environment_values, installed_step)
++                                            .is_some_and(|records| {
++                                                payload_value(&reply).is_ok_and(|value| {
++                                                    legacy::receipt_verdict(
++                                                        &records, &value, &reply,
++                                                    ) == CompatibilityVerdict::Degraded
++                                                })
++                                            }),
++                                        _ => false,
++                                    }) || assertions
+                                         .contains(&CompatibilityAssertion::DegradedCoverage)
+                                         || assertions.iter().any(|assertion| {
+                                             matches!(
+@@ -743,6 +819,16 @@
+                 }
+             }
+             if matches!(
++                step,
++                CompatibilityStep::Environment {
++                    action: FixtureEnvironmentAction::InspectLegacyDurableState { .. },
++                    ..
++                }
++            ) || matches!(step, CompatibilityStep::Call { assertions, .. } if assertions.iter().any(|assertion| matches!(assertion, CompatibilityAssertion::LegacyReceiptPreserved { .. })))
++            {
++                legacy_identity_verdicts.push(row.verdict);
++            }
++            if matches!(
+                 row.verdict,
+                 CompatibilityVerdict::Unknown | CompatibilityVerdict::Failed
+             ) {
+@@ -763,6 +849,8 @@
+             report.results.push(row);
+         }
+     }
++    report.legacy_delivery_identity =
++        legacy::aggregate(report.common_program_matched, &legacy_identity_verdicts);
+     report
+         .missing_operations
+         .retain(|operation| !report.reached_operations.contains(operation));
+@@ -837,13 +925,20 @@
+                 && !observations.is_empty()
+                 && *source_count == observations.len() as u64
+                 && records.len() == observations.len()
+-                && records.iter().all(|record| {
+-                    bounded_opaque_text(&record.stable_memory_ref, 1024)
+-                        && bounded_opaque_text(&record.original_operation_id, 256)
+-                        && bounded_opaque_text(&record.original_idempotency_key, 256)
+-                        && crate::fixture::is_lowercase_sha256(&record.original_receipt_sha256)
+-                        && legacy_fields_valid(&record.retained_source_fields)
+-                })
++                && records.len() <= 64
++                && records
++                    .iter()
++                    .map(|record| &record.stable_memory_ref)
++                    .collect::<BTreeSet<_>>()
++                    .len()
++                    == records.len()
++                && records.iter().all(legacy::record_valid)
++        }
++        (
++            FixtureEnvironmentAction::InspectLegacyDurableState { .. },
++            FixtureEnvironmentEvidence::LegacyDurableState { records },
++        ) => {
++            !records.is_empty() && records.len() <= 64 && records.iter().all(legacy::durable_valid)
+         }
+         (
+             FixtureEnvironmentAction::CorruptPayloadPreservingDigest,
+@@ -1655,31 +1750,18 @@
+                             == Some(sha256(content.as_bytes()).as_str())
+                     })
+             }
+-            CompatibilityAssertion::LegacyReceiptPreserved { installed_step } => environment_values
+-                .get(installed_step)
+-                .and_then(|value| value.get("records"))
+-                .and_then(Value::as_array)
+-                .is_some_and(|records| {
+-                    value
+-                        .get("items")
+-                        .and_then(Value::as_array)
+-                        .is_some_and(|items| {
+-                            !records.is_empty()
+-                                && items.len() == records.len()
+-                                && records.iter().all(|record| {
+-                                    items.iter().any(|item| {
+-                                        item.get("operation_id")
+-                                            == record.get("original_operation_id")
+-                                            && item.get("idempotency_key")
+-                                                == record.get("original_idempotency_key")
+-                                            && item.get("provider_receipt_digest")
+-                                                == record.get("original_receipt_sha256")
+-                                            && item.get("stable_memory_ref")
+-                                                == record.get("stable_memory_ref")
+-                                    })
+-                                })
+-                        })
+-                }),
++            CompatibilityAssertion::LegacyReceiptPreserved {
++                installed_step,
++                inspected_step,
++            } => {
++                legacy::prerequisite(environment_values, installed_step, inspected_step).is_none()
++                    && legacy::records(environment_values, installed_step).is_some_and(|records| {
++                        matches!(
++                            legacy::receipt_verdict(&records, &value, reply),
++                            CompatibilityVerdict::Passed | CompatibilityVerdict::Degraded
++                        )
++                    })
++            }
+             CompatibilityAssertion::LegacyTraceRetained {
+                 installed_step,
+                 content,
+@@ -3321,12 +3403,19 @@
+             "maximum_items": 16, "maximum_bytes": 65536, "redaction_policy_revision": 1, "cursor": null }),
+         vec![CompatibilityAssertion::LegacyReceiptPreserved {
+             installed_step: "migration.install_v1".into(),
++            inspected_step: "migration.audit_durable_state".into(),
+         }],
+     )?;
+-    if let CompatibilityStep::Call { bindings, .. } = &mut receipt {
++    if let CompatibilityStep::Call {
++        fixture, bindings, ..
++    } = &mut receipt
++    {
++        fixture.expectation.terminal =
++            TerminalExpectation::one_of([TerminalCode::Success, TerminalCode::Partial])
++                .map_err(|error| error.to_string())?;
+         bindings.push(ReplyBinding {
+             step_id: "migration.install_v1".into(),
+-            source_pointer: "/records/0/original_idempotency_key".into(),
++            source_pointer: "/records/0/original_idempotency_key/value".into(),
+             destination_pointer: "/selector/idempotency_key".into(),
+         });
+     }
+@@ -3364,7 +3453,18 @@
+                 .map_err(|error| error.to_string())?;
+     }
+     let mut again = receipt.clone();
+-    if let CompatibilityStep::Call { fixture, .. } = &mut again {
++    if let CompatibilityStep::Call {
++        fixture,
++        assertions,
++        ..
++    } = &mut again
++    {
++        for assertion in assertions {
++            if let CompatibilityAssertion::LegacyReceiptPreserved { inspected_step, .. } = assertion
++            {
++                *inspected_step = "migration.audit_durable_state_again".into();
++            }
++        }
+         fixture.step_id = "migration.original_receipt_after_second_restart".into();
+         fixture.request_id = "migration.original_receipt_after_second_restart.request".into();
+         fixture.operation_id = operation_uuid(&fixture.step_id);
+@@ -3391,10 +3491,22 @@
+                 },
+             ),
+             environment_step("migration.restart", FixtureEnvironmentAction::Restart),
++            environment_step(
++                "migration.audit_durable_state",
++                FixtureEnvironmentAction::InspectLegacyDurableState {
++                    installed_step: "migration.install_v1".into(),
++                },
++            ),
+             receipt,
+             trace,
+             recalled,
+             environment_step("migration.restart_again", FixtureEnvironmentAction::Restart),
++            environment_step(
++                "migration.audit_durable_state_again",
++                FixtureEnvironmentAction::InspectLegacyDurableState {
++                    installed_step: "migration.install_v1".into(),
++                },
++            ),
+             again,
+             environment_step(
+                 "migration.open_other_session",
+@@ -4262,9 +4374,15 @@
+     fn legacy_record() -> LegacyRecordEvidence {
+         LegacyRecordEvidence {
+             stable_memory_ref: "legacy-reference-1".into(),
+-            original_operation_id: "legacy-operation-1".into(),
+-            original_idempotency_key: "legacy-key-1".into(),
++            original_operation_id: LegacyIdentityEvidence::Retained {
++                value: "legacy-operation-1".into(),
++            },
++            original_idempotency_key: LegacyIdentityEvidence::Retained {
++                value: "legacy-key-1".into(),
++            },
+             original_receipt_sha256: "a".repeat(64),
++            immutable_record_sha256: "b".repeat(64),
++            stored_receipt_bytes_sha256: "c".repeat(64),
+             retained_source_fields: BTreeMap::new(),
+         }
+     }
+@@ -4283,8 +4401,12 @@
+             records: vec![record],
+         };
+         assert!(environment_errors(&action, &evidence(record.clone())).is_empty());
+-        record.original_operation_id = "é".repeat(128);
+-        record.original_idempotency_key = "x".repeat(256);
++        record.original_operation_id = LegacyIdentityEvidence::Retained {
++            value: "é".repeat(128),
++        };
++        record.original_idempotency_key = LegacyIdentityEvidence::Retained {
++            value: "x".repeat(256),
++        };
+         assert!(environment_errors(&action, &evidence(record.clone())).is_empty());
+         for bad in [
+             String::new(),
+@@ -4293,10 +4415,11 @@
+             "embedded\ncontrol".into(),
+         ] {
+             let mut invalid = record.clone();
+-            invalid.original_idempotency_key = bad.clone();
++            invalid.original_idempotency_key =
++                LegacyIdentityEvidence::Retained { value: bad.clone() };
+             assert!(!environment_errors(&action, &evidence(invalid)).is_empty());
+             let mut invalid = record.clone();
+-            invalid.original_operation_id = bad;
++            invalid.original_operation_id = LegacyIdentityEvidence::Retained { value: bad };
+             assert!(!environment_errors(&action, &evidence(invalid)).is_empty());
+         }
+         assert!(!legacy_fields_valid(&BTreeMap::from([(
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -19,7 +19,8 @@
+ use tracedecay_memory_conformance::compatibility::{
+     CommonAdvisoryFixture, CommonAdvisoryFixtureFactory, CompatibilityScenario,
+     CompatibilityVerdict, FixtureEnvironmentAction, FixtureEnvironmentEvidence, FixtureUnavailable,
+-    LegacyRecordEvidence, run_common_advisory_suite,
++    LegacyDurableRecordEvidence, LegacyIdentityEvidence, LegacyRecordEvidence,
++    run_common_advisory_suite,
+ };
+ use tracedecay_memory_conformance::real_fixture::{FixtureAuthority, FixtureAuthoritySnapshot};
+ use tracedecay_memory_provider_api::contract::{
+@@ -598,6 +599,7 @@
+     host: Option<FixtureHost>,
+     stopped_process: Option<ProcessIdentity>,
+     namespace_number: u64,
++    legacy_references: Vec<u64>,
+ }
+ 
+ impl RealNcmFixture {
+@@ -628,6 +630,7 @@
+             host: None,
+             stopped_process: None,
+             namespace_number: 0,
++            legacy_references: Vec::new(),
+         };
+         fs::create_dir(fixture.root.join("host")).map_err(err)?;
+         fixture.persist_authority()?;
+@@ -890,7 +893,7 @@
+         let rows = self.legacy_sqlite_json(
+             &database,
+             "capsules_and_journal",
+-            "SELECT c.record_id, c.source_id, c.key_text, c.value_text, c.provenance, c.status, c.commit_seq, e.seq, e.kind, e.idempotency_key, e.payload_sha256, e.receipt FROM capsules AS c JOIN events AS e ON e.seq = c.commit_seq ORDER BY c.record_id;",
++            &format!("{LEGACY_DURABLE_SELECT} ORDER BY c.record_id;"),
+             deadline,
+             &mut sqlite_evidence,
+         )?;
+@@ -996,9 +999,15 @@
+                 // The old API returns a numeric record_id. Its exact decimal
+                 // representation preserves that original provider reference.
+                 stable_memory_ref: record_id.to_string(),
+-                original_operation_id: reply.terminal.operation_id().to_owned(),
+-                original_idempotency_key: original_key.to_owned(),
++                original_operation_id: LegacyIdentityEvidence::CallerObservedOnly {
++                    value: reply.terminal.operation_id().to_owned(),
++                },
++                original_idempotency_key: LegacyIdentityEvidence::CallerObservedOnly {
++                    value: original_key.to_owned(),
++                },
+                 original_receipt_sha256: original_receipt.to_owned(),
++                immutable_record_sha256: ncm_legacy_immutable_record_sha256(row)?,
++                stored_receipt_bytes_sha256: sha256(receipt_text.as_bytes()),
+                 retained_source_fields: BTreeMap::new(),
+             });
+             durability.push(json!({
+@@ -1033,6 +1042,14 @@
+             }))
+             .map_err(err)?,
+         )?;
++        self.legacy_references = rows
++            .iter()
++            .map(|row| {
++                row["record_id"]
++                    .as_u64()
++                    .ok_or_else(|| "legacy stored reference missing".to_owned())
++            })
++            .collect::<Result<Vec<_>, String>>()?;
+         self.host = Some(self.make_host(&owner)?);
+         if self.build_identity()? != build {
+             return Err(
+@@ -1241,6 +1258,29 @@
+                         .retain_failed_legacy_evidence = true;
+                 }
+                 result
++            }
++            FixtureEnvironmentAction::InspectLegacyDurableState { .. } => {
++                // Use actual old stored numeric references only. Keep the reopened
++                // worker live; inability to read within the budget remains Unknown.
++                if self.legacy_references.is_empty() || self.legacy_references.len() > 64 {
++                    return Err("legacy physical audit has no bounded stored references".into());
++                }
++                let mut records = Vec::new();
++                for reference in &self.legacy_references {
++                    let rows = sqlite_json(
++                        &self.namespace_database(),
++                        &format!(
++                            "{LEGACY_DURABLE_SELECT} WHERE c.record_id = {reference} LIMIT 2;"
++                        ),
++                        true,
++                        deadline,
++                        &self.cleanup,
++                    )?;
++                    for row in rows {
++                        records.push(ncm_legacy_durable_record(&row));
++                    }
++                }
++                Ok(FixtureEnvironmentEvidence::LegacyDurableState { records })
+             }
+             FixtureEnvironmentAction::CorruptPayloadPreservingDigest => {
+                 self.corrupt_payload(deadline)
+@@ -1436,6 +1476,59 @@
+     )
+     .map_err(err)?;
+     Ok(call.with_sanitization(receipt))
++}
++
++// The existing old-writer audit projection, shared by baseline and both live
++// point reads. These fields identify retained content and its original event.
++// Mutable model/recall counters, center state and global generation are excluded.
++const LEGACY_DURABLE_SELECT: &str = "SELECT c.record_id, c.source_id, c.key_text, c.value_text, c.provenance, c.status, c.commit_seq, e.seq, e.kind, e.idempotency_key, e.payload_sha256, e.receipt FROM capsules AS c JOIN events AS e ON e.seq = c.commit_seq";
++fn ncm_legacy_immutable_record_sha256(row: &Value) -> Result<String, String> {
++    let mut projection = serde_json::Map::new();
++    for field in [
++        "record_id",
++        "source_id",
++        "key_text",
++        "value_text",
++        "provenance",
++        "status",
++        "commit_seq",
++        "seq",
++        "kind",
++        "idempotency_key",
++        "payload_sha256",
++    ] {
++        projection.insert(
++            field.into(),
++            row.get(field)
++                .ok_or("legacy immutable stored field missing")?
++                .clone(),
++        );
++    }
++    Ok(sha256(&serde_json::to_vec(&projection).map_err(err)?))
++}
++fn ncm_legacy_durable_record(row: &Value) -> LegacyDurableRecordEvidence {
++    let receipt_bytes = row["receipt"]
++        .as_str()
++        .map(str::as_bytes)
++        .unwrap_or_default();
++    let parsed = serde_json::from_slice::<Value>(receipt_bytes).ok();
++    // The fresh immutable projection includes the exact old capsule-free
++    // provenance bytes. A newly synthesized mapping changes that fingerprint.
++    // This old representation has no stored original public operation/key.
++    LegacyDurableRecordEvidence {
++        stable_memory_ref: row["record_id"]
++            .as_u64()
++            .map(|value| value.to_string())
++            .unwrap_or_default(),
++        immutable_record_sha256: ncm_legacy_immutable_record_sha256(row).unwrap_or_default(),
++        stored_receipt_bytes_sha256: sha256(receipt_bytes),
++        original_receipt_sha256: parsed
++            .as_ref()
++            .and_then(|value| legacy_receipt_from_durable_basis(value).ok())
++            .unwrap_or_default(),
++        retained_operation_id: None,
++        retained_idempotency_key: None,
++    }
+ }
+ 
+ /// Verify the observed old receipt against its actual durable basis. This never
+@@ -1675,6 +1768,7 @@
+         "cleanup": cleanup,
+         "common_program_matched": report.common_program_matched,
+         "compatible": report.compatible(),
++        "legacy_delivery_identity": report.legacy_delivery_identity,
+         "denominators": {"planned": d.planned, "passed": d.passed, "failed": d.failed,
+             "degraded": d.degraded, "unknown": d.unknown, "unknown_effects": d.unknown_effects,
+             "reconciled_effects": d.reconciled_effects},
+--- a/product/contracts/memory-provider-v1/common-advisory-profile.md
++++ b/product/contracts/memory-provider-v1/common-advisory-profile.md
+@@ -125,6 +125,37 @@
+ Missing original evidence produces no synthesized item and reports partial
+ coverage or a warning. Current exact scope, byte/item bounds, redaction policy and
+ scope-bound cursor rules continue to apply.
++
++
++The common migration fixture distinguishes each original public operation and
++idempotency key as `retained`, `caller_observed_only`, or `unverified`. A retained
++value must be read from the actual old durable representation. Caller-only
++status requires both the actual original dispatch evidence and proof that the
++old representation did not retain that public identifier. A caller-only key may
++select an inspection; it must not be synthesized into a retained receipt item.
++Unverified identity remains unresolved.
++
++After each of the two migration restarts, a trusted fixture action independently
++point-reads the actual owned records and original receipts while the restarted
++provider remains live. It compares the original public reference, a declared
++immutable old-record projection, exact stored receipt bytes, the original public
++receipt digest or its verified durable basis, and every retained public
++operation/key. Fingerprints exclude legitimate mutable runtime counters and
++fields newly added by migration. Missing audit capability remains unknown;
++changed retained evidence fails. The amended common program has 192 actions,
++including both added physical audits; all existing actions remain required.
++
++When both identifiers were retained, receipt inspection still requires the
++exact original four-field item and successful terminal. When an identifier was
++proved caller-only, the incomplete item must be omitted and the provider must
++report partial coverage or a bounded nonempty warning. This outcome is degraded
++only after the independent durable audit succeeds. Both paths require no effect,
++unchanged generation and forbidden fallback. Invented or changed items, silent
++loss, and changed durable records or receipts fail. Mixed evidence preserves
++complete items and omits only known incomplete items. Reports separately expose
++`legacy_delivery_identity` as `complete`, `degraded`, `unknown`, or `failed`;
++overall compatibility with expected degradation does not claim complete
++preservation of original delivery identifiers.
+ 
+ Common `trace` inspection uses exactly
+ `selector: { "stable_memory_ref": "<retained public target>" }`. Each item has

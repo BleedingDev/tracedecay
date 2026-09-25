@@ -1,0 +1,25 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
+@@ -181,9 +181,7 @@
+ 
+     fn validate(&self, accepted_at: UtcMicros) -> Result<()> {
+         self.actor.validate().map_err(|_| invalid("actor"))?;
+-        self.request_id
+-            .validate()
+-            .map_err(|_| invalid("request identity"))?;
++        RequestId::new(self.request_id.as_str()).map_err(|_| invalid("request identity"))?;
+         self.resolved_host_scope
+             .validate()
+             .map_err(|_| invalid("resolved host scope"))?;
+@@ -290,9 +288,7 @@
+ 
+     fn validate(&self, accepted_at: UtcMicros) -> Result<()> {
+         self.actor.validate().map_err(|_| invalid("actor"))?;
+-        self.request_id
+-            .validate()
+-            .map_err(|_| invalid("request identity"))?;
++        RequestId::new(self.request_id.as_str()).map_err(|_| invalid("request identity"))?;
+         self.resolved_host_scope
+             .validate()
+             .map_err(|_| invalid("resolved host scope"))?;

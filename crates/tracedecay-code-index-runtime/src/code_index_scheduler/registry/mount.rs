@@ -2341,6 +2341,7 @@ impl CodeIndexSchedulerRegistryV1 {
             repository_id,
             worktree_id,
             query_authority: None,
+            semantic_runtime: None,
             scheduler,
             build_publication_lock,
             historical_generation_owner,

@@ -1,0 +1,69 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -297,6 +297,13 @@
+ }
+ 
+ impl RecallAdmissionLedgerV1 {
++    #[cfg(test)]
++    pub(crate) fn open_for_control_test(
++        store_data_root: &Path,
++    ) -> Result<Self, CognitiveRecallMountError> {
++        Self::open(store_data_root.join(LEDGER_FILE_NAME))
++    }
++
+     fn open(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
+         let connection =
+             Connection::open(&path).map_err(|source| CognitiveRecallMountError::LedgerOpen {
+diff --git a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/mod.rs b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/mod.rs
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/mod.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/mod.rs
+@@ -19,6 +19,8 @@
+ mod hermes;
+ mod ingest;
+ mod origin;
++#[cfg(test)]
++pub(crate) use origin::capture_live_origin_for_control_test;
+ mod terminal;
+ 
+ #[cfg(test)]
+diff --git a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -393,6 +393,36 @@
+     None
+ }
+ 
++/// Exposes only the production filesystem/Git capture to the source-control
++/// integration fixture. Ledger retention and observation admission remain real.
++#[cfg(test)]
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn capture_live_origin_for_control_test(
++    project_root: PathBuf,
++    project_id: ProjectId,
++    brain_id: BrainId,
++    profile_id: UserProfileId,
++    source_path: PathBuf,
++    source: ObservationSourceIdentityV1,
++    previous: Option<&HookLiveOriginBoundaryV1>,
++    now: UtcMicros,
++    deadline: Instant,
++) -> Option<HookLiveOriginObservationV1> {
++    capture_origin(
++        LiveOriginSource {
++            project_root,
++            project_id,
++            brain_id,
++            profile_id,
++            source_path,
++            source,
++        },
++        previous,
++        now,
++        deadline,
++    )
++}
++
+ #[cfg(all(test, unix))]
+ mod tests {
+     use super::{MAX_REFLOG_TAIL_BYTES, capture_branch_evidence};

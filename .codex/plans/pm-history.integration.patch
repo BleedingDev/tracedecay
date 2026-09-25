@@ -1,0 +1,237 @@
+--- a/crates/tracedecay/src/daemon/project_composition.rs
++++ b/crates/tracedecay/src/daemon/project_composition.rs
+@@ -320,6 +320,12 @@
+     })
+ }
+ 
++#[cfg(feature = "memory-provider-host")]
++type ProjectObservationMountWithHistoryV1 = (
++    ConfiguredObservationProviderMountV1,
++    Arc<super::retained_owner::provider_history::ProviderHistoryAuthorityMountV1>,
++);
++
+ /// Mounts the project's memory-provider host.
+ ///
+ /// This is `async` for one reason: the enabled arm opens the Native provider's
+@@ -339,7 +345,7 @@
+     #[cfg(test)] native_port_interposition: Option<NativeApplicationPortInterpositionV1>,
+ ) -> Result<(
+     crate::mcp::server::MemoryProviderHostMount,
+-    Vec<ConfiguredObservationProviderMountV1>,
++    Vec<ProjectObservationMountWithHistoryV1>,
+ )> {
+     use tracedecay_domain::configuration::{MemoryProviderKindV1, MemoryProviderParticipationV1};
+     use tracedecay_memory_provider_registry::{
+@@ -374,13 +380,15 @@
+         } else {
+             ObservationMountRequirementV1::Optional
+         };
++        let history_mount = Arc::new(super::retained_owner::provider_history::ProviderHistoryAuthorityMountV1::default());
++        let admission_authority: Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority> = history_mount.clone();
+         let constructed: Result<(ProviderRegistrationV1, ConfiguredObservationProviderMountV1)> = match kind {
+             MemoryProviderKindV1::Native => async {
+                 let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(cg)));
+                 let provider_state_root = cg.store_layout().data_root
+                     .join(super::retained_owner::observation_journey::PROVIDER_STATE_DIR_NAME);
+-                let port = super::retained_owner::native_provider::project_native_memory_application_port_off_runtime(
+-                    graph_cell, canonical_project_path.to_path_buf(), profile_id.clone(), provider_state_root,
++                let port = super::retained_owner::native_provider::project_native_memory_application_port_with_authority_off_runtime(
++                    graph_cell, canonical_project_path.to_path_buf(), profile_id.clone(), provider_state_root, Arc::clone(&admission_authority),
+                 ).await.map_err(|error| TraceDecayError::Config {
+                     message: format!("could not construct project Native application port: {error}"),
+                 })?;
+@@ -420,7 +428,7 @@
+                     worker_binary.clone(), state_root.clone(), Arc::clone(ncm_worker_owner), profile_id.clone(),
+                 );
+                 match tokio::task::spawn_blocking(move || {
+-                    construct_ncm_registration(&owners, &profile_id, worker_binary, state_root, 1, mode)
++                    ncm_observer::construct_ncm_registration_with_authority(&owners, &profile_id, worker_binary, state_root, 1, mode, Some(admission_authority))
+                 }).await {
+                     Ok(result) => result.map(|(registration, mount)| (
+                         registration,
+@@ -445,7 +453,7 @@
+                 } else {
+                     observers.push(registration)
+                 }
+-                observation_mounts.push(mount);
++                observation_mounts.push((mount, history_mount));
+             }
+             Err(error) if requirement == ObservationMountRequirementV1::Optional => {
+                 tracing::warn!(provider = kind.provider_id(), error = %error, "optional memory observer unavailable before registration");
+@@ -966,7 +974,7 @@
+     #[cfg(feature = "memory-provider-host")]
+     memory_provider_host_mount: crate::mcp::server::MemoryProviderHostMount,
+     #[cfg(feature = "memory-provider-host")]
+-    observation_provider_mounts: Vec<ConfiguredObservationProviderMountV1>,
++    observation_provider_mounts: Vec<ProjectObservationMountWithHistoryV1>,
+     #[cfg(feature = "memory-provider-host")]
+     cognitive_recall_mount: Option<crate::mcp::server::CognitiveRecallMount>,
+     ports: ProjectRoutePorts,
+@@ -1824,10 +1832,21 @@
+             )
+             .await?;
+         #[cfg(feature = "memory-provider-host")]
++        let hook_origin_reader = Arc::new(super::retained_owner::provider_history::HookOriginReaderV1::new(
++            cg.hook_store_layout().data_root.clone(),
++            core.profile_identity.brain_id().clone(), core.profile_identity.profile_id().clone(),
++        ));
++        let original_provenance_resolver: Option<Arc<dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1>> = {
++            #[cfg(feature = "memory-provider-host")]
++            { Some(hook_origin_reader.clone()) }
++            #[cfg(not(feature = "memory-provider-host"))]
++            { None }
++        };
++        #[cfg(feature = "memory-provider-host")]
+         let (observation_journey_mounts, deferred_observation_journeys) = {
+             let mut journeys = Vec::with_capacity(core.observation_provider_mounts.len());
+             let mut deferred = Vec::new();
+-            for configured in &core.observation_provider_mounts {
++            for (configured, history_mount) in &core.observation_provider_mounts {
+                 let provider = &configured.mount;
+                 let required = configured.requirement == ObservationMountRequirementV1::Required;
+                 let inputs = super::retained_owner::observation_journey::ObservationJourneyMountInputsV1 {
+@@ -1839,25 +1858,31 @@
+                         provider: provider.clone(),
+                         policy: super::retained_owner::observation_journey::ObservationJourneyPolicyV1::project_default(),
+                     };
+-                let mounted =
++                let mounted = async {
++                    use super::retained_owner::provider_history::{HistoryIdentityBridgeV1, MountedOriginalObservationAuthorityV1, ProviderHistoryAuthorityV1};
++                    use super::retained_owner::observation_journey::{ObservationJourneyError, activate_required_with_startup_replay, mount_observer_dormant};
++                    let journey = mount_observer_dormant(inputs, self.cancellation).await?;
++                    let bridge = Arc::new(HistoryIdentityBridgeV1::admit(
++                        self.canonical_project_path, core.profile_identity.profile_id(),
++                        &code_index.scope, &session_db.binding().shard_id,
++                    )?);
++                    let original_authority = Arc::new(MountedOriginalObservationAuthorityV1 {
++                        reader: Arc::clone(&hook_origin_reader), bridge: Arc::clone(&bridge),
++                    });
++                    let authority = Arc::new(ProviderHistoryAuthorityV1 {
++                        bridge, observations: Arc::new(session_db.observation_store()),
++                        dispositions: Arc::new(cg.db().clone()), original_authority,
++                        journal: journey.history_journal(), provider_id: provider.provider_id.clone(),
++                        policy_revision: 1, runtime: tokio::runtime::Handle::current(),
++                    });
++                    history_mount.bind(authority.clone())?;
++                    journey.bind_history_authority(authority)?;
+                     if configured.activation == ObservationMountActivationV1::BeforePublication {
+-                        Box::pin(
+-                            super::retained_owner::observation_journey::mount_and_replay(
+-                                inputs,
+-                                session_db.observation_store(),
+-                                self.cancellation,
+-                            ),
+-                        )
+-                        .await
++                        activate_required_with_startup_replay(journey, session_db.observation_store(), self.cancellation).await
+                     } else {
+-                        Box::pin(
+-                            super::retained_owner::observation_journey::mount_observer_dormant(
+-                                inputs,
+-                                self.cancellation,
+-                            ),
+-                        )
+-                        .await
+-                    };
++                        Ok::<_, ObservationJourneyError>(journey)
++                    }
++                }.await;
+                 match mounted {
+                     Ok(journey) => {
+                         if configured.activation == ObservationMountActivationV1::AfterPublication {
+@@ -1935,7 +1960,7 @@
+                     core.transcript_source_home.clone(),
+                     refresh_schedulers.codex_discovery(),
+                     Arc::clone(&background_cpu),
+-                )),
++                ).with_original_provenance_resolver(original_provenance_resolver.clone())),
+             )
+             .await;
+         let user_session_refresh_wake = refresh_schedulers
+@@ -1954,7 +1979,7 @@
+             .await;
+         let session_sync_owner = self.store_administration.session_sync_service();
+         session_sync_owner
+-            .register_project(DaemonSessionSyncConfig {
++            .register_project_with_original_provenance(DaemonSessionSyncConfig {
+                 brain_id: core.profile_identity.brain_id().clone(),
+                 profile_id: core.profile_identity.profile_id().clone(),
+                 project_id: code_index.project_id.clone(),
+@@ -1969,7 +1994,7 @@
+                 startup_import: cg.get_config().sync.session_start_sync,
+                 project_refresh: project_session_refresh_wake.clone(),
+                 user_refresh: user_session_refresh_wake.clone(),
+-            })
++            }, original_provenance_resolver.clone())
+             .await?;
+         let session_sync_port: Arc<dyn tracedecay_contracts::session_sync::SessionSyncServicePort> =
+             session_sync_owner;
+--- a/crates/tracedecay/src/daemon/project_composition/ncm_observer.rs
++++ b/crates/tracedecay/src/daemon/project_composition/ncm_observer.rs
+@@ -177,6 +177,18 @@
+     registration_revision: u64,
+     mode: EnabledProviderMode,
+ ) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
++    construct_ncm_registration_with_authority(owners, profile_id, worker_binary, state_root, registration_revision, mode, None)
++}
++
++pub(in crate::daemon) fn construct_ncm_registration_with_authority(
++    owners: &NcmWorkerOwnerSlot,
++    profile_id: &UserProfileId,
++    worker_binary: PathBuf,
++    state_root: PathBuf,
++    registration_revision: u64,
++    mode: EnabledProviderMode,
++    authority: Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
++) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
+     let worker = owners.acquire(profile_id, &worker_binary, &state_root)?;
+     let lifecycle =
+         ProviderLifecycleOwnershipV1::Owned(Arc::new(NcmLifecycleOwner(Arc::clone(&worker))));
+@@ -186,7 +198,11 @@
+     let instance_proof = Some(
+         Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
+     );
+-    let provider = Arc::new(NcmProviderAdapter::new(surface)?);
++    let provider = NcmProviderAdapter::new(surface)?;
++    let provider = Arc::new(match authority {
++        Some(authority) => provider.with_admission_authority(authority),
++        None => provider,
++    });
+     let mount = ObservationProviderMountV1 {
+         provider_id: descriptor.provider_id.clone(),
+         registration_revision,
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+@@ -4956,16 +4956,22 @@
+ where
+     S: ObservationAdmissionPort + 'static,
+ {
+-    // Off the runtime worker. `mount_project_observation_journey` opens the
+-    // journal file, applies its schema inside an IMMEDIATE transaction, and
+-    // creates the provider state directory — all synchronous filesystem work
+-    // that can wait on an fsync or on another writer holding the same
+-    // database. Running it inline made project open park a tokio worker for
+-    // however long the disk took, which on a single-worker runtime is the
+-    // whole runtime.
+-    let journey = tokio::task::spawn_blocking(move || mount_project_observation_journey(inputs))
+-        .await
+-        .map_err(ObservationJourneyError::MountTask)??;
++    let journey = mount_observer_dormant(inputs, cancellation).await?;
++    activate_required_with_startup_replay(journey, observation_store, cancellation).await
++}
++
++/// Starts the existing required journey after its source authority is bound,
++/// preserving startup replay classification and the project-open cancellation.
++pub(crate) async fn activate_required_with_startup_replay<S>(
++    journey: Arc<ProjectObservationJourneyV1>,
++    observation_store: S,
++    cancellation: &HostCancellationToken,
++) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError>
++where S: ObservationAdmissionPort + 'static {
++    if cancellation.is_cancelled() {
++        return Err(ObservationJourneyError::Cancelled { admitted: 0 });
++    }
++    journey.start_delivery_worker()?;
+     let admitted = match run_startup_replay(journey.as_ref(), &observation_store, cancellation)
+         .await
+     {

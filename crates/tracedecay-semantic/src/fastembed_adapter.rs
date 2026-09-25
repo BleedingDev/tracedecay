@@ -104,9 +104,7 @@ pub enum EmbedError {
     DimensionMismatch { expected: u32, actual: usize },
     /// A produced vector does not declare the L2 normalization required by
     /// the semantic cosine projection.
-    UnsupportedNormalization {
-        actual: EmbeddingNormalizationV1,
-    },
+    UnsupportedNormalization { actual: EmbeddingNormalizationV1 },
     /// A produced vector contains NaN or infinite values.
     NonFiniteVectorValue,
     /// Runtime-level failure (load, OOM, corruption, revocation,

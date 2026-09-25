@@ -1,0 +1,977 @@
+--- a/crates/tracedecay-memory-observation/src/sqlite/retention.rs
++++ b/crates/tracedecay-memory-observation/src/sqlite/retention.rs
+@@ -183,6 +183,272 @@
+     .transpose()
+ }
+ 
++/// Validated retry identity shared by legacy and controlled fence transitions.
++struct PreparedSourceFenceTransition<'a> {
++    operation_id: &'a str,
++    provider_id: &'a str,
++    source: &'a str,
++    expected: u64,
++    mode: &'a str,
++    revision: Option<&'a str>,
++    authority_ref: &'a str,
++    accepted_at: i64,
++    admit_revision: bool,
++    request_json: String,
++}
++
++impl<'a> PreparedSourceFenceTransition<'a> {
++    #[allow(clippy::too_many_arguments)]
++    fn new(
++        operation_id: &'a str,
++        provider_id: &'a str,
++        source: &'a str,
++        expected: u64,
++        mode: &'a str,
++        revision: Option<&'a str>,
++        authority_ref: &'a str,
++        accepted_at: i64,
++        admit_revision: bool,
++    ) -> Result<Self, ObservationJournalError> {
++        for (value, field) in [
++            (operation_id, "operation_id"),
++            (provider_id, "provider_id"),
++            (authority_ref, "authority_ref"),
++        ] {
++            validate_fence_label(value, field)?;
++        }
++        if let Some(revision) = revision {
++            validate_fence_label(revision, "source_revision")?;
++        }
++        crate::identity::require_sha256(source, "original_source_sha256")?;
++        let request_json = serde_json::to_string(&(
++            source,
++            expected,
++            mode,
++            revision,
++            authority_ref,
++            admit_revision,
++        ))
++        .map_err(|error| ObservationJournalError::serialization("source_intent_request", &error))?;
++        Ok(Self {
++            operation_id,
++            provider_id,
++            source,
++            expected,
++            mode,
++            revision,
++            authority_ref,
++            accepted_at,
++            admit_revision,
++            request_json,
++        })
++    }
++
++    fn deletion(
++        request: &'a ProviderSourceDeletionIntentV1<'a>,
++    ) -> Result<Self, ObservationJournalError> {
++        Self::new(
++            request.operation_id,
++            request.provider_id,
++            request.original_source_sha256,
++            request.expected_fence_revision,
++            request.mode.as_wire(),
++            request.source_revision,
++            request.authority_ref,
++            request.accepted_at_utc_micros,
++            false,
++        )
++    }
++
++    /// Exact operation key plus the complete immutable request identity.
++    fn read_receipt(
++        &self,
++        connection: &rusqlite::Connection,
++    ) -> Result<Option<ProviderSourceIntentReceiptV1>, ObservationJournalError> {
++        const MAX_JSON_BYTES: usize = 16_384;
++        let row: Option<(Vec<u8>, Vec<u8>)> = connection
++            .query_row(
++                "SELECT substr(CAST(request_json AS BLOB), 1, 16385),
++                    substr(CAST(receipt_json AS BLOB), 1, 16385)
++             FROM tdmem_provider_source_intent_receipt_v1
++             WHERE provider_id = ?1 AND operation_id = ?2",
++                params![self.provider_id, self.operation_id],
++                |row| Ok((row.get(0)?, row.get(1)?)),
++            )
++            .optional()?;
++        row.map(|(request, receipt)| {
++            if request.len() > MAX_JSON_BYTES || receipt.len() > MAX_JSON_BYTES {
++                return Err(fence_conflict("source_intent_receipt_size"));
++            }
++            if request != self.request_json.as_bytes() {
++                return Err(fence_conflict("source_intent_idempotency_conflict"));
++            }
++            let receipt: ProviderSourceIntentReceiptV1 =
++                serde_json::from_slice(&receipt).map_err(|error| {
++                    ObservationJournalError::serialization("source_intent_receipt", &error)
++                })?;
++            let fence = &receipt.fence;
++            let expected_revision = self
++                .expected
++                .checked_add(1)
++                .filter(|value| *value <= i64::MAX as u64)
++                .ok_or(ObservationJournalError::ValueOutOfRange {
++                    field: "fence_revision",
++                })?;
++            if receipt.operation_id != self.operation_id
++                || fence.provider_id != self.provider_id
++                || fence.original_source_sha256 != self.source
++                || receipt.provider_erasure_verified
++                || fence.revision != expected_revision
++                || fence.authority_ref != self.authority_ref
++                || !matches!(
++                    fence.mode.as_str(),
++                    "remove_influence" | "anonymize" | "hard_delete"
++                )
++                || (fence.mode != "remove_influence" && fence.admitted_source_revision.is_some())
++                || (self.admit_revision
++                    && (fence.mode != "remove_influence"
++                        || fence.admitted_source_revision.as_deref() != self.revision))
++                || (!self.admit_revision
++                    && (fence.deleted_source_revision.as_deref() != self.revision
++                        || fence.admitted_source_revision.is_some()
++                        || (self.mode == "hard_delete" && fence.mode != "hard_delete")
++                        || (self.mode == "anonymize" && fence.mode == "remove_influence")))
++            {
++                return Err(fence_conflict("source_intent_receipt_binding"));
++            }
++            validate_fence_label(&fence.authority_ref, "fence_authority_ref")?;
++            for revision in [
++                &fence.deleted_source_revision,
++                &fence.admitted_source_revision,
++            ]
++            .into_iter()
++            .flatten()
++            {
++                validate_fence_label(revision, "source_revision")?;
++            }
++            Ok(receipt)
++        })
++        .transpose()
++    }
++
++    fn apply(
++        &self,
++        transaction: &Transaction<'_>,
++        check: &impl Fn() -> Result<(), ObservationJournalError>,
++    ) -> Result<ProviderSourceIntentReceiptV1, ObservationJournalError> {
++        let operation_id = self.operation_id;
++        let provider_id = self.provider_id;
++        let source = self.source;
++        let expected = self.expected;
++        let mode = self.mode;
++        let revision = self.revision;
++        let authority_ref = self.authority_ref;
++        let accepted_at = self.accepted_at;
++        let admit_revision = self.admit_revision;
++        let request_json = &self.request_json;
++        check()?;
++        // A late retry returns its immutable receipt before consulting current CAS.
++        if let Some(receipt) = self.read_receipt(transaction)? {
++            return Ok(receipt);
++        }
++        let current = read_source_fence(transaction, provider_id, source)?;
++        if current.as_ref().map_or(0, |fence| fence.revision) != expected {
++            return Err(fence_conflict("source_fence_revision_conflict"));
++        }
++        let next = expected
++            .checked_add(1)
++            .filter(|next| *next <= i64::MAX as u64)
++            .ok_or(ObservationJournalError::ValueOutOfRange {
++                field: "fence_revision",
++            })?;
++        let mut fence = if admit_revision {
++            let mut fence = current.ok_or_else(|| fence_conflict("source_fence_missing"))?;
++            if fence.mode != "remove_influence"
++                || revision.is_none()
++                || revision == fence.deleted_source_revision.as_deref()
++                || revision == fence.admitted_source_revision.as_deref()
++            {
++                return Err(fence_conflict("source_revision_not_admitted"));
++            }
++            fence.admitted_source_revision = revision.map(str::to_owned);
++            fence
++        } else {
++            // Strong privacy modes cannot be weakened by a later intent.
++            let previous_mode = current.as_ref().map(|fence| fence.mode.as_str());
++            let mode = if mode == "hard_delete" || previous_mode == Some("hard_delete") {
++                "hard_delete"
++            } else if mode == "anonymize" || previous_mode == Some("anonymize") {
++                "anonymize"
++            } else {
++                "remove_influence"
++            };
++            ProviderSourceFenceV1 {
++                provider_id: provider_id.to_owned(),
++                original_source_sha256: source.to_owned(),
++                revision: next,
++                mode: mode.to_owned(),
++                deleted_source_revision: revision.map(str::to_owned),
++                admitted_source_revision: None,
++                authority_ref: authority_ref.to_owned(),
++                accepted_at_utc_micros: accepted_at,
++            }
++        };
++        fence.revision = next;
++        fence.authority_ref = authority_ref.to_owned();
++        fence.accepted_at_utc_micros = accepted_at;
++        let fence_json = serde_json::to_string(&fence)
++            .map_err(|error| ObservationJournalError::serialization("source_fence", &error))?;
++        check()?;
++        transaction.execute(
++                "INSERT INTO tdmem_provider_source_fence_v1 (provider_id, original_source_sha256, revision, fence_json)
++                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(provider_id, original_source_sha256)
++                 DO UPDATE SET revision=excluded.revision, fence_json=excluded.fence_json",
++                params![provider_id, source, next as i64, fence_json],
++            )?;
++        let receipt = ProviderSourceIntentReceiptV1 {
++            operation_id: operation_id.to_owned(),
++            fence,
++            provider_erasure_verified: false,
++        };
++        let json = serde_json::to_string(&receipt).map_err(|error| {
++            ObservationJournalError::serialization("source_intent_receipt", &error)
++        })?;
++        check()?;
++        transaction.execute(
++                "INSERT INTO tdmem_provider_source_intent_receipt_v1 (provider_id, operation_id, request_json, receipt_json)
++                 VALUES (?1, ?2, ?3, ?4)", params![provider_id, operation_id, request_json, json],
++            )?;
++        Ok(receipt)
++    }
++}
++
++fn source_intent_control_check(
++    started: std::time::Instant,
++    budget: crate::RecoveryTimeBudgetV1,
++    cancellation: &tracedecay_memory_provider_api::CancellationToken,
++    operation: &'static str,
++) -> Result<(), ObservationJournalError> {
++    if cancellation.is_cancelled() {
++        return Err(ObservationJournalError::OperationCancelled { operation });
++    }
++    if source_intent_remaining(started, budget).is_spent() {
++        return Err(ObservationJournalError::BudgetExhausted { operation });
++    }
++    Ok(())
++}
++
++fn source_intent_remaining(
++    started: std::time::Instant,
++    budget: crate::RecoveryTimeBudgetV1,
++) -> crate::RecoveryTimeBudgetV1 {
++    crate::RecoveryTimeBudgetV1 {
++        remaining_micros: budget
++            .remaining_micros
++            .saturating_sub(i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX)),
++    }
++}
++
+ impl SqliteObservationJournal {
+     /// Existing callers keep the established five-second SQLite allowance;
+     /// callers with an operation control must use the explicitly bounded method.
+@@ -276,6 +542,97 @@
+         )
+     }
+ 
++    /// One cancellable host intent transaction using the caller's remaining budget.
++    /// Successful COMMIT always returns the durable receipt, including cancellation
++    /// racing with the commit. This receipt does not establish provider erasure.
++    pub fn record_provider_source_deletion_intent_bounded(
++        &self,
++        request: &ProviderSourceDeletionIntentV1<'_>,
++        budget: crate::RecoveryTimeBudgetV1,
++        cancellation: &tracedecay_memory_provider_api::CancellationToken,
++    ) -> Result<ProviderSourceIntentReceiptV1, ObservationJournalError> {
++        const OPERATION: &str = "record_provider_source_deletion_intent";
++        let started = std::time::Instant::now();
++        let check = || source_intent_control_check(started, budget, cancellation, OPERATION);
++        check()?;
++        let prepared = PreparedSourceFenceTransition::deletion(request)?;
++        let mut guard = self.lock_within_cancellable(
++            OPERATION,
++            source_intent_remaining(started, budget),
++            Some(cancellation),
++        )?;
++        check()?;
++        // One short SQLite wait; no retry or fresh operation allowance is minted.
++        let sqlite_budget = crate::RecoveryTimeBudgetV1 {
++            remaining_micros: source_intent_remaining(started, budget)
++                .remaining_micros
++                .min(10_000),
++        };
++        let mut committed = None;
++        let outcome = super::with_busy_budget(
++            &mut guard,
++            OPERATION,
++            sqlite_budget,
++            std::time::Instant::now(),
++            |connection| {
++                check()?;
++                let transaction = connection
++                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
++                let receipt = prepared.apply(&transaction, &check)?;
++                check()?;
++                transaction.commit()?;
++                // Preserve commit truth even if the busy-timeout restoration fails.
++                committed = Some(receipt.clone());
++                Ok(receipt)
++            },
++        );
++        if let Some(receipt) = committed {
++            return Ok(receipt);
++        }
++        check()?;
++        outcome
++    }
++
++    /// Reads one original immutable receipt without performing a transition.
++    /// The full request identity is required; acceptance time is not retry identity.
++    pub fn read_provider_source_deletion_intent_receipt_bounded(
++        &self,
++        request: &ProviderSourceDeletionIntentV1<'_>,
++        budget: crate::RecoveryTimeBudgetV1,
++        cancellation: &tracedecay_memory_provider_api::CancellationToken,
++    ) -> Result<Option<ProviderSourceIntentReceiptV1>, ObservationJournalError> {
++        const OPERATION: &str = "read_provider_source_deletion_intent_receipt";
++        let started = std::time::Instant::now();
++        let check = || source_intent_control_check(started, budget, cancellation, OPERATION);
++        check()?;
++        let prepared = PreparedSourceFenceTransition::deletion(request)?;
++        let mut guard = self.lock_within_cancellable(
++            OPERATION,
++            source_intent_remaining(started, budget),
++            Some(cancellation),
++        )?;
++        check()?;
++        let sqlite_budget = crate::RecoveryTimeBudgetV1 {
++            remaining_micros: source_intent_remaining(started, budget)
++                .remaining_micros
++                .min(10_000),
++        };
++        let outcome = super::with_busy_budget(
++            &mut guard,
++            OPERATION,
++            sqlite_budget,
++            std::time::Instant::now(),
++            |connection| {
++                check()?;
++                let receipt = prepared.read_receipt(connection)?;
++                check()?;
++                Ok(receipt)
++            },
++        );
++        check()?;
++        outcome
++    }
++
+     /// Admits one exact new revision under a current host-authorized transition.
+     /// This is a lifecycle write, never an automatic effect of read or replay.
+     pub fn admit_provider_source_revision(
+@@ -308,95 +665,18 @@
+         accepted_at: i64,
+         admit_revision: bool,
+     ) -> Result<ProviderSourceIntentReceiptV1, ObservationJournalError> {
+-        for (value, field) in [
+-            (operation_id, "operation_id"),
+-            (provider_id, "provider_id"),
+-            (authority_ref, "authority_ref"),
+-        ] {
+-            validate_fence_label(value, field)?;
+-        }
+-        if let Some(revision) = revision {
+-            validate_fence_label(revision, "source_revision")?;
+-        }
+-        crate::identity::require_sha256(source, "original_source_sha256")?;
+-        let request_json = serde_json::to_string(&(
++        let prepared = PreparedSourceFenceTransition::new(
++            operation_id,
++            provider_id,
+             source,
+             expected,
+             mode,
+             revision,
+             authority_ref,
++            accepted_at,
+             admit_revision,
+-        ))
+-        .map_err(|error| ObservationJournalError::serialization("source_intent_request", &error))?;
+-        self.with_transaction(|transaction| {
+-            // Check immutable receipt first: a late retry cannot reapply deletion
+-            // after an explicitly admitted revision or another deletion intent.
+-            let prior: Option<(String, String)> = transaction.query_row(
+-                "SELECT request_json, receipt_json FROM tdmem_provider_source_intent_receipt_v1
+-                 WHERE provider_id = ?1 AND operation_id = ?2", params![provider_id, operation_id],
+-                |row| Ok((row.get(0)?, row.get(1)?)),
+-            ).optional()?;
+-            if let Some((original_request, receipt)) = prior {
+-                if original_request != request_json { return Err(fence_conflict("source_intent_idempotency_conflict")); }
+-                let receipt: ProviderSourceIntentReceiptV1 = serde_json::from_str(&receipt)
+-                    .map_err(|error| ObservationJournalError::serialization("source_intent_receipt", &error))?;
+-                if receipt.operation_id != operation_id || receipt.fence.provider_id != provider_id
+-                    || receipt.fence.original_source_sha256 != source || receipt.provider_erasure_verified {
+-                    return Err(fence_conflict("source_intent_receipt_binding"));
+-                }
+-                return Ok(receipt);
+-            }
+-            let current = read_source_fence(transaction, provider_id, source)?;
+-            if current.as_ref().map_or(0, |fence| fence.revision) != expected {
+-                return Err(fence_conflict("source_fence_revision_conflict"));
+-            }
+-            let next = expected.checked_add(1).filter(|next| *next <= i64::MAX as u64)
+-                .ok_or(ObservationJournalError::ValueOutOfRange { field: "fence_revision" })?;
+-            let mut fence = if admit_revision {
+-                let mut fence = current.ok_or_else(|| fence_conflict("source_fence_missing"))?;
+-                if fence.mode != "remove_influence" || revision.is_none()
+-                    || revision == fence.deleted_source_revision.as_deref()
+-                    || revision == fence.admitted_source_revision.as_deref() {
+-                    return Err(fence_conflict("source_revision_not_admitted"));
+-                }
+-                fence.admitted_source_revision = revision.map(str::to_owned);
+-                fence
+-            } else {
+-                // Strong privacy modes cannot be weakened by a later intent.
+-                let previous_mode = current.as_ref().map(|fence| fence.mode.as_str());
+-                let mode = if mode == "hard_delete" || previous_mode == Some("hard_delete") {
+-                    "hard_delete"
+-                } else if mode == "anonymize" || previous_mode == Some("anonymize") {
+-                    "anonymize"
+-                } else {
+-                    "remove_influence"
+-                };
+-                ProviderSourceFenceV1 {
+-                    provider_id: provider_id.to_owned(), original_source_sha256: source.to_owned(),
+-                    revision: next, mode: mode.to_owned(), deleted_source_revision: revision.map(str::to_owned),
+-                    admitted_source_revision: None, authority_ref: authority_ref.to_owned(), accepted_at_utc_micros: accepted_at,
+-                }
+-            };
+-            fence.revision = next;
+-            fence.authority_ref = authority_ref.to_owned();
+-            fence.accepted_at_utc_micros = accepted_at;
+-            let fence_json = serde_json::to_string(&fence)
+-                .map_err(|error| ObservationJournalError::serialization("source_fence", &error))?;
+-            transaction.execute(
+-                "INSERT INTO tdmem_provider_source_fence_v1 (provider_id, original_source_sha256, revision, fence_json)
+-                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT(provider_id, original_source_sha256)
+-                 DO UPDATE SET revision=excluded.revision, fence_json=excluded.fence_json",
+-                params![provider_id, source, next as i64, fence_json],
+-            )?;
+-            let receipt = ProviderSourceIntentReceiptV1 { operation_id: operation_id.to_owned(), fence, provider_erasure_verified: false };
+-            let json = serde_json::to_string(&receipt)
+-                .map_err(|error| ObservationJournalError::serialization("source_intent_receipt", &error))?;
+-            transaction.execute(
+-                "INSERT INTO tdmem_provider_source_intent_receipt_v1 (provider_id, operation_id, request_json, receipt_json)
+-                 VALUES (?1, ?2, ?3, ?4)", params![provider_id, operation_id, request_json, json],
+-            )?;
+-            Ok(receipt)
+-        })
++        )?;
++        self.with_transaction(|transaction| prepared.apply(transaction, &|| Ok(())))
+     }
+ }
+ 
+--- a/crates/tracedecay-memory-observation/tests/provider_source_fences.rs
++++ b/crates/tracedecay-memory-observation/tests/provider_source_fences.rs
+@@ -226,3 +226,314 @@
+     );
+     Ok(())
+ }
++
++#[test]
++fn bounded_intent_refuses_cancelled_or_spent_work_without_recording_intent() -> TestResult {
++    use tracedecay_memory_observation::{ObservationJournalError, RecoveryTimeBudgetV1};
++    use tracedecay_memory_provider_api::CancellationToken;
++    let journal = SqliteObservationJournal::open_in_memory(support::policy())?;
++    let request = deletion(DeletionMode::HardDelete);
++    let token = CancellationToken::new();
++    token.cancel();
++    assert!(matches!(
++        journal.record_provider_source_deletion_intent_bounded(
++            &request,
++            RecoveryTimeBudgetV1 {
++                remaining_micros: 1_000_000
++            },
++            &token,
++        ),
++        Err(ObservationJournalError::OperationCancelled { .. })
++    ));
++    assert!(matches!(
++        journal.read_provider_source_deletion_intent_receipt_bounded(
++            &request,
++            RecoveryTimeBudgetV1 {
++                remaining_micros: 1_000_000
++            },
++            &token,
++        ),
++        Err(ObservationJournalError::OperationCancelled { .. })
++    ));
++    let token = CancellationToken::new();
++    assert!(matches!(
++        journal.record_provider_source_deletion_intent_bounded(
++            &request,
++            RecoveryTimeBudgetV1 {
++                remaining_micros: 0
++            },
++            &token,
++        ),
++        Err(ObservationJournalError::BudgetExhausted { .. })
++    ));
++    assert!(journal.read_provider_source_fence("ncm", SOURCE)?.is_none());
++    assert!(
++        journal
++            .read_provider_source_deletion_intent_receipt_bounded(
++                &request,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 1_000_000
++                },
++                &token,
++            )?
++            .is_none()
++    );
++    Ok(())
++}
++
++#[test]
++fn bounded_intent_and_receipt_lookup_keep_original_acceptance_after_later_revision() -> TestResult {
++    use tracedecay_memory_observation::RecoveryTimeBudgetV1;
++    use tracedecay_memory_provider_api::CancellationToken;
++    let directory = tempfile::tempdir()?;
++    let path = directory.path().join("journal.sqlite");
++    let request = deletion(DeletionMode::RemoveInfluence);
++    let token = CancellationToken::new();
++    let budget = || RecoveryTimeBudgetV1 {
++        remaining_micros: 1_000_000,
++    };
++    let original = {
++        let journal = SqliteObservationJournal::open(&path, support::policy())?;
++        let receipt =
++            journal.record_provider_source_deletion_intent_bounded(&request, budget(), &token)?;
++        assert!(!receipt.provider_erasure_verified);
++        journal.admit_provider_source_revision(&admission())?;
++        receipt
++    };
++    let journal = SqliteObservationJournal::open(&path, support::policy())?;
++    let observer = rusqlite::Connection::open(&path)?;
++    let before: i64 = observer.query_row("PRAGMA data_version", [], |row| row.get(0))?;
++    let mut retry = deletion(DeletionMode::RemoveInfluence);
++    retry.accepted_at_utc_micros = 9_999;
++    assert_eq!(
++        journal.read_provider_source_deletion_intent_receipt_bounded(&retry, budget(), &token)?,
++        Some(original.clone())
++    );
++    let after: i64 = observer.query_row("PRAGMA data_version", [], |row| row.get(0))?;
++    assert_eq!(before, after);
++    assert_eq!(
++        journal.record_provider_source_deletion_intent_bounded(&retry, budget(), &token)?,
++        original
++    );
++    let current = journal.read_provider_source_fence("ncm", SOURCE)?.unwrap();
++    assert_eq!(current.revision, 2);
++    assert!(!current.blocks_revision(Some("source_r2")));
++    retry.source_revision = Some("changed_retry");
++    assert!(
++        journal
++            .read_provider_source_deletion_intent_receipt_bounded(&retry, budget(), &token)
++            .is_err()
++    );
++    assert!(
++        journal
++            .record_provider_source_deletion_intent_bounded(&retry, budget(), &token)
++            .is_err()
++    );
++    assert_eq!(
++        journal.read_provider_source_fence("ncm", SOURCE)?.unwrap(),
++        current
++    );
++    Ok(())
++}
++
++#[test]
++fn bounded_intent_refuses_a_busy_writer_without_leaving_either_atomic_row() -> TestResult {
++    use tracedecay_memory_observation::{ObservationJournalError, RecoveryTimeBudgetV1};
++    use tracedecay_memory_provider_api::CancellationToken;
++    let directory = tempfile::tempdir()?;
++    let path = directory.path().join("journal.sqlite");
++    let journal = SqliteObservationJournal::open(&path, support::policy())?;
++    let writer = rusqlite::Connection::open(&path)?;
++    writer.execute_batch("BEGIN IMMEDIATE")?;
++    let token = CancellationToken::new();
++    let request = deletion(DeletionMode::HardDelete);
++    let started = std::time::Instant::now();
++    let result = journal.record_provider_source_deletion_intent_bounded(
++        &request,
++        RecoveryTimeBudgetV1 {
++            remaining_micros: 5_000_000,
++        },
++        &token,
++    );
++    assert!(matches!(
++        result,
++        Err(ObservationJournalError::BudgetExhausted { .. })
++    ));
++    assert!(started.elapsed() < std::time::Duration::from_secs(1));
++    writer.execute_batch("ROLLBACK")?;
++    assert!(journal.read_provider_source_fence("ncm", SOURCE)?.is_none());
++    assert!(
++        journal
++            .read_provider_source_deletion_intent_receipt_bounded(
++                &request,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 1_000_000
++                },
++                &token,
++            )?
++            .is_none()
++    );
++    let receipt = journal.record_provider_source_deletion_intent_bounded(
++        &request,
++        RecoveryTimeBudgetV1 {
++            remaining_micros: 1_000_000,
++        },
++        &token,
++    )?;
++    assert_eq!(receipt.fence.revision, 1);
++    Ok(())
++}
++
++#[test]
++fn immutable_receipt_lookup_refuses_corrupt_binding_and_oversized_json() -> TestResult {
++    use tracedecay_memory_observation::RecoveryTimeBudgetV1;
++    use tracedecay_memory_provider_api::CancellationToken;
++    let directory = tempfile::tempdir()?;
++    let path = directory.path().join("journal.sqlite");
++    let journal = SqliteObservationJournal::open(&path, support::policy())?;
++    let request = deletion(DeletionMode::HardDelete);
++    let original = journal.record_provider_source_deletion_intent(&request)?;
++    let baseline = serde_json::to_value(&original)?;
++    let observer = rusqlite::Connection::open(&path)?;
++    let token = CancellationToken::new();
++    let modifications = [
++        ("/operation_id", serde_json::json!("another_operation")),
++        ("/provider_erasure_verified", serde_json::json!(true)),
++        ("/fence/provider_id", serde_json::json!("tracedecay.native")),
++        (
++            "/fence/original_source_sha256",
++            serde_json::json!("f".repeat(64)),
++        ),
++        ("/fence/revision", serde_json::json!(99)),
++        ("/fence/mode", serde_json::json!("remove_influence")),
++        (
++            "/fence/deleted_source_revision",
++            serde_json::json!("changed"),
++        ),
++        ("/fence/admitted_source_revision", serde_json::json!("new")),
++        ("/fence/authority_ref", serde_json::json!("changed")),
++    ];
++    for (pointer, replacement) in modifications {
++        let mut corrupt = baseline.clone();
++        *corrupt.pointer_mut(pointer).unwrap() = replacement;
++        observer.execute(
++            "UPDATE tdmem_provider_source_intent_receipt_v1 SET receipt_json = ?1
++             WHERE provider_id = ?2 AND operation_id = ?3",
++            rusqlite::params![
++                serde_json::to_string(&corrupt)?,
++                request.provider_id,
++                request.operation_id
++            ],
++        )?;
++        assert!(
++            journal
++                .read_provider_source_deletion_intent_receipt_bounded(
++                    &request,
++                    RecoveryTimeBudgetV1 {
++                        remaining_micros: 1_000_000
++                    },
++                    &token,
++                )
++                .is_err(),
++            "{pointer}"
++        );
++        assert!(
++            journal
++                .record_provider_source_deletion_intent_bounded(
++                    &request,
++                    RecoveryTimeBudgetV1 {
++                        remaining_micros: 1_000_000
++                    },
++                    &token,
++                )
++                .is_err(),
++            "{pointer}"
++        );
++        assert_eq!(
++            journal.read_provider_source_fence("ncm", SOURCE)?.unwrap(),
++            original.fence
++        );
++    }
++    observer.execute(
++        "UPDATE tdmem_provider_source_intent_receipt_v1 SET receipt_json = ?1
++         WHERE provider_id = ?2 AND operation_id = ?3",
++        rusqlite::params![
++            "x".repeat(16_385),
++            request.provider_id,
++            request.operation_id
++        ],
++    )?;
++    assert!(
++        journal
++            .read_provider_source_deletion_intent_receipt_bounded(
++                &request,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 1_000_000
++                },
++                &token,
++            )
++            .is_err()
++    );
++    observer.execute(
++        "UPDATE tdmem_provider_source_intent_receipt_v1 SET receipt_json = ?1, request_json = ?2
++         WHERE provider_id = ?3 AND operation_id = ?4",
++        rusqlite::params![
++            serde_json::to_string(&original)?,
++            "x".repeat(16_385),
++            request.provider_id,
++            request.operation_id
++        ],
++    )?;
++    assert!(
++        journal
++            .read_provider_source_deletion_intent_receipt_bounded(
++                &request,
++                RecoveryTimeBudgetV1 {
++                    remaining_micros: 1_000_000
++                },
++                &token,
++            )
++            .is_err()
++    );
++    Ok(())
++}
++
++#[test]
++fn bounded_intent_rolls_back_fence_when_immutable_receipt_insert_fails() -> TestResult {
++    use tracedecay_memory_observation::RecoveryTimeBudgetV1;
++    use tracedecay_memory_provider_api::CancellationToken;
++    let directory = tempfile::tempdir()?;
++    let path = directory.path().join("journal.sqlite");
++    let journal = SqliteObservationJournal::open(&path, support::policy())?;
++    let observer = rusqlite::Connection::open(&path)?;
++    observer.execute_batch(
++        "CREATE TRIGGER refuse_intent_receipt BEFORE INSERT
++         ON tdmem_provider_source_intent_receipt_v1
++         BEGIN SELECT RAISE(ABORT, 'test receipt refusal'); END",
++    )?;
++    let request = deletion(DeletionMode::HardDelete);
++    let token = CancellationToken::new();
++    let budget = || RecoveryTimeBudgetV1 {
++        remaining_micros: 1_000_000,
++    };
++    assert!(
++        journal
++            .record_provider_source_deletion_intent_bounded(&request, budget(), &token,)
++            .is_err()
++    );
++    assert!(journal.read_provider_source_fence("ncm", SOURCE)?.is_none());
++    assert!(
++        journal
++            .read_provider_source_deletion_intent_receipt_bounded(&request, budget(), &token,)?
++            .is_none()
++    );
++    observer.execute_batch("DROP TRIGGER refuse_intent_receipt")?;
++    let receipt =
++        journal.record_provider_source_deletion_intent_bounded(&request, budget(), &token)?;
++    assert_eq!(receipt.fence.revision, 1);
++    assert_eq!(
++        journal.read_provider_source_deletion_intent_receipt_bounded(&request, budget(), &token,)?,
++        Some(receipt)
++    );
++    Ok(())
++}
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
+@@ -2,7 +2,7 @@
+ //!
+ //! Composition supplies the existing canonical ports and opens host-owned data
+ //! files under its own project-open budget. This module never starts a provider,
+-//! creates a missing retained store, dispatches a control, or records deletion.
++//! creates a missing retained store or dispatches a provider control.
+ 
+ use std::collections::BTreeMap;
+ use std::path::{Path, PathBuf};
+@@ -11,9 +11,12 @@
+ use tracedecay_contracts::ResolvedScope;
+ use tracedecay_domain::UserProfileId;
+ use tracedecay_global_db::{GlobalDbObservationStore, RegisteredGlobalDbLeaseV1};
+-use tracedecay_memory_observation::SqliteObservationJournal;
++use tracedecay_memory_observation::{
++    ObservationJournalError, ProviderSourceDeletionIntentV1, ProviderSourceIntentReceiptV1,
++    RecoveryTimeBudgetV1, SqliteObservationJournal,
++};
+ use tracedecay_memory_provider_registry::{
+-    HistoryGrant, NATIVE_PROVIDER_ID, OperationControl, OwnedProviderId,
++    HistoryGrant, NATIVE_PROVIDER_ID, OperationControl, OwnedProviderId, TerminalCode,
+ };
+ use tracedecay_runtime_core::db::Database;
+ 
+@@ -24,7 +27,7 @@
+ use super::super::observation_journey::ObservationJourneyPolicyV1;
+ use super::super::provider_history::{
+     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
+-    ProviderHistoryErrorV1, ProviderHistoryReaderV1, bounded_read,
++    ProviderHistoryErrorV1, ProviderHistoryReaderV1, bounded_read, original_source_fence_digest,
+ };
+ 
+ type Result<T> = std::result::Result<T, ProviderHistoryErrorV1>;
+@@ -227,6 +230,149 @@
+     }
+ }
+ 
++/// A confirmed receipt wins over every later cancellation or worker condition.
++#[derive(Debug, thiserror::Error)]
++pub(crate) enum ProviderSourceIntentActionErrorV1 {
++    #[error("host intent refused before commit: {0}")]
++    Refused(ObservationJournalError),
++    #[error("host intent authority refused before journal access: {0}")]
++    Authority(#[from] ProviderHistoryErrorV1),
++    #[error("host intent storage outcome was not confirmed: {0}")]
++    StorageUnconfirmed(ObservationJournalError),
++    #[error("host intent worker did not return a confirmed outcome")]
++    WorkerUnavailable,
++}
++
++impl AuthorizedRetainedControlSourceV1 {
++    /// The host has already chosen and authorized the deletion policy. This helper
++    /// only binds that intent to the freshly authorized original source and journal.
++    /// Await it directly: a read timeout must not hide a committed host receipt.
++    pub(crate) async fn record_deletion_intent(
++        &self,
++        request: &ProviderSourceDeletionIntentV1<'_>,
++        control: &OperationControl,
++    ) -> std::result::Result<ProviderSourceIntentReceiptV1, ProviderSourceIntentActionErrorV1> {
++        self.deletion_journal_action(request, control, true)
++            .await?
++            .ok_or(ProviderSourceIntentActionErrorV1::WorkerUnavailable)
++    }
++
++    /// Exact, immutable receipt lookup for an uncertain previous host write.
++    pub(crate) async fn read_deletion_intent_receipt(
++        &self,
++        request: &ProviderSourceDeletionIntentV1<'_>,
++        control: &OperationControl,
++    ) -> std::result::Result<Option<ProviderSourceIntentReceiptV1>, ProviderSourceIntentActionErrorV1>
++    {
++        self.deletion_journal_action(request, control, false).await
++    }
++
++    async fn deletion_journal_action(
++        &self,
++        request: &ProviderSourceDeletionIntentV1<'_>,
++        control: &OperationControl,
++        record: bool,
++    ) -> std::result::Result<Option<ProviderSourceIntentReceiptV1>, ProviderSourceIntentActionErrorV1>
++    {
++        check(control)?;
++        self.grant
++            .validate_structure()
++            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("control history grant"))?;
++        let [source] = self.grant.sources.as_slice() else {
++            return Err(
++                ProviderHistoryErrorV1::ClaimMismatch("control history source count").into(),
++            );
++        };
++        let expected = self
++            .retained
++            .original_source
++            .to_owned_attribution()
++            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained original source"))?;
++        if self.grant.destination_scope != self.retained.scope.delivery_scope
++            || source.attribution != expected
++            || request.provider_id != self.retained.scope.provider_id.as_str()
++            || request.original_source_sha256 != original_source_fence_digest(&expected)?
++            || request.source_revision != expected.source.source_revision.as_deref()
++        {
++            return Err(ProviderHistoryErrorV1::ClaimMismatch("host intent source binding").into());
++        }
++        let journal = Arc::clone(&self.journal);
++        let operation = control.clone();
++        let operation_id = request.operation_id.to_owned();
++        let provider_id = request.provider_id.to_owned();
++        let source = request.original_source_sha256.to_owned();
++        let expected_fence_revision = request.expected_fence_revision;
++        let mode = request.mode;
++        let source_revision = request.source_revision.map(str::to_owned);
++        let authority_ref = request.authority_ref.to_owned();
++        let accepted_at_utc_micros = request.accepted_at_utc_micros;
++        let work = tokio::task::spawn_blocking(move || {
++            // Snapshot after the blocking-pool queue wait; the original request
++            // never receives a replacement budget or cancellation token.
++            let snapshot = operation
++                .snapshot()
++                .map_err(ProviderHistoryErrorV1::Control)?;
++            let budget = RecoveryTimeBudgetV1 {
++                remaining_micros: i64::try_from(snapshot.remaining_millis)
++                    .unwrap_or(i64::MAX)
++                    .saturating_mul(1_000),
++            };
++            let request = ProviderSourceDeletionIntentV1 {
++                operation_id: &operation_id,
++                provider_id: &provider_id,
++                original_source_sha256: &source,
++                expected_fence_revision,
++                mode,
++                source_revision: source_revision.as_deref(),
++                authority_ref: &authority_ref,
++                accepted_at_utc_micros,
++            };
++            let result = if record {
++                journal
++                    .record_provider_source_deletion_intent_bounded(
++                        &request,
++                        budget,
++                        &operation.cancellation(),
++                    )
++                    .map(Some)
++            } else {
++                journal.read_provider_source_deletion_intent_receipt_bounded(
++                    &request,
++                    budget,
++                    &operation.cancellation(),
++                )
++            };
++            result.map_err(|error| {
++                // These refusal variants are emitted before COMMIT. An actual
++                // successful COMMIT already returned its captured receipt.
++                if record
++                    && matches!(
++                        &error,
++                        ObservationJournalError::UnsettledSource { .. }
++                            | ObservationJournalError::BudgetExhausted { .. }
++                            | ObservationJournalError::OperationCancelled { .. }
++                    )
++                {
++                    ProviderSourceIntentActionErrorV1::Refused(error)
++                } else {
++                    // SQLite/serialization errors are kept intact. The legacy
++                    // error surface does not reveal whether COMMIT was entered.
++                    ProviderSourceIntentActionErrorV1::StorageUnconfirmed(error)
++                }
++            })
++        });
++        // Always join this write in the host control path. The typed journal
++        // receipt, not a subsequent deadline snapshot, determines commit truth.
++        let result = work
++            .await
++            .map_err(|_| ProviderSourceIntentActionErrorV1::WorkerUnavailable)?;
++        if !record {
++            check(control)?;
++        }
++        result
++    }
++}
++
+ fn validate_retained_scope_identity(scope: &RetainedRecallControlScopeV1) -> Result<()> {
+     OwnedProviderId::new(scope.provider_id.as_str())
+         .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained producing provider"))?;

@@ -1304,7 +1304,7 @@ async fn inspect_workflow_schema_for_admission(
     // workflow table must be found in the view SQL before this early return.
     let current_workflow_namespace_present =
         tables.iter().any(|(object_type, name, table, sql)| {
-            is_workflow_schema_object(object_type, name, table, sql)
+            is_workflow_schema_object(object_type, table, sql)
                 && !is_legacy_workflow_schema_object(name, table)
         });
     let workflow_view_drift_present = tables.iter().any(|(object_type, _, _, sql)| {
@@ -1327,16 +1327,16 @@ async fn inspect_workflow_schema_for_admission(
 
     // Workflow has two durable namespaces in this database: the final
     // source-journal tables and the legacy workflow-run index. Every object
-    // attached to either namespace is admission-owned. Inventorying by both
-    // object name and table catches an extra index or trigger even when its
-    // name does not carry the workflow prefix; sqlite's autoindexes remain
-    // excluded by the sqlite_master query above.
+    // attached to either namespace is admission-owned. SQLite records the
+    // owning table in `tbl_name` for tables, indexes, and triggers, so that
+    // field keeps similarly named objects owned by another authority out of
+    // this inventory. Views require the SQL dependency check below because
+    // their `tbl_name` is the view name. SQLite autoindexes remain excluded by
+    // the sqlite_master query above.
     let expected_workflow_objects = expected_workflow_schema_objects();
     let actual_workflow_objects = tables
         .iter()
-        .filter(|(object_type, name, table, sql)| {
-            is_workflow_schema_object(object_type, name, table, sql)
-        })
+        .filter(|(object_type, _, table, sql)| is_workflow_schema_object(object_type, table, sql))
         .map(|(object_type, name, table, _)| {
             (
                 object_type.to_ascii_lowercase(),
@@ -1345,13 +1345,15 @@ async fn inspect_workflow_schema_for_admission(
             )
         })
         .collect::<BTreeSet<_>>();
-    if actual_workflow_objects
-        .iter()
-        .any(|object| !expected_workflow_objects.contains(object))
-    {
-        return Err(workflow_schema_reset_required(
-            "workflow schema contains an unexpected index, trigger, table, or view",
-        ));
+    let unexpected_workflow_objects = actual_workflow_objects
+        .difference(&expected_workflow_objects)
+        .map(|(object_type, name, table)| format!("{object_type} {name} on {table}"))
+        .collect::<Vec<_>>();
+    if !unexpected_workflow_objects.is_empty() {
+        return Err(workflow_schema_reset_required(&format!(
+            "workflow schema contains unexpected objects: {}",
+            unexpected_workflow_objects.join(", ")
+        )));
     }
 
     let mut schema = conn
@@ -1445,19 +1447,14 @@ fn workflow_schema_reset_required(reason: &str) -> tracedecay_domain::errors::Tr
     tracedecay_domain::errors::TraceDecayError::reset_required("workflow", reason)
 }
 
-fn is_workflow_schema_object(
-    object_type: &str,
-    name: &str,
-    table: &str,
-    sql: &Option<String>,
-) -> bool {
-    [name, table].iter().any(|value| {
-        let value = value.to_ascii_lowercase();
-        value.starts_with("workflow_") || value.starts_with("idx_workflow_")
-    }) || (object_type.eq_ignore_ascii_case("view")
-        && sql
-            .as_deref()
-            .is_some_and(sql_mentions_workflow_table_identifier))
+fn is_workflow_schema_object(object_type: &str, table: &str, sql: &Option<String>) -> bool {
+    let table = table.to_ascii_lowercase();
+    table.starts_with("workflow_")
+        || table.starts_with("idx_workflow_")
+        || (object_type.eq_ignore_ascii_case("view")
+            && sql
+                .as_deref()
+                .is_some_and(sql_mentions_workflow_table_identifier))
 }
 
 fn is_legacy_workflow_schema_object(name: &str, table: &str) -> bool {

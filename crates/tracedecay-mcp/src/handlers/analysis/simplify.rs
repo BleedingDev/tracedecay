@@ -820,7 +820,8 @@ mod tests {
         assert!(SimplifyScanRequest::parse(&json!({"files": []}), None).is_err());
         assert!(SimplifyScanRequest::parse(&json!({"files": [""]}), None).is_err());
         let error = SimplifyScanRequest::parse(&json!({"files": ["src2/main.rs"]}), Some("src"))
-            .expect_err("outside-scope files must fail closed");
+            .err()
+            .expect("outside-scope files must fail closed");
         assert_eq!(
             error.project_route_context().map(|context| context.0),
             Some("analysis-file-outside-scope")

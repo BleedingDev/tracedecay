@@ -38,6 +38,7 @@ use tracedecay_daemon_service::{
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_lsp::analyzer::broker::AdmittedLspProvider;
 use tracedecay_lsp::analyzer::client::LspRefreshTimeouts;
+use tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1;
 
 mod advisory_runtime;
 mod automation_effect_recovery;
@@ -157,6 +158,108 @@ pub(crate) async fn install_project_open_source_edit_owners_for_test(
     Ok(true)
 }
 
+/// Publish the callable-code authorization and primitive runtime carried by
+/// the admitted core route. Provider and full-owner activation happens later;
+/// failures there must not remove these already-usable read authorities.
+pub(super) async fn register_project_open_core_read_owners(
+    invocation: &DaemonInvocationState,
+    project_root: &Path,
+    project_id: &str,
+    graph: Arc<crate::project::TraceDecay>,
+    code_graph: crate::mcp::server::CodeGraphProjectionReadPort,
+    ignored_dependency_admission: crate::mcp::server::CodeIndexIgnoredDependencyAdmissionPort,
+    session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+    session_retrieval: Arc<dyn SessionApplicationRetrievalPortV1>,
+) -> Result<()> {
+    let owner_registration_started = Instant::now();
+    let mut owner_phase_started = owner_registration_started;
+    let project_id =
+        ProjectId::new(project_id.to_owned()).map_err(|_| TraceDecayError::Config {
+            message: "project-open core read owners require authoritative project identity"
+                .to_owned(),
+        })?;
+    let database = graph.db().clone();
+    let scope =
+        tracedecay_code_index_runtime::resolved_scope_for_project(project_root, &project_id)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("project-open core read scope denied: {error}"),
+            })?;
+    let configuration = graph
+        .configuration_runtime()
+        .client()
+        .current()
+        .await
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open core read configuration failed: {error}"),
+        })?;
+    let access =
+        daemon_owned_project_source_access_at(&scope, project_root, &configuration, now_micros())
+            .map_err(|error| TraceDecayError::Config {
+            message: format!("project-open core read source access denied: {error}"),
+        })?;
+    match hotpath::future!(
+        invocation.feedback_runtime_registrar().open_and_register(
+            database,
+            project_root.to_path_buf(),
+            scope.clone(),
+            access.clone(),
+            Arc::new(DaemonCallableCodeAuthorizationSource::production(
+                project_root.to_path_buf(),
+                scope,
+                Arc::clone(graph.configuration_runtime()),
+            )),
+        ),
+        label = "daemon.project.open.owners.feedback"
+    )
+    .await
+    {
+        Ok(_) | Err(DaemonFeedbackRuntimeRegistrationError::AlreadyRegistered) => {}
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!("project-open feedback runtime registration failed: {error:?}"),
+            });
+        }
+    }
+    tracing::info!(
+        event = "project_open_owner_phase",
+        project = %project_root.display(),
+        phase = "feedback_runtime_registered",
+        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
+        elapsed_ms = owner_registration_started.elapsed().as_millis(),
+    );
+    owner_phase_started = Instant::now();
+    let admitted_root_uri =
+        admitted_root_uri_for_project(project_root).map_err(|error| TraceDecayError::Config {
+            message: format!("project-open admitted root URI denied: {error}"),
+        })?;
+    let source = graph
+        .source_read_context()
+        .ok_or_else(|| TraceDecayError::Config {
+            message: "project-open primitive runtime requires an exact registered source identity"
+                .to_owned(),
+        })?;
+    open_and_register_project_primitive_runtime(
+        invocation,
+        project_root,
+        source,
+        code_graph,
+        ignored_dependency_admission,
+        session_db,
+        session_retrieval,
+        access,
+        &admitted_root_uri,
+    )
+    .await?;
+    tracing::info!(
+        event = "project_open_owner_phase",
+        project = %project_root.display(),
+        phase = "primitive_runtime_registered",
+        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
+        elapsed_ms = owner_registration_started.elapsed().as_millis(),
+    );
+    Ok(())
+}
+
 /// Memory belongs to core publication; session and LCM join once mounted.
 pub(super) async fn register_project_open_retained_owner(
     invocation: &DaemonInvocationState,
@@ -213,7 +316,7 @@ pub(super) async fn register_project_open_production_owners(
     native_integration: &DaemonNativeIntegrationServiceRegistry,
     project_root: &Path,
     project_id: &str,
-    server: &McpServer,
+    server: &Arc<McpServer>,
     source_edit_mutation: Arc<SourceEditMutationGate>,
 ) -> Result<ProjectOpenDependentOwnerState> {
     // Retain the admitted owner state once across its asynchronous phases.
@@ -327,70 +430,10 @@ pub(super) async fn register_project_open_production_owners(
         })?;
     let grant_expires_at = access.grant_expires_at;
     let requester = access.requester.clone();
-    // Primitive reads are part of the admitted core route. Publish their
-    // runtime and callable-code authorization before the slower mutation,
-    // delivery, native-integration, and Work owners finish mounting.
-    match hotpath::future!(
-        invocation.feedback_runtime_registrar().open_and_register(
-            database.clone(),
-            project_root.to_path_buf(),
-            scope.clone(),
-            access.clone(),
-            Arc::new(DaemonCallableCodeAuthorizationSource::production(
-                project_root.to_path_buf(),
-                scope.clone(),
-                Arc::clone(graph.configuration_runtime()),
-            )),
-        ),
-        label = "daemon.project.open.owners.feedback"
-    )
-    .await
-    {
-        Ok(_) | Err(DaemonFeedbackRuntimeRegistrationError::AlreadyRegistered) => {}
-        Err(error) => {
-            return Err(TraceDecayError::Config {
-                message: format!("project-open feedback runtime registration failed: {error:?}"),
-            });
-        }
-    }
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "feedback_runtime_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
-
     let admitted_root_uri =
         admitted_root_uri_for_project(project_root).map_err(|error| TraceDecayError::Config {
             message: format!("project-open admitted root URI denied: {error}"),
         })?;
-    let source = graph
-        .source_read_context()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project-open primitive runtime requires an exact registered source identity"
-                .to_owned(),
-        })?;
-    open_and_register_project_primitive_runtime(
-        invocation,
-        project_root,
-        source,
-        server,
-        session_db.clone(),
-        access.clone(),
-        &admitted_root_uri,
-    )
-    .await?;
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "primitive_runtime_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
-
     // One worktree discovery serves both the Git transaction authority here
     // and the native-integration mount below.
     let repository_root = tracedecay_runtime_core::worktree::git_worktree_root(project_root);
@@ -734,6 +777,7 @@ pub(super) async fn register_project_open_production_owners(
         })?;
     crate::daemon::hook_v2_replay_consumer::register_hook_v2_replay_consumer(
         Arc::clone(&graph),
+        server,
         delivery_settlements,
         session_db.clone(),
         server.background_cpu_authority().ok_or_else(|| TraceDecayError::Config {

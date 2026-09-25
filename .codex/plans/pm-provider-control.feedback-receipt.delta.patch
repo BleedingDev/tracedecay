@@ -1,0 +1,57 @@
+diff --git a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+--- a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
++++ b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+@@ -142,6 +142,9 @@
+     }
+ }
+ 
++/// An explicit caller feedback assertion. The host durably records the
++/// authenticated assertion and supplies its real outcome receipt to the provider.
++/// Acceptance does not establish objective usefulness or provider completion.
+ #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+ #[serde(deny_unknown_fields)]
+ pub struct ProviderFeedbackRequestV1 {
+@@ -150,8 +153,7 @@
+     /// Canonical decimal text in the closed interval zero through one.
+     #[schemars(length(min = 1, max = 64))]
+     pub weight: String,
+-    #[schemars(length(min = 1, max = 1024))]
+-    pub canonical_outcome_receipt: String,
++    /// Caller evidence claims; the host resolves each retained reference.
+     #[schemars(length(max = 64))]
+     pub evidence_refs: Vec<String>,
+     pub occurred_at: UtcMicros,
+@@ -357,7 +359,6 @@
+             Self::Feedback(request) => {
+                 validate_source_selector(&request.source)?;
+                 require(valid_weight(&request.weight), "provider feedback weight")?;
+-                validate_reference(&request.canonical_outcome_receipt)?;
+                 validate_references(
+                     &request.evidence_refs,
+                     0,
+@@ -2052,7 +2053,7 @@
+     RetainedSurfaceSpec {
+         operation: RetainedSurfaceOperation::ProviderFeedback,
+         summary: "Record provider feedback",
+-        description: "Record canonically settled feedback for one retained provider source.",
++        description: "Record an authenticated feedback assertion for one retained provider source.",
+         example: "Mark this recalled provider source as helpful",
+         effect: EffectClass::Administrative,
+         scope: PROVIDER_CONTROL_SCOPE,
+@@ -2161,7 +2162,7 @@
+     }
+     fn requests() -> Vec<ProviderControlRequestV1> {
+         [
+-            json!({"operation":"feedback","request":{"source":source(),"signal":"helpful","weight":"0.5","canonical_outcome_receipt":"outcome.settled","evidence_refs":["evidence.1"],"occurred_at":10}}),
++            json!({"operation":"feedback","request":{"source":source(),"signal":"helpful","weight":"0.5","evidence_refs":["evidence.1"],"occurred_at":10}}),
+             json!({"operation":"correction","request":{"source":source(),"expected_source_revision":"revision.1","correction":{"kind":"replace_content","replacement_receipt_ref":"observation.replacement"},"reason":"Retained correction evidence","evidence_refs":[]}}),
+             json!({"operation":"delete_by_source","request":{"source":source(),"mode":"remove_influence","expected_fence_revision":0,"include_snapshots":true}}),
+             json!({"operation":"health","request":{"state":state(),"requested_checks":["state","privacy"]}}),
+@@ -2280,6 +2281,7 @@
+             for field in [
+                 "exact_scope_identity",
+                 "history_grant",
++                "canonical_outcome_receipt",
+                 "ready_receipt_digest",
+                 "operation_id",
+                 "idempotency_key",

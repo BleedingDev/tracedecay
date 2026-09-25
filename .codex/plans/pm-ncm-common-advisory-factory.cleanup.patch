@@ -1,0 +1,872 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -4,10 +4,12 @@
+ 
+ use std::collections::BTreeMap;
+ use std::fs::{self, File};
+-use std::io::Write;
++use std::io::{Read, Write};
++use std::os::fd::OwnedFd;
+ use std::os::unix::fs::{MetadataExt, symlink};
++use std::os::unix::net::UnixStream;
+ use std::path::{Path, PathBuf};
+-use std::process::Command;
++use std::process::{Child, Command, Output, Stdio};
+ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+@@ -42,6 +44,8 @@
+ const QUARANTINED: u8 = 4;
+ const REGISTRATION_REVISION: u64 = 1;
+ const LIFECYCLE_BUDGET: Duration = Duration::from_secs(30);
++const HELPER_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
++const REAP_RESERVE: Duration = Duration::from_millis(100);
+ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+ 
+ /// Same post-commit cancellation seam as the direct Rust backend regression.
+@@ -50,6 +54,8 @@
+ struct WithholdCommittedReply {
+     inner: Arc<RustNcmSurface>,
+     armed: Arc<AtomicBool>,
++    worker: Arc<TrackedWorker>,
++    cleanup: Arc<CleanupCollector>,
+ }
+ 
+ impl NcmCognitiveSurface for WithholdCommittedReply {
+@@ -58,11 +64,16 @@
+     }
+ 
+     fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
+-        self.inner.handshake(request)
++        let deadline = inherited_deadline(&request.control);
++        let reply = self.inner.handshake(request);
++        self.worker.observe_process(deadline, &self.cleanup);
++        reply
+     }
+ 
+     fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
++        let deadline = inherited_deadline(&call.control);
+         let reply = self.inner.invoke(call);
++        self.worker.observe_process(deadline, &self.cleanup);
+         if call.operation.mutates_provider_state() && self.armed.swap(false, Ordering::SeqCst) {
+             assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
+             assert_eq!(
+@@ -88,6 +99,8 @@
+ struct LegacyWriterSurface {
+     inner: Arc<RustNcmSurface>,
+     dispatched: Arc<Mutex<Vec<(NcmSurfaceCall, ProviderReply)>>>,
++    worker: Arc<TrackedWorker>,
++    cleanup: Arc<CleanupCollector>,
+ }
+ 
+ impl NcmCognitiveSurface for LegacyWriterSurface {
+@@ -96,11 +109,16 @@
+     }
+ 
+     fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
+-        self.inner.handshake(request)
++        let deadline = inherited_deadline(&request.control);
++        let reply = self.inner.handshake(request);
++        self.worker.observe_process(deadline, &self.cleanup);
++        reply
+     }
+ 
+     fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
++        let deadline = inherited_deadline(&call.control);
+         let reply = self.inner.invoke(call);
++        self.worker.observe_process(deadline, &self.cleanup);
+         if call.operation == ProviderOperation::Observe {
+             self.dispatched
+                 .lock()
+@@ -202,8 +220,13 @@
+ }
+ 
+ impl ProcessIdentity {
+-    fn read(pid: u32) -> Result<Option<Self>, String> {
+-        let output = Command::new("ps")
++    fn read(
++        pid: u32,
++        deadline: Instant,
++        cleanup: &CleanupCollector,
++    ) -> Result<Option<Self>, String> {
++        let mut command = Command::new("ps");
++        command
+             .args([
+                 "-p",
+                 &pid.to_string(),
+@@ -214,9 +237,8 @@
+                 "-o",
+                 "lstart=",
+             ])
+-            .env("LC_ALL", "C")
+-            .output()
+-            .map_err(err)?;
++            .env("LC_ALL", "C");
++        let output = bounded_output(&mut command, deadline, cleanup)?;
+         if output.status.code() == Some(1) && output.stdout.is_empty() {
+             return Ok(None);
+         }
+@@ -249,15 +271,324 @@
+         )
+     }
+ 
+-    fn confirm_exited(&self) -> Result<(), String> {
+-        if Self::read(self.pid)?.as_ref() == Some(self) {
++    fn confirm_exited(&self, deadline: Instant, cleanup: &CleanupCollector) -> Result<(), String> {
++        if Self::read(self.pid, deadline, cleanup)?.as_ref() == Some(self) {
+             return Err("owned worker still exists after the bounded reap".into());
+         }
+         Ok(())
+     }
+ }
+ 
++/// Keeps all actual owners alive until the explicit factory cleanup pass. Drop
++/// may attempt cleanup, but only this later pass can establish final success.
++#[derive(Default)]
++struct CleanupCollector {
++    workers: Mutex<Vec<Arc<TrackedWorker>>>,
++    helper_events: Mutex<Vec<Value>>,
++    unconfirmed_helpers: Mutex<Vec<Child>>,
++}
++
++struct TrackedWorker {
++    owner: Arc<RustNcmWorkerOwner>,
++    root: PathBuf,
++    state: Mutex<WorkerCleanupState>,
++}
++
++#[derive(Default)]
++struct WorkerCleanupState {
++    identity: Option<ProcessIdentity>,
++    active: bool,
++    identity_missing: bool,
++    preserve_state: bool,
++    final_confirmed: bool,
++    events: Vec<Value>,
++}
++
++impl TrackedWorker {
++    fn observe_process(&self, deadline: Instant, cleanup: &CleanupCollector) {
++        let Some(pid) = self.owner.worker_pid() else {
++            return;
++        };
++        let mut state = self.state.lock().expect("worker cleanup state");
++        if state.active && state.identity.as_ref().is_some_and(|old| old.pid == pid) {
++            return;
++        }
++        state.active = true;
++        state.final_confirmed = false;
++        // Record ownership before the bounded identity helper can fail.
++        state
++            .events
++            .push(json!({"action": "observed_owned_pid", "pid": pid}));
++        match ProcessIdentity::read(pid, deadline, cleanup) {
++            Ok(Some(identity)) if identity.parent_pid == std::process::id() => {
++                state.events.push(
++                    json!({"action": "captured_start_identity", "identity": identity.evidence()}),
++                );
++                state.identity = Some(identity);
++            }
++            result => {
++                state.identity_missing = true;
++                state.preserve_state = true;
++                state.events.push(json!({"action": "identity_unconfirmed", "pid": pid, "outcome": format!("{result:?}")}));
++            }
++        }
++    }
++
++    fn stop(
++        &self,
++        deadline: Instant,
++        cleanup: &CleanupCollector,
++        action: &str,
++    ) -> Result<Option<ProcessIdentity>, String> {
++        // Never run ps before stop: the real owner must first attempt its
++        // bounded child reap and pipe-thread joins using the inherited deadline.
++        let pid_before_stop = self.owner.worker_pid();
++        let stopped = self.owner.request_stop(deadline).map_err(err);
++        let mut outcome = match &stopped {
++            Ok(true) if self.owner.worker_pid().is_none() => Ok(()),
++            value => Err(format!(
++                "owned worker stop did not confirm reap and pipe joins: {value:?}"
++            )),
++        };
++        let stop_failed = outcome.is_err();
++        let mut killed = None;
++        if stop_failed {
++            let result = self.owner.kill(deadline).map_err(err);
++            killed = Some(format!("{result:?}"));
++            outcome = result.and_then(|()| {
++                if self.owner.worker_pid().is_none() {
++                    Ok(())
++                } else {
++                    Err("owned worker remains after kill".into())
++                }
++            });
++        }
++        let mut state = self.state.lock().expect("worker cleanup state");
++        if let Some(pid) = pid_before_stop
++            && !state
++                .identity
++                .as_ref()
++                .is_some_and(|identity| identity.pid == pid)
++        {
++            state.identity_missing = true;
++            state
++                .events
++                .push(json!({"action": "uncaptured_owned_pid_at_stop", "pid": pid}));
++        }
++        if stop_failed {
++            state.preserve_state = true;
++        }
++        if outcome.is_ok()
++            && let Some(identity) = &state.identity
++        {
++            outcome = identity.confirm_exited(deadline, cleanup);
++        }
++        if outcome.is_ok() && state.identity_missing {
++            outcome = Err("worker start identity was not captured; state retained".into());
++        }
++        let identity = state.identity.as_ref().map(ProcessIdentity::evidence);
++        state.events.push(json!({"action": action, "identity": identity,
++            "stop_result": format!("{stopped:?}"), "kill_result": killed, "outcome": format!("{outcome:?}"),
++            "remaining_owned_pid": self.owner.worker_pid()}));
++        if outcome.is_ok() {
++            state.active = false;
++        } else {
++            state.preserve_state = true;
++        }
++        state.final_confirmed = action == "factory_final_cleanup" && outcome.is_ok();
++        outcome.map(|()| state.identity.clone())
++    }
++}
++
++impl CleanupCollector {
++    fn finish(&self, deadline: Instant) -> Value {
++        let workers = self.workers.lock().expect("factory workers").clone();
++        for worker in &workers {
++            let _recorded = worker.stop(deadline, self, "factory_final_cleanup");
++        }
++        let mut pending = self.unconfirmed_helpers.lock().expect("helper ownership");
++        pending.retain_mut(|child| {
++            let outcome = terminate_and_reap(child, deadline);
++            self.helper_events.lock().expect("helper events").push(json!({
++                "pid": child.id(), "action": "factory_final_cleanup", "outcome": format!("{outcome:?}"), "reaped": outcome.is_ok(),
++            }));
++            outcome.is_err()
++        });
++        let unconfirmed_workers = workers
++            .iter()
++            .filter(|worker| {
++                !worker
++                    .state
++                    .lock()
++                    .expect("worker cleanup state")
++                    .final_confirmed
++            })
++            .count();
++        let confirmed = unconfirmed_workers == 0 && pending.is_empty();
++        let mut preserve_roots = BTreeMap::<PathBuf, bool>::new();
++        for worker in &workers {
++            let state = worker.state.lock().expect("worker cleanup state");
++            *preserve_roots.entry(worker.root.clone()).or_default() |=
++                state.preserve_state || !confirmed;
++        }
++        // Aggregate every physical owner of a scenario before removing its
++        // root, including replaced owners from FreshNamespace.
++        let roots: Vec<_> = preserve_roots.iter().map(|(root, preserve)| {
++            let removal = if !preserve && root.exists() { Some(fs::remove_dir_all(root).map_err(err)) } else { None };
++            json!({"root": root, "state_preserved": root.exists(), "removal": format!("{removal:?}")})
++        }).collect();
++        let worker_rows: Vec<_> = workers
++            .iter()
++            .map(|worker| {
++                let state = worker.state.lock().expect("worker cleanup state");
++                json!({"root": worker.root, "final_confirmed": state.final_confirmed,
++                "state_preserved": worker.root.exists(), "events": state.events})
++            })
++            .collect();
++        json!({"confirmed": confirmed, "unconfirmed_workers": unconfirmed_workers,
++            "unconfirmed_helpers": pending.len(), "workers": worker_rows, "roots": roots,
++            "helpers": *self.helper_events.lock().expect("helper events")})
++    }
++}
++
++fn inherited_deadline(control: &OperationControl) -> Instant {
++    let now = Instant::now();
++    let remaining = control
++        .snapshot()
++        .map_or(0, |snapshot| snapshot.remaining_millis);
++    now + Duration::from_millis(remaining)
++}
++
++fn remaining_control(deadline: Instant) -> Result<OperationControl, String> {
++    let millis = u64::try_from(
++        deadline
++            .saturating_duration_since(Instant::now())
++            .as_millis(),
++    )
++    .map_err(err)?;
++    if millis == 0 {
++        return Err("fixture action deadline elapsed".into());
++    }
++    Ok(OperationControl::new(
++        i64::MAX,
++        millis,
++        CancellationToken::new(),
++    ))
++}
++
++/// One owned-child runner for ps and sqlite3, with no blocking reader threads.
++/// Nonblocking socket readers bound both output and waiting under the original
++/// action deadline; the final 100 ms of that same budget is reserved for reap.
++fn bounded_output(
++    command: &mut Command,
++    deadline: Instant,
++    cleanup: &CleanupCollector,
++) -> Result<Output, String> {
++    let work_deadline = deadline
++        .checked_sub(REAP_RESERVE)
++        .ok_or("helper deadline underflow")?;
++    if Instant::now() >= work_deadline {
++        return Err("helper has no inherited work budget".into());
++    }
++    let (mut stdout, stdout_child) = UnixStream::pair().map_err(err)?;
++    let (mut stderr, stderr_child) = UnixStream::pair().map_err(err)?;
++    stdout.set_nonblocking(true).map_err(err)?;
++    stderr.set_nonblocking(true).map_err(err)?;
++    command
++        .stdin(Stdio::null())
++        .stdout(Stdio::from(OwnedFd::from(stdout_child)))
++        .stderr(Stdio::from(OwnedFd::from(stderr_child)));
++    let mut child = command.spawn().map_err(err)?;
++    // Command retains its configured descriptors after spawn. Drop the parent
++    // copies of the writer ends so EOF can prove the helper closed both streams.
++    command.stdout(Stdio::null()).stderr(Stdio::null());
++    let pid = child.id();
++    let mut out = Vec::new();
++    let mut errors = Vec::new();
++    let mut closed = [false; 2];
++    let mut total_bytes = 0_usize;
++    let result = (|| {
++        loop {
++            for (index, stream, bytes) in
++                [(0, &mut stdout, &mut out), (1, &mut stderr, &mut errors)]
++            {
++                let mut buffer = [0_u8; 8192];
++                // One read per stream per poll prevents a prolific writer from
++                // starving the original deadline or the other output stream.
++                match stream.read(&mut buffer) {
++                    Ok(0) => closed[index] = true,
++                    Ok(count) => {
++                        total_bytes += count;
++                        if total_bytes > HELPER_OUTPUT_LIMIT {
++                            return Err("helper output limit exceeded".into());
++                        }
++                        bytes.extend_from_slice(&buffer[..count]);
++                    }
++                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
++                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
++                    Err(error) => return Err(err(error)),
++                }
++            }
++            if let Some(status) = child.try_wait().map_err(err)?
++                && closed.iter().all(|value| *value)
++            {
++                return Ok(Output {
++                    status,
++                    stdout: out,
++                    stderr: errors,
++                });
++            }
++            if Instant::now() >= work_deadline {
++                return Err("helper inherited deadline elapsed".into());
++            }
++            std::thread::sleep(
++                Duration::from_millis(2)
++                    .min(work_deadline.saturating_duration_since(Instant::now())),
++            );
++        }
++    })();
++    let reaped = if result.is_ok() {
++        Ok(())
++    } else {
++        terminate_and_reap(&mut child, deadline)
++    };
++    cleanup.helper_events.lock().expect("helper events").push(json!({"pid": pid,
++        "program": command.get_program().to_string_lossy(), "reaped": reaped.is_ok(),
++        "outcome": result.as_ref().map(|output| format!("exit={}", output.status)).unwrap_or_else(|error| error.clone()),
++        "reap_outcome": format!("{reaped:?}")}));
++    if let Err(reason) = reaped {
++        cleanup
++            .unconfirmed_helpers
++            .lock()
++            .expect("helper ownership")
++            .push(child);
++        return Err(format!("helper termination unconfirmed: {reason}"));
++    }
++    result
++}
++
++fn terminate_and_reap(child: &mut Child, deadline: Instant) -> Result<(), String> {
++    if child.try_wait().map_err(err)?.is_some() {
++        return Ok(());
++    }
++    let killed = child.kill().map_err(err);
++    loop {
++        if child.try_wait().map_err(err)?.is_some() {
++            return Ok(());
++        }
++        if Instant::now() >= deadline {
++            return Err(format!(
++                "owned helper reap deadline elapsed; kill={killed:?}"
++            ));
++        }
++        std::thread::sleep(
++            Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())),
++        );
++    }
++}
++
+ struct RealNcmFactory {
++    cleanup: Arc<CleanupCollector>,
+     run_root: PathBuf,
+     worker_binary: PathBuf,
+     models: PathBuf,
+@@ -276,6 +607,8 @@
+ }
+ 
+ struct RealNcmFixture {
++    cleanup: Arc<CleanupCollector>,
++    worker: Option<Arc<TrackedWorker>>,
+     root: PathBuf,
+     provider_root: PathBuf,
+     worker_binary: PathBuf,
+@@ -304,6 +637,8 @@
+         let authority = FixtureAuthority::from_scenario(scenario, scope)?;
+         fs::create_dir(&root).map_err(err)?;
+         let mut fixture = Self {
++            cleanup: Arc::clone(&factory.cleanup),
++            worker: None,
+             provider_root: root.join("provider-0"),
+             root,
+             worker_binary: factory.worker_binary.clone(),
+@@ -361,6 +696,8 @@
+         let surface = Arc::new(WithholdCommittedReply {
+             inner,
+             armed: Arc::clone(&self.lose_reply),
++            worker: Arc::clone(self.worker.as_ref().ok_or("missing worker cleanup owner")?),
++            cleanup: Arc::clone(&self.cleanup),
+         });
+         let adapter = NcmProviderAdapter::new(surface)
+             .map_err(err)?
+@@ -383,51 +720,47 @@
+             })
+             .map_err(err)?,
+         );
++        let worker = Arc::new(TrackedWorker {
++            owner: Arc::clone(&owner),
++            root: self.root.clone(),
++            state: Mutex::new(WorkerCleanupState::default()),
++        });
++        self.cleanup
++            .workers
++            .lock()
++            .expect("factory workers")
++            .push(Arc::clone(&worker));
++        self.worker = Some(worker);
++        self.owner = Some(Arc::clone(&owner));
+         self.host = Some(self.make_host(&owner)?);
+-        self.owner = Some(owner);
+         if self.namespace_database().exists() {
+             return Err("new physical namespace was unexpectedly populated".into());
+         }
+         Ok(())
+     }
+ 
+-    fn start_current(&mut self) -> Result<ProcessIdentity, String> {
+-        self.owner()?
+-            .start(Instant::now() + LIFECYCLE_BUDGET)
+-            .map_err(err)?;
+-        let pid = self
+-            .owner()?
+-            .worker_pid()
+-            .ok_or("start returned without an owned child")?;
+-        let identity =
+-            ProcessIdentity::read(pid)?.ok_or("started child exited before identity capture")?;
+-        if identity.parent_pid != std::process::id() {
+-            return Err("worker process is not owned by this fixture process".into());
+-        }
++    fn start_current(&mut self, deadline: Instant) -> Result<ProcessIdentity, String> {
++        let started = self.owner()?.start(deadline).map_err(err);
++        let worker = self.worker.as_ref().ok_or("missing worker cleanup owner")?;
++        worker.observe_process(deadline, &self.cleanup);
++        started?;
++        let state = worker.state.lock().expect("worker cleanup state");
++        let identity = state
++            .identity
++            .clone()
++            .filter(|identity| {
++                Some(identity.pid) == self.owner().ok().and_then(|owner| owner.worker_pid())
++            })
++            .ok_or("started child has no captured process identity")?;
+         self.stopped_process = None;
+         Ok(identity)
+     }
+ 
+-    fn stop_current(&mut self) -> Result<Option<ProcessIdentity>, String> {
+-        let Some(owner) = self.owner.as_ref() else {
++    fn stop_current(&mut self, deadline: Instant) -> Result<Option<ProcessIdentity>, String> {
++        let Some(worker) = self.worker.as_ref() else {
+             return Ok(self.stopped_process.clone());
+         };
+-        let previous = match owner.worker_pid() {
+-            Some(pid) => {
+-                Some(ProcessIdentity::read(pid)?.ok_or("owned child vanished before stop")?)
+-            }
+-            None => self.stopped_process.clone(),
+-        };
+-        if !owner
+-            .request_stop(Instant::now() + LIFECYCLE_BUDGET)
+-            .map_err(err)?
+-            || owner.worker_pid().is_some()
+-        {
+-            return Err("worker stop did not confirm process reap and pipe-thread joins".into());
+-        }
+-        if let Some(previous) = &previous {
+-            previous.confirm_exited()?;
+-        }
++        let previous = worker.stop(deadline, &self.cleanup, "fixture_explicit_stop")?;
+         self.stopped_process.clone_from(&previous);
+         Ok(previous)
+     }
+@@ -455,7 +788,7 @@
+     /// Opens the actual persisted namespace during an environment restart.
+     /// A corrupt/incompatible state still proves that the worker addressed the
+     /// original namespace; the suite makes the subsequent readiness verdict.
+-    fn reopen_persisted_namespace(&self) -> Result<(), String> {
++    fn reopen_persisted_namespace(&self, deadline: Instant) -> Result<(), String> {
+         let descriptor = self.host()?.descriptor();
+         let request = HandshakeRequest::new(HandshakeRequestParts {
+             provider_id: descriptor.provider_id,
+@@ -467,7 +800,7 @@
+             ),
+             required_capabilities: descriptor.capabilities.into_iter().collect(),
+             host_limits: descriptor.limits,
+-            control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++            control: remaining_control(deadline)?,
+             challenge_nonce: [0x6e; 32],
+         })
+         .map_err(err)?;
+@@ -496,6 +829,7 @@
+     fn install_legacy(
+         &mut self,
+         observations: &[Value],
++        deadline: Instant,
+     ) -> Result<FixtureEnvironmentEvidence, String> {
+         if observations.is_empty()
+             || observations.len() as u64 > self.host()?.descriptor().limits.observation_batch_items
+@@ -516,13 +850,15 @@
+                 RustNcmSurface::from_production_worker(Arc::clone(&owner)).map_err(err)?,
+             ),
+             dispatched: Arc::clone(&dispatched),
++            worker: Arc::clone(self.worker.as_ref().ok_or("missing legacy cleanup owner")?),
++            cleanup: Arc::clone(&self.cleanup),
+         });
+         // This adapter intentionally has no common admission authority. Only
+         // the existing legacy Observe payload is submitted to its real worker.
+         let writer = NcmProviderAdapter::new(surface.clone()).map_err(err)?;
+         let mut observed = Vec::new();
+         for observation in observations {
+-            let call = legacy_observation_call(&writer, &self.scope, observation)?;
++            let call = legacy_observation_call(&writer, &self.scope, observation, deadline)?;
+             let reply = writer.invoke(&call);
+             if reply.terminal.terminal_code() != TerminalCode::Success
+                 || reply.terminal.committed_effect().state() != CommittedEffectState::Committed
+@@ -541,7 +877,7 @@
+             observed.push((call, reply));
+         }
+         let writer_process = self
+-            .stop_current()?
++            .stop_current(deadline)?
+             .ok_or("legacy writer did not start a real process")?;
+         if writer_process.parent_pid != std::process::id() {
+             return Err("legacy writer process was not owned by this fixture".into());
+@@ -563,6 +899,8 @@
+             &database,
+             "SELECT CAST(value AS TEXT) AS schema_version FROM meta WHERE key = 'schema_version';",
+             true,
++            deadline,
++            &self.cleanup,
+         )?;
+         if metadata.len() != 1 || metadata[0]["schema_version"] != "1" {
+             return Err("actual legacy writer did not retain its version 1 storage schema".into());
+@@ -576,11 +914,15 @@
+             &database,
+             "SELECT c.record_id, c.source_id, c.key_text, c.value_text, c.provenance, c.status, c.commit_seq, e.seq, e.kind, e.idempotency_key, e.payload_sha256, e.receipt FROM capsules AS c JOIN events AS e ON e.seq = c.commit_seq ORDER BY c.record_id;",
+             true,
++            deadline,
++            &self.cleanup,
+         )?;
+         let counts = sqlite_json(
+             &database,
+             "SELECT (SELECT count(*) FROM capsules) AS capsules, (SELECT count(*) FROM events) AS events;",
+             true,
++            deadline,
++            &self.cleanup,
+         )?;
+         if rows.len() != observations.len()
+             || counts.len() != 1
+@@ -727,11 +1069,11 @@
+         })
+     }
+ 
+-    fn corrupt_payload(&mut self) -> Result<FixtureEnvironmentEvidence, String> {
+-        self.stop_current()?
++    fn corrupt_payload(&mut self, deadline: Instant) -> Result<FixtureEnvironmentEvidence, String> {
++        self.stop_current(deadline)?
+             .ok_or("cannot corrupt an unstarted provider")?;
+         let database = self.namespace_database();
+-        let before = read_capsule(&database)?;
++        let before = read_capsule(&database, deadline, &self.cleanup)?;
+         let record_id = before["record_id"]
+             .as_u64()
+             .ok_or("capsule record ID is invalid")?;
+@@ -768,11 +1110,13 @@
+                 encoded.replace('\'', "''"),
+             ),
+             false,
++            deadline,
++            &self.cleanup,
+         )?;
+         if changed_rows.as_slice() != [json!({"changed": 1})] {
+             return Err("physical corruption did not update exactly the selected capsule".into());
+         }
+-        let after = read_capsule(&database)?;
++        let after = read_capsule(&database, deadline, &self.cleanup)?;
+         if after["record_id"] != before["record_id"] {
+             return Err("physical corruption selected a different retained record".into());
+         }
+@@ -802,6 +1146,7 @@
+         &mut self,
+         action: &FixtureEnvironmentAction,
+     ) -> Result<FixtureEnvironmentEvidence, String> {
++        let deadline = Instant::now() + LIFECYCLE_BUDGET;
+         match action {
+             FixtureEnvironmentAction::Restart => {
+                 let identity = self.build_identity()?;
+@@ -809,13 +1154,13 @@
+                 let metadata = fs::metadata(&database).map_err(err)?;
+                 let physical_file = (metadata.dev(), metadata.ino());
+                 let previous = self
+-                    .stop_current()?
++                    .stop_current(deadline)?
+                     .ok_or("restart has no previous real process")?;
+-                let current = self.start_current()?;
++                let current = self.start_current(deadline)?;
+                 if previous == current {
+                     return Err("restart reused the previous process start identity".into());
+                 }
+-                self.reopen_persisted_namespace()?;
++                self.reopen_persisted_namespace(deadline)?;
+                 let metadata = fs::metadata(&database).map_err(err)?;
+                 if physical_file != (metadata.dev(), metadata.ino())
+                     || identity != self.build_identity()?
+@@ -824,7 +1169,7 @@
+                         "restart changed the physical store or selected implementation".into(),
+                     );
+                 }
+-                previous.confirm_exited()?;
++                previous.confirm_exited(deadline, &self.cleanup)?;
+                 Ok(FixtureEnvironmentEvidence::Restarted {
+                     previous_process: previous.evidence(),
+                     current_process: current.evidence(),
+@@ -836,7 +1181,7 @@
+                 let previous_namespace = self.namespace_evidence();
+                 let identity = self.build_identity()?;
+                 self.revalidate_current_authority()?;
+-                self.stop_current()?;
++                self.stop_current(deadline)?;
+                 self.host.take();
+                 self.owner.take();
+                 self.namespace_number = self
+@@ -847,7 +1192,7 @@
+                     .root
+                     .join(format!("provider-{}", self.namespace_number));
+                 self.open_physical_namespace()?;
+-                self.start_current()?;
++                self.start_current(deadline)?;
+                 if self.namespace_database().exists() || self.build_identity()? != identity {
+                     return Err(
+                         "fresh namespace did not preserve selection and empty physical state"
+@@ -871,9 +1216,11 @@
+                 })
+             }
+             FixtureEnvironmentAction::InstallLegacyV1 { observations } => {
+-                self.install_legacy(observations)
+-            }
+-            FixtureEnvironmentAction::CorruptPayloadPreservingDigest => self.corrupt_payload(),
++                self.install_legacy(observations, deadline)
++            }
++            FixtureEnvironmentAction::CorruptPayloadPreservingDigest => {
++                self.corrupt_payload(deadline)
++            }
+             FixtureEnvironmentAction::RecordSourceDisposition {
+                 source_key,
+                 disposition,
+@@ -920,11 +1267,11 @@
+                 })
+             }
+             FixtureEnvironmentAction::Shutdown => {
+-                let previous = self.stop_current()?;
++                let previous = self.stop_current(deadline)?;
+                 self.host.take();
+                 self.owner.take();
+                 if let Some(previous) = previous {
+-                    previous.confirm_exited()?;
++                    previous.confirm_exited(deadline, &self.cleanup)?;
+                 }
+                 Ok(FixtureEnvironmentEvidence::Shutdown {
+                     remaining_workers: 0,
+@@ -952,17 +1299,17 @@
+ 
+ impl Drop for RealNcmFixture {
+     fn drop(&mut self) {
+-        let mut confirmed = self.stop_current().is_ok();
+-        if !confirmed && let Some(owner) = self.owner.as_ref() {
+-            confirmed = owner.kill(Instant::now() + LIFECYCLE_BUDGET).is_ok()
+-                && owner.worker_pid().is_none();
+-        }
++        if let Some(worker) = &self.worker {
++            let _recorded = worker.stop(
++                Instant::now() + LIFECYCLE_BUDGET,
++                &self.cleanup,
++                "fixture_drop_provisional",
++            );
++        }
++        // Factory retains every actual owner and state directory until its
++        // explicit final cleanup; this best-effort Drop is never a pass signal.
+         self.host.take();
+         self.owner.take();
+-        // Never unlink mutable state while a fixture child may still own it.
+-        if confirmed {
+-            let _ = fs::remove_dir_all(&self.root);
+-        }
+     }
+ }
+ 
+@@ -970,6 +1317,7 @@
+     writer: &NcmProviderAdapter,
+     scope: &OwnedExactScope,
+     observation: &Value,
++    deadline: Instant,
+ ) -> Result<ProviderCall, String> {
+     if observation["observation_kind"] != "session.message_committed.v1"
+         || observation["payload_contract"] != "tracedecay.memory.observation.session-message.v1"
+@@ -1007,7 +1355,7 @@
+             OwnedVersionedId::new(ProviderOperation::Observe.capability_id()).map_err(err)?,
+         ],
+         host_limits: descriptor.limits,
+-        control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++        control: remaining_control(deadline)?,
+         challenge_nonce: [0x76; 32],
+     })
+     .map_err(err)?;
+@@ -1040,7 +1388,7 @@
+             .ok_or("legacy readiness has no descriptor")?
+             .state_generation,
+         idempotency_key: Some(format!("fixture.legacy.original-delivery.{identity}")),
+-        control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++        control: remaining_control(deadline)?,
+         payload: CanonicalPayload::new(
+             OwnedVersionedId::new("tracedecay.memory.provider.observation.v1").map_err(err)?,
+             bytes,
+@@ -1111,11 +1459,17 @@
+         .collect()
+ }
+ 
+-fn read_capsule(database: &Path) -> Result<Value, String> {
++fn read_capsule(
++    database: &Path,
++    deadline: Instant,
++    cleanup: &CleanupCollector,
++) -> Result<Value, String> {
+     let mut rows = sqlite_json(
+         database,
+         "SELECT record_id, provenance FROM capsules WHERE status = 'valid' ORDER BY record_id LIMIT 1;",
+         true,
++        deadline,
++        cleanup,
+     )?;
+     if rows.len() != 1 {
+         return Err("physical fixture has no single retained capsule".into());
+@@ -1123,7 +1477,13 @@
+     Ok(rows.remove(0))
+ }
+ 
+-fn sqlite_json(database: &Path, sql: &str, read_only: bool) -> Result<Vec<Value>, String> {
++fn sqlite_json(
++    database: &Path,
++    sql: &str,
++    read_only: bool,
++    deadline: Instant,
++    cleanup: &CleanupCollector,
++) -> Result<Vec<Value>, String> {
+     if !database.is_file() {
+         return Err("fixture database does not exist".into());
+     }
+@@ -1132,7 +1492,8 @@
+     if read_only {
+         command.arg("-readonly");
+     }
+-    let output = command.arg(database).arg(sql).output().map_err(err)?;
++    command.arg(database).arg(sql);
++    let output = bounded_output(&mut command, deadline, cleanup)?;
+     if !output.status.success() {
+         return Err(format!(
+             "fixture SQLite action failed: {}",
+@@ -1216,6 +1577,7 @@
+     ));
+     fs::create_dir_all(&run_root).unwrap();
+     let factory = RealNcmFactory {
++        cleanup: Arc::new(CleanupCollector::default()),
+         run_root: run_root.clone(),
+         worker_binary,
+         models,
+@@ -1233,7 +1595,14 @@
+         ),
+     )
+     .unwrap();
+-    let report = run_common_advisory_suite(&factory, &scope, REGISTRATION_REVISION).unwrap();
++    let report = run_common_advisory_suite(&factory, &scope, REGISTRATION_REVISION);
++    let cleanup = factory.cleanup.finish(Instant::now() + LIFECYCLE_BUDGET);
++    write_synced(
++        &run_root.join("cleanup.json"),
++        &serde_json::to_vec_pretty(&cleanup).unwrap(),
++    )
++    .unwrap();
++    let report = report.unwrap();
+     let rows: Vec<_> = report.results.iter().map(|row| json!({
+         "case_id": row.case_id, "step_id": row.step_id,
+         "verdict": format!("{:?}", row.verdict), "details": row.details,
+@@ -1242,6 +1611,7 @@
+     })).collect();
+     let d = report.denominators;
+     let summary = json!({
++        "cleanup": cleanup,
+         "common_program_matched": report.common_program_matched,
+         "compatible": report.compatible(),
+         "denominators": {"planned": d.planned, "passed": d.passed, "failed": d.failed,
+@@ -1277,6 +1647,11 @@
+         })
+         .collect();
+     assert!(
++        cleanup["confirmed"] == true,
++        "real fixture cleanup unconfirmed; evidence at {}: {cleanup}",
++        run_root.display()
++    );
++    assert!(
+         report.compatible(),
+         "real NCM common suite is not compatible; actual report at {}\n{}",
+         run_root.display(),

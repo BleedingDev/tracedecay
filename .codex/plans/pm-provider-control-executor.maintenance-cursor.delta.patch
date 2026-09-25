@@ -1,0 +1,11 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
+@@ -48,6 +48,7 @@
+                 "maximum_bytes": request.maximum_bytes,
+                 "maximum_duration_millis": request.maximum_duration_millis,
+                 "dry_run": request.dry_run,
++                "resume_cursor": request.resume_cursor,
+             }),
+             &invocation.identity,
+             None,

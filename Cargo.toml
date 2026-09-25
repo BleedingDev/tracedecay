@@ -63,6 +63,7 @@ members = [
     "crates/tracedecay-store-runtime",
     "crates/tracedecay-tool-catalog",
     "crates/tracedecay-application",
+    "crates/tracedecay-vector-authority",
 ]
 exclude = [
     "vendor/hotpath-macros",
@@ -98,6 +99,7 @@ rusqlite = { version = "0.40.1", default-features = false, features = ["backup",
 # added for one is never missing for the other.
 gix = { version = "=0.86.0", default-features = false, features = ["revision", "blob-diff", "parallel", "sha1", "sha256", "status"] }
 tracedecay-semantic-contracts = { path = "crates/tracedecay-semantic-contracts", version = "0.1.0" }
+tracedecay-vector-authority = { path = "crates/tracedecay-vector-authority", version = "0.1.0" }
 
 [profile.bench]
 opt-level = 3

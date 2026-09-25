@@ -1,0 +1,1005 @@
+diff --git a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
+@@ -154,8 +154,14 @@
+                 if acknowledged != page.previous || page.first > acknowledged.saturating_add(1) {
+                     return invalid("replay sequence gap", handle.commit_seq);
+                 }
++                if let Some(reply) = public_replay_no_change(Some(handle), &page, deadline, started)
++                {
++                    return reply;
++                }
+             } else if page.expected != 0 || page.previous != 0 || page.first != 1 {
+                 return invalid("replay sequence gap", 0);
++            } else if let Some(reply) = public_replay_no_change(None, &page, deadline, started) {
++                return reply;
+             }
+         }
+         let mut output = page.output();
+@@ -232,7 +238,13 @@
+                     continue;
+                 }
+             }
+-            let reply = self.replay_item(namespace, item, deadline, started);
++            let reply = self.replay_item(
++                namespace,
++                item,
++                page.page_delivery_capsule.is_some(),
++                deadline,
++                started,
++            );
+             generation = generation.max(reply.state_generation);
+             if reply.outcome == Outcome::Success {
+                 let Some(mut state) = reply.payload["state"].as_str() else {
+@@ -349,12 +361,11 @@
+         &self,
+         namespace: &str,
+         item: &ReplayItem,
++        public_page: bool,
+         deadline: Deadline,
+         started: Instant,
+     ) -> EngineReply {
+-        let digest = match canonical_digest(
+-            &json!({"sequence":item.sequence,"receipt":item.receipt_digest,"source":item.source,"admitted":item.admitted,"observation":item.observation["payload_sha256"]}),
+-        ) {
++        let digest = match replay_item_digest(item) {
+             Ok(value) => value,
+             Err(reason) => return invalid(&reason, 0),
+         };
+@@ -380,6 +391,7 @@
+                 self,
+                 handle,
+                 item,
++                public_page,
+                 request.as_ref(),
+                 &digest,
+                 deadline,
+@@ -412,6 +424,7 @@
+             self,
+             handle,
+             item,
++            public_page,
+             Some(&request),
+             &digest,
+             deadline,
+@@ -480,10 +493,12 @@
+     }
+ }
+ 
++#[allow(clippy::too_many_arguments)]
+ fn existing_item(
+     engine: &NcmEngine,
+     handle: &mut NamespaceHandle,
+     item: &ReplayItem,
++    public_page: bool,
+     request: Option<&ObserveRequest>,
+     digest: &str,
+     deadline: Deadline,
+@@ -496,11 +511,12 @@
+             Value::Null,
+         ));
+     }
+-    match lookup_item_replay(handle, item, request, digest) {
++    let retained_delivery = match lookup_item_replay(handle, item, request, digest) {
++        Ok(Some(reply)) if public_page && reply.outcome == Outcome::Success => true,
+         Ok(Some(reply)) => return Some(reply),
+-        Ok(None) => {}
++        Ok(None) => false,
+         Err(reply) => return Some(reply),
+-    }
++    };
+     let previous = match replay_sequence(handle, Some(item)) {
+         Ok(value) => value,
+         Err(reply) => return Some(reply),
+@@ -508,6 +524,56 @@
+     if item.sequence > previous.saturating_add(1) {
+         return Some(invalid("replay sequence gap", handle.commit_seq));
+     }
++    let (state, reason, record) =
++        match classify_replay_item(handle, item, request, deadline, started) {
++            Ok(Some(state)) => state,
++            Ok(None) if retained_delivery => {
++                return Some(EngineReply::new(
++                    Outcome::Corrupt,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            Ok(None) => return None,
++            Err(reply) => return Some(reply),
++        };
++    if retained_delivery {
++        // A new public page resolves current source state; only a retained page
++        // receipt can establish a duplicate public delivery.
++        return Some(EngineReply::new(
++            Outcome::Success,
++            handle.commit_seq,
++            item.output(state, reason, record),
++        ));
++    }
++    let live = match read_live(handle) {
++        Ok(value) => value,
++        Err(reply) => return Some(reply),
++    };
++    Some(commit_common(
++        engine,
++        handle,
++        (*live).clone(),
++        &item.delivery_key,
++        digest,
++        Vec::new(),
++        Vec::new(),
++        None,
++        item.output(state, reason, record),
++        deadline,
++        started,
++    ))
++}
++
++type ExistingReplayItem = (&'static str, Option<&'static str>, Option<u64>);
++
++fn classify_replay_item(
++    handle: &NamespaceHandle,
++    item: &ReplayItem,
++    request: Option<&ObserveRequest>,
++    deadline: Deadline,
++    started: Instant,
++) -> Result<Option<ExistingReplayItem>, EngineReply> {
+     let state = if !item.admitted {
+         Some(("rejected", Some("current_disposition"), None))
+     } else if let Err(error) = handle.store.ensure_source_provenance_not_revoked(
+@@ -517,7 +583,7 @@
+         if matches!(error, crate::store::StoreError::SourceRevoked) {
+             Some(("rejected", Some("source_revoked"), None))
+         } else {
+-            return Some(store_reply(error, handle.commit_seq));
++            return Err(store_reply(error, handle.commit_seq));
+         }
+     } else {
+         None
+@@ -525,14 +591,16 @@
+     let state = if let Some(state) = state {
+         Some(state)
+     } else {
+-        let request = request?;
++        let Some(request) = request else {
++            return Ok(None);
++        };
+         let binding = match crate::source_binding::read(
+             handle.store.namespace(),
+             &request.source,
+             &request.provenance,
+         ) {
+             Ok(binding) => binding,
+-            Err(reason) => return Some(invalid(&reason, handle.commit_seq)),
++            Err(reason) => return Err(invalid(&reason, handle.commit_seq)),
+         };
+         let filter = binding
+             .as_ref()
+@@ -542,7 +610,7 @@
+         let mut found = None;
+         loop {
+             if remaining_deadline(deadline, started).remaining_ms == 0 {
+-                return Some(EngineReply::new(
++                return Err(EngineReply::new(
+                     Outcome::Cancelled,
+                     handle.commit_seq,
+                     Value::Null,
+@@ -551,26 +619,26 @@
+             let limit = 128_u64.min(1_000_000_u64.saturating_sub(scanned).saturating_add(1));
+             let capsules = match handle.store.capsule_page(Some(&filter.0), after, limit) {
+                 Ok(value) => value,
+-                Err(error) => return Some(store_reply(error, handle.commit_seq)),
++                Err(error) => return Err(store_reply(error, handle.commit_seq)),
+             };
+             let complete = capsules.len() < limit as usize;
+             for capsule in capsules {
+                 if remaining_deadline(deadline, started).remaining_ms == 0 {
+-                    return Some(EngineReply::new(
++                    return Err(EngineReply::new(
+                         Outcome::Cancelled,
+                         handle.commit_seq,
+                         Value::Null,
+                     ));
+                 }
+                 if scanned == 1_000_000 {
+-                    return Some(EngineReply::new(
++                    return Err(EngineReply::new(
+                         Outcome::BudgetExceeded,
+                         handle.commit_seq,
+                         Value::Null,
+                     ));
+                 }
+                 if capsule.record_id.0 <= after {
+-                    return Some(EngineReply::new(
++                    return Err(EngineReply::new(
+                         Outcome::Corrupt,
+                         handle.commit_seq,
+                         Value::Null,
+@@ -584,7 +652,7 @@
+                 let provenance: Value = match serde_json::from_str(&capsule.provenance) {
+                     Ok(value) => value,
+                     Err(_) => {
+-                        return Some(EngineReply::new(
++                        return Err(EngineReply::new(
+                             Outcome::Corrupt,
+                             handle.commit_seq,
+                             Value::Null,
+@@ -598,7 +666,7 @@
+                 ) {
+                     Ok(binding) => binding,
+                     Err(reason) => {
+-                        return Some(EngineReply::new(
++                        return Err(EngineReply::new(
+                             Outcome::Corrupt,
+                             handle.commit_seq,
+                             json!({"reason":reason}),
+@@ -631,7 +699,7 @@
+                         || provenance["common_capsule"]["sha256"]
+                             != request.provenance["common_capsule"]["sha256"]
+                     {
+-                        return Some(conflict(handle.commit_seq));
++                        return Err(conflict(handle.commit_seq));
+                     }
+                     found = Some(("source_already_applied", None, Some(capsule.record_id.0)));
+                     break;
+@@ -643,24 +711,108 @@
+         }
+         found
+     };
+-    let (state, reason, record) = state?;
+-    let live = match read_live(handle) {
+-        Ok(value) => value,
+-        Err(reply) => return Some(reply),
+-    };
+-    Some(commit_common(
+-        engine,
+-        handle,
+-        (*live).clone(),
+-        &item.delivery_key,
+-        digest,
+-        Vec::new(),
+-        Vec::new(),
+-        None,
+-        item.output(state, reason, record),
+-        deadline,
+-        started,
+-    ))
++    Ok(state)
++}
++
++fn replay_item_digest(item: &ReplayItem) -> Result<String, String> {
++    canonical_digest(
++        &json!({"sequence":item.sequence,"receipt":item.receipt_digest,"source":item.source,"admitted":item.admitted,"observation":item.observation["payload_sha256"]}),
++    )
++}
++
++// This read-only path runs with the namespace lock after the page identity,
++// generation, and contiguous-cursor checks. No receipt or acknowledgement is
++// recorded when every item is already present or already durably fenced.
++fn public_replay_no_change(
++    mut handle: Option<&mut NamespaceHandle>,
++    page: &ReplayPage,
++    deadline: Deadline,
++    started: Instant,
++) -> Option<EngineReply> {
++    page.page_delivery_capsule.as_ref()?;
++    if let Some(handle) = handle.as_deref() {
++        if let Err(reply) = read_live(handle) {
++            return Some(reply);
++        }
++    }
++    let mut output = page.output();
++    for item in &page.items {
++        if remaining_deadline(deadline, started).remaining_ms == 0 {
++            return Some(EngineReply::new(
++                Outcome::Cancelled,
++                page.expected,
++                Value::Null,
++            ));
++        }
++        let state = if let Some(handle) = handle.as_deref_mut() {
++            if let Err(reply) = replay_sequence(handle, Some(item)) {
++                return Some(reply);
++            }
++            if item.blocked {
++                match handle.store.ensure_source_provenance_not_revoked(
++                    &SourceId(item.source.clone()),
++                    &Value::Null,
++                ) {
++                    Err(crate::store::StoreError::SourceRevoked) => {}
++                    Ok(()) => return None,
++                    Err(error) => return Some(store_reply(error, handle.commit_seq)),
++                }
++                for source in std::iter::once(&item.source).chain(item.legacy_source.iter()) {
++                    match handle.store.has_retained_source(&SourceId(source.clone())) {
++                        Ok(false) => {}
++                        Ok(true) => return None,
++                        Err(error) => return Some(store_reply(error, handle.commit_seq)),
++                    }
++                }
++            }
++            let request = if item.admitted {
++                match replacement_request(&item.observation, deadline) {
++                    Ok(request) => Some(request),
++                    Err(reason) => return Some(invalid(&reason, handle.commit_seq)),
++                }
++            } else {
++                None
++            };
++            let digest = match replay_item_digest(item) {
++                Ok(digest) => digest,
++                Err(reason) => return Some(invalid(&reason, handle.commit_seq)),
++            };
++            let retained = match lookup_item_replay(handle, item, request.as_ref(), &digest) {
++                Ok(Some(reply)) if reply.outcome == Outcome::Success => true,
++                Ok(Some(reply)) => return Some(reply),
++                Ok(None) => false,
++                Err(reply) => return Some(reply),
++            };
++            match classify_replay_item(handle, item, request.as_ref(), deadline, started) {
++                Ok(Some(state)) => state,
++                Ok(None) if retained => {
++                    return Some(EngineReply::new(
++                        Outcome::Corrupt,
++                        handle.commit_seq,
++                        Value::Null,
++                    ));
++                }
++                Ok(None) => return None,
++                Err(reply) => return Some(reply),
++            }
++        } else if !item.admitted && !item.blocked {
++            ("rejected", Some("current_disposition"), None)
++        } else {
++            return None;
++        };
++        if let Err(reply) = push_item(&mut output, item, state.0, state.1, state.2, page.expected) {
++            return Some(reply);
++        }
++    }
++    if remaining_deadline(deadline, started).remaining_ms == 0 {
++        return Some(EngineReply::new(
++            Outcome::Cancelled,
++            page.expected,
++            Value::Null,
++        ));
++    }
++    output["no_change"] = json!(true);
++    Some(EngineReply::new(Outcome::Success, page.expected, output))
+ }
+ 
+ fn replay_sequence(
+diff --git a/crates/tracedecay-memory-ncm-runtime/tests/common_portability.rs b/crates/tracedecay-memory-ncm-runtime/tests/common_portability.rs
+--- a/crates/tracedecay-memory-ncm-runtime/tests/common_portability.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/common_portability.rs
+@@ -365,6 +365,219 @@
+ }
+ 
+ #[test]
++fn public_fresh_pages_resolve_existing_sources_without_new_receipts_or_acknowledgements() {
++    let directory = TempDir::new().unwrap();
++    let live = engine(&directory);
++    let original = public_page(
++        "first-public",
++        "original-operation",
++        0,
++        0,
++        vec![item(1, "alpha", "original-internal")],
++    );
++    let applied = live.common_portability(&namespace(), original.clone(), DEADLINE);
++    assert_eq!(applied.outcome, Outcome::Success, "{applied:?}");
++    let original_receipt = worker_receipt("replay", &applied);
++    let generation = applied.state_generation;
++    let before = inspect(&live);
++    for (key, internal_key) in [
++        ("fresh-public-same-item", "original-internal"),
++        ("fresh-public-new-item", "different-internal"),
++    ] {
++        let resolved = live.common_portability(
++            &namespace(),
++            public_page(
++                key,
++                "fresh-operation",
++                generation,
++                1,
++                vec![item(1, "alpha", internal_key)],
++            ),
++            DEADLINE,
++        );
++        assert_eq!(resolved.outcome, Outcome::Success, "{resolved:?}");
++        assert_eq!(resolved.state_generation, generation);
++        assert_eq!(resolved.payload["no_change"], true);
++        assert_eq!(resolved.payload["sources_already_applied"], 1);
++        assert_eq!(resolved.payload["duplicate_observations"], 0);
++        assert_eq!(resolved.payload["applied_observations"], 0);
++        assert_eq!(resolved.payload["acknowledged_sequence"], 1);
++        assert_eq!(resolved.payload["state_generation_before"], generation);
++        assert_eq!(resolved.payload["state_generation_after"], generation);
++        assert_eq!(inspect(&live), before);
++        let receipt = receipt_inspection(&live, generation, key, None, 0, 16);
++        assert!(receipt["items"].as_array().unwrap().is_empty());
++    }
++    drop(live);
++    let reopened = engine(&directory);
++    let mut retry = original;
++    retry["expected_generation"] = json!(generation);
++    retry["page_delivery_capsule"] = delivery_capsule("retry-operation", "first-public");
++    let duplicate = reopened.common_portability(&namespace(), retry, DEADLINE);
++    assert_eq!(duplicate.outcome, Outcome::Success, "{duplicate:?}");
++    assert_eq!(duplicate.payload["replayed"], true);
++    assert_eq!(duplicate.state_generation, generation);
++    assert_eq!(worker_receipt("replay", &duplicate), original_receipt);
++    assert_eq!(
++        duplicate.payload["page_delivery_capsule"],
++        delivery_capsule("original-operation", "first-public")
++    );
++    let recovered = inspect(&reopened);
++    assert_eq!(recovered["commit_seq"], before["commit_seq"]);
++    assert_eq!(recovered["state_digest"], before["state_digest"]);
++    assert_eq!(
++        recovered["quota_usage"]["event_bytes"],
++        before["quota_usage"]["event_bytes"]
++    );
++}
++
++#[test]
++fn already_fenced_public_replay_after_restore_preserves_generation_and_cursor() {
++    for fresh in [false, true] {
++        let source_dir = TempDir::new().unwrap();
++        let source = engine(&source_dir);
++        let observed = source.observe(
++            &namespace(),
++            observation("erased-source", "first-observation"),
++        );
++        assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
++        let exported = snapshot::export(&source, &namespace(), DEADLINE)
++            .unwrap()
++            .into_vec();
++        let deleted = source.delete_by_source(
++            &namespace(),
++            &SourceId(digest("erased-source")),
++            &digest("first-deletion"),
++            DEADLINE,
++        );
++        assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
++        let destination_dir = TempDir::new().unwrap();
++        let (live, state_dir, expected) = if fresh {
++            drop(source);
++            (engine(&destination_dir), &destination_dir, 0)
++        } else {
++            (source, &source_dir, deleted.state_generation)
++        };
++        let snapshot_hash: String = Sha256::digest(&exported)
++            .iter()
++            .map(|byte| format!("{byte:02x}"))
++            .collect();
++        let restored = live.common_portability(&namespace(), json!({"action":"snapshot_restore",
++            "idempotency_key":digest("restored"),"expected_generation":expected,"bytes":exported,
++            "blocked_sources":[digest("erased-source")],"snapshot_id":format!("ncm-snapshot:{snapshot_hash}"),"observation_sequence":1}), DEADLINE);
++        assert_eq!(restored.outcome, Outcome::Success, "{restored:?}");
++        let generation = restored.state_generation;
++        let before = inspect(&live);
++        let mut blocked = item(1, "erased-source", "fresh-blocked-internal");
++        blocked["admitted"] = json!(false);
++        blocked["blocked"] = json!(true);
++        blocked["observation"] = Value::Null;
++        let request = public_page(
++            "no-change-fenced",
++            "no-change-operation",
++            generation,
++            0,
++            vec![blocked.clone()],
++        );
++        let rejected = live.common_portability(&namespace(), request.clone(), DEADLINE);
++        assert_eq!(rejected.outcome, Outcome::Success, "{rejected:?}");
++        assert_eq!(rejected.state_generation, generation);
++        assert_eq!(rejected.payload["no_change"], true);
++        assert_eq!(rejected.payload["rejected_observations"], 1);
++        assert_eq!(rejected.payload["applied_observations"], 0);
++        assert_eq!(rejected.payload["acknowledged_sequence"], 0);
++        assert_eq!(inspect(&live), before);
++        let receipt = receipt_inspection(&live, generation, "no-change-fenced", None, 0, 16);
++        assert!(receipt["items"].as_array().unwrap().is_empty());
++        let mut stale = request.clone();
++        stale["expected_generation"] = json!(generation + 1);
++        assert!(matches!(
++            live.common_portability(&namespace(), stale, DEADLINE)
++                .outcome,
++            Outcome::Rejected(_)
++        ));
++        let mut stale_cursor = request.clone();
++        stale_cursor["expected_previous_acknowledged_sequence"] = json!(1);
++        assert!(matches!(
++            live.common_portability(&namespace(), stale_cursor, DEADLINE)
++                .outcome,
++            Outcome::Rejected(_)
++        ));
++        // A no-effect page cannot create the missing acknowledgement for seq 2.
++        let successor = public_page(
++            "gapped-successor",
++            "gapped-operation",
++            generation,
++            0,
++            vec![item(2, "positive-source", "positive-internal")],
++        );
++        assert!(matches!(
++            live.common_portability(&namespace(), successor, DEADLINE)
++                .outcome,
++            Outcome::Rejected(_)
++        ));
++        let mut blocked_gap = blocked.clone();
++        blocked_gap["source_sequence"] = json!(2);
++        assert!(matches!(
++            live.common_portability(
++                &namespace(),
++                public_page(
++                    "blocked-gap",
++                    "blocked-gap-operation",
++                    generation,
++                    0,
++                    vec![blocked_gap]
++                ),
++                DEADLINE
++            )
++            .outcome,
++            Outcome::Rejected(_)
++        ));
++        assert_eq!(inspect(&live), before);
++        drop(live);
++        let reopened = engine(state_dir);
++        let rejected_again = reopened.common_portability(&namespace(), request, DEADLINE);
++        assert_eq!(
++            rejected_again.outcome,
++            Outcome::Success,
++            "{rejected_again:?}"
++        );
++        assert_eq!(rejected_again.state_generation, generation);
++        assert_eq!(rejected_again.payload["acknowledged_sequence"], 0);
++        let recovered = inspect(&reopened);
++        assert_eq!(recovered["commit_seq"], before["commit_seq"]);
++        assert_eq!(recovered["state_digest"], before["state_digest"]);
++        assert_eq!(
++            recovered["quota_usage"]["event_bytes"],
++            before["quota_usage"]["event_bytes"]
++        );
++        let forbidden = reopened.observe(
++            &namespace(),
++            observation("erased-source", "another-observation"),
++        );
++        assert!(matches!(forbidden.outcome, Outcome::Rejected(_)));
++        // A contiguous successor page still executes its actual positive effect.
++        let contiguous = reopened.common_portability(
++            &namespace(),
++            public_page(
++                "contiguous-successor",
++                "contiguous-operation",
++                generation,
++                0,
++                vec![blocked, item(2, "positive-source", "positive-internal")],
++            ),
++            DEADLINE,
++        );
++        assert_eq!(contiguous.outcome, Outcome::Success, "{contiguous:?}");
++        assert_eq!(contiguous.payload["rejected_observations"], 1);
++        assert_eq!(contiguous.payload["applied_observations"], 1);
++        assert_eq!(contiguous.payload["acknowledged_sequence"], 2);
++        assert!(contiguous.state_generation > generation);
++        assert_ne!(contiguous.payload["no_change"], true);
++    }
++}
++
++#[test]
+ fn public_replay_page_receipt_keeps_original_identity_hash_and_actual_stable_refs_after_restart() {
+     let directory = TempDir::new().unwrap();
+     let live = engine(&directory);
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/portability.rs b/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
+@@ -522,6 +522,14 @@
+     if worker["common_portability"] != call.operation.as_wire() {
+         return None;
+     }
++    let no_change = call.operation == ProviderOperation::Replay && worker["no_change"] == true;
++    let response_evidence = if no_change {
++        let payload = reply.payload.as_ref()?;
++        payload.validate().ok()?;
++        Some(payload.sha256.clone())
++    } else {
++        None
++    };
+     let mut output = if call.operation == ProviderOperation::SnapshotExport {
+         let bytes = byte_array(&worker["bytes"], limits.snapshot_bytes)?;
+         let inventory = snapshot_inventory(
+@@ -549,6 +557,7 @@
+         output.remove("replayed");
+         output.remove("_retained_receipt");
+         if call.operation == ProviderOperation::Replay {
++            output.remove("no_change");
+             let delivery =
+                 super::lifecycle::decode_receipt_capsule(&worker["page_delivery_capsule"])?;
+             fields(&delivery, &["operation_id", "idempotency_key"])?;
+@@ -591,6 +600,22 @@
+                 effect_unknown: worker["effect_unknown_observations"].as_u64()?,
+             };
+             accounting.validate().ok()?;
++            if no_change
++                && (reply.terminal.committed_effect().state() != crate::CommittedEffectState::None
++                    || reply.terminal.terminal_code() != TerminalCode::Success
++                    || reply.state_generation != call.expected_state_generation
++                    || worker["state_generation_before"].as_u64()? != reply.state_generation
++                    || worker["state_generation_after"].as_u64()? != reply.state_generation
++                    || worker["acknowledged_sequence"]
++                        != request["expected_previous_acknowledged_sequence"]
++                    || worker["partial"] != false
++                    || worker["replayed"] != false
++                    || accounting.applied != 0
++                    || accounting.delivery_duplicates != 0
++                    || accounting.effect_unknown != 0)
++            {
++                return None;
++            }
+             if worker["replayed"] == true {
+                 accounting.delivery_duplicates = accounting
+                     .delivery_duplicates
+@@ -617,6 +642,10 @@
+     if call.operation != ProviderOperation::SnapshotExport {
+         if let Some(receipt) = reply.terminal.committed_effect().provider_receipt_sha256() {
+             output["provider_receipt_digest"] = json!(receipt);
++        } else if let Some(response_evidence) = response_evidence {
++            // Required public response evidence hashes the actual validated worker
++            // payload. None effect carries no journal receipt or duplicate claim.
++            output["provider_receipt_digest"] = json!(response_evidence);
+         } else if reply.terminal.terminal_code() == TerminalCode::Success {
+             return None;
+         }
+@@ -826,6 +855,169 @@
+     }
+ 
+     #[test]
++    fn no_change_replay_preserves_validated_response_evidence_without_a_commit_receipt() {
++        use tracedecay_memory_provider_api::{
++            CancellationToken, CommittedEffectEvidence, FallbackDirective, OperationControl,
++            OwnedVersionedId, ProviderCallParts, TerminalRecord,
++        };
++        let (exact, _, _, _) = fixture();
++        let request = serde_json::to_vec(&json!({
++            "resolved_observations":[{}], "expected_previous_acknowledged_sequence":1
++        }))
++        .unwrap();
++        let call = ProviderCall::new(ProviderCallParts {
++            operation: ProviderOperation::Replay,
++            provider_id: OwnedProviderId::new(crate::NCM_PROVIDER_ID).unwrap(),
++            registration_revision: 1,
++            ready_receipt_sha256: "ab".repeat(32),
++            exact_scope: exact,
++            request_id: "no-change-request".to_owned(),
++            operation_id: "no-change-operation".to_owned(),
++            expected_state_generation: 2,
++            idempotency_key: Some("no-change-key".to_owned()),
++            control: OperationControl::new(i64::MAX, 60_000, CancellationToken::new()),
++            payload: CanonicalPayload::new(
++                OwnedVersionedId::new("tracedecay.memory.provider.replay.v1").unwrap(),
++                request.clone(),
++                hex_digest(&Sha256::digest(&request)),
++            )
++            .unwrap(),
++            required_capabilities: vec![OwnedVersionedId::new("replay.apply.v1").unwrap()],
++            extensions: Vec::new(),
++        })
++        .unwrap();
++        let limits = ProviderLimits {
++            request_bytes: 1_048_576,
++            response_bytes: 1_048_576,
++            observation_batch_items: 16,
++            recall_candidates: 32,
++            concurrent_operations: 4,
++            operation_millis: 60_000,
++            snapshot_bytes: 1_048_576,
++            inspection_items: 64,
++        };
++        let descriptor = ProviderDescriptor::new(
++            call.provider_id.clone(),
++            "ab".repeat(32),
++            "ncm-state-v1",
++            2,
++            [
++                "provider.health.v1",
++                "observation.accept.v1",
++                "recall.query.v1",
++                "replay.apply.v1",
++            ]
++            .into_iter()
++            .map(|id| OwnedVersionedId::new(id).unwrap()),
++            limits,
++        )
++        .unwrap();
++        let delivery = serde_json::to_vec(
++            &json!({"operation_id":call.operation_id,"idempotency_key":call.idempotency_key}),
++        )
++        .unwrap();
++        let worker = serde_json::to_vec(&json!({
++            "common_portability":"replay", "first_source_sequence":1,"last_source_sequence":1,
++            "acknowledged_sequence":1,"state_generation_before":2,"state_generation_after":2,
++            "applied_observations":0,"duplicate_observations":0,"sources_already_applied":1,
++            "rejected_observations":0,"effect_unknown_observations":0,"partial":false,"replayed":false,
++            "warnings":[],"no_change":true,"items":[{"source_sequence":1,"receipt_digest":"ab".repeat(32),
++                "state":"source_already_applied","reason":null,"record_id":1,"state_generation":2}],
++            "page_delivery_capsule":{"version":1,"bytes":delivery,"sha256":hex_digest(&Sha256::digest(&delivery))}
++        })).unwrap();
++        let response_digest = hex_digest(&Sha256::digest(&worker));
++        let incoming = ProviderReply {
++            terminal: TerminalRecord::new(
++                call.operation,
++                call.provider_id.clone(),
++                TerminalCode::Success,
++                CommittedEffectEvidence::none(Some(2)),
++                FallbackDirective::forbidden(),
++                call.operation_id.clone(),
++                call.exact_scope.exact_scope_sha256(),
++                None,
++            )
++            .unwrap(),
++            payload: Some(
++                CanonicalPayload::new(
++                    call.payload.contract_id.clone(),
++                    worker,
++                    response_digest.clone(),
++                )
++                .unwrap(),
++            ),
++            warnings: Vec::new(),
++            extensions: Vec::new(),
++            state_generation: 2,
++        };
++        let mut reply = incoming.clone();
++        reconstruct(&call, &mut reply, &descriptor, limits).unwrap();
++        reply.validate(limits.response_bytes).unwrap();
++        let output: Value = serde_json::from_slice(&reply.payload.as_ref().unwrap().bytes).unwrap();
++        fields(
++            &output,
++            &[
++                "first_source_sequence",
++                "last_source_sequence",
++                "acknowledged_sequence",
++                "state_generation_before",
++                "state_generation_after",
++                "applied_observations",
++                "duplicate_observations",
++                "sources_already_applied",
++                "rejected_observations",
++                "effect_unknown_observations",
++                "partial",
++                "warnings",
++                "items",
++                "provider_receipt_digest",
++            ],
++        )
++        .unwrap();
++        assert_eq!(output["provider_receipt_digest"], response_digest);
++        assert_eq!(output["state_generation_before"], 2);
++        assert_eq!(output["state_generation_after"], 2);
++        assert_eq!(output["sources_already_applied"], 1);
++        assert_eq!(
++            reply.terminal.committed_effect().state(),
++            crate::CommittedEffectState::None
++        );
++        assert!(
++            reply
++                .terminal
++                .committed_effect()
++                .provider_receipt_sha256()
++                .is_none()
++        );
++        assert!(
++            reply
++                .terminal
++                .committed_effect()
++                .verification_sha256()
++                .is_none()
++        );
++        assert!(
++            reply
++                .terminal
++                .committed_effect()
++                .duplicate_of_operation_id()
++                .is_none()
++        );
++        for malformed in ["missing", "digest", "bytes"] {
++            let mut invalid = incoming.clone();
++            match malformed {
++                "missing" => invalid.payload = None,
++                "digest" => invalid.payload.as_mut().unwrap().sha256 = "f".repeat(64),
++                _ => invalid.payload.as_mut().unwrap().bytes.push(b' '),
++            }
++            assert!(
++                reconstruct(&call, &mut invalid, &descriptor, limits).is_none(),
++                "accepted {malformed}"
++            );
++        }
++    }
++
++    #[test]
+     fn inventory_requires_unique_actual_sources_and_exact_declared_identities() {
+         let (exact, namespace, mut snapshot, _) = fixture();
+         let actual =
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs b/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs
+@@ -56,6 +56,14 @@
+     if response.get("page_delivery_capsule").is_some() {
+         response_fields.push("page_delivery_capsule");
+     }
++    let no_change = match response.get("no_change") {
++        None => false,
++        Some(Value::Bool(true)) => {
++            response_fields.push("no_change");
++            true
++        }
++        Some(_) => return None,
++    };
+     fields(response, &response_fields)?;
+     if request["action"] != "replay" || response["common_portability"] != "replay" {
+         return None;
+@@ -182,7 +190,26 @@
+             return None;
+         }
+     }
++    if no_change && effect != crate::CommittedEffectState::None {
++        return None;
++    }
+     match effect {
++        crate::CommittedEffectState::None => {
++            if !no_change
++                || response.get("page_delivery_capsule").is_none()
++                || partial
++                || replayed
++                || counts[0] != 0
++                || counts[1] != 0
++                || counts[4] != 0
++                || acknowledged != previous
++                || before != after
++                || stored_before != stored_after
++                || terminal != TerminalCode::Success
++            {
++                return None;
++            }
++        }
+         crate::CommittedEffectState::Partial => {
+             if !partial
+                 || counts[4] > 0
+@@ -212,7 +239,6 @@
+                 return None;
+             }
+         }
+-        _ => return None,
+     }
+     Some(())
+ }
+@@ -257,6 +283,97 @@
+         response["items"][1]["record_id"] = json!(2);
+         response["items"][1]["state_generation"] = json!(2);
+         (request, response)
++    }
++
++    #[test]
++    fn public_no_change_replay_requires_unchanged_generation_and_acknowledgement() {
++        let (mut request, mut response) = completed_page();
++        request["expected_previous_acknowledged_sequence"] = json!(2);
++        response["state_generation_before"] = json!(3);
++        response["applied_observations"] = json!(0);
++        response["sources_already_applied"] = json!(2);
++        response["no_change"] = json!(true);
++        for row in response["items"].as_array_mut().unwrap() {
++            row["state"] = json!("source_already_applied");
++        }
++        assert!(
++            validate(
++                &request,
++                &response,
++                3,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::None
++            )
++            .is_some()
++        );
++        assert!(
++            validate(
++                &request,
++                &response,
++                3,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Committed
++            )
++            .is_none()
++        );
++        for changed in [
++            "missing_marker",
++            "false_marker",
++            "generation",
++            "acknowledgement",
++            "partial",
++            "replayed",
++            "applied",
++            "duplicate",
++            "legacy",
++        ] {
++            let mut request = request.clone();
++            let mut response = response.clone();
++            match changed {
++                "missing_marker" => {
++                    response.as_object_mut().unwrap().remove("no_change");
++                }
++                "false_marker" => response["no_change"] = json!(false),
++                "generation" => response["state_generation_after"] = json!(4),
++                "acknowledgement" => request["expected_previous_acknowledged_sequence"] = json!(1),
++                "partial" => response["partial"] = json!(true),
++                "replayed" => response["replayed"] = json!(true),
++                "applied" => {
++                    response["sources_already_applied"] = json!(1);
++                    response["applied_observations"] = json!(1);
++                    response["items"][0]["state"] = json!("applied");
++                }
++                "duplicate" => {
++                    response["sources_already_applied"] = json!(1);
++                    response["duplicate_observations"] = json!(1);
++                    response["items"][0]["state"] = json!("delivery_duplicate");
++                }
++                _ => {
++                    request
++                        .as_object_mut()
++                        .unwrap()
++                        .remove("page_delivery_capsule");
++                    response
++                        .as_object_mut()
++                        .unwrap()
++                        .remove("page_delivery_capsule");
++                }
++            }
++            assert!(
++                validate(
++                    &request,
++                    &response,
++                    3,
++                    3,
++                    TerminalCode::Success,
++                    crate::CommittedEffectState::None
++                )
++                .is_none(),
++                "accepted {changed}"
++            );
++        }
+     }
+ 
+     #[test]
+diff --git a/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs b/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
+--- a/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
+@@ -932,8 +932,24 @@
+             TerminalCode::Success,
+             "{next_page:?}"
+         );
+-        assert_eq!(response_json(&next_page)["duplicate_observations"], 1);
++        assert_eq!(response_json(&next_page)["sources_already_applied"], 1);
++        assert_eq!(response_json(&next_page)["duplicate_observations"], 0);
+         assert_eq!(response_json(&next_page)["applied_observations"], 0);
++        assert_eq!(response_json(&next_page)["acknowledged_sequence"], 1);
++        assert_eq!(next_page.state_generation, duplicate.state_generation);
++        let effect = next_page.terminal.committed_effect();
++        assert_eq!(effect.state(), CommittedEffectState::None);
++        assert!(effect.provider_receipt_sha256().is_none());
++        assert!(effect.verification_sha256().is_none());
++        assert!(effect.duplicate_of_operation_id().is_none());
++        assert!(effect.duplicate_of_idempotency_key().is_none());
++        let public = response_json(&next_page);
++        assert!(public.get("no_change").is_none());
++        assert!(public.get("page_delivery_capsule").is_none());
++        assert_eq!(
++            public["provider_receipt_digest"].as_str().unwrap().len(),
++            64
++        );
+         body["resolved_observations"][0]["observation"]["canonical_payload"]["facts"][0]["content"] =
+             json!("Changed source content under the same delivery key.");
+         body["expected_previous_acknowledged_sequence"] = json!(0);

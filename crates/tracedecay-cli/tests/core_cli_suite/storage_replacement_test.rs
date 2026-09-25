@@ -6,12 +6,13 @@
 //! payloads, and checkout workflow/Git bytes before a fresh runtime can reopen
 //! the published profile.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_domain::ProjectId;
@@ -64,10 +65,93 @@ fn replacement_command(fixture: &ReplacementFixture, backup_id: &str) -> Command
     command
 }
 
+#[cfg(target_os = "macos")]
+fn isolated_stopped_service_path(fixture: &ReplacementFixture) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fake_bin = fixture.home.join("test-bin");
+    fs::create_dir_all(&fake_bin).expect("create isolated service program directory");
+    let launchctl = fake_bin.join("launchctl");
+    fs::write(
+        &launchctl,
+        "#!/bin/sh\nprintf '\"com.tracedecay.daemon\" => true\\n'\n",
+    )
+    .expect("write isolated launchctl probe");
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755))
+        .expect("make isolated launchctl executable");
+
+    let service_dir = fixture.home.join("Library/LaunchAgents");
+    fs::create_dir_all(&service_dir).expect("create isolated launchd service directory");
+    let socket = fixture.profile.join("daemon.sock");
+    let plist = format!(
+        "<plist><dict>\n\
+         <key>Label</key><string>com.tracedecay.daemon</string>\n\
+         <key>ProgramArguments</key><array>\n\
+         <string>{}</string><string>daemon</string><string>run</string>\n\
+         <string>--socket</string><string>{}</string>\n\
+         </array>\n\
+         <key>EnvironmentVariables</key><dict>\n\
+         <key>TRACEDECAY_DATA_DIR</key><string>{}</string>\n\
+         <key>TRACEDECAY_GLOBAL_DB</key><string>{}</string>\n\
+         </dict></dict></plist>\n",
+        env!("CARGO_BIN_EXE_tracedecay"),
+        socket.display(),
+        fixture.profile.display(),
+        fixture.profile.join("global.db").display(),
+    );
+    fs::write(service_dir.join("com.tracedecay.daemon.plist"), plist)
+        .expect("write isolated stopped service unit");
+
+    let mut search_path = vec![fake_bin];
+    if let Some(existing) = std::env::var_os("PATH") {
+        search_path.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(search_path).expect("compose isolated service PATH")
+}
+
 fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut snapshot = BTreeMap::new();
     snapshot_tree_into(root, Path::new(""), &mut snapshot);
     snapshot
+}
+
+fn assert_tree_snapshot(root: &Path, expected: &BTreeMap<String, Vec<u8>>, message: &str) {
+    let actual = snapshot_tree(root);
+    if &actual == expected {
+        return;
+    }
+
+    let keys = actual
+        .keys()
+        .chain(expected.keys())
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let differences = keys
+        .into_iter()
+        .filter_map(|key| match (expected.get(key), actual.get(key)) {
+            (None, Some(bytes)) => Some(format!(
+                "added {key} ({} bytes, sha256 {})",
+                bytes.len(),
+                hex::encode(Sha256::digest(bytes))
+            )),
+            (Some(bytes), None) => Some(format!(
+                "removed {key} ({} bytes, sha256 {})",
+                bytes.len(),
+                hex::encode(Sha256::digest(bytes))
+            )),
+            (Some(expected_bytes), Some(actual_bytes)) if expected_bytes != actual_bytes => {
+                Some(format!(
+                    "changed {key} (expected {} bytes sha256 {}; actual {} bytes sha256 {})",
+                    expected_bytes.len(),
+                    hex::encode(Sha256::digest(expected_bytes)),
+                    actual_bytes.len(),
+                    hex::encode(Sha256::digest(actual_bytes))
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    panic!("{message}:\n{}", differences.join("\n"));
 }
 
 fn snapshot_tree_into(root: &Path, relative: &Path, snapshot: &mut BTreeMap<String, Vec<u8>>) {
@@ -155,11 +239,11 @@ fn make_git_project(project: &Path) {
 
 fn fixture_profile() -> ReplacementFixture {
     let temp = TempDir::new().expect("create replacement fixture");
-    let home = canonical_existing_path(temp.path().join("home"));
+    let home = canonical_existing_path(&temp.path().join("home"));
     fs::create_dir_all(&home).expect("create fixture home");
-    let profile = canonical_existing_path(home.join(".tracedecay"));
-    let project = canonical_existing_path(temp.path().join("project"));
-    let backup_parent = canonical_existing_path(temp.path().join("external-backups"));
+    let profile = canonical_existing_path(&home.join(".tracedecay"));
+    let project = canonical_existing_path(&temp.path().join("project"));
+    let backup_parent = canonical_existing_path(&temp.path().join("external-backups"));
     make_git_project(&project);
     let project_id = default_profile_project_id(&project);
 
@@ -230,6 +314,11 @@ fn fixture_profile() -> ReplacementFixture {
             .profile_memory()
             .await
             .expect("open profile memory authority");
+        runtime
+            .session_registry_for_test()
+            .shutdown_terminal_tasks()
+            .await
+            .expect("join replacement fixture background tasks");
         runtime
             .checkpoint_session_database_for_test(HostAdmissionScope::Profile)
             .await
@@ -332,6 +421,56 @@ fn replacement_dry_run_is_truthful_and_zero_write() {
         snapshot_tree(fixture._temp.path()),
         before,
         "dry-run must not write"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn installed_service_makes_plan_infeasible_and_apply_is_zero_write() {
+    let fixture = fixture_profile();
+    let isolated_path = isolated_stopped_service_path(&fixture);
+    let before = snapshot_tree(fixture._temp.path());
+
+    let plan_output = replacement_command(&fixture, "installed-service-plan")
+        .env("PATH", &isolated_path)
+        .env_remove(tracedecay_daemon_control::SERVICE_NAMESPACE_ENV)
+        .args(["--dry-run", "--json"])
+        .output()
+        .expect("run replacement plan with isolated installed service");
+    assert!(
+        plan_output.status.success(),
+        "dry-run failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&plan_output.stdout),
+        String::from_utf8_lossy(&plan_output.stderr)
+    );
+    let plan: serde_json::Value =
+        serde_json::from_slice(&plan_output.stdout).expect("dry-run JSON");
+    assert_eq!(plan["service_present"], true);
+    assert_eq!(plan["service_handoff_ready"], false);
+    assert!(plan["apply_feasibility"].as_str().is_some_and(|text| {
+        text.contains("cannot prove or perform an atomic V1-to-V2 service handoff")
+    }));
+    assert_tree_snapshot(
+        fixture._temp.path(),
+        &before,
+        "installed-service plan must be byte-exact read-only",
+    );
+
+    let apply_output = replacement_command(&fixture, "installed-service-apply")
+        .env("PATH", isolated_path)
+        .env_remove(tracedecay_daemon_control::SERVICE_NAMESPACE_ENV)
+        .args(["--yes", "--json"])
+        .output()
+        .expect("run replacement apply with isolated installed service");
+    assert!(!apply_output.status.success());
+    assert!(
+        String::from_utf8_lossy(&apply_output.stderr)
+            .contains("cannot prove or perform an atomic V1-to-V2 service handoff")
+    );
+    assert_tree_snapshot(
+        fixture._temp.path(),
+        &before,
+        "installed-service refusal must precede every profile and backup mutation",
     );
 }
 

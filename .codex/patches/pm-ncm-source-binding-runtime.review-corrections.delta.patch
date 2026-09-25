@@ -1,0 +1,485 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
+@@ -181,10 +181,11 @@
+             Ok(live) => live,
+             Err(reply) => return reply,
+         };
+-        let (target, mut provenance) = match resolve_target(namespace, handle, &payload["target"]) {
+-            Ok(found) => found,
+-            Err(reply) => return reply,
+-        };
++        let (target, mut provenance) =
++            match resolve_target(namespace, handle, &payload["target"], deadline, started) {
++                Ok(found) => found,
++                Err(reply) => return reply,
++            };
+         if let Err(error) = handle
+             .store
+             .ensure_source_provenance_not_revoked(&target.source_id, &provenance)
+@@ -491,6 +492,8 @@
+     namespace: &str,
+     handle: &NamespaceHandle,
+     target: &Value,
++    deadline: Deadline,
++    started: Instant,
+ ) -> Result<(StoredCapsule, Value), EngineReply> {
+     let stable = target["stable_memory_ref"]
+         .as_str()
+@@ -499,55 +502,88 @@
+         .as_str()
+         .or_else(|| target["source"].as_str())
+         .ok_or_else(|| invalid("missing source target", handle.commit_seq))?;
+-    let capsules = handle
+-        .store
+-        .capsule_page(Some(filter), 0, 1_000_001)
+-        .map_err(|error| store_reply(error, handle.commit_seq))?;
+-    if capsules.len() > 1_000_000 {
+-        return Err(EngineReply::new(
+-            Outcome::BudgetExceeded,
+-            handle.commit_seq,
+-            Value::Null,
+-        ));
+-    }
+-    for capsule in capsules {
+-        if (target["source"].as_str() != Some(&capsule.source_id.0)
+-            && target["legacy_source"].as_str() != Some(&capsule.source_id.0))
+-            || capsule.status == CapsuleStatus::Revoked
+-        {
+-            continue;
+-        }
+-        let provenance: Value = serde_json::from_str(&capsule.provenance)
+-            .map_err(|error| invalid(&error.to_string(), handle.commit_seq))?;
+-        let Some(digest) = provenance
+-            .pointer("/common_capsule/sha256")
+-            .and_then(Value::as_str)
+-        else {
+-            continue;
+-        };
+-        if stable_reference(namespace, capsule.record_id.0, digest) != stable {
+-            continue;
+-        }
+-        if target["source_identity_sha256"] != provenance["selection"]["source_identity_sha256"] {
+-            return Err(invalid("source target binding differs", handle.commit_seq));
+-        }
+-        if let Some(binding) =
+-            crate::source_binding::read(namespace, &capsule.source_id, &provenance)
+-                .map_err(|reason| invalid(&reason, handle.commit_seq))?
+-        {
+-            if binding
+-                .full_source_id
+-                .as_ref()
+-                .map(|source| source.0.as_str())
+-                != target["source"].as_str()
+-                || Some(binding.legacy_source_id.0.as_str()) != target["legacy_source"].as_str()
++    let mut after = 0;
++    let mut scanned = 0_u64;
++    loop {
++        if remaining_deadline(deadline, started).remaining_ms == 0 {
++            return Err(EngineReply::new(
++                Outcome::Cancelled,
++                handle.commit_seq,
++                Value::Null,
++            ));
++        }
++        let limit = 128_u64.min(1_000_000_u64.saturating_sub(scanned).saturating_add(1));
++        let capsules = handle
++            .store
++            .capsule_page(Some(filter), after, limit)
++            .map_err(|error| store_reply(error, handle.commit_seq))?;
++        let complete = capsules.len() < limit as usize;
++        for capsule in capsules {
++            if remaining_deadline(deadline, started).remaining_ms == 0 {
++                return Err(EngineReply::new(
++                    Outcome::Cancelled,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            if scanned == 1_000_000 {
++                return Err(EngineReply::new(
++                    Outcome::BudgetExceeded,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            if capsule.record_id.0 <= after {
++                return Err(EngineReply::new(
++                    Outcome::Corrupt,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            after = capsule.record_id.0;
++            scanned += 1;
++            if (target["source"].as_str() != Some(&capsule.source_id.0)
++                && target["legacy_source"].as_str() != Some(&capsule.source_id.0))
++                || capsule.status == CapsuleStatus::Revoked
+             {
+-                return Err(invalid("source target aliases differ", handle.commit_seq));
+-            }
+-        }
+-        return Ok((capsule, provenance));
+-    }
+-    Err(invalid("stable target is unknown", handle.commit_seq))
++                continue;
++            }
++            let provenance: Value = serde_json::from_str(&capsule.provenance)
++                .map_err(|error| invalid(&error.to_string(), handle.commit_seq))?;
++            let Some(digest) = provenance
++                .pointer("/common_capsule/sha256")
++                .and_then(Value::as_str)
++            else {
++                continue;
++            };
++            if stable_reference(namespace, capsule.record_id.0, digest) != stable {
++                continue;
++            }
++            if target["source_identity_sha256"] != provenance["selection"]["source_identity_sha256"]
++            {
++                return Err(invalid("source target binding differs", handle.commit_seq));
++            }
++            let binding = crate::source_binding::read(namespace, &capsule.source_id, &provenance)
++                .map_err(|reason| invalid(&reason, handle.commit_seq))?;
++            if target.get("legacy_source").is_some()
++                && let Some(binding) = binding
++            {
++                if binding
++                    .full_source_id
++                    .as_ref()
++                    .map(|source| source.0.as_str())
++                    != target["source"].as_str()
++                    || Some(binding.legacy_source_id.0.as_str()) != target["legacy_source"].as_str()
++                {
++                    return Err(invalid("source target aliases differ", handle.commit_seq));
++                }
++            }
++            return Ok((capsule, provenance));
++        }
++        if complete {
++            return Err(invalid("stable target is unknown", handle.commit_seq));
++        }
++    }
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/observe.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/observe.rs
+@@ -75,7 +75,7 @@
+             {
+                 return store_reply(error, handle.commit_seq);
+             }
+-            if let Err(reply) = reject_reused_source(handle, &request) {
++            if let Err(reply) = reject_reused_source(handle, &request, started) {
+                 return reply;
+             }
+         }
+@@ -125,7 +125,7 @@
+         {
+             return store_reply(error, handle.commit_seq);
+         }
+-        if let Err(reply) = reject_reused_source(handle, &request) {
++        if let Err(reply) = reject_reused_source(handle, &request, started) {
+             return reply;
+         }
+         let live = match read_live(handle) {
+@@ -289,6 +289,7 @@
+ fn reject_reused_source(
+     handle: &NamespaceHandle,
+     request: &ObserveRequest,
++    started: Instant,
+ ) -> Result<(), EngineReply> {
+     let Some(identity) = request
+         .provenance
+@@ -308,50 +309,84 @@
+     let filter = binding
+         .as_ref()
+         .map_or(&request.source, |binding| &binding.legacy_source_id);
+-    let capsules = handle
+-        .store
+-        .capsule_page(Some(&filter.0), 0, 1_000_001)
+-        .map_err(|error| store_reply(error, handle.commit_seq))?;
+-    if capsules.len() > 1_000_000 {
+-        return Err(EngineReply::new(
+-            Outcome::BudgetExceeded,
+-            handle.commit_seq,
+-            Value::Null,
+-        ));
++    let mut after = 0;
++    let mut scanned = 0_u64;
++    loop {
++        if remaining_deadline(request.deadline, started).remaining_ms == 0 {
++            return Err(EngineReply::new(
++                Outcome::Cancelled,
++                handle.commit_seq,
++                Value::Null,
++            ));
++        }
++        let limit = 128_u64.min(1_000_000_u64.saturating_sub(scanned).saturating_add(1));
++        let capsules = handle
++            .store
++            .capsule_page(Some(&filter.0), after, limit)
++            .map_err(|error| store_reply(error, handle.commit_seq))?;
++        let complete = capsules.len() < limit as usize;
++        for capsule in capsules {
++            if remaining_deadline(request.deadline, started).remaining_ms == 0 {
++                return Err(EngineReply::new(
++                    Outcome::Cancelled,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            if scanned == 1_000_000 {
++                return Err(EngineReply::new(
++                    Outcome::BudgetExceeded,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            if capsule.record_id.0 <= after {
++                return Err(EngineReply::new(
++                    Outcome::Corrupt,
++                    handle.commit_seq,
++                    Value::Null,
++                ));
++            }
++            after = capsule.record_id.0;
++            scanned += 1;
++            let provenance: Value = serde_json::from_str(&capsule.provenance)
++                .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
++            let retained = crate::source_binding::read(
++                handle.store.namespace(),
++                &capsule.source_id,
++                &provenance,
++            )
++            .map_err(|reason| {
++                EngineReply::new(
++                    Outcome::Corrupt,
++                    handle.commit_seq,
++                    json!({"reason":reason}),
++                )
++            })?;
++            if binding.as_ref().is_some_and(|request| {
++                !request.is_legacy
++                    && retained
++                        .as_ref()
++                        .and_then(|binding| binding.full_source_id.as_ref())
++                        != request.full_source_id.as_ref()
++            }) {
++                continue;
++            }
++            if provenance
++                .pointer("/selection/observation_identity")
++                .and_then(Value::as_str)
++                == Some(identity)
++            {
++                return Err(EngineReply::rejected(
++                    RejectReason::IdempotencyConflict,
++                    handle.commit_seq,
++                ));
++            }
++        }
++        if complete {
++            return Ok(());
++        }
+     }
+-    for capsule in capsules {
+-        let provenance: Value = serde_json::from_str(&capsule.provenance)
+-            .map_err(|_| EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null))?;
+-        let retained =
+-            crate::source_binding::read(handle.store.namespace(), &capsule.source_id, &provenance)
+-                .map_err(|reason| {
+-                    EngineReply::new(
+-                        Outcome::Corrupt,
+-                        handle.commit_seq,
+-                        json!({"reason":reason}),
+-                    )
+-                })?;
+-        if binding.as_ref().is_some_and(|request| {
+-            !request.is_legacy
+-                && retained
+-                    .as_ref()
+-                    .and_then(|binding| binding.full_source_id.as_ref())
+-                    != request.full_source_id.as_ref()
+-        }) {
+-            continue;
+-        }
+-        if provenance
+-            .pointer("/selection/observation_identity")
+-            .and_then(Value::as_str)
+-            == Some(identity)
+-        {
+-            return Err(EngineReply::rejected(
+-                RejectReason::IdempotencyConflict,
+-                handle.commit_seq,
+-            ));
+-        }
+-    }
+-    Ok(())
+ }
+ 
+ /// Upgraded common requests can reconcile only the exact retained legacy body.
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
+@@ -537,74 +537,107 @@
+         let filter = binding
+             .as_ref()
+             .map_or(&request.source, |binding| &binding.legacy_source_id);
+-        let capsules = match handle.store.capsule_page(Some(&filter.0), 0, 1_000_001) {
+-            Ok(value) if value.len() <= 1_000_000 => value,
+-            Ok(_) => {
++        let mut after = 0;
++        let mut scanned = 0_u64;
++        let mut found = None;
++        loop {
++            if remaining_deadline(deadline, started).remaining_ms == 0 {
+                 return Some(EngineReply::new(
+-                    Outcome::BudgetExceeded,
++                    Outcome::Cancelled,
+                     handle.commit_seq,
+                     Value::Null,
+                 ));
+             }
+-            Err(error) => return Some(store_reply(error, handle.commit_seq)),
+-        };
+-        let mut found = None;
+-        for capsule in capsules {
+-            if capsule.status == CapsuleStatus::Revoked {
+-                continue;
+-            }
+-            let provenance: Value = match serde_json::from_str(&capsule.provenance) {
++            let limit = 128_u64.min(1_000_000_u64.saturating_sub(scanned).saturating_add(1));
++            let capsules = match handle.store.capsule_page(Some(&filter.0), after, limit) {
+                 Ok(value) => value,
+-                Err(_) => {
++                Err(error) => return Some(store_reply(error, handle.commit_seq)),
++            };
++            let complete = capsules.len() < limit as usize;
++            for capsule in capsules {
++                if remaining_deadline(deadline, started).remaining_ms == 0 {
++                    return Some(EngineReply::new(
++                        Outcome::Cancelled,
++                        handle.commit_seq,
++                        Value::Null,
++                    ));
++                }
++                if scanned == 1_000_000 {
++                    return Some(EngineReply::new(
++                        Outcome::BudgetExceeded,
++                        handle.commit_seq,
++                        Value::Null,
++                    ));
++                }
++                if capsule.record_id.0 <= after {
+                     return Some(EngineReply::new(
+                         Outcome::Corrupt,
+                         handle.commit_seq,
+                         Value::Null,
+                     ));
+                 }
+-            };
+-            let retained_binding = match crate::source_binding::read(
+-                handle.store.namespace(),
+-                &capsule.source_id,
+-                &provenance,
+-            ) {
+-                Ok(binding) => binding,
+-                Err(reason) => {
+-                    return Some(EngineReply::new(
+-                        Outcome::Corrupt,
+-                        handle.commit_seq,
+-                        json!({"reason":reason}),
+-                    ));
+-                }
+-            };
+-            if binding.as_ref().is_some_and(|request| {
+-                !request.is_legacy
+-                    && retained_binding
+-                        .as_ref()
+-                        .and_then(|binding| binding.full_source_id.as_ref())
+-                        != request.full_source_id.as_ref()
+-            }) {
+-                continue;
+-            }
+-            let original = &request.provenance["selection"];
+-            if provenance["selection"]["observation_identity"] == original["observation_identity"]
+-                && provenance["selection"]["revision_digest"] == original["revision_digest"]
+-            {
+-                let same_source = capsule.source_id == request.source
+-                    || binding.as_ref().is_some_and(|request| {
+-                        !request.is_legacy
+-                            && retained_binding.as_ref().is_some_and(|retained| {
+-                                retained.is_legacy
+-                                    && retained.full_source_id == request.full_source_id
+-                            })
+-                    });
+-                if !same_source
+-                    || provenance["common_capsule"]["sha256"]
+-                        != request.provenance["common_capsule"]["sha256"]
++                after = capsule.record_id.0;
++                scanned += 1;
++                if capsule.status == CapsuleStatus::Revoked {
++                    continue;
++                }
++                let provenance: Value = match serde_json::from_str(&capsule.provenance) {
++                    Ok(value) => value,
++                    Err(_) => {
++                        return Some(EngineReply::new(
++                            Outcome::Corrupt,
++                            handle.commit_seq,
++                            Value::Null,
++                        ));
++                    }
++                };
++                let retained_binding = match crate::source_binding::read(
++                    handle.store.namespace(),
++                    &capsule.source_id,
++                    &provenance,
++                ) {
++                    Ok(binding) => binding,
++                    Err(reason) => {
++                        return Some(EngineReply::new(
++                            Outcome::Corrupt,
++                            handle.commit_seq,
++                            json!({"reason":reason}),
++                        ));
++                    }
++                };
++                if binding.as_ref().is_some_and(|request| {
++                    !request.is_legacy
++                        && retained_binding
++                            .as_ref()
++                            .and_then(|binding| binding.full_source_id.as_ref())
++                            != request.full_source_id.as_ref()
++                }) {
++                    continue;
++                }
++                let original = &request.provenance["selection"];
++                if provenance["selection"]["observation_identity"]
++                    == original["observation_identity"]
++                    && provenance["selection"]["revision_digest"] == original["revision_digest"]
+                 {
+-                    return Some(conflict(handle.commit_seq));
+-                }
+-                found = Some(("source_already_applied", None, Some(capsule.record_id.0)));
++                    let same_source = capsule.source_id == request.source
++                        || binding.as_ref().is_some_and(|request| {
++                            !request.is_legacy
++                                && retained_binding.as_ref().is_some_and(|retained| {
++                                    retained.is_legacy
++                                        && retained.full_source_id == request.full_source_id
++                                })
++                        });
++                    if !same_source
++                        || provenance["common_capsule"]["sha256"]
++                            != request.provenance["common_capsule"]["sha256"]
++                    {
++                        return Some(conflict(handle.commit_seq));
++                    }
++                    found = Some(("source_already_applied", None, Some(capsule.record_id.0)));
++                    break;
++                }
++            }
++            if found.is_some() || complete {
+                 break;
+             }
+         }

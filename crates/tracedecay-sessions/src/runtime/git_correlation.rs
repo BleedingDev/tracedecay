@@ -12,6 +12,9 @@ use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
     CanonicalGitEvidenceKindV1, CanonicalObservationEnvelopeV1, CanonicalObservationFactV1,
 };
+use tracedecay_lcm::schema::{
+    SESSION_SCHEMA_MIGRATIONS_TABLE_DDL, SESSION_SCHEMA_MIGRATIONS_TABLE_DEFINITION,
+};
 use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, Value, params};
 
 use super::SessionMessageRecord;
@@ -230,7 +233,6 @@ const GIT_CORRELATION_FINAL_TABLE_COLUMNS: &[(
 
 const GIT_CORRELATION_FINAL_INDEX_SQL: &str = "CREATE INDEX idx_git_evidence_publication_outbox_pending ON git_evidence_publication_outbox(created_at, receipt_id)";
 const GIT_CORRELATION_FINAL_TRIGGER_SQL: &str = "CREATE TRIGGER git_evidence_publication_outbox_immutable BEFORE UPDATE ON git_evidence_publication_outbox BEGIN SELECT RAISE(ABORT, 'Git evidence publication receipt is immutable'); END";
-const SESSION_SCHEMA_MIGRATIONS_SCHEMA_SQL: &str = "CREATE TABLE session_schema_migrations (name TEXT PRIMARY KEY, version INTEGER NOT NULL, applied_at INTEGER NOT NULL DEFAULT (unixepoch()))";
 const GIT_CORRELATION_META_SCHEMA_SQL: &str = "CREATE TABLE git_correlation_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL, updated_at INTEGER NOT NULL DEFAULT (unixepoch()))";
 const GIT_EVIDENCE_PUBLICATION_OUTBOX_SCHEMA_SQL: &str = "CREATE TABLE git_evidence_publication_outbox (receipt_id TEXT PRIMARY KEY CHECK(length(receipt_id) > 0), publication_prefix TEXT NOT NULL CHECK(length(publication_prefix) > 0), evidence_json TEXT NOT NULL CHECK(length(evidence_json) > 0), created_at INTEGER NOT NULL DEFAULT (unixepoch()))";
 const SESSION_SCHEMA_MIGRATION_NAMES: [&str; 3] = ["git_correlation", "lcm", "workflow_indexing"];
@@ -1138,32 +1140,14 @@ pub async fn ensure_git_correlation_receipt_schema_in_transaction(
         GitCorrelationSchemaAdmission::Fresh => {}
     }
 
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_schema_migrations (
-            name TEXT PRIMARY KEY,
-            version INTEGER NOT NULL,
-            applied_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        CREATE TABLE IF NOT EXISTS git_correlation_meta (
-            key TEXT PRIMARY KEY,
-            value INTEGER NOT NULL,
-            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        CREATE TABLE IF NOT EXISTS git_evidence_publication_outbox (
-            receipt_id TEXT PRIMARY KEY CHECK(length(receipt_id) > 0),
-            publication_prefix TEXT NOT NULL CHECK(length(publication_prefix) > 0),
-            evidence_json TEXT NOT NULL CHECK(length(evidence_json) > 0),
-            created_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        CREATE INDEX IF NOT EXISTS idx_git_evidence_publication_outbox_pending
-            ON git_evidence_publication_outbox(created_at, receipt_id);
-        CREATE TRIGGER IF NOT EXISTS git_evidence_publication_outbox_immutable
-        BEFORE UPDATE ON git_evidence_publication_outbox
-        BEGIN
-            SELECT RAISE(ABORT, 'Git evidence publication receipt is immutable');
-        END;",
-    )
-    .await?;
+    conn.execute_batch(SESSION_SCHEMA_MIGRATIONS_TABLE_DDL)
+        .await?;
+    conn.execute_batch(GIT_CORRELATION_META_SCHEMA_SQL).await?;
+    conn.execute_batch(GIT_EVIDENCE_PUBLICATION_OUTBOX_SCHEMA_SQL)
+        .await?;
+    conn.execute_batch(GIT_CORRELATION_FINAL_INDEX_SQL).await?;
+    conn.execute_batch(GIT_CORRELATION_FINAL_TRIGGER_SQL)
+        .await?;
     backfill::history_progress::install_final_schema(conn).await?;
     backfill::history_failures::install_final_schema(conn).await?;
     conn.execute(
@@ -1258,7 +1242,7 @@ async fn stored_git_correlation_schema_version(
     };
     if kind != "table"
         || normalize_schema_sql(&schema)
-            != normalize_schema_sql(SESSION_SCHEMA_MIGRATIONS_SCHEMA_SQL)
+            != normalize_schema_sql(SESSION_SCHEMA_MIGRATIONS_TABLE_DEFINITION)
         || !session_schema_migrations_objects_are_intact(conn).await?
     {
         return Err(git_correlation_schema_reset(None));

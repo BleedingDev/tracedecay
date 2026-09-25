@@ -1,0 +1,588 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -2,13 +2,14 @@
+ #![cfg(all(feature = "rust-backend", unix))]
+ #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+ 
++use std::collections::BTreeMap;
+ use std::fs::{self, File};
+ use std::io::Write;
+ use std::os::unix::fs::{MetadataExt, symlink};
+ use std::path::{Path, PathBuf};
+ use std::process::Command;
+-use std::sync::Arc;
+ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex};
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ use serde_json::{Value, json};
+@@ -16,16 +17,18 @@
+ use tracedecay_memory_conformance::compatibility::{
+     CommonAdvisoryFixture, CommonAdvisoryFixtureFactory, CompatibilityScenario,
+     CompatibilityVerdict, FixtureEnvironmentAction, FixtureEnvironmentEvidence, FixtureUnavailable,
+-    run_common_advisory_suite,
++    LegacyRecordEvidence, run_common_advisory_suite,
+ };
+ use tracedecay_memory_conformance::real_fixture::{FixtureAuthority, FixtureAuthoritySnapshot};
+ use tracedecay_memory_provider_api::contract::{
+     CommittedEffectState, SourceDisposition, TerminalCode,
+ };
+ use tracedecay_memory_provider_api::{
+-    CancellationToken, HandshakeRequest, HandshakeRequestParts, HandshakeResponse, MemoryProvider,
+-    OperationControl, OwnedExactScope, ProviderCall, ProviderDescriptor, ProviderOperation,
+-    ProviderReply, TerminalRecord,
++    CancellationToken, CanonicalPayload, HandshakeRequest, HandshakeRequestParts,
++    HandshakeResponse, MemoryProvider, OperationControl, OwnedExactScope, OwnedVersionedId,
++    PayloadSanitizationReceipt, PayloadSanitizationReceiptParts, ProviderCall, ProviderCallParts,
++    ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
++    observation_extensions_digest,
+ };
+ use tracedecay_memory_provider_ncm::{
+     NcmCognitiveSurface, NcmNamespace, NcmProviderAdapter, NcmSurfaceCall,
+@@ -75,6 +78,34 @@
+                     .is_some()
+             );
+             call.control.cancellation().cancel();
++        }
++        reply
++    }
++}
++
++/// Observes the existing legacy projection and real replies without rewriting
++/// either. The captured opaque key is checked against the durable journal.
++struct LegacyWriterSurface {
++    inner: Arc<RustNcmSurface>,
++    dispatched: Arc<Mutex<Vec<(NcmSurfaceCall, ProviderReply)>>>,
++}
++
++impl NcmCognitiveSurface for LegacyWriterSurface {
++    fn descriptor(&self) -> ProviderDescriptor {
++        self.inner.descriptor()
++    }
++
++    fn handshake(&self, request: &NcmSurfaceHandshakeRequest) -> NcmSurfaceHandshakeResponse {
++        self.inner.handshake(request)
++    }
++
++    fn invoke(&self, call: &NcmSurfaceCall) -> ProviderReply {
++        let reply = self.inner.invoke(call);
++        if call.operation == ProviderOperation::Observe {
++            self.dispatched
++                .lock()
++                .expect("legacy capture lock")
++                .push((call.clone(), reply.clone()));
+         }
+         reply
+     }
+@@ -462,6 +493,240 @@
+         }
+     }
+ 
++    fn install_legacy(
++        &mut self,
++        observations: &[Value],
++    ) -> Result<FixtureEnvironmentEvidence, String> {
++        if observations.is_empty()
++            || observations.len() as u64 > self.host()?.descriptor().limits.observation_batch_items
++            || self.namespace_database().exists()
++            || self.owner()?.worker_pid().is_some()
++        {
++            return Err(
++                "legacy installation requires bounded sources and an unopened empty namespace"
++                    .into(),
++            );
++        }
++        let build = self.build_identity()?;
++        let owner = Arc::clone(self.owner()?);
++        self.host.take();
++        let dispatched = Arc::new(Mutex::new(Vec::new()));
++        let surface = Arc::new(LegacyWriterSurface {
++            inner: Arc::new(
++                RustNcmSurface::from_production_worker(Arc::clone(&owner)).map_err(err)?,
++            ),
++            dispatched: Arc::clone(&dispatched),
++        });
++        // This adapter intentionally has no common admission authority. Only
++        // the existing legacy Observe payload is submitted to its real worker.
++        let writer = NcmProviderAdapter::new(surface.clone()).map_err(err)?;
++        let mut observed = Vec::new();
++        for observation in observations {
++            let call = legacy_observation_call(&writer, &self.scope, observation)?;
++            let reply = writer.invoke(&call);
++            if reply.terminal.terminal_code() != TerminalCode::Success
++                || reply.terminal.committed_effect().state() != CommittedEffectState::Committed
++                || reply.terminal.operation_id() != call.operation_id
++                || reply
++                    .terminal
++                    .committed_effect()
++                    .provider_receipt_sha256()
++                    .is_none()
++            {
++                return Err(format!(
++                    "real legacy Observe did not establish its original commit: {:?}",
++                    reply.terminal
++                ));
++            }
++            observed.push((call, reply));
++        }
++        let writer_process = self
++            .stop_current()?
++            .ok_or("legacy writer did not start a real process")?;
++        if writer_process.parent_pid != std::process::id() {
++            return Err("legacy writer process was not owned by this fixture".into());
++        }
++        drop(writer);
++        drop(surface);
++        let dispatched = std::mem::take(
++            &mut *dispatched
++                .lock()
++                .map_err(|_| "legacy capture lock poisoned")?,
++        );
++        if dispatched.len() != observed.len() {
++            return Err(
++                "legacy capture count differs from the actual submitted observations".into(),
++            );
++        }
++        let database = self.namespace_database();
++        let metadata = sqlite_json(
++            &database,
++            "SELECT CAST(value AS TEXT) AS schema_version FROM meta WHERE key = 'schema_version';",
++            true,
++        )?;
++        if metadata.len() != 1 || metadata[0]["schema_version"] != "1" {
++            return Err("actual legacy writer did not retain its version 1 storage schema".into());
++        }
++        let stored_version: u64 = metadata[0]["schema_version"]
++            .as_str()
++            .ok_or("stored schema version is not text")?
++            .parse()
++            .map_err(err)?;
++        let rows = sqlite_json(
++            &database,
++            "SELECT c.record_id, c.source_id, c.key_text, c.value_text, c.provenance, c.status, c.commit_seq, e.seq, e.kind, e.idempotency_key, e.payload_sha256, e.receipt FROM capsules AS c JOIN events AS e ON e.seq = c.commit_seq ORDER BY c.record_id;",
++            true,
++        )?;
++        let counts = sqlite_json(
++            &database,
++            "SELECT (SELECT count(*) FROM capsules) AS capsules, (SELECT count(*) FROM events) AS events;",
++            true,
++        )?;
++        if rows.len() != observations.len()
++            || counts.len() != 1
++            || counts[0]["capsules"].as_u64() != Some(rows.len() as u64)
++            || counts[0]["events"].as_u64() != Some(rows.len() as u64)
++        {
++            return Err(
++                "actual legacy writer did not populate exactly the requested source records".into(),
++            );
++        }
++        let mut records = Vec::new();
++        let mut durability = Vec::new();
++        for (((call, reply), (opaque_call, surface_reply)), row) in
++            observed.iter().zip(dispatched.iter()).zip(rows.iter())
++        {
++            let public_reply: Value = serde_json::from_slice(
++                &reply
++                    .payload
++                    .as_ref()
++                    .ok_or("legacy Observe returned no payload")?
++                    .bytes,
++            )
++            .map_err(err)?;
++            let record_id = public_reply["record_id"]
++                .as_u64()
++                .filter(|id| *id > 0)
++                .ok_or("legacy worker returned no positive record reference")?;
++            let original_key = call
++                .idempotency_key
++                .as_deref()
++                .ok_or("legacy caller key missing")?;
++            let original_receipt = reply
++                .terminal
++                .committed_effect()
++                .provider_receipt_sha256()
++                .ok_or("legacy original commit receipt missing")?;
++            let opaque_key = opaque_call
++                .idempotency_key
++                .as_deref()
++                .ok_or("legacy dispatch key missing")?;
++            let public_input: Value = serde_json::from_slice(&call.payload.bytes).map_err(err)?;
++            let opaque_input: Value =
++                serde_json::from_slice(&opaque_call.payload.bytes).map_err(err)?;
++            let provenance: Value = serde_json::from_str(
++                row["provenance"]
++                    .as_str()
++                    .ok_or("legacy capsule provenance missing")?,
++            )
++            .map_err(err)?;
++            let expected_provenance = json!({
++                "observation_kind": public_input["observation_kind"],
++                "payload_contract": public_input["payload_contract"],
++            });
++            let receipt_text = row["receipt"]
++                .as_str()
++                .ok_or("legacy journal receipt missing")?;
++            let receipt: Value = serde_json::from_str(receipt_text).map_err(err)?;
++            let content = public_input["canonical_payload"]["content"]
++                .as_str()
++                .ok_or("legacy content missing")?;
++            let role = public_input["canonical_payload"]["role"]
++                .as_str()
++                .ok_or("legacy role missing")?;
++            if provenance != expected_provenance
++                || provenance.get("common_capsule").is_some()
++                || provenance.get("delivery_capsule").is_some()
++                || row["record_id"].as_u64() != Some(record_id)
++                || row["key_text"] != content
++                || row["value_text"] != format!("{role}: {content}")
++                || row["source_id"] != opaque_input["canonical_payload"]["forget_source_key"]
++                || row["idempotency_key"].as_str() != Some(opaque_key)
++                || row["kind"] != "observe"
++                || row["status"] != "valid"
++                || row["seq"].as_u64() != Some(reply.state_generation)
++                || row["commit_seq"].as_u64() != Some(reply.state_generation)
++                || receipt["reply"]["state_generation"].as_u64() != Some(reply.state_generation)
++                || receipt["reply"]["payload"] != public_reply
++                || receipt["operation"]["observe"]["record_id"].as_u64() != Some(record_id)
++                || surface_reply.payload != reply.payload
++                || legacy_receipt_from_durable_basis(&receipt)? != original_receipt
++            {
++                return Err(
++                    "legacy capsule or journal does not match the real dispatched commit".into(),
++                );
++            }
++            let stored_record = serde_json::to_string(row).map_err(err)?;
++            if stored_record.contains(&call.operation_id)
++                || stored_record.contains(original_key)
++                || stored_record.contains(original_receipt)
++            {
++                return Err("legacy durable identity assumptions differ from the actual stored representation".into());
++            }
++            records.push(LegacyRecordEvidence {
++                // The old API returns a numeric record_id. Its exact decimal
++                // representation preserves that original provider reference.
++                stable_memory_ref: record_id.to_string(),
++                original_operation_id: reply.terminal.operation_id().to_owned(),
++                original_idempotency_key: original_key.to_owned(),
++                original_receipt_sha256: original_receipt.to_owned(),
++                retained_source_fields: BTreeMap::new(),
++            });
++            durability.push(json!({
++                "provider_reference": {"observed_record_id": record_id,
++                    "durable_capsule_record_id": row["record_id"], "durable_journal_record_id": receipt["operation"]["observe"]["record_id"],
++                    "legacy_reference_text": record_id.to_string()},
++                "caller_observed_only": {"original_operation_id": reply.terminal.operation_id(),
++                    "original_public_idempotency_key": original_key,
++                    "operation_id_retained_in_capsule_or_event": false,
++                    "public_idempotency_key_retained_in_capsule_or_event": false},
++                "provider_receipt": {"observed_original_sha256": original_receipt,
++                    "digest_stored_verbatim": false, "durable_basis_verified": true,
++                    "durable_basis": "events.receipt.reply.state_generation and payload, excluding replayed"},
++                "observed_dispatch": {"opaque_operation_id": opaque_call.operation_id,
++                    "opaque_idempotency_key": opaque_key,
++                    "opaque_source": opaque_input["canonical_payload"]["forget_source_key"]},
++                "actually_durable": {"record": row, "parsed_receipt": receipt},
++                "retained_canonical_source_fields": {},
++                "common_capsule_present": false, "delivery_capsule_present": false,
++            }));
++        }
++        // Preserve this audit beside the scenario directory, so fixture cleanup
++        // cannot erase the distinction between retained and caller-only identity.
++        write_synced(
++            &self.root.with_extension("legacy-writer-evidence.json"),
++            &serde_json::to_vec_pretty(&json!({
++                "representation": "production legacy Observe without common capsules",
++                "stored_schema_version": stored_version, "numeric_schema_migration": false,
++                "writer_process": writer_process.evidence(), "writer_process_exited": true,
++                "namespace": self.namespace_evidence(), "records": durability,
++                "common_suite_records": records,
++            }))
++            .map_err(err)?,
++        )?;
++        self.host = Some(self.make_host(&owner)?);
++        if self.build_identity()? != build {
++            return Err(
++                "legacy installation changed the selected production implementation".into(),
++            );
++        }
++        Ok(FixtureEnvironmentEvidence::LegacyV1Installed {
++            stored_version,
++            source_count: rows.len() as u64,
++            records,
++        })
++    }
++
+     fn corrupt_payload(&mut self) -> Result<FixtureEnvironmentEvidence, String> {
+         self.stop_current()?
+             .ok_or("cannot corrupt an unstarted provider")?;
+@@ -543,20 +808,28 @@
+                 let database = self.namespace_database();
+                 let metadata = fs::metadata(&database).map_err(err)?;
+                 let physical_file = (metadata.dev(), metadata.ino());
+-                let previous = self.stop_current()?.ok_or("restart has no previous real process")?;
++                let previous = self
++                    .stop_current()?
++                    .ok_or("restart has no previous real process")?;
+                 let current = self.start_current()?;
+                 if previous == current {
+                     return Err("restart reused the previous process start identity".into());
+                 }
+                 self.reopen_persisted_namespace()?;
+                 let metadata = fs::metadata(&database).map_err(err)?;
+-                if physical_file != (metadata.dev(), metadata.ino()) || identity != self.build_identity()? {
+-                    return Err("restart changed the physical store or selected implementation".into());
++                if physical_file != (metadata.dev(), metadata.ino())
++                    || identity != self.build_identity()?
++                {
++                    return Err(
++                        "restart changed the physical store or selected implementation".into(),
++                    );
+                 }
+                 previous.confirm_exited()?;
+                 Ok(FixtureEnvironmentEvidence::Restarted {
+-                    previous_process: previous.evidence(), current_process: current.evidence(),
+-                    previous_process_exited: true, reopened_persisted_namespace: true,
++                    previous_process: previous.evidence(),
++                    current_process: current.evidence(),
++                    previous_process_exited: true,
++                    reopened_persisted_namespace: true,
+                 })
+             }
+             FixtureEnvironmentAction::FreshNamespace => {
+@@ -566,15 +839,24 @@
+                 self.stop_current()?;
+                 self.host.take();
+                 self.owner.take();
+-                self.namespace_number = self.namespace_number.checked_add(1).ok_or("namespace counter overflow")?;
+-                self.provider_root = self.root.join(format!("provider-{}", self.namespace_number));
++                self.namespace_number = self
++                    .namespace_number
++                    .checked_add(1)
++                    .ok_or("namespace counter overflow")?;
++                self.provider_root = self
++                    .root
++                    .join(format!("provider-{}", self.namespace_number));
+                 self.open_physical_namespace()?;
+                 self.start_current()?;
+                 if self.namespace_database().exists() || self.build_identity()? != identity {
+-                    return Err("fresh namespace did not preserve selection and empty physical state".into());
++                    return Err(
++                        "fresh namespace did not preserve selection and empty physical state"
++                            .into(),
++                    );
+                 }
+                 Ok(FixtureEnvironmentEvidence::FreshNamespace {
+-                    previous_namespace, current_namespace: self.namespace_evidence(),
++                    previous_namespace,
++                    current_namespace: self.namespace_evidence(),
+                     current_dispositions_revalidated: true,
+                 })
+             }
+@@ -588,16 +870,22 @@
+                     selected_provider_unchanged: self.build_identity()? == identity,
+                 })
+             }
+-            FixtureEnvironmentAction::InstallLegacyV1 { .. } => Err(
+-                "No genuine pre-common NCM writer retains the common public stable reference and original delivery receipt required by LegacyRecordEvidence. The actual pre-common schema is already version 1; its key/value/source records lack common_capsule and delivery_capsule. Current observations cannot be relabeled as legacy, and a production migration/inspection seam has not been supplied.".into(),
+-            ),
++            FixtureEnvironmentAction::InstallLegacyV1 { observations } => {
++                self.install_legacy(observations)
++            }
+             FixtureEnvironmentAction::CorruptPayloadPreservingDigest => self.corrupt_payload(),
+-            FixtureEnvironmentAction::RecordSourceDisposition { source_key, disposition } => {
+-                let state = SourceDisposition::from_wire(disposition).ok_or("unknown source disposition")?;
++            FixtureEnvironmentAction::RecordSourceDisposition {
++                source_key,
++                disposition,
++            } => {
++                let state = SourceDisposition::from_wire(disposition)
++                    .ok_or("unknown source disposition")?;
+                 let authority_ref = self.authority.record_disposition(source_key, state)?;
+                 self.persist_authority()?;
+                 Ok(FixtureEnvironmentEvidence::SourceDispositionRecorded {
+-                    source_key: source_key.clone(), disposition: disposition.clone(), authority_ref,
++                    source_key: source_key.clone(),
++                    disposition: disposition.clone(),
++                    authority_ref,
+                 })
+             }
+             FixtureEnvironmentAction::LoseNextReplyAfterCommit => {
+@@ -609,19 +897,24 @@
+             FixtureEnvironmentAction::SetAdmissionAuthorityAvailable { available } => {
+                 self.authority.set_available(*available)?;
+                 self.persist_authority()?;
+-                Ok(FixtureEnvironmentEvidence::AuthorityAvailability { available: *available })
++                Ok(FixtureEnvironmentEvidence::AuthorityAvailability {
++                    available: *available,
++                })
+             }
+             FixtureEnvironmentAction::SetMode { mode } => {
+                 let identity = self.build_identity()?;
+                 let next = match mode.as_str() {
+-                    "active" => ACTIVE, "observe" => OBSERVE,
+-                    "disabled" => DISABLED, "quarantined" => QUARANTINED,
++                    "active" => ACTIVE,
++                    "observe" => OBSERVE,
++                    "disabled" => DISABLED,
++                    "quarantined" => QUARANTINED,
+                     _ => return Err("unknown fixture host mode".into()),
+                 };
+                 write_synced(&self.root.join("host/mode"), mode.as_bytes())?;
+                 self.mode.store(next, Ordering::SeqCst);
+                 Ok(FixtureEnvironmentEvidence::ModeChanged {
+-                    mode: mode.clone(), selected_provider_unchanged: self.build_identity()? == identity,
++                    mode: mode.clone(),
++                    selected_provider_unchanged: self.build_identity()? == identity,
+                     recall_admitted: self.host()?.admits(ProviderOperation::Recall),
+                     observation_admitted: self.host()?.admits(ProviderOperation::Observe),
+                 })
+@@ -630,8 +923,12 @@
+                 let previous = self.stop_current()?;
+                 self.host.take();
+                 self.owner.take();
+-                if let Some(previous) = previous { previous.confirm_exited()?; }
+-                Ok(FixtureEnvironmentEvidence::Shutdown { remaining_workers: 0 })
++                if let Some(previous) = previous {
++                    previous.confirm_exited()?;
++                }
++                Ok(FixtureEnvironmentEvidence::Shutdown {
++                    remaining_workers: 0,
++                })
+             }
+         }
+     }
+@@ -667,6 +964,133 @@
+             let _ = fs::remove_dir_all(&self.root);
+         }
+     }
++}
++
++fn legacy_observation_call(
++    writer: &NcmProviderAdapter,
++    scope: &OwnedExactScope,
++    observation: &Value,
++) -> Result<ProviderCall, String> {
++    if observation["observation_kind"] != "session.message_committed.v1"
++        || observation["payload_contract"] != "tracedecay.memory.observation.session-message.v1"
++    {
++        return Err(
++            "legacy fixture writer requires the supplied session message observation".into(),
++        );
++    }
++    let content = observation["canonical_payload"]["content"]
++        .as_str()
++        .filter(|value| !value.is_empty())
++        .ok_or("legacy fixture source text is absent")?;
++    let role = observation["canonical_payload"]["role"]
++        .as_str()
++        .filter(|value| !value.is_empty())
++        .ok_or("legacy fixture message role is absent")?;
++    let forget_source_key = observation
++        .pointer("/source_identity/original_source/source/source_key")
++        .and_then(Value::as_str)
++        .filter(|value| !value.is_empty())
++        .ok_or("legacy routing key is absent")?;
++    let legacy = json!({
++        "observation_kind": "session.message_committed.v1",
++        "payload_contract": "tracedecay.memory.observation.session-message.v1",
++        "canonical_payload": {"role": role, "content": content, "forget_source_key": forget_source_key},
++    });
++    let descriptor = writer.descriptor();
++    let identity = NEXT_ID.fetch_add(1, Ordering::Relaxed);
++    let ready_request = HandshakeRequest::new(HandshakeRequestParts {
++        provider_id: descriptor.provider_id.clone(),
++        registration_revision: REGISTRATION_REVISION,
++        exact_scope: scope.clone(),
++        request_id: format!("fixture.legacy.ready.{identity}"),
++        required_capabilities: vec![
++            OwnedVersionedId::new(ProviderOperation::Observe.capability_id()).map_err(err)?,
++        ],
++        host_limits: descriptor.limits,
++        control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++        challenge_nonce: [0x76; 32],
++    })
++    .map_err(err)?;
++    let mut ready = writer.handshake(&ready_request);
++    if ready.terminal.terminal_code() == TerminalCode::StaleIdentity {
++        ready = writer.handshake(&ready_request);
++    }
++    if ready.terminal.terminal_code() != TerminalCode::Success
++        || ready.accepted_scope.as_ref() != Some(scope)
++    {
++        return Err(format!(
++            "real legacy worker could not become ready: {:?}",
++            ready.terminal
++        ));
++    }
++    let bytes = serde_json::to_vec(&legacy).map_err(err)?;
++    let digest = sha256(&bytes);
++    let call = ProviderCall::new(ProviderCallParts {
++        operation: ProviderOperation::Observe,
++        provider_id: descriptor.provider_id,
++        registration_revision: REGISTRATION_REVISION,
++        ready_receipt_sha256: ready
++            .ready_receipt_sha256
++            .ok_or("legacy readiness has no receipt")?,
++        exact_scope: scope.clone(),
++        request_id: format!("fixture.legacy.request.{identity}"),
++        operation_id: format!("fixture.legacy.original-operation.{identity}"),
++        expected_state_generation: ready
++            .descriptor
++            .ok_or("legacy readiness has no descriptor")?
++            .state_generation,
++        idempotency_key: Some(format!("fixture.legacy.original-delivery.{identity}")),
++        control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++        payload: CanonicalPayload::new(
++            OwnedVersionedId::new("tracedecay.memory.provider.observation.v1").map_err(err)?,
++            bytes,
++            digest,
++        )
++        .map_err(err)?,
++        required_capabilities: vec![
++            OwnedVersionedId::new(ProviderOperation::Observe.capability_id()).map_err(err)?,
++        ],
++        extensions: Vec::new(),
++    })
++    .map_err(err)?;
++    // This is the same explicit fixture hygiene admission as the existing
++    // legacy adapter tests; it creates no common source authorization capsule.
++    let receipt = PayloadSanitizationReceipt::new(
++        PayloadSanitizationReceiptParts::accepted_unmodified_with_extensions(
++            "tracedecay.memory.observation.hygiene.v1+ncm-real-legacy-fixture",
++            call.payload.sha256.clone(),
++            observation_extensions_digest(&call.extensions).map_err(err)?,
++        ),
++    )
++    .map_err(err)?;
++    Ok(call.with_sanitization(receipt))
++}
++
++/// Verify the observed old receipt against its actual durable basis. This never
++/// supplies a substitute receipt or invents an original operation identity.
++fn legacy_receipt_from_durable_basis(receipt: &Value) -> Result<String, String> {
++    let generation = receipt["reply"]["state_generation"]
++        .as_u64()
++        .ok_or("legacy durable reply generation missing")?;
++    let mut payload = receipt["reply"]["payload"].clone();
++    let object = payload
++        .as_object_mut()
++        .ok_or("legacy durable reply payload missing")?;
++    object.remove("replayed");
++    object.remove("common_observation");
++    let bytes = serde_json::to_vec(&payload).map_err(err)?;
++    let mut digest = Sha256::new();
++    digest.update(b"tracedecay.ncm.rust-worker-receipt.v1\0");
++    digest.update((b"observe".len() as u64).to_be_bytes());
++    digest.update(b"observe");
++    digest.update(generation.to_be_bytes());
++    digest.update((bytes.len() as u64).to_be_bytes());
++    digest.update(&bytes);
++    Ok(digest
++        .finalize()
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect())
+ }
+ 
+ fn capsule_bytes(provenance: &Value) -> Result<Vec<u8>, String> {

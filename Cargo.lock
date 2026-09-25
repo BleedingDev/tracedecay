@@ -5820,6 +5820,8 @@ dependencies = [
  "tracedecay-rusqlite-runtime",
  "tracedecay-sdk",
  "tracedecay-search-eval",
+ "tracedecay-semantic",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-memory",
  "tracedecay-session-runtime",
  "tracedecay-session-temporal-store",
@@ -5957,6 +5959,7 @@ dependencies = [
  "tracedecay-store",
  "tracedecay-temporal-query",
  "tracedecay-tool-catalog",
+ "tracedecay-vector-authority",
  "tracing",
  "ureq",
  "url",
@@ -6087,6 +6090,7 @@ dependencies = [
  "tracedecay-private-fs",
  "tracedecay-runtime-core",
  "tracedecay-sdk",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-memory",
  "tracedecay-session-temporal-store",
  "tracedecay-sessions",
@@ -6233,6 +6237,7 @@ dependencies = [
  "tracedecay-lcm",
  "tracedecay-policy",
  "tracedecay-runtime-core",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-memory",
 ]
 
@@ -6474,6 +6479,7 @@ dependencies = [
  "tracedecay-private-fs",
  "tracedecay-runtime-core",
  "tracedecay-rusqlite-runtime",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-temporal-store",
  "tracedecay-sessions",
  "tracedecay-store",
@@ -6709,6 +6715,7 @@ dependencies = [
  "tracedecay-project",
  "tracedecay-query",
  "tracedecay-runtime-core",
+ "tracedecay-semantic-contracts",
  "tracedecay-session-memory",
  "tracedecay-session-runtime",
  "tracedecay-session-temporal-store",
@@ -7117,6 +7124,7 @@ dependencies = [
  "tracedecay-query",
  "tracedecay-runtime-core",
  "tracedecay-semantic-contracts",
+ "tracedecay-vector-authority",
  "url",
 ]
 
@@ -7301,6 +7309,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tracedecay-domain",
  "tracedecay-temporal-query",
+ "tracedecay-vector-authority",
 ]
 
 [[package]]
@@ -7363,6 +7372,16 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "thiserror 2.0.19",
+ "tracedecay-domain",
+]
+
+[[package]]
+name = "tracedecay-vector-authority"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "tracedecay-domain",
 ]

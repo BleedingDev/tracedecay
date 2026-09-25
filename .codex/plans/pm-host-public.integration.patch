@@ -1,0 +1,1231 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -1909,6 +1909,9 @@
+     port: Result<ProjectCognitiveRecallPortV1, CognitiveRecallMountError>,
+     mount: Option<&ProjectCognitiveRecallMountV1>,
+     call: AdvisoryRecallCallV1,
++    context_memory_contribution: Option<
++        &tracedecay_contracts::retrieval::ContextMemoryContributionV1,
++    >,
+ ) -> Option<AdvisoryMemoryContextV1> {
+     // No mounted route is no lane at all: a dormant composition and an
+     // observer-only routing gate stay silent rather than announcing a
+@@ -2006,6 +2009,7 @@
+         &port,
+         mount,
+         AdvisoryRecallInputsV1 {
++            context_memory_contribution,
+             canonical_session_id: session.canonical_session_id(),
+             query: &call.query,
+             maximum_candidates: ADVISORY_RECALL_MAXIMUM_CANDIDATES,
+@@ -2054,6 +2058,11 @@
+ /// The exact scope, the routing policy, the budgets, and the policy revision
+ /// are *not* here: they are mount-owned and cannot be influenced by a call.
+ pub(crate) struct AdvisoryRecallInputsV1<'inputs> {
++    /// Exact policy and canonical fact identity metadata from the completed
++    /// context handler. Fact owner/revision tuples remain typed; an anchor or
++    /// bare fact ID cannot become a provider exclusion or history authority.
++    pub(crate) context_memory_contribution:
++        Option<&'inputs tracedecay_contracts::retrieval::ContextMemoryContributionV1>,
+     /// Canonical host session identity, exactly as the host supplied it --
+     /// either the structural session identity the call was routed under, or
+     /// the MCP connection scope the host minted this call's request identity
+@@ -2071,6 +2080,27 @@
+     pub(crate) cancellation: tracedecay_contracts::CancellationSignal,
+ }
+ 
++/// Consumes only the already-admitted policy. The contribution's complete
++/// owner/fact/assertion/event identity remains on the original ToolResult;
++/// provider stable references cannot stand in for host-confirmed revisions.
++fn apply_context_memory_policy(
++    mut request: tracedecay_contracts::memory::CognitiveRecallRequest,
++    contribution: Option<&tracedecay_contracts::retrieval::ContextMemoryContributionV1>,
++) -> Result<
++    tracedecay_contracts::memory::CognitiveRecallRequest,
++    tracedecay_contracts::ApplicationContractError,
++> {
++    if let Some(contribution) = contribution {
++        if let Some(temporal) = contribution.temporal_query() {
++            request = request.with_temporal_query(temporal.clone())?;
++        }
++        if let Some(exclusions) = contribution.exclusions() {
++            request = request.with_exclusions(exclusions.clone())?;
++        }
++    }
++    Ok(request)
++}
++
+ /// Runs one bounded advisory recall over a mounted route and projects the
+ /// admitted candidates into the tool-facing advisory value.
+ ///
+@@ -2131,7 +2161,9 @@
+         inputs.cancellation.context(),
+         inputs.query,
+         inputs.maximum_candidates,
+-    ) {
++    )
++    .and_then(|request| apply_context_memory_policy(request, inputs.context_memory_contribution))
++    {
+         Ok(request) => request,
+         Err(error) => {
+             return AdvisoryMemoryContextV1::unavailable(
+@@ -5479,6 +5511,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.advisory",
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -5570,6 +5603,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id,
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -5684,6 +5718,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id,
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -5779,6 +5814,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.hostile",
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -5973,6 +6009,7 @@
+             &session_port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: RECALL_SESSION,
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -6120,6 +6157,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.ordinary",
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -6189,6 +6227,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.foreign-evidence",
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -6239,6 +6278,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.budget",
+                 query: "cognitive recall ledger durable retrieval",
+                 // The mount's own host ceiling, which is deliberately larger
+@@ -6288,6 +6328,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.cancelled",
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -6439,6 +6480,7 @@
+             &port,
+             &mount,
+             AdvisoryRecallInputsV1 {
++                context_memory_contribution: None,
+                 canonical_session_id: "session.cognitive-recall.sections",
+                 query: "cognitive recall ledger",
+                 maximum_candidates: 5,
+@@ -6542,6 +6584,7 @@
+             mount.port_for_session("session.cognitive-recall.elapsed"),
+             Some(mount.as_ref()),
+             call,
++            None,
+         )
+         .await
+         .expect("a mounted active route always yields a lane");
+@@ -6742,6 +6785,7 @@
+             mount.port_for_session(call.canonical_session_id()),
+             Some(mount.as_ref()),
+             call,
++            None,
+         )
+         .await
+         .expect("a mounted route always yields a lane");
+@@ -6798,6 +6842,7 @@
+                 Err(CognitiveRecallMountError::CompositionDisabled),
+                 None,
+                 call,
++                None,
+             )
+             .await
+             .is_none()
+@@ -6840,6 +6885,7 @@
+             mount.port_for_session(call.canonical_session_id()),
+             Some(mount.as_ref()),
+             call,
++            None,
+         )
+         .await
+         .expect("a mounted route always yields a lane");
+@@ -6923,6 +6969,7 @@
+             mount.port_for_session(call.canonical_session_id()),
+             Some(mount),
+             call,
++            None,
+         )
+         .await
+         .expect("a mounted route always yields a lane")
+@@ -7229,6 +7276,99 @@
+     }
+ 
+     #[test]
++    fn context_contribution_preserves_explicit_temporal_policy_and_every_exclusion() {
++        use tracedecay_contracts::memory::{
++            CognitiveRecallExclusions, CognitiveRecallRequest, CognitiveRecallTemporalQuery,
++            CognitiveRecallUnknownValidityPolicy,
++        };
++        use tracedecay_contracts::retrieval::{
++            ContextMemoryContributionV1, ContextSurfaceRequestV1,
++        };
++        use tracedecay_contracts::{CancellationContext, Deadline, RequestId};
++        use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
++        let now = try_now_micros().unwrap();
++        let scope = ResolvedScope::new(
++            ProjectId::new("project.sidecar").unwrap(),
++            RepositoryId::new("repository.sidecar").unwrap(),
++            WorktreeId::new("worktree.sidecar").unwrap(),
++            Some(RefId::new("refs/heads/sidecar").unwrap()),
++        )
++        .unwrap();
++        let base = CognitiveRecallRequest::new(
++            scope,
++            RequestId::new("request.sidecar").unwrap(),
++            Deadline::new(UtcMicros(now.0 + 60_000_000)).unwrap(),
++            CancellationContext::active("token.sidecar").unwrap(),
++            "sidecar policy",
++            8,
++        )
++        .unwrap();
++        assert!(
++            apply_context_memory_policy(base.clone(), None)
++                .unwrap()
++                .temporal_query()
++                .is_none()
++        );
++        assert!(
++            apply_context_memory_policy(base.clone(), None)
++                .unwrap()
++                .exclusions()
++                .is_none()
++        );
++        let exclusions = CognitiveRecallExclusions {
++            stable_memory_refs: vec!["memory:explicit".to_owned()],
++            candidate_ids: vec!["candidate:explicit".to_owned()],
++            source_refs: vec!["source:explicit".to_owned()],
++            trace_refs: vec!["trace:explicit".to_owned()],
++            observation_ids: vec!["observation:explicit".to_owned()],
++            content_sha256: vec!["a".repeat(64)],
++        };
++        let current = CognitiveRecallTemporalQuery::current(now);
++        let queries = [
++            current
++                .clone()
++                .with_policy(false, true, CognitiveRecallUnknownValidityPolicy::Exclude),
++            current
++                .clone()
++                .with_as_of(UtcMicros(now.0 - 3_000_000))
++                .unwrap()
++                .with_policy(true, false, CognitiveRecallUnknownValidityPolicy::Degrade),
++            current
++                .clone()
++                .with_interval(UtcMicros(now.0 - 3_000_000), UtcMicros(now.0 - 1_000_000))
++                .unwrap()
++                .with_policy(
++                    false,
++                    true,
++                    CognitiveRecallUnknownValidityPolicy::AllowWithWarning,
++                ),
++            current.with_history().with_policy(
++                true,
++                true,
++                CognitiveRecallUnknownValidityPolicy::Exclude,
++            ),
++        ];
++        for temporal in queries {
++            let context: ContextSurfaceRequestV1 = serde_json::from_value(json!({
++                "task": "sidecar policy", "include_memory": false,
++                "temporal_query": temporal, "exclusions": exclusions,
++            }))
++            .unwrap();
++            let contribution =
++                ContextMemoryContributionV1::from_matches(&context, &[], None, None, now).unwrap();
++            let retained = contribution.clone();
++            let request = apply_context_memory_policy(base.clone(), Some(&contribution)).unwrap();
++            assert_eq!(request.temporal_query(), Some(&temporal));
++            assert_eq!(request.exclusions(), Some(&exclusions));
++            assert_eq!(request.deadline(), base.deadline());
++            assert_eq!(request.cancellation(), base.cancellation());
++            assert_eq!(request.scope(), base.scope());
++            assert_eq!(contribution, retained);
++            assert!(contribution.facts().is_empty());
++        }
++    }
++
++    #[test]
+     fn observation_hydration_requires_every_immutable_source_and_unchanged_disposition() {
+         let (sources, grant) = history();
+         assert!(
+diff --git a/crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs b/crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs
+--- a/crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs
++++ b/crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs
+@@ -418,6 +418,7 @@
+                     self.cognitive_recall_port_for_session(call.canonical_session_id()),
+                     self.cognitive_recall_mount.as_deref(),
+                     call,
++                    result.context_memory_contribution(),
+                 )
+                 .await
+                 {
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_admission.rs b/crates/tracedecay-memory-provider-registry/src/recall_admission.rs
+--- a/crates/tracedecay-memory-provider-registry/src/recall_admission.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_admission.rs
+@@ -1347,6 +1347,31 @@
+     authorized: &RecallScopeBindingsV1,
+     reply: &ProviderReply,
+ ) -> Result<RecallAdmission, RecallAdmissionError> {
++    admit_recall_reply_with_profile(call, temporal, maximum_candidates, authorized, reply, false)
++}
++
++/// The production port supplies this requirement from the exact registration
++/// metadata it pinned, never from a provider or payload claim.
++pub(crate) fn admit_recall_reply_with_profile(
++    call: &ProviderCall,
++    temporal: &AdmittedTemporalQuery,
++    maximum_candidates: usize,
++    authorized: &RecallScopeBindingsV1,
++    reply: &ProviderReply,
++    requires_common_profile: bool,
++) -> Result<RecallAdmission, RecallAdmissionError> {
++    let common_bindings;
++    let authorized = if requires_common_profile {
++        common_bindings = RecallScopeBindingsV1::new(authorized.iter().filter(|binding| {
++            !matches!(
++                binding,
++                ScopeBinding::ProjectFacts | ScopeBinding::ProfileFacts
++            )
++        }));
++        &common_bindings
++    } else {
++        authorized
++    };
+     let terminal_code = reply.terminal.terminal_code();
+     if !matches!(
+         terminal_code,
+@@ -1371,6 +1396,8 @@
+     #[derive(Deserialize)]
+     struct DispatchedRecallExclusions {
+         exclusions: tracedecay_contracts::memory::CognitiveRecallExclusions,
++        policy_revision: u64,
++        history_grant: Option<Value>,
+     }
+     let context: DispatchedRecallExclusions =
+         serde_json::from_slice(&call.payload.bytes).map_err(|error| {
+@@ -1383,13 +1410,23 @@
+             detail: bounded_detail(&error.to_string()),
+         }
+     })?;
+-    admit_recall_candidates_with_exclusions(
++    let common_profile = requires_common_profile
++        .then(|| {
++            CommonRecallProfileV1::from_dispatched_history(
++                call,
++                context.policy_revision,
++                context.history_grant.as_ref(),
++            )
++        })
++        .transpose()?;
++    admit_recall_candidates_with_context(
+         &call.exact_scope,
+         &call.request_id,
+         temporal,
+         authorized,
+         outcome.candidates,
+         Some(&context.exclusions),
++        common_profile.as_ref(),
+     )
+ }
+ 
+@@ -1464,23 +1501,25 @@
+     authorized: &RecallScopeBindingsV1,
+     candidates: Vec<RecallCandidateV1>,
+ ) -> Result<RecallAdmission, RecallAdmissionError> {
+-    admit_recall_candidates_with_exclusions(
++    admit_recall_candidates_with_context(
+         admitted_scope,
+         request_id,
+         temporal,
+         authorized,
+         candidates,
+         None,
++        None,
+     )
+ }
+ 
+-fn admit_recall_candidates_with_exclusions(
++fn admit_recall_candidates_with_context(
+     admitted_scope: &OwnedExactScope,
+     request_id: &str,
+     temporal: &AdmittedTemporalQuery,
+     authorized: &RecallScopeBindingsV1,
+     candidates: Vec<RecallCandidateV1>,
+     exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
++    common_profile: Option<&CommonRecallProfileV1>,
+ ) -> Result<RecallAdmission, RecallAdmissionError> {
+     admitted_scope.validate()?;
+     let mut seen = BTreeSet::new();
+@@ -1500,7 +1539,14 @@
+     let mut denied = Vec::new();
+     let mut degraded = false;
+     for candidate in candidates {
+-        match admit_one(admitted_scope, temporal, authorized, &candidate, exclusions) {
++        match admit_one(
++            admitted_scope,
++            temporal,
++            authorized,
++            &candidate,
++            exclusions,
++            common_profile,
++        ) {
+             Ok(parts) => {
+                 degraded |= parts.decision.degrades_lane;
+                 admitted.push(AdmittedRecallCandidate {
+@@ -1554,6 +1600,83 @@
+     degrades_lane: bool,
+ }
+ 
++/// Sources the host already selected and freshly revalidated before dispatch.
++/// Matching this snapshot is an admission prerequisite, not privacy authority:
++/// the root still re-reads canonical disposition before any source is hydrated.
++struct CommonRecallProfileV1 {
++    granted_sources: Vec<tracedecay_memory_provider_api::SourceAttribution>,
++}
++
++impl CommonRecallProfileV1 {
++    fn from_dispatched_history(
++        call: &ProviderCall,
++        policy_revision: u64,
++        grant: Option<&Value>,
++    ) -> Result<Self, RecallAdmissionError> {
++        let invalid = || RecallAdmissionError::InvalidTemporalQuery {
++            field: "history_grant",
++            detail: "common recall history must bind the dispatched scope and original sources",
++        };
++        let Some(grant) = grant else {
++            // A required common profile remains required when history is
++            // absent; its empty allowlist cannot admit a fabricated source.
++            return Ok(Self {
++                granted_sources: Vec::new(),
++            });
++        };
++        if grant.get("destination_scope") != Some(&scope_wire_value(&call.exact_scope))
++            || grant.get("policy_revision").and_then(Value::as_u64) != Some(policy_revision)
++        {
++            return Err(invalid());
++        }
++        let sources = grant
++            .get("sources")
++            .and_then(Value::as_array)
++            .ok_or_else(invalid)?;
++        if sources.is_empty()
++            || sources.len() > tracedecay_memory_provider_api::MAX_ADVISORY_ADMISSION_SOURCES
++        {
++            return Err(invalid());
++        }
++        let granted_sources = sources
++            .iter()
++            .map(|source| {
++                let attribution: RecallSourceAttributionV1 =
++                    serde_json::from_value(source.get("attribution").ok_or_else(invalid)?.clone())
++                        .map_err(|_| invalid())?;
++                attribution.to_owned_attribution().map_err(|_| invalid())
++            })
++            .collect::<Result<Vec<_>, _>>()?;
++        Ok(Self { granted_sources })
++    }
++
++    fn check_candidate(
++        &self,
++        candidate: &RecallCandidateV1,
++        sources: &[RecallSourceAttributionV1],
++    ) -> Result<(), RecallDenialReason> {
++        let invalid = |detail: &str| RecallDenialReason::InvalidSourceAttribution {
++            detail: detail.to_owned(),
++        };
++        if candidate.memory_class.as_str() != Some(SESSION_OBSERVATION_MEMORY_CLASS)
++            || sources.is_empty()
++        {
++            return Err(invalid(
++                "common advisory recall requires original observation attribution",
++            ));
++        }
++        for source in sources {
++            let attribution = source.to_owned_attribution()?;
++            if !self.granted_sources.contains(&attribution) {
++                return Err(invalid(
++                    "original observation is outside dispatched canonical history",
++                ));
++            }
++        }
++        Ok(())
++    }
++}
++
+ struct AdmittedCandidateParts {
+     decision: AdmitDecision,
+     native_score: ValidatedNativeScoreV1,
+@@ -1589,6 +1712,7 @@
+     authorized: &RecallScopeBindingsV1,
+     candidate: &RecallCandidateV1,
+     exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
++    common_profile: Option<&CommonRecallProfileV1>,
+ ) -> Result<AdmittedCandidateParts, RecallDenialReason> {
+     check_class_binding(
+         &candidate.memory_class,
+@@ -1599,6 +1723,9 @@
+     let original_sources = original_sources_from_provenance(&candidate.provenance)?;
+     check_recall_exclusions(candidate, &original_sources, exclusions)?;
+     check_original_source_claims(candidate, &original_sources)?;
++    if let Some(common_profile) = common_profile {
++        common_profile.check_candidate(candidate, &original_sources)?;
++    }
+     let decision = check_validity(temporal, &candidate.validity)?;
+     // Relevance inputs are admitted, never repaired: a score the host cannot
+     // project honestly denies the candidate here rather than reaching
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs b/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
+--- a/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
+@@ -66,7 +66,7 @@
+ /// Revision of [`HOST_CONTEXT_PACK_POLICY_ID`]. Any change to section
+ /// priority, quota arithmetic, the exclusion vocabulary, or the pack-hash
+ /// encoding must increment this.
+-pub const HOST_CONTEXT_PACK_POLICY_REVISION: u64 = 2;
++pub const HOST_CONTEXT_PACK_POLICY_REVISION: u64 = 3;
+ 
+ /// Host authority label for accepted TraceDecay Native project-memory facts
+ /// carried in a context answer. Native stays the authority for accepted
+@@ -377,7 +377,14 @@
+     pub fn label(&self) -> String {
+         match self {
+             Self::Available { source } => format!("available:{source}"),
+-            Self::Hydrated { evidence } => format!("hydrated:{}", evidence.label()),
++            Self::Hydrated { evidence } => match self.canonical_observation_evidence() {
++                Some(original) => format!(
++                    "hydrated:{}:evidence={}",
++                    evidence.label(),
++                    serde_json::json!(original)
++                ),
++                None => format!("hydrated:{}", evidence.label()),
++            },
+             Self::Unresolvable { source, reason } => format!("unresolvable:{source}:{reason}"),
+             Self::Redacted { reason } => format!("redacted:{reason}"),
+             Self::Unknown => "unknown".to_owned(),
+@@ -400,6 +407,31 @@
+             Self::Redacted { reason } => format!("redacted: {reason}"),
+             Self::Unknown => "provenance unknown".to_owned(),
+         }
++    }
++
++    /// This is the existing confirmed evidence object, never a second source
++    /// projection or a provider's unresolved attribution.
++    fn canonical_observation_evidence(
++        &self,
++    ) -> Option<&crate::recall_provenance_hydration::HostEvidenceRefV1> {
++        match self {
++            Self::Hydrated { evidence: evidence @ crate::recall_provenance_hydration::HostEvidenceRefV1::CanonicalObservations { .. } } => Some(evidence),
++            _ => None,
++        }
++    }
++
++    /// Markdown retains the familiar human label and the same typed evidence
++    /// object the JSON candidate carries. Both enter token admission whole.
++    fn markdown_label(&self) -> String {
++        let mut label = self.human_label();
++        if let Some(evidence) = self.canonical_observation_evidence() {
++            let _ = write!(
++                label,
++                "; provenance_evidence={}",
++                serde_json::json!(evidence)
++            );
++        }
++        label
+     }
+ 
+     /// Whether this state names host-confirmed evidence rather than a bare
+@@ -1482,10 +1514,10 @@
+     if !is_contained_provider_label(&item.content) {
+         return Some(ProviderMetadataFieldV1::Content);
+     }
+-    // Both encodings are checked: `human_label` is what markdown renders and
++    // Both encodings are checked: `markdown_label` is what markdown renders and
+     // `label` is what the pack hash absorbs, and they interpolate the same
+     // provider strings through different framing.
+-    if !is_contained_provider_label(&item.provenance.human_label())
++    if !is_contained_provider_label(&item.provenance.markdown_label())
+         || !is_contained_provider_label(&item.provenance.label())
+     {
+         return Some(ProviderMetadataFieldV1::Provenance);
+@@ -1657,7 +1689,7 @@
+         ContextPackRenderFormV1::Markdown => {
+             let mut fragment = format!(
+                 "- {candidate_id} — {content} [{}]\n",
+-                provenance.human_label()
++                provenance.markdown_label()
+             );
+             if let Some(explanation) = explanation {
+                 let _ = writeln!(fragment, "  - {explanation}");
+@@ -1678,12 +1710,16 @@
+     provenance: &ProviderItemProvenanceV1,
+     explanation: Option<&str>,
+ ) -> serde_json::Value {
+-    serde_json::json!({
++    let mut candidate = serde_json::json!({
+         "candidate_id": candidate_id,
+         "content": content,
+         "provenance": provenance.human_label(),
+         "explanation": explanation,
+-    })
++    });
++    if let Some(evidence) = provenance.canonical_observation_evidence() {
++        candidate["provenance_evidence"] = serde_json::json!(evidence);
++    }
++    candidate
+ }
+ 
+ /// The advisory lane's own framing: everything the lane renders that is not a
+@@ -1915,7 +1951,7 @@
+             candidate_provenance,
+             explanation,
+             ..
+-        } => (candidate_provenance.human_label(), explanation.clone()),
++        } => (candidate_provenance.markdown_label(), explanation.clone()),
+         ContextItemProvenanceV1::Host { authority } => (format!("host {authority}"), None),
+     };
+     let mut rendered = format!("- {} — {} [{provenance}]\n", item.item_id, item.content);
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_port.rs b/crates/tracedecay-memory-provider-registry/src/recall_port.rs
+--- a/crates/tracedecay-memory-provider-registry/src/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_port.rs
+@@ -87,8 +87,8 @@
+ use crate::recall_admission::{
+     AdmittedTemporalQuery, RECALL_QUERY_CAPABILITY_ID, RecallAdmissionError, RecallAdmissionReport,
+     RecallBudgetsV1, RecallCandidateContent, RecallCandidateV1, RecallRequestParts,
+-    UnknownValidityPolicy, admit_recall_reply, build_recall_request_payload_with_context,
+-    rfc3339_utc_micros,
++    UnknownValidityPolicy, admit_recall_reply_with_profile,
++    build_recall_request_payload_with_context, rfc3339_utc_micros,
+ };
+ use crate::recall_normalization::{
+     RecallNormalizationError, RecallNormalizationPolicyV1, RecallNormalizationV1,
+@@ -392,6 +392,7 @@
+ /// composition.
+ pub struct ProjectCognitiveRecallPortV1 {
+     composition: Arc<ProjectMemoryProviderComposition>,
++    registration_profiles: BTreeMap<OwnedProviderId, (u64, bool)>,
+     scope_binding: Arc<dyn ExactScopeBinding>,
+     invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
+     admission_observer: Arc<dyn RecallAdmissionObserver>,
+@@ -464,10 +465,26 @@
+     /// Mounts the port. A disabled composition has no recall route and is
+     /// refused here rather than at first use.
+     pub fn mount(inputs: CognitiveRecallPortInputsV1) -> Result<Self, CognitiveRecallPortError> {
+-        inputs
++        let registry = inputs
+             .composition
+             .registry()
+             .ok_or(CognitiveRecallPortError::CompositionDisabled)?;
++        // Snapshot the actual composition metadata, including an explicit
++        // false for legacy registrations. Provider names, descriptor claims,
++        // sidecars and history-grant presence cannot set this requirement.
++        let registration_profiles = registry
++            .registrations
++            .iter()
++            .map(|(id, registration)| {
++                (
++                    id.clone(),
++                    (
++                        registration.registration_revision,
++                        registration.requires_common_advisory_profile,
++                    ),
++                )
++            })
++            .collect();
+         inputs
+             .budgets
+             .validate()
+@@ -482,6 +499,7 @@
+         .map_err(CognitiveRecallPortError::SelectionPolicy)?;
+         Ok(Self {
+             composition: inputs.composition,
++            registration_profiles,
+             scope_binding: inputs.scope_binding,
+             invocation_boundary: inputs.invocation_boundary,
+             admission_observer: inputs.admission_observer,
+@@ -693,6 +711,7 @@
+         // into a stranded worker.
+         let provider_stop = cancellation_token.clone();
+         let plan = RecallCallPlan {
++            registration_profiles: self.registration_profiles.clone(),
+             cancellation: cancellation_token,
+             exact_scope,
+             request_id: request.request_id().as_str().to_owned(),
+@@ -747,14 +766,16 @@
+                         .registry()
+                         .ok_or(CognitiveRecallPortError::CompositionDisabled)
+                         .and_then(|registry| {
+-                            registry
++                            let routed = registry
+                                 .route_active(&routing, RECALL_QUERY_CAPABILITY_ID, &plan)
+-                                .map_err(routing_error)
++                                .map_err(routing_error)?;
++                            let requires_common_profile = plan.common_profile_for(&routed.call)?;
++                            Ok((routed, requires_common_profile))
+                         })
+                 },
+             )
+             .await;
+-        let routed = match dispatched {
++        let (routed, requires_common_profile) = match dispatched {
+             Ok(Ok(routed)) => routed,
+             Ok(Err(CognitiveRecallPortError::HandshakeNotReady { terminal_code })) => {
+                 let Some(degradation) = readiness_degradation(terminal_code) else {
+@@ -872,8 +893,15 @@
+             .ok_or_else(|| CognitiveRecallPortError::ScopeBindingsUnrecorded {
+                 provider_id: call.provider_id.as_str().to_owned(),
+             })?;
+-        let admission = admit_recall_reply(&call, &temporal, admitted_budget, &authorized, &reply)
+-            .map_err(CognitiveRecallPortError::Admission)?;
++        let admission = admit_recall_reply_with_profile(
++            &call,
++            &temporal,
++            admitted_budget,
++            &authorized,
++            &reply,
++            requires_common_profile,
++        )
++        .map_err(CognitiveRecallPortError::Admission)?;
+         // Host order is the normalization's order, not the provider's: the
+         // provider's own rank is retained inside the normalized set so the
+         // reordering stays explainable, and no raw provider score is ever
+@@ -1132,6 +1160,8 @@
+ /// second provider only ever sees a handshake and a call bound to its own
+ /// identity, registration revision, ready receipt, and state generation.
+ struct RecallCallPlan {
++    /// Host registration/revision profile requirements pinned by this mount.
++    registration_profiles: BTreeMap<OwnedProviderId, (u64, bool)>,
+     /// The one live cancellation token of this recall, cloned into every
+     /// handshake and call control so a cancellation requested after dispatch
+     /// is observed by whichever provider is currently working.
+@@ -1151,6 +1181,18 @@
+ }
+ 
+ impl RecallCallPlan {
++    fn common_profile_for(&self, call: &ProviderCall) -> Result<bool, CognitiveRecallPortError> {
++        self.registration_profiles
++            .get(&call.provider_id)
++            .filter(|(revision, _)| *revision == call.registration_revision)
++            .map(|(_, required)| *required)
++            .ok_or(CognitiveRecallPortError::Admission(
++                RecallAdmissionError::OutcomeBinding {
++                    field: "host registration profile",
++                },
++            ))
++    }
++
+     fn control(&self) -> OperationControl {
+         OperationControl::new(
+             self.deadline_utc_micros,
+diff --git a/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs b/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
+@@ -1354,3 +1354,173 @@
+     );
+     Ok(())
+ }
++
++fn canonical_observation_provenance(branch: &str, revision: &str) -> ProviderItemProvenanceV1 {
++    use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
++    let mut scope = scope_value(&admitted_scope());
++    scope["branch_identity"] = serde_json::json!(branch);
++    let source: RecallSourceAttributionV1 = serde_json::from_value(serde_json::json!({
++        "source": {"canonical_provider_id": "claude", "canonical_session_id": "session-original", "source_key": "source-original", "stable_record_id": null,
++            "observation_id": "observation-original", "source_revision": revision, "content_sha256": ONE_SHA},
++        "origin_scope": {"state": "recorded", "exact_scope_identity": scope, "authority_ref": "host-original"},
++        "source_sequence": 7, "occurred_at": null, "ingested_at": "2025-01-01T00:00:00.000000Z",
++        "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null},
++    })).unwrap();
++    source.to_owned_attribution().unwrap();
++    ProviderItemProvenanceV1::Hydrated {
++        evidence: tracedecay_memory_provider_registry::HostEvidenceRefV1::CanonicalObservations {
++            sources: vec![source],
++        },
++    }
++}
++
++#[test]
++fn final_provenance_evidence_preserves_original_sources_and_binds_revision_and_scope() {
++    for form in [
++        ContextPackRenderFormV1::Json,
++        ContextPackRenderFormV1::Markdown,
++    ] {
++        let compile = |provenance: ProviderItemProvenanceV1| {
++            let mut item = provider_item("candidate-original", "retained source content");
++            item.provenance = provenance;
++            compile_context_pack(
++                ContextPackPolicyV1::new(12_000, 6_000, form).unwrap(),
++                &CANONICAL,
++                &[],
++                &lane(contribution(vec![item])),
++            )
++            .unwrap()
++        };
++        let provenance = canonical_observation_provenance("refs/heads/a", "revision-1");
++        let expected = match &provenance {
++            ProviderItemProvenanceV1::Hydrated { evidence } => {
++                serde_json::to_value(evidence).unwrap()
++            }
++            _ => unreachable!(),
++        };
++        let original = compile(provenance.clone());
++        let revision = compile(canonical_observation_provenance(
++            "refs/heads/a",
++            "revision-2",
++        ));
++        let scope = compile(canonical_observation_provenance(
++            "refs/heads/b",
++            "revision-1",
++        ));
++        for changed in [&revision, &scope] {
++            let original_item = &original
++                .section(ContextSectionKind::ProviderMemory)
++                .unwrap()
++                .items[0];
++            let changed_item = &changed
++                .section(ContextSectionKind::ProviderMemory)
++                .unwrap()
++                .items[0];
++            assert_eq!(original_item.item_id, changed_item.item_id);
++            assert_eq!(original_item.content, changed_item.content);
++            assert_eq!(
++                original_item.tokens, changed_item.tokens,
++                "same-size metadata must not rely on token counts to change the hash"
++            );
++            assert_ne!(original.pack_hash, changed.pack_hash);
++            assert_ne!(
++                sha256_hex(original.rendered.as_bytes()),
++                sha256_hex(changed.rendered.as_bytes())
++            );
++        }
++        assert!(original.rendered.contains("session-original"));
++        assert!(original.rendered.contains("revision-1"));
++        assert!(original.rendered.contains("source-original"));
++        match form {
++            ContextPackRenderFormV1::Json => {
++                let rendered: serde_json::Value = serde_json::from_str(&original.rendered).unwrap();
++                let candidate = &rendered
++                    [tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"]
++                    [0];
++                assert_eq!(candidate["provenance"], provenance.human_label());
++                assert_eq!(candidate["provenance_evidence"], expected);
++            }
++            ContextPackRenderFormV1::Markdown => {
++                assert!(original.rendered.contains(&provenance.human_label()));
++                assert!(
++                    original
++                        .rendered
++                        .contains(&format!("provenance_evidence={expected}"))
++                );
++            }
++        }
++    }
++}
++
++#[test]
++fn confirmed_source_evidence_is_charged_before_candidate_budget_admission() {
++    for form in [
++        ContextPackRenderFormV1::Json,
++        ContextPackRenderFormV1::Markdown,
++    ] {
++        let mut item = provider_item("candidate-original", "retained source content");
++        item.provenance = canonical_observation_provenance("refs/heads/a", "revision-1");
++        let rich = contribution(vec![item.clone()]);
++        let roomy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
++        let full = compile_context_pack(roomy, &CANONICAL, &[], &lane(rich.clone())).unwrap();
++        let quota = full.advisory_tokens() - 1;
++        let tight = ContextPackPolicyV1::new(12_000, quota, form).unwrap();
++        let withheld = compile_context_pack(tight, &CANONICAL, &[], &lane(rich)).unwrap();
++        assert!(
++            withheld
++                .section(ContextSectionKind::ProviderMemory)
++                .is_none()
++        );
++        assert_eq!(withheld.excluded_provider_items.len(), 1);
++        assert!(!withheld.rendered.contains("session-original"));
++        assert!(!withheld.rendered.contains("retained source content"));
++        item.provenance = ProviderItemProvenanceV1::Hydrated {
++            evidence: tracedecay_memory_provider_registry::HostEvidenceRefV1::CanonicalRecord {
++                record_id: "observation-original".to_owned(),
++            },
++        };
++        let smaller =
++            compile_context_pack(tight, &CANONICAL, &[], &lane(contribution(vec![item]))).unwrap();
++        assert_eq!(
++            smaller
++                .section(ContextSectionKind::ProviderMemory)
++                .unwrap()
++                .items
++                .len(),
++            1
++        );
++        assert!(full.advisory_tokens() > smaller.advisory_tokens());
++    }
++}
++
++#[test]
++fn unconfirmed_and_redacted_states_never_render_confirmed_original_sources() {
++    for provenance in [
++        ProviderItemProvenanceV1::Unknown,
++        ProviderItemProvenanceV1::Redacted {
++            reason: "provider redacted".to_owned(),
++        },
++        ProviderItemProvenanceV1::Available {
++            source: "record:observation-original".to_owned(),
++        },
++        ProviderItemProvenanceV1::Unresolvable {
++            source: "record:observation-original".to_owned(),
++            reason: "unavailable".to_owned(),
++        },
++    ] {
++        let mut item = provider_item("candidate-original", "advisory content");
++        item.provenance = provenance;
++        let pack = compile_context_pack(
++            ContextPackPolicyV1::new(12_000, 6_000, ContextPackRenderFormV1::Json).unwrap(),
++            &CANONICAL,
++            &[],
++            &lane(contribution(vec![item])),
++        )
++        .unwrap();
++        let rendered: serde_json::Value = serde_json::from_str(&pack.rendered).unwrap();
++        let candidate = &rendered
++            [tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"][0];
++        assert!(candidate.get("provenance_evidence").is_none());
++        assert!(!pack.rendered.contains("canonical_observations"));
++    }
++}
+diff --git a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+@@ -2305,3 +2305,290 @@
+         );
+     }
+ }
++
++/// Both paths use the exact same provider identity and capability declaration.
++/// Only the actual host registration path decides the common-profile policy.
++fn compose_profile_fixture(
++    mut fixture: RecallFixturePort,
++    common_profile: bool,
++) -> Arc<ProjectMemoryProviderComposition> {
++    use tracedecay_memory_provider_api::OwnedVersionedId;
++    use tracedecay_memory_provider_native::NativeProvider;
++    use tracedecay_memory_provider_registry::{
++        COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES,
++        ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1, ProviderRegistrationV1,
++        SelectedProviderActivationV1,
++    };
++    for capability in std::iter::once(COMMON_ADVISORY_PROFILE_ID)
++        .chain(COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter().copied())
++    {
++        fixture
++            .descriptor
++            .capabilities
++            .insert(OwnedVersionedId::new(capability).unwrap());
++    }
++    let fixture = Arc::new(fixture);
++    let composition = if common_profile {
++        Arc::new(
++            ProjectMemoryProviderComposition::compose_registered(
++                SelectedProviderActivationV1::Injected {
++                    fabric_config: FabricConfig {
++                        max_registered_providers: 1,
++                        max_in_flight: 2,
++                    },
++                    registration: ProviderRegistrationV1 {
++                        provider: Arc::new(NativeProvider::new(fixture).unwrap()),
++                        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap(),
++                        registration_revision: 31,
++                        mode: EnabledProviderMode::Active,
++                        execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
++                        recall_scope_bindings: authorized_native(),
++                        lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
++                    },
++                },
++                vec![],
++            )
++            .unwrap(),
++        )
++    } else {
++        compose_mode(fixture, EnabledProviderMode::Active)
++    };
++    assert_eq!(
++        composition
++            .registry()
++            .unwrap()
++            .selected_registration()
++            .unwrap()
++            .requires_common_advisory_profile,
++        common_profile
++    );
++    composition
++}
++
++/// Host-dispatched canonical history fixture. The registry checks membership;
++/// the production host separately revalidates disposition before hydration.
++fn dispatched_history_fixture(
++    exact: &OwnedExactScope,
++    source: &serde_json::Value,
++) -> serde_json::Value {
++    serde_json::json!({
++        "authorization_ref": "host.history.fixture", "policy_revision": 1,
++        "destination_scope": scope_value(exact), "relation": "exact_scope",
++        "sources": [{ "attribution": source, "current_disposition": {
++            "state": "available", "authority_ref": "host.disposition.fixture",
++            "authority_revision": 1, "checked_at": EVALUATION_TIME,
++        }}],
++        "disposition_checkpoint": { "exact_scope": scope_value(exact),
++            "authority_ref": "host.checkpoint.fixture", "authority_revision": 1,
++            "checked_at": EVALUATION_TIME,
++        },
++    })
++}
++
++#[tokio::test]
++async fn common_profile_denies_fact_projection_and_ungranted_sources_before_selection() {
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
++    let source = canonical_observation_source(&exact);
++    for defect in [
++        "project_fact",
++        "profile_fact",
++        "exact_scope_fact",
++        "missing_sources",
++        "ungranted_revision",
++    ] {
++        let mut denied = observation_candidate_fields(&source, &exact);
++        match defect {
++            "project_fact" => {
++                denied["memory_class"] = serde_json::json!("project");
++                denied["exact_scope_identity"] = project_facts_candidate_value(&exact);
++            }
++            "profile_fact" => {
++                denied["memory_class"] = serde_json::json!("profile");
++                denied["exact_scope_identity"] = serde_json::json!({
++                    "scope_binding": "profile_facts", "profile_id": exact.profile_id,
++                    "project_id": "", "repository_identity": "", "worktree_identity": "",
++                    "branch_identity": "", "agent_session_id": "", "resolved_scope_digest": "",
++                });
++            }
++            "exact_scope_fact" => denied["memory_class"] = serde_json::json!("project"),
++            "missing_sources" => {
++                denied["provenance"]
++                    .as_object_mut()
++                    .unwrap()
++                    .remove("original_sources");
++            }
++            "ungranted_revision" => {
++                denied["provenance"]["original_sources"][0]["source"]["source_revision"] =
++                    serde_json::json!("revision-not-granted");
++            }
++            _ => unreachable!(),
++        }
++        let mut fixture = RecallFixturePort::new();
++        fixture.candidate_contents = Some(vec![
++            (
++                "aa-denied".to_owned(),
++                "higher-ranked denied candidate".to_owned(),
++            ),
++            (
++                "zz-granted".to_owned(),
++                "distinct granted observation".to_owned(),
++            ),
++        ]);
++        fixture
++            .candidate_overrides
++            .insert("aa-denied".to_owned(), denied);
++        fixture.candidate_overrides.insert(
++            "zz-granted".to_owned(),
++            observation_candidate_fields(&source, &exact),
++        );
++        let port = mount(
++            compose_profile_fixture(fixture, true),
++            Arc::new(LedgerObserver::default()),
++        )
++        .unwrap()
++        .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
++        let outcome = port
++            .recall_admitted_with_history(
++                request(scope.clone(), 60_000_000, false),
++                &live_signal(),
++                Some(dispatched_history_fixture(&exact, &source)),
++            )
++            .await
++            .unwrap();
++        assert_eq!(
++            outcome.result.candidates().len(),
++            1,
++            "{defect}: {:?}",
++            outcome.report
++        );
++        assert_eq!(
++            outcome.result.candidates()[0].candidate_id(),
++            "zz-granted",
++            "{defect}"
++        );
++        assert_eq!(
++            outcome.normalization.as_ref().unwrap().candidates.len(),
++            1,
++            "{defect}"
++        );
++        assert!(
++            outcome
++                .selection
++                .as_ref()
++                .unwrap()
++                .budget_excluded
++                .is_empty(),
++            "{defect}"
++        );
++        let report = outcome.report.unwrap();
++        assert_eq!(
++            (
++                report.received_count,
++                report.admitted_count,
++                report.denied.len()
++            ),
++            (2, 1, 1),
++            "{defect}"
++        );
++        assert!(
++            !report
++                .authorized_scope_bindings
++                .authorizes(ScopeBinding::ProjectFacts)
++        );
++        assert!(
++            !report
++                .authorized_scope_bindings
++                .authorizes(ScopeBinding::ProfileFacts)
++        );
++        assert_eq!(report.denied[0].candidate_id, "aa-denied", "{defect}");
++        if matches!(defect, "project_fact" | "profile_fact") {
++            assert!(
++                matches!(
++                    report.denied[0].reason,
++                    RecallDenialReason::ScopeBindingUnauthorized { .. }
++                ),
++                "{defect}: {:?}",
++                report.denied
++            );
++        } else {
++            assert!(
++                matches!(
++                    report.denied[0].reason,
++                    RecallDenialReason::InvalidSourceAttribution { .. }
++                ),
++                "{defect}: {:?}",
++                report.denied
++            );
++        }
++        assert_eq!(
++            serde_json::to_value(&outcome.original_sources["zz-granted"]).unwrap(),
++            serde_json::json!([source.clone()])
++        );
++    }
++}
++
++#[tokio::test]
++async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or_grant_presence() {
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
++    let source = canonical_observation_source(&exact);
++    // The common registration cannot escape its policy when no grant exists.
++    let mut common = RecallFixturePort::new();
++    common.candidate_contents = Some(vec![(
++        "observation".to_owned(),
++        "ungranted observation".to_owned(),
++    )]);
++    common.candidate_overrides.insert(
++        "observation".to_owned(),
++        observation_candidate_fields(&source, &exact),
++    );
++    let port = mount(
++        compose_profile_fixture(common, true),
++        Arc::new(LedgerObserver::default()),
++    )
++    .unwrap();
++    let outcome = port
++        .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
++        .await
++        .unwrap();
++    assert!(outcome.result.candidates().is_empty());
++    assert!(matches!(
++        outcome.report.unwrap().denied[0].reason,
++        RecallDenialReason::InvalidSourceAttribution { .. }
++    ));
++    // The legacy registration keeps fact extension bindings even with the
++    // same common capabilities and a real-shaped host history grant present.
++    let mut legacy = RecallFixturePort::new();
++    legacy.candidate_contents = Some(vec![(
++        "legacy-fact".to_owned(),
++        "retained canonical fact extension".to_owned(),
++    )]);
++    let port = mount(
++        compose_profile_fixture(legacy, false),
++        Arc::new(LedgerObserver::default()),
++    )
++    .unwrap();
++    let outcome = port
++        .recall_admitted_with_history(
++            request(scope, 60_000_000, false),
++            &live_signal(),
++            Some(dispatched_history_fixture(&exact, &source)),
++        )
++        .await
++        .unwrap();
++    assert_eq!(outcome.result.candidates().len(), 1, "{:?}", outcome.report);
++    assert_eq!(outcome.result.candidates()[0].candidate_id(), "legacy-fact");
++    let report = outcome.report.unwrap();
++    assert!(
++        report
++            .authorized_scope_bindings
++            .authorizes(ScopeBinding::ProjectFacts)
++    );
++    assert!(
++        report
++            .authorized_scope_bindings
++            .authorizes(ScopeBinding::ProfileFacts)
++    );
++    assert!(outcome.original_sources.is_empty());
++}

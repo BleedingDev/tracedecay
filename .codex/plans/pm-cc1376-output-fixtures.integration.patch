@@ -1,0 +1,69 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -7126,7 +7126,19 @@
+         );
+ 
+         let (form, host_items) = host_evidence(host_answer);
+-        let AdvisoryContextPackV1::Compiled(pack) = advisory.context_pack(form, &host_items) else {
++        let control_refs = advisory
++            .provisional_control_refs()
++            .expect("control references");
++        let recall_trace = advisory
++            .provisional_recall_trace()
++            .expect("mounted recall trace");
++        let AdvisoryContextPackV1::Compiled(pack) = advisory.context_pack_with_control_metadata(
++            form,
++            &host_items,
++            &control_refs,
++            advisory.retained_replay_metadata(),
++            Some(&recall_trace),
++        ) else {
+             panic!("the mounted journey must compile its pack");
+         };
+         let sections: Vec<(&str, String)> = pack
+@@ -7162,6 +7174,25 @@
+         );
+         assert!(pack.rendered_tokens <= pack.total_token_budget);
+         assert!(pack.advisory_tokens() <= pack.advisory_token_quota);
++        let emitted: ContextRecallTraceV1 = serde_json::from_str(
++            text.lines()
++                .find_map(|line| line.strip_prefix("recall_trace="))
++                .expect("rendered recall trace"),
++        )
++        .expect("recall trace metadata");
++        assert_eq!(pack.recall_trace.as_ref(), Some(&emitted));
++        let retained = mount
++            .explain_trace(emitted.trace_ref.rsplit(':').next().unwrap())
++            .expect("retained trace read")
++            .expect("the emitted trace was retained before publication");
++        assert_eq!(retained.trace.request_id, emitted.request_id);
++        assert_eq!(
++            emitted.trace_ref,
++            format!(
++                "recall-trace-v1:{}:{}",
++                retained.exact_scope_sha256, retained.trace.trace_id
++            )
++        );
+     }
+ 
+     /// An advisory lane whose deadline has already elapsed never contacts a
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
+@@ -241,11 +241,13 @@
+             .unwrap();
+         assert_eq!(session.session_id, SESSION);
+         assert_eq!(session.provider, "claude");
++        let identity = identify_claude_source(&transcript).unwrap();
++        assert_eq!(identity.provider, session.provider);
++        assert_eq!(identity.session_id, session.session_id);
+         assert_eq!(
+-            std::fs::canonicalize(session.transcript_path.as_deref().unwrap()).unwrap(),
++            std::fs::canonicalize(&identity.source_path).unwrap(),
+             std::fs::canonicalize(&transcript).unwrap()
+         );
+-        let identity = identify_claude_source(&transcript).unwrap();
+         let source = ObservationSourceIdentityV1::for_provider_source(
+             ProviderId::new("claude").unwrap(),
+             SessionId::new(identity.session_id).unwrap(),

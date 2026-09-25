@@ -1,0 +1,327 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/util.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/util.rs
+@@ -318,6 +318,42 @@
+     }
+ }
+ 
++/// Validates the integrity wrapper without interpreting opaque host evidence.
++pub(super) fn validate_common_capsule(provenance: &Value) -> Result<(), StoreError> {
++    let Some(capsule) = provenance.get("common_capsule") else {
++        return Ok(());
++    };
++    let corrupt = || StoreError::Corrupt("common capsule integrity mismatch".to_owned());
++    if capsule["version"].as_u64() != Some(1) {
++        return Err(corrupt());
++    }
++    let values = capsule["bytes"].as_array().ok_or_else(corrupt)?;
++    if values.len() > 131_072 {
++        return Err(corrupt());
++    }
++    let digest = capsule["sha256"].as_str().ok_or_else(corrupt)?;
++    if digest.len() != 64
++        || !digest
++            .bytes()
++            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
++    {
++        return Err(corrupt());
++    }
++    let bytes = values
++        .iter()
++        .map(|value| {
++            value
++                .as_u64()
++                .and_then(|value| u8::try_from(value).ok())
++                .ok_or_else(corrupt)
++        })
++        .collect::<Result<Vec<_>, _>>()?;
++    if sha256_hex(&bytes) != digest {
++        return Err(corrupt());
++    }
++    Ok(())
++}
++
+ pub(super) fn store_reply(error: StoreError, commit_seq: u64) -> EngineReply {
+     match error {
+         StoreError::Busy => EngineReply::new(Outcome::Busy, commit_seq, Value::Null),
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
+@@ -15,6 +15,7 @@
+ };
+ use tracedecay_memory_provider_api::{OwnedTemporalQuery, RecordedValidity, TemporalEligibility};
+ 
++use super::util::validate_common_capsule;
+ use crate::engine::{EngineReply, Outcome};
+ use crate::store::{NamespaceStore, StoreError};
+ 
+@@ -156,6 +157,7 @@
+                 .ok_or_else(|| StoreError::Corrupt("record capsule missing".to_owned()))?;
+             let provenance: Value = serde_json::from_str(&capsule.provenance)
+                 .map_err(|error| StoreError::Corrupt(error.to_string()))?;
++            validate_common_capsule(&provenance)?;
+             if provenance
+                 .pointer("/control/feedback/suppressed")
+                 .and_then(Value::as_bool)
+@@ -370,3 +372,122 @@
+             .bytes()
+             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+ }
++
++#[cfg(test)]
++#[allow(clippy::field_reassign_with_default, clippy::unwrap_used)]
++mod tests {
++    use crate::embedding::doubles::HashEncoder;
++    use crate::engine::{NcmEngine, ObserveRequest, Outcome, RecallRequest};
++    use crate::ports::{Deadline, StateRoot};
++    use serde_json::{Value, json};
++    use sha2::{Digest, Sha256};
++    use std::sync::Arc;
++    use tempfile::TempDir;
++    use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
++
++    #[test]
++    fn selected_read_rejects_corruption_before_suppression_or_unknown_metadata() {
++        for suppressed in [false, true] {
++            let tempdir = TempDir::new().unwrap();
++            let namespace = format!("5d{}", "0".repeat(62));
++            let deadline = Deadline {
++                remaining_ms: u64::MAX,
++            };
++            let mut config = NcmConfig::default();
++            config.terrain_resolution = 3;
++            config.stm.n_centers = 8;
++            config.stm.top_k_read = 8;
++            config.stm.top_k_write = 8;
++            config.ltm.n_centers = 8;
++            config.ltm.top_k_read = 8;
++            config.ltm.top_k_write = 8;
++            config.hybrid_candidates = 8;
++            let engine = NcmEngine::new(
++                StateRoot::new(tempdir.path()).unwrap(),
++                Arc::new(HashEncoder::new()),
++                config,
++            );
++            let bytes = vec![255_u8, 0, 42];
++            let mut request = ObserveRequest {
++                idempotency_key: "integrity-observe".to_owned(),
++                payload_sha256: String::new(),
++                source: SourceId("source-integrity-observe".to_owned()),
++                key_text: "integrity key".to_owned(),
++                value_text: "retained answer".to_owned(),
++                affect: None,
++                surprise: 0.4,
++                intensity: 1.0,
++                provenance: json!({
++                    "common_capsule": {
++                        "version": 1,
++                        "sha256": format!("{:x}", Sha256::digest(&bytes)),
++                        "bytes": bytes
++                    },
++                    "control": {"feedback": {"suppressed": suppressed}}
++                }),
++                deadline,
++            };
++            request.payload_sha256 = request.canonical_payload_sha256().unwrap();
++            let observed = engine.observe(&namespace, request);
++            assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
++
++            let published = {
++                let mut namespaces = engine.namespace_lock().unwrap();
++                let handle = namespaces.get_mut(&namespace).unwrap();
++                let published = handle.live.read().unwrap().clone();
++                let capsule = handle.store.capsule(RecordId(1)).unwrap().unwrap();
++                let mut provenance: Value = serde_json::from_str(&capsule.provenance).unwrap();
++                provenance["common_capsule"]["bytes"][2] = json!(43);
++                // The resident store owns the exclusive connection. Corrupt its
++                // retained bytes through that connection without republishing.
++                let mut mutation = handle.store.begin_mutation().unwrap();
++                mutation
++                    .update_capsule_provenance(RecordId(1), &provenance.to_string())
++                    .unwrap();
++                // Keep the cached generation aligned with this test store edit.
++                handle.commit_seq = mutation.commit().unwrap();
++                published
++            };
++            let before = engine.inspection(&namespace);
++            assert_eq!(before.outcome, Outcome::Success);
++            let reply = engine.recall_selected(
++                &namespace,
++                RecallRequest {
++                    query_text: "integrity key".to_owned(),
++                    top_k: 8,
++                    deadline,
++                },
++                json!({
++                    "mode": "current",
++                    "evaluation": 0,
++                    "as_of": null,
++                    "start": null,
++                    "end": null,
++                    "include_superseded": false,
++                    "include_revoked": false,
++                    "unknown_policy": "exclude",
++                    "maximum_candidates": 8,
++                    "request_token": "a".repeat(64),
++                    "exclusions": {
++                        "stable_memory_refs": [],
++                        "candidate_ids": [],
++                        "source_refs": [],
++                        "trace_refs": [],
++                        "observation_ids": [],
++                        "content_sha256": []
++                    }
++                }),
++            );
++            assert_eq!(reply.outcome, Outcome::Corrupt, "{reply:?}");
++            assert_eq!(reply.state_generation, before.state_generation);
++            assert_eq!(before, engine.inspection(&namespace));
++            let namespaces = engine.namespace_lock().unwrap();
++            let handle = namespaces.get(&namespace).unwrap();
++            assert_eq!(
++                handle.store.meta().unwrap().commit_seq,
++                before.state_generation
++            );
++            assert!(Arc::ptr_eq(&published, &handle.live.read().unwrap()));
++        }
++    }
++}
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/recovery.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/recovery.rs
+@@ -1,5 +1,5 @@
+ use super::super::*;
+-use super::util::{core_reply, corrupt_reply, sha256_hex, store_reply};
++use super::util::{core_reply, corrupt_reply, sha256_hex, store_reply, validate_common_capsule};
+ use crate::store::{Event, NamespaceStore, StoreMeta, StoredCapsule};
+ use tracedecay_memory_ncm_core::kernel::{NcmKernel, NewRecord};
+ use tracedecay_memory_ncm_core::types::{CoreError, NcmConfig};
+@@ -54,6 +54,12 @@
+     let capsules = store
+         .capsules_in_commit_order(false)
+         .map_err(|error| store_reply(error, meta.commit_seq))?;
++    for capsule in &capsules {
++        let provenance: serde_json::Value = serde_json::from_str(&capsule.provenance)
++            .map_err(|_| corrupt_reply(meta.commit_seq, "invalid capsule provenance"))?;
++        validate_common_capsule(&provenance)
++            .map_err(|error| store_reply(error, meta.commit_seq))?;
++    }
+     let events = store
+         .events_after(applied_seq)
+         .map_err(|error| store_reply(error, meta.commit_seq))?;
+--- a/crates/tracedecay-memory-ncm-runtime/tests/engine_transactions.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/engine_transactions.rs
+@@ -8,6 +8,7 @@
+ 
+ use rusqlite::Connection;
+ use serde_json::{Value, json};
++use sha2::{Digest, Sha256};
+ use std::sync::Arc;
+ use tempfile::TempDir;
+ use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
+@@ -553,3 +554,108 @@
+         Some(&"rust-record")
+     );
+ }
++
++fn integrity_observation(common: bool) -> ObserveRequest {
++    let mut request = observe_request("integrity key", "retained answer", "integrity-observe");
++    if common {
++        // Opaque bytes deliberately need not contain JSON or host schema.
++        let bytes = vec![255_u8, 0, 42];
++        request.provenance["common_capsule"] =
++            json!({"version":1,"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes});
++    }
++    request.payload_sha256 = request.canonical_payload_sha256().unwrap();
++    request
++}
++
++fn corrupt_capsule_bytes(tempdir: &TempDir, ns: &str) {
++    let connection = Connection::open(
++        tempdir
++            .path()
++            .join("namespaces")
++            .join(ns)
++            .join("ncm.sqlite"),
++    )
++    .unwrap();
++    let stored: String = connection
++        .query_row(
++            "SELECT provenance FROM capsules WHERE record_id = 1",
++            [],
++            |row| row.get(0),
++        )
++        .unwrap();
++    let mut provenance: Value = serde_json::from_str(&stored).unwrap();
++    provenance["common_capsule"]["bytes"][2] = json!(43);
++    connection
++        .execute(
++            "UPDATE capsules SET provenance = ?1 WHERE record_id = 1",
++            [provenance.to_string()],
++        )
++        .unwrap();
++}
++
++#[test]
++fn checkpoint_recovery_rejects_changed_common_capsule_bytes() {
++    let tempdir = TempDir::new().unwrap();
++    let ns = namespace(91);
++    let engine = make_engine(&tempdir);
++    assert_eq!(
++        engine.observe(&ns, integrity_observation(true)).outcome,
++        Outcome::Success
++    );
++    let checkpoint = engine.maintenance(
++        &ns,
++        MaintenanceRequest {
++            idempotency_key: "integrity-checkpoint".to_owned(),
++            kind: MaintenanceKind::Checkpoint,
++            deadline: DEADLINE,
++        },
++    );
++    assert_eq!(checkpoint.outcome, Outcome::Success);
++    drop(engine);
++    corrupt_capsule_bytes(&tempdir, &ns);
++    let reopened = make_engine(&tempdir);
++    let reply = reopened.handshake(&ns);
++    assert_eq!(reply.outcome, Outcome::Corrupt, "{reply:?}");
++    assert_eq!(reply.state_generation, checkpoint.state_generation);
++}
++
++#[test]
++fn valid_opaque_and_legacy_capsules_survive_checkpoint_recovery() {
++    for common in [false, true] {
++        let tempdir = TempDir::new().unwrap();
++        let ns = namespace(92);
++        let engine = make_engine(&tempdir);
++        assert_eq!(
++            engine.observe(&ns, integrity_observation(common)).outcome,
++            Outcome::Success
++        );
++        assert_eq!(
++            engine
++                .maintenance(
++                    &ns,
++                    MaintenanceRequest {
++                        idempotency_key: "valid-checkpoint".to_owned(),
++                        kind: MaintenanceKind::Checkpoint,
++                        deadline: DEADLINE
++                    }
++                )
++                .outcome,
++            Outcome::Success
++        );
++        let before = inspect(&engine, &ns);
++        drop(engine);
++        let reopened = make_engine(&tempdir);
++        assert_eq!(reopened.handshake(&ns).outcome, Outcome::Success);
++        assert_semantic_state_eq(&before, &inspect(&reopened, &ns));
++        let reply = reopened.recall(
++            &ns,
++            RecallRequest {
++                query_text: "integrity key".to_owned(),
++                top_k: 8,
++                deadline: DEADLINE,
++            },
++        );
++        assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
++        assert!(recalled_values(&reply.payload).contains(&"retained answer"));
++    }
++}

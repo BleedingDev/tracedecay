@@ -158,7 +158,7 @@ pub(in super::super) async fn install_final_schema(
     ]
     .into_iter()
     .map(|table| {
-        final_table_schema_sql(table, true)
+        final_table_schema_sql(table, false)
             .expect("canonical Git history schema table must be installable")
     })
     .collect::<Vec<_>>()

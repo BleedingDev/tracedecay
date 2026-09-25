@@ -1,0 +1,325 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
+@@ -15,7 +15,9 @@
+ };
+ use tracedecay_domain::{ComponentVersion, ManifestDigest, UtcMicros, canonical_sha256};
+ use tracedecay_memory_observation::ProviderSourceIntentReceiptV1;
+-use tracedecay_memory_provider_registry::TerminalCode;
++use tracedecay_memory_provider_registry::{
++    ProviderCall, ProviderReply, TerminalCode, TerminalRecord,
++};
+ use tracedecay_tool_catalog::{EffectClass, SortContractId};
+ 
+ use super::super::cognitive_recall::control_attribution::{
+@@ -55,8 +57,13 @@
+         )
+         && !verified_no_change(&completed.result)
+     {
++        // Retain the receipt the provider actually supplied before removing
++        // malformed operation data; a host observation is not a provider receipt.
++        let provider_receipt_digest = mutation_receipt(&completed.result.result)
++            .map(|receipt| receipt.provider_receipt_digest.clone());
+         completed.result.terminal = ProviderControlTerminalV1::ContractViolation;
+         completed.result.effect = unknown_effect();
++        completed.result.effect.provider_receipt_digest = provider_receipt_digest;
+         completed.result.result = absent_operation_result(request);
+         completed.result.warnings.truncate(31);
+         completed.result.warnings.push("host: successful provider no-effect reply lacked operation-specific no-change evidence; reconcile the same operation".to_owned());
+@@ -71,7 +78,7 @@
+         if completed.host_receipt.is_some() {
+             return Err(invalid_field("host effect on a provider read"));
+         }
+-        read_outcome(context, completed.result)
++        read_outcome(context, request, completed.result)
+     }
+ }
+ 
+@@ -155,11 +162,27 @@
+ ) -> ProviderControlResultV1 {
+     let mutation = retained_surface_operation_is_effect(request.operation());
+     let (terminal, possible_effect) = failure_terminal(failure, mutation);
+-    let effect = if possible_effect {
++    let received_terminal = match failure {
++        ControlFailureStageV1::Projection { dispatched, .. }
++        | ControlFailureStageV1::PortabilityArtifact { dispatched, .. } => {
++            validated_reply_terminal(&dispatched.call, &dispatched.reply)
++        }
++        _ => None,
++    };
++    let mut effect = if possible_effect {
+         unknown_effect()
+     } else {
+         no_effect()
+     };
++    if possible_effect {
++        if let Some(received) = received_terminal {
++            let evidence = received.committed_effect();
++            effect.provider_receipt_digest = evidence.provider_receipt_sha256().map(str::to_owned);
++            if let Some(action) = evidence.reconciliation_action() {
++                effect.reconciliation_action = Some(action.to_owned());
++            }
++        }
++    }
+     ProviderControlResultV1 {
+         provider_id: state.provider_id.as_str().to_owned(),
+         registration_revision: state.registration_revision,
+@@ -167,12 +190,29 @@
+         operation_id: identity.operation_id.clone(),
+         idempotency_key: mutation.then(|| identity.idempotency_key.clone()).flatten(),
+         terminal,
+-        diagnostic_id: None,
++        diagnostic_id: received_terminal
++            .and_then(TerminalRecord::diagnostic_id)
++            .map(str::to_owned),
+         domain_detail: None,
+         effect,
+         result: absent_operation_result(request),
+         warnings: vec![failure_notice(failure).to_owned()],
+     }
++}
++
++/// Core terminal construction validates the provider effect shape separately
++/// from operation data. Retain that evidence only for the call it answers.
++fn validated_reply_terminal<'reply>(
++    call: &ProviderCall,
++    reply: &'reply ProviderReply,
++) -> Option<&'reply TerminalRecord> {
++    let terminal = &reply.terminal;
++    (terminal.provider_id() == &call.provider_id
++        && terminal.operation() == call.operation
++        && terminal.operation_id() == call.operation_id
++        && terminal.exact_scope_sha256() == call.exact_scope.exact_scope_sha256()
++        && terminal.validate_duplicate_binding_for_call(call).is_ok())
++    .then_some(terminal)
+ }
+ 
+ fn completed_failure(
+@@ -437,6 +477,8 @@
+     }
+ }
+ 
++/// Host-observed uncertainty can have no provider reply and hence no provider
++/// receipt. Received provider evidence is attached only after its own checks.
+ fn unknown_effect() -> ProviderControlEffectV1 {
+     ProviderControlEffectV1 {
+         state: ProviderControlEffectStateV1::Unknown,
+@@ -708,8 +750,23 @@
+ 
+ fn read_outcome(
+     context: &RetainedSurfaceExecutionContextV1<'_>,
++    request: &ProviderControlRequestV1,
+     result: ProviderControlResultV1,
+ ) -> OutcomeResult<ApplicationOutcome<RetainedSurfaceResultV1>> {
++    let complete_initial_inspection = matches!(
++        (request, &result.result),
++        (
++            ProviderControlRequestV1::Inspection(request),
++            ProviderControlOperationResultV1::Inspection(Some(data)),
++        ) if request.cursor.is_none()
++            && data.coverage == ProviderControlInspectionCoverageV1::Complete
++            && data.next_cursor.is_none()
++            && data.redactions.is_empty()
++            && matches!(
++                result.terminal,
++                ProviderControlTerminalV1::Success | ProviderControlTerminalV1::SuccessZeroResults
++            )
++    );
+     let finished_at = now_micros();
+     let operation = result.operation();
+     let execution_terminal = read_termination(result.terminal);
+@@ -734,7 +791,11 @@
+         SortContractId::new(format!("sort.provider-control.{}.v1", operation.as_str()))
+             .map_err(invalid_outcome)?,
+         1,
+-        facts.total,
++        if complete_initial_inspection {
++            Some(facts.returned)
++        } else {
++            facts.total
++        },
+         facts.returned,
+     )
+     .map_err(invalid_outcome)?;
+@@ -873,7 +934,11 @@
+         Deadline, DisclosureClass, RequestContext, RequestId, ResolvedScope,
+     };
+     use tracedecay_domain::{ActorId, ProjectId, RefId, RepositoryId, WorktreeId};
+-    use tracedecay_memory_provider_registry::{OwnedExactScope, OwnedProviderId};
++    use tracedecay_memory_provider_registry::{
++        CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
++        OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCallParts,
++        ProviderOperation,
++    };
+ 
+     fn state() -> RetainedRecallControlScopeV1 {
+         RetainedRecallControlScopeV1 {
+@@ -1016,6 +1081,67 @@
+     }
+ 
+     #[test]
++    fn received_terminal_evidence_belongs_to_the_original_call() {
++        let state = state();
++        let identity = identity();
++        let operation = ProviderOperation::Maintenance;
++        let bytes = b"{}".to_vec();
++        let call = ProviderCall::new(ProviderCallParts {
++            operation,
++            provider_id: state.provider_id,
++            registration_revision: state.registration_revision,
++            ready_receipt_sha256: "a".repeat(64),
++            exact_scope: state.delivery_scope,
++            request_id: "request.control".to_owned(),
++            operation_id: identity.operation_id,
++            expected_state_generation: 5,
++            idempotency_key: identity.idempotency_key,
++            control: OperationControl::new(i64::MAX, 1000, CancellationToken::new()),
++            payload: CanonicalPayload::new(
++                OwnedVersionedId::new("tracedecay.memory.provider.maintenance.v1").unwrap(),
++                bytes.clone(),
++                tracedecay_domain::canonical_text::sha256_hex(&bytes),
++            )
++            .unwrap(),
++            required_capabilities: vec![
++                OwnedVersionedId::new(operation.capability_id()).unwrap(),
++            ],
++            extensions: Vec::new(),
++        })
++        .unwrap();
++        let reply = |operation_id: &str| ProviderReply {
++            terminal: TerminalRecord::new(
++                operation,
++                call.provider_id.clone(),
++                TerminalCode::EffectUnknown,
++                CommittedEffectEvidence::unknown("c".repeat(64), "reconcile.actual").unwrap(),
++                FallbackDirective::forbidden(),
++                operation_id,
++                call.exact_scope.exact_scope_sha256(),
++                Some("actual.provider.diagnostic".to_owned()),
++            )
++            .unwrap(),
++            payload: None,
++            warnings: Vec::new(),
++            extensions: Vec::new(),
++            state_generation: 5,
++        };
++        let received = reply(&call.operation_id);
++        let terminal = validated_reply_terminal(&call, &received).unwrap();
++        assert_eq!(
++            terminal.committed_effect().provider_receipt_sha256(),
++            Some("c".repeat(64).as_str())
++        );
++        assert_eq!(
++            terminal.committed_effect().reconciliation_action(),
++            Some("reconcile.actual")
++        );
++        assert_eq!(terminal.diagnostic_id(), Some("actual.provider.diagnostic"));
++        let another_operation = reply("01952a1e-5000-7000-8000-000000000002");
++        assert!(validated_reply_terminal(&call, &another_operation).is_none());
++    }
++
++    #[test]
+     fn accepted_identity_survives_known_refusals_without_inventing_possible_effects() {
+         let cases = [
+             (
+@@ -1085,6 +1211,24 @@
+             unknown.idempotency_key.as_str(),
+             identity().idempotency_key.as_deref().unwrap()
+         );
++        let Some(RetainedSurfaceResultV1::ProviderControl(retained)) = &unknown.payload else {
++            panic!("host uncertainty retains the control identity and warning");
++        };
++        assert_eq!(retained.provider_id, state().provider_id.as_str());
++        assert_eq!(retained.registration_revision, state().registration_revision);
++        assert_eq!(retained.scope, projection::scope(&state().delivery_scope));
++        assert_eq!(retained.operation_id, identity().operation_id);
++        assert_eq!(retained.idempotency_key, identity().idempotency_key);
++        assert_eq!(retained.effect.state, ProviderControlEffectStateV1::Unknown);
++        assert!(retained.effect.provider_receipt_digest.is_none());
++        assert!(retained.diagnostic_id.is_none());
++        assert_eq!(
++            retained.effect.reconciliation_action.as_deref(),
++            Some("reconcile_same_operation")
++        );
++        assert!(retained.warnings.iter().any(|warning| {
++            warning.contains("durable receipt could not be confirmed")
++        }));
+ 
+         let mut committed = unchanged_result();
+         let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut committed.result
+@@ -1097,8 +1241,9 @@
+         committed.effect.state = ProviderControlEffectStateV1::Committed;
+         committed.effect.state_generation_before = Some(5);
+         committed.effect.state_generation_after = Some(6);
+-        committed.effect.committed_boundary = Some("maintenance:compacted".to_owned());
++        committed.effect.committed_boundary = None;
+         committed.effect.provider_receipt_digest = Some("c".repeat(64));
++        committed.effect.verification_digest = Some("e".repeat(64));
+         let committed = assembled(committed);
+         assert_eq!(committed.receipt.outcome, EffectTermination::Completed);
+         assert!(committed.receipt.committed_state.is_some());
+@@ -1111,6 +1256,7 @@
+     #[test]
+     fn malformed_success_after_contact_retains_operation_for_reconciliation() {
+         let mut result = unchanged_result();
++        result.diagnostic_id = Some("actual.provider.diagnostic".to_owned());
+         let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut result.result else {
+             unreachable!()
+         };
+@@ -1127,6 +1273,17 @@
+         );
+         assert_eq!(result.operation_id, identity().operation_id);
+         assert_eq!(result.idempotency_key, identity().idempotency_key);
++        assert_eq!(
++            result.diagnostic_id.as_deref(),
++            Some("actual.provider.diagnostic")
++        );
++        assert_eq!(result.effect.state, ProviderControlEffectStateV1::Unknown);
++        assert_eq!(result.effect.provider_receipt_digest, Some("c".repeat(64)));
++        assert_eq!(
++            result.effect.reconciliation_action.as_deref(),
++            Some("reconcile_same_operation")
++        );
++        assert!(result.effect.verification_digest.is_none());
+         assert!(matches!(
+             result.result,
+             ProviderControlOperationResultV1::Maintenance(None)
+@@ -1239,6 +1396,39 @@
+         let ProviderControlRequestV1::Inspection(inspection) = &mut request else {
+             unreachable!()
+         };
++        inspection.cursor = Some("cursor.capabilities.2".to_owned());
++        result.terminal = ProviderControlTerminalV1::Success;
++        let ProviderControlOperationResultV1::Inspection(Some(data)) = &mut result.result else {
++            unreachable!()
++        };
++        data.coverage = ProviderControlInspectionCoverageV1::Complete;
++        data.next_cursor = None;
++        let resumed = assemble_outcome(
++            &context,
++            &request,
++            Ok(CompletedProviderControlV1 {
++                result: result.clone(),
++                host_receipt: None,
++            }),
++            &configuration,
++        )
++        .unwrap();
++        let ApplicationOutcome::Evidence(resumed) = resumed else {
++            panic!("resumed inspection evidence")
++        };
++        assert_eq!(resumed.coverage.returned, 2);
++        assert_eq!(resumed.page.returned, 2);
++        assert_eq!(resumed.page.sort_revision, 1);
++        assert_eq!(resumed.page.total, None);
++        assert!(resumed.page.cursor.is_none());
++        assert_eq!(
++            resumed.payload,
++            Some(RetainedSurfaceResultV1::ProviderControl(result.clone()))
++        );
++
++        let ProviderControlRequestV1::Inspection(inspection) = &mut request else {
++            unreachable!()
++        };
+         inspection.maximum_items = 1;
+         assert!(
+             assemble_outcome(

@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "tracedecay.host-comparison.report.v1",
+  "type": "object",
+  "required": [
+    "format",
+    "mode",
+    "experiment",
+    "task_benefit",
+    "metadata",
+    "planned",
+    "strata",
+    "paired_case_deltas",
+    "raw_metric_reports",
+    "invalid_comparisons",
+    "comparative_conclusion",
+    "provider_conformance",
+    "performance"
+  ],
+  "properties": {
+    "format": {
+      "const": "tracedecay.host-comparison.report.v1"
+    },
+    "mode": {
+      "enum": [
+        "controlled_preparation",
+        "production_host"
+      ]
+    },
+    "experiment": {
+      "const": "host_retrieval_assessment"
+    },
+    "task_benefit": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "const": "unmeasured"
+        }
+      },
+      "required": [
+        "status",
+        "reason"
+      ]
+    },
+    "planned": {
+      "const": {
+        "complete_replays": 24,
+        "case_trials": 432,
+        "query_attempts": 1344
+      }
+    },
+    "strata": {
+      "type": "array",
+      "minItems": 8,
+      "maxItems": 8
+    },
+    "comparative_conclusion": {
+      "enum": [
+        "invalid",
+        "incomplete",
+        "review_paired_intervals"
+      ]
+    },
+    "provider_conformance": {
+      "type": "object"
+    },
+    "performance": {
+      "type": "object"
+    }
+  }
+}

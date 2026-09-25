@@ -1,0 +1,22 @@
+{
+  "crates/tracedecay-sessions/src/runtime/source.rs": {
+    "before_index_sha256": "f8ed32e4820cb31ab0a6c063a6cf9635a2c923730586e52fff38be5dc2636639",
+    "before_live_sha256": "f8ed32e4820cb31ab0a6c063a6cf9635a2c923730586e52fff38be5dc2636639",
+    "after_live_sha256": "3d670d3f13b89ad5bde5bdac106d4aa8a6ca314f0fe4326fc9d68522d1fa0d18"
+  },
+  "crates/tracedecay-sessions/src/runtime/source/jsonl.rs": {
+    "before_index_sha256": "0f4d56676dc8e7a2b9065e3a3824086d091617d53b5e56f080af19448103c60a",
+    "before_live_sha256": "0f4d56676dc8e7a2b9065e3a3824086d091617d53b5e56f080af19448103c60a",
+    "after_live_sha256": "afcd125fa6f7005283a9464831a0e0f3df1f05936dd8bfd25e158385e54e6677"
+  },
+  "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs": {
+    "before_index_sha256": "683cd531278dc073b14343e6abfb54fee574dbf869312e9125be94524b72ddb9",
+    "before_live_sha256": "683cd531278dc073b14343e6abfb54fee574dbf869312e9125be94524b72ddb9",
+    "after_live_sha256": "60e2aaa29630f516b79039274aac8478c4598f560f27f4eaa715fea9a44998e2"
+  },
+  "crates/tracedecay-hooks/src/admission_ledger.rs": {
+    "before_index_sha256": "b64d4ec2e9d8765ece688351571bcea90735b6d1d305dfcdc99c8c57ce485f39",
+    "before_live_sha256": "b64d4ec2e9d8765ece688351571bcea90735b6d1d305dfcdc99c8c57ce485f39",
+    "after_live_sha256": "fe05537bd810194fa69d076609769f6b558107362cb080a3c2394644fe3d7081"
+  }
+}

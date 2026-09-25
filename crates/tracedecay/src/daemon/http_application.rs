@@ -53,7 +53,7 @@ type ProjectRouterResolverFuture =
 type ProjectRouterResolver =
     Arc<dyn Fn(ProjectId) -> ProjectRouterResolverFuture + Send + Sync + 'static>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProjectRouterResolutionError {
+pub(super) enum ProjectRouterResolutionError {
     Saturated,
     TimedOut,
     Unavailable,
@@ -388,7 +388,7 @@ impl DaemonHttpApplicationRegistry {
     }
 
     #[hotpath::skip]
-    async fn resolve(
+    pub(super) async fn resolve(
         &self,
         project_id: &str,
     ) -> std::result::Result<Option<Router>, ProjectRouterResolutionError> {

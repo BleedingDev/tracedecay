@@ -1,0 +1,533 @@
+--- a/crates/tracedecay-memory-provider-api/src/lib.rs
++++ b/crates/tracedecay-memory-provider-api/src/lib.rs
+@@ -1253,6 +1253,8 @@
+     /// [`ProviderCall::with_sanitization`], and the only way to read one is
+     /// [`ProviderCall::sanitization`].
+     sanitization: Option<PayloadSanitizationReceipt>,
++    /// Untrusted in-process history claim, never part of the canonical wire payload.
++    history_grant: Option<HistoryGrant>,
+ }
+ 
+ impl ProviderCall {
+@@ -1287,6 +1289,7 @@
+             required_capabilities,
+             extensions: parts.extensions,
+             sanitization: None,
++            history_grant: None,
+         };
+         call.validate_envelope()?;
+         Ok(call)
+@@ -1307,6 +1310,23 @@
+     #[must_use]
+     pub fn sanitization(&self) -> Option<&PayloadSanitizationReceipt> {
+         self.sanitization.as_ref()
++    }
++
++    /// Attaches an untrusted history claim for the installed host authority.
++    ///
++    /// This does not authorize history or change the canonical wire payload.
++    /// The authority must independently validate the claim immediately before
++    /// use; [`AdvisoryCallBinding`] binds it against subsequent replacement.
++    #[must_use]
++    pub fn with_history_grant(mut self, grant: HistoryGrant) -> Self {
++        self.history_grant = Some(grant);
++        self
++    }
++
++    /// Returns the in-process history claim, which is not source authorization.
++    #[must_use]
++    pub fn history_grant(&self) -> Option<&HistoryGrant> {
++        self.history_grant.as_ref()
+     }
+ 
+     /// Revalidates the complete public call envelope after mutation, and — for
+--- a/crates/tracedecay-memory-provider-api/src/advisory_admission.rs
++++ b/crates/tracedecay-memory-provider-api/src/advisory_admission.rs
+@@ -10,9 +10,10 @@
+ 
+ use crate::contract::{SourceDisposition, TerminalCode};
+ use crate::{
+-    AdvisoryContractError, ApiError, CurrentSourceDisposition, GrantedHistorySource,
+-    MAX_COMMITTED_EFFECT_ITEM_REFS, OperationControl, OriginalSourceIdentity, OwnedExactScope,
+-    ProviderCall, ProviderOperation, RestoreDispositionCheckpoint, lowercase_sha256_hex,
++    AdvisoryContractError, ApiError, CurrentSourceDisposition, GrantedHistorySource, HistoryGrant,
++    MAX_COMMITTED_EFFECT_ITEM_REFS, OperationControl, OriginScopeEvidence, OriginalSourceIdentity,
++    OwnedExactScope, ProviderCall, ProviderOperation, RecordedValidity,
++    RestoreDispositionCheckpoint, SourceAttribution, lowercase_sha256_hex,
+     opaque_extensions_digest,
+ };
+ 
+@@ -113,6 +114,7 @@
+     /// Validates the call and binds its identities, operation, scope, readiness,
+     /// generation, idempotency, canonical payload, extensions, capabilities and
+     /// original finite control budget. The payload digest covers any raw grant.
++    /// A separate typed digest covers the optional in-process history claim.
+     /// Retained runtime control identity also prevents replacement of the live
+     /// cancellation token or restarting an otherwise identical monotonic budget.
+     pub fn from_call(call: &ProviderCall) -> Result<Self, AdvisoryAdmissionError> {
+@@ -161,6 +163,10 @@
+         for capability in &call.required_capabilities {
+             bind_field(&mut digest, capability.as_str().as_bytes());
+         }
++        if let Some(grant) = call.history_grant() {
++            bind_field(&mut digest, b"in-process-history-grant.v1");
++            bind_field(&mut digest, &history_grant_sha256(grant));
++        }
+         call.control
+             .snapshot()
+             .map_err(AdvisoryAdmissionError::Control)?;
+@@ -191,6 +197,125 @@
+ fn bind_field(digest: &mut Sha256, value: &[u8]) {
+     digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
+     digest.update(value);
++}
++
++// Canonical typed encoding for an untrusted claim: every field is length framed,
++// optional values and origin variants carry explicit tags, and source order is
++// preserved. Exhaustive destructuring makes new fields require a binding update.
++// This fingerprint performs no authority check and is never a wire contract.
++fn history_grant_sha256(grant: &HistoryGrant) -> [u8; 32] {
++    let HistoryGrant {
++        authorization_ref,
++        policy_revision,
++        destination_scope,
++        relation,
++        sources,
++        disposition_checkpoint,
++    } = grant;
++    let mut digest = Sha256::new();
++    digest.update(b"tracedecay.memory-provider.history-grant-claim.v1\0");
++    bind_field(&mut digest, authorization_ref.as_bytes());
++    bind_field(&mut digest, &policy_revision.to_be_bytes());
++    bind_field(
++        &mut digest,
++        destination_scope.exact_scope_sha256().as_bytes(),
++    );
++    bind_field(&mut digest, relation.as_wire().as_bytes());
++    bind_field(
++        &mut digest,
++        &u64::try_from(sources.len())
++            .unwrap_or(u64::MAX)
++            .to_be_bytes(),
++    );
++    for GrantedHistorySource {
++        attribution,
++        current_disposition,
++    } in sources
++    {
++        bind_source_attribution(&mut digest, attribution);
++        let CurrentSourceDisposition {
++            state,
++            authority_ref,
++            authority_revision,
++            checked_at_utc_nanos,
++        } = current_disposition;
++        bind_field(&mut digest, state.as_wire().as_bytes());
++        bind_field(&mut digest, authority_ref.as_bytes());
++        bind_optional_field(&mut digest, authority_revision.map(u64::to_be_bytes));
++        bind_field(&mut digest, &checked_at_utc_nanos.to_be_bytes());
++    }
++    let RestoreDispositionCheckpoint {
++        exact_scope,
++        authority_ref,
++        authority_revision,
++        checked_at_utc_nanos,
++    } = disposition_checkpoint;
++    bind_field(&mut digest, exact_scope.exact_scope_sha256().as_bytes());
++    bind_field(&mut digest, authority_ref.as_bytes());
++    bind_optional_field(&mut digest, authority_revision.map(u64::to_be_bytes));
++    bind_field(&mut digest, &checked_at_utc_nanos.to_be_bytes());
++    digest.finalize().into()
++}
++
++fn bind_source_attribution(digest: &mut Sha256, attribution: &SourceAttribution) {
++    let SourceAttribution {
++        source,
++        origin_scope,
++        source_sequence,
++        occurred_at_utc_nanos,
++        ingested_at_utc_nanos,
++        validity,
++    } = attribution;
++    let OriginalSourceIdentity {
++        canonical_provider_id,
++        canonical_session_id,
++        source_key,
++        stable_record_id,
++        observation_id,
++        source_revision,
++        content_sha256,
++    } = source;
++    bind_field(digest, canonical_provider_id.as_str().as_bytes());
++    bind_field(digest, canonical_session_id.as_bytes());
++    bind_field(digest, source_key.as_bytes());
++    bind_optional_field(digest, stable_record_id.as_deref().map(str::as_bytes));
++    bind_field(digest, observation_id.as_bytes());
++    bind_optional_field(digest, source_revision.as_deref().map(str::as_bytes));
++    bind_field(digest, content_sha256.as_bytes());
++    match origin_scope {
++        OriginScopeEvidence::Recorded {
++            scope,
++            authority_ref,
++        } => {
++            bind_field(digest, b"recorded");
++            bind_field(digest, scope.exact_scope_sha256().as_bytes());
++            bind_field(digest, authority_ref.as_bytes());
++        }
++        OriginScopeEvidence::IngestionOnly => bind_field(digest, b"ingestion_only"),
++        OriginScopeEvidence::Unavailable => bind_field(digest, b"unavailable"),
++    }
++    bind_field(digest, &source_sequence.to_be_bytes());
++    bind_optional_field(digest, occurred_at_utc_nanos.map(i64::to_be_bytes));
++    bind_field(digest, &ingested_at_utc_nanos.to_be_bytes());
++    let RecordedValidity {
++        valid_from_utc_nanos,
++        valid_until_utc_nanos,
++        superseded_at_utc_nanos,
++        superseded_by,
++        revoked_at_utc_nanos,
++    } = validity;
++    bind_optional_field(digest, valid_from_utc_nanos.map(i64::to_be_bytes));
++    bind_optional_field(digest, valid_until_utc_nanos.map(i64::to_be_bytes));
++    bind_optional_field(digest, superseded_at_utc_nanos.map(i64::to_be_bytes));
++    bind_optional_field(digest, superseded_by.as_deref().map(str::as_bytes));
++    bind_optional_field(digest, revoked_at_utc_nanos.map(i64::to_be_bytes));
++}
++
++fn bind_optional_field<T: AsRef<[u8]>>(digest: &mut Sha256, value: Option<T>) {
++    bind_field(digest, &[u8::from(value.is_some())]);
++    if let Some(value) = value {
++        bind_field(digest, value.as_ref());
++    }
+ }
+ 
+ /// Current per-source restore decisions read independently of snapshot creation.
+--- a/crates/tracedecay-memory-provider-api/tests/advisory_admission.rs
++++ b/crates/tracedecay-memory-provider-api/tests/advisory_admission.rs
+@@ -3,14 +3,14 @@
+ use std::error::Error;
+ 
+ use sha2::{Digest, Sha256};
+-use tracedecay_memory_provider_api::contract::{SourceDisposition, TerminalCode};
++use tracedecay_memory_provider_api::contract::{HistoryRelation, SourceDisposition, TerminalCode};
+ use tracedecay_memory_provider_api::{
+     AdvisoryAdmissionAuthority, AdvisoryAdmissionError, AdvisoryCallBinding, CancellationToken,
+     CanonicalPayload, CurrentAdvisoryAdmission, CurrentRestoreAdmission, CurrentSourceDisposition,
+-    GrantedHistorySource, MAX_ADVISORY_ADMISSION_SOURCES, OperationControl, OriginScopeEvidence,
+-    OriginalSourceIdentity, OwnedExactScope, OwnedOpaqueExtension, OwnedProviderId,
+-    OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderOperation, RecordedValidity,
+-    RestoreDispositionCheckpoint, SourceAttribution,
++    GrantedHistorySource, HistoryGrant, MAX_ADVISORY_ADMISSION_SOURCES, OperationControl,
++    OriginScopeEvidence, OriginalSourceIdentity, OwnedExactScope, OwnedOpaqueExtension,
++    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderCallParts, ProviderOperation,
++    RecordedValidity, RestoreDispositionCheckpoint, SourceAttribution,
+ };
+ 
+ const DIGEST: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+@@ -88,6 +88,195 @@
+         },
+         vec![(source()?, disposition(SourceDisposition::Available))],
+     )?)
++}
++
++fn history_grant() -> Result<HistoryGrant, Box<dyn Error>> {
++    let first = GrantedHistorySource {
++        attribution: SourceAttribution {
++            source: source()?,
++            origin_scope: OriginScopeEvidence::Recorded {
++                scope: scope()?,
++                authority_ref: "original-event-receipt".into(),
++            },
++            source_sequence: 12,
++            occurred_at_utc_nanos: Some(10),
++            ingested_at_utc_nanos: 11,
++            validity: RecordedValidity {
++                valid_from_utc_nanos: Some(10),
++                valid_until_utc_nanos: Some(100),
++                superseded_at_utc_nanos: Some(90),
++                superseded_by: Some("replacement-record".into()),
++                revoked_at_utc_nanos: Some(95),
++            },
++        },
++        current_disposition: disposition(SourceDisposition::Available),
++    };
++    let mut second = first.clone();
++    second.attribution.source.observation_id = "second-observation".into();
++    second.attribution.source_sequence = 13;
++    let grant = HistoryGrant {
++        authorization_ref: "untrusted-history-claim".into(),
++        policy_revision: 7,
++        destination_scope: scope()?,
++        relation: HistoryRelation::ExactScope,
++        sources: vec![first, second],
++        disposition_checkpoint: restore()?.checkpoint,
++    };
++    grant.validate_structure()?;
++    Ok(grant)
++}
++
++#[test]
++fn private_history_claim_preserves_wire_payload_and_absent_binding() -> Result<(), Box<dyn Error>> {
++    let original = call(ProviderOperation::Replay)?;
++    assert!(original.history_grant().is_none());
++    let absent = AdvisoryCallBinding::from_call(&original)?;
++    // Pre-claim binding fixture: adding the optional carrier keeps None identical.
++    assert_eq!(
++        absent.sha256(),
++        "87e437d28775e5346b564ab640f51ff1faaffbbd21465f9a14d0bf6fec22add0"
++    );
++    absent.verify_for(&original.clone())?;
++    let grant = history_grant()?;
++    let claimed = original.clone().with_history_grant(grant.clone());
++    assert_eq!(claimed.history_grant(), Some(&grant));
++    assert_eq!(claimed.payload, original.payload);
++    assert_eq!(claimed.extensions, original.extensions);
++    assert_eq!(claimed.sanitization(), original.sanitization());
++    claimed.validate()?;
++    assert_eq!(
++        absent.verify_for(&claimed),
++        Err(AdvisoryAdmissionError::BindingMismatch)
++    );
++    let admission = CurrentAdvisoryAdmission::new(&claimed, Vec::new(), None)?;
++    admission.verify_for(&claimed.clone())?;
++    assert_eq!(
++        admission.verify_for(&original),
++        Err(AdvisoryAdmissionError::BindingMismatch)
++    );
++    Ok(())
++}
++
++#[test]
++fn private_history_claim_swap_invalidates_admission_for_every_nested_field()
++-> Result<(), Box<dyn Error>> {
++    let grant = history_grant()?;
++    let original = call(ProviderOperation::Replay)?.with_history_grant(grant.clone());
++    let admission = CurrentAdvisoryAdmission::new(&original, Vec::new(), None)?;
++    for field in [
++        "authorization",
++        "policy",
++        "destination",
++        "relation",
++        "source_count",
++        "source_order",
++        "provider",
++        "session",
++        "source_key",
++        "record",
++        "record_absent",
++        "observation",
++        "revision",
++        "revision_absent",
++        "content",
++        "origin_scope",
++        "origin_authority",
++        "origin_ingestion",
++        "origin_unavailable",
++        "sequence",
++        "occurred",
++        "occurred_absent",
++        "ingested",
++        "valid_from",
++        "valid_until",
++        "superseded_at",
++        "superseded_by",
++        "revoked_at",
++        "disposition",
++        "disposition_authority",
++        "disposition_revision",
++        "disposition_checked",
++        "checkpoint_scope",
++        "checkpoint_authority",
++        "checkpoint_revision",
++        "checkpoint_checked",
++    ] {
++        let mut changed = grant.clone();
++        let source = &mut changed.sources[0];
++        match field {
++            "authorization" => changed.authorization_ref.push('x'),
++            "policy" => changed.policy_revision += 1,
++            "destination" => changed.destination_scope.project_id.push('x'),
++            "relation" => changed.relation = HistoryRelation::SameCheckout,
++            "source_count" => {
++                changed.sources.pop();
++            }
++            "source_order" => changed.sources.swap(0, 1),
++            "provider" => {
++                source.attribution.source.canonical_provider_id = OwnedProviderId::new("other")?
++            }
++            "session" => source.attribution.source.canonical_session_id.push('x'),
++            "source_key" => source.attribution.source.source_key.push('x'),
++            "record" => source.attribution.source.stable_record_id = Some("other-record".into()),
++            "record_absent" => source.attribution.source.stable_record_id = None,
++            "observation" => source.attribution.source.observation_id.push('x'),
++            "revision" => source.attribution.source.source_revision = Some("other-revision".into()),
++            "revision_absent" => source.attribution.source.source_revision = None,
++            "content" => source.attribution.source.content_sha256 = OTHER_DIGEST.into(),
++            "origin_scope" => {
++                if let OriginScopeEvidence::Recorded { scope, .. } =
++                    &mut source.attribution.origin_scope
++                {
++                    scope.branch_identity.push('x');
++                }
++            }
++            "origin_authority" => {
++                if let OriginScopeEvidence::Recorded { authority_ref, .. } =
++                    &mut source.attribution.origin_scope
++                {
++                    authority_ref.push('x');
++                }
++            }
++            "origin_ingestion" => {
++                source.attribution.origin_scope = OriginScopeEvidence::IngestionOnly
++            }
++            "origin_unavailable" => {
++                source.attribution.origin_scope = OriginScopeEvidence::Unavailable
++            }
++            "sequence" => source.attribution.source_sequence += 1,
++            "occurred" => source.attribution.occurred_at_utc_nanos = Some(20),
++            "occurred_absent" => source.attribution.occurred_at_utc_nanos = None,
++            "ingested" => source.attribution.ingested_at_utc_nanos += 1,
++            "valid_from" => source.attribution.validity.valid_from_utc_nanos = None,
++            "valid_until" => source.attribution.validity.valid_until_utc_nanos = None,
++            "superseded_at" => source.attribution.validity.superseded_at_utc_nanos = None,
++            "superseded_by" => source.attribution.validity.superseded_by = None,
++            "revoked_at" => source.attribution.validity.revoked_at_utc_nanos = None,
++            "disposition" => source.current_disposition.state = SourceDisposition::Deleted,
++            "disposition_authority" => source.current_disposition.authority_ref.push('x'),
++            "disposition_revision" => source.current_disposition.authority_revision = None,
++            "disposition_checked" => source.current_disposition.checked_at_utc_nanos += 1,
++            "checkpoint_scope" => changed
++                .disposition_checkpoint
++                .exact_scope
++                .worktree_identity
++                .push('x'),
++            "checkpoint_authority" => changed.disposition_checkpoint.authority_ref.push('x'),
++            "checkpoint_revision" => changed.disposition_checkpoint.authority_revision = None,
++            "checkpoint_checked" => changed.disposition_checkpoint.checked_at_utc_nanos += 1,
++            _ => return Err("unknown private claim mutation".into()),
++        }
++        // Some substitutions are invalid claims; binding is not authorization.
++        // They must still differ even though the canonical wire bytes are identical.
++        let changed = original.clone().with_history_grant(changed);
++        assert_eq!(changed.payload, original.payload);
++        assert_eq!(
++            admission.verify_for(&changed),
++            Err(AdvisoryAdmissionError::BindingMismatch),
++            "changed {field}"
++        );
++    }
++    Ok(())
+ }
+ 
+ #[test]
+@@ -452,10 +641,17 @@
+     original.validate()?;
+     let constructed = CurrentAdvisoryAdmission::new(&original, Vec::new(), None)?;
+     constructed.verify_for(&original)?;
++    let claimed = original.clone().with_history_grant(history_grant()?);
++    let bound_claim = CurrentAdvisoryAdmission::new(&claimed, Vec::new(), None)?;
++    bound_claim.verify_for(&claimed)?;
+     let installed: &dyn AdvisoryAdmissionAuthority = &DeniedAuthority;
+     assert_eq!(
+         installed.admit(&original),
+         Err(AdvisoryAdmissionError::Denied("unknown original receipt"))
+     );
+-    Ok(())
+-}
++    assert_eq!(
++        installed.admit(&claimed),
++        Err(AdvisoryAdmissionError::Denied("unknown original receipt"))
++    );
++    Ok(())
++}
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
+@@ -7,7 +7,7 @@
+ use std::collections::BTreeSet;
+ 
+ use serde_json::{Value, json};
+-use tracedecay_memory_provider_registry::ProviderReply;
++use tracedecay_memory_provider_registry::{HistoryGrant, ProviderReply};
+ 
+ use super::{
+     ApiError, Arc, BoundedCallRefusalV1, CanonicalPayload, ObservationJourneyError,
+@@ -29,6 +29,8 @@
+     pub(crate) idempotency_key: Option<String>,
+     /// Already-authorized operation fields, with no caller-supplied host header.
+     pub(crate) operation_body: Value,
++    /// Untrusted in-process claim for current host admission, outside wire JSON.
++    pub(crate) history_grant: Option<HistoryGrant>,
+     /// The host policy revision that authorized this control.
+     pub(crate) policy_revision: u64,
+     /// Cloning this preserves its running monotonic budget and live token.
+@@ -414,6 +416,10 @@
+                         extensions: Vec::new(),
+                     })
+                     .map_err(JourneyControlDispatchErrorV1::Contract)?;
++                    let call = match request.history_grant {
++                        Some(grant) => call.with_history_grant(grant),
++                        None => call,
++                    };
+                     let reply = registry
+                         .invoke_control(&call)
+                         .map_err(JourneyControlDispatchErrorV1::Fabric)?;
+@@ -456,6 +462,7 @@
+             operation_id: "control-operation".to_owned(),
+             idempotency_key: Some("original-control-key".to_owned()),
+             operation_body: json!({}),
++            history_grant: None,
+             policy_revision: 1,
+             control: OperationControl::new(
+                 tracedecay_contracts::now_micros()
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
+@@ -44,6 +44,7 @@
+         operation_id: "control-shutdown-operation".to_owned(),
+         idempotency_key: None,
+         operation_body: serde_json::json!({"requested_checks": ["state"]}),
++        history_grant: None,
+         policy_revision: 7,
+         control,
+         expected_state_generation: None,
+@@ -246,7 +247,6 @@
+         Arc::clone(&port),
+     )
+     .await;
+-    port.on_health(successful_health_reply);
+     let original_control = OperationControl::new(
+         tracedecay_contracts::now_micros()
+             .0
+@@ -257,11 +257,33 @@
+     let mut request = health_request(&fixture, original_control.clone());
+     request.operation_body = serde_json::json!({"requested_checks": ["scope", "state"]});
+     let original_body = request.operation_body.clone();
++    // An intentionally untrusted claim exercises only transport on this health
++    // fixture; an installed history authority still owns source authorization.
++    let claim = tracedecay_memory_provider_registry::HistoryGrant {
++        authorization_ref: "untrusted-control-claim".to_owned(),
++        policy_revision: 7,
++        destination_scope: request.exact_scope.clone(),
++        relation: tracedecay_memory_provider_registry::HistoryRelation::ExactScope,
++        sources: Vec::new(),
++        disposition_checkpoint: tracedecay_memory_provider_registry::RestoreDispositionCheckpoint {
++            exact_scope: request.exact_scope.clone(),
++            authority_ref: "untrusted-checkpoint".to_owned(),
++            authority_revision: Some(7),
++            checked_at_utc_nanos: 100,
++        },
++    };
++    request.history_grant = Some(claim.clone());
++    let expected_claim = claim.clone();
++    port.on_health(move |call| {
++        assert_eq!(call.history_grant(), Some(&expected_claim));
++        successful_health_reply(call)
++    });
+     let journey = Arc::clone(&fixture.journey);
+     let dispatched = tokio::task::spawn_blocking(move || journey.dispatch_control(request))
+         .await
+         .expect("health caller")
+         .expect("actual health dispatch");
++    assert_eq!(dispatched.call.history_grant(), Some(&claim));
+     let payload: Value =
+         serde_json::from_slice(&dispatched.call.payload.bytes).expect("canonical health payload");
+     let header = &payload["common_request"];

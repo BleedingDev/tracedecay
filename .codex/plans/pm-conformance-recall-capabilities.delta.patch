@@ -1,0 +1,64 @@
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -1976,10 +1976,27 @@
+             operation_id: operation_uuid(id),
+             idempotency_key: mutation.then(|| sha256(id.as_bytes())),
+             payload: payload_envelope(operation, &payload)?,
+-            required_capabilities: vec![
+-                OwnedVersionedId::new(operation.capability_id())
+-                    .map_err(|error| error.to_string())?,
+-            ],
++            required_capabilities: if operation == ProviderOperation::Recall {
++                payload
++                    .get("required_capabilities")
++                    .and_then(Value::as_array)
++                    .ok_or("canonical Recall required_capabilities missing")?
++                    .iter()
++                    .map(|capability| {
++                        OwnedVersionedId::new(
++                            capability
++                                .as_str()
++                                .ok_or("canonical Recall capability must be a versioned ID")?,
++                        )
++                        .map_err(|error| error.to_string())
++                    })
++                    .collect::<Result<Vec<_>, String>>()?
++            } else {
++                vec![
++                    OwnedVersionedId::new(operation.capability_id())
++                        .map_err(|error| error.to_string())?,
++                ]
++            },
+             extensions: Vec::new(),
+             control: RequestControlFixture::live(i64::MAX, 30_000)
+                 .map_err(|error| error.to_string())?,
+@@ -4411,6 +4428,29 @@
+                 if let CompatibilityStep::Call { fixture, .. } = step {
+                     let value: Value = serde_json::from_slice(&fixture.payload.bytes)
+                         .map_err(|error| error.to_string())?;
++                    if fixture.operation == ProviderOperation::Recall {
++                        let outer: Vec<_> = fixture
++                            .required_capabilities
++                            .iter()
++                            .map(OwnedVersionedId::as_str)
++                            .collect();
++                        assert_eq!(
++                            value["required_capabilities"],
++                            json!(outer),
++                            "{}",
++                            fixture.step_id
++                        );
++                        assert_eq!(outer, vec!["recall.query.v1", "recall.temporal.v1"]);
++                    } else {
++                        assert_eq!(
++                            fixture
++                                .required_capabilities
++                                .iter()
++                                .map(OwnedVersionedId::as_str)
++                                .collect::<Vec<_>>(),
++                            vec![fixture.operation.capability_id()]
++                        );
++                    }
+                     if fixture.operation == ProviderOperation::Observe {
+                         assert_eq!(
+                             value

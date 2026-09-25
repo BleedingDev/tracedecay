@@ -5162,6 +5162,30 @@ export const SignificantTableGrowthSampleV1Schema = z.object({
 });
 export type SignificantTableGrowthSampleV1 = z.infer<typeof SignificantTableGrowthSampleV1Schema>;
 
+export const SimilarAlignedDifferenceV1Schema = z.object({
+  candidate_span: z.lazy(() => SimilarTokenSpanV1Schema),
+  candidate_token_count: z.number().int().min(0),
+  source_span: z.lazy(() => SimilarTokenSpanV1Schema),
+  source_token_count: z.number().int().min(0),
+}).strict();
+export type SimilarAlignedDifferenceV1 = z.infer<typeof SimilarAlignedDifferenceV1Schema>;
+
+export const SimilarAlignmentAnchorV1Schema = z.object({
+  candidate_token_position: z.number().int().min(0),
+  fingerprint: z.number().int().safe().min(0),
+  source_token_position: z.number().int().min(0),
+}).strict();
+export type SimilarAlignmentAnchorV1 = z.infer<typeof SimilarAlignmentAnchorV1Schema>;
+
+export const SimilarAlignmentV1Schema = z.object({
+  anchors: z.array(z.lazy(() => SimilarAlignmentAnchorV1Schema)),
+  shared_token_count: z.number().int().min(0),
+}).strict();
+export type SimilarAlignmentV1 = z.infer<typeof SimilarAlignmentV1Schema>;
+
+export const SimilarContainmentV1Schema = z.enum(["candidate_contains_selected_range", "equal", "selected_range_contains_candidate"]);
+export type SimilarContainmentV1 = z.infer<typeof SimilarContainmentV1Schema>;
+
 export const SimilarCoverageV1Schema = z.discriminatedUnion("status", [z.object({
   status: z.literal("complete"),
 }).strict(), z.object({
@@ -5189,6 +5213,51 @@ export type SimilarFamilyV1 = z.infer<typeof SimilarFamilyV1Schema>;
 export const SimilarMatchClassV1Schema = z.enum(["conservative_exact", "rename_normalized_exact"]);
 export type SimilarMatchClassV1 = z.infer<typeof SimilarMatchClassV1Schema>;
 
+export const SimilarNearCoverageV1Schema = z.discriminatedUnion("status", [z.object({
+  status: z.literal("complete"),
+}).strict(), z.object({
+  status: z.literal("excluded_incomplete_tokenization"),
+}).strict(), z.object({
+  minimum_tokens: z.number().int().min(0),
+  status: z.literal("excluded_too_small"),
+}).strict(), z.object({
+  reasons: z.array(z.lazy(() => SimilarNearPartialReasonV1Schema)),
+  status: z.literal("partial"),
+}).strict(), z.object({
+  reason: z.lazy(() => SimilarNearUnavailableReasonV1Schema),
+  status: z.literal("unavailable"),
+}).strict()]);
+export type SimilarNearCoverageV1 = z.infer<typeof SimilarNearCoverageV1Schema>;
+
+/** One candidate supported by verified fingerprint anchors. Directional
+coverage is reported separately for source and candidate; no scalar score
+is meaningful for a directional code comparison and none is emitted. */
+export const SimilarNearMatchV1Schema = z.object({
+  alignment: z.lazy(() => SimilarAlignmentV1Schema),
+  candidate: z.lazy(() => SimilarOccurrenceV1Schema),
+  candidate_coverage_millionths: z.number().int().min(0),
+  containment: z.union([z.lazy(() => SimilarContainmentV1Schema), z.null()]).optional(),
+  differences: z.array(z.lazy(() => SimilarAlignedDifferenceV1Schema)),
+  extent: z.lazy(() => SimilarSourceExtentV1Schema),
+  match_class: z.lazy(() => SimilarMatchClassV1Schema),
+  source_coverage_millionths: z.number().int().min(0),
+}).strict();
+export type SimilarNearMatchV1 = z.infer<typeof SimilarNearMatchV1Schema>;
+
+export const SimilarNearPartialReasonV1Schema = z.enum(["cancelled", "candidate_body_budget", "deadline_exceeded", "hot_postings", "posting_row_budget", "verification_body_budget", "verification_work_budget"]);
+export type SimilarNearPartialReasonV1 = z.infer<typeof SimilarNearPartialReasonV1Schema>;
+
+export const SimilarNearResultV1Schema = z.object({
+  coverage: z.lazy(() => SimilarNearCoverageV1Schema),
+  extent: z.lazy(() => SimilarSourceExtentV1Schema),
+  matches: z.array(z.lazy(() => SimilarNearMatchV1Schema)),
+  next_cursor: z.string().nullable(),
+}).strict();
+export type SimilarNearResultV1 = z.infer<typeof SimilarNearResultV1Schema>;
+
+export const SimilarNearUnavailableReasonV1Schema = z.enum(["authority_unavailable", "cancelled", "capability_unavailable", "capacity_unavailable", "corruption_reset_required", "generation_unavailable", "generation_unverified", "internal", "invalid_request", "linked_worktree_disabled", "timed_out"]);
+export type SimilarNearUnavailableReasonV1 = z.infer<typeof SimilarNearUnavailableReasonV1Schema>;
+
 export const SimilarOccurrenceV1Schema = z.object({
   body_span: z.lazy(() => SourceSpanSchema),
   path: z.string(),
@@ -5204,10 +5273,32 @@ export type SimilarOccurrenceV1 = z.infer<typeof SimilarOccurrenceV1Schema>;
 export const SimilarResultV1Schema = z.object({
   coverage: z.lazy(() => SimilarCoverageV1Schema),
   families: z.array(z.lazy(() => SimilarFamilyV1Schema)),
+  near: z.union([z.lazy(() => SimilarNearResultV1Schema), z.null()]).optional(),
   source: z.lazy(() => SimilarOccurrenceV1Schema),
   source_generation: z.lazy(() => CodeGenerationIdSchema),
 }).strict();
 export type SimilarResultV1 = z.infer<typeof SimilarResultV1Schema>;
+
+/** The source extent compared by the verified shared-code lane.
+
+The field on [`SimilarSurfaceRequestV1`] is optional for wire
+compatibility; an omitted value means [`Self::WholeBody`]. A selected
+extent is measured in the canonical normalized token stream, so mutable
+source line numbers never become part of the comparison request. */
+export const SimilarSourceExtentV1Schema = z.discriminatedUnion("kind", [z.object({
+  end: z.number().int().min(0),
+  kind: z.literal("selected_token_range"),
+  start: z.number().int().min(0),
+}).strict(), z.object({
+  kind: z.literal("whole_body"),
+}).strict()]);
+export type SimilarSourceExtentV1 = z.infer<typeof SimilarSourceExtentV1Schema>;
+
+export const SimilarTokenSpanV1Schema = z.object({
+  end: z.number().int().min(0),
+  start: z.number().int().min(0),
+}).strict();
+export type SimilarTokenSpanV1 = z.infer<typeof SimilarTokenSpanV1Schema>;
 
 /** Byte range inside one sanitized source file. Mutable line numbers are
 never part of identity. */

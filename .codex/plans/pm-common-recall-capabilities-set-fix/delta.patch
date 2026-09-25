@@ -1,0 +1,44 @@
+diff --git a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+index e04754f5ff1173a74ee124d0505450fd246bd549..59a36a1f44e40a36e48c0c97d7a73ad26f670107 100644
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+@@ -9,6 +9,7 @@
+ 
+ mod recall_fixture;
+ 
++use std::collections::BTreeSet;
+ use std::sync::atomic::Ordering;
+ use std::sync::{Arc, Mutex};
+ 
+@@ -2309,7 +2310,7 @@ async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_source
+ /// Record the two dispatch envelopes while preserving the existing fixture's behavior.
+ struct ProfileRecordingFixture {
+     inner: RecallFixturePort,
+-    required_capabilities: Mutex<Vec<(ProviderOperation, Vec<OwnedVersionedId>)>>,
++    required_capabilities: Mutex<Vec<(ProviderOperation, BTreeSet<OwnedVersionedId>)>>,
+ }
+ 
+ impl NativeMemoryApplicationPort for ProfileRecordingFixture {
+@@ -2671,11 +2672,11 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
+         tracedecay_memory_provider_registry::RECALL_QUERY_CAPABILITY_ID,
+     )
+     .unwrap();
+-    let common_capabilities = vec![
++    let common_capabilities = BTreeSet::from([
+         recall_capability.clone(),
+         OwnedVersionedId::new(tracedecay_memory_provider_registry::COMMON_ADVISORY_PROFILE_ID)
+             .unwrap(),
+-    ];
++    ]);
+     assert_eq!(
+         *common_recording.required_capabilities.lock().unwrap(),
+         vec![
+@@ -2684,7 +2685,7 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
+         ],
+         "the pinned common profile must reach both dispatch envelopes even without a grant"
+     );
+-    let legacy_capabilities = vec![recall_capability];
++    let legacy_capabilities = BTreeSet::from([recall_capability]);
+     assert_eq!(
+         *legacy_recording.required_capabilities.lock().unwrap(),
+         vec![

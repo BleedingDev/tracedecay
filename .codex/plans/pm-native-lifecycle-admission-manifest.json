@@ -1,0 +1,14 @@
+{
+  "crates/tracedecay-agent-hosts/src/hooks/dispatch.rs": {
+    "before_sha256": "a2f351ea72a5d5acd9032c9cac55bf15f1606b4327803de39a5fc92f2d6abc59",
+    "after_sha256": "72b6342cdb831333398a8bcb5621a14ada2a762f02c24f27ce0665d672fcdd98"
+  },
+  "crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs": {
+    "before_sha256": "8a61e43c619bb16f4ef6715d41308aacc3f7873e75640749bdda6863375a62bc",
+    "after_sha256": "e55e58bbffe9f51df78605a0624ad830a3bd039d395eaf74ad9995d219395060"
+  },
+  "crates/tracedecay-agent-hosts/src/hooks/codex.rs": {
+    "before_sha256": "d759f1504b575be56b8d9644d4c9e14cbe55bc1d5a058a262ffb3b7abfa6a019",
+    "after_sha256": "3b291e95fee1445d9a6f672711e7de38c628c4a0fa8de0a3b79ecc1afda7fe0d"
+  }
+}

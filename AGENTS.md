@@ -21,11 +21,11 @@ unauthorized external action after completing independent, authorized work.
 
 ## Working checkout authority
 
-- Always work in the primary checkout at `/fast/projects/tracedecay`.
-- Always work on `codex/tracedecay-total-redesign-plan-reopened`, the head branch
-  of PR #707. Merge outside work into this branch before continuing.
-- Do not create or use linked worktrees or work from another branch.
-- Multiple agents may work concurrently in the primary checkout; preserve peer
+- Use the checkout and branch authorized for the current task. Upstream
+  machine-specific paths and branch names do not override that authority.
+- Do not switch checkouts or branches merely to match another contributor's
+  environment.
+- Multiple agents may work concurrently in the same checkout; preserve peer
   edits and stage only the paths owned by the current task.
 
 ## Layout

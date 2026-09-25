@@ -1450,8 +1450,18 @@ impl VectorGenerationIdV1 {
         &self.0
     }
 
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
     pub fn validate(&self) -> Result<(), DomainError> {
         self.0.validate()
+    }
+}
+
+impl fmt::Display for VectorGenerationIdV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 

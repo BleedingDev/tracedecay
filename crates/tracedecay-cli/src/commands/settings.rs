@@ -145,23 +145,7 @@ async fn invoke_configuration_surface(
 pub(crate) async fn current_configuration_revision(
     project_path: &Path,
 ) -> tracedecay_domain::errors::Result<ConfigurationRevisionId> {
-    let envelope = invoke_configuration_surface(
-        project_path,
-        ApplicationSurfaceOperation::ConfigurationObservedState,
-        ConfigurationWireRequestV1::ObservedState(ConfigurationObservedStateRequestV1 {}),
-    )
-    .await?;
-    let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
-        return Err(configuration_error(
-            "configuration state returned a non-evidence outcome",
-        ));
-    };
-    let states: Vec<ComponentConfigurationState> = serde_json::from_value(
-        evidence
-            .payload
-            .ok_or_else(|| configuration_error("configuration state omitted its payload"))?,
-    )
-    .map_err(|error| configuration_error(format!("invalid configuration state: {error}")))?;
+    let states = current_configuration_states(project_path).await?;
     let revision = states
         .first()
         .map(|state| state.desired_revision_id.clone())
@@ -175,6 +159,37 @@ pub(crate) async fn current_configuration_revision(
         ));
     }
     Ok(revision)
+}
+
+pub(crate) async fn current_configuration_restart_required(
+    project_path: &Path,
+) -> tracedecay_domain::errors::Result<bool> {
+    Ok(current_configuration_states(project_path)
+        .await?
+        .iter()
+        .any(|state| state.restart_required))
+}
+
+async fn current_configuration_states(
+    project_path: &Path,
+) -> tracedecay_domain::errors::Result<Vec<ComponentConfigurationState>> {
+    let envelope = invoke_configuration_surface(
+        project_path,
+        ApplicationSurfaceOperation::ConfigurationObservedState,
+        ConfigurationWireRequestV1::ObservedState(ConfigurationObservedStateRequestV1 {}),
+    )
+    .await?;
+    let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
+        return Err(configuration_error(
+            "configuration state returned a non-evidence outcome",
+        ));
+    };
+    serde_json::from_value(
+        evidence
+            .payload
+            .ok_or_else(|| configuration_error("configuration state omitted its payload"))?,
+    )
+    .map_err(|error| configuration_error(format!("invalid configuration state: {error}")))
 }
 
 pub(crate) async fn current_project_setting(

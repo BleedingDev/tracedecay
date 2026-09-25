@@ -480,6 +480,135 @@ async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
     );
 }
 
+/// Provider preparation and activation happen after the exact core route is
+/// ready. Either failure must retire the private full candidate and its owners
+/// while leaving that core route usable and truthfully marked degraded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_upgrade_failure_retains_the_admitted_core_route() {
+    let _failure_lock = PROJECT_OPEN_FAILURE_TEST_LOCK.lock().await;
+    let _failure_reset = ProjectOpenFailureReset;
+
+    for (phase, label, expected_publication) in [
+        (
+            super::super::project_composition::ProjectOpenFailurePhase::ProviderMount,
+            "provider-mount-failure-retains-core",
+            Some(ProjectRuntimePublicationStateV1::Failed),
+        ),
+        (
+            super::super::project_composition::ProjectOpenFailurePhase::ProviderActivated,
+            "provider-activation-failure-retains-core",
+            Some(ProjectRuntimePublicationStateV1::Failed),
+        ),
+    ] {
+        let (_temp, _database_scope, engine, handshake) = unopened_committed_fixture(label).await;
+        let canonical_project = handshake
+            .project_path
+            .as_deref()
+            .expect("project alias")
+            .canonicalize()
+            .expect("canonical project root");
+        let route = super::super::ProjectRouteKey::from_handshake(&canonical_project, &handshake)
+            .expect("project route");
+        let holder_count_before = engine
+            .invocation
+            .service
+            .session_holder_database_count()
+            .await;
+
+        super::super::project_composition::fail_project_open_after(phase);
+        let core = engine
+            .project_server(&handshake)
+            .await
+            .unwrap_or_else(|error| panic!("{phase:?} must degrade to the admitted core: {error}"));
+
+        let registered_key = {
+            let servers = engine.store_administration.project_servers().lock().await;
+            let (key, registered) = servers
+                .get_route(&route)
+                .expect("the exact core route remains registered");
+            assert_eq!(
+                servers
+                    .servers
+                    .get(key)
+                    .expect("registered core entry")
+                    .publication,
+                super::super::project_open_admission::ProjectServerPublication::Core,
+                "{phase:?} must not fabricate full publication"
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(registered, &core),
+                "{phase:?} must return the exact retained core"
+            );
+            key.clone()
+        };
+        assert_eq!(
+            engine
+                .invocation
+                .service
+                .project_runtimes
+                .publication_state(&canonical_project),
+            expected_publication,
+            "{phase:?} must preserve the publication boundary reached before degradation"
+        );
+        assert!(
+            !engine
+                .invocation
+                .service
+                .project_runtimes
+                .holds::<RegisteredRetainedRuntime>(&canonical_project)
+                .await,
+            "{phase:?} must retire the failed full retained owner"
+        );
+        assert_eq!(
+            engine
+                .invocation
+                .service
+                .session_holder_database_count()
+                .await,
+            holder_count_before,
+            "{phase:?} must release full-candidate session-holder leases"
+        );
+
+        let observed_at = tracedecay_contracts::clock::now_micros();
+        assert_primitive_routes_mounted(
+            &engine,
+            &handshake,
+            observed_at,
+            Deadline::new(UtcMicros(observed_at.0.saturating_add(30_000_000)))
+                .expect("daemon invocation deadline"),
+            CancellationContext::active(format!("cancel.{label}"))
+                .expect("daemon invocation cancellation"),
+        )
+        .await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            engine
+                .automation_config_probe_attempts
+                .load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "{phase:?} must not start full-owner automation against a core-only route"
+        );
+        assert!(
+            !engine
+                .store_administration
+                .automation_schedulers()
+                .lock()
+                .await
+                .contains_key(&registered_key),
+            "{phase:?} must not publish a full-owner automation scheduler"
+        );
+
+        let shutdown = engine.shutdown_all().await;
+        assert!(
+            shutdown.project_servers.is_clean(),
+            "retained core must shut down cleanly after {phase:?}: {shutdown:?}"
+        );
+        super::super::project_composition::clear_project_open_failure();
+    }
+}
+
 /// A failure after dependent owner registration must remove every owner the
 /// attempt mounted before the next open. In particular, runtime retirement is
 /// reopenable here: terminal retirement would leave the root fenced and make

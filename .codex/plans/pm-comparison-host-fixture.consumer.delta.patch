@@ -1,0 +1,487 @@
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+@@ -10,6 +10,10 @@
+ use std::os::unix::net::UnixStream;
+ use std::os::unix::process::CommandExt;
+ use std::panic::{AssertUnwindSafe, catch_unwind};
++use tracedecay::daemon::test_context_evidence::{
++    OperationControl, OwnedExactScope, project_delivered_context_for_test,
++    read_retained_context_trace_for_test,
++};
+ 
+ const PROTOCOL: &str = "tracedecay.host-comparison.v1";
+ // A valid 16 MiB host response may grow when carried as JSON. The durable
+@@ -19,6 +23,9 @@
+ const COMMAND_DEADLINE: Duration = Duration::from_secs(180);
+ const CLEANUP_DEADLINE: Duration = Duration::from_secs(15);
+ const PROCESS_POLL: Duration = Duration::from_millis(20);
++// A separate read-only evidence operation, begun after the scheduled host call.
++// This must never replace or extend the provider's original request control.
++const TRACE_EVIDENCE_READ_MILLIS: u64 = 5_000;
+ 
+ type FixtureResult<T> = Result<T, String>;
+ 
+@@ -52,6 +59,58 @@
+         && value
+             .bytes()
+             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++}
++
++fn context_payload_index(result: &Value) -> FixtureResult<(usize, Value)> {
++    let payload = tracedecay::daemon::tool_json_payload(result, "tracedecay_context")
++        .map_err(|error| format!("actual context payload: {error}"))?;
++    // Use the production unique-JSON-payload rule to identify its original
++    // content position. Warnings may have been prepended after the pack ran.
++    let matches: Vec<_> = result["content"]
++        .as_array()
++        .ok_or("context result lacks content array")?
++        .iter()
++        .enumerate()
++        .filter_map(|(index, block)| {
++            let text = block["text"].as_str()?;
++            serde_json::from_str::<Value>(text)
++                .ok()
++                .map(|value| (index, value))
++        })
++        .collect();
++    let [(index, observed)] = matches.as_slice() else {
++        return Err("context payload position is absent or ambiguous".into());
++    };
++    if observed != &payload || result["content"][*index]["type"] != "text" {
++        return Err(
++            "context payload position does not identify the production text payload".into(),
++        );
++    }
++    Ok((*index, payload))
++}
++
++fn observed_delivery_scope(advisory: &Value) -> FixtureResult<OwnedExactScope> {
++    let replay = &advisory["canonical_history_replay"];
++    let revision = advisory["registration_revision"]
++        .as_u64()
++        .filter(|revision| *revision > 0)
++        .ok_or("actual advisory registration revision is unavailable")?;
++    if string(replay, "provider_id")? != string(advisory, "provider_id")?
++        || replay["registration_revision"].as_u64() != Some(revision)
++    {
++        return Err("actual replay carrier and advisory provider registration disagree".into());
++    }
++    let scope = &replay["delivery_scope"];
++    OwnedExactScope::new(
++        string(scope, "profile_id")?,
++        string(scope, "project_id")?,
++        string(scope, "repository_identity")?,
++        string(scope, "worktree_identity")?,
++        string(scope, "branch_identity")?,
++        string(scope, "agent_session_id")?,
++        string(scope, "resolved_scope_digest")?,
++    )
++    .map_err(|error| format!("actual delivered destination scope: {error}"))
+ }
+ 
+ struct Channel {
+@@ -1637,6 +1696,199 @@
+         }
+     }
+ 
++    fn actual_context_store(&self, scope: &OwnedExactScope) -> FixtureResult<(PathBuf, Value)> {
++        let profile =
++            tracedecay_daemon_identity::profile_identity::load_existing(&self.journey.profile)
++                .map_err(|error| format!("read existing isolated profile authority: {error}"))?;
++        if scope.profile_id != profile.profile_id().as_str() || scope.project_id != self.project_id
++        {
++            return Err(
++                "actual delivery scope does not match isolated profile/project authority".into(),
++            );
++        }
++        let registered = &self.initial_evidence["registered_project"];
++        let project = &registered["project"];
++        let root = io_result(
++            fs::canonicalize(&self.journey.project),
++            "canonical fixture project",
++        )?;
++        if string(project, "project_id")? != self.project_id
++            || Path::new(string(project, "canonical_root")?) != root
++        {
++            return Err(
++                "registered project evidence does not match the actual fixture project".into(),
++            );
++        }
++        let matches: Vec<_> = registered["stores"]
++            .as_array()
++            .ok_or("registered project lacks actual store records")?
++            .iter()
++            .filter(|entry| {
++                entry["store"]["store_kind"] == "code_project"
++                    && entry["store"]["project_id"] == self.project_id
++            })
++            .collect();
++        let [selected] = matches.as_slice() else {
++            return Err("registered canonical project store is absent or ambiguous".into());
++        };
++        let store = &selected["store"];
++        if store["storage_mode"] != "profile_sharded" {
++            return Err(
++                "actual project store does not use the supported profile-sharded layout".into(),
++            );
++        }
++        let relative = Path::new(string(store, "store_relpath")?);
++        if relative
++            .components()
++            .any(|component| !matches!(component, std::path::Component::Normal(_)))
++        {
++            return Err("actual registry store path is not a contained relative path".into());
++        }
++        let observed_path = profile.profile_root().join(relative);
++        let production_path = tracedecay_runtime_core::storage::profile_sharded_data_root(
++            profile.profile_root(),
++            &self.project_id,
++        );
++        if observed_path != production_path {
++            return Err(
++                "actual registry store path and production layout resolver disagree".into(),
++            );
++        }
++        let data_root = io_result(
++            fs::canonicalize(&observed_path),
++            "canonical registered data root",
++        )?;
++        if !data_root.is_dir()
++            || !data_root.starts_with(profile.profile_root())
++            || data_root != observed_path
++        {
++            return Err(
++                "actual canonical project store escapes or redirects its registered path".into(),
++            );
++        }
++        Ok((
++            data_root.clone(),
++            json!({
++                "registered_project": project, "registered_store": selected,
++                "profile_root": profile.profile_root(), "profile_id": profile.profile_id().as_str(),
++                "canonical_store_data_root": data_root,
++            }),
++        ))
++    }
++
++    fn capture_retained_context_trace(&mut self, advisory: &Value) -> Value {
++        let started = self.clock_ns();
++        let captured = (|| -> FixtureResult<Value> {
++            let now = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .map_err(|error| format!("trace evidence operation clock: {error}"))?;
++            let now_micros = i64::try_from(now.as_micros())
++                .map_err(|_| "trace evidence operation clock exceeds supported range")?;
++            let deadline_micros = now_micros
++                .checked_add((TRACE_EVIDENCE_READ_MILLIS * 1_000) as i64)
++                .ok_or("trace evidence deadline exceeds supported range")?;
++            let control = OperationControl::new(
++                deadline_micros,
++                TRACE_EVIDENCE_READ_MILLIS,
++                Default::default(),
++            );
++            let provider_id = string(advisory, "provider_id")?;
++            let expected = self
++                .lane
++                .provider()
++                .ok_or("control lane has no advisory provider")?;
++            if provider_id != expected.id() {
++                return Err(
++                    "delivered advisory provider does not match selected operator lane".into(),
++                );
++            }
++            let scope = observed_delivery_scope(advisory)?;
++            let revision = advisory["registration_revision"]
++                .as_u64()
++                .ok_or("actual advisory registration revision is unavailable")?;
++            let correlation = &advisory["recall_trace"];
++            let request_id = string(correlation, "request_id")?;
++            let trace_ref = string(correlation, "trace_ref")?;
++            let authority = self.authority()?;
++            let (data_root, store_evidence) = self.actual_context_store(&scope)?;
++            control
++                .snapshot()
++                .map_err(|code| format!("trace evidence pre-read stopped: {code:?}"))?;
++            // This synchronous fixture thread is outside an async executor. The
++            // reader opens one read-only WAL transaction with this separate
++            // evidence operation's original control, never a provider call.
++            let trace = read_retained_context_trace_for_test(
++                &data_root,
++                trace_ref,
++                request_id,
++                provider_id,
++                revision,
++                &scope,
++                &control,
++            )
++            .map_err(|error| format!("actual retained recall trace: {error}"))?;
++            control
++                .snapshot()
++                .map_err(|code| format!("trace evidence capture stopped: {code:?}"))?;
++            let bytes = serde_json::to_vec(&trace).map_err(|error| error.to_string())?;
++            self.command_sequence += 1;
++            let artifact = write_durable(
++                &self
++                    .archive
++                    .join(format!("context-trace-{:06}.json", self.command_sequence)),
++                &bytes,
++            )?;
++            control
++                .snapshot()
++                .map_err(|code| format!("trace evidence capture stopped: {code:?}"))?;
++            Ok(json!({"status": "observed", "artifact": artifact,
++                "correlation": correlation,
++                "provider_id": trace.provider_id, "registration_revision": trace.registration_revision,
++                "delivery_scope": advisory["canonical_history_replay"]["delivery_scope"],
++                "store_evidence": store_evidence,
++                "daemon_identity": {"pid": authority.pid, "process_run_id": authority.process_run_id},
++                "token_summary_scope": "retained production context pack; excludes enclosing CLI serialization and all other final blocks",
++                "candidate_trace_scope": "actual retained trace items; comparison stage flags and delivery claims have not been inferred",
++            }))
++        })();
++        let ended = self.clock_ns();
++        let mut evidence =
++            captured.unwrap_or_else(|reason| json!({"status": "unavailable", "reason": reason}));
++        evidence["timing"] = json!({"phase": "retained_trace_evidence_read", "status": "measured",
++            "clock": "fixture_process_monotonic_elapsed", "start_monotonic_ns": started,
++            "end_monotonic_ns": ended, "elapsed_ns": ended.saturating_sub(started)});
++        evidence["operation_budget_ms"] = json!(TRACE_EVIDENCE_READ_MILLIS);
++        evidence
++    }
++
++    fn capture_context_projection(
++        &mut self,
++        result: &Value,
++        payload_content_index: usize,
++        payload: &Value,
++    ) -> FixtureResult<Value> {
++        let projection = project_delivered_context_for_test(result, payload_content_index)
++            .map_err(|error| format!("actual final context projector: {error}"))?;
++        let bytes = serde_json::to_vec(&projection).map_err(|error| error.to_string())?;
++        self.command_sequence += 1;
++        let artifact = write_durable(
++            &self.archive.join(format!(
++                "context-projection-{:06}.json",
++                self.command_sequence
++            )),
++            &bytes,
++        )?;
++        let trace = if let Some(advisory) = payload.get("advisory_provider_memory") {
++            self.capture_retained_context_trace(advisory)
++        } else {
++            json!({"status": "unavailable", "reason": "actual payload carries no advisory recall correlation"})
++        };
++        Ok(json!({"status": "observed", "artifact": artifact,
++            "payload_content_index": payload_content_index, "retained_trace": trace,
++            "projection_scope": "decoded original result and production semantic member classifications; raw stdout remains the exact CLI byte boundary",
++        }))
++    }
++
+     fn recall(&mut self, action: &Value) -> FixtureResult<Value> {
+         let task = string(&action["query"], "text")?;
+         let session = format!(
+@@ -1652,6 +1904,7 @@
+         if !raw.record["cutoff"].is_null() {
+             return Err("context command exceeded capture bound; cutoff and complete raw artifacts retained".into());
+         }
++        let capture_started = self.clock_ns();
+         let value = raw.decode()?;
+         // Inspect an independent decoded copy; never strip, join, re-render,
+         // or use its serialization as the captured stdout/token boundary.
+@@ -1677,27 +1930,34 @@
+                 .join(format!("context-blocks-{:06}.json", self.command_sequence)),
+             &blocks_bytes,
+         )?;
+-        let payload = tracedecay::daemon::tool_json_payload(&value, "tracedecay_context").ok();
+-        let advisory = payload
+-            .as_ref()
+-            .and_then(|payload| payload.get("advisory_provider_memory"))
+-            .cloned();
+-        if self.lane.provider().is_none() && advisory.is_some() {
++        let payload = context_payload_index(&value);
++        if self.lane.provider().is_none()
++            && payload
++                .as_ref()
++                .is_ok_and(|(_, payload)| payload.get("advisory_provider_memory").is_some())
++        {
+             return Err(
+                 "control lane unexpectedly received an advisory provider lane; raw result retained"
+                     .into(),
+             );
+         }
++        let projection = payload
++            .and_then(|(index, payload)| self.capture_context_projection(&value, index, &payload))
++            .unwrap_or_else(|reason| json!({"status": "unavailable", "reason": reason}));
++        let capture_ended = self.clock_ns();
+         Ok(
+             json!({"raw_command": raw.record, "final_text_blocks": blocks_ref,
+-                "advisory_observation": advisory,
++                "context_projection": projection,
++                "evidence_capture_timing": {"phase": "host_evidence_capture", "status": "measured",
++                    "clock": "fixture_process_monotonic_elapsed", "start_monotonic_ns": capture_started,
++                    "end_monotonic_ns": capture_ended, "elapsed_ns": capture_ended.saturating_sub(capture_started)},
+                 "request_session_projection": session,
+                 "terminal": if value["isError"] == true { "tool_result_error" } else { "tool_result_completed" },
+                 "terminal_scope": "complete CLI ToolResult; provider terminal unavailable without retained host trace",
+                 "provider_contacted": if self.lane.provider().is_none() { json!(false) } else { Value::Null },
+                 "successful_completion": false,
+                 "delivery_status": {"status": "unavailable",
+-                    "reason": "exact renderer section/token/stage projector pending; complete stdout and block boundaries retained"},
++                    "reason": "complete CLI wrapper token accounting and comparison candidate-stage mapping remain unavailable; raw stdout and actual semantic projection are retained separately"},
+                 "documentation_delivery_status": if self.lane == Lane::Documentation {
+                     json!({"status": "unavailable", "reason": "actual explicit documentation read/delivery route pending"})
+                 } else { Value::Null },
+@@ -1744,11 +2004,26 @@
+             )),
+         };
+         let end = self.clock_ns();
++        let fixture_timing = json!({"phase": "fixture_action", "status": "measured",
++            "clock": "fixture_process_monotonic_elapsed", "start_monotonic_ns": start,
++            "end_monotonic_ns": end, "elapsed_ns": end.saturating_sub(start)});
++        let mut timing = if operation == "recall" {
++            // The read-only trace capture runs after the only scheduled query.
++            // Its SQL, decoding, and fsync time must not inflate host latency.
++            self.commands[command_start..]
++                .iter()
++                .find(|command| command["label"] == "tracedecay_context")
++                .map(|command| command["timing"].clone())
++                .unwrap_or_else(|| json!({"status": "unavailable",
++                    "reason": "scheduled context command did not acquire a measured process interval"}))
++        } else {
++            fixture_timing.clone()
++        };
++        timing["phase"] = json!(phase);
+         let mut result = json!({"input": action, "action": operation, "request_id": action["step"]["query_id"],
+             "selected_provider": null, "phase": phase, "delivery": null,
+             "process_group": self.processes.root.public(), "expectation": "indeterminate",
+-            "timing": {"phase": phase, "status": "measured", "clock": "fixture_process_monotonic_elapsed",
+-                "start_monotonic_ns": start, "end_monotonic_ns": end, "elapsed_ns": end.saturating_sub(start)},
++            "timing": timing, "fixture_action_timing": fixture_timing,
+             "raw_commands": &self.commands[command_start..]});
+         match outcome {
+             Ok(evidence) => {
+@@ -1774,8 +2049,9 @@
+                 };
+                 result["successful_completion"] = json!(false);
+                 result["reason"] = json!(error);
+-                if started {
+-                    result["timing"]["elapsed_at_cutoff_ns"] = json!(end.saturating_sub(start));
++                if started && result["timing"]["status"] == "measured" {
++                    result["timing"]["elapsed_at_cutoff_ns"] =
++                        result["timing"]["elapsed_ns"].clone();
+                 }
+             }
+         }
+@@ -1957,6 +2233,112 @@
+ }
+ 
+ #[cfg(test)]
++mod context_evidence_tests {
++    use super::*;
++
++    #[test]
++    fn actual_payload_position_survives_warning_and_metrics_blocks() {
++        let payload = json!({"host": "evidence", "future_field": [1, 2, 3]});
++        let result = json!({"content": [
++            {"type": "text", "text": "Warning: production diagnostic"},
++            {"type": "text", "text": payload.to_string()},
++            {"type": "text", "text": "tracedecay_metrics: before=99 after=42"},
++        ], "isError": false, "unknown_result_field": "preserve"});
++        let original = result.clone();
++        let (index, observed) = context_payload_index(&result).expect("one actual JSON payload");
++        assert_eq!(index, 1);
++        assert_eq!(observed, payload);
++        let projection =
++            project_delivered_context_for_test(&result, index).expect("production projection");
++        assert_eq!(projection.result, original);
++        assert_eq!(projection.text_blocks.len(), 3);
++        assert_eq!(projection.text_blocks[0].content_index, 0);
++        assert_eq!(
++            projection.text_blocks[2].text,
++            "tracedecay_metrics: before=99 after=42"
++        );
++    }
++
++    #[test]
++    fn duplicate_or_absent_payloads_never_choose_a_position() {
++        for blocks in [
++            json!([]),
++            json!([{"type": "text", "text": "warning only"}]),
++            json!([{"type": "text", "text": "{}"}, {"type": "text", "text": "{}"}]),
++            json!([{"type": "text", "text": "null"}, {"type": "text", "text": "{}"}]),
++            json!([{"type": "resource", "text": "{}"}]),
++        ] {
++            assert!(context_payload_index(&json!({"content": blocks})).is_err());
++        }
++    }
++
++    fn observed_advisory() -> Value {
++        json!({"provider_id": "tracedecay.native", "registration_revision": 7,
++            "canonical_history_replay": {
++                "provider_id": "tracedecay.native", "registration_revision": 7,
++                "batches": [], "delivery_scope": {
++                    "profile_id": "actual-profile", "project_id": "actual-project",
++                    "repository_identity": "actual-repository", "worktree_identity": "actual-worktree",
++                    "branch_identity": "actual-branch", "agent_session_id": "actual-destination-session",
++                    "resolved_scope_digest": format!("sha256:{}", "a".repeat(64)),
++                },
++            },
++        })
++    }
++
++    #[test]
++    fn empty_history_still_requires_the_complete_actual_destination_scope() {
++        let advisory = observed_advisory();
++        let scope = observed_delivery_scope(&advisory).expect("complete actual carrier");
++        assert_eq!(scope.agent_session_id, "actual-destination-session");
++        for field in [
++            "profile_id",
++            "project_id",
++            "repository_identity",
++            "worktree_identity",
++            "branch_identity",
++            "agent_session_id",
++            "resolved_scope_digest",
++        ] {
++            let mut missing = advisory.clone();
++            missing["canonical_history_replay"]["delivery_scope"]
++                .as_object_mut()
++                .unwrap()
++                .remove(field);
++            assert!(
++                observed_delivery_scope(&missing).is_err(),
++                "missing {field}"
++            );
++        }
++    }
++
++    #[test]
++    fn replay_and_advisory_registration_must_reconcile() {
++        for (pointer, replacement) in [
++            ("/provider_id", json!("ncm")),
++            ("/registration_revision", json!(8)),
++            ("/registration_revision", json!(0)),
++            ("/canonical_history_replay/provider_id", Value::Null),
++            (
++                "/canonical_history_replay/registration_revision",
++                Value::Null,
++            ),
++            (
++                "/canonical_history_replay/delivery_scope/resolved_scope_digest",
++                json!("unvalidated"),
++            ),
++        ] {
++            let mut advisory = observed_advisory();
++            *advisory.pointer_mut(pointer).unwrap() = replacement;
++            assert!(
++                observed_delivery_scope(&advisory).is_err(),
++                "mismatched {pointer}"
++            );
++        }
++    }
++}
++
++#[cfg(test)]
+ mod transport_tests {
+     use super::*;
+ 

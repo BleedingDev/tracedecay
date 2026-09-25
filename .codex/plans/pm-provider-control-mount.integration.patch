@@ -1,0 +1,289 @@
+--- a/crates/tracedecay/src/daemon/dashboard_configuration_test_runtime.rs
++++ b/crates/tracedecay/src/daemon/dashboard_configuration_test_runtime.rs
+@@ -425,6 +425,8 @@
+             project_retrieval: None,
+             project_workflow_index: None,
+             project_lcm: None,
++            #[cfg(feature = "memory-provider-host")]
++            provider_control: None,
+             invocation_service: Some(service.clone()),
+             configuration_digest: retained_access.configuration_digest.clone(),
+         },
+--- a/crates/tracedecay/src/daemon/project_composition.rs
++++ b/crates/tracedecay/src/daemon/project_composition.rs
+@@ -1850,9 +1850,10 @@
+             { None }
+         };
+         #[cfg(feature = "memory-provider-host")]
+-        let (observation_journey_mounts, deferred_observation_journeys) = {
++        let (observation_journey_mounts, deferred_observation_journeys, control_journals) = {
+             let mut journeys = Vec::with_capacity(core.observation_provider_mounts.len());
+             let mut deferred = Vec::new();
++            let mut control_journals = Vec::new();
+             for (configured, history_mount) in &core.observation_provider_mounts {
+                 let provider = &configured.mount;
+                 let required = configured.requirement == ObservationMountRequirementV1::Required;
+@@ -1932,6 +1933,7 @@
+                                 requirement: configured.requirement,
+                             });
+                         }
++                        control_journals.push((provider.provider_id.clone(), journey.history_journal()));
+                         journeys.push(journey);
+                     },
+                     Err(super::retained_owner::observation_journey::ObservationJourneyError::Cancelled { .. }) => {
+@@ -1943,7 +1945,95 @@
+                     Err(error) => tracing::warn!(provider = provider.provider_id.as_str(), error = %error, "observer journey unavailable"),
+                 }
+             }
+-            (journeys, deferred)
++            (journeys, deferred, control_journals)
++        };
++        #[cfg(feature = "memory-provider-host")]
++        let provider_control_mount = {
++            use super::retained_owner::provider_control::{
++                ProviderControlMountInputsV1,
++                authority::{ProviderControlAuthorityInputsV1, ProviderControlAuthorityV1},
++                project_provider_control_port,
++            };
++            use tracedecay_memory_provider_registry::{CancellationToken, OperationControl};
++
++            // This is a cooperative admission budget, not a hard bound on the
++            // synchronous filesystem, identity, or existing schema open work.
++            // Keep ownership and always join the one blocking task.
++            let now = tracedecay_contracts::now_micros().0;
++            let control = OperationControl::new(
++                now.saturating_add(1_000_000),
++                1_000,
++                CancellationToken::new(),
++            );
++            let inputs = ProviderControlAuthorityInputsV1 {
++                canonical_project_path: self.canonical_project_path.to_path_buf(),
++                profile_id: core.profile_identity.profile_id().clone(),
++                mounted_scope: code_index.scope.clone(),
++                session_db: session_db.clone(),
++                dispositions: Arc::new(cg.db().clone()),
++                hook_origin_reader: Arc::clone(&hook_origin_reader),
++                store_data_root: cg.store_layout().data_root.clone(),
++                live_ledger: core
++                    .cognitive_recall_mount
++                    .as_ref()
++                    .map(|mount| mount.control_ledger()),
++                live_journals: control_journals,
++                runtime: tokio::runtime::Handle::current(),
++            };
++            let blocking_control = control.clone();
++            let mut work = tokio::task::spawn_blocking(move || {
++                ProviderControlAuthorityV1::from_mounted_data(inputs, &blocking_control)
++            });
++            let joined = tokio::select! {
++                biased;
++                () = self.cancellation.cancelled() => {
++                    control.cancellation().cancel();
++                    let _ = work.await;
++                    return Err(project_open_cancellation_error());
++                }
++                joined = &mut work => joined,
++            };
++            project_open_cancellation_checkpoint(self.cancellation)?;
++            let authority = if control.snapshot().is_err() {
++                tracing::debug!(
++                    cause = "admission_budget",
++                    "provider source controls unavailable"
++                );
++                None
++            } else {
++                match joined {
++                    Ok(Ok(authority)) => Some(Arc::new(authority)),
++                    Ok(Err(_)) => {
++                        tracing::debug!(
++                            cause = "retained_authority",
++                            "provider source controls unavailable"
++                        );
++                        None
++                    }
++                    Err(_) => {
++                        tracing::debug!(
++                            cause = "mount_task",
++                            "provider source controls unavailable"
++                        );
++                        None
++                    }
++                }
++            };
++            project_provider_control_port(ProviderControlMountInputsV1 {
++                authority,
++                composition: Arc::clone(&core.memory_provider_host_mount),
++                journeys: observation_journey_mounts.clone(),
++                profile_id: core.profile_identity.profile_id().clone(),
++                mounted_scope: code_index.scope.clone(),
++                authoritative_project_id: code_index.project_id.clone(),
++                project_root: self.canonical_project_path.to_path_buf(),
++                configuration_digest: runtime_configuration
++                    .snapshot()
++                    .effective_behavior_digest
++                    .clone(),
++                canonical_session_db: session_db.clone(),
++                canonical_dispositions: Arc::new(cg.db().clone()),
++            })
+         };
+         self.invocation
+             .service
+@@ -2136,7 +2226,8 @@
+             .iter()
+             .fold(full_context, |context, journey| {
+                 context.with_observation_journey_mount(Arc::clone(journey))
+-            });
++            })
++            .with_provider_control_mount(provider_control_mount);
+         let full_construction_started = Instant::now();
+         let full_candidate = crate::mcp::McpServer::new_with_context(full_context).await;
+         full_candidate
+--- a/crates/tracedecay/src/daemon/retained_owner.rs
++++ b/crates/tracedecay/src/daemon/retained_owner.rs
+@@ -30,9 +30,11 @@
+ pub(crate) mod native_staged_observations;
+ #[cfg(feature = "memory-provider-host")]
+ pub(crate) mod observation_journey;
++mod profile;
++#[cfg(feature = "memory-provider-host")]
++pub(crate) mod provider_control;
+ #[cfg(feature = "memory-provider-host")]
+ pub(crate) mod provider_history;
+-mod profile;
+ mod session;
+ pub(crate) mod session_refresh;
+ 
+@@ -68,6 +70,10 @@
+     pub(crate) project_workflow_index: Option<Arc<dyn tracedecay_sessions::WorkflowIndexReadPort>>,
+     pub(crate) project_lcm:
+         Option<Arc<dyn tracedecay_session_runtime::lcm_authority::MountedLcmAuthorityPort>>,
++    #[cfg(feature = "memory-provider-host")]
++    pub(crate) provider_control: Option<
++        Arc<dyn tracedecay_contracts::retained_surfaces::RetainedProviderControlExecutionPortV1>,
++    >,
+     pub(crate) configuration_digest: ManifestDigest,
+     pub(crate) invocation_service: Option<DaemonInvocationService>,
+ }
+@@ -82,6 +88,10 @@
+             authorities.configuration_digest.clone(),
+         ),
+     ));
++    #[cfg(feature = "memory-provider-host")]
++    if let Some(provider_control) = authorities.provider_control {
++        ports = ports.with_provider_control(provider_control);
++    }
+     if let Some(invocation_service) = authorities.invocation_service.clone() {
+         ports = ports.with_automation(Arc::new(automation::DirectRetainedAutomationPortV1::new(
+             Arc::clone(&authorities.cg),
+--- a/crates/tracedecay/src/daemon/scheduler/combined_effect.rs
++++ b/crates/tracedecay/src/daemon/scheduler/combined_effect.rs
+@@ -1220,6 +1220,8 @@
+                     project_retrieval: None,
+                     project_workflow_index: None,
+                     project_lcm: None,
++                    #[cfg(feature = "memory-provider-host")]
++                    provider_control: None,
+                     configuration_digest: access.configuration_digest.clone(),
+                     invocation_service: Some(invocation_service),
+                 },
+--- a/crates/tracedecay/src/mcp/server/construction.rs
++++ b/crates/tracedecay/src/mcp/server/construction.rs
+@@ -97,6 +97,11 @@
+ #[cfg(feature = "memory-provider-host")]
+ pub(crate) type ObservationJourneyMount =
+     Arc<crate::daemon::retained_owner::observation_journey::ProjectObservationJourneyV1>;
++
++/// Existing project control port retained for one project-server lifetime.
++#[cfg(feature = "memory-provider-host")]
++pub(crate) type ProviderControlMount =
++    Arc<dyn tracedecay_contracts::retained_surfaces::RetainedProviderControlExecutionPortV1>;
+ 
+ /// Cognitive-recall route retained for exactly one project-server lifetime;
+ /// session ports are minted from it on demand.
+@@ -214,6 +219,8 @@
+     #[cfg(feature = "memory-provider-host")]
+     pub(crate) observation_journey_mount: Vec<ObservationJourneyMount>,
+     #[cfg(feature = "memory-provider-host")]
++    pub(crate) provider_control_mount: Option<ProviderControlMount>,
++    #[cfg(feature = "memory-provider-host")]
+     pub(crate) cognitive_recall_mount: Option<CognitiveRecallMount>,
+     pub(crate) project_server_live: Option<Arc<AtomicBool>>,
+     #[cfg(any(test, feature = "test-transport"))]
+@@ -328,6 +335,8 @@
+             memory_provider_host_mount: None,
+             #[cfg(feature = "memory-provider-host")]
+             observation_journey_mount: Vec::new(),
++            #[cfg(feature = "memory-provider-host")]
++            provider_control_mount: None,
+             #[cfg(feature = "memory-provider-host")]
+             cognitive_recall_mount: None,
+             project_server_live: None,
+@@ -439,6 +448,8 @@
+             #[cfg(feature = "memory-provider-host")]
+             observation_journey_mount: Vec::new(),
+             #[cfg(feature = "memory-provider-host")]
++            provider_control_mount: None,
++            #[cfg(feature = "memory-provider-host")]
+             cognitive_recall_mount: None,
+             project_server_live: None,
+             #[cfg(any(test, feature = "test-transport"))]
+@@ -511,6 +522,8 @@
+             #[cfg(feature = "memory-provider-host")]
+             observation_journey_mount: Vec::new(),
+             #[cfg(feature = "memory-provider-host")]
++            provider_control_mount: None,
++            #[cfg(feature = "memory-provider-host")]
+             cognitive_recall_mount: None,
+             project_server_live: None,
+             #[cfg(any(test, feature = "test-transport"))]
+@@ -717,6 +730,12 @@
+     #[cfg(feature = "memory-provider-host")]
+     pub(crate) fn with_observation_journey_mount(mut self, mount: ObservationJourneyMount) -> Self {
+         self.observation_journey_mount.push(mount);
++        self
++    }
++
++    #[cfg(feature = "memory-provider-host")]
++    pub(crate) fn with_provider_control_mount(mut self, mount: ProviderControlMount) -> Self {
++        self.provider_control_mount = Some(mount);
+         self
+     }
+ 
+--- a/crates/tracedecay/src/mcp/server.rs
++++ b/crates/tracedecay/src/mcp/server.rs
+@@ -479,6 +479,8 @@
+     _memory_provider_host_mount: Option<MemoryProviderHostMount>,
+     #[cfg(feature = "memory-provider-host")]
+     _observation_journey_mount: Vec<ObservationJourneyMount>,
++    #[cfg(feature = "memory-provider-host")]
++    provider_control_mount: Option<ProviderControlMount>,
+     /// Retains the cognitive-recall route so session recall ports can be
+     /// minted against this project server's exact scope and admission ledger.
+     #[cfg(feature = "memory-provider-host")]
+@@ -868,6 +870,8 @@
+             #[cfg(feature = "memory-provider-host")]
+             observation_journey_mount,
+             #[cfg(feature = "memory-provider-host")]
++            provider_control_mount,
++            #[cfg(feature = "memory-provider-host")]
+             cognitive_recall_mount,
+             project_server_live,
+             #[cfg(any(test, feature = "test-transport"))]
+@@ -1171,6 +1175,8 @@
+             #[cfg(feature = "memory-provider-host")]
+             _observation_journey_mount: observation_journey_mount,
+             #[cfg(feature = "memory-provider-host")]
++            provider_control_mount,
++            #[cfg(feature = "memory-provider-host")]
+             cognitive_recall_mount,
+             project_server_live,
+             project_server_lifecycle: ProjectServerResponseLifecycle::default(),
+@@ -1419,6 +1425,8 @@
+                     .map(|mounted| Arc::clone(&mounted.service)),
+                 project_workflow_index,
+                 project_lcm: self.project_lcm_authority.clone(),
++                #[cfg(feature = "memory-provider-host")]
++                provider_control: self.provider_control_mount.clone(),
+                 invocation_service: self.daemon_invocation_service.clone(),
+             },
+         )

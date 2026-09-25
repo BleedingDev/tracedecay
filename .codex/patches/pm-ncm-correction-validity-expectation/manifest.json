@@ -1,0 +1,11 @@
+{
+  "status": "draft_only_unapplied",
+  "patch_sha256": "6da3f2142737b3ac63197e9d9880ed5acd3dc00f4e7ea1ae98e7f23d8e857605",
+  "files": [
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs",
+      "baseline_sha256": "f0b1eab69834a353e8aef240de0b6fc18cc35b22360d3983095b7f75927b2804",
+      "proposed_sha256": "7fb45477386b68695082fed70d08b1b1ceb6babc9a657b0c675d609c06de07f0"
+    }
+  ]
+}

@@ -3,11 +3,9 @@ use std::path::PathBuf;
 use tracedecay_domain::{
     EmbeddingDeviceClassV1, EmbeddingDocumentCompositionV1, EmbeddingMetricV1,
     EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingTruncationSideV1,
-    ManifestDigest,
 };
 use tracedecay_semantic_contracts::configuration::{
-    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticFallbackReasonV1, SemanticProfileSelection,
-    SemanticResourceCeilings,
+    DEFAULT_FASTEMBED_MODEL_ID, SemanticConfig, SemanticFallbackReasonV1, SemanticResourceCeilings,
 };
 use tracedecay_semantic_contracts::lifecycle::{
     SemanticModelLifecycleStateV1, SemanticModelLifecycleStatusV1, SemanticModelRemediationV1,
@@ -99,27 +97,27 @@ fn sample_manifest() -> ModelArtifactManifestV1 {
 }
 
 #[test]
-fn semantic_config_preserves_omitted_defaults_and_explicit_null_disabling() {
+fn semantic_config_defaults_disabled_and_selects_only_cpu_jina_when_enabled() {
     let omitted: SemanticConfig = serde_json::from_str("{}").expect("omitted configuration");
-    assert_eq!(
-        omitted.selected_model.as_deref(),
-        Some(DEFAULT_FASTEMBED_MODEL_ID)
-    );
-    assert!(omitted.auto_download);
+    assert!(!omitted.enabled);
+    assert!(!omitted.auto_download);
+    assert_eq!(omitted.effective_model_id(), None);
     assert_eq!(omitted.resources, SemanticResourceCeilings::default());
 
-    let disabled: SemanticConfig =
-        serde_json::from_str(r#"{"selected_model":null}"#).expect("disabled configuration");
-    assert_eq!(disabled.selected_model, None);
-    assert!(disabled.auto_download);
+    let enabled: SemanticConfig =
+        serde_json::from_str(r#"{"enabled":true}"#).expect("enabled semantic configuration");
+    assert_eq!(
+        enabled.effective_model_id(),
+        Some(DEFAULT_FASTEMBED_MODEL_ID)
+    );
+    assert!(!enabled.auto_download);
 }
 
 #[test]
 fn semantic_config_serialization_preserves_contract_field_order() {
     let encoded = serde_json::to_string(&SemanticConfig::default()).expect("configuration JSON");
     assert!(encoded.starts_with(concat!(
-        r#"{"selected_model":"JinaEmbeddingsV2BaseCode","#,
-        r#""auto_download":true,"active_profile":null,"rollback_profile":null,"resources":{"#
+        r#"{"enabled":false,"auto_download":false,"resources":{"#
     )));
     let model = encoded.find(r#""max_model_bytes":"#).expect("model field");
     let tokenizer = encoded
@@ -129,9 +127,9 @@ fn semantic_config_serialization_preserves_contract_field_order() {
         .find(r#""max_resident_bytes":"#)
         .expect("resident field");
     assert!(model < tokenizer && tokenizer < resident);
-    assert!(
-        encoded.ends_with(r#","load_deadline_ms":30000},"document_composition":"sanitized_text"}"#)
-    );
+    assert!(encoded.ends_with(
+        r#","load_deadline_ms":30000},"document_composition":"symbol_context_header"}"#
+    ));
 }
 
 /// Audit finding B1: "the operator pinned a resident ceiling" has to be a
@@ -179,52 +177,37 @@ fn a_pinned_resident_ceiling_below_the_model_ceiling_is_rejected() {
 }
 
 #[test]
-fn semantic_config_without_a_document_composition_selects_sanitized_text() {
-    let legacy = r#"{"selected_model":"JinaEmbeddingsV2BaseCode","auto_download":true,"active_profile":null,"rollback_profile":null,"resources":{"max_model_bytes":734003200,"max_tokenizer_bytes":67108864,"max_resident_bytes":2147483648,"max_threads":4,"max_concurrent_sessions":16,"max_batch_size":32,"max_sequence_length":4096,"load_deadline_ms":30000}}"#;
-    let config: SemanticConfig = serde_json::from_str(legacy).expect("persisted configuration");
+fn semantic_config_without_a_document_composition_selects_symbol_context_header() {
+    let without_composition = r#"{"enabled":true,"auto_download":false,"resources":{"max_model_bytes":734003200,"max_tokenizer_bytes":67108864,"max_resident_bytes":2147483648,"max_threads":4,"max_concurrent_sessions":16,"max_batch_size":32,"max_sequence_length":4096,"load_deadline_ms":30000}}"#;
+    let config: SemanticConfig =
+        serde_json::from_str(without_composition).expect("persisted configuration");
     assert_eq!(
         config.document_composition,
-        EmbeddingDocumentCompositionV1::SanitizedText
-    );
-
-    let header: SemanticConfig = serde_json::from_str(&legacy.replace(
-        r#""load_deadline_ms":30000}}"#,
-        r#""load_deadline_ms":30000},"document_composition":"symbol_context_header"}"#,
-    ))
-    .expect("configuration selecting the header composition");
-    assert_eq!(
-        header.document_composition,
         EmbeddingDocumentCompositionV1::SymbolContextHeader
     );
-    header
+
+    let sanitized: SemanticConfig = serde_json::from_str(&without_composition.replace(
+        r#""load_deadline_ms":30000}}"#,
+        r#""load_deadline_ms":30000},"document_composition":"sanitized_text"}"#,
+    ))
+    .expect("configuration selecting sanitized text composition");
+    assert_eq!(
+        sanitized.document_composition,
+        EmbeddingDocumentCompositionV1::SanitizedText
+    );
+    sanitized
         .validate()
-        .expect("header composition is a valid selection");
+        .expect("sanitized text composition remains a valid explicit selection");
 }
 
 #[test]
-fn semantic_config_retains_profile_and_resource_validation_failures() {
+fn semantic_config_retains_resource_validation_failures() {
     let mut config = SemanticConfig::default();
     config.resources.max_threads = 0;
     assert!(config.validate().is_err());
 
-    // Model-id validation here is structural only; catalog membership is
-    // admitted by the production catalog in `tracedecay-semantic`.
     config.resources = SemanticResourceCeilings::default();
-    config.selected_model = Some(String::new());
-    assert!(config.validate().is_err());
-    config.selected_model = Some("x".repeat(129));
-    assert!(config.validate().is_err());
-    config.selected_model = Some("NotARealModel".to_owned());
-    assert!(config.validate().is_ok());
-
-    config.selected_model = SemanticConfig::default().selected_model;
-    config.active_profile = Some(SemanticProfileSelection {
-        profile_id: "fixture".to_owned(),
-        accepted_profile_digest: ManifestDigest::new(format!("sha256:{}", "a".repeat(64)))
-            .expect("manifest digest"),
-        artifact_digest: "b".repeat(64),
-        artifact_path: PathBuf::from("../relative/model"),
-    });
+    config.auto_download = true;
     assert!(config.validate().is_err());
 }
 

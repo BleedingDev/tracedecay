@@ -1,0 +1,1018 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+@@ -194,7 +194,7 @@
+         Option<Arc<dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority>>,
+ }
+ 
+-/// Only the latest successful handshake can supply health evidence. The
++/// Only the latest successful handshake can supply descriptor evidence. The
+ /// immutable implementation/capability descriptor remains owned by the port.
+ #[derive(Clone)]
+ struct NativeAcceptedReadiness {
+@@ -3197,6 +3197,12 @@
+ }
+ 
+ impl ProjectNativeMemoryApplicationPort {
++    fn actual_capability_states(&self) -> Vec<Value> {
++        self.descriptor.capabilities.iter().map(|capability| {
++            serde_json::json!({"capability_id":capability.as_str(),"state":"available"})
++        }).collect()
++    }
++
+     fn complete_health_response(
+         &self,
+         outcome: &mut StagedControlOutcome,
+@@ -3217,19 +3223,77 @@
+             return Err(NativeReadFailure::ProviderUnavailable);
+         };
+         response.extend([
+-            ("provider_id".to_owned(), self.descriptor.provider_id.as_str().into()),
+-            ("provider_instance_id".to_owned(), accepted.provider_instance_id.clone().into()),
+-            ("implementation_identity_digest".to_owned(), self.descriptor.implementation_identity_sha256.clone().into()),
+-            ("state_identity_digest".to_owned(), sha256_hex(&state_bytes).into()),
+-            ("state_generation".to_owned(), outcome.generation_after.into()),
+-            ("scope_digest".to_owned(), accepted.exact_scope_sha256.clone().into()),
+-            ("capability_states".to_owned(), self.descriptor.capabilities.iter().map(|capability| {
+-                serde_json::json!({"capability_id": capability.as_str(), "state": "available"})
+-            }).collect::<Vec<_>>().into()),
+-            ("effective_limits_digest".to_owned(), hex::encode(limits_digest.finalize()).into()),
+-            ("backlog".to_owned(), self.actor.queued_requests.load(Ordering::Acquire).into()),
++            (
++                "provider_id".to_owned(),
++                self.descriptor.provider_id.as_str().into(),
++            ),
++            (
++                "provider_instance_id".to_owned(),
++                accepted.provider_instance_id.clone().into(),
++            ),
++            (
++                "implementation_identity_digest".to_owned(),
++                self.descriptor
++                    .implementation_identity_sha256
++                    .clone()
++                    .into(),
++            ),
++            (
++                "state_identity_digest".to_owned(),
++                sha256_hex(&state_bytes).into(),
++            ),
++            (
++                "state_generation".to_owned(),
++                outcome.generation_after.into(),
++            ),
++            (
++                "scope_digest".to_owned(),
++                accepted.exact_scope_sha256.clone().into(),
++            ),
++            (
++                "capability_states".to_owned(),
++                self.actual_capability_states().into(),
++            ),
++            (
++                "effective_limits_digest".to_owned(),
++                hex::encode(limits_digest.finalize()).into(),
++            ),
++            (
++                "backlog".to_owned(),
++                self.actor.queued_requests.load(Ordering::Acquire).into(),
++            ),
+         ]);
+         Ok(())
++    }
++
++    fn complete_capability_response(
++        &self,
++        outcome: &mut StagedControlOutcome,
++        call: &ProviderCall,
++        request: &Value,
++        accepted: &NativeAcceptedReadiness,
++    ) -> Result<(), NativeReadFailure> {
++        let Value::Object(response) = &mut outcome.response else {
++            return Err(NativeReadFailure::ProviderUnavailable);
++        };
++        response.extend([
++            ("items".to_owned(), self.actual_capability_states().into()),
++            (
++                "state_generation".to_owned(),
++                outcome.generation_after.into(),
++            ),
++            ("coverage".to_owned(), "complete".into()),
++            ("next_cursor".to_owned(), Value::Null),
++            ("redactions".to_owned(), serde_json::json!([])),
++            ("warnings".to_owned(), serde_json::json!([])),
++        ]);
++        super::native_staged_observations::paginate_inspection_evidence(
++            &mut outcome.response,
++            call,
++            request,
++            accepted.effective_limits.inspection_items,
++        )
++        .map_err(store_failure)
+     }
+ 
+     fn lifecycle_call(&self, call: &ProviderCall) -> ProviderReply {
+@@ -3239,38 +3303,64 @@
+         if let Err(failure) = control_failure(&call.control) {
+             return self.observe_failure(call, failure);
+         }
+-        let health_readiness = if call.operation == ProviderOperation::Health {
+-            let latest = match self.accepted_readiness.lock() {
+-                Ok(latest) => latest,
+-                Err(_) => {
+-                    return self.observe_failure(call, NativeReadFailure::ProviderUnavailable);
+-                }
+-            };
+-            match latest.as_ref() {
+-                Some(accepted)
+-                    if accepted.registration_revision == call.registration_revision
+-                        && accepted.exact_scope_sha256 == call_scope_digest(call)
+-                        && accepted.ready_receipt_sha256 == call.ready_receipt_sha256 =>
+-                {
+-                    Some(accepted.clone())
+-                }
+-                _ => return self.observe_failure(call, NativeReadFailure::ProviderUnavailable),
++        let inspection_request = if call.operation == ProviderOperation::Inspection {
++            match serde_json::from_slice::<Value>(&call.payload.bytes) {
++                Ok(request) => Some(request),
++                Err(_) => return self.observe_invalid(call),
+             }
+         } else {
+             None
+         };
++        let capability_status = inspection_request
++            .as_ref()
++            .is_some_and(|request| request["view"] == "capability_status");
++        let descriptor_readiness =
++            if call.operation == ProviderOperation::Health || capability_status {
++                let latest = match self.accepted_readiness.lock() {
++                    Ok(latest) => latest,
++                    Err(_) => {
++                        return self.observe_failure(call, NativeReadFailure::ProviderUnavailable);
++                    }
++                };
++                match latest.as_ref() {
++                    Some(accepted)
++                        if accepted.registration_revision == call.registration_revision
++                            && accepted.exact_scope_sha256 == call_scope_digest(call)
++                            && accepted.ready_receipt_sha256 == call.ready_receipt_sha256 =>
++                    {
++                        Some(accepted.clone())
++                    }
++                    _ => return self.observe_failure(call, NativeReadFailure::ProviderUnavailable),
++                }
++            } else {
++                None
++            };
+         match self
+             .actor
+             .dispatch_control(call.clone(), self.admission_authority.clone())
+         {
+             Ok(mut outcome) => {
+-                let (generation, maximum_response_bytes) = if let Some(accepted) = health_readiness
++                let (generation, maximum_response_bytes) = if let Some(accepted) =
++                    descriptor_readiness
+                 {
+                     let generation = outcome.generation_after;
+-                    if let Err(failure) = self.complete_health_response(&mut outcome, &accepted) {
++                    let completed = if let Some(request) = inspection_request.as_ref() {
++                        self.complete_capability_response(&mut outcome, call, request, &accepted)
++                    } else {
++                        self.complete_health_response(&mut outcome, &accepted)
++                    };
++                    if let Err(failure) = completed {
+                         return self.observe_failure(call, failure);
+                     }
+                     (generation, accepted.effective_limits.response_bytes)
++                } else if inspection_request
++                    .as_ref()
++                    .is_some_and(|request| request["view"] == "maintenance_receipt")
++                {
++                    (
++                        outcome.generation_after,
++                        native_provider_limits().response_bytes,
++                    )
+                 } else {
+                     (
+                         self.staged
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
+@@ -642,6 +642,270 @@
+     let mut changed = request;
+     changed.challenge_nonce[0] ^= 0xff;
+     assert_ne!(first, ready_receipt(&changed, limits));
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn native_capability_inspection_uses_readiness_and_pages_the_probed_descriptor() {
++    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
++    let port = Arc::new(
++        ProjectNativeMemoryApplicationPort::new(
++            Arc::new(tokio::sync::RwLock::new(graph)),
++            project_root.clone(),
++            test_profile_id(),
++            &test_provider_state_root(&project_root),
++        )
++        .expect("real Native application port"),
++    );
++    let provider = NativeProvider::new(port.clone()).expect("real Native adapter");
++    let mut request = ready_request();
++    request.exact_scope = recall_exact_scope(project_id.as_str());
++    request.host_limits.response_bytes = 4096;
++    request.host_limits.inspection_items = 64;
++    let ready = provider.handshake(&request);
++    assert_eq!(ready.terminal.terminal_code(), TerminalCode::Success);
++    let call_for = |request: &HandshakeRequest,
++                    ready: &HandshakeResponse,
++                    cursor: Value,
++                    maximum_items: u64,
++                    maximum_bytes: u64| {
++        let value = json!({"common_request":{
++            "provider_id":request.provider_id.as_str(),"registration_revision":request.registration_revision,
++            "ready_receipt_digest":ready.ready_receipt_sha256,
++            "exact_scope_identity":tracedecay_memory_conformance::compatibility::scope_json(&request.exact_scope),
++            "operation_id":"operation.native-capabilities","idempotency_key":null,
++            "expected_state_generation":0,"request_identity":"request.native-capabilities","policy_revision":1,
++            "deadline":{"deadline_utc_micros":i64::MAX,"remaining_millis":5000},"cancellation":"live","extensions":[]},
++            "view":"capability_status","selector":{},"maximum_items":maximum_items,"maximum_bytes":maximum_bytes,
++            "redaction_policy_revision":1,"cursor":cursor});
++        let bytes = serde_json::to_vec(&value).expect("inspection bytes");
++        ProviderCall::new(ProviderCallParts {
++            operation: ProviderOperation::Inspection,
++            provider_id: request.provider_id.clone(),
++            registration_revision: request.registration_revision,
++            ready_receipt_sha256: ready
++                .ready_receipt_sha256
++                .clone()
++                .expect("accepted receipt"),
++            exact_scope: request.exact_scope.clone(),
++            request_id: "request.native-capabilities".into(),
++            operation_id: "operation.native-capabilities".into(),
++            expected_state_generation: 0,
++            idempotency_key: None,
++            control: OperationControl::new(i64::MAX, 5000, CancellationToken::new()),
++            payload: CanonicalPayload::new(
++                OwnedVersionedId::new("tracedecay.memory.provider.inspection.v1")
++                    .expect("inspection contract"),
++                bytes.clone(),
++                sha256_hex(&bytes),
++            )
++            .expect("inspection payload"),
++            required_capabilities: vec![
++                OwnedVersionedId::new(ProviderOperation::Inspection.capability_id())
++                    .expect("inspection capability"),
++            ],
++            extensions: Vec::new(),
++        })
++        .expect("inspection call")
++    };
++    let decode = |reply: &ProviderReply| -> Value {
++        assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
++        serde_json::from_slice(&reply.payload.as_ref().expect("inspection payload").bytes)
++            .expect("inspection response")
++    };
++    let observation = session_message_payload(
++        "capability-record",
++        "session.capability",
++        "capability state beacon",
++    );
++    let observe_call = staged_session_call(
++        project_id.as_str(),
++        &observation,
++        "key.capability",
++        "operation.capability-observe",
++    );
++    assert_eq!(
++        port.observe(staged_observation_for(&observe_call, observation))
++            .terminal
++            .terminal_code(),
++        TerminalCode::Success
++    );
++    let generation = port.staged.generation().expect("actual generation");
++    assert!(generation > 0);
++    let full_call = call_for(&request, &ready, Value::Null, 64, 65536);
++    let full_reply = provider.invoke(&full_call);
++    full_reply.validate(4096).expect("accepted reply budget");
++    let full = decode(&full_reply);
++    let expected: Vec<Value> = ready
++        .descriptor
++        .as_ref()
++        .expect("accepted descriptor")
++        .capabilities
++        .iter()
++        .map(|capability| json!({"capability_id":capability.as_str(),"state":"available"}))
++        .collect();
++    assert!(expected.len() > 2);
++    assert_eq!(full["view"], "capability_status");
++    assert_eq!(full["items"], json!(expected));
++    assert_eq!(full["coverage"], "complete");
++    assert_eq!(full["next_cursor"], Value::Null);
++    assert_eq!(full["state_generation"], generation);
++    assert_eq!(full["state_generation_before"], generation);
++    assert_eq!(full["state_generation_after"], generation);
++    assert_eq!(full_reply.state_generation, generation);
++    assert_eq!(
++        full_reply
++            .terminal
++            .committed_effect()
++            .state_generation_after(),
++        Some(generation)
++    );
++
++    let first_call = call_for(&request, &ready, Value::Null, 1, 65536);
++    let first_reply = provider.invoke(&first_call);
++    let first = decode(&first_reply);
++    assert_eq!(first["items"], json!([expected[0]]));
++    assert_eq!(first["coverage"], "partial");
++    assert!(first["next_cursor"].as_str().expect("continuation").len() <= 1024);
++    assert_eq!(
++        decode(&provider.invoke(&first_call))["next_cursor"],
++        first["next_cursor"]
++    );
++    let next = decode(&provider.invoke(&call_for(
++        &request,
++        &ready,
++        first["next_cursor"].clone(),
++        64,
++        65536,
++    )));
++    assert_eq!(next["items"], json!(&expected[1..]));
++    assert_eq!(next["coverage"], "complete");
++    assert_eq!(next["next_cursor"], Value::Null);
++    let byte_limit = first_reply
++        .payload
++        .as_ref()
++        .expect("first page")
++        .bytes
++        .len() as u64;
++    let byte_reply = provider.invoke(&call_for(&request, &ready, Value::Null, 64, byte_limit));
++    assert!(
++        byte_reply
++            .payload
++            .as_ref()
++            .expect("byte-limited page")
++            .bytes
++            .len() as u64
++            <= byte_limit
++    );
++    assert_eq!(decode(&byte_reply)["items"], first["items"]);
++    let small = provider.invoke(&call_for(&request, &ready, Value::Null, 64, 1));
++    assert_eq!(
++        small.terminal.terminal_code(),
++        TerminalCode::CapacityExceeded
++    );
++    assert!(small.payload.is_none());
++    assert_eq!(
++        provider
++            .invoke(&call_for(
++                &request,
++                &ready,
++                "wrong-cursor".into(),
++                64,
++                65536
++            ))
++            .terminal
++            .terminal_code(),
++        TerminalCode::InvalidRequest
++    );
++
++    // Completing a previously probed response cannot substitute a later store revision.
++    let mut probe = port
++        .staged
++        .control(&full_call, None)
++        .expect("descriptor generation probe");
++    let accepted = port
++        .accepted_readiness
++        .lock()
++        .expect("readiness")
++        .clone()
++        .expect("accepted readiness");
++    let next_observation = session_message_payload(
++        "capability-record-next",
++        "session.capability",
++        "next capability beacon",
++    );
++    let mut next_call = staged_session_call(
++        project_id.as_str(),
++        &next_observation,
++        "key.capability-next",
++        "operation.capability-observe-next",
++    );
++    next_call.expected_state_generation = generation;
++    assert_eq!(
++        port.observe(staged_observation_for(&next_call, next_observation))
++            .terminal
++            .terminal_code(),
++        TerminalCode::Success
++    );
++    assert!(port.staged.generation().expect("later generation") > generation);
++    let request_value: Value =
++        serde_json::from_slice(&full_call.payload.bytes).expect("request value");
++    port.complete_capability_response(&mut probe, &full_call, &request_value, &accepted)
++        .expect("complete original probe");
++    assert_eq!(probe.response["state_generation"], generation);
++    assert_eq!(probe.response["state_generation_before"], generation);
++    assert_eq!(probe.response["state_generation_after"], generation);
++    assert_eq!(probe.response["items"], json!(expected));
++    assert_eq!(
++        provider
++            .invoke(&call_for(
++                &request,
++                &ready,
++                first["next_cursor"].clone(),
++                64,
++                65536
++            ))
++            .terminal
++            .terminal_code(),
++        TerminalCode::InvalidRequest
++    );
++
++    for mismatch in ["receipt", "scope", "registration"] {
++        let mut wrong = call_for(&request, &ready, Value::Null, 64, 65536);
++        match mismatch {
++            "receipt" => wrong.ready_receipt_sha256 = "f".repeat(64),
++            "scope" => wrong.exact_scope.agent_session_id = "session.wrong".into(),
++            "registration" => wrong.registration_revision += 1,
++            _ => unreachable!(),
++        }
++        assert_eq!(
++            provider.invoke(&wrong).terminal.terminal_code(),
++            TerminalCode::ProviderUnavailable
++        );
++    }
++    let mut limited_request = request.clone();
++    limited_request.challenge_nonce = [19; 32];
++    limited_request.host_limits.inspection_items = 1;
++    let limited_ready = provider.handshake(&limited_request);
++    assert_eq!(
++        limited_ready.terminal.terminal_code(),
++        TerminalCode::Success
++    );
++    assert_eq!(
++        provider
++            .invoke(&call_for(&request, &ready, Value::Null, 64, 65536))
++            .terminal
++            .terminal_code(),
++        TerminalCode::ProviderUnavailable
++    );
++    let negotiated = decode(&provider.invoke(&call_for(
++        &limited_request,
++        &limited_ready,
++        Value::Null,
++        64,
++        65536,
++    )));
++    assert_eq!(negotiated["items"], json!([expected[0]]));
++    assert_eq!(negotiated["coverage"], "partial");
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+@@ -1474,6 +1474,275 @@
+     }
+ 
+     #[test]
++    fn maintenance_inspection_preserves_journal_evidence_and_refuses_corruption() {
++        use tracedecay_memory_provider_registry::ProviderOperation;
++        let root = TempDir::new().expect("root");
++        let exact_scope = scope("session.maintenance-inspection");
++        let staged = store(&root, 8);
++        staged
++            .stage_or_duplicate(record(
++                &exact_scope,
++                "maintenance-source",
++                "maintenance-event",
++                1,
++                "maintenance beacon",
++            ))
++            .expect("populated staged store");
++        let maintenance_request = json!({"task":"validate_state","dry_run":false,
++            "maximum_items":64,"maximum_bytes":65536,"maximum_duration_millis":1000,"resume_cursor":null});
++        let maintenance = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Maintenance,
++            "maintenance.first",
++            staged.generation().expect("generation"),
++            &maintenance_request,
++        );
++        let first = staged
++            .control(&maintenance, None)
++            .expect("actual maintenance");
++        assert_eq!(first.response["scanned_items"], 1);
++        let original_response = first.response.to_string();
++        let later = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Maintenance,
++            "maintenance.later",
++            first.generation_after,
++            &maintenance_request,
++        );
++        let current = staged
++            .control(&later, None)
++            .expect("later maintenance")
++            .generation_after;
++        assert!(current > first.generation_after);
++        drop(staged);
++        let staged = store(&root, 8);
++        let request = json!({"view":"maintenance_receipt",
++            "selector":{"operation_id":maintenance.operation_id,"idempotency_key":"maintenance.first"},
++            "maximum_items":64,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null});
++        let inspect = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.maintenance",
++            0,
++            &request,
++        );
++        let inspected = staged
++            .control(&inspect, None)
++            .expect("persisted maintenance inspection");
++        assert_eq!(inspected.generation_after, current);
++        assert_eq!(inspected.response["state_generation"], current);
++        assert_eq!(inspected.response["state_generation_before"], current);
++        assert_eq!(inspected.response["state_generation_after"], current);
++        assert_eq!(inspected.response["coverage"], "complete");
++        assert_eq!(inspected.response["warnings"], first.response["warnings"]);
++        let mut expected = first.response.clone();
++        let fields = expected.as_object_mut().expect("maintenance object");
++        for field in [
++            "provider_receipt_digest",
++            "state_generation_before",
++            "state_generation_after",
++            "warnings",
++        ] {
++            fields.remove(field);
++        }
++        expected["receipt"] = json!({"state_generation_before":first.generation_before,
++            "state_generation_after":first.generation_after,"provider_receipt_digest":first.receipt});
++        assert_eq!(
++            inspected.response["items"],
++            json!([{"operation_id":maintenance.operation_id,
++            "idempotency_key":"maintenance.first","outcome":expected}])
++        );
++
++        let mut key_only = request.clone();
++        key_only["selector"]
++            .as_object_mut()
++            .expect("selector")
++            .remove("operation_id");
++        let key_only_call = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.key-only",
++            current,
++            &key_only,
++        );
++        assert_eq!(
++            staged
++                .control(&key_only_call, None)
++                .expect("key-only inspection")
++                .response["items"],
++            inspected.response["items"]
++        );
++        for selector in [
++            json!({"idempotency_key":"maintenance.missing"}),
++            json!({"idempotency_key":"maintenance.first","operation_id":"operation.wrong"}),
++        ] {
++            let mut missing = request.clone();
++            missing["selector"] = selector;
++            let call = lifecycle_call(
++                &exact_scope,
++                1,
++                ProviderOperation::Inspection,
++                "inspect.missing",
++                current,
++                &missing,
++            );
++            let result = staged.control(&call, None).expect("honest missing receipt");
++            assert_eq!(result.response["items"], json!([]));
++            assert_eq!(result.response["coverage"], "complete");
++        }
++        let other_scope = scope("session.other-maintenance-inspection");
++        let other = lifecycle_call(
++            &other_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.other-scope",
++            current,
++            &request,
++        );
++        assert_eq!(
++            staged.control(&other, None).expect("other scope").response["items"],
++            json!([])
++        );
++        let mut dry_run = maintenance_request.clone();
++        dry_run["dry_run"] = true.into();
++        let dry = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Maintenance,
++            "maintenance.dry",
++            current,
++            &dry_run,
++        );
++        assert!(!staged.control(&dry, None).expect("actual dry run").changed);
++        let mut dry_inspection = request.clone();
++        dry_inspection["selector"] =
++            json!({"operation_id":dry.operation_id,"idempotency_key":"maintenance.dry"});
++        let dry_inspect = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.dry",
++            current,
++            &dry_inspection,
++        );
++        assert_eq!(
++            staged
++                .control(&dry_inspect, None)
++                .expect("dry run has no journal")
++                .response["items"],
++            json!([])
++        );
++        let mut summary_request = request.clone();
++        summary_request["view"] = "state_summary".into();
++        summary_request["selector"] = json!({});
++        let summary = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.summary",
++            current,
++            &summary_request,
++        );
++        let summary = staged
++            .control(&summary, None)
++            .expect("explicit state summary");
++        assert_eq!(
++            summary.response["items"]
++                .as_array()
++                .expect("summary rows")
++                .len(),
++            1
++        );
++        assert!(summary.response["items"][0]["stable_memory_ref"].is_string());
++        summary_request["view"] = "snapshot_metadata".into();
++        let snapshot = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.snapshot",
++            current,
++            &summary_request,
++        );
++        assert!(matches!(
++            staged.control(&snapshot, None),
++            Err(StagedStoreError::InvalidAdvisory("inspection view"))
++        ));
++
++        for (field, invalid) in [
++            ("task", json!("unknown_task")),
++            ("dry_run", json!(true)),
++            ("scanned_items", json!("1")),
++            ("changed_items", json!(2)),
++            ("proposed_changes", Value::Null),
++            ("partial", json!("false")),
++            ("resume_cursor", json!("unexpected")),
++            ("warnings", json!([1])),
++            ("provider_receipt_digest", json!("f".repeat(64))),
++            (
++                "state_generation_before",
++                json!(first.generation_before + 1),
++            ),
++        ] {
++            let mut corrupt = first.response.clone();
++            corrupt[field] = invalid;
++            {
++                let connection = staged.connection().expect("connection");
++                connection.execute("UPDATE tdmem_native_operation_v2 SET response=?1 WHERE scope=?2 AND idempotency_key=?3",
++                    params![corrupt.to_string(), exact_scope.exact_scope_sha256(), "maintenance.first"]).expect("corrupt response fixture");
++            }
++            assert!(
++                staged.control(&inspect, None).is_err(),
++                "corrupt {field} must refuse"
++            );
++        }
++        {
++            let mut forged = first.response.clone();
++            forged["provider_receipt_digest"] = "f".repeat(64).into();
++            let connection = staged.connection().expect("connection");
++            connection.execute("UPDATE tdmem_native_operation_v2 SET response=?1,receipt=?2 WHERE scope=?3 AND idempotency_key=?4",
++                params![forged.to_string(), "f".repeat(64), exact_scope.exact_scope_sha256(), "maintenance.first"]).expect("corrupt consistent receipt claims");
++        }
++        assert!(staged.control(&inspect, None).is_err());
++        {
++            let connection = staged.connection().expect("connection");
++            connection.execute("UPDATE tdmem_native_operation_v2 SET response=?1,receipt=?2 WHERE scope=?3 AND idempotency_key=?4",
++                params![original_response, first.receipt, exact_scope.exact_scope_sha256(), "maintenance.first"]).expect("restore receipt evidence");
++        }
++        let mut too_small = request.clone();
++        too_small["maximum_bytes"] = 1.into();
++        let small_call = lifecycle_call(
++            &exact_scope,
++            1,
++            ProviderOperation::Inspection,
++            "inspect.small",
++            current,
++            &too_small,
++        );
++        assert!(matches!(
++            staged.control(&small_call, None),
++            Err(StagedStoreError::ValueOutOfRange { .. })
++        ));
++        assert_eq!(
++            staged
++                .control(&maintenance, None)
++                .expect("original redelivery")
++                .response
++                .to_string(),
++            original_response
++        );
++        assert_eq!(
++            staged
++                .generation()
++                .expect("unchanged inspection generation"),
++            current
++        );
++    }
++
++    #[test]
+     fn lifecycle_target_receipts_preserve_attribution_and_inspection_across_reopen() {
+         use tracedecay_memory_conformance::compatibility::{
+             T1, T2, T3, common_observation, scope_json,
+@@ -2906,6 +3175,16 @@
+             response["postcondition"]["state_generation_after"] = after.into();
+         }
+         response["provider_receipt_digest"] = receipt.clone().into();
++        if call.operation == ProviderOperation::Inspection
++            && request["view"] == "maintenance_receipt"
++        {
++            paginate_inspection_evidence(
++                &mut response,
++                call,
++                &request,
++                super::native_provider::native_provider_limits().inspection_items,
++            )?;
++        }
+         if !read && changed {
+             transaction.execute(
+                 "UPDATE tdmem_native_state_v2 SET generation = ?1 WHERE singleton = 1",
+@@ -3355,15 +3634,17 @@
+ ) -> Result<Value, StagedStoreError> {
+     let scope = call.exact_scope.exact_scope_sha256();
+     let view = required_text(request, "view")?;
++    if view == "maintenance_receipt" {
++        return inspect_maintenance_receipt(connection, call, request, generation);
++    }
++    if view == "capability_status" {
++        // The application port supplies descriptor evidence after this exact
++        // store-generation probe and an accepted-readiness check.
++        return Ok(serde_json::json!({"view":view,"state_generation":generation}));
++    }
+     if !matches!(
+         view,
+-        "state_summary"
+-            | "source_influence"
+-            | "trace"
+-            | "delivery_receipt"
+-            | "maintenance_receipt"
+-            | "snapshot_metadata"
+-            | "capability_status"
++        "state_summary" | "source_influence" | "trace" | "delivery_receipt"
+     ) {
+         return Err(StagedStoreError::InvalidAdvisory("inspection view"));
+     }
+@@ -3418,9 +3699,13 @@
+                     .map_err(|_| StagedStoreError::InvalidAdvisory("inspection attribution"))
+             })
+             .transpose()?;
+-        let mut item = serde_json::json!({"stable_memory_ref":row.get::<_,String>(0)?,"sequence":sqlite_u64(row, 1)?,
+-            "source_revision":row.get::<_,Option<String>>(2)?,"ranking_bias":row.get::<_,f64>(3)?,"privacy_or_retention_tombstone":row.get::<_,bool>(4)?,
+-            "validity":attribution.as_ref().and_then(|source|source.get("validity")),"receipt":row.get::<_,String>(6)?});
++        let mut item = if view == "state_summary" {
++            serde_json::json!({"stable_memory_ref":row.get::<_,String>(0)?,"sequence":sqlite_u64(row, 1)?,
++                "source_revision":row.get::<_,Option<String>>(2)?,"ranking_bias":row.get::<_,f64>(3)?,"privacy_or_retention_tombstone":row.get::<_,bool>(4)?,
++                "validity":attribution.as_ref().and_then(|source|source.get("validity")),"receipt":row.get::<_,String>(6)?})
++        } else {
++            Value::Null
++        };
+         if view == "delivery_receipt" {
+             item = serde_json::json!({"operation_id":row.get::<_,String>(9)?,"idempotency_key":row.get::<_,String>(10)?,
+                 "provider_receipt_digest":row.get::<_,String>(6)?,"stable_memory_ref":row.get::<_,String>(0)?});
+@@ -3546,6 +3831,208 @@
+     )
+ }
+ 
++fn inspect_maintenance_receipt(
++    connection: &Connection,
++    call: &tracedecay_memory_provider_registry::ProviderCall,
++    request: &Value,
++    generation: u64,
++) -> Result<Value, StagedStoreError> {
++    let scope = call.exact_scope.exact_scope_sha256();
++    let selector = &request["selector"];
++    let key = required_text(selector, "idempotency_key")?;
++    let requested_operation = selector
++        .get("operation_id")
++        .map(|_| required_text(selector, "operation_id"))
++        .transpose()?;
++    let stored: Option<(String, String, u64, u64, String, String)> = connection
++        .query_row(
++            "SELECT request_digest,operation_id,generation_before,generation_after,response,receipt \
++             FROM tdmem_native_operation_v2 WHERE scope=?1 AND idempotency_key=?2 \
++               AND (?3 IS NULL OR operation_id=?3)",
++            params![scope, key, requested_operation],
++            |row| {
++                Ok((
++                    row.get(0)?,
++                    row.get(1)?,
++                    sqlite_u64(row, 2)?,
++                    sqlite_u64(row, 3)?,
++                    row.get(4)?,
++                    row.get(5)?,
++                ))
++            },
++        )
++        .optional()?;
++    let mut response = serde_json::json!({"view":"maintenance_receipt","items":[],
++        "coverage":"complete","next_cursor":null,"redactions":[],
++        "state_generation":generation,"warnings":[]});
++    let Some((digest, operation_id, before, after, stored_response, receipt)) = stored else {
++        // Dry runs have no journal entry, just like an unknown exact key.
++        return Ok(response);
++    };
++    let stored: Value = serde_json::from_str(&stored_response)
++        .map_err(|_| StagedStoreError::InvalidAdvisory("maintenance receipt response"))?;
++    if operation_id.is_empty()
++        || after < before
++        || digest.len() != 64
++        || !digest
++            .bytes()
++            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
++        || receipt != sha256_hex(format!("{scope}:{key}:{digest}:{before}:{after}").as_bytes())
++        || stored["provider_receipt_digest"] != receipt
++        || stored["state_generation_before"] != before
++        || stored["state_generation_after"] != after
++    {
++        return Err(StagedStoreError::LifecycleConflict(
++            "maintenance receipt integrity",
++        ));
++    }
++    let task = required_text(&stored, "task")?;
++    if !matches!(
++        task,
++        "consolidate" | "decay" | "prune_expired" | "validate_state" | "repair" | "compact"
++    ) || stored.get("dry_run").and_then(Value::as_bool) != Some(false)
++    {
++        return Err(StagedStoreError::InvalidAdvisory(
++            "maintenance receipt task",
++        ));
++    }
++    let counter = |field: &str| {
++        stored
++            .get(field)
++            .and_then(Value::as_u64)
++            .ok_or(StagedStoreError::InvalidAdvisory(
++                "maintenance receipt counters",
++            ))
++    };
++    let scanned = counter("scanned_items")?;
++    let changed = counter("changed_items")?;
++    let removed = counter("removed_items")?;
++    if removed > changed || changed > scanned {
++        return Err(StagedStoreError::InvalidAdvisory(
++            "maintenance receipt counters",
++        ));
++    }
++    if stored
++        .get("proposed_changes")
++        .is_some_and(|value| value.as_u64().is_none())
++    {
++        return Err(StagedStoreError::InvalidAdvisory(
++            "maintenance proposed changes",
++        ));
++    }
++    let partial =
++        stored
++            .get("partial")
++            .and_then(Value::as_bool)
++            .ok_or(StagedStoreError::InvalidAdvisory(
++                "maintenance receipt partial",
++            ))?;
++    match stored.get("resume_cursor") {
++        Some(Value::Null) if !partial => {}
++        Some(Value::String(cursor)) if partial && !cursor.is_empty() => {}
++        _ => {
++            return Err(StagedStoreError::InvalidAdvisory(
++                "maintenance receipt cursor",
++            ));
++        }
++    }
++    let warnings = stored
++        .get("warnings")
++        .and_then(Value::as_array)
++        .filter(|warnings| warnings.iter().all(Value::is_string))
++        .ok_or(StagedStoreError::InvalidAdvisory(
++            "maintenance receipt warnings",
++        ))?;
++    let mut outcome = serde_json::json!({"task":task,"dry_run":false,
++        "scanned_items":scanned,"changed_items":changed,
++        "removed_items":removed,"partial":partial,"resume_cursor":stored["resume_cursor"],
++        "receipt":{"state_generation_before":before,"state_generation_after":after,
++            "provider_receipt_digest":receipt}});
++    if let Some(proposed) = stored.get("proposed_changes") {
++        outcome["proposed_changes"] = proposed.clone();
++    }
++    response["items"] = serde_json::json!([{"operation_id":operation_id,
++        "idempotency_key":key,"outcome":outcome}]);
++    response["warnings"] = warnings.clone().into();
++    Ok(response)
++}
++
++/// Pages finite descriptor or journal evidence after the actual read receipt
++/// and generation fields have been attached. No evidence is synthesized here.
++pub(super) fn paginate_inspection_evidence(
++    response: &mut Value,
++    call: &tracedecay_memory_provider_registry::ProviderCall,
++    request: &Value,
++    maximum_items: u64,
++) -> Result<(), StagedStoreError> {
++    let maximum = bounded_integer(request, "maximum_items", 64)?.min(maximum_items) as usize;
++    let byte_limit = bounded_integer(request, "maximum_bytes", 65536)? as usize;
++    bounded_integer(request, "redaction_policy_revision", u64::MAX)?;
++    let identity = serde_json::json!({"scope":call.exact_scope.exact_scope_sha256(),
++        "view":request["view"],"generation":response["state_generation"],"selector":request["selector"],
++        "registration_revision":call.registration_revision,"ready_receipt":call.ready_receipt_sha256});
++    let prefix = format!(
++        "native-evidence:{}:",
++        sha256_hex(identity.to_string().as_bytes())
++    );
++    let after = match request.get("cursor") {
++        None | Some(Value::Null) => 0,
++        Some(Value::String(cursor)) => cursor
++            .strip_prefix(&prefix)
++            .and_then(|offset| offset.parse::<usize>().ok())
++            .ok_or(StagedStoreError::InvalidAdvisory("inspection cursor"))?,
++        _ => return Err(StagedStoreError::InvalidAdvisory("inspection cursor")),
++    };
++    let items = std::mem::take(
++        response
++            .get_mut("items")
++            .and_then(Value::as_array_mut)
++            .ok_or(StagedStoreError::InvalidAdvisory("inspection items"))?,
++    );
++    if after > items.len() {
++        return Err(StagedStoreError::InvalidAdvisory("inspection cursor"));
++    }
++    let set_cursor = |response: &mut Value, end: usize| {
++        let partial = end < items.len();
++        response["coverage"] = if partial { "partial" } else { "complete" }.into();
++        response["next_cursor"] = if partial {
++            format!("{prefix}{end}").into()
++        } else {
++            Value::Null
++        };
++    };
++    set_cursor(response, after);
++    for (index, item) in items.iter().enumerate().skip(after) {
++        call.control
++            .snapshot()
++            .map_err(StagedStoreError::ControlEnded)?;
++        response["items"]
++            .as_array_mut()
++            .ok_or(StagedStoreError::InvalidAdvisory("inspection items"))?
++            .push(item.clone());
++        set_cursor(response, index + 1);
++        if index + 1 - after > maximum || response.to_string().len() > byte_limit {
++            response["items"]
++                .as_array_mut()
++                .ok_or(StagedStoreError::InvalidAdvisory("inspection items"))?
++                .pop();
++            set_cursor(response, index);
++            if index == after {
++                return Err(StagedStoreError::ValueOutOfRange {
++                    field: "inspection evidence bytes",
++                });
++            }
++            break;
++        }
++    }
++    if response.to_string().len() > byte_limit {
++        return Err(StagedStoreError::ValueOutOfRange {
++            field: "inspection evidence bytes",
++        });
++    }
++    Ok(())
++}
++
+ fn maintain_advisory(
+     connection: &Connection,
+     call: &tracedecay_memory_provider_registry::ProviderCall,

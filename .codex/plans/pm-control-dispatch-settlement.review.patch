@@ -1,0 +1,155 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+@@ -2799,7 +2799,7 @@
+     where
+         T: Send + 'static,
+     {
+-        self.call_within_with_shutdown(budget_millis, cancellation, None, work)
++        self.call_within_with_shutdown(budget_millis, cancellation, None, false, work)
+     }
+ 
+     /// Runs the same bounded engine while synchronously forwarding journey
+@@ -2810,6 +2810,7 @@
+         budget_millis: u64,
+         cancellation: &CancellationToken,
+         stopping: Option<&HostCancellationToken>,
++        preserve_settled_result: bool,
+         work: impl FnOnce() -> T + Send + 'static,
+     ) -> Result<T, BoundedCallRefusalV1>
+     where
+@@ -2887,25 +2888,12 @@
+             let wait = remaining.min(slice);
+             match inbox.recv_timeout(wait) {
+                 Ok(Ok(answer)) => {
+-                    // Cancellation wins over an answer that arrives after it,
+-                    // however narrow the margin: the worker releases its slot
+-                    // before it sends, so there is nothing to abandon here —
+-                    // only an answer the host no longer has consent to act on.
+-                    // Without this, a provider that ignores cancellation could
+-                    // still settle a delivery by being fast enough to beat the
+-                    // next polling slice.
+-                    if cancellation.is_cancelled() {
+-                        return Err(BoundedCallRefusalV1::Cancelled);
+-                    }
+-                    // This completed answer is already witnessed while the
+-                    // original token is live. Forward a newly observed stop,
+-                    // but retain the result and its possible committed evidence.
+-                    // A stop observed while waiting cancelled the token above
+-                    // and still refuses a provider's later answer.
+-                    if stopping.is_some_and(HostCancellationToken::is_cancelled) {
+-                        cancellation.cancel();
+-                    }
+-                    return Ok(answer);
++                    return Self::settled_answer(
++                        cancellation,
++                        stopping,
++                        preserve_settled_result,
++                        answer,
++                    );
+                 }
+                 Ok(Err(_)) => {
+                     // Shutdown owns classification once it has fired, even if
+@@ -2942,6 +2930,24 @@
+                 }
+             }
+         }
++    }
++
++    /// A received control answer may contain committed effects. Forward stop
++    /// into the original token, but never discard that witnessed evidence.
++    /// Observation calls retain their existing cancellation-wins policy.
++    fn settled_answer<T>(
++        cancellation: &CancellationToken,
++        stopping: Option<&HostCancellationToken>,
++        preserve_settled_result: bool,
++        answer: T,
++    ) -> Result<T, BoundedCallRefusalV1> {
++        if stopping.is_some_and(HostCancellationToken::is_cancelled) {
++            cancellation.cancel();
++        }
++        if !preserve_settled_result && cancellation.is_cancelled() {
++            return Err(BoundedCallRefusalV1::Cancelled);
++        }
++        Ok(answer)
+     }
+ }
+ 
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
+@@ -320,6 +320,7 @@
+                 remaining_millis,
+                 &cancellation,
+                 Some(&self.stopping),
++                true,
+                 move || {
+                     request.validate_before_readiness(
+                         delivery.provider_id.as_str(),
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
+@@ -326,3 +326,63 @@
+         .await;
+     assert!(failures.is_empty(), "{failures:?}");
+ }
++
++#[test]
++fn witnessed_committed_control_answer_survives_caller_cancellation_and_journey_stop() {
++    let original_reply = ProviderReply {
++        terminal: TerminalRecord::new(
++            ProviderOperation::Feedback,
++            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
++            TerminalCode::Success,
++            CommittedEffectEvidence::committed(
++                5,
++                6,
++                vec!["feedback:committed-control".to_owned()],
++                PROVIDER_RECEIPT,
++                EFFECT_DIGEST,
++            )
++            .expect("actual committed evidence"),
++            FallbackDirective::forbidden(),
++            "committed-control-operation",
++            "4".repeat(64),
++            None,
++        )
++        .expect("committed feedback terminal"),
++        payload: None,
++        warnings: vec!["committed-control-warning".to_owned()],
++        extensions: Vec::new(),
++        state_generation: 6,
++    };
++    for stop_journey in [false, true] {
++        let cancellation = CancellationToken::new();
++        let stopping = HostCancellationToken::new();
++        // This is the exact branch entered after recv_timeout produced an
++        // answer. Fire cancellation before it classifies that known reply;
++        // no scheduler timing can turn this into the no-answer timeout path.
++        let witnessed_reply = original_reply.clone();
++        if stop_journey {
++            stopping.cancel();
++            assert!(!cancellation.is_cancelled());
++        } else {
++            cancellation.cancel();
++        }
++        let retained = ThreadBoundedProviderCallV1::settled_answer(
++            &cancellation,
++            Some(&stopping),
++            true,
++            witnessed_reply,
++        )
++        .expect("a witnessed control reply must retain its committed evidence");
++        assert_eq!(retained, original_reply);
++        assert!(cancellation.is_cancelled());
++    }
++
++    // The ordinary observation policy still refuses an answer when its
++    // caller has already cancelled, even though that answer is available.
++    let cancellation = CancellationToken::new();
++    cancellation.cancel();
++    assert!(matches!(
++        ThreadBoundedProviderCallV1::settled_answer(&cancellation, None, false, original_reply),
++        Err(BoundedCallRefusalV1::Cancelled)
++    ));
++}

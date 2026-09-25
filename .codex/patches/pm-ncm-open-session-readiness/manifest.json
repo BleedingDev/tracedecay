@@ -1,0 +1,11 @@
+{
+  "status": "draft_only_unapplied",
+  "patch_sha256": "e4bfb578524a03dc99a65d48e3a7f4da2904ad7fd9624f3cbd5bb9dd05da6060",
+  "files": [
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs",
+      "baseline_sha256": "7f438b3bf070952a1cf5d127f072ee3ead9f46bdaf1a728e3ede746899ab43ef",
+      "proposed_sha256": "80be59f3648fab27c58ccbc6b9de8eafaf43ac1a79313708a4d4a27298977d6f"
+    }
+  ]
+}

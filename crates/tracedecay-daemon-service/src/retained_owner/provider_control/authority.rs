@@ -29,8 +29,8 @@ use super::super::cognitive_recall::{
 };
 use super::super::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
-    PhysicalPathIdentityV1, PhysicalPathKind, ProviderHistoryErrorV1, ProviderHistoryReaderV1,
-    bounded_read, original_source_fence_digest,
+    OriginalObservationAuthorityV1, PhysicalPathIdentityV1, PhysicalPathKind,
+    ProviderHistoryErrorV1, ProviderHistoryReaderV1, bounded_read, original_source_fence_digest,
 };
 
 type Result<T> = std::result::Result<T, ProviderHistoryErrorV1>;

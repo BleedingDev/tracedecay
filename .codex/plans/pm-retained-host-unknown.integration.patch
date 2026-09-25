@@ -1,0 +1,122 @@
+--- a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
++++ b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+@@ -1197,8 +1197,12 @@
+ }
+ 
+ impl ProviderControlEffectV1 {
+-    /// Reuses the common terminal effect shapes, including disjoint partial
+-    /// partitions and receipt-backed unknown reconciliation without a boundary.
++    /// Validates retained effect evidence, including disjoint partial partitions.
++    /// An unknown outcome may be observed by the host without a provider reply
++    /// or confirmed host intent, so only that retained shape permits an absent
++    /// provider receipt. A present digest must still name actual provider evidence;
++    /// host uncertainty never supplies a replacement provider receipt.
++    /// The core provider-reply contract keeps its stricter receipt requirement.
+     pub fn validate(&self) -> Result<(), ApplicationContractError> {
+         require(
+             self.committed_item_refs
+@@ -1291,7 +1295,6 @@
+                     && self.state_generation_after.is_none()
+                     && self.committed_boundary.is_none()
+                     && no_items
+-                    && self.provider_receipt_digest.is_some()
+                     && self.reconciliation_action.is_some()
+                     && self.verification_digest.is_none()
+             }
+@@ -2908,6 +2911,96 @@
+     }
+ 
+     #[test]
++    fn retained_host_unknown_without_provider_receipt_cannot_claim_commit_evidence() {
++        let request = &requests()[5];
++        let mut value = result_value(request, Value::Null, "effect_unknown");
++        value["effect"]["state"] = json!("unknown");
++        value["effect"]["reconciliation_action"] = json!("reconcile_same_operation");
++        value["warnings"] = json!(["host: no provider reply was witnessed"]);
++        let retained: ProviderControlResultV1 =
++            serde_json::from_value(value.clone()).expect("retained host uncertainty");
++        retained.validate_for(request).expect("unknown without a provider reply");
++        assert!(retained.effect.provider_receipt_digest.is_none());
++
++        let mut observed = value.clone();
++        observed["effect"]["provider_receipt_digest"] = json!("b".repeat(64));
++        serde_json::from_value::<ProviderControlResultV1>(observed)
++            .expect("retained provider uncertainty")
++            .validate_for(request)
++            .expect("actual provider receipt remains admissible");
++
++        for (field, bad) in [
++            ("provider_receipt_digest", json!("not-a-provider-receipt")),
++            ("state_generation_before", json!(3)),
++            ("state_generation_after", json!(4)),
++            ("committed_boundary", json!("source.1")),
++            ("committed_item_refs", json!(["source.1"])),
++            ("uncommitted_item_refs", json!(["source.2"])),
++            ("verification_digest", json!("c".repeat(64))),
++            ("duplicate_of_idempotency_key", json!("d".repeat(64))),
++            ("duplicate_of_operation_id", json!("original.operation")),
++            ("reconciliation_action", Value::Null),
++            ("reconciliation_action", json!("")),
++            ("reconciliation_action", json!("r".repeat(513))),
++        ] {
++            let mut malformed = value.clone();
++            malformed["effect"][field] = bad;
++            assert!(
++                serde_json::from_value::<ProviderControlResultV1>(malformed)
++                    .expect("typed host uncertainty")
++                    .validate_for(request)
++                    .is_err(),
++                "host uncertainty must reject {field}"
++            );
++        }
++        for (field, bad) in [
++            ("terminal", json!("success")),
++            ("idempotency_key", Value::Null),
++            ("operation_id", json!("not-an-operation-id")),
++            ("registration_revision", json!(8)),
++            ("scope", Value::Null),
++        ] {
++            let mut malformed = value.clone();
++            malformed[field] = bad;
++            let rejected = serde_json::from_value::<ProviderControlResultV1>(malformed)
++                .map_or(true, |result| result.validate_for(request).is_err());
++            assert!(rejected, "host uncertainty must retain the {field} contract");
++        }
++    }
++
++    #[test]
++    fn committed_partial_and_duplicate_effects_still_require_provider_receipts() {
++        let committed = committed_effect();
++        let mut partial = committed_effect();
++        partial["state"] = json!("partial");
++        partial["committed_boundary"] = json!("source.1");
++        partial["committed_item_refs"] = json!(["source.1"]);
++        partial["uncommitted_item_refs"] = json!(["source.2"]);
++        partial["reconciliation_action"] = json!("Resume after source.1");
++        let mut duplicate = none_effect();
++        duplicate["state"] = json!("duplicate");
++        duplicate["state_generation_before"] = json!(4);
++        duplicate["state_generation_after"] = json!(4);
++        duplicate["provider_receipt_digest"] = json!("b".repeat(64));
++        duplicate["duplicate_of_idempotency_key"] = json!("d".repeat(64));
++        duplicate["duplicate_of_operation_id"] = json!("original.operation");
++
++        for mut effect in [committed, partial, duplicate] {
++            serde_json::from_value::<ProviderControlEffectV1>(effect.clone())
++                .expect("typed provider effect")
++                .validate()
++                .expect("provider receipt supports this effect shape");
++            effect["provider_receipt_digest"] = Value::Null;
++            assert!(
++                serde_json::from_value::<ProviderControlEffectV1>(effect)
++                    .expect("effect without its receipt")
++                    .validate()
++                    .is_err()
++            );
++        }
++    }
++
++    #[test]
+     fn provider_effects_preserve_duplicates_partitions_and_unknown_reconciliation() {
+         let request = &requests()[0];
+         let mut value = result_value(request, successful_data(0), "success");

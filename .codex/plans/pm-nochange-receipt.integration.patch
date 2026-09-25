@@ -1,0 +1,323 @@
+--- a/crates/tracedecay-contracts/src/result/receipt.rs
++++ b/crates/tracedecay-contracts/src/result/receipt.rs
+@@ -119,6 +119,9 @@
+ #[serde(rename_all = "snake_case")]
+ pub enum EffectTermination {
+     Completed,
++    // The admitted command completed with verified no effect. This does not
++    // represent an unknown outcome or a policy refusal.
++    NoChange,
+     Cancelled,
+     TimedOut,
+     Failed,
+@@ -129,7 +132,7 @@
+ impl From<EffectTermination> for OperationTermination {
+     fn from(value: EffectTermination) -> Self {
+         match value {
+-            EffectTermination::Completed => Self::Completed,
++            EffectTermination::Completed | EffectTermination::NoChange => Self::Completed,
+             EffectTermination::Cancelled => Self::Cancelled,
+             EffectTermination::TimedOut => Self::TimedOut,
+             EffectTermination::Failed => Self::Failed,
+@@ -141,7 +144,23 @@
+ 
+ #[cfg(test)]
+ mod tests {
+-    use super::OperationTermination;
++    use super::{EffectTermination, OperationTermination};
++
++    #[test]
++    fn no_change_effect_has_a_distinct_wire_state_and_completed_operation() {
++        let encoded =
++            serde_json::to_string(&EffectTermination::NoChange).expect("encode termination");
++
++        assert_eq!(encoded, "\"no_change\"");
++        assert_eq!(
++            serde_json::from_str::<EffectTermination>(&encoded).expect("decode termination"),
++            EffectTermination::NoChange
++        );
++        assert_eq!(
++            OperationTermination::from(EffectTermination::NoChange),
++            OperationTermination::Completed
++        );
++    }
+ 
+     #[test]
+     fn unavailable_read_receipt_has_a_distinct_wire_state() {
+@@ -256,6 +275,13 @@
+         }
+         if let Some(proof) = &self.external_proof {
+             proof.validate()?;
++        }
++        if self.outcome == EffectTermination::NoChange
++            && (self.committed_state.is_some() || self.external_proof.is_some())
++        {
++            return Err(ApplicationContractError::Inconsistent {
++                field: "no-change effect receipt proof",
++            });
+         }
+         if self.outcome == EffectTermination::Completed
+             && self.committed_state.is_none()
+--- a/crates/tracedecay-contracts/src/git/transactions.rs
++++ b/crates/tracedecay-contracts/src/git/transactions.rs
+@@ -593,7 +593,9 @@
+ 
+ const fn expected_operation_termination(termination: EffectTermination) -> OperationTermination {
+     match termination {
+-        EffectTermination::Completed => OperationTermination::Completed,
++        EffectTermination::Completed | EffectTermination::NoChange => {
++            OperationTermination::Completed
++        }
+         EffectTermination::Cancelled => OperationTermination::Cancelled,
+         EffectTermination::TimedOut => OperationTermination::TimedOut,
+         EffectTermination::Failed => OperationTermination::Failed,
+--- a/crates/tracedecay-code-index-runtime/src/git_transactions/service.rs
++++ b/crates/tracedecay-code-index-runtime/src/git_transactions/service.rs
+@@ -878,7 +878,9 @@
+ 
+ const fn operation_termination(termination: EffectTermination) -> OperationTermination {
+     match termination {
+-        EffectTermination::Completed => OperationTermination::Completed,
++        EffectTermination::Completed | EffectTermination::NoChange => {
++            OperationTermination::Completed
++        }
+         EffectTermination::Cancelled => OperationTermination::Cancelled,
+         EffectTermination::TimedOut => OperationTermination::TimedOut,
+         EffectTermination::Failed => OperationTermination::Failed,
+--- a/crates/tracedecay-source-edit/src/records.rs
++++ b/crates/tracedecay-source-edit/src/records.rs
+@@ -176,7 +176,9 @@
+         committed_state
+     };
+     let operation_termination = match termination {
+-        EffectTermination::Completed => OperationTermination::Completed,
++        EffectTermination::Completed | EffectTermination::NoChange => {
++            OperationTermination::Completed
++        }
+         EffectTermination::Cancelled => OperationTermination::Cancelled,
+         EffectTermination::TimedOut => OperationTermination::TimedOut,
+         EffectTermination::Failed => OperationTermination::Failed,
+@@ -246,7 +248,9 @@
+ ) -> Result<SourceEditDurableResultV1> {
+     let request = &journal.request;
+     let operation_termination = match termination {
+-        EffectTermination::Completed => OperationTermination::Completed,
++        EffectTermination::Completed | EffectTermination::NoChange => {
++            OperationTermination::Completed
++        }
+         EffectTermination::Cancelled => OperationTermination::Cancelled,
+         EffectTermination::TimedOut => OperationTermination::TimedOut,
+         EffectTermination::Failed => OperationTermination::Failed,
+--- a/crates/tracedecay-sdk/src/codegen.rs
++++ b/crates/tracedecay-sdk/src/codegen.rs
+@@ -1026,7 +1026,7 @@
+ export type RetryDirective = "never" | "same_request" | "after_delay" | "after_revalidate" | "after_reconcile" | UnknownValue;
+ export type LegalAction = "correct_request" | "reauthorize" | "refresh" | "retry" | "reconcile" | "reset" | "contact_administrator" | UnknownValue;
+ export type OperationTermination = "completed" | "cancelled" | "timed_out" | "failed" | "unavailable" | "partial" | "effect_unknown" | UnknownValue;
+-export type EffectTermination = "completed" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown" | UnknownValue;
++export type EffectTermination = "completed" | "no_change" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown" | UnknownValue;
+ export type ApplicationProblemKind = "invalid_request" | "not_found_or_not_authorized" | "conflict" | "partial_effect" | "stale" | "unsupported" | "unavailable" | "execution_failed" | "reset_required" | "saturated" | "cancelled" | "timed_out" | UnknownValue;
+ export type ApplicationUnavailableClassV1 = "authority" | "backend_unavailable" | "backend_disconnected" | "backend_retryable" | UnknownValue;
+ export type ApplicationExecutionFailureClassV1 = "denied" | "malformed_output" | "permanent" | UnknownValue;
+--- a/sdks/typescript/src/types.ts
++++ b/sdks/typescript/src/types.ts
+@@ -5,7 +5,7 @@
+ export type RetryDirective = "never" | "same_request" | "after_delay" | "after_revalidate" | "after_reconcile" | UnknownValue;
+ export type LegalAction = "correct_request" | "reauthorize" | "refresh" | "retry" | "reconcile" | "reset" | "contact_administrator" | UnknownValue;
+ export type OperationTermination = "completed" | "cancelled" | "timed_out" | "failed" | "unavailable" | "partial" | "effect_unknown" | UnknownValue;
+-export type EffectTermination = "completed" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown" | UnknownValue;
++export type EffectTermination = "completed" | "no_change" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown" | UnknownValue;
+ export type ApplicationProblemKind = "invalid_request" | "not_found_or_not_authorized" | "conflict" | "partial_effect" | "stale" | "unsupported" | "unavailable" | "execution_failed" | "reset_required" | "saturated" | "cancelled" | "timed_out" | UnknownValue;
+ export type ApplicationUnavailableClassV1 = "authority" | "backend_unavailable" | "backend_disconnected" | "backend_retryable" | UnknownValue;
+ export type ApplicationExecutionFailureClassV1 = "denied" | "malformed_output" | "permanent" | UnknownValue;
+--- a/sdks/typescript/src/operations.ts
++++ b/sdks/typescript/src/operations.ts
+@@ -182,7 +182,7 @@
+ export type EffectClass = "read" | "preview" | "source_edit" | "git_index_stage" | "git_index_unstage" | "git_index_commit" | "configuration_write" | "administrative";
+ export type EffectReceipt_2 = { readonly actor: ActorId; readonly catalog_digest: ManifestDigest; readonly committed_state?: ManifestDigest | null; readonly configuration_digest: ManifestDigest; readonly effect_class: EffectClass; readonly expected_state: ManifestDigest; readonly external_proof?: RetrievalAnchorId | null; readonly idempotency_key: string; readonly input_digest: ManifestDigest; readonly operation: UseCaseId; readonly outcome: EffectTermination_2; readonly policy_digest: ManifestDigest; readonly privacy_digest: ManifestDigest; readonly request_id: string; readonly scope: ResolvedScope };
+ export type EffectResult_2 = { readonly authority: AuthorityReceipt; readonly effect_class: EffectClass; readonly effect_id: string; readonly execution: OperationReceipt_2; readonly expected_state: ManifestDigest; readonly idempotency_key: string; readonly payload?: SourceEditDurableEffectPayloadV1 | null; readonly receipt: EffectReceipt_2; readonly reconciliation: ReconciliationState };
+-export type EffectTermination_2 = "completed" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown";
++export type EffectTermination_2 = "completed" | "no_change" | "cancelled" | "timed_out" | "failed" | "partial" | "effect_unknown";
+ export type ExactOccurrenceRecord = { readonly matched_kind: ExactTechnicalTermKindV1; readonly matched_literal: string; readonly occurrence: CodeOccurrenceRecord };
+ export type ExactTechnicalTermKindV1 = "whole_symbol" | "qualified_name" | "path" | "compiler_error_code" | "compiler_error_text" | "runtime_error_code" | "runtime_error_text" | "cli_flag" | "tool_name" | "configuration_key" | "commit_identifier";
+ export type ExecutionBlockedCauseV1 = "dependency" | "needs_input" | "capability" | "policy" | "scope" | "conflict" | "lease" | "backpressure" | "test" | "ci" | "review" | "effect_unknown" | "other" | "unknown";
+@@ -1420,7 +1420,7 @@
+   EffectClass: {"description":"The stable effect classification of one application operation.\n\nGit index writes remain separate classes so policy cannot accidentally\nsubstitute one index mutation for another.","enum":["read","preview","source_edit","git_index_stage","git_index_unstage","git_index_commit","configuration_write","administrative"],"type":"string"},
+   EffectReceipt_2: {"additionalProperties":false,"description":"Durable effect proof. It records identities and receipts, never credentials\nor arbitrary command text.","properties":{"actor":{"$ref":"#/$defs/ActorId"},"catalog_digest":{"$ref":"#/$defs/ManifestDigest"},"committed_state":{"anyOf":[{"$ref":"#/$defs/ManifestDigest"},{"type":"null"}]},"configuration_digest":{"$ref":"#/$defs/ManifestDigest"},"effect_class":{"$ref":"#/$defs/EffectClass"},"expected_state":{"$ref":"#/$defs/ManifestDigest"},"external_proof":{"anyOf":[{"$ref":"#/$defs/RetrievalAnchorId"},{"type":"null"}]},"idempotency_key":{"type":"string"},"input_digest":{"$ref":"#/$defs/ManifestDigest"},"operation":{"$ref":"#/$defs/UseCaseId"},"outcome":{"$ref":"#/$defs/EffectTermination"},"policy_digest":{"$ref":"#/$defs/ManifestDigest"},"privacy_digest":{"$ref":"#/$defs/ManifestDigest"},"request_id":{"type":"string"},"scope":{"$ref":"#/$defs/ResolvedScope"}},"required":["operation","request_id","actor","scope","effect_class","idempotency_key","input_digest","expected_state","policy_digest","configuration_digest","catalog_digest","privacy_digest","outcome"],"type":"object"},
+   EffectResult_2: {"additionalProperties":false,"description":"Result of an admitted effect. `EffectUnknown` remains a receipt state and\ncannot be remapped into a pre-admission problem.","properties":{"authority":{"$ref":"#/$defs/AuthorityReceipt"},"effect_class":{"$ref":"#/$defs/EffectClass"},"effect_id":{"type":"string"},"execution":{"$ref":"#/$defs/OperationReceipt"},"expected_state":{"$ref":"#/$defs/ManifestDigest"},"idempotency_key":{"type":"string"},"payload":{"anyOf":[{"$ref":"#/$defs/SourceEditDurableEffectPayloadV1"},{"type":"null"}]},"receipt":{"$ref":"#/$defs/EffectReceipt"},"reconciliation":{"$ref":"#/$defs/ReconciliationState"}},"required":["effect_id","effect_class","idempotency_key","authority","expected_state","execution","reconciliation","receipt"],"type":"object"},
+-  EffectTermination_2: {"description":"Durable effect receipt terminal state.","enum":["completed","cancelled","timed_out","failed","partial","effect_unknown"],"type":"string"},
++  EffectTermination_2: {"description":"Durable effect receipt terminal state.","enum":["completed","no_change","cancelled","timed_out","failed","partial","effect_unknown"],"type":"string"},
+   ExactOccurrenceRecord: {"additionalProperties":false,"properties":{"matched_kind":{"$ref":"#/$defs/ExactTechnicalTermKindV1"},"matched_literal":{"type":"string"},"occurrence":{"$ref":"#/$defs/CodeOccurrenceRecord"}},"required":["occurrence","matched_kind","matched_literal"],"type":"object"},
+   ExactTechnicalTermKindV1: {"description":"The classification of one whole exact technical term. Whole exact terms\nand language-profiled subtokens are distinct fields.","enum":["whole_symbol","qualified_name","path","compiler_error_code","compiler_error_text","runtime_error_code","runtime_error_text","cli_flag","tool_name","configuration_key","commit_identifier"],"type":"string"},
+   ExecutionBlockedCauseV1: {"description":"Cause a work item was blocked for.","enum":["dependency","needs_input","capability","policy","scope","conflict","lease","backpressure","test","ci","review","effect_unknown","other","unknown"],"type":"string"},
+--- a/dashboard/codegen/schemas/dashboard-contracts.schema.json
++++ b/dashboard/codegen/schemas/dashboard-contracts.schema.json
+@@ -8551,6 +8551,7 @@
+       "description": "Durable effect receipt terminal state.",
+       "enum": [
+         "completed",
++        "no_change",
+         "cancelled",
+         "timed_out",
+         "failed",
+--- a/dashboard/src/contracts/generated.ts
++++ b/dashboard/src/contracts/generated.ts
+@@ -1782,7 +1782,7 @@
+ export type EffectReceipt = z.infer<typeof EffectReceiptSchema>;
+ 
+ /** Durable effect receipt terminal state. */
+-export const EffectTerminationSchema = z.enum(["cancelled", "completed", "effect_unknown", "failed", "partial", "timed_out"]);
++export const EffectTerminationSchema = z.enum(["cancelled", "completed", "effect_unknown", "failed", "no_change", "partial", "timed_out"]);
+ export type EffectTermination = z.infer<typeof EffectTerminationSchema>;
+ 
+ export const EnvironmentSettingsPayloadV1Schema = z.object({
+--- a/crates/tracedecay-contracts/tests/effect_receipts.rs
++++ b/crates/tracedecay-contracts/tests/effect_receipts.rs
+@@ -1,11 +1,33 @@
+ mod common;
+ 
+ use tracedecay_contracts::{
+-    EffectId, EffectReceipt, EffectResult, EffectTermination, IdempotencyKey, OperationReceipt,
+-    OperationTermination, ReconciliationState,
++    ApplicationContractError, EffectId, EffectReceipt, EffectResult, EffectTermination,
++    IdempotencyKey, OperationReceipt, OperationTermination, ReconciliationState,
+ };
+-use tracedecay_domain::UtcMicros;
++use tracedecay_domain::{RetrievalAnchorId, UtcMicros};
+ use tracedecay_tool_catalog::EffectClass;
++
++fn effect_receipt(outcome: EffectTermination) -> EffectReceipt {
++    let operation = common::operation();
++    let context = common::context(&operation);
++    EffectReceipt {
++        operation: operation.use_case_id().clone(),
++        request_id: context.request_id().clone(),
++        actor: context.actor().clone(),
++        scope: context.scope().clone(),
++        effect_class: EffectClass::SourceEdit,
++        idempotency_key: IdempotencyKey::new("idempotency.fixture").unwrap(),
++        input_digest: common::digest(common::SHA256_A),
++        expected_state: common::digest(common::SHA256_A),
++        policy_digest: common::digest(common::SHA256_B),
++        configuration_digest: common::digest(common::SHA256_A),
++        catalog_digest: common::digest(common::SHA256_B),
++        privacy_digest: common::digest(common::SHA256_A),
++        outcome,
++        committed_state: None,
++        external_proof: None,
++    }
++}
+ 
+ #[test]
+ fn effect_unknown_stays_in_an_admitted_effect_receipt() {
+@@ -19,23 +41,7 @@
+         budget: Default::default(),
+         termination: OperationTermination::EffectUnknown,
+     };
+-    let receipt = EffectReceipt {
+-        operation: operation.use_case_id().clone(),
+-        request_id: context.request_id().clone(),
+-        actor: context.actor().clone(),
+-        scope: context.scope().clone(),
+-        effect_class: EffectClass::SourceEdit,
+-        idempotency_key: IdempotencyKey::new("idempotency.fixture").unwrap(),
+-        input_digest: common::digest(common::SHA256_A),
+-        expected_state: common::digest(common::SHA256_A),
+-        policy_digest: common::digest(common::SHA256_B),
+-        configuration_digest: common::digest(common::SHA256_A),
+-        catalog_digest: common::digest(common::SHA256_B),
+-        privacy_digest: common::digest(common::SHA256_A),
+-        outcome: EffectTermination::EffectUnknown,
+-        committed_state: None,
+-        external_proof: None,
+-    };
++    let receipt = effect_receipt(EffectTermination::EffectUnknown);
+     assert!(
+         EffectResult::new(
+             EffectId::new("effect.mismatched-state.fixture").unwrap(),
+@@ -68,3 +74,85 @@
+     assert_eq!(effect.reconciliation, ReconciliationState::Pending);
+     assert!(effect.payload.is_none());
+ }
++
++#[test]
++fn no_change_is_a_completed_admitted_result_without_commit_proof() {
++    let operation = common::operation();
++    let context = common::context(&operation);
++    let receipt = effect_receipt(EffectTermination::NoChange);
++    receipt.validate().expect("verified no-change receipt");
++
++    let encoded = serde_json::to_value(&receipt).expect("encode no-change receipt");
++    assert_eq!(encoded["outcome"], "no_change");
++    assert!(encoded["committed_state"].is_null());
++    assert!(encoded["external_proof"].is_null());
++    let decoded: EffectReceipt = serde_json::from_value(encoded).expect("decode no-change receipt");
++    assert_eq!(decoded, receipt);
++    decoded.validate().expect("decoded no-change receipt");
++
++    let execution = OperationReceipt::completed(
++        UtcMicros(2),
++        UtcMicros(3),
++        context.deadline().clone(),
++        Default::default(),
++    )
++    .unwrap();
++    let effect_id = EffectId::new("effect.no-change.fixture").unwrap();
++    let authority = common::authority(&context);
++    let effect = EffectResult::new(
++        effect_id.clone(),
++        receipt.effect_class,
++        receipt.idempotency_key.clone(),
++        authority.clone(),
++        receipt.expected_state.clone(),
++        execution.clone(),
++        ReconciliationState::Reconciled,
++        decoded,
++        None::<()>,
++    )
++    .expect("no-change result has completed execution");
++
++    assert_eq!(effect.effect_id, effect_id);
++    assert_eq!(effect.authority, authority);
++    assert_eq!(effect.idempotency_key, receipt.idempotency_key);
++    assert_eq!(effect.expected_state, receipt.expected_state);
++    assert_eq!(effect.receipt, receipt);
++    assert_eq!(effect.execution, execution);
++    assert_eq!(effect.reconciliation, ReconciliationState::Reconciled);
++}
++
++#[test]
++fn no_change_rejects_committed_state_or_external_proof() {
++    for (committed, external) in [(true, false), (false, true), (true, true)] {
++        let mut receipt = effect_receipt(EffectTermination::NoChange);
++        receipt.committed_state = committed.then(|| common::digest(common::SHA256_B));
++        receipt.external_proof =
++            external.then(|| RetrievalAnchorId::new("anchor.fixture").unwrap());
++
++        assert!(matches!(
++            receipt.validate(),
++            Err(ApplicationContractError::Inconsistent {
++                field: "no-change effect receipt proof",
++            })
++        ));
++    }
++}
++
++#[test]
++fn completed_still_requires_committed_state_or_external_proof() {
++    let receipt = effect_receipt(EffectTermination::Completed);
++    assert!(matches!(
++        receipt.validate(),
++        Err(ApplicationContractError::Inconsistent {
++            field: "completed effect receipt proof",
++        })
++    ));
++
++    for (committed, external) in [(true, false), (false, true), (true, true)] {
++        let mut receipt = receipt.clone();
++        receipt.committed_state = committed.then(|| common::digest(common::SHA256_B));
++        receipt.external_proof =
++            external.then(|| RetrievalAnchorId::new("anchor.fixture").unwrap());
++        receipt.validate().expect("completed receipt retains proof");
++    }
++}

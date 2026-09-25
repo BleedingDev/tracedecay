@@ -1,0 +1,323 @@
+--- a/crates/tracedecay-sessions/src/runtime/hosts/codex.rs
++++ b/crates/tracedecay-sessions/src/runtime/hosts/codex.rs
+@@ -3213,3 +3213,320 @@
+         })
+     }
+ }
++
++#[cfg(test)]
++mod live_session_locator_tests {
++    use super::*;
++    use serde_json::json;
++    use std::time::{Duration, Instant};
++
++    const NATIVE_ID: &str = "0198a011-1234-5678-abcd-0123456789ab";
++
++    fn fixture() -> (tempfile::TempDir, PathBuf, CodexSource) {
++        let home = tempfile::tempdir().expect("fixture home");
++        let project = home.path().join("project");
++        std::fs::create_dir(&project).expect("fixture project");
++        std::fs::create_dir(project.join(".git")).expect("checkout marker");
++        let project = project.canonicalize().expect("canonical fixture project");
++        let source = CodexSource::with_home(home.path());
++        (home, project, source)
++    }
++
++    fn write_rollout(directory: &Path, prefix: &str, payload: serde_json::Value) -> PathBuf {
++        std::fs::create_dir_all(directory).expect("rollout directory");
++        let path = directory.join(format!("rollout-{prefix}-{NATIVE_ID}.jsonl"));
++        let header = json!({"type":"session_meta", "payload":payload});
++        std::fs::write(&path, format!("{header}\n")).expect("native header");
++        path.canonicalize().expect("canonical rollout")
++    }
++
++    fn locate(source: &CodexSource, project: &Path) -> Option<PathBuf> {
++        source
++            .find_live_session_transcript(
++                NATIVE_ID,
++                project,
++                Instant::now() + Duration::from_secs(5),
++            )
++            .expect("bounded live locator")
++            .map(|locator| locator.path().to_owned())
++    }
++
++    #[test]
++    fn metadata_only_native_start_needs_no_transcript_path() {
++        let (_home, project, source) = fixture();
++        let path = write_rollout(
++            &source.sessions_dir.join("2026/09/10"),
++            "2026-09-10T12-00-00",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        let before = std::fs::read(&path).unwrap();
++        assert_eq!(locate(&source, &project), Some(path.clone()));
++        assert_eq!(std::fs::read(&path).unwrap(), before);
++        assert!(!source.archived_sessions_dir.exists());
++    }
++
++    #[test]
++    fn archived_native_header_and_session_id_alias_are_supported() {
++        let (_home, project, source) = fixture();
++        let cwd = project.join("src");
++        std::fs::create_dir(&cwd).unwrap();
++        let path = write_rollout(
++            &source.archived_sessions_dir,
++            "archived",
++            json!({"session_id": NATIVE_ID, "cwd": cwd}),
++        );
++        assert_eq!(locate(&source, &project), Some(path));
++    }
++
++    #[test]
++    fn filename_fallback_and_conflicting_native_ids_do_not_bootstrap() {
++        for payload in [
++            json!({}),
++            json!({"id": "another-session"}),
++            json!({"id": ""}),
++            json!({"id": null}),
++            json!({"id": 42}),
++            json!({"id": NATIVE_ID, "session_id": "another-session"}),
++            json!({"id": null, "session_id": NATIVE_ID}),
++        ] {
++            let (_home, project, source) = fixture();
++            let mut payload = payload;
++            payload["cwd"] = json!(project);
++            write_rollout(&source.sessions_dir, "match", payload);
++            assert_eq!(locate(&source, &project), None);
++        }
++    }
++
++    #[test]
++    fn cwd_must_belong_to_the_admitted_checkout() {
++        let (home, project, source) = fixture();
++        let sibling = home.path().join("project-other");
++        let nested = project.join("nested");
++        std::fs::create_dir(&sibling).unwrap();
++        std::fs::create_dir(&nested).unwrap();
++        std::fs::write(nested.join(".git"), "gitdir: elsewhere\n").unwrap();
++        for cwd in [
++            sibling,
++            nested,
++            PathBuf::from("."),
++            home.path().join("missing"),
++        ] {
++            write_rollout(
++                &source.sessions_dir,
++                "match",
++                json!({"id": NATIVE_ID, "cwd": cwd}),
++            );
++            assert!(!matches!(
++                source.find_live_session_transcript(
++                    NATIVE_ID,
++                    &project,
++                    Instant::now() + Duration::from_secs(5)
++                ),
++                Ok(Some(_))
++            ));
++        }
++    }
++
++    #[test]
++    fn header_must_be_the_first_complete_bounded_frame() {
++        let (_home, project, source) = fixture();
++        let path = write_rollout(
++            &source.sessions_dir,
++            "match",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        let valid = std::fs::read_to_string(&path).unwrap();
++        for invalid in [
++            String::new(),
++            valid.trim_end().to_owned(),
++            format!("\n{valid}"),
++            format!("not-json\n{valid}"),
++            format!("{{\"type\":\"event_msg\"}}\n{valid}"),
++            format!("{}\n{valid}", " ".repeat(64 * 1024 + 1)),
++        ] {
++            std::fs::write(&path, invalid).unwrap();
++            assert_eq!(locate(&source, &project), None);
++        }
++    }
++
++    #[test]
++    fn duplicate_after_an_exact_hook_page_in_other_root_is_ambiguous() {
++        let (_home, project, source) = fixture();
++        write_rollout(
++            &source.sessions_dir,
++            "first",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        for index in 0..EXACT_HOOK_DISCOVERY_UNITS_PER_CALL + 1 {
++            std::fs::write(
++                source.sessions_dir.join(format!("unrelated-{index}.jsonl")),
++                "{}\n",
++            )
++            .unwrap();
++        }
++        write_rollout(
++            &source.archived_sessions_dir,
++            "second",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        assert_eq!(locate(&source, &project), None);
++    }
++
++    #[test]
++    fn missing_roots_are_not_created_and_expired_start_is_cancelled() {
++        let (_home, project, source) = fixture();
++        assert_eq!(locate(&source, &project), None);
++        assert!(!source.sessions_dir.exists());
++        assert!(!source.archived_sessions_dir.exists());
++        assert!(matches!(
++            source.find_live_session_transcript(NATIVE_ID, &project, Instant::now()),
++            Err(TranscriptIngestError::Cancelled { provider: "codex" })
++        ));
++    }
++
++    #[test]
++    fn an_over_budget_corpus_never_claims_a_unique_early_hit() {
++        let (_home, project, source) = fixture();
++        write_rollout(
++            &source.sessions_dir,
++            "early",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        for index in 0..LIVE_SESSION_DISCOVERY_ENTRIES {
++            std::fs::write(
++                source.sessions_dir.join(format!("unrelated-{index}.jsonl")),
++                "{}\n",
++            )
++            .unwrap();
++        }
++        assert_eq!(locate(&source, &project), None);
++        assert_eq!(locate(&source, &project), None);
++    }
++
++    #[test]
++    fn an_unvisited_deep_directory_prevents_a_completeness_claim() {
++        let (_home, project, source) = fixture();
++        write_rollout(
++            &source.sessions_dir,
++            "early",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        let mut deep = source.archived_sessions_dir.clone();
++        for _ in 0..=MAX_SCAN_DEPTH {
++            deep.push("nested");
++        }
++        std::fs::create_dir_all(deep).unwrap();
++        assert_eq!(locate(&source, &project), None);
++    }
++
++    #[test]
++    fn header_validation_rejects_replacement_or_changes_to_the_opened_source() {
++        let (_home, project, source) = fixture();
++        let path = write_rollout(
++            &source.sessions_dir,
++            "match",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&path).unwrap();
++        let initial = file.metadata().unwrap();
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let guard = source
++            .find_live_session_transcript(NATIVE_ID, &project, deadline)
++            .unwrap()
++            .unwrap();
++        assert_eq!(guard.path(), path);
++        assert!(guard.matches_current_source(deadline).unwrap());
++        assert_eq!(
++            meta::live_session_meta_cwd(&file, NATIVE_ID, deadline).unwrap(),
++            Some(project)
++        );
++        assert!(live_codex_candidate_unchanged(&path, &file, &initial, deadline).unwrap());
++        let contents = std::fs::read(&path).unwrap();
++        let saved = path.with_extension("saved");
++        std::fs::rename(&path, &saved).unwrap();
++        std::fs::write(&path, &contents).unwrap();
++        assert!(!live_codex_candidate_unchanged(&path, &file, &initial, deadline).unwrap());
++        assert!(!guard.matches_current_source(deadline).unwrap());
++        std::fs::remove_file(&path).unwrap();
++        std::fs::rename(saved, &path).unwrap();
++        let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&path).unwrap();
++        let initial = file.metadata().unwrap();
++        let guard = CodexLiveSessionTranscript {
++            path: path.clone(),
++            native_identity: crate::runtime::source::jsonl_native_file_identity(&file, &initial)
++                .unwrap(),
++            source_identity: codex_corpus_identity(&path, &initial).unwrap(),
++        };
++        std::fs::write(
++            &path,
++            format!("{}{{}}\n", String::from_utf8(contents).unwrap()),
++        )
++        .unwrap();
++        assert!(!live_codex_candidate_unchanged(&path, &file, &initial, deadline).unwrap());
++        assert!(!guard.matches_current_source(deadline).unwrap());
++        assert!(matches!(
++            guard.matches_current_source(Instant::now()),
++            Err(TranscriptIngestError::Cancelled { provider: "codex" })
++        ));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn same_inode_same_size_header_rewrite_invalidates_the_guard() {
++        let (_home, project, source) = fixture();
++        let path = write_rollout(
++            &source.sessions_dir,
++            "match",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let guard = source
++            .find_live_session_transcript(NATIVE_ID, &project, deadline)
++            .unwrap()
++            .unwrap();
++        let initial = std::fs::metadata(&path).unwrap();
++        let changed = std::fs::read_to_string(&path)
++            .unwrap()
++            .replace(NATIVE_ID, "0198a011-1234-5678-abcd-0123456789ac");
++        std::fs::write(&path, changed).unwrap();
++        filetime::set_file_mtime(
++            &path,
++            filetime::FileTime::from_last_modification_time(&initial),
++        )
++        .unwrap();
++        let current = std::fs::metadata(&path).unwrap();
++        assert_eq!(current.ino(), initial.ino());
++        assert_eq!(current.len(), initial.len());
++        assert!(!guard.matches_current_source(deadline).unwrap());
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn links_and_nonregular_native_candidates_are_rejected() {
++        use std::os::unix::fs::symlink;
++
++        let (_home, project, source) = fixture();
++        let path = write_rollout(
++            &source.sessions_dir,
++            "match",
++            json!({"id": NATIVE_ID, "cwd": project}),
++        );
++        let saved = path.with_extension("saved");
++        std::fs::rename(&path, &saved).unwrap();
++        symlink(&saved, &path).unwrap();
++        assert_eq!(locate(&source, &project), None);
++        std::fs::remove_file(&path).unwrap();
++        assert!(
++            std::process::Command::new("mkfifo")
++                .arg(&path)
++                .status()
++                .unwrap()
++                .success()
++        );
++        assert_eq!(locate(&source, &project), None);
++        std::fs::remove_file(&path).unwrap();
++        std::fs::rename(&saved, &path).unwrap();
++        symlink(&source.sessions_dir, &source.archived_sessions_dir).unwrap();
++        assert_eq!(locate(&source, &project), None);
++    }
++}

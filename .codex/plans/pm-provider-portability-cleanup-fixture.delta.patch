@@ -1,0 +1,52 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/portability.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/portability.rs
+@@ -1656,7 +1656,13 @@
+                 continue;
+             };
+             let reference = format!("{prefix}{key}");
+-            let path = path_for(&root, kind, &reference)?;
++            let path = match path_for(&root, kind, &reference) {
++                Ok(path) => path,
++                Err(_) => {
++                    result.incomplete();
++                    continue;
++                }
++            };
+             let (original_file, header) = match read_header(&path, kind, &reference, control) {
+                 Ok(value) => value,
+                 Err(_) => {
+@@ -1705,6 +1711,34 @@
+         };
+     }
+     result
++}
++
++/// Seeds storage fixtures from real granted source inventory. Production
++/// publication/binding checks are reused; no provider reply is manufactured.
++#[cfg(test)]
++pub(crate) fn seed_snapshot_artifact_for_test(
++    ledger: &RecallAdmissionLedgerV1,
++    scope: &RetainedRecallControlScopeV1,
++    sources: &[GrantedHistorySource],
++    snapshot: &Value,
++    control: &OperationControl,
++) -> Result<String> {
++    checkpoint(control)?;
++    let decoded: SnapshotCarrierV1 = serde_json::from_value(snapshot.clone())
++        .map_err(|_| PortabilityErrorV1::Invalid("snapshot fixture carrier"))?;
++    let candidate = prepare_artifact(
++        ArtifactKindV1::Snapshot,
++        scope,
++        full_sources(sources)?,
++        carrier(ArtifactKindV1::Snapshot, snapshot)?,
++        Some(decoded.identity),
++        Vec::new(),
++    )?;
++    decode_snapshot(&candidate)?;
++    let root = root_for(ledger)?;
++    prepare_root(&root, control)?;
++    let _lock = acquire_admission_lock(&root, control)?;
++    Ok(retain_artifact(&root, candidate, control)?.reference)
+ }
+ 
+ #[cfg(test)]

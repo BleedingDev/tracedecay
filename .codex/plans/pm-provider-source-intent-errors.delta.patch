@@ -1,0 +1,118 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
+@@ -230,6 +230,19 @@
+     }
+ }
+ 
++/// A confirmed receipt wins over every later cancellation or worker condition.
++#[derive(Debug, thiserror::Error)]
++pub(crate) enum ProviderSourceIntentActionErrorV1 {
++    #[error("host intent refused before commit: {0}")]
++    Refused(ObservationJournalError),
++    #[error("host intent authority refused before journal access: {0}")]
++    Authority(#[from] ProviderHistoryErrorV1),
++    #[error("host intent storage outcome was not confirmed: {0}")]
++    StorageUnconfirmed(ObservationJournalError),
++    #[error("host intent worker did not return a confirmed outcome")]
++    WorkerUnavailable,
++}
++
+ impl AuthorizedRetainedControlSourceV1 {
+     /// The host has already chosen and authorized the deletion policy. This helper
+     /// only binds that intent to the freshly authorized original source and journal.
+@@ -238,12 +251,10 @@
+         &self,
+         request: &ProviderSourceDeletionIntentV1<'_>,
+         control: &OperationControl,
+-    ) -> Result<ProviderSourceIntentReceiptV1> {
++    ) -> std::result::Result<ProviderSourceIntentReceiptV1, ProviderSourceIntentActionErrorV1> {
+         self.deletion_journal_action(request, control, true)
+             .await?
+-            .ok_or(ProviderHistoryErrorV1::Unavailable(
+-                "committed host intent receipt",
+-            ))
++            .ok_or(ProviderSourceIntentActionErrorV1::WorkerUnavailable)
+     }
+ 
+     /// Exact, immutable receipt lookup for an uncertain previous host write.
+@@ -251,7 +262,8 @@
+         &self,
+         request: &ProviderSourceDeletionIntentV1<'_>,
+         control: &OperationControl,
+-    ) -> Result<Option<ProviderSourceIntentReceiptV1>> {
++    ) -> std::result::Result<Option<ProviderSourceIntentReceiptV1>, ProviderSourceIntentActionErrorV1>
++    {
+         self.deletion_journal_action(request, control, false).await
+     }
+ 
+@@ -260,15 +272,16 @@
+         request: &ProviderSourceDeletionIntentV1<'_>,
+         control: &OperationControl,
+         record: bool,
+-    ) -> Result<Option<ProviderSourceIntentReceiptV1>> {
++    ) -> std::result::Result<Option<ProviderSourceIntentReceiptV1>, ProviderSourceIntentActionErrorV1>
++    {
+         check(control)?;
+         self.grant
+             .validate_structure()
+             .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("control history grant"))?;
+         let [source] = self.grant.sources.as_slice() else {
+-            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+-                "control history source count",
+-            ));
++            return Err(
++                ProviderHistoryErrorV1::ClaimMismatch("control history source count").into(),
++            );
+         };
+         let expected = self
+             .retained
+@@ -281,9 +294,7 @@
+             || request.original_source_sha256 != original_source_fence_digest(&expected)?
+             || request.source_revision != expected.source.source_revision.as_deref()
+         {
+-            return Err(ProviderHistoryErrorV1::ClaimMismatch(
+-                "host intent source binding",
+-            ));
++            return Err(ProviderHistoryErrorV1::ClaimMismatch("host intent source binding").into());
+         }
+         let journal = Arc::clone(&self.journal);
+         let operation = control.clone();
+@@ -331,21 +342,30 @@
+                     &operation.cancellation(),
+                 )
+             };
+-            result.map_err(|error| match error {
+-                ObservationJournalError::BudgetExhausted { .. } => {
+-                    ProviderHistoryErrorV1::Control(TerminalCode::DeadlineExceeded)
++            result.map_err(|error| {
++                // These refusal variants are emitted before COMMIT. An actual
++                // successful COMMIT already returned its captured receipt.
++                if record
++                    && matches!(
++                        &error,
++                        ObservationJournalError::UnsettledSource { .. }
++                            | ObservationJournalError::BudgetExhausted { .. }
++                            | ObservationJournalError::OperationCancelled { .. }
++                    )
++                {
++                    ProviderSourceIntentActionErrorV1::Refused(error)
++                } else {
++                    // SQLite/serialization errors are kept intact. The legacy
++                    // error surface does not reveal whether COMMIT was entered.
++                    ProviderSourceIntentActionErrorV1::StorageUnconfirmed(error)
+                 }
+-                ObservationJournalError::OperationCancelled { .. } => {
+-                    ProviderHistoryErrorV1::Control(TerminalCode::Cancelled)
+-                }
+-                _ => ProviderHistoryErrorV1::Unavailable("provider source intent journal"),
+             })
+         });
+         // Always join this write in the host control path. The typed journal
+         // receipt, not a subsequent deadline snapshot, determines commit truth.
+         let result = work
+             .await
+-            .map_err(|_| ProviderHistoryErrorV1::Unavailable("provider source intent worker"))?;
++            .map_err(|_| ProviderSourceIntentActionErrorV1::WorkerUnavailable)?;
+         if !record {
+             check(control)?;
+         }

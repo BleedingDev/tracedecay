@@ -515,8 +515,7 @@ async fn mount_one_production_composition_project(
                             FromRuntimeConfigurationWithNativePortInterposition(interposition),
                         None,
                     )
-                    .await
-                    .map(|composition| (composition.canonical_project_path, composition.server));
+                    .await;
                 }
                 production_project_server(
                     store_administration,

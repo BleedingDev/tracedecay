@@ -1,0 +1,88 @@
+--- a/crates/tracedecay-global-db/src/observation/codec.rs
++++ b/crates/tracedecay-global-db/src/observation/codec.rs
+@@ -45,7 +45,9 @@
+         return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
+     }
+     let origin = origin_json
+-        .map(|origin| decode::<tracedecay_store::ObservationOriginV1>(origin, operation))
++        .map(|origin| {
++            decode::<tracedecay_store::observation::ObservationOriginV1>(origin, operation)
++        })
+         .transpose()?;
+     RepositoryProvenanceAttachmentV1::new(
+         availability,
+--- a/crates/tracedecay-global-db/src/observation_adapter.rs
++++ b/crates/tracedecay-global-db/src/observation_adapter.rs
+@@ -746,7 +746,7 @@
+     payload_reference: PayloadReferenceV1,
+     identity: ObservationIdentityMaterialV1,
+     receipt: SanitizationReceiptV1,
+-    origin: tracedecay_store::ObservationOriginV1,
++    origin: tracedecay_store::observation::ObservationOriginV1,
+ }
+ 
+ #[derive(Clone)]
+@@ -1319,7 +1319,11 @@
+         let repository_origin = row
+             .get::<Option<String>>(11)
+             .map_err(|error| runtime_storage_error(operation, error))?
+-            .map(|encoded| decode_json::<tracedecay_store::ObservationOriginV1>(encoded, operation))
++            .map(|encoded| {
++                decode_json::<tracedecay_store::observation::ObservationOriginV1>(
++                    encoded, operation,
++                )
++            })
+             .transpose()?;
+         let repository_provenance =
+             RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs
+@@ -355,13 +355,13 @@
+         return Err(invalid("observation repository provenance collision"));
+     };
+     let retained_origin = origin_json
+-        .map(decode::<tracedecay_store::ObservationOriginV1>)
++        .map(decode::<tracedecay_store::observation::ObservationOriginV1>)
+         .transpose()?
+         .unwrap_or_else(|| {
+             if capture.is_some() {
+-                tracedecay_store::ObservationOriginV1::IngestionOnly
++                tracedecay_store::observation::ObservationOriginV1::IngestionOnly
+             } else {
+-                tracedecay_store::ObservationOriginV1::Unavailable
++                tracedecay_store::observation::ObservationOriginV1::Unavailable
+             }
+         });
+     // Capture-clock normalization below must never normalize a changed live
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs
+@@ -135,7 +135,7 @@
+         return Err(invalid("observation repository owner binding mismatch"));
+     }
+     let repository_origin = repository_origin
+-        .map(decode::<tracedecay_store::ObservationOriginV1>)
++        .map(decode::<tracedecay_store::observation::ObservationOriginV1>)
+         .transpose()?;
+     let repository_provenance =
+         RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/tests.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/tests.rs
+@@ -14,13 +14,14 @@
+     SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1,
+     SensitivityV1, SessionId, UtcMicros, VectorWatermark,
+ };
++use tracedecay_store::observation::ObservationOriginV1;
+ use tracedecay_store::{
+     AnchorDispositionReasonClassV1, AnchorDispositionStateV1, AnchoredObservationWrite,
+     CursorAdvanceLedgerReasonV1, CursorAdvanceLedgerReceiptIdV1, ObservationCoverageReason,
+-    ObservationCursorAdvance, ObservationOriginV1, ObservationReadOperationV1,
+-    ObservationReadResultV1, ObservationWrite, RetrievalAnchorDispositionRecordV1,
+-    SESSION_MESSAGE_PROJECTOR_VERSION, StorageRuntimeErrorV1,
+-    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
++    ObservationCursorAdvance, ObservationReadOperationV1, ObservationReadResultV1,
++    ObservationWrite, RetrievalAnchorDispositionRecordV1, SESSION_MESSAGE_PROJECTOR_VERSION,
++    StorageRuntimeErrorV1, build_observation_resolution_authorization_v1,
++    build_observation_retrieval_anchor_v2,
+ };
+ 
+ use crate::operation::StorageOperationError;

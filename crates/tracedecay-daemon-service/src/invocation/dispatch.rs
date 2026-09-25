@@ -186,7 +186,7 @@ impl DaemonInvocationService {
         admitted_cancellation: Option<CancellationToken>,
     ) -> DaemonInvocationResponse {
         self.invoke_with_admission(
-            profile_id,
+            Some(profile_id),
             lsp_registry,
             project_root,
             lsp_workspace,
@@ -244,7 +244,7 @@ impl DaemonInvocationService {
         project_admission: &crate::project_runtime::ProjectRuntimeRequestLeaseV1,
     ) -> DaemonInvocationResponse {
         self.invoke_with_admission(
-            profile_id,
+            Some(profile_id),
             lsp_registry,
             Some(project_root),
             None,

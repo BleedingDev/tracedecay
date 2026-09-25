@@ -1,0 +1,889 @@
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_admission.rs b/crates/tracedecay-memory-provider-registry/src/recall_admission.rs
+--- a/crates/tracedecay-memory-provider-registry/src/recall_admission.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_admission.rs
+@@ -342,6 +342,11 @@
+         /// Bounded content-free structural defect, never raw source content.
+         detail: String,
+     },
++    /// A returned candidate matches an exclusion in the dispatched request.
++    RequestExcluded {
++        /// Host-owned canonical exclusion field name, without provider content.
++        field: String,
++    },
+     /// Inline content does not hash to the declared `content_sha256`.
+     ContentDigestMismatch,
+     /// The candidate carries neither or both of `content` / `content_ref`.
+@@ -379,6 +384,7 @@
+             Self::UnknownValidity => "unknown_validity",
+             Self::InvalidValidityRecord { .. } => "invalid_validity_record",
+             Self::InvalidSourceAttribution { .. } => "invalid_source_attribution",
++            Self::RequestExcluded { .. } => "request_excluded",
+             Self::ContentDigestMismatch => "content_digest_mismatch",
+             Self::ContentSelectionInvalid => "content_selection_invalid",
+             Self::NativeScoreMalformed { .. } => "native_score_malformed",
+@@ -460,6 +466,12 @@
+         /// Bounded diagnostic.
+         detail: &'static str,
+     },
++    /// The dispatched request did not carry valid canonical exclusions.
++    #[error("recall request exclusions invalid: {detail}")]
++    InvalidRequestExclusions {
++        /// Bounded structural diagnostic.
++        detail: String,
++    },
+     /// A recall request part failed API validation.
+     #[error("recall request part invalid: {0}")]
+     Api(#[from] ApiError),
+@@ -1164,6 +1176,14 @@
+     pub fn original_sources(&self) -> &[RecallSourceAttributionV1] {
+         &self.original_sources
+     }
++
++    /// Observation claims whose declared provenance passed the canonical
++    /// binding checks. Host authority must still confirm every source.
++    #[must_use]
++    pub fn observation_history_sources(&self) -> Option<&[RecallSourceAttributionV1]> {
++        observation_history_claim(&self.candidate, &self.original_sources)
++            .then_some(self.original_sources.as_slice())
++    }
+     /// Returns the candidate as the provider returned it.
+     #[must_use]
+     pub const fn candidate(&self) -> &RecallCandidateV1 {
+@@ -1346,12 +1366,30 @@
+             maximum: maximum_candidates,
+         });
+     }
+-    admit_recall_candidates(
++    // Read the exclusions from the exact hashed request that was dispatched,
++    // so a buggy provider cannot make a returned candidate eligible again.
++    #[derive(Deserialize)]
++    struct DispatchedRecallExclusions {
++        exclusions: tracedecay_contracts::memory::CognitiveRecallExclusions,
++    }
++    let context: DispatchedRecallExclusions =
++        serde_json::from_slice(&call.payload.bytes).map_err(|error| {
++            RecallAdmissionError::InvalidRequestExclusions {
++                detail: bounded_detail(&error.to_string()),
++            }
++        })?;
++    context.exclusions.validate().map_err(|error| {
++        RecallAdmissionError::InvalidRequestExclusions {
++            detail: bounded_detail(&error.to_string()),
++        }
++    })?;
++    admit_recall_candidates_with_exclusions(
+         &call.exact_scope,
+         &call.request_id,
+         temporal,
+         authorized,
+         outcome.candidates,
++        Some(&context.exclusions),
+     )
+ }
+ 
+@@ -1426,6 +1464,24 @@
+     authorized: &RecallScopeBindingsV1,
+     candidates: Vec<RecallCandidateV1>,
+ ) -> Result<RecallAdmission, RecallAdmissionError> {
++    admit_recall_candidates_with_exclusions(
++        admitted_scope,
++        request_id,
++        temporal,
++        authorized,
++        candidates,
++        None,
++    )
++}
++
++fn admit_recall_candidates_with_exclusions(
++    admitted_scope: &OwnedExactScope,
++    request_id: &str,
++    temporal: &AdmittedTemporalQuery,
++    authorized: &RecallScopeBindingsV1,
++    candidates: Vec<RecallCandidateV1>,
++    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
++) -> Result<RecallAdmission, RecallAdmissionError> {
+     admitted_scope.validate()?;
+     let mut seen = BTreeSet::new();
+     for candidate in &candidates {
+@@ -1444,7 +1500,7 @@
+     let mut denied = Vec::new();
+     let mut degraded = false;
+     for candidate in candidates {
+-        match admit_one(admitted_scope, temporal, authorized, &candidate) {
++        match admit_one(admitted_scope, temporal, authorized, &candidate, exclusions) {
+             Ok(parts) => {
+                 degraded |= parts.decision.degrades_lane;
+                 admitted.push(AdmittedRecallCandidate {
+@@ -1532,6 +1588,7 @@
+     temporal: &AdmittedTemporalQuery,
+     authorized: &RecallScopeBindingsV1,
+     candidate: &RecallCandidateV1,
++    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
+ ) -> Result<AdmittedCandidateParts, RecallDenialReason> {
+     check_class_binding(
+         &candidate.memory_class,
+@@ -1539,8 +1596,10 @@
+     )?;
+     check_scope(admitted_scope, authorized, &candidate.exact_scope_identity)?;
+     check_content(candidate)?;
++    let original_sources = original_sources_from_provenance(&candidate.provenance)?;
++    check_recall_exclusions(candidate, &original_sources, exclusions)?;
++    check_original_source_claims(candidate, &original_sources)?;
+     let decision = check_validity(temporal, &candidate.validity)?;
+-    let original_sources = original_sources_from_provenance(&candidate.provenance)?;
+     // Relevance inputs are admitted, never repaired: a score the host cannot
+     // project honestly denies the candidate here rather than reaching
+     // normalization as a neutral value.
+@@ -1554,6 +1613,175 @@
+         confidence,
+         original_sources,
+     })
++}
++
++fn provenance_refs<'a>(
++    candidate: &'a RecallCandidateV1,
++    field: &str,
++) -> impl Iterator<Item = &'a str> {
++    candidate
++        .provenance
++        .get(field)
++        .and_then(Value::as_array)
++        .into_iter()
++        .flatten()
++        .filter_map(Value::as_str)
++}
++
++fn observation_history_claim(
++    candidate: &RecallCandidateV1,
++    sources: &[RecallSourceAttributionV1],
++) -> bool {
++    !sources.is_empty()
++        && candidate.memory_class.as_str() == Some(SESSION_OBSERVATION_MEMORY_CLASS)
++        && candidate.provenance.get("state").and_then(Value::as_str) == Some("available")
++}
++
++fn original_record_ref(source: &RecallSourceAttributionV1) -> String {
++    format!(
++        "record:{}",
++        source
++            .source
++            .stable_record_id
++            .as_deref()
++            .unwrap_or(&source.source.observation_id)
++    )
++}
++
++/// Typed attribution cannot replace a contradictory declared claim. Native
++/// observations name source keys and staged origins; NCM observations name
++/// canonical records. Facts retain their separate host record authority.
++fn check_original_source_claims(
++    candidate: &RecallCandidateV1,
++    sources: &[RecallSourceAttributionV1],
++) -> Result<(), RecallDenialReason> {
++    if !observation_history_claim(candidate, sources) {
++        return Ok(());
++    }
++    let invalid = |detail: &str| RecallDenialReason::InvalidSourceAttribution {
++        detail: detail.to_owned(),
++    };
++    let declared = candidate
++        .provenance
++        .get("observation_refs")
++        .and_then(Value::as_array)
++        .ok_or_else(|| invalid("observation_refs must cover original source identities"))?;
++    if declared.iter().any(|value| value.as_str().is_none()) {
++        return Err(invalid("observation_refs contains a non-reference"));
++    }
++    let declared: BTreeSet<_> = declared.iter().filter_map(Value::as_str).collect();
++    let original: BTreeSet<_> = sources
++        .iter()
++        .map(|source| source.source.observation_id.as_str())
++        .collect();
++    if declared != original {
++        return Err(invalid(
++            "observation_refs contradict original source identities",
++        ));
++    }
++    let record_refs: BTreeSet<_> = sources.iter().map(original_record_ref).collect();
++    let source_keys: BTreeSet<_> = sources
++        .iter()
++        .map(|source| source.source.source_key.as_str())
++        .collect();
++    for field in ["source_refs", "origin_refs"] {
++        let Some(values) = candidate.provenance.get(field).and_then(Value::as_array) else {
++            return Err(invalid("source provenance references must be arrays"));
++        };
++        if values.iter().any(|value| value.as_str().is_none()) {
++            return Err(invalid("source provenance contains a non-reference"));
++        }
++    }
++    for reference in provenance_refs(candidate, "source_refs")
++        .chain(candidate.source_refs.iter().map(String::as_str))
++    {
++        if !source_keys.contains(reference) && !record_refs.contains(reference) {
++            return Err(invalid("source_refs contradict original source identities"));
++        }
++    }
++    for reference in provenance_refs(candidate, "origin_refs") {
++        if reference.starts_with("record:") && !record_refs.contains(reference)
++            || (reference.starts_with("source:") || reference.starts_with("session:"))
++                && !source_keys.contains(reference)
++        {
++            return Err(invalid("origin_refs contradict original source identities"));
++        }
++    }
++    Ok(())
++}
++
++/// Exclusions run over the complete admitted content and reference sets,
++/// before normalization, deduplication, or host output truncation.
++fn check_recall_exclusions(
++    candidate: &RecallCandidateV1,
++    sources: &[RecallSourceAttributionV1],
++    exclusions: Option<&tracedecay_contracts::memory::CognitiveRecallExclusions>,
++) -> Result<(), RecallDenialReason> {
++    let Some(exclusions) = exclusions else {
++        return Ok(());
++    };
++    let contains =
++        |values: &[String], reference: &str| values.iter().any(|value| value == reference);
++    let field = if candidate
++        .stable_memory_ref
++        .as_deref()
++        .is_some_and(|reference| contains(&exclusions.stable_memory_refs, reference))
++    {
++        Some("stable_memory_refs")
++    } else if contains(&exclusions.candidate_ids, &candidate.candidate_id) {
++        Some("candidate_ids")
++    } else if candidate
++        .source_refs
++        .iter()
++        .map(String::as_str)
++        .chain(provenance_refs(candidate, "source_refs"))
++        .chain(provenance_refs(candidate, "origin_refs"))
++        .any(|reference| contains(&exclusions.source_refs, reference))
++        || sources.iter().any(|source| {
++            contains(&exclusions.source_refs, &source.source.source_key)
++                || contains(&exclusions.source_refs, &original_record_ref(source))
++        })
++    {
++        Some("source_refs")
++    } else if candidate
++        .trace_refs
++        .iter()
++        .map(String::as_str)
++        .chain(provenance_refs(candidate, "provider_trace_refs"))
++        .chain(
++            candidate
++                .explanation
++                .get("activation_trace_refs")
++                .and_then(Value::as_array)
++                .into_iter()
++                .flatten()
++                .filter_map(Value::as_str),
++        )
++        .any(|reference| contains(&exclusions.trace_refs, reference))
++    {
++        Some("trace_refs")
++    } else if provenance_refs(candidate, "observation_refs")
++        .any(|reference| contains(&exclusions.observation_ids, reference))
++        || sources
++            .iter()
++            .any(|source| contains(&exclusions.observation_ids, &source.source.observation_id))
++    {
++        Some("observation_ids")
++    } else if contains(&exclusions.content_sha256, &candidate.content_sha256)
++        || sources
++            .iter()
++            .any(|source| contains(&exclusions.content_sha256, &source.source.content_sha256))
++    {
++        Some("content_sha256")
++    } else {
++        None
++    };
++    match field {
++        Some(field) => Err(RecallDenialReason::RequestExcluded {
++            field: field.to_owned(),
++        }),
++        None => Ok(()),
++    }
+ }
+ 
+ /// Memory class of one provider-local staged session observation.
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_explain_trace.rs b/crates/tracedecay-memory-provider-registry/src/recall_explain_trace.rs
+--- a/crates/tracedecay-memory-provider-registry/src/recall_explain_trace.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_explain_trace.rs
+@@ -325,6 +325,7 @@
+         | RecallDenialReason::ForbiddenIdentity { field } => Some(format!("field={field:?}")),
+         RecallDenialReason::InvalidValidityRecord { detail }
+         | RecallDenialReason::InvalidSourceAttribution { detail } => Some(detail.clone()),
++        RecallDenialReason::RequestExcluded { field } => Some(format!("field={field}")),
+         RecallDenialReason::NativeScoreMalformed { defect } => Some(format!("{defect:?}")),
+         RecallDenialReason::ConfidenceMalformed { defect } => Some(format!("{defect:?}")),
+         RecallDenialReason::StaleIdentity
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_port.rs b/crates/tracedecay-memory-provider-registry/src/recall_port.rs
+--- a/crates/tracedecay-memory-provider-registry/src/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_port.rs
+@@ -447,8 +447,10 @@
+     /// inline content and were therefore withheld pending scope-revalidated
+     /// hydration, which this port does not perform.
+     pub unhydrated_reference_candidate_ids: Vec<String>,
+-    /// Immutable source claims from the actual admitted selected inline candidates.
+-    /// Kept outside application contracts for canonical host hydration.
++    /// Immutable source claims from selected inline observations whose actual
++    /// Available provenance passed the complete declared-reference binding.
++    /// Fact claims and unavailable/redacted states retain their own authority.
++    /// These are still claims; the host must confirm them against canonical history.
+     pub original_sources: BTreeMap<String, Vec<RecallSourceAttributionV1>>,
+     /// The router's fallback decision for this recall:
+     /// [`FallbackDecision::NotApplicable`] for successful terminals and for
+@@ -936,10 +938,9 @@
+                     .with_explanation(summary)
+                     .map_err(CognitiveRecallPortError::Application)?;
+             }
+-            original_sources.insert(
+-                candidate.candidate_id.clone(),
+-                admitted.original_sources().to_vec(),
+-            );
++            if let Some(sources) = admitted.observation_history_sources() {
++                original_sources.insert(candidate.candidate_id.clone(), sources.to_vec());
++            }
+             candidates.push(application_candidate);
+         }
+ 
+diff --git a/crates/tracedecay-memory-provider-registry/tests/recall_fixture/mod.rs b/crates/tracedecay-memory-provider-registry/tests/recall_fixture/mod.rs
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_fixture/mod.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_fixture/mod.rs
+@@ -240,8 +240,8 @@
+     pub stable_memory_ref_overrides: std::collections::BTreeMap<String, Value>,
+     /// Replaces the validity object of named candidates.
+     pub validity_overrides: std::collections::BTreeMap<String, Value>,
+-    /// Source metadata overrides for tracing actual admitted attribution through the port.
+-    pub original_source_overrides: std::collections::BTreeMap<String, Value>,
++    /// Candidate field replacements for deliberately contradictory provider replies.
++    pub candidate_overrides: std::collections::BTreeMap<String, Value>,
+     /// Replaces the whole candidate list with `(candidate_id, content)` pairs,
+     /// every one of them in-scope and current, so a test can drive the real
+     /// fabric, adapter, and port path with a candidate stream of its own
+@@ -261,7 +261,7 @@
+             native_score_overrides: std::collections::BTreeMap::new(),
+             stable_memory_ref_overrides: std::collections::BTreeMap::new(),
+             validity_overrides: std::collections::BTreeMap::new(),
+-            original_source_overrides: std::collections::BTreeMap::new(),
++            candidate_overrides: std::collections::BTreeMap::new(),
+             candidate_contents: None,
+         }
+     }
+@@ -286,8 +286,10 @@
+                 if let Some(validity) = self.validity_overrides.get(&id) {
+                     candidate["validity"] = validity.clone();
+                 }
+-                if let Some(sources) = self.original_source_overrides.get(&id) {
+-                    candidate["provenance"]["original_sources"] = sources.clone();
++                if let Some(fields) = self.candidate_overrides.get(&id).and_then(Value::as_object) {
++                    for (field, value) in fields {
++                        candidate[field.as_str()] = value.clone();
++                    }
+                 }
+             }
+         }
+diff --git a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+@@ -1954,23 +1954,44 @@
+     );
+ }
+ 
+-#[tokio::test]
+-async fn selected_inline_outcome_preserves_actual_admitted_original_sources() {
+-    let scope = resolved_scope(Some("refs/heads/recall-port"));
+-    let exact = TestScopeBinding
+-        .bind_exact_scope(&scope)
+-        .expect("bound scope");
+-    let source = serde_json::json!({
++fn canonical_observation_source(exact: &OwnedExactScope) -> serde_json::Value {
++    serde_json::json!({
+         "source": {
+             "canonical_provider_id": "claude", "canonical_session_id": "session-original",
+             "source_key": "source-key", "stable_record_id": null,
+             "observation_id": "observation-original", "source_revision": "revision-original",
+             "content_sha256": "a".repeat(64),
+         },
+-        "origin_scope": {"state": "recorded", "exact_scope_identity": scope_value(&exact), "authority_ref": "host-original"},
++        "origin_scope": {"state": "recorded", "exact_scope_identity": scope_value(exact), "authority_ref": "host-original"},
+         "source_sequence": 7, "occurred_at": null, "ingested_at": "2025-01-01T00:00:00.000000Z",
+         "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null},
+-    });
++    })
++}
++
++fn observation_candidate_fields(source: &serde_json::Value) -> serde_json::Value {
++    let record = source["source"]["stable_record_id"]
++        .as_str()
++        .unwrap_or(source["source"]["observation_id"].as_str().unwrap());
++    serde_json::json!({
++        "memory_class": "session_observation",
++        "provenance": {
++            "state": "available",
++            "origin_refs": [format!("record:{record}")],
++            "source_refs": [format!("record:{record}")],
++            "observation_refs": [source["source"]["observation_id"]],
++            "transform_chain": [], "provider_trace_refs": [], "redaction_reason": null,
++            "original_sources": [source],
++        },
++    })
++}
++
++#[tokio::test]
++async fn selected_inline_outcome_preserves_actual_admitted_original_sources() {
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding
++        .bind_exact_scope(&scope)
++        .expect("bound scope");
++    let source = canonical_observation_source(&exact);
+     let mut fixture = RecallFixturePort::new();
+     fixture.candidate_contents = Some(duplicate_candidate_stream());
+     for id in [
+@@ -1980,8 +2001,8 @@
+         "zz-other",
+     ] {
+         fixture
+-            .original_source_overrides
+-            .insert(id.to_owned(), serde_json::json!([source.clone()]));
++            .candidate_overrides
++            .insert(id.to_owned(), observation_candidate_fields(&source));
+     }
+     let port = mount(
+         compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+@@ -2011,3 +2032,253 @@
+         );
+     }
+ }
++
++#[tokio::test]
++async fn buggy_provider_exclusions_are_denied_before_normalization_and_selection() {
++    use tracedecay_contracts::memory::CognitiveRecallExclusions;
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
++    let source = canonical_observation_source(&exact);
++    let full_content = format!(
++        "{} excluded full content tail",
++        "long source content ".repeat(100)
++    );
++    for field in [
++        "stable_memory_refs",
++        "candidate_ids",
++        "source_refs",
++        "trace_refs",
++        "observation_ids",
++        "content_sha256",
++    ] {
++        let mut exclusions = CognitiveRecallExclusions::default();
++        match field {
++            "stable_memory_refs" => exclusions
++                .stable_memory_refs
++                .push("memory:aa-denied".to_owned()),
++            "candidate_ids" => exclusions.candidate_ids.push("aa-denied".to_owned()),
++            // These two classes also inspect original typed attribution, even
++            // when the provider omits the corresponding top-level list.
++            "source_refs" => exclusions.source_refs.push("source-key".to_owned()),
++            "trace_refs" => exclusions.trace_refs.push("trace:excluded".to_owned()),
++            "observation_ids" => exclusions
++                .observation_ids
++                .push("observation-original".to_owned()),
++            "content_sha256" => exclusions
++                .content_sha256
++                .push(sha256_hex(full_content.as_bytes())),
++            _ => unreachable!(),
++        }
++        let mut fixture = RecallFixturePort::new();
++        fixture.candidate_contents = Some(vec![
++            ("aa-denied".to_owned(), full_content.clone()),
++            (
++                "zz-survivor".to_owned(),
++                "distinct surviving content".to_owned(),
++            ),
++        ]);
++        let mut fields = observation_candidate_fields(&source);
++        fields["provenance"]["provider_trace_refs"] = serde_json::json!(["trace:excluded"]);
++        fixture
++            .candidate_overrides
++            .insert("aa-denied".to_owned(), fields);
++        let port = mount(
++            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
++            Arc::new(LedgerObserver::default()),
++        )
++        .unwrap()
++        .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
++        let request = request(scope.clone(), 60_000_000, false)
++            .with_exclusions(exclusions)
++            .unwrap();
++        let outcome = port.recall_admitted(request, &live_signal()).await.unwrap();
++        assert_eq!(outcome.result.candidates().len(), 1, "{field}");
++        assert_eq!(
++            outcome.result.candidates()[0].candidate_id(),
++            "zz-survivor",
++            "{field}"
++        );
++        assert_eq!(
++            outcome.normalization.as_ref().unwrap().candidates.len(),
++            1,
++            "{field}"
++        );
++        let report = outcome.report.unwrap();
++        assert_eq!(
++            (
++                report.received_count,
++                report.admitted_count,
++                report.denied.len()
++            ),
++            (2, 1, 1),
++            "{field}"
++        );
++        assert!(
++            matches!(&report.denied[0].reason, RecallDenialReason::RequestExcluded { field: actual } if actual == field)
++        );
++        assert_eq!(report.denial_counts(), vec![("request_excluded", 1)]);
++        assert!(
++            outcome.selection.unwrap().budget_excluded.is_empty(),
++            "{field}"
++        );
++        assert!(outcome.original_sources.is_empty(), "{field}");
++    }
++}
++
++#[tokio::test]
++async fn typed_sources_preserve_unavailable_redacted_and_legacy_fact_provenance() {
++    use tracedecay_contracts::memory::CognitiveRecallProvenance;
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
++    let source = canonical_observation_source(&exact);
++    for state in ["unavailable", "redacted", "legacy_fact"] {
++        let mut fields = observation_candidate_fields(&source);
++        let expected = match state {
++            "unavailable" => {
++                fields["provenance"]["state"] = serde_json::json!("unavailable");
++                CognitiveRecallProvenance::unavailable()
++            }
++            "redacted" => {
++                fields["provenance"]["state"] = serde_json::json!("redacted");
++                fields["provenance"]["redaction_reason"] = serde_json::json!("source redacted");
++                CognitiveRecallProvenance::redacted("source redacted").unwrap()
++            }
++            "legacy_fact" => {
++                fields["memory_class"] = serde_json::json!("project");
++                fields["provenance"]["origin_refs"] = serde_json::json!(["record:foreign-fact"]);
++                CognitiveRecallProvenance::available("record:foreign-fact").unwrap()
++            }
++            _ => unreachable!(),
++        };
++        let mut fixture = RecallFixturePort::new();
++        fixture.candidate_contents =
++            Some(vec![("claim".to_owned(), "fixture source text".to_owned())]);
++        fixture
++            .candidate_overrides
++            .insert("claim".to_owned(), fields);
++        let port = mount(
++            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
++            Arc::new(LedgerObserver::default()),
++        )
++        .unwrap();
++        let outcome = port
++            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
++            .await
++            .unwrap();
++        assert_eq!(outcome.result.candidates().len(), 1, "{state}");
++        assert_eq!(
++            outcome.result.candidates()[0].provenance(),
++            &expected,
++            "{state}"
++        );
++        assert!(
++            outcome.original_sources.is_empty(),
++            "{state} must use its declared provenance authority"
++        );
++    }
++}
++
++#[tokio::test]
++async fn contradictory_observation_claims_cannot_borrow_legitimate_typed_sources() {
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
++    let mut source = canonical_observation_source(&exact);
++    source["source"]["stable_record_id"] = serde_json::json!("stable-original");
++    for defect in [
++        "foreign_record",
++        "observation_instead_of_stable_record",
++        "foreign_source",
++        "missing_observation",
++        "extra_observation",
++    ] {
++        let mut fields = observation_candidate_fields(&source);
++        match defect {
++            "foreign_record" => {
++                fields["provenance"]["origin_refs"] = serde_json::json!(["record:foreign-fact"])
++            }
++            "observation_instead_of_stable_record" => {
++                fields["provenance"]["origin_refs"] =
++                    serde_json::json!(["record:observation-original"])
++            }
++            "foreign_source" => {
++                fields["source_refs"] = serde_json::json!(["source:foreign.rs#L1-L2"])
++            }
++            "missing_observation" => {
++                fields["provenance"]["observation_refs"] = serde_json::json!([])
++            }
++            "extra_observation" => {
++                fields["provenance"]["observation_refs"] =
++                    serde_json::json!(["observation-original", "observation-unrelated"])
++            }
++            _ => unreachable!(),
++        }
++        let mut fixture = RecallFixturePort::new();
++        fixture.candidate_contents =
++            Some(vec![("claim".to_owned(), "fixture source text".to_owned())]);
++        fixture
++            .candidate_overrides
++            .insert("claim".to_owned(), fields);
++        let port = mount(
++            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
++            Arc::new(LedgerObserver::default()),
++        )
++        .unwrap();
++        let outcome = port
++            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
++            .await
++            .unwrap();
++        assert!(outcome.result.candidates().is_empty(), "{defect}");
++        assert!(outcome.original_sources.is_empty(), "{defect}");
++        let report = outcome.report.unwrap();
++        assert_eq!(report.denied.len(), 1, "{defect}");
++        assert!(
++            matches!(
++                report.denied[0].reason,
++                RecallDenialReason::InvalidSourceAttribution { .. }
++            ),
++            "{defect}"
++        );
++    }
++}
++
++#[tokio::test]
++async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_sources() {
++    let scope = resolved_scope(Some("refs/heads/recall-port"));
++    let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
++    for format in ["native", "ncm_observation", "ncm_stable"] {
++        let mut source = canonical_observation_source(&exact);
++        if format == "ncm_stable" {
++            source["source"]["stable_record_id"] = serde_json::json!("stable-original");
++        }
++        let mut fields = observation_candidate_fields(&source);
++        if format == "native" {
++            fields["provenance"]["origin_refs"] = serde_json::json!([
++                "native-stage:original",
++                "operation:delivery",
++                "request:delivery"
++            ]);
++            fields["provenance"]["source_refs"] = serde_json::json!(["source-key"]);
++        }
++        let mut fixture = RecallFixturePort::new();
++        fixture.candidate_contents =
++            Some(vec![("claim".to_owned(), "fixture source text".to_owned())]);
++        fixture
++            .candidate_overrides
++            .insert("claim".to_owned(), fields);
++        let port = mount(
++            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
++            Arc::new(LedgerObserver::default()),
++        )
++        .unwrap();
++        let outcome = port
++            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
++            .await
++            .unwrap();
++        assert_eq!(outcome.result.candidates().len(), 1, "{format}");
++        assert_eq!(
++            serde_json::to_value(&outcome.original_sources["claim"]).unwrap(),
++            serde_json::json!([source]),
++            "{format}"
++        );
++    }
++}
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -1116,6 +1116,7 @@
+ /// existing hydration pass still meters it and checks the caller's controls.
+ struct ConfirmedObservationEvidenceV1<'a> {
+     scope: &'a HostEvidenceScopeV1,
++    claimed_source: String,
+     evidence: Result<HostEvidenceRefV1, &'static str>,
+ }
+ 
+@@ -1127,10 +1128,10 @@
+         control: &HostEvidenceControlV1<'_>,
+     ) -> Result<HostEvidenceRefV1, ProvenanceHydrationError> {
+         control.check(source)?;
+-        if scope != self.scope {
++        if scope != self.scope || source != self.claimed_source {
+             return Err(ProvenanceHydrationError::Unresolvable {
+                 claimed_source: source.to_owned(),
+-                reason: "canonical observation scope differs".to_owned(),
++                reason: "canonical observation claim or scope differs".to_owned(),
+             });
+         }
+         self.evidence
+@@ -1140,6 +1141,40 @@
+                 reason: reason.to_owned(),
+             })
+     }
++}
++
++/// History can confirm only the provider's actual Available declaration.
++/// The registry supplies sources only after the observation class and full
++/// declared reference set agree with that attribution.
++fn observation_claim_authority<'a>(
++    scope: &'a HostEvidenceScopeV1,
++    claim: &ProviderItemProvenanceV1,
++    sources: Option<&[RecallSourceAttributionV1]>,
++    dispatched: Option<&HistoryGrant>,
++    refreshed: Option<&HistoryGrant>,
++) -> Option<ConfirmedObservationEvidenceV1<'a>> {
++    let ProviderItemProvenanceV1::Available { source } = claim else {
++        return None;
++    };
++    let sources = sources.filter(|sources| !sources.is_empty())?;
++    let evidence = if let Some(record_id) = source.strip_prefix("record:")
++        && !sources.iter().any(|attribution| {
++            attribution
++                .source
++                .stable_record_id
++                .as_deref()
++                .unwrap_or(&attribution.source.observation_id)
++                == record_id
++        }) {
++        Err("declared record contradicts canonical observation attribution")
++    } else {
++        confirmed_original_sources(sources, dispatched, refreshed)
++    };
++    Some(ConfirmedObservationEvidenceV1 {
++        scope,
++        claimed_source: source.clone(),
++        evidence,
++    })
+ }
+ 
+ /// Every claimed immutable attribution must match both the dispatch grant and
+@@ -2385,23 +2420,19 @@
+         // `Available` claim the provider supplied.
+         let typed_sources = original_sources
+             .get(candidate.candidate_id())
+-            .filter(|sources| !sources.is_empty());
+-        let decision = if let Some(sources) = typed_sources {
+-            let authority = ConfirmedObservationEvidenceV1 {
+-                scope: &hydration_scope,
+-                evidence: confirmed_original_sources(
+-                    sources,
+-                    prepared.grant.as_ref(),
+-                    refreshed_history.as_ref(),
+-                ),
+-            };
++            .map(Vec::as_slice);
++        let decision = if let Some(authority) = observation_claim_authority(
++            &hydration_scope,
++            &claimed_provenance,
++            typed_sources,
++            prepared.grant.as_ref(),
++            refreshed_history.as_ref(),
++        ) {
+             hydration.hydrate(
+                 &authority,
+                 &hydration_scope,
+                 &hydration_control,
+-                &ProviderItemProvenanceV1::Available {
+-                    source: "canonical observations".to_owned(),
+-                },
++                &claimed_provenance,
+             )
+         } else {
+             hydration.hydrate(
+@@ -7224,6 +7255,78 @@
+         assert!(HostEvidenceRefV1::parse("observations:first,second").is_err());
+     }
+ 
++    #[test]
++    fn typed_history_never_upgrades_unavailable_redacted_or_foreign_record_claims() {
++        let (sources, grant) = history();
++        let scope = HostEvidenceScopeV1::new(
++            "profile",
++            ResolvedScope::new(
++                tracedecay_domain::ProjectId::new("project").unwrap(),
++                tracedecay_domain::RepositoryId::new("repository").unwrap(),
++                tracedecay_domain::WorktreeId::new("worktree").unwrap(),
++                Some(tracedecay_domain::RefId::new("refs/heads/main").unwrap()),
++            )
++            .unwrap(),
++            "session",
++            std::env::current_dir().unwrap(),
++        )
++        .unwrap();
++        let signal =
++            tracedecay_contracts::CancellationSignal::active("history.provenance").unwrap();
++        let control = HostEvidenceControlV1::new(1, 2, &signal);
++        for claim in [
++            ProviderItemProvenanceV1::Unknown,
++            ProviderItemProvenanceV1::Redacted {
++                reason: "provider_redacted".to_owned(),
++            },
++        ] {
++            assert!(
++                observation_claim_authority(
++                    &scope,
++                    &claim,
++                    Some(&sources),
++                    Some(&grant),
++                    Some(&grant)
++                )
++                .is_none()
++            );
++        }
++        let claim = ProviderItemProvenanceV1::Available {
++            source: "record:foreign-fact".to_owned(),
++        };
++        let authority =
++            observation_claim_authority(&scope, &claim, Some(&sources), Some(&grant), Some(&grant))
++                .unwrap();
++        let mut pass = ProvenanceHydrationPassV1::new(ProvenanceHydrationPolicyV1::default());
++        let decision = pass.hydrate(&authority, &scope, &control, &claim);
++        assert!(decision.excluded);
++        assert!(
++            matches!(decision.provenance, ProviderItemProvenanceV1::Unresolvable { source, .. } if source == "record:foreign-fact")
++        );
++        let claim = ProviderItemProvenanceV1::Available {
++            source: "record:first".to_owned(),
++        };
++        let authority =
++            observation_claim_authority(&scope, &claim, Some(&sources), Some(&grant), Some(&grant))
++                .unwrap();
++        assert!(matches!(
++            pass.hydrate(&authority, &scope, &control, &claim)
++                .provenance,
++            ProviderItemProvenanceV1::Hydrated {
++                evidence: HostEvidenceRefV1::CanonicalObservations { .. }
++            }
++        ));
++        assert!(
++            authority
++                .resolve("record:foreign-fact", &scope, &control)
++                .is_err()
++        );
++        // Legacy fact claims arrive without an eligible observation sidecar.
++        assert!(
++            observation_claim_authority(&scope, &claim, None, Some(&grant), Some(&grant)).is_none()
++        );
++    }
++
+     #[tokio::test]
+     async fn history_control_preserves_original_deadline_and_cancels_on_drop() {
+         let now = try_now_micros().unwrap();

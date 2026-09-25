@@ -67,7 +67,7 @@ pub use self::semantic::{
     SemanticRequestRefusalV1, SemanticRetrievalRequestV1, SemanticSearchExecutionV1,
     SemanticSearchKindV1, SemanticVectorReadPort, SemanticVectorReadRequestV1,
     SemanticVectorRecordV1, SemanticVectorScanSummaryV1, apply_bounded_rerank_outcome,
-    restore_frozen_semantic_order,
+    validate_frozen_semantic_composition,
 };
 
 pub const QUERY_EXACT_RETRIEVER_REVISION_V1: &str = "retriever.exact.daemon.v1";

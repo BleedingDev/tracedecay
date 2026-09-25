@@ -1,0 +1,53 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -276,9 +276,29 @@
+             return None;
+         }
+         let register = self.source_path.is_none();
+-        let mut codex_guard = None;
++        // An indexed locator does not establish the current rollout's native
++        // identity or uniqueness. Every Codex Start revalidates the same
++        // complete native lookup, and carries its guard through capture.
++        let codex_guard = if is_start && self.producer == HookHostV1::Codex {
++            Some(
++                tracedecay_sessions::runtime::codex::CodexSource::with_home(home?)
++                    .find_live_session_transcript(
++                        self.native_session.as_str(),
++                        &project_root,
++                        deadline,
++                    )
++                    .ok()??,
++            )
++        } else {
++            None
++        };
+         let source_path = match self.source_path {
+             Some(path) => {
++                if let Some(guard) = &codex_guard
++                    && fs::canonicalize(&path).ok()? != guard.path()
++                {
++                    return None;
++                }
+                 if is_start && self.producer == HookHostV1::ClaudeCode {
+                     // A new native Start cannot silently reuse an indexed
+                     // locator after the host named a different physical file.
+@@ -311,18 +331,7 @@
+                         deadline,
+                     )?
+                 }
+-                HookHostV1::Codex => {
+-                    let guard = tracedecay_sessions::runtime::codex::CodexSource::with_home(home?)
+-                        .find_live_session_transcript(
+-                            self.native_session.as_str(),
+-                            &project_root,
+-                            deadline,
+-                        )
+-                        .ok()??;
+-                    let path = guard.path().to_path_buf();
+-                    codex_guard = Some(guard);
+-                    path
+-                }
++                HookHostV1::Codex => codex_guard.as_ref()?.path().to_path_buf(),
+                 _ => return None,
+             },
+             None => return None,

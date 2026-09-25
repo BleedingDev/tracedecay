@@ -22,11 +22,9 @@
 //! - [`tracedecay_configuration::PinnedRuntimeConfigurationCachePort`], installed
 //!   via [`tracedecay_configuration::install_pinned_runtime_configuration_cache`]
 //!   by the composition root, which owns opening durable configuration.
-//!   Configuration
-//!   value/persistence contracts live in `tracedecay-configuration` (re-exported
-//!   from `tracedecay_global_db::configuration::contracts`), not duplicated here.
-//!   [`config::retrieval`] stays in this crate because it is production-load-bearing
-//!   on search-eval.
+//!   Configuration value and persistence contracts live in
+//!   `tracedecay-configuration` (re-exported from
+//!   `tracedecay_global_db::configuration::contracts`), not duplicated here.
 //! - Transport-independent response handles live in
 //!   `tracedecay_session_memory::response_handles`; MCP adapters should call
 //!   that module rather than keep a parallel handle store.
@@ -53,7 +51,6 @@ pub(crate) fn register_test_schema_installer() {
 
 pub mod advisory;
 pub mod code_index;
-pub mod config;
 pub mod dashboard_diagnostics;
 pub mod delivery;
 pub mod diagnose;
@@ -82,7 +79,6 @@ pub mod semantic_runtime;
 pub mod settings_control;
 pub mod source_authorization;
 pub mod stack_coordinator;
-pub mod store;
 pub mod tracedecay;
 pub mod work;
 

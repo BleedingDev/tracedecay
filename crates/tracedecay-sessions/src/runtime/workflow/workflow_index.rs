@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 
 use crate::runtime::git_correlation::MAX_SESSIONS_FOR_LIMIT;
 pub use crate::{WorkflowAgent, WorkflowRun, WorkflowScopeFilter, WorkflowStatus};
+use tracedecay_lcm::schema::SESSION_SCHEMA_MIGRATIONS_TABLE_DDL;
 use tracedecay_runtime_core::db::DatabaseEngineReadSnapshot;
 use tracedecay_runtime_core::db::engine::{
     Executor, QueryExecutor, Row, Value, opt_i64, opt_text, params,
@@ -128,13 +129,10 @@ pub async fn ensure_workflow_index_schema(conn: &impl Executor) -> Result<(), Wo
         WorkflowIndexSchemaAdmission::Current => return Ok(()),
         WorkflowIndexSchemaAdmission::Fresh => {}
     }
+    conn.execute_batch(SESSION_SCHEMA_MIGRATIONS_TABLE_DDL)
+        .await?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_schema_migrations (
-            name TEXT PRIMARY KEY,
-            version INTEGER NOT NULL,
-            applied_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        CREATE TABLE IF NOT EXISTS workflow_runs (
+        "CREATE TABLE IF NOT EXISTS workflow_runs (
             run_id TEXT PRIMARY KEY,
             parent_session_id TEXT NOT NULL DEFAULT '',
             name TEXT,

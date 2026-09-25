@@ -490,9 +490,14 @@ impl RustNcmSurface {
         })
     }
 
-    fn update_generation(&self, generation: u64) {
+    fn update_generation(&self, namespace: &str, generation: u64) {
         if let Ok(mut state) = self.state.lock() {
             state.descriptor.state_generation = generation;
+            if state.identity_namespace.as_deref() == Some(namespace)
+                && let Some(identity) = state.identity.as_mut()
+            {
+                identity.epoch = generation;
+            }
         }
     }
 
@@ -823,7 +828,7 @@ impl NcmCognitiveSurface for RustNcmSurface {
         if call.operation.mutates_provider_state()
             && reply.state_generation >= call.expected_state_generation
         {
-            self.update_generation(reply.state_generation);
+            self.update_generation(call.namespace.as_str(), reply.state_generation);
         }
         worker_reply(&self.fallback_descriptor.provider_id, call, reply)
     }

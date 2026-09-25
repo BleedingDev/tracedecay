@@ -1,0 +1,382 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs b/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
+@@ -84,8 +84,9 @@
+         "validity": {"valid_from": null, "valid_until": null, "superseded_at": null, "superseded_by": null, "revoked_at": null}});
+     let source = attribution(&original)?;
+     let identity = json!({"source": target["source"], "origin_scope": target["original_scope"]});
++    let binding = source_binding(namespace, &source)?;
+     Some(
+-        json!({"stable_memory_ref": stable, "source": opaque_surface_id(namespace, b"forget-source-key", &source.source.source_key),
++        json!({"stable_memory_ref": stable, "source": binding.source_id, "legacy_source": binding.legacy_source_id,
+         "source_identity_sha256": opaque_surface_id(namespace, b"source-target", &serde_json::to_string(&identity).ok()?)}),
+     )
+ }
+@@ -360,12 +361,31 @@
+             if query.len() > 32768 {
+                 return None;
+             }
+-            control["sources"] = json!(
+-                sources
+-                    .iter()
+-                    .map(|source| opaque_surface_id(namespace, b"forget-source-key", source))
+-                    .collect::<Vec<_>>()
+-            );
++            if call.history_grant().is_some() {
++                let current = admission?;
++                current.verify_for(call).ok()?;
++                let bindings =
++                    source_binding::claimed_source_bindings(namespace, &sources, current)?;
++                control["sources"] = json!(
++                    bindings
++                        .iter()
++                        .map(|binding| &binding.source_id)
++                        .collect::<Vec<_>>()
++                );
++                control["source_bindings"] = json!(
++                    bindings
++                        .iter()
++                        .map(source_binding::SourceBinding::target)
++                        .collect::<Vec<_>>()
++                );
++            } else {
++                control["sources"] = json!(
++                    sources
++                        .iter()
++                        .map(|source| opaque_surface_id(namespace, b"forget-source-key", source))
++                        .collect::<Vec<_>>()
++                );
++            }
+             control["verification_query_digest"] =
+                 json!(hex_digest(&Sha256::digest(query.as_bytes())));
+         }
+@@ -455,8 +475,8 @@
+                     let original =
+                         value["replacement"].pointer("/source_identity/original_source")?;
+                     let replacement = attribution(original)?;
+-                    if replacement.source.source_key
+-                        != value["target"]["source"]["source_key"].as_str()?
++                    let replacement_binding = source_binding(namespace, &replacement)?;
++                    if replacement_binding.source_id != control["target"]["source"].as_str()?
+                         || replacement.source.source_revision.as_deref()? == expected
+                     {
+                         return None;
+@@ -469,7 +489,7 @@
+                     let (key_text, value_text) =
+                         evidence_text(kind, &value["replacement"]["canonical_payload"])?;
+                     control["replacement"] = json!({"observation_kind": kind, "payload_contract": value["replacement"]["payload_contract"],
+-                        "canonical_payload": {"forget_source_key": opaque_surface_id(namespace, b"forget-source-key", &replacement.source.source_key),
++                        "canonical_payload": {"forget_source_key": replacement_binding.source_id,
+                             "_ncm_key_text": key_text, "_ncm_value_text": value_text}, "provenance": provenance});
+                 }
+                 "change_validity" => {
+@@ -737,16 +757,15 @@
+             let retained = decode_capsule(&row["provenance"])?;
+             let original = &retained["original_source"];
+             let source = attribution(original)?;
+-            if scope(&retained["delivery_scope"])? != call.exact_scope
+-                || row["source"]
+-                    != opaque_surface_id(
+-                        &namespace,
+-                        b"forget-source-key",
+-                        &source.source.source_key,
+-                    )
+-            {
+-                return None;
+-            }
++            if scope(&retained["delivery_scope"])? != call.exact_scope {
++                return None;
++            }
++            validate_source_binding(
++                &namespace,
++                &source,
++                &row["provenance"],
++                row["source"].as_str()?,
++            )?;
+             let stable = stable_reference(
+                 &namespace,
+                 row["record_id"].as_u64()?,
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/portability.rs b/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
+@@ -100,11 +100,14 @@
+                         }
+                     }
+                     "deleted" | "redacted" | "expired" => {
+-                        blocked.insert(opaque_surface_id(
+-                            namespace,
+-                            b"forget-source-key",
+-                            &source.source_key,
+-                        ));
++                        let index = inventory.sources.iter().position(|item| item == source)?;
++                        let binding = source_binding(namespace, &inventory.attributions[index])?;
++                        // A raw-key fence would erase every colliding origin. A
++                        // blocked legacy capsule cannot be safely imported.
++                        if inventory.stored_source_ids[index] != binding.source_id {
++                            return None;
++                        }
++                        blocked.insert(binding.source_id);
+                     }
+                     _ => return None,
+                 }
+@@ -238,8 +241,8 @@
+         };
+         let kind = string(&observation["observation_kind"])?;
+         let (key_text, value_text) = evidence_text(kind, &observation["canonical_payload"])?;
+-        let source_id =
+-            opaque_surface_id(namespace, b"forget-source-key", &source.source.source_key);
++        let binding = source_binding(namespace, &source)?;
++        let source_id = &binding.source_id;
+         let delivery_key = opaque_surface_id(
+             namespace,
+             b"replay-delivery-key",
+@@ -256,7 +259,7 @@
+         };
+         projected.push(json!({"source_sequence":source.source_sequence,
+             "receipt_digest":opaque_surface_id(namespace,b"replay-receipt",receipt),
+-            "delivery_key":delivery_key,"source":source_id,"admitted":eligible,"blocked":blocked,
++            "delivery_key":delivery_key,"source":source_id,"legacy_source":binding.legacy_source_id,"admitted":eligible,"blocked":blocked,
+             "observation":if eligible { json!({"observation_kind":kind,"payload_contract":observation["payload_contract"],
+                 "canonical_payload":{"forget_source_key":source_id,"_ncm_key_text":key_text,"_ncm_value_text":value_text},"provenance":provenance}) } else { Value::Null }}));
+     }
+@@ -292,6 +295,7 @@
+     observation_sequence: u64,
+     sources: Vec<OriginalSourceIdentity>,
+     attributions: Vec<SourceAttribution>,
++    stored_source_ids: Vec<String>,
+     effective_validities: BTreeMap<String, RecordedValidity>,
+     wire_sources: Vec<Value>,
+ }
+@@ -314,6 +318,7 @@
+         observation_sequence: 0,
+         sources: Vec::new(),
+         attributions: Vec::new(),
++        stored_source_ids: Vec::new(),
+         effective_validities: BTreeMap::new(),
+         wire_sources: Vec::new(),
+     };
+@@ -335,13 +340,12 @@
+             ],
+         )?;
+         let source = attribution(&retained["original_source"])?;
+-        if scope(&retained["delivery_scope"])? != *exact
+-            || !seen.insert(source_key(&source.source))
+-            || capsule["source_id"]
+-                != opaque_surface_id(namespace, b"forget-source-key", &source.source.source_key)
++        if scope(&retained["delivery_scope"])? != *exact || !seen.insert(source_key(&source.source))
+         {
+             return None;
+         }
++        let stored_source_id = capsule["source_id"].as_str()?;
++        validate_source_binding(namespace, &source, &provenance, stored_source_id)?;
+         let (key, value) = evidence_text(
+             string(&retained["projection"]["observation_kind"])?,
+             &retained["canonical_payload"],
+@@ -368,6 +372,9 @@
+             .push(retained["original_source"]["source"].clone());
+         inventory.sources.push(source.source.clone());
+         inventory.attributions.push(source);
++        inventory
++            .stored_source_ids
++            .push(stored_source_id.to_owned());
+     }
+     Some(inventory)
+ }
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/source_binding.rs b/crates/tracedecay-memory-provider-ncm/src/common/source_binding.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/tracedecay-memory-provider-ncm/src/common/source_binding.rs
+@@ -0,0 +1,88 @@
++//! Private source identities bind original scope and canonical source lineage.
++
++use super::*;
++
++pub(super) struct SourceBinding {
++    pub(super) source_id: String,
++    pub(super) legacy_source_id: String,
++}
++
++impl SourceBinding {
++    pub(super) fn provenance(&self) -> Value {
++        json!({"version": 1, "source_id": self.source_id,
++            "legacy_source_id": self.legacy_source_id})
++    }
++
++    pub(super) fn target(&self) -> Value {
++        json!({"source_id": self.source_id, "legacy_source_id": self.legacy_source_id})
++    }
++}
++
++pub(super) fn source_binding(
++    namespace: &NcmNamespace,
++    source: &SourceAttribution,
++) -> Option<SourceBinding> {
++    let origin = source.origin_scope.recorded_scope().ok()?;
++    let identity = serde_json::to_string(&json!([
++        origin.profile_id,
++        origin.project_id,
++        source.source.canonical_provider_id.as_str(),
++        source.source.canonical_session_id,
++        source.source.source_key,
++    ]))
++    .ok()?;
++    Some(SourceBinding {
++        source_id: opaque_surface_id(namespace, b"common-source-key-v1", &identity),
++        legacy_source_id: opaque_surface_id(
++            namespace,
++            b"forget-source-key",
++            &source.source.source_key,
++        ),
++    })
++}
++
++pub(crate) fn project_source_id(namespace: &NcmNamespace, original: &Value) -> Option<String> {
++    Some(source_binding(namespace, &attribution(original)?)?.source_id)
++}
++
++/// Existing raw identities remain readable only in their original unbound form.
++/// A v1 claim must agree with both the retained original and the stored full ID.
++pub(super) fn validate_source_binding(
++    namespace: &NcmNamespace,
++    source: &SourceAttribution,
++    provenance: &Value,
++    actual: &str,
++) -> Option<()> {
++    let Some(binding) = provenance.get("source_binding") else {
++        return (actual
++            == opaque_surface_id(namespace, b"forget-source-key", &source.source.source_key))
++        .then_some(());
++    };
++    fields(binding, &["version", "source_id", "legacy_source_id"])?;
++    let expected = source_binding(namespace, source)?;
++    (binding == &expected.provenance() && actual == expected.source_id).then_some(())
++}
++
++/// Fresh host admission chooses a single original lineage per requested alias.
++/// Multiple revisions of that lineage are harmless; multiple origins are not.
++pub(super) fn claimed_source_bindings(
++    namespace: &NcmNamespace,
++    sources: &[String],
++    admission: &CurrentAdvisoryAdmission,
++) -> Option<Vec<SourceBinding>> {
++    let mut bindings = std::collections::BTreeMap::new();
++    for key in sources {
++        let mut matching = std::collections::BTreeMap::new();
++        for entry in &admission.history_sources {
++            if entry.attribution.source.source_key == *key {
++                let binding = source_binding(namespace, &entry.attribution)?;
++                matching.insert(binding.source_id.clone(), binding);
++            }
++        }
++        if matching.len() != 1 {
++            return None;
++        }
++        bindings.extend(matching);
++    }
++    Some(bindings.into_values().collect())
++}
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common.rs b/crates/tracedecay-memory-provider-ncm/src/common.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common.rs
+@@ -21,11 +21,14 @@
+ mod lifecycle;
+ mod portability;
+ mod replay_boundary;
++mod source_binding;
+ pub(crate) use lifecycle::{project as project_lifecycle, reconstruct as reconstruct_lifecycle};
+ pub(crate) use portability::{
+     project as project_portability, reconstruct as reconstruct_portability,
+ };
+ pub(crate) use replay_boundary::valid_replay_payload;
++pub(crate) use source_binding::project_source_id;
++use source_binding::{source_binding, validate_source_binding};
+ 
+ const BUDGETS: &[&str] = &[
+     "maximum_candidates",
+@@ -403,6 +406,7 @@
+     .ok()?;
+     let delivery_digest = hex_digest(&Sha256::digest(&delivery_bytes));
+     Some(Some(json!({
++        "source_binding": source_binding(namespace, &admitted)?.provenance(),
+         "common_capsule": {"version": 1, "bytes": bytes, "sha256": digest},
+         "delivery_capsule": {"version": 1, "bytes": delivery_bytes, "sha256": delivery_digest},
+         "selection": {
+@@ -538,12 +542,15 @@
+     let delivery = decode_named_capsule(&metadata["provenance"], "delivery_capsule")?;
+     let source = attribution(&retained["original_source"])?;
+     let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+-    if scope(&retained["delivery_scope"])? != call.exact_scope
+-        || metadata["source"]
+-            != opaque_surface_id(&namespace, b"forget-source-key", &source.source.source_key)
+-    {
+-        return None;
+-    }
++    if scope(&retained["delivery_scope"])? != call.exact_scope {
++        return None;
++    }
++    validate_source_binding(
++        &namespace,
++        &source,
++        &metadata["provenance"],
++        metadata["source"].as_str()?,
++    )?;
+     let original_key = string(&delivery["idempotency_key"])?;
+     if Some(original_key) != call.idempotency_key.as_deref() {
+         return None;
+@@ -625,9 +632,13 @@
+             return None;
+         }
+         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
+-        if row["source"].as_str()?
+-            != opaque_surface_id(&namespace, b"forget-source-key", &source.source.source_key)
+-            || row["key_text"] != retained["projection"]["key_text"]
++        validate_source_binding(
++            &namespace,
++            &source,
++            &row["provenance"],
++            row["source"].as_str()?,
++        )?;
++        if row["key_text"] != retained["projection"]["key_text"]
+             || row["value_text"] != retained["projection"]["value_text"]
+         {
+             return None;
+@@ -671,11 +682,14 @@
+             request["exclusions"][*name]
+                 .as_array()
+                 .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(value)))
+-        }) || source_refs.iter().any(|source| {
+-            request["exclusions"]["source_refs"]
+-                .as_array()
+-                .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(source)))
+-        });
++        }) || source_refs
++            .iter()
++            .chain(std::iter::once(&source.source.source_key))
++            .any(|source| {
++                request["exclusions"]["source_refs"]
++                    .as_array()
++                    .is_some_and(|items| items.iter().any(|item| item.as_str() == Some(source)))
++            });
+         if is_excluded {
+             excluded += 1;
+             continue;
+diff --git a/crates/tracedecay-memory-provider-ncm/src/lib.rs b/crates/tracedecay-memory-provider-ncm/src/lib.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/lib.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/lib.rs
+@@ -1807,14 +1807,12 @@
+         .get("source_identity")
+         .and_then(|value| value.get("original_source"))
+     {
+-        let source = original
+-            .pointer("/source/source_key")
+-            .and_then(Value::as_str)?;
++        let source_id = common::project_source_id(namespace, original)?;
+         let kind = object.get("observation_kind").and_then(Value::as_str)?;
+         let contract = object.get("payload_contract").and_then(Value::as_str)?;
+         let (key_text, value_text) = common::evidence_text(kind, object.get("canonical_payload")?)?;
+         *value = serde_json::json!({"observation_kind": kind, "payload_contract": contract,
+-            "canonical_payload": {"forget_source_key": opaque_surface_id(namespace, b"forget-source-key", source),
++            "canonical_payload": {"forget_source_key": source_id,
+                 "_ncm_key_text": key_text, "_ncm_value_text": value_text}});
+         return Some(());
+     }

@@ -1,0 +1,1401 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
+@@ -1,6 +1,6 @@
+-//! Authenticated explicit feedback assertions retained by the recall ledger.
++//! Authenticated feedback assertions and deletion command identities retained by the recall ledger.
+ //!
+-//! This receipt proves durable host acceptance of the caller's assertion. It
++//! Acceptance proves the host durably retained the caller's command identity. It
+ //! does not establish objective usefulness, provider completion, or permission
+ //! to mutate canonical facts. The controller resolves and authorizes the target
+ //! before acceptance, then dispatches only with the opaque accepted value.
+@@ -17,7 +17,7 @@
+ use serde::{Deserialize, Serialize};
+ use tracedecay_contracts::retained_surfaces::{
+     MAX_PROVIDER_CONTROL_EVIDENCE_REFS, MAX_PROVIDER_CONTROL_REFERENCE_BYTES,
+-    ProviderControlRequestV1, ProviderFeedbackRequestV1,
++    ProviderControlRequestV1, ProviderDeleteBySourceRequestV1, ProviderFeedbackRequestV1,
+ };
+ use tracedecay_contracts::{RequestContext, RequestId, ResolvedScope, now_micros};
+ use tracedecay_domain::canonical_text::sha256_hex;
+@@ -39,12 +39,12 @@
+ 
+ use super::super::cognitive_recall::RecallAdmissionLedgerV1;
+ 
+-const ROOT_NAME: &str = "recall-feedback-v1";
++const ROOT_NAME: &str = "recall-source-commands-v1";
+ const LOCK_NAME: &str = ".admission.lock";
+ const RECEIPT_PREFIX: &str = "host-feedback-assertion-v1:";
+-const KEY_DOMAIN: &str = "tracedecay.host-feedback.request.v1";
+-const OPERATION_DOMAIN: &str = "tracedecay.host-feedback.operation.v1";
+-const MAGIC: &[u8; 8] = b"TDFBACK1";
++const KEY_DOMAIN: &str = "tracedecay.host-source-command.request.v1";
++const OPERATION_DOMAIN: &str = "tracedecay.host-source-command.operation.v1";
++const MAGIC: &[u8; 8] = b"TDSCMD01";
+ const HEADER_BYTES: usize = MAGIC.len() + 4;
+ const MAX_RECEIPT_BYTES: usize = 256 * 1024;
+ const MAX_ARTIFACT_FILES: usize = 16_384;
+@@ -64,20 +64,20 @@
+ }
+ 
+ #[derive(Debug, thiserror::Error)]
+-pub(crate) enum FeedbackAssertionErrorV1 {
+-    #[error("invalid host feedback assertion: {0}")]
++pub(crate) enum HostSourceCommandErrorV1 {
++    #[error("invalid host source command: {0}")]
+     Invalid(&'static str),
+-    #[error("retained host feedback assertion is missing")]
++    #[error("retained host source command is missing")]
+     Missing,
+-    #[error("feedback request identity is already bound to a different assertion")]
++    #[error("source command request identity is already bound to a different command")]
+     Conflict,
+-    #[error("retained host feedback assertion is corrupt: {0}")]
++    #[error("retained host source command is corrupt: {0}")]
+     Corrupt(&'static str),
+-    #[error("host feedback assertion stopped before durable acceptance: {0:?}")]
++    #[error("host source command stopped before durable acceptance: {0:?}")]
+     Control(TerminalCode),
+-    #[error("recall ledger feedback artifact capacity is exhausted")]
++    #[error("recall ledger source command artifact capacity is exhausted")]
+     CapacityExceeded,
+-    #[error("host feedback assertion storage failed ({publication:?}): {source}")]
++    #[error("host source command storage failed ({publication:?}): {source}")]
+     Storage {
+         publication: FeedbackAssertionPublicationV1,
+         #[source]
+@@ -85,16 +85,18 @@
+     },
+ }
+ 
+-type Result<T> = std::result::Result<T, FeedbackAssertionErrorV1>;
++pub(crate) type FeedbackAssertionErrorV1 = HostSourceCommandErrorV1;
++
++type Result<T> = std::result::Result<T, HostSourceCommandErrorV1>;
+ 
+ /// A value returned only after a complete immutable receipt has passed the
+ /// durability barrier. Deserializing a file does not construct this capability.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+-pub(crate) struct AcceptedFeedbackAssertionV1(StoredFeedbackAssertionV1);
++pub(crate) struct AcceptedFeedbackAssertionV1(StoredSourceCommandV1, String);
+ 
+ impl AcceptedFeedbackAssertionV1 {
+     pub(crate) fn canonical_outcome_receipt(&self) -> &str {
+-        &self.0.canonical_outcome_receipt
++        &self.1
+     }
+ 
+     pub(crate) fn operation_id(&self) -> &str {
+@@ -119,13 +121,13 @@
+         original_attribution: &SourceAttribution,
+     ) -> Result<bool> {
+         Ok(self.0.binding
+-            == FeedbackAssertionBindingV1::prepare(
++            == BoundSourceCommandV1::FeedbackAssertion(FeedbackAssertionBindingV1::prepare(
+                 context,
+                 request,
+                 target,
+                 original_attribution,
+                 self.0.accepted_at,
+-            )?)
++            )?))
+     }
+ }
+ 
+@@ -136,7 +138,7 @@
+     request_id: RequestId,
+     resolved_host_scope: ResolvedScope,
+     request: ProviderFeedbackRequestV1,
+-    target: FeedbackAssertionTargetV1,
++    target: SourceCommandTargetV1,
+ }
+ 
+ /// Only a stable memory target is accepted. Its original scope and source are
+@@ -144,7 +146,7 @@
+ /// against the resolved LifecycleTarget. The delivery scope remains separate.
+ #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+ #[serde(deny_unknown_fields)]
+-struct FeedbackAssertionTargetV1 {
++struct SourceCommandTargetV1 {
+     provider_id: String,
+     registration_revision: u64,
+     delivery_scope: RecallOutcomeScopeV1,
+@@ -164,37 +166,14 @@
+             .validate()
+             .map_err(|_| invalid("authenticated context"))?;
+         validate_public_request(request, accepted_at)?;
+-        target
+-            .validate()
+-            .map_err(|_| invalid("resolved lifecycle target"))?;
+-        original_attribution
+-            .validate()
+-            .map_err(|_| invalid("original attribution"))?;
+-        original_attribution
+-            .origin_scope
+-            .recorded_scope()
+-            .map_err(|_| invalid("recorded original source scope is required"))?;
+-        if target.source != original_attribution.source
+-            || target.original_scope != original_attribution.origin_scope
+-            || request.source.observation_id != original_attribution.source.observation_id
+-        {
+-            return Err(invalid("target and source attribution disagree"));
+-        }
+-        let LifecycleTargetReference::StableMemoryRef(stable_memory_ref) = &target.reference else {
+-            return Err(invalid("resolved stable memory reference is required"));
+-        };
++        let resolved_target =
++            prepare_target(target, original_attribution, &request.source.observation_id)?;
+         let binding = Self {
+             actor: context.actor().clone(),
+             request_id: context.request_id().clone(),
+             resolved_host_scope: context.scope().clone(),
+             request: request.clone(),
+-            target: FeedbackAssertionTargetV1 {
+-                provider_id: target.provider_id.as_str().to_owned(),
+-                registration_revision: target.registration_revision,
+-                delivery_scope: scope_wire(&target.delivery_scope),
+-                stable_memory_ref: stable_memory_ref.clone(),
+-                original_attribution: attribution_wire(original_attribution),
+-            },
++            target: resolved_target,
+         };
+         binding.validate(accepted_at)?;
+         Ok(binding)
+@@ -212,10 +191,175 @@
+         if accepted_at.0 < 0 || self.target.registration_revision == 0 {
+             return Err(invalid("acceptance time or registration revision"));
+         }
+-        let provider_id = OwnedProviderId::new(&self.target.provider_id)
+-            .map_err(|_| invalid("producing provider"))?;
++        self.target
++            .validate_for_observation(&self.request.source.observation_id)?;
++        Ok(())
++    }
++
++    fn lookup_key(&self) -> Result<String> {
++        request_key(
++            &self.actor,
++            &self.resolved_host_scope,
++            SourceCommandKindV1::Feedback,
++            &self.request_id,
++        )
++    }
++}
++
++/// Host acceptance of one immutable deletion request. This identity is not a
++/// deletion fence, erasure receipt, or proof of provider-local deletion.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub(crate) struct AcceptedDeletionCommandV1(StoredSourceCommandV1);
++
++impl AcceptedDeletionCommandV1 {
++    pub(crate) fn operation_id(&self) -> &str {
++        &self.0.operation_id
++    }
++    pub(crate) fn idempotency_key(&self) -> &str {
++        &self.0.idempotency_key
++    }
++    pub(crate) fn accepted_at(&self) -> UtcMicros {
++        self.0.accepted_at
++    }
++    pub(crate) fn matches(
++        &self,
++        context: &RequestContext,
++        request: &ProviderDeleteBySourceRequestV1,
++        target: &LifecycleTarget,
++        original_attribution: &SourceAttribution,
++    ) -> Result<bool> {
++        Ok(self.0.binding
++            == BoundSourceCommandV1::DeletionCommand(DeletionCommandBindingV1::prepare(
++                context,
++                request,
++                target,
++                original_attribution,
++                self.0.accepted_at,
++            )?))
++    }
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum SourceCommandKindV1 {
++    Feedback,
++    DeleteBySource,
++}
++
++impl SourceCommandKindV1 {
++    fn operation(self) -> &'static str {
++        match self {
++            Self::Feedback => "feedback",
++            Self::DeleteBySource => "delete_by_source",
++        }
++    }
++}
++
++#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
++#[serde(deny_unknown_fields)]
++struct DeletionCommandBindingV1 {
++    actor: ActorId,
++    request_id: RequestId,
++    resolved_host_scope: ResolvedScope,
++    request: ProviderDeleteBySourceRequestV1,
++    target: SourceCommandTargetV1,
++}
++
++impl DeletionCommandBindingV1 {
++    fn prepare(
++        context: &RequestContext,
++        request: &ProviderDeleteBySourceRequestV1,
++        target: &LifecycleTarget,
++        original_attribution: &SourceAttribution,
++        accepted_at: UtcMicros,
++    ) -> Result<Self> {
++        context
++            .validate()
++            .map_err(|_| invalid("authenticated context"))?;
++        validate_deletion_request(request, accepted_at)?;
++        let target = prepare_target(target, original_attribution, &request.source.observation_id)?;
++        let binding = Self {
++            actor: context.actor().clone(),
++            request_id: context.request_id().clone(),
++            resolved_host_scope: context.scope().clone(),
++            request: request.clone(),
++            target,
++        };
++        binding.validate(accepted_at)?;
++        Ok(binding)
++    }
++
++    fn validate(&self, accepted_at: UtcMicros) -> Result<()> {
++        self.actor.validate().map_err(|_| invalid("actor"))?;
++        self.request_id
++            .validate()
++            .map_err(|_| invalid("request identity"))?;
++        self.resolved_host_scope
++            .validate()
++            .map_err(|_| invalid("resolved host scope"))?;
++        validate_deletion_request(&self.request, accepted_at)?;
++        if accepted_at.0 < 0 {
++            return Err(invalid("acceptance time"));
++        }
++        self.target
++            .validate_for_observation(&self.request.source.observation_id)
++    }
++
++    fn lookup_key(&self) -> Result<String> {
++        request_key(
++            &self.actor,
++            &self.resolved_host_scope,
++            SourceCommandKindV1::DeleteBySource,
++            &self.request_id,
++        )
++    }
++}
++
++/// The complete storage protocol is deliberately closed to these two accepted
++/// source commands. Snapshot/replay payloads use their own artifact owner.
++#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
++#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
++enum BoundSourceCommandV1 {
++    FeedbackAssertion(FeedbackAssertionBindingV1),
++    DeletionCommand(DeletionCommandBindingV1),
++}
++
++impl From<FeedbackAssertionBindingV1> for BoundSourceCommandV1 {
++    fn from(binding: FeedbackAssertionBindingV1) -> Self {
++        Self::FeedbackAssertion(binding)
++    }
++}
++impl From<DeletionCommandBindingV1> for BoundSourceCommandV1 {
++    fn from(binding: DeletionCommandBindingV1) -> Self {
++        Self::DeletionCommand(binding)
++    }
++}
++
++impl BoundSourceCommandV1 {
++    fn validate(&self, accepted_at: UtcMicros) -> Result<()> {
++        match self {
++            Self::FeedbackAssertion(binding) => binding.validate(accepted_at),
++            Self::DeletionCommand(binding) => binding.validate(accepted_at),
++        }
++    }
++    fn lookup_key(&self) -> Result<String> {
++        match self {
++            Self::FeedbackAssertion(binding) => binding.lookup_key(),
++            Self::DeletionCommand(binding) => binding.lookup_key(),
++        }
++    }
++    fn kind(&self) -> SourceCommandKindV1 {
++        match self {
++            Self::FeedbackAssertion(_) => SourceCommandKindV1::Feedback,
++            Self::DeletionCommand(_) => SourceCommandKindV1::DeleteBySource,
++        }
++    }
++}
++
++impl SourceCommandTargetV1 {
++    fn validate_for_observation(&self, observation_id: &str) -> Result<()> {
++        let provider_id =
++            OwnedProviderId::new(&self.provider_id).map_err(|_| invalid("producing provider"))?;
+         let original_attribution = self
+-            .target
+             .original_attribution
+             .to_owned_attribution()
+             .map_err(|_| invalid("original attribution"))?;
+@@ -225,45 +369,75 @@
+             .map_err(|_| invalid("recorded original scope"))?;
+         let target = LifecycleTarget {
+             provider_id,
+-            registration_revision: self.target.registration_revision,
+-            original_scope: original_attribution.origin_scope.clone(),
+-            delivery_scope: scope_owned(&self.target.delivery_scope)?,
++            registration_revision: self.registration_revision,
++            original_scope: original_attribution.origin_scope,
++            delivery_scope: scope_owned(&self.delivery_scope)?,
+             source: original_attribution.source,
+-            reference: LifecycleTargetReference::StableMemoryRef(
+-                self.target.stable_memory_ref.clone(),
+-            ),
++            reference: LifecycleTargetReference::StableMemoryRef(self.stable_memory_ref.clone()),
+         };
+         target.validate().map_err(|_| invalid("lifecycle target"))?;
+-        if self.request.source.observation_id != target.source.observation_id {
++        if observation_id != target.source.observation_id {
+             return Err(invalid("selected observation identity"));
+         }
+         Ok(())
+     }
+-
+-    fn lookup_key(&self) -> Result<String> {
+-        request_key(&self.actor, &self.resolved_host_scope, &self.request_id)
+-    }
++}
++
++fn prepare_target(
++    target: &LifecycleTarget,
++    original_attribution: &SourceAttribution,
++    observation_id: &str,
++) -> Result<SourceCommandTargetV1> {
++    target
++        .validate()
++        .map_err(|_| invalid("resolved lifecycle target"))?;
++    original_attribution
++        .validate()
++        .map_err(|_| invalid("original attribution"))?;
++    original_attribution
++        .origin_scope
++        .recorded_scope()
++        .map_err(|_| invalid("recorded original source scope is required"))?;
++    if target.source != original_attribution.source
++        || target.original_scope != original_attribution.origin_scope
++        || observation_id != original_attribution.source.observation_id
++    {
++        return Err(invalid("target and source attribution disagree"));
++    }
++    let LifecycleTargetReference::StableMemoryRef(stable_memory_ref) = &target.reference else {
++        return Err(invalid("resolved stable memory reference is required"));
++    };
++    Ok(SourceCommandTargetV1 {
++        provider_id: target.provider_id.as_str().to_owned(),
++        registration_revision: target.registration_revision,
++        delivery_scope: scope_wire(&target.delivery_scope),
++        stable_memory_ref: stable_memory_ref.clone(),
++        original_attribution: attribution_wire(original_attribution),
++    })
+ }
+ 
+ #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+ #[serde(deny_unknown_fields)]
+-struct StoredFeedbackAssertionV1 {
++struct StoredSourceCommandV1 {
+     version: u32,
+     lookup_key: String,
+-    binding: FeedbackAssertionBindingV1,
++    binding: BoundSourceCommandV1,
+     accepted_at: UtcMicros,
+-    canonical_outcome_receipt: String,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    canonical_outcome_receipt: Option<String>,
+     operation_id: String,
+     idempotency_key: String,
+ }
+ 
+-impl StoredFeedbackAssertionV1 {
+-    fn new(binding: FeedbackAssertionBindingV1, accepted_at: UtcMicros) -> Result<Self> {
++impl StoredSourceCommandV1 {
++    fn new(binding: impl Into<BoundSourceCommandV1>, accepted_at: UtcMicros) -> Result<Self> {
++        let binding = binding.into();
+         binding.validate(accepted_at)?;
+         let lookup_key = binding.lookup_key()?;
+         let record = Self {
+             version: 1,
+-            canonical_outcome_receipt: format!("{RECEIPT_PREFIX}{lookup_key}"),
++            canonical_outcome_receipt: (binding.kind() == SourceCommandKindV1::Feedback)
++                .then(|| format!("{RECEIPT_PREFIX}{lookup_key}")),
+             operation_id: operation_uuid_v7(&lookup_key, accepted_at)?,
+             idempotency_key: lookup_key.clone(),
+             lookup_key,
+@@ -278,19 +452,21 @@
+         self.binding.validate(self.accepted_at)?;
+         if self.version != 1
+             || self.lookup_key != self.binding.lookup_key()?
+-            || self.canonical_outcome_receipt != format!("{RECEIPT_PREFIX}{}", self.lookup_key)
++            || self.canonical_outcome_receipt
++                != (self.binding.kind() == SourceCommandKindV1::Feedback)
++                    .then(|| format!("{RECEIPT_PREFIX}{}", self.lookup_key))
+             || self.operation_id != operation_uuid_v7(&self.lookup_key, self.accepted_at)?
+             || self.idempotency_key != self.lookup_key
+         {
+-            return Err(FeedbackAssertionErrorV1::Corrupt("identity binding"));
++            return Err(HostSourceCommandErrorV1::Corrupt("identity binding"));
+         }
+         Ok(())
+     }
+ }
+ 
+ impl RecallAdmissionLedgerV1 {
+-    /// Run on the controller's existing blocking pool using its original live
+-    /// OperationControl. This method owns no executor, provider, cache or DB.
++    /// Execute on the controller's existing blocking pool using its original
++    /// live OperationControl, after current source/target authorization.
+     pub(crate) fn accept_feedback_assertion(
+         &self,
+         context: &RequestContext,
+@@ -298,7 +474,7 @@
+         target: &LifecycleTarget,
+         original_attribution: &SourceAttribution,
+         control: &OperationControl,
+-    ) -> Result<AcceptedFeedbackAssertionV1> {
++    ) -> std::result::Result<AcceptedFeedbackAssertionV1, FeedbackAssertionErrorV1> {
+         checkpoint(control)?;
+         let binding = FeedbackAssertionBindingV1::prepare(
+             context,
+@@ -307,51 +483,125 @@
+             original_attribution,
+             now_micros(),
+         )?;
+-        accept_at_root(
++        accepted_feedback(accept_at_root(
+             &receipt_root(self.path())?,
+-            binding,
++            binding.into(),
+             control,
+             ArtifactQuota::DEFAULT,
+             publish_receipt,
+-        )
+-    }
+-
+-    /// Exact authenticated request lookup, including restart reconciliation.
+-    /// Missing/corrupt records never create an accepted receipt capability.
++        )?)
++    }
++
++    pub(crate) fn accept_deletion_command(
++        &self,
++        context: &RequestContext,
++        request: &ProviderDeleteBySourceRequestV1,
++        target: &LifecycleTarget,
++        original_attribution: &SourceAttribution,
++        control: &OperationControl,
++    ) -> Result<AcceptedDeletionCommandV1> {
++        checkpoint(control)?;
++        let binding = DeletionCommandBindingV1::prepare(
++            context,
++            request,
++            target,
++            original_attribution,
++            now_micros(),
++        )?;
++        accepted_deletion(accept_at_root(
++            &receipt_root(self.path())?,
++            binding.into(),
++            control,
++            ArtifactQuota::DEFAULT,
++            publish_receipt,
++        )?)
++    }
++
+     pub(crate) fn retained_feedback_assertion(
+         &self,
+         context: &RequestContext,
+         control: &OperationControl,
+     ) -> Result<AcceptedFeedbackAssertionV1> {
++        accepted_feedback(self.retained_source_command(
++            context,
++            SourceCommandKindV1::Feedback,
++            control,
++        )?)
++    }
++
++    pub(crate) fn retained_deletion_command(
++        &self,
++        context: &RequestContext,
++        control: &OperationControl,
++    ) -> Result<AcceptedDeletionCommandV1> {
++        accepted_deletion(self.retained_source_command(
++            context,
++            SourceCommandKindV1::DeleteBySource,
++            control,
++        )?)
++    }
++
++    fn retained_source_command(
++        &self,
++        context: &RequestContext,
++        kind: SourceCommandKindV1,
++        control: &OperationControl,
++    ) -> Result<StoredSourceCommandV1> {
+         checkpoint(control)?;
+         context
+             .validate()
+             .map_err(|_| invalid("authenticated context"))?;
+-        let key = request_key(context.actor(), context.scope(), context.request_id())?;
++        let key = request_key(context.actor(), context.scope(), kind, context.request_id())?;
+         let root = receipt_root(self.path())?;
+         prepare_root(&root, control)?;
+         let _lock = acquire_admission_lock(&root, control)?;
+         let path = receipt_path(&root, &key);
+         let (file, record) =
+-            read_record(&path, control)?.ok_or(FeedbackAssertionErrorV1::Missing)?;
+-        if record.lookup_key != key {
+-            return Err(FeedbackAssertionErrorV1::Corrupt("request lookup key"));
++            read_record(&path, control)?.ok_or(HostSourceCommandErrorV1::Missing)?;
++        if record.lookup_key != key || record.binding.kind() != kind {
++            return Err(HostSourceCommandErrorV1::Corrupt("request lookup kind/key"));
+         }
+         confirm_existing_durability(&path, &file, control)?;
+-        Ok(AcceptedFeedbackAssertionV1(record))
+-    }
++        Ok(record)
++    }
++}
++
++// Called only on the successful return of durable acceptance/read methods.
++fn accepted_feedback(record: StoredSourceCommandV1) -> Result<AcceptedFeedbackAssertionV1> {
++    match (&record.binding, &record.canonical_outcome_receipt) {
++        (BoundSourceCommandV1::FeedbackAssertion(_), Some(reference)) => {
++            let reference = reference.clone();
++            Ok(AcceptedFeedbackAssertionV1(record, reference))
++        }
++        _ => Err(HostSourceCommandErrorV1::Corrupt(
++            "feedback acceptance kind",
++        )),
++    }
++}
++
++fn accepted_deletion(record: StoredSourceCommandV1) -> Result<AcceptedDeletionCommandV1> {
++    if record.binding.kind() != SourceCommandKindV1::DeleteBySource
++        || record.canonical_outcome_receipt.is_some()
++    {
++        return Err(HostSourceCommandErrorV1::Corrupt(
++            "deletion acceptance kind",
++        ));
++    }
++    Ok(AcceptedDeletionCommandV1(record))
+ }
+ 
+ #[derive(Clone, Copy)]
+-struct ArtifactQuota {
+-    maximum_files: usize,
+-    maximum_bytes: u64,
++pub(super) struct ArtifactQuota {
++    pub(super) maximum_files: usize,
++    pub(super) maximum_bytes: u64,
++    pub(super) maximum_record_bytes: usize,
+ }
+ 
+ impl ArtifactQuota {
+     const DEFAULT: Self = Self {
+         maximum_files: MAX_ARTIFACT_FILES,
+         maximum_bytes: MAX_ACCOUNTED_ARTIFACT_BYTES,
++        maximum_record_bytes: MAX_RECEIPT_BYTES,
+     };
+ }
+ 
+@@ -359,11 +609,11 @@
+ // exact durability boundaries. Production always supplies publish_receipt.
+ fn accept_at_root(
+     root: &Path,
+-    binding: FeedbackAssertionBindingV1,
++    binding: BoundSourceCommandV1,
+     control: &OperationControl,
+     quota: ArtifactQuota,
+     publish: impl FnOnce(&Path, &[u8], &OperationControl) -> Result<()>,
+-) -> Result<AcceptedFeedbackAssertionV1> {
++) -> Result<StoredSourceCommandV1> {
+     checkpoint(control)?;
+     binding.validate(now_micros())?;
+     let key = binding.lookup_key()?;
+@@ -372,26 +622,26 @@
+     let path = receipt_path(root, &key);
+     if let Some((file, stored)) = read_record(&path, control)? {
+         if stored.lookup_key != key {
+-            return Err(FeedbackAssertionErrorV1::Corrupt("request lookup key"));
++            return Err(HostSourceCommandErrorV1::Corrupt("request lookup key"));
+         }
+         if stored.binding != binding {
+-            return Err(FeedbackAssertionErrorV1::Conflict);
++            return Err(HostSourceCommandErrorV1::Conflict);
+         }
+         // Retry verification precedes quota admission: saturation never evicts
+         // or prevents reading a live retry record. The fsync also reconciles a
+         // complete record left by an earlier uncertain directory-sync failure.
+         confirm_existing_durability(&path, &file, control)?;
+-        return Ok(AcceptedFeedbackAssertionV1(stored));
++        return Ok(stored);
+     }
+     checkpoint(control)?;
+-    let record = StoredFeedbackAssertionV1::new(binding, now_micros())?;
++    let record = StoredSourceCommandV1::new(binding, now_micros())?;
+     let frame = encode_record(&record)?;
+     check_quota(root, frame.len(), quota, control)?;
+     checkpoint(control)?;
+     publish(&path, &frame, control)?;
+     // Never replace successful persistence with a later cancellation. The
+     // controller still checks live control before any provider dispatch.
+-    Ok(AcceptedFeedbackAssertionV1(record))
++    Ok(record)
+ }
+ 
+ fn receipt_root(ledger_path: &Path) -> Result<PathBuf> {
+@@ -409,15 +659,30 @@
+     root.join(format!("{key}.receipt"))
+ }
+ 
+-fn prepare_root(root: &Path, control: &OperationControl) -> Result<()> {
++/// Only host-fixed descendants of the existing ledger root may be passed.
++pub(super) fn prepare_root(root: &Path, control: &OperationControl) -> Result<()> {
+     checkpoint(control)?;
+-    PrivateStoreIo::create_dir_all_durable(root).map_err(storage_unpublished)?;
+-    reject_symlink_components(root, "recall ledger feedback root").map_err(storage_unpublished)?;
++    let mut terminal = None;
++    PrivateStoreIo::create_dir_all_durable_interruptible(root, &mut || {
++        control.snapshot().map(|_| ()).map_err(|code| {
++            terminal = Some(code);
++            io::Error::new(
++                io::ErrorKind::Interrupted,
++                "original operation control stopped",
++            )
++        })
++    })
++    .map_err(|source| match terminal {
++        Some(code) => HostSourceCommandErrorV1::Control(code),
++        None => storage_unpublished(source),
++    })?;
++    reject_symlink_components(root, "retained ledger artifact root")
++        .map_err(storage_unpublished)?;
+     drop(open_private_directory(root).map_err(storage_unpublished)?);
+     checkpoint(control)
+ }
+ 
+-fn acquire_admission_lock(root: &Path, control: &OperationControl) -> Result<File> {
++pub(super) fn acquire_admission_lock(root: &Path, control: &OperationControl) -> Result<File> {
+     checkpoint(control)?;
+     let path = root.join(LOCK_NAME);
+     let file = match create_private_file(&path) {
+@@ -430,7 +695,7 @@
+     loop {
+         let remaining = control
+             .snapshot()
+-            .map_err(FeedbackAssertionErrorV1::Control)?;
++            .map_err(HostSourceCommandErrorV1::Control)?;
+         match FileExt::try_lock_exclusive(&file) {
+             Ok(()) => {
+                 checkpoint(control)?;
+@@ -444,20 +709,43 @@
+     }
+ }
+ 
+-fn check_quota(
++/// The caller holds this root's admission lock; pending stage files are charged.
++pub(super) fn check_quota(
+     root: &Path,
+     incoming: usize,
+     quota: ArtifactQuota,
+     control: &OperationControl,
+ ) -> Result<()> {
+-    if incoming > MAX_RECEIPT_BYTES {
++    if incoming > quota.maximum_record_bytes {
+         return Err(invalid("receipt byte bound"));
+     }
++    if incoming > available_artifact_bytes(root, quota, control)? {
++        return Err(HostSourceCommandErrorV1::CapacityExceeded);
++    }
++    Ok(())
++}
++
++/// Available bytes for one complete ENCODED artifact, after reserving the root
++/// lock and the incoming file's namespace overhead. Typed carrier owners must
++/// also subtract their frame/metadata overhead and conservative encoding
++/// expansion before deriving a raw provider-payload budget.
++///
++/// The caller holds the root admission lock throughout calculation/publication,
++/// or reacquires it and calls check_quota with the final encoded length before
++/// publication. This is the same bounded quota scan, not a cached reservation.
++pub(super) fn available_artifact_bytes(
++    root: &Path,
++    quota: ArtifactQuota,
++    control: &OperationControl,
++) -> Result<usize> {
++    checkpoint(control)?;
+     let mut count = 0usize;
+     let mut bytes = ROOT_RESERVED_BYTES
+         .checked_add(FILE_RESERVED_BYTES)
+-        .and_then(|reserved| reserved.checked_add(incoming as u64))
+-        .ok_or(FeedbackAssertionErrorV1::CapacityExceeded)?;
++        .ok_or(HostSourceCommandErrorV1::CapacityExceeded)?;
++    if quota.maximum_files == 0 || bytes > quota.maximum_bytes {
++        return Err(HostSourceCommandErrorV1::CapacityExceeded);
++    }
+     let entries = std::fs::read_dir(root).map_err(storage_unpublished)?;
+     for entry in entries {
+         checkpoint(control)?;
+@@ -467,31 +755,36 @@
+         }
+         count = count
+             .checked_add(1)
+-            .ok_or(FeedbackAssertionErrorV1::CapacityExceeded)?;
++            .ok_or(HostSourceCommandErrorV1::CapacityExceeded)?;
+         // Leave room for the incoming artifact and stop before scanning past
+         // the count budget. Crashed staging files are charged; nothing is swept.
+         if count >= quota.maximum_files {
+-            return Err(FeedbackAssertionErrorV1::CapacityExceeded);
++            return Err(HostSourceCommandErrorV1::CapacityExceeded);
+         }
+         let file = open_private_file(&entry.path()).map_err(storage_unpublished)?;
+         bytes = bytes
+             .checked_add(file.metadata().map_err(storage_unpublished)?.len())
+             .and_then(|value| value.checked_add(FILE_RESERVED_BYTES))
+-            .ok_or(FeedbackAssertionErrorV1::CapacityExceeded)?;
++            .ok_or(HostSourceCommandErrorV1::CapacityExceeded)?;
+         if bytes > quota.maximum_bytes {
+-            return Err(FeedbackAssertionErrorV1::CapacityExceeded);
+-        }
+-    }
+-    if quota.maximum_files == 0 || bytes > quota.maximum_bytes {
+-        return Err(FeedbackAssertionErrorV1::CapacityExceeded);
+-    }
+-    checkpoint(control)
++            return Err(HostSourceCommandErrorV1::CapacityExceeded);
++        }
++    }
++    checkpoint(control)?;
++    let remaining = quota
++        .maximum_bytes
++        .checked_sub(bytes)
++        .ok_or(HostSourceCommandErrorV1::CapacityExceeded)?;
++    let per_record = u64::try_from(quota.maximum_record_bytes)
++        .map_err(|_| HostSourceCommandErrorV1::CapacityExceeded)?;
++    usize::try_from(remaining.min(per_record))
++        .map_err(|_| HostSourceCommandErrorV1::CapacityExceeded)
+ }
+ 
+ fn read_record(
+     path: &Path,
+     control: &OperationControl,
+-) -> Result<Option<(File, StoredFeedbackAssertionV1)>> {
++) -> Result<Option<(File, StoredSourceCommandV1)>> {
+     checkpoint(control)?;
+     let mut file = match open_private_file(path) {
+         Ok(file) => file,
+@@ -500,7 +793,7 @@
+     };
+     let length = file.metadata().map_err(storage_unpublished)?.len();
+     if length < (HEADER_BYTES + CHECKSUM_BYTES) as u64 || length > MAX_RECEIPT_BYTES as u64 {
+-        return Err(FeedbackAssertionErrorV1::Corrupt("file length"));
++        return Err(HostSourceCommandErrorV1::Corrupt("file length"));
+     }
+     let mut bytes = Vec::with_capacity(length as usize);
+     let mut chunk = [0u8; 8192];
+@@ -515,20 +808,24 @@
+         }
+         bytes.extend_from_slice(&chunk[..count]);
+         if bytes.len() > MAX_RECEIPT_BYTES {
+-            return Err(FeedbackAssertionErrorV1::Corrupt(
++            return Err(HostSourceCommandErrorV1::Corrupt(
+                 "file grew beyond byte bound",
+             ));
+         }
+     }
+     if bytes.len() != length as usize {
+-        return Err(FeedbackAssertionErrorV1::Corrupt("file length changed"));
++        return Err(HostSourceCommandErrorV1::Corrupt("file length changed"));
+     }
+     let record = decode_record(&bytes)?;
+     checkpoint(control)?;
+     Ok(Some((file, record)))
+ }
+ 
+-fn confirm_existing_durability(path: &Path, file: &File, control: &OperationControl) -> Result<()> {
++pub(super) fn confirm_existing_durability(
++    path: &Path,
++    file: &File,
++    control: &OperationControl,
++) -> Result<()> {
+     checkpoint(control)?;
+     file.sync_all().map_err(storage_uncertain)?;
+     // Once the durability barrier starts, complete it before interpreting a
+@@ -537,8 +834,20 @@
+ }
+ 
+ fn publish_receipt(path: &Path, bytes: &[u8], control: &OperationControl) -> Result<()> {
++    publish_private_artifact(path, bytes, control, MAX_RECEIPT_BYTES)
++}
++
++/// The caller has prepared its fixed private root, holds its admission lock,
++/// and admitted these bytes under its own fixed artifact quota. The caller
++/// owns typed encoding; this helper only publishes bounded immutable bytes.
++pub(super) fn publish_private_artifact(
++    path: &Path,
++    bytes: &[u8],
++    control: &OperationControl,
++    maximum_record_bytes: usize,
++) -> Result<()> {
+     checkpoint(control)?;
+-    if bytes.len() > MAX_RECEIPT_BYTES {
++    if bytes.is_empty() || bytes.len() > maximum_record_bytes {
+         return Err(invalid("receipt byte bound"));
+     }
+     let published = Cell::new(false);
+@@ -548,13 +857,13 @@
+             stopped.set(Some(code));
+             io::Error::new(
+                 io::ErrorKind::Interrupted,
+-                "feedback assertion control stopped",
++                "retained artifact control stopped",
+             )
+         })
+     };
+     let result = with_owned_temp_publish(
+         path,
+-        "feedback-assertion",
++        "retained-artifact",
+         |temporary, destination| {
+             control_io()?;
+             rename_noreplace(temporary, destination)?;
+@@ -574,13 +883,13 @@
+         Ok(()) => Ok(()),
+         Err(error) if published.get() => Err(storage_uncertain(error)),
+         Err(error) => match stopped.get() {
+-            Some(code) => Err(FeedbackAssertionErrorV1::Control(code)),
++            Some(code) => Err(HostSourceCommandErrorV1::Control(code)),
+             None => Err(storage_unpublished(error)),
+         },
+     }
+ }
+ 
+-fn encode_record(record: &StoredFeedbackAssertionV1) -> Result<Vec<u8>> {
++fn encode_record(record: &StoredSourceCommandV1) -> Result<Vec<u8>> {
+     record.validate()?;
+     let payload = canonical_json_bytes(record).map_err(|_| invalid("receipt encoding"))?;
+     let total = HEADER_BYTES
+@@ -598,8 +907,8 @@
+     Ok(frame)
+ }
+ 
+-fn decode_record(bytes: &[u8]) -> Result<StoredFeedbackAssertionV1> {
+-    let corrupt = FeedbackAssertionErrorV1::Corrupt;
++fn decode_record(bytes: &[u8]) -> Result<StoredSourceCommandV1> {
++    let corrupt = HostSourceCommandErrorV1::Corrupt;
+     if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES
+         || bytes.len() > MAX_RECEIPT_BYTES
+         || bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice())
+@@ -621,7 +930,7 @@
+         return Err(corrupt("frame checksum"));
+     }
+     let payload = &bytes[HEADER_BYTES..checksum_at];
+-    let record: StoredFeedbackAssertionV1 =
++    let record: StoredSourceCommandV1 =
+         serde_json::from_slice(payload).map_err(|_| corrupt("strict receipt schema"))?;
+     record
+         .validate()
+@@ -634,8 +943,13 @@
+     Ok(record)
+ }
+ 
+-fn request_key(actor: &ActorId, scope: &ResolvedScope, request_id: &RequestId) -> Result<String> {
+-    let bytes = canonical_json_bytes(&(KEY_DOMAIN, actor, scope, "feedback", request_id))
++fn request_key(
++    actor: &ActorId,
++    scope: &ResolvedScope,
++    kind: SourceCommandKindV1,
++    request_id: &RequestId,
++) -> Result<String> {
++    let bytes = canonical_json_bytes(&(KEY_DOMAIN, actor, scope, kind.operation(), request_id))
+         .map_err(|_| invalid("request identity encoding"))?;
+     Ok(sha256_hex(&bytes))
+ }
+@@ -763,26 +1077,45 @@
+         .map_err(|_| invalid("public feedback request"))
+ }
+ 
++fn validate_deletion_request(
++    request: &ProviderDeleteBySourceRequestV1,
++    accepted_at: UtcMicros,
++) -> Result<()> {
++    if [
++        &request.source.trace_ref,
++        &request.source.item_ref,
++        &request.source.observation_id,
++    ]
++    .into_iter()
++    .any(|value| value.len() > MAX_PROVIDER_CONTROL_REFERENCE_BYTES)
++    {
++        return Err(invalid("public deletion request byte bound"));
++    }
++    ProviderControlRequestV1::DeleteBySource(request.clone())
++        .validate_at(accepted_at)
++        .map_err(|_| invalid("public deletion request"))
++}
++
+ fn checkpoint(control: &OperationControl) -> Result<()> {
+     control
+         .snapshot()
+         .map(|_| ())
+-        .map_err(FeedbackAssertionErrorV1::Control)
+-}
+-
+-fn invalid(field: &'static str) -> FeedbackAssertionErrorV1 {
+-    FeedbackAssertionErrorV1::Invalid(field)
+-}
+-
+-fn storage_unpublished(source: io::Error) -> FeedbackAssertionErrorV1 {
+-    FeedbackAssertionErrorV1::Storage {
++        .map_err(HostSourceCommandErrorV1::Control)
++}
++
++fn invalid(field: &'static str) -> HostSourceCommandErrorV1 {
++    HostSourceCommandErrorV1::Invalid(field)
++}
++
++fn storage_unpublished(source: io::Error) -> HostSourceCommandErrorV1 {
++    HostSourceCommandErrorV1::Storage {
+         publication: FeedbackAssertionPublicationV1::NotAttempted,
+         source,
+     }
+ }
+ 
+-fn storage_uncertain(source: io::Error) -> FeedbackAssertionErrorV1 {
+-    FeedbackAssertionErrorV1::Storage {
++fn storage_uncertain(source: io::Error) -> HostSourceCommandErrorV1 {
++    HostSourceCommandErrorV1::Storage {
+         publication: FeedbackAssertionPublicationV1::DurabilityUnknown,
+         source,
+     }
+@@ -917,6 +1250,22 @@
+             .unwrap()
+     }
+ 
++    fn accept_at_root(
++        root: &Path,
++        binding: FeedbackAssertionBindingV1,
++        control: &OperationControl,
++        quota: ArtifactQuota,
++        publish: impl FnOnce(&Path, &[u8], &OperationControl) -> Result<()>,
++    ) -> Result<AcceptedFeedbackAssertionV1> {
++        accepted_feedback(super::accept_at_root(
++            root,
++            binding.into(),
++            control,
++            quota,
++            publish,
++        )?)
++    }
++
+     fn accept(
+         root: &Path,
+         binding: FeedbackAssertionBindingV1,
+@@ -1175,7 +1524,7 @@
+ 
+     #[test]
+     fn strict_decode_rejects_unknown_missing_fields_overflow_and_bound_bypass() {
+-        let record = StoredFeedbackAssertionV1::new(binding(), now_micros()).unwrap();
++        let record = StoredSourceCommandV1::new(binding(), now_micros()).unwrap();
+         let valid = encode_record(&record).unwrap();
+         let mut bad_length = valid.clone();
+         bad_length[MAGIC.len()..HEADER_BYTES].copy_from_slice(&u32::MAX.to_be_bytes());
+@@ -1200,6 +1549,78 @@
+             assert!(decode_record(&frame_json(&corrupt)).is_err());
+         }
+         assert!(operation_uuid_v7("key", UtcMicros(-1)).is_err());
++    }
++
++    #[test]
++    fn first_use_rejects_original_cancelled_and_expired_controls_without_publication() {
++        let temporary = tempfile::tempdir().unwrap();
++        let cancelled = control();
++        cancelled.cancellation().cancel();
++        for (name, operation, expected) in [
++            ("cancelled", cancelled, TerminalCode::Cancelled),
++            (
++                "expired",
++                OperationControl::new(0, 5000, CancellationToken::new()),
++                TerminalCode::DeadlineExceeded,
++            ),
++        ] {
++            let root = temporary.path().join(name);
++            let result = accept_at_root(
++                &root,
++                binding(),
++                &operation,
++                ArtifactQuota::DEFAULT,
++                |_path, _bytes, _control| panic!("stopped first use must never publish a receipt"),
++            );
++            assert!(matches!(
++                result,
++                Err(HostSourceCommandErrorV1::Control(code)) if code == expected
++            ));
++            assert!(
++                !root.exists(),
++                "stopped first use must not create the receipt root"
++            );
++        }
++    }
++
++    #[cfg(any(unix, windows))]
++    #[test]
++    fn first_use_directory_lock_preserves_expired_control_before_release() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join(ROOT_NAME);
++        let lock_path = temporary
++            .path()
++            .join(format!(".{ROOT_NAME}.durable-directory.lock"));
++        let held = create_private_file(&lock_path).unwrap();
++        FileExt::lock_exclusive(&held).unwrap();
++        let worker_root = root.clone();
++        let (completed, result) = std::sync::mpsc::channel();
++        let worker = std::thread::spawn(move || {
++            let operation = OperationControl::new(i64::MAX, 20, CancellationToken::new());
++            let outcome = accept_at_root(
++                &worker_root,
++                binding(),
++                &operation,
++                ArtifactQuota::DEFAULT,
++                |_path, _bytes, _control| panic!("expired first use must never publish a receipt"),
++            );
++            completed.send(outcome).unwrap();
++        });
++        let before_release = result.recv_timeout(Duration::from_secs(2));
++        let absent_before_release = !root.exists();
++        drop(held);
++        worker.join().unwrap();
++        assert!(matches!(
++            before_release
++                .expect("deadline must return while the directory sidecar remains locked"),
++            Err(HostSourceCommandErrorV1::Control(
++                TerminalCode::DeadlineExceeded
++            ))
++        ));
++        assert!(
++            absent_before_release,
++            "expired first use must not publish the receipt root"
++        );
+     }
+ 
+     #[test]
+@@ -1320,7 +1741,7 @@
+         )
+         .unwrap();
+         assert!(matches!(operation.snapshot(), Err(TerminalCode::Cancelled)));
+-        assert_eq!(accepted.0.binding, binding());
++        assert_eq!(accepted.0.binding, binding().into());
+     }
+ 
+     #[test]
+@@ -1330,6 +1751,7 @@
+         let quota = ArtifactQuota {
+             maximum_files: 1,
+             maximum_bytes: MAX_ACCOUNTED_ARTIFACT_BYTES,
++            maximum_record_bytes: MAX_RECEIPT_BYTES,
+         };
+         let accepted =
+             accept_at_root(&root, binding(), &control(), quota, publish_receipt).unwrap();
+@@ -1342,6 +1764,7 @@
+         let exhausted = ArtifactQuota {
+             maximum_files: 0,
+             maximum_bytes: 0,
++            maximum_record_bytes: MAX_RECEIPT_BYTES,
+         };
+         assert_eq!(
+             accept_at_root(&root, binding(), &control(), exhausted, publish_receipt).unwrap(),
+@@ -1351,7 +1774,7 @@
+         let empty_root = temporary.path().join("quota-byte-fixture");
+         prepare_root(&empty_root, &control()).unwrap();
+         let bytes =
+-            encode_record(&StoredFeedbackAssertionV1::new(second, now_micros()).unwrap()).unwrap();
++            encode_record(&StoredSourceCommandV1::new(second, now_micros()).unwrap()).unwrap();
+         let exact = ROOT_RESERVED_BYTES + FILE_RESERVED_BYTES + bytes.len() as u64;
+         check_quota(
+             &empty_root,
+@@ -1359,6 +1782,7 @@
+             ArtifactQuota {
+                 maximum_files: 1,
+                 maximum_bytes: exact,
++                maximum_record_bytes: MAX_RECEIPT_BYTES,
+             },
+             &control(),
+         )
+@@ -1369,7 +1793,8 @@
+                 bytes.len(),
+                 ArtifactQuota {
+                     maximum_files: 1,
+-                    maximum_bytes: exact - 1
++                    maximum_bytes: exact - 1,
++                    maximum_record_bytes: MAX_RECEIPT_BYTES,
+                 },
+                 &control()
+             ),
+@@ -1391,12 +1816,15 @@
+         let temporary = tempfile::tempdir().unwrap();
+         let root = temporary.path().join(ROOT_NAME);
+         prepare_root(&root, &control()).unwrap();
+-        let stored = StoredFeedbackAssertionV1::new(binding(), now_micros()).unwrap();
++        let stored = StoredSourceCommandV1::new(binding(), now_micros()).unwrap();
+         let path = receipt_path(&root, &stored.lookup_key);
+         let bytes = encode_record(&stored).unwrap();
+         write_private(&path, &bytes);
+         let mut different = stored.clone();
+-        different.binding.request.signal = ProviderControlFeedbackSignalV1::Harmful;
++        let BoundSourceCommandV1::FeedbackAssertion(ref mut feedback) = different.binding else {
++            panic!("feedback fixture")
++        };
++        feedback.request.signal = ProviderControlFeedbackSignalV1::Harmful;
+         assert!(matches!(
+             publish_receipt(&path, &encode_record(&different).unwrap(), &control()),
+             Err(FeedbackAssertionErrorV1::Storage {
+@@ -1429,4 +1857,235 @@
+         PrivateStoreIo::create_private_directory(&other.join("nested")).unwrap();
+         assert!(check_quota(&other, 100, ArtifactQuota::DEFAULT, &control()).is_err());
+     }
+-}
++
++    fn deletion_inputs() -> (
++        RequestContext,
++        ProviderDeleteBySourceRequestV1,
++        LifecycleTarget,
++        SourceAttribution,
++    ) {
++        let (context, feedback, target, source) = inputs();
++        let request = ProviderDeleteBySourceRequestV1 {
++            source: feedback.source,
++            mode:
++                tracedecay_contracts::retained_surfaces::ProviderControlDeletionModeV1::HardDelete,
++            expected_fence_revision: 4,
++            include_snapshots: true,
++        };
++        (context, request, target, source)
++    }
++
++    fn deletion_binding() -> DeletionCommandBindingV1 {
++        let (context, request, target, source) = deletion_inputs();
++        DeletionCommandBindingV1::prepare(&context, &request, &target, &source, now_micros())
++            .unwrap()
++    }
++
++    fn accept_deletion(
++        root: &Path,
++        binding: DeletionCommandBindingV1,
++    ) -> Result<AcceptedDeletionCommandV1> {
++        accepted_deletion(super::accept_at_root(
++            root,
++            binding.into(),
++            &control(),
++            ArtifactQuota::DEFAULT,
++            publish_receipt,
++        )?)
++    }
++
++    #[test]
++    fn deletion_restart_keeps_original_fence_lookup_body_uuid_and_has_no_feedback_receipt() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join(ROOT_NAME);
++        let command = deletion_binding();
++        let first = accept_deletion(&root, command.clone()).unwrap();
++        let retained = encode_record(&first.0).unwrap();
++        let second = accept_deletion(&root, command.clone()).unwrap();
++        assert_eq!(first, second);
++        assert_eq!(second.operation_id().as_bytes()[14], b'7');
++        assert_eq!(second.idempotency_key(), command.lookup_key().unwrap());
++        assert_eq!(second.accepted_at(), first.accepted_at());
++        let (context, request, target, source) = deletion_inputs();
++        assert!(
++            second
++                .matches(&context, &request, &target, &source)
++                .unwrap()
++        );
++        let json = serde_json::to_value(&second.0).unwrap();
++        assert!(json.get("canonical_outcome_receipt").is_none());
++        assert_eq!(json["binding"]["kind"], "deletion_command");
++        assert_eq!(json["binding"]["request"]["expected_fence_revision"], 4);
++        assert!(accepted_feedback(second.0.clone()).is_err());
++        assert_eq!(encode_record(&second.0).unwrap(), retained);
++        let mut forged = json;
++        forged["canonical_outcome_receipt"] = "host-feedback-assertion-v1:forged".into();
++        assert!(decode_record(&frame_json(&forged)).is_err());
++    }
++
++    #[test]
++    fn deletion_changes_conflict_instead_of_rekeying_to_new_fence_or_target() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join(ROOT_NAME);
++        let original = deletion_binding();
++        let accepted = accept_deletion(&root, original.clone()).unwrap();
++        let changes: Vec<Box<dyn Fn(&mut DeletionCommandBindingV1)>> = vec![
++            Box::new(|command| command.request.expected_fence_revision += 1),
++            Box::new(|command| command.request.include_snapshots = false),
++            Box::new(|command| {
++                command.request.mode = tracedecay_contracts::retained_surfaces::ProviderControlDeletionModeV1::RemoveInfluence
++            }),
++            Box::new(|command| command.target.stable_memory_ref = "memory.another".to_owned()),
++            Box::new(|command| command.target.original_attribution.source_sequence += 1),
++        ];
++        for change in changes {
++            let mut modified = original.clone();
++            change(&mut modified);
++            assert_eq!(
++                modified.lookup_key().unwrap(),
++                original.lookup_key().unwrap()
++            );
++            assert!(matches!(
++                accept_deletion(&root, modified),
++                Err(HostSourceCommandErrorV1::Conflict)
++            ));
++        }
++        assert_eq!(accept_deletion(&root, original).unwrap(), accepted);
++    }
++
++    #[test]
++    fn operation_kind_partitions_commands_without_minting_false_receipt_claims() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join(ROOT_NAME);
++        let feedback = binding();
++        let deletion = deletion_binding();
++        assert_eq!(feedback.actor, deletion.actor);
++        assert_eq!(feedback.request_id, deletion.request_id);
++        assert_eq!(feedback.resolved_host_scope, deletion.resolved_host_scope);
++        assert_ne!(
++            feedback.lookup_key().unwrap(),
++            deletion.lookup_key().unwrap()
++        );
++        let accepted_feedback = accept(&root, feedback).unwrap();
++        let accepted_delete = accept_deletion(&root, deletion).unwrap();
++        assert_ne!(
++            accepted_feedback.idempotency_key(),
++            accepted_delete.idempotency_key()
++        );
++        assert_ne!(
++            accepted_feedback.operation_id(),
++            accepted_delete.operation_id()
++        );
++        assert!(accepted_deletion(accepted_feedback.0).is_err());
++        assert_eq!(receipt_count(&root), 2);
++    }
++
++    #[test]
++    fn concurrent_deletion_retries_share_one_original_command_identity() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join(ROOT_NAME);
++        prepare_root(&root, &control()).unwrap();
++        let start = Arc::new(Barrier::new(4));
++        let handles = (0..4)
++            .map(|_| {
++                let root = root.clone();
++                let start = Arc::clone(&start);
++                std::thread::spawn(move || {
++                    start.wait();
++                    accept_deletion(&root, deletion_binding()).unwrap()
++                })
++            })
++            .collect::<Vec<_>>();
++        let accepted = handles
++            .into_iter()
++            .map(|handle| handle.join().unwrap())
++            .collect::<Vec<_>>();
++        assert!(accepted.iter().all(|item| item == &accepted[0]));
++        assert_eq!(receipt_count(&root), 1);
++    }
++
++    #[test]
++    fn shared_artifact_io_honors_owner_bound_without_widening_source_command_quota() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join("recall-portability-test-v1");
++        prepare_root(&root, &control()).unwrap();
++        let _lock = acquire_admission_lock(&root, &control()).unwrap();
++        let bytes = vec![42; MAX_RECEIPT_BYTES + 1];
++        assert!(check_quota(&root, bytes.len(), ArtifactQuota::DEFAULT, &control()).is_err());
++        let own_quota = ArtifactQuota {
++            maximum_files: 2,
++            maximum_bytes: 2 * 1024 * 1024,
++            maximum_record_bytes: 1024 * 1024,
++        };
++        check_quota(&root, bytes.len(), own_quota, &control()).unwrap();
++        let path = root.join("host-fixed-test-artifact");
++        publish_private_artifact(&path, &bytes, &control(), own_quota.maximum_record_bytes)
++            .unwrap();
++        assert_eq!(std::fs::read(&path).unwrap(), bytes);
++        assert!(
++            publish_receipt(
++                &root.join("cannot-bypass-command-bound"),
++                &bytes,
++                &control()
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn available_artifact_bytes_charges_existing_and_incoming_overhead_and_caps_encoded_bytes() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join("available-artifact-test-v1");
++        prepare_root(&root, &control()).unwrap();
++        let _lock = acquire_admission_lock(&root, &control()).unwrap();
++        let quota = ArtifactQuota {
++            maximum_files: 3,
++            maximum_bytes: ROOT_RESERVED_BYTES
++                + FILE_RESERVED_BYTES
++                + FILE_RESERVED_BYTES
++                + 17
++                + 100,
++            maximum_record_bytes: MAX_RECEIPT_BYTES,
++        };
++        assert_eq!(
++            available_artifact_bytes(&root, quota, &control()).unwrap(),
++            FILE_RESERVED_BYTES as usize + 17 + 100
++        );
++        write_private(&root.join(".orphan-stage.tmp"), &[1; 17]);
++        assert_eq!(
++            available_artifact_bytes(&root, quota, &control()).unwrap(),
++            100
++        );
++        check_quota(&root, 100, quota, &control()).unwrap();
++        assert!(matches!(
++            check_quota(&root, 101, quota, &control()),
++            Err(HostSourceCommandErrorV1::CapacityExceeded)
++        ));
++        let record_limited = ArtifactQuota {
++            maximum_record_bytes: 50,
++            ..quota
++        };
++        assert_eq!(
++            available_artifact_bytes(&root, record_limited, &control()).unwrap(),
++            50
++        );
++        let file_limited = ArtifactQuota {
++            maximum_files: 1,
++            ..quota
++        };
++        assert!(matches!(
++            available_artifact_bytes(&root, file_limited, &control()),
++            Err(HostSourceCommandErrorV1::CapacityExceeded)
++        ));
++        let stopped = control();
++        stopped.cancellation().cancel();
++        assert!(matches!(
++            available_artifact_bytes(&root, quota, &stopped),
++            Err(HostSourceCommandErrorV1::Control(TerminalCode::Cancelled))
++        ));
++        assert_eq!(
++            std::fs::read(&root.join(".orphan-stage.tmp")).unwrap(),
++            vec![1; 17]
++        );
++    }
++}

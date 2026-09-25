@@ -1,0 +1,655 @@
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+@@ -14,9 +14,23 @@
+ use std::os::unix::process::CommandExt;
+ use std::panic::{AssertUnwindSafe, catch_unwind};
+ use tracedecay::daemon::test_context_evidence::{
+-    OperationControl, OwnedExactScope, project_delivered_context_for_test,
++    COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES, OperationControl,
++    OwnedExactScope, ProviderDeclaredLimitsForTestV1, ProviderNumericDeclarationForTestV1,
++    production_provider_numeric_declaration_for_test, project_delivered_context_for_test,
+     read_retained_context_trace_for_test,
+ };
++use tracedecay_contracts::retained_surfaces::{
++    ProviderControlHealthCheckV1, ProviderControlOperationResultV1, ProviderControlReadinessV1,
++    ProviderControlRequestV1, ProviderControlResultV1, ProviderControlScopeV1,
++    ProviderControlStateSelectorV1, ProviderControlTerminalV1, ProviderHealthRequestV1,
++    RetainedSurfaceResultV1,
++};
++use tracedecay_contracts::{
++    ApplicationOutcome, CancellationSignal, CoverageCompleteness, Deadline, OperationReceipt,
++    OperationTermination, RequestId, ResolvedScope,
++};
++use tracedecay_daemon_protocol::{DaemonInvocationOutcome, DaemonInvocationResponse};
++use tracedecay_domain::UtcMicros;
+ 
+ const PROTOCOL: &str = "tracedecay.host-comparison.v1";
+ // A valid 16 MiB host response may grow when carried as JSON. The durable
+@@ -29,6 +43,7 @@
+ // A separate read-only evidence operation, begun after the scheduled host call.
+ // This must never replace or extend the provider's original request control.
+ const TRACE_EVIDENCE_READ_MILLIS: u64 = 5_000;
++const SETUP_HEALTH_MILLIS: u64 = 5_000;
+ 
+ type FixtureResult<T> = Result<T, String>;
+ 
+@@ -114,6 +129,183 @@
+         string(scope, "resolved_scope_digest")?,
+     )
+     .map_err(|error| format!("actual delivered destination scope: {error}"))
++}
++
++fn complete_limits_digest(limits: &ProviderDeclaredLimitsForTestV1) -> String {
++    let mut digest = Sha256::new();
++    for value in [
++        limits.request_bytes,
++        limits.response_bytes,
++        limits.observation_batch_items,
++        limits.recall_candidates,
++        limits.concurrent_operations,
++        limits.operation_millis,
++        limits.snapshot_bytes,
++        limits.inspection_items,
++    ] {
++        digest.update(value.to_be_bytes());
++    }
++    digest
++        .finalize()
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect()
++}
++
++fn health_scope_from_actual_application(
++    application: &ResolvedScope,
++    profile_id: &str,
++    expected_project_id: &str,
++    native_session: &str,
++) -> FixtureResult<ProviderControlScopeV1> {
++    application
++        .validate()
++        .map_err(|error| format!("actual Health application scope: {error}"))?;
++    if application.project_id.as_str() != expected_project_id {
++        return Err(
++            "actual Health application scope belongs to a different registered project".into(),
++        );
++    }
++    let reference = application
++        .reference
++        .as_ref()
++        .ok_or("actual Health application scope has no exact reference")?;
++    // These fields come from the actual daemon response, persisted profile
++    // authority, and the native session whose real Start preceded this call.
++    // The production destination bridge compares exactly these same fields.
++    let scope = ProviderControlScopeV1 {
++        profile_id: profile_id.to_owned(),
++        project_id: application.project_id.as_str().to_owned(),
++        repository_identity: application.repository_id.as_str().to_owned(),
++        worktree_identity: application.worktree_id.as_str().to_owned(),
++        branch_identity: reference.as_str().to_owned(),
++        agent_session_id: native_session.to_owned(),
++        resolved_scope_digest: application.scope_digest.as_str().to_owned(),
++    };
++    scope
++        .validate()
++        .map_err(|error| format!("actual Health destination scope: {error}"))?;
++    Ok(scope)
++}
++
++fn accept_health_numeric_evidence(
++    request: &ProviderControlRequestV1,
++    expected_scope: &ProviderControlScopeV1,
++    declaration: &ProviderNumericDeclarationForTestV1,
++    result: &ProviderControlResultV1,
++) -> FixtureResult<Value> {
++    result
++        .validate_for(request)
++        .map_err(|error| format!("actual Health result contract: {error}"))?;
++    if !matches!(request, ProviderControlRequestV1::Health(_))
++        || result.terminal != ProviderControlTerminalV1::Success
++        || result.provider_id != declaration.provider_id
++        || result.registration_revision != declaration.declared_registration_revision
++        || &result.scope != expected_scope
++    {
++        return Err("actual Health success, provider, registration, or complete destination scope does not match".into());
++    }
++    let ProviderControlOperationResultV1::Health(Some(health)) = &result.result else {
++        return Err("actual successful Health data is unavailable".into());
++    };
++    if health.readiness != ProviderControlReadinessV1::Ready
++        || health.provider_instance_id != declaration.declared_provider_instance_id
++        || health.implementation_identity_digest
++            != declaration.declared_implementation_identity_digest
++        || health.scope_digest != expected_scope.sha256()
++        || health.effective_limits_digest != declaration.declared_limits_digest
++        || complete_limits_digest(&declaration.declared_limits)
++            != declaration.declared_limits_digest
++    {
++        return Err("actual Health readiness, instance, implementation, scope, or complete eight-field limits digest does not match".into());
++    }
++    for required in std::iter::once(COMMON_ADVISORY_PROFILE_ID)
++        .chain(COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter().copied())
++    {
++        if !health.capability_states.iter().any(|capability| {
++            capability.capability_id == required && capability.state == "available"
++        }) {
++            return Err(format!(
++                "actual Health does not report required common capability {required} available"
++            ));
++        }
++    }
++    Ok(
++        json!({"status": "observed", "provider_id": result.provider_id,
++            "registration_revision": result.registration_revision, "scope": result.scope,
++            "provider_instance_id": health.provider_instance_id,
++            "implementation_identity_digest": health.implementation_identity_digest,
++            "state_identity_digest": health.state_identity_digest, "state_generation": health.state_generation,
++            "readiness": health.readiness, "capability_states": health.capability_states,
++            "effective_limits": declaration.declared_limits,
++            "effective_limits_digest": health.effective_limits_digest,
++            "numeric_evidence_source": "complete production eight-field declaration matched to this fresh actual Health result",
++        }),
++    )
++}
++
++fn validate_fresh_health_execution(
++    receipt: &OperationReceipt,
++    observed_at: UtcMicros,
++    deadline: &Deadline,
++) -> FixtureResult<()> {
++    receipt
++        .validate()
++        .map_err(|error| format!("actual Health execution receipt: {error}"))?;
++    if receipt.termination != OperationTermination::Completed
++        || receipt.cancellation.is_some()
++        || receipt.started_at < observed_at
++        || receipt.ended_at > deadline.expires_at
++        || receipt.effective_deadline.expires_at > deadline.expires_at
++        || receipt.ended_at > receipt.effective_deadline.expires_at
++    {
++        return Err(
++            "actual Health execution is interrupted or outside its original fresh request interval"
++                .into(),
++        );
++    }
++    Ok(())
++}
++
++#[allow(clippy::too_many_arguments)]
++fn accept_fresh_setup_health_response(
++    response: &DaemonInvocationResponse,
++    request_id: &RequestId,
++    request: &ProviderControlRequestV1,
++    observed_at: UtcMicros,
++    deadline: &Deadline,
++    profile_id: &str,
++    project_id: &str,
++    native_session: &str,
++    declaration: &ProviderNumericDeclarationForTestV1,
++) -> FixtureResult<Value> {
++    if response.request_id != request_id.as_str() {
++        return Err("actual Health response does not match its caller-owned request ID".into());
++    }
++    let DaemonInvocationOutcome::RetainedApplication { scope, outcome } = &response.outcome else {
++        return Err("Health invocation did not return retained application evidence".into());
++    };
++    let ApplicationOutcome::Evidence(packet) = outcome else {
++        return Err("Health invocation did not return read-only evidence".into());
++    };
++    validate_fresh_health_execution(&packet.execution, observed_at, deadline)?;
++    if packet.coverage.completeness != CoverageCompleteness::Complete
++        || !packet.omissions.is_empty()
++    {
++        return Err("actual Health evidence is incomplete".into());
++    }
++    let Some(RetainedSurfaceResultV1::ProviderControl(result)) = &packet.payload else {
++        return Err("Health invocation lacks actual typed provider-control evidence".into());
++    };
++    let expected_scope =
++        health_scope_from_actual_application(scope, profile_id, project_id, native_session)?;
++    let mut accepted =
++        accept_health_numeric_evidence(request, &expected_scope, declaration, result)?;
++    accepted["actual_application_scope"] =
++        serde_json::to_value(scope).map_err(|error| error.to_string())?;
++    accepted["actual_execution_receipt"] =
++        serde_json::to_value(&packet.execution).map_err(|error| error.to_string())?;
++    Ok(accepted)
+ }
+ 
+ struct Channel {
+@@ -1699,6 +1891,135 @@
+         }
+     }
+ 
++    /// Setup metadata only. The caller must first establish this real native
++    /// session through the shipped Start hook. The host then authorizes that
++    /// canonical row and live boundary again for this actual Health request.
++    /// This has no caller until the reviewed bootstrap integration is present.
++    fn capture_setup_health(&mut self, canonical_provider_id: &str, native_session: &str) -> Value {
++        let started = self.clock_ns();
++        let captured = (|| -> FixtureResult<Value> {
++            let selected = self
++                .lane
++                .provider()
++                .ok_or("control lane cannot dispatch provider Health")?;
++            if canonical_provider_id
++                != if self.journey.codex {
++                    "codex"
++                } else {
++                    "claude"
++                }
++                || !self.started_sessions.contains(native_session)
++            {
++                return Err(
++                    "setup Health requires this fixture's already started real native session"
++                        .into(),
++                );
++            }
++            let declaration = production_provider_numeric_declaration_for_test(selected.id())
++                .map_err(|error| format!("production provider declaration: {error}"))?
++                .ok_or("production provider declaration is unsupported")?;
++            if declaration.provider_id != selected.id()
++                || declaration.declared_registration_revision == 0
++            {
++                return Err(
++                    "production provider declaration does not bind selected operator lane".into(),
++                );
++            }
++            let profile =
++                tracedecay_daemon_identity::profile_identity::load_existing(&self.journey.profile)
++                    .map_err(|error| format!("read existing Health profile authority: {error}"))?;
++            let request = ProviderControlRequestV1::Health(ProviderHealthRequestV1 {
++                state: ProviderControlStateSelectorV1::CanonicalSession {
++                    provider_id: declaration.provider_id.clone(),
++                    registration_revision: declaration.declared_registration_revision,
++                    canonical_provider_id: canonical_provider_id.to_owned(),
++                    session_id: native_session.to_owned(),
++                },
++                requested_checks: vec![
++                    ProviderControlHealthCheckV1::Protocol,
++                    ProviderControlHealthCheckV1::State,
++                    ProviderControlHealthCheckV1::Scope,
++                    ProviderControlHealthCheckV1::Capacity,
++                    ProviderControlHealthCheckV1::Persistence,
++                    ProviderControlHealthCheckV1::Recovery,
++                    ProviderControlHealthCheckV1::Privacy,
++                ],
++            });
++            // This is the caller's real metadata operation ID, never a guessed
++            // host-minted recall request ID, operation UUID, or state generation.
++            let request_id = RequestId::new(format!(
++                "comparison.setup.health.{}",
++                sha256(string(&self.invocation, "case_trial_id")?.as_bytes())
++            ))
++            .map_err(|error| format!("setup Health caller request ID: {error}"))?;
++            let cancellation =
++                CancellationSignal::active(format!("{}.cancel", request_id.as_str()))
++                    .map_err(|error| format!("setup Health cancellation identity: {error}"))?;
++            let now = std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .map_err(|error| format!("setup Health operation clock: {error}"))?;
++            let observed_at = UtcMicros(
++                i64::try_from(now.as_micros())
++                    .map_err(|_| "setup Health clock exceeds supported range")?,
++            );
++            request
++                .validate_at(observed_at)
++                .map_err(|error| format!("setup Health request: {error}"))?;
++            let deadline = Deadline::new(UtcMicros(
++                observed_at
++                    .0
++                    .checked_add((SETUP_HEALTH_MILLIS * 1_000) as i64)
++                    .ok_or("setup Health deadline exceeds supported range")?,
++            ))
++            .map_err(|error| format!("setup Health deadline: {error}"))?;
++            let rpc = self.controlled_provider_rpc(
++                request_id.clone(),
++                request.clone(),
++                observed_at,
++                deadline.clone(),
++                cancellation,
++            )?;
++            // From here onward, every capture/refusal keeps the dispatched typed
++            // result and its separate durable RPC record. Nothing is retried.
++            let accepted = if let Some(error) = &rpc.capture_error {
++                Err(format!(
++                    "actual setup Health RPC evidence could not be retained: {error}"
++                ))
++            } else {
++                rpc.result
++                    .as_ref()
++                    .map_err(|error| format!("actual setup Health RPC client outcome: {error:?}"))
++                    .and_then(|response| {
++                        accept_fresh_setup_health_response(
++                            response,
++                            &request_id,
++                            &request,
++                            observed_at,
++                            &deadline,
++                            profile.profile_id().as_str(),
++                            &self.project_id,
++                            native_session,
++                            &declaration,
++                        )
++                    })
++            };
++            Ok(json!({"status": "captured", "rpc": rpc.record,
++                "declared_policy": declaration,
++                "declaration_scope": "production request expectations; none of these fields alone establishes a live provider",
++                "actual_health_binding": accepted.unwrap_or_else(|reason| json!({"status": "unavailable", "reason": reason})),
++                "complete_pin_status": {"status": "unavailable",
++                    "reason": "actual executable/model/state-schema pin binding remains separate from Health numeric acceptance"},
++            }))
++        })();
++        let ended = self.clock_ns();
++        let mut evidence =
++            captured.unwrap_or_else(|reason| json!({"status": "unavailable", "reason": reason}));
++        evidence["timing"] = json!({"phase": "provider_setup_health_evidence", "status": "measured",
++            "clock": "fixture_process_monotonic_elapsed", "start_monotonic_ns": started,
++            "end_monotonic_ns": ended, "elapsed_ns": ended.saturating_sub(started)});
++        evidence
++    }
++
+     fn actual_context_store(&self, scope: &OwnedExactScope) -> FixtureResult<(PathBuf, Value)> {
+         let profile =
+             tracedecay_daemon_identity::profile_identity::load_existing(&self.journey.profile)
+@@ -2236,6 +2557,299 @@
+ }
+ 
+ #[cfg(test)]
++mod health_evidence_tests {
++    use super::*;
++
++    #[test]
++    fn fresh_execution_rejects_stale_widened_and_interrupted_receipts() {
++        let observed_at = UtcMicros(100);
++        let original_deadline = Deadline::new(UtcMicros(200)).unwrap();
++        let complete = OperationReceipt::completed(
++            UtcMicros(110),
++            UtcMicros(150),
++            Deadline::new(UtcMicros(180)).unwrap(),
++            Default::default(),
++        )
++        .unwrap();
++        validate_fresh_health_execution(&complete, observed_at, &original_deadline)
++            .expect("fresh complete receipt within a narrower deadline");
++        let variants = [
++            OperationReceipt {
++                started_at: UtcMicros(99),
++                ..complete.clone()
++            },
++            OperationReceipt {
++                ended_at: UtcMicros(201),
++                ..complete.clone()
++            },
++            OperationReceipt {
++                effective_deadline: Deadline::new(UtcMicros(201)).unwrap(),
++                ..complete.clone()
++            },
++            OperationReceipt {
++                ended_at: UtcMicros(181),
++                ..complete.clone()
++            },
++            OperationReceipt {
++                termination: OperationTermination::Partial,
++                ..complete.clone()
++            },
++            OperationReceipt {
++                cancellation: Some(tracedecay_contracts::CancellationObservation {
++                    stage: tracedecay_contracts::CancellationStage::DuringRead,
++                    observed_at: UtcMicros(130),
++                }),
++                ..complete
++            },
++        ];
++        for receipt in variants {
++            assert!(
++                validate_fresh_health_execution(&receipt, observed_at, &original_deadline).is_err()
++            );
++        }
++    }
++
++    fn declaration(provider: &str) -> ProviderNumericDeclarationForTestV1 {
++        production_provider_numeric_declaration_for_test(provider)
++            .expect("pure production declaration")
++            .expect("supported test provider")
++    }
++
++    // Synthetic wire evidence exercises only the acceptance gate. No fixture
++    // below is dispatched or reported as an actual provider observation.
++    fn gate_fixture(
++        declaration: &ProviderNumericDeclarationForTestV1,
++    ) -> (
++        ProviderControlRequestV1,
++        ProviderControlScopeV1,
++        ProviderControlResultV1,
++    ) {
++        let scope = ProviderControlScopeV1 {
++            profile_id: "profile.health-gate".into(),
++            project_id: "project.health-gate".into(),
++            repository_identity: "repository.health-gate".into(),
++            worktree_identity: "worktree.health-gate".into(),
++            branch_identity: "ref.health-gate".into(),
++            agent_session_id: "session.health-gate".into(),
++            resolved_scope_digest: format!("sha256:{}", "a".repeat(64)),
++        };
++        let request = ProviderControlRequestV1::Health(ProviderHealthRequestV1 {
++            state: ProviderControlStateSelectorV1::CanonicalSession {
++                provider_id: declaration.provider_id.clone(),
++                registration_revision: declaration.declared_registration_revision,
++                canonical_provider_id: "claude".into(),
++                session_id: scope.agent_session_id.clone(),
++            },
++            requested_checks: vec![ProviderControlHealthCheckV1::Protocol],
++        });
++        let capabilities: Vec<_> = std::iter::once(COMMON_ADVISORY_PROFILE_ID)
++            .chain(COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter().copied())
++            .map(|id| json!({"capability_id": id, "state": "available"}))
++            .collect();
++        let result = serde_json::from_value(json!({
++            "provider_id": declaration.provider_id,
++            "registration_revision": declaration.declared_registration_revision,
++            "scope": scope, "operation_id": "01988c58-0000-7000-8000-000000000001",
++            "idempotency_key": null, "terminal": "success", "diagnostic_id": null,
++            "domain_detail": null, "warnings": [],
++            "effect": {"state": "none", "committed_boundary": null,
++                "state_generation_before": null, "state_generation_after": null,
++                "committed_item_refs": [], "uncommitted_item_refs": [],
++                "provider_receipt_digest": null, "reconciliation_action": null,
++                "verification_digest": null, "duplicate_of_idempotency_key": null,
++                "duplicate_of_operation_id": null},
++            "result": {"operation": "health", "data": {
++                "provider_instance_id": declaration.declared_provider_instance_id,
++                "implementation_identity_digest": declaration.declared_implementation_identity_digest,
++                "state_identity_digest": "b".repeat(64), "state_generation": 17,
++                "scope_digest": scope.sha256(), "readiness": "ready",
++                "capability_states": capabilities,
++                "effective_limits_digest": declaration.declared_limits_digest,
++                "backlog": 0, "recovery_state": "ready",
++            }},
++        })).expect("typed synthetic Health evidence");
++        (request, scope, result)
++    }
++
++    #[test]
++    fn all_eight_production_fields_match_the_production_health_digest() {
++        for provider in [CONFIGURED_PROVIDER_ID, NCM_OBSERVER_PROVIDER_ID] {
++            let declared = declaration(provider);
++            let limits = &declared.declared_limits;
++            let bytes: Vec<u8> = [
++                limits.request_bytes,
++                limits.response_bytes,
++                limits.observation_batch_items,
++                limits.recall_candidates,
++                limits.concurrent_operations,
++                limits.operation_millis,
++                limits.snapshot_bytes,
++                limits.inspection_items,
++            ]
++            .into_iter()
++            .flat_map(u64::to_be_bytes)
++            .collect();
++            assert_eq!(sha256(&bytes), declared.declared_limits_digest);
++            let (request, scope, response) = gate_fixture(&declared);
++            let accepted = accept_health_numeric_evidence(&request, &scope, &declared, &response)
++                .expect("complete synthetic binding admits declared numbers");
++            assert_eq!(
++                accepted["effective_limits"],
++                serde_json::to_value(limits).unwrap()
++            );
++            assert_eq!(accepted["state_generation"], 17);
++        }
++    }
++
++    fn lower_one_limit(limits: &mut ProviderDeclaredLimitsForTestV1, index: usize) {
++        let field = match index {
++            0 => &mut limits.request_bytes,
++            1 => &mut limits.response_bytes,
++            2 => &mut limits.observation_batch_items,
++            3 => &mut limits.recall_candidates,
++            4 => &mut limits.concurrent_operations,
++            5 => &mut limits.operation_millis,
++            6 => &mut limits.snapshot_bytes,
++            7 => &mut limits.inspection_items,
++            _ => panic!("all eight fields are enumerated"),
++        };
++        assert!(
++            *field > 0,
++            "production declaration has a finite positive ceiling"
++        );
++        *field -= 1;
++    }
++
++    #[test]
++    fn every_lower_negotiated_limit_remains_unavailable() {
++        for provider in [CONFIGURED_PROVIDER_ID, NCM_OBSERVER_PROVIDER_ID] {
++            let declared = declaration(provider);
++            for index in 0..8 {
++                let mut lower = declared.declared_limits.clone();
++                lower_one_limit(&mut lower, index);
++                let (request, scope, mut response) = gate_fixture(&declared);
++                let ProviderControlOperationResultV1::Health(Some(health)) = &mut response.result
++                else {
++                    panic!("Health fixture");
++                };
++                health.effective_limits_digest = complete_limits_digest(&lower);
++                assert!(
++                    accept_health_numeric_evidence(&request, &scope, &declared, &response).is_err(),
++                    "provider {provider}, changed field {index}"
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn every_destination_dimension_must_match_independent_application_evidence() {
++        let declared = declaration(CONFIGURED_PROVIDER_ID);
++        for field in [
++            "profile_id",
++            "project_id",
++            "repository_identity",
++            "worktree_identity",
++            "branch_identity",
++            "agent_session_id",
++            "resolved_scope_digest",
++        ] {
++            let (request, scope, mut response) = gate_fixture(&declared);
++            let mut altered = serde_json::to_value(&response.scope).unwrap();
++            altered[field] = if field == "resolved_scope_digest" {
++                json!(format!("sha256:{}", "c".repeat(64)))
++            } else {
++                json!("different.valid-identity")
++            };
++            response.scope = serde_json::from_value(altered).unwrap();
++            let ProviderControlOperationResultV1::Health(Some(health)) = &mut response.result
++            else {
++                panic!("Health fixture");
++            };
++            // Internal self-consistency cannot replace the independently bound
++            // application/profile/native-session expectation.
++            health.scope_digest = response.scope.sha256();
++            assert!(
++                accept_health_numeric_evidence(&request, &scope, &declared, &response).is_err(),
++                "changed {field}"
++            );
++        }
++    }
++
++    #[test]
++    fn missing_or_mismatched_health_never_admits_declared_numbers() {
++        let declared = declaration(CONFIGURED_PROVIDER_ID);
++        for (pointer, replacement) in [
++            ("/provider_id", json!(NCM_OBSERVER_PROVIDER_ID)),
++            (
++                "/registration_revision",
++                json!(declared.declared_registration_revision + 1),
++            ),
++            ("/terminal", json!("partial")),
++            ("/result/data", Value::Null),
++            ("/result/data/readiness", json!("degraded")),
++            (
++                "/result/data/provider_instance_id",
++                json!("different-instance"),
++            ),
++            (
++                "/result/data/implementation_identity_digest",
++                json!("c".repeat(64)),
++            ),
++            (
++                "/result/data/effective_limits_digest",
++                json!("c".repeat(64)),
++            ),
++        ] {
++            let (request, scope, response) = gate_fixture(&declared);
++            let mut wire = serde_json::to_value(response).unwrap();
++            *wire.pointer_mut(pointer).unwrap() = replacement;
++            let response = serde_json::from_value(wire).expect("typed mismatch fixture");
++            assert!(
++                accept_health_numeric_evidence(&request, &scope, &declared, &response).is_err(),
++                "changed {pointer}"
++            );
++        }
++        assert!(
++            production_provider_numeric_declaration_for_test("unsupported.provider")
++                .unwrap()
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn every_common_capability_must_be_available_in_the_actual_response() {
++        let declared = declaration(CONFIGURED_PROVIDER_ID);
++        for required in std::iter::once(COMMON_ADVISORY_PROFILE_ID)
++            .chain(COMMON_ADVISORY_REQUIRED_CAPABILITIES.iter().copied())
++        {
++            for remove in [true, false] {
++                let (request, scope, mut response) = gate_fixture(&declared);
++                let ProviderControlOperationResultV1::Health(Some(health)) = &mut response.result
++                else {
++                    panic!("Health fixture");
++                };
++                if remove {
++                    health
++                        .capability_states
++                        .retain(|capability| capability.capability_id != required);
++                } else {
++                    health
++                        .capability_states
++                        .iter_mut()
++                        .find(|capability| capability.capability_id == required)
++                        .unwrap()
++                        .state = "unavailable".into();
++                }
++                assert!(
++                    accept_health_numeric_evidence(&request, &scope, &declared, &response).is_err(),
++                    "capability {required}, removed={remove}"
++                );
++            }
++        }
++    }
++}
++
++#[cfg(test)]
+ mod context_evidence_tests {
+     use super::*;
+ 

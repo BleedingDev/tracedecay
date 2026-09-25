@@ -150,6 +150,7 @@ fn search_request(
     CodeIndexSearchRequestV1 {
         project_root: project_root.to_path_buf(),
         query: "alpha".to_owned(),
+        semantic_mode: None,
         source_revision: None,
         source_tree: None,
         source_reference: None,
@@ -501,6 +502,7 @@ fn family_request(
     CodeIndexSimilarRequestV1 {
         project_root: project_root.to_path_buf(),
         target: CodeIndexSimilarTargetV1::SymbolOccurrence(source.clone()),
+        source_extent: tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody,
         match_classes: vec![
             tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
             tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,

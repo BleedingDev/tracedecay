@@ -1,0 +1,1295 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -65,11 +65,14 @@
+     UntrustedRecallItemV1, UntrustedRecallMetadataFieldV1, UntrustedRecallTrustV1,
+     UntrustedRecallWithheldReasonV1, exact_scope_for_session, provider_agent_session_id,
+ };
++use super::provider_control::portability::{
++    PortabilityErrorV1, RetainedCanonicalHistoryReplayV1, retain_settled_replay_batches,
++};
+ use super::provider_history::{ProviderHistoryErrorV1, history_grant_json};
+ 
+ use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
+ use tracedecay_memory_provider_registry::recall_context_pack::{
+-    ContextRecallControlRefV1, compile_context_pack_with_control_refs,
++    CanonicalHistoryReplayV1, ContextRecallControlRefV1, compile_context_pack_with_control_metadata,
+ };
+ use tracedecay_memory_provider_registry::{
+     HistoryGrant, HostEvidenceRefV1, HostProvenanceAuthority, OperationControl,
+@@ -1102,6 +1105,72 @@
+     pub(crate) invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
+ }
+ 
++/// Per-call ownership visible to the lane's outer timeout. This holds only
++/// the retention stage's original control, never a replacement token or budget.
++#[derive(Default)]
++struct RecallReplayRetentionActivityV1 {
++    active: Mutex<Option<OperationControl>>,
++}
++
++impl RecallReplayRetentionActivityV1 {
++    fn enter(&self, control: &OperationControl) -> RecallReplayRetentionGuardV1<'_> {
++        let mut active = self
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        debug_assert!(
++            active.is_none(),
++            "one recall may own only one retention stage"
++        );
++        *active = Some(control.clone());
++        RecallReplayRetentionGuardV1 { activity: self }
++    }
++
++    fn cancel_active(&self) -> bool {
++        let active = self
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let Some(control) = active.as_ref() else {
++            return false;
++        };
++        control.cancellation().cancel();
++        true
++    }
++
++    async fn within_lane_fuse<T>(
++        &self,
++        wall_clock_budget: std::time::Duration,
++        recall: impl std::future::Future<Output = T>,
++    ) -> Result<T, tokio::time::error::Elapsed> {
++        tokio::pin!(recall);
++        match tokio::time::timeout(wall_clock_budget, &mut recall).await {
++            Ok(context) => Ok(context),
++            Err(_) if self.cancel_active() => {
++                // Retention still owns work. Its original stop reaches it,
++                // and the same future remains joined until its actual result.
++                // The inner lane records host_stopped before any provider recall.
++                Ok(recall.await)
++            }
++            Err(elapsed) => Err(elapsed),
++        }
++    }
++}
++
++struct RecallReplayRetentionGuardV1<'a> {
++    activity: &'a RecallReplayRetentionActivityV1,
++}
++
++impl Drop for RecallReplayRetentionGuardV1<'_> {
++    fn drop(&mut self) {
++        self.activity
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++    }
++}
++
+ /// One recall's linked controls. Dropping an outer timeout also cancels any
+ /// already-issued history work; this owns no worker or provider lifecycle.
+ struct RecallHistoryControlV1 {
+@@ -1157,6 +1226,51 @@
+                 }
+             },
+         }
++    }
++
++    /// Retention owns filesystem work which must remain joined after stop.
++    /// Forward the original controls, then await that same bounded stage so
++    /// an already committed artifact remains an actual result. Publication
++    /// separately observes whether the host lane was stopped.
++    async fn run_replay_retention<T, E>(
++        &self,
++        activity: Option<&RecallReplayRetentionActivityV1>,
++        stage: impl std::future::Future<Output = Result<T, E>>,
++    ) -> (Result<T, E>, bool) {
++        let _owned_retention = activity.map(|activity| activity.enter(&self.operation));
++        tokio::pin!(stage);
++        let already_stopped = self.caller.is_cancelled()
++            || self.operation.snapshot().is_err()
++            || tokio::time::Instant::now() >= self.deadline;
++        let result = if already_stopped {
++            self.operation.cancellation().cancel();
++            self.cancellation.cancel();
++            stage.await
++        } else {
++            tokio::select! {
++                biased;
++                result = &mut stage => result,
++                () = self.caller.cancelled() => {
++                    self.operation.cancellation().cancel();
++                    self.cancellation.cancel();
++                    stage.await
++                }
++                () = tokio::time::sleep_until(self.deadline) => {
++                    self.operation.cancellation().cancel();
++                    self.cancellation.cancel();
++                    stage.await
++                }
++            }
++        };
++        let host_stopped = already_stopped
++            || self.caller.is_cancelled()
++            || self.operation.snapshot().is_err()
++            || tokio::time::Instant::now() >= self.deadline;
++        if host_stopped {
++            self.operation.cancellation().cancel();
++            self.cancellation.cancel();
++        }
++        (result, host_stopped)
+     }
+ }
+ 
+@@ -2066,7 +2180,8 @@
+         u64::try_from(deadline.expires_at.0.saturating_sub(now.0)).unwrap_or(0),
+     )
+     .saturating_add(ADVISORY_RECALL_LANE_GRACE);
+-    let recall = advisory_context_recall(
++    let retention = RecallReplayRetentionActivityV1::default();
++    let recall = advisory_context_recall_with_retention(
+         &port,
+         mount,
+         AdvisoryRecallInputsV1 {
+@@ -2077,8 +2192,9 @@
+             deadline,
+             cancellation,
+         },
++        Some(&retention),
+     );
+-    match tokio::time::timeout(wall_clock_budget, recall).await {
++    match retention.within_lane_fuse(wall_clock_budget, recall).await {
+         Ok(context) => Some(context),
+         Err(_) => unavailable(
+             AdvisoryRecallUnavailableV1::LaneDeadlineExceeded,
+@@ -2171,10 +2287,20 @@
+ /// and consume *only* admitted candidates, each carrying its provenance
+ /// label. Denied candidates never appear here; they remain visible only in
+ /// the mount's admission ledger.
++#[cfg(test)]
+ pub(crate) async fn advisory_context_recall(
+     port: &ProjectCognitiveRecallPortV1,
+     mount: &ProjectCognitiveRecallMountV1,
+     inputs: AdvisoryRecallInputsV1<'_>,
++) -> AdvisoryMemoryContextV1 {
++    advisory_context_recall_with_retention(port, mount, inputs, None).await
++}
++
++async fn advisory_context_recall_with_retention(
++    port: &ProjectCognitiveRecallPortV1,
++    mount: &ProjectCognitiveRecallMountV1,
++    inputs: AdvisoryRecallInputsV1<'_>,
++    retention: Option<&RecallReplayRetentionActivityV1>,
+ ) -> AdvisoryMemoryContextV1 {
+     use tracedecay_contracts::memory::CognitiveRecallProvenance;
+ 
+@@ -2268,6 +2394,58 @@
+                 error.to_string(),
+             );
+         }
++    };
++    // Retain only the actual settled admission selected above. The producer
++    // reauthorizes it and resolves its original journal receipts; neither the
++    // enqueue watermark nor the recall candidate list can mint replay refs.
++    let retained_replay = match mount.selected_history.get() {
++        Some(selected) if selected.authority.original_authority.is_some() => {
++            let (retention, host_stopped) = history_control
++                .run_replay_retention(retention, async {
++                    let delivery_scope = exact_scope_for_session(
++                        &mount.profile_id,
++                        &mount.scope,
++                        inputs.canonical_session_id,
++                    )
++                    .map_err(|_| PortabilityErrorV1::Invalid("recall replay delivery scope"))?;
++                    let scope = control_attribution::RetainedRecallControlScopeV1 {
++                        provider_id: routed_provider.clone(),
++                        registration_revision: routed_registration_revision,
++                        delivery_scope,
++                    };
++                    retain_settled_replay_batches(
++                        &mount.ledger,
++                        &selected.authority,
++                        &scope,
++                        prepared.grant.as_ref(),
++                        &history_control.operation,
++                    )
++                    .await
++                })
++                .await;
++            match retention {
++                Ok(retained) if !host_stopped => Some(Arc::new(retained)),
++                Ok(_retained) => {
++                    // The durable carrier really completed. The caller's
++                    // ended lane cannot publish it, and no recall follows.
++                    return AdvisoryMemoryContextV1::unavailable(
++                        routed_provider.clone(),
++                        routed_registration_revision,
++                        AdvisoryRecallUnavailableV1::HistoryReplayPublicationWithheld,
++                        "canonical replay retained; stopped host lane withheld publication",
++                    );
++                }
++                Err(error) => {
++                    return AdvisoryMemoryContextV1::unavailable(
++                        routed_provider.clone(),
++                        routed_registration_revision,
++                        AdvisoryRecallUnavailableV1::HistoryReplayRetentionFailed,
++                        format!("canonical replay artifact retention failed: {error}"),
++                    );
++                }
++            }
++        }
++        _ => None,
+     };
+     let history_payload = match prepared.grant.as_ref().map(history_grant_json).transpose() {
+         Ok(payload) => payload,
+@@ -2650,6 +2828,7 @@
+             explanations,
+             control_delivery_scope,
+             control_bindings,
++            canonical_history_replay: retained_replay,
+             sink: Arc::clone(&mount.ledger) as Arc<dyn RecallExplainTraceSinkV1>,
+         })
+     });
+@@ -3222,6 +3401,10 @@
+     HistoryCancelled,
+     /// The original recall deadline elapsed during canonical history work.
+     HistoryDeadlineExceeded,
++    /// Replay artifact retention failed; preserve the whole host result.
++    HistoryReplayRetentionFailed,
++    /// Replay retention completed, but the stopped host lane cannot publish it.
++    HistoryReplayPublicationWithheld,
+     /// The untrusted-memory gate could not be built, so no provider text was
+     /// classified. Provider recall is untrusted advisory data and is never
+     /// delivered unclassified: the lane reports itself unavailable instead.
+@@ -3250,6 +3433,10 @@
+             Self::HistoryUnavailable => "advisory_history_unavailable",
+             Self::HistoryCancelled => "advisory_history_cancelled",
+             Self::HistoryDeadlineExceeded => "advisory_history_deadline_exceeded",
++            Self::HistoryReplayRetentionFailed => "advisory_history_replay_retention_failed",
++            Self::HistoryReplayPublicationWithheld => {
++                "advisory_history_replay_publication_withheld"
++            }
+             Self::UntrustedGateUnavailable => "advisory_untrusted_gate_unavailable",
+             Self::UntrustedGateFaulted => "advisory_untrusted_gate_faulted",
+         }
+@@ -3381,6 +3568,7 @@
+     explanations: BTreeMap<String, RecallExplainProviderExplanationV1>,
+     control_delivery_scope: Option<OwnedExactScope>,
+     control_bindings: BTreeMap<String, control_attribution::RetainedRecallControlBindingV1>,
++    canonical_history_replay: Option<Arc<RetainedCanonicalHistoryReplayV1>>,
+     sink: Arc<dyn RecallExplainTraceSinkV1>,
+ }
+ 
+@@ -3419,6 +3607,14 @@
+         self.receipts() == other.receipts()
+             && self.control_delivery_scope == other.control_delivery_scope
+             && self.control_bindings == other.control_bindings
++            && self
++                .canonical_history_replay
++                .as_ref()
++                .map(|retained| retained.metadata())
++                == other
++                    .canonical_history_replay
++                    .as_ref()
++                    .map(|retained| retained.metadata())
+             && Arc::ptr_eq(&self.sink, &other.sink)
+     }
+ }
+@@ -3736,6 +3932,16 @@
+         host_items: &[HostContextItemV1],
+         control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
+     ) -> AdvisoryContextPackV1 {
++        self.context_pack_with_control_metadata(render_form, host_items, control_refs, None)
++    }
++
++    fn context_pack_with_control_metadata(
++        &self,
++        render_form: ContextPackRenderFormV1,
++        host_items: &[HostContextItemV1],
++        control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
++        canonical_history_replay: Option<&CanonicalHistoryReplayV1>,
++    ) -> AdvisoryContextPackV1 {
+         let policy = match ContextPackPolicyV1::new(
+             ADVISORY_CONTEXT_PACK_TOTAL_TOKEN_BUDGET,
+             ADVISORY_CONTEXT_PACK_PROVIDER_TOKEN_QUOTA,
+@@ -3746,18 +3952,38 @@
+                 return AdvisoryContextPackV1::Refused(AdvisoryContextPackFailureV1::Policy(error));
+             }
+         };
+-        match compile_context_pack_with_control_refs(
++        match compile_context_pack_with_control_metadata(
+             policy,
+             &O200kBaseContextTokenizer,
+             host_items,
+             &self.advisory_lane(),
+             control_refs,
++            canonical_history_replay,
+         ) {
+             Ok(pack) => AdvisoryContextPackV1::Compiled(pack),
+             Err(error) => {
+                 AdvisoryContextPackV1::Refused(AdvisoryContextPackFailureV1::Compile(error))
+             }
+         }
++    }
++
++    fn retained_replay_metadata(&self) -> Option<&CanonicalHistoryReplayV1> {
++        match self {
++            Self::Answered {
++                explain: Some(explain),
++                ..
++            } => explain
++                .canonical_history_replay
++                .as_ref()
++                .map(|retained| retained.metadata()),
++            _ => None,
++        }
++    }
++
++    fn retained_replay_metadata_matches(&self, pack: &ContextPackV1) -> bool {
++        pack.canonical_history_replay
++            .as_ref()
++            .is_none_or(|emitted| self.retained_replay_metadata() == Some(emitted))
+     }
+ 
+     fn provisional_control_refs(&self) -> Option<BTreeMap<String, ContextRecallControlRefV1>> {
+@@ -3841,6 +4067,16 @@
+     /// answer unchanged with a typed withheld notice.
+     #[must_use]
+     pub fn appended_to(&self, mut result: ToolResult) -> ToolResult {
++        if matches!(
++            self,
++            Self::Unavailable {
++                outcome: AdvisoryRecallUnavailableV1::HistoryReplayRetentionFailed
++                    | AdvisoryRecallUnavailableV1::HistoryReplayPublicationWithheld,
++                ..
++            }
++        ) {
++            return result;
++        }
+         let Some(text) = result
+             .value
+             .pointer("/content/0/text")
+@@ -3857,10 +4093,11 @@
+             );
+             return result;
+         };
+-        let delivery = match self.context_pack_with_control_refs(
++        let delivery = match self.context_pack_with_control_metadata(
+             render_form,
+             &host_items,
+             &control_refs,
++            self.retained_replay_metadata(),
+         ) {
+             AdvisoryContextPackV1::Compiled(pack) => {
+                 let delivery = merge_compiled_advisory(render_form, &text, &pack.rendered);
+@@ -3870,7 +4107,9 @@
+                         // Publish controlled provenance only after its exact
+                         // final trace and source bindings are retained atomically.
+                         let retained = self.retain_explain_trace(Some(&pack), None);
+-                        if !self.retained_control_refs_match(&pack, retained.as_ref()) {
++                        if !self.retained_control_refs_match(&pack, retained.as_ref())
++                            || !self.retained_replay_metadata_matches(&pack)
++                        {
+                             tracing::warn!(
+                                 event = "memory_recall_control_retention_failed",
+                                 "controlled advisory contribution withheld; host answer preserved"
+@@ -7899,6 +8138,7 @@
+                 explanations,
+                 control_delivery_scope: Some(scope.clone()),
+                 control_bindings: bindings,
++                canonical_history_replay: None,
+                 sink,
+             })),
+         };
+@@ -8085,4 +8325,237 @@
+         assert!(!delivered.value.to_string().contains("recall-trace-v1:"));
+         assert!(!delivered.value.to_string().contains("provenance_evidence"));
+     }
+-}
++
++    #[tokio::test]
++    async fn replay_retention_forwards_stop_and_joins_the_same_stage_to_its_actual_result() {
++        use std::task::Poll;
++        for expired in [false, true] {
++            let now = try_now_micros().unwrap();
++            let signal =
++                tracedecay_contracts::CancellationSignal::active("replay.retention-stop").unwrap();
++            let deadline =
++                tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(if expired {
++                    now.0 - 1
++                } else {
++                    now.0 + 60_000_000
++                }))
++                .unwrap();
++            let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
++            let original = control.operation.clone();
++            let completed = std::sync::atomic::AtomicBool::new(false);
++            let stage = async {
++                if !expired {
++                    assert!(signal.cancel(try_now_micros().unwrap()));
++                }
++                std::future::poll_fn(|context| {
++                    if original.cancellation().is_cancelled() {
++                        // The joined stage can still return its known durable
++                        // result after the original stop was forwarded to it.
++                        completed.store(true, std::sync::atomic::Ordering::Release);
++                        Poll::Ready(Ok::<_, ()>(17_u64))
++                    } else {
++                        context.waker().wake_by_ref();
++                        Poll::Pending
++                    }
++                })
++                .await
++            };
++            let (actual, host_stopped) = control.run_replay_retention(None, stage).await;
++            assert_eq!(actual, Ok(17));
++            assert!(host_stopped);
++            assert!(completed.load(std::sync::atomic::Ordering::Acquire));
++            assert!(original.cancellation().is_cancelled());
++            assert!(control.cancellation.is_cancelled());
++            assert_eq!(
++                control.operation.deadline_utc_micros(),
++                original.deadline_utc_micros()
++            );
++            assert_eq!(
++                control.operation.remaining_millis(),
++                original.remaining_millis()
++            );
++        }
++    }
++
++    #[test]
++    fn replay_retention_failure_and_stopped_publication_preserve_the_whole_host_result() {
++        use tracedecay_contracts::retrieval::{
++            ContextMemoryContributionV1, ContextSurfaceRequestV1,
++        };
++        let policy: ContextSurfaceRequestV1 = serde_json::from_value(
++            json!({"task": "retained host context", "include_memory": false}),
++        )
++        .unwrap();
++        let sidecar = ContextMemoryContributionV1::from_matches(
++            &policy,
++            &[],
++            None,
++            None,
++            try_now_micros().unwrap(),
++        )
++        .unwrap();
++        for outcome in [
++            AdvisoryRecallUnavailableV1::HistoryReplayRetentionFailed,
++            AdvisoryRecallUnavailableV1::HistoryReplayPublicationWithheld,
++        ] {
++            let lane = AdvisoryMemoryContextV1::unavailable(
++                OwnedProviderId::new("provider.replay").unwrap(),
++                7,
++                outcome,
++                "private replay retention status",
++            );
++            for text in [
++                "{\"answer\":\"original host evidence\"}",
++                "## Code Context\noriginal host evidence\n",
++            ] {
++                let original = ToolResult::new(
++                    json!({"content": [{"type": "text", "text": text}]}),
++                    vec!["host.rs".to_owned()],
++                )
++                .with_context_memory_contribution(sidecar.clone());
++                let delivered = lane.appended_to(original.clone());
++                assert_eq!(delivered.value, original.value);
++                assert_eq!(delivered.touched_files, original.touched_files);
++                assert_eq!(
++                    delivered.context_memory_contribution(),
++                    original.context_memory_contribution()
++                );
++                assert!(
++                    !delivered
++                        .value
++                        .to_string()
++                        .contains("canonical_history_replay")
++                );
++                assert!(
++                    !delivered
++                        .value
++                        .to_string()
++                        .contains("host-observation-batch-v1:")
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn zero_candidate_lane_requires_the_actual_retained_carrier_before_replay_publication() {
++        use tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayBatchV1;
++        let lane = AdvisoryMemoryContextV1::Answered {
++            provider_id: "provider.replay".to_owned(),
++            registration_revision: 7,
++            degradation: None,
++            candidates: Vec::new(),
++            explain: None,
++        };
++        let metadata = CanonicalHistoryReplayV1 {
++            provider_id: "provider.replay".to_owned(),
++            registration_revision: 7,
++            delivery_scope: tracedecay_memory_provider_registry::RecallOutcomeScopeV1 {
++                profile_id: "profile.replay".to_owned(),
++                project_id: "project.replay".to_owned(),
++                repository_identity: "repository.replay".to_owned(),
++                worktree_identity: "worktree.replay".to_owned(),
++                branch_identity: "refs/heads/replay".to_owned(),
++                agent_session_id: "session.replay".to_owned(),
++                resolved_scope_digest: format!("sha256:{}", "1".repeat(64)),
++            },
++            batches: vec![CanonicalHistoryReplayBatchV1 {
++                observation_batch_ref: format!("host-observation-batch-v1:{}", "a".repeat(64)),
++                first_source_sequence: 11,
++                last_source_sequence: 12,
++                observation_count: 2,
++            }],
++        };
++        let AdvisoryContextPackV1::Compiled(pack) = lane.context_pack_with_control_metadata(
++            ContextPackRenderFormV1::Json,
++            &[],
++            &BTreeMap::new(),
++            Some(&metadata),
++        ) else {
++            panic!("bounded replay lane metadata");
++        };
++        assert!(pack.items().next().is_none());
++        assert_eq!(pack.canonical_history_replay, Some(metadata));
++        assert!(!lane.retained_replay_metadata_matches(&pack));
++    }
++
++    #[tokio::test]
++    async fn outer_lane_fuse_joins_active_retention_and_prevents_provider_continuation() {
++        use std::future::Future;
++        use std::task::Poll;
++        let now = try_now_micros().unwrap();
++        let signal = tracedecay_contracts::CancellationSignal::active("replay.outer-fuse").unwrap();
++        let deadline =
++            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 + 60_000_000))
++                .unwrap();
++        let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
++        let original = control.operation.clone();
++        let activity = RecallReplayRetentionActivityV1::default();
++        let completed = std::sync::atomic::AtomicBool::new(false);
++        let provider_continued = std::sync::atomic::AtomicBool::new(false);
++        let recall = async {
++            let stage = std::future::poll_fn(|context| {
++                if original.cancellation().is_cancelled() {
++                    completed.store(true, std::sync::atomic::Ordering::Release);
++                    Poll::Ready(Ok::<_, ()>(23_u64))
++                } else {
++                    context.waker().wake_by_ref();
++                    Poll::Pending
++                }
++            });
++            let (actual, host_stopped) = control.run_replay_retention(Some(&activity), stage).await;
++            if !host_stopped {
++                provider_continued.store(true, std::sync::atomic::Ordering::Release);
++            }
++            (actual, host_stopped)
++        };
++        tokio::pin!(recall);
++        // Enter the real retention wrapper before firing the outer fuse.
++        // One explicit poll establishes ownership without a timing sleep.
++        std::future::poll_fn(|context| match recall.as_mut().poll(context) {
++            Poll::Pending => Poll::Ready(()),
++            Poll::Ready(_) => panic!("retention finished before the outer fuse"),
++        })
++        .await;
++        assert!(!original.cancellation().is_cancelled());
++        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
++        let actual = activity
++            .within_lane_fuse(std::time::Duration::ZERO, recall)
++            .await
++            .unwrap();
++        assert_eq!(actual, (Ok(23), true));
++        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
++        assert!(!provider_continued.load(std::sync::atomic::Ordering::Acquire));
++        assert!(original.cancellation().is_cancelled());
++        assert_eq!(
++            control.operation.deadline_utc_micros(),
++            original.deadline_utc_micros()
++        );
++        assert_eq!(
++            control.operation.remaining_millis(),
++            original.remaining_millis()
++        );
++        assert!(
++            !activity.cancel_active(),
++            "completed retention must release its ownership slot"
++        );
++    }
++
++    #[tokio::test]
++    async fn outer_lane_fuse_still_stops_when_no_retention_work_is_owned() {
++        let activity = RecallReplayRetentionActivityV1::default();
++        assert_eq!(
++            activity
++                .within_lane_fuse(std::time::Duration::from_secs(1), async { 7 })
++                .await
++                .unwrap(),
++            7,
++        );
++        assert!(
++            activity
++                .within_lane_fuse(std::time::Duration::ZERO, std::future::pending::<()>(),)
++                .await
++                .is_err()
++        );
++        assert!(!activity.cancel_active());
++    }
++}
+--- a/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
+@@ -66,7 +66,7 @@
+ /// Revision of [`HOST_CONTEXT_PACK_POLICY_ID`]. Any change to section
+ /// priority, quota arithmetic, the exclusion vocabulary, or the pack-hash
+ /// encoding must increment this.
+-pub const HOST_CONTEXT_PACK_POLICY_REVISION: u64 = 4;
++pub const HOST_CONTEXT_PACK_POLICY_REVISION: u64 = 5;
+ 
+ /// Host authority label for accepted TraceDecay Native project-memory facts
+ /// carried in a context answer. Native stays the authority for accepted
+@@ -980,6 +980,44 @@
+     pub excluded_metadata_not_contained: u64,
+ }
+ 
++/// Exact canonical history already settled in the original provider journal.
++///
++/// The host artifact producer supplies these fields only after retaining and
++/// reading back every referenced batch. The compiler budgets this whole lane
++/// value; it never derives batches from an enqueue count or recall candidates.
++#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct CanonicalHistoryReplayV1 {
++    /// Original provider whose journal settled these observations.
++    pub provider_id: String,
++    /// Original registration under which they settled.
++    pub registration_revision: u64,
++    /// Complete destination namespace of the original admissions.
++    pub delivery_scope: crate::RecallOutcomeScopeV1,
++    /// Increasing contiguous runs of the actual settled source sequences.
++    pub batches: Vec<CanonicalHistoryReplayBatchV1>,
++}
++
++/// One durably retained contiguous run from the actual settled history page.
++#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct CanonicalHistoryReplayBatchV1 {
++    /// Opaque host artifact reference, resolved by the durable artifact owner.
++    pub observation_batch_ref: String,
++    /// First actual source sequence in this contiguous run, inclusive.
++    pub first_source_sequence: u64,
++    /// Last actual source sequence in this contiguous run, inclusive.
++    pub last_source_sequence: u64,
++    /// Actual observations in this run; gaps belong in separate batches.
++    pub observation_count: u64,
++}
++
++/// One bounded serialization shared by framing, final rendering, and hashing.
++struct PreparedCanonicalHistoryReplayV1<'a> {
++    metadata: &'a CanonicalHistoryReplayV1,
++    json: String,
++}
++
+ /// One compiled, token-budgeted context pack.
+ ///
+ /// [`Self::rendered`] is the exact agent-visible text this pack compiles to,
+@@ -1005,6 +1043,10 @@
+     pub total_token_budget: u64,
+     /// Advisory quota that bounded the provider section.
+     pub advisory_token_quota: u64,
++    /// Retained canonical history admitted with the lane, including zero-result
++    /// lanes. Absent when the lane's complete framing did not fit its budget.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub canonical_history_replay: Option<CanonicalHistoryReplayV1>,
+     /// Compiled sections in priority order. A section with no admitted item
+     /// is omitted.
+     pub sections: Vec<ContextPackSectionV1>,
+@@ -1140,7 +1182,30 @@
+     lane: &AdvisoryLaneV1,
+     control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
+ ) -> Result<ContextPackV1, ContextPackError> {
++    compile_context_pack_with_control_metadata(
++        policy,
++        tokenizer,
++        host_items,
++        lane,
++        control_refs,
++        None,
++    )
++}
++
++/// Compiles retained lane metadata through the same framing, quota, and hash
++/// path as the provider contribution. The host must compare the final emitted
++/// metadata with its private durable-retention carrier before publication.
++pub fn compile_context_pack_with_control_metadata(
++    policy: ContextPackPolicyV1,
++    tokenizer: &dyn ContextTokenizer,
++    host_items: &[HostContextItemV1],
++    lane: &AdvisoryLaneV1,
++    control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
++    canonical_history_replay: Option<&CanonicalHistoryReplayV1>,
++) -> Result<ContextPackV1, ContextPackError> {
+     validate_control_refs(lane, control_refs)?;
++    let canonical_history_replay =
++        prepare_canonical_history_replay(lane, canonical_history_replay)?;
+     if tokenizer.tokenizer_id() != CANONICAL_CONTEXT_TOKENIZER_ID
+         || tokenizer.tokenizer_revision() != CANONICAL_CONTEXT_TOKENIZER_REVISION
+     {
+@@ -1193,7 +1258,7 @@
+     // competes for the budget: a header, an identity line, and a bounded
+     // receipt are agent-visible tokens exactly like content is.
+     let host_framing_tokens = tokenizer.count_tokens(&host_framing_probe(form, lane));
+-    let lane_framing_text = lane_framing_text(form, lane);
++    let lane_framing_text = lane_framing_text(form, lane, canonical_history_replay.as_ref());
+     let lane_framing_tokens = tokenizer.count_tokens(&lane_framing_text);
+     let lane_fits_quota = lane_framing_tokens <= policy.advisory_token_quota;
+     let framing_tokens = host_framing_tokens.saturating_add(if lane_fits_quota {
+@@ -1343,6 +1408,7 @@
+             tokenizer,
+             host_items,
+             lane,
++            canonical_history_replay.as_ref(),
+             lane_fits_quota,
+             &required_sections,
+             &advisory_items,
+@@ -1370,6 +1436,7 @@
+                 tokenizer,
+                 host_items,
+                 lane,
++                canonical_history_replay.as_ref(),
+                 false,
+                 &required_sections,
+                 &[],
+@@ -1415,6 +1482,7 @@
+     tokenizer: &dyn ContextTokenizer,
+     host_items: &[HostContextItemV1],
+     lane: &AdvisoryLaneV1,
++    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
+     lane_rendered: bool,
+     required_sections: &[ContextPackSectionV1],
+     advisory_items: &[ContextPackItemV1],
+@@ -1433,7 +1501,12 @@
+             items: advisory_items.to_vec(),
+         });
+     }
+-    let pack_hash = pack_hash(policy, tokenizer, &sections);
++    let canonical_history_replay = if lane_rendered {
++        canonical_history_replay
++    } else {
++        None
++    };
++    let pack_hash = pack_hash(policy, tokenizer, &sections, canonical_history_replay);
+     let receipt = ContextPackReceiptV1 {
+         state: "compiled".to_owned(),
+         pack_hash: pack_hash.clone(),
+@@ -1482,6 +1555,7 @@
+         policy.render_form,
+         host_items,
+         lane,
++        canonical_history_replay,
+         lane_rendered,
+         advisory_items,
+         &receipt,
+@@ -1497,6 +1571,7 @@
+             render_form: policy.render_form,
+             total_token_budget: policy.total_token_budget,
+             advisory_token_quota: policy.advisory_token_quota,
++            canonical_history_replay: canonical_history_replay.map(|value| value.metadata.clone()),
+             sections,
+             excluded_provider_items: excluded_provider_items.to_vec(),
+             framing_tokens,
+@@ -1593,6 +1668,102 @@
+         }
+     }
+     Ok(())
++}
++
++/// Validate only bounded projection shape here. Current authorization, actual
++/// journal settlement, artifact identity, and durable retention stay with the
++/// host producer; the compiler cannot manufacture any of those facts.
++fn prepare_canonical_history_replay<'a>(
++    lane: &AdvisoryLaneV1,
++    metadata: Option<&'a CanonicalHistoryReplayV1>,
++) -> Result<Option<PreparedCanonicalHistoryReplayV1<'a>>, ContextPackError> {
++    let Some(metadata) = metadata else {
++        return Ok(None);
++    };
++    let invalid = || ContextPackError::ProviderAttributionInvalid {
++        field: "canonical_history_replay",
++    };
++    let Some(contribution) = lane.contribution() else {
++        return Err(invalid());
++    };
++    if metadata.provider_id != contribution.provider_id
++        || metadata.registration_revision != contribution.registration_revision
++        || metadata.registration_revision == 0
++        || metadata.registration_revision > i64::MAX as u64
++        || metadata.batches.len() > 256
++    {
++        return Err(invalid());
++    }
++    let scope = &metadata.delivery_scope;
++    for value in [
++        metadata.provider_id.as_str(),
++        scope.profile_id.as_str(),
++        scope.project_id.as_str(),
++        scope.repository_identity.as_str(),
++        scope.worktree_identity.as_str(),
++        scope.branch_identity.as_str(),
++        scope.agent_session_id.as_str(),
++        scope.resolved_scope_digest.as_str(),
++    ] {
++        if value.is_empty()
++            || value.len() > 1_024
++            || value.trim() != value
++            || !is_contained_provider_label(value)
++        {
++            return Err(invalid());
++        }
++    }
++    crate::OwnedProviderId::new(metadata.provider_id.clone()).map_err(|_| invalid())?;
++    crate::OwnedExactScope::new(
++        scope.profile_id.clone(),
++        scope.project_id.clone(),
++        scope.repository_identity.clone(),
++        scope.worktree_identity.clone(),
++        scope.branch_identity.clone(),
++        scope.agent_session_id.clone(),
++        scope.resolved_scope_digest.clone(),
++    )
++    .map_err(|_| invalid())?;
++    let mut previous_last = None;
++    let mut total_observations = 0_u64;
++    let mut references = BTreeSet::new();
++    for batch in &metadata.batches {
++        let Some(digest) = batch
++            .observation_batch_ref
++            .strip_prefix("host-observation-batch-v1:")
++        else {
++            return Err(invalid());
++        };
++        if digest.len() != 64
++            || !digest
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++            || !references.insert(batch.observation_batch_ref.as_str())
++            || batch.first_source_sequence == 0
++            || previous_last.is_some_and(|last| batch.first_source_sequence <= last)
++            || batch.observation_count == 0
++            || batch.observation_count > 256
++            || batch
++                .last_source_sequence
++                .checked_sub(batch.first_source_sequence)
++                .and_then(|difference| difference.checked_add(1))
++                != Some(batch.observation_count)
++        {
++            return Err(invalid());
++        }
++        total_observations = total_observations
++            .checked_add(batch.observation_count)
++            .ok_or_else(invalid)?;
++        if total_observations > 256 {
++            return Err(invalid());
++        }
++        previous_last = Some(batch.last_source_sequence);
++    }
++    let json = serde_json::to_string(metadata).map_err(|_| invalid())?;
++    if json.len() > 131_072 {
++        return Err(invalid());
++    }
++    Ok(Some(PreparedCanonicalHistoryReplayV1 { metadata, json }))
+ }
+ 
+ /// The first provider-controlled string of one item that fails containment.
+@@ -1818,42 +1989,33 @@
+ 
+ /// The advisory lane's own framing: everything the lane renders that is not a
+ /// candidate and not the receipt. It is charged to the advisory quota.
+-fn lane_framing_text(form: ContextPackRenderFormV1, lane: &AdvisoryLaneV1) -> String {
++fn lane_framing_text(
++    form: ContextPackRenderFormV1,
++    lane: &AdvisoryLaneV1,
++    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++) -> String {
+     match (form, lane) {
+         (_, AdvisoryLaneV1::Absent) => String::new(),
+-        (
+-            ContextPackRenderFormV1::Markdown,
+-            AdvisoryLaneV1::Notice {
+-                provider_id,
+-                registration_revision,
+-                notice,
+-            },
+-        ) => format!(
+-            "{ADVISORY_MARKDOWN_HEADING}Provider {provider_id} (registration revision \
+-             {registration_revision}), unavailable: {notice}\n"
+-        ),
+-        (ContextPackRenderFormV1::Markdown, AdvisoryLaneV1::Contribution(contribution)) => {
+-            let mut framing = format!(
+-                "{ADVISORY_MARKDOWN_HEADING}Provider {} (registration revision {})",
+-                contribution.provider_id, contribution.registration_revision
+-            );
+-            if let Some(degradation) = &contribution.degradation {
+-                let _ = write!(framing, ", degraded: {degradation}");
++        (ContextPackRenderFormV1::Markdown, lane) => {
++            let mut framing = lane_head_markdown(lane, canonical_history_replay);
++            if lane.contribution().is_some() {
++                framing.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
+             }
+-            framing.push('\n');
+-            framing.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
+             framing
+         }
+         (ContextPackRenderFormV1::Json, lane) => {
+-            let scaffold = json_lane_head(lane);
++            let scaffold = json_lane_head(lane, canonical_history_replay);
+             format!(",\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{scaffold}\"candidates\":[]}}",)
+         }
+     }
+ }
+ 
+ /// The JSON lane's leading members, up to but excluding `candidates`.
+-fn json_lane_head(lane: &AdvisoryLaneV1) -> String {
+-    match lane {
++fn json_lane_head(
++    lane: &AdvisoryLaneV1,
++    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++) -> String {
++    let mut head = match lane {
+         AdvisoryLaneV1::Absent => String::new(),
+         AdvisoryLaneV1::Notice {
+             provider_id,
+@@ -1877,7 +2039,11 @@
+                 contribution.registration_revision
+             )
+         }
+-    }
++    };
++    if let Some(replay) = canonical_history_replay {
++        let _ = write!(head, "\"canonical_history_replay\":{},", replay.json);
++    }
++    head
+ }
+ 
+ /// Everything the pack renders that is neither host content nor advisory
+@@ -1951,6 +2117,7 @@
+     form: ContextPackRenderFormV1,
+     host_items: &[HostContextItemV1],
+     lane: &AdvisoryLaneV1,
++    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
+     lane_rendered: bool,
+     advisory_items: &[ContextPackItemV1],
+     receipt: &ContextPackReceiptV1,
+@@ -1965,7 +2132,7 @@
+             }
+             let mut advisory_block = String::new();
+             if lane_rendered && !matches!(lane, AdvisoryLaneV1::Absent) {
+-                advisory_block.push_str(&lane_head_markdown(lane));
++                advisory_block.push_str(&lane_head_markdown(lane, canonical_history_replay));
+                 if lane.contribution().is_some() {
+                     if advisory_items.is_empty() {
+                         advisory_block.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
+@@ -1995,12 +2162,12 @@
+                     .join(",");
+                 advisory_block = format!(
+                     ",\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{}\"candidates\":[{candidates}]}}",
+-                    json_lane_head(lane)
++                    json_lane_head(lane, canonical_history_replay)
+                 );
+                 members.push(format!(
+                     "\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{}\"candidates\":[{candidates}],\
+                      \"context_pack\":{}}}",
+-                    json_lane_head(lane),
++                    json_lane_head(lane, canonical_history_replay),
+                     serde_json::to_string(receipt).unwrap_or_default()
+                 ));
+             }
+@@ -2013,8 +2180,11 @@
+ }
+ 
+ /// The advisory lane's markdown head: heading plus identity or notice.
+-fn lane_head_markdown(lane: &AdvisoryLaneV1) -> String {
+-    match lane {
++fn lane_head_markdown(
++    lane: &AdvisoryLaneV1,
++    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++) -> String {
++    let mut head = match lane {
+         AdvisoryLaneV1::Absent => String::new(),
+         AdvisoryLaneV1::Notice {
+             provider_id,
+@@ -2035,7 +2205,11 @@
+             head.push('\n');
+             head
+         }
+-    }
++    };
++    if let Some(replay) = canonical_history_replay {
++        let _ = writeln!(head, "canonical_history_replay={}", replay.json);
++    }
++    head
+ }
+ 
+ /// One admitted advisory item as the markdown form renders it.
+@@ -2101,6 +2275,7 @@
+     policy: &ContextPackPolicyV1,
+     tokenizer: &dyn ContextTokenizer,
+     sections: &[ContextPackSectionV1],
++    canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
+ ) -> String {
+     let mut hasher = Sha256::new();
+     absorb(&mut hasher, policy.policy_id.as_bytes());
+@@ -2110,6 +2285,10 @@
+     absorb(&mut hasher, policy.render_form.label().as_bytes());
+     absorb(&mut hasher, &policy.total_token_budget.to_be_bytes());
+     absorb(&mut hasher, &policy.advisory_token_quota.to_be_bytes());
++    if let Some(replay) = canonical_history_replay {
++        absorb(&mut hasher, b"canonical_history_replay");
++        absorb(&mut hasher, replay.json.as_bytes());
++    }
+     for section in sections {
+         absorb(&mut hasher, section.section.label().as_bytes());
+         absorb(&mut hasher, &section.tokens.to_be_bytes());
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
+@@ -1689,3 +1689,237 @@
+         .is_err()
+     );
+ }
++
++fn settled_replay_metadata()
++-> tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayV1 {
++    use tracedecay_memory_provider_registry::recall_context_pack::{
++        CanonicalHistoryReplayBatchV1, CanonicalHistoryReplayV1,
++    };
++    CanonicalHistoryReplayV1 {
++        provider_id: "provider.native".to_owned(),
++        registration_revision: 7,
++        delivery_scope: tracedecay_memory_provider_registry::RecallOutcomeScopeV1 {
++            profile_id: "profile.replay".to_owned(),
++            project_id: "project.replay".to_owned(),
++            repository_identity: "repository.replay".to_owned(),
++            worktree_identity: "worktree.replay".to_owned(),
++            branch_identity: "refs/heads/replay".to_owned(),
++            agent_session_id: "session.replay".to_owned(),
++            resolved_scope_digest: format!("sha256:{}", "1".repeat(64)),
++        },
++        batches: vec![
++            CanonicalHistoryReplayBatchV1 {
++                observation_batch_ref: format!("host-observation-batch-v1:{}", "a".repeat(64)),
++                first_source_sequence: 11,
++                last_source_sequence: 12,
++                observation_count: 2,
++            },
++            CanonicalHistoryReplayBatchV1 {
++                observation_batch_ref: format!("host-observation-batch-v1:{}", "b".repeat(64)),
++                first_source_sequence: 18,
++                last_source_sequence: 18,
++                observation_count: 1,
++            },
++        ],
++    }
++}
++
++#[test]
++fn settled_replay_metadata_is_budgeted_and_hashed_even_with_zero_recall_candidates() {
++    use std::collections::BTreeMap;
++    use tracedecay_memory_provider_registry::recall_context_pack::compile_context_pack_with_control_metadata;
++    let lane = lane(contribution(Vec::new()));
++    let metadata = settled_replay_metadata();
++    for form in [ContextPackRenderFormV1::Json, MARKDOWN] {
++        let policy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
++        let pack = compile_context_pack_with_control_metadata(
++            policy,
++            &CANONICAL,
++            &[],
++            &lane,
++            &BTreeMap::new(),
++            Some(&metadata),
++        )
++        .unwrap();
++        assert!(pack.items().next().is_none());
++        assert_eq!(pack.canonical_history_replay.as_ref(), Some(&metadata));
++        let wire = if form == ContextPackRenderFormV1::Json {
++            let rendered: serde_json::Value = serde_json::from_str(&pack.rendered).unwrap();
++            assert_eq!(
++                rendered[tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["candidates"],
++                serde_json::json!([])
++            );
++            rendered[tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["canonical_history_replay"].clone()
++        } else {
++            let line = pack
++                .rendered
++                .lines()
++                .find_map(|line| line.strip_prefix("canonical_history_replay="))
++                .unwrap();
++            serde_json::from_str(line).unwrap()
++        };
++        assert_eq!(wire, serde_json::to_value(&metadata).unwrap());
++        assert_eq!(wire["batches"][0]["last_source_sequence"], 12);
++        assert_eq!(wire["batches"][1]["first_source_sequence"], 18);
++        assert_eq!(wire["batches"].as_array().unwrap().len(), 2);
++        let ordinary = compile_context_pack(policy, &CANONICAL, &[], &lane).unwrap();
++        assert!(ordinary.canonical_history_replay.is_none());
++        assert!(!ordinary.rendered.contains("canonical_history_replay"));
++        assert!(pack.advisory_tokens() > ordinary.advisory_tokens());
++        assert!(pack.rendered_tokens <= policy.total_token_budget());
++        assert!(pack.advisory_tokens() <= policy.advisory_token_quota());
++        let mut changed = metadata.clone();
++        changed.delivery_scope.agent_session_id = "session.replay-other".to_owned();
++        let changed = compile_context_pack_with_control_metadata(
++            policy,
++            &CANONICAL,
++            &[],
++            &lane,
++            &BTreeMap::new(),
++            Some(&changed),
++        )
++        .unwrap();
++        assert_ne!(pack.pack_hash, changed.pack_hash);
++        let mut empty = metadata.clone();
++        empty.batches.clear();
++        let empty = compile_context_pack_with_control_metadata(
++            policy,
++            &CANONICAL,
++            &[],
++            &lane,
++            &BTreeMap::new(),
++            Some(&empty),
++        )
++        .unwrap();
++        assert!(empty.canonical_history_replay.unwrap().batches.is_empty());
++        assert!(empty.rendered.contains("canonical_history_replay"));
++    }
++}
++
++#[test]
++fn replay_metadata_that_does_not_fit_is_neither_published_nor_hashed() {
++    use std::collections::BTreeMap;
++    use tracedecay_memory_provider_registry::recall_context_pack::compile_context_pack_with_control_metadata;
++    let lane = lane(contribution(Vec::new()));
++    let metadata = settled_replay_metadata();
++    for form in [ContextPackRenderFormV1::Json, MARKDOWN] {
++        let roomy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
++        let full = compile_context_pack_with_control_metadata(
++            roomy,
++            &CANONICAL,
++            &[],
++            &lane,
++            &BTreeMap::new(),
++            Some(&metadata),
++        )
++        .unwrap();
++        let ordinary = compile_context_pack(roomy, &CANONICAL, &[], &lane).unwrap();
++        assert!(full.advisory_tokens() > ordinary.advisory_tokens());
++        let tight = ContextPackPolicyV1::new(12_000, ordinary.advisory_tokens(), form).unwrap();
++        let withheld = compile_context_pack_with_control_metadata(
++            tight,
++            &CANONICAL,
++            &[],
++            &lane,
++            &BTreeMap::new(),
++            Some(&metadata),
++        )
++        .unwrap();
++        assert!(withheld.canonical_history_replay.is_none());
++        assert!(!withheld.rendered.contains("canonical_history_replay"));
++        assert!(!withheld.rendered.contains("host-observation-batch-v1:"));
++        assert_eq!(withheld.advisory_tokens(), 0);
++        let mut changed = metadata.clone();
++        changed.batches[0].observation_batch_ref =
++            format!("host-observation-batch-v1:{}", "c".repeat(64));
++        let changed = compile_context_pack_with_control_metadata(
++            tight,
++            &CANONICAL,
++            &[],
++            &lane,
++            &BTreeMap::new(),
++            Some(&changed),
++        )
++        .unwrap();
++        assert!(changed.canonical_history_replay.is_none());
++        assert_eq!(withheld.pack_hash, changed.pack_hash);
++        assert_eq!(withheld.rendered, changed.rendered);
++    }
++}
++
++#[test]
++fn replay_projection_refuses_wrong_owner_invalid_scope_and_invented_contiguous_ranges() {
++    use std::collections::BTreeMap;
++    use tracedecay_memory_provider_registry::recall_context_pack::{
++        CanonicalHistoryReplayV1, compile_context_pack_with_control_metadata,
++    };
++    let lane = lane(contribution(Vec::new()));
++    let policy = ContextPackPolicyV1::new(12_000, 6_000, MARKDOWN).unwrap();
++    let changes: [fn(&mut CanonicalHistoryReplayV1); 11] = [
++        |value| value.provider_id = "provider.other".to_owned(),
++        |value| value.registration_revision = 8,
++        |value| value.delivery_scope.agent_session_id.clear(),
++        |value| value.delivery_scope.branch_identity.push('\n'),
++        |value| {
++            value.batches[0].first_source_sequence = 0;
++            value.batches[0].last_source_sequence = 1;
++        },
++        |value| value.batches[1].first_source_sequence = 12,
++        |value| value.batches[0].observation_count = 3,
++        |value| {
++            value.batches[0].last_source_sequence = 18;
++            value.batches.truncate(1);
++            value.batches[0].observation_count = 3;
++        },
++        |value| value.batches[0].observation_batch_ref.push('x'),
++        |value| {
++            value.batches[1].observation_batch_ref = value.batches[0].observation_batch_ref.clone()
++        },
++        |value| value.batches = vec![value.batches[0].clone(); 257],
++    ];
++    for change in changes {
++        let mut metadata = settled_replay_metadata();
++        change(&mut metadata);
++        assert!(
++            compile_context_pack_with_control_metadata(
++                policy,
++                &CANONICAL,
++                &[],
++                &lane,
++                &BTreeMap::new(),
++                Some(&metadata),
++            )
++            .is_err()
++        );
++    }
++    assert!(
++        compile_context_pack_with_control_metadata(
++            policy,
++            &CANONICAL,
++            &[],
++            &NO_LANE,
++            &BTreeMap::new(),
++            Some(&settled_replay_metadata()),
++        )
++        .is_err()
++    );
++    let mut largest = settled_replay_metadata();
++    largest.batches = (0..256).map(|index| {
++        tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayBatchV1 {
++            observation_batch_ref: format!("host-observation-batch-v1:{:064x}", index + 1),
++            first_source_sequence: index * 2 + 1,
++            last_source_sequence: index * 2 + 1,
++            observation_count: 1,
++        }
++    }).collect();
++    let large = compile_context_pack_with_control_metadata(
++        ContextPackPolicyV1::new(200_000, 100_000, MARKDOWN).unwrap(),
++        &CANONICAL,
++        &[],
++        &lane,
++        &BTreeMap::new(),
++        Some(&largest),
++    )
++    .unwrap();
++    assert_eq!(large.canonical_history_replay.unwrap().batches.len(), 256);
++}

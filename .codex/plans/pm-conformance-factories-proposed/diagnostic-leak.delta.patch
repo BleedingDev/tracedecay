@@ -1,0 +1,66 @@
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -1467,6 +1467,7 @@
+                 let effect = reply.terminal.committed_effect();
+                 positive_reply(previous.get(populated_step))
+                     && !foreign_scope_leaks_source(reply, previous.get(populated_step))
++                    && reply.terminal.fallback() == &FallbackDirective::forbidden()
+                     && effect.state() == CommittedEffectState::None
+                     && match (
+                         effect.state_generation_before(),
+@@ -4094,6 +4095,9 @@
+         return true;
+     };
+     let mut exposed = reply.warnings.join("\n");
++    if let Some(diagnostic) = reply.terminal.diagnostic_id() {
++        exposed.push_str(diagnostic);
++    }
+     if let Some(payload) = &reply.payload {
+         exposed.push_str(&String::from_utf8_lossy(&payload.bytes));
+     }
+--- a/crates/tracedecay-memory-conformance/src/real_fixture/tests.rs
++++ b/crates/tracedecay-memory-conformance/src/real_fixture/tests.rs
+@@ -510,7 +510,13 @@
+                 FallbackDirective::forbidden(),
+                 "isolation-recall",
+                 scope.exact_scope_sha256(),
+-                None,
++                (!matches!(
++                    code,
++                    TerminalCode::Success
++                        | TerminalCode::SuccessZeroResults
++                        | TerminalCode::Partial
++                ))
++                .then(|| "independent-transport-diagnostic".into()),
+             )
+             .map_err(err)?,
+             payload: value
+@@ -544,6 +550,28 @@
+     assert!(assertion_errors(&assertions, &empty, &prior, &scope).is_empty());
+     let outage = make_reply(TerminalCode::ProviderUnavailable, None)?;
+     assert!(!assertion_errors(&assertions, &outage, &prior, &scope).is_empty());
++    for (diagnostic, leaks_source) in [
++        ("original-source-key", true),
++        ("original-stable-ref", true),
++        ("independent-transport-diagnostic", false),
++    ] {
++        let mut diagnostic_reply = make_reply(TerminalCode::ScopeMismatch, None)?;
++        diagnostic_reply.terminal = TerminalRecord::new(
++            ProviderOperation::Recall,
++            OwnedProviderId::new("fixture-provider").map_err(err)?,
++            TerminalCode::ScopeMismatch,
++            CommittedEffectEvidence::none(Some(7)),
++            FallbackDirective::forbidden(),
++            "isolation-recall",
++            scope.exact_scope_sha256(),
++            Some(diagnostic.into()),
++        )
++        .map_err(err)?;
++        assert_eq!(
++            !assertion_errors(&assertions, &diagnostic_reply, &prior, &scope).is_empty(),
++            leaks_source,
++        );
++    }
+     let mut leak = refusal;
+     leak.warnings.push("original secret fixture content".into());
+     assert!(!assertion_errors(&assertions, &leak, &prior, &scope).is_empty());

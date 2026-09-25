@@ -555,6 +555,7 @@ fn dry_run_canonical_component_set(
         options,
         home,
         lifecycle_root,
+        None,
         Some(tracedecay_bin),
     )?;
     eprintln!(

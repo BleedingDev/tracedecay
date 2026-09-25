@@ -1,0 +1,40 @@
+--- a/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
+@@ -1739,6 +1739,7 @@
+                 .bytes()
+                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+             || !references.insert(batch.observation_batch_ref.as_str())
++            || batch.first_source_sequence == 0
+             || previous_last.is_some_and(|last| batch.first_source_sequence <= last)
+             || batch.observation_count == 0
+             || batch.observation_count > 256
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
+@@ -1855,11 +1855,15 @@
+     };
+     let lane = lane(contribution(Vec::new()));
+     let policy = ContextPackPolicyV1::new(12_000, 6_000, MARKDOWN).unwrap();
+-    let changes: [fn(&mut CanonicalHistoryReplayV1); 10] = [
++    let changes: [fn(&mut CanonicalHistoryReplayV1); 11] = [
+         |value| value.provider_id = "provider.other".to_owned(),
+         |value| value.registration_revision = 8,
+         |value| value.delivery_scope.agent_session_id.clear(),
+         |value| value.delivery_scope.branch_identity.push('\n'),
++        |value| {
++            value.batches[0].first_source_sequence = 0;
++            value.batches[0].last_source_sequence = 1;
++        },
+         |value| value.batches[1].first_source_sequence = 12,
+         |value| value.batches[0].observation_count = 3,
+         |value| {
+@@ -1903,8 +1907,8 @@
+     largest.batches = (0..256).map(|index| {
+         tracedecay_memory_provider_registry::recall_context_pack::CanonicalHistoryReplayBatchV1 {
+             observation_batch_ref: format!("host-observation-batch-v1:{:064x}", index + 1),
+-            first_source_sequence: index * 2,
+-            last_source_sequence: index * 2,
++            first_source_sequence: index * 2 + 1,
++            last_source_sequence: index * 2 + 1,
+             observation_count: 1,
+         }
+     }).collect();

@@ -108,6 +108,20 @@ struct CurrentTarget {
     family: &'static str,
 }
 
+pub(crate) struct WorkerArtifactIdentity {
+    pub(crate) sha256: String,
+    pub(crate) bytes: u64,
+    pub(crate) triple: String,
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) family: &'static str,
+}
+
+struct WorkerContentIdentity {
+    sha256: String,
+    bytes: u64,
+}
+
 /// Owns one verified worker copy for exactly one process lifetime.
 ///
 /// The source path is never passed to the child process. The private directory
@@ -203,26 +217,14 @@ fn stage_verified_worker_binary_at(
 }
 
 fn stage_verified_file(
-    mut file: File,
+    file: File,
     target: &WorkerTarget,
 ) -> Result<VerifiedWorkerArtifact, WorkerIntegrityError> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
-    if !metadata.is_file() {
-        return Err(WorkerIntegrityError::NotRegularFile);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
-            return Err(WorkerIntegrityError::NotExecutable);
-        }
-    }
-    if metadata.len() != target.bytes {
+    let bytes = validate_open_worker(&file)?;
+    if bytes != target.bytes {
         return Err(WorkerIntegrityError::SizeMismatch {
             expected: target.bytes,
-            actual: metadata.len(),
+            actual: bytes,
         });
     }
 
@@ -236,44 +238,11 @@ fn stage_verified_file(
     let staged_path = staging.path().join(WORKER_NAME);
     let mut staged = tracedecay_private_fs::create_private_file(&staged_path)
         .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
-    let mut digest = Sha256::new();
-    let mut bytes_read = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
-        if read == 0 {
-            break;
-        }
-        bytes_read = bytes_read.saturating_add(read as u64);
-        digest.update(&buffer[..read]);
-        staged
-            .write_all(&buffer[..read])
-            .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
-    }
-    if bytes_read != target.bytes {
-        return Err(WorkerIntegrityError::SizeMismatch {
-            expected: target.bytes,
-            actual: bytes_read,
-        });
-    }
-    let final_size = file
-        .metadata()
-        .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?
-        .len();
-    if final_size != target.bytes {
-        return Err(WorkerIntegrityError::SizeMismatch {
-            expected: target.bytes,
-            actual: final_size,
-        });
-    }
-    let digest = digest.finalize();
-    let actual = hex_digest(&digest);
-    if actual != target.sha256 {
+    let identity = measure_open_worker(file, bytes, &mut staged)?;
+    if identity.sha256 != target.sha256 {
         return Err(WorkerIntegrityError::DigestMismatch {
             expected: target.sha256.clone(),
-            actual,
+            actual: identity.sha256,
         });
     }
     staged
@@ -283,9 +252,85 @@ fn stage_verified_file(
     Ok(VerifiedWorkerArtifact {
         _directory: staging,
         path: staged_path,
-        digest: actual,
+        digest: identity.sha256,
         manifest: Vec::new(),
         manifest_digest: String::new(),
+    })
+}
+
+pub(crate) fn worker_artifact_identity(
+    path: &Path,
+) -> Result<WorkerArtifactIdentity, WorkerIntegrityError> {
+    let file = open_worker_binary(path)?;
+    let bytes = validate_open_worker(&file)?;
+    let identity = measure_open_worker(file, bytes, std::io::sink())?;
+    let target = current_target();
+    Ok(WorkerArtifactIdentity {
+        sha256: identity.sha256,
+        bytes: identity.bytes,
+        triple: target.triple,
+        os: target.os,
+        arch: target.arch,
+        family: target.family,
+    })
+}
+
+fn validate_open_worker(file: &File) -> Result<u64, WorkerIntegrityError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(WorkerIntegrityError::NotRegularFile);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(WorkerIntegrityError::NotExecutable);
+        }
+    }
+    Ok(metadata.len())
+}
+
+fn measure_open_worker(
+    mut file: File,
+    expected_bytes: u64,
+    mut copy: impl Write,
+) -> Result<WorkerContentIdentity, WorkerIntegrityError> {
+    let mut digest = Sha256::new();
+    let mut bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.saturating_add(read as u64);
+        digest.update(&buffer[..read]);
+        copy.write_all(&buffer[..read])
+            .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
+    }
+    let final_bytes = file
+        .metadata()
+        .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?
+        .len();
+    if bytes != expected_bytes {
+        return Err(WorkerIntegrityError::SizeMismatch {
+            expected: expected_bytes,
+            actual: bytes,
+        });
+    }
+    if final_bytes != expected_bytes {
+        return Err(WorkerIntegrityError::SizeMismatch {
+            expected: expected_bytes,
+            actual: final_bytes,
+        });
+    }
+    Ok(WorkerContentIdentity {
+        sha256: hex_digest(&digest.finalize()),
+        bytes,
     })
 }
 

@@ -307,6 +307,8 @@ pub struct ToolCallRegistryOptions<'a> {
         Option<crate::mcp::server::CodeIndexRedundancyExecutor>,
     pub(crate) code_index_branch_diff_executor:
         Option<crate::mcp::server::CodeIndexBranchDiffExecutor>,
+    pub(crate) semantic_admin_executor:
+        Option<tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1>,
     pub(crate) code_index_search_authority: Option<crate::mcp::server::CodeIndexSearchAuthorityV1>,
     /// The checkout the serving route was admitted for. Every scoped authority
     /// a moved handler family reads binds against this one scope; absent, no
@@ -378,6 +380,7 @@ impl Default for ToolCallRegistryOptions<'_> {
             code_index_similar_executor: None,
             code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
+            semantic_admin_executor: None,
             code_index_search_authority: None,
             admitted_project_scope: None,
             code_graph_projection_read_port: None,

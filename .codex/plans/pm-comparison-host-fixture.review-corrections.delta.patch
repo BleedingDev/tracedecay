@@ -1,0 +1,531 @@
+diff --git a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+index 857bc7540..2ffe0847a 100644
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+@@ -23,13 +23,23 @@ const PROCESS_POLL: Duration = Duration::from_millis(20);
+ type FixtureResult<T> = Result<T, String>;
+ 
+ fn sha256(bytes: &[u8]) -> String {
+-    format!("{:x}", Sha256::digest(bytes))
++    Sha256::digest(bytes)
++        .iter()
++        .map(|byte| format!("{byte:02x}"))
++        .collect()
+ }
+ 
+ fn io_result<T>(value: io::Result<T>, operation: &str) -> FixtureResult<T> {
+     value.map_err(|error| format!("{operation}: {error}"))
+ }
+ 
++fn before_deadline(deadline: Instant, operation: &str) -> FixtureResult<()> {
++    if Instant::now() >= deadline {
++        return Err(format!("{operation} exceeded its original deadline"));
++    }
++    Ok(())
++}
++
+ fn string<'a>(value: &'a Value, key: &str) -> FixtureResult<&'a str> {
+     value[key]
+         .as_str()
+@@ -49,6 +59,82 @@ struct Channel {
+     nonce: String,
+ }
+ 
++fn frame_remaining(deadline: Instant) -> FixtureResult<Duration> {
++    deadline
++        .checked_duration_since(Instant::now())
++        .filter(|remaining| !remaining.is_zero())
++        .ok_or_else(|| "comparison frame exceeded its original transfer deadline".into())
++}
++
++fn read_frame_bytes(
++    stream: &mut UnixStream,
++    bytes: &mut [u8],
++    deadline: Instant,
++) -> FixtureResult<()> {
++    let mut offset = 0;
++    while offset < bytes.len() {
++        io_result(
++            stream.set_read_timeout(Some(frame_remaining(deadline)?)),
++            "set remaining frame read deadline",
++        )?;
++        match stream.read(&mut bytes[offset..]) {
++            Ok(0) => {
++                return Err(format!(
++                    "comparison frame ended after {offset} of {} bytes",
++                    bytes.len()
++                ));
++            }
++            Ok(count) => offset += count,
++            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++            Err(error)
++                if matches!(
++                    error.kind(),
++                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
++                ) =>
++            {
++                return Err("comparison frame exceeded its original transfer deadline".into());
++            }
++            Err(error) => return Err(format!("read comparison frame: {error}")),
++        }
++    }
++    frame_remaining(deadline)?;
++    Ok(())
++}
++
++fn write_frame_bytes(
++    stream: &mut UnixStream,
++    bytes: &[u8],
++    deadline: Instant,
++) -> FixtureResult<()> {
++    let mut offset = 0;
++    while offset < bytes.len() {
++        io_result(
++            stream.set_write_timeout(Some(frame_remaining(deadline)?)),
++            "set remaining frame write deadline",
++        )?;
++        match stream.write(&bytes[offset..]) {
++            Ok(0) => {
++                return Err(format!(
++                    "comparison frame wrote zero bytes at offset {offset}"
++                ));
++            }
++            Ok(count) => offset += count,
++            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
++            Err(error)
++                if matches!(
++                    error.kind(),
++                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
++                ) =>
++            {
++                return Err("comparison frame exceeded its original transfer deadline".into());
++            }
++            Err(error) => return Err(format!("write comparison frame: {error}")),
++        }
++    }
++    frame_remaining(deadline)?;
++    Ok(())
++}
++
+ impl Channel {
+     fn connect() -> FixtureResult<Self> {
+         let path = PathBuf::from(
+@@ -83,11 +169,12 @@ impl Channel {
+     }
+ 
+     fn receive(&mut self) -> FixtureResult<Value> {
++        self.receive_until(Instant::now() + CHANNEL_DEADLINE)
++    }
++
++    fn receive_until(&mut self, deadline: Instant) -> FixtureResult<Value> {
+         let mut header = [0u8; 8];
+-        io_result(
+-            self.stream.read_exact(&mut header),
+-            "read comparison frame header",
+-        )?;
++        read_frame_bytes(&mut self.stream, &mut header, deadline)?;
+         let declared = u64::from_be_bytes(header);
+         if declared == 0 || declared > MAX_FRAME_BYTES as u64 {
+             return Err(format!(
+@@ -96,10 +183,8 @@ impl Channel {
+         }
+         // Check the untrusted declaration before allocating any payload bytes.
+         let mut bytes = vec![0u8; declared as usize];
+-        io_result(
+-            self.stream.read_exact(&mut bytes),
+-            "read complete comparison frame",
+-        )?;
++        // Header and every partial payload read share this one deadline.
++        read_frame_bytes(&mut self.stream, &mut bytes, deadline)?;
+         let value: Value = serde_json::from_slice(&bytes)
+             .map_err(|error| format!("comparison frame is not UTF-8 JSON: {error}"))?;
+         if value["protocol"] != PROTOCOL || value["nonce"] != self.nonce {
+@@ -117,6 +202,7 @@ impl Channel {
+     }
+ 
+     fn send(&mut self, kind: &str, index: Option<usize>, body: Value) -> FixtureResult<String> {
++        let deadline = Instant::now() + CHANNEL_DEADLINE;
+         let bytes = serde_json::to_vec(&json!({
+             "protocol": PROTOCOL, "nonce": self.nonce, "kind": kind,
+             "action_index": index, "body": body,
+@@ -129,15 +215,19 @@ impl Channel {
+                 bytes.len()
+             ));
+         }
+-        io_result(
+-            self.stream.write_all(&(bytes.len() as u64).to_be_bytes()),
+-            "write comparison frame header",
++        write_frame_bytes(
++            &mut self.stream,
++            &(bytes.len() as u64).to_be_bytes(),
++            deadline,
+         )?;
++        write_frame_bytes(&mut self.stream, &bytes, deadline)?;
+         io_result(
+-            self.stream.write_all(&bytes),
+-            "write complete comparison frame",
++            self.stream
++                .set_write_timeout(Some(frame_remaining(deadline)?)),
++            "set remaining frame flush deadline",
+         )?;
+         io_result(self.stream.flush(), "flush comparison frame")?;
++        frame_remaining(deadline)?;
+         Ok(sha256(&bytes))
+     }
+ 
+@@ -175,9 +265,78 @@ impl ProcessIdentity {
+     }
+ }
+ 
++// A process-inspection helper is also an owned direct child. Its guard exists
++// before the first fallible poll and preserves cleanup evidence on every error
++// path, including an unwind, without selecting any external PID.
++struct InspectionChild {
++    child: Child,
++    parent: PathBuf,
++    exit: Option<std::process::ExitStatus>,
++    cleanup_attempted: bool,
++}
++
++impl InspectionChild {
++    fn poll(&mut self) -> FixtureResult<Option<std::process::ExitStatus>> {
++        if self.exit.is_none() {
++            self.exit = io_result(self.child.try_wait(), "join process inspection command")?;
++        }
++        Ok(self.exit)
++    }
++
++    fn cleanup(&mut self, primary: &str) -> Value {
++        self.cleanup_attempted = true;
++        let mut errors = BTreeSet::new();
++        match self.poll() {
++            Ok(Some(_)) => {}
++            Ok(None) | Err(_) => {
++                if let Err(error) = self.child.kill() {
++                    errors.insert(format!("kill owned inspection child: {error}"));
++                }
++            }
++        }
++        let deadline = Instant::now() + Duration::from_secs(2);
++        while self.exit.is_none() && Instant::now() < deadline {
++            if let Err(error) = self.poll() {
++                errors.insert(error);
++            }
++            if self.exit.is_none() {
++                std::thread::sleep(Duration::from_millis(5));
++            }
++        }
++        use std::os::unix::process::ExitStatusExt;
++        let evidence = json!({"scope": "owned process inspection helper", "pid": self.child.id(),
++            "status": if self.exit.is_some() { "completed" } else { "unmeasured" },
++            "joined": self.exit.is_some(), "primary_failure": primary,
++            "exit_code": self.exit.and_then(|status| status.code()),
++            "exit_signal": self.exit.and_then(|status| status.signal()), "cleanup_errors": errors});
++        static FAILURE_SEQUENCE: std::sync::atomic::AtomicU64 =
++            std::sync::atomic::AtomicU64::new(0);
++        let sequence = FAILURE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        let path = self.parent.join(format!(
++            "host-inspection-cleanup-{}-{sequence}.json",
++            self.child.id()
++        ));
++        match serde_json::to_vec(&evidence)
++            .map_err(|error| error.to_string())
++            .and_then(|bytes| write_durable(&path, &bytes))
++        {
++            Ok(artifact) => json!({"evidence": evidence, "artifact": artifact}),
++            Err(error) => json!({"evidence": evidence, "artifact_error": error}),
++        }
++    }
++}
++
++impl Drop for InspectionChild {
++    fn drop(&mut self) {
++        if self.exit.is_none() && !self.cleanup_attempted {
++            let _ = self.cleanup("process inspection exited without a joined child");
++        }
++    }
++}
++
+ // Same identity boundary used by the reviewed Python process capture: pid and
+-// OS-reported lstart. This is observation of actual ancestry/group membership;
+-// waiting on a daemon alone does not prove its worker children disappeared.
++// OS-reported lstart. Actual ancestry/group membership is observed; a daemon
++// wait alone is never evidence that its worker children disappeared.
+ fn inspect_process_command(command: &mut Command) -> FixtureResult<(u32, Output)> {
+     let parent = PathBuf::from(
+         std::env::var_os("TRACEDECAY_HOST_COMPARISON_ARTIFACT_ROOT")
+@@ -201,56 +360,58 @@ fn inspect_process_command(command: &mut Command) -> FixtureResult<(u32, Output)
+             stderr.try_clone(),
+             "clone process inspection error",
+         )?));
+-    let mut child = io_result(command.spawn(), "spawn bounded process inspection command")?;
+-    let pid = child.id();
+-    let deadline = Instant::now() + Duration::from_secs(2);
+-    let mut killed = false;
+-    let status = loop {
+-        if let Some(status) = io_result(child.try_wait(), "join process inspection command")? {
+-            break status;
+-        }
+-        if Instant::now() >= deadline {
+-            if !killed {
+-                // This exact unreaped direct Child remains owned by this
+-                // scope; no process-name or unrelated PID selection occurs.
+-                io_result(child.kill(), "stop timed-out process inspection command")?;
+-                killed = true;
+-            } else if Instant::now() >= deadline + Duration::from_secs(2) {
+-                return Err(
+-                    "process inspection child did not join within its cleanup bound".into(),
+-                );
++    let child = io_result(command.spawn(), "spawn bounded process inspection command")?;
++    let mut owner = InspectionChild {
++        child,
++        parent,
++        exit: None,
++        cleanup_attempted: false,
++    };
++    let pid = owner.child.id();
++    let result: FixtureResult<(u32, Output)> = (|| {
++        let deadline = Instant::now() + Duration::from_secs(2);
++        let status = loop {
++            if let Some(status) = owner.poll()? {
++                break status;
+             }
++            if Instant::now() >= deadline {
++                return Err("process inspection exceeded its original deadline".into());
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        };
++        let read = |file: &mut fs::File| -> FixtureResult<Vec<u8>> {
++            if io_result(file.metadata(), "process inspection output size")?.len()
++                > MAX_FRAME_BYTES as u64
++            {
++                return Err("process inspection output exceeded its allocation bound".into());
++            }
++            io_result(
++                std::io::Seek::seek(file, std::io::SeekFrom::Start(0)),
++                "rewind process inspection output",
++            )?;
++            let mut bytes = Vec::new();
++            io_result(
++                file.read_to_end(&mut bytes),
++                "read complete process inspection output",
++            )?;
++            Ok(bytes)
++        };
++        Ok((
++            pid,
++            Output {
++                status,
++                stdout: read(&mut stdout)?,
++                stderr: read(&mut stderr)?,
++            },
++        ))
++    })();
++    match result {
++        Ok(output) => Ok(output),
++        Err(primary) => {
++            let cleanup = owner.cleanup(&primary);
++            Err(format!("{primary}; inspection cleanup: {cleanup}"))
+         }
+-        std::thread::sleep(Duration::from_millis(5));
+-    };
+-    if killed {
+-        return Err("process inspection exceeded its original deadline".into());
+     }
+-    let read = |file: &mut fs::File| -> FixtureResult<Vec<u8>> {
+-        if io_result(file.metadata(), "process inspection output size")?.len()
+-            > MAX_FRAME_BYTES as u64
+-        {
+-            return Err("process inspection output exceeded its allocation bound".into());
+-        }
+-        io_result(
+-            std::io::Seek::seek(file, std::io::SeekFrom::Start(0)),
+-            "rewind process inspection output",
+-        )?;
+-        let mut bytes = Vec::new();
+-        io_result(
+-            file.read_to_end(&mut bytes),
+-            "read complete process inspection output",
+-        )?;
+-        Ok(bytes)
+-    };
+-    Ok((
+-        pid,
+-        Output {
+-            status,
+-            stdout: read(&mut stdout)?,
+-            stderr: read(&mut stderr)?,
+-        },
+-    ))
+ }
+ 
+ fn process_snapshot() -> FixtureResult<BTreeMap<u32, ProcessIdentity>> {
+@@ -564,7 +725,9 @@ fn existing_artifact(path: &Path) -> FixtureResult<Value> {
+         digest.update(&buffer[..count]);
+         bytes += count as u64;
+     }
+-    Ok(json!({"path": path, "bytes": bytes, "sha256": format!("{:x}", digest.finalize())}))
++    Ok(
++        json!({"path": path, "bytes": bytes, "sha256": digest.finalize().iter().map(|byte| format!("{byte:02x}")).collect::<String>()}),
++    )
+ }
+ 
+ struct RawCommand {
+@@ -943,12 +1106,14 @@ impl<'owner> HostFixture<'owner> {
+             .map_err(|error| error.to_string())?;
+         let mut observations = Vec::new();
+         loop {
++            before_deadline(deadline, "startup history")?;
+             let outcome = self.journey.startup_sync_status_for_daemon(
+                 &runtime,
+                 &key,
+                 deadline,
+                 authority.pid,
+             );
++            before_deadline(deadline, "startup history")?;
+             observations.push(outcome.clone());
+             match outcome["status"].as_str() {
+                 Some("complete") => {
+@@ -1003,7 +1168,18 @@ impl<'owner> HostFixture<'owner> {
+             &status_bytes,
+         )?;
+         loop {
+-            let raw = self.tool("tracedecay_lcm_doctor", &json!({"format": "json"}), None)?;
++            before_deadline(deadline, "startup projection")?;
++            let remaining = deadline.saturating_duration_since(Instant::now());
++            let raw = self.tool(
++                "tracedecay_lcm_doctor",
++                &json!({"format": "json"}),
++                Some(
++                    u64::try_from(remaining.as_millis())
++                        .unwrap_or(u64::MAX)
++                        .max(1),
++                ),
++            )?;
++            before_deadline(deadline, "startup projection")?;
+             let doctor = Self::payload(&raw, "tracedecay_lcm_doctor")?;
+             let projection = doctor
+                 .pointer("/outcome/value/payload/projection")
+@@ -1354,12 +1530,14 @@ impl<'owner> HostFixture<'owner> {
+     fn await_source(&mut self, slot: usize) -> FixtureResult<Value> {
+         let deadline = Instant::now() + SETTLEMENT_BUDGET;
+         loop {
++            before_deadline(deadline, "native source settlement")?;
+             self.processes.sample()?;
+             let source = &self.projected[slot];
+             if let Some(journal) = self.journey.journal_for(self.lane == Lane::Ncm) {
+                 let mut cursor = None;
+                 let mut scanned = 0usize;
+                 loop {
++                    before_deadline(deadline, "native source evidence page")?;
+                     let page = journal
+                         .inspect(&JournalInspectionFilterV1 {
+                             limit: JOURNAL_INSPECTION_PAGE_LIMIT,
+@@ -1367,6 +1545,7 @@ impl<'owner> HostFixture<'owner> {
+                             ..JournalInspectionFilterV1::default()
+                         })
+                         .map_err(|error| format!("inspect actual observation journal: {error}"))?;
++                    before_deadline(deadline, "native source evidence page")?;
+                     scanned += page.rows.len();
+                     if scanned > 100_000 {
+                         return Err(
+@@ -1375,6 +1554,7 @@ impl<'owner> HostFixture<'owner> {
+                         );
+                     }
+                     for row in &page.rows {
++                        before_deadline(deadline, "native source evidence row")?;
+                         if row.source_stream != "session_observation_store" {
+                             continue;
+                         }
+@@ -1389,6 +1569,7 @@ impl<'owner> HostFixture<'owner> {
+                         let canonical: tracedecay_domain::observation::CanonicalObservationEnvelopeV1 =
+                             serde_json::from_value(payload["canonical_payload"].clone()).map_err(|error| error.to_string())?;
+                         canonical.validate().map_err(|error| error.to_string())?;
++                        before_deadline(deadline, "native source evidence row")?;
+                         let range = canonical.evidence().range();
+                         if canonical.provider().as_str()
+                             != if self.journey.codex {
+@@ -1409,6 +1590,7 @@ impl<'owner> HostFixture<'owner> {
+                         let receipts = journal
+                             .receipts_for(&row.observation_id)
+                             .map_err(|error| error.to_string())?;
++                        before_deadline(deadline, "native source receipt evidence")?;
+                         let receipt_rows: Vec<_> = receipts.iter().map(|receipt| json!({
+                             "receipt_id": receipt.receipt_id.as_str(), "observation_id": receipt.observation_id.as_str(),
+                             "idempotency_key": receipt.idempotency_key.as_str(), "payload_sha256": receipt.payload_sha256,
+@@ -1425,6 +1607,7 @@ impl<'owner> HostFixture<'owner> {
+                             &self.archive.join(format!("source-{slot:06}.admitted.json")),
+                             &admitted.payload.bytes,
+                         )?;
++                        before_deadline(deadline, "native source evidence capture")?;
+                         let latest = receipts.last();
+                         return Ok(json!({"status": "observed", "admitted_payload": bytes_ref,
+                             "canonical_payload": payload["canonical_payload"], "original_scope": admitted_scope(&admitted),
+@@ -1827,6 +2010,67 @@ mod transport_tests {
+         assert!(channel.receive_kind("hello").unwrap_err().contains("nonce"));
+     }
+ 
++    #[test]
++    fn accepts_fragmented_header_and_payload_within_one_deadline() {
++        let (mut channel, mut parent) = pair();
++        let value = json!({"protocol": PROTOCOL, "nonce": "a".repeat(64), "kind": "hello"});
++        let expected = value.clone();
++        let peer = std::thread::spawn(move || {
++            let payload = serde_json::to_vec(&value).expect("fragmented frame");
++            let bytes = [
++                (payload.len() as u64).to_be_bytes().as_slice(),
++                payload.as_slice(),
++            ]
++            .concat();
++            for chunk in bytes.chunks(3) {
++                parent.write_all(chunk).expect("write fragment");
++            }
++        });
++        assert_eq!(
++            channel
++                .receive_until(Instant::now() + Duration::from_secs(2))
++                .expect("bounded fragmented frame"),
++            expected
++        );
++        peer.join().expect("joined fragmented-frame peer");
++    }
++
++    #[test]
++    fn partial_payload_progress_does_not_restart_the_original_frame_deadline() {
++        let (mut channel, mut parent) = pair();
++        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
++        let (go_sender, go_receiver) = std::sync::mpsc::channel();
++        let peer = std::thread::spawn(move || {
++            let payload = serde_json::to_vec(&json!({"protocol": PROTOCOL,
++                "nonce": "a".repeat(64), "kind": "hello", "padding": "x".repeat(128)}))
++            .expect("drip frame");
++            parent
++                .write_all(&(payload.len() as u64).to_be_bytes())
++                .expect("drip header");
++            ready_sender.send(()).expect("header ready");
++            go_receiver
++                .recv_timeout(Duration::from_secs(2))
++                .expect("begin bounded transfer");
++            // Each individual read progresses before a fresh 80 ms timeout.
++            // The complete frame nevertheless exceeds the original bound.
++            for chunk in payload.chunks(16) {
++                if parent.write_all(chunk).is_err() {
++                    break;
++                }
++                std::thread::sleep(Duration::from_millis(15));
++            }
++        });
++        ready_receiver
++            .recv_timeout(Duration::from_secs(2))
++            .expect("peer header readiness");
++        let deadline = Instant::now() + Duration::from_millis(80);
++        go_sender.send(()).expect("start original deadline");
++        let error = channel.receive_until(deadline).unwrap_err();
++        assert!(error.contains("original transfer deadline"), "{error}");
++        drop(channel);
++        peer.join().expect("joined drip-frame peer");
++    }
++
+     #[test]
+     fn acknowledgement_binds_exact_payload_kind_and_index() {
+         for wrong_field in ["ack_kind", "action_index", "frame_sha256"] {

@@ -254,15 +254,13 @@ fn install_or_update(
             super::ensure_pinned_metadata(&manifest, &expected)?;
             super::validate_materialized_encoder(&download_path, &manifest)?;
 
-            let candidate_path =
+            let candidate_models =
                 create_private_directory(&staging_directory, &staging_path, CANDIDATE_DIRECTORY)?;
-            let candidate_root_directory = open_directory_nofollow(
+            let candidate_directory = open_directory_nofollow(
                 &staging_directory,
                 OsStr::new(CANDIDATE_DIRECTORY),
-                &candidate_path,
+                &candidate_models,
             )?;
-            let (candidate_models, candidate_directory) =
-                super::prepare_model_cache_at(&candidate_root_directory, &candidate_path)?;
             super::publish_materialized_snapshot(
                 &download_path,
                 &candidate_models,
@@ -2006,18 +2004,6 @@ fn is_valid_operation_id(value: &str, operation: Operation) -> bool {
         && nonce
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
-#[cfg(test)]
-fn refuse_pending_journal(path: &Path) -> Result<(), EncoderError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Err(EncoderError::ArtifactMismatch(format!(
-            "model lifecycle has a pending journal at {}; run recover first",
-            path.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(io_error("inspect model lifecycle journal", path, error)),
-    }
 }
 
 #[cfg(test)]

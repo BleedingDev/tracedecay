@@ -1,0 +1,41 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
+@@ -565,7 +565,7 @@
+                 // retained bytes through that connection without republishing.
+                 let mut mutation = handle.store.begin_mutation().unwrap();
+                 mutation
+-                    .update_capsule_provenance(RecordId(1), &provenance.to_string())
++                    .corrupt_capsule_provenance_for_test(RecordId(1), &provenance.to_string())
+                     .unwrap();
+                 // Keep the cached generation aligned with this test store edit.
+                 handle.commit_seq = mutation.commit().unwrap();
+--- a/crates/tracedecay-memory-ncm-runtime/src/store/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/store/mod.rs
+@@ -974,6 +974,27 @@
+             )
+             .map_err(map_sqlite_error)?;
+         self.ensure_budget(0, false)?;
++        Ok(())
++    }
++
++    /// Injects physical corruption through the resident transaction for read-integrity tests.
++    /// The caller must commit it; ordinary provenance writes retain all validation.
++    #[cfg(test)]
++    pub(crate) fn corrupt_capsule_provenance_for_test(
++        &mut self,
++        record_id: RecordId,
++        provenance: &str,
++    ) -> Result<(), StoreError> {
++        let updated = self
++            .tx
++            .execute(
++                "UPDATE capsules SET provenance = ?1 WHERE record_id = ?2",
++                params![provenance, sqlite_i64(record_id.0, "record ID")?],
++            )
++            .map_err(map_sqlite_error)?;
++        if updated != 1 {
++            return Err(StoreError::UnknownRecord(record_id));
++        }
+         Ok(())
+     }
+ 

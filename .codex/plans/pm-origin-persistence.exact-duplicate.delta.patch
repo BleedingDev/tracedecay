@@ -1,0 +1,35 @@
+--- a/crates/tracedecay-global-db/src/observation_adapter.rs
++++ b/crates/tracedecay-global-db/src/observation_adapter.rs
+@@ -590,6 +590,16 @@
+                     retained.observation().receipt() == observation.receipt()
+                 }));
+         if existed_exact {
++            let incoming_origin = write.repository_provenance_attachment().origin();
++            if pending
++                .as_ref()
++                .is_some_and(|retained| &retained.origin != incoming_origin)
++                || existing.as_ref().is_some_and(|retained| {
++                    retained.repository_provenance_attachment().origin() != incoming_origin
++                })
++            {
++                return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
++            }
+             if pending.is_some() {
+                 return Ok(PreparedObservationPersist::DeferredExactDuplicate(
+                     Box::new(write),
+@@ -736,6 +746,7 @@
+     payload_reference: PayloadReferenceV1,
+     identity: ObservationIdentityMaterialV1,
+     receipt: SanitizationReceiptV1,
++    origin: tracedecay_store::ObservationOriginV1,
+ }
+ 
+ #[derive(Clone)]
+@@ -802,6 +813,7 @@
+                 payload_reference: write.observation().payload_reference().clone(),
+                 identity: write.observation().identity().clone(),
+                 receipt: write.observation().receipt().clone(),
++                origin: write.repository_provenance_attachment().origin().clone(),
+             },
+         );
+         self.pending_receipts.insert(

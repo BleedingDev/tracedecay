@@ -58,7 +58,7 @@ use tracedecay_domain::{
     ComponentVersion, DurableObservationV1, ManifestDigest, ObservationId,
     ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
     ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
-    ObservationSourceRangeV1, PayloadReferenceV1, ProjectionGenerationId, ProviderId, RefId,
+    ObservationSourceRangeV1, PayloadReferenceV1, ProjectionGenerationId, ProviderId,
     RetentionClass, SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1,
     SanitizerDispositionV1, SensitivityV1, SessionId, UserProfileId, UtcMicros,
 };
@@ -400,7 +400,7 @@ fn replace_project_store_with_released_v34(path: &Path) {
     remove_database_and_sidecars(path);
     let conn = Connection::open(path).expect("create released v34 project store");
     conn.execute_batch(include_str!(
-        "../../../../tracedecay-runtime-core/tests/fixtures/project-store-released-v34.sql"
+        "../../../tracedecay-runtime-core/tests/fixtures/project-store-released-v34.sql"
     ))
     .expect("load released v34 project schema");
     conn.execute_batch("PRAGMA user_version = 34;")
@@ -796,7 +796,7 @@ fn convert_session_to_released_v3(path: &Path) {
     conn.execute_batch(SESSION_TEMPORAL_PROJECTION_RECEIPTS_V3_DDL)
         .expect("install beta37 projection receipt table");
     conn.execute_batch(include_str!(
-        "../../../../tracedecay-global-db/tests/fixtures/session-relation-receipts-before-recovery.sql"
+        "../../../tracedecay-global-db/tests/fixtures/session-relation-receipts-before-recovery.sql"
     ))
     .expect("install beta37 relation receipt table");
     for sql in trigger_sql {
@@ -804,7 +804,7 @@ fn convert_session_to_released_v3(path: &Path) {
             .expect("restore beta37 projection trigger");
     }
     conn.execute_batch(include_str!(
-        "../../../../tracedecay-global-db/tests/fixtures/session-temporal-released-v3-triggers.sql"
+        "../../../tracedecay-global-db/tests/fixtures/session-temporal-released-v3-triggers.sql"
     ))
     .expect("install beta37 temporal triggers");
     let changed = conn
@@ -878,7 +878,7 @@ fn replace_configuration_with_released_beta37(path: &Path) {
         }
     }
     conn.execute_batch(include_str!(
-        "../../../../tracedecay-global-db/tests/fixtures/configuration-released-beta37.sql"
+        "../../../tracedecay-global-db/tests/fixtures/configuration-released-beta37.sql"
     ))
     .expect("install beta37 configuration schema");
     conn.execute_batch(&format!(
@@ -1719,8 +1719,8 @@ fn assert_beta37_session_database(path: &Path) {
         i64,
         String,
         String,
-        String,
         i64,
+        String,
         String,
     ) = sessions
         .query_row(
@@ -2281,7 +2281,7 @@ fn parse_command_json_object(stdout: &[u8], label: &str) -> Value {
     // result itself may contain nested objects. Select the complete command
     // envelope, rather than returning the last parseable nested object.
     for (offset, _) in stdout.match_indices('{') {
-        if let Ok(value) = serde_json::from_str(&stdout[offset..]) {
+        if let Ok(value) = serde_json::from_str::<Value>(&stdout[offset..]) {
             if value.get("status").is_some() || value.get("protocol").is_some() {
                 return value;
             }
@@ -2392,9 +2392,7 @@ fn assert_v1_process_stopped(value: &Value, label: &str) {
         .unwrap_or_else(|| panic!("{label} must expose a joined process exit result"));
     assert!(exited, "{label} released service process must be reaped");
     assert!(
-        value
-            .get("exit_error")
-            .is_some_and(Value::is_null),
+        value.get("exit_error").is_some_and(Value::is_null),
         "{label} must expose a null process exit error after a confirmed reap"
     );
 }
@@ -2749,8 +2747,11 @@ fn assert_cli_backup_tree_closure(source_root: &Path, backup_root: &Path, label:
             continue;
         }
         assert_eq!(
-            source_bytes,
-            backup.get(&path).expect("normalized backup authority path"),
+            source_bytes.as_slice(),
+            backup
+                .get(&path)
+                .expect("normalized backup authority path")
+                .as_slice(),
             "{label} backup changed opaque/non-SQLite authority bytes at {path}"
         );
     }
@@ -3034,7 +3035,7 @@ fn replacement_ncm_factory(
                 Some(authority) => provider.with_admission_authority(authority),
                 None => provider,
             };
-            let provider: Arc<dyn tracedecay_memory_provider_registry::MemoryProvider> =
+            let provider: Arc<dyn tracedecay_memory_provider_registry::MemoryProviderV1> =
                 Arc::new(provider);
             let registration = ProviderRegistrationV1 {
                 provider_id: descriptor.provider_id.clone(),
@@ -3261,10 +3262,8 @@ async fn bind_canonical_project_retrieval(
     .await
     .expect("mount canonical project session retrieval root");
     let retrieval = Arc::new(
-        tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalService::new(
-            session_db.clone(),
-            root,
-            None,
+        tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalService::new_without_refresh_worker(
+            session_db.clone(), root,
         )
         .expect("construct canonical project session retrieval service"),
     );
@@ -3330,6 +3329,7 @@ async fn mount_production_replacement_project(
     routing: tracedecay_domain::configuration::MemoryProviderRecallRoutingV1,
     factory: Option<crate::retained_owner::NcmRegistrationFactoryV1>,
 ) -> MountedReplacementProject {
+    let expected_active_provider = selection.active_provider();
     let runtime =
         HostAdmissionTestRuntimeV1::project(profile_root, project_root, project_id.clone())
             .await
@@ -3371,6 +3371,31 @@ async fn mount_production_replacement_project(
     )
     .await
     .expect("compose production project memory-provider host");
+    let selected_registration = host
+        .registry()
+        .and_then(|registry| registry.selected_registration());
+    match expected_active_provider {
+        Some(tracedecay_domain::configuration::MemoryProviderKindV1::Native) => {
+            let registration = selected_registration.expect("selected Native registration");
+            assert_eq!(registration.provider_id.as_str(), "tracedecay.native");
+            assert!(
+                !registration.requires_common_advisory_profile,
+                "canonical Native activation must not claim the provider-local common profile"
+            );
+        }
+        Some(tracedecay_domain::configuration::MemoryProviderKindV1::Ncm) => {
+            let registration = selected_registration.expect("selected NCM registration");
+            assert_eq!(registration.provider_id.as_str(), "ncm");
+            assert!(
+                registration.requires_common_advisory_profile,
+                "active injected NCM must retain the complete common profile requirement"
+            );
+        }
+        None => assert!(
+            selected_registration.is_none(),
+            "observer-only composition must not publish a selected registration"
+        ),
+    }
     bind_canonical_project_retrieval(
         &host,
         &runtime,
@@ -3456,7 +3481,7 @@ async fn production_cognitive_recall(
     scope: &ResolvedScope,
     query: &str,
     suffix: &str,
-) -> tracedecay_contracts::CognitiveRecallResult {
+) -> tracedecay_contracts::memory::CognitiveRecallResult {
     let mount = host
         .cognitive_recall_mount()
         .expect("production cognitive recall mount");
@@ -3473,7 +3498,7 @@ async fn production_cognitive_recall(
             .saturating_add(60_000_000),
     ))
     .expect("production recall deadline");
-    let request = tracedecay_contracts::CognitiveRecallRequest::new(
+    let request = tracedecay_contracts::memory::CognitiveRecallRequest::new(
         scope.clone(),
         request_id,
         deadline,
@@ -3504,7 +3529,7 @@ struct RecallSnapshot {
 
 #[cfg(unix)]
 fn snapshot_recall(
-    result: &tracedecay_contracts::CognitiveRecallResult,
+    result: &tracedecay_contracts::memory::CognitiveRecallResult,
     expected_provider: &str,
     expected_text: &str,
     scope: &ResolvedScope,
@@ -3535,7 +3560,7 @@ fn snapshot_recall(
     assert!(
         matches!(
             candidate.provenance(),
-            tracedecay_contracts::CognitiveRecallProvenance::Available { .. }
+            tracedecay_contracts::memory::CognitiveRecallProvenance::Available { .. }
         ),
         "{label} candidate provenance must remain available"
     );

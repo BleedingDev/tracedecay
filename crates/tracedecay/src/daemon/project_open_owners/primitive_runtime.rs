@@ -9,39 +9,27 @@ use tracedecay_application::primitives::{
 use tracedecay_application::source_authorization::ProjectSourceAccessSnapshot;
 
 use crate::daemon::DaemonInvocationState;
-use crate::mcp::McpServer;
 use tracedecay_daemon_service::{
     DaemonPrimitiveRuntimeRegistrationError, daemon_operation_event_authority,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_graph_query::SourceReadContext;
 use tracedecay_session_runtime::session_retrieval::DaemonSessionLookupPrimitiveV1;
+use tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1;
 
 #[hotpath::measure(label = "daemon.project.owners.primitive", future = true)]
 pub(super) async fn open_and_register_project_primitive_runtime(
     invocation: &DaemonInvocationState,
     project_root: &Path,
     source: SourceReadContext,
-    server: &McpServer,
+    code_graph: crate::mcp::server::CodeGraphProjectionReadPort,
+    ignored_dependency_admission: crate::mcp::server::CodeIndexIgnoredDependencyAdmissionPort,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+    session_retrieval: Arc<dyn SessionApplicationRetrievalPortV1>,
     access: ProjectSourceAccessSnapshot,
     admitted_root_uri: &str,
 ) -> Result<()> {
-    let code_graph = server
-        .code_graph_projection_read_port()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project-open primitive runtime requires the production code-graph projection authority"
-                .to_owned(),
-        })?;
-    let ignored_dependency_admission = server
-        .code_index_ignored_dependency_admission()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project-open primitive runtime requires the mounted ignored-dependency admission authority"
-                .to_owned(),
-        })?;
-    let temporal = Arc::new(DaemonSessionLookupPrimitiveV1::new(
-        server.project_session_application_retrieval_service(&access.scope)?,
-    ));
+    let temporal = Arc::new(DaemonSessionLookupPrimitiveV1::new(session_retrieval));
     invocation
         .primitive_runtime_registrar()
         .open_and_register(

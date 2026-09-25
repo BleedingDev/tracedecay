@@ -1,0 +1,29 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/native_common_factory_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_common_factory_tests.rs
+@@ -140,7 +140,7 @@
+     }
+     fn check(&self) -> Result<(), String> {
+         if let Some(control) = self.control {
+-            control.snapshot().map_err(failure)?;
++            control.snapshot().map_err(|error| format!("{error:?}"))?;
+         }
+         if Instant::now() >= self.deadline {
+             return Err("fixture transport bound elapsed".into());
+@@ -419,7 +419,7 @@
+         }
+         let witness: ProbeWitness = serde_json::from_slice(&bytes).map_err(failure)?;
+         let control = control.ok_or("probe has no original call control")?;
+-        control.snapshot().map_err(failure)?;
++        control.snapshot().map_err(|error| format!("{error:?}"))?;
+         if witness.operation_id != self.config.operation_id
+             || Some(witness.pid) != self.evidence.pid
+             || Some(witness.rpc_id) != self.evidence.rpc_id
+@@ -2037,7 +2037,7 @@
+         })
+     };
+     let mut active_request_id = None;
+-    let result = (|| {
++    let result: Result<(), String> = (|| {
+         let authority = FixtureAuthority::from_snapshot(config.authority.clone())?;
+         let probe = Arc::new(Mutex::new(ChildProbeState::default()));
+         let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -1,9 +1,8 @@
 //! Runtime pin surfaces and control-plane config helpers.
 //!
-//! Retrieval-profile evaluation stays in `tracedecay-application::config::retrieval`.
 //! The re-export rows below are surfaces `tracedecay-global-db` and
-//! `tracedecay-domain` already own, kept under the `crate::config::…`
-//! spelling so call sites share one import path.
+//! `tracedecay-domain` already own, kept under the `crate::config::…` spelling
+//! so call sites share one import path.
 
 pub mod analyzer;
 pub mod model;
@@ -31,12 +30,13 @@ use tracedecay_domain::configuration::{
     INDEX_MAX_FILE_SIZE_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
     INDEX_TRACK_CALL_SITES_SETTING_KEY, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
     MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-    SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SettingKey,
-    TELEMETRY_TIMINGS_SETTING_KEY,
+    SEMANTIC_RUNTIME_SETTING_KEY_V2, SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY,
+    SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY, SettingKey, TELEMETRY_TIMINGS_SETTING_KEY,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_global_db::configuration::contracts::ConfigurationCurrentStateV1;
+use tracedecay_semantic_contracts::SemanticConfig;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeTraceDecayConfig {
@@ -51,6 +51,7 @@ pub struct RuntimeTraceDecayConfig {
     pub memory_provider_native_enabled: bool,
     pub memory_provider_ncm_observer: MemoryProviderNcmObserverV1,
     pub memory_provider_recall_routing: MemoryProviderRecallRoutingV1,
+    pub semantic: SemanticConfig,
     pub sync: RuntimeSyncConfig,
     pub telemetry: RuntimeTelemetryConfig,
 }
@@ -69,6 +70,7 @@ impl Default for RuntimeTraceDecayConfig {
             memory_provider_native_enabled: false,
             memory_provider_ncm_observer: MemoryProviderNcmObserverV1::default(),
             memory_provider_recall_routing: MemoryProviderRecallRoutingV1::default(),
+            semantic: SemanticConfig::default(),
             sync: RuntimeSyncConfig::default(),
             telemetry: RuntimeTelemetryConfig::default(),
         }
@@ -260,6 +262,7 @@ fn runtime_config_from_snapshot(
         )?,
         memory_provider_ncm_observer: memory_provider_ncm_observer_from_snapshot(snapshot)?,
         memory_provider_recall_routing: memory_provider_recall_routing_from_snapshot(snapshot)?,
+        semantic: semantic_runtime_from_snapshot(snapshot)?,
         sync: RuntimeSyncConfig {
             auto_track_pr_branches: required_bool(
                 snapshot,
@@ -274,6 +277,27 @@ fn runtime_config_from_snapshot(
             timings: required_bool(snapshot, TELEMETRY_TIMINGS_SETTING_KEY)?,
         },
     })
+}
+
+fn semantic_runtime_from_snapshot(snapshot: &ConfigurationSnapshotV1) -> Result<SemanticConfig> {
+    let semantic: SemanticConfig = match required_setting(snapshot, SEMANTIC_RUNTIME_SETTING_KEY_V2)? {
+        ConfigurationValueV1::Text(value) => serde_json::from_str(value).map_err(|error| {
+            config_error(format!(
+                "resolved configuration setting '{SEMANTIC_RUNTIME_SETTING_KEY_V2}' is not a semantic runtime document: {error}"
+            ))
+        })?,
+        _ => {
+            return Err(config_error(format!(
+                "resolved configuration setting '{SEMANTIC_RUNTIME_SETTING_KEY_V2}' is not text"
+            )));
+        }
+    };
+    semantic.validate().map_err(|error| {
+        config_error(format!(
+            "resolved configuration setting '{SEMANTIC_RUNTIME_SETTING_KEY_V2}' is invalid: {error}"
+        ))
+    })?;
+    Ok(semantic)
 }
 
 fn setting_key(key_name: &str) -> Result<SettingKey> {
@@ -455,6 +479,47 @@ mod memory_provider_snapshot_tests {
 
     fn routing_text(routing: &MemoryProviderRecallRoutingV1) -> ConfigurationValueV1 {
         ConfigurationValueV1::Text(serde_json::to_string(routing).expect("routing encodes"))
+    }
+
+    #[test]
+    fn semantic_runtime_snapshot_defaults_off_and_rejects_the_released_v1_shape() {
+        let stock = runtime_config_from_snapshot(&default_snapshot()).expect("default runtime");
+        assert_eq!(stock.semantic, SemanticConfig::default());
+        assert!(!stock.semantic.enabled);
+        assert!(!stock.semantic.auto_download);
+
+        let enabled = SemanticConfig {
+            enabled: true,
+            ..SemanticConfig::default()
+        };
+        let selected = runtime_config_from_snapshot(&snapshot_with(
+            SEMANTIC_RUNTIME_SETTING_KEY_V2,
+            Some(ConfigurationValueV1::Text(
+                serde_json::to_string(&enabled).expect("semantic config encodes"),
+            )),
+        ))
+        .expect("enabled semantic runtime");
+        assert_eq!(selected.semantic, enabled);
+        assert_eq!(
+            selected.semantic.effective_model_id(),
+            Some(tracedecay_semantic_contracts::DEFAULT_FASTEMBED_MODEL_ID)
+        );
+
+        let old_v1 = ConfigurationValueV1::Text(
+            r#"{"selected_model":"JinaEmbeddingsV2BaseCode","auto_download":true,"active_profile":null,"rollback_profile":null}"#
+                .to_owned(),
+        );
+        assert!(
+            runtime_config_from_snapshot(&snapshot_with(
+                SEMANTIC_RUNTIME_SETTING_KEY_V2,
+                Some(old_v1)
+            ))
+            .is_err()
+        );
+        assert!(
+            runtime_config_from_snapshot(&snapshot_with(SEMANTIC_RUNTIME_SETTING_KEY_V2, None))
+                .is_err()
+        );
     }
 
     #[test]

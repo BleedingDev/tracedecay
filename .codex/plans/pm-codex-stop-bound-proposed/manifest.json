@@ -1,0 +1,47 @@
+[
+  {
+    "path": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest/kernels.rs",
+    "before_sha256": "3132cee9e9f921a5eb80345e6503f511f6660f21cac6784aabd81a7252d822fc",
+    "after_sha256": "68a552347f755ce5585084eb9e5ff6045141dc687e50e27fc3a422b0ad607126"
+  },
+  {
+    "path": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/ingest.rs",
+    "before_sha256": "562591d22669961b715399c044d74998fd13a99b839cc6a9d49121200f9f4a03",
+    "after_sha256": "ae6e53f8435d9b6670e8f8f02758f54eeca829a6bc3e126155654333856ef3a3"
+  },
+  {
+    "path": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/terminal.rs",
+    "before_sha256": "2a385b7dcd49f6311cd3b60f95f85528b40ca4b0679cad9d44a57f9190b29ede",
+    "after_sha256": "814430aff5f4407a59ca05bf3856bfe4ebd5ead4ba34829ef70ec3838f24b542"
+  },
+  {
+    "path": "crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs",
+    "before_sha256": "6d4ade27c71127a22eb514e17b0a55c9286ac79b4bc7591fa0ab4e66185b27ac",
+    "after_sha256": "a9862740554c1f0c1e55c8c33615daef1a6b153ee4eb2b68bc996d45ce8b5c97"
+  },
+  {
+    "path": "crates/tracedecay-sessions/src/runtime/hosts/codex/observation.rs",
+    "before_sha256": "ab982915a57a44199622c68fd1009f3f694c9132a92e7859aa3f183af51bedd3",
+    "after_sha256": "ee44837188162e078b6e155802c3355b4c70bc64760b323bb3f655a0d7b6d461"
+  },
+  {
+    "path": "crates/tracedecay-sessions/src/runtime/hosts/codex.rs",
+    "before_sha256": "394457207ef493f6dee95f021e0c15ef1e5927530f7f774d4291dfa8e2187dd5",
+    "after_sha256": "f1192d282f075b694ec9ed6d8ad12076c71697e1f3ae7568ad707cf50a01990a"
+  },
+  {
+    "path": "crates/tracedecay-sessions/src/runtime/observation/jsonl_observation_admission/tests.rs",
+    "before_sha256": "c4584746cf256be546e88d7cdb85c2b68bb972a90a3c94cbe4506e21eb496144",
+    "after_sha256": "00d376d9077c7e958f4b45e4ceaa431291cb51ad3847925de306f2cde48dfc33"
+  },
+  {
+    "path": "crates/tracedecay-sessions/src/runtime/observation/jsonl_observation_admission.rs",
+    "before_sha256": "5d2f5fafd624c870c6bbe0fe0a39a11875fce7bebb03fc559994119bbf18647e",
+    "after_sha256": "410c4a2d3ee430591c63d5d63b910a410f44bc0178539ae413839ecb6d18852d"
+  },
+  {
+    "path": "crates/tracedecay-sessions/src/runtime/source.rs",
+    "before_sha256": "c08e946435c9c6ee194017740eac80486e4c1d17ba8428db36db7d4dce6a6f8d",
+    "after_sha256": "f8ed32e4820cb31ab0a6c063a6cf9635a2c923730586e52fff38be5dc2636639"
+  }
+]

@@ -288,6 +288,7 @@ fn core_query_policy() -> Result<(FusionProfile, DiversityPolicy), QueryRuntimeM
         minimum_calibrated_feature_micros: BTreeMap::new(),
         weights_micros,
         diversity_policy_id: fallback_policy_id("diversity.candidate.v1")?,
+        rerank_policy_id: None,
         retrieval_budget: RetrievalBudget {
             max_candidates_per_lane: 32,
             max_fused_candidates: 32,

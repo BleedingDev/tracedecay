@@ -1,31 +1,24 @@
 //! The immutable generation state machine and its exact-flat read path.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 
 use crate::types::{
-    AdmittedEmbeddingProjectionKeyV1, BaseGenerationIncompatibilityV1,
+    AdmittedEmbeddingProjectionKeyV1, BaseGenerationIncompatibilityV1, ChangedCodeChunkSetV1,
     CodeChunkProjectionReceiptV1, CodeGenerationId, CodeSearchChunkId, ContentDigest,
-    ManifestDigest, PreparedVectorGenerationV1, ProjectedChunkVectorV1, ProjectionBatchReceiptV1,
-    ProjectionOperationV1, ProjectionOutcomeV1, ProjectionReplayReasonV1,
-    PublishedVectorGenerationV1, PublishedVectorRowV1, SearchCompatibilityV1, SearchHitV1,
-    VECTOR_AUTHORITY_SCHEMA_V1, VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, VectorAuthorityError,
-    VectorGenerationBuildIdV1, VectorGenerationIdV1, VectorGenerationPlanV1,
-    VectorGenerationPublicationV1, VectorProjectionCheckpointV1, VectorSearchRequestV1,
-    VectorTombstoneV1, cosine_similarity, digest_bytes, validate_values, vector_output_digest,
+    EmbeddingMetricV1, ManifestDigest, PreparedVectorGenerationV1, ProjectedChunkVectorV1,
+    ProjectionBatchReceiptV1, ProjectionOperationV1, ProjectionOutcomeV1,
+    PublishedVectorGenerationV1, PublishedVectorReadRowV1, PublishedVectorReadSnapshotV1,
+    PublishedVectorRowV1, SearchCompatibilityV1, SearchHitV1, VECTOR_AUTHORITY_SCHEMA_V1,
+    VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, VectorAuthorityError, VectorGenerationBuildIdV1,
+    VectorGenerationIdV1, VectorGenerationPlanV1, VectorGenerationPublicationV1,
+    VectorProjectionCheckpointV1, VectorSearchRequestV1, VectorTombstoneV1, cosine_similarity,
+    digest_bytes, validate_values, vector_output_digest,
 };
-
-/// Whether a staging driver keeps a second copy of prepared values.  The
-/// authority itself always stores values once in its content-addressed pool;
-/// the enum is retained for compatibility with the historical in-memory and
-/// graph drivers.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StagedVectorValueRetentionV1 {
-    #[default]
-    Retained,
-    Elided,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -56,6 +49,7 @@ impl StagedVectorRowV1 {
 struct CommittedBatchV1 {
     request_digest: ManifestDigest,
     prepared_digest: ManifestDigest,
+    reused_digest: ManifestDigest,
     receipt: ProjectionBatchReceiptV1,
 }
 
@@ -74,7 +68,7 @@ struct StagedVectorGenerationV1 {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct VectorBlobV1 {
-    values: Vec<f32>,
+    values: Arc<[f32]>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -95,15 +89,17 @@ struct SnapshotEnvelopeV1 {
     checksum: ManifestDigest,
 }
 
-/// A validated batch decision. Validation is read-only; the persistent driver
-/// can write this value durably and call [`VectorGenerationAuthority::apply_batch`]
-/// afterwards without re-running inference or copying accumulated rows.
+/// A validated batch decision. Validation is read-only; a persistent driver
+/// can commit the canonical prepared batch and this decision's checkpoint,
+/// then call [`VectorGenerationAuthority::apply_batch`] without re-running
+/// inference.
 #[derive(Clone, Debug)]
 pub struct PreparedBatchCommitV1 {
     embedding_key: AdmittedEmbeddingProjectionKeyV1,
     checkpoint: VectorProjectionCheckpointV1,
     receipt: ProjectionBatchReceiptV1,
     prepared_digest: ManifestDigest,
+    reused_digest: ManifestDigest,
     effects: Vec<StagedEffectV1>,
     pool_additions: Vec<(ContentDigest, Vec<f32>)>,
     row_count_after: u64,
@@ -167,27 +163,11 @@ pub enum BatchCommitDecisionV1 {
 #[derive(Clone, Debug, Default)]
 pub struct VectorGenerationAuthority {
     state: AuthorityStateV1,
-    staged_value_retention: StagedVectorValueRetentionV1,
 }
-
-pub type VectorGenerationStateMachineV1 = VectorGenerationAuthority;
-pub type FakeVectorGenerationStoreV1 = VectorGenerationAuthority;
-pub type VectorGenerationStoreErrorV1 = VectorAuthorityError;
 
 impl VectorGenerationAuthority {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_staged_value_retention(retention: StagedVectorValueRetentionV1) -> Self {
-        Self {
-            state: AuthorityStateV1::default(),
-            staged_value_retention: retention,
-        }
-    }
-
-    pub fn staged_value_retention(&self) -> StagedVectorValueRetentionV1 {
-        self.staged_value_retention
     }
 
     /// Start or resume the deterministic build identified by `plan`.
@@ -258,6 +238,57 @@ impl VectorGenerationAuthority {
         generation_id: &VectorGenerationIdV1,
     ) -> Option<&PublishedVectorGenerationV1> {
         self.state.published.get(generation_id)
+    }
+
+    pub fn generation_read_snapshot(
+        &self,
+        generation_id: &VectorGenerationIdV1,
+    ) -> Result<Option<Arc<PublishedVectorReadSnapshotV1>>, VectorAuthorityError> {
+        let Some(generation) = self.state.published.get(generation_id) else {
+            return Ok(None);
+        };
+        if generation.embedding_key.embedding_key().metric != EmbeddingMetricV1::Cosine {
+            return Err(VectorAuthorityError::SearchContextMismatch(
+                "exact-flat search currently admits cosine projections only".to_owned(),
+            ));
+        }
+        let rows = generation
+            .rows()
+            .values()
+            .map(|row| {
+                let values = self
+                    .state
+                    .vector_pool
+                    .get(&row.output_digest)
+                    .ok_or_else(|| {
+                        VectorAuthorityError::Corrupt(format!(
+                            "published row {} is missing bytes",
+                            row.chunk_id
+                        ))
+                    })?;
+                Ok(PublishedVectorReadRowV1::new(
+                    row.chunk_id.clone(),
+                    row.chunk_digest.clone(),
+                    row.output_digest.clone(),
+                    Arc::clone(&values.values),
+                ))
+            })
+            .collect::<Result<Vec<_>, VectorAuthorityError>>()?;
+        Ok(Some(Arc::new(PublishedVectorReadSnapshotV1::new(
+            generation.generation_id().clone(),
+            SearchCompatibilityV1::from_generation(generation),
+            generation.embedding_key().clone(),
+            rows,
+        ))))
+    }
+
+    pub fn active_read_snapshot(
+        &self,
+    ) -> Result<Option<Arc<PublishedVectorReadSnapshotV1>>, VectorAuthorityError> {
+        let Some(generation_id) = self.active_generation() else {
+            return Ok(None);
+        };
+        self.generation_read_snapshot(generation_id)
     }
 
     pub fn generation_ids(&self) -> impl Iterator<Item = &VectorGenerationIdV1> {
@@ -331,12 +362,34 @@ impl VectorGenerationAuthority {
                 "request target projection differs from admitted model".to_owned(),
             ));
         }
-        if prepared.request.request_digest != prepared.request.compute_digest()? {
+        if prepared.request.request_digest
+            != tracedecay_domain::canonical_sha256(&(
+                "tracedecay.projection-batch-request.v1",
+                &prepared.request.changes,
+                &prepared.request.previous_projection_key,
+                &prepared.request.target_projection_key,
+                prepared.request.replay_reason,
+            ))?
+        {
             return Err(VectorAuthorityError::BatchIdentityMismatch(
                 "projection request digest mismatch".to_owned(),
             ));
         }
-        prepared.receipt.validate_digest()?;
+        if tracedecay_domain::projection_batch_publication_digest(&prepared.receipt)?
+            != prepared.receipt.publication_digest
+        {
+            return Err(VectorAuthorityError::BatchIdentityMismatch(
+                "projection batch publication digest mismatch".to_owned(),
+            ));
+        }
+        if prepared.request.changes.reused_count == 0 {
+            let (_, empty_reused_digest) = ChangedCodeChunkSetV1::seal_reused_partition(&[])?;
+            if prepared.request.changes.reused_digest != empty_reused_digest {
+                return Err(VectorAuthorityError::BatchIdentityMismatch(
+                    "empty compact reused partition has a non-canonical digest".to_owned(),
+                ));
+            }
+        }
         validate_receipt_identity(&staged.plan, prepared)?;
 
         let vectors_by_chunk = unique_vectors(&prepared.vectors)?;
@@ -495,10 +548,7 @@ impl VectorGenerationAuthority {
                         || receipt.prior_chunk_digest.as_ref() != Some(&prior.chunk_digest)
                         || receipt.current_chunk_digest.is_some()
                         || receipt.output_digest.is_some()
-                        || !matches!(
-                            receipt.outcome,
-                            ProjectionOutcomeV1::Applied | ProjectionOutcomeV1::Tombstoned
-                        )
+                        || receipt.outcome != ProjectionOutcomeV1::Applied
                     {
                         return Err(VectorAuthorityError::MissingBaseVector(
                             receipt.chunk_id.to_string(),
@@ -518,7 +568,12 @@ impl VectorGenerationAuthority {
             .receipt
             .receipts
             .iter()
-            .filter(|receipt| receipt.operation.produces_vector())
+            .filter(|receipt| {
+                matches!(
+                    receipt.operation,
+                    ProjectionOperationV1::Added | ProjectionOperationV1::Updated
+                )
+            })
             .count();
         let tombstone_receipts = prepared
             .receipt
@@ -533,13 +588,7 @@ impl VectorGenerationAuthority {
                 "prepared rows and receipt operations have different cardinality".to_owned(),
             ));
         }
-        let reused_count = prepared
-            .receipt
-            .receipts
-            .iter()
-            .filter(|receipt| receipt.operation == ProjectionOperationV1::Reused)
-            .count() as u64;
-        if prepared.receipt.reused_count != reused_count {
+        if prepared.receipt.reused_count != prepared.request.changes.reused_count {
             return Err(VectorAuthorityError::BatchIdentityMismatch(
                 "reused receipt count mismatch".to_owned(),
             ));
@@ -569,6 +618,7 @@ impl VectorGenerationAuthority {
             checkpoint,
             receipt: prepared.receipt.clone(),
             prepared_digest,
+            reused_digest: prepared.request.changes.reused_digest.clone(),
             effects,
             pool_additions,
             row_count_after,
@@ -599,6 +649,7 @@ impl VectorGenerationAuthority {
             checkpoint,
             receipt,
             prepared_digest,
+            reused_digest,
             effects,
             pool_additions,
             row_count_after,
@@ -668,7 +719,7 @@ impl VectorGenerationAuthority {
                                 self.state
                                     .vector_pool
                                     .get(&row.output_digest)
-                                    .map(|blob| blob.values.as_slice())
+                                    .map(|blob| blob.values.as_ref())
                             })
                             .ok_or_else(|| {
                                 VectorAuthorityError::Corrupt(format!(
@@ -723,7 +774,7 @@ impl VectorGenerationAuthority {
         // so the second pass is atomic with respect to this operation.
         for (digest, values) in &pool_additions {
             if let Some(existing) = self.state.vector_pool.get(digest)
-                && existing.values != *values
+                && existing.values.as_ref() != values.as_slice()
             {
                 return Err(VectorAuthorityError::ContentAddressConflict);
             }
@@ -732,7 +783,9 @@ impl VectorGenerationAuthority {
             self.state
                 .vector_pool
                 .entry(digest)
-                .or_insert(VectorBlobV1 { values });
+                .or_insert(VectorBlobV1 {
+                    values: values.into(),
+                });
         }
 
         let staged = self
@@ -773,6 +826,7 @@ impl VectorGenerationAuthority {
         staged.committed_batches.push(CommittedBatchV1 {
             request_digest: receipt.request_digest.clone(),
             prepared_digest,
+            reused_digest,
             receipt,
         });
         Ok(staged.checkpoint.clone())
@@ -789,8 +843,8 @@ impl VectorGenerationAuthority {
         let actual = self.state.active_generation.as_ref();
         if actual != expected_active {
             return Err(VectorAuthorityError::ActivePointerMismatch {
-                expected: expected_active.map(ToString::to_string),
-                actual: actual.map(ToString::to_string),
+                expected: expected_active.map(|id| id.as_digest().to_string()),
+                actual: actual.map(|id| id.as_digest().to_string()),
             });
         }
         let staged = self
@@ -799,13 +853,14 @@ impl VectorGenerationAuthority {
             .get(build_id)
             .ok_or(VectorAuthorityError::UnknownBuild)?;
         self.validate_staged(staged)?;
+        let complete_rows = self.complete_rows_for_publish(staged)?;
         if staged.committed_batches.is_empty()
-            || staged.rows.len() != staged.plan.expected_chunk_ids.len()
+            || complete_rows.len() != staged.plan.expected_chunk_ids.len()
             || staged
                 .plan
                 .expected_chunk_ids
                 .iter()
-                .any(|chunk_id| !staged.rows.contains_key(chunk_id))
+                .any(|chunk_id| !complete_rows.contains_key(chunk_id))
         {
             return Err(VectorAuthorityError::IncompleteGeneration);
         }
@@ -818,8 +873,7 @@ impl VectorGenerationAuthority {
                 .embedding_key
                 .clone()
                 .ok_or(VectorAuthorityError::IncompleteGeneration)?,
-            rows: staged
-                .rows
+            rows: complete_rows
                 .iter()
                 .map(|(chunk_id, row)| (chunk_id.clone(), row.as_published()))
                 .collect(),
@@ -828,6 +882,11 @@ impl VectorGenerationAuthority {
                 .committed_batches
                 .iter()
                 .map(|batch| batch.receipt.clone())
+                .collect(),
+            reused_digests: staged
+                .committed_batches
+                .iter()
+                .map(|batch| batch.reused_digest.clone())
                 .collect(),
             checkpoint: staged.checkpoint.clone(),
             manifest_digest: manifest_digest.clone(),
@@ -897,12 +956,12 @@ impl VectorGenerationAuthority {
     ) -> Result<Option<VectorGenerationIdV1>, VectorAuthorityError> {
         if self.state.active_generation.as_ref() != expected_active {
             return Err(VectorAuthorityError::ActivePointerMismatch {
-                expected: expected_active.map(ToString::to_string),
+                expected: expected_active.map(|id| id.as_digest().to_string()),
                 actual: self
                     .state
                     .active_generation
                     .as_ref()
-                    .map(ToString::to_string),
+                    .map(|id| id.as_digest().to_string()),
             });
         }
         if !self.state.published.contains_key(generation_id) {
@@ -932,12 +991,12 @@ impl VectorGenerationAuthority {
     ) -> Result<VectorGenerationIdV1, VectorAuthorityError> {
         if self.state.active_generation.as_ref() != expected_active {
             return Err(VectorAuthorityError::ActivePointerMismatch {
-                expected: expected_active.map(ToString::to_string),
+                expected: expected_active.map(|id| id.as_digest().to_string()),
                 actual: self
                     .state
                     .active_generation
                     .as_ref()
-                    .map(ToString::to_string),
+                    .map(|id| id.as_digest().to_string()),
             });
         }
         let rollback = self
@@ -960,6 +1019,45 @@ impl VectorGenerationAuthority {
         self.rollback_generation_if_current(expected.as_ref())
     }
 
+    /// Restore the serving pointer after a later runtime installation fails.
+    ///
+    /// The expected generation fences compensation from overwriting a newer
+    /// publication. Restoring the first publication to no active generation
+    /// also clears rollback because a rollback target without an active head
+    /// is not a valid authority state.
+    pub fn restore_active_generation_if_current(
+        &mut self,
+        expected_active: &VectorGenerationIdV1,
+        replacement: Option<&VectorGenerationIdV1>,
+    ) -> Result<(), VectorAuthorityError> {
+        if self.state.active_generation.as_ref() != Some(expected_active) {
+            return Err(VectorAuthorityError::ActivePointerMismatch {
+                expected: Some(expected_active.as_digest().to_string()),
+                actual: self
+                    .state
+                    .active_generation
+                    .as_ref()
+                    .map(|id| id.as_digest().to_string()),
+            });
+        }
+        if let Some(replacement) = replacement
+            && !self.state.published.contains_key(replacement)
+        {
+            return Err(VectorAuthorityError::UnknownGeneration);
+        }
+        match replacement {
+            Some(replacement) => {
+                self.state.active_generation = Some(replacement.clone());
+                self.state.rollback_generation = Some(expected_active.clone());
+            }
+            None => {
+                self.state.active_generation = None;
+                self.state.rollback_generation = None;
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_vector(
         &self,
         generation_id: &VectorGenerationIdV1,
@@ -974,14 +1072,14 @@ impl VectorGenerationAuthority {
         self.state
             .vector_pool
             .get(&row.output_digest)
-            .map(|blob| blob.values.clone())
+            .map(|blob| blob.values.to_vec())
     }
 
     pub fn vector_content(&self, digest: &ContentDigest) -> Option<&[f32]> {
         self.state
             .vector_pool
             .get(digest)
-            .map(|blob| blob.values.as_slice())
+            .map(|blob| blob.values.as_ref())
     }
 
     pub fn vector_pool_len(&self) -> usize {
@@ -1014,7 +1112,7 @@ impl VectorGenerationAuthority {
         }
         validate_values(
             &request.query,
-            generation.embedding_key().dimensions() as usize,
+            generation.embedding_key().embedding_key().dimensions as usize,
         )?;
         let mut hits = Vec::with_capacity(generation.rows().len());
         for (chunk_id, row) in generation.rows() {
@@ -1085,7 +1183,7 @@ impl VectorGenerationAuthority {
             .map_err(|error| VectorAuthorityError::Serialization(error.to_string()))?;
         let envelope = SnapshotEnvelopeV1 {
             schema: VECTOR_AUTHORITY_SCHEMA_V1.to_owned(),
-            checksum: digest_bytes(VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, &payload),
+            checksum: digest_bytes(VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, &payload)?,
             payload,
         };
         serde_json::to_vec(&envelope)
@@ -1105,7 +1203,7 @@ impl VectorGenerationAuthority {
                 "unknown vector authority snapshot schema".to_owned(),
             ));
         }
-        let expected = digest_bytes(VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, &envelope.payload);
+        let expected = digest_bytes(VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, &envelope.payload)?;
         if envelope.checksum != expected {
             return Err(VectorAuthorityError::Corrupt(
                 "vector authority snapshot checksum mismatch".to_owned(),
@@ -1115,10 +1213,7 @@ impl VectorGenerationAuthority {
             serde_json::from_slice(&envelope.payload).map_err(|error| {
                 VectorAuthorityError::Corrupt(format!("invalid snapshot state: {error}"))
             })?;
-        let authority = Self {
-            state,
-            staged_value_retention: StagedVectorValueRetentionV1::Retained,
-        };
+        let authority = Self { state };
         authority
             .validate_state()
             .map_err(|error| VectorAuthorityError::Corrupt(error.to_string()))?;
@@ -1127,6 +1222,56 @@ impl VectorGenerationAuthority {
 
     pub fn restore(bytes: &[u8]) -> Result<Self, VectorAuthorityError> {
         Self::reopen_sealed(bytes)
+    }
+
+    pub fn restore_published(
+        generations: Vec<PublishedVectorGenerationV1>,
+        blobs: Vec<(ContentDigest, Vec<f32>)>,
+        active: Option<VectorGenerationIdV1>,
+        rollback: Option<VectorGenerationIdV1>,
+    ) -> Result<Self, VectorAuthorityError> {
+        let mut state = AuthorityStateV1 {
+            active_generation: active,
+            rollback_generation: rollback,
+            ..AuthorityStateV1::default()
+        };
+        for (digest, values) in blobs {
+            if values.is_empty() {
+                return Err(VectorAuthorityError::Corrupt(format!(
+                    "content-addressed vector {digest} has no values"
+                )));
+            }
+            match state.vector_pool.entry(digest) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(VectorBlobV1 {
+                        values: values.into(),
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().values.as_ref() != values.as_slice() =>
+                {
+                    return Err(VectorAuthorityError::ContentAddressConflict);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        for generation in generations {
+            let generation_id = generation.generation_id().clone();
+            match state.published.entry(generation_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(generation);
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get() != &generation =>
+                {
+                    return Err(VectorAuthorityError::ImmutableGenerationConflict);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+        }
+        let authority = Self { state };
+        authority.validate_state()?;
+        Ok(authority)
     }
 
     pub fn validate_state(&self) -> Result<(), VectorAuthorityError> {
@@ -1179,7 +1324,7 @@ impl VectorGenerationAuthority {
                     "content-addressed vector {digest} has no values"
                 )));
             }
-            validate_values(blob.values.as_slice(), blob.values.len())?;
+            validate_values(blob.values.as_ref(), blob.values.len())?;
             if digest.as_str().is_empty() {
                 return Err(VectorAuthorityError::Corrupt(
                     "empty content-addressed vector digest".to_owned(),
@@ -1187,6 +1332,79 @@ impl VectorGenerationAuthority {
             }
         }
         Ok(())
+    }
+
+    fn complete_rows_for_publish(
+        &self,
+        staged: &StagedVectorGenerationV1,
+    ) -> Result<BTreeMap<CodeSearchChunkId, StagedVectorRowV1>, VectorAuthorityError> {
+        let mut rows = staged.rows.clone();
+        let missing = staged
+            .plan
+            .expected_chunk_ids
+            .iter()
+            .filter(|chunk_id| !rows.contains_key(*chunk_id))
+            .collect::<Vec<_>>();
+        let reuse_batches = staged
+            .committed_batches
+            .iter()
+            .filter(|batch| batch.receipt.reused_count > 0)
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            if !reuse_batches.is_empty() {
+                return Err(VectorAuthorityError::IncompleteGeneration);
+            }
+            return Ok(rows);
+        }
+        let [reuse_batch] = reuse_batches.as_slice() else {
+            return Err(VectorAuthorityError::IncompleteGeneration);
+        };
+        let base_id = staged.plan.base_generation.as_ref().ok_or(
+            VectorAuthorityError::IncompatibleBaseGeneration(
+                BaseGenerationIncompatibilityV1::MissingPublished,
+            ),
+        )?;
+        let base = self.state.published.get(base_id).ok_or(
+            VectorAuthorityError::IncompatibleBaseGeneration(
+                BaseGenerationIncompatibilityV1::MissingPublished,
+            ),
+        )?;
+        let reused = missing
+            .iter()
+            .map(|chunk_id| {
+                let prior = base
+                    .rows
+                    .get(*chunk_id)
+                    .ok_or_else(|| VectorAuthorityError::MissingBaseVector(chunk_id.to_string()))?;
+                Ok(((*chunk_id).clone(), prior.chunk_digest.clone()))
+            })
+            .collect::<Result<Vec<_>, VectorAuthorityError>>()?;
+        let (reused_count, reused_digest) = ChangedCodeChunkSetV1::seal_reused_partition(&reused)?;
+        if reused_count != reuse_batch.receipt.reused_count
+            || reused_digest != reuse_batch.reused_digest
+        {
+            return Err(VectorAuthorityError::BatchIdentityMismatch(
+                "compact reused complement does not match the immutable base".to_owned(),
+            ));
+        }
+        for chunk_id in missing {
+            let prior = base
+                .rows
+                .get(chunk_id)
+                .ok_or_else(|| VectorAuthorityError::MissingBaseVector(chunk_id.to_string()))?;
+            rows.insert(
+                chunk_id.clone(),
+                StagedVectorRowV1 {
+                    projection_key: staged.plan.target_projection_key.clone(),
+                    source_generation: staged.plan.source_generation.clone(),
+                    source_manifest_digest: staged.plan.source_manifest_digest.clone(),
+                    chunk_id: chunk_id.clone(),
+                    chunk_digest: prior.chunk_digest.clone(),
+                    output_digest: prior.output_digest.clone(),
+                },
+            );
+        }
+        Ok(rows)
     }
 
     fn base_for_batch<'a>(
@@ -1300,7 +1518,7 @@ impl VectorGenerationAuthority {
                             row.chunk_id
                         ))
                     })?;
-                validate_values(&blob.values, key.dimensions() as usize)?;
+                validate_values(&blob.values, key.embedding_key().dimensions as usize)?;
                 if vector_output_digest(
                     &row.projection_key,
                     &row.chunk_id,
@@ -1379,6 +1597,7 @@ impl VectorGenerationAuthority {
             || generation.checkpoint.source_manifest_digest
                 != generation.plan.source_manifest_digest
             || generation.checkpoint.completed_batches != generation.receipts.len() as u64
+            || generation.reused_digests.len() != generation.receipts.len()
             || generation.receipts.is_empty()
         {
             return Err(VectorAuthorityError::Corrupt(
@@ -1421,7 +1640,10 @@ impl VectorGenerationAuthority {
                         row.chunk_id
                     ))
                 })?;
-            validate_values(&blob.values, generation.embedding_key.dimensions() as usize)?;
+            validate_values(
+                &blob.values,
+                generation.embedding_key.embedding_key().dimensions as usize,
+            )?;
             if vector_output_digest(
                 &row.projection_key,
                 &row.chunk_id,
@@ -1472,12 +1694,17 @@ impl VectorGenerationAuthority {
                 .receipts
                 .iter()
                 .cloned()
-                .map(|receipt| CommittedBatchV1 {
-                    request_digest: receipt.request_digest.clone(),
-                    prepared_digest: ManifestDigest::zero(),
-                    receipt,
+                .zip(generation.reused_digests.iter().cloned())
+                .map(|(receipt, reused_digest)| {
+                    Ok(CommittedBatchV1 {
+                        request_digest: receipt.request_digest.clone(),
+                        prepared_digest: ManifestDigest::zero()
+                            .map_err(VectorAuthorityError::from)?,
+                        reused_digest,
+                        receipt,
+                    })
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Result<Vec<_>, VectorAuthorityError>>()?,
             &generation
                 .rows
                 .iter()
@@ -1516,6 +1743,9 @@ fn validate_receipts_and_effects(
 ) -> Result<(), VectorAuthorityError> {
     let mut request_digests = BTreeSet::new();
     let mut effect_ids = BTreeSet::new();
+    let mut reused_count = 0_u64;
+    let mut reused_batch = None;
+    let (_, empty_reused_digest) = ChangedCodeChunkSetV1::seal_reused_partition(&[])?;
     for batch in batches {
         if batch.request_digest != batch.receipt.request_digest
             || !request_digests.insert(batch.request_digest.clone())
@@ -1524,7 +1754,13 @@ fn validate_receipts_and_effects(
                 "committed batch request identity is duplicate or inconsistent".to_owned(),
             ));
         }
-        batch.receipt.validate_digest()?;
+        if tracedecay_domain::projection_batch_publication_digest(&batch.receipt)?
+            != batch.receipt.publication_digest
+        {
+            return Err(VectorAuthorityError::Corrupt(
+                "committed receipt publication digest is inconsistent".to_owned(),
+            ));
+        }
         if batch.receipt.target_projection_key != plan.target_projection_key
             || batch.receipt.source_generation != plan.source_generation
         {
@@ -1543,15 +1779,18 @@ fn validate_receipts_and_effects(
             ));
         }
         batch.receipt.source_manifest_digest.validate()?;
-        let expected_reused = batch
-            .receipt
-            .receipts
-            .iter()
-            .filter(|receipt| receipt.operation == ProjectionOperationV1::Reused)
-            .count() as u64;
-        if batch.receipt.reused_count != expected_reused {
+        reused_count = reused_count
+            .checked_add(batch.receipt.reused_count)
+            .ok_or_else(|| VectorAuthorityError::Corrupt("reused census overflow".to_owned()))?;
+        if batch.receipt.reused_count == 0 {
+            if batch.reused_digest != empty_reused_digest {
+                return Err(VectorAuthorityError::Corrupt(
+                    "empty compact reused partition has a non-canonical digest".to_owned(),
+                ));
+            }
+        } else if reused_batch.replace(batch).is_some() {
             return Err(VectorAuthorityError::Corrupt(
-                "committed receipt reused census is inconsistent".to_owned(),
+                "compact reused partition appears in more than one batch".to_owned(),
             ));
         }
         for receipt in &batch.receipt.receipts {
@@ -1563,7 +1802,8 @@ fn validate_receipts_and_effects(
             }
             if receipt.source_manifest_digest != batch.receipt.source_manifest_digest
                 || receipt.request_digest != batch.receipt.request_digest
-                || receipt.prior_generation.as_ref() != expected_prior_generation
+                || expected_prior_generation.is_some()
+                    && receipt.prior_generation.as_ref() != expected_prior_generation
             {
                 return Err(VectorAuthorityError::Corrupt(
                     "durable chunk receipt differs from its batch watermark".to_owned(),
@@ -1579,7 +1819,7 @@ fn validate_receipts_and_effects(
             "committed effect index differs from receipts".to_owned(),
         ));
     }
-    if rows.keys().any(|chunk_id| !effect_ids.contains(chunk_id))
+    if rows.keys().any(|chunk_id| !effect_ids.contains(chunk_id)) && expected_effects.is_some()
         || tombstones
             .keys()
             .any(|chunk_id| !effect_ids.contains(chunk_id))
@@ -1587,6 +1827,27 @@ fn validate_receipts_and_effects(
         return Err(VectorAuthorityError::Corrupt(
             "durable row census contains an unreceipted chunk".to_owned(),
         ));
+    }
+    if expected_effects.is_none() {
+        let compact_reused = rows
+            .iter()
+            .filter(|(chunk_id, _)| !effect_ids.contains(*chunk_id))
+            .map(|(chunk_id, row)| (chunk_id.clone(), row.chunk_digest.clone()))
+            .collect::<Vec<_>>();
+        if compact_reused.len() as u64 != reused_count {
+            return Err(VectorAuthorityError::Corrupt(
+                "published compact reused census differs from rows".to_owned(),
+            ));
+        }
+        let (_, compact_reused_digest) =
+            ChangedCodeChunkSetV1::seal_reused_partition(&compact_reused)?;
+        if reused_count > 0
+            && reused_batch.map(|batch| &batch.reused_digest) != Some(&compact_reused_digest)
+        {
+            return Err(VectorAuthorityError::Corrupt(
+                "published compact reused digest differs from rows".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1598,7 +1859,6 @@ fn validate_persisted_receipt_row(
     tombstones: &BTreeMap<CodeSearchChunkId, ContentDigest>,
 ) -> Result<(), VectorAuthorityError> {
     receipt.chunk_id.validate()?;
-    receipt.projection_key.validate()?;
     receipt.source_manifest_digest.validate()?;
     if let Some(digest) = &receipt.prior_chunk_digest {
         digest.validate()?;
@@ -1672,10 +1932,7 @@ fn validate_persisted_receipt_row(
             if receipt.prior_chunk_digest.is_none()
                 || receipt.current_chunk_digest.is_some()
                 || receipt.output_digest.is_some()
-                || !matches!(
-                    receipt.outcome,
-                    ProjectionOutcomeV1::Applied | ProjectionOutcomeV1::Tombstoned
-                )
+                || receipt.outcome != ProjectionOutcomeV1::Applied
             {
                 return Err(VectorAuthorityError::Corrupt(
                     "durable delete receipt has invalid evidence".to_owned(),
@@ -1706,8 +1963,7 @@ fn validate_batch_identity(
         ));
     }
     if request.previous_projection_key.as_ref() != Some(&request.target_projection_key)
-        && !request.changes.reused.is_empty()
-        && request.replay_reason != ProjectionReplayReasonV1::ProjectionProfileChange
+        && request.changes.reused_count > 0
     {
         return Err(VectorAuthorityError::BatchIdentityMismatch(
             "projection-key replay requires explicit re-embedding".to_owned(),
@@ -1765,7 +2021,6 @@ fn validate_receipt_identity(
                 "chunk receipt belongs to a foreign projection batch".to_owned(),
             ));
         }
-        row.projection_key.validate()?;
         row.source_manifest_digest.validate()?;
         if let Some(digest) = &row.prior_chunk_digest {
             digest.validate()?;
@@ -1782,7 +2037,6 @@ fn validate_receipt_identity(
         .added_or_changed
         .iter()
         .chain(request.changes.deleted.iter())
-        .chain(request.changes.reused.iter())
         .map(|change| change.chunk_id.clone())
         .collect::<BTreeSet<_>>();
     if receipt_ids != expected_ids {
@@ -1837,20 +2091,8 @@ fn change_for_receipt<'a>(
         ProjectionOperationV1::Updated => changes
             .added_or_changed
             .iter()
-            .find(|change| change.chunk_id == receipt.chunk_id)
-            .or_else(|| {
-                // A projection-profile change re-embeds the unchanged
-                // `reused` partition, so its receipt operation is Updated
-                // even though its source change remains in that partition.
-                changes
-                    .reused
-                    .iter()
-                    .find(|change| change.chunk_id == receipt.chunk_id)
-            }),
-        ProjectionOperationV1::Reused => changes
-            .reused
-            .iter()
             .find(|change| change.chunk_id == receipt.chunk_id),
+        ProjectionOperationV1::Reused => None,
         ProjectionOperationV1::Deleted => changes
             .deleted
             .iter()
@@ -1920,7 +2162,7 @@ fn ensure_pool_compatible(
     values: &[f32],
 ) -> Result<(), VectorAuthorityError> {
     if let Some(existing) = pool.get(digest) {
-        if existing.values != values {
+        if existing.values.as_ref() != values {
             return Err(VectorAuthorityError::ContentAddressConflict);
         }
         return Ok(());

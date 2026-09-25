@@ -1,0 +1,194 @@
+--- a/crates/tracedecay/Cargo.toml
++++ b/crates/tracedecay/Cargo.toml
+@@ -342,6 +342,7 @@
+     "tracedecay-daemon-service/test-helpers",
+     "tracedecay-host-admission/test-helpers",
+     "tracedecay-maintenance/test-helpers",
++    "tracedecay-memory-provider-ncm?/test-helpers",
+     "tracedecay-runtime-core/test-helpers",
+     "tracedecay-session-runtime/test-helpers",
+     "tracedecay-sessions/test-helpers",
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall/test_context_evidence.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall/test_context_evidence.rs
+@@ -12,8 +12,13 @@
+ use serde::Serialize;
+ use serde_json::Value;
+ use tracedecay_memory_provider_registry::{
+-    ContextSectionKind, OperationControl, OwnedExactScope, RecallExplainHostDecisionV1,
+-    RecallExplainItemV1, RecallExplainTraceV1, TerminalCode,
++    ContextSectionKind, RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainTraceV1,
++    TerminalCode,
++};
++
++/// Existing control and scope types for callers of this test-only facade.
++pub use tracedecay_memory_provider_registry::{
++    CancellationToken, OperationControl, OwnedExactScope,
+ };
+ 
+ use super::control_attribution::{
+@@ -21,6 +26,92 @@
+     optional_text, read_retained_control_scope_on_connection, required_text,
+ };
+ use super::{ADVISORY_CONTEXT_PACK_JSON_KEY, LEDGER_FILE_NAME, PROJECT_RECALL_BUDGETS};
++
++/// All eight finite ceilings copied from a production provider declaration.
++/// These become numeric evidence only after the complete fresh-health match.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
++pub struct ProviderDeclaredLimitsForTestV1 {
++    /// Maximum canonical request bytes.
++    pub request_bytes: u64,
++    /// Maximum canonical response bytes.
++    pub response_bytes: u64,
++    /// Maximum observations in one batch.
++    pub observation_batch_items: u64,
++    /// Maximum recall candidates.
++    pub recall_candidates: u64,
++    /// Maximum concurrent operations.
++    pub concurrent_operations: u64,
++    /// Maximum operation duration in milliseconds.
++    pub operation_millis: u64,
++    /// Maximum snapshot bytes.
++    pub snapshot_bytes: u64,
++    /// Maximum inspection items.
++    pub inspection_items: u64,
++}
++
++/// A pure production declaration, carrying no claim about a running provider.
++#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
++pub struct ProviderNumericDeclarationForTestV1 {
++    /// Actual logical provider ID in the production descriptor.
++    pub provider_id: String,
++    /// Production instance identity expected in a successful health result.
++    pub declared_provider_instance_id: String,
++    /// Production descriptor's immutable implementation digest.
++    pub declared_implementation_identity_digest: String,
++    /// Declared numeric ceilings; lower negotiated limits fail the digest match.
++    pub declared_limits: ProviderDeclaredLimitsForTestV1,
++    /// Production health digest of the complete eight-field declared vector.
++    pub declared_limits_digest: String,
++}
++
++/// Copies an existing production declaration without constructing provider state.
++///
++/// A fixture may accept these numeric fields only after validating a fresh actual
++/// Health success with Ready state, the actual selected provider and registration,
++/// the full delivery scope and its digest, required available capabilities, this
++/// exact instance and implementation identity, and equality of the complete
++/// eight-field effective-limits digest. Missing or mismatched evidence stays
++/// explicitly unavailable; this function does not guess a negotiated minimum.
++///
++/// Live state identity/generation come only from that same health response.
++/// Descriptor registration-time generation is deliberately omitted here. Actual
++/// executable/build hashes must be captured by the fixture from the running build.
++///
++/// # Errors
++/// Returns an invalid declaration error if the existing production descriptor
++/// cannot be produced. Unsupported provider IDs return `Ok(None)`.
++pub fn production_provider_numeric_declaration_for_test(
++    provider_id: &str,
++) -> Result<Option<ProviderNumericDeclarationForTestV1>> {
++    let (descriptor, instance, digest) = match provider_id {
++        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID => {
++            super::super::native_provider::production_provider_declaration_for_test()
++                .map_err(|_| ContextEvidenceReadErrorV1::Invalid("Native production declaration"))?
++        }
++        tracedecay_memory_provider_ncm::NCM_PROVIDER_ID => {
++            tracedecay_memory_provider_ncm::rust_backend::production_provider_declaration_for_test()
++                .map_err(|_| ContextEvidenceReadErrorV1::Invalid("NCM production declaration"))?
++        }
++        _ => return Ok(None),
++    };
++    let limits = descriptor.limits;
++    Ok(Some(ProviderNumericDeclarationForTestV1 {
++        provider_id: descriptor.provider_id.as_str().to_owned(),
++        declared_provider_instance_id: instance,
++        declared_implementation_identity_digest: descriptor.implementation_identity_sha256,
++        declared_limits: ProviderDeclaredLimitsForTestV1 {
++            request_bytes: limits.request_bytes,
++            response_bytes: limits.response_bytes,
++            observation_batch_items: limits.observation_batch_items,
++            recall_candidates: limits.recall_candidates,
++            concurrent_operations: limits.concurrent_operations,
++            operation_millis: limits.operation_millis,
++            snapshot_bytes: limits.snapshot_bytes,
++            inspection_items: limits.inspection_items,
++        },
++        declared_limits_digest: digest,
++    }))
++}
+ 
+ /// A bounded evidence read failed; absence is never converted into an empty trace.
+ #[derive(Debug, thiserror::Error)]
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+@@ -824,6 +824,18 @@
+         capabilities,
+         native_provider_limits(),
+     )
++}
++
++/// Copies the production declaration without constructing a provider or state.
++/// The limits remain declared ceilings until a caller matches actual health.
++#[cfg(feature = "test-helpers")]
++pub(crate) fn production_provider_declaration_for_test()
++-> Result<(ProviderDescriptor, String, String), ApiError> {
++    let descriptor = native_descriptor()?;
++    let mut digest = Sha256::new();
++    digest_native_limits(&mut digest, descriptor.limits);
++    let limits_digest = hex::encode(digest.finalize());
++    Ok((descriptor, PROVIDER_INSTANCE_ID.to_owned(), limits_digest))
+ }
+ 
+ fn request_scope_digest(request: &HandshakeRequest) -> String {
+--- a/crates/tracedecay-memory-provider-ncm/Cargo.toml
++++ b/crates/tracedecay-memory-provider-ncm/Cargo.toml
+@@ -10,6 +10,8 @@
+ [features]
+ default = []
+ rust-backend = ["dep:tracedecay-memory-ncm-runtime"]
++# Pure production declarations for consumers that separately validate live health.
++test-helpers = []
+ 
+ [dependencies]
+ chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+--- a/crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs
+@@ -574,6 +574,38 @@
+         provider_limits(),
+     )
+     .map_err(|error| RustNcmError::HandshakeIdentity(error.to_string()))
++}
++
++/// Copies the pinned production declaration without a worker, model, or state root.
++///
++/// The descriptor generation is its registration-time value, not live state.
++/// The returned instance and eight-field limits digest must be matched against
++/// a successful fresh health response before treating the limits as negotiated.
++///
++/// # Errors
++/// Returns the same declaration/profile errors as the production surface.
++#[cfg(feature = "test-helpers")]
++pub fn production_provider_declaration_for_test()
++-> Result<(ProviderDescriptor, String, String), RustNcmError> {
++    let (algorithm, encoder) =
++        tracedecay_memory_ncm_runtime::engine::production_identity_declaration()
++            .map_err(RustNcmError::HandshakeIdentity)?;
++    if algorithm.profile != ALGORITHM_PROFILE {
++        return Err(RustNcmError::HandshakeIdentity(
++            "production algorithm profile does not match adapter".to_owned(),
++        ));
++    }
++    let descriptor = descriptor_for(
++        &algorithm.config_sha256,
++        &encoder.model,
++        &encoder.artifact_sha256,
++        0,
++    )?;
++    let instance = implementation_version(&algorithm.config_sha256);
++    let mut digest = Sha256::new();
++    crate::digest_limits(&mut digest, descriptor.limits);
++    let limits_digest = hex_digest(&digest.finalize());
++    Ok((descriptor, instance, limits_digest))
+ }
+ 
+ fn descriptor_from_identity(

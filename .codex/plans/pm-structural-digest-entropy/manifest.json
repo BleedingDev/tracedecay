@@ -1,0 +1,12 @@
+[
+  {
+    "path": "crates/tracedecay-privacy/src/detector_kernel.rs",
+    "index_before_sha256": "5a101feaaecacd677f01685301c01229a85f5f6f279c5b510ae9509c07f13bfa",
+    "live_after_sha256": "f64e551aeece451b3492526d6cbf1cd629d8312990872d25ef4f2ae7ce697cb9"
+  },
+  {
+    "path": "crates/tracedecay-memory-hygiene/src/lib.rs",
+    "index_before_sha256": "99f9565544b266e34850f113ce1980ff29cf7b9aeda94a5cf3f6c5e6d3cb3eb1",
+    "live_after_sha256": "b6591611326d757c785f695bca6b2b39fe827e4bb9575231ea24b0614fb12c95"
+  }
+]

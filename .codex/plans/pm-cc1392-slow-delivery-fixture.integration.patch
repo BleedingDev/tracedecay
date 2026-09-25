@@ -1,0 +1,22 @@
+diff --git a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+--- a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+@@ -1271,7 +1271,7 @@
+             &'a self,
+             _envelope: &'a HookEventEnvelopeV2,
+             _feedback: &'a tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+-            _deadline: HookSynchronousDeadlineV1,
++            deadline: HookSynchronousDeadlineV1,
+         ) -> tracedecay_hooks::HookDeliveryFutureV1<'a> {
+             Box::pin(async move {
+                 use std::sync::atomic::Ordering;
+@@ -1280,7 +1280,8 @@
+                     "optional delivery cannot precede required producer work"
+                 );
+                 self.delivery_attempted.store(true, Ordering::SeqCst);
+-                std::future::pending().await
++                tokio::time::sleep(Duration::from_micros(deadline.remaining_micros())).await;
++                tracedecay_hooks::HookFeedbackDeliveryOutcomeV1::Unavailable
+             })
+         }
+ 

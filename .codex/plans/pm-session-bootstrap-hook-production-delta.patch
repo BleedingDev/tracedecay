@@ -1,0 +1,228 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -278,7 +278,26 @@
+         let register = self.source_path.is_none();
+         let mut codex_guard = None;
+         let source_path = match self.source_path {
+-            Some(path) => path,
++            Some(path) => {
++                if is_start && self.producer == HookHostV1::ClaudeCode {
++                    // A new native Start cannot silently reuse an indexed
++                    // locator after the host named a different physical file.
++                    let locator = locator?;
++                    if locator.session_id != self.native_session {
++                        return None;
++                    }
++                    let actual = validated_claude_start_source(
++                        &locator.transcript_path,
++                        &self.native_session,
++                        home?,
++                        deadline,
++                    )?;
++                    if fs::canonicalize(&path).ok()? != actual {
++                        return None;
++                    }
++                }
++                path
++            }
+             None if is_start => match self.producer {
+                 HookHostV1::ClaudeCode => {
+                     let locator = locator?;
+--- a/crates/tracedecay-agent-hosts/src/hooks/codex.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/codex.rs
+@@ -63,20 +63,17 @@
+         &event,
+         &parsed,
+     );
+-    let guidance = super::dispatch::dispatch_for_scope(
++    let (dispatched, queued) = super::dispatch::dispatch_for_scope_with_required_work(
+         runtime,
+         tracedecay_hooks::HookHostV1::Codex,
+         &event,
+         root.as_deref(),
+         Some(&telemetry),
+         started,
+-    )
+-    .await
+-    .into_recorded_guidance(&telemetry)
+-    .flatten();
+-    // The same deadline covers both live sealing and retained ingest admission.
+-    let queued =
+-        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started).await;
++        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started),
++    )
++    .await;
++    let guidance = dispatched.into_recorded_guidance(&telemetry).flatten();
+     let output = guidance.map_or_else(
+         || "{}".to_owned(),
+         |guidance| additional_context_json("Stop", &guidance),
+--- a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+@@ -464,19 +464,41 @@
+     telemetry: Option<&HookTimingSpan>,
+     started: Instant,
+ ) -> HookDispatch {
++    dispatch_with_required_work(
++        runtime,
++        host,
++        event_json,
++        project_root,
++        telemetry,
++        started,
++        async {},
++    )
++    .await
++    .0
++}
++
++async fn dispatch_with_required_work<T>(
++    runtime: &HookRuntimeV1,
++    host: HookHostV1,
++    event_json: &str,
++    project_root: &Path,
++    telemetry: Option<&HookTimingSpan>,
++    started: Instant,
++    required: impl std::future::Future<Output = T>,
++) -> (HookDispatch, T) {
+     let decoded = match tracedecay_hooks::decode_native_hook_event(host, event_json.as_bytes()) {
+         Ok(decoded) => decoded,
+         Err(
+             NativeHookDecodeError::UnsupportedNativeEvent
+             | NativeHookDecodeError::UnsupportedNativeFamily,
+         ) => {
+-            return HookDispatch::NotApplicable;
+-        }
+-        Err(_) => return unavailable(),
++            return (HookDispatch::NotApplicable, required.await);
++        }
++        Err(_) => return (unavailable(), required.await),
+     };
+     let Some(prepared) = prepare_bound_hook(host, event_json, project_root, decoded, started)
+     else {
+-        return unavailable();
++        return (unavailable(), required.await);
+     };
+     let native_session_id = prepared.native_session_id.clone();
+     let native_lifecycle = prepared.native_lifecycle.clone();
+@@ -490,13 +512,14 @@
+         telemetry,
+     );
+     let delivery = DaemonFeedbackNoticeDeliveryPort::new(runtime, project_root);
+-    dispatch_decoded(
++    dispatch_decoded_with_required_work(
+         runtime,
+         prepared,
+         project_root,
+         started,
+         &admission,
+         &delivery,
++        required,
+     )
+     .await
+ }
+@@ -517,6 +540,38 @@
+             dispatch(runtime, host, event_json, project_root, telemetry, started).await
+         }
+         None => dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await,
++    }
++}
++
++/// Admit the live event, then run required producer work before any optional
++/// guidance delivery can spend the remainder of the original hook deadline.
++pub(crate) async fn dispatch_for_scope_with_required_work<T>(
++    runtime: &HookRuntimeV1,
++    host: HookHostV1,
++    event_json: &str,
++    project_root: Option<&Path>,
++    telemetry: Option<&HookTimingSpan>,
++    started: Instant,
++    required: impl std::future::Future<Output = T>,
++) -> (HookDispatch, T) {
++    match project_root {
++        Some(project_root) => {
++            dispatch_with_required_work(
++                runtime,
++                host,
++                event_json,
++                project_root,
++                telemetry,
++                started,
++                required,
++            )
++            .await
++        }
++        None => {
++            let dispatched =
++                dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await;
++            (dispatched, required.await)
++        }
+     }
+ }
+ 
+@@ -714,7 +769,6 @@
+     })
+ }
+ 
+-#[hotpath::measure(future = true, label = "hosts.hooks.dispatch_decoded")]
+ async fn dispatch_decoded(
+     runtime: &HookRuntimeV1,
+     prepared: PreparedBoundHook,
+@@ -725,6 +779,31 @@
+         tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+     >,
+ ) -> HookDispatch {
++    dispatch_decoded_with_required_work(
++        runtime,
++        prepared,
++        project_root,
++        started,
++        admission,
++        delivery,
++        async {},
++    )
++    .await
++    .0
++}
++
++#[hotpath::measure(future = true, label = "hosts.hooks.dispatch_decoded")]
++async fn dispatch_decoded_with_required_work<T>(
++    runtime: &HookRuntimeV1,
++    prepared: PreparedBoundHook,
++    project_root: &Path,
++    started: Instant,
++    admission: &DaemonAdmissionPort<'_>,
++    delivery: &impl AsyncHookFeedbackDeliveryPortV1<
++        tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
++    >,
++    required: impl std::future::Future<Output = T>,
++) -> (HookDispatch, T) {
+     let PreparedBoundHook {
+         host,
+         layout,
+@@ -747,6 +826,7 @@
+         },
+         None => HookImmediateAdmissionV1::TimedOut,
+     };
++    let required_result = required.await;
+     let replay = match immediate {
+         HookImmediateAdmissionV1::Accepted { .. } | HookImmediateAdmissionV1::CatchupRequired => {
+             None
+@@ -781,7 +861,7 @@
+     );
+     let feedback_notice = admission.take_feedback_notice();
+     let github_stack_signal_available = admission.take_github_stack_signal_available();
+-    match completed {
++    let dispatched = match completed {
+         Ok(result) => {
+             let rollback = HookFeedbackRollbackSwitchV1 {
+                 configuration_revision: snapshot.revision,
+@@ -838,7 +918,8 @@
+             }
+         }
+         Err(_) => unavailable(),
+-    }
++    };
++    (dispatched, required_result)
+ }
+ 
+ #[cfg(test)]

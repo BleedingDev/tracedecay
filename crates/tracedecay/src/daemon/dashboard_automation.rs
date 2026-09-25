@@ -7,7 +7,6 @@ use std::sync::Arc;
 use serde_json::Value;
 use tracedecay_application::observability::BoundedObservabilityProducerV1;
 use tracedecay_automation::managed_skills::validate_skill_id;
-use tracedecay_automation_runtime::automation::AutomationRunControl;
 use tracedecay_automation_runtime::automation::backend::CodexAppServerBackend;
 use tracedecay_automation_runtime::automation::config::{
     AutomationConfig, from_configuration_snapshot,
@@ -22,7 +21,9 @@ use tracedecay_automation_runtime::automation::managed_skills::{
     load_managed_skill, managed_skill_dir, preview_managed_skill_update, restore_managed_skill,
     save_managed_skill,
 };
-use tracedecay_automation_runtime::automation::run_ledger::AutomationTrigger;
+use tracedecay_automation_runtime::automation::run_ledger::{
+    AutomationRunLedgerRecord, AutomationTrigger,
+};
 use tracedecay_automation_runtime::automation::runner::{
     MemoryCuratorAutomationOptions, RetainedAutomationRun, SessionReflectorAutomationOptions,
     SkillWriterAutomationOptions, run_memory_curator_with_backend_for_retained_settlement,
@@ -30,6 +31,7 @@ use tracedecay_automation_runtime::automation::runner::{
     run_skill_writer_with_backend_for_retained_settlement,
 };
 use tracedecay_automation_runtime::automation::skill_writer::deploy_managed_skills_to_project;
+use tracedecay_automation_runtime::automation::{AutomationCommittedReceipt, AutomationRunControl};
 use tracedecay_automation_runtime::ports::session_evidence::{LcmGrepSort, LcmScope};
 use tracedecay_contracts::now_micros;
 use tracedecay_contracts::retained_surfaces::{LcmGrepSortV1, LcmRoleV1, LcmSearchScopeV1};
@@ -241,24 +243,31 @@ async fn prepare_dashboard_automation_effect(
     }
 }
 
-async fn settle_dashboard_automation_run<T>(
+async fn settle_dashboard_automation_run<T, P>(
     effect: Box<AutomationEffectAuthority>,
     retained_run: RetainedAutomationRun<T>,
     producer: &Arc<BoundedObservabilityProducerV1>,
     project_root: &Path,
     surface: &'static str,
+    projector: P,
 ) -> DashboardAutomationResult<DashboardAutomationRunOutcomeV1>
 where
     T: Send + 'static,
+    P: FnOnce(
+            T,
+        ) -> (
+            AutomationRunLedgerRecord,
+            Option<AutomationCommittedReceipt>,
+        ) + Send
+        + 'static,
 {
     let observer = tracedecay_daemon_service::automation_observation::automation_run_observer(
         Arc::clone(producer),
         project_root.to_path_buf(),
         surface,
     );
-    let waiter = effect.start_retained_automation_settlement(retained_run, Some(observer), |run| {
-        (run.ledger_record, run.committed_receipt)
-    });
+    let waiter =
+        effect.start_retained_automation_settlement(retained_run, Some(observer), projector);
     match waiter.wait().await.map_err(automation_failed)? {
         RetainedAutomationSettlementOutcome::Run {
             terminal,
@@ -632,6 +641,7 @@ async fn execute_dashboard_automation_run(
                 &producer,
                 cg.project_root(),
                 "dashboard_memory_curator",
+                |run| (run.ledger_record, run.committed_receipt),
             )
             .await?
         }
@@ -701,6 +711,7 @@ async fn execute_dashboard_automation_run(
                 &producer,
                 cg.project_root(),
                 "dashboard_session_reflector",
+                |run| (run.ledger_record, run.committed_receipt),
             )
             .await?
         }
@@ -754,6 +765,7 @@ async fn execute_dashboard_automation_run(
                 &producer,
                 cg.project_root(),
                 "dashboard_skill_writer",
+                |run| (run.ledger_record, run.committed_receipt),
             )
             .await?
         }

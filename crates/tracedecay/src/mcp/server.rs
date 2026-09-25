@@ -273,6 +273,7 @@ pub(crate) type CodeIndexPublicationIdentityResolver = Arc<
         + 'static,
 >;
 
+pub(crate) use tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1;
 /// Code-index search boundary contracts, owned by the query kernel.
 ///
 /// The whole `CodeIndexSearch*V1` family is pure request/outcome data with no
@@ -403,6 +404,8 @@ pub struct McpServer {
     code_index_redundancy_executor: Option<CodeIndexRedundancyExecutor>,
     /// Daemon-owned exact sealed-generation branch comparison bridge.
     code_index_branch_diff_executor: Option<CodeIndexBranchDiffExecutor>,
+    /// Daemon-owned exact-scope semantic model lifecycle bridge.
+    semantic_admin_executor: Option<SemanticAdminExecutorV1>,
     code_graph_projection_read_port: Option<CodeGraphProjectionReadPort>,
     code_graph_read_admission_port: Option<CodeGraphReadAdmissionPort>,
     verified_graph_query_port:
@@ -591,6 +594,66 @@ impl MountedProjectApplicationRetrievalV1 {
             )
             .with_federated_authority(federated_authority),
         )
+    }
+}
+
+fn mounted_project_application_retrieval(
+    registered: RegisteredGlobalDbLeaseV1,
+    root: DaemonSessionRetrievalRoot,
+    refresh_wake: Option<&Arc<dyn tracedecay_sessions::serving::SessionRefreshWorkerPort>>,
+) -> Option<MountedProjectApplicationRetrievalV1> {
+    let identity = root.identity().clone();
+    let service = DaemonSessionRetrievalService::new_with_serving_port(
+        registered,
+        root,
+        refresh_wake.map_or_else(
+            || Arc::new(tracedecay_sessions::serving::RefreshWorkerMissing),
+            construction::refresh_worker_serving_port,
+        ),
+    )?;
+    Some(MountedProjectApplicationRetrievalV1 {
+        identity,
+        service: Arc::new(service) as Arc<dyn SessionApplicationRetrievalPortV1>,
+    })
+}
+
+async fn project_application_retrieval_for_context(
+    context: &McpServerConstructionContext,
+) -> Option<MountedProjectApplicationRetrievalV1> {
+    let registry = context.registry_db.as_deref()?;
+    let profile = context.profile_identity.as_deref()?;
+    let registered = context.project_session_db.as_ref()?;
+    let project_id = context.cg.store_layout().identity.project_id.as_deref()?;
+    let serving_db = context.cg.db().canonical_database_path().to_path_buf();
+    let serving = SessionRetrievalServingIdentityV1::resolve_project(
+        project_id,
+        &serving_db,
+        context.cg.serving_branch(),
+        context.cg.project_root(),
+        profile.profile_id(),
+        &registered.binding().shard_id,
+        registry,
+    )
+    .await?;
+    let root = DaemonSessionRetrievalRoot::project(serving, registry).await?;
+    mounted_project_application_retrieval(
+        registered.clone(),
+        root,
+        context.project_session_refresh_wake.as_ref(),
+    )
+}
+
+impl McpServerConstructionContext {
+    pub(crate) async fn project_session_application_retrieval_service(
+        &self,
+        expected_scope: &tracedecay_contracts::ResolvedScope,
+    ) -> Result<Arc<dyn SessionApplicationRetrievalPortV1>> {
+        match project_application_retrieval_for_context(self).await {
+            Some(mounted) => mounted.retrieval_for_scope(expected_scope),
+            None => Ok(Arc::new(UnavailableSessionApplicationRetrievalV1::new(
+                expected_scope.clone(),
+            ))),
+        }
     }
 }
 
@@ -861,6 +924,7 @@ impl McpServer {
             code_index_similar_executor,
             code_index_redundancy_executor,
             code_index_branch_diff_executor,
+            semantic_admin_executor,
             code_graph_projection_read_port,
             code_graph_read_admission_port,
             verified_graph_query_port,
@@ -1030,21 +1094,11 @@ impl McpServer {
             .as_ref()
             .zip(project_session_retrieval_root.clone())
             .and_then(|(database, root)| {
-                let identity = root.identity().clone();
-                // A direct or core server mounts no project refresh worker;
-                // its retrieval says so instead of serving `RequireFresh`.
-                let service = DaemonSessionRetrievalService::new_with_serving_port(
+                mounted_project_application_retrieval(
                     database.clone(),
                     root,
-                    project_session_refresh_wake.as_ref().map_or_else(
-                        || Arc::new(tracedecay_sessions::serving::RefreshWorkerMissing),
-                        construction::refresh_worker_serving_port,
-                    ),
-                )?;
-                Some(MountedProjectApplicationRetrievalV1 {
-                    identity,
-                    service: Arc::new(service) as Arc<dyn SessionApplicationRetrievalPortV1>,
-                })
+                    project_session_refresh_wake.as_ref(),
+                )
             });
         let project_lcm_authority = project_session_retrieval_root
             .as_ref()
@@ -1143,6 +1197,7 @@ impl McpServer {
             code_index_similar_executor,
             code_index_redundancy_executor,
             code_index_branch_diff_executor,
+            semantic_admin_executor,
             code_graph_projection_read_port,
             code_graph_read_admission_port,
             verified_graph_query_port,

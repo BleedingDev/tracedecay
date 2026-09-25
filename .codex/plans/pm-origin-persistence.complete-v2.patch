@@ -1,0 +1,813 @@
+--- a/crates/tracedecay-store/src/observation/anchored_write.rs
++++ b/crates/tracedecay-store/src/observation/anchored_write.rs
+@@ -133,6 +133,26 @@
+     /// Returns retained original-source evidence without promoting it to a grant.
+     pub fn origin(&self) -> &ObservationOriginV1 {
+         &self.origin
++    }
++
++    /// Restores the origin retained beside the repository capture. Legacy rows
++    /// without an origin keep the ingestion-only or unavailable constructor
++    /// result. This restores evidence; the host must still validate its receipt.
++    pub fn with_retained_origin(
++        mut self,
++        origin: Option<ObservationOriginV1>,
++    ) -> ObservationStoreResult<Self> {
++        match origin {
++            Some(ObservationOriginV1::Recorded {
++                authority_ref,
++                source_identity,
++            }) => self.with_recorded_origin(authority_ref, source_identity),
++            Some(origin) => {
++                self.origin = origin;
++                Ok(self)
++            }
++            None => Ok(self),
++        }
+     }
+ 
+     /// Retains the live-event proof already checked by the host producer. A caller
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs
+@@ -296,8 +296,9 @@
+     }
+     connection.execute(
+         "INSERT INTO observation_repository_provenance (
+-            observation_id, availability_json, capture_json, retrieval_anchor_id, owner_json
+-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
++            observation_id, availability_json, capture_json, retrieval_anchor_id, owner_json,
++            origin_json
++         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         params![
+             observation_id,
+             encode(attachment.availability())?,
+@@ -309,6 +310,7 @@
+                 .anchor()
+                 .map(|anchor| encode(anchor.owner()))
+                 .transpose()?,
++            encode(attachment.origin())?,
+         ],
+     )?;
+     Ok(())
+@@ -334,7 +336,8 @@
+     let attachment = write.repository_provenance_attachment();
+     let stored = connection
+         .query_row(
+-            "SELECT availability_json, capture_json, retrieval_anchor_id, owner_json
++            "SELECT availability_json, capture_json, retrieval_anchor_id, owner_json,
++                    origin_json
+              FROM observation_repository_provenance WHERE observation_id = ?1",
+             [observation_id],
+             |row| {
+@@ -343,10 +346,30 @@
+                     row.get::<_, Option<String>>(1)?,
+                     row.get::<_, Option<String>>(2)?,
+                     row.get::<_, Option<String>>(3)?,
++                    row.get::<_, Option<String>>(4)?,
+                 ))
+             },
+         )
+         .optional()?;
++    let Some((availability, capture, anchor_id, owner, origin_json)) = stored else {
++        return Err(invalid("observation repository provenance collision"));
++    };
++    let retained_origin = origin_json
++        .map(decode::<tracedecay_store::observation::ObservationOriginV1>)
++        .transpose()?
++        .unwrap_or_else(|| {
++            if capture.is_some() {
++                tracedecay_store::observation::ObservationOriginV1::IngestionOnly
++            } else {
++                tracedecay_store::observation::ObservationOriginV1::Unavailable
++            }
++        });
++    // Capture-clock normalization below must never normalize a changed live
++    // receipt or promote a legacy row to recorded origin on duplicate replay.
++    if &retained_origin != attachment.origin() {
++        return Err(invalid("observation original provenance collision"));
++    }
++    let stored = (availability, capture, anchor_id, owner);
+     let expected = (
+         encode(attachment.availability())?,
+         attachment.provenance().map(encode).transpose()?,
+@@ -358,10 +381,8 @@
+             .map(|anchor| encode(anchor.owner()))
+             .transpose()?,
+     );
+-    if stored.as_ref() != Some(&expected) {
+-        let Some((availability, capture, anchor_id, owner)) = stored else {
+-            return Err(invalid("observation repository provenance collision"));
+-        };
++    if stored != expected {
++        let (availability, capture, anchor_id, owner) = stored;
+         let replay = repository_replay_anchor(attachment, &availability)?;
+         let Some(replay) = replay else {
+             return Err(invalid("observation repository provenance collision"));
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs
+@@ -29,6 +29,7 @@
+     Option<String>,
+     Option<String>,
+     i64,
++    Option<String>,
+ );
+ 
+ /// The single projection every observation read decodes through.
+@@ -48,7 +49,7 @@
+                 SELECT 1 FROM projection_queue
+                 WHERE projection_queue.observation_id =
+                       observation.observation_id
+-            )
++            ), repository.origin_json
+      FROM observations AS observation
+      LEFT JOIN observation_retrieval_anchors AS binding
+        ON binding.observation_id = observation.observation_id
+@@ -74,6 +75,7 @@
+         row.get::<_, Option<String>>(7)?,
+         row.get::<_, Option<String>>(8)?,
+         row.get::<_, i64>(9)?,
++        row.get::<_, Option<String>>(10)?,
+     ))
+ }
+ 
+@@ -89,6 +91,7 @@
+         repository_anchor,
+         repository_owner,
+         projection_queued,
++        repository_origin,
+     ): EncodedObservationRow,
+ ) -> rusqlite::Result<StoredObservationRowV1> {
+     let repository_availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1> =
+@@ -131,8 +134,12 @@
+     if repository_owner != expected_repository_owner {
+         return Err(invalid("observation repository owner binding mismatch"));
+     }
++    let repository_origin = repository_origin
++        .map(decode::<tracedecay_store::observation::ObservationOriginV1>)
++        .transpose()?;
+     let repository_provenance =
+         RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
++            .and_then(|attachment| attachment.with_retained_origin(repository_origin))
+             .map_err(invalid)?;
+     ObservationCommitReceipt::new(
+         sequence,
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/tests.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/tests.rs
+@@ -14,6 +14,7 @@
+     SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1,
+     SensitivityV1, SessionId, UtcMicros, VectorWatermark,
+ };
++use tracedecay_store::observation::ObservationOriginV1;
+ use tracedecay_store::{
+     AnchorDispositionReasonClassV1, AnchorDispositionStateV1, AnchoredObservationWrite,
+     CursorAdvanceLedgerReasonV1, CursorAdvanceLedgerReceiptIdV1, ObservationCoverageReason,
+@@ -245,8 +246,149 @@
+     assert_eq!(read(&mut connection, &request).unwrap(), retained);
+ }
+ 
++fn recorded_repository_write(clock: i64, authority_ref: &str) -> AnchoredObservationWrite {
++    let write = repository_write(clock, "refs/heads/main", EvidenceClass::Observed);
++    let attachment = write
++        .repository_provenance_attachment()
++        .clone()
++        .with_recorded_origin(
++            authority_ref.to_owned(),
++            write.observation().identity().clone(),
++        )
++        .unwrap();
++    write
++        .with_original_repository_provenance_attachment(attachment)
++        .unwrap()
++}
++
++#[test]
++fn recorded_origin_survives_reopen_and_replay_without_accepting_changed_proof() {
++    let directory = tempfile::TempDir::new().unwrap();
++    let path = directory.path().join("observations.sqlite3");
++    let first = recorded_repository_write(1, "live-event:original");
++    let request = ObservationReadOperationV1::Observation {
++        observation_id: first.observation().observation_id().clone(),
++    };
++    let mut connection = initialize_connection(Connection::open(&path).unwrap());
++    execute(&mut connection, &first).unwrap();
++    drop(connection);
++
++    let mut connection = Connection::open(&path).unwrap();
++    let point = read(&mut connection, &request).unwrap();
++    let ObservationReadResultV1::Observation(row) = &point else {
++        panic!("expected a point read");
++    };
++    assert_eq!(
++        &row.as_ref().as_ref().unwrap().repository_provenance,
++        first.repository_provenance_attachment()
++    );
++    let ObservationReadResultV1::Replay(rows) = read(
++        &mut connection,
++        &ObservationReadOperationV1::Replay {
++            after_sequence: 0,
++            limit: 10,
++        },
++    )
++    .unwrap() else {
++        panic!("expected replay rows");
++    };
++    assert_eq!(rows.len(), 1);
++    assert_eq!(
++        &rows[0].repository_provenance,
++        first.repository_provenance_attachment()
++    );
++
++    execute(
++        &mut connection,
++        &recorded_repository_write(2, "live-event:original"),
++    )
++    .expect("capture clock normalization must preserve the same retained proof");
++    assert!(
++        execute(
++            &mut connection,
++            &recorded_repository_write(3, "live-event:changed"),
++        )
++        .is_err(),
++        "capture clock normalization must not accept a different proof"
++    );
++    assert_eq!(read(&mut connection, &request).unwrap(), point);
++
++    let foreign_identity = observation_write_at("foreign", "receipt.foreign", 2, 0, 1, None)
++        .observation()
++        .identity()
++        .clone();
++    let tampered = ObservationOriginV1::Recorded {
++        authority_ref: "live-event:original".to_owned(),
++        source_identity: foreign_identity,
++    };
++    connection
++        .execute(
++            "UPDATE observation_repository_provenance SET origin_json = ?1",
++            [serde_json::to_string(&tampered).unwrap()],
++        )
++        .unwrap();
++    assert!(
++        read(&mut connection, &request).is_err(),
++        "a retained proof for another source generation must fail read validation"
++    );
++}
++
++#[test]
++fn null_legacy_origin_keeps_constructor_default_and_cannot_gain_a_proof_on_replay() {
++    for write in [
++        repository_write(1, "refs/heads/main", EvidenceClass::Observed),
++        anchored_observation_write("legacy unavailable", "receipt.legacy-unavailable"),
++    ] {
++        let mut connection = connection();
++        execute(&mut connection, &write).unwrap();
++        connection
++            .execute(
++                "UPDATE observation_repository_provenance SET origin_json = NULL",
++                [],
++            )
++            .unwrap();
++        let request = ObservationReadOperationV1::Observation {
++            observation_id: write.observation().observation_id().clone(),
++        };
++        let ObservationReadResultV1::Observation(row) = read(&mut connection, &request).unwrap()
++        else {
++            panic!("expected a legacy point read");
++        };
++        assert_eq!(
++            row.unwrap().repository_provenance.origin(),
++            write.repository_provenance_attachment().origin()
++        );
++        execute(&mut connection, &write).expect("unchanged legacy evidence can replay");
++        if write
++            .repository_provenance_attachment()
++            .provenance()
++            .is_some()
++        {
++            assert!(
++                execute(
++                    &mut connection,
++                    &recorded_repository_write(2, "live-event:new"),
++                )
++                .is_err(),
++                "a duplicate cannot invent recorded origin for an old row"
++            );
++        }
++        let origin: Option<String> = connection
++            .query_row(
++                "SELECT origin_json FROM observation_repository_provenance",
++                [],
++                |row| row.get(0),
++            )
++            .unwrap();
++        assert!(origin.is_none());
++    }
++}
++
+ fn connection() -> Connection {
+-    let connection = Connection::open_in_memory().unwrap();
++    initialize_connection(Connection::open_in_memory().unwrap())
++}
++
++fn initialize_connection(connection: Connection) -> Connection {
+     connection
+         .execute_batch(
+             "CREATE TABLE sanitization_receipts (
+@@ -307,7 +449,8 @@
+                     availability_json TEXT NOT NULL,
+                     capture_json TEXT,
+                     retrieval_anchor_id TEXT UNIQUE,
+-                    owner_json TEXT
++                    owner_json TEXT,
++                    origin_json TEXT CHECK(origin_json IS NULL OR json_valid(origin_json))
+                  );
+                  CREATE TABLE observation_projection_checkpoints (
+                     projector_version TEXT PRIMARY KEY,
+--- a/crates/tracedecay-global-db/src/observation/schema.rs
++++ b/crates/tracedecay-global-db/src/observation/schema.rs
+@@ -8,9 +8,11 @@
+ /// Typed reset authority for the observation store. No observation shape has
+ /// ever shipped in a published release (`observations` is absent from both the
+ /// v0.0.66 package and `origin/master`), so any schema drift here is a
+-/// branch-local development artifact and refuses admission with
++/// incompatible branch-local development artifact and refuses admission with
+ /// [`ResetRequired`](tracedecay_domain::errors::TraceDecayError::ResetRequired)
+-/// instead of migrating.
++/// instead of migrating. The nullable live-origin evidence column is an
++/// additive exception: old rows keep their unknown origin without rewriting
++/// their canonical observation or repository capture.
+ pub const OBSERVATION_AUTHORITY: &str = "observations";
+ 
+ /// Marker proving `observations` was created with the canonical AUTOINCREMENT
+@@ -379,6 +381,7 @@
+             capture_json TEXT CHECK(capture_json IS NULL OR json_valid(capture_json)),
+             retrieval_anchor_id TEXT UNIQUE,
+             owner_json TEXT CHECK(owner_json IS NULL OR json_valid(owner_json)),
++            origin_json TEXT CHECK(origin_json IS NULL OR json_valid(origin_json)),
+             CHECK((capture_json IS NULL) = (retrieval_anchor_id IS NULL)),
+             CHECK((owner_json IS NULL) = (retrieval_anchor_id IS NULL)),
+             FOREIGN KEY(observation_id) REFERENCES observations(observation_id),
+@@ -453,6 +456,17 @@
+     conn.execute_batch(OBSERVATION_AUTHORITY_SCHEMA_SQL)
+         .await
+         .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
++    super::super::ensure_table_columns(
++        conn,
++        "observation_repository_provenance",
++        &[(
++            "origin_json",
++            "ALTER TABLE observation_repository_provenance ADD COLUMN origin_json TEXT \
++             CHECK(origin_json IS NULL OR json_valid(origin_json))",
++        )],
++    )
++    .await
++    .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
+     if !table_preexisted {
+         conn.execute(
+             "INSERT OR IGNORE INTO global_schema_migrations(migration) VALUES (?1)",
+--- a/crates/tracedecay-global-db/src/schema_contract/definitions.rs
++++ b/crates/tracedecay-global-db/src/schema_contract/definitions.rs
+@@ -437,6 +437,7 @@
+             column("capture_json", "TEXT", false, None, 0),
+             column("retrieval_anchor_id", "TEXT", false, None, 0),
+             column("owner_json", "TEXT", false, None, 0),
++            column("origin_json", "TEXT", false, None, 0),
+         ],
+         [
+             foreign_key(
+--- a/crates/tracedecay-global-db/src/observation/codec.rs
++++ b/crates/tracedecay-global-db/src/observation/codec.rs
+@@ -33,6 +33,7 @@
+     availability_json: &str,
+     capture_json: Option<&str>,
+     anchor_json: Option<&str>,
++    origin_json: Option<&str>,
+     operation: &'static str,
+ ) -> ObservationStoreResult<RepositoryProvenanceAttachmentV1> {
+     let availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1> =
+@@ -43,12 +44,18 @@
+     if availability.value() != capture.as_ref() {
+         return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
+     }
++    let origin = origin_json
++        .map(|origin| {
++            decode::<tracedecay_store::observation::ObservationOriginV1>(origin, operation)
++        })
++        .transpose()?;
+     RepositoryProvenanceAttachmentV1::new(
+         availability,
+         anchor_json
+             .map(|anchor| decode::<RetrievalAnchorRecordV2>(anchor, operation))
+             .transpose()?,
+-    )
++    )?
++    .with_retained_origin(origin)
+ }
+ 
+ pub(super) fn decode_sequence(value: i64, operation: &'static str) -> ObservationStoreResult<u64> {
+--- a/crates/tracedecay-global-db/src/observation/persist.rs
++++ b/crates/tracedecay-global-db/src/observation/persist.rs
+@@ -48,6 +48,9 @@
+     let repository_anchor_json = row
+         .get::<Option<String>>(7)
+         .map_err(|error| storage(operation, error))?;
++    let repository_origin_json = row
++        .get::<Option<String>>(8)
++        .map_err(|error| storage(operation, error))?;
+     Ok(Some(
+         ObservationCommitReceipt::new(
+             sequence,
+@@ -62,6 +65,7 @@
+                 &repository_availability_json,
+                 repository_capture_json.as_deref(),
+                 repository_anchor_json.as_deref(),
++                repository_origin_json.as_deref(),
+                 operation,
+             )?,
+         )?,
+@@ -77,7 +81,8 @@
+         "SELECT observation.sequence, observation.observation_json,
+                 observation.committed_cursor_json, anchor.anchor_json,
+                 anchor.projection_generation, repository.availability_json,
+-                repository.capture_json, repository_anchor.anchor_json
++                repository.capture_json, repository_anchor.anchor_json,
++                repository.origin_json
+          FROM observations AS observation
+          JOIN observation_retrieval_anchors AS binding
+            ON binding.observation_id = observation.observation_id
+--- a/crates/tracedecay-global-db/src/observation_adapter.rs
++++ b/crates/tracedecay-global-db/src/observation_adapter.rs
+@@ -590,6 +590,16 @@
+                     retained.observation().receipt() == observation.receipt()
+                 }));
+         if existed_exact {
++            let incoming_origin = write.repository_provenance_attachment().origin();
++            if pending
++                .as_ref()
++                .is_some_and(|retained| &retained.origin != incoming_origin)
++                || existing.as_ref().is_some_and(|retained| {
++                    retained.repository_provenance_attachment().origin() != incoming_origin
++                })
++            {
++                return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
++            }
+             if pending.is_some() {
+                 return Ok(PreparedObservationPersist::DeferredExactDuplicate(
+                     Box::new(write),
+@@ -736,6 +746,7 @@
+     payload_reference: PayloadReferenceV1,
+     identity: ObservationIdentityMaterialV1,
+     receipt: SanitizationReceiptV1,
++    origin: tracedecay_store::observation::ObservationOriginV1,
+ }
+ 
+ #[derive(Clone)]
+@@ -802,6 +813,7 @@
+                 payload_reference: write.observation().payload_reference().clone(),
+                 identity: write.observation().identity().clone(),
+                 receipt: write.observation().receipt().clone(),
++                origin: write.repository_provenance_attachment().origin().clone(),
+             },
+         );
+         self.pending_receipts.insert(
+@@ -1171,7 +1183,7 @@
+             EXISTS(
+                 SELECT 1 FROM projection_queue
+                 WHERE projection_queue.observation_id = observation.observation_id
+-            )
++            ), repository.origin_json
+      FROM observations AS observation
+      LEFT JOIN observation_retrieval_anchors AS binding
+        ON binding.observation_id = observation.observation_id
+@@ -1304,8 +1316,18 @@
+                 "observation repository owner binding mismatch",
+             ));
+         }
++        let repository_origin = row
++            .get::<Option<String>>(11)
++            .map_err(|error| runtime_storage_error(operation, error))?
++            .map(|encoded| {
++                decode_json::<tracedecay_store::observation::ObservationOriginV1>(
++                    encoded, operation,
++                )
++            })
++            .transpose()?;
+         let repository_provenance =
+             RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
++                .and_then(|attachment| attachment.with_retained_origin(repository_origin))
+                 .map_err(|error| runtime_storage_error(operation, error))?;
+         let projection_queued = row
+             .get::<i64>(10)
+--- a/crates/tracedecay-global-db/src/observation/retention.rs
++++ b/crates/tracedecay-global-db/src/observation/retention.rs
+@@ -800,7 +800,8 @@
+     // IS NULL)` satisfied.
+     let sql = format!(
+         "SELECT p.observation_id,
+-                LENGTH(p.availability_json) + LENGTH(COALESCE(p.capture_json, '')) AS len,
++                LENGTH(p.availability_json) + LENGTH(COALESCE(p.capture_json, ''))
++                    + LENGTH(COALESCE(p.origin_json, '')) AS len,
+                 (
+                     SELECT d.effective_at
+                     FROM retrieval_anchor_dispositions d
+@@ -871,7 +872,7 @@
+             .join(",");
+         let sql = format!(
+             "UPDATE observation_repository_provenance
+-             SET availability_json = ?1, capture_json = ?1
++             SET availability_json = ?1, capture_json = ?1, origin_json = NULL
+              WHERE observation_id IN ({placeholders})"
+         );
+         let mut values = Vec::with_capacity(chunk.len() + 1);
+--- a/crates/tracedecay-global-db/src/observation/retention/restore.rs
++++ b/crates/tracedecay-global-db/src/observation/retention/restore.rs
+@@ -60,7 +60,8 @@
+                      SELECT current.capture_json
+                      FROM current_authority.observation_repository_provenance AS current
+                      WHERE current.observation_id = staging.observation_id
+-                 )
++                 ),
++                 origin_json = NULL
+              WHERE EXISTS(
+                  SELECT 1
+                  FROM current_authority.observation_repository_provenance AS current
+@@ -96,7 +97,8 @@
+         CREATE TABLE observation_repository_provenance (
+             observation_id TEXT PRIMARY KEY,
+             availability_json TEXT NOT NULL,
+-            capture_json TEXT
++            capture_json TEXT,
++            origin_json TEXT
+         );";
+ 
+     fn seed(path: &std::path::Path, released: bool) {
+@@ -130,7 +132,7 @@
+         connection
+             .execute(
+                 "INSERT INTO observation_repository_provenance
+-                 VALUES ('observation.1', ?1, ?1)",
++                 VALUES ('observation.1', ?1, ?1, '{\"retained_origin\":true}')",
+                 [provenance],
+             )
+             .unwrap();
+@@ -168,7 +170,8 @@
+                     (SELECT anchor_json FROM retrieval_anchors),
+                     (SELECT observation_json FROM observations),
+                     (SELECT availability_json FROM observation_repository_provenance),
+-                    (SELECT capture_json FROM observation_repository_provenance)",
++                    (SELECT capture_json FROM observation_repository_provenance),
++                    (SELECT origin_json FROM observation_repository_provenance)",
+                 (),
+                 |row| {
+                     Ok((
+@@ -176,6 +179,7 @@
+                         row.get::<_, String>(1)?,
+                         row.get::<_, String>(2)?,
+                         row.get::<_, String>(3)?,
++                        row.get::<_, Option<String>>(4)?,
+                     ))
+                 },
+             )
+@@ -187,6 +191,7 @@
+                 OBSERVATION_RELEASED_MARKER.to_owned(),
+                 PROVENANCE_RELEASED_MARKER.to_owned(),
+                 PROVENANCE_RELEASED_MARKER.to_owned(),
++                None,
+             )
+         );
+         for mutation in [
+--- a/crates/tracedecay-global-db/src/observation/retention/tests.rs
++++ b/crates/tracedecay-global-db/src/observation/retention/tests.rs
+@@ -132,14 +132,15 @@
+     .map_err(|err| format!("insert binding: {err}"))?;
+     conn.execute(
+         "INSERT INTO observation_repository_provenance(observation_id,
+-             availability_json, capture_json, retrieval_anchor_id, owner_json)
+-         VALUES (?1, ?2, ?3, ?4, ?5)",
++             availability_json, capture_json, retrieval_anchor_id, owner_json, origin_json)
++         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         params![
+             observation_id.as_str(),
+             payload("avail", size),
+             payload("capture", size),
+             anchor_id,
+-            OWNER
++            OWNER,
++            payload("retained_origin", size)
+         ],
+     )
+     .await
+@@ -395,6 +396,14 @@
+         assert!(is_released(
+             &fetch_str(&conn, "SELECT availability_json FROM observation_repository_provenance WHERE observation_id = 'obs-anchor-1'").await?
+         ));
++        assert_eq!(
++            fetch_str(
++                &conn,
++                "SELECT COALESCE(origin_json, 'released') FROM observation_repository_provenance WHERE observation_id = 'obs-anchor-1'"
++            ).await?,
++            "released",
++            "{state}: original event proof is released with provenance"
++        );
+     }
+     Ok(())
+ }
+--- a/crates/tracedecay-global-db/src/observation_batch_tests.rs
++++ b/crates/tracedecay-global-db/src/observation_batch_tests.rs
+@@ -293,6 +293,197 @@
+         write.projection_generation().clone(),
+     )
+     .unwrap()
++}
++
++fn recorded_origin_write(session_id: &str, authority_ref: &str) -> AnchoredObservationWrite {
++    use tracedecay_domain::{
++        AnchorSourceGenerationV2, EvidenceAvailabilityV1, GenerationBoundRepositoryProvenanceV1,
++        PrivacyDomainBoundLocatorDigest, ProjectId, RefId, RepositoryEvidenceV1, RepositoryId,
++        RepositoryProvenanceV1, RepositoryRemoteIdentityV1, RetrievalAnchorTargetV2,
++    };
++
++    let project = ProjectId::new("project.observation-origin").unwrap();
++    let observation = sequential_observation(&SessionId::new(session_id).unwrap(), 0, "origin");
++    let identity = observation.identity();
++    let observation = DurableObservationV1::new(
++        ObservationIdentityMaterialV1::for_native_record(
++            observation.source().clone(),
++            ObservationScopeV1::Project {
++                project_id: project.clone(),
++            },
++            identity.generation(),
++            identity.position(),
++            identity.ordering_domain(),
++            identity.native_record_id().unwrap().clone(),
++        )
++        .unwrap(),
++        observation.receipt().clone(),
++        observation.retention_class().clone(),
++        observation.payload().clone(),
++    )
++    .unwrap();
++    let write = anchored_write(observation, None);
++    let capture = RepositoryProvenanceV1::new(
++        RepositoryId::new("repository.observation-origin").unwrap(),
++        Some(project),
++        None,
++        PrivacyDomainBoundLocatorDigest::new(
++            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
++        )
++        .unwrap(),
++        RepositoryEvidenceV1::new(
++            EvidenceAvailabilityV1::Known(RefId::new("refs/heads/main").unwrap()),
++            EvidenceAvailabilityV1::Unborn,
++            EvidenceAvailabilityV1::Unavailable,
++            EvidenceAvailabilityV1::Unknown,
++            RepositoryRemoteIdentityV1::Unknown,
++            EvidenceAvailabilityV1::Unknown,
++        )
++        .unwrap(),
++        UtcMicros(1),
++    )
++    .unwrap();
++    let binding = GenerationBoundRepositoryProvenanceV1::new(
++        write.projection_generation().clone(),
++        capture,
++        Some(write.observation().observation_id().clone()),
++    )
++    .unwrap();
++    let retained = write.retrieval_anchor();
++    let anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
++        target: RetrievalAnchorTargetV2::RepositoryCapture {
++            repository_id: binding.capture().repository_id().clone(),
++            capture_id: binding.capture_id().clone(),
++            receipt: write.observation().receipt().receipt().clone(),
++        },
++        owner: retained.owner().clone(),
++        aliases: vec![],
++        occurred_at: retained.occurred_at(),
++        ingested_at: retained.ingested_at(),
++        evidence_class: retained.evidence_class(),
++        source_generation: AnchorSourceGenerationV2::RepositoryCapture(
++            binding.capture_id().clone(),
++        ),
++        projection_generation: retained.projection_generation().clone(),
++        projection_watermark: retained.projection_watermark().clone(),
++        coverage: retained.coverage().clone(),
++        source_observations: retained.source_observations().to_vec(),
++        source_anchors: vec![],
++        authorization: retained.authorization().clone(),
++        payload_access: retained.payload_access(),
++        retention_class: retained.retention_class().clone(),
++        durability: retained.durability().clone(),
++    })
++    .unwrap();
++    let attachment = tracedecay_store::RepositoryProvenanceAttachmentV1::new(
++        EvidenceAvailabilityV1::Known(binding),
++        Some(anchor),
++    )
++    .unwrap()
++    .with_recorded_origin(
++        authority_ref.to_owned(),
++        write.observation().identity().clone(),
++    )
++    .unwrap();
++    write
++        .with_original_repository_provenance_attachment(attachment)
++        .unwrap()
++}
++
++#[tokio::test]
++async fn recorded_origin_batch_hydration_and_exact_duplicates_preserve_proof() {
++    let tmp = TempDir::new().unwrap();
++    let runtime = HostAdmissionTestRuntimeV1::project(
++        tmp.path().join("profile"),
++        tmp.path().join("project"),
++        tracedecay_domain::ProjectId::new("project.observation-origin").unwrap(),
++    )
++    .await
++    .unwrap();
++    let store = runtime
++        .observation_store(HostAdmissionScope::Project)
++        .unwrap();
++    let write = recorded_origin_write("session.origin.batch", "live-event:original");
++    let expected = write.repository_provenance_attachment();
++    let outcomes = store
++        .persist_observations(vec![write.clone(), write.clone()])
++        .await
++        .unwrap();
++    assert!(matches!(
++        outcomes[0].outcome(),
++        ObservationPersistOutcome::Committed(_)
++    ));
++    assert!(matches!(
++        outcomes[1].outcome(),
++        ObservationPersistOutcome::ExactDuplicate(_)
++    ));
++    for outcome in &outcomes {
++        assert_eq!(
++            outcome.stored().unwrap().repository_provenance_attachment(),
++            expected
++        );
++        assert_eq!(
++            outcome
++                .outcome()
++                .receipt()
++                .repository_provenance_attachment(),
++            expected
++        );
++    }
++    let stored = store
++        .get_observation(write.observation().observation_id())
++        .await
++        .unwrap()
++        .unwrap();
++    assert_eq!(stored.repository_provenance_attachment(), expected);
++    let duplicate = store.persist_observation(write.clone()).await.unwrap();
++    assert!(matches!(
++        duplicate,
++        ObservationPersistOutcome::ExactDuplicate(_)
++    ));
++    assert_eq!(
++        duplicate.receipt().repository_provenance_attachment(),
++        expected
++    );
++
++    let changed = recorded_origin_write("session.origin.batch", "live-event:changed");
++    assert!(matches!(
++        store.persist_observation(changed).await,
++        Err(ObservationStoreError::RepositoryProvenanceBindingMismatch)
++    ));
++    let pending = recorded_origin_write("session.origin.pending", "live-event:original");
++    let changed = recorded_origin_write("session.origin.pending", "live-event:changed");
++    assert!(matches!(
++        store
++            .persist_observations(vec![pending.clone(), changed])
++            .await,
++        Err(ObservationStoreError::RepositoryProvenanceBindingMismatch)
++    ));
++    assert!(
++        store
++            .get_observation(pending.observation().observation_id())
++            .await
++            .unwrap()
++            .is_none(),
++        "a changed pending proof must not commit the valid prefix"
++    );
++    let recorded = recorded_origin_write("session.origin.legacy", "live-event:new");
++    let attachment = recorded.repository_provenance_attachment();
++    let legacy = recorded
++        .clone()
++        .with_original_repository_provenance_attachment(
++            tracedecay_store::RepositoryProvenanceAttachmentV1::new(
++                attachment.availability().clone(),
++                attachment.anchor().cloned(),
++            )
++            .unwrap(),
++        )
++        .unwrap();
++    store.persist_observation(legacy).await.unwrap();
++    assert!(matches!(
++        store.persist_observation(recorded).await,
++        Err(ObservationStoreError::RepositoryProvenanceBindingMismatch)
++    ));
+ }
+ 
+ fn colliding_rewrite(

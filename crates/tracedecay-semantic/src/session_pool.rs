@@ -1392,12 +1392,7 @@ pub mod test_support {
     }
 
     pub fn authority_with_load_deadline_ms(load_deadline_ms: u64) -> AdmittedProjectionArtifactV1 {
-        let artifact = admitted_artifact_limits(
-            5,
-            9,
-            2 * 1024 * 1024 * 1024,
-            load_deadline_ms,
-        );
+        let artifact = admitted_artifact_limits(5, 9, 2 * 1024 * 1024 * 1024, load_deadline_ms);
         let projection = projection_for(&artifact)
             .admit()
             .expect("valid projection fixture");

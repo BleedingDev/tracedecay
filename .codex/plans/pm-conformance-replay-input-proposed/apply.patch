@@ -1,0 +1,272 @@
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -2825,24 +2825,24 @@
+         "authority_revision": 1, "checked_at": T4 })
+ }
+ 
+-fn history_grant(scope: &OwnedExactScope, observations: &[Value], state: &str) -> Value {
++fn history_grant(scope: &OwnedExactScope, observations: &[(&Value, SourceDisposition)]) -> Value {
+     json!({ "authorization_ref": "fixture.host.admitted-history", "policy_revision": 1,
+         "destination_scope": scope_json(scope), "relation": "exact_scope",
+-        "sources": observations.iter().map(|observation| json!({
++        "sources": observations.iter().map(|(observation, state)| json!({
+             "attribution": observation["source_identity"]["original_source"],
+-            "current_disposition": disposition(state) })).collect::<Vec<_>>(),
++            "current_disposition": disposition(state.as_wire()) })).collect::<Vec<_>>(),
+         "disposition_checkpoint": checkpoint(scope) })
+ }
+ 
+-fn replay(scope: &OwnedExactScope, observations: &[Value], state: &str) -> Value {
+-    let resolved: Vec<Value> = observations.iter().map(|observation| json!({
++fn replay(scope: &OwnedExactScope, observations: &[(&Value, SourceDisposition)]) -> Value {
++    let resolved: Vec<Value> = observations.iter().map(|(observation, _)| json!({
+         "receipt_ref": format!("fixture.host.observation-receipt.{}", observation["source_sequence"]),
+         "observation": observation })).collect();
+     json!({ "observation_batch_refs": resolved.iter().map(|row| row["receipt_ref"].clone()).collect::<Vec<_>>(),
+-        "resolved_observations": resolved, "first_source_sequence": observations.first().map(|value| value["source_sequence"].clone()),
+-        "last_source_sequence": observations.last().map(|value| value["source_sequence"].clone()),
++        "resolved_observations": resolved, "first_source_sequence": observations.first().map(|(value, _)| value["source_sequence"].clone()),
++        "last_source_sequence": observations.last().map(|(value, _)| value["source_sequence"].clone()),
+         "expected_previous_acknowledged_sequence": 0, "expected_state_generation": 0,
+-        "history_grant": history_grant(scope, observations, state) })
++        "history_grant": history_grant(scope, observations) })
+ }
+ 
+ fn deletion(observation: &Value) -> Value {
+@@ -2983,7 +2983,7 @@
+     let mut replay_deleted = call_step(
+         &format!("{prefix}.fresh_delivery_replay"),
+         ProviderOperation::Replay,
+-        replay(scope, &[first], "deleted"),
++        replay(scope, &[(&first, SourceDisposition::Deleted)]),
+         vec![CompatibilityAssertion::ReplayAccounting {
+             applied: 0,
+             sources_already_applied: 0,
+@@ -2998,11 +2998,17 @@
+     steps.push(call_step(
+         &format!("{prefix}.replay_positive"),
+         ProviderOperation::Replay,
+-        replay(scope, &[replay_only.clone()], "available"),
++        replay(
++            scope,
++            &[
++                (&first, SourceDisposition::Deleted),
++                (&replay_only, SourceDisposition::Available),
++            ],
++        ),
+         vec![CompatibilityAssertion::ReplayAccounting {
+             applied: 1,
+             sources_already_applied: 0,
+-            rejected: 0,
++            rejected: 1,
+         }],
+     )?);
+     steps.push(call_step(
+@@ -3016,14 +3022,28 @@
+     let mut already_applied = call_step(
+         &format!("{prefix}.new_key_same_source"),
+         ProviderOperation::Replay,
+-        replay(scope, &[replay_only], "available"),
++        replay(
++            scope,
++            &[
++                (&first, SourceDisposition::Deleted),
++                (&replay_only, SourceDisposition::Available),
++            ],
++        ),
+         vec![CompatibilityAssertion::ReplayAccounting {
+             applied: 0,
+             sources_already_applied: 1,
+-            rejected: 0,
++            rejected: 1,
+         }],
+     )?;
+-    if let CompatibilityStep::Call { fixture, .. } = &mut already_applied {
++    if let CompatibilityStep::Call {
++        fixture, bindings, ..
++    } = &mut already_applied
++    {
++        bindings.push(ReplyBinding {
++            step_id: format!("{prefix}.replay_positive"),
++            source_pointer: "/acknowledged_sequence".into(),
++            destination_pointer: "/expected_previous_acknowledged_sequence".into(),
++        });
+         fixture.expectation.committed_effect = ExpectedCommittedEffect::none();
+         fixture.expectation.state_generation = GenerationExpectation::Unchanged;
+     }
+@@ -3127,10 +3147,16 @@
+     let mut replay_step = call_step(
+         "predelete.replay_after_restart",
+         ProviderOperation::Replay,
+-        replay(scope, &[forbidden], "deleted"),
++        replay(
++            scope,
++            &[
++                (&positive, SourceDisposition::Available),
++                (&forbidden, SourceDisposition::Deleted),
++            ],
++        ),
+         vec![CompatibilityAssertion::ReplayAccounting {
+             applied: 0,
+-            sources_already_applied: 0,
++            sources_already_applied: 1,
+             rejected: 1,
+         }],
+     )?;
+@@ -3986,9 +4012,9 @@
+     );
+     let mut destination = scope.clone();
+     destination.agent_session_id = "common-advisory-destination-session".into();
+-    let mut grant = history_grant(&destination, &[original.clone()], "available");
++    let mut grant = history_grant(&destination, &[(&original, SourceDisposition::Available)]);
+     grant["relation"] = json!("same_checkout");
+-    let mut replay_payload = replay(&destination, &[original.clone()], "available");
++    let mut replay_payload = replay(&destination, &[(&original, SourceDisposition::Available)]);
+     replay_payload["history_grant"] = grant.clone();
+     let mut steps = vec![
+         call_step(
+@@ -4189,7 +4215,7 @@
+             fixture.expectation.payload = PayloadExpectation::Any;
+         }
+         steps.push(absent);
+-        let mut forbidden = replay(&foreign, &[original.clone()], "available");
++        let mut forbidden = replay(&foreign, &[(&original, SourceDisposition::Available)]);
+         forbidden["history_grant"]["relation"] = json!("same_checkout");
+         let mut forbidden = call_step(
+             &format!("authority.foreign_{label}_grant_denied"),
+@@ -4623,4 +4649,112 @@
+         );
+         Ok(())
+     }
+-}
++    #[test]
++    fn replay_pages_are_contiguous_use_current_dispositions_and_bind_actual_ack()
++    -> Result<(), String> {
++        let scope = scope()?;
++        let cases = common_advisory_scenarios(&scope, 1)?;
++        let mut replay_count = 0;
++        for case in &cases {
++            let mut dispositions = BTreeMap::new();
++            for step in &case.steps {
++                match step {
++                    CompatibilityStep::Environment {
++                        action:
++                            FixtureEnvironmentAction::RecordSourceDisposition {
++                                source_key,
++                                disposition,
++                            },
++                        ..
++                    } => {
++                        dispositions.insert(source_key.clone(), disposition.clone());
++                    }
++                    CompatibilityStep::Call {
++                        fixture,
++                        bindings,
++                        assertions,
++                    } if fixture.operation == ProviderOperation::Replay
++                        && (fixture.step_id.starts_with("restore.")
++                            || fixture.step_id.starts_with("predelete.")) =>
++                    {
++                        replay_count += 1;
++                        let value: Value = serde_json::from_slice(&fixture.payload.bytes)
++                            .map_err(|error| error.to_string())?;
++                        let rows = value["resolved_observations"]
++                            .as_array()
++                            .ok_or("replay rows missing")?;
++                        let grants = value["history_grant"]["sources"]
++                            .as_array()
++                            .ok_or("replay grants missing")?;
++                        assert_eq!(rows.len(), grants.len());
++                        assert_eq!(value["first_source_sequence"], 1);
++                        assert_eq!(value["last_source_sequence"], rows.len());
++                        for (index, (row, grant)) in rows.iter().zip(grants).enumerate() {
++                            let observation = &row["observation"];
++                            assert_eq!(observation["source_sequence"], index + 1);
++                            assert_eq!(
++                                row["receipt_ref"],
++                                format!("fixture.host.observation-receipt.{}", index + 1)
++                            );
++                            assert_eq!(
++                                grant["attribution"],
++                                observation["source_identity"]["original_source"]
++                            );
++                            let key = grant["attribution"]["source"]["source_key"]
++                                .as_str()
++                                .ok_or("source key absent")?;
++                            let current = dispositions
++                                .get(key)
++                                .map(String::as_str)
++                                .unwrap_or("available");
++                            assert_eq!(grant["current_disposition"]["state"], current);
++                        }
++                        let positive = fixture.step_id.ends_with(".replay_positive");
++                        let repeated = fixture.step_id.ends_with(".new_key_same_source");
++                        let predelete = fixture.step_id == "predelete.replay_after_restart";
++                        let expected = CompatibilityAssertion::ReplayAccounting {
++                            applied: u64::from(positive),
++                            sources_already_applied: u64::from(repeated || predelete),
++                            rejected: 1,
++                        };
++                        assert!(assertions.contains(&expected));
++                        if positive || repeated || predelete {
++                            assert_eq!(rows.len(), 2);
++                        } else {
++                            assert_eq!(rows.len(), 1);
++                        }
++                        if !positive {
++                            assert_eq!(
++                                fixture.expectation.committed_effect,
++                                ExpectedCommittedEffect::none()
++                            );
++                            assert_eq!(
++                                fixture.expectation.state_generation,
++                                GenerationExpectation::Unchanged
++                            );
++                        }
++                        assert_eq!(value["expected_previous_acknowledged_sequence"], 0);
++                        if repeated {
++                            assert_eq!(
++                                bindings.as_slice(),
++                                &[ReplyBinding {
++                                    step_id: fixture
++                                        .step_id
++                                        .replace(".new_key_same_source", ".replay_positive"),
++                                    source_pointer: "/acknowledged_sequence".into(),
++                                    destination_pointer: "/expected_previous_acknowledged_sequence"
++                                        .into(),
++                                }]
++                            );
++                        } else {
++                            assert!(bindings.is_empty());
++                        }
++                    }
++                    _ => {}
++                }
++            }
++        }
++        assert_eq!(replay_count, 7);
++        Ok(())
++    }
++}
+--- a/product/contracts/memory-provider-v1/common-advisory-profile.md
++++ b/product/contracts/memory-provider-v1/common-advisory-profile.md
+@@ -94,6 +94,19 @@
+ original canonical envelope, the history grant covers every source, and the
+ source sequence/order matches the admitted replay bounds. The provider never
+ looks up the host's canonical database to resolve these receipts.
++
++
++Replay fixtures respect the existing contiguous sequence and acknowledged-cursor
++contract. An ordinary Observe or SnapshotRestore does not itself establish a
++replay acknowledgement. A page that changes no observation, effect or fence
++leaves acknowledgement and generation unchanged. Successor pages therefore
++include the full contiguous source range from the actual replay cursor, including
++sources currently deleted by the host. Each grant entry carries that source's
++actual current disposition; privacy checks still reject deleted sources. A fresh
++key repeating a completed page binds `expected_previous_acknowledged_sequence`
++to the actual prior Replay reply's `acknowledged_sequence`, while source-already-
++applied and rejected counts retain their separate meanings. No fixture assumes
++an acknowledgement from an unrelated Observe or restore generation.
+ 
+ Snapshot export returns `snapshot: { "identity": …, "bytes": [0..255],
+ "sources": […] }`. Identity uses the existing snapshot identity fields; its

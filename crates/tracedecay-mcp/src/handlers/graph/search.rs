@@ -102,36 +102,7 @@ fn preserve_complete_search_after_lazy_admission(result: Result<()>) -> Result<(
 /// response, including the successful ones, because "no matches" and "the
 /// matching lane was not running" are otherwise indistinguishable.
 fn coverage_value(coverage: &tracedecay_query::code_search::CodeIndexSearchCoverageV1) -> Value {
-    fn lane(status: &tracedecay_query::code_search::CodeIndexLaneStatusV1) -> Value {
-        match status {
-            tracedecay_query::code_search::CodeIndexLaneStatusV1::Complete => json!("complete"),
-            tracedecay_query::code_search::CodeIndexLaneStatusV1::Stale { generation } => json!({
-                "status": "stale",
-                "generation": generation,
-            }),
-            tracedecay_query::code_search::CodeIndexLaneStatusV1::Partial {
-                generation,
-                reason,
-            } => {
-                json!({
-                    "status": "partial",
-                    "generation": generation,
-                    "reason": reason,
-                })
-            }
-            tracedecay_query::code_search::CodeIndexLaneStatusV1::Unavailable { reason } => json!({
-                "status": "unavailable",
-                "reason": reason,
-            }),
-        }
-    }
-
-    json!({
-        "exact": lane(&coverage.exact),
-        "lexical": lane(&coverage.lexical),
-        "graph": lane(&coverage.graph),
-        "recall": if coverage.is_degraded() { "partial" } else { "full" },
-    })
+    json!(primitive_search_coverage(coverage))
 }
 
 fn user_line(line: u32) -> u32 {
@@ -214,6 +185,17 @@ where
             })?;
 
     let lexical_routing = lexical_routing::routing_from_args(&args)?;
+    let semantic_mode = args
+        .get("semantic_mode")
+        .map(|value| {
+            serde_json::from_value::<tracedecay_contracts::retrieval::SemanticQueryModeV1>(
+                value.clone(),
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!("invalid semantic_mode: {error}"),
+            })
+        })
+        .transpose()?;
     let lazy_indexing_requested = dependency_hints::lazy_indexing_requested(&args);
     let cursor = retrieval_cursor(&args)?;
     let include_graph_node_ids = render::wants_json(&args);
@@ -230,6 +212,7 @@ where
     let search_request = tracedecay_query::code_search::CodeIndexSearchRequestV1 {
         project_root: ctx.project_root().to_path_buf(),
         query: query.to_owned(),
+        semantic_mode,
         source_revision: None,
         source_tree: None,
         source_reference: None,
@@ -742,6 +725,10 @@ where
     let deadline = ctx.deadline().cloned();
     let cancellation = ctx.cancellation().cloned();
     let request: ContextSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_context")?;
+    let strict_semantic_requested = matches!(
+        request.semantic_mode,
+        Some(tracedecay_contracts::retrieval::SemanticQueryModeV1::StrictSemantic)
+    );
     let memory_policy_admitted_at =
         tracedecay_contracts::try_now_micros().map_err(|error| TraceDecayError::Config {
             message: format!("context memory policy admission clock unavailable: {error}"),
@@ -775,6 +762,7 @@ where
         tracedecay_query::code_search::CodeIndexSearchRequestV1 {
             project_root: ctx.project_root().to_path_buf(),
             query: task.to_owned(),
+            semantic_mode: request.semantic_mode,
             source_revision: None,
             source_tree: None,
             source_reference: None,
@@ -797,6 +785,7 @@ where
     // state at serve time, not a snapshot taken before the lanes ran.
     let freshness_payload = ctx.freshness().await;
     let worktree_freshness = worktree_freshness_from_payload(freshness_payload.as_ref());
+    let mut strict_failure = None;
     let (complete, code_generation, coverage, freshness, search_matches) = match outcome {
         tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(complete) => {
             let search_matches = context_search_matches(&complete, scope_prefix);
@@ -815,19 +804,23 @@ where
                 search_matches,
             )
         }
-        tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(unavailable) => (
-            None,
-            unavailable.code_generation,
-            primitive_search_coverage(&unavailable.coverage),
-            search_freshness(
-                ServedGenerationV1::Unavailable {
-                    reason: unavailable.reason.as_str(),
-                },
-                &unavailable.coverage,
-                &worktree_freshness,
-            ),
-            Vec::new(),
-        ),
+        tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(unavailable) => {
+            let reason = unavailable.reason.as_str();
+            if strict_semantic_requested {
+                strict_failure = Some(format!("code-index context unavailable: {reason}"));
+            }
+            (
+                None,
+                unavailable.code_generation,
+                primitive_search_coverage(&unavailable.coverage),
+                search_freshness(
+                    ServedGenerationV1::Unavailable { reason },
+                    &unavailable.coverage,
+                    &worktree_freshness,
+                ),
+                Vec::new(),
+            )
+        }
     };
     let graph = match complete.as_ref() {
         Some(complete) => bind_verified_graph_to_search(graph, &complete.code_generation),
@@ -981,7 +974,7 @@ where
         ),
     );
     let preview = (!render::wants_json(&args)).then(|| context_markdown_lane_preview(&output));
-    Ok(rendered_context_tool_result(
+    let result = rendered_context_tool_result(
         ctx.project_root(),
         &args,
         value,
@@ -989,7 +982,13 @@ where
         output,
         preview.as_deref(),
         memory_contribution,
-    ))
+    );
+    Ok(match strict_failure {
+        Some(failure) => result
+            .with_semantic_error(true)
+            .with_failure_message(failure),
+        None => result,
+    })
 }
 
 /// Bare-name lookup against `idx_nodes_name` — no BM25 scoring, no fuzzy
@@ -1566,7 +1565,8 @@ fn similar_unavailable_reason(
     reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1,
 ) -> SimilarNearUnavailableReasonV1 {
     match reason {
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable => {
+        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable
+        | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::SemanticUnavailable => {
             SimilarNearUnavailableReasonV1::CapabilityUnavailable
         }
         tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable => {
@@ -2799,6 +2799,7 @@ mod tests {
         let outcome = execute_code_index_search(
             Some(&executor),
             tracedecay_query::code_search::CodeIndexSearchRequestV1 {
+                semantic_mode: None,
                 project_root: std::path::PathBuf::from("/fixture"),
                 query: "fixture".to_owned(),
                 source_revision: None,
@@ -2831,6 +2832,7 @@ mod tests {
         let outcome = execute_code_index_search(
             None,
             tracedecay_query::code_search::CodeIndexSearchRequestV1 {
+                semantic_mode: None,
                 project_root: std::path::PathBuf::from("/fixture"),
                 query: "fixture".to_owned(),
                 source_revision: None,
@@ -2995,7 +2997,10 @@ mod tests {
                 assert_eq!(carried.source, hit.fact.source);
             }
             assert!(result.value.get("context_memory_contribution").is_none());
-            assert!(!response_text(&result).contains("context_memory_contribution"));
+            let rendered = result.value["content"][0]["text"]
+                .as_str()
+                .expect("rendered context text");
+            assert!(!rendered.contains("context_memory_contribution"));
         }
     }
 

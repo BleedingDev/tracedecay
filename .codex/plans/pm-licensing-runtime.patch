@@ -1,0 +1,346 @@
+--- a/crates/tracedecay/Cargo.toml
++++ b/crates/tracedecay/Cargo.toml
+@@ -438,6 +438,7 @@
+ path = "../../tests/storage_runtime_rusqlite_suite/main.rs"
+ 
+ [dependencies]
++tracedecay-licensing = { path = "../tracedecay-licensing", default-features = false }
+ axum = "0.8"
+ chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
+ hotpath.workspace = true
+--- a/crates/tracedecay/src/daemon/bootstrap.rs
++++ b/crates/tracedecay/src/daemon/bootstrap.rs
+@@ -89,6 +89,11 @@
+     let profile_root = crate::config::user_data_dir().ok_or_else(|| TraceDecayError::Config {
+         message: "could not determine TraceDecay user data directory".to_string(),
+     })?;
++    tracedecay_licensing::pin_profile_root(profile_root.clone())
++        .and_then(|()| tracedecay_licensing::guard_process())
++        .map_err(|_| TraceDecayError::Config {
++            message: "TraceDecay license admission denied".to_owned(),
++        })?;
+     let catalog_prewarm = tokio::task::spawn_blocking(prewarm_static_daemon_bootstrap_catalog);
+     let requested = default_loopback_endpoint();
+     let _lifecycle_lease = hotpath::measure_block!("daemon.bootstrap.lifecycle_lease", {
+@@ -523,6 +528,11 @@
+     let profile_root = crate::config::user_data_dir().ok_or_else(|| TraceDecayError::Config {
+         message: "could not determine TraceDecay user data directory".to_string(),
+     })?;
++    tracedecay_licensing::pin_profile_root(profile_root.clone())
++        .and_then(|()| tracedecay_licensing::guard_process())
++        .map_err(|_| TraceDecayError::Config {
++            message: "TraceDecay license admission denied".to_owned(),
++        })?;
+     let catalog_prewarm = tokio::task::spawn_blocking(prewarm_static_daemon_bootstrap_catalog);
+     let endpoint = DaemonEndpoint::Unix(socket_path);
+     let _lifecycle = hotpath::measure_block!("daemon.bootstrap.lifecycle_lease", {
+--- a/crates/tracedecay/src/daemon/http_application.rs
++++ b/crates/tracedecay/src/daemon/http_application.rs
+@@ -363,12 +363,16 @@
+         match remote {
+             Some(remote) => Ok((
+                 crate::application_surface::with_hotpath_server_layer(
+-                    local.merge(Router::new().nest("/remote", remote.router)),
++                    local
++                        .merge(Router::new().nest("/remote", remote.router))
++                        .layer(middleware::from_fn(require_http_license)),
+                 ),
+                 Some(remote.credentials),
+             )),
+             None => Ok((
+-                crate::application_surface::with_hotpath_server_layer(local),
++                crate::application_surface::with_hotpath_server_layer(
++                    local.layer(middleware::from_fn(require_http_license)),
++                ),
+                 None,
+             )),
+         }
+@@ -696,6 +700,13 @@
+     next.run(request).await
+ }
+ 
++async fn require_http_license(request: Request<Body>, next: Next) -> Response {
++    if tracedecay_licensing::guard_request().is_err() {
++        return StatusCode::FORBIDDEN.into_response();
++    }
++    next.run(request).await
++}
++
+ async fn force_remote_connection_close(request: Request<Body>, next: Next) -> Response {
+     let mut response = next.run(request).await;
+     response
+@@ -817,6 +828,7 @@
+                     router: crate::application_surface::with_hotpath_server_layer(
+                         Router::new()
+                             .nest("/remote", router)
++                            .layer(middleware::from_fn(require_http_license))
+                             .layer(middleware::from_fn(force_remote_connection_close)),
+                     ),
+                     admission,
+@@ -1769,3 +1781,48 @@
+         message: format!("failed to {operation}: {error}"),
+     }
+ }
++
++#[cfg(test)]
++mod license_admission_tests {
++    use super::*;
++
++    #[tokio::test]
++    async fn http_license_is_checked_before_the_mounted_application_handler() {
++        let reached = Arc::new(AtomicUsize::new(0));
++        let handler_reached = Arc::clone(&reached);
++        let registry = DaemonHttpApplicationRegistry::default();
++        registry
++            .mount(
++                "license-project",
++                Router::new().route(
++                    "/probe",
++                    get(move || {
++                        handler_reached.fetch_add(1, Ordering::SeqCst);
++                        async { StatusCode::NO_CONTENT }
++                    }),
++                ),
++            )
++            .await
++            .unwrap();
++        let admission = LocalHttpAdmission::new(
++            &"ab".repeat(32),
++            SocketAddr::from((Ipv4Addr::LOCALHOST, 12345)),
++        )
++        .unwrap();
++        let request = Request::builder()
++            .uri("/projects/license-project/application/probe")
++            .header(AUTHORIZATION, admission.authorization.clone())
++            .header(ORIGIN, admission.origin.clone())
++            .body(Body::empty())
++            .unwrap();
++        let (router, _) = registry.router(admission).unwrap();
++        let response = router.oneshot(request).await.unwrap();
++        if tracedecay_licensing::LICENSED_DISTRIBUTION {
++            assert_eq!(response.status(), StatusCode::FORBIDDEN);
++            assert_eq!(reached.load(Ordering::SeqCst), 0);
++        } else {
++            assert_eq!(response.status(), StatusCode::NO_CONTENT);
++            assert_eq!(reached.load(Ordering::SeqCst), 1);
++        }
++    }
++}
+--- a/crates/tracedecay/src/daemon/invocation_dispatch.rs
++++ b/crates/tracedecay/src/daemon/invocation_dispatch.rs
+@@ -241,6 +241,12 @@
+     request: DaemonInvocationRequest,
+     #[cfg(test)] project_open_attempts: Option<Arc<AtomicUsize>>,
+ ) -> DaemonInvocationResponse {
++    if tracedecay_licensing::guard_request().is_err() {
++        return DaemonInvocationResponse::problem(
++            request.request_id.clone(),
++            DaemonInvocationProblem::NotFoundOrNotAuthorized,
++        );
++    }
+     if let Some(response) = invalid_multi_root_invocation_response(&request) {
+         return response;
+     }
+@@ -589,6 +595,12 @@
+     handshake: &DaemonHandshake,
+     request: DaemonInvocationRequest,
+ ) -> DaemonInvocationResponse {
++    if tracedecay_licensing::guard_request().is_err() {
++        return DaemonInvocationResponse::problem(
++            request.request_id.clone(),
++            DaemonInvocationProblem::NotFoundOrNotAuthorized,
++        );
++    }
+     if let Some(response) = invalid_multi_root_invocation_response(&request) {
+         return response;
+     }
+--- a/crates/tracedecay/src/mcp/server/requests.rs
++++ b/crates/tracedecay/src/mcp/server/requests.rs
+@@ -410,6 +410,20 @@
+         connection.clear_selected_response_lease();
+         connection.clear_selected_request_server();
+         let method = request.method_class();
++        // Cancellation only releases admitted work and must remain available after expiry.
++        if !matches!(method, McpMethod::Cancelled) && tracedecay_licensing::guard_request().is_err()
++        {
++            return request.cloned_id().map(|id| JsonRpcResponse {
++                jsonrpc: "2.0".to_owned(),
++                id,
++                result: None,
++                error: Some(tracedecay_mcp::JsonRpcError {
++                    code: -32001,
++                    message: "TraceDecay license admission denied".to_owned(),
++                    data: None,
++                }),
++            });
++        }
+         // Borrowed from the transport's request, not the envelope, so it
+         // survives the envelope move into `tools/call` preparation below.
+         let method_name = request.method();
+--- a/crates/tracedecay-memory-ncm-runtime/Cargo.toml
++++ b/crates/tracedecay-memory-ncm-runtime/Cargo.toml
+@@ -16,6 +16,7 @@
+ harness = false
+ 
+ [dependencies]
++tracedecay-licensing = { path = "../tracedecay-licensing", default-features = false }
+ cap-std = "4.0.2"
+ tempfile = "3"
+ tracedecay-private-fs = { path = "../tracedecay-private-fs" }
+--- a/crates/tracedecay-memory-ncm-runtime/src/bin/tracedecay-ncm-worker.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/bin/tracedecay-ncm-worker.rs
+@@ -21,6 +21,13 @@
+ }
+ 
+ fn run() -> Result<(), ()> {
++    if tracedecay_licensing::guard_process().is_err() {
++        let _ = std::io::Write::write_all(
++            &mut std::io::stderr().lock(),
++            b"TraceDecay license admission denied.\n",
++        );
++        return Err(());
++    }
+     let arguments = parse_arguments(std::env::args_os().skip(1))?;
+     let root = StateRoot::new(arguments.state_root).map_err(|_| ())?;
+     let (encoder, encoder_ready): (Arc<dyn TextEncoder>, bool) =
+--- a/crates/tracedecay-memory-ncm-runtime/src/client/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/client/mod.rs
+@@ -838,6 +838,11 @@
+ impl WorkerProcess {
+     fn spawn(launch: &Launch, pid: Arc<AtomicU32>) -> Result<Self, ClientError> {
+         let mut command = ProcessCommand::new(&launch.binary);
++        command.env(
++            "TRACEDECAY_DATA_DIR",
++            tracedecay_licensing::profile_root()
++                .map_err(|_| ClientError::Spawn("license profile unavailable".to_owned()))?,
++        );
+         command
+             .arg("--state-root")
+             .arg(&launch.root)
+--- a/crates/tracedecay-memory-ncm-runtime/src/worker/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/worker/mod.rs
+@@ -85,6 +85,13 @@
+ }
+ 
+ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> EngineReply {
++    if tracedecay_licensing::guard_request().is_err() {
++        return EngineReply::new(
++            Outcome::Unavailable("license admission denied".to_owned()),
++            0,
++            Value::Null,
++        );
++    }
+     let started = Instant::now();
+     if request.protocol_version != PROTOCOL_VERSION {
+         return incompatible(&format!(
+--- /dev/null
++++ b/crates/tracedecay-memory-ncm-runtime/tests/licensing.rs
+@@ -0,0 +1,108 @@
++#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
++#![doc = "License admission at the real worker startup and request boundaries."]
++
++use serde_json::{Value, json};
++use std::io::Cursor;
++use std::process::{Command, Stdio};
++use std::sync::Arc;
++use tempfile::TempDir;
++use tracedecay_memory_ncm_core::types::{NcmConfig, SourceId};
++use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
++use tracedecay_memory_ncm_runtime::engine::{NcmEngine, ObserveRequest, Outcome};
++use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
++use tracedecay_memory_ncm_runtime::wire::{self, Operation, Request};
++
++#[test]
++fn worker_startup_requires_license_before_state_or_encoder_work() {
++    let directory = TempDir::new().unwrap();
++    let profile = directory.path().join("absent-profile");
++    let state = directory.path().join("absent-state");
++    let output = Command::new(env!("CARGO_BIN_EXE_tracedecay-ncm-worker"))
++        .args(["--state-root", state.to_str().unwrap(), "--test-double"])
++        .env("TRACEDECAY_DATA_DIR", &profile)
++        .stdin(Stdio::null())
++        .output()
++        .unwrap();
++    if tracedecay_licensing::LICENSED_DISTRIBUTION {
++        assert_eq!(output.status.code(), Some(2));
++        assert_eq!(output.stderr, b"TraceDecay license admission denied.\n");
++    } else {
++        assert!(output.status.success(), "{output:?}");
++        assert!(output.stderr.is_empty());
++    }
++    assert!(output.stdout.is_empty());
++    assert!(!state.exists());
++    assert!(!profile.exists());
++}
++
++#[test]
++fn worker_request_checks_license_before_observation_side_effects() {
++    let directory = TempDir::new().unwrap();
++    let state = directory.path().join("request-state");
++    let mut config = NcmConfig {
++        terrain_resolution: 3,
++        ..NcmConfig::default()
++    };
++    config.stm.n_centers = 8;
++    config.stm.top_k_read = 8;
++    config.stm.top_k_write = 8;
++    config.ltm.n_centers = 8;
++    config.ltm.top_k_read = 8;
++    config.ltm.top_k_write = 8;
++    config.hybrid_candidates = 8;
++    let engine = Arc::new(NcmEngine::new(
++        StateRoot::new(&state).unwrap(),
++        Arc::new(HashEncoder::new()),
++        config,
++    ));
++    let observation = ObserveRequest {
++        idempotency_key: "license-bound-observation".to_owned(),
++        payload_sha256: String::new(),
++        source: SourceId("license-test-source".to_owned()),
++        key_text: "license test".to_owned(),
++        value_text: "This observation must require an admitted process.".to_owned(),
++        affect: None,
++        surprise: 0.2,
++        intensity: 1.0,
++        provenance: json!({"origin":"license-boundary-test"}),
++        deadline: Deadline {
++            remaining_ms: 10000,
++        },
++    };
++    let request = Request::new(
++        7,
++        10000,
++        Operation::Observe,
++        "ab".repeat(32),
++        json!({
++            "idempotency_key":observation.idempotency_key,
++            "payload_sha256":observation.canonical_payload_sha256().unwrap(),
++            "source":observation.source.0,
++            "key_text":observation.key_text,
++            "value_text":observation.value_text,
++            "affect":observation.affect,
++            "surprise":observation.surprise,
++            "intensity":observation.intensity,
++            "provenance":observation.provenance
++        }),
++    );
++    let input = wire::encode_request(&request).unwrap();
++    let mut output = Vec::new();
++    tracedecay_memory_ncm_runtime::worker::serve(Cursor::new(input), &mut output, engine).unwrap();
++    let reply = wire::read_reply(&mut Cursor::new(output)).unwrap().unwrap();
++    assert_eq!(reply.id, request.id);
++    if tracedecay_licensing::LICENSED_DISTRIBUTION {
++        assert_eq!(
++            reply.outcome,
++            Outcome::Unavailable("license admission denied".to_owned())
++        );
++        assert_eq!(reply.state_generation, 0);
++        assert_eq!(reply.payload, None);
++        assert!(!state.exists());
++    } else {
++        assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
++        assert_eq!(reply.state_generation, 1);
++        assert_ne!(reply.payload, Some(Value::Null));
++        assert!(state.exists());
++    }
++}

@@ -1,0 +1,106 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+@@ -3398,6 +3398,10 @@
+         },
+         if view == "trace" {
+             Some(required_text(&request["selector"], "stable_memory_ref")?)
++        } else if view == "source_influence" {
++            request
++                .pointer("/selector/stable_memory_ref")
++                .and_then(Value::as_str)
+         } else {
+             None
+         },
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs b/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
+@@ -372,6 +372,79 @@
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn common_advisory_source_influence_selector_matches_one_recorded_revision() {
++    let (_temp, root, graph, _owner, project) = real_project_fixture().await;
++    let scope = recall_exact_scope(project.as_str());
++    let provider = NativeProvider::new(new_port(&graph, &root)).unwrap();
++    let first = common_observation(
++        &scope,
++        1,
++        Some("revision.alpha"),
++        "compatibility beacon original revision",
++        Some(T1),
++        Some(T3),
++    );
++    let source_key = first["source_identity"]["original_source"]["source"]["source_key"].clone();
++    let mut second = common_observation(
++        &scope,
++        2,
++        Some("revision.beta"),
++        "compatibility beacon later revision",
++        Some(T3),
++        None,
++    );
++    second["source_identity"]["original_source"]["source"]["source_key"] = source_key.clone();
++    for (label, observation) in [("selector-alpha", first), ("selector-beta", second)] {
++        body(&provider.invoke(&common_call(
++            &provider,
++            &scope,
++            ProviderOperation::Observe,
++            label,
++            observation,
++        )));
++    }
++    let aggregate = body(&provider.invoke(&common_call(
++        &provider,
++        &scope,
++        ProviderOperation::Inspection,
++        "selector-all-revisions",
++        inspection("source_influence", json!({"source_key":source_key})),
++    )));
++    let items = aggregate["items"].as_array().unwrap();
++    assert_eq!(items.len(), 2);
++    assert_eq!(items[0]["source"]["source_revision"], "revision.alpha");
++    assert_eq!(items[1]["source"]["source_revision"], "revision.beta");
++    assert_ne!(
++        items[0]["target"]["reference"],
++        items[1]["target"]["reference"]
++    );
++    for (index, item) in items.iter().enumerate() {
++        let exact = body(&provider.invoke(&common_call(
++            &provider,
++            &scope,
++            ProviderOperation::Inspection,
++            &format!("selector-exact-{index}"),
++            inspection(
++                "source_influence",
++                json!({"source_key":source_key,"stable_memory_ref":item["target"]["reference"]["reference"]}),
++            ),
++        )));
++        assert_eq!(exact["items"], json!([item]));
++    }
++    let mismatched = body(&provider.invoke(&common_call(
++        &provider,
++        &scope,
++        ProviderOperation::Inspection,
++        "selector-mismatched-source",
++        inspection(
++            "source_influence",
++            json!({"source_key":"source.unrelated","stable_memory_ref":items[0]["target"]["reference"]["reference"]}),
++        ),
++    )));
++    assert!(mismatched["items"].as_array().unwrap().is_empty());
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+ async fn common_advisory_feedback_correction_restart_and_effect_receipts() {
+     let (_temp, root, graph, _owner, project) = real_project_fixture().await;
+     let scope = recall_exact_scope(project.as_str());
+@@ -569,7 +642,7 @@
+     )));
+     assert!(!exported["snapshot"]["bytes"].as_array().unwrap().is_empty());
+     let source = original["source_identity"]["original_source"]["source"].clone();
+-    let deletion = json!({"forget_source_keys":[source["source_key"],"future.source"],"mode":"hard_delete","include_snapshots":true,"retention_lock_policy_revision":1,"verification_query":{"source_key":source["source_key"]}});
++    let deletion = json!({"forget_source_keys":[source["source_key"],"future.source"],"mode":"hard_delete","include_snapshots":true,"retention_lock_policy_revision":1,"verification_query":source["source_key"]});
+     let deleted = body(&provider.invoke(&common_call(
+         &provider,
+         &scope,

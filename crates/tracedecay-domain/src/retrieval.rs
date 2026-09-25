@@ -1151,6 +1151,15 @@ pub struct HydrationReceipt {
     pub freshness: SourceFreshness,
 }
 
+/// Explicit opt-in to code-semantic retrieval. Omission keeps baseline search.
+#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema, PartialEq, Eq, Serialize)]
+pub enum SemanticQueryModeV1 {
+    #[serde(rename = "fallback")]
+    FallbackAllowed,
+    #[serde(rename = "strict")]
+    StrictSemantic,
+}
+
 /// Optional semantic continuation authenticated by the same query cursor
 /// key as the canonical fallback. All source, model, privacy, candidate-set,
 /// and ranking identities are frozen here so resume never recomputes a
@@ -1158,6 +1167,7 @@ pub struct HydrationReceipt {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticRetrievalContinuationV1 {
+    pub mode: SemanticQueryModeV1,
     pub profile_id: FusionProfileId,
     pub profile_digest: ManifestDigest,
     pub code_generation: CodeGenerationId,
@@ -1178,7 +1188,7 @@ pub struct SemanticRetrievalContinuationV1 {
     pub lane_checkpoints: Vec<RetrieverContinuation>,
     pub ranking_revision: RankingRevision,
     pub rerank: OptionalStagePublicStatus,
-    pub ordered_candidate_anchors: Vec<RetrievalAnchorId>,
+    pub candidate_count: u32,
     pub next_ordinal: u32,
 }
 
@@ -1240,17 +1250,9 @@ impl SemanticRetrievalContinuationV1 {
                 field: "semantic lane checkpoint without admitted lane status",
             });
         }
-        let unique_anchors = self
-            .ordered_candidate_anchors
-            .iter()
-            .collect::<BTreeSet<_>>();
-        if unique_anchors.len() != self.ordered_candidate_anchors.len()
-            || usize::try_from(self.next_ordinal)
-                .ok()
-                .is_none_or(|next| next > self.ordered_candidate_anchors.len())
-        {
+        if self.next_ordinal > self.candidate_count {
             return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic frozen candidate order",
+                field: "semantic frozen candidate position",
             });
         }
         Ok(())
@@ -1258,58 +1260,43 @@ impl SemanticRetrievalContinuationV1 {
 
     /// Validate identities shared with the enclosing authenticated cursor.
     ///
-    /// The semantic continuation is nested for wire compatibility, but it is
-    /// not an independent cursor. Its profile, candidate set, ranking, page
-    /// ordinal, source scope, statuses, checkpoints, and frozen order must be
-    /// the same values sealed by the top-level cursor.
+    /// The outer cursor freezes the canonical fallback composition consumed
+    /// before semantic execution. The nested continuation freezes the distinct
+    /// augmented composition. Both values are covered by the same cursor MAC,
+    /// while only their query privacy, comparator, and fallback-lane evidence
+    /// are required to agree. Semantic source, order digest, and ordinal state
+    /// remain canonical inside the nested, MAC-covered continuation.
     pub fn validate_for_cursor(
         &self,
         cursor: &RetrievalCursor,
     ) -> Result<(), RetrievalContractError> {
         self.validate()?;
-        if self.profile_id != cursor.profile_id
-            || self.candidate_set_digest != cursor.candidate_set_digest
-            || self.ranking_revision != cursor.ranking_revision
-            || self.next_ordinal != cursor.next_ordinal
+        if self.ranking_revision != cursor.ranking_revision
             || self.privacy_domain != cursor.privacy_domain
             || self.privacy_key_epoch != cursor.key_epoch
         {
             return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation top-level identities",
+                field: "semantic continuation shared identities",
             });
         }
-        match cursor.semantic_source_scope.as_ref() {
-            Some(scope) if scope == &self.source_scope => {}
-            _ => {
-                return Err(RetrievalContractError::InvalidCursorBinding {
-                    field: "semantic continuation source scope",
-                });
-            }
-        }
-        match cursor.semantic_candidate_order.as_ref() {
-            Some(order) if order == &self.ordered_candidate_anchors => {}
-            _ => {
-                return Err(RetrievalContractError::InvalidCursorBinding {
-                    field: "semantic continuation candidate order",
-                });
-            }
-        }
-        if self
-            .public_lane_statuses
-            .iter()
-            .any(|(lane, status)| cursor.public_lane_statuses.get(lane) != Some(status))
-        {
+        if RetrieverKind::QUERY_FALLBACK_LANES.into_iter().any(|lane| {
+            self.public_lane_statuses.get(&lane) != cursor.public_lane_statuses.get(&lane)
+        }) {
             return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation lane statuses",
+                field: "semantic continuation fallback lane statuses",
             });
         }
-        if self
+        let semantic_fallback_checkpoints = self
             .lane_checkpoints
             .iter()
-            .any(|checkpoint| !cursor.lane_checkpoints.contains(checkpoint))
-        {
+            .filter(|checkpoint| checkpoint.lane.is_query_fallback_lane());
+        let cursor_fallback_checkpoints = cursor
+            .lane_checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.lane.is_query_fallback_lane());
+        if !semantic_fallback_checkpoints.eq(cursor_fallback_checkpoints) {
             return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation lane checkpoints",
+                field: "semantic continuation fallback lane checkpoints",
             });
         }
         Ok(())
@@ -1335,10 +1322,12 @@ impl CodeSourceCursorBindingV1 {
     }
 }
 
+pub const RETRIEVAL_CURSOR_MAX_ENVELOPE_BYTES: usize = 4_096;
+
 /// Authenticated retrieval cursor. Binds the query snapshot, profile ID,
 /// authorized freshness digest, authorization revision, ordered candidate
-/// set digest, sanitized lane statuses, and lane checkpoints; resume uses
-/// the bound set or rejects, it never recomputes.
+/// set digest, sanitized lane statuses, and lane checkpoints; a recomposed
+/// continuation must match the bound set exactly or resume rejects it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RetrievalCursor {
@@ -1360,13 +1349,6 @@ pub struct RetrievalCursor {
     /// from canonical bytes so a fallback-only cursor remains byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic: Option<SemanticRetrievalContinuationV1>,
-    /// Top-level copies of semantic scope/order make the nested continuation
-    /// part of the same authenticated cursor identity. They are omitted for
-    /// fallback-only cursors, preserving that wire shape byte-for-byte.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_source_scope: Option<SemanticSourceScopeV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_candidate_order: Option<Vec<RetrievalAnchorId>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_source: Option<CodeSourceCursorBindingV1>,
     pub expiry: UtcMicros,
@@ -1400,9 +1382,24 @@ impl RetrievalCursor {
         if let Some(semantic) = &self.semantic {
             semantic.validate()?;
             semantic.validate_for_cursor(self)?;
-        } else if self.semantic_source_scope.is_some() || self.semantic_candidate_order.is_some() {
+            if let Some(source) = &self.code_source
+                && (semantic.code_generation != source.generation
+                    || semantic
+                        .source_scope
+                        .reference
+                        .as_ref()
+                        .is_some_and(|reference| reference != &source.reference))
+            {
+                return Err(RetrievalContractError::InvalidCursorBinding {
+                    field: "semantic continuation code source",
+                });
+            }
+        }
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| RetrievalContractError::CanonicalSerialization(error.to_string()))?;
+        if encoded.len() > RETRIEVAL_CURSOR_MAX_ENVELOPE_BYTES {
             return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "unbound semantic top-level identity",
+                field: "cursor exceeds its bounded authenticated envelope",
             });
         }
         Ok(())
@@ -1763,6 +1760,7 @@ mod tests {
             .and_then(|profile| profile.index_key())
             .expect("canonical semantic index key");
         let continuation = SemanticRetrievalContinuationV1 {
+            mode: SemanticQueryModeV1::FallbackAllowed,
             profile_id: id("profile.semantic.cursor.v1"),
             profile_digest: id(ZERO_DIGEST),
             code_generation: id("generation.semantic.cursor.v1"),
@@ -1792,7 +1790,7 @@ mod tests {
             lane_checkpoints: Vec::new(),
             ranking_revision: id("ranking.semantic.cursor.v1"),
             rerank: OptionalStagePublicStatus::NotRequested,
-            ordered_candidate_anchors: vec![id("anchor.semantic.cursor.0")],
+            candidate_count: 1,
             next_ordinal: 0,
         };
         continuation
@@ -1819,8 +1817,6 @@ mod tests {
             lane_checkpoints: semantic.lane_checkpoints.clone(),
             ranking_revision: semantic.ranking_revision.clone(),
             next_ordinal: semantic.next_ordinal,
-            semantic_source_scope: Some(semantic.source_scope.clone()),
-            semantic_candidate_order: Some(semantic.ordered_candidate_anchors.clone()),
             semantic: Some(semantic),
             code_source: None,
             expiry: UtcMicros(1),
@@ -1829,11 +1825,12 @@ mod tests {
     }
 
     #[test]
-    fn semantic_cursor_cross_binds_nested_identity_and_order() {
+    fn semantic_cursor_binds_nested_identity_and_compositions() {
         let index_key = crate::code_intelligence::SemanticSearchIndexProfileV1::exact_flat_v1()
             .and_then(|profile| profile.index_key())
             .expect("canonical semantic index key");
         let continuation = SemanticRetrievalContinuationV1 {
+            mode: SemanticQueryModeV1::FallbackAllowed,
             profile_id: id("profile.semantic.cursor.binding.v1"),
             profile_digest: id(ZERO_DIGEST),
             code_generation: id("generation.semantic.cursor.binding.v1"),
@@ -1863,28 +1860,110 @@ mod tests {
             lane_checkpoints: Vec::new(),
             ranking_revision: id("ranking.semantic.cursor.binding.v1"),
             rerank: OptionalStagePublicStatus::NotRequested,
-            ordered_candidate_anchors: vec![id("anchor.semantic.cursor.binding.0")],
+            candidate_count: 1,
             next_ordinal: 0,
         };
         let mut cursor = semantic_cursor(continuation.clone());
         cursor.validate().expect("bound semantic cursor validates");
 
-        let mut missing_scope_copy = cursor.clone();
-        missing_scope_copy.semantic_source_scope = None;
+        let mut dual_composition = cursor.clone();
+        dual_composition.profile_id = id("profile.fallback.cursor.binding.v1");
+        dual_composition.candidate_set_digest = id(&format!("sha256:{}", "2".repeat(64)));
+        dual_composition.public_lane_statuses = RetrieverKind::QUERY_FALLBACK_LANES
+            .into_iter()
+            .map(|lane| (lane, PublicRetrieverStatus::Complete))
+            .collect();
+        dual_composition.next_ordinal = 1;
+        let semantic = dual_composition
+            .semantic
+            .as_mut()
+            .expect("semantic continuation");
+        semantic.public_lane_statuses.extend(
+            RetrieverKind::QUERY_FALLBACK_LANES
+                .into_iter()
+                .map(|lane| (lane, PublicRetrieverStatus::Complete)),
+        );
+        semantic.candidate_count = 2;
+        semantic.next_ordinal = 2;
+        dual_composition
+            .validate()
+            .expect("fallback and augmented cursor state validate independently");
+
+        let semantic_generation = dual_composition
+            .semantic
+            .as_ref()
+            .expect("semantic continuation")
+            .code_generation
+            .clone();
+        dual_composition.code_source = Some(CodeSourceCursorBindingV1 {
+            reference: id("refs/heads/semantic-cursor"),
+            commit: crate::GitOidV1::new("1".repeat(40)).expect("commit"),
+            tree: crate::GitOidV1::new("2".repeat(40)).expect("tree"),
+            generation: semantic_generation,
+        });
+        dual_composition
+            .validate()
+            .expect("semantic and exact source generation agree");
+
+        let mut mismatched_source_generation = dual_composition.clone();
+        mismatched_source_generation
+            .code_source
+            .as_mut()
+            .expect("code source")
+            .generation = id("generation.semantic.cursor.binding.other");
         assert!(matches!(
-            missing_scope_copy.validate(),
+            mismatched_source_generation.validate(),
             Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation source scope"
+                field: "semantic continuation code source"
             })
         ));
 
-        cursor.semantic_candidate_order = Some(vec![id("anchor.semantic.cursor.other")]);
+        let mut mismatched_source_reference = dual_composition.clone();
+        let semantic = mismatched_source_reference
+            .semantic
+            .as_mut()
+            .expect("semantic continuation");
+        semantic.source_scope.reference = Some(id("refs/heads/other"));
         assert!(matches!(
-            cursor.validate(),
+            mismatched_source_reference.validate(),
             Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation candidate order"
+                field: "semantic continuation code source"
             })
         ));
+
+        let mut mismatched_fallback_status = dual_composition.clone();
+        mismatched_fallback_status
+            .semantic
+            .as_mut()
+            .expect("semantic continuation")
+            .public_lane_statuses
+            .insert(RetrieverKind::Lexical, PublicRetrieverStatus::Partial);
+        assert!(matches!(
+            mismatched_fallback_status.validate(),
+            Err(RetrievalContractError::InvalidCursorBinding {
+                field: "semantic continuation fallback lane statuses"
+            })
+        ));
+
+        let mut mismatched_ranking = dual_composition;
+        mismatched_ranking
+            .semantic
+            .as_mut()
+            .expect("semantic continuation")
+            .ranking_revision = id("ranking.semantic.cursor.binding.v2");
+        assert!(matches!(
+            mismatched_ranking.validate(),
+            Err(RetrievalContractError::InvalidCursorBinding {
+                field: "semantic continuation shared identities"
+            })
+        ));
+
+        cursor
+            .semantic
+            .as_mut()
+            .expect("semantic continuation")
+            .next_ordinal = 2;
+        assert!(cursor.validate().is_err());
     }
 
     #[test]

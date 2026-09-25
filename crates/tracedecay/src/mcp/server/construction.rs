@@ -185,6 +185,7 @@ pub(crate) struct McpServerConstructionContext {
     pub(crate) code_index_similar_executor: Option<super::CodeIndexSimilarExecutor>,
     pub(crate) code_index_redundancy_executor: Option<super::CodeIndexRedundancyExecutor>,
     pub(crate) code_index_branch_diff_executor: Option<super::CodeIndexBranchDiffExecutor>,
+    pub(crate) semantic_admin_executor: Option<super::SemanticAdminExecutorV1>,
     pub(crate) code_graph_projection_read_port: Option<CodeGraphProjectionReadPort>,
     pub(crate) code_graph_read_admission_port: Option<CodeGraphReadAdmissionPort>,
     pub(crate) verified_graph_query_port:
@@ -320,6 +321,7 @@ impl McpServerConstructionContext {
             code_index_similar_executor: None,
             code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
+            semantic_admin_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
             verified_graph_query_port: None,
@@ -433,6 +435,7 @@ impl McpServerConstructionContext {
             code_index_similar_executor: None,
             code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
+            semantic_admin_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
             verified_graph_query_port: None,
@@ -509,6 +512,7 @@ impl McpServerConstructionContext {
             code_index_similar_executor: None,
             code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
+            semantic_admin_executor: None,
             code_graph_projection_read_port: None,
             code_graph_read_admission_port: None,
             verified_graph_query_port: None,
@@ -595,6 +599,14 @@ impl McpServerConstructionContext {
         executor: super::CodeIndexBranchDiffExecutor,
     ) -> Self {
         self.code_index_branch_diff_executor = Some(executor);
+        self
+    }
+
+    pub(crate) fn with_semantic_admin_executor(
+        mut self,
+        executor: super::SemanticAdminExecutorV1,
+    ) -> Self {
+        self.semantic_admin_executor = Some(executor);
         self
     }
 
@@ -800,7 +812,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn direct_context_installs_only_explicit_code_index_executors() {
+    async fn direct_context_installs_only_explicit_route_executors() {
         let _pin = crate::config::PinnedUserDataDir::new();
         let project = tempfile::tempdir().expect("project");
         let git_init = Command::new("git")
@@ -845,11 +857,21 @@ mod tests {
                 })
             },
         );
+        let semantic_admin_executor: crate::mcp::server::SemanticAdminExecutorV1 =
+            Arc::new(|_, _, _| {
+                Box::pin(async {
+                    Err(tracedecay_domain::errors::TraceDecayError::Config {
+                        message: "semantic fixture executor invoked".to_owned(),
+                    })
+                })
+            });
         let context = McpServerConstructionContext::direct(cg, None)
             .with_code_index_search_executor(executor)
-            .with_code_index_branch_diff_executor(branch_diff_executor);
+            .with_code_index_branch_diff_executor(branch_diff_executor)
+            .with_semantic_admin_executor(semantic_admin_executor);
         assert!(context.code_index_search_executor.is_some());
         assert!(context.code_index_branch_diff_executor.is_some());
+        assert!(context.semantic_admin_executor.is_some());
         assert!(
             context.code_index_search_authority.is_none(),
             "installing an executor must not fabricate route admission"

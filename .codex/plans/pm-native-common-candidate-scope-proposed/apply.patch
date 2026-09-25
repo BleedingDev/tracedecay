@@ -1,0 +1,25 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+@@ -2717,6 +2717,13 @@
+     if truncated {
+         limitations.push("content truncated to the staged candidate byte cap".to_owned());
+     }
++    let exact_scope_identity = if common_recall(request) {
++        let mut scope = exact_scope_value(call);
++        scope["scope_binding"] = serde_json::json!("exact_coding_scope");
++        scope
++    } else {
++        staged_scope_attestation(row)
++    };
+     let mut candidate = serde_json::json!({
+         "candidate_id": format!("{}:{}", call.request_id, row.provider_reference),
+         "stable_memory_ref": row.provider_reference,
+@@ -2739,7 +2746,7 @@
+             },
+         },
+         "confidence": Value::Null,
+-        "exact_scope_identity": if common_recall(request) { exact_scope_value(call) } else { staged_scope_attestation(row) },
++        "exact_scope_identity": exact_scope_identity,
+         "validity": {
+             "observed_at": observed_at,
+             "valid_from": row.validity.valid_from_utc_nanos.and_then(format_rfc3339_nanos),

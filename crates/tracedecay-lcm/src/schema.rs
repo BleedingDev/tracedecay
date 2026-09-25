@@ -13,6 +13,28 @@ use super::util;
 
 pub const LCM_SCHEMA_VERSION: i64 = 8;
 
+/// Idempotent creation statement for the migration marker shared by the
+/// session-store schema owners.
+pub const SESSION_SCHEMA_MIGRATIONS_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS session_schema_migrations (
+        name TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+    );";
+
+/// Canonical persisted definition of the migration marker shared by the
+/// session-store schema owners.
+///
+/// SQLite removes `IF NOT EXISTS` and the trailing semicolon when it records
+/// the creating statement in `sqlite_master`, while preserving the whitespace
+/// before the closing parenthesis.
+pub const SESSION_SCHEMA_MIGRATIONS_TABLE_DEFINITION: &str =
+    "CREATE TABLE session_schema_migrations (
+        name TEXT PRIMARY KEY,
+        version INTEGER NOT NULL,
+        applied_at INTEGER NOT NULL DEFAULT (unixepoch())
+    )";
+
 const MIGRATION_NAME: &str = "lcm";
 
 /// Indexes that keep expensive LCM reads off the message-body table pages.
@@ -869,13 +891,10 @@ pub async fn ensure_lcm_schema_in_transaction(
         LcmSchemaAdmission::Fresh => {}
     }
 
+    conn.execute_batch(SESSION_SCHEMA_MIGRATIONS_TABLE_DDL)
+        .await?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS session_schema_migrations (
-            name TEXT PRIMARY KEY,
-            version INTEGER NOT NULL,
-            applied_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        CREATE TABLE IF NOT EXISTS lcm_raw_messages (
+        "CREATE TABLE IF NOT EXISTS lcm_raw_messages (
             provider TEXT NOT NULL,
             message_id TEXT NOT NULL,
             session_id TEXT NOT NULL,

@@ -1,0 +1,916 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/admission.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/admission.rs
+@@ -551,6 +551,7 @@
+     let now = hook_now();
+     let native_session_id = hook_v2_native_session_id(args, &envelope);
+     let native_lifecycle = hook_v2_native_context_scout_lifecycle(args, &envelope);
++    let native_start_locator = super::envelope::hook_v2_native_start_locator(args, &envelope);
+     Ok(
+         match admit_hook_v2_envelope_with_lifecycle(
+             cg,
+@@ -563,6 +564,7 @@
+                 profile_identity: session_authorities.profile_identity.as_deref(),
+                 background_cpu: session_authorities.background_cpu.as_ref(),
+                 entered_at,
++                native_start_locator,
+             }),
+             now,
+         )
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/envelope.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/envelope.rs
+@@ -38,6 +38,15 @@
+     (tracedecay_agent_hosts::hooks::protected_native_session_id(session.as_str())
+         == envelope.protected_session_id)
+         .then_some(session)
++}
++
++pub(super) fn hook_v2_native_start_locator(
++    args: &Value,
++    envelope: &tracedecay_hooks::HookEventEnvelopeV2,
++) -> Option<tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1> {
++    let locator: tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1 =
++        serde_json::from_value(args.get("native_start_locator")?.clone()).ok()?;
++    locator.matches_envelope(envelope).then_some(locator)
+ }
+ 
+ pub(super) fn hook_v2_requires_producer_work(
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -37,6 +37,8 @@
+         Option<&'a std::sync::Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>>,
+     /// Captured at the live handler entry, before parsing and ledger admission.
+     pub entered_at: Instant,
++    /// Validated against the native envelope before daemon ID minting.
++    pub native_start_locator: Option<tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1>,
+ }
+ 
+ #[derive(Debug)]
+@@ -54,6 +56,24 @@
+     profile_id: UserProfileId,
+     source_path: PathBuf,
+     source: ObservationSourceIdentityV1,
++}
++
++struct LiveOriginSession {
++    project_root: PathBuf,
++    project_id: ProjectId,
++    brain_id: BrainId,
++    profile_id: UserProfileId,
++    producer: HookHostV1,
++    native_session: SessionId,
++    recorded_project_path: Option<PathBuf>,
++    source_path: Option<PathBuf>,
++}
++
++struct LiveSessionLocator {
++    provider: String,
++    session_id: String,
++    project_path: String,
++    transcript_path: String,
+ }
+ 
+ /// The public replay entry never supplies `live`; retries cannot observe a
+@@ -68,6 +88,9 @@
+     receipt: HookAdmissionLedgerReceiptV1,
+     now: UtcMicros,
+ ) -> LiveOriginOutcomeV1 {
++    if receipt.decision != tracedecay_hooks::HookAdmissionDecisionV1::Admitted {
++        return LiveOriginOutcomeV1::Unavailable;
++    }
+     let Some(deadline) = live.entered_at.checked_add(Duration::from_micros(
+         tracedecay_hooks::runtime::HOOK_SYNCHRONOUS_BUDGET_MICROS,
+     )) else {
+@@ -78,8 +101,14 @@
+     };
+     let data_root = cg.hook_store_layout().data_root.clone();
+     let previous = live_hook_origin_baseline(&data_root, envelope, now);
++    let is_start = matches!(
++        envelope.event,
++        tracedecay_hooks::HookEventV2::SessionBoundary {
++            boundary: tracedecay_hooks::HookBoundaryV1::Start
++        }
++    );
+     let capture = async {
+-        let source = retained_source(
++        let session = retained_session(
+             cg,
+             envelope,
+             native_session,
+@@ -90,30 +119,82 @@
+         let Some(permit) = live.background_cpu.and_then(|cpu| cpu.try_acquire()) else {
+             return LiveOriginOutcomeV1::Unavailable;
+         };
+-        let previous = previous.clone();
+-        let envelope = envelope.clone();
+-        match tokio::task::spawn_blocking(move || {
+-            // The permit stays in the actual blocking operation when the
+-            // caller times out; abandoned reads cannot multiply CPU workers.
+-            let _permit = permit;
+-            let observation =
+-                source.and_then(|source| capture_origin(source, previous.as_ref(), now, deadline));
+-            if Instant::now() >= deadline {
+-                return LiveOriginOutcomeV1::Deadline;
+-            }
+-            match retain_live_hook_origin(&data_root, &envelope, receipt, observation, now) {
+-                Ok(HookLiveOriginOutcomeV1::Unavailable) => LiveOriginOutcomeV1::Unavailable,
+-                Ok(outcome) => LiveOriginOutcomeV1::Recorded(outcome),
+-                Err(error) => LiveOriginOutcomeV1::Ledger(error),
+-            }
++        let locator = live.native_start_locator;
++        // Carry the caller's configured/task-scoped native home into blocking I/O.
++        let home = tracedecay_sessions::runtime::home_dir();
++        let captured = tokio::task::spawn_blocking(move || {
++            // This task only reads. Cancellation can leave a bounded read in
++            // flight, holding its permit, but cannot register or retain a
++            // live boundary after the owning request has been dropped.
++            let captured = session.and_then(|session| {
++                let (source, register, codex_guard) = session.resolve_source(
++                    is_start,
++                    locator.as_ref(),
++                    home.as_deref(),
++                    deadline,
++                )?;
++                let registration = if register {
++                    Some(LiveSessionLocator {
++                        provider: source.source.provider().as_str().to_owned(),
++                        session_id: source.source.session_id().as_str().to_owned(),
++                        project_path: source.project_root.to_str()?.to_owned(),
++                        transcript_path: source.source_path.to_str()?.to_owned(),
++                    })
++                } else {
++                    None
++                };
++                let observation = capture_origin(source, previous.as_ref(), now, deadline)?;
++                if let Some(guard) = codex_guard
++                    && !guard.matches_current_source(deadline).ok()?
++                {
++                    return None;
++                }
++                Some((observation, registration))
++            });
++            (permit, captured)
+         })
+-        .await
+-        {
+-            Ok(outcome) => outcome,
++        .await;
++        let (_permit, captured) = match captured {
++            Ok(captured) => captured,
+             Err(error) => {
+                 tracing::debug!(?error, "live hook origin capture task unavailable");
+-                LiveOriginOutcomeV1::Unavailable
++                return LiveOriginOutcomeV1::Unavailable;
+             }
++        };
++        if Instant::now() >= deadline {
++            return LiveOriginOutcomeV1::Deadline;
++        }
++        let observation = if let Some((observation, registration)) = captured {
++            if let Some(registration) = registration {
++                let Some(sessions) = sessions else {
++                    return LiveOriginOutcomeV1::Unavailable;
++                };
++                let registered = sessions
++                    .register_live_session_locator(
++                        &registration.provider,
++                        &registration.session_id,
++                        &registration.project_path,
++                        &registration.transcript_path,
++                    )
++                    .await;
++                if !matches!(registered, Ok(true)) {
++                    return LiveOriginOutcomeV1::Unavailable;
++                }
++            }
++            Some(observation)
++        } else {
++            None
++        };
++        if Instant::now() >= deadline {
++            return LiveOriginOutcomeV1::Deadline;
++        }
++        // Keep the permit through the existing bounded ledger write. This
++        // synchronous commit stays in the owning request, so an abandoned
++        // capture task has no detached authority-producing continuation.
++        match retain_live_hook_origin(&data_root, envelope, receipt, observation, now) {
++            Ok(HookLiveOriginOutcomeV1::Unavailable) => LiveOriginOutcomeV1::Unavailable,
++            Ok(outcome) => LiveOriginOutcomeV1::Recorded(outcome),
++            Err(error) => LiveOriginOutcomeV1::Ledger(error),
+         }
+     };
+     match tokio::time::timeout(remaining, capture).await {
+@@ -122,13 +203,13 @@
+     }
+ }
+ 
+-async fn retained_source(
++async fn retained_session(
+     cg: &TraceDecay,
+     envelope: &HookEventEnvelopeV2,
+     native_session: Option<&SessionId>,
+     sessions: Option<&RegisteredGlobalDb>,
+     profile: Option<&dyn ProfileIdentityReadPort>,
+-) -> Option<LiveOriginSource> {
++) -> Option<LiveOriginSession> {
+     let (native_session, sessions, profile) = (native_session?, sessions?, profile?);
+     if tracedecay_agent_hosts::hooks::protected_native_session_id(native_session.as_str())
+         != envelope.protected_session_id
+@@ -150,47 +231,172 @@
+     {
+         return None;
+     }
+-    // This indexed path is a locator only. No catch-up cursor or captured
+-    // historical branch is accepted as a live baseline.
+     let session = sessions
+         .get_session_result(provider, native_session.as_str())
+         .await
+-        .ok()??;
+-    if session.provider != provider || session.session_id != native_session.as_str() {
+-        return None;
+-    }
+-    let source_path = PathBuf::from(session.transcript_path?);
+-    if !source_path.is_absolute() || source_path.as_os_str().len() > 4096 {
+-        return None;
+-    }
+-    let source = match envelope.producer {
+-        HookHostV1::ClaudeCode => {
+-            let identity =
+-                tracedecay_sessions::runtime::claude::identify_claude_source(&source_path)?;
+-            if identity.session_id != native_session.as_str() {
+-                return None;
+-            }
+-            ObservationSourceIdentityV1::for_provider_source(
+-                ProviderId::new(provider).ok()?,
+-                native_session.clone(),
+-                SessionId::new(identity.source_id).ok()?,
+-            )
+-            .ok()?
+-        }
+-        HookHostV1::Codex => tracedecay_sessions::runtime::codex::codex_observation_source_v2(
+-            native_session.as_str(),
+-        )
+-        .ok()?,
+-        _ => return None,
+-    };
+-    Some(LiveOriginSource {
++        .ok()?;
++    if session.as_ref().is_some_and(|session| {
++        session.provider != provider || session.session_id != native_session.as_str()
++    }) {
++        return None;
++    }
++    Some(LiveOriginSession {
+         project_root: cg.project_root().to_path_buf(),
+         project_id: project_id.clone(),
+         brain_id: profile.brain_id().clone(),
+         profile_id: profile.profile_id().clone(),
+-        source_path,
+-        source,
++        producer: envelope.producer,
++        native_session: native_session.clone(),
++        recorded_project_path: session
++            .as_ref()
++            .map(|session| session.project_path.clone().into()),
++        source_path: session.and_then(|session| session.transcript_path.map(PathBuf::from)),
+     })
++}
++
++impl LiveOriginSession {
++    fn resolve_source(
++        self,
++        is_start: bool,
++        locator: Option<&tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1>,
++        home: Option<&Path>,
++        deadline: Instant,
++    ) -> Option<(
++        LiveOriginSource,
++        bool,
++        Option<tracedecay_sessions::runtime::codex::CodexLiveSessionTranscript>,
++    )> {
++        if Instant::now() >= deadline {
++            return None;
++        }
++        let project_root = fs::canonicalize(&self.project_root).ok()?;
++        if let Some(recorded) = &self.recorded_project_path
++            && fs::canonicalize(recorded).ok()? != project_root
++        {
++            return None;
++        }
++        let register = self.source_path.is_none();
++        let mut codex_guard = None;
++        let source_path = match self.source_path {
++            Some(path) => {
++                if is_start && self.producer == HookHostV1::ClaudeCode {
++                    // A new native Start cannot silently reuse an indexed
++                    // locator after the host named a different physical file.
++                    let locator = locator?;
++                    if locator.session_id != self.native_session {
++                        return None;
++                    }
++                    let actual = validated_claude_start_source(
++                        &locator.transcript_path,
++                        &self.native_session,
++                        home?,
++                        deadline,
++                    )?;
++                    if fs::canonicalize(&path).ok()? != actual {
++                        return None;
++                    }
++                }
++                path
++            }
++            None if is_start => match self.producer {
++                HookHostV1::ClaudeCode => {
++                    let locator = locator?;
++                    if locator.session_id != self.native_session {
++                        return None;
++                    }
++                    validated_claude_start_source(
++                        &locator.transcript_path,
++                        &self.native_session,
++                        home?,
++                        deadline,
++                    )?
++                }
++                HookHostV1::Codex => {
++                    let guard = tracedecay_sessions::runtime::codex::CodexSource::with_home(home?)
++                        .find_live_session_transcript(
++                            self.native_session.as_str(),
++                            &project_root,
++                            deadline,
++                        )
++                        .ok()??;
++                    let path = guard.path().to_path_buf();
++                    codex_guard = Some(guard);
++                    path
++                }
++                _ => return None,
++            },
++            None => return None,
++        };
++        if !source_path.is_absolute() || source_path.as_os_str().len() > 4096 {
++            return None;
++        }
++        let source = match self.producer {
++            HookHostV1::ClaudeCode => {
++                let identity =
++                    tracedecay_sessions::runtime::claude::identify_claude_source(&source_path)?;
++                if identity.session_id != self.native_session.as_str() {
++                    return None;
++                }
++                ObservationSourceIdentityV1::for_provider_source(
++                    ProviderId::new("claude").ok()?,
++                    self.native_session,
++                    SessionId::new(identity.source_id).ok()?,
++                )
++                .ok()?
++            }
++            HookHostV1::Codex => tracedecay_sessions::runtime::codex::codex_observation_source_v2(
++                self.native_session.as_str(),
++            )
++            .ok()?,
++            _ => return None,
++        };
++        Some((
++            LiveOriginSource {
++                project_root,
++                project_id: self.project_id,
++                brain_id: self.brain_id,
++                profile_id: self.profile_id,
++                source_path,
++                source,
++            },
++            register,
++            codex_guard,
++        ))
++    }
++}
++
++fn validated_claude_start_source(
++    path: &Path,
++    native_session: &SessionId,
++    home: &Path,
++    deadline: Instant,
++) -> Option<PathBuf> {
++    if Instant::now() >= deadline
++        || !path.is_absolute()
++        || path.as_os_str().len() > 4096
++        || path.extension().and_then(|extension| extension.to_str()) != Some("jsonl")
++    {
++        return None;
++    }
++    let identity = tracedecay_sessions::runtime::claude::identify_claude_source(path)?;
++    if identity.session_id != native_session.as_str() {
++        return None;
++    }
++    let host_root = fs::canonicalize(home.join(".claude/projects")).ok()?;
++    let canonical = fs::canonicalize(path).ok()?;
++    if !canonical.starts_with(&host_root) || canonical == host_root {
++        return None;
++    }
++    let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(path).ok()?;
++    let before = file.metadata().ok()?;
++    if before.len() > MAX_LIVE_SOURCE_BYTES
++        || native_file_evidence(&before)? != native_file_evidence(&fs::metadata(path).ok()?)?
++        || fs::canonicalize(path).ok()? != canonical
++        || Instant::now() >= deadline
++    {
++        return None;
++    }
++    Some(canonical)
+ }
+ 
+ #[hotpath::measure(label = "mcp.hook_runtime.live_origin.capture")]
+--- a/crates/tracedecay-agent-hosts/src/hooks/claude.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/claude.rs
+@@ -184,6 +184,22 @@
+         event,
+         &parsed,
+     );
++    // Record the live frontier before catch-up can admit the appended rows.
++    let output = super::dispatch::dispatch_for_scope(
++        runtime,
++        tracedecay_hooks::HookHostV1::ClaudeCode,
++        event,
++        root.as_deref(),
++        Some(&hook_telemetry),
++        started,
++    )
++    .await
++    .into_recorded_guidance(&hook_telemetry)
++    .flatten()
++    .map_or_else(
++        || serde_json::json!({}).to_string(),
++        |guidance| additional_context_json("SessionStart", &guidance),
++    );
+     if let Some(project_root) = root.as_deref() {
+         super::notify_hook_event_with_telemetry(
+             runtime,
+@@ -202,21 +218,6 @@
+         )
+         .await;
+     }
+-    let output = super::dispatch::dispatch_for_scope(
+-        runtime,
+-        tracedecay_hooks::HookHostV1::ClaudeCode,
+-        event,
+-        root.as_deref(),
+-        Some(&hook_telemetry),
+-        started,
+-    )
+-    .await
+-    .into_recorded_guidance(&hook_telemetry)
+-    .flatten()
+-    .map_or_else(
+-        || serde_json::json!({}).to_string(),
+-        |guidance| additional_context_json("SessionStart", &guidance),
+-    );
+     (root, output)
+ }
+ 
+@@ -361,6 +362,22 @@
+         event,
+         &parsed,
+     );
++    // Record the live frontier before catch-up can admit the appended rows.
++    let output = super::dispatch::dispatch_for_scope(
++        runtime,
++        tracedecay_hooks::HookHostV1::ClaudeCode,
++        event,
++        root.as_deref(),
++        Some(&hook_telemetry),
++        started,
++    )
++    .await
++    .into_recorded_guidance(&hook_telemetry)
++    .flatten()
++    .map_or_else(
++        || serde_json::json!({}).to_string(),
++        |guidance| additional_context_json("Stop", &guidance),
++    );
+     if let Some(project_root) = root.as_deref() {
+         ingest_claude_project_transcript(
+             runtime,
+@@ -372,21 +389,6 @@
+         )
+         .await;
+     }
+-    let output = super::dispatch::dispatch_for_scope(
+-        runtime,
+-        tracedecay_hooks::HookHostV1::ClaudeCode,
+-        event,
+-        root.as_deref(),
+-        Some(&hook_telemetry),
+-        started,
+-    )
+-    .await
+-    .into_recorded_guidance(&hook_telemetry)
+-    .flatten()
+-    .map_or_else(
+-        || serde_json::json!({}).to_string(),
+-        |guidance| additional_context_json("Stop", &guidance),
+-    );
+     (root, output)
+ }
+ 
+--- a/crates/tracedecay-agent-hosts/src/hooks/codex.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/codex.rs
+@@ -46,7 +46,7 @@
+     super::additional_context_json(event_name, additional_context)
+ }
+ 
+-/// Codex `Stop` response: admit daemon-owned ingest before optional V2 guidance.
++/// Codex `Stop` response: seal the live frontier before queuing transcript ingest.
+ pub async fn hook_codex_stop(runtime: &HookRuntimeV1) -> i32 {
+     let started = Instant::now();
+     let event = read_hook_event!();
+@@ -63,20 +63,17 @@
+         &event,
+         &parsed,
+     );
+-    // Required producer admission must not be starved by optional guidance work.
+-    let queued =
+-        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started).await;
+-    let guidance = super::dispatch::dispatch_for_scope(
++    let (dispatched, queued) = super::dispatch::dispatch_for_scope_with_required_work(
+         runtime,
+         tracedecay_hooks::HookHostV1::Codex,
+         &event,
+         root.as_deref(),
+         Some(&telemetry),
+         started,
+-    )
+-    .await
+-    .into_recorded_guidance(&telemetry)
+-    .flatten();
++        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started),
++    )
++    .await;
++    let guidance = dispatched.into_recorded_guidance(&telemetry).flatten();
+     let output = guidance.map_or_else(
+         || "{}".to_owned(),
+         |guidance| additional_context_json("Stop", &guidance),
+@@ -199,6 +196,17 @@
+         &event,
+         &parsed,
+     );
++    let guidance = super::dispatch::dispatch_for_scope(
++        runtime,
++        tracedecay_hooks::HookHostV1::Codex,
++        &event,
++        root.as_deref(),
++        Some(&hook_telemetry),
++        started,
++    )
++    .await
++    .into_recorded_guidance(&hook_telemetry)
++    .flatten();
+     if let Some(project_root) = root.as_deref() {
+         super::notify_hook_event_with_telemetry(
+             runtime,
+@@ -208,17 +216,6 @@
+         )
+         .await;
+     }
+-    let guidance = super::dispatch::dispatch_for_scope(
+-        runtime,
+-        tracedecay_hooks::HookHostV1::Codex,
+-        &event,
+-        root.as_deref(),
+-        Some(&hook_telemetry),
+-        started,
+-    )
+-    .await
+-    .into_recorded_guidance(&hook_telemetry)
+-    .flatten();
+     let output = guidance.map_or_else(
+         || serde_json::json!({}).to_string(),
+         |guidance| additional_context_json("SessionStart", &guidance),
+--- a/crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs
+@@ -25,13 +25,14 @@
+ use crate::ports::hook_runtime::HookRuntimeV1;
+ 
+ use super::analytics::HookTimingSpan;
+-use super::dispatch::NativeContextScoutLifecycleV1;
++use super::dispatch::{NativeContextScoutLifecycleV1, NativeSessionStartLocatorV1};
+ 
+ pub(crate) struct DaemonAdmissionPort<'a> {
+     runtime: &'a HookRuntimeV1,
+     project_root: &'a Path,
+     session_id: Option<&'a str>,
+     lifecycle: Option<&'a NativeContextScoutLifecycleV1>,
++    start_locator: Option<&'a NativeSessionStartLocatorV1>,
+     feedback_notice: Mutex<Option<tracedecay_application::advisory::AdvisoryHookLookupNoticeV1>>,
+     github_stack_signal_available: Mutex<bool>,
+     /// The caller's hook span, so the admission round trip is attributed like
+@@ -46,6 +47,7 @@
+         project_root: &'a Path,
+         session_id: Option<&'a str>,
+         lifecycle: Option<&'a NativeContextScoutLifecycleV1>,
++        start_locator: Option<&'a NativeSessionStartLocatorV1>,
+         telemetry: Option<&'a HookTimingSpan>,
+     ) -> Self {
+         Self {
+@@ -53,6 +55,7 @@
+             project_root,
+             session_id,
+             lifecycle,
++            start_locator,
+             feedback_notice: Mutex::new(None),
+             github_stack_signal_available: Mutex::new(false),
+             telemetry,
+@@ -191,6 +194,7 @@
+                         "envelope": envelope,
+                         "native_session_id": self.session_id,
+                         "native_lifecycle": self.lifecycle,
++                        "native_start_locator": self.start_locator,
+                     }),
+                     self.telemetry,
+                 ),
+--- a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+@@ -188,6 +188,7 @@
+     #[serde(alias = "sessionID")]
+     session_id: Option<String>,
+     conversation_id: Option<String>,
++    transcript_path: Option<String>,
+     generation_id: Option<String>,
+     #[serde(alias = "filePath")]
+     file_path: Option<String>,
+@@ -260,6 +261,45 @@
+ #[derive(Default, Deserialize)]
+ struct NativeIdentityReceipt {
+     tool_call_id: Option<String>,
++}
++
++/// Private native Start locator. The path locates a candidate only; the daemon
++/// validates the actual file and registered project before retaining a boundary.
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct NativeSessionStartLocatorV1 {
++    pub session_id: SessionId,
++    pub event_id: [u8; 16],
++    pub transcript_path: std::path::PathBuf,
++}
++
++impl NativeSessionStartLocatorV1 {
++    pub fn matches_envelope(&self, envelope: &HookEventEnvelopeV2) -> bool {
++        envelope.producer == HookHostV1::ClaudeCode
++            && matches!(
++                envelope.event,
++                tracedecay_hooks::HookEventV2::SessionBoundary {
++                    boundary: tracedecay_hooks::HookBoundaryV1::Start
++                }
++            )
++            && protected_session_id_for_native(self.session_id.as_str())
++                == envelope.protected_session_id
++            && self.event_id == envelope.event_id
++            && self.transcript_path.is_absolute()
++            && self.transcript_path.as_os_str().len() <= 4096
++    }
++}
++
++fn native_session_start_locator(
++    fields: &NativeIdentityFields,
++    envelope: &HookEventEnvelopeV2,
++) -> Option<NativeSessionStartLocatorV1> {
++    let locator = NativeSessionStartLocatorV1 {
++        session_id: SessionId::new(fields.session_id()?.to_owned()).ok()?,
++        event_id: envelope.event_id,
++        transcript_path: fields.transcript_path.as_deref()?.into(),
++    };
++    locator.matches_envelope(envelope).then_some(locator)
+ }
+ 
+ /// Provider-native lifecycle identity that may cross the local hook/daemon
+@@ -424,37 +464,62 @@
+     telemetry: Option<&HookTimingSpan>,
+     started: Instant,
+ ) -> HookDispatch {
++    dispatch_with_required_work(
++        runtime,
++        host,
++        event_json,
++        project_root,
++        telemetry,
++        started,
++        async {},
++    )
++    .await
++    .0
++}
++
++async fn dispatch_with_required_work<T>(
++    runtime: &HookRuntimeV1,
++    host: HookHostV1,
++    event_json: &str,
++    project_root: &Path,
++    telemetry: Option<&HookTimingSpan>,
++    started: Instant,
++    required: impl std::future::Future<Output = T>,
++) -> (HookDispatch, T) {
+     let decoded = match tracedecay_hooks::decode_native_hook_event(host, event_json.as_bytes()) {
+         Ok(decoded) => decoded,
+         Err(
+             NativeHookDecodeError::UnsupportedNativeEvent
+             | NativeHookDecodeError::UnsupportedNativeFamily,
+         ) => {
+-            return HookDispatch::NotApplicable;
+-        }
+-        Err(_) => return unavailable(),
++            return (HookDispatch::NotApplicable, required.await);
++        }
++        Err(_) => return (unavailable(), required.await),
+     };
+     let Some(prepared) = prepare_bound_hook(host, event_json, project_root, decoded, started)
+     else {
+-        return unavailable();
++        return (unavailable(), required.await);
+     };
+     let native_session_id = prepared.native_session_id.clone();
+     let native_lifecycle = prepared.native_lifecycle.clone();
++    let native_start_locator = prepared.native_start_locator.clone();
+     let admission = DaemonAdmissionPort::new(
+         runtime,
+         project_root,
+         native_session_id.as_deref(),
+         native_lifecycle.as_ref(),
++        native_start_locator.as_ref(),
+         telemetry,
+     );
+     let delivery = DaemonFeedbackNoticeDeliveryPort::new(runtime, project_root);
+-    dispatch_decoded(
++    dispatch_decoded_with_required_work(
+         runtime,
+         prepared,
+         project_root,
+         started,
+         &admission,
+         &delivery,
++        required,
+     )
+     .await
+ }
+@@ -475,6 +540,38 @@
+             dispatch(runtime, host, event_json, project_root, telemetry, started).await
+         }
+         None => dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await,
++    }
++}
++
++/// Admit the live event, then run required producer work before any optional
++/// guidance delivery can spend the remainder of the original hook deadline.
++pub(crate) async fn dispatch_for_scope_with_required_work<T>(
++    runtime: &HookRuntimeV1,
++    host: HookHostV1,
++    event_json: &str,
++    project_root: Option<&Path>,
++    telemetry: Option<&HookTimingSpan>,
++    started: Instant,
++    required: impl std::future::Future<Output = T>,
++) -> (HookDispatch, T) {
++    match project_root {
++        Some(project_root) => {
++            dispatch_with_required_work(
++                runtime,
++                host,
++                event_json,
++                project_root,
++                telemetry,
++                started,
++                required,
++            )
++            .await
++        }
++        None => {
++            let dispatched =
++                dispatch_profile_scoped(runtime, host, event_json, telemetry, started).await;
++            (dispatched, required.await)
++        }
+     }
+ }
+ 
+@@ -575,11 +672,13 @@
+     };
+     let native_session_id = prepared.native_session_id.clone();
+     let native_lifecycle = prepared.native_lifecycle.clone();
++    let native_start_locator = prepared.native_start_locator.clone();
+     let admission = DaemonAdmissionPort::new(
+         runtime,
+         project_root,
+         native_session_id.as_deref(),
+         native_lifecycle.as_ref(),
++        native_start_locator.as_ref(),
+         telemetry,
+     );
+     let delivery = DaemonFeedbackNoticeDeliveryPort::new(runtime, project_root);
+@@ -625,6 +724,7 @@
+     envelope: HookEventEnvelopeV2,
+     native_session_id: Option<String>,
+     native_lifecycle: Option<NativeContextScoutLifecycleV1>,
++    native_start_locator: Option<NativeSessionStartLocatorV1>,
+     prepared_at: UtcMicros,
+ }
+ 
+@@ -656,6 +756,7 @@
+             PendingEnvelopeV1::Exact(queued) => queued,
+             PendingEnvelopeV1::Unavailable => return None,
+         };
++    let native_start_locator = native_session_start_locator(&native_fields, &envelope);
+     Some(PreparedBoundHook {
+         host,
+         layout,
+@@ -663,11 +764,11 @@
+         envelope,
+         native_session_id,
+         native_lifecycle,
++        native_start_locator,
+         prepared_at: now,
+     })
+ }
+ 
+-#[hotpath::measure(future = true, label = "hosts.hooks.dispatch_decoded")]
+ async fn dispatch_decoded(
+     runtime: &HookRuntimeV1,
+     prepared: PreparedBoundHook,
+@@ -678,6 +779,31 @@
+         tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
+     >,
+ ) -> HookDispatch {
++    dispatch_decoded_with_required_work(
++        runtime,
++        prepared,
++        project_root,
++        started,
++        admission,
++        delivery,
++        async {},
++    )
++    .await
++    .0
++}
++
++#[hotpath::measure(future = true, label = "hosts.hooks.dispatch_decoded")]
++async fn dispatch_decoded_with_required_work<T>(
++    runtime: &HookRuntimeV1,
++    prepared: PreparedBoundHook,
++    project_root: &Path,
++    started: Instant,
++    admission: &DaemonAdmissionPort<'_>,
++    delivery: &impl AsyncHookFeedbackDeliveryPortV1<
++        tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
++    >,
++    required: impl std::future::Future<Output = T>,
++) -> (HookDispatch, T) {
+     let PreparedBoundHook {
+         host,
+         layout,
+@@ -700,6 +826,7 @@
+         },
+         None => HookImmediateAdmissionV1::TimedOut,
+     };
++    let required_result = required.await;
+     let replay = match immediate {
+         HookImmediateAdmissionV1::Accepted { .. } | HookImmediateAdmissionV1::CatchupRequired => {
+             None
+@@ -734,7 +861,7 @@
+     );
+     let feedback_notice = admission.take_feedback_notice();
+     let github_stack_signal_available = admission.take_github_stack_signal_available();
+-    match completed {
++    let dispatched = match completed {
+         Ok(result) => {
+             let rollback = HookFeedbackRollbackSwitchV1 {
+                 configuration_revision: snapshot.revision,
+@@ -791,7 +918,8 @@
+             }
+         }
+         Err(_) => unavailable(),
+-    }
++    };
++    (dispatched, required_result)
+ }
+ 
+ #[cfg(test)]
+--- a/crates/tracedecay-agent-hosts/src/hooks/mod.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/mod.rs
+@@ -33,6 +33,7 @@
+ pub mod tool_hints;
+ pub use dispatch::NATIVE_HOOK_HOSTS;
+ pub use dispatch::NativeContextScoutLifecycleV1;
++pub use dispatch::NativeSessionStartLocatorV1;
+ pub use dispatch::native_capture_material;
+ pub use dispatch::project_and_worktree_locators_for_scope as hook_scope_locators;
+ pub use dispatch::project_id_for_layout as hook_project_id_for_layout;
+@@ -47,8 +48,8 @@
+     codex_additional_context_json, codex_apply_patch_rel_paths, codex_project_root_from_event,
+     codex_subagent_start_log_line, codex_user_prompt_submit_context_for_event,
+     codex_workspace_status_from_event, evaluate_codex_subagent_start, hook_codex_post_compact,
+-    hook_codex_post_tool_use, hook_codex_session_start, hook_codex_stop, hook_codex_user_prompt_submit,
+-    record_codex_subagent_start,
++    hook_codex_post_tool_use, hook_codex_session_start, hook_codex_stop,
++    hook_codex_user_prompt_submit, record_codex_subagent_start,
+ };
+ pub use cursor::{
+     CURSOR_CATCH_UP_INGEST_MAX_BYTES, cursor_project_root_from_event, cursor_session_start_json,

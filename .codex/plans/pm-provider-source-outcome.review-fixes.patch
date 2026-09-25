@@ -1,0 +1,163 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
+@@ -615,6 +615,7 @@
+         }
+         ProviderControlOperationResultV1::Maintenance(Some(value)) => {
+             (value.dry_run || (value.changed_items == 0 && value.removed_items == 0))
++                && value.state_changed != Some(true)
+                 && !value.partial
+         }
+         ProviderControlOperationResultV1::SnapshotRestore(Some(_)) => true,
+@@ -906,6 +907,7 @@
+             maximum_bytes: 65536,
+             maximum_duration_millis: 1000,
+             dry_run: false,
++            resume_cursor: None,
+         })
+     }
+ 
+@@ -973,6 +975,7 @@
+                 changed_items: 0,
+                 removed_items: 0,
+                 proposed_changes: None,
++                state_changed: Some(false),
+                 partial: false,
+                 resume_cursor: None,
+                 receipt: ProviderControlMutationReceiptV1 {
+@@ -1091,6 +1094,7 @@
+             unreachable!()
+         };
+         data.changed_items = 1;
++        data.state_changed = Some(true);
+         data.receipt.state_generation_after = 6;
+         committed.effect.state = ProviderControlEffectStateV1::Committed;
+         committed.effect.state_generation_before = Some(5);
+@@ -1130,4 +1134,126 @@
+             ProviderControlOperationResultV1::Maintenance(None)
+         ));
+     }
+-}
++
++    #[test]
++    fn maintenance_kernel_change_cannot_be_reported_as_no_change() {
++        let mut result = unchanged_result();
++        let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut result.result else {
++            unreachable!()
++        };
++        data.state_changed = Some(true);
++        assert!(!verified_no_change(&result));
++        let output = assembled(result);
++        assert_eq!(output.receipt.outcome, EffectTermination::EffectUnknown);
++        assert_eq!(output.reconciliation, ReconciliationState::Pending);
++        assert!(output.receipt.committed_state.is_none());
++    }
++
++    #[test]
++    fn multi_item_inspection_outcome_preserves_actual_page_and_cursor() {
++        let maintenance = request();
++        let mut request = ProviderControlRequestV1::Inspection(ProviderInspectionRequestV1 {
++            state: maintenance.state_selector().unwrap().clone(),
++            selection: ProviderControlInspectionSelectorV1::CapabilityStatus,
++            maximum_items: 2,
++            maximum_bytes: 65_536,
++            cursor: None,
++        });
++        let (request_context, cancellation_signal) = context(&request);
++        let operation =
++            tracedecay_contracts::retained_surface_application_operation(request.operation())
++                .unwrap();
++        let context = RetainedSurfaceExecutionContextV1 {
++            request_context: &request_context,
++            cancellation_signal: &cancellation_signal,
++            operation: &operation,
++            observed_at: now_micros(),
++        };
++        let configuration = ManifestDigest::new(format!("sha256:{}", "d".repeat(64))).unwrap();
++        let mut result = result_after_failure(
++            &request,
++            &state(),
++            &identity(),
++            &ControlFailureStageV1::Control(TerminalCode::Cancelled),
++        );
++        for partial in [false, true] {
++            result.terminal = if partial {
++                ProviderControlTerminalV1::Partial
++            } else {
++                ProviderControlTerminalV1::Success
++            };
++            result.warnings.clear();
++            let cursor = partial.then(|| "cursor.capabilities.2".to_owned());
++            result.result =
++                ProviderControlOperationResultV1::Inspection(Some(ProviderInspectionResultV1 {
++                    selection: ProviderControlInspectionSelectorV1::CapabilityStatus,
++                    evidence_origin: ProviderControlInspectionEvidenceOriginV1::ProviderRuntime,
++                    items: ProviderControlInspectionItemsV1::CapabilityStatus(vec![
++                        ProviderControlCapabilityStatusV1 {
++                            capability_id: "memory.recall".to_owned(),
++                            state: "supported".to_owned(),
++                        },
++                        ProviderControlCapabilityStatusV1 {
++                            capability_id: "memory.inspection".to_owned(),
++                            state: "supported".to_owned(),
++                        },
++                    ]),
++                    coverage: if partial {
++                        ProviderControlInspectionCoverageV1::Partial
++                    } else {
++                        ProviderControlInspectionCoverageV1::Complete
++                    },
++                    next_cursor: cursor.clone(),
++                    redactions: Vec::new(),
++                    state_generation: Some(5),
++                }));
++            let output = assemble_outcome(
++                &context,
++                &request,
++                Ok(CompletedProviderControlV1 {
++                    result: result.clone(),
++                    host_receipt: None,
++                }),
++                &configuration,
++            )
++            .unwrap();
++            let ApplicationOutcome::Evidence(output) = output else {
++                panic!("inspection evidence")
++            };
++            assert_eq!(output.coverage.returned, 2);
++            assert_eq!(output.page.returned, 2);
++            assert_eq!(output.page.sort_revision, 1);
++            assert_eq!(output.page.total, (!partial).then_some(2));
++            assert_eq!(
++                output
++                    .page
++                    .cursor
++                    .as_ref()
++                    .and_then(|cursor| cursor.as_opaque())
++                    .map(|cursor| cursor.as_str()),
++                cursor.as_deref()
++            );
++            assert_eq!(
++                output.payload,
++                Some(RetainedSurfaceResultV1::ProviderControl(result.clone()))
++            );
++        }
++        let ProviderControlRequestV1::Inspection(inspection) = &mut request else {
++            unreachable!()
++        };
++        inspection.maximum_items = 1;
++        assert!(
++            assemble_outcome(
++                &context,
++                &request,
++                Ok(CompletedProviderControlV1 {
++                    result,
++                    host_receipt: None,
++                }),
++                &configuration
++            )
++            .is_err(),
++            "the actual inspection request limit still applies"
++        );
++    }
++}

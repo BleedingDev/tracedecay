@@ -211,6 +211,27 @@ impl HookProjectRouteCache {
         }
     }
 
+    /// Publishes the native session identity from an admitted Hook V2
+    /// SessionStart onto the same private-route cache used by legacy hook
+    /// events. The caller owns V2 envelope and project-scope validation; this
+    /// cache owns only the already-authorized structural route.
+    pub(crate) fn observe_session_workspace_route(
+        &mut self,
+        session_id: &str,
+        route: WorkspaceProjectRoute,
+    ) -> tracedecay_domain::errors::Result<()> {
+        let session_id =
+            tracedecay_privacy::protect_sensitive_structural_id(session_id).map_err(|_| {
+                tracedecay_domain::errors::TraceDecayError::project_route(
+                    "project_route_invalid_identity",
+                    false,
+                    "Hook V2 session identity could not be protected",
+                )
+            })?;
+        self.insert_session_workspace_route(session_id, route);
+        Ok(())
+    }
+
     #[hotpath::measure(label = "mcp.project_route.select_route")]
     pub(crate) fn workspace_route_for_arguments(
         &self,
@@ -347,6 +368,22 @@ impl SharedHookProjectRouteCache {
         let mut state = self.inner.lock().map_err(|_| Self::unavailable("update"))?;
         state.cache.clone_from(cache);
         state.cache.connection_route = None;
+        state.generation += 1;
+        Ok(())
+    }
+
+    /// Atomically adds one admitted V2 session route without replacing routes
+    /// published concurrently by other hook connections.
+    #[hotpath::measure(label = "mcp.project_route.publish_session")]
+    pub(crate) fn publish_session_route(
+        &self,
+        session_id: &str,
+        route: WorkspaceProjectRoute,
+    ) -> tracedecay_domain::errors::Result<()> {
+        let mut state = self.inner.lock().map_err(|_| Self::unavailable("update"))?;
+        state
+            .cache
+            .observe_session_workspace_route(session_id, route)?;
         state.generation += 1;
         Ok(())
     }

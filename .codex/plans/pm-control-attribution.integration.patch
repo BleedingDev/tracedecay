@@ -1,0 +1,313 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -27,6 +27,8 @@
+ //! The port is minted per session through
+ //! [`ProjectCognitiveRecallMountV1::port_for_session`]; the mount itself lives
+ //! for exactly one project-server lifetime.
++
++pub(crate) mod control_attribution;
+ 
+ use std::collections::BTreeMap;
+ use std::fmt::Write as _;
+@@ -158,6 +160,11 @@
+ /// Typed failure of retaining one admission report.
+ #[derive(Debug, thiserror::Error)]
+ pub enum RecallAdmissionLedgerError {
++    /// Control data differs from the final trace, or the sink cannot retain it.
++    #[error(
++        "recall control metadata does not match the final trace or is unsupported by this sink"
++    )]
++    InvalidControlMetadata,
+     /// The host clock could not stamp the ledger row.
+     #[error("host clock unavailable for the recall admission ledger: {0}")]
+     Clock(#[source] tracedecay_contracts::ClockError),
+@@ -228,6 +235,20 @@
+         exact_scope_sha256: &str,
+         trace: &RecallExplainTraceV1,
+     ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError>;
++
++    /// Retains control attribution in the same transaction as the trace.
++    /// A legacy sink refuses metadata instead of claiming it retained authority.
++    fn record_explain_trace_with_control(
++        &self,
++        exact_scope_sha256: &str,
++        trace: &RecallExplainTraceV1,
++        metadata: Option<&control_attribution::PreparedRecallControlMetadataV1>,
++    ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
++        if metadata.is_some() {
++            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
++        }
++        self.record_explain_trace(exact_scope_sha256, trace)
++    }
+ }
+ 
+ /// One retained explain trace as the project audit ledger holds it.
+@@ -350,6 +371,12 @@
+                 source,
+             }
+         })?;
++        control_attribution::initialize_schema(&connection).map_err(|source| {
++            CognitiveRecallMountError::LedgerOpen {
++                path: path.clone(),
++                source,
++            }
++        })?;
+         Ok(Self {
+             path,
+             connection: Mutex::new(connection),
+@@ -488,6 +515,18 @@
+         exact_scope_sha256: &str,
+         trace: &RecallExplainTraceV1,
+     ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
++        self.retain_explain_trace_with_control(exact_scope_sha256, trace, None)
++    }
++
++    pub(crate) fn retain_explain_trace_with_control(
++        &self,
++        exact_scope_sha256: &str,
++        trace: &RecallExplainTraceV1,
++        metadata: Option<&control_attribution::PreparedRecallControlMetadataV1>,
++    ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
++        if metadata.is_some_and(|value| !value.matches_trace(exact_scope_sha256, trace)) {
++            return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
++        }
+         let recorded_at = try_now_micros().map_err(RecallAdmissionLedgerError::Clock)?;
+         let trace_bytes = serde_json::to_vec(trace).map_err(RecallAdmissionLedgerError::Encode)?;
+         let trace_sha256 = tracedecay_domain::canonical_text::sha256_hex(&trace_bytes);
+@@ -510,17 +549,19 @@
+         let transaction = connection
+             .transaction()
+             .map_err(RecallAdmissionLedgerError::Sqlite)?;
+-        let existing: Option<String> = transaction
++        let existing: Option<(String, Option<String>)> = transaction
+             .query_row(
+-                "SELECT trace_sha256 FROM recall_explain_traces
++                "SELECT trace_sha256, control_metadata_sha256 FROM recall_explain_traces
+                  WHERE exact_scope_sha256 = ?1 AND trace_id = ?2",
+                 params![exact_scope_sha256, trace.trace_id],
+-                |row| row.get(0),
++                |row| Ok((row.get(0)?, row.get(1)?)),
+             )
+             .optional()
+             .map_err(RecallAdmissionLedgerError::Sqlite)?;
+-        if let Some(existing) = existing {
+-            return if existing == trace_sha256 {
++        if let Some((existing, existing_metadata)) = existing {
++            return if existing == trace_sha256
++                && existing_metadata.as_deref() == metadata.map(|value| value.metadata_sha256())
++            {
+                 Ok(RecallAdmissionLedgerWriteV1::AlreadyRecorded)
+             } else {
+                 Err(RecallAdmissionLedgerError::ConflictingTrace {
+@@ -534,8 +575,9 @@
+                 "INSERT INTO recall_explain_traces (
+                      exact_scope_sha256, trace_id, request_id, provider_id,
+                      registration_revision, requested_count, degraded, trace_sha256,
+-                     token_summary_json, recorded_at_utc_micros
+-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
++                     token_summary_json, recorded_at_utc_micros,
++                     delivery_scope_json, control_metadata_sha256
++                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 params![
+                     exact_scope_sha256,
+                     trace.trace_id,
+@@ -547,17 +589,21 @@
+                     trace_sha256,
+                     token_summary_json,
+                     recorded_at.0,
++                    metadata.map(|value| value.delivery_scope_json()),
++                    metadata.map(|value| value.metadata_sha256()),
+                 ],
+             )
+             .map_err(RecallAdmissionLedgerError::Sqlite)?;
+         for (item, host_decision_json, provider_explanation_json) in &item_rows {
++            let binding = metadata.and_then(|value| value.item_sql(item.provider_rank));
+             transaction
+                 .execute(
+                     "INSERT INTO recall_explain_trace_items (
+                          exact_scope_sha256, trace_id, provider_rank, candidate_id, stage,
+                          host_reason_code, host_reason_detail, host_decision_json,
+-                         provider_explanation_json, section, tokens
+-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
++                         provider_explanation_json, section, tokens,
++                         stable_memory_ref, original_sources_json, control_binding_sha256
++                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     params![
+                         exact_scope_sha256,
+                         trace.trace_id,
+@@ -571,6 +617,9 @@
+                         item.section,
+                         item.tokens
+                             .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
++                        binding.map(|(reference, _, _)| reference),
++                        binding.map(|(_, sources, _)| sources),
++                        binding.map(|(_, _, digest)| digest),
+                     ],
+                 )
+                 .map_err(RecallAdmissionLedgerError::Sqlite)?;
+@@ -828,6 +877,15 @@
+     ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
+         self.retain_explain_trace(exact_scope_sha256, trace)
+     }
++
++    fn record_explain_trace_with_control(
++        &self,
++        exact_scope_sha256: &str,
++        trace: &RecallExplainTraceV1,
++        metadata: Option<&control_attribution::PreparedRecallControlMetadataV1>,
++    ) -> Result<RecallAdmissionLedgerWriteV1, RecallAdmissionLedgerError> {
++        self.retain_explain_trace_with_control(exact_scope_sha256, trace, metadata)
++    }
+ }
+ 
+ impl RecallAdmissionObserver for RecallAdmissionLedgerV1 {
+@@ -2385,6 +2443,14 @@
+             explanations.insert(normalized.candidate_id.clone(), state);
+         }
+     }
++    let control_delivery_scope = SessionExactScopeBindingV1 {
++        profile_id: mount.profile_id.clone(),
++        scope: mount.scope.clone(),
++        canonical_session_id: inputs.canonical_session_id.to_owned(),
++    }
++    .bind_exact_scope(&mount.scope)
++    .ok();
++    let mut control_bindings = BTreeMap::new();
+     let mut candidates = Vec::with_capacity(result.candidates().len());
+     for candidate in result.candidates() {
+         let hydration_now = match try_now_micros() {
+@@ -2500,11 +2566,26 @@
+                 );
+             }
+         };
++        let disposition = AdvisoryCandidateDispositionV1::from_gate(&hardened);
++        if matches!(disposition, AdvisoryCandidateDispositionV1::Admitted { .. })
++            && let Some(stable_memory_ref) = candidate.stable_reference()
++            && let ProviderItemProvenanceV1::Hydrated {
++                evidence: HostEvidenceRefV1::CanonicalObservations { sources },
++            } = &provenance
++        {
++            control_bindings.insert(
++                candidate.candidate_id().to_owned(),
++                control_attribution::RetainedRecallControlBindingV1 {
++                    stable_memory_ref: stable_memory_ref.to_owned(),
++                    original_sources: sources.clone(),
++                },
++            );
++        }
+         candidates.push(AdvisoryMemoryCandidateV1 {
+             candidate_id: identity,
+             content: hardened.rendered_content(),
+             explanation: hardened.rendered_explanation(),
+-            disposition: AdvisoryCandidateDispositionV1::from_gate(&hardened),
++            disposition,
+             provenance,
+         });
+     }
+@@ -2532,6 +2613,8 @@
+             host_withheld,
+             pack_identity_aliases,
+             explanations,
++            control_delivery_scope,
++            control_bindings,
+             sink: Arc::clone(&mount.ledger) as Arc<dyn RecallExplainTraceSinkV1>,
+         })
+     });
+@@ -3261,6 +3344,8 @@
+     host_withheld: Vec<RecallExplainHostWithholdingV1>,
+     pack_identity_aliases: BTreeMap<String, String>,
+     explanations: BTreeMap<String, RecallExplainProviderExplanationV1>,
++    control_delivery_scope: Option<OwnedExactScope>,
++    control_bindings: BTreeMap<String, control_attribution::RetainedRecallControlBindingV1>,
+     sink: Arc<dyn RecallExplainTraceSinkV1>,
+ }
+ 
+@@ -3296,7 +3381,10 @@
+ 
+ impl PartialEq for AdvisoryRecallExplainV1 {
+     fn eq(&self, other: &Self) -> bool {
+-        self.receipts() == other.receipts() && Arc::ptr_eq(&self.sink, &other.sink)
++        self.receipts() == other.receipts()
++            && self.control_delivery_scope == other.control_delivery_scope
++            && self.control_bindings == other.control_bindings
++            && Arc::ptr_eq(&self.sink, &other.sink)
+     }
+ }
+ 
+@@ -3348,7 +3436,7 @@
+         &self,
+         pack: Option<&ContextPackV1>,
+         final_withholding: Option<&AdvisoryDeliveryWithheldReasonV1>,
+-    ) {
++    ) -> Option<control_attribution::PreparedRecallControlMetadataV1> {
+         let mut host_withheld = self.host_withheld.clone();
+         if let (Some(reason), Some(selection)) = (final_withholding, self.selection.as_ref()) {
+             for candidate_id in selection.selected_candidate_ids() {
+@@ -3385,13 +3473,34 @@
+                     error = %error,
+                     "recall explain trace could not be reconciled; no partial trace was retained"
+                 );
+-                return;
++                return None;
+             }
+         };
+-        if let Err(error) = self
+-            .sink
+-            .record_explain_trace(&self.exact_scope_sha256, &trace)
++        let metadata = match self
++            .control_delivery_scope
++            .as_ref()
++            .map(|scope| {
++                control_attribution::PreparedRecallControlMetadataV1::prepare(
++                    &trace,
++                    scope,
++                    &self.control_bindings,
++                )
++            })
++            .transpose()
+         {
++            Ok(metadata) => metadata,
++            Err(error) => {
++                tracing::warn!(event = "memory_recall_control_metadata_invalid",
++                    request_id = %self.report.request_id, error = %error,
++                    "recall control metadata could not be retained");
++                return None;
++            }
++        };
++        if let Err(error) = self.sink.record_explain_trace_with_control(
++            &self.exact_scope_sha256,
++            &trace,
++            metadata.as_ref(),
++        ) {
+             tracing::warn!(
+                 event = "memory_recall_explain_trace_not_retained",
+                 request_id = %self.report.request_id,
+@@ -3399,7 +3508,9 @@
+                 error = %error,
+                 "recall explain trace could not be retained in the project audit ledger"
+             );
+-        }
++            return None;
++        }
++        metadata
+     }
+ }
+ 
+@@ -3565,13 +3676,15 @@
+         &self,
+         pack: Option<&ContextPackV1>,
+         final_withholding: Option<&AdvisoryDeliveryWithheldReasonV1>,
+-    ) {
++    ) -> Option<control_attribution::PreparedRecallControlMetadataV1> {
+         if let Self::Answered {
+             explain: Some(explain),
+             ..
+         } = self
+         {
+-            explain.retain(pack, final_withholding);
++            explain.retain(pack, final_withholding)
++        } else {
++            None
+         }
+     }
+ 

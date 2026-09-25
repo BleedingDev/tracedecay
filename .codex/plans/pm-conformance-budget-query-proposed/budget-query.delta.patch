@@ -1,0 +1,98 @@
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -3551,14 +3551,13 @@
+ }
+ 
+ fn budgets_scenario(scope: &OwnedExactScope) -> Result<CompatibilityScenario, String> {
++    let budget_sentence = "compatibility beacon café evidence respects every recall budget.";
++    let repeated = format!("{budget_sentence} ").repeat(30);
+     let observation = common_observation(
+         scope,
+         1,
+         Some("budget_full_content_revision"),
+-        &format!(
+-            "compatibility beacon full digest {}",
+-            "Unicode café evidence. ".repeat(30)
+-        ),
++        &format!("{repeated}First independent source retains its full content."),
+         Some(T1),
+         None,
+     );
+@@ -3566,14 +3565,14 @@
+         scope,
+         2,
+         Some("budget_other_content_revision"),
+-        &format!(
+-            "compatibility beacon other digest {}",
+-            "Second independent eligible source. ".repeat(30)
+-        ),
++        &format!("{repeated}Second independent source retains different full content."),
+         Some(T1),
+         None,
+     );
+-    let mut small = common_recall("current", T4, None);
++    let mut full = common_recall("current", T4, None);
++    full["query"] = json!(budget_sentence);
++    full["objective"] = json!(budget_sentence);
++    let mut small = full.clone();
+     small["budgets"] = json!({ "maximum_candidates": 1, "maximum_candidate_content_bytes": 64,
+         "maximum_total_content_bytes": 64, "maximum_source_refs_per_candidate": 1,
+         "maximum_trace_refs_per_candidate": 1, "maximum_warnings": 8,
+@@ -3613,7 +3612,7 @@
+             call_step(
+                 "budgets.full",
+                 ProviderOperation::Recall,
+-                common_recall("current", T4, None),
++                full,
+                 vec![CompatibilityAssertion::RecallSources(vec![
+                     expected_source(&observation),
+                     expected_source(&another),
+--- a/crates/tracedecay-memory-conformance/tests/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/tests/compatibility.rs
+@@ -674,17 +674,44 @@
+         .ok_or_else(|| io::Error::other("budget case"))?;
+     let mut sources = Vec::new();
+     let mut budgets = Value::Null;
++    let mut recall_requests = Vec::new();
+     for step in &budget_case.steps {
+         if let CompatibilityStep::Call { fixture, .. } = step {
+             let value: Value = serde_json::from_slice(&fixture.payload.bytes)?;
+             if fixture.operation == ProviderOperation::Observe {
+                 sources.push(value);
+-            } else if fixture.step_id == "budgets.bounded" {
+-                budgets = value["budgets"].clone();
++            } else if fixture.operation == ProviderOperation::Recall {
++                if fixture.step_id == "budgets.bounded" {
++                    budgets = value["budgets"].clone();
++                }
++                recall_requests.push(value);
+             }
+         }
+     }
+     assert_eq!(sources.len(), 2);
++    assert_eq!(recall_requests.len(), 2);
++    let query = recall_requests[0]["query"]
++        .as_str()
++        .ok_or_else(|| io::Error::other("budget query"))?;
++    assert!(query.contains("café"));
++    for request in &recall_requests {
++        assert_eq!(request["query"], json!(query));
++        assert_eq!(request["objective"], json!(query));
++    }
++    let quota = budgets["maximum_candidate_content_bytes"]
++        .as_u64()
++        .ok_or_else(|| io::Error::other("candidate byte quota"))?;
++    for source in &sources {
++        let content = source["canonical_payload"]["content"]
++            .as_str()
++            .ok_or_else(|| io::Error::other("budget source content"))?;
++        assert!(content.len() as u64 > quota);
++        assert!(content.matches(query).count() > 1);
++    }
++    assert_ne!(
++        sources[0]["canonical_payload"]["content"],
++        sources[1]["canonical_payload"]["content"]
++    );
+     let mut candidates: Vec<Value> = sources
+         .iter()
+         .enumerate()

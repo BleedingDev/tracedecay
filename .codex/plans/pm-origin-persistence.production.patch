@@ -1,0 +1,322 @@
+--- a/crates/tracedecay-store/src/observation/anchored_write.rs
++++ b/crates/tracedecay-store/src/observation/anchored_write.rs
+@@ -133,6 +133,26 @@
+     /// Returns retained original-source evidence without promoting it to a grant.
+     pub fn origin(&self) -> &ObservationOriginV1 {
+         &self.origin
++    }
++
++    /// Restores the origin retained beside the repository capture. Legacy rows
++    /// without an origin keep the ingestion-only or unavailable constructor
++    /// result. This restores evidence; the host must still validate its receipt.
++    pub fn with_retained_origin(
++        mut self,
++        origin: Option<ObservationOriginV1>,
++    ) -> ObservationStoreResult<Self> {
++        match origin {
++            Some(ObservationOriginV1::Recorded {
++                authority_ref,
++                source_identity,
++            }) => self.with_recorded_origin(authority_ref, source_identity),
++            Some(origin) => {
++                self.origin = origin;
++                Ok(self)
++            }
++            None => Ok(self),
++        }
+     }
+ 
+     /// Retains the live-event proof already checked by the host producer. A caller
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs
+@@ -296,8 +296,9 @@
+     }
+     connection.execute(
+         "INSERT INTO observation_repository_provenance (
+-            observation_id, availability_json, capture_json, retrieval_anchor_id, owner_json
+-         ) VALUES (?1, ?2, ?3, ?4, ?5)",
++            observation_id, availability_json, capture_json, retrieval_anchor_id, owner_json,
++            origin_json
++         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+         params![
+             observation_id,
+             encode(attachment.availability())?,
+@@ -309,6 +310,7 @@
+                 .anchor()
+                 .map(|anchor| encode(anchor.owner()))
+                 .transpose()?,
++            encode(attachment.origin())?,
+         ],
+     )?;
+     Ok(())
+@@ -334,7 +336,8 @@
+     let attachment = write.repository_provenance_attachment();
+     let stored = connection
+         .query_row(
+-            "SELECT availability_json, capture_json, retrieval_anchor_id, owner_json
++            "SELECT availability_json, capture_json, retrieval_anchor_id, owner_json,
++                    origin_json
+              FROM observation_repository_provenance WHERE observation_id = ?1",
+             [observation_id],
+             |row| {
+@@ -343,10 +346,30 @@
+                     row.get::<_, Option<String>>(1)?,
+                     row.get::<_, Option<String>>(2)?,
+                     row.get::<_, Option<String>>(3)?,
++                    row.get::<_, Option<String>>(4)?,
+                 ))
+             },
+         )
+         .optional()?;
++    let Some((availability, capture, anchor_id, owner, origin_json)) = stored else {
++        return Err(invalid("observation repository provenance collision"));
++    };
++    let retained_origin = origin_json
++        .map(decode::<tracedecay_store::ObservationOriginV1>)
++        .transpose()?
++        .unwrap_or_else(|| {
++            if capture.is_some() {
++                tracedecay_store::ObservationOriginV1::IngestionOnly
++            } else {
++                tracedecay_store::ObservationOriginV1::Unavailable
++            }
++        });
++    // Capture-clock normalization below must never normalize a changed live
++    // receipt or promote a legacy row to recorded origin on duplicate replay.
++    if &retained_origin != attachment.origin() {
++        return Err(invalid("observation original provenance collision"));
++    }
++    let stored = (availability, capture, anchor_id, owner);
+     let expected = (
+         encode(attachment.availability())?,
+         attachment.provenance().map(encode).transpose()?,
+@@ -358,10 +381,8 @@
+             .map(|anchor| encode(anchor.owner()))
+             .transpose()?,
+     );
+-    if stored.as_ref() != Some(&expected) {
+-        let Some((availability, capture, anchor_id, owner)) = stored else {
+-            return Err(invalid("observation repository provenance collision"));
+-        };
++    if stored != expected {
++        let (availability, capture, anchor_id, owner) = stored;
+         let replay = repository_replay_anchor(attachment, &availability)?;
+         let Some(replay) = replay else {
+             return Err(invalid("observation repository provenance collision"));
+--- a/crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs
++++ b/crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs
+@@ -29,6 +29,7 @@
+     Option<String>,
+     Option<String>,
+     i64,
++    Option<String>,
+ );
+ 
+ /// The single projection every observation read decodes through.
+@@ -48,7 +49,7 @@
+                 SELECT 1 FROM projection_queue
+                 WHERE projection_queue.observation_id =
+                       observation.observation_id
+-            )
++            ), repository.origin_json
+      FROM observations AS observation
+      LEFT JOIN observation_retrieval_anchors AS binding
+        ON binding.observation_id = observation.observation_id
+@@ -74,6 +75,7 @@
+         row.get::<_, Option<String>>(7)?,
+         row.get::<_, Option<String>>(8)?,
+         row.get::<_, i64>(9)?,
++        row.get::<_, Option<String>>(10)?,
+     ))
+ }
+ 
+@@ -89,6 +91,7 @@
+         repository_anchor,
+         repository_owner,
+         projection_queued,
++        repository_origin,
+     ): EncodedObservationRow,
+ ) -> rusqlite::Result<StoredObservationRowV1> {
+     let repository_availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1> =
+@@ -131,8 +134,12 @@
+     if repository_owner != expected_repository_owner {
+         return Err(invalid("observation repository owner binding mismatch"));
+     }
++    let repository_origin = repository_origin
++        .map(decode::<tracedecay_store::ObservationOriginV1>)
++        .transpose()?;
+     let repository_provenance =
+         RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
++            .and_then(|attachment| attachment.with_retained_origin(repository_origin))
+             .map_err(invalid)?;
+     ObservationCommitReceipt::new(
+         sequence,
+--- a/crates/tracedecay-global-db/src/observation/schema.rs
++++ b/crates/tracedecay-global-db/src/observation/schema.rs
+@@ -8,9 +8,11 @@
+ /// Typed reset authority for the observation store. No observation shape has
+ /// ever shipped in a published release (`observations` is absent from both the
+ /// v0.0.66 package and `origin/master`), so any schema drift here is a
+-/// branch-local development artifact and refuses admission with
++/// incompatible branch-local development artifact and refuses admission with
+ /// [`ResetRequired`](tracedecay_domain::errors::TraceDecayError::ResetRequired)
+-/// instead of migrating.
++/// instead of migrating. The nullable live-origin evidence column is an
++/// additive exception: old rows keep their unknown origin without rewriting
++/// their canonical observation or repository capture.
+ pub const OBSERVATION_AUTHORITY: &str = "observations";
+ 
+ /// Marker proving `observations` was created with the canonical AUTOINCREMENT
+@@ -379,6 +381,7 @@
+             capture_json TEXT CHECK(capture_json IS NULL OR json_valid(capture_json)),
+             retrieval_anchor_id TEXT UNIQUE,
+             owner_json TEXT CHECK(owner_json IS NULL OR json_valid(owner_json)),
++            origin_json TEXT CHECK(origin_json IS NULL OR json_valid(origin_json)),
+             CHECK((capture_json IS NULL) = (retrieval_anchor_id IS NULL)),
+             CHECK((owner_json IS NULL) = (retrieval_anchor_id IS NULL)),
+             FOREIGN KEY(observation_id) REFERENCES observations(observation_id),
+@@ -453,6 +456,17 @@
+     conn.execute_batch(OBSERVATION_AUTHORITY_SCHEMA_SQL)
+         .await
+         .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
++    super::super::ensure_table_columns(
++        conn,
++        "observation_repository_provenance",
++        &[(
++            "origin_json",
++            "ALTER TABLE observation_repository_provenance ADD COLUMN origin_json TEXT \
++             CHECK(origin_json IS NULL OR json_valid(origin_json))",
++        )],
++    )
++    .await
++    .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
+     if !table_preexisted {
+         conn.execute(
+             "INSERT OR IGNORE INTO global_schema_migrations(migration) VALUES (?1)",
+--- a/crates/tracedecay-global-db/src/schema_contract/definitions.rs
++++ b/crates/tracedecay-global-db/src/schema_contract/definitions.rs
+@@ -437,6 +437,7 @@
+             column("capture_json", "TEXT", false, None, 0),
+             column("retrieval_anchor_id", "TEXT", false, None, 0),
+             column("owner_json", "TEXT", false, None, 0),
++            column("origin_json", "TEXT", false, None, 0),
+         ],
+         [
+             foreign_key(
+--- a/crates/tracedecay-global-db/src/observation/codec.rs
++++ b/crates/tracedecay-global-db/src/observation/codec.rs
+@@ -33,6 +33,7 @@
+     availability_json: &str,
+     capture_json: Option<&str>,
+     anchor_json: Option<&str>,
++    origin_json: Option<&str>,
+     operation: &'static str,
+ ) -> ObservationStoreResult<RepositoryProvenanceAttachmentV1> {
+     let availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1> =
+@@ -43,12 +44,16 @@
+     if availability.value() != capture.as_ref() {
+         return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
+     }
++    let origin = origin_json
++        .map(|origin| decode::<tracedecay_store::ObservationOriginV1>(origin, operation))
++        .transpose()?;
+     RepositoryProvenanceAttachmentV1::new(
+         availability,
+         anchor_json
+             .map(|anchor| decode::<RetrievalAnchorRecordV2>(anchor, operation))
+             .transpose()?,
+-    )
++    )?
++    .with_retained_origin(origin)
+ }
+ 
+ pub(super) fn decode_sequence(value: i64, operation: &'static str) -> ObservationStoreResult<u64> {
+--- a/crates/tracedecay-global-db/src/observation/persist.rs
++++ b/crates/tracedecay-global-db/src/observation/persist.rs
+@@ -48,6 +48,9 @@
+     let repository_anchor_json = row
+         .get::<Option<String>>(7)
+         .map_err(|error| storage(operation, error))?;
++    let repository_origin_json = row
++        .get::<Option<String>>(8)
++        .map_err(|error| storage(operation, error))?;
+     Ok(Some(
+         ObservationCommitReceipt::new(
+             sequence,
+@@ -62,6 +65,7 @@
+                 &repository_availability_json,
+                 repository_capture_json.as_deref(),
+                 repository_anchor_json.as_deref(),
++                repository_origin_json.as_deref(),
+                 operation,
+             )?,
+         )?,
+@@ -77,7 +81,8 @@
+         "SELECT observation.sequence, observation.observation_json,
+                 observation.committed_cursor_json, anchor.anchor_json,
+                 anchor.projection_generation, repository.availability_json,
+-                repository.capture_json, repository_anchor.anchor_json
++                repository.capture_json, repository_anchor.anchor_json,
++                repository.origin_json
+          FROM observations AS observation
+          JOIN observation_retrieval_anchors AS binding
+            ON binding.observation_id = observation.observation_id
+--- a/crates/tracedecay-global-db/src/observation_adapter.rs
++++ b/crates/tracedecay-global-db/src/observation_adapter.rs
+@@ -1171,7 +1171,7 @@
+             EXISTS(
+                 SELECT 1 FROM projection_queue
+                 WHERE projection_queue.observation_id = observation.observation_id
+-            )
++            ), repository.origin_json
+      FROM observations AS observation
+      LEFT JOIN observation_retrieval_anchors AS binding
+        ON binding.observation_id = observation.observation_id
+@@ -1304,8 +1304,14 @@
+                 "observation repository owner binding mismatch",
+             ));
+         }
++        let repository_origin = row
++            .get::<Option<String>>(11)
++            .map_err(|error| runtime_storage_error(operation, error))?
++            .map(|encoded| decode_json::<tracedecay_store::ObservationOriginV1>(encoded, operation))
++            .transpose()?;
+         let repository_provenance =
+             RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
++                .and_then(|attachment| attachment.with_retained_origin(repository_origin))
+                 .map_err(|error| runtime_storage_error(operation, error))?;
+         let projection_queued = row
+             .get::<i64>(10)
+--- a/crates/tracedecay-global-db/src/observation/retention.rs
++++ b/crates/tracedecay-global-db/src/observation/retention.rs
+@@ -800,7 +800,8 @@
+     // IS NULL)` satisfied.
+     let sql = format!(
+         "SELECT p.observation_id,
+-                LENGTH(p.availability_json) + LENGTH(COALESCE(p.capture_json, '')) AS len,
++                LENGTH(p.availability_json) + LENGTH(COALESCE(p.capture_json, ''))
++                    + LENGTH(COALESCE(p.origin_json, '')) AS len,
+                 (
+                     SELECT d.effective_at
+                     FROM retrieval_anchor_dispositions d
+@@ -871,7 +872,7 @@
+             .join(",");
+         let sql = format!(
+             "UPDATE observation_repository_provenance
+-             SET availability_json = ?1, capture_json = ?1
++             SET availability_json = ?1, capture_json = ?1, origin_json = NULL
+              WHERE observation_id IN ({placeholders})"
+         );
+         let mut values = Vec::with_capacity(chunk.len() + 1);
+--- a/crates/tracedecay-global-db/src/observation/retention/restore.rs
++++ b/crates/tracedecay-global-db/src/observation/retention/restore.rs
+@@ -60,7 +60,8 @@
+                      SELECT current.capture_json
+                      FROM current_authority.observation_repository_provenance AS current
+                      WHERE current.observation_id = staging.observation_id
+-                 )
++                 ),
++                 origin_json = NULL
+              WHERE EXISTS(
+                  SELECT 1
+                  FROM current_authority.observation_repository_provenance AS current

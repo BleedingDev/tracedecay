@@ -556,10 +556,7 @@ impl SemanticModelLifecycleOwnerV1 {
     /// Check that a persisted lifecycle state still owns verified bytes. The
     /// private install path is rehashed in full; shared installs are admitted
     /// through the artifact store's own content-addressed verifier.
-    fn lifecycle_state_path_is_admissible(
-        &self,
-        state: &SemanticModelLifecycleStateV1,
-    ) -> bool {
+    fn lifecycle_state_path_is_admissible(&self, state: &SemanticModelLifecycleStateV1) -> bool {
         let Some(path) = install_path_of(state) else {
             return true;
         };
@@ -573,7 +570,13 @@ impl SemanticModelLifecycleOwnerV1 {
         // artifact store's content-addressed directory. Distinguish those
         // cases by the path itself; using only the lifecycle digest would
         // demote every valid shared install on restart.
-        if path == install_path_for(&self.root, &model.model_id, &model.source.revision, &catalog_digest)
+        if path
+            == install_path_for(
+                &self.root,
+                &model.model_id,
+                &model.source.revision,
+                &catalog_digest,
+            )
         {
             // `existing_install_path` validates the derived path, install
             // metadata, every declared member length, and every SHA-256 pin.
@@ -1001,9 +1004,7 @@ impl SemanticModelLifecycleOwnerV1 {
     }
 
     /// Queue background acquisition after semantic retrieval is demanded.
-    pub fn enqueue_demand_acquisition_if_needed(
-        &self,
-    ) -> Result<bool, ModelLifecycleErrorV1> {
+    pub fn enqueue_demand_acquisition_if_needed(&self) -> Result<bool, ModelLifecycleErrorV1> {
         let status = self.status();
         let selected_model = status.selected_model.clone();
         if !status.auto_download {
@@ -1023,6 +1024,19 @@ impl SemanticModelLifecycleOwnerV1 {
             return Ok(false);
         }
         self.spawn_acquire(true, selected_model.as_deref())
+    }
+
+    /// Queue acquisition only for an explicit administrative request.
+    ///
+    /// This bypasses the automatic-acquisition preference while preserving the
+    /// selected model, acquisition epoch, catalog pins, and verified install
+    /// publication owned by this lifecycle. Query execution never calls it.
+    pub fn begin_explicit_acquisition(&self) -> Result<bool, ModelLifecycleErrorV1> {
+        let model_id = self
+            .status()
+            .selected_model
+            .ok_or(ModelLifecycleErrorV1::Rejected)?;
+        self.spawn_acquire(false, Some(&model_id))
     }
 
     pub fn retry(&self) -> Result<SemanticModelLifecycleStatusV1, ModelLifecycleErrorV1> {
@@ -1517,7 +1531,6 @@ impl SemanticModelLifecycleOwnerV1 {
         if worker.handle.is_some() {
             return Ok(false);
         }
-        let epoch = self.acquisition.begin_epoch();
         let root = self.root.clone();
         let catalog = self.catalog.clone();
         let source = Arc::clone(&self.source);
@@ -1546,6 +1559,10 @@ impl SemanticModelLifecycleOwnerV1 {
         let Some(model_id) = selected else {
             return Ok(false);
         };
+        if !cfg!(all(feature = "semantic-fastembed", not(windows))) {
+            return Err(ModelLifecycleErrorV1::AcquisitionUnavailable);
+        }
+        let epoch = self.acquisition.begin_epoch();
         let worker_root = root.clone();
         let worker_catalog = catalog.clone();
         let worker_model_id = model_id.clone();

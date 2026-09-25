@@ -191,6 +191,9 @@ pub enum CognitiveRecallMountError {
     /// The canonical session identity is not a usable identifier.
     #[error("canonical session identity is empty, untrimmed, or carries control characters")]
     SessionIdentityInvalid,
+    /// The host-private Native session binding could not be retained.
+    #[error("canonical Native session binding authority is unavailable")]
+    SessionBindingUnavailable,
     /// The admission ledger could not be opened or initialised.
     #[error("recall admission ledger at {path} could not be opened: {source}")]
     LedgerOpen {
@@ -218,6 +221,7 @@ impl CognitiveRecallMountError {
             Self::NoActiveProviderConfigured => "recall_mount_no_active_provider",
             Self::ScopeDisagreement { .. } => "recall_mount_scope_disagreement",
             Self::SessionIdentityInvalid => "recall_mount_session_identity_invalid",
+            Self::SessionBindingUnavailable => "recall_mount_session_binding_unavailable",
             Self::LedgerOpen { .. } => "recall_mount_ledger_unopenable",
             Self::Port(error) => error.code(),
         }
@@ -1370,6 +1374,7 @@ struct SessionExactScopeBindingV1 {
     profile_id: UserProfileId,
     scope: ResolvedScope,
     canonical_session_id: String,
+    native_session_binding: Option<super::native_authority::NativeSessionBindingV1>,
 }
 
 impl ExactScopeBinding for SessionExactScopeBindingV1 {
@@ -1430,13 +1435,17 @@ impl ExactScopeBinding for SessionExactScopeBindingV1 {
                 scope.scope_digest.as_str(),
             ));
         }
+        let provider_session_id = self.native_session_binding.as_ref().map_or_else(
+            || provider_agent_session_id(&self.profile_id, &self.scope, &self.canonical_session_id),
+            |binding| binding.provider_session_id().to_owned(),
+        );
         OwnedExactScope::new(
             self.profile_id.as_str(),
             self.scope.project_id.as_str(),
             self.scope.repository_id.as_str(),
             self.scope.worktree_id.as_str(),
             reference.as_str(),
-            provider_agent_session_id(&self.profile_id, &self.scope, &self.canonical_session_id),
+            provider_session_id,
             self.scope.scope_digest.as_str(),
         )
         .map_err(ExactScopeBindingError::Contract)
@@ -1559,6 +1568,10 @@ pub(crate) struct CognitiveRecallMountInputsV1 {
     /// that stranded a worker under one session must stay refused under
     /// every other session too.
     pub(crate) invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
+    /// Host-private Native session authority shared with the selected Native
+    /// application port when Native participates in this composition.
+    pub(crate) native_session_retrieval_mount:
+        Option<Arc<super::native_authority::NativeSessionRetrievalMountV1>>,
     /// Durable host secret used for all retained identity/source projections.
     pub(crate) locator_key: control_attribution::RecallLocatorKeyV1,
 }
@@ -1876,6 +1889,8 @@ pub struct ProjectCognitiveRecallMountV1 {
     routing: ActiveRoutingPolicy,
     host_limits: ProviderLimits,
     locator_key: control_attribution::RecallLocatorKeyV1,
+    native_session_retrieval_mount:
+        Option<Arc<super::native_authority::NativeSessionRetrievalMountV1>>,
     /// Composition-time binding only; provider selection stays in the registry.
     selected_history: OnceLock<SelectedProviderHistoryV1>,
 }
@@ -2241,12 +2256,31 @@ impl ProjectCognitiveRecallMountV1 {
         {
             return Err(CognitiveRecallMountError::SessionIdentityInvalid);
         }
+        let native_session_binding = match self.native_session_retrieval_mount.as_ref() {
+            Some(mount) => {
+                let canonical_session_id =
+                    tracedecay_domain::SessionId::new(canonical_session_id.to_owned())
+                        .map_err(|_| CognitiveRecallMountError::SessionIdentityInvalid)?;
+                let provider_session_id = provider_agent_session_id(
+                    &self.profile_id,
+                    &self.scope,
+                    canonical_session_id.as_str(),
+                );
+                Some(
+                    mount
+                        .bind_session(provider_session_id, canonical_session_id)
+                        .map_err(|_| CognitiveRecallMountError::SessionBindingUnavailable)?,
+                )
+            }
+            None => None,
+        };
         ProjectCognitiveRecallPortV1::mount(CognitiveRecallPortInputsV1 {
             composition: Arc::clone(&self.composition),
             scope_binding: Arc::new(SessionExactScopeBindingV1 {
                 profile_id: self.profile_id.clone(),
                 scope: self.scope.clone(),
                 canonical_session_id: canonical_session_id.to_owned(),
+                native_session_binding,
             }),
             invocation_boundary: Arc::clone(&self.invocation_boundary),
             admission_observer: Arc::clone(&self.ledger) as Arc<dyn RecallAdmissionObserver>,
@@ -3133,6 +3167,7 @@ async fn advisory_context_recall_with_retention(
         profile_id: mount.profile_id.clone(),
         scope: mount.scope.clone(),
         canonical_session_id: inputs.canonical_session_id.to_owned(),
+        native_session_binding: None,
     }
     .bind_exact_scope(&mount.scope)
     .ok();
@@ -3555,6 +3590,7 @@ pub(crate) fn mount_project_cognitive_recall(
         routing: inputs.routing,
         host_limits: inputs.host_limits,
         locator_key: inputs.locator_key,
+        native_session_retrieval_mount: inputs.native_session_retrieval_mount,
         selected_history: OnceLock::new(),
     }))
 }
@@ -5901,18 +5937,9 @@ mod tests {
         production_mount_with_evidence_host(fixture, mode, worktree, fixture)
     }
 
-    /// The host-granted provider-state root this mount's Native port is given,
-    /// derived exactly as `production_mount_with_evidence_host` derives it.
-    fn mount_provider_state_root(fixture: &StoreFixture, worktree: &str) -> PathBuf {
-        fixture
-            .ledger_root
-            .join(worktree)
-            .join(super::super::observation_journey::PROVIDER_STATE_DIR_NAME)
-    }
-
     /// The production mount plus a handle on the very Native port it routes
-    /// to, so a test can stage a provider-local observation into the same
-    /// store the mounted recall reads.
+    /// to, so a test can exercise the same canonical project authority the
+    /// mounted recall reads.
     fn production_mount_with_native_port(
         fixture: &StoreFixture,
         worktree: &str,
@@ -5923,13 +5950,10 @@ mod tests {
         let ledger_root = fixture.ledger_root.join(worktree);
         std::fs::create_dir_all(&ledger_root).expect("ledger root for mount");
         let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-        let provider_state_root = mount_provider_state_root(fixture, worktree);
         let port = Arc::new(
             super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
                 graph_cell,
                 fixture.project_root.clone(),
-                UserProfileId::new(MOUNTED_PROFILE).expect("profile id"),
-                &provider_state_root,
             )
             .expect("construct project Native application port"),
         );
@@ -5958,6 +5982,7 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
+            native_session_retrieval_mount: None,
             locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route");
@@ -6151,13 +6176,9 @@ mod tests {
         let ledger_root = fixture.ledger_root.join(worktree);
         std::fs::create_dir_all(&ledger_root).expect("ledger root for mount");
         let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-        let provider_state_root =
-            ledger_root.join(super::super::observation_journey::PROVIDER_STATE_DIR_NAME);
         let inner = super::super::native_provider::project_native_memory_application_port(
             graph_cell,
             fixture.project_root.clone(),
-            UserProfileId::new(MOUNTED_PROFILE).expect("profile id"),
-            &provider_state_root,
         )
         .expect("construct project Native application port");
         let invocation_boundary = host_provider_invocation_boundary(1);
@@ -6185,6 +6206,7 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
+            native_session_retrieval_mount: None,
             locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route");
@@ -6207,15 +6229,9 @@ mod tests {
         let ledger_root = fixture.ledger_root.join(worktree);
         std::fs::create_dir_all(&ledger_root).expect("ledger root for mount");
         let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-        // The same host-granted provider-state root production composition
-        // grants, derived from this mount's own store data root.
-        let provider_state_root =
-            ledger_root.join(super::super::observation_journey::PROVIDER_STATE_DIR_NAME);
         let port = super::super::native_provider::project_native_memory_application_port(
             graph_cell,
             fixture.project_root.clone(),
-            UserProfileId::new(MOUNTED_PROFILE).expect("profile id"),
-            &provider_state_root,
         )
         .expect("construct project Native application port");
         let invocation_boundary = host_provider_invocation_boundary(1);
@@ -6242,6 +6258,7 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
+            native_session_retrieval_mount: None,
             locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route")

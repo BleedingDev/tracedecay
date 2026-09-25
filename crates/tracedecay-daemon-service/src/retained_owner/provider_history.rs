@@ -1245,7 +1245,7 @@ impl HookOriginReaderV1 {
         Ok(matched)
     }
 
-    fn live_boundaries(
+    pub(crate) fn live_boundaries(
         &self,
     ) -> HistoryResult<Vec<tracedecay_hooks::admission_ledger::HookLiveOriginBoundaryV1>> {
         self.validate_bound_data_root()?;

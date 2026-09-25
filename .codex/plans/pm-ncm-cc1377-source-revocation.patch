@@ -1,0 +1,177 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/store/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/store/mod.rs
+@@ -394,6 +394,8 @@
+     BudgetExceeded,
+     /// An idempotency key is already present in the event journal.
+     IdempotencyConflict,
++    /// The source is durably revoked and cannot accept a new effect.
++    SourceRevoked,
+     /// The caller supplied malformed or dimensionally invalid data.
+     InvalidInput(String),
+     /// The requested record does not exist.
+@@ -415,6 +417,7 @@
+             Self::Incompatible { field } => write!(formatter, "incompatible store field: {field}"),
+             Self::BudgetExceeded => formatter.write_str("namespace storage budget exceeded"),
+             Self::IdempotencyConflict => formatter.write_str("idempotency key already exists"),
++            Self::SourceRevoked => formatter.write_str("source has been revoked"),
+             Self::InvalidInput(reason) => write!(formatter, "invalid store input: {reason}"),
+             Self::UnknownRecord(record_id) => write!(formatter, "unknown record {}", record_id.0),
+             Self::Io(reason) => write!(formatter, "store filesystem error: {reason}"),
+@@ -1384,9 +1387,7 @@
+         )
+         .map_err(map_sqlite_error)?;
+     if revoked {
+-        return Err(StoreError::InvalidInput(
+-            "source has been revoked".to_owned(),
+-        ));
++        return Err(StoreError::SourceRevoked);
+     }
+     Ok(())
+ }
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/mod.rs
+@@ -95,6 +95,8 @@
+ pub enum RejectReason {
+     /// The same idempotency key was previously bound to another payload digest.
+     IdempotencyConflict,
++    /// A durable source revocation rejects a new effect before commit.
++    SourceRevoked,
+     /// The request was malformed or outside a declared input bound.
+     InvalidRequest(String),
+     /// A referenced record does not exist.
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/util.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/util.rs
+@@ -367,6 +367,7 @@
+         StoreError::IdempotencyConflict => {
+             EngineReply::rejected(RejectReason::IdempotencyConflict, commit_seq)
+         }
++        StoreError::SourceRevoked => EngineReply::rejected(RejectReason::SourceRevoked, commit_seq),
+         StoreError::InvalidInput(reason) | StoreError::InvalidNamespace(reason) => {
+             EngineReply::rejected(RejectReason::InvalidRequest(reason), commit_seq)
+         }
+--- a/crates/tracedecay-memory-ncm-runtime/src/privacy/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/privacy/mod.rs
+@@ -935,6 +935,7 @@
+         StoreError::IdempotencyConflict => {
+             EngineReply::rejected(RejectReason::IdempotencyConflict, commit_seq)
+         }
++        StoreError::SourceRevoked => EngineReply::rejected(RejectReason::SourceRevoked, commit_seq),
+         StoreError::InvalidInput(reason) | StoreError::InvalidNamespace(reason) => {
+             EngineReply::rejected(RejectReason::InvalidRequest(reason), commit_seq)
+         }
+--- a/crates/tracedecay-memory-ncm-runtime/src/snapshot/mod.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/snapshot/mod.rs
+@@ -1667,6 +1667,9 @@
+         crate::store::StoreError::IdempotencyConflict => {
+             EngineReply::rejected(RejectReason::IdempotencyConflict, commit_seq)
+         }
++        crate::store::StoreError::SourceRevoked => {
++            EngineReply::rejected(RejectReason::SourceRevoked, commit_seq)
++        }
+         crate::store::StoreError::InvalidInput(reason)
+         | crate::store::StoreError::InvalidNamespace(reason) => {
+             EngineReply::rejected(RejectReason::InvalidRequest(reason), commit_seq)
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
+@@ -514,7 +514,7 @@
+         &SourceId(item.source.clone()),
+         &request.map_or(Value::Null, |request| request.provenance.clone()),
+     ) {
+-        if matches!(error, crate::store::StoreError::InvalidInput(_)) {
++        if matches!(error, crate::store::StoreError::SourceRevoked) {
+             Some(("rejected", Some("source_revoked"), None))
+         } else {
+             return Some(store_reply(error, handle.commit_seq));
+--- a/crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/rust_backend/mod.rs
+@@ -1378,6 +1378,7 @@
+         Outcome::Success => TerminalCode::Success,
+         Outcome::Empty => TerminalCode::SuccessZeroResults,
+         Outcome::Rejected(RejectReason::IdempotencyConflict) => TerminalCode::Conflict,
++        Outcome::Rejected(RejectReason::SourceRevoked) => TerminalCode::Unauthorized,
+         Outcome::Rejected(RejectReason::InvalidRequest(_) | RejectReason::UnknownRecord(_)) => {
+             TerminalCode::InvalidRequest
+         }
+@@ -1403,6 +1404,7 @@
+     match outcome {
+         Outcome::Success | Outcome::Empty => "ncm.rust.success",
+         Outcome::Rejected(RejectReason::IdempotencyConflict) => "ncm.rust.idempotency_conflict",
++        Outcome::Rejected(RejectReason::SourceRevoked) => "ncm.rust.source_revoked",
+         Outcome::Rejected(_) => "ncm.rust.request_rejected",
+         Outcome::Busy => "ncm.rust.worker_busy",
+         Outcome::Cancelled => "ncm.rust.worker_cancelled",
+@@ -1509,3 +1511,20 @@
+     }
+     output
+ }
++
++#[cfg(test)]
++mod source_revocation_tests {
++    use super::*;
++
++    #[test]
++    fn revocation_is_unauthorized_without_reclassifying_invalid_requests() {
++        let revoked = Outcome::Rejected(RejectReason::SourceRevoked);
++        assert_eq!(outcome_terminal_code(&revoked), TerminalCode::Unauthorized);
++        assert_eq!(outcome_diagnostic(&revoked), "ncm.rust.source_revoked");
++        let malformed = Outcome::Rejected(RejectReason::InvalidRequest("invalid field".into()));
++        assert_eq!(
++            outcome_terminal_code(&malformed),
++            TerminalCode::InvalidRequest
++        );
++    }
++}
+--- a/crates/tracedecay-memory-ncm-runtime/tests/deletion.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/deletion.rs
+@@ -683,9 +683,7 @@
+         let rejected = engine.observe(&namespace, fresh);
+         assert_eq!(
+             rejected.outcome,
+-            Outcome::Rejected(RejectReason::InvalidRequest(
+-                "source has been revoked".to_owned()
+-            ))
++            Outcome::Rejected(RejectReason::SourceRevoked)
+         );
+         assert_eq!(rejected.state_generation, deleted.state_generation);
+ 
+@@ -859,9 +857,7 @@
+     let rejected = engine.observe(&namespace, request.clone());
+     assert_eq!(
+         rejected.outcome,
+-        Outcome::Rejected(RejectReason::InvalidRequest(
+-            "source has been revoked".to_owned()
+-        ))
++        Outcome::Rejected(RejectReason::SourceRevoked)
+     );
+     assert_eq!(encoder.encode_calls.load(Ordering::Relaxed), 2);
+     let after_deletion = inspect(&engine, &namespace);
+@@ -890,3 +886,29 @@
+         "rejection consumes no record identity"
+     );
+ }
++
++#[test]
++fn source_revocation_adds_a_wire_case_without_changing_existing_rejections() {
++    let cases = [
++        (
++            RejectReason::IdempotencyConflict,
++            json!("idempotency_conflict"),
++        ),
++        (
++            RejectReason::InvalidRequest("invalid".into()),
++            json!({"invalid_request": "invalid"}),
++        ),
++        (
++            RejectReason::UnknownRecord(RecordId(7)),
++            json!({"unknown_record": 7}),
++        ),
++        (RejectReason::SourceRevoked, json!("source_revoked")),
++    ];
++    for (reason, encoded) in cases {
++        assert_eq!(serde_json::to_value(&reason).unwrap(), encoded);
++        assert_eq!(
++            serde_json::from_value::<RejectReason>(encoded).unwrap(),
++            reason
++        );
++    }
++}

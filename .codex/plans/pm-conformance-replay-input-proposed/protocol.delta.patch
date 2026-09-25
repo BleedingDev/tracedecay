@@ -1,0 +1,22 @@
+--- a/product/contracts/memory-provider-v1/common-advisory-profile.md
++++ b/product/contracts/memory-provider-v1/common-advisory-profile.md
+@@ -94,6 +94,19 @@
+ original canonical envelope, the history grant covers every source, and the
+ source sequence/order matches the admitted replay bounds. The provider never
+ looks up the host's canonical database to resolve these receipts.
++
++
++Replay fixtures respect the existing contiguous sequence and acknowledged-cursor
++contract. An ordinary Observe or SnapshotRestore does not itself establish a
++replay acknowledgement. A page that changes no observation, effect or fence
++leaves acknowledgement and generation unchanged. Successor pages therefore
++include the full contiguous source range from the actual replay cursor, including
++sources currently deleted by the host. Each grant entry carries that source's
++actual current disposition; privacy checks still reject deleted sources. A fresh
++key repeating a completed page binds `expected_previous_acknowledged_sequence`
++to the actual prior Replay reply's `acknowledged_sequence`, while source-already-
++applied and rejected counts retain their separate meanings. No fixture assumes
++an acknowledgement from an unrelated Observe or restore generation.
+ 
+ Snapshot export returns `snapshot: { "identity": …, "bytes": [0..255],
+ "sources": […] }`. Identity uses the existing snapshot identity fields; its

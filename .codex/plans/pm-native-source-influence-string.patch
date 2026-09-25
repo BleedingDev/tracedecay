@@ -1,0 +1,68 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+@@ -3115,11 +3115,22 @@
+             } else {
+                 "available"
+             };
++            let effect_summary = serde_json::json!({
++                "ranking_bias": row.get::<_, f64>(3)?,
++                "feedback_suppressed": suppressed,
++                "validity": validity,
++            })
++            .to_string();
++            if effect_summary.len() > 8192 {
++                return Err(StagedStoreError::ValueOutOfRange {
++                    field: "provider_local_effect_summary",
++                });
++            }
+             item = serde_json::json!({"target":{"provider_id":call.provider_id.as_str(),"registration_revision":call.registration_revision,
+                 "original_scope":attribution["origin_scope"],"delivery_scope":scope_json(&call.exact_scope),"source":attribution["source"],
+                 "reference":{"kind":"stable_memory_ref","reference":reference}},"source":attribution["source"],
+                 "active":!tombstone&&!suppressed&&disposition=="available","disposition":disposition,"settled_feedback":feedback,"last_feedback_receipt":last,
+-                "provider_local_effect_summary":{"ranking_bias":row.get::<_,f64>(3)?,"feedback_suppressed":suppressed,"validity":validity}});
++                "provider_local_effect_summary":effect_summary});
+         }
+         let size = item.to_string().len() + 1;
+         if items.len() >= maximum as usize || bytes + size > byte_limit {
+--- a/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_common_tests.rs
+@@ -1062,9 +1062,16 @@
+         influence["items"][0]["last_feedback_receipt"],
+         settled["provider_receipt_digest"]
+     );
+-    assert_eq!(
+-        influence["items"][0]["provider_local_effect_summary"]["ranking_bias"],
+-        0.5
++    let effect_summary = influence["items"][0]["provider_local_effect_summary"]
++        .as_str()
++        .expect("source influence summary is a string");
++    assert!(!effect_summary.is_empty() && effect_summary.len() <= 8192);
++    let effect: Value = serde_json::from_str(effect_summary).expect("complete effect details");
++    assert_eq!(effect["ranking_bias"], 0.5);
++    assert_eq!(effect["feedback_suppressed"], false);
++    assert_eq!(
++        effect["validity"],
++        original["source_identity"]["original_source"]["validity"]
+     );
+     let retry = fresh.invoke(&common_call(
+         &fresh,
+@@ -1381,9 +1388,16 @@
+     assert_eq!(decay["changed_items"], 1);
+     let influence=body(&provider.invoke(&common_call(&provider,&scope,ProviderOperation::Inspection,"maintenance-influence",
+         inspection("source_influence",json!({"source_key":active["source_identity"]["original_source"]["source"]["source_key"]})))));
+-    assert_eq!(
+-        influence["items"][0]["provider_local_effect_summary"]["ranking_bias"],
+-        0.45
++    let effect_summary = influence["items"][0]["provider_local_effect_summary"]
++        .as_str()
++        .expect("source influence summary is a string");
++    assert!(!effect_summary.is_empty() && effect_summary.len() <= 8192);
++    let effect: Value = serde_json::from_str(effect_summary).expect("complete effect details");
++    assert_eq!(effect["ranking_bias"], 0.45);
++    assert_eq!(effect["feedback_suppressed"], false);
++    assert_eq!(
++        effect["validity"],
++        active["source_identity"]["original_source"]["validity"]
+     );
+     assert_eq!(
+         recall_common(

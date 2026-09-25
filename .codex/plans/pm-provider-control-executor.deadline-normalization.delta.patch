@@ -1,0 +1,238 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+@@ -6,6 +6,7 @@
+ use std::future::Future;
+ use std::path::PathBuf;
+ use std::sync::Arc;
++use std::sync::atomic::{AtomicU8, Ordering};
+ 
+ use serde_json::Value;
+ use tracedecay_contracts::retained_surfaces::{
+@@ -36,7 +37,7 @@
+     ProjectObservationJourneyV1,
+     control_dispatch::{
+         JourneyControlDispatchErrorV1, JourneyControlDispatchReplyV1,
+-        JourneyControlDispatchRequestV1,
++        JourneyControlDispatchRequestV1, JourneyControlNotDispatchedV1,
+     },
+ };
+ use super::provider_history::ProviderHistoryErrorV1;
+@@ -224,6 +225,13 @@
+     }
+ }
+ 
++#[repr(u8)]
++#[derive(Clone, Copy)]
++enum ControlStopCauseV1 {
++    Caller = 1,
++    Deadline = 2,
++}
++
+ /// One authenticated request's controls. The monotonic deadline is fixed once;
+ /// every clone of OperationControl shares the original elapsed budget and token.
+ pub(super) struct ControlInvocationV1<'a, 'context> {
+@@ -232,6 +240,8 @@
+     pub(super) control: OperationControl,
+     pub(super) identity: ControlOperationIdentityV1,
+     deadline: tokio::time::Instant,
++    /// Shared by nested stages; the first observed host stop cause wins.
++    stop_cause: AtomicU8,
+ }
+ 
+ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
+@@ -297,21 +307,66 @@
+                 )?,
+             },
+             deadline: tokio::time::Instant::now() + std::time::Duration::from_micros(remaining),
++            stop_cause: AtomicU8::new(0),
+         };
+         invocation.check()?;
+         Ok(invocation)
++    }
++
++    fn stop(&self, cause: ControlStopCauseV1) {
++        let _ =
++            self.stop_cause
++                .compare_exchange(0, cause as u8, Ordering::AcqRel, Ordering::Acquire);
++        self.control.cancellation().cancel();
++    }
++
++    fn normalize_control_refusal<T>(&self, result: ControlResult<T>) -> ControlResult<T> {
++        if self.stop_cause.load(Ordering::Acquire) != ControlStopCauseV1::Deadline as u8 {
++            return result;
++        }
++        result.map_err(|mut failure| {
++            // OperationControl checks its cancellation token first. A host
++            // deadline uses that token to stop work, but remains a timeout.
++            // Change only explicit control refusals, preserving all receipts,
++            // actual provider replies, and possible post-contact effects.
++            let code = match &mut failure.stage {
++                ControlFailureStageV1::Control(code)
++                | ControlFailureStageV1::Attribution(RecallControlAttributionErrorV1::Control(
++                    code,
++                ))
++                | ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(code)) => {
++                    Some(code)
++                }
++                ControlFailureStageV1::Dispatch {
++                    error:
++                        JourneyControlDispatchErrorV1::NotDispatched(
++                            JourneyControlNotDispatchedV1::Control(code),
++                        ),
++                    ..
++                } => Some(code),
++                _ => None,
++            };
++            if let Some(code) = code {
++                if *code == TerminalCode::Cancelled {
++                    *code = TerminalCode::DeadlineExceeded;
++                }
++            }
++            failure
++        })
+     }
+ 
+     pub(super) fn check(&self) -> ControlResult<()> {
+         if self.context.cancellation_signal.is_cancelled()
+             || self.context.request_context.cancellation().is_cancelled()
+         {
+-            self.control.cancellation().cancel();
+-        }
+-        self.control
+-            .snapshot()
+-            .map(|_| ())
+-            .map_err(|code| ControlFailureV1::new(ControlFailureStageV1::Control(code)))
++            self.stop(ControlStopCauseV1::Caller);
++        }
++        self.normalize_control_refusal(
++            self.control
++                .snapshot()
++                .map(|_| ())
++                .map_err(|code| ControlFailureV1::new(ControlFailureStageV1::Control(code))),
++        )
+     }
+ 
+     /// Forward cancellation/deadline but retain ownership of the stage until it
+@@ -322,18 +377,19 @@
+     ) -> ControlResult<T> {
+         self.check()?;
+         tokio::pin!(future);
+-        tokio::select! {
++        let result = tokio::select! {
+             biased;
+             () = self.context.cancellation_signal.cancelled() => {
+-                self.control.cancellation().cancel();
++                self.stop(ControlStopCauseV1::Caller);
+                 future.await
+             }
+             () = tokio::time::sleep_until(self.deadline) => {
+-                self.control.cancellation().cancel();
++                self.stop(ControlStopCauseV1::Deadline);
+                 future.await
+             }
+             result = &mut future => result,
+-        }
++        };
++        self.normalize_control_refusal(result)
+     }
+ }
+ 
+@@ -901,6 +957,97 @@
+         };
+         let (result, ()) = tokio::join!(run, cancel);
+         assert_eq!(result.unwrap(), "actual settled result");
++        // A nested stage may see the deadline after the caller stopped it.
++        // The original caller cancellation still owns the refusal cause.
++        invocation.stop(ControlStopCauseV1::Deadline);
++        let refusal: ControlResult<()> = invocation.normalize_control_refusal(Err(
++            ControlFailureV1::new(ControlFailureStageV1::Authority(
++                ProviderHistoryErrorV1::Control(TerminalCode::Cancelled),
++            )),
++        ));
++        assert!(matches!(
++            refusal,
++            Err(ControlFailureV1 {
++                stage: ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
++                    TerminalCode::Cancelled
++                )),
++                ..
++            })
++        ));
++    }
++
++    #[tokio::test]
++    async fn deadline_joins_nested_stage_and_only_normalizes_control_refusal() {
++        for refuse in [true, false] {
++            let (request_context, signal) = context("actor.one", "request.one", "worktree.one");
++            let request_context = request_context.with_deadline(
++                Deadline::new(UtcMicros(tracedecay_contracts::now_micros().0 + 100_000)).unwrap(),
++            );
++            let request = health_request();
++            let operation =
++                tracedecay_contracts::retained_surface_application_operation(request.operation())
++                    .unwrap();
++            let context = RetainedSurfaceExecutionContextV1 {
++                request_context: &request_context,
++                cancellation_signal: &signal,
++                operation: &operation,
++                observed_at: tracedecay_contracts::now_micros(),
++            };
++            let invocation = ControlInvocationV1::new(&context, &request).unwrap();
++            let settled = std::sync::atomic::AtomicBool::new(false);
++            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
++            let (settle_tx, settle_rx) = tokio::sync::oneshot::channel();
++            let run = invocation.run_controlled(invocation.run_controlled(async {
++                entered_tx.send(()).unwrap();
++                settle_rx.await.unwrap();
++                assert_eq!(
++                    invocation.control.snapshot().unwrap_err(),
++                    TerminalCode::Cancelled
++                );
++                settled.store(true, Ordering::Release);
++                if refuse {
++                    Err(ControlFailureV1::new(ControlFailureStageV1::Authority(
++                        ProviderHistoryErrorV1::Control(TerminalCode::Cancelled),
++                    )))
++                } else {
++                    Ok("actual settled result")
++                }
++            }));
++            let release = async {
++                entered_rx.await.unwrap();
++                tokio::time::sleep_until(invocation.deadline).await;
++                tokio::task::yield_now().await;
++                assert!(invocation.control.cancellation().is_cancelled());
++                assert!(!signal.is_cancelled());
++                assert!(
++                    !settled.load(Ordering::Acquire),
++                    "deadline must keep joining the stage"
++                );
++                settle_tx.send(()).unwrap();
++            };
++            let (result, ()) = tokio::join!(run, release);
++            assert!(settled.load(Ordering::Acquire));
++            if refuse {
++                assert!(matches!(
++                    result,
++                    Err(ControlFailureV1 {
++                        stage: ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
++                            TerminalCode::DeadlineExceeded
++                        )),
++                        ..
++                    })
++                ));
++            } else {
++                assert_eq!(result.unwrap(), "actual settled result");
++            }
++            assert!(matches!(
++                invocation.check(),
++                Err(ControlFailureV1 {
++                    stage: ControlFailureStageV1::Control(TerminalCode::DeadlineExceeded),
++                    ..
++                })
++            ));
++        }
+     }
+ 
+     #[tokio::test]

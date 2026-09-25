@@ -1,0 +1,22 @@
+{
+  "patch": ".codex/plans/pm-core-fixture-failures.delta.patch",
+  "patch_sha256": "6ebe289e5830170b52d9cd802bc3761f182b38decc777f035c9c0a2bf76b2f89",
+  "files": [
+    {
+      "path": "crates/tracedecay/src/application_surface/tests.rs",
+      "baseline_sha256": "c28886257f0866145e86deb9bffa142190f4913828b91601099df88f5256be73",
+      "proposed_sha256": "0f8b99ac000fa41a4322372098cfd894120c5ecee8e398df293d853fac9b156e"
+    },
+    {
+      "path": "crates/tracedecay/src/daemon/http_application_tests.rs",
+      "baseline_sha256": "80bddaf8779228b4a5a7ac4f0c3bdf4907b22775d2afcb8f69cb27483b28a902",
+      "proposed_sha256": "cc0edc6cace62296b5f0f8078b864be7b602962d09ee136804fafe8b800d059b"
+    },
+    {
+      "path": "crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs",
+      "baseline_sha256": "90a9836d68ed36754516752ce3d3a4747db1ad8250bfe0ede2b77c724315293e",
+      "proposed_sha256": "7eb9912de2eb6668f8d3b15d6dcf9d51a1cc627a6d8c87cd15db081b88425953"
+    }
+  ],
+  "scope": "DRAFT ONLY; no live apply, no Cargo; baseline captured before root PR707 integration"
+}

@@ -1,0 +1,71 @@
+{
+  "baseline": "/var/folders/l5/j97t559s5ljgmjc_ylqn1jmh0000gn/T/pm-origin-persistence-3ai9wetw",
+  "patch_sha256": "5a0f81226540e8c38dfa9b6e3760a7127aa4fe606c79856fce4f983e7ca94925",
+  "files": [
+    {
+      "path": "crates/tracedecay-store/src/observation/anchored_write.rs",
+      "before_sha256": "5453a21a02578255f1532ba3c1f5bf0bdd18e3c97052f2f1824c2f05b5499ee8",
+      "after_sha256": "48cf3a108a0799f887bb928f5018c13032828f0b54367d146b6793a1f1326497"
+    },
+    {
+      "path": "crates/tracedecay-rusqlite-runtime/src/repository/observation/authority.rs",
+      "before_sha256": "185254d4f4546a098f0df011eb4879fed360aeef413392d64b16400485725b39",
+      "after_sha256": "896eab1a8273782bf0ce602426a5761e7cbdd4ce48c7c3ddee3b93b45d166139"
+    },
+    {
+      "path": "crates/tracedecay-rusqlite-runtime/src/repository/observation/rows.rs",
+      "before_sha256": "8b7613198f709bd7d3e3e8d98d65877e9e745f91b54c13dfb0c9ee58b68e3415",
+      "after_sha256": "129338eb2a5a21f610f67527fdcdae59a185bea11cbc627f444f037df3820f36"
+    },
+    {
+      "path": "crates/tracedecay-rusqlite-runtime/src/repository/observation/tests.rs",
+      "before_sha256": "a992ac03006a76185822d948550d3d39e885153d6207bb991b9a4c078db2d48c",
+      "after_sha256": "63737bc90949324e202bac07386890293211f1f5b2cd943ae90a785a217338f6"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation/schema.rs",
+      "before_sha256": "b144bf39f23e94761724b3181e547486567b8e0666b67a20c4880279bc9db499",
+      "after_sha256": "5bfccdcd9418d3393d0fa2e18dfecdd293d3499d8a1b872a023b040fb3002ab0"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/schema_contract/definitions.rs",
+      "before_sha256": "3053f4837ab64e7887acd78c0469758a4847017517deaddb88425316e3c85d9d",
+      "after_sha256": "9333ef41b04e321241bd29c1684c139bf90743fbd1c307ac91a6e918d34a5cb4"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation/codec.rs",
+      "before_sha256": "abbeb26914f8f33fa0ca94694f8c4bf0ca5ffecabc8564ba6b132008c94d5ad1",
+      "after_sha256": "76d9f48eac6a0c57fdd37b3fafadabf908541f87bd1434753738be701aed2fb8"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation/persist.rs",
+      "before_sha256": "7732c0ef45834c7701680a6a29a0cce75b08ef14cd92b277640972c79ba3d944",
+      "after_sha256": "47eed6f2c9df7c4e92a091138ba67ac406fab97bca2e29f9914dae64f51651b4"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation_adapter.rs",
+      "before_sha256": "867f0b211164171e1362de6029cfdd9c2248b9ea1da39dab7d358300859060d4",
+      "after_sha256": "e42f0a50c2b96346adf3b2d152de39c33e1ce56558f0ff3cadd49c12024ea3c7"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation/retention.rs",
+      "before_sha256": "56fc4ce3e1ec2e1fd2a4742006d123c234ea81f72889366b18374a027ff8eac0",
+      "after_sha256": "fc806fed038c4e2f5afb92e4895eb6856a27407202741a9331ec79c97393fde2"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation/retention/restore.rs",
+      "before_sha256": "ccf9fd20ae0b100cc73bce02cedfc63d22f7fd7a7ae4f5001ed7d41da8615ad6",
+      "after_sha256": "bf97fac3ebf439f79fe82958b0009e5f8530a5708015f77149c3811c5020da6c"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation/retention/tests.rs",
+      "before_sha256": "f09e7a83839ffef567b9abaf1a86b89407a7aef2d188aaffad96a7270a7be015",
+      "after_sha256": "f710dc07b27130071923abbaca236314da744bb14b8e3dc2a6ee2a907a209f16"
+    },
+    {
+      "path": "crates/tracedecay-global-db/src/observation_batch_tests.rs",
+      "before_sha256": "4cd9284480ae2f66df9cd871fd50b061ad59cc295f3e9032f29552bc1b543d18",
+      "after_sha256": "3d857d3bcfdb4697cbad0e6713507f13d2abec05ca2072bde69bb846c4180f91"
+    }
+  ]
+}

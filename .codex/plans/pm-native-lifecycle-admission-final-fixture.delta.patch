@@ -1,0 +1,43 @@
+--- a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+@@ -1566,7 +1566,8 @@
+     fn native_claude_stop(path: &Path) -> (String, NativeIdentityFields) {
+         let payload = serde_json::json!({
+             "hook_event_name": "Stop", "session_id": "session-one",
+-            "transcript_path": path, "cwd": "/workspace", "stop_hook_active": false
++            "transcript_path": path, "cwd": "/workspace", "stop_hook_active": false,
++            "permission_mode": "default", "last_assistant_message": "finished"
+         })
+         .to_string();
+         let fields: NativeIdentityFields = serde_json::from_str(&payload).unwrap();
+@@ -1684,6 +1685,7 @@
+         fields.session_id = Some("session-one".to_owned());
+         fields.transcript_path = None;
+         assert!(check(&fields, native_lifecycle_deadline(Instant::now())).is_none());
++        std::fs::write(home.path().join("session-one.jsonl"), b"{}\n").unwrap();
+         for candidate in [
+             home.path().join("session-one.jsonl"),
+             std::path::PathBuf::from("session-one.jsonl"),
+@@ -1701,6 +1703,9 @@
+         assert!(check(&fields, native_lifecycle_deadline(Instant::now())).is_none());
+         std::fs::remove_file(&path).unwrap();
+         assert!(check(&fields, native_lifecycle_deadline(Instant::now())).is_none());
++        std::fs::create_dir(&path).unwrap();
++        assert!(check(&fields, native_lifecycle_deadline(Instant::now())).is_none());
++        std::fs::remove_dir(&path).unwrap();
+         #[cfg(unix)]
+         {
+             let target = directory.join("target.jsonl");
+--- a/crates/tracedecay-agent-hosts/src/hooks/codex.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/codex.rs
+@@ -190,7 +190,9 @@
+     let runtime = crate::ports::hook_runtime::crate_test_runtime();
+     let event = serde_json::json!({
+         "hook_event_name": "Stop", "session_id": "session-stop-reserve",
+-        "turn_id": "turn-one", "stop_hook_active": false
++        "turn_id": "turn-one", "cwd": "/workspace", "model": "codex",
++        "permission_mode": "default", "stop_hook_active": false,
++        "last_assistant_message": "finished"
+     });
+     let started = Instant::now() - std::time::Duration::from_millis(900);
+     assert!(

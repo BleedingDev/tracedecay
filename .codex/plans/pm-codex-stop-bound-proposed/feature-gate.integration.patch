@@ -1,0 +1,30 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/terminal.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/terminal.rs
+@@ -76,16 +76,18 @@
+                     None => None,
+                 };
+                 let stop_bound = match (graph.as_deref(), project.as_ref()) {
+-                    (Some(cg), Some((_, sessions))) => Some(
+-                        retained_codex_source_bound(
+-                            cg,
+-                            sessions,
+-                            profile_identity.as_ref(),
+-                            &task_session_id,
+-                            &cancellation,
++                    (Some(cg), Some((_, sessions))) if cfg!(feature = "memory-provider-host") => {
++                        Some(
++                            retained_codex_source_bound(
++                                cg,
++                                sessions,
++                                profile_identity.as_ref(),
++                                &task_session_id,
++                                &cancellation,
++                            )
++                            .await,
+                         )
+-                        .await,
+-                    ),
++                    }
+                     _ => None,
+                 };
+                 let ingest_args = json!({

@@ -38,6 +38,55 @@ impl McpServer {
         }
     }
 
+    /// Publishes a successfully admitted Hook V2 SessionStart through the
+    /// daemon-wide private-route cache. V2 admission has already authenticated
+    /// the envelope against this server's project binding; resolving the
+    /// registered route here also caches the current retained server.
+    pub(crate) async fn publish_hook_v2_session_route(
+        self: &Arc<Self>,
+        project_root: &Path,
+        session_id: &str,
+    ) -> tracedecay_domain::errors::Result<()> {
+        let route = crate::mcp::server::routing::resolve_private_project_route(
+            project_root,
+            self.registry_db.as_deref(),
+            self.retained_project_server_resolver.clone(),
+        )
+        .await;
+        let resolved_scope = match &route {
+            crate::mcp::project_route::WorkspaceProjectRoute::Resolved(resolved) => {
+                let current_server = resolved.retained_server()?;
+                if !Arc::ptr_eq(&current_server, self) {
+                    return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                        "project_route_unavailable",
+                        true,
+                        "Hook V2 admission server is not the registered project route",
+                    ));
+                }
+                &resolved.scope
+            }
+            crate::mcp::project_route::WorkspaceProjectRoute::Failed(failure) => {
+                return Err(failure.clone().into_error());
+            }
+        };
+        let admitted_scope = self.admitted_project_scope().ok_or_else(|| {
+            tracedecay_domain::errors::TraceDecayError::project_route(
+                "project_route_unavailable",
+                true,
+                "Hook V2 admission server has no registered project scope",
+            )
+        })?;
+        if resolved_scope != &admitted_scope {
+            return Err(tracedecay_domain::errors::TraceDecayError::project_route(
+                "project_route_scope_mismatch",
+                false,
+                "Hook V2 admission scope does not match the registered project route",
+            ));
+        }
+        self.hook_project_routes
+            .publish_session_route(session_id, route)
+    }
+
     #[hotpath::skip]
     pub(crate) async fn update_hook_workspace_route(
         &self,

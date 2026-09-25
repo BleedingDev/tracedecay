@@ -55,6 +55,7 @@ mod query_authority;
 #[cfg(test)]
 mod reconcile_failure_isolation_tests;
 mod scope_identity;
+mod semantic_runtime;
 #[cfg(test)]
 mod serving_readiness_tests;
 mod serving_reads;
@@ -660,6 +661,12 @@ pub struct MountedCodeIndexWorktreeV1 {
         ManifestDigest,
         Arc<tracedecay_query::retrieval::QueryAuthorityV1>,
     )>,
+    /// Optional per-project semantic owner. The mounted worktree remains the
+    /// sole route authority; semantic lifecycle, vectors, and query state are
+    /// retired with this exact checkout instead of living in a process-global
+    /// side registry.
+    pub semantic_runtime:
+        Option<Arc<tracedecay_application::semantic_runtime::ProjectSemanticRuntimeV1>>,
     pub scheduler: Arc<Mutex<CodeIndexWorktreeSchedulerV1>>,
     /// Explicit same-store build/publication invariant shared by source
     /// reconcile, ignored-dependency publication, and historical generation
@@ -2957,6 +2964,17 @@ impl CodeIndexSchedulerRegistryV1 {
         let cold_mount_completions = self.cold_mount_reservation_completions();
         let mut retiring = self.retiring.lock().await;
         let mounted = std::mem::take(&mut *self.mounted.lock().await);
+        let semantic_deadline =
+            tokio::time::Instant::now() + super::super::DAEMON_TASK_ABORT_DEADLINE;
+        let semantic_shutdowns = mounted
+            .values()
+            .filter_map(|worktree| worktree.semantic_runtime.as_ref().map(Arc::clone))
+            .map(|runtime| {
+                tokio::spawn(async move {
+                    let _ = runtime.shutdown(semantic_deadline).await;
+                })
+            })
+            .collect::<Vec<_>>();
         self.test_attribution_authorities
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3026,6 +3044,9 @@ impl CodeIndexSchedulerRegistryV1 {
             )
             .await;
         }
+        for shutdown in semantic_shutdowns {
+            let _ = shutdown.await;
+        }
         tracedecay_runtime_core::logging::log_daemon_event(
             "daemon_shutdown",
             &[
@@ -3055,6 +3076,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_roots: &std::collections::BTreeSet<PathBuf>,
         timeout: std::time::Duration,
     ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut retiring = self.retiring.lock().await;
         let (retired, cold_mount_waiting, mut completed_cold_mounts) = {
             let mut mounted = self.mounted.lock().await;
@@ -3069,6 +3091,15 @@ impl CodeIndexSchedulerRegistryV1 {
                 .collect::<Vec<_>>();
             (retired, cold_mounts.0, cold_mounts.1)
         };
+        let semantic_shutdowns = retired
+            .iter()
+            .filter_map(|(_, worktree)| worktree.semantic_runtime.as_ref().map(Arc::clone))
+            .map(|runtime| {
+                tokio::spawn(async move {
+                    let _ = runtime.shutdown(deadline).await;
+                })
+            })
+            .collect::<Vec<_>>();
         {
             let mut authorities = match self.test_attribution_authorities.write() {
                 Ok(authorities) => authorities,
@@ -3084,7 +3115,6 @@ impl CodeIndexSchedulerRegistryV1 {
             worktree.wake.notify_one();
             retiring.insert(root, worktree);
         }
-        let deadline = tokio::time::Instant::now() + timeout;
         let mut drained = true;
         // A cold owner needs `retiring` for its final cancellation fence before
         // it can drop the reservation that this wait observes. The retired
@@ -3116,6 +3146,11 @@ impl CodeIndexSchedulerRegistryV1 {
             }
         }
         retiring.retain(|root, _| !joined.contains(root));
+        for shutdown in semantic_shutdowns {
+            if tokio::time::timeout_at(deadline, shutdown).await.is_err() {
+                drained = false;
+            }
+        }
         self.release_completed_retired_cold_mount_reservations(&completed_cold_mounts);
         drained
     }

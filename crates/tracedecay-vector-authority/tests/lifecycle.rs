@@ -1,7 +1,6 @@
 use tracedecay_vector_authority::*;
 
 use serde_json::Value;
-use sha2::{Digest as Sha2Digest, Sha256};
 
 fn digest(seed: u8) -> ManifestDigest {
     ManifestDigest::new(format!("sha256:{}", format!("{seed:02x}").repeat(32))).unwrap()
@@ -12,16 +11,7 @@ fn content(seed: u8) -> ContentDigest {
 }
 
 fn snapshot_checksum(payload: &[u8]) -> ManifestDigest {
-    let mut hasher = Sha256::new();
-    hasher.update(VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1.as_bytes());
-    hasher.update([0]);
-    hasher.update(payload);
-    let digest = hasher.finalize();
-    let hex = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    ManifestDigest::new(format!("sha256:{hex}")).unwrap()
+    tracedecay_domain::canonical_sha256(&(VECTOR_SNAPSHOT_DIGEST_DOMAIN_V1, payload)).unwrap()
 }
 
 fn generation(value: &str) -> CodeGenerationId {
@@ -72,11 +62,18 @@ fn changes(
     let mut changes = ChangedCodeChunkSetV1 {
         from_generation,
         to_generation,
-        manifest_digest: ManifestDigest::zero(),
+        manifest_digest: ManifestDigest::zero().unwrap(),
         added_or_changed,
         deleted,
-        reused,
+        reused_count: 0,
+        reused_digest: ChangedCodeChunkSetV1::seal_reused_partition(&[]).unwrap().1,
     };
+    let reused = reused
+        .into_iter()
+        .map(|change| (change.chunk_id, change.current_digest.unwrap()))
+        .collect::<Vec<_>>();
+    (changes.reused_count, changes.reused_digest) =
+        ChangedCodeChunkSetV1::seal_reused_partition(&reused).unwrap();
     changes.manifest_digest = changes.compute_digest().unwrap();
     changes
 }
@@ -88,13 +85,20 @@ fn request(
     replay_reason: ProjectionReplayReasonV1,
 ) -> ProjectionBatchRequestV1 {
     let mut request = ProjectionBatchRequestV1 {
-        request_digest: ManifestDigest::zero(),
+        request_digest: ManifestDigest::zero().unwrap(),
         changes,
         previous_projection_key,
         target_projection_key,
         replay_reason,
     };
-    request.request_digest = request.compute_digest().unwrap();
+    request.request_digest = tracedecay_domain::canonical_sha256(&(
+        "tracedecay.projection-batch-request.v1",
+        &request.changes,
+        &request.previous_projection_key,
+        &request.target_projection_key,
+        request.replay_reason,
+    ))
+    .unwrap();
     request
 }
 
@@ -131,20 +135,17 @@ fn batch_receipt(
     request: &ProjectionBatchRequestV1,
     receipts: Vec<CodeChunkProjectionReceiptV1>,
 ) -> ProjectionBatchReceiptV1 {
-    let reused_count = receipts
-        .iter()
-        .filter(|receipt| receipt.operation == ProjectionOperationV1::Reused)
-        .count() as u64;
     let mut receipt = ProjectionBatchReceiptV1 {
         target_projection_key: admitted.projection_key().clone(),
         request_digest: request.request_digest.clone(),
         source_generation: request.changes.to_generation.clone(),
         source_manifest_digest: request.changes.manifest_digest.clone(),
         receipts,
-        reused_count,
-        publication_digest: ManifestDigest::zero(),
+        reused_count: request.changes.reused_count,
+        publication_digest: ManifestDigest::zero().unwrap(),
     };
-    receipt.publication_digest = receipt.expected_publication_digest().unwrap();
+    receipt.publication_digest =
+        tracedecay_domain::projection_batch_publication_digest(&receipt).unwrap();
     receipt
 }
 
@@ -290,7 +291,7 @@ fn staged_generation_is_invisible_until_complete_publication_and_search_is_fence
         None,
         None,
         Some(vector.chunk_digest.clone()),
-        ProjectionOperationV1::Add,
+        ProjectionOperationV1::Added,
         ProjectionOutcomeV1::Applied,
         Some(vector.output_digest.clone()),
     );
@@ -547,7 +548,7 @@ fn update_reuse_delete_share_base_bytes_and_rollback_is_atomic() {
             None,
             None,
             Some(a_digest.clone()),
-            ProjectionOperationV1::Add,
+            ProjectionOperationV1::Added,
             ProjectionOutcomeV1::Applied,
             Some(base_a.output_digest.clone()),
         ),
@@ -559,7 +560,7 @@ fn update_reuse_delete_share_base_bytes_and_rollback_is_atomic() {
             None,
             None,
             Some(b_digest.clone()),
-            ProjectionOperationV1::Add,
+            ProjectionOperationV1::Added,
             ProjectionOutcomeV1::Applied,
             Some(base_b.output_digest.clone()),
         ),
@@ -571,7 +572,7 @@ fn update_reuse_delete_share_base_bytes_and_rollback_is_atomic() {
             None,
             None,
             Some(d_digest.clone()),
-            ProjectionOperationV1::Add,
+            ProjectionOperationV1::Added,
             ProjectionOutcomeV1::Applied,
             Some(base_d.output_digest.clone()),
         ),
@@ -659,7 +660,7 @@ fn update_reuse_delete_share_base_bytes_and_rollback_is_atomic() {
             Some(generation("code-base")),
             Some(a_digest.clone()),
             Some(updated_a_digest.clone()),
-            ProjectionOperationV1::Update,
+            ProjectionOperationV1::Updated,
             ProjectionOutcomeV1::Applied,
             Some(target_a.output_digest.clone()),
         ),
@@ -671,8 +672,8 @@ fn update_reuse_delete_share_base_bytes_and_rollback_is_atomic() {
             Some(generation("code-base")),
             Some(b_digest.clone()),
             None,
-            ProjectionOperationV1::Delete,
-            ProjectionOutcomeV1::Tombstoned,
+            ProjectionOperationV1::Deleted,
+            ProjectionOutcomeV1::Applied,
             None,
         ),
         receipt(
@@ -683,21 +684,9 @@ fn update_reuse_delete_share_base_bytes_and_rollback_is_atomic() {
             Some(generation("code-base")),
             None,
             Some(target_c.chunk_digest.clone()),
-            ProjectionOperationV1::Add,
+            ProjectionOperationV1::Added,
             ProjectionOutcomeV1::Applied,
             Some(target_c.output_digest.clone()),
-        ),
-        receipt(
-            &admitted,
-            &target_request,
-            generation("code-target"),
-            d.clone(),
-            Some(generation("code-base")),
-            Some(d_digest.clone()),
-            Some(d_digest.clone()),
-            ProjectionOperationV1::Reuse,
-            ProjectionOutcomeV1::Reused,
-            None,
         ),
     ];
     authority
@@ -852,7 +841,6 @@ fn tampered_batch_digest_and_foreign_chunk_scope_are_rejected_without_mutation()
     let admitted = embedding_key(5, 3);
     let id = chunk("src/tamper.rs#0");
     let source_generation = generation("code-tamper");
-    let source_manifest = digest(121);
     let plan = plan(
         &admitted,
         source_generation.as_str(),
@@ -863,25 +851,6 @@ fn tampered_batch_digest_and_foreign_chunk_scope_are_rejected_without_mutation()
     let build_id = plan.build_id().unwrap();
     let mut authority = VectorGenerationAuthority::new();
     authority.begin_generation(plan.clone()).unwrap();
-
-    let canonical_chunk = CodeSearchChunkV1::from_text(
-        id.clone(),
-        source_generation.clone(),
-        source_manifest.clone(),
-        admitted.privacy_domain().clone(),
-        admitted.privacy_key_epoch(),
-        "fn tamper() {}",
-    )
-    .unwrap();
-    canonical_chunk
-        .validate_for_generation(&plan, &admitted)
-        .unwrap();
-    let mut foreign_chunk = canonical_chunk.clone();
-    foreign_chunk.source_generation = generation("other-scope");
-    assert!(matches!(
-        foreign_chunk.validate_for_generation(&plan, &admitted),
-        Err(VectorAuthorityError::BatchIdentityMismatch(_))
-    ));
 
     let changes = changes(
         None,
@@ -917,13 +886,19 @@ fn tampered_batch_digest_and_foreign_chunk_scope_are_rejected_without_mutation()
         None,
         None,
         Some(vector.chunk_digest.clone()),
-        ProjectionOperationV1::Add,
+        ProjectionOperationV1::Added,
         ProjectionOutcomeV1::Applied,
         Some(vector.output_digest.clone()),
     );
     let valid_prepared = prepared(&admitted, request, vec![receipt], vec![vector], Vec::new());
+    let mut foreign = valid_prepared.clone();
+    foreign.vectors[0].source_generation = generation("other-scope");
+    assert!(matches!(
+        authority.commit_batch(&build_id, None, foreign),
+        Err(VectorAuthorityError::BatchIdentityMismatch(_))
+    ));
     let mut tampered = valid_prepared.clone();
-    tampered.vectors[0].output_digest = ContentDigest::zero();
+    tampered.vectors[0].output_digest = content(0);
     assert!(matches!(
         authority.commit_batch(&build_id, None, tampered),
         Err(VectorAuthorityError::BatchIdentityMismatch(_))
@@ -940,7 +915,7 @@ fn tampered_batch_digest_and_foreign_chunk_scope_are_rejected_without_mutation()
     assert!(authority.active_generation().is_none());
 
     let mut tampered_receipt = valid_prepared;
-    tampered_receipt.receipt.publication_digest = ManifestDigest::zero();
+    tampered_receipt.receipt.publication_digest = ManifestDigest::zero().unwrap();
     assert!(matches!(
         authority.commit_batch(&build_id, None, tampered_receipt),
         Err(VectorAuthorityError::BatchIdentityMismatch(_))
@@ -1026,7 +1001,7 @@ fn recomputed_checksum_cannot_admit_swapped_persisted_rows_and_receipts() {
             Some(generation("code-swap-base")),
             Some(first_digest),
             Some(updated_first_digest),
-            ProjectionOperationV1::Update,
+            ProjectionOperationV1::Updated,
             ProjectionOutcomeV1::Applied,
             Some(first_vector.output_digest.clone()),
         ),
@@ -1038,7 +1013,7 @@ fn recomputed_checksum_cannot_admit_swapped_persisted_rows_and_receipts() {
             Some(generation("code-swap-base")),
             None,
             Some(second_vector.chunk_digest.clone()),
-            ProjectionOperationV1::Add,
+            ProjectionOperationV1::Added,
             ProjectionOutcomeV1::Applied,
             Some(second_vector.output_digest.clone()),
         ),
@@ -1094,7 +1069,8 @@ fn recomputed_checksum_cannot_admit_swapped_persisted_rows_and_receipts() {
     receipts[1]["current_chunk_digest"] = first_current;
     receipts[1]["output_digest"] = first_output;
     let mut batch: ProjectionBatchReceiptV1 = serde_json::from_value(batch_value.clone()).unwrap();
-    batch.publication_digest = batch.expected_publication_digest().unwrap();
+    batch.publication_digest =
+        tracedecay_domain::projection_batch_publication_digest(&batch).unwrap();
     *batch_value = serde_json::to_value(&batch).unwrap();
     generation_value["checkpoint"]["last_publication_digest"] =
         serde_json::to_value(batch.publication_digest).unwrap();
@@ -1190,13 +1166,13 @@ fn projection_profile_change_reembeds_a_reused_partition_from_the_base() {
     let target_changes = changes(
         Some(generation("code-profile-base")),
         generation("code-profile-target"),
-        Vec::new(),
-        Vec::new(),
         vec![ChangedCodeChunkV1 {
             chunk_id: chunk_id.clone(),
-            prior_digest: Some(prior_digest.clone()),
+            prior_digest: None,
             current_digest: Some(prior_digest.clone()),
         }],
+        Vec::new(),
+        Vec::new(),
     );
     let target_request = request(
         target_changes,
@@ -1219,9 +1195,9 @@ fn projection_profile_change_reembeds_a_reused_partition_from_the_base() {
         generation("code-profile-target"),
         chunk_id.clone(),
         Some(generation("code-profile-base")),
-        Some(prior_digest.clone()),
+        None,
         Some(prior_digest),
-        ProjectionOperationV1::Update,
+        ProjectionOperationV1::Added,
         ProjectionOutcomeV1::Applied,
         Some(target_vector.output_digest.clone()),
     );
@@ -1244,4 +1220,53 @@ fn projection_profile_change_reembeds_a_reused_partition_from_the_base() {
         authority.read_vector(&publication.generation_id, &chunk_id),
         Some(vec![0.0, 1.0])
     );
+}
+
+#[test]
+fn normalized_restore_reopens_an_immutable_read_lease() {
+    let admitted = embedding_key(12, 2);
+    let chunk_id = chunk("src/restored.rs#0");
+    let mut authority = VectorGenerationAuthority::new();
+    let publication = publish_single_added(
+        &mut authority,
+        &admitted,
+        "code-restored",
+        111,
+        chunk_id.clone(),
+        content(112),
+        vec![1.0, 0.0],
+    );
+    let generation = authority
+        .generation(&publication.generation_id)
+        .unwrap()
+        .clone();
+    let row = generation.rows().get(&chunk_id).unwrap();
+    let output_digest = row.output_digest.clone();
+    let values = authority.vector_content(&output_digest).unwrap().to_vec();
+    let lease = authority.active_read_snapshot().unwrap().unwrap();
+
+    authority
+        .restore_active_generation_if_current(&publication.generation_id, None)
+        .unwrap();
+    assert!(authority.active_generation().is_none());
+    assert_eq!(lease.rows()[0].chunk_id(), &chunk_id);
+    assert_eq!(lease.search(&[1.0, 0.0], 1).unwrap()[0].chunk_id, chunk_id);
+
+    let restored = VectorGenerationAuthority::restore_published(
+        vec![generation],
+        vec![(output_digest, values)],
+        Some(publication.generation_id.clone()),
+        None,
+    )
+    .unwrap();
+    let reopened = restored.active_read_snapshot().unwrap().unwrap();
+    assert_eq!(reopened.generation_id(), &publication.generation_id);
+    assert_eq!(
+        reopened
+            .embedding_key()
+            .embedding_key()
+            .model_artifact_digest,
+        admitted.embedding_key().model_artifact_digest
+    );
+    assert_eq!(reopened.rows()[0].values().as_ref(), &[1.0, 0.0]);
 }

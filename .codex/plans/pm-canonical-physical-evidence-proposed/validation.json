@@ -1,0 +1,26 @@
+[
+  {
+    "name": "rustfmt",
+    "exit_code": 0,
+    "output": "",
+    "pass": true
+  },
+  {
+    "name": "apply baseline",
+    "exit_code": 0,
+    "output": "",
+    "pass": true
+  },
+  {
+    "name": "apply live",
+    "exit_code": 0,
+    "output": "",
+    "pass": true
+  },
+  {
+    "name": "whitespace",
+    "exit_code": 1,
+    "output": "",
+    "pass": true
+  }
+]

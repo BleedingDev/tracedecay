@@ -21,11 +21,12 @@ pub(crate) use profile_replacement::{
     INTERNAL_REPLACEMENT_MIGRATION_ARG, run_internal_profile_migration,
 };
 pub(crate) use profile_storage::handle_profile_storage_action;
-pub(crate) use scope::resolve_project_scope;
+pub(crate) use scope::{ResolvedCliScope, resolve_project_scope};
 pub(crate) use settings::{
-    canonical_upload_enabled, current_configuration_revision, current_project_setting,
-    handle_gitignore, handle_upload_counter, mutate_project_configuration,
-    project_configuration_set, report_configuration_receipt,
+    canonical_upload_enabled, current_configuration_restart_required,
+    current_configuration_revision, current_project_setting, handle_gitignore,
+    handle_upload_counter, mutate_project_configuration, project_configuration_set,
+    report_configuration_receipt,
 };
 pub(crate) use storage::{
     ProfileOfflineAuthority, handle_list, handle_wipe, join_outcome_and_restore,

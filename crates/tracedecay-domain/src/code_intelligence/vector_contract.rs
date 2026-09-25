@@ -13,7 +13,10 @@ pub fn semantic_vector_output_digest(
     chunk_digest: &ContentDigest,
     values: &[f32],
 ) -> Result<ContentDigest, DomainError> {
-    let bits = values.iter().map(|value| value.to_bits()).collect::<Vec<_>>();
+    let bits = values
+        .iter()
+        .map(|value| value.to_bits())
+        .collect::<Vec<_>>();
     let digest = canonical_sha256(&(
         VECTOR_OUTPUT_DIGEST_DOMAIN,
         projection_key,

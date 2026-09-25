@@ -50,36 +50,7 @@ pub(in super::super) const fn canonical_table_schema_sql() -> &'static str {
 pub(in super::super) async fn install_final_schema(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), GitCorrelationError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS git_history_index_failures (
-            source_rowid INTEGER NOT NULL PRIMARY KEY,
-            activity_timestamp INTEGER NOT NULL,
-            provider TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            project_path TEXT NOT NULL,
-            window_start INTEGER NOT NULL,
-            window_end INTEGER NOT NULL,
-            reason TEXT NOT NULL
-                CHECK(reason IN (
-                    'unsupported_source_framing',
-                    'unsupported_canonical_worktree_encoding'
-                )),
-            source_generation TEXT,
-            reflog_digest TEXT,
-            CHECK(window_start <= window_end),
-            CHECK(
-                (source_generation IS NULL AND reflog_digest IS NULL)
-                OR
-                (
-                    source_generation IS NOT NULL
-                    AND length(source_generation) > 0
-                    AND reflog_digest IS NOT NULL
-                    AND length(reflog_digest) > 0
-                )
-            )
-        );",
-    )
-    .await?;
+    conn.execute_batch(FAILURE_SCHEMA_SQL).await?;
     Ok(())
 }
 

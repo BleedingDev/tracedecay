@@ -1,0 +1,7 @@
+{
+  "file": "crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs",
+  "baseline_sha256": "f07cffb2cfa2152b2bda94e6f029a04f1bc466624ab10004a3408e3eda8981d5",
+  "proposed_sha256": "6d4ade27c71127a22eb514e17b0a55c9286ac79b4bc7591fa0ab4e66185b27ac",
+  "patch_sha256": "46f8e8bcc5dbbcc5267c0592012630fa96890464a3d5cb7c3bb877766888b756",
+  "patch_lines": 200
+}

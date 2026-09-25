@@ -1,0 +1,388 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
+@@ -243,6 +243,7 @@
+                     "stable_memory_refs",
+                     opaque(namespace, b"stable_memory_refs", &stable),
+                 ),
++                ("trace_refs", opaque(namespace, b"trace_refs", &stable)),
+                 (
+                     "candidate_ids",
+                     opaque(namespace, b"candidate_ids", &candidate),
+@@ -392,6 +393,7 @@
+ #[allow(clippy::field_reassign_with_default, clippy::unwrap_used)]
+ mod tests {
+     use super::super::util::sha256_hex;
++    use super::opaque;
+     use crate::embedding::doubles::HashEncoder;
+     use crate::engine::{NcmEngine, ObserveRequest, Outcome, RecallRequest};
+     use crate::ports::{Deadline, StateRoot};
+@@ -399,6 +401,112 @@
+     use std::sync::Arc;
+     use tempfile::TempDir;
+     use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
++
++    #[test]
++    fn selected_trace_exclusion_returns_next_candidate_before_top_k() {
++        let tempdir = TempDir::new().unwrap();
++        let namespace = format!("6e{}", "0".repeat(62));
++        let deadline = Deadline {
++            remaining_ms: u64::MAX,
++        };
++        let mut config = NcmConfig::default();
++        config.terrain_resolution = 3;
++        config.stm.n_centers = 8;
++        config.stm.top_k_read = 8;
++        config.stm.top_k_write = 8;
++        config.ltm.n_centers = 8;
++        config.ltm.top_k_read = 8;
++        config.ltm.top_k_write = 8;
++        config.hybrid_candidates = 8;
++        let engine = NcmEngine::new(
++            StateRoot::new(tempdir.path()).unwrap(),
++            Arc::new(HashEncoder::new()),
++            config,
++        );
++        for number in 1..=2 {
++            let bytes = serde_json::to_vec(&json!({"retained_fixture":number})).unwrap();
++            let mut request = ObserveRequest {
++                idempotency_key: format!("trace-observe-{number}"),
++                payload_sha256: String::new(),
++                source: SourceId(format!("trace-source-{number}")),
++                key_text: "trace exclusion retrieval".to_owned(),
++                value_text: format!("retained trace answer {number}"),
++                affect: None,
++                surprise: 0.4,
++                intensity: 1.0,
++                provenance: json!({
++                    "common_capsule":{"version":1,"sha256":sha256_hex(&bytes),"bytes":bytes},
++                    "selection":{"valid_from":0,"valid_until":null,"superseded_at":null,
++                        "superseded_by":null,"revoked_at":null,"source_refs":[],
++                        "observation_ids":[],"unknown_revision":false}
++                }),
++                deadline,
++            };
++            request.payload_sha256 = request.canonical_payload_sha256().unwrap();
++            let observed = engine.observe(&namespace, request);
++            assert_eq!(observed.outcome, Outcome::Success, "{observed:?}");
++        }
++        let mut selection = json!({
++            "mode":"current","evaluation":1,"as_of":null,"start":null,"end":null,
++            "include_superseded":false,"include_revoked":false,"unknown_policy":"exclude",
++            "maximum_candidates":2,"request_token":"a".repeat(64),
++            "exclusions":{"stable_memory_refs":[],"candidate_ids":[],"source_refs":[],
++                "trace_refs":[],"observation_ids":[],"content_sha256":[]}
++        });
++        let recall = |selection| {
++            engine.recall_selected(
++                &namespace,
++                RecallRequest {
++                    query_text: "trace exclusion retrieval".to_owned(),
++                    top_k: 8,
++                    deadline,
++                },
++                selection,
++            )
++        };
++        let before = engine.inspection(&namespace);
++        let ranked = recall(selection.clone());
++        assert_eq!(ranked.outcome, Outcome::Success, "{ranked:?}");
++        let candidates = ranked.payload["common_recall"]["candidates"]
++            .as_array()
++            .unwrap();
++        assert_eq!(candidates.len(), 2);
++        let first_trace = candidates[0]["stable_memory_ref"].as_str().unwrap();
++        let expected_next = candidates[1]["stable_memory_ref"].clone();
++        let trace = engine.common_control(
++            &namespace,
++            json!({"action":"inspection","expected_generation":ranked.state_generation,
++                "view":"trace","stable_memory_ref":first_trace,
++                "maximum_items":8,"maximum_bytes":65536,"after":0}),
++            deadline,
++        );
++        assert_eq!(trace.outcome, Outcome::Success, "{trace:?}");
++        assert_eq!(trace.payload["items"].as_array().unwrap().len(), 1);
++        assert_eq!(trace.payload["items"][0]["stable_memory_ref"], first_trace);
++        assert_eq!(
++            trace.payload["items"][0]["content"],
++            candidates[0]["value_text"]
++        );
++
++        selection["maximum_candidates"] = json!(1);
++        selection["exclusions"]["trace_refs"] =
++            json!([opaque(&namespace, b"trace_refs", first_trace)]);
++        let excluded = recall(selection);
++        assert_eq!(excluded.outcome, Outcome::Success, "{excluded:?}");
++        assert_eq!(
++            excluded.payload["common_recall"]["candidates"]
++                .as_array()
++                .unwrap()
++                .len(),
++            1
++        );
++        assert_eq!(
++            excluded.payload["common_recall"]["candidates"][0]["stable_memory_ref"],
++            expected_next
++        );
++        assert_eq!(excluded.payload["common_recall"]["excluded_items"], 1);
++        assert_eq!(engine.inspection(&namespace), before);
++    }
+ 
+     #[test]
+     fn selected_read_rejects_corruption_before_suppression_or_unknown_metadata() {
+--- a/crates/tracedecay-memory-provider-ncm/src/common/source_binding.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/source_binding.rs
+@@ -366,4 +366,182 @@
+             assert_eq!(result["coverage"]["truncated_items"], 0);
+         }
+     }
+-}
++
++    fn recall_projection_fixture(
++        messages: [(&str, &str); 2],
++    ) -> (OwnedExactScope, Value, Vec<Value>, Vec<Value>) {
++        let (exact, original) = fixture();
++        let namespace = NcmNamespace::from_exact_scope(&exact);
++        let request = json!({
++            "temporal_query":{"mode":"current","evaluation_time":"2026-01-02T00:00:00Z",
++                "as_of":null,"interval_start":null,"interval_end":null,"include_superseded":false,
++                "include_revoked":false,"unknown_validity_policy":"exclude"},
++            "exclusions":{"stable_memory_refs":[],"candidate_ids":[],"source_refs":[],
++                "trace_refs":[],"observation_ids":[],"content_sha256":[]},
++            "budgets":{"maximum_candidates":2,"maximum_candidate_content_bytes":128,
++                "maximum_total_content_bytes":256,"maximum_source_refs_per_candidate":1,
++                "maximum_trace_refs_per_candidate":1,"maximum_warnings":4,
++                "maximum_extensions_per_candidate":1}
++        });
++        let call = call(&exact, ProviderOperation::Recall, request.clone());
++        let mut rows = Vec::new();
++        let mut originals = Vec::new();
++        for (index, (role, content)) in messages.into_iter().enumerate() {
++            let record = (index + 1) as u64;
++            let mut item = original.clone();
++            item["source"]["source_key"] = json!(format!("source-{record}"));
++            item["source"]["stable_record_id"] = json!(format!("record-{record}"));
++            item["source"]["observation_id"] = json!(format!("observation-{record}"));
++            item["source_sequence"] = json!(record);
++            let observation = json!({"source_identity":{"original_source":item},
++                "observation_kind":"session.message_committed.v1",
++                "canonical_payload":{"role":role,"content":content}});
++            let provenance = project_attribution(&call, &observation, &namespace, None)
++                .unwrap()
++                .unwrap();
++            let source = source_binding(&namespace, &attribution(&item).unwrap())
++                .unwrap()
++                .source_id;
++            let stable = stable_reference(
++                &namespace,
++                record,
++                provenance["common_capsule"]["sha256"].as_str().unwrap(),
++            );
++            let token = opaque_surface_id(&namespace, b"recall-request", &call.request_id);
++            let mut digest = Sha256::new();
++            for field in [token.as_bytes(), stable.as_bytes()] {
++                digest.update((field.len() as u64).to_be_bytes());
++                digest.update(field);
++            }
++            rows.push(
++                json!({"record_id":record,"source":source,"stable_memory_ref":stable,
++                "candidate_id":format!("ncm-candidate:{}",hex_digest(&digest.finalize())),
++                "key_text":content,"value_text":format!("{role}: {content}"),
++                "activation":if index == 0 {1.0} else {0.5},"provenance":provenance}),
++            );
++            originals.push(item);
++        }
++        (exact, request, rows, originals)
++    }
++
++    fn reconstruct_fixture(call: &ProviderCall, rows: &[Value]) -> Value {
++        let worker = serde_json::to_vec(&json!({"common_recall":{"candidates":rows,
++            "truncated":false,"unknown_items":0,"excluded_items":0,
++            "scanned_items":rows.len(),"score_upper_bound":1.0}}))
++        .unwrap();
++        let mut reply = ProviderReply {
++            terminal: tracedecay_memory_provider_api::TerminalRecord::internal_failure_before_dispatch_for_call(call, "recall-projection-test"),
++            payload: Some(CanonicalPayload::new(call.payload.contract_id.clone(), worker.clone(), hex_digest(&Sha256::digest(&worker))).unwrap()),
++            warnings: Vec::new(), extensions: Vec::new(), state_generation: 2,
++        };
++        reconstruct_recall(call, "ncm-instance", &mut reply, None).unwrap();
++        serde_json::from_slice(&reply.payload.unwrap().bytes).unwrap()
++    }
++
++    #[test]
++    fn recall_exposes_retained_trace_and_defensively_excludes_it_before_budgeting() {
++        let (exact, mut request, rows, originals) = recall_projection_fixture([
++            ("assistant", "excluded retained evidence"),
++            ("assistant", "kept"),
++        ]);
++        let full = reconstruct_fixture(
++            &call(&exact, ProviderOperation::Recall, request.clone()),
++            &rows,
++        );
++        for (candidate, row) in full["candidates"].as_array().unwrap().iter().zip(&rows) {
++            let trace = json!([row["stable_memory_ref"]]);
++            assert_eq!(candidate["trace_refs"], trace);
++            assert_eq!(candidate["provenance"]["provider_trace_refs"], trace);
++            assert_eq!(candidate["explanation"]["activation_trace_refs"], json!([]));
++        }
++        request["exclusions"]["trace_refs"] = full["candidates"][0]["trace_refs"].clone();
++        request["budgets"]["maximum_candidates"] = json!(1);
++        request["budgets"]["maximum_candidate_content_bytes"] = json!(16);
++        request["budgets"]["maximum_total_content_bytes"] = json!(16);
++        let filtered =
++            reconstruct_fixture(&call(&exact, ProviderOperation::Recall, request), &rows);
++        assert_eq!(filtered["candidates"].as_array().unwrap().len(), 1);
++        assert_eq!(filtered["candidates"][0]["content"], "assistant: kept");
++        assert_eq!(
++            filtered["candidates"][0]["provenance"]["original_sources"][0],
++            originals[1]
++        );
++        assert_eq!(filtered["coverage"]["excluded_items"], 1);
++        assert_eq!(filtered["coverage"]["truncated_items"], 0);
++        assert_eq!(filtered["terminal"]["code"], "success");
++    }
++
++    #[test]
++    fn recall_clips_utf8_under_candidate_and_remaining_total_budgets() {
++        let (exact, request, rows, originals) = recall_projection_fixture([
++            ("assistant", "éclair retained evidence"),
++            ("assistant", "éclair second source"),
++        ]);
++        for (candidate_limit, total_limit, expected) in [
++            (12, 128, ["assistant: ", "assistant: "]),
++            (13, 25, ["assistant: é", "assistant: "]),
++        ] {
++            let mut bounded = request.clone();
++            bounded["budgets"]["maximum_candidate_content_bytes"] = json!(candidate_limit);
++            bounded["budgets"]["maximum_total_content_bytes"] = json!(total_limit);
++            let result =
++                reconstruct_fixture(&call(&exact, ProviderOperation::Recall, bounded), &rows);
++            let candidates = result["candidates"].as_array().unwrap();
++            assert_eq!(candidates.len(), 2);
++            let mut total = 0;
++            for ((candidate, expected), original) in candidates.iter().zip(expected).zip(&originals)
++            {
++                assert_eq!(candidate["content"], expected);
++                assert_eq!(
++                    candidate["content_sha256"],
++                    hex_digest(&Sha256::digest(expected.as_bytes()))
++                );
++                assert_eq!(
++                    serde_json::to_vec(&candidate["provenance"]["original_sources"][0]).unwrap(),
++                    serde_json::to_vec(original).unwrap()
++                );
++                assert!(expected.len() <= candidate_limit);
++                total += expected.len();
++            }
++            assert!(total <= total_limit);
++            assert_eq!(result["terminal"]["code"], "partial");
++            assert_eq!(result["coverage"]["truncated_items"], 2);
++            assert_eq!(result["warnings"], json!(["ncm.recall_budget_truncated"]));
++        }
++
++        let mut excluded = request;
++        excluded["budgets"]["maximum_candidates"] = json!(1);
++        excluded["budgets"]["maximum_candidate_content_bytes"] = json!(12);
++        excluded["exclusions"]["content_sha256"] = json!([hex_digest(&Sha256::digest(
++            rows[0]["value_text"].as_str().unwrap().as_bytes()
++        ))]);
++        let result = reconstruct_fixture(&call(&exact, ProviderOperation::Recall, excluded), &rows);
++        assert_eq!(result["candidates"].as_array().unwrap().len(), 1);
++        assert_eq!(result["candidates"][0]["content"], "assistant: ");
++        assert_eq!(
++            result["candidates"][0]["provenance"]["original_sources"][0],
++            originals[1]
++        );
++        assert_eq!(result["coverage"]["excluded_items"], 1);
++        assert_eq!(result["coverage"]["truncated_items"], 1);
++    }
++
++    #[test]
++    fn recall_does_not_emit_or_charge_content_when_no_utf8_character_fits() {
++        let (exact, mut request, rows, originals) = recall_projection_fixture([
++            ("é", "cannot fit a complete initial character"),
++            ("assistant", "fits one ASCII character"),
++        ]);
++        request["budgets"]["maximum_candidate_content_bytes"] = json!(1);
++        request["budgets"]["maximum_total_content_bytes"] = json!(1);
++        let result = reconstruct_fixture(&call(&exact, ProviderOperation::Recall, request), &rows);
++        assert_eq!(result["candidates"].as_array().unwrap().len(), 1);
++        assert_eq!(result["candidates"][0]["content"], "a");
++        assert_eq!(
++            result["candidates"][0]["provenance"]["original_sources"][0],
++            originals[1]
++        );
++        assert_eq!(result["coverage"]["truncated_items"], 2);
++        assert_eq!(result["terminal"]["code"], "partial");
++    }
++}
+--- a/crates/tracedecay-memory-provider-ncm/src/common.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common.rs
+@@ -673,6 +673,7 @@
+         let source_refs = strings(&retained["source_refs"])?;
+         let is_excluded = [
+             ("stable_memory_refs", stable),
++            ("trace_refs", stable),
+             ("candidate_ids", candidate_id),
+             ("observation_ids", source.source.observation_id.as_str()),
+             ("content_sha256", digest.as_str()),
+@@ -695,14 +696,30 @@
+             continue;
+         }
+         if candidates.len() == max_candidates
+-            || content.len() as u64 > max_content
+-            || total.saturating_add(content.len() as u64) > max_total
+             || source_refs.len() as u64 > budgets["maximum_source_refs_per_candidate"].as_u64()?
+         {
+             truncated = true;
+             truncated_items += 1;
+             continue;
+         }
++        let content_limit = max_content.min(max_total.saturating_sub(total));
++        let mut boundary = usize::try_from(content_limit)
++            .unwrap_or(usize::MAX)
++            .min(content.len());
++        while !content.is_char_boundary(boundary) {
++            boundary -= 1;
++        }
++        if boundary < content.len() {
++            truncated = true;
++            truncated_items += 1;
++        }
++        let emitted_content = &content[..boundary];
++        if emitted_content.is_empty() {
++            continue;
++        }
++        // Exclusions above use the complete retained content; this digest
++        // describes exactly the UTF-8 excerpt emitted under the caller's budget.
++        let emitted_digest = hex_digest(&Sha256::digest(emitted_content.as_bytes()));
+         let score = row["activation"].as_f64()?;
+         if !score.is_finite() {
+             return None;
+@@ -750,10 +767,12 @@
+         };
+         let mut candidate_scope = scope_value(&call.exact_scope);
+         candidate_scope["scope_binding"] = json!("exact_coding_scope");
+-        total += content.len() as u64;
++        total += emitted_content.len() as u64;
++        // The validated stable reference is also the existing retained trace
++        // inspection selector. It does not attest a kernel activation trace.
+         candidates.push(json!({
+             "candidate_id": candidate_id, "stable_memory_ref": stable,
+-            "content": content, "content_ref": null, "content_sha256": digest,
++            "content": emitted_content, "content_ref": null, "content_sha256": emitted_digest,
+             "native_score": {"score_domain_id": "ncm.rbf_activation.v1", "score_domain_version": 1,
+                 "raw_value": (score as f32).to_string(), "direction": "higher_is_better", "declared_minimum": "0",
+                 "declared_maximum": (worker["common_recall"]["score_upper_bound"].as_f64()? as f32).to_string(), "calibration_state": "uncalibrated",
+@@ -766,10 +785,10 @@
+                 "source_revision": original["source"]["source_revision"], "temporal_state": temporal_state},
+             "provenance": {"state": "available", "origin_refs": source_refs, "observation_refs": [source.source.observation_id],
+                 "source_refs": source_refs, "transform_chain": ["ncm.canonical_evidence_projection.v1"],
+-                "provider_trace_refs": [], "redaction_reason": null, "original_sources": [original]},
++                "provider_trace_refs": [stable], "redaction_reason": null, "original_sources": [original]},
+             "explanation": {"summary": "Retained source content recalled through NCM center support", "matched_features": [],
+                 "activation_trace_refs": [], "limitations": ["Uncalibrated provider-native score"]},
+-            "source_refs": source_refs, "trace_refs": [], "sensitivity": "internal",
++            "source_refs": source_refs, "trace_refs": [stable], "sensitivity": "internal",
+             "memory_class": "session_observation", "warnings": warnings, "extensions": []
+         }));
+     }

@@ -1,0 +1,129 @@
+diff --git a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/portability.rs
+@@ -749,13 +749,19 @@
+                 return Some(reply);
+             }
+             if item.blocked {
+-                match handle.store.ensure_source_provenance_not_revoked(
+-                    &SourceId(item.source.clone()),
+-                    &Value::Null,
+-                ) {
+-                    Err(crate::store::StoreError::SourceRevoked) => {}
+-                    Ok(()) => return None,
+-                    Err(error) => return Some(store_reply(error, handle.commit_seq)),
++                let mut fenced = false;
++                for source in std::iter::once(&item.source).chain(item.legacy_source.iter()) {
++                    match handle.store.ensure_source_provenance_not_revoked(
++                        &SourceId(source.clone()),
++                        &Value::Null,
++                    ) {
++                        Err(crate::store::StoreError::SourceRevoked) => fenced = true,
++                        Ok(()) => {}
++                        Err(error) => return Some(store_reply(error, handle.commit_seq)),
++                    }
++                }
++                if !fenced {
++                    return None;
+                 }
+                 for source in std::iter::once(&item.source).chain(item.legacy_source.iter()) {
+                     match handle.store.has_retained_source(&SourceId(source.clone())) {
+diff --git a/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs b/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
+--- a/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
+@@ -991,6 +991,95 @@
+ }
+ 
+ #[test]
++fn public_blocked_replay_reuses_a_verified_legacy_fence_without_writes_after_restart() {
++    for legacy_capsule in [false, true] {
++        let directory = TempDir::new().unwrap();
++        let live = engine(&directory);
++        observe(
++            &live,
++            A.observation(
++                "before-legacy-fence",
++                "retained before deletion",
++                !legacy_capsule,
++            ),
++        );
++        let deleted = delete(&live, A, "legacy-fence", false);
++        assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
++        assert!(record_ids(&live).is_empty());
++        assert_eq!(
++            live.revoked_sources(&namespace()).unwrap(),
++            vec![A.legacy_id()]
++        );
++        let before = inspect(&live);
++        let before_bytes = export(&live);
++        drop(live);
++
++        let encoder = Arc::new(CountingEncoder::default());
++        let reopened = with_encoder(&directory, encoder.clone());
++        assert_same_durable_inspection(inspect(&reopened), &before);
++        // A real canonical request with verified retained original attribution
++        // is already rejected by this legacy-only fence before any encoding.
++        let future = A.observation("future-bound-observation", "must remain erased", true);
++        assert_eq!(future.source, A.full_id());
++        assert_eq!(future.provenance["source_binding"], A.binding());
++        let refused = reopened.observe(&namespace(), future);
++        assert_eq!(
++            refused.outcome,
++            Outcome::Rejected(RejectReason::SourceRevoked)
++        );
++        assert_same_durable_inspection(inspect(&reopened), &before);
++        assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
++
++        let mut blocked = replay_item(
++            1,
++            A.observation("blocked-public-delivery", "not admitted", true),
++        );
++        blocked["admitted"] = json!(false);
++        blocked["blocked"] = json!(true);
++        blocked["observation"] = Value::Null;
++        assert_eq!(blocked["source"], A.full_id().0);
++        assert_eq!(blocked["legacy_source"], A.legacy_id().0);
++        let mut request = replay_page(
++            "no-change-legacy-fence",
++            before.state_generation,
++            0,
++            vec![blocked],
++        );
++        request["page_delivery_capsule"] = encoded(&json!({
++            "operation_id": "no-change-legacy-operation", "idempotency_key": "no-change-legacy-fence"
++        }));
++        let live_before = inspect(&reopened);
++        let rejected = reopened.common_portability(&namespace(), request.clone(), DEADLINE);
++        assert_eq!(rejected.outcome, Outcome::Success, "{rejected:?}");
++        assert_eq!(rejected.state_generation, before.state_generation);
++        assert_eq!(rejected.payload["no_change"], true);
++        assert_eq!(rejected.payload["rejected_observations"], 1);
++        assert_eq!(rejected.payload["applied_observations"], 0);
++        assert_eq!(rejected.payload["duplicate_observations"], 0);
++        assert_eq!(rejected.payload["acknowledged_sequence"], 0);
++        assert_eq!(inspect(&reopened), live_before);
++        assert_same_durable_inspection(inspect(&reopened), &before);
++        assert_eq!(export(&reopened), before_bytes);
++        assert_eq!(
++            reopened.revoked_sources(&namespace()).unwrap(),
++            vec![A.legacy_id()]
++        );
++        assert_eq!(encoder.calls.load(Ordering::Relaxed), 0);
++        drop(reopened);
++
++        let recovered = engine(&directory);
++        let again = recovered.common_portability(&namespace(), request, DEADLINE);
++        assert_eq!(again, rejected);
++        assert_same_durable_inspection(inspect(&recovered), &before);
++        assert_eq!(export(&recovered), before_bytes);
++        assert_eq!(
++            recovered.revoked_sources(&namespace()).unwrap(),
++            vec![A.legacy_id()]
++        );
++    }
++}
++
++#[test]
+ fn blocked_replay_uses_guarded_full_source_deletion_and_refuses_unverifiable_old_page_upgrade() {
+     for legacy_capsule in [true, false] {
+         let directory = TempDir::new().unwrap();

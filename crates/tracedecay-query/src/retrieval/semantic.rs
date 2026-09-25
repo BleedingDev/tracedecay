@@ -13,6 +13,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::Arc;
 
 use super::ports::{
     CodeCandidateBindingV1, RetrievalExecutionControl, RetrievalPortError,
@@ -40,7 +41,7 @@ mod service;
 pub use execution_authority::{
     ExecutedSemanticCompositionV1, SemanticCompositionAuthorityErrorV1,
     SemanticCompositionExecutionAuthorityV1, SemanticCompositionExecutionOutcomeV1,
-    apply_bounded_rerank_outcome, restore_frozen_semantic_order,
+    apply_bounded_rerank_outcome, validate_frozen_semantic_composition,
 };
 pub use service::{
     CalibratedSemanticQueryService, CompleteSemanticGenerationV1, SemanticAbstentionDispositionV1,
@@ -424,7 +425,7 @@ pub struct SemanticVectorRecordV1 {
     pub chunk_id: CodeSearchChunkId,
     pub candidate: CompactCandidate,
     pub binding: CodeCandidateBindingV1,
-    pub values: Vec<f32>,
+    pub values: Arc<[f32]>,
 }
 
 /// Store-owned coverage for one complete exact-flat generation scan.

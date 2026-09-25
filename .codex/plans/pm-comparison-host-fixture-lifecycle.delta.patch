@@ -1,0 +1,313 @@
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+@@ -1061,7 +1061,7 @@
+     commands: Vec<Value>,
+     project_id: String,
+     initial_origin: Option<Value>,
+-    started_sessions: BTreeSet<String>,
++    started_sessions: BTreeMap<String, Value>,
+     projected: Vec<ProjectedSource>,
+     initial_evidence: Value,
+ }
+@@ -1116,7 +1116,7 @@
+             commands: Vec::new(),
+             project_id: String::new(),
+             initial_origin: None,
+-            started_sessions: BTreeSet::new(),
++            started_sessions: BTreeMap::new(),
+             projected: Vec::new(),
+             initial_evidence: Value::Null,
+         })
+@@ -1558,6 +1558,22 @@
+         self.initial_evidence = json!({"initial_daemon": initial_daemon, "stopped_initial_daemon": stopped,
+             "selected_daemon": selected_daemon, "configuration_revision": revision,
+             "registered_project": context_value, "canonical_start": canonical_start});
++        // Establish the real destination before metadata acknowledgement and
++        // before any scheduled query. Its transcript contains no query text.
++        let destination_session = self.destination_session()?;
++        let destination_start = self.ensure_native_session_started(&destination_session)?;
++        self.initial_evidence["destination_native_start"] = destination_start;
++        if self.lane.provider().is_some() {
++            // Health is a separate setup evidence operation. Control lanes
++            // never dispatch it, and it does not consume a scheduled recall.
++            let host = if self.journey.codex {
++                "codex"
++            } else {
++                "claude"
++            };
++            self.initial_evidence["provider_setup_health"] =
++                self.capture_setup_health(host, &destination_session);
++        }
+         Ok(())
+     }
+ 
+@@ -1590,7 +1606,82 @@
+         )
+     }
+ 
+-    fn project_source(&mut self, source: &Value, index: usize) -> FixtureResult<usize> {
++    fn destination_session(&self) -> FixtureResult<String> {
++        Ok(format!(
++            "comparison-request-{}",
++            &sha256(string(&self.invocation["case"], "id")?.as_bytes())[..32]
++        ))
++    }
++
++    fn ensure_native_session_started(&mut self, session: &str) -> FixtureResult<Value> {
++        if let Some(evidence) = self.started_sessions.get(session) {
++            return Ok(json!({"reused": true, "evidence": evidence}));
++        }
++        let path = self.journey.transcript_path_for_session(session);
++        match fs::symlink_metadata(&path) {
++            Ok(_) => {
++                return Err(
++                    "unstarted native transcript already exists; refusing to replace its bytes"
++                        .into(),
++                );
++            }
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => {
++                return Err(format!(
++                    "inspect native transcript before initialization: {error}"
++                ));
++            }
++        }
++        // Reuse the production journey's empty Claude / metadata-only Codex
++        // initializer. No scheduled message is present at this live baseline.
++        self.journey.initialize_session_transcript(session);
++        let initial_file = io_result(
++            fs::OpenOptions::new().read(true).write(true).open(&path),
++            "open initialized native transcript for durability",
++        )?;
++        io_result(
++            initial_file.sync_all(),
++            "fsync initialized native transcript",
++        )?;
++        let parent = path.parent().ok_or("native transcript parent missing")?;
++        io_result(
++            io_result(fs::File::open(parent), "open native transcript directory")?.sync_all(),
++            "fsync initialized native transcript directory",
++        )?;
++        let initial_bytes = io_result(fs::read(&path), "read exact native session baseline")?;
++        let initial_artifact = write_durable(
++            &self.archive.join(format!(
++                "session-{}.initial.jsonl",
++                sha256(session.as_bytes())
++            )),
++            &initial_bytes,
++        )?;
++        let command = if self.journey.codex {
++            "hook-codex-session-start"
++        } else {
++            "hook-claude-session-start"
++        };
++        let raw = self.hook(
++            command,
++            &json!({"session_id": session, "transcript_path": path,
++            "cwd": self.journey.project, "hook_event_name": "SessionStart", "source": "startup"}),
++        )?;
++        if !raw.success() {
++            return Err("native SessionStart failed; exact baseline/input/output retained".into());
++        }
++        let evidence = json!({
++            "native_host": if self.journey.codex { "codex" } else { "claude" },
++            "native_session_id": session, "transcript_path": path,
++            "initial_transcript": initial_artifact, "hook": raw.record,
++            "canonical_bootstrap_evidence": {"status": "unavailable",
++                "reason": "successful native hook and retained baseline do not alone prove the canonical session row or live-origin boundary"},
++        });
++        self.started_sessions
++            .insert(session.to_owned(), evidence.clone());
++        Ok(json!({"reused": false, "evidence": evidence}))
++    }
++
++    fn source_session_projection(&self, source: &Value) -> FixtureResult<(Value, String)> {
+         let origin = source
+             .get("origin")
+             .filter(|value| value.is_object())
+@@ -1616,6 +1707,14 @@
+             "comparison-session-{}",
+             &sha256(string(origin, "session")?.as_bytes())[..32]
+         );
++        Ok((scope, session))
++    }
++
++    fn project_source(&mut self, source: &Value, index: usize) -> FixtureResult<usize> {
++        let (scope, session) = self.source_session_projection(source)?;
++        if !self.started_sessions.contains_key(&session) {
++            return Err("scheduled source requires its native SessionStart before append".into());
++        }
+         let source_id = string(source, "id")?;
+         let revision = string(source, "revision")?;
+         let content = string(source, "content")?;
+@@ -1624,28 +1723,15 @@
+             &sha256(format!("{source_id}\0{revision}").as_bytes())[..32]
+         );
+         let path = self.journey.transcript_path_for_session(&session);
+-        let first = !path.exists();
+-        io_result(
+-            fs::create_dir_all(path.parent().ok_or("native transcript parent missing")?),
+-            "create native transcript directory",
+-        )?;
+         let mut file = io_result(
+-            fs::OpenOptions::new().create(true).append(true).open(&path),
+-            "open owned native transcript",
++            fs::OpenOptions::new().append(true).open(&path),
++            "open already initialized native transcript",
+         )?;
+         // This stable native timestamp represents scheduled order only; it is
+         // never reused as canonical revision or host receipt time.
+         let timestamp = format!("2026-02-01T00:{:02}:{:02}.000Z", index / 60, index % 60);
+         if index >= 3600 {
+             return Err("native fixture timestamp projection exceeds its explicit bound".into());
+-        }
+-        if self.journey.codex && first {
+-            let metadata = json!({"timestamp": timestamp, "type": "session_meta",
+-                "payload": {"id": session, "cwd": self.journey.project}});
+-            io_result(
+-                writeln!(file, "{metadata}"),
+-                "write native Codex session metadata",
+-            )?;
+         }
+         let start = io_result(file.metadata(), "native transcript start offset")?.len();
+         let record = if self.journey.codex {
+@@ -1719,48 +1805,31 @@
+     }
+ 
+     fn observe(&mut self, action: &Value, index: usize) -> FixtureResult<Value> {
++        let (_, session) = self.source_session_projection(&action["source"])?;
++        let session_start = self.ensure_native_session_started(&session)?;
+         let slot = self.project_source(&action["source"], index)?;
+         let projected = &self.projected[slot];
+-        let session = projected.session.clone();
+         let path = projected.path.clone();
+-        let first = self.started_sessions.insert(session.clone());
+-        let mut hooks = Vec::new();
+-        if first {
+-            let command = if self.journey.codex {
+-                "hook-codex-session-start"
+-            } else {
+-                "hook-claude-session-start"
+-            };
+-            let raw = self.hook(command, &json!({"session_id": session, "transcript_path": path,
+-                "cwd": self.journey.project, "hook_event_name": "SessionStart", "source": "startup"}))?;
+-            let success = raw.success();
+-            hooks.push(raw.record);
+-            if !success {
+-                return Err("native SessionStart failed; exact input/output retained".into());
+-            }
+-        }
+-        if self.journey.codex || !first {
+-            let (command, payload) = if self.journey.codex {
+-                (
+-                    "hook-codex-stop",
+-                    json!({"session_id": session,
+-                    "turn_id": action["action_id"], "transcript_path": path, "cwd": self.journey.project,
+-                    "hook_event_name": "Stop", "model": "host-comparison-fixture", "permission_mode": "default",
+-                    "stop_hook_active": false, "last_assistant_message": null}),
+-                )
+-            } else {
+-                (
+-                    "hook-stop",
+-                    json!({"session_id": session, "transcript_path": path,
+-                    "cwd": self.journey.project, "hook_event_name": "Stop", "stop_hook_active": false}),
+-                )
+-            };
+-            let raw = self.hook(command, &payload)?;
+-            let success = raw.success();
+-            hooks.push(raw.record);
+-            if !success {
+-                return Err("native Stop failed; exact input/output retained".into());
+-            }
++        // Every appended source has a real Stop, including the first Claude
++        // source after its now content-free SessionStart baseline.
++        let (command, payload) = if self.journey.codex {
++            (
++                "hook-codex-stop",
++                json!({"session_id": session,
++                "turn_id": action["action_id"], "transcript_path": path, "cwd": self.journey.project,
++                "hook_event_name": "Stop", "model": "host-comparison-fixture", "permission_mode": "default",
++                "stop_hook_active": false, "last_assistant_message": null}),
++            )
++        } else {
++            (
++                "hook-stop",
++                json!({"session_id": session, "transcript_path": path,
++                "cwd": self.journey.project, "hook_event_name": "Stop", "stop_hook_active": false}),
++            )
++        };
++        let raw = self.hook(command, &payload)?;
++        if !raw.success() {
++            return Err("native Stop failed; exact input/output retained".into());
+         }
+         let admitted = if self.lane.provider().is_some() {
+             self.await_source(slot)?
+@@ -1770,15 +1839,17 @@
+             json!({"status": "unavailable", "reason": "canonical-store source read helper pending for control lane"})
+         };
+         let source = &self.projected[slot];
+-        Ok(json!({"hooks": hooks, "admitted": admitted,
+-            "source_projection": {"scheduled_source": source.source, "native_session_id": source.session,
+-                "path": source.path, "byte_start": source.start, "byte_end": source.end,
+-                "native_bytes_sha256": source.native_bytes_sha256},
+-            "provider_contacted": admitted.get("provider_contacted").cloned().unwrap_or_else(||
+-                if self.lane.provider().is_none() { json!(false) } else { Value::Null }),
+-            "terminal": admitted.get("terminal").cloned().unwrap_or(json!("native_hook_completed")),
+-            "successful_completion": admitted["successful_completion"] == true,
+-        }))
++        Ok(
++            json!({"native_session_start": session_start, "hooks": [raw.record], "admitted": admitted,
++                "source_projection": {"scheduled_source": source.source, "native_session_id": source.session,
++                    "path": source.path, "byte_start": source.start, "byte_end": source.end,
++                    "native_bytes_sha256": source.native_bytes_sha256},
++                "provider_contacted": admitted.get("provider_contacted").cloned().unwrap_or_else(||
++                    if self.lane.provider().is_none() { json!(false) } else { Value::Null }),
++                "terminal": admitted.get("terminal").cloned().unwrap_or(json!("native_hook_completed")),
++                "successful_completion": admitted["successful_completion"] == true,
++            }),
++        )
+     }
+ 
+     fn await_source(&mut self, slot: usize) -> FixtureResult<Value> {
+@@ -1894,7 +1965,6 @@
+     /// Setup metadata only. The caller must first establish this real native
+     /// session through the shipped Start hook. The host then authorizes that
+     /// canonical row and live boundary again for this actual Health request.
+-    /// This has no caller until the reviewed bootstrap integration is present.
+     fn capture_setup_health(&mut self, canonical_provider_id: &str, native_session: &str) -> Value {
+         let started = self.clock_ns();
+         let captured = (|| -> FixtureResult<Value> {
+@@ -1908,7 +1978,7 @@
+                 } else {
+                     "claude"
+                 }
+-                || !self.started_sessions.contains(native_session)
++                || !self.started_sessions.contains_key(native_session)
+             {
+                 return Err(
+                     "setup Health requires this fixture's already started real native session"
+@@ -2215,10 +2285,12 @@
+ 
+     fn recall(&mut self, action: &Value) -> FixtureResult<Value> {
+         let task = string(&action["query"], "text")?;
+-        let session = format!(
+-            "comparison-request-{}",
+-            &sha256(string(&self.invocation["case"], "id")?.as_bytes())[..32]
+-        );
++        let session = self.destination_session()?;
++        let session_start = self
++            .started_sessions
++            .get(&session)
++            .cloned()
++            .ok_or("scheduled recall destination lacks its completed native SessionStart")?;
+         let raw = self.tool("tracedecay_context", &json!({
+             "task": task, "format": "json", "memory_limit": self.invocation["budgets"]["requested_candidates"],
+             // Canonical explicit facts remain common to all four lanes. The
+@@ -2276,6 +2348,7 @@
+                     "clock": "fixture_process_monotonic_elapsed", "start_monotonic_ns": capture_started,
+                     "end_monotonic_ns": capture_ended, "elapsed_ns": capture_ended.saturating_sub(capture_started)},
+                 "request_session_projection": session,
++                "request_session_start": session_start,
+                 "terminal": if value["isError"] == true { "tool_result_error" } else { "tool_result_completed" },
+                 "terminal_scope": "complete CLI ToolResult; provider terminal unavailable without retained host trace",
+                 "provider_contacted": if self.lane.provider().is_none() { json!(false) } else { Value::Null },

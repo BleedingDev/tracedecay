@@ -1,0 +1,56 @@
+--- a/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
+@@ -514,13 +514,18 @@
+                     json!({"stable_memory_ref": stable, "content": content, "content_sha256": hex_digest(&Sha256::digest(content.as_bytes())), "original_source": original})
+                 }
+             } else {
++                let effect_summary = serde_json::to_string(&json!({"provider_id": "ncm",
++                    "suppressed": row["provenance"]["control"]["feedback"]["suppressed"].as_bool().unwrap_or(false),
++                    "centers_updated": row["provenance"]["control"]["feedback"]["centers_updated"].as_u64().unwrap_or(0)})).ok()?;
++                if effect_summary.is_empty() || effect_summary.len() > 8192 {
++                    return None;
++                }
+                 json!({"target": {"provider_id": call.provider_id.as_str(), "registration_revision": call.registration_revision,
+                 "original_scope": original["origin_scope"], "delivery_scope": scope_value(&call.exact_scope), "source": original["source"],
+                 "reference": {"kind": "stable_memory_ref", "reference": stable}}, "source": original["source"], "active": row["active"],
+                 "disposition": row["disposition"], "settled_feedback": row["provenance"]["control"]["feedback"]["settled_counts"].as_object().cloned().unwrap_or_default(),
+                 "last_feedback_receipt": row["provenance"]["control"]["feedback"]["receipt"],
+-                "provider_local_effect_summary": {"provider_id": "ncm", "suppressed": row["provenance"]["control"]["feedback"]["suppressed"].as_bool().unwrap_or(false),
+-                    "centers_updated": row["provenance"]["control"]["feedback"]["centers_updated"].as_u64().unwrap_or(0)}})
++                "provider_local_effect_summary": effect_summary})
+             };
+             let item_bytes = serde_json::to_vec(&item).ok()?.len() as u64;
+             if bytes_used.saturating_add(item_bytes) > request["maximum_bytes"].as_u64()? {
+--- a/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
+@@ -1043,6 +1043,30 @@
+                 trace["original_source"],
+                 canonical_observation(&exact_scope, 1, text)["source_identity"]["original_source"]
+             );
++            let request = canonical_lifecycle_call(
++                &adapter,
++                &exact_scope,
++                ProviderOperation::Inspection,
++                None,
++                json!({"view":"source_influence","selector":{"source_key":trace["original_source"]["source"]["source_key"]},"maximum_items":8,"maximum_bytes":65536,"redaction_policy_revision":1,"cursor":null}),
++            );
++            let reply = adapter.invoke(&request);
++            assert_eq!(
++                reply.terminal.terminal_code(),
++                TerminalCode::Success,
++                "{reply:?}"
++            );
++            let influence = &response_json(&reply)["items"][0];
++            let summary = influence["provider_local_effect_summary"]
++                .as_str()
++                .expect("source influence summary is a string");
++            assert!((1..=8192).contains(&summary.len()));
++            assert_eq!(
++                serde_json::from_str::<Value>(summary).unwrap(),
++                json!({"provider_id":"ncm","suppressed":false,"centers_updated":0})
++            );
++            assert_eq!(influence["active"], true);
++            assert_eq!(influence["disposition"], "available");
+             let (receipt, generation) = canonical_ready(&adapter, &exact_scope);
+             let request = call(
+                 ProviderOperation::Observe,

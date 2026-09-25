@@ -1,0 +1,223 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+@@ -3288,10 +3288,11 @@
+             ("warnings".to_owned(), serde_json::json!([])),
+         ]);
+         super::native_staged_observations::paginate_inspection_evidence(
+-            &mut outcome.response,
++            outcome,
+             call,
+             request,
+             accepted.effective_limits.inspection_items,
++            accepted.effective_limits.response_bytes,
+         )
+         .map_err(store_failure)
+     }
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider_tests.rs
+@@ -897,15 +897,68 @@
+             .terminal_code(),
+         TerminalCode::ProviderUnavailable
+     );
+-    let negotiated = decode(&provider.invoke(&call_for(
++    let negotiated_reply = provider.invoke(&call_for(
+         &limited_request,
+         &limited_ready,
+         Value::Null,
+         64,
+         65536,
+-    )));
++    ));
++    let negotiated = decode(&negotiated_reply);
+     assert_eq!(negotiated["items"], json!([expected[0]]));
+     assert_eq!(negotiated["coverage"], "partial");
++    let next_single_reply = provider.invoke(&call_for(
++        &limited_request,
++        &limited_ready,
++        negotiated["next_cursor"].clone(),
++        64,
++        65536,
++    ));
++    assert_eq!(decode(&next_single_reply)["items"], json!([expected[1]]));
++    // Measure complete one-item replies, including framing, before negotiating
++    // a limit too small for the full descriptor but sufficient for either page.
++    let (mut lower, mut upper) = (1_u64, 4096_u64);
++    while lower < upper {
++        let middle = lower + (upper - lower) / 2;
++        if negotiated_reply.validate(middle).is_ok() && next_single_reply.validate(middle).is_ok() {
++            upper = middle;
++        } else {
++            lower = middle + 1;
++        }
++    }
++    let mut byte_request = request.clone();
++    byte_request.challenge_nonce = [23; 32];
++    byte_request.host_limits.response_bytes = upper;
++    let byte_ready = provider.handshake(&byte_request);
++    assert_eq!(byte_ready.terminal.terminal_code(), TerminalCode::Success);
++    assert!(full_reply.validate(upper).is_err());
++    let byte_first_reply = provider.invoke(&call_for(
++        &byte_request,
++        &byte_ready,
++        Value::Null,
++        64,
++        65536,
++    ));
++    byte_first_reply
++        .validate(upper)
++        .expect("one item and framing fit negotiated bytes");
++    let byte_first = decode(&byte_first_reply);
++    assert_eq!(byte_first["items"], json!([expected[0]]));
++    assert_eq!(byte_first["coverage"], "partial");
++    let byte_next_reply = provider.invoke(&call_for(
++        &byte_request,
++        &byte_ready,
++        byte_first["next_cursor"].clone(),
++        64,
++        65536,
++    ));
++    byte_next_reply
++        .validate(upper)
++        .expect("second page fits negotiated bytes");
++    let byte_next = decode(&byte_next_reply);
++    assert_eq!(byte_next["items"], json!([expected[1]]));
++    assert_eq!(byte_next["coverage"], "partial");
++    assert_ne!(byte_next["next_cursor"], byte_first["next_cursor"]);
+ }
+ 
+ #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+@@ -3175,16 +3175,6 @@
+             response["postcondition"]["state_generation_after"] = after.into();
+         }
+         response["provider_receipt_digest"] = receipt.clone().into();
+-        if call.operation == ProviderOperation::Inspection
+-            && request["view"] == "maintenance_receipt"
+-        {
+-            paginate_inspection_evidence(
+-                &mut response,
+-                call,
+-                &request,
+-                super::native_provider::native_provider_limits().inspection_items,
+-            )?;
+-        }
+         if !read && changed {
+             transaction.execute(
+                 "UPDATE tdmem_native_state_v2 SET generation = ?1 WHERE singleton = 1",
+@@ -3204,7 +3194,7 @@
+                 ],
+             )?;
+         }
+-        let outcome = StagedControlOutcome {
++        let mut outcome = StagedControlOutcome {
+             response,
+             generation_before: before,
+             generation_after: after,
+@@ -3213,6 +3203,17 @@
+             duplicate: false,
+             changed,
+         };
++        if call.operation == ProviderOperation::Inspection
++            && request["view"] == "maintenance_receipt"
++        {
++            paginate_inspection_evidence(
++                &mut outcome,
++                call,
++                &request,
++                super::native_provider::native_provider_limits().inspection_items,
++                super::native_provider::native_provider_limits().response_bytes,
++            )?;
++        }
+         if super::native_provider::native_control_reply(
+             call,
+             outcome.clone(),
+@@ -3958,18 +3959,21 @@
+ }
+ 
+ /// Pages finite descriptor or journal evidence after the actual read receipt
+-/// and generation fields have been attached. No evidence is synthesized here.
++/// and generation fields have been attached, checking complete reply framing
++/// against the response limit. No evidence is synthesized here.
+ pub(super) fn paginate_inspection_evidence(
+-    response: &mut Value,
++    outcome: &mut StagedControlOutcome,
+     call: &tracedecay_memory_provider_registry::ProviderCall,
+     request: &Value,
+     maximum_items: u64,
++    maximum_response_bytes: u64,
+ ) -> Result<(), StagedStoreError> {
+     let maximum = bounded_integer(request, "maximum_items", 64)?.min(maximum_items) as usize;
+-    let byte_limit = bounded_integer(request, "maximum_bytes", 65536)? as usize;
++    let byte_limit =
++        bounded_integer(request, "maximum_bytes", 65536)?.min(maximum_response_bytes) as usize;
+     bounded_integer(request, "redaction_policy_revision", u64::MAX)?;
+     let identity = serde_json::json!({"scope":call.exact_scope.exact_scope_sha256(),
+-        "view":request["view"],"generation":response["state_generation"],"selector":request["selector"],
++        "view":request["view"],"generation":outcome.response["state_generation"],"selector":request["selector"],
+         "registration_revision":call.registration_revision,"ready_receipt":call.ready_receipt_sha256});
+     let prefix = format!(
+         "native-evidence:{}:",
+@@ -3984,7 +3988,8 @@
+         _ => return Err(StagedStoreError::InvalidAdvisory("inspection cursor")),
+     };
+     let items = std::mem::take(
+-        response
++        outcome
++            .response
+             .get_mut("items")
+             .and_then(Value::as_array_mut)
+             .ok_or(StagedStoreError::InvalidAdvisory("inspection items"))?,
+@@ -4001,22 +4006,34 @@
+             Value::Null
+         };
+     };
+-    set_cursor(response, after);
++    let fits_response = |outcome: &StagedControlOutcome| {
++        outcome.response.to_string().len() <= byte_limit
++            && super::native_provider::native_control_reply(
++                call,
++                outcome.clone(),
++                outcome.generation_after,
++                maximum_response_bytes,
++            )
++            .terminal
++            .terminal_code()
++                == tracedecay_memory_provider_registry::TerminalCode::Success
++    };
++    set_cursor(&mut outcome.response, after);
+     for (index, item) in items.iter().enumerate().skip(after) {
+         call.control
+             .snapshot()
+             .map_err(StagedStoreError::ControlEnded)?;
+-        response["items"]
++        outcome.response["items"]
+             .as_array_mut()
+             .ok_or(StagedStoreError::InvalidAdvisory("inspection items"))?
+             .push(item.clone());
+-        set_cursor(response, index + 1);
+-        if index + 1 - after > maximum || response.to_string().len() > byte_limit {
+-            response["items"]
++        set_cursor(&mut outcome.response, index + 1);
++        if index + 1 - after > maximum || !fits_response(outcome) {
++            outcome.response["items"]
+                 .as_array_mut()
+                 .ok_or(StagedStoreError::InvalidAdvisory("inspection items"))?
+                 .pop();
+-            set_cursor(response, index);
++            set_cursor(&mut outcome.response, index);
+             if index == after {
+                 return Err(StagedStoreError::ValueOutOfRange {
+                     field: "inspection evidence bytes",
+@@ -4025,7 +4042,7 @@
+             break;
+         }
+     }
+-    if response.to_string().len() > byte_limit {
++    if !fits_response(outcome) {
+         return Err(StagedStoreError::ValueOutOfRange {
+             field: "inspection evidence bytes",
+         });

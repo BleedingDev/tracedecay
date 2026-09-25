@@ -46,6 +46,7 @@ pub(super) fn search_coverage(
         exact: lane_status(&coverage.exact),
         lexical: lane_status(&coverage.lexical),
         graph: lane_status(&coverage.graph),
+        semantic: coverage.semantic.as_ref().map(lane_status),
         recall: if coverage.is_degraded() {
             PrimitiveRecallV1::Partial
         } else {

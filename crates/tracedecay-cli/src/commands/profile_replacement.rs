@@ -120,31 +120,22 @@ fn provider_name(provider: ReplacementProviderArg) -> &'static str {
 fn provider_readiness(
     provider: ReplacementProviderArg,
     profile_root: &Path,
-) -> (bool, &'static str) {
+) -> Result<(bool, &'static str)> {
     match provider {
-        ReplacementProviderArg::Native => (
+        ReplacementProviderArg::Native => Ok((
             true,
             "Native serving is selected by the shipped host composition",
-        ),
+        )),
         ReplacementProviderArg::Ncm => {
-            let configured = std::env::var_os("TRACEDECAY_NCM_WORKER")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    let candidate = profile_root.join("ncm").join(if cfg!(windows) {
-                        "tracedecay-ncm-worker.exe"
-                    } else {
-                        "tracedecay-ncm-worker"
-                    });
-                    fs::symlink_metadata(&candidate)
-                        .ok()
-                        .filter(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-                        .map(|_| candidate)
-                });
+            let configured = match std::env::var_os("TRACEDECAY_NCM_WORKER") {
+                Some(worker) => Some(PathBuf::from(worker)),
+                None => crate::ncm_cmd::configured_ncm_worker_for_replacement(profile_root)?,
+            };
             let Some(worker) = configured else {
-                return (
+                return Ok((
                     false,
                     "NCM requires an installed, independently attested worker bundle",
-                );
+                ));
             };
             // The dry-run path must remain read-only.  The runtime helper
             // seals a verified copy in a temporary directory, which is
@@ -152,14 +143,14 @@ fn provider_readiness(
             // mutate the host.  Recompute the same release manifest and
             // worker-byte attestation here without staging anything.
             match verify_ncm_worker_read_only(&worker) {
-                Ok(()) => (
+                Ok(()) => Ok((
                     true,
                     "NCM worker bytes and manifest match the shipped attestation",
-                ),
-                Err(_) => (
+                )),
+                Err(_) => Ok((
                     false,
                     "NCM worker is missing or does not match the shipped attestation",
-                ),
+                )),
             }
         }
     }
@@ -283,7 +274,7 @@ fn verify_ncm_worker_read_only(worker: &Path) -> Result<()> {
         }
         digest.update(&buffer[..read]);
     }
-    if !expected_digest.eq_ignore_ascii_case(&format!("{:x}", digest.finalize())) {
+    if !expected_digest.eq_ignore_ascii_case(&hex::encode(digest.finalize())) {
         return Err(config_error(
             "NCM worker bytes differ from their shipped attestation",
         ));
@@ -296,7 +287,7 @@ fn first_party_dry_run_check_for_provider(
     provider: ReplacementProviderArg,
 ) -> Result<()> {
     first_party_dry_run_check(profile_root)?;
-    if provider == ReplacementProviderArg::Ncm && !provider_readiness(provider, profile_root).0 {
+    if provider == ReplacementProviderArg::Ncm && !provider_readiness(provider, profile_root)?.0 {
         return Err(config_error(
             "NCM replacement requires an installed, independently attested worker bundle",
         ));
@@ -346,9 +337,26 @@ struct ReplacementServicePlan {
     was_installed: bool,
 }
 
+const MANAGED_SERVICE_HANDOFF_UNAVAILABLE: &str = "offline replacement cannot apply while a managed daemon service is installed in the current service namespace: this release cannot prove or perform an atomic V1-to-V2 service handoff. Use a fresh V2 profile for the supported transition path; this offline command requires an empty service namespace, and removing a service does not make an otherwise unsupported V1 profile eligible";
+
+fn ensure_managed_service_handoff_is_supported(was_installed: bool) -> Result<()> {
+    if was_installed {
+        return Err(config_error(MANAGED_SERVICE_HANDOFF_UNAVAILABLE));
+    }
+    Ok(())
+}
+
+fn replacement_service_was_installed() -> Result<bool> {
+    Ok(!matches!(
+        tracedecay_daemon_control::installed_service_state()?,
+        tracedecay_daemon_control::DaemonServiceState::Missing
+    ))
+}
+
 fn resolve_replacement_service_plan(
     profile_root: &Path,
     operation_id: &str,
+    was_installed: bool,
 ) -> Result<ReplacementServicePlan> {
     // Resolve the typed namespace once. The lifecycle crate owns validation
     // and identity formatting; this coordinator stores only the validated
@@ -360,14 +368,6 @@ fn resolve_replacement_service_plan(
         short_digest(operation_id)
     ))?;
     let endpoint = profile_root.join("daemon-v2.sock");
-    let was_installed = tracedecay_daemon_control::installed_service_state()
-        .map(|state| {
-            !matches!(
-                state,
-                tracedecay_daemon_control::DaemonServiceState::Missing
-            )
-        })
-        .unwrap_or(false);
     Ok(ReplacementServicePlan {
         source_namespace: source_namespace.suffix().map(ToOwned::to_owned),
         target_namespace: target_namespace
@@ -382,8 +382,9 @@ fn resolve_replacement_service_plan(
 fn resolve_replacement_service_identity(
     profile_root: &Path,
     operation_id: &str,
+    was_installed: bool,
 ) -> Result<ReplacementServiceIdentity> {
-    let plan = resolve_replacement_service_plan(profile_root, operation_id)?;
+    let plan = resolve_replacement_service_plan(profile_root, operation_id, was_installed)?;
     Ok(ReplacementServiceIdentity {
         source_namespace: plan.source_namespace,
         target_namespace: plan.target_namespace,
@@ -728,6 +729,7 @@ struct ReplacementPlan {
     rollback: &'static str,
     service_namespace: Option<String>,
     service_present: bool,
+    service_handoff_ready: bool,
     provider_ready: bool,
     provider_validation: &'static str,
     platform_supported: bool,
@@ -792,6 +794,13 @@ pub(crate) async fn handle_replace_v1(
     // or mutate a journal. A symlinked selector must never be allowed to
     // redirect recovery into a different profile.
     validate_profile_root_path(&profile_root)?;
+    // Service admission must precede recovery and every profile mutation. The
+    // daemon-control state is namespace-wide, so an installed unit cannot be
+    // proven unrelated to this profile and must fail closed.
+    let service_was_installed = replacement_service_was_installed()?;
+    if !dry_run {
+        ensure_managed_service_handoff_is_supported(service_was_installed)?;
+    }
     if let Some(summary) =
         recover_interrupted_replacement_if_present(&profile_root, dry_run, timeout_seconds)?
     {
@@ -839,12 +848,13 @@ pub(crate) async fn handle_replace_v1(
             backup_id,
             provider,
             worker,
+            service_was_installed,
             json,
         );
     }
     let worker_sha256 = sha256_worker(&worker)?;
     ensure_supported_replacement_platform()?;
-    if !provider_readiness(provider, &profile_root).0 {
+    if !provider_readiness(provider, &profile_root)?.0 {
         return Err(config_error(format!(
             "selected {} replacement provider is not ready; no profile mutation was started",
             provider_name(provider)
@@ -852,7 +862,8 @@ pub(crate) async fn handle_replace_v1(
     }
 
     let operation_id = replacement_operation_id();
-    let service = resolve_replacement_service_identity(&profile_root, &operation_id)?;
+    let service =
+        resolve_replacement_service_identity(&profile_root, &operation_id, service_was_installed)?;
     let parent = profile_root
         .parent()
         .ok_or_else(|| config_error("profile root has no parent directory"))?
@@ -947,6 +958,7 @@ fn print_replacement_plan(
     backup_id: String,
     provider: ReplacementProviderArg,
     worker: PathBuf,
+    service_was_installed: bool,
     json: bool,
 ) -> Result<()> {
     let backup_destination = backup_parent.join(&backup_id);
@@ -969,8 +981,14 @@ fn print_replacement_plan(
         .is_some_and(|parent| directory_creation_feasible(parent));
     let worker_ready =
         worker_sha256.is_some() && worker_is_executable(&worker) && target_parent_feasible;
-    let provider_readiness = provider_readiness(provider, &profile_root);
-    let first_party_preflight_ready = profile_authorities_missing.is_empty()
+    let provider_readiness = provider_readiness(provider, &profile_root)?;
+    let profile_authorities_ready = profile_authorities_missing.is_empty();
+    let service =
+        resolve_replacement_service_plan(&profile_root, &backup_id, service_was_installed)?;
+    let service_handoff_ready =
+        ensure_managed_service_handoff_is_supported(service.was_installed).is_ok();
+    let first_party_preflight_ready = service_handoff_ready
+        && profile_authorities_ready
         && first_party_dry_run_check_for_provider(&profile_root, provider).is_ok();
     let backup_feasible = backup_destination_available
         && !matches!(
@@ -979,7 +997,6 @@ fn print_replacement_plan(
         )
         && directory_creation_feasible(&backup_parent);
     let target_namespace_feasible = target_parent_feasible;
-    let service = resolve_replacement_service_plan(&profile_root, &backup_id)?;
     let (platform_supported, platform_validation) = replacement_platform_validation();
     let plan = ReplacementPlan {
         protocol: REPLACEMENT_PROTOCOL,
@@ -1003,7 +1020,9 @@ fn print_replacement_plan(
         worker_validation: FIRST_PARTY_WORKER_DESCRIPTION,
         apply_feasibility: if !platform_supported {
             "unsupported platform release gate; no mutation can start"
-        } else if !profile_authorities_missing.is_empty() {
+        } else if !service_handoff_ready {
+            MANAGED_SERVICE_HANDOFF_UNAVAILABLE
+        } else if !profile_authorities_ready {
             "required authorities are missing from the source profile"
         } else if !worker_ready {
             "the running first-party binary cannot be staged or is not executable"
@@ -1031,6 +1050,7 @@ fn print_replacement_plan(
         rollback: "stop V2, select the V1 binary/service, and restore the external backup; never open V2 files with V1",
         service_namespace: Some(service.target_namespace),
         service_present: service.was_installed,
+        service_handoff_ready,
         provider_ready: provider_readiness.0,
         provider_validation: provider_readiness.1,
         platform_supported,
@@ -1047,6 +1067,7 @@ fn print_replacement_plan(
             plan.service_namespace.as_deref().unwrap_or("unavailable"),
             plan.service_present
         );
+        println!("  service handoff ready: {}", plan.service_handoff_ready);
         println!(
             "  external backup: {}/{}",
             plan.backup_parent.display(),
@@ -2693,8 +2714,8 @@ fn copy_first_party_opaque_sidecars(source: &Path, target: &Path) -> Result<()> 
                 continue;
             }
             if path_exists(&destination_path)? {
-                let source_digest = replacement_entry_digest(&source_path, &name)?;
-                let target_digest = replacement_entry_digest(&destination_path, &name)?;
+                let source_digest = replacement_entry_digest(&source_path, Path::new(&name))?;
+                let target_digest = replacement_entry_digest(&destination_path, Path::new(&name))?;
                 if source_digest != target_digest {
                     return Err(config_error(format!(
                         "opaque sidecar '{}' differs in the resumable target",
@@ -2748,8 +2769,8 @@ fn rebind_first_party_store_manifests(target_root: &Path, source_root: &Path) ->
                 manifest_path.display()
             )));
         }
-        let project_id = store
-            .file_name()
+        let project_store_name = store.file_name();
+        let project_id = project_store_name
             .to_str()
             .ok_or_else(|| config_error("first-party project store id is not Unicode"))?;
         if paths_overlap(&manifest.project_root, source_root)? {
@@ -3562,7 +3583,7 @@ fn profile_tree_digest(root: &Path) -> Result<String> {
     let mut digest = Sha256::new();
     digest.update(b"tracedecay-v1-to-v2-tree-v1\0");
     digest_profile_tree(root, Path::new(""), &mut digest)?;
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn staging_marker_path(root: &Path) -> PathBuf {
@@ -3823,18 +3844,18 @@ fn write_staging_marker(path: &Path, marker: &ReplacementStagingMarker) -> Resul
         &bytes,
         expectation,
         tracedecay_private_fs::framed_log::ConditionalPublishCallbacks {
-            prepare: |temporary| {
+            prepare: |temporary: &Path| {
                 tracedecay_private_fs::framed_log::tighten_existing_file(temporary)
             },
             before_publish: || {},
             after_publish: || {},
-            verify_displaced: move |displaced| {
+            verify_displaced: move |displaced: &Path| {
                 let Some(expected) = previous_for_verify.as_deref() else {
                     return Ok(false);
                 };
                 Ok(fs::read(displaced).ok().as_deref() == Some(expected))
             },
-            verify_published: move |published| {
+            verify_published: move |published: &Path| {
                 Ok(fs::read(published).ok().as_deref() == Some(bytes_for_verify.as_slice()))
             },
         },
@@ -4275,7 +4296,7 @@ fn opaque_observation(root: &Path) -> Result<(String, u64)> {
         let child_count = digest_authority_entry(&child, Path::new(&name), &mut digest)?;
         count = count.saturating_add(child_count);
     }
-    Ok((format!("{:x}", digest.finalize()), count))
+    Ok((hex::encode(digest.finalize()), count))
 }
 
 fn external_project_manifest(
@@ -4329,7 +4350,7 @@ fn external_project_observation(root: &Path) -> Result<(String, u64)> {
     let mut digest = Sha256::new();
     digest.update(b"tracedecay-v1-to-v2-external-project-v1\0");
     let entries = digest_project_entry(root, Path::new(""), &mut digest)?;
-    Ok((format!("{:x}", digest.finalize()), entries))
+    Ok((hex::encode(digest.finalize()), entries))
 }
 
 fn digest_project_entry(path: &Path, relative: &Path, digest: &mut Sha256) -> Result<u64> {
@@ -4471,7 +4492,7 @@ fn aggregate_row_digest(tables: &[SemanticTableReport]) -> String {
         digest.update(table.row_digest.as_bytes());
         digest.update(b"\0");
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn aggregate_disposition(dispositions: &[SemanticDisposition]) -> String {
@@ -4509,7 +4530,7 @@ fn authority_semantic_observation(
             digest.update(b"tracedecay-v1-to-v2-semantic-v1\0");
             digest.update(authority.as_bytes());
             digest.update(b"\0missing\0");
-            return Ok((format!("{:x}", digest.finalize()), 0, Vec::new()));
+            return Ok((hex::encode(digest.finalize()), 0, Vec::new()));
         }
         Err(error) => {
             return Err(config_error(format!(
@@ -4552,7 +4573,7 @@ fn authority_semantic_observation(
                 tables.push(table);
             }
         }
-        return Ok((format!("{:x}", digest.finalize()), rows, tables));
+        return Ok((hex::encode(digest.finalize()), rows, tables));
     } else {
         let (_, entries) = authority_observation(root, authority)?;
         let rows = entries;
@@ -4565,7 +4586,7 @@ fn authority_semantic_observation(
             status_counts: BTreeMap::new(),
         });
         digest.update(rows.to_le_bytes());
-        return Ok((format!("{:x}", digest.finalize()), rows, tables));
+        return Ok((hex::encode(digest.finalize()), rows, tables));
     }
 }
 
@@ -4712,7 +4733,7 @@ fn semantic_sqlite_tables(
                     *status_counts.entry(status).or_insert(0) += 1;
                 }
             }
-            row_digests.push(format!("{:x}", row_digest.finalize()));
+            row_digests.push(hex::encode(row_digest.finalize()));
         }
         row_digests.sort_unstable();
         let count = u64::try_from(row_digests.len()).map_err(|_| {
@@ -4728,7 +4749,7 @@ fn semantic_sqlite_tables(
             table_digest.update(row_digest.as_bytes());
             table_digest.update(b"\0");
         }
-        let row_digest = format!("{:x}", table_digest.finalize());
+        let row_digest = hex::encode(table_digest.finalize());
         rows = rows.saturating_add(count);
         tables.push(SemanticTableReport {
             table: table_key,
@@ -4826,6 +4847,7 @@ fn semantic_dispositions(
                         "transformed"
                     }
                 }
+                (Some(_), Some(_)) => "transformed",
                 (Some(source), None) if is_rebuildable_projection(source) => "rebuilt_projection",
                 (Some(_), None) => "retained_in_backup",
                 (None, Some(target)) if is_rebuildable_projection(target) => "rebuilt_projection",
@@ -4995,7 +5017,7 @@ fn authority_mapping_digest(
         digest.update(status.as_bytes());
         digest.update(count.to_le_bytes());
     }
-    format!("{:x}", digest.finalize())
+    hex::encode(digest.finalize())
 }
 
 fn authority_observation(root: &Path, authority: &str) -> Result<(String, u64)> {
@@ -5007,7 +5029,7 @@ fn authority_observation(root: &Path, authority: &str) -> Result<(String, u64)> 
             digest.update(b"tracedecay-v1-to-v2-authority-v1\0");
             digest.update(authority.as_bytes());
             digest.update(b"\0M\0");
-            return Ok((format!("{:x}", digest.finalize()), 0));
+            return Ok((hex::encode(digest.finalize()), 0));
         }
         Err(error) => {
             return Err(config_error(format!(
@@ -5033,14 +5055,14 @@ fn authority_observation(root: &Path, authority: &str) -> Result<(String, u64)> 
     digest.update(authority.as_bytes());
     digest.update(b"\0");
     let entries = digest_authority_entry(&path, Path::new(""), &mut digest)?;
-    Ok((format!("{:x}", digest.finalize()), entries))
+    Ok((hex::encode(digest.finalize()), entries))
 }
 
 fn replacement_entry_digest(path: &Path, relative: &Path) -> Result<String> {
     let mut digest = Sha256::new();
     digest.update(b"tracedecay-v1-to-v2-entry-v1\0");
     let _ = digest_authority_entry(path, relative, &mut digest)?;
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn digest_authority_entry(path: &Path, relative: &Path, digest: &mut Sha256) -> Result<u64> {
@@ -6124,10 +6146,12 @@ fn recover_interrupted_replacement(
                     });
             if exchanged_target {
                 ensure_recovery_rehearsal(profile_root, &journal)?;
+                let rehearsal_root = journal.rehearsal_root.clone();
+                let rollback_root = journal.rollback_root.clone();
                 rollback_from_rehearsal(
                     profile_root,
-                    &journal.rehearsal_root,
-                    &journal.rollback_root,
+                    &rehearsal_root,
+                    &rollback_root,
                     journal_path,
                     &mut journal,
                 )?;
@@ -6214,10 +6238,12 @@ fn recover_interrupted_replacement(
             // verified rehearsal, retaining any published V2 bytes in the
             // journal-owned rollback quarantine.
             ensure_recovery_rehearsal(profile_root, &journal)?;
+            let rehearsal_root = journal.rehearsal_root.clone();
+            let rollback_root = journal.rollback_root.clone();
             rollback_from_rehearsal(
                 profile_root,
-                &journal.rehearsal_root,
-                &journal.rollback_root,
+                &rehearsal_root,
+                &rollback_root,
                 journal_path,
                 &mut journal,
             )?;
@@ -6450,20 +6476,26 @@ fn resume_prepared_replacement(
     )?;
     write_journal(journal_path, journal)?;
 
+    let target_root = journal.target_root.clone();
+    let quarantine_root = journal.quarantine_root.clone();
+    let rehearsal_root = journal.rehearsal_root.clone();
+    let rollback_root = journal.rollback_root.clone();
+    let operation_id = journal.operation_id.clone();
+    let provider = journal.provider.clone();
     if let Err(error) = publish_target(
         profile_root,
         profile_root
             .parent()
             .ok_or_else(|| config_error("replacement profile has no parent during resume"))?,
-        &journal.target_root,
-        &journal.quarantine_root,
+        &target_root,
+        &quarantine_root,
         journal_path,
         journal,
     ) {
         let rollback = rollback_from_rehearsal(
             profile_root,
-            &journal.rehearsal_root,
-            &journal.rollback_root,
+            &rehearsal_root,
+            &rollback_root,
             journal_path,
             journal,
         );
@@ -6475,26 +6507,21 @@ fn resume_prepared_replacement(
         }));
     }
 
-    let post_verify = first_party_verify(
-        profile_root,
-        &journal.quarantine_root,
-        &journal.operation_id,
-        &journal.provider,
-    )?;
+    let post_verify = first_party_verify(profile_root, &quarantine_root, &operation_id, &provider)?;
     validate_worker_report(
         post_verify,
         WorkerPhase::Verify,
-        &journal.operation_id,
-        &journal.provider,
-        &journal.quarantine_root,
+        &operation_id,
+        &provider,
+        &quarantine_root,
         profile_root,
     )
     .and_then(|_| verify_profile_namespace(profile_root, true))
     .map_err(|error| {
         let rollback = rollback_from_rehearsal(
             profile_root,
-            &journal.rehearsal_root,
-            &journal.rollback_root,
+            &rehearsal_root,
+            &rollback_root,
             journal_path,
             journal,
         );
@@ -7129,10 +7156,6 @@ fn remove_owned_rehearsal_after_marker_authentication(
     operation_id: &str,
 ) -> Result<()> {
     validate_staging_marker_identity(path, operation_id, "rehearsal")?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| config_error("replacement rehearsal has no Unicode directory name"))?;
     if !staging_path_matches_kind(path, operation_id, "rehearsal") {
         return Err(config_error(format!(
             "replacement rehearsal '{}' is not operation-shaped",
@@ -7594,7 +7617,7 @@ fn sha256_worker(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn sha256_regular_file(path: &Path) -> Result<String> {
@@ -7630,7 +7653,7 @@ fn sha256_regular_file(path: &Path) -> Result<String> {
         }
         digest.update(&buffer[..read]);
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex::encode(digest.finalize()))
 }
 
 fn stage_worker(
@@ -7714,7 +7737,7 @@ fn stage_worker(
         ))
     })?;
     drop(staged_file);
-    let observed_sha256 = format!("{:x}", digest.finalize());
+    let observed_sha256 = hex::encode(digest.finalize());
     if observed_sha256 != expected_sha256 {
         return Err(config_error(format!(
             "pinned migration worker digest changed during staging (expected SHA-256 {}, observed {})",
@@ -7819,7 +7842,7 @@ fn validate_backup_parent(profile_root: &Path, backup_parent: &Path) -> Result<P
     // existing ancestor with symlink_metadata, rather than exists(), so a
     // dangling symlink anywhere in a not-yet-created path is rejected too.
     let mut existing = backup_parent.to_path_buf();
-    let canonical_existing = loop {
+    loop {
         match fs::symlink_metadata(&existing) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(config_error(format!(
@@ -7834,12 +7857,13 @@ fn validate_backup_parent(profile_root: &Path, backup_parent: &Path) -> Result<P
                 )));
             }
             Ok(_) => {
-                break existing.canonicalize().map_err(|error| {
+                existing.canonicalize().map_err(|error| {
                     config_error(format!(
                         "canonicalize replacement backup parent '{}': {error}",
                         backup_parent.display()
                     ))
                 })?;
+                break;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if !existing.pop() {
@@ -7856,11 +7880,11 @@ fn validate_backup_parent(profile_root: &Path, backup_parent: &Path) -> Result<P
                 )));
             }
         }
-    };
+    }
     let canonical_profile = profile_root
         .canonicalize()
         .map_err(|error| config_error(format!("canonicalize replacement profile: {error}")))?;
-    if paths_overlap(&canonical_existing, &canonical_profile)? {
+    if paths_overlap(backup_parent, &canonical_profile)? {
         return Err(config_error(format!(
             "replacement backup parent '{}' must be outside profile '{}'",
             backup_parent.display(),
@@ -8150,18 +8174,18 @@ fn write_journal(path: &Path, journal: &ReplacementJournal) -> Result<()> {
         &bytes,
         expectation,
         tracedecay_private_fs::framed_log::ConditionalPublishCallbacks {
-            prepare: |temporary| {
+            prepare: |temporary: &Path| {
                 tracedecay_private_fs::framed_log::tighten_existing_file(temporary)
             },
             before_publish: || {},
             after_publish: || {},
-            verify_displaced: move |displaced| {
+            verify_displaced: move |displaced: &Path| {
                 let Some(expected) = previous_for_verify.as_deref() else {
                     return Ok(false);
                 };
                 Ok(fs::read(displaced).ok().as_deref() == Some(expected))
             },
-            verify_published: move |published| {
+            verify_published: move |published: &Path| {
                 Ok(fs::read(published).ok().as_deref() == Some(bytes_for_verify.as_slice()))
             },
         },

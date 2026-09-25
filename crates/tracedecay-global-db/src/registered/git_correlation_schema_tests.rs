@@ -3,7 +3,7 @@ use std::fs;
 use tempfile::TempDir;
 use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_runtime_core::db::TestDatabaseRuntimeScope;
-use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, TestConnection};
+use tracedecay_runtime_core::db::engine::TestConnection;
 
 use crate::tests::harness::open_registered_test_database_fixture;
 
@@ -18,6 +18,14 @@ async fn assert_git_schema_reset_without_mutation(malformed_schema: &str) {
         )
         .await
         .unwrap(),
+    );
+    drop(
+        open_registered_test_database_fixture(
+            &database_path,
+            TestDatabaseRuntimeScope::ProfileSessions,
+        )
+        .await
+        .expect("a freshly composed global schema must reopen"),
     );
 
     let database = TestConnection::open(&database_path);

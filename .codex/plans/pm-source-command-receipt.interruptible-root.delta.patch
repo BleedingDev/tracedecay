@@ -1,0 +1,104 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/feedback_receipt.rs
+@@ -662,7 +662,20 @@
+ /// Only host-fixed descendants of the existing ledger root may be passed.
+ pub(super) fn prepare_root(root: &Path, control: &OperationControl) -> Result<()> {
+     checkpoint(control)?;
+-    PrivateStoreIo::create_dir_all_durable(root).map_err(storage_unpublished)?;
++    let mut terminal = None;
++    PrivateStoreIo::create_dir_all_durable_interruptible(root, &mut || {
++        control.snapshot().map(|_| ()).map_err(|code| {
++            terminal = Some(code);
++            io::Error::new(
++                io::ErrorKind::Interrupted,
++                "original operation control stopped",
++            )
++        })
++    })
++    .map_err(|source| match terminal {
++        Some(code) => HostSourceCommandErrorV1::Control(code),
++        None => storage_unpublished(source),
++    })?;
+     reject_symlink_components(root, "retained ledger artifact root")
+         .map_err(storage_unpublished)?;
+     drop(open_private_directory(root).map_err(storage_unpublished)?);
+@@ -1539,6 +1552,78 @@
+     }
+ 
+     #[test]
++    fn first_use_rejects_original_cancelled_and_expired_controls_without_publication() {
++        let temporary = tempfile::tempdir().unwrap();
++        let cancelled = control();
++        cancelled.cancellation().cancel();
++        for (name, operation, expected) in [
++            ("cancelled", cancelled, TerminalCode::Cancelled),
++            (
++                "expired",
++                OperationControl::new(0, 5000, CancellationToken::new()),
++                TerminalCode::DeadlineExceeded,
++            ),
++        ] {
++            let root = temporary.path().join(name);
++            let result = accept_at_root(
++                &root,
++                binding(),
++                &operation,
++                ArtifactQuota::DEFAULT,
++                |_path, _bytes, _control| panic!("stopped first use must never publish a receipt"),
++            );
++            assert!(matches!(
++                result,
++                Err(HostSourceCommandErrorV1::Control(code)) if code == expected
++            ));
++            assert!(
++                !root.exists(),
++                "stopped first use must not create the receipt root"
++            );
++        }
++    }
++
++    #[cfg(any(unix, windows))]
++    #[test]
++    fn first_use_directory_lock_preserves_expired_control_before_release() {
++        let temporary = tempfile::tempdir().unwrap();
++        let root = temporary.path().join(ROOT_NAME);
++        let lock_path = temporary
++            .path()
++            .join(format!(".{ROOT_NAME}.durable-directory.lock"));
++        let held = create_private_file(&lock_path).unwrap();
++        FileExt::lock_exclusive(&held).unwrap();
++        let worker_root = root.clone();
++        let (completed, result) = std::sync::mpsc::channel();
++        let worker = std::thread::spawn(move || {
++            let operation = OperationControl::new(i64::MAX, 20, CancellationToken::new());
++            let outcome = accept_at_root(
++                &worker_root,
++                binding(),
++                &operation,
++                ArtifactQuota::DEFAULT,
++                |_path, _bytes, _control| panic!("expired first use must never publish a receipt"),
++            );
++            completed.send(outcome).unwrap();
++        });
++        let before_release = result.recv_timeout(Duration::from_secs(2));
++        let absent_before_release = !root.exists();
++        drop(held);
++        worker.join().unwrap();
++        assert!(matches!(
++            before_release
++                .expect("deadline must return while the directory sidecar remains locked"),
++            Err(HostSourceCommandErrorV1::Control(
++                TerminalCode::DeadlineExceeded
++            ))
++        ));
++        assert!(
++            absent_before_release,
++            "expired first use must not publish the receipt root"
++        );
++    }
++
++    #[test]
+     fn lock_wait_obeys_original_live_cancellation_and_deadline_without_publication() {
+         let temporary = tempfile::tempdir().unwrap();
+         let root = temporary.path().join(ROOT_NAME);

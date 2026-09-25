@@ -1,0 +1,703 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_provider.rs
+@@ -3806,9 +3806,10 @@
+     let required = matches!(
+         call.operation,
+         ProviderOperation::Replay | ProviderOperation::SnapshotRestore
+-    ) || payload
+-        .get("history_grant")
+-        .is_some_and(|grant| !grant.is_null())
++    ) || call.history_grant().is_some()
++        || payload
++            .get("history_grant")
++            .is_some_and(|grant| !grant.is_null())
+         || (call.operation == ProviderOperation::Observe && cross_origin);
+     if !required {
+         return Ok(None);
+@@ -3816,6 +3817,22 @@
+     let authority = authority.ok_or(NativeReadFailure::ProviderUnavailable)?;
+     let admission = authority.admit(call).map_err(admission_failure)?;
+     admission.verify_for(call).map_err(admission_failure)?;
++    if let Some(grant) = call.history_grant() {
++        if grant.sources.len() != admission.history_sources.len() {
++            return Err(NativeReadFailure::RecallScopeMismatch);
++        }
++        let mut covered = std::collections::BTreeSet::new();
++        for claimed in &grant.sources {
++            let index = admission
++                .history_sources
++                .iter()
++                .position(|trusted| claimed.attribution == trusted.attribution)
++                .ok_or(NativeReadFailure::RecallScopeMismatch)?;
++            if !covered.insert(index) {
++                return Err(NativeReadFailure::RecallScopeMismatch);
++            }
++        }
++    }
+     if let Some(sources) = payload
+         .pointer("/history_grant/sources")
+         .and_then(Value::as_array)
+@@ -3953,7 +3970,7 @@
+         "authority_revision":disposition.authority_revision,"checked_at":format_rfc3339_nanos(disposition.checked_at_utc_nanos)})
+ }
+ 
+-fn source_identity_matches(
++pub(super) fn source_identity_matches(
+     value: &Value,
+     source: &tracedecay_memory_provider_registry::OriginalSourceIdentity,
+ ) -> bool {
+diff --git a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/native_staged_observations.rs
+@@ -1985,7 +1985,7 @@
+             {
+                 let connection = staged.connection().expect("connection");
+                 assert!(matches!(
+-                    delete_advisory(&connection, &call, &invalid, generation + 1),
++                    delete_advisory(&connection, &call, &invalid, generation + 1, None),
+                     Err(StagedStoreError::InvalidAdvisory("verification query"))
+                 ));
+                 assert_eq!(
+@@ -2896,13 +2896,164 @@
+     )
+ }
+ 
+-fn source_deleted(
++// A separate checkout domain keeps a typed digest disjoint from every legacy
++// raw source key, including a raw key whose bytes happen to equal the digest.
++fn source_fence_checkout_digest(scope: &ExactScopeFields) -> String {
++    canonical_framed_sha256(
++        b"tracedecay.native.canonical-source-fence-checkout.v1",
++        &[checkout_digest(scope).as_bytes()],
++    )
++}
++
++#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
++struct NativeSourceTarget {
++    canonical_provider_id: String,
++    canonical_session_id: String,
++    source_key: String,
++}
++
++impl NativeSourceTarget {
++    fn from_source(source: &Value) -> Result<Self, StagedStoreError> {
++        Ok(Self {
++            canonical_provider_id: required_text(source, "canonical_provider_id")?.to_owned(),
++            canonical_session_id: required_text(source, "canonical_session_id")?.to_owned(),
++            source_key: required_text(source, "source_key")?.to_owned(),
++        })
++    }
++
++    fn digest(&self) -> String {
++        canonical_framed_sha256(
++            b"tracedecay.native.canonical-source-fence.v1",
++            &[
++                self.canonical_provider_id.as_bytes(),
++                self.canonical_session_id.as_bytes(),
++                self.source_key.as_bytes(),
++            ],
++        )
++    }
++}
++
++fn recorded_origin_matches_checkout(attribution: &Value, scope: &ExactScopeFields) -> bool {
++    attribution
++        .pointer("/origin_scope/state")
++        .and_then(Value::as_str)
++        == Some("recorded")
++        && attribution
++            .pointer("/origin_scope/exact_scope_identity/profile_id")
++            .and_then(Value::as_str)
++            == Some(scope.profile_id.as_str())
++        && attribution
++            .pointer("/origin_scope/exact_scope_identity/project_id")
++            .and_then(Value::as_str)
++            == Some(scope.project_id.as_str())
++}
++
++fn legacy_source_deleted(
+     connection: &Connection,
+     scope: &ExactScopeFields,
+     source_key: &str,
+ ) -> Result<bool, StagedStoreError> {
+     Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM tdmem_native_deleted_source_v2 WHERE checkout = ?1 AND source_key = ?2)",
+         params![checkout_digest(scope), source_key], |row| row.get(0))?)
++}
++
++fn source_deleted(
++    connection: &Connection,
++    scope: &ExactScopeFields,
++    source_key: &str,
++    attribution: Option<&Value>,
++) -> Result<bool, StagedStoreError> {
++    let legacy = legacy_source_deleted(connection, scope, source_key)?;
++    if legacy {
++        return Ok(true);
++    }
++    let Some(attribution) = attribution else {
++        return Ok(false);
++    };
++    // Recorded foreign origins never alias this checkout's original namespace.
++    // Missing origin evidence cannot override an existing canonical-source fence.
++    if attribution
++        .pointer("/origin_scope/state")
++        .and_then(Value::as_str)
++        == Some("recorded")
++        && !recorded_origin_matches_checkout(attribution, scope)
++    {
++        return Ok(false);
++    }
++    let target = NativeSourceTarget::from_source(&attribution["source"])?;
++    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM tdmem_native_deleted_source_v2 WHERE checkout = ?1 AND source_key = ?2)",
++        params![source_fence_checkout_digest(scope), target.digest()], |row| row.get(0))?)
++}
++
++fn claimed_deletion_targets(
++    call: &tracedecay_memory_provider_registry::ProviderCall,
++    request: &Value,
++    admission: Option<&tracedecay_memory_provider_registry::CurrentAdvisoryAdmission>,
++) -> Result<Option<Vec<NativeSourceTarget>>, StagedStoreError> {
++    use tracedecay_memory_provider_registry::{OriginScopeEvidence, ProviderOperation};
++    if call.operation != ProviderOperation::DeleteBySource || call.history_grant().is_none() {
++        return Ok(None);
++    }
++    let admission = admission.ok_or(StagedStoreError::LifecycleConflict(
++        "deletion authority unavailable",
++    ))?;
++    admission
++        .verify_for(call)
++        .map_err(|_| StagedStoreError::LifecycleConflict("deletion authority binding"))?;
++    let keys = request
++        .get("forget_source_keys")
++        .and_then(Value::as_array)
++        .filter(|keys| !keys.is_empty() && keys.len() <= 1024)
++        .ok_or(StagedStoreError::InvalidAdvisory("forget source keys"))?;
++    let mut targets = BTreeSet::new();
++    let mut unique = BTreeSet::new();
++    for key in keys {
++        let key = key
++            .as_str()
++            .filter(|key| !key.is_empty() && key.len() <= 1024)
++            .ok_or(StagedStoreError::InvalidAdvisory("source key"))?;
++        if !unique.insert(key) {
++            return Err(StagedStoreError::InvalidAdvisory("duplicate source key"));
++        }
++        let mut matching = BTreeSet::new();
++        for trusted in &admission.history_sources {
++            if trusted.attribution.source.source_key != key {
++                continue;
++            }
++            // The mounted authority guarantees this namespace; repeat the check
++            // here because custom authorities implement the same public trait.
++            let OriginScopeEvidence::Recorded { scope, .. } = &trusted.attribution.origin_scope
++            else {
++                return Err(StagedStoreError::LifecycleConflict(
++                    "deletion origin unavailable",
++                ));
++            };
++            if scope.profile_id != call.exact_scope.profile_id
++                || scope.project_id != call.exact_scope.project_id
++            {
++                return Err(StagedStoreError::LifecycleConflict(
++                    "deletion origin namespace",
++                ));
++            }
++            matching.insert(NativeSourceTarget {
++                canonical_provider_id: trusted
++                    .attribution
++                    .source
++                    .canonical_provider_id
++                    .as_str()
++                    .to_owned(),
++                canonical_session_id: trusted.attribution.source.canonical_session_id.clone(),
++                source_key: trusted.attribution.source.source_key.clone(),
++            });
++        }
++        if matching.len() != 1 {
++            return Err(StagedStoreError::LifecycleConflict(
++                "deletion source ambiguous or unavailable",
++            ));
++        }
++        targets.extend(matching);
++    }
++    Ok(Some(targets.into_iter().collect()))
+ }
+ 
+ pub(crate) fn recorded_validity(
+@@ -3084,7 +3235,23 @@
+         if let Some(object) = semantic.as_object_mut() {
+             object.remove("common_request");
+         }
+-        let digest = sha256_hex(format!("{:?}:{}", call.operation, semantic).as_bytes());
++        let deletion_targets = claimed_deletion_targets(call, &request, admission)?;
++        let legacy_digest = sha256_hex(format!("{:?}:{}", call.operation, semantic).as_bytes());
++        let digest = if let Some(targets) = &deletion_targets {
++            let mut target_digests = targets
++                .iter()
++                .map(NativeSourceTarget::digest)
++                .collect::<Vec<_>>();
++            target_digests.sort();
++            let encoded = serde_json::to_vec(&target_digests)
++                .map_err(|_| StagedStoreError::InvalidAdvisory("deletion targets"))?;
++            canonical_framed_sha256(
++                b"tracedecay.native.claimed-deletion.v1",
++                &[legacy_digest.as_bytes(), &encoded],
++            )
++        } else {
++            legacy_digest
++        };
+         if !read {
+             if key.is_empty() {
+                 return Err(StagedStoreError::InvalidAdvisory("idempotency key"));
+@@ -3138,9 +3305,13 @@
+             ProviderOperation::Correction => {
+                 correct_advisory(&transaction, call, &request, self.retention)?
+             }
+-            ProviderOperation::DeleteBySource => {
+-                delete_advisory(&transaction, call, &request, before.saturating_add(1))?
+-            }
++            ProviderOperation::DeleteBySource => delete_advisory(
++                &transaction,
++                call,
++                &request,
++                before.saturating_add(1),
++                deletion_targets.as_deref(),
++            )?,
+             ProviderOperation::Maintenance => maintain_advisory(&transaction, call, &request)?,
+             ProviderOperation::SnapshotExport => {
+                 (export_snapshot(&transaction, call, before)?, false)
+@@ -3324,7 +3495,12 @@
+         .pointer("/source/source_key")
+         .and_then(Value::as_str)
+         .ok_or(StagedStoreError::InvalidAdvisory("target source key"))?;
+-    if source_deleted(connection, &call.exact_scope, source_key)? {
++    if source_deleted(
++        connection,
++        &call.exact_scope,
++        source_key,
++        attribution.as_ref(),
++    )? {
+         return Err(StagedStoreError::PrivacyDeleted);
+     }
+     // Match NCM's digest of the complete admitted target JSON, before any
+@@ -3570,11 +3746,161 @@
+         params![scope.profile_id,scope.project_id,scope.repository_identity,scope.worktree_identity,scope.branch_identity,source])? as u64)
+ }
+ 
++fn preflight_targeted_deletion(
++    connection: &Connection,
++    call: &tracedecay_memory_provider_registry::ProviderCall,
++    targets: &[NativeSourceTarget],
++) -> Result<(), StagedStoreError> {
++    let scope = &call.exact_scope;
++    for target in targets {
++        call.control
++            .snapshot()
++            .map_err(StagedStoreError::ControlEnded)?;
++        let mut statement = connection.prepare("SELECT original_source FROM tdmem_native_staged_observation_v1
++            WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3 AND worktree_identity=?4 AND branch_identity=?5
++            AND (json_extract(original_source,'$.source.source_key')=?6 OR deleted_source_key=?6 OR (original_source IS NULL AND source_event_id=?6))
++            AND (sanitized_payload IS NOT NULL OR original_source IS NOT NULL OR validity_override IS NOT NULL OR feedback!=0 OR feedback_suppressed!=0)")?;
++        let mut rows = statement.query(params![
++            scope.profile_id,
++            scope.project_id,
++            scope.repository_identity,
++            scope.worktree_identity,
++            scope.branch_identity,
++            target.source_key
++        ])?;
++        while let Some(row) = rows.next()? {
++            call.control
++                .snapshot()
++                .map_err(StagedStoreError::ControlEnded)?;
++            let text: Option<String> = row.get(0)?;
++            let text = text.ok_or(StagedStoreError::LifecycleConflict(
++                "deletion legacy source ambiguous",
++            ))?;
++            let attribution: Value = serde_json::from_str(&text)
++                .map_err(|_| StagedStoreError::LifecycleConflict("deletion source unavailable"))?;
++            if validate_attribution(&attribution).is_err()
++                || !recorded_origin_matches_checkout(&attribution, scope)
++                || NativeSourceTarget::from_source(&attribution["source"]).is_err()
++            {
++                return Err(StagedStoreError::LifecycleConflict(
++                    "deletion original source ambiguous",
++                ));
++            }
++        }
++    }
++    Ok(())
++}
++
++fn fence_and_scrub_target(
++    connection: &Connection,
++    scope: &ExactScopeFields,
++    target: &NativeSourceTarget,
++    generation: u64,
++) -> Result<u64, StagedStoreError> {
++    let digest = target.digest();
++    connection.execute(
++        "INSERT OR IGNORE INTO tdmem_native_deleted_source_v2 VALUES(?1,?2,?3)",
++        params![
++            source_fence_checkout_digest(scope),
++            digest,
++            sqlite_i64(generation, "deletion generation")?
++        ],
++    )?;
++    Ok(connection.execute("UPDATE tdmem_native_staged_observation_v1 SET sanitized_payload=NULL,tombstone=1,feedback=0,feedback_suppressed=0,
++        deleted_source_key=?6,original_source=NULL,validity_override=NULL,valid_from_nanos=NULL,valid_until_nanos=NULL,superseded_nanos=NULL,revoked_nanos=NULL,projected_content_sha256=NULL
++        WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3 AND worktree_identity=?4 AND branch_identity=?5
++        AND json_extract(original_source,'$.origin_scope.state')='recorded'
++        AND json_extract(original_source,'$.origin_scope.exact_scope_identity.profile_id')=?1
++        AND json_extract(original_source,'$.origin_scope.exact_scope_identity.project_id')=?2
++        AND json_extract(original_source,'$.source.canonical_provider_id')=?7
++        AND json_extract(original_source,'$.source.canonical_session_id')=?8
++        AND json_extract(original_source,'$.source.source_key')=?9
++        AND (sanitized_payload IS NOT NULL OR original_source IS NOT NULL OR validity_override IS NOT NULL OR feedback!=0 OR feedback_suppressed!=0)",
++        params![scope.profile_id,scope.project_id,scope.repository_identity,scope.worktree_identity,scope.branch_identity,digest,
++            target.canonical_provider_id,target.canonical_session_id,target.source_key])? as u64)
++}
++
++// Imported privacy evidence retains a digest, never an invented source preimage.
++// Walk resident attribution in bounded pages and scrub only exact digest matches.
++fn fence_and_scrub_target_digest(
++    connection: &Connection,
++    call: &tracedecay_memory_provider_registry::ProviderCall,
++    digest: &str,
++    generation: u64,
++) -> Result<(), StagedStoreError> {
++    if digest.len() != 64
++        || !digest
++            .bytes()
++            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++    {
++        return Err(StagedStoreError::InvalidAdvisory(
++            "snapshot typed fence digest",
++        ));
++    }
++    let scope = &call.exact_scope;
++    let mut after = String::new();
++    loop {
++        call.control
++            .snapshot()
++            .map_err(StagedStoreError::ControlEnded)?;
++        let batch = {
++            let mut statement = connection.prepare("SELECT provider_reference,original_source FROM tdmem_native_staged_observation_v1
++                WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3 AND worktree_identity=?4 AND branch_identity=?5
++                AND original_source IS NOT NULL AND provider_reference>?6 ORDER BY provider_reference LIMIT 128")?;
++            let values = statement
++                .query_map(
++                    params![
++                        scope.profile_id,
++                        scope.project_id,
++                        scope.repository_identity,
++                        scope.worktree_identity,
++                        scope.branch_identity,
++                        after
++                    ],
++                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
++                )?
++                .collect::<Result<Vec<_>, _>>()?;
++            values
++        };
++        if batch.is_empty() {
++            break;
++        }
++        for (reference, text) in batch {
++            call.control
++                .snapshot()
++                .map_err(StagedStoreError::ControlEnded)?;
++            after = reference;
++            let attribution: Value = serde_json::from_str(&text)
++                .map_err(|_| StagedStoreError::InvalidAdvisory("resident source attribution"))?;
++            validate_attribution(&attribution)?;
++            let target = NativeSourceTarget::from_source(&attribution["source"])?;
++            if target.digest() == digest {
++                if !recorded_origin_matches_checkout(&attribution, scope) {
++                    return Err(StagedStoreError::LifecycleConflict(
++                        "snapshot fence origin unavailable",
++                    ));
++                }
++                fence_and_scrub_target(connection, scope, &target, generation)?;
++            }
++        }
++    }
++    connection.execute(
++        "INSERT OR IGNORE INTO tdmem_native_deleted_source_v2 VALUES(?1,?2,?3)",
++        params![
++            source_fence_checkout_digest(scope),
++            digest,
++            sqlite_i64(generation, "deletion generation")?
++        ],
++    )?;
++    Ok(())
++}
++
+ fn delete_advisory(
+     connection: &Connection,
+     call: &tracedecay_memory_provider_registry::ProviderCall,
+     request: &Value,
+     generation: u64,
++    targets: Option<&[NativeSourceTarget]>,
+ ) -> Result<(Value, bool), StagedStoreError> {
+     let sources = request
+         .get("forget_source_keys")
+@@ -3594,6 +3920,9 @@
+         .get("verification_query")
+         .and_then(Value::as_str)
+         .ok_or(StagedStoreError::InvalidAdvisory("verification query"))?;
++    if let Some(targets) = targets {
++        preflight_targeted_deletion(connection, call, targets)?;
++    }
+     let mut unique = BTreeSet::new();
+     let mut removed = 0_u64;
+     for source in sources {
+@@ -3607,14 +3936,39 @@
+         if !unique.insert(source) {
+             return Err(StagedStoreError::InvalidAdvisory("duplicate source key"));
+         }
+-        removed += fence_and_scrub_source(connection, &call.exact_scope, source, generation)?;
+-    }
+-    let remaining: u64 = unique.iter().map(|source| connection.query_row("SELECT COUNT(*) FROM tdmem_native_staged_observation_v1
++        removed += if let Some(targets) = targets {
++            let target = targets
++                .iter()
++                .find(|target| target.source_key == source)
++                .ok_or(StagedStoreError::LifecycleConflict(
++                    "deletion target coverage",
++                ))?;
++            fence_and_scrub_target(connection, &call.exact_scope, target, generation)?
++        } else {
++            fence_and_scrub_source(connection, &call.exact_scope, source, generation)?
++        };
++    }
++    let remaining: u64 = if let Some(targets) = targets {
++        targets.iter().map(|target| connection.query_row("SELECT COUNT(*) FROM tdmem_native_staged_observation_v1
++            WHERE profile_id=?1 AND project_id=?2 AND repository_identity=?3 AND worktree_identity=?4 AND branch_identity=?5
++            AND json_extract(original_source,'$.origin_scope.state')='recorded'
++            AND json_extract(original_source,'$.origin_scope.exact_scope_identity.profile_id')=?1
++            AND json_extract(original_source,'$.origin_scope.exact_scope_identity.project_id')=?2
++            AND json_extract(original_source,'$.source.canonical_provider_id')=?6
++            AND json_extract(original_source,'$.source.canonical_session_id')=?7
++            AND json_extract(original_source,'$.source.source_key')=?8 AND tombstone=0",
++            params![call.exact_scope.profile_id,call.exact_scope.project_id,call.exact_scope.repository_identity,
++                call.exact_scope.worktree_identity,call.exact_scope.branch_identity,target.canonical_provider_id,
++                target.canonical_session_id,target.source_key], |row| sqlite_u64(row,0)))
++            .collect::<Result<Vec<_>,_>>()?.iter().sum()
++    } else {
++        unique.iter().map(|source| connection.query_row("SELECT COUNT(*) FROM tdmem_native_staged_observation_v1
+         WHERE profile_id = ?1 AND project_id = ?2 AND repository_identity = ?3 AND worktree_identity = ?4 AND branch_identity = ?5
+         AND (json_extract(original_source, '$.source.source_key') = ?6 OR (original_source IS NULL AND source_event_id = ?6)) AND tombstone = 0",
+         params![call.exact_scope.profile_id, call.exact_scope.project_id, call.exact_scope.repository_identity,
+             call.exact_scope.worktree_identity, call.exact_scope.branch_identity, source], |row| sqlite_u64(row, 0)))
+-        .collect::<Result<Vec<_>,_>>()?.iter().sum();
++        .collect::<Result<Vec<_>,_>>()?.iter().sum()
++    };
+     if remaining != 0 {
+         return Err(StagedStoreError::LifecycleConflict("deletion verification"));
+     }
+@@ -4199,7 +4553,12 @@
+         .and_then(|source| source.pointer("/source/source_key"))
+         .and_then(Value::as_str)
+         .unwrap_or(&record.source_event_id);
+-    if source_deleted(&transaction, &record.scope, source_key)? {
++    if source_deleted(
++        &transaction,
++        &record.scope,
++        source_key,
++        original_source.as_ref(),
++    )? {
+         return Err(StagedStoreError::PrivacyDeleted);
+     }
+     let existing = transaction
+@@ -4385,6 +4744,10 @@
+ }
+ 
+ const SNAPSHOT_SCHEMA: &str = super::native_provider::STATE_SCHEMA_VERSION;
++// Old decoders compare this internal field before reading deletion fences. Keep
++// the public provider/database schema stable while refusing unsafe old decoding.
++const SOURCE_FENCE_SNAPSHOT_SCHEMA: &str = "native-staged-snapshot-source-fences-v1";
++const SOURCE_FENCE_KIND: &str = "canonical_source_v1";
+ const SNAPSHOT_COLUMNS: &[&str] = &[
+     "exact_scope_sha256",
+     "idempotency_key",
+@@ -4491,14 +4854,28 @@
+             "operation_id":row.get::<_,String>(2)?,"generation_before":sqlite_u64(row, 3)?,"generation_after":sqlite_u64(row, 4)?,
+             "response":row.get::<_,String>(5)?,"receipt":row.get::<_,String>(6)?}));
+     }
+-    let mut statement = connection.prepare("SELECT source_key,generation FROM tdmem_native_deleted_source_v2 WHERE checkout=?1 ORDER BY source_key LIMIT 1025")?;
+-    let fences = statement.query_map(params![checkout_digest(&call.exact_scope)],|row|Ok(serde_json::json!({"source_key":row.get::<_,String>(0)?,"generation":sqlite_u64(row, 1)?})))?.collect::<Result<Vec<_>,_>>()?;
++    let legacy_checkout = checkout_digest(&call.exact_scope);
++    let typed_checkout = source_fence_checkout_digest(&call.exact_scope);
++    let mut statement = connection.prepare("SELECT checkout,source_key,generation FROM tdmem_native_deleted_source_v2 WHERE checkout IN (?1,?2) ORDER BY checkout,source_key LIMIT 1025")?;
++    let fences = statement.query_map(params![legacy_checkout,typed_checkout],|row| {
++        let checkout: String = row.get(0)?;
++        let mut fence = serde_json::json!({"source_key":row.get::<_,String>(1)?,"generation":sqlite_u64(row, 2)?});
++        if checkout == typed_checkout {
++            fence["kind"] = SOURCE_FENCE_KIND.into();
++        }
++        Ok(fence)
++    })?.collect::<Result<Vec<_>,_>>()?;
+     if fences.len() > 1024 {
+         return Err(StagedStoreError::ValueOutOfRange {
+             field: "snapshot deletion fences",
+         });
+     }
+-    let body = serde_json::json!({"schema":SNAPSHOT_SCHEMA,"scope":scope,"generation":generation,"observation_sequence":observation_sequence,
++    let body_schema = if fences.iter().any(|fence| fence.get("kind").is_some()) {
++        SOURCE_FENCE_SNAPSHOT_SCHEMA
++    } else {
++        SNAPSHOT_SCHEMA
++    };
++    let body = serde_json::json!({"schema":body_schema,"scope":scope,"generation":generation,"observation_sequence":observation_sequence,
+         "rows":values,"operations":operations,"deletion_fences":fences,"acknowledged_sequence":acknowledged});
+     let bytes = serde_json::to_vec(&body)
+         .map_err(|_| StagedStoreError::InvalidAdvisory("snapshot encoding"))?;
+@@ -4574,7 +4951,8 @@
+     }
+     let body: Value = serde_json::from_slice(&bytes)
+         .map_err(|_| StagedStoreError::InvalidAdvisory("snapshot contents"))?;
+-    if body["schema"] != SNAPSHOT_SCHEMA
++    let typed_fence_schema = body["schema"] == SOURCE_FENCE_SNAPSHOT_SCHEMA;
++    if (!typed_fence_schema && body["schema"] != SNAPSHOT_SCHEMA)
+         || body["scope"] != scope
+         || body["generation"] != identity["state_generation"]
+         || body["observation_sequence"] != identity["observation_sequence"]
+@@ -4658,14 +5036,45 @@
+         .ok_or(StagedStoreError::InvalidAdvisory(
+             "snapshot deletion fences",
+         ))?;
+-    for fence in fences {
+-        let source_key = required_text(fence, "source_key")?;
+-        let generation = fence["generation"]
+-            .as_u64()
+-            .ok_or(StagedStoreError::InvalidAdvisory(
+-                "snapshot fence generation",
+-            ))?;
+-        fence_and_scrub_source(connection, &call.exact_scope, source_key, generation)?;
++    // Validate all fence kinds before calling either mutation helper, including
++    // when a malformed typed entry follows a valid legacy entry.
++    let parsed_fences = fences
++        .iter()
++        .map(|fence| {
++            let source_key = required_text(fence, "source_key")?;
++            let generation =
++                fence["generation"]
++                    .as_u64()
++                    .ok_or(StagedStoreError::InvalidAdvisory(
++                        "snapshot fence generation",
++                    ))?;
++            let typed = match fence.get("kind") {
++                None => false,
++                Some(Value::String(kind)) if typed_fence_schema && kind == SOURCE_FENCE_KIND => {
++                    true
++                }
++                _ => return Err(StagedStoreError::LifecycleConflict("snapshot fence schema")),
++            };
++            if typed
++                && (source_key.len() != 64
++                    || !source_key
++                        .bytes()
++                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
++            {
++                return Err(StagedStoreError::InvalidAdvisory(
++                    "snapshot typed fence digest",
++                ));
++            }
++            sqlite_i64(generation, "deletion generation")?;
++            Ok((typed, source_key, generation))
++        })
++        .collect::<Result<Vec<_>, StagedStoreError>>()?;
++    for (typed, source_key, generation) in parsed_fences {
++        if typed {
++            fence_and_scrub_target_digest(connection, call, source_key, generation)?;
++        } else {
++            fence_and_scrub_source(connection, &call.exact_scope, source_key, generation)?;
++        }
+     }
+     let mut keep = BTreeSet::new();
+     let mut source_targets = BTreeSet::new();
+@@ -4709,7 +5118,15 @@
+         }
+         let mut restored_row = row.clone();
+         if let Some(source_key) = row["deleted_source_key"].as_str() {
+-            fence_and_scrub_source(connection, &call.exact_scope, source_key, before)?;
++            // Fence inventory was applied by explicit kind above. A scrubbed row
++            // marker carries no origin proof and must never create a raw fence.
++            if row["tombstone"] != 1
++                || !fences.iter().any(|fence| fence["source_key"] == source_key)
++            {
++                return Err(StagedStoreError::LifecycleConflict(
++                    "snapshot deletion marker",
++                ));
++            }
+         }
+ 
+         if let Some(text) = row["original_source"].as_str() {
+@@ -4726,14 +5143,53 @@
+                 .get(&source.to_string())
+                 .copied()
+                 .ok_or(StagedStoreError::LifecycleConflict("source coverage"))?;
+-            let privacy = matches!(state, "deleted" | "redacted" | "expired")
+-                || source_deleted(connection, &call.exact_scope, source_key)?;
++            let fresh_privacy = matches!(state, "deleted" | "redacted" | "expired");
++            let legacy_privacy = legacy_source_deleted(connection, &call.exact_scope, source_key)?;
++            let privacy = fresh_privacy
++                || source_deleted(
++                    connection,
++                    &call.exact_scope,
++                    source_key,
++                    Some(&attribution),
++                )?;
+             if privacy {
+-                fence_and_scrub_source(connection, &call.exact_scope, source_key, before)?;
++                let marker = if fresh_privacy || !legacy_privacy {
++                    if !recorded_origin_matches_checkout(&attribution, &call.exact_scope) {
++                        return Err(StagedStoreError::LifecycleConflict(
++                            "restore deletion origin unavailable",
++                        ));
++                    }
++                    let target = NativeSourceTarget::from_source(source)?;
++                    let fresh_privacy_admitted = admission
++                        .and_then(|admission| admission.restore.as_ref())
++                        .is_some_and(|restore| {
++                            restore.sources.iter().any(|(identity, disposition)| {
++                                super::native_provider::source_identity_matches(source, identity)
++                                    && matches!(
++                                        disposition.state,
++                                        tracedecay_memory_provider_registry::SourceDisposition::Deleted
++                                            | tracedecay_memory_provider_registry::SourceDisposition::Redacted
++                                            | tracedecay_memory_provider_registry::SourceDisposition::Expired
++                                    )
++                            })
++                        });
++                    if fresh_privacy && !fresh_privacy_admitted {
++                        return Err(StagedStoreError::LifecycleConflict(
++                            "restore deletion authority unavailable",
++                        ));
++                    }
++                    fence_and_scrub_target(connection, &call.exact_scope, &target, before)?;
++                    target.digest()
++                } else {
++                    // An imported or resident legacy raw fence keeps its original
++                    // broad semantics; typed evidence never enters this branch.
++                    fence_and_scrub_source(connection, &call.exact_scope, source_key, before)?;
++                    source_key.to_owned()
++                };
+                 restored_row["sanitized_payload"] = Value::Null;
+                 restored_row["tombstone"] = 1.into();
+                 restored_row["feedback"] = 0.into();
+-                restored_row["deleted_source_key"] = source_key.into();
++                restored_row["deleted_source_key"] = marker.into();
+                 for field in [
+                     "original_source",
+                     "validity_override",
+@@ -5087,6 +5543,7 @@
+             transaction,
+             &call.exact_scope,
+             required_text(original, "source_key")?,
++            Some(attribution),
+         )? {
+             rejected += 1;
+             continue;

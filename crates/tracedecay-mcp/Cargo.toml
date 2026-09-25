@@ -33,6 +33,7 @@ test-helpers = ["tracedecay-project/test-helpers"]
 source-analysis = ["tracedecay-code-extraction/lite"]
 
 [dependencies]
+tracedecay-semantic-contracts.workspace = true
 futures-util = "0.3.33"
 gix.workspace = true
 glob = "0.3"

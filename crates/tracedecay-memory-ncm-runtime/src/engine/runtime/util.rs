@@ -12,11 +12,6 @@ use tracedecay_memory_ncm_core::kernel::{LayerWriteKind, NcmKernel};
 use tracedecay_memory_ncm_core::signals::affect;
 use tracedecay_memory_ncm_core::types::{AffectVector, CoreError};
 
-const REFERENCE_WORKER_MANIFEST: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../product/ncm/reference/worker-manifest.json"
-));
-
 pub(super) fn lookup_replay(
     handle: &mut NamespaceHandle,
     key: &str,
@@ -481,22 +476,14 @@ pub(super) fn ready_payload(
         "epoch": epoch
     });
 
-    // A production ready response must carry the same immutable worker and
-    // model evidence that the provider pins before it starts routing calls.
-    // If the checked-in manifests cannot be decoded, keep the legacy shape so
-    // the provider fails closed instead of treating incomplete metadata as a
-    // V2 proof.
-    let Some(worker) = reference_worker_identity() else {
-        return payload;
-    };
+    // The worker loop adds the executing artifact identity. The engine owns
+    // only the model and durable-state portions of the ready proof.
     let Ok(encoder) = PinnedEncoder::reference() else {
         return payload;
     };
     let Some(object) = payload.as_object_mut() else {
         return payload;
     };
-    object.insert("identity_revision".to_owned(), Value::from(2_u64));
-    object.insert("worker".to_owned(), worker);
     object.insert(
         "encoder".to_owned(),
         json!({
@@ -516,57 +503,6 @@ pub(super) fn ready_payload(
         }),
     );
     payload
-}
-
-fn reference_worker_identity() -> Option<Value> {
-    let manifest: Value = serde_json::from_str(REFERENCE_WORKER_MANIFEST).ok()?;
-    let target_triple = current_target_triple();
-    let target = manifest
-        .get("targets")
-        .and_then(Value::as_array)?
-        .iter()
-        .find(|target| {
-            target.get("triple").and_then(Value::as_str) == Some(target_triple.as_str())
-        })?;
-    let sha256 = target.get("sha256").and_then(Value::as_str)?;
-    let bytes = target.get("bytes").and_then(Value::as_u64)?;
-    let triple = target.get("triple").and_then(Value::as_str)?;
-    let os = target.get("os").and_then(Value::as_str)?;
-    let arch = target.get("arch").and_then(Value::as_str)?;
-    let family = target.get("family").and_then(Value::as_str)?;
-    if sha256.len() != 64
-        || bytes == 0
-        || triple.is_empty()
-        || os.is_empty()
-        || arch.is_empty()
-        || family.is_empty()
-    {
-        return None;
-    }
-    Some(json!({
-        "sha256": sha256,
-        "bytes": bytes,
-        "target": {
-            "triple": triple,
-            "os": os,
-            "arch": arch,
-            "family": family,
-        },
-    }))
-}
-
-fn current_target_triple() -> String {
-    option_env!("TRACEDECAY_NCM_TARGET_TRIPLE")
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            let platform = match std::env::consts::OS {
-                "macos" => "apple-darwin",
-                "windows" => "pc-windows-msvc",
-                "linux" => "unknown-linux-gnu",
-                other => other,
-            };
-            format!("{}-{platform}", std::env::consts::ARCH)
-        })
 }
 
 pub(super) fn encoder_payload(identity: &EncoderIdentity) -> Value {

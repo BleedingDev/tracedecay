@@ -26,7 +26,7 @@ use tracedecay_semantic_contracts::{
     Sha256DigestHex, TruncationPolicyV1, UpstreamSourceV1,
 };
 
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 use hf_hub::{Cache, Repo, RepoType, api::sync::ApiBuilder};
 
 use super::artifact_store::{
@@ -73,6 +73,8 @@ pub enum ModelLifecycleErrorV1 {
     StoreUnavailable,
     #[error("semantic model lifecycle operation rejected")]
     Rejected,
+    #[error("semantic model acquisition is unavailable in this build")]
+    AcquisitionUnavailable,
     #[error("semantic model download failed")]
     DownloadFailed,
     #[error("semantic model download failed: {0}")]
@@ -245,7 +247,7 @@ impl ModelMemberSourceV1 for HfHubModelMemberSourceV1 {
 
 // The hub source is lifecycle-owned and compiles only with the optional
 // FastEmbed acquisition feature. Runtime session opening never calls it.
-#[cfg(feature = "semantic-fastembed")]
+#[cfg(all(feature = "semantic-fastembed", not(windows)))]
 fn fetch_hf_hub_member(
     cache_dir: &Path,
     endpoint: Option<&str>,
@@ -341,7 +343,7 @@ fn hf_hub_offline() -> bool {
         .is_ok_and(|value| !value.is_empty() && !matches!(value.as_str(), "0" | "false" | "FALSE"))
 }
 
-#[cfg(not(feature = "semantic-fastembed"))]
+#[cfg(not(all(feature = "semantic-fastembed", not(windows))))]
 fn fetch_hf_hub_member(
     cache_dir: &Path,
     endpoint: Option<&str>,
@@ -358,8 +360,8 @@ fn fetch_hf_hub_member(
         upstream_path,
         destination,
     );
-    crate::hotpath_observe::record_remote_failure("rejected");
-    Err(ModelLifecycleErrorV1::Rejected)
+    crate::hotpath_observe::record_remote_failure("acquisition_unavailable");
+    Err(ModelLifecycleErrorV1::AcquisitionUnavailable)
 }
 
 include!("model_lifecycle/owner.rs");
@@ -392,6 +394,44 @@ mod tests {
     }
 
     #[test]
+    fn explicit_acquisition_rejects_a_disabled_lifecycle_without_starting_work() {
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let owner =
+            SemanticModelLifecycleOwnerV1::open_default(root.path()).expect("open lifecycle owner");
+        owner
+            .select_model(None, false)
+            .expect("disable semantic lifecycle");
+
+        assert_eq!(
+            owner.begin_explicit_acquisition(),
+            Err(ModelLifecycleErrorV1::Rejected)
+        );
+        assert_eq!(owner.status().selected_model, None);
+        assert_eq!(owner.resolve_background_acquisition_outcome(), None);
+    }
+
+    #[cfg(not(all(feature = "semantic-fastembed", not(windows))))]
+    #[test]
+    fn explicit_acquisition_reports_an_unavailable_backend_before_queueing() {
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let owner =
+            SemanticModelLifecycleOwnerV1::open_default(root.path()).expect("open lifecycle owner");
+        owner
+            .select_model(Some(DEFAULT_FASTEMBED_MODEL_ID), false)
+            .expect("select production model");
+
+        assert_eq!(
+            owner.begin_explicit_acquisition(),
+            Err(ModelLifecycleErrorV1::AcquisitionUnavailable)
+        );
+        assert!(matches!(
+            owner.status().state,
+            Some(SemanticModelLifecycleStateV1::SelectedNotDownloaded { .. })
+        ));
+        assert_eq!(owner.resolve_background_acquisition_outcome(), None);
+    }
+
+    #[test]
     fn private_install_is_reverified_before_ready_on_restart_and_rollback() {
         let root = tempfile::tempdir().expect("lifecycle root");
         let mut catalog = FastEmbedModelCatalogV1::production();
@@ -406,15 +446,10 @@ mod tests {
         let model_id = model.model_id.clone();
         let revision = model.source.revision.clone();
         let artifact_digest = catalog_package_digest(model);
-        let source = Arc::new(HfHubModelMemberSourceV1::new(
-            root.path().join("hf-cache"),
-        ));
-        let owner = SemanticModelLifecycleOwnerV1::open(
-            root.path(),
-            catalog.clone(),
-            source.clone(),
-        )
-        .expect("open lifecycle owner");
+        let source = Arc::new(HfHubModelMemberSourceV1::new(root.path().join("hf-cache")));
+        let owner =
+            SemanticModelLifecycleOwnerV1::open(root.path(), catalog.clone(), source.clone())
+                .expect("open lifecycle owner");
 
         owner
             .select_model(Some(&model_id), false)

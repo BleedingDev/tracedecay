@@ -1,0 +1,1805 @@
+--- a/crates/tracedecay-memory-conformance/src/compatibility.rs
++++ b/crates/tracedecay-memory-conformance/src/compatibility.rs
+@@ -250,6 +250,12 @@
+     /// A populated earlier recall establishes that this absence is non-vacuous.
+     RecallAbsent {
+         /// Earlier positive recall step.
++        populated_step: String,
++    },
++    /// Foreign checkout isolation permits a healthy empty recall or a typed
++    /// effect-free scope refusal, after a populated original-scope witness.
++    ForeignScopeIsolated {
++        /// Earlier positive recall that proves the isolated source exists.
+         populated_step: String,
+     },
+     /// Current host privacy disposition either filters or explicitly withholds
+@@ -1261,7 +1267,7 @@
+     }
+ }
+ 
+-fn utc_nanos(value: &str) -> Option<i64> {
++pub(crate) fn utc_nanos(value: &str) -> Option<i64> {
+     let (seconds, nanos) = crate::scenario_corpus::utc_ordering_key(value)?;
+     let year = seconds[..4].parse::<i64>().ok()?;
+     let month = seconds[5..7].parse::<i64>().ok()?;
+@@ -1411,7 +1417,11 @@
+         Err(_)
+             if reply.payload.is_none()
+                 && assertions.iter().all(|assertion| {
+-                    matches!(assertion, CompatibilityAssertion::PrivacyWithheld { .. })
++                    matches!(
++                        assertion,
++                        CompatibilityAssertion::PrivacyWithheld { .. }
++                            | CompatibilityAssertion::ForeignScopeIsolated { .. }
++                    )
+                 }) =>
+         {
+             Value::Null
+@@ -1452,6 +1462,34 @@
+                         value.pointer("/coverage/state").and_then(Value::as_str),
+                         Some("complete" | "zero_results")
+                     )
++            }
++            CompatibilityAssertion::ForeignScopeIsolated { populated_step } => {
++                let effect = reply.terminal.committed_effect();
++                positive_reply(previous.get(populated_step))
++                    && !foreign_scope_leaks_source(reply, previous.get(populated_step))
++                    && reply.terminal.fallback() == &FallbackDirective::forbidden()
++                    && effect.state() == CommittedEffectState::None
++                    && match (
++                        effect.state_generation_before(),
++                        effect.state_generation_after(),
++                    ) {
++                        (Some(before), Some(after)) => before == after,
++                        _ => true,
++                    }
++                    && ((reply.terminal.terminal_code() == TerminalCode::ScopeMismatch
++                        && reply.payload.is_none()
++                        && reply.extensions.is_empty())
++                        || (matches!(
++                            reply.terminal.terminal_code(),
++                            TerminalCode::Success | TerminalCode::SuccessZeroResults
++                        ) && value
++                            .get("candidates")
++                            .and_then(Value::as_array)
++                            .is_some_and(Vec::is_empty)
++                            && matches!(
++                                value.pointer("/coverage/state").and_then(Value::as_str),
++                                Some("complete" | "zero_results")
++                            )))
+             }
+             CompatibilityAssertion::PrivacyWithheld { populated_step } => {
+                 positive_reply(previous.get(populated_step))
+@@ -4007,11 +4045,19 @@
+             &format!("authority.foreign_{label}_absence"),
+             ProviderOperation::Recall,
+             common_recall("current", T4, None),
+-            vec![CompatibilityAssertion::RecallAbsent {
++            vec![CompatibilityAssertion::ForeignScopeIsolated {
+                 populated_step: "authority.original_positive".into(),
+             }],
+         )?;
+-        expect_absence(&mut absent)?;
++        if let CompatibilityStep::Call { fixture, .. } = &mut absent {
++            fixture.expectation.terminal = TerminalExpectation::one_of([
++                TerminalCode::Success,
++                TerminalCode::SuccessZeroResults,
++                TerminalCode::ScopeMismatch,
++            ])
++            .map_err(|error| error.to_string())?;
++            fixture.expectation.payload = PayloadExpectation::Any;
++        }
+         steps.push(absent);
+         let mut forbidden = replay(&foreign, &[original.clone()], "available");
+         forbidden["history_grant"]["relation"] = json!("same_checkout");
+@@ -4038,6 +4084,66 @@
+     Ok(CompatibilityScenario {
+         case_id: "common.source_authority_session_scope_isolation".into(),
+         steps,
++    })
++}
++
++fn foreign_scope_leaks_source(reply: &ProviderReply, populated: Option<&ProviderReply>) -> bool {
++    let Some(prior) = populated.and_then(|reply| payload_value(reply).ok()) else {
++        return true;
++    };
++    let Some(candidates) = prior.get("candidates").and_then(Value::as_array) else {
++        return true;
++    };
++    let mut exposed = reply.warnings.join("\n");
++    if let Some(diagnostic) = reply.terminal.diagnostic_id() {
++        exposed.push_str(diagnostic);
++    }
++    if let Some(payload) = &reply.payload {
++        exposed.push_str(&String::from_utf8_lossy(&payload.bytes));
++    }
++    for extension in &reply.extensions {
++        exposed.push_str(&String::from_utf8_lossy(&extension.canonical_payload));
++    }
++    candidates.iter().any(|candidate| {
++        let mut retained = Vec::new();
++        for field in [
++            "content",
++            "stable_memory_ref",
++            "candidate_id",
++            "content_sha256",
++        ] {
++            retained.extend(candidate.get(field).and_then(Value::as_str));
++        }
++        for field in ["source_refs", "trace_refs", "observation_refs"] {
++            if let Some(values) = candidate
++                .pointer(&format!("/provenance/{field}"))
++                .and_then(Value::as_array)
++            {
++                retained.extend(values.iter().filter_map(Value::as_str));
++            }
++        }
++        if let Some(sources) = candidate
++            .pointer("/provenance/original_sources")
++            .and_then(Value::as_array)
++        {
++            for source in sources {
++                for field in [
++                    "source_key",
++                    "observation_id",
++                    "content_sha256",
++                    "stable_record_id",
++                ] {
++                    retained.extend(
++                        source
++                            .pointer(&format!("/source/{field}"))
++                            .and_then(Value::as_str),
++                    );
++                }
++            }
++        }
++        retained
++            .into_iter()
++            .any(|text| !text.is_empty() && exposed.contains(text))
+     })
+ }
+ 
+--- /dev/null
++++ b/crates/tracedecay-memory-conformance/src/real_fixture.rs
+@@ -0,0 +1,538 @@
++//! Shared trusted setup for real-provider conformance factories.
++//!
++//! This module owns no provider, storage implementation, process or runtime. Its
++//! inventory is registered from the unchanged suite before a provider is opened.
++//! Caller-supplied grants are checked against that inventory and a fixed fixture
++//! policy; they never add sources or overwrite current disposition state.
++
++use std::collections::{BTreeMap, BTreeSet};
++use std::sync::{Arc, Mutex};
++use std::time::{SystemTime, UNIX_EPOCH};
++
++use serde::{Deserialize, Serialize};
++use serde_json::Value;
++use tracedecay_memory_provider_api::contract::SourceDisposition;
++use tracedecay_memory_provider_api::{
++    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CurrentAdvisoryAdmission,
++    CurrentRestoreAdmission, CurrentSourceDisposition, GrantedHistorySource, OriginScopeEvidence,
++    OriginalSourceIdentity, OwnedExactScope, OwnedProviderId, ProviderCall, ProviderOperation,
++    RecordedValidity, RestoreDispositionCheckpoint, SourceAttribution,
++};
++
++use crate::compatibility::{CompatibilityScenario, CompatibilityStep, FixtureEnvironmentAction};
++
++mod transport;
++pub use transport::{
++    DescriptorDto, HandshakeRequestDto, HandshakeResponseDto, MAX_TRANSPORT_JSON_BYTES,
++    ProviderCallDto, ProviderReplyDto,
++};
++
++const MAX_SOURCES: usize = 4096;
++const MAX_INVENTORY_BYTES: usize = 16 * 1024 * 1024;
++const ADMISSION_REF: &str = "fixture.host.admitted-history";
++
++/// Serializable trusted fixture state for a child restart. Deserialize only from
++/// the owning test process; this is never a provider call or a grant payload.
++#[derive(Clone, Debug, Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++pub struct FixtureAuthoritySnapshot {
++    base_scope: Value,
++    observations: BTreeMap<String, Value>,
++    dispositions: BTreeMap<String, String>,
++    available: bool,
++    revision: u64,
++}
++
++/// One fixture-owned authority shared across physical namespaces and processes.
++#[derive(Clone, Debug)]
++pub struct FixtureAuthority {
++    state: Arc<Mutex<FixtureAuthoritySnapshot>>,
++}
++
++impl FixtureAuthority {
++    /// Registers original evidence from actual observation bodies in the given
++    /// scenario. No assertion, case name or provider identity affects admission.
++    pub fn from_scenario(
++        scenario: &CompatibilityScenario,
++        scope: &OwnedExactScope,
++    ) -> Result<Self, String> {
++        scope.validate().map_err(err)?;
++        let mut state = FixtureAuthoritySnapshot {
++            base_scope: crate::compatibility::scope_json(scope),
++            observations: BTreeMap::new(),
++            dispositions: BTreeMap::new(),
++            available: true,
++            revision: 1,
++        };
++        for step in &scenario.steps {
++            match step {
++                CompatibilityStep::Call { fixture, .. } => {
++                    let value: Value =
++                        serde_json::from_slice(&fixture.payload.bytes).map_err(err)?;
++                    match fixture.operation {
++                        ProviderOperation::Observe => register(&mut state, &value)?,
++                        ProviderOperation::Correction => {
++                            if value["replacement"].get("source_identity").is_some() {
++                                register(&mut state, &value["replacement"])?;
++                            }
++                        }
++                        ProviderOperation::Replay => {
++                            for row in array(&value["resolved_observations"])? {
++                                register(&mut state, &row["observation"])?;
++                            }
++                        }
++                        _ => {}
++                    }
++                }
++                CompatibilityStep::Environment {
++                    action: FixtureEnvironmentAction::InstallLegacyV1 { observations },
++                    ..
++                } => {
++                    for observation in observations {
++                        register(&mut state, observation)?;
++                    }
++                }
++                _ => {}
++            }
++        }
++        Self::from_snapshot(state)
++    }
++
++    /// Reopens a trusted owning-process snapshot without relabeling its sources.
++    pub fn from_snapshot(snapshot: FixtureAuthoritySnapshot) -> Result<Self, String> {
++        bounded_inventory(&snapshot)?;
++        parse_scope(&snapshot.base_scope)?;
++        if snapshot.revision == 0
++            || snapshot.observations.len() > MAX_SOURCES
++            || snapshot.dispositions.len() != snapshot.observations.len()
++        {
++            return Err("invalid fixture authority inventory bounds".into());
++        }
++        for (key, observation) in &snapshot.observations {
++            let source = parse_attribution(&observation["source_identity"]["original_source"])?;
++            verify_observation(observation)?;
++            if source.source.source_key != *key {
++                return Err("fixture inventory source key differs".into());
++            }
++            let state = snapshot
++                .dispositions
++                .get(key)
++                .and_then(|s| SourceDisposition::from_wire(s))
++                .ok_or("missing fixture disposition")?;
++            if state == SourceDisposition::Unknown {
++                return Err("unknown fixture disposition".into());
++            }
++        }
++        Ok(Self {
++            state: Arc::new(Mutex::new(snapshot)),
++        })
++    }
++
++    /// Copies the independently owned current state for a real process restart.
++    pub fn snapshot(&self) -> Result<FixtureAuthoritySnapshot, String> {
++        self.state
++            .lock()
++            .map(|state| state.clone())
++            .map_err(|_| "fixture authority lock poisoned".into())
++    }
++
++    /// Changes the actual callback availability, independently of request JSON.
++    pub fn set_available(&self, available: bool) -> Result<(), String> {
++        self.state
++            .lock()
++            .map_err(|_| "fixture authority lock poisoned")?
++            .available = available;
++        Ok(())
++    }
++
++    /// Records a known source's actual current disposition and returns the
++    /// authority-local journal reference. Unknown sources cannot be registered.
++    pub fn record_disposition(
++        &self,
++        source_key: &str,
++        disposition: SourceDisposition,
++    ) -> Result<String, String> {
++        if disposition == SourceDisposition::Unknown {
++            return Err("unknown fixture disposition".into());
++        }
++        let mut state = self
++            .state
++            .lock()
++            .map_err(|_| "fixture authority lock poisoned")?;
++        if !state.observations.contains_key(source_key) {
++            return Err("unregistered fixture source".into());
++        }
++        state.revision = state
++            .revision
++            .checked_add(1)
++            .ok_or("fixture authority revision overflow")?;
++        state
++            .dispositions
++            .insert(source_key.into(), disposition.as_wire().into());
++        Ok(format!(
++            "fixture.host.disposition-journal.{}",
++            state.revision
++        ))
++    }
++}
++
++impl AdvisoryAdmissionAuthority for FixtureAuthority {
++    fn admit(
++        &self,
++        call: &ProviderCall,
++    ) -> Result<CurrentAdvisoryAdmission, AdvisoryAdmissionError> {
++        call.control
++            .snapshot()
++            .map_err(AdvisoryAdmissionError::Control)?;
++        call.validate()?;
++        let state = self
++            .state
++            .lock()
++            .map_err(|_| AdvisoryAdmissionError::Unavailable("fixture authority lock"))?;
++        if !state.available {
++            return Err(AdvisoryAdmissionError::Unavailable("fixture authority"));
++        }
++        let result = resolve(&state, call).map_err(|_| {
++            AdvisoryAdmissionError::Denied("fixture source or policy evidence differs")
++        })?;
++        CurrentAdvisoryAdmission::new(call, result.0, result.1)
++    }
++}
++
++fn resolve(
++    state: &FixtureAuthoritySnapshot,
++    call: &ProviderCall,
++) -> Result<(Vec<GrantedHistorySource>, Option<CurrentRestoreAdmission>), String> {
++    let value: Value = serde_json::from_slice(&call.payload.bytes).map_err(err)?;
++    let now = current_nanos()?;
++    let mut requested = BTreeSet::new();
++    let grant = value.get("history_grant").filter(|value| !value.is_null());
++    if let Some(grant) = grant {
++        if string(&grant["authorization_ref"])? != ADMISSION_REF
++            || grant["policy_revision"].as_u64() != Some(1)
++            || parse_scope(&grant["destination_scope"])? != call.exact_scope
++        {
++            return Err("fixture history policy differs".into());
++        }
++        let relation = string(&grant["relation"])?;
++        let claims = array(&grant["sources"])?;
++        if claims.is_empty() || claims.len() > MAX_SOURCES {
++            return Err("fixture history source bounds".into());
++        }
++        for claim in claims {
++            let attribution = &claim["attribution"];
++            let source = parse_attribution(attribution)?;
++            let registered = state
++                .observations
++                .get(&source.source.source_key)
++                .ok_or("unregistered fixture history source")?;
++            if registered["source_identity"]["original_source"] != *attribution {
++                return Err("fixture attribution differs".into());
++            }
++            let origin = source.origin_scope.recorded_scope().map_err(err)?;
++            if !match relation {
++                "exact_scope" => origin == &call.exact_scope,
++                "same_checkout" => same_checkout(origin, &call.exact_scope),
++                _ => false,
++            } {
++                return Err("fixture history scope relation denied".into());
++            }
++            if !requested.insert(source.source.source_key) {
++                return Err("duplicate fixture history source".into());
++            }
++        }
++    }
++    if call.operation == ProviderOperation::Replay {
++        if grant.is_none() {
++            return Err("replay has no admitted history relation".into());
++        }
++        let rows = array(&value["resolved_observations"])?;
++        let mut replay_sources = BTreeSet::new();
++        let mut receipts = BTreeSet::new();
++        for row in rows {
++            let observation = &row["observation"];
++            let key = observation_key(observation)?;
++            let registered = state
++                .observations
++                .get(key)
++                .ok_or("unregistered replay source")?;
++            verify_same_observation(registered, observation)?;
++            let sequence = registered["source_sequence"]
++                .as_u64()
++                .ok_or("missing source sequence")?;
++            let receipt = format!("fixture.host.observation-receipt.{sequence}");
++            if string(&row["receipt_ref"])? != receipt
++                || !receipts.insert(receipt)
++                || !replay_sources.insert(key.to_owned())
++            {
++                return Err("fixture retained replay receipt differs".into());
++            }
++        }
++        if replay_sources != requested {
++            return Err("fixture replay coverage differs".into());
++        }
++    } else if call.operation != ProviderOperation::SnapshotRestore {
++        for (key, observation) in &state.observations {
++            let source = parse_attribution(&observation["source_identity"]["original_source"])?;
++            if source.origin_scope.recorded_scope().map_err(err)? == &call.exact_scope {
++                requested.insert(key.clone());
++            }
++        }
++    }
++    for observation in match call.operation {
++        ProviderOperation::Observe => vec![&value],
++        ProviderOperation::Correction if value["replacement"].get("source_identity").is_some() => {
++            vec![&value["replacement"]]
++        }
++        _ => vec![],
++    } {
++        let key = observation_key(observation)?;
++        let registered = state
++            .observations
++            .get(key)
++            .ok_or("unregistered dispatched observation")?;
++        verify_same_observation(registered, observation)?;
++        if !requested.contains(key) {
++            return Err("observation source scope denied".into());
++        }
++    }
++    let restore = if call.operation == ProviderOperation::SnapshotRestore {
++        let mut sources = Vec::new();
++        let mut seen = BTreeSet::new();
++        for raw in array(&value["snapshot"]["sources"])? {
++            let source = parse_identity(raw)?;
++            let registered = state
++                .observations
++                .get(&source.source_key)
++                .ok_or("unregistered snapshot source")?;
++            let attribution = parse_attribution(&registered["source_identity"]["original_source"])?;
++            if attribution.source != source
++                || !same_checkout(
++                    attribution.origin_scope.recorded_scope().map_err(err)?,
++                    &call.exact_scope,
++                )
++                || !seen.insert(source.source_key.clone())
++            {
++                return Err("fixture snapshot source differs".into());
++            }
++            requested.insert(source.source_key.clone());
++            sources.push((
++                source.clone(),
++                current_disposition(state, &source.source_key, now)?,
++            ));
++        }
++        Some(
++            CurrentRestoreAdmission::new(
++                RestoreDispositionCheckpoint {
++                    exact_scope: call.exact_scope.clone(),
++                    authority_ref: "fixture.host.current-disposition-checkpoint".into(),
++                    authority_revision: Some(state.revision),
++                    checked_at_utc_nanos: now,
++                },
++                sources,
++            )
++            .map_err(err)?,
++        )
++    } else {
++        None
++    };
++    let history = requested
++        .into_iter()
++        .map(|key| {
++            let observation = state
++                .observations
++                .get(&key)
++                .ok_or("missing fixture source")?;
++            Ok(GrantedHistorySource {
++                attribution: parse_attribution(&observation["source_identity"]["original_source"])?,
++                current_disposition: current_disposition(state, &key, now)?,
++            })
++        })
++        .collect::<Result<Vec<_>, String>>()?;
++    Ok((history, restore))
++}
++
++fn current_disposition(
++    state: &FixtureAuthoritySnapshot,
++    key: &str,
++    now: i64,
++) -> Result<CurrentSourceDisposition, String> {
++    Ok(CurrentSourceDisposition {
++        state: state
++            .dispositions
++            .get(key)
++            .and_then(|s| SourceDisposition::from_wire(s))
++            .ok_or("missing fixture disposition")?,
++        authority_ref: "fixture.host.current-source-disposition".into(),
++        authority_revision: Some(state.revision),
++        checked_at_utc_nanos: now,
++    })
++}
++
++fn register(state: &mut FixtureAuthoritySnapshot, observation: &Value) -> Result<(), String> {
++    verify_observation(observation)?;
++    let key = observation_key(observation)?.to_owned();
++    if let Some(existing) = state.observations.get(&key) {
++        verify_same_observation(existing, observation)?;
++    } else {
++        if state.observations.len() >= MAX_SOURCES {
++            return Err("fixture source inventory bound exceeded".into());
++        }
++        state.observations.insert(key.clone(), observation.clone());
++        state.dispositions.insert(key, "available".into());
++    }
++    bounded_inventory(state)
++}
++
++fn verify_observation(observation: &Value) -> Result<(), String> {
++    let original = parse_attribution(&observation["source_identity"]["original_source"])?;
++    if original.source.content_sha256
++        != crate::canonical_json_sha256(&observation["canonical_payload"]).map_err(err)?
++        || observation["payload_sha256"].as_str() != Some(original.source.content_sha256.as_str())
++        || observation["observation_id"].as_str() != Some(original.source.observation_id.as_str())
++        || observation["source_sequence"].as_u64() != Some(original.source_sequence)
++        || observation["source_identity"]["canonical_settlement_receipt"].as_str()
++            != Some("fixture.host.settled-message")
++    {
++        return Err("fixture original observation evidence differs".into());
++    }
++    original.origin_scope.recorded_scope().map_err(err)?;
++    Ok(())
++}
++
++fn verify_same_observation(expected: &Value, actual: &Value) -> Result<(), String> {
++    for field in [
++        "observation_id",
++        "observation_kind",
++        "payload_contract",
++        "canonical_payload",
++        "payload_sha256",
++        "source_identity",
++        "provenance",
++        "privacy",
++        "occurred_at",
++        "admitted_at",
++        "source_sequence",
++    ] {
++        if expected.get(field) != actual.get(field) {
++            return Err(format!("fixture original observation {field} differs"));
++        }
++    }
++    Ok(())
++}
++
++fn observation_key(observation: &Value) -> Result<&str, String> {
++    string(&observation["source_identity"]["original_source"]["source"]["source_key"])
++}
++fn bounded_inventory(state: &FixtureAuthoritySnapshot) -> Result<(), String> {
++    if serde_json::to_vec(state).map_err(err)?.len() > MAX_INVENTORY_BYTES {
++        return Err("fixture inventory byte bound exceeded".into());
++    }
++    Ok(())
++}
++fn same_checkout(a: &OwnedExactScope, b: &OwnedExactScope) -> bool {
++    a.profile_id == b.profile_id
++        && a.project_id == b.project_id
++        && a.repository_identity == b.repository_identity
++        && a.worktree_identity == b.worktree_identity
++        && a.branch_identity == b.branch_identity
++        && a.resolved_scope_digest == b.resolved_scope_digest
++}
++fn current_nanos() -> Result<i64, String> {
++    i64::try_from(
++        SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_err(err)?
++            .as_nanos(),
++    )
++    .map_err(err)
++}
++fn err(error: impl std::fmt::Display) -> String {
++    error.to_string()
++}
++fn string(value: &Value) -> Result<&str, String> {
++    value
++        .as_str()
++        .ok_or_else(|| "fixture text field missing".into())
++}
++fn array(value: &Value) -> Result<&Vec<Value>, String> {
++    value
++        .as_array()
++        .ok_or_else(|| "fixture array field missing".into())
++}
++fn optional_string(value: &Value) -> Result<Option<String>, String> {
++    if value.is_null() {
++        Ok(None)
++    } else {
++        string(value).map(|s| Some(s.to_owned()))
++    }
++}
++fn instant(value: &Value) -> Result<Option<i64>, String> {
++    if value.is_null() {
++        Ok(None)
++    } else {
++        crate::compatibility::utc_nanos(string(value)?)
++            .map(Some)
++            .ok_or_else(|| "fixture UTC timestamp invalid".into())
++    }
++}
++fn parse_scope(value: &Value) -> Result<OwnedExactScope, String> {
++    OwnedExactScope::new(
++        string(&value["profile_id"])?,
++        string(&value["project_id"])?,
++        string(&value["repository_identity"])?,
++        string(&value["worktree_identity"])?,
++        string(&value["branch_identity"])?,
++        string(&value["agent_session_id"])?,
++        string(&value["resolved_scope_digest"])?,
++    )
++    .map_err(err)
++}
++fn parse_identity(value: &Value) -> Result<OriginalSourceIdentity, String> {
++    let source = OriginalSourceIdentity {
++        canonical_provider_id: OwnedProviderId::new(string(&value["canonical_provider_id"])?)
++            .map_err(err)?,
++        canonical_session_id: string(&value["canonical_session_id"])?.into(),
++        source_key: string(&value["source_key"])?.into(),
++        stable_record_id: optional_string(&value["stable_record_id"])?,
++        observation_id: string(&value["observation_id"])?.into(),
++        source_revision: optional_string(&value["source_revision"])?,
++        content_sha256: string(&value["content_sha256"])?.into(),
++    };
++    source.validate().map_err(err)?;
++    Ok(source)
++}
++fn parse_attribution(value: &Value) -> Result<SourceAttribution, String> {
++    let origin = &value["origin_scope"];
++    let validity = &value["validity"];
++    let source = SourceAttribution {
++        source: parse_identity(&value["source"])?,
++        origin_scope: match string(&origin["state"])? {
++            "recorded" => OriginScopeEvidence::Recorded {
++                scope: parse_scope(&origin["exact_scope_identity"])?,
++                authority_ref: string(&origin["authority_ref"])?.into(),
++            },
++            "ingestion_only" => OriginScopeEvidence::IngestionOnly,
++            "unavailable" => OriginScopeEvidence::Unavailable,
++            _ => return Err("fixture origin evidence state invalid".into()),
++        },
++        source_sequence: value["source_sequence"]
++            .as_u64()
++            .ok_or("fixture source sequence missing")?,
++        occurred_at_utc_nanos: instant(&value["occurred_at"])?,
++        ingested_at_utc_nanos: instant(&value["ingested_at"])?
++            .ok_or("fixture ingestion timestamp missing")?,
++        validity: RecordedValidity {
++            valid_from_utc_nanos: instant(&validity["valid_from"])?,
++            valid_until_utc_nanos: instant(&validity["valid_until"])?,
++            superseded_at_utc_nanos: instant(&validity["superseded_at"])?,
++            superseded_by: optional_string(&validity["superseded_by"])?,
++            revoked_at_utc_nanos: instant(&validity["revoked_at"])?,
++        },
++    };
++    source.validate().map_err(err)?;
++    Ok(source)
++}
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/crates/tracedecay-memory-conformance/src/real_fixture/transport.rs
+@@ -0,0 +1,452 @@
++//! Lossless bounded DTOs for an owned real-provider test child.
++//!
++//! Values originate in the actual provider API. No field is inferred from a
++//! host scope, implementation name or expected scenario result. The process
++//! owner must bound its receive wait by the ORIGINAL caller control and forward
++//! live cancellation to the token passed to restore, including while a child
++//! call is executing. A serialized cancellation snapshot alone is insufficient.
++
++use super::{array, err, optional_string, parse_scope, string};
++use serde::{Deserialize, Serialize};
++use serde_json::{Value, json};
++use std::time::{Duration, SystemTime, UNIX_EPOCH};
++use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
++use tracedecay_memory_provider_api::{
++    CancellationToken, CanonicalPayload, CommittedEffectEvidence, CommittedEffectEvidenceParts,
++    FallbackDirective, HandshakeRequest, HandshakeRequestParts, HandshakeResponse,
++    OperationControl, OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId,
++    PayloadSanitizationReceipt, PinnedFallbackPolicy, ProviderCall, ProviderCallParts,
++    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
++};
++
++/// Finite JSON frame ceiling, including byte-array encoding expansion.
++pub const MAX_TRANSPORT_JSON_BYTES: usize = 192 * 1024 * 1024;
++
++macro_rules! dto {
++    ($name:ident, $doc:literal) => {
++        #[doc = $doc]
++        #[derive(Clone, Debug, Serialize, Deserialize)]
++        #[serde(transparent)]
++        pub struct $name(Value);
++        impl $name {
++            /// Encodes one bounded owned-child frame without changing its data.
++            pub fn encode(&self) -> Result<Vec<u8>, String> {
++                encode(&self.0)
++            }
++            /// Decodes a bounded child frame; restore checks all required types.
++            pub fn decode(bytes: &[u8]) -> Result<Self, String> {
++                decode(bytes).map(Self)
++            }
++        }
++    };
++}
++dto!(
++    DescriptorDto,
++    "Actual provider descriptor, including its full capability and limit set."
++);
++dto!(
++    HandshakeRequestDto,
++    "Original handshake request with its exact nonce and finite live control snapshot."
++);
++dto!(
++    HandshakeResponseDto,
++    "Actual provider handshake response, including terminal, receipt and accepted scope."
++);
++dto!(
++    ProviderCallDto,
++    "Actual call bytes and identities, opaque extensions and original sanitization receipt."
++);
++dto!(
++    ProviderReplyDto,
++    "Actual provider reply bytes and complete typed terminal/effect/fallback evidence."
++);
++
++impl DescriptorDto {
++    /// Captures the actual provider descriptor.
++    pub fn capture(value: &ProviderDescriptor) -> Result<Self, String> {
++        checked(descriptor(value)).map(Self)
++    }
++    /// Restores every descriptor field from this frame alone.
++    pub fn restore(self) -> Result<ProviderDescriptor, String> {
++        checked(self.0).and_then(|value| read_descriptor(&value))
++    }
++}
++impl HandshakeRequestDto {
++    /// Captures remaining time now, never the original unspent duration.
++    pub fn capture(value: &HandshakeRequest) -> Result<Self, String> {
++        checked(json!({"provider_id": value.provider_id.as_str(), "registration_revision": value.registration_revision,
++            "exact_scope": crate::compatibility::scope_json(&value.exact_scope), "request_id": value.request_id,
++            "required_capabilities": capabilities(&value.required_capabilities), "host_limits": limits(value.host_limits),
++            "control": control(&value.control)?, "challenge_nonce": value.challenge_nonce})).map(Self)
++    }
++    /// Restores with a live caller-cancellation bridge. `transport_elapsed` must
++    /// include known queue/transit delay; wall transit is also subtracted. The
++    /// original parent control must still bound the transport's entire wait.
++    pub fn restore(
++        self,
++        cancellation: CancellationToken,
++        transport_elapsed: Duration,
++    ) -> Result<HandshakeRequest, String> {
++        let v = checked(self.0)?;
++        let nonce = bytes(&v["challenge_nonce"])?;
++        HandshakeRequest::new(HandshakeRequestParts {
++            provider_id: provider(&v["provider_id"])?,
++            registration_revision: number(&v["registration_revision"])?,
++            exact_scope: parse_scope(&v["exact_scope"])?,
++            request_id: string(&v["request_id"])?.into(),
++            required_capabilities: read_capabilities(&v["required_capabilities"])?,
++            host_limits: read_limits(&v["host_limits"])?,
++            control: read_control(&v["control"], cancellation, transport_elapsed)?,
++            challenge_nonce: nonce
++                .try_into()
++                .map_err(|_| "child handshake nonce length differs")?,
++        })
++        .map_err(err)
++    }
++}
++impl HandshakeResponseDto {
++    /// Captures the real response, including failure responses without readiness.
++    pub fn capture(value: &HandshakeResponse) -> Result<Self, String> {
++        checked(json!({"terminal": terminal(&value.terminal), "descriptor": value.descriptor.as_ref().map(descriptor),
++            "provider_instance_id": value.provider_instance_id, "state_namespace": value.state_namespace,
++            "accepted_scope": value.accepted_scope.as_ref().map(crate::compatibility::scope_json),
++            "effective_limits": value.effective_limits.map(limits), "ready_receipt_sha256": value.ready_receipt_sha256,
++            "warnings": value.warnings})).map(Self)
++    }
++    /// Restores only the actual transmitted provider fields.
++    pub fn restore(self) -> Result<HandshakeResponse, String> {
++        let v = checked(self.0)?;
++        Ok(HandshakeResponse {
++            terminal: read_terminal(&v["terminal"])?,
++            descriptor: optional(&v["descriptor"], read_descriptor)?,
++            provider_instance_id: optional_string(&v["provider_instance_id"])?,
++            state_namespace: optional_string(&v["state_namespace"])?,
++            accepted_scope: optional(&v["accepted_scope"], parse_scope)?,
++            effective_limits: optional(&v["effective_limits"], read_limits)?,
++            ready_receipt_sha256: optional_string(&v["ready_receipt_sha256"])?,
++            warnings: strings(&v["warnings"])?,
++        })
++    }
++}
++impl ProviderCallDto {
++    /// Copies original canonical bytes and the actual receipt; it never mints a
++    /// replacement receipt or rebuilds a payload from projected host context.
++    pub fn capture(value: &ProviderCall) -> Result<Self, String> {
++        checked(json!({"operation": value.operation.as_wire(), "provider_id": value.provider_id.as_str(),
++            "registration_revision": value.registration_revision, "ready_receipt_sha256": value.ready_receipt_sha256,
++            "exact_scope": crate::compatibility::scope_json(&value.exact_scope), "request_id": value.request_id,
++            "operation_id": value.operation_id, "expected_state_generation": value.expected_state_generation,
++            "idempotency_key": value.idempotency_key, "control": control(&value.control)?, "payload": payload(&value.payload),
++            "required_capabilities": capabilities(&value.required_capabilities), "extensions": extensions(&value.extensions),
++            "sanitization_receipt": value.sanitization().map(PayloadSanitizationReceipt::to_json)})).map(Self)
++    }
++    /// Recreates the original call with a live cancellation bridge and a reduced
++    /// budget. The owner must keep polling the original control during the RPC.
++    pub fn restore(
++        self,
++        cancellation: CancellationToken,
++        transport_elapsed: Duration,
++    ) -> Result<ProviderCall, String> {
++        let v = checked(self.0)?;
++        let mut call = ProviderCall::new(ProviderCallParts {
++            operation: operation(&v["operation"])?,
++            provider_id: provider(&v["provider_id"])?,
++            registration_revision: number(&v["registration_revision"])?,
++            ready_receipt_sha256: string(&v["ready_receipt_sha256"])?.into(),
++            exact_scope: parse_scope(&v["exact_scope"])?,
++            request_id: string(&v["request_id"])?.into(),
++            operation_id: string(&v["operation_id"])?.into(),
++            expected_state_generation: number(&v["expected_state_generation"])?,
++            idempotency_key: optional_string(&v["idempotency_key"])?,
++            control: read_control(&v["control"], cancellation, transport_elapsed)?,
++            payload: read_payload(&v["payload"])?,
++            required_capabilities: read_capabilities(&v["required_capabilities"])?,
++            extensions: read_extensions(&v["extensions"])?,
++        })
++        .map_err(err)?;
++        if let Some(receipt) = optional_string(&v["sanitization_receipt"])? {
++            call = call
++                .with_sanitization(PayloadSanitizationReceipt::from_json(&receipt).map_err(err)?);
++        }
++        call.validate().map_err(err)?;
++        Ok(call)
++    }
++}
++impl ProviderReplyDto {
++    /// Copies all real reply fields, preserving invalid payload digests too so
++    /// the common runner, rather than the transport, assesses provider behavior.
++    pub fn capture(value: &ProviderReply) -> Result<Self, String> {
++        checked(json!({"terminal": terminal(&value.terminal), "payload": value.payload.as_ref().map(payload),
++            "warnings": value.warnings, "extensions": extensions(&value.extensions), "state_generation": value.state_generation})).map(Self)
++    }
++    /// Restores the transmitted evidence without inferring success or content.
++    pub fn restore(self) -> Result<ProviderReply, String> {
++        let v = checked(self.0)?;
++        Ok(ProviderReply {
++            terminal: read_terminal(&v["terminal"])?,
++            payload: optional(&v["payload"], read_payload)?,
++            warnings: strings(&v["warnings"])?,
++            extensions: read_extensions(&v["extensions"])?,
++            state_generation: number(&v["state_generation"])?,
++        })
++    }
++}
++
++fn encode(value: &Value) -> Result<Vec<u8>, String> {
++    let bytes = serde_json::to_vec(value).map_err(err)?;
++    if bytes.len() > MAX_TRANSPORT_JSON_BYTES {
++        return Err("child transport frame byte bound exceeded".into());
++    }
++    Ok(bytes)
++}
++fn checked(value: Value) -> Result<Value, String> {
++    encode(&value)?;
++    if !value.is_object() {
++        return Err("child transport object required".into());
++    }
++    Ok(value)
++}
++fn decode(bytes: &[u8]) -> Result<Value, String> {
++    if bytes.len() > MAX_TRANSPORT_JSON_BYTES {
++        return Err("child transport frame byte bound exceeded".into());
++    }
++    checked(serde_json::from_slice(bytes).map_err(err)?)
++}
++fn optional<T>(
++    value: &Value,
++    f: impl FnOnce(&Value) -> Result<T, String>,
++) -> Result<Option<T>, String> {
++    if value.is_null() {
++        Ok(None)
++    } else {
++        f(value).map(Some)
++    }
++}
++fn number(value: &Value) -> Result<u64, String> {
++    value
++        .as_u64()
++        .ok_or_else(|| "child unsigned integer required".into())
++}
++fn signed(value: &Value) -> Result<i64, String> {
++    value
++        .as_i64()
++        .ok_or_else(|| "child signed integer required".into())
++}
++fn boolean(value: &Value) -> Result<bool, String> {
++    value
++        .as_bool()
++        .ok_or_else(|| "child boolean required".into())
++}
++fn strings(value: &Value) -> Result<Vec<String>, String> {
++    array(value)?
++        .iter()
++        .map(|v| string(v).map(str::to_owned))
++        .collect()
++}
++fn bytes(value: &Value) -> Result<Vec<u8>, String> {
++    array(value)?
++        .iter()
++        .map(|v| u8::try_from(number(v)?).map_err(err))
++        .collect()
++}
++fn provider(value: &Value) -> Result<OwnedProviderId, String> {
++    OwnedProviderId::new(string(value)?).map_err(err)
++}
++fn version(value: &Value) -> Result<OwnedVersionedId, String> {
++    OwnedVersionedId::new(string(value)?).map_err(err)
++}
++fn operation(value: &Value) -> Result<ProviderOperation, String> {
++    [
++        ProviderOperation::Handshake,
++        ProviderOperation::Health,
++        ProviderOperation::Observe,
++        ProviderOperation::Recall,
++        ProviderOperation::Feedback,
++        ProviderOperation::Maintenance,
++        ProviderOperation::Inspection,
++        ProviderOperation::Correction,
++        ProviderOperation::DeleteBySource,
++        ProviderOperation::SnapshotExport,
++        ProviderOperation::SnapshotRestore,
++        ProviderOperation::Replay,
++    ]
++    .into_iter()
++    .find(|operation| Some(operation.as_wire()) == value.as_str())
++    .ok_or_else(|| "child operation invalid".into())
++}
++fn capabilities(value: &std::collections::BTreeSet<OwnedVersionedId>) -> Vec<&str> {
++    value.iter().map(OwnedVersionedId::as_str).collect()
++}
++fn read_capabilities(value: &Value) -> Result<Vec<OwnedVersionedId>, String> {
++    array(value)?.iter().map(version).collect()
++}
++fn payload(value: &CanonicalPayload) -> Value {
++    json!({"contract_id": value.contract_id.as_str(), "bytes": value.bytes, "sha256": value.sha256})
++}
++fn read_payload(value: &Value) -> Result<CanonicalPayload, String> {
++    Ok(CanonicalPayload {
++        contract_id: version(&value["contract_id"])?,
++        bytes: bytes(&value["bytes"])?,
++        sha256: string(&value["sha256"])?.into(),
++    })
++}
++fn extensions(values: &[OwnedOpaqueExtension]) -> Vec<Value> {
++    values.iter().map(|v| json!({"extension_id": v.extension_id.as_str(), "extension_version": v.extension_version, "required": v.required,
++        "payload_sha256": v.payload_sha256, "canonical_payload": v.canonical_payload})).collect()
++}
++fn read_extensions(value: &Value) -> Result<Vec<OwnedOpaqueExtension>, String> {
++    array(value)?
++        .iter()
++        .map(|v| {
++            Ok(OwnedOpaqueExtension {
++                extension_id: version(&v["extension_id"])?,
++                extension_version: u32::try_from(number(&v["extension_version"])?).map_err(err)?,
++                required: boolean(&v["required"])?,
++                payload_sha256: string(&v["payload_sha256"])?.into(),
++                canonical_payload: bytes(&v["canonical_payload"])?,
++            })
++        })
++        .collect()
++}
++fn limits(v: ProviderLimits) -> Value {
++    json!({"request_bytes":v.request_bytes,"response_bytes":v.response_bytes,"observation_batch_items":v.observation_batch_items,
++    "recall_candidates":v.recall_candidates,"concurrent_operations":v.concurrent_operations,"operation_millis":v.operation_millis,"snapshot_bytes":v.snapshot_bytes,"inspection_items":v.inspection_items})
++}
++fn read_limits(v: &Value) -> Result<ProviderLimits, String> {
++    Ok(ProviderLimits {
++        request_bytes: number(&v["request_bytes"])?,
++        response_bytes: number(&v["response_bytes"])?,
++        observation_batch_items: number(&v["observation_batch_items"])?,
++        recall_candidates: number(&v["recall_candidates"])?,
++        concurrent_operations: number(&v["concurrent_operations"])?,
++        operation_millis: number(&v["operation_millis"])?,
++        snapshot_bytes: number(&v["snapshot_bytes"])?,
++        inspection_items: number(&v["inspection_items"])?,
++    })
++}
++fn descriptor(v: &ProviderDescriptor) -> Value {
++    json!({"provider_id":v.provider_id.as_str(),"implementation_identity_sha256":v.implementation_identity_sha256,
++    "state_schema_version":v.state_schema_version,"state_generation":v.state_generation,"protocol_major":v.protocol_major,"protocol_minor":v.protocol_minor,
++    "capabilities":capabilities(&v.capabilities),"limits":limits(v.limits)})
++}
++fn read_descriptor(v: &Value) -> Result<ProviderDescriptor, String> {
++    Ok(ProviderDescriptor {
++        provider_id: provider(&v["provider_id"])?,
++        implementation_identity_sha256: string(&v["implementation_identity_sha256"])?.into(),
++        state_schema_version: string(&v["state_schema_version"])?.into(),
++        state_generation: number(&v["state_generation"])?,
++        protocol_major: u16::try_from(number(&v["protocol_major"])?).map_err(err)?,
++        protocol_minor: u16::try_from(number(&v["protocol_minor"])?).map_err(err)?,
++        capabilities: read_capabilities(&v["capabilities"])?.into_iter().collect(),
++        limits: read_limits(&v["limits"])?,
++    })
++}
++fn now_micros() -> Result<i64, String> {
++    i64::try_from(
++        SystemTime::now()
++            .duration_since(UNIX_EPOCH)
++            .map_err(err)?
++            .as_micros(),
++    )
++    .map_err(err)
++}
++fn control(v: &OperationControl) -> Result<Value, String> {
++    // Capture wall time before the live snapshot. Any clock sampling/coding delay
++    // is charged against transit, and a backward wall jump expires the child.
++    let captured_at = now_micros()?;
++    let remaining = v.snapshot().map(|s| s.remaining_millis).unwrap_or(0);
++    Ok(
++        json!({"deadline_utc_micros":v.deadline_utc_micros(),"remaining_millis":remaining,
++        "captured_at_utc_micros":captured_at,"cancelled":v.cancellation().is_cancelled()}),
++    )
++}
++fn read_control(
++    v: &Value,
++    cancellation: CancellationToken,
++    transport_elapsed: Duration,
++) -> Result<OperationControl, String> {
++    if boolean(&v["cancelled"])? {
++        cancellation.cancel();
++    }
++    let captured = signed(&v["captured_at_utc_micros"])?;
++    let now = now_micros()?;
++    let wall_elapsed = now
++        .checked_sub(captured)
++        .filter(|delta| *delta >= 0)
++        .map(|delta| Duration::from_micros(delta as u64));
++    let elapsed = wall_elapsed.map(|duration| duration.max(transport_elapsed));
++    let spent = elapsed
++        .map(|duration| {
++            u64::try_from(duration.as_nanos().saturating_add(999_999) / 1_000_000)
++                .unwrap_or(u64::MAX)
++        })
++        .unwrap_or(u64::MAX);
++    Ok(OperationControl::new(
++        signed(&v["deadline_utc_micros"])?,
++        number(&v["remaining_millis"])?.saturating_sub(spent),
++        cancellation,
++    ))
++}
++fn terminal(v: &TerminalRecord) -> Value {
++    let e = v.committed_effect();
++    let f = v.fallback();
++    json!({"operation":v.operation().as_wire(),"provider_id":v.provider_id().as_str(),"terminal_code":v.terminal_code().as_wire(),
++        "operation_id":v.operation_id(),"exact_scope_sha256":v.exact_scope_sha256(),"diagnostic_id":v.diagnostic_id(),
++        "effect":{"state":e.state().as_wire(),"committed_boundary":e.committed_boundary(),"state_generation_before":e.state_generation_before(),
++            "state_generation_after":e.state_generation_after(),"committed_item_refs":e.committed_item_refs(),"uncommitted_item_refs":e.uncommitted_item_refs(),
++            "provider_receipt_sha256":e.provider_receipt_sha256(),"reconciliation_action":e.reconciliation_action(),"verification_sha256":e.verification_sha256(),
++            "duplicate_of_idempotency_key":e.duplicate_of_idempotency_key(),"duplicate_of_operation_id":e.duplicate_of_operation_id()},
++        "fallback":{"eligibility":f.eligibility().as_wire(),"source_provider_id":f.source_provider_id().map(OwnedProviderId::as_str),
++            "policy":f.policy().map(|p|json!({"policy_id":p.policy_id(),"policy_revision":p.policy_revision(),"target_provider_id":p.target_provider_id().as_str()})),"reason":f.reason()}})
++}
++fn read_terminal(v: &Value) -> Result<TerminalRecord, String> {
++    let e = &v["effect"];
++    let f = &v["fallback"];
++    let effect = CommittedEffectEvidence::from_parts(CommittedEffectEvidenceParts {
++        state: CommittedEffectState::from_wire(string(&e["state"])?)
++            .ok_or("child effect invalid")?,
++        committed_boundary: optional_string(&e["committed_boundary"])?,
++        state_generation_before: optional(&e["state_generation_before"], number)?,
++        state_generation_after: optional(&e["state_generation_after"], number)?,
++        committed_item_refs: strings(&e["committed_item_refs"])?,
++        uncommitted_item_refs: strings(&e["uncommitted_item_refs"])?,
++        provider_receipt_sha256: optional_string(&e["provider_receipt_sha256"])?,
++        reconciliation_action: optional_string(&e["reconciliation_action"])?,
++        verification_sha256: optional_string(&e["verification_sha256"])?,
++        duplicate_of_idempotency_key: optional_string(&e["duplicate_of_idempotency_key"])?,
++        duplicate_of_operation_id: optional_string(&e["duplicate_of_operation_id"])?,
++    })
++    .map_err(err)?;
++    let fallback = match string(&f["eligibility"])? {
++        "forbidden"
++            if f["source_provider_id"].is_null()
++                && f["policy"].is_null()
++                && f["reason"].is_null() =>
++        {
++            FallbackDirective::forbidden()
++        }
++        "explicit_policy_only" => FallbackDirective::explicit_policy_only(
++            &provider(&f["source_provider_id"])?,
++            PinnedFallbackPolicy::new(
++                string(&f["policy"]["policy_id"])?,
++                number(&f["policy"]["policy_revision"])?,
++                provider(&f["policy"]["target_provider_id"])?,
++            )
++            .map_err(err)?,
++            string(&f["reason"])?,
++        )
++        .map_err(err)?,
++        _ => return Err("child fallback fields invalid".into()),
++    };
++    TerminalRecord::new(
++        operation(&v["operation"])?,
++        provider(&v["provider_id"])?,
++        TerminalCode::from_wire(string(&v["terminal_code"])?).ok_or("child terminal invalid")?,
++        effect,
++        fallback,
++        string(&v["operation_id"])?,
++        string(&v["exact_scope_sha256"])?,
++        optional_string(&v["diagnostic_id"])?,
++    )
++    .map_err(err)
++}
+--- /dev/null
++++ b/crates/tracedecay-memory-conformance/src/real_fixture/tests.rs
+@@ -0,0 +1,634 @@
++use std::time::Duration;
++
++use super::*;
++use crate::compatibility::{T1, common_advisory_scenarios, common_observation};
++use serde_json::json;
++use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
++use tracedecay_memory_provider_api::{
++    CancellationToken, CanonicalPayload, CommittedEffectEvidence, CommittedEffectEvidenceParts,
++    FallbackDirective, HandshakeRequest, HandshakeRequestParts, HandshakeResponse,
++    OperationControl, OwnedOpaqueExtension, OwnedVersionedId, PayloadSanitizationReceipt,
++    PayloadSanitizationReceiptParts, PinnedFallbackPolicy, ProviderCallParts, ProviderDescriptor,
++    ProviderLimits, ProviderReply, TerminalRecord,
++};
++
++fn scope() -> Result<OwnedExactScope, String> {
++    OwnedExactScope::new(
++        "fixture-profile",
++        "fixture-project",
++        "fixture-repository",
++        "fixture-worktree",
++        "fixture-branch",
++        "fixture-session",
++        format!("sha256:{}", "a".repeat(64)),
++    )
++    .map_err(err)
++}
++fn call(
++    operation: ProviderOperation,
++    value: &Value,
++    scope: &OwnedExactScope,
++) -> Result<ProviderCall, String> {
++    let payload = CanonicalPayload::new(
++        OwnedVersionedId::new("tracedecay.memory.provider.fixture.v1").map_err(err)?,
++        crate::canonical_json(value).map_err(err)?,
++        crate::canonical_json_sha256(value).map_err(err)?,
++    )
++    .map_err(err)?;
++    let receipt =
++        PayloadSanitizationReceipt::new(PayloadSanitizationReceiptParts::accepted_unmodified(
++            "fixture-sanitizer",
++            payload.sha256.clone(),
++        ))
++        .map_err(err)?;
++    let call = ProviderCall::new(ProviderCallParts {
++        operation,
++        provider_id: OwnedProviderId::new("fixture-provider").map_err(err)?,
++        registration_revision: 3,
++        ready_receipt_sha256: "b".repeat(64),
++        exact_scope: scope.clone(),
++        request_id: "fixture.request.1".into(),
++        operation_id: "fixture.operation.1".into(),
++        expected_state_generation: 7,
++        idempotency_key: operation
++            .mutates_provider_state()
++            .then(|| "fixture.delivery.1".into()),
++        control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++        payload,
++        required_capabilities: vec![OwnedVersionedId::new(operation.capability_id()).map_err(err)?],
++        extensions: vec![],
++    })
++    .map_err(err)?;
++    Ok(if operation == ProviderOperation::Observe {
++        call.with_sanitization(receipt)
++    } else {
++        call
++    })
++}
++fn source() -> Result<Value, String> {
++    Ok(common_observation(
++        &scope()?,
++        1,
++        Some("opaque_revision"),
++        "compatibility beacon original",
++        Some(T1),
++        None,
++    ))
++}
++fn authority(observation: &Value) -> Result<FixtureAuthority, String> {
++    let mut state = FixtureAuthoritySnapshot {
++        base_scope: crate::compatibility::scope_json(&scope()?),
++        observations: BTreeMap::new(),
++        dispositions: BTreeMap::new(),
++        available: true,
++        revision: 1,
++    };
++    register(&mut state, observation)?;
++    FixtureAuthority::from_snapshot(state)
++}
++fn history(observation: &Value, destination: &OwnedExactScope) -> Value {
++    json!({"history_grant":{"authorization_ref":ADMISSION_REF,"policy_revision":1,
++        "destination_scope":crate::compatibility::scope_json(destination),"relation":"same_checkout",
++        "sources":[{"attribution":observation["source_identity"]["original_source"],"current_disposition":{"state":"available"}}]}})
++}
++
++#[test]
++fn every_unchanged_scenario_registers_without_provider_or_expected_result_rules()
++-> Result<(), String> {
++    let scope = scope()?;
++    for scenario in common_advisory_scenarios(&scope, 1)? {
++        let authority = FixtureAuthority::from_scenario(&scenario, &scope)?;
++        let encoded = serde_json::to_vec(&authority.snapshot()?).map_err(err)?;
++        let restored =
++            FixtureAuthority::from_snapshot(serde_json::from_slice(&encoded).map_err(err)?)?;
++        assert_eq!(
++            serde_json::to_value(authority.snapshot()?).map_err(err)?,
++            serde_json::to_value(restored.snapshot()?).map_err(err)?
++        );
++    }
++    Ok(())
++}
++
++#[test]
++fn authority_checks_immutable_sources_and_current_disposition_after_restart() -> Result<(), String>
++{
++    let original = source()?;
++    let authority = authority(&original)?;
++    let original_call = call(ProviderOperation::Observe, &original, &scope()?)?;
++    let admitted = authority.admit(&original_call).map_err(err)?;
++    assert_eq!(admitted.history_sources.len(), 1);
++    let mut destination = scope()?;
++    destination.agent_session_id = "destination-session".into();
++    let mut claim = history(&original, &destination);
++    let recall = call(ProviderOperation::Recall, &claim, &destination)?;
++    let admitted = authority.admit(&recall).map_err(err)?;
++    assert_eq!(
++        admitted.history_sources[0].current_disposition.state,
++        SourceDisposition::Available
++    );
++    assert_eq!(
++        admitted.history_sources[0].attribution,
++        parse_attribution(&original["source_identity"]["original_source"])?
++    );
++    assert!(
++        admitted
++            .verify_for(&call(ProviderOperation::Recall, &claim, &destination)?)
++            .is_err()
++    );
++    authority.record_disposition("common-advisory/source/1", SourceDisposition::Deleted)?;
++    let restored = FixtureAuthority::from_snapshot(authority.snapshot()?)?;
++    assert_eq!(
++        restored.admit(&recall).map_err(err)?.history_sources[0]
++            .current_disposition
++            .state,
++        SourceDisposition::Deleted
++    );
++    assert_eq!(
++        claim["history_grant"]["sources"][0]["current_disposition"]["state"],
++        "available"
++    );
++    restored.set_available(false)?;
++    assert!(matches!(
++        restored.admit(&recall),
++        Err(AdvisoryAdmissionError::Unavailable(_))
++    ));
++    restored.set_available(true)?;
++    assert!(restored.admit(&recall).is_ok());
++    claim["history_grant"]["authorization_ref"] = json!("forged");
++    assert!(
++        restored
++            .admit(&call(ProviderOperation::Recall, &claim, &destination)?)
++            .is_err()
++    );
++    let mut changed = original.clone();
++    changed["source_identity"]["original_source"]["source"]["source_revision"] = json!("invented");
++    assert!(
++        restored
++            .admit(&call(ProviderOperation::Observe, &changed, &scope()?)?)
++            .is_err()
++    );
++    Ok(())
++}
++
++#[test]
++fn authority_denies_foreign_checkout_and_unregistered_restore_inventory() -> Result<(), String> {
++    let original = source()?;
++    let authority = authority(&original)?;
++    for field in ["worktree", "branch", "project"] {
++        let mut foreign = scope()?;
++        match field {
++            "worktree" => foreign.worktree_identity = "foreign".into(),
++            "branch" => foreign.branch_identity = "foreign".into(),
++            _ => foreign.project_id = "foreign".into(),
++        }
++        assert!(
++            authority
++                .admit(&call(
++                    ProviderOperation::Recall,
++                    &history(&original, &foreign),
++                    &foreign
++                )?)
++                .is_err()
++        );
++        assert!(
++            authority
++                .admit(&call(ProviderOperation::Recall, &json!({}), &foreign)?)
++                .map_err(err)?
++                .history_sources
++                .is_empty()
++        );
++    }
++    let mut restore =
++        json!({"snapshot":{"sources":[original["source_identity"]["original_source"]["source"]]}});
++    let admitted = authority
++        .admit(&call(
++            ProviderOperation::SnapshotRestore,
++            &restore,
++            &scope()?,
++        )?)
++        .map_err(err)?;
++    let checkpoint = admitted.restore.ok_or("missing restore admission")?;
++    assert_eq!(checkpoint.sources.len(), 1);
++    authority.record_disposition("common-advisory/source/1", SourceDisposition::Redacted)?;
++    assert_eq!(
++        authority
++            .admit(&call(
++                ProviderOperation::SnapshotRestore,
++                &restore,
++                &scope()?
++            )?)
++            .map_err(err)?
++            .restore
++            .ok_or("missing restore")?
++            .sources[0]
++            .1
++            .state,
++        SourceDisposition::Redacted
++    );
++    restore["snapshot"]["sources"][0]["source_revision"] = json!("unregistered");
++    assert!(
++        authority
++            .admit(&call(
++                ProviderOperation::SnapshotRestore,
++                &restore,
++                &scope()?
++            )?)
++            .is_err()
++    );
++    Ok(())
++}
++
++#[test]
++fn replay_requires_original_receipts_and_exact_registered_payload() -> Result<(), String> {
++    let original = source()?;
++    let authority = authority(&original)?;
++    let mut value = history(&original, &scope()?);
++    value["resolved_observations"] =
++        json!([{"receipt_ref":"fixture.host.observation-receipt.1","observation":original}]);
++    assert!(
++        authority
++            .admit(&call(ProviderOperation::Replay, &value, &scope()?)?)
++            .is_ok()
++    );
++    value["resolved_observations"][0]["receipt_ref"] = json!("forged.receipt");
++    assert!(
++        authority
++            .admit(&call(ProviderOperation::Replay, &value, &scope()?)?)
++            .is_err()
++    );
++    value["resolved_observations"][0]["receipt_ref"] = json!("fixture.host.observation-receipt.1");
++    value["resolved_observations"][0]["observation"]["canonical_payload"]["content"] =
++        json!("rewritten");
++    assert!(
++        authority
++            .admit(&call(ProviderOperation::Replay, &value, &scope()?)?)
++            .is_err()
++    );
++    Ok(())
++}
++
++fn limits() -> ProviderLimits {
++    ProviderLimits {
++        request_bytes: 1_000_000,
++        response_bytes: 2_000_000,
++        observation_batch_items: 100,
++        recall_candidates: 20,
++        concurrent_operations: 2,
++        operation_millis: 30_000,
++        snapshot_bytes: 4_000_000,
++        inspection_items: 100,
++    }
++}
++fn descriptor() -> Result<ProviderDescriptor, String> {
++    ProviderDescriptor::new(
++        OwnedProviderId::new("fixture-provider").map_err(err)?,
++        "c".repeat(64),
++        "real.schema.v2",
++        7,
++        [
++            "provider.health.v1",
++            "observation.accept.v1",
++            "recall.query.v1",
++        ]
++        .into_iter()
++        .map(OwnedVersionedId::new)
++        .collect::<Result<Vec<_>, _>>()
++        .map_err(err)?,
++        limits(),
++    )
++    .map_err(err)
++}
++fn extension() -> Result<OwnedOpaqueExtension, String> {
++    let value = json!({"opaque":"preserve bytes"});
++    OwnedOpaqueExtension::new(
++        OwnedVersionedId::new("fixture.opaque.v1").map_err(err)?,
++        2,
++        false,
++        crate::canonical_json_sha256(&value).map_err(err)?,
++        crate::canonical_json(&value).map_err(err)?,
++    )
++    .map_err(err)
++}
++
++#[test]
++fn child_dtos_preserve_descriptor_handshake_and_observation_receipt() -> Result<(), String> {
++    let descriptor = descriptor()?;
++    assert_eq!(
++        DescriptorDto::decode(&DescriptorDto::capture(&descriptor)?.encode()?)?.restore()?,
++        descriptor
++    );
++    let request = HandshakeRequest::new(HandshakeRequestParts {
++        provider_id: descriptor.provider_id.clone(),
++        registration_revision: 3,
++        exact_scope: scope()?,
++        request_id: "original.handshake".into(),
++        required_capabilities: descriptor.capabilities.iter().cloned().collect(),
++        host_limits: limits(),
++        control: OperationControl::new(i64::MAX, 30_000, CancellationToken::new()),
++        challenge_nonce: [42; 32],
++    })
++    .map_err(err)?;
++    let copy = HandshakeRequestDto::decode(&HandshakeRequestDto::capture(&request)?.encode()?)?
++        .restore(CancellationToken::new(), Duration::from_millis(20))?;
++    assert_eq!(copy.provider_id, request.provider_id);
++    assert_eq!(copy.exact_scope, request.exact_scope);
++    assert_eq!(copy.request_id, request.request_id);
++    assert_eq!(copy.challenge_nonce, request.challenge_nonce);
++    assert_eq!(copy.required_capabilities, request.required_capabilities);
++    assert_eq!(copy.host_limits, request.host_limits);
++    assert_eq!(
++        copy.control.deadline_utc_micros(),
++        request.control.deadline_utc_micros()
++    );
++    assert!(copy.control.remaining_millis() <= 29_980);
++    let response = HandshakeResponse {
++        terminal: TerminalRecord::new(
++            ProviderOperation::Handshake,
++            descriptor.provider_id.clone(),
++            TerminalCode::Success,
++            CommittedEffectEvidence::none(Some(7)),
++            FallbackDirective::forbidden(),
++            "original.handshake",
++            scope()?.exact_scope_sha256(),
++            None,
++        )
++        .map_err(err)?,
++        descriptor: Some(descriptor),
++        provider_instance_id: Some("process-actual-instance".into()),
++        state_namespace: Some("actual.namespace".into()),
++        accepted_scope: Some(scope()?),
++        effective_limits: Some(limits()),
++        ready_receipt_sha256: Some("d".repeat(64)),
++        warnings: vec!["actual warning".into()],
++    };
++    assert_eq!(
++        HandshakeResponseDto::decode(&HandshakeResponseDto::capture(&response)?.encode()?)?
++            .restore()?,
++        response
++    );
++    let original = call(ProviderOperation::Observe, &source()?, &scope()?)?;
++    let restored = ProviderCallDto::decode(&ProviderCallDto::capture(&original)?.encode()?)?
++        .restore(CancellationToken::new(), Duration::from_millis(10))?;
++    assert_eq!(restored.payload, original.payload);
++    assert_eq!(restored.sanitization(), original.sanitization());
++    assert_eq!(restored.provider_id, original.provider_id);
++    assert_eq!(restored.exact_scope, original.exact_scope);
++    assert_eq!(restored.operation, original.operation);
++    assert_eq!(restored.operation_id, original.operation_id);
++    assert_eq!(restored.request_id, original.request_id);
++    assert_eq!(restored.idempotency_key, original.idempotency_key);
++    assert_eq!(
++        restored.expected_state_generation,
++        original.expected_state_generation
++    );
++    assert_eq!(
++        restored.registration_revision,
++        original.registration_revision
++    );
++    assert_eq!(restored.ready_receipt_sha256, original.ready_receipt_sha256);
++    assert_eq!(
++        restored.required_capabilities,
++        original.required_capabilities
++    );
++    assert_eq!(
++        restored.control.deadline_utc_micros(),
++        original.control.deadline_utc_micros()
++    );
++    assert!(restored.control.remaining_millis() < original.control.remaining_millis());
++    Ok(())
++}
++
++#[test]
++fn child_dto_does_not_extend_expired_or_cancelled_control() -> Result<(), String> {
++    let original = call(
++        ProviderOperation::Recall,
++        &json!({"query":"bytes"}),
++        &scope()?,
++    )?;
++    let dto = ProviderCallDto::capture(&original)?;
++    let exhausted = dto
++        .clone()
++        .restore(CancellationToken::new(), Duration::from_secs(31))?;
++    assert_eq!(
++        exhausted.control.snapshot(),
++        Err(TerminalCode::DeadlineExceeded)
++    );
++    let bridge = CancellationToken::new();
++    let live = dto.restore(bridge.clone(), Duration::ZERO)?;
++    bridge.cancel();
++    assert_eq!(live.control.snapshot(), Err(TerminalCode::Cancelled));
++    original.control.cancellation().cancel();
++    let cancelled =
++        ProviderCallDto::capture(&original)?.restore(CancellationToken::new(), Duration::ZERO)?;
++    assert_eq!(cancelled.control.snapshot(), Err(TerminalCode::Cancelled));
++    Ok(())
++}
++
++#[test]
++fn child_reply_preserves_complete_effect_and_fallback_evidence_and_corrupt_digest()
++-> Result<(), String> {
++    let provider = OwnedProviderId::new("fixture-provider").map_err(err)?;
++    let effect = CommittedEffectEvidence::from_parts(CommittedEffectEvidenceParts {
++        state: CommittedEffectState::Duplicate,
++        committed_boundary: None,
++        state_generation_before: Some(7),
++        state_generation_after: Some(7),
++        committed_item_refs: vec![],
++        uncommitted_item_refs: vec![],
++        provider_receipt_sha256: Some("e".repeat(64)),
++        reconciliation_action: None,
++        verification_sha256: None,
++        duplicate_of_idempotency_key: Some("original-key".into()),
++        duplicate_of_operation_id: Some("original-operation".into()),
++    })
++    .map_err(err)?;
++    let mut reply = ProviderReply {
++        terminal: TerminalRecord::new(
++            ProviderOperation::Observe,
++            provider.clone(),
++            TerminalCode::Success,
++            effect,
++            FallbackDirective::forbidden(),
++            "current-operation",
++            scope()?.exact_scope_sha256(),
++            Some("actual-diagnostic".into()),
++        )
++        .map_err(err)?,
++        payload: Some(
++            call(
++                ProviderOperation::Recall,
++                &json!({"kept":"exact bytes"}),
++                &scope()?,
++            )?
++            .payload,
++        ),
++        warnings: vec!["original-warning".into()],
++        extensions: vec![extension()?],
++        state_generation: 7,
++    };
++    if let Some(payload) = &mut reply.payload {
++        payload.sha256 = "0".repeat(64);
++    }
++    assert_eq!(
++        ProviderReplyDto::decode(&ProviderReplyDto::capture(&reply)?.encode()?)?.restore()?,
++        reply
++    );
++    let policy = PinnedFallbackPolicy::new(
++        "host-policy",
++        3,
++        OwnedProviderId::new("other-provider").map_err(err)?,
++    )
++    .map_err(err)?;
++    reply.terminal = TerminalRecord::new(
++        ProviderOperation::Recall,
++        provider.clone(),
++        TerminalCode::ProviderUnavailable,
++        CommittedEffectEvidence::none(Some(7)),
++        FallbackDirective::explicit_policy_only(&provider, policy, "actual provider unavailable")
++            .map_err(err)?,
++        "actual-recall",
++        scope()?.exact_scope_sha256(),
++        Some("retained-diagnostic".into()),
++    )
++    .map_err(err)?;
++    reply.payload = None;
++    assert_eq!(ProviderReplyDto::capture(&reply)?.restore()?, reply);
++    Ok(())
++}
++
++#[test]
++fn foreign_isolation_requires_prior_content_and_rejects_outages_and_leaks() -> Result<(), String> {
++    use crate::compatibility::{CompatibilityAssertion, assertion_errors};
++    let scope = scope()?;
++    let make_reply = |code, value: Option<Value>| -> Result<ProviderReply, String> {
++        Ok(ProviderReply {
++            terminal: TerminalRecord::new(
++                ProviderOperation::Recall,
++                OwnedProviderId::new("fixture-provider").map_err(err)?,
++                code,
++                CommittedEffectEvidence::none(Some(7)),
++                FallbackDirective::forbidden(),
++                "isolation-recall",
++                scope.exact_scope_sha256(),
++                (!matches!(
++                    code,
++                    TerminalCode::Success
++                        | TerminalCode::SuccessZeroResults
++                        | TerminalCode::Partial
++                ))
++                .then(|| "independent-transport-diagnostic".into()),
++            )
++            .map_err(err)?,
++            payload: value
++                .map(|value| {
++                    call(ProviderOperation::Recall, &value, &scope).map(|call| call.payload)
++                })
++                .transpose()?,
++            warnings: vec![],
++            extensions: vec![],
++            state_generation: 7,
++        })
++    };
++    let populated = make_reply(
++        TerminalCode::Success,
++        Some(
++            json!({"candidates":[{"content":"original secret fixture content","stable_memory_ref":"original-stable-ref",
++        "provenance":{"source_refs":["original-source-reference"],"original_sources":[{"source":{"source_key":"original-source-key"}}]}}]}),
++        ),
++    )?;
++    let prior = BTreeMap::from([("positive".into(), populated)]);
++    let assertions = [CompatibilityAssertion::ForeignScopeIsolated {
++        populated_step: "positive".into(),
++    }];
++    let refusal = make_reply(TerminalCode::ScopeMismatch, None)?;
++    assert!(assertion_errors(&assertions, &refusal, &prior, &scope).is_empty());
++    assert!(!assertion_errors(&assertions, &refusal, &BTreeMap::new(), &scope).is_empty());
++    let empty = make_reply(
++        TerminalCode::SuccessZeroResults,
++        Some(json!({"candidates":[],"coverage":{"state":"zero_results"}})),
++    )?;
++    assert!(assertion_errors(&assertions, &empty, &prior, &scope).is_empty());
++    let outage = make_reply(TerminalCode::ProviderUnavailable, None)?;
++    assert!(!assertion_errors(&assertions, &outage, &prior, &scope).is_empty());
++    for (diagnostic, leaks_source) in [
++        ("original-source-key", true),
++        ("original-stable-ref", true),
++        ("independent-transport-diagnostic", false),
++    ] {
++        let mut diagnostic_reply = make_reply(TerminalCode::ScopeMismatch, None)?;
++        diagnostic_reply.terminal = TerminalRecord::new(
++            ProviderOperation::Recall,
++            OwnedProviderId::new("fixture-provider").map_err(err)?,
++            TerminalCode::ScopeMismatch,
++            CommittedEffectEvidence::none(Some(7)),
++            FallbackDirective::forbidden(),
++            "isolation-recall",
++            scope.exact_scope_sha256(),
++            Some(diagnostic.into()),
++        )
++        .map_err(err)?;
++        assert_eq!(
++            !assertion_errors(&assertions, &diagnostic_reply, &prior, &scope).is_empty(),
++            leaks_source,
++        );
++    }
++    let mut leak = refusal;
++    leak.warnings.push("original secret fixture content".into());
++    assert!(!assertion_errors(&assertions, &leak, &prior, &scope).is_empty());
++    let leaked_metadata = make_reply(
++        TerminalCode::SuccessZeroResults,
++        Some(
++            json!({"candidates":[],"coverage":{"state":"zero_results"},"debug":{"source":"original-source-key"}}),
++        ),
++    )?;
++    assert!(!assertion_errors(&assertions, &leaked_metadata, &prior, &scope).is_empty());
++    Ok(())
++}
++
++#[test]
++fn child_reply_preserves_partial_and_unknown_reconciliation_fields() -> Result<(), String> {
++    for (code, effect) in [
++        (
++            TerminalCode::Partial,
++            CommittedEffectEvidence::partial(
++                "actual-commit-boundary",
++                7,
++                8,
++                vec!["committed-ref".into()],
++                vec!["uncommitted-ref".into()],
++                "e".repeat(64),
++                "resume-original-operation",
++                "f".repeat(64),
++            )
++            .map_err(err)?,
++        ),
++        (
++            TerminalCode::EffectUnknown,
++            CommittedEffectEvidence::unknown("e".repeat(64), "reconcile-original-delivery")
++                .map_err(err)?,
++        ),
++    ] {
++        let reply = ProviderReply {
++            terminal: TerminalRecord::new(
++                ProviderOperation::Observe,
++                OwnedProviderId::new("fixture-provider").map_err(err)?,
++                code,
++                effect,
++                FallbackDirective::forbidden(),
++                "actual-original-operation",
++                scope()?.exact_scope_sha256(),
++                Some("actual-diagnostic".into()),
++            )
++            .map_err(err)?,
++            payload: None,
++            warnings: vec![],
++            extensions: vec![],
++            state_generation: 8,
++        };
++        assert_eq!(
++            ProviderReplyDto::decode(&ProviderReplyDto::capture(&reply)?.encode()?)?.restore()?,
++            reply
++        );
++    }
++    Ok(())
++}
+--- a/crates/tracedecay-memory-conformance/src/lib.rs
++++ b/crates/tracedecay-memory-conformance/src/lib.rs
+@@ -25,6 +25,8 @@
+ 
+ pub mod adversarial;
+ pub mod compatibility;
++/// Trusted real-provider fixture authority and lossless test-child transport.
++pub mod real_fixture;
+ mod baseline;
+ mod canonical;
+ mod error;

@@ -10,10 +10,11 @@ use std::sync::Arc;
 
 use thiserror::Error;
 use tracedecay_domain::{
-    ComponentRevision, DiversityPolicy, EphemeralSanitizedQueryViewV1, FusionProfile,
-    PrivacyDomainId, QueryDigest, QueryFallbackSubpayload, RetrievalContractError, RetrievalCursor,
+    CalibrationProfileId, ComponentRevision, DiversityPolicy, EphemeralSanitizedQueryViewV1,
+    FusionProfile, FusionProfileId, ManifestDigest, PrivacyDomainId, QueryDigest,
+    QueryFallbackSubpayload, RetrievalAnchorId, RetrievalContractError, RetrievalCursor,
     RetrievalCursorKeyId, RetrievalError, RetrievalRequest, RetrieverBatch, RetrieverKind,
-    RetrieverOutcome, ScoreDomainId,
+    RetrieverOutcome, ScoreDomainCalibrationV1, ScoreDomainId, canonical_sha256,
 };
 
 use super::evidence_lanes::{TaskSessionCandidateSelectionV1, TaskSessionLaneEvidenceV1};
@@ -21,12 +22,45 @@ use super::fusion::{
     CompositionKernel, CompositionLaneInput, CompositionOutputV1, CompositionPageV1,
     FusionStageError, FusionStageInput, QueryDigestAuthenticationError, RetrievalCursorKeyringV1,
 };
+use super::semantic::SemanticCompositionExecutionAuthorityV1;
 
 /// Immutable comparator/ranking revision shared by the query evaluator,
 /// production authority, and cursor validation.
 pub const QUERY_RANKING_REVISION_V1: &str = "ranking.candidate.v1";
 /// Versioned request-local cursor lifetime for the canonical query authority.
 pub const QUERY_CURSOR_TTL_MICROS_V1: u64 = 15 * 60 * 1_000_000;
+
+/// Checked-in semantic composition profile layered over the mounted fallback.
+pub const CANONICAL_SEMANTIC_COMPOSITION_PROFILE_ID_V1: &str =
+    "profile.query-semantic.jina-cosine-exact-flat.v1";
+/// Versioned calibration identity for Jina cosine distance on the CPU exact-flat lane.
+pub(crate) const CANONICAL_SEMANTIC_CALIBRATION_PROFILE_ID_V1: &str =
+    "calibration.semantic.jina-cosine-exact-flat.v1";
+/// The fixed semantic contribution accepted by the canonical composition policy.
+pub const CANONICAL_SEMANTIC_WEIGHT_MICROS_V1: u32 = 250_000;
+/// Highest descending raw score, representing zero cosine distance.
+pub const CANONICAL_SEMANTIC_RAW_MAX_MICROS_V1: u64 = i64::MAX as u64;
+/// Lowest descending raw score, representing cosine distance `2.0` at scale `1e9`.
+pub const CANONICAL_SEMANTIC_RAW_MIN_MICROS_V1: u64 =
+    CANONICAL_SEMANTIC_RAW_MAX_MICROS_V1 - 2_000_000_000;
+
+const CANONICAL_SEMANTIC_POLICY_ID_V1: &str = "policy.query-semantic.jina-cosine-exact-flat.v1";
+const CANONICAL_SEMANTIC_POLICY_DIGEST_DOMAIN_V1: &str =
+    "tracedecay.query.semantic-composition-policy.v1";
+const CANONICAL_SEMANTIC_PROFILE_DIGEST_DOMAIN_V1: &str =
+    "tracedecay.query.semantic-composition-profile.v1";
+
+/// Canonical semantic composition policy derived from one mounted fallback authority.
+///
+/// The application retains ownership of immutable generation, projection, model,
+/// vector, and source bindings. This value owns only deterministic composition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CanonicalSemanticCompositionAuthorityV1 {
+    /// Existing execution authority over the derived four-lane profile.
+    pub execution: SemanticCompositionExecutionAuthorityV1,
+    /// Canonical digest of the final profile, diversity policy, and ranking revision.
+    pub profile_digest: ManifestDigest,
+}
 
 /// Complete authenticated query composition retained for server-side audit.
 /// The fallback payload is the canonical exact/lexical/graph result.
@@ -199,6 +233,100 @@ impl QueryAuthorityV1 {
 
     pub fn ranking_revision(&self) -> &ComponentRevision {
         self.kernel.ranking_revision()
+    }
+
+    /// Derive the checked-in Jina cosine semantic composition from this fallback.
+    ///
+    /// Baseline exact, lexical, and graph calibrations, weights, thresholds,
+    /// budget, diversity caps, key authority, and ranking revision remain
+    /// unchanged. The derived authority adds exactly one semantic lane and no
+    /// reranker. Its policy anchor and digest are content-bound; they are not an
+    /// accepted evaluation receipt or a substitute for an application-owned
+    /// immutable ready binding.
+    pub fn canonical_semantic_composition_authority(
+        &self,
+    ) -> Result<CanonicalSemanticCompositionAuthorityV1, QueryAuthorityErrorV1> {
+        if self.mode != QueryAuthorityModeV1::Fallback {
+            return Err(QueryAuthorityErrorV1::AuthorityModeMismatch);
+        }
+
+        let mut profile = self.profile.clone();
+        let mut diversity = self.diversity.clone();
+        let semantic_calibration =
+            policy_identity::<CalibrationProfileId>(CANONICAL_SEMANTIC_CALIBRATION_PROFILE_ID_V1)?;
+        let semantic_score_domain =
+            policy_identity::<ScoreDomainId>(super::QUERY_SEMANTIC_SCORE_DOMAIN_V1)?;
+        if profile
+            .calibrations
+            .insert(RetrieverKind::Semantic, semantic_calibration.clone())
+            .is_some()
+            || profile
+                .score_domain_calibrations
+                .insert(
+                    semantic_score_domain.clone(),
+                    ScoreDomainCalibrationV1 {
+                        calibration_profile_id: semantic_calibration,
+                        score_domain: semantic_score_domain,
+                        raw_min_micros: CANONICAL_SEMANTIC_RAW_MIN_MICROS_V1,
+                        raw_max_micros: CANONICAL_SEMANTIC_RAW_MAX_MICROS_V1,
+                    },
+                )
+                .is_some()
+            || profile
+                .weights_micros
+                .insert(RetrieverKind::Semantic, CANONICAL_SEMANTIC_WEIGHT_MICROS_V1)
+                .is_some()
+            || profile
+                .minimum_calibrated_feature_micros
+                .insert(RetrieverKind::Semantic, 0)
+                .is_some()
+        {
+            return Err(QueryAuthorityErrorV1::InvalidAuthority(
+                "fallback authority already contains semantic policy material".to_owned(),
+            ));
+        }
+        profile.profile_id =
+            policy_identity::<FusionProfileId>(CANONICAL_SEMANTIC_COMPOSITION_PROFILE_ID_V1)?;
+        profile.rerank_policy_id = None;
+
+        // Follow the checked-in core-query policy: hash a versioned provisional
+        // policy, then publish that digest as the immutable policy anchor.
+        let provisional_anchor =
+            policy_identity::<RetrievalAnchorId>(CANONICAL_SEMANTIC_POLICY_ID_V1)?;
+        profile.evaluation_result_anchor = provisional_anchor.clone();
+        diversity.evaluation_result_anchor = Some(provisional_anchor);
+        let policy_digest = canonical_sha256(&(
+            CANONICAL_SEMANTIC_POLICY_DIGEST_DOMAIN_V1,
+            &profile,
+            &diversity,
+            self.ranking_revision(),
+        ))
+        .map_err(|error| QueryAuthorityErrorV1::InvalidAuthority(error.to_string()))?;
+        let policy_anchor = policy_identity::<RetrievalAnchorId>(&format!(
+            "{CANONICAL_SEMANTIC_POLICY_ID_V1}.{}",
+            policy_digest.as_str()
+        ))?;
+        profile.evaluation_result_anchor = policy_anchor.clone();
+        diversity.evaluation_result_anchor = Some(policy_anchor);
+
+        let profile_digest = canonical_sha256(&(
+            CANONICAL_SEMANTIC_PROFILE_DIGEST_DOMAIN_V1,
+            &profile,
+            &diversity,
+            self.ranking_revision(),
+        ))
+        .map_err(|error| QueryAuthorityErrorV1::InvalidAuthority(error.to_string()))?;
+        let execution = SemanticCompositionExecutionAuthorityV1::new(
+            profile,
+            diversity,
+            None,
+            self.ranking_revision().clone(),
+        )
+        .map_err(|error| QueryAuthorityErrorV1::InvalidAuthority(error.to_string()))?;
+        Ok(CanonicalSemanticCompositionAuthorityV1 {
+            execution,
+            profile_digest,
+        })
     }
 
     pub fn task_session_score_domain(&self) -> Result<ScoreDomainId, QueryAuthorityErrorV1> {
@@ -463,11 +591,12 @@ impl QueryAuthorityV1 {
         semantic: tracedecay_domain::SemanticRetrievalContinuationV1,
     ) -> Result<(), QueryAuthorityErrorV1> {
         semantic.validate()?;
-        semantic.validate_for_cursor(cursor)?;
-        cursor.semantic_source_scope = Some(semantic.source_scope.clone());
-        cursor.semantic_candidate_order = Some(semantic.ordered_candidate_anchors.clone());
-        cursor.semantic = Some(semantic);
-        self.keyring.resign_cursor(cursor)?;
+        let mut bound = cursor.clone();
+        semantic.validate_for_cursor(&bound)?;
+        bound.semantic = Some(semantic);
+        self.keyring.resign_cursor(&mut bound)?;
+        bound.validate()?;
+        *cursor = bound;
         Ok(())
     }
 
@@ -478,6 +607,7 @@ impl QueryAuthorityV1 {
     ) -> Result<(), QueryAuthorityErrorV1> {
         binding.validate()?;
         cursor.code_source = Some(binding);
+        cursor.validate()?;
         self.keyring.resign_cursor(cursor)?;
         Ok(())
     }
@@ -506,6 +636,15 @@ impl QueryAuthorityV1 {
         }
         Ok(())
     }
+}
+
+fn policy_identity<T>(value: &str) -> Result<T, QueryAuthorityErrorV1>
+where
+    T: TryFrom<String>,
+    T::Error: std::fmt::Display,
+{
+    T::try_from(value.to_owned())
+        .map_err(|error| QueryAuthorityErrorV1::InvalidAuthority(error.to_string()))
 }
 
 /// Caller deadlines narrow an evaluated profile budget without changing the
@@ -539,4 +678,232 @@ fn validate_lane_set(
         return Err(QueryAuthorityErrorV1::LaneSetMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use tracedecay_domain::{
+        CalibrationProfileId, DiversityPolicyId, FusionProfileId, RetrievalAnchorId,
+        RetrievalBudget, ScoreDomainCalibrationV1,
+    };
+
+    use super::*;
+
+    fn id<T>(value: &str) -> T
+    where
+        T: TryFrom<String>,
+        T::Error: std::fmt::Debug,
+    {
+        T::try_from(value.to_owned()).expect("valid test identity")
+    }
+
+    fn fallback_policy() -> (FusionProfile, DiversityPolicy) {
+        let evaluation_anchor = id::<RetrievalAnchorId>(
+            "policy.query-fallback.v1.sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let diversity_policy_id = id::<DiversityPolicyId>("diversity.candidate.v1");
+        let mut calibrations = BTreeMap::new();
+        let mut score_domain_calibrations = BTreeMap::new();
+        let mut weights_micros = BTreeMap::new();
+        for (lane, score_domain, weight) in [
+            (
+                RetrieverKind::ExactLiteral,
+                "score.exact.fixture.v1",
+                1_000_000,
+            ),
+            (
+                RetrieverKind::Lexical,
+                "score.lexical.fixture.v1",
+                1_000_000,
+            ),
+            (RetrieverKind::Graph, "score.graph.fixture.v1", 250_000),
+        ] {
+            let calibration =
+                id::<CalibrationProfileId>(&format!("calibration.{}.fixture.v1", lane.as_str()));
+            let score_domain = id::<ScoreDomainId>(score_domain);
+            calibrations.insert(lane, calibration.clone());
+            score_domain_calibrations.insert(
+                score_domain.clone(),
+                ScoreDomainCalibrationV1 {
+                    calibration_profile_id: calibration,
+                    score_domain,
+                    raw_min_micros: 0,
+                    raw_max_micros: 1_000_000,
+                },
+            );
+            weights_micros.insert(lane, weight);
+        }
+        (
+            FusionProfile {
+                profile_id: id::<FusionProfileId>("profile.query-fallback.fixture.v1"),
+                evaluation_result_anchor: evaluation_anchor.clone(),
+                calibrations,
+                score_domain_calibrations,
+                minimum_calibrated_feature_micros: BTreeMap::from([(
+                    RetrieverKind::Lexical,
+                    125_000,
+                )]),
+                weights_micros,
+                diversity_policy_id: diversity_policy_id.clone(),
+                rerank_policy_id: None,
+                retrieval_budget: RetrievalBudget {
+                    max_candidates_per_lane: 32,
+                    max_fused_candidates: 32,
+                    max_hydrated_results: 16,
+                    max_hydration_bytes: 65_536,
+                    deadline_micros: None,
+                },
+            },
+            DiversityPolicy {
+                policy_id: diversity_policy_id,
+                evaluation_result_anchor: Some(evaluation_anchor),
+                per_source_namespace: None,
+                per_source_instance: None,
+                per_repository: None,
+                per_file: Some(2),
+                per_session_or_thread: None,
+                per_copy_cluster: None,
+                per_evidence_role: None,
+            },
+        )
+    }
+
+    fn authority_with_policy(
+        profile: FusionProfile,
+        diversity: DiversityPolicy,
+    ) -> QueryAuthorityV1 {
+        let keyring = RetrievalCursorKeyringV1::new(
+            id::<PrivacyDomainId>("privacy.semantic-composition.fixture"),
+            id::<RetrievalCursorKeyId>("retrieval-key.semantic-composition.fixture"),
+            1,
+            vec![7_u8; 32],
+            1_000_000,
+        )
+        .expect("valid keyring");
+        QueryAuthorityV1::new(
+            profile,
+            diversity,
+            id::<ComponentRevision>(QUERY_RANKING_REVISION_V1),
+            keyring,
+        )
+        .expect("valid fallback authority")
+    }
+
+    #[test]
+    fn canonical_semantic_factory_preserves_fallback_policy_and_adds_fixed_jina_lane() {
+        let (profile, diversity) = fallback_policy();
+        let baseline_profile = profile.clone();
+        let baseline_diversity = diversity.clone();
+        let authority = authority_with_policy(profile, diversity);
+
+        let semantic = authority
+            .canonical_semantic_composition_authority()
+            .expect("canonical semantic authority");
+        let semantic_profile = semantic.execution.profile();
+        let semantic_diversity = semantic.execution.diversity();
+
+        assert_eq!(
+            semantic_profile.profile_id.as_str(),
+            CANONICAL_SEMANTIC_COMPOSITION_PROFILE_ID_V1
+        );
+        for lane in RetrieverKind::QUERY_FALLBACK_LANES {
+            assert_eq!(
+                semantic_profile.calibrations.get(&lane),
+                baseline_profile.calibrations.get(&lane)
+            );
+            assert_eq!(
+                semantic_profile.weights_micros.get(&lane),
+                baseline_profile.weights_micros.get(&lane)
+            );
+        }
+        assert_eq!(
+            semantic_profile
+                .minimum_calibrated_feature_micros
+                .get(&RetrieverKind::Lexical),
+            Some(&125_000)
+        );
+        assert_eq!(
+            semantic_profile
+                .minimum_calibrated_feature_micros
+                .get(&RetrieverKind::Semantic),
+            Some(&0)
+        );
+        assert_eq!(
+            semantic_profile.weights_micros[&RetrieverKind::Semantic],
+            CANONICAL_SEMANTIC_WEIGHT_MICROS_V1
+        );
+        let semantic_score_domain =
+            id::<ScoreDomainId>(super::super::QUERY_SEMANTIC_SCORE_DOMAIN_V1);
+        let calibration = &semantic_profile.score_domain_calibrations[&semantic_score_domain];
+        assert_eq!(
+            calibration.calibration_profile_id.as_str(),
+            CANONICAL_SEMANTIC_CALIBRATION_PROFILE_ID_V1
+        );
+        assert_eq!(calibration.raw_max_micros, 9_223_372_036_854_775_807);
+        assert_eq!(calibration.raw_min_micros, 9_223_372_034_854_775_807);
+        assert_eq!(
+            semantic_profile.retrieval_budget,
+            baseline_profile.retrieval_budget
+        );
+        assert!(semantic_profile.rerank_policy_id.is_none());
+        assert_eq!(semantic.execution.rerank_policy(), None);
+        assert_eq!(semantic_diversity.policy_id, baseline_diversity.policy_id);
+        assert_eq!(semantic_diversity.per_file, baseline_diversity.per_file);
+        assert_eq!(
+            semantic_diversity.evaluation_result_anchor.as_ref(),
+            Some(&semantic_profile.evaluation_result_anchor)
+        );
+        assert_ne!(
+            semantic_profile.evaluation_result_anchor,
+            baseline_profile.evaluation_result_anchor
+        );
+        assert!(
+            semantic_profile
+                .evaluation_result_anchor
+                .as_str()
+                .starts_with("policy.query-semantic.jina-cosine-exact-flat.v1.sha256:")
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_factory_is_deterministic_and_binds_baseline_policy_changes() {
+        let (profile, diversity) = fallback_policy();
+        let authority = authority_with_policy(profile.clone(), diversity.clone());
+        let first = authority
+            .canonical_semantic_composition_authority()
+            .expect("first canonical authority");
+        let repeated = authority
+            .canonical_semantic_composition_authority()
+            .expect("repeated canonical authority");
+        assert_eq!(first, repeated);
+
+        let mut changed = profile;
+        changed.weights_micros.insert(RetrieverKind::Graph, 249_999);
+        let changed = authority_with_policy(changed, diversity)
+            .canonical_semantic_composition_authority()
+            .expect("changed canonical authority");
+        assert_ne!(first.profile_digest, changed.profile_digest);
+        assert_ne!(
+            first.execution.profile().evaluation_result_anchor,
+            changed.execution.profile().evaluation_result_anchor
+        );
+        assert_eq!(
+            changed.execution.profile().weights_micros[&RetrieverKind::Graph],
+            249_999
+        );
+    }
+
+    #[test]
+    fn canonical_semantic_factory_rejects_a_non_fallback_authority_mode() {
+        let (profile, diversity) = fallback_policy();
+        let mut authority = authority_with_policy(profile, diversity);
+        authority.mode = QueryAuthorityModeV1::Federated;
+
+        assert!(matches!(
+            authority.canonical_semantic_composition_authority(),
+            Err(QueryAuthorityErrorV1::AuthorityModeMismatch)
+        ));
+    }
 }

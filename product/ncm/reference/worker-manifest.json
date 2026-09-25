@@ -9,8 +9,8 @@
       "os": "macos",
       "arch": "aarch64",
       "family": "unix",
-      "bytes": 38396840,
-      "sha256": "9ae71d014941fd7fe7ee3718548533efacaa98f14bfe823ee2214e9268e7dae9"
+      "bytes": 36086000,
+      "sha256": "8e554dbfabd5163f0a59be5c80232deb264c390be906410e385629aa6935d591"
     }
   ]
 }

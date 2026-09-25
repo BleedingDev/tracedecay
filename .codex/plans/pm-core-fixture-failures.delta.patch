@@ -1,0 +1,113 @@
+--- a/crates/tracedecay/src/application_surface/tests.rs
++++ b/crates/tracedecay/src/application_surface/tests.rs
+@@ -790,6 +790,15 @@
+             "node",
+             "port_order",
+             "port_status",
++            "provider_correction",
++            "provider_delete_by_source",
++            "provider_feedback",
++            "provider_health",
++            "provider_inspection",
++            "provider_maintenance",
++            "provider_replay",
++            "provider_snapshot_export",
++            "provider_snapshot_restore",
+             "redundancy",
+             "rename_preview",
+             "rename_symbol",
+--- a/crates/tracedecay/src/daemon/http_application_tests.rs
++++ b/crates/tracedecay/src/daemon/http_application_tests.rs
+@@ -168,19 +168,23 @@
+         request.push_str("\r\n");
+     }
+     request.push_str("\r\n");
++    // Header-only denials can complete before a separately scheduled body
++    // write. Submit the unchanged headers and body in one test write.
++    let mut request = request.into_bytes();
++    request.extend_from_slice(body);
+     stream
+-        .write_all(request.as_bytes())
++        .write_all(&request)
+         .await
+         .expect("write HTTP request");
+-    stream
+-        .write_all(body)
+-        .await
+-        .expect("write HTTP request body");
+     let mut response = String::new();
+     stream
+         .read_to_string(&mut response)
+         .await
+-        .expect("read HTTP response");
++        .unwrap_or_else(|error| {
++            panic!(
++                "read complete HTTP response for {method} {path}: {error}; received {response:?}"
++            )
++        });
+     response
+ }
+ 
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey/comparison_fixture.rs
+@@ -3148,8 +3148,14 @@
+ 
+     #[test]
+     fn acknowledgement_binds_exact_payload_kind_and_index() {
+-        for wrong_field in ["ack_kind", "action_index", "frame_sha256"] {
++        for wrong_field in [
++            None,
++            Some("ack_kind"),
++            Some("action_index"),
++            Some("frame_sha256"),
++        ] {
+             let (mut channel, mut parent) = pair();
++            let (completed, completion) = std::sync::mpsc::channel();
+             let peer = std::thread::spawn(move || {
+                 let mut header = [0; 8];
+                 parent.read_exact(&mut header).expect("action header");
+@@ -3157,20 +3163,30 @@
+                 parent.read_exact(&mut bytes).expect("action bytes");
+                 let mut ack = json!({"protocol": PROTOCOL, "nonce": "a".repeat(64), "kind": "ack",
+                     "ack_kind": "action", "action_index": 3, "frame_sha256": sha256(&bytes)});
+-                ack[wrong_field] = if wrong_field == "action_index" {
+-                    json!(2)
+-                } else {
+-                    json!("wrong")
+-                };
++                if let Some(wrong_field) = wrong_field {
++                    ack[wrong_field] = if wrong_field == "action_index" {
++                        json!(2)
++                    } else {
++                        json!("wrong")
++                    };
++                }
+                 frame(&mut parent, &ack);
++                // Darwin rejects timeout updates after the peer closes, even
++                // while a complete ACK remains buffered. Keep this peer alive
++                // until the test has observed the acknowledgement decision.
++                completion
++                    .recv_timeout(Duration::from_secs(2))
++                    .expect("acknowledgement validation completed");
+             });
+-            assert!(
+-                channel
+-                    .durable("action", Some(3), json!({"original": "bytes\n"}))
+-                    .unwrap_err()
+-                    .contains("acknowledgement")
+-            );
++            let result = channel.durable("action", Some(3), json!({"original": "bytes\n"}));
++            completed.send(()).expect("release acknowledgement peer");
+             peer.join().expect("joined test peer");
+-        }
+-    }
+-}
++            if let Some(wrong_field) = wrong_field {
++                let error = result.unwrap_err();
++                assert!(error.contains("acknowledgement"), "{wrong_field}: {error}");
++            } else {
++                result.expect("exact acknowledgement accepted");
++            }
++        }
++    }
++}

@@ -1,0 +1,14 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -1549,7 +1549,9 @@
+     let mut command = Command::new("sqlite3");
+     command.args(["-batch", "-json"]);
+     if read_only {
+-        command.arg("-readonly");
++        // A closed WAL database can have no sidecars. Permit SQLite to open
++        // its WAL infrastructure while prohibiting SQL writes to retained data.
++        command.args(["-cmd", "PRAGMA query_only=ON;"]);
+     }
+     command.arg(database).arg(sql);
+     let output = bounded_output(&mut command, deadline, cleanup)?;

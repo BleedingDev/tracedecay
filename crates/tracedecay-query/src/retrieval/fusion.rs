@@ -1293,13 +1293,12 @@ fn build_cursor(
         )?,
         next_ordinal,
         semantic: None,
-        semantic_source_scope: None,
-        semantic_candidate_order: None,
         code_source: None,
         expiry: keyring.expiry_from(now)?,
         signature: QueryMac::new(format!("hmac-sha256:{}", "0".repeat(64)))?,
     };
     cursor.signature = keyring.sign_cursor(&cursor)?;
+    cursor.validate()?;
     Ok(cursor)
 }
 
@@ -1322,10 +1321,6 @@ struct CursorAuthenticatedPayload<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     semantic: &'a Option<tracedecay_domain::SemanticRetrievalContinuationV1>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    semantic_source_scope: &'a Option<tracedecay_domain::SemanticSourceScopeV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    semantic_candidate_order: &'a Option<Vec<tracedecay_domain::RetrievalAnchorId>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     code_source: &'a Option<tracedecay_domain::CodeSourceCursorBindingV1>,
     expiry: UtcMicros,
 }
@@ -1347,8 +1342,6 @@ fn cursor_authenticated_bytes(cursor: &RetrievalCursor) -> Result<Vec<u8>, Retri
         ranking_revision: &cursor.ranking_revision,
         next_ordinal: cursor.next_ordinal,
         semantic: &cursor.semantic,
-        semantic_source_scope: &cursor.semantic_source_scope,
-        semantic_candidate_order: &cursor.semantic_candidate_order,
         code_source: &cursor.code_source,
         expiry: cursor.expiry,
     })

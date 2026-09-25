@@ -263,9 +263,7 @@ fn map_embed_error(error: EmbedError) -> RetrievalPortError {
         EmbedError::DeadlineExceeded => RetrievalPortError::BudgetExceeded,
         EmbedError::DimensionMismatch { .. }
         | EmbedError::UnsupportedNormalization { .. }
-        | EmbedError::NonFiniteVectorValue => {
-            RetrievalPortError::IncompatibleProjection
-        }
+        | EmbedError::NonFiniteVectorValue => RetrievalPortError::IncompatibleProjection,
         EmbedError::BatchBytesExceeded { .. } | EmbedError::AttentionBudgetExceeded { .. } => {
             RetrievalPortError::BudgetExceeded
         }

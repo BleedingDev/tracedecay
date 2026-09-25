@@ -1,0 +1,23 @@
+{
+  "file": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs",
+  "production_patch_sha256": "2d6d1b3438daa5c6653b6dcba816c1945c8505cbcb98f96575177b0dde5e0d3c",
+  "tests": {
+    "path": ".codex/plans/pm-session-bootstrap-indexed-codex-tests.patch",
+    "sha256": "f6caf01a1010951929b7fb9a14f47b7d139669b2f0f3eaed522c554da1cdda30",
+    "lines": 125
+  },
+  "integration": {
+    "path": ".codex/plans/pm-session-bootstrap-indexed-codex-integration.patch",
+    "sha256": "d50c2240e12acecf4d6b7303ba79323098b10d9c5379c2035abfb3fb42d467a0",
+    "lines": 176
+  },
+  "baseline_sha256": "52a5f8894ba26c2f15b8f1f52d3d861c5016ef4f859b871ad1a6c9653d946e04",
+  "proposed_sha256": "85c48f34fcfea7cec3a260aac0fbdedfec5ede9a9a7a1fc08611d828c9b56495",
+  "checks": [
+    "rustfmt passed",
+    "production plus tests applied cleanly to isolated baseline and equals proposed",
+    "integration applicability passed",
+    "live file equals baseline",
+    "no Cargo/tests/live edits"
+  ]
+}

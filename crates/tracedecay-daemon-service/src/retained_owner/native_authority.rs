@@ -7,10 +7,11 @@
 //! therefore consume the same proof regardless of whether the destination is
 //! Native or another provider.
 
-use std::sync::{Arc, OnceLock};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tracedecay_contracts::CancellationSignal;
-use tracedecay_domain::CanonicalObservationIdV1;
+use tracedecay_domain::{CanonicalObservationIdV1, SessionId};
 use tracedecay_global_db::GlobalDbObservationStore;
 use tracedecay_memory_observation::{
     AdmittedObservationV1, DeliveryStateV1, ObservationDeliveryReceiptV1, ObservationJournalError,
@@ -93,6 +94,55 @@ pub(crate) struct NativeSessionRetrievalMountV1 {
     authority: OnceLock<Arc<dyn SessionApplicationRetrievalPortV1>>,
     profile_id: Option<tracedecay_domain::UserProfileId>,
     scope: Option<tracedecay_contracts::ResolvedScope>,
+    session_bindings: Arc<Mutex<BTreeMap<String, NativeSessionBindingEntryV1>>>,
+}
+
+struct NativeSessionBindingEntryV1 {
+    canonical_session_id: SessionId,
+    holders: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeSessionBindingErrorV1 {
+    AuthorityUnavailable,
+    IdentityCollision,
+    HolderLimitExceeded,
+}
+
+/// Lifetime-bound bridge from the host's canonical session identity to the
+/// provider-private derivative carried by an exact scope.
+pub(crate) struct NativeSessionBindingV1 {
+    provider_session_id: String,
+    session_bindings: Weak<Mutex<BTreeMap<String, NativeSessionBindingEntryV1>>>,
+}
+
+impl NativeSessionBindingV1 {
+    pub(crate) fn provider_session_id(&self) -> &str {
+        &self.provider_session_id
+    }
+}
+
+impl Drop for NativeSessionBindingV1 {
+    fn drop(&mut self) {
+        let Some(bindings) = self.session_bindings.upgrade() else {
+            return;
+        };
+        let Ok(mut bindings) = bindings.lock() else {
+            tracing::error!("Native session binding authority poisoned during retirement");
+            return;
+        };
+        let remove = match bindings.get_mut(&self.provider_session_id) {
+            Some(entry) if entry.holders > 1 => {
+                entry.holders -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            bindings.remove(&self.provider_session_id);
+        }
+    }
 }
 
 impl Default for NativeSessionRetrievalMountV1 {
@@ -101,6 +151,7 @@ impl Default for NativeSessionRetrievalMountV1 {
             authority: OnceLock::new(),
             profile_id: None,
             scope: None,
+            session_bindings: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -115,14 +166,67 @@ impl NativeSessionRetrievalMountV1 {
             authority: OnceLock::new(),
             profile_id: Some(profile_id),
             scope: Some(scope),
+            session_bindings: Arc::new(Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Retains one real canonical session binding for exactly as long as its
+    /// session-scoped recall port exists. The provider call still carries only
+    /// `provider_session_id`; Native resolves it privately at execution time.
+    pub(crate) fn bind_session(
+        &self,
+        provider_session_id: String,
+        canonical_session_id: SessionId,
+    ) -> std::result::Result<NativeSessionBindingV1, NativeSessionBindingErrorV1> {
+        let mut bindings = self
+            .session_bindings
+            .lock()
+            .map_err(|_| NativeSessionBindingErrorV1::AuthorityUnavailable)?;
+        match bindings.get_mut(&provider_session_id) {
+            Some(entry) if entry.canonical_session_id != canonical_session_id => {
+                return Err(NativeSessionBindingErrorV1::IdentityCollision);
+            }
+            Some(entry) => {
+                entry.holders = entry
+                    .holders
+                    .checked_add(1)
+                    .ok_or(NativeSessionBindingErrorV1::HolderLimitExceeded)?;
+            }
+            None => {
+                bindings.insert(
+                    provider_session_id.clone(),
+                    NativeSessionBindingEntryV1 {
+                        canonical_session_id,
+                        holders: 1,
+                    },
+                );
+            }
+        }
+        Ok(NativeSessionBindingV1 {
+            provider_session_id,
+            session_bindings: Arc::downgrade(&self.session_bindings),
+        })
+    }
+
+    /// Resolves only a currently live host binding. A stale or fabricated
+    /// provider-session derivative has no same-session read authority.
+    pub(crate) fn canonical_session_id(
+        &self,
+        provider_session_id: &str,
+    ) -> std::result::Result<Option<SessionId>, NativeSessionBindingErrorV1> {
+        Ok(self
+            .session_bindings
+            .lock()
+            .map_err(|_| NativeSessionBindingErrorV1::AuthorityUnavailable)?
+            .get(provider_session_id)
+            .map(|entry| entry.canonical_session_id.clone()))
     }
 
     /// Installs the canonical retrieval service after session admission.
     pub(crate) fn bind(
         &self,
         authority: Arc<dyn SessionApplicationRetrievalPortV1>,
-    ) -> Result<(), &'static str> {
+    ) -> std::result::Result<(), &'static str> {
         self.authority
             .set(authority)
             .map_err(|_| "Native session retrieval authority already mounted")

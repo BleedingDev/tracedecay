@@ -1,0 +1,56 @@
+--- a/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
+@@ -1488,9 +1488,6 @@
+         assert_eq!(corrected.state_generation, observed.state_generation + 1);
+         let new_ref = response_json(&corrected)["replacement_ref"].clone();
+         assert_ne!(new_ref, old_ref);
+-        let mut superseded = source.clone();
+-        superseded["validity"]["superseded_at"] = json!(transition);
+-        superseded["validity"]["superseded_by"] = new_ref.clone();
+         drop(adapter);
+ 
+         let adapter = NcmProviderAdapter::new(surface(&root)).unwrap();
+@@ -1500,20 +1497,20 @@
+                 AdmittedTemporalQuery::current(evaluation).unwrap(),
+                 new_text,
+                 replacement["source_identity"]["original_source"].clone(),
+-                new_ref,
++                new_ref.clone(),
+             ),
+             (
+                 "as-of",
+                 AdmittedTemporalQuery::as_of(evaluation, before_transition).unwrap(),
+                 old_text,
+-                superseded.clone(),
++                source.clone(),
+                 old_ref.clone(),
+             ),
+             (
+                 "interval",
+                 AdmittedTemporalQuery::interval(evaluation, before_transition, transition).unwrap(),
+                 old_text,
+-                superseded,
++                source.clone(),
+                 old_ref,
+             ),
+         ] {
+@@ -1542,6 +1539,19 @@
+             assert_eq!(
+                 candidate.provenance["original_sources"],
+                 json!([expected_source]),
++                "{name}"
++            );
++            let expected_supersession = if name == "current" {
++                (None, None)
++            } else {
++                (Some(transition), new_ref.as_str())
++            };
++            assert_eq!(
++                (
++                    candidate.validity.superseded_at.as_deref(),
++                    candidate.validity.superseded_by.as_deref(),
++                ),
++                expected_supersession,
+                 "{name}"
+             );
+             assert_eq!(

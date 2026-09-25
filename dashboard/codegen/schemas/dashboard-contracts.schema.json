@@ -21339,6 +21339,89 @@
       ],
       "type": "object"
     },
+    "SimilarAlignedDifferenceV1": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_span": {
+          "$ref": "#/$defs/SimilarTokenSpanV1"
+        },
+        "candidate_token_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_span": {
+          "$ref": "#/$defs/SimilarTokenSpanV1"
+        },
+        "source_token_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "source_span",
+        "candidate_span",
+        "source_token_count",
+        "candidate_token_count"
+      ],
+      "type": "object"
+    },
+    "SimilarAlignmentAnchorV1": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_token_position": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fingerprint": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "source_token_position": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "fingerprint",
+        "source_token_position",
+        "candidate_token_position"
+      ],
+      "type": "object"
+    },
+    "SimilarAlignmentV1": {
+      "additionalProperties": false,
+      "properties": {
+        "anchors": {
+          "items": {
+            "$ref": "#/$defs/SimilarAlignmentAnchorV1"
+          },
+          "type": "array"
+        },
+        "shared_token_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "shared_token_count",
+        "anchors"
+      ],
+      "type": "object"
+    },
+    "SimilarContainmentV1": {
+      "enum": [
+        "equal",
+        "candidate_contains_selected_range",
+        "selected_range_contains_candidate"
+      ],
+      "type": "string"
+    },
     "SimilarCoverageV1": {
       "oneOf": [
         {
@@ -21459,6 +21542,204 @@
       ],
       "type": "string"
     },
+    "SimilarNearCoverageV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reasons": {
+              "items": {
+                "$ref": "#/$defs/SimilarNearPartialReasonV1"
+              },
+              "type": "array"
+            },
+            "status": {
+              "const": "partial",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reasons"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/SimilarNearUnavailableReasonV1"
+            },
+            "status": {
+              "const": "unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "minimum_tokens": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "status": {
+              "const": "excluded_too_small",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status",
+            "minimum_tokens"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "status": {
+              "const": "excluded_incomplete_tokenization",
+              "type": "string"
+            }
+          },
+          "required": [
+            "status"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SimilarNearMatchV1": {
+      "additionalProperties": false,
+      "description": "One candidate supported by verified fingerprint anchors. Directional\ncoverage is reported separately for source and candidate; no scalar score\nis meaningful for a directional code comparison and none is emitted.",
+      "properties": {
+        "alignment": {
+          "$ref": "#/$defs/SimilarAlignmentV1"
+        },
+        "candidate": {
+          "$ref": "#/$defs/SimilarOccurrenceV1"
+        },
+        "candidate_coverage_millionths": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "containment": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimilarContainmentV1"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "differences": {
+          "items": {
+            "$ref": "#/$defs/SimilarAlignedDifferenceV1"
+          },
+          "type": "array"
+        },
+        "extent": {
+          "$ref": "#/$defs/SimilarSourceExtentV1"
+        },
+        "match_class": {
+          "$ref": "#/$defs/SimilarMatchClassV1"
+        },
+        "source_coverage_millionths": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "candidate",
+        "match_class",
+        "extent",
+        "source_coverage_millionths",
+        "candidate_coverage_millionths",
+        "alignment",
+        "differences"
+      ],
+      "type": "object"
+    },
+    "SimilarNearPartialReasonV1": {
+      "enum": [
+        "posting_row_budget",
+        "candidate_body_budget",
+        "hot_postings",
+        "verification_body_budget",
+        "verification_work_budget",
+        "cancelled",
+        "deadline_exceeded"
+      ],
+      "type": "string"
+    },
+    "SimilarNearResultV1": {
+      "additionalProperties": false,
+      "properties": {
+        "coverage": {
+          "$ref": "#/$defs/SimilarNearCoverageV1"
+        },
+        "extent": {
+          "$ref": "#/$defs/SimilarSourceExtentV1"
+        },
+        "matches": {
+          "items": {
+            "$ref": "#/$defs/SimilarNearMatchV1"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "extent",
+        "matches",
+        "coverage",
+        "next_cursor"
+      ],
+      "type": "object"
+    },
+    "SimilarNearUnavailableReasonV1": {
+      "enum": [
+        "capability_unavailable",
+        "authority_unavailable",
+        "linked_worktree_disabled",
+        "cancelled",
+        "timed_out",
+        "capacity_unavailable",
+        "generation_unavailable",
+        "generation_unverified",
+        "invalid_request",
+        "corruption_reset_required",
+        "internal"
+      ],
+      "type": "string"
+    },
     "SimilarOccurrenceV1": {
       "additionalProperties": false,
       "properties": {
@@ -21518,6 +21799,17 @@
           },
           "type": "array"
         },
+        "near": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SimilarNearResultV1"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Additive verified near/contained evidence. `None` is retained for\ncallers constructing the exact-family-only compatibility response."
+        },
         "source": {
           "$ref": "#/$defs/SimilarOccurrenceV1"
         },
@@ -21530,6 +21822,69 @@
         "families",
         "source_generation",
         "coverage"
+      ],
+      "type": "object"
+    },
+    "SimilarSourceExtentV1": {
+      "description": "The source extent compared by the verified shared-code lane.\n\nThe field on [`SimilarSurfaceRequestV1`] is optional for wire\ncompatibility; an omitted value means [`Self::WholeBody`]. A selected\nextent is measured in the canonical normalized token stream, so mutable\nsource line numbers never become part of the comparison request.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "whole_body",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "end": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "selected_token_range",
+              "type": "string"
+            },
+            "start": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "start",
+            "end"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SimilarTokenSpanV1": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "start": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "start",
+        "end"
       ],
       "type": "object"
     },

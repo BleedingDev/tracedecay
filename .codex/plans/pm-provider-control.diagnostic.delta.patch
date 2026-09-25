@@ -1,0 +1,81 @@
+diff --git a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+--- a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
++++ b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+@@ -1039,6 +1039,10 @@
+     pub operation_id: String,
+     pub idempotency_key: Option<String>,
+     pub terminal: ProviderControlTerminalV1,
++    /// Exact provider diagnostic reference, never a synthesized explanation.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    #[schemars(length(min = 1, max = 128))]
++    pub diagnostic_id: Option<String>,
+     pub domain_detail: Option<ProviderControlDomainDetailV1>,
+     pub effect: ProviderControlEffectV1,
+     pub result: ProviderControlOperationResultV1,
+@@ -1474,6 +1478,15 @@
+             require(
+                 self.effect.duplicate_of_idempotency_key == self.idempotency_key,
+                 "provider duplicate delivery binding",
++            )?;
++        }
++        if let Some(diagnostic_id) = &self.diagnostic_id {
++            require(
++                valid_text(
++                    diagnostic_id,
++                    generated_contract::TERMINAL_DIAGNOSTIC_ID_MAX_BYTES,
++                ),
++                "provider diagnostic reference",
+             )?;
+         }
+         if let Some(detail) = &self.domain_detail {
+@@ -2128,7 +2141,6 @@
+     },
+ ];
+ 
+-#[cfg(test)]
+ #[allow(dead_code)]
+ #[path = "../../../../product/contracts/memory-provider-v1/generated/rust/memory_provider_v1.rs"]
+ mod generated_contract;
+@@ -2714,6 +2726,42 @@
+     }
+ 
+     #[test]
++    fn diagnostic_reference_is_optional_lossless_and_uses_the_generated_bound() {
++        let request = &requests()[3];
++        let absent = result_value(request, Value::Null, "provider_unavailable");
++        let result: ProviderControlResultV1 =
++            serde_json::from_value(absent).expect("legacy omitted diagnostic remains valid");
++        result.validate_for(request).expect("omitted diagnostic");
++        assert!(result.diagnostic_id.is_none());
++        assert!(
++            serde_json::to_value(&result)
++                .expect("result")
++                .get("diagnostic_id")
++                .is_none()
++        );
++        let maximum = generated_contract::TERMINAL_DIAGNOSTIC_ID_MAX_BYTES;
++        assert_eq!(
++            maximum, 128,
++            "schema bound follows the generated canonical bound"
++        );
++        let mut result = result;
++        let diagnostic = "d".repeat(maximum);
++        result.diagnostic_id = Some(diagnostic.clone());
++        result
++            .validate_for(request)
++            .expect("maximum diagnostic reference");
++        assert_eq!(
++            serde_json::to_value(&result).expect("result")["diagnostic_id"],
++            diagnostic
++        );
++        assert!(result.domain_detail.is_none());
++        for invalid in [String::new(), " d".to_owned(), "d".repeat(maximum + 1)] {
++            result.diagnostic_id = Some(invalid);
++            assert!(result.validate().is_err());
++        }
++    }
++
++    #[test]
+     fn serde_enums_and_terminal_effect_policy_match_generated_wire_contract() {
+         for value in [
+             ProviderControlFeedbackSignalV1::Helpful,

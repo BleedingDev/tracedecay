@@ -3,7 +3,7 @@ use super::{
     AutomationRunsAction, AutomationSkillsAction, BranchAction, Cli, Commands, DaemonAction,
     FeedbackRollbackAction, HostBundleAction, LspAction, MemoryAction, PackageHookAction,
     ProfileStorageAction, RemoteAction, ReplacementProviderArg, ScoopPackageHookAction,
-    SessionsAction, SessionsRefreshAction,
+    SemanticAction, SessionsAction, SessionsRefreshAction,
 };
 use clap::{Parser, error::ErrorKind};
 
@@ -1971,4 +1971,82 @@ fn remote_enroll_parses_both_credential_files() {
     );
     assert_eq!(authority.request_file, std::path::Path::new("enroll.json"));
     assert!(!authority.json);
+}
+
+#[test]
+fn semantic_commands_keep_project_selection_and_explicit_artifact_inputs() {
+    let status = Cli::try_parse_from([
+        "tracedecay",
+        "semantic",
+        "status",
+        "--project-id",
+        "project.fixture",
+        "--json",
+    ])
+    .expect("semantic status should parse");
+    assert!(matches!(
+        status.command,
+        Some(Commands::Semantic {
+            action: SemanticAction::Status { project, json: true }
+        }) if project.project_id.as_deref() == Some("project.fixture")
+    ));
+
+    let enable = Cli::try_parse_from([
+        "tracedecay",
+        "semantic",
+        "enable",
+        "--path",
+        "/tmp/project",
+        "--auto-download",
+    ])
+    .expect("semantic enable should parse");
+    assert!(matches!(
+        enable.command,
+        Some(Commands::Semantic {
+            action: SemanticAction::Enable {
+                project,
+                auto_download: true,
+                json: false,
+            }
+        }) if project.path.as_deref() == Some("/tmp/project")
+    ));
+
+    let import = Cli::try_parse_from([
+        "tracedecay",
+        "semantic",
+        "import",
+        "--project-path",
+        "/tmp/project",
+        "--manifest",
+        "manifest.json",
+        "--source",
+        "artifact",
+    ])
+    .expect("semantic import should parse");
+    assert!(matches!(
+        import.command,
+        Some(Commands::Semantic {
+            action: SemanticAction::Import {
+                project,
+                manifest,
+                source,
+                json: false,
+            }
+        }) if project.project_path.as_deref() == Some("/tmp/project")
+            && manifest == std::path::Path::new("manifest.json")
+            && source == std::path::Path::new("artifact")
+    ));
+
+    assert!(
+        Cli::try_parse_from([
+            "tracedecay",
+            "semantic",
+            "status",
+            "--path",
+            "/tmp/a",
+            "--project-id",
+            "project.fixture",
+        ])
+        .is_err()
+    );
 }

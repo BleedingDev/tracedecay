@@ -1,0 +1,43 @@
+{
+  "status": "frozen draft only; no live apply; no Cargo/test execution",
+  "head": "6010f31e7eee1b1c52ddf72a7df18e873a03b2da",
+  "files": {
+    "crates/tracedecay-sessions/src/runtime/hosts/codex.rs": {
+      "baseline_sha256": "c50b66f04852d593d85b6e8101a5ea3cd0508f51f58a761362484c893ba8e95d",
+      "proposed_sha256": "394457207ef493f6dee95f021e0c15ef1e5927530f7f774d4291dfa8e2187dd5",
+      "live_equals_baseline": true
+    },
+    "crates/tracedecay-sessions/src/runtime/hosts/codex/meta.rs": {
+      "baseline_sha256": "f03a6032bd6512f4f2a29229d093cae68f1272458f15b87e6aa2b27c242aa7c0",
+      "proposed_sha256": "69d78cae792869ddf83259e667fa0cd1ebbe2bb84041663ab903aeee1f28a3e0",
+      "live_equals_baseline": true
+    }
+  },
+  "patches": {
+    "integration": {
+      "path": ".codex/plans/pm-session-bootstrap-codex-integration.patch",
+      "sha256": "9e44fbb03227847ab0f871d5f8cf39f3afe4e1b8e99b6c58c4b516cff23952c0",
+      "bytes": 31740
+    },
+    "production": {
+      "path": ".codex/plans/pm-session-bootstrap-codex-production.patch",
+      "sha256": "e701fb7c486063b2f565de580bce4f9bc922c311d6100dfe9cf7cbcf71d7728a",
+      "bytes": 19484
+    },
+    "tests": {
+      "path": ".codex/plans/pm-session-bootstrap-codex-tests.patch",
+      "sha256": "c73f077e99b67c88c0c6af2800c351a7d3ec6b61c1e2ef6f2e5b84b190aeba06",
+      "bytes": 12376
+    }
+  },
+  "test_module": "runtime::hosts::codex::live_session_locator_tests",
+  "test_count": 12,
+  "validation": {
+    "rustfmt": "PASS: rustfmt --check --edition 2024 --config skip_children=true for both proposed files",
+    "integration_apply_check": "PASS: git apply --check integration.patch against unchanged live owned files",
+    "split_apply_check": "PASS: git apply --check production.patch, tests.patch, and both together",
+    "cargo": "NOT RUN (draft-only scope)",
+    "tests": "12 added; NOT RUN (draft-only scope)",
+    "live_source_edits": "NONE; SHA-256 equals each frozen baseline"
+  }
+}

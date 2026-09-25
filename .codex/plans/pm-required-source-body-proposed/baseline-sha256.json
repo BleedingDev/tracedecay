@@ -1,0 +1,10 @@
+{
+  "crates/tracedecay-contracts/src/retrieval/source_read.rs": "0c5781f5715efff5692e15027caedc101207f709a0c098e223ec422ce1b28225",
+  "crates/tracedecay-contracts/src/retrieval/mod.rs": "2a475a17dd2d0d6811b5a66d7dd2e148accd0a628ff9911a1ae8d89742f496f1",
+  "crates/tracedecay-mcp/src/tools/definitions/graph.rs": "a9d6bfeb013676acc6b31d37dc28824deb9c503ef236b28e0bb797e495f8b4f8",
+  "crates/tracedecay-mcp/src/handlers/info/read.rs": "7d084889c70fbc57ce459fcc2463fec0a5ba03a6401e307c40a64c451be2124b",
+  "crates/tracedecay-application/src/primitives/concrete.rs": "d79286071dbbd2fadfa94dcab1108719670bb72aedd292cad200888286af1992",
+  "crates/tracedecay-graph-query/src/context/source_read.rs": "79d4dd0d5553ed87755f5a9a1fb081338b0ba3cf644f6c53f4d67370176f948d",
+  "crates/tracedecay-graph-query/src/verified_query_source_tests.rs": "1d46073d789bb65e40fd0e3d4ffa308ec4b32259fb42732647ba361f0c363c3c",
+  "crates/tracedecay/src/tracedecay/concrete_runtime_tests.rs": "75acea44ba35176927046b21a41c3b7095e5dced086e420e5987fcbc64576e62"
+}

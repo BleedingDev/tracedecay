@@ -1,0 +1,6 @@
+{
+  "file": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs",
+  "patch_sha256": "a1e8f5c9c4e59b1dceebb6f289c5f4a639d178c7b66273ad39bbc19bd60ab16c",
+  "baseline_sha256": "69bd173052a82191782657a3e4760f3266fbe93d972fce6c7c56d5d1eec163d2",
+  "proposed_sha256": "0893c4598fe9d398e723380661abd291090d8da02b48f9cdc0096401600ed700"
+}

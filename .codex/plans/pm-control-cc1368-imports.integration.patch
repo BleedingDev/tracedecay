@@ -1,0 +1,127 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+@@ -1585,7 +1585,7 @@
+ /// operating system. Feeding a counter here would collide on the journal's
+ /// unique index, so the entropy is not decorative — and an entropy failure is
+ /// reported rather than papered over with a constant.
+-fn mint_observation_id(
++pub(super) fn mint_observation_id(
+     admitted_at_unix_micros: i64,
+ ) -> Result<ObservationIdV1, ObservationJournalError> {
+     let unix_millis = u64::try_from(admitted_at_unix_micros.max(0) / 1_000).unwrap_or(0);
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
+@@ -869,12 +869,10 @@
+     use super::*;
+     use std::collections::BTreeSet;
+     use tracedecay_contracts::{
+-        CancellationContext, CancellationSignal, CapabilityGrantSnapshot, Deadline,
+-        DisclosureClass, RequestContext, ResolvedScope,
++        CancellationContext, CancellationSignal, CapabilityGrantId, CapabilityGrantSnapshot,
++        Deadline, DisclosureClass, RequestContext, RequestId, ResolvedScope,
+     };
+-    use tracedecay_domain::{
+-        ActorId, CapabilityGrantId, ProjectId, RefId, RepositoryId, RequestId, WorktreeId,
+-    };
++    use tracedecay_domain::{ActorId, ProjectId, RefId, RepositoryId, WorktreeId};
+     use tracedecay_memory_provider_registry::{OwnedExactScope, OwnedProviderId};
+ 
+     fn state() -> RetainedRecallControlScopeV1 {
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs
+@@ -11,9 +11,9 @@
+ use tracedecay_memory_observation::{
+     ObservationJournalError, ProviderSourceDeletionIntentV1, ProviderSourceIntentReceiptV1,
+ };
+-use tracedecay_memory_provider_registry::contract::DeletionMode;
+ use tracedecay_memory_provider_registry::{
+-    CanonicalPayload, HistoryGrant, OwnedExactScope, SourceAttribution, rfc3339_utc_micros,
++    CanonicalPayload, DeletionMode, HistoryGrant, OwnedExactScope, SourceAttribution,
++    rfc3339_utc_micros,
+ };
+ 
+ use super::super::cognitive_recall::control_attribution::RetainedRecallControlScopeV1;
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
+@@ -7,13 +7,14 @@
+ use std::time::{Duration, Instant};
+ use tempfile::TempDir;
+ use tracedecay_contracts::{
+-    ApplicationOutcome, CancellationContext, CancellationSignal, CapabilityGrantSnapshot, Deadline,
+-    DisclosureClass, EffectTermination, ReconciliationState, RequestContext, ResolvedScope,
+-    RetainedProviderControlExecutionPortV1, RetainedSurfaceExecutionContextV1,
++    ApplicationOutcome, CancellationContext, CancellationSignal, CapabilityGrantId,
++    CapabilityGrantSnapshot, Deadline, DisclosureClass, EffectTermination, ReconciliationState,
++    RequestContext, RequestId, ResolvedScope, RetainedProviderControlExecutionPortV1,
++    RetainedSurfaceExecutionContextV1,
+ };
+ use tracedecay_domain::{
+-    ActorId, CapabilityGrantId, ManifestDigest, ObservationScopeV1, ObservationSourceIdentityV1,
+-    ProjectId, ProviderId, RequestId, SessionId,
++    ActorId, ManifestDigest, ObservationScopeV1, ObservationSourceIdentityV1, ProjectId,
++    ProviderId, SessionId,
+ };
+ use tracedecay_hooks::admission_ledger::{
+     HookAdmissionLedgerLimitsV1, HookAdmissionLedgerV1, HookLiveOriginOutcomeV1,
+@@ -24,12 +25,13 @@
+ };
+ use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
+ use tracedecay_memory_observation::{RecoveryTimeBudgetV1, SqliteObservationJournal};
++use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
+ use tracedecay_memory_provider_registry::{
+     AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CancellationToken,
+     CurrentAdvisoryAdmission, OperationControl, OwnedProviderId, OwnedVersionedId,
+     ProjectMemoryProviderComposition, ProviderCall, ProviderCallParts, ProviderOperation,
+     RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainProviderExplanationV1,
+-    RecallExplainTraceV1, RecallSourceAttributionV1,
++    RecallExplainTraceV1,
+ };
+ use tracedecay_sessions::admission::HostAdmissionScope;
+ use tracedecay_sessions::observation::ObservationCancellation;
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+@@ -299,6 +299,14 @@
+             .expires_at
+             .min(context.request_context.grant().expires_at);
+         let remaining = u64::try_from(expires_at.0.saturating_sub(now.0)).unwrap_or(0);
++        let operation_id = super::observation_journey::mint_observation_id(now.0)
++            .map_err(|error| {
++                ControlFailureV1::new(ControlFailureStageV1::Request(
++                    RetainedSurfaceExecutionErrorV1::unavailable(error.to_string()),
++                ))
++            })?
++            .as_str()
++            .to_owned();
+         let invocation = Self {
+             context,
+             request,
+@@ -308,7 +316,7 @@
+                 tracedecay_memory_provider_registry::CancellationToken::new(),
+             ),
+             identity: ControlOperationIdentityV1 {
+-                operation_id: uuid::Uuid::now_v7().to_string(),
++                operation_id,
+                 idempotency_key: provider_mutation_key(
+                     context.request_context,
+                     request.operation(),
+@@ -860,12 +868,10 @@
+         ProviderControlHealthCheckV1, ProviderHealthRequestV1,
+     };
+     use tracedecay_contracts::{
+-        CancellationContext, CancellationSignal, CapabilityGrantSnapshot, Deadline,
+-        DisclosureClass, RequestContext,
++        CancellationContext, CancellationSignal, CapabilityGrantId, CapabilityGrantSnapshot,
++        Deadline, DisclosureClass, RequestContext, RequestId,
+     };
+-    use tracedecay_domain::{
+-        ActorId, CapabilityGrantId, RefId, RepositoryId, RequestId, UtcMicros, WorktreeId,
+-    };
++    use tracedecay_domain::{ActorId, RefId, RepositoryId, UtcMicros, WorktreeId};
+ 
+     fn context(
+         actor: &str,

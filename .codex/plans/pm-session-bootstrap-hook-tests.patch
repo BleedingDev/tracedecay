@@ -1,0 +1,616 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -755,4 +755,365 @@
+             linked_before
+         );
+     }
+-}
++    #[test]
++    fn claude_start_requires_the_real_host_source_and_exact_session() {
++        use tracedecay_domain::SessionId;
++        let home = tempfile::tempdir().unwrap();
++        let path = home
++            .path()
++            .join(".claude/projects/project/session-one.jsonl");
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        fs::write(&path, b"").unwrap();
++        let session = SessionId::new("session-one").unwrap();
++        assert_eq!(
++            super::validated_claude_start_source(&path, &session, home.path(), deadline()),
++            Some(fs::canonicalize(&path).unwrap())
++        );
++        assert!(
++            super::validated_claude_start_source(
++                &path,
++                &SessionId::new("other").unwrap(),
++                home.path(),
++                deadline()
++            )
++            .is_none()
++        );
++        assert!(
++            super::validated_claude_start_source(&path, &session, home.path(), Instant::now())
++                .is_none()
++        );
++        let outside = home.path().join("session-one.jsonl");
++        fs::write(&outside, b"").unwrap();
++        assert!(
++            super::validated_claude_start_source(&outside, &session, home.path(), deadline())
++                .is_none()
++        );
++        fs::remove_file(&path).unwrap();
++        assert!(
++            super::validated_claude_start_source(&path, &session, home.path(), deadline())
++                .is_none()
++        );
++        assert!(
++            !path.exists(),
++            "bootstrap must not create missing native files"
++        );
++    }
++
++    #[test]
++    fn claude_start_rejects_links_directories_and_fifo_without_reading() {
++        use std::os::unix::fs::symlink;
++        use tracedecay_domain::SessionId;
++        let home = tempfile::tempdir().unwrap();
++        let path = home
++            .path()
++            .join(".claude/projects/project/session-one.jsonl");
++        fs::create_dir_all(path.parent().unwrap()).unwrap();
++        let actual = path.with_file_name("actual.jsonl");
++        fs::write(&actual, b"").unwrap();
++        let session = SessionId::new("session-one").unwrap();
++        symlink(&actual, &path).unwrap();
++        assert!(
++            super::validated_claude_start_source(&path, &session, home.path(), deadline())
++                .is_none()
++        );
++        fs::remove_file(&path).unwrap();
++        fs::create_dir(&path).unwrap();
++        assert!(
++            super::validated_claude_start_source(&path, &session, home.path(), deadline())
++                .is_none()
++        );
++        fs::remove_dir(&path).unwrap();
++        let status = Command::new("mkfifo").arg(&path).status().unwrap();
++        assert!(status.success());
++        assert!(
++            super::validated_claude_start_source(&path, &session, home.path(), deadline())
++                .is_none()
++        );
++    }
++
++    #[test]
++    fn existing_session_start_rejects_a_conflicting_native_source() {
++        use tracedecay_domain::{BrainId, ProjectId, SessionId, UserProfileId};
++        let home = tempfile::tempdir().unwrap();
++        let project = repository();
++        let first = home.path().join(".claude/projects/first/session-one.jsonl");
++        let second = home
++            .path()
++            .join(".claude/projects/second/session-one.jsonl");
++        for path in [&first, &second] {
++            fs::create_dir_all(path.parent().unwrap()).unwrap();
++            fs::write(path, b"").unwrap();
++        }
++        let session = || super::LiveOriginSession {
++            project_root: project.path().to_path_buf(),
++            project_id: ProjectId::new("project.locator-test").unwrap(),
++            brain_id: BrainId::new("brain.locator-test").unwrap(),
++            profile_id: UserProfileId::new("profile.locator-test").unwrap(),
++            producer: tracedecay_hooks::HookHostV1::ClaudeCode,
++            native_session: SessionId::new("session-one").unwrap(),
++            recorded_project_path: Some(project.path().to_path_buf()),
++            source_path: Some(first.clone()),
++        };
++        let mut locator = tracedecay_agent_hosts::hooks::NativeSessionStartLocatorV1 {
++            session_id: SessionId::new("session-one").unwrap(),
++            event_id: [1; 16],
++            transcript_path: second,
++        };
++        assert!(
++            session()
++                .resolve_source(true, Some(&locator), Some(home.path()), deadline())
++                .is_none()
++        );
++        assert!(
++            session()
++                .resolve_source(true, None, Some(home.path()), deadline())
++                .is_none()
++        );
++        locator.transcript_path = first.clone();
++        let (_, register, _) = session()
++            .resolve_source(true, Some(&locator), Some(home.path()), deadline())
++            .unwrap();
++        assert!(!register, "a matching indexed source needs no new row");
++    }
++
++    fn native_hook_request(
++        binding: &tracedecay_hooks::HookScopeBindingV1,
++        session: &str,
++        transcript: &Path,
++        project: &Path,
++        event_name: &str,
++        sequence: u8,
++    ) -> (serde_json::Value, String) {
++        let host = binding.host;
++        let mut payload = serde_json::json!({
++            "id": format!("native-hook-{sequence}"),
++            "session_id": session,
++            "transcript_path": transcript,
++            "cwd": project,
++            "hook_event_name": event_name,
++            "source": "startup",
++            "prompt_id": format!("prompt-{sequence}"),
++            "permission_mode": "default",
++            "stop_hook_active": false,
++            "last_assistant_message": null,
++            "background_tasks": [],
++            "session_crons": [],
++        });
++        if host == tracedecay_hooks::HookHostV1::Codex {
++            payload.as_object_mut().unwrap().remove("transcript_path");
++        }
++        let payload = payload.to_string();
++        let material = tracedecay_agent_hosts::hooks::native_capture_material(
++            tracedecay_hooks::NativeHookCaptureSourceV1::Host(host),
++            payload.as_bytes(),
++            tracedecay_contracts::now_micros(),
++        )
++        .unwrap();
++        let envelope = tracedecay_hooks::decode_native_hook_event(host, payload.as_bytes())
++            .unwrap()
++            .into_envelope(binding, material)
++            .unwrap();
++        let mut request = serde_json::json!({
++            "action": "hook_v2_admit", "envelope": envelope,
++            "native_session_id": session,
++        });
++        if event_name == "SessionStart" && host == tracedecay_hooks::HookHostV1::ClaudeCode {
++            request["native_start_locator"] = serde_json::json!({
++                "session_id": session, "event_id": envelope.event_id,
++                "transcript_path": transcript,
++            });
++        }
++        (request, payload)
++    }
++
++    #[tokio::test]
++    async fn live_start_and_two_real_stop_ingest_cycles_preserve_the_canonical_locator() {
++        use super::super::super::SessionAuthorities;
++        use super::super::admission::hook_v2_admit;
++        use super::super::ingest::ingest_transcript;
++        use crate::host_admission::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
++        use crate::tracedecay::TraceDecayOpenOptions;
++        use std::io::Write;
++        use std::sync::Arc;
++        use tracedecay_domain::ProjectId;
++        use tracedecay_hooks::admission_ledger::{
++            read_hook_live_origin_boundaries, read_hook_live_origin_proofs,
++        };
++
++        let project = repository();
++        let project_root = fs::canonicalize(project.path()).unwrap();
++        let profile_root = tempfile::tempdir().unwrap();
++        let home = tempfile::tempdir().unwrap();
++        let runtime = HostAdmissionTestRuntimeV1::project(
++            profile_root.path(),
++            &project_root,
++            ProjectId::new("project.live-bootstrap-two-cycles").unwrap(),
++        )
++        .await
++        .unwrap();
++        let cg = runtime
++            .initialize_project_graph_for_test(
++                &project_root,
++                TraceDecayOpenOptions {
++                    profile_root: Some(profile_root.path().to_path_buf()),
++                    global_db_path: None,
++                },
++            )
++            .await
++            .unwrap();
++        let project_db = runtime
++            .registered_database_arc(HostAdmissionScope::Project)
++            .unwrap();
++        let profile = Arc::new(
++            tracedecay_daemon_identity::profile_identity::load_existing(
++                runtime.profile_root_for_test(),
++            )
++            .unwrap(),
++        );
++        let authorities = SessionAuthorities::new(Some(&project_db), None)
++            .with_profile_identity(Some(profile))
++            .with_background_cpu(Some(runtime.background_cpu()));
++        tracedecay_agent_hosts::hooks::publish_hook_bindings(
++            &crate::runtime_ports::hook_runtime(),
++            cg.hook_store_layout(),
++        )
++        .unwrap();
++        let host = tracedecay_hooks::HookHostV1::ClaudeCode;
++        let subscriber = tracedecay_hooks::HookConfigurationSubscriberV1::new(
++            tracedecay_hooks::HookConfigurationFileReaderV1::new(
++                tracedecay_hooks::hook_configuration_path(&cg.hook_store_layout().data_root, host),
++            ),
++        );
++        let tracedecay_hooks::HookConfigurationReadOutcomeV1::Bound(snapshot) =
++            subscriber.load_current(host, tracedecay_contracts::now_micros())
++        else {
++            panic!("real fixture binding was not published");
++        };
++        let transcript = home
++            .path()
++            .join(".claude/projects/live/session-source.jsonl");
++        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
++        fs::write(&transcript, b"").unwrap();
++        let expected_path = fs::canonicalize(&transcript)
++            .unwrap()
++            .to_str()
++            .unwrap()
++            .to_owned();
++        let ledger = cg
++            .hook_store_layout()
++            .data_root
++            .join("hook-v2-admissions")
++            .join(host.hook_key());
++        tracedecay_sessions::runtime::with_transcript_source_home(home.path().to_path_buf(), async {
++            let (start, _) = native_hook_request(
++                &snapshot.binding, "session-source", &transcript, &project_root, "SessionStart", 1,
++            );
++            hook_v2_admit(&cg, &start, "hook_v2_admit", authorities.clone()).await.unwrap();
++            let session = project_db.get_session_result("claude", "session-source").await.unwrap().unwrap();
++            assert_eq!(session.transcript_path.as_deref(), Some(expected_path.as_str()));
++            assert_eq!(project_db.session_message_count().await.unwrap(), 0);
++            let boundaries = read_hook_live_origin_boundaries(&ledger, host, tracedecay_contracts::now_micros()).unwrap();
++            assert_eq!(boundaries.len(), 1, "empty native Start must establish a real boundary");
++            assert_eq!(boundaries[0].start.physical_eof, 0);
++
++            for turn in 1..=2_u8 {
++                let record = serde_json::json!({
++                    "type": "user", "sessionId": "session-source",
++                    "uuid": format!("source-message-{turn}"),
++                    "timestamp": format!("2026-02-01T00:00:0{turn}Z"),
++                    "cwd": project_root,
++                    "message": {"role": "user", "content": format!("Turn {turn} preserves the registered live locator.")},
++                });
++                let mut file = fs::OpenOptions::new().append(true).open(&transcript).unwrap();
++                writeln!(file, "{record}").unwrap();
++                file.sync_all().unwrap();
++                drop(file);
++                let (stop, event_json) = native_hook_request(
++                    &snapshot.binding, "session-source", &transcript, &project_root, "Stop", turn + 1,
++                );
++                hook_v2_admit(&cg, &stop, "hook_v2_admit", authorities.clone()).await.unwrap();
++                let proofs = read_hook_live_origin_proofs(&ledger, host, tracedecay_contracts::now_micros()).unwrap();
++                assert_eq!(proofs.len(), usize::from(turn), "each actual Stop seals its appended frame before ingest");
++                ingest_transcript(
++                    Some(&cg),
++                    &serde_json::json!({"provider": "claude", "event_json": event_json, "user_scope": false}),
++                    Some(runtime.profile_root_for_test()), None, None, authorities.clone(),
++                ).await.unwrap();
++                let after = project_db.get_session_result("claude", "session-source").await.unwrap().unwrap();
++                assert_eq!(after.transcript_path.as_deref(), Some(expected_path.as_str()), "canonical projection must preserve the live locator after each ingest");
++                assert_eq!(project_db.session_message_count().await.unwrap(), i64::from(turn));
++                assert!(after.started_at.is_some(), "real canonical projection must enrich the minimal row");
++            }
++
++            let destination = transcript.with_file_name("session-destination.jsonl");
++            fs::write(&destination, b"").unwrap();
++            let (destination_start, _) = native_hook_request(
++                &snapshot.binding, "session-destination", &destination, &project_root, "SessionStart", 4,
++            );
++            hook_v2_admit(&cg, &destination_start, "hook_v2_admit", authorities.clone()).await.unwrap();
++            assert!(project_db.get_session_result("claude", "session-destination").await.unwrap().is_some());
++            assert!(read_hook_live_origin_boundaries(&ledger, host, tracedecay_contracts::now_micros()).unwrap()
++                .iter().any(|boundary| boundary.observation.source.session_id().as_str() == "session-destination"));
++            assert_eq!(project_db.session_message_count().await.unwrap(), 2, "destination Start must not fabricate a message");
++
++            let rejected = transcript.with_file_name("session-stale.jsonl");
++            fs::write(&rejected, b"").unwrap();
++            let (mut stale, _) = native_hook_request(
++                &snapshot.binding, "session-stale", &rejected, &project_root, "SessionStart", 5,
++            );
++            stale["envelope"]["worktree_epoch"] = serde_json::json!(snapshot.binding.worktree_epoch + 1);
++            hook_v2_admit(&cg, &stale, "hook_v2_admit", authorities.clone()).await.unwrap();
++            assert!(project_db.get_session_result("claude", "session-stale").await.unwrap().is_none());
++            let before_duplicate = fs::read(&ledger.join("admission-live-origins.json")).unwrap();
++            hook_v2_admit(&cg, &destination_start, "hook_v2_admit", authorities.clone()).await.unwrap();
++            assert_eq!(fs::read(ledger.join("admission-live-origins.json")).unwrap(), before_duplicate, "duplicate Start cannot refresh origin authority");
++
++            // Codex Start supplies no transcript path. Its actual native metadata
++            // header must locate and bind the source before any content appears.
++            let codex_host = tracedecay_hooks::HookHostV1::Codex;
++            let codex_subscriber = tracedecay_hooks::HookConfigurationSubscriberV1::new(
++                tracedecay_hooks::HookConfigurationFileReaderV1::new(
++                    tracedecay_hooks::hook_configuration_path(&cg.hook_store_layout().data_root, codex_host),
++                ),
++            );
++            let tracedecay_hooks::HookConfigurationReadOutcomeV1::Bound(codex_snapshot) =
++                codex_subscriber.load_current(codex_host, tracedecay_contracts::now_micros())
++            else { panic!("Codex fixture binding missing"); };
++            let codex_path = home.path().join(".codex/sessions/2026/02/01/rollout-session-codex.jsonl");
++            fs::create_dir_all(codex_path.parent().unwrap()).unwrap();
++            let header = serde_json::json!({
++                "type": "session_meta", "timestamp": "2026-02-01T00:00:00Z",
++                "payload": { "id": "session-codex", "cwd": project_root },
++            });
++            fs::write(&codex_path, format!("{header}\n")).unwrap();
++            let codex_initial_len = fs::metadata(&codex_path).unwrap().len();
++            let (codex_start, native_start) = native_hook_request(
++                &codex_snapshot.binding, "session-codex", &codex_path, &project_root, "SessionStart", 6,
++            );
++            assert!(serde_json::from_str::<serde_json::Value>(&native_start).unwrap().get("transcript_path").is_none());
++            assert!(codex_start.get("native_start_locator").is_none());
++            hook_v2_admit(&cg, &codex_start, "hook_v2_admit", authorities.clone()).await.unwrap();
++            let codex_session = project_db.get_session_result("codex", "session-codex").await.unwrap().unwrap();
++            assert_eq!(codex_session.transcript_path.as_deref(), fs::canonicalize(&codex_path).unwrap().to_str());
++            assert_eq!(project_db.session_message_count().await.unwrap(), 2);
++            let codex_ledger = cg.hook_store_layout().data_root.join("hook-v2-admissions").join(codex_host.hook_key());
++            let boundaries = read_hook_live_origin_boundaries(&codex_ledger, codex_host, tracedecay_contracts::now_micros()).unwrap();
++            assert_eq!(boundaries.len(), 1);
++            assert_eq!(boundaries[0].start.physical_eof, codex_initial_len);
++            let mut file = fs::OpenOptions::new().append(true).open(&codex_path).unwrap();
++            writeln!(file, "{}", serde_json::json!({
++                "type": "event_msg", "timestamp": "2026-02-01T00:00:01Z",
++                "payload": {"type": "user_message", "message": "A real Codex user turn."},
++            })).unwrap();
++            file.sync_all().unwrap();
++            drop(file);
++            let (codex_stop, _) = native_hook_request(
++                &codex_snapshot.binding, "session-codex", &codex_path, &project_root, "Stop", 7,
++            );
++            hook_v2_admit(&cg, &codex_stop, "hook_v2_admit", authorities.clone()).await.unwrap();
++            let codex_proofs = read_hook_live_origin_proofs(&codex_ledger, codex_host, tracedecay_contracts::now_micros()).unwrap();
++            assert_eq!(codex_proofs.len(), 1);
++            assert_eq!(codex_proofs[0].frames.len(), 1, "pre-Start metadata must remain excluded");
++        }).await;
++    }
++}
+--- a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+@@ -1182,3 +1182,244 @@
+ 
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++mod start_locator_tests {
++    use super::*;
++
++    fn start(session: &str) -> HookEventEnvelopeV2 {
++        HookEventEnvelopeV2 {
++            schema_version: tracedecay_hooks::HOOK_EVENT_SCHEMA_VERSION,
++            event_id: [1; 16],
++            producer: HookHostV1::ClaudeCode,
++            protected_session_id: protected_session_id_for_native(session),
++            project_id: [2; 16],
++            repository_id: [3; 16],
++            worktree_id: [4; 16],
++            worktree_epoch: 1,
++            binding_token: [5; 32],
++            ordering: tracedecay_hooks::HookOrderingV1::Unknown,
++            observed_at: UtcMicros(1),
++            event: tracedecay_hooks::HookEventV2::SessionBoundary {
++                boundary: tracedecay_hooks::HookBoundaryV1::Start,
++            },
++        }
++    }
++
++    #[test]
++    fn private_start_locator_is_bound_to_native_session_event_and_host() {
++        let envelope = start("session-one");
++        let fields: NativeIdentityFields = serde_json::from_value(serde_json::json!({
++            "session_id": "session-one", "transcript_path": "/native/session-one.jsonl"
++        }))
++        .unwrap();
++        let locator = native_session_start_locator(&fields, &envelope).unwrap();
++        assert!(locator.matches_envelope(&envelope));
++        for changed in [
++            HookEventEnvelopeV2 {
++                producer: HookHostV1::Codex,
++                ..envelope.clone()
++            },
++            HookEventEnvelopeV2 {
++                event_id: [9; 16],
++                ..envelope.clone()
++            },
++            start("session-two"),
++            HookEventEnvelopeV2 {
++                event: tracedecay_hooks::HookEventV2::SessionBoundary {
++                    boundary: tracedecay_hooks::HookBoundaryV1::TurnComplete,
++                },
++                ..envelope.clone()
++            },
++        ] {
++            assert!(!locator.matches_envelope(&changed));
++        }
++        let encoded = serde_json::to_value(&locator).unwrap();
++        let decoded: NativeSessionStartLocatorV1 = serde_json::from_value(encoded.clone()).unwrap();
++        assert_eq!(decoded, locator);
++        let mut open = encoded;
++        open["authority"] = serde_json::json!("caller-claimed");
++        assert!(serde_json::from_value::<NativeSessionStartLocatorV1>(open).is_err());
++    }
++
++    #[test]
++    fn start_locator_rejects_missing_relative_and_oversized_paths() {
++        for path in [
++            None,
++            Some("relative/session-one.jsonl".to_owned()),
++            Some(format!("/{}", "x".repeat(4096))),
++        ] {
++            let fields: NativeIdentityFields = serde_json::from_value(serde_json::json!({
++                "session_id": "session-one", "transcript_path": path
++            }))
++            .unwrap();
++            assert!(native_session_start_locator(&fields, &start("session-one")).is_none());
++        }
++    }
++
++    struct SlowOptionalDelivery {
++        required_done: std::sync::atomic::AtomicBool,
++        delivery_attempted: std::sync::atomic::AtomicBool,
++    }
++
++    impl
++        AsyncHookFeedbackDeliveryPortV1<
++            tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
++        > for SlowOptionalDelivery
++    {
++        fn deliver_hook_v2<'a>(
++            &'a self,
++            _envelope: &'a HookEventEnvelopeV2,
++            _feedback: &'a tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
++            _deadline: HookSynchronousDeadlineV1,
++        ) -> tracedecay_hooks::HookDeliveryFutureV1<'a> {
++            Box::pin(async move {
++                use std::sync::atomic::Ordering;
++                assert!(
++                    self.required_done.load(Ordering::SeqCst),
++                    "optional delivery cannot precede required producer work"
++                );
++                self.delivery_attempted.store(true, Ordering::SeqCst);
++                std::future::pending().await
++            })
++        }
++
++        fn deliver_legacy<'a>(
++            &'a self,
++            _envelope: &'a HookEventEnvelopeV2,
++            _feedback: &'a tracedecay_application::advisory::AdvisoryHookLookupNoticeV1,
++            _deadline: HookSynchronousDeadlineV1,
++        ) -> tracedecay_hooks::HookDeliveryFutureV1<'a> {
++            Box::pin(async { tracedecay_hooks::HookFeedbackDeliveryOutcomeV1::Unavailable })
++        }
++    }
++
++    #[tokio::test]
++    async fn slow_optional_delivery_cannot_starve_required_stop_enqueue() {
++        use std::sync::atomic::{AtomicBool, Ordering};
++        use tracedecay_domain::feedback::{FeedbackCycleId, FeedbackResultId, FeedbackScopeV1};
++        use tracedecay_domain::{
++            CodeGenerationId, CommitId, ManifestDigest, RepositoryId, WorktreeId,
++        };
++
++        let project = tempfile::tempdir().unwrap();
++        let profile = tempfile::tempdir().unwrap();
++        let runtime = crate::ports::hook_runtime::crate_test_runtime();
++        let layout = tracedecay_runtime_core::storage::default_profile_sharded_layout(
++            project.path(),
++            profile.path(),
++        )
++        .unwrap();
++        let notice = tracedecay_application::advisory::AdvisoryHookLookupNoticeV1 {
++            scope: FeedbackScopeV1 {
++                project_id: ProjectId::new("project.required-stop").unwrap(),
++                repository_id: RepositoryId::new("repository.required-stop").unwrap(),
++                worktree_id: WorktreeId::new("worktree.required-stop").unwrap(),
++                branch_ref: "refs/heads/main".to_owned(),
++                head_commit_id: CommitId::new("a".repeat(40)).unwrap(),
++            },
++            result_id: FeedbackResultId::new("result.required-stop").unwrap(),
++            cycle_id: FeedbackCycleId::new("cycle.required-stop").unwrap(),
++            generation_id: CodeGenerationId::new("generation.required-stop").unwrap(),
++            generation_digest: ManifestDigest::new(format!("sha256:{}", "b".repeat(64))).unwrap(),
++            returned_findings: 1,
++            omitted_findings: 0,
++        };
++        let now = now_utc();
++        let mut envelope = start("session-one");
++        envelope.producer = HookHostV1::Codex;
++        envelope.project_id = envelope_identity_hash16("project", notice.scope.project_id.as_str());
++        envelope.repository_id =
++            envelope_identity_hash16("repository", notice.scope.repository_id.as_str());
++        envelope.worktree_id =
++            envelope_identity_hash16("worktree", notice.scope.worktree_id.as_str());
++        envelope.observed_at = now;
++        envelope.event = tracedecay_hooks::HookEventV2::SessionBoundary {
++            boundary: tracedecay_hooks::HookBoundaryV1::TurnComplete,
++        };
++        let snapshot = HookConfigurationSnapshotV1 {
++            schema_version: tracedecay_hooks::HOOK_CONFIGURATION_SCHEMA_VERSION,
++            revision: 1,
++            published_at: now,
++            expires_at: UtcMicros(now.0 + 1_000_000),
++            binding: HookScopeBindingV1 {
++                host: envelope.producer,
++                project_id: envelope.project_id,
++                repository_id: envelope.repository_id,
++                worktree_id: envelope.worktree_id,
++                worktree_epoch: envelope.worktree_epoch,
++                binding_token: envelope.binding_token,
++                capabilities: vec![tracedecay_hooks::HookCapabilityV1 {
++                    family: tracedecay_hooks::HookEventFamily::SessionBoundary,
++                    support: tracedecay_hooks::HookEventSupportV1::Native,
++                }],
++            },
++        };
++        let prepared = PreparedBoundHook {
++            host: HookHostV1::Codex,
++            layout,
++            snapshot,
++            envelope,
++            native_session_id: Some("session-one".to_owned()),
++            native_lifecycle: None,
++            native_start_locator: None,
++            prepared_at: now,
++        };
++        let guard = crate::hooks::TestDaemonHookActionGuard::install([
++            serde_json::json!({
++                "action": "hook_v2_admit", "status": "accepted", "disposition": "accepted",
++                "orchestration": null, "ready_guidance": null, "feedback_notice": notice,
++                "reason": null,
++            }),
++            serde_json::json!({"queued": true}),
++        ]);
++        let admission = DaemonAdmissionPort::new(
++            &runtime,
++            project.path(),
++            Some("session-one"),
++            None,
++            None,
++            None,
++        );
++        let delivery = SlowOptionalDelivery {
++            required_done: AtomicBool::new(false),
++            delivery_attempted: AtomicBool::new(false),
++        };
++        let started = Instant::now();
++        let (dispatched, queued) = dispatch_decoded_with_required_work(
++            &runtime,
++            prepared,
++            project.path(),
++            started,
++            &admission,
++            &delivery,
++            async {
++                assert_eq!(
++                    guard.calls().len(),
++                    1,
++                    "live admission must precede enqueue"
++                );
++                assert!(HookSynchronousDeadlineV1::after_elapsed(elapsed_us(started)).is_some());
++                let response = super::super::daemon_hook_action(
++                    &runtime,
++                    Some(project.path()),
++                    serde_json::json!({"action": "codex_stop", "session_id": "session-one"}),
++                    None,
++                )
++                .await
++                .unwrap();
++                delivery.required_done.store(true, Ordering::SeqCst);
++                response["queued"] == true
++            },
++        )
++        .await;
++        assert!(queued);
++        assert!(delivery.delivery_attempted.load(Ordering::SeqCst));
++        assert!(matches!(dispatched, HookDispatch::Handled { .. }));
++        assert_eq!(guard.calls()[1].1["action"], "codex_stop");
++        assert!(
++            HookSynchronousDeadlineV1::after_elapsed(elapsed_us(started)).is_none(),
++            "slow optional delivery consumes only the original remaining deadline"
++        );
++    }
++}

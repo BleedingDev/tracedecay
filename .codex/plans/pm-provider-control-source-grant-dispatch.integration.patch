@@ -1,0 +1,52 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+@@ -21,8 +21,9 @@
+ use tracedecay_domain::{ManifestDigest, ProjectId, UserProfileId, canonical_json_bytes};
+ use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+ use tracedecay_memory_provider_registry::{
+-    GrantedHistorySource, LifecycleTarget, LifecycleTargetReference, OperationControl,
+-    OwnedProviderId, ProjectMemoryProviderComposition, ProviderOperation, TerminalCode,
++    GrantedHistorySource, HistoryGrant, LifecycleTarget, LifecycleTargetReference,
++    OperationControl, OwnedProviderId, ProjectMemoryProviderComposition, ProviderOperation,
++    TerminalCode,
+ };
+ use tracedecay_runtime_core::db::Database;
+ 
+@@ -688,6 +689,28 @@
+         identity: &ControlOperationIdentityV1,
+         expected_state_generation: Option<u64>,
+     ) -> ControlResult<JourneyControlDispatchReplyV1> {
++        self.dispatch_with_source_grant(
++            invocation,
++            state,
++            operation_body,
++            identity,
++            expected_state_generation,
++            None,
++        )
++        .await
++    }
++
++    /// Carry source-grant claims through the private dispatch seam for
++    /// downstream revalidation without adding them to the public operation body.
++    pub(super) async fn dispatch_with_source_grant(
++        &self,
++        invocation: &ControlInvocationV1<'_, '_>,
++        state: &ResolvedControlStateV1,
++        operation_body: Value,
++        identity: &ControlOperationIdentityV1,
++        expected_state_generation: Option<u64>,
++        history_grant: Option<HistoryGrant>,
++    ) -> ControlResult<JourneyControlDispatchReplyV1> {
+         self.validate_invocation(invocation)?;
+         let Some(journey) = state.journey.as_ref().cloned() else {
+             return Err(ControlFailureV1::new(ControlFailureStageV1::Offline {
+@@ -710,6 +733,7 @@
+             operation_id: identity.operation_id.clone(),
+             idempotency_key: identity.idempotency_key.clone(),
+             operation_body,
++            history_grant,
+             policy_revision: PROVIDER_CONTROL_POLICY_REVISION_V1,
+             control: invocation.control.clone(),
+             expected_state_generation,

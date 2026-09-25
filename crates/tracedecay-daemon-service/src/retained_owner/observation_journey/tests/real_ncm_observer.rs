@@ -31,8 +31,13 @@ struct NcmObserverFixture {
     worker_owner: Arc<RustNcmWorkerOwner>,
 }
 
-#[derive(Debug)]
 struct NcmInstanceProof(Arc<RustNcmSurface>);
+
+impl std::fmt::Debug for NcmInstanceProof {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NcmInstanceProof")
+    }
+}
 
 impl ObservationInstanceProofV1 for NcmInstanceProof {
     fn prove(

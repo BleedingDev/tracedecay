@@ -1,0 +1,40 @@
+--- a/product/contracts/memory-provider-v1/common-advisory-profile.md
++++ b/product/contracts/memory-provider-v1/common-advisory-profile.md
+@@ -125,6 +125,37 @@
+ Missing original evidence produces no synthesized item and reports partial
+ coverage or a warning. Current exact scope, byte/item bounds, redaction policy and
+ scope-bound cursor rules continue to apply.
++
++
++The common migration fixture distinguishes each original public operation and
++idempotency key as `retained`, `caller_observed_only`, or `unverified`. A retained
++value must be read from the actual old durable representation. Caller-only
++status requires both the actual original dispatch evidence and proof that the
++old representation did not retain that public identifier. A caller-only key may
++select an inspection; it must not be synthesized into a retained receipt item.
++Unverified identity remains unresolved.
++
++After each of the two migration restarts, a trusted fixture action independently
++point-reads the actual owned records and original receipts while the restarted
++provider remains live. It compares the original public reference, a declared
++immutable old-record projection, exact stored receipt bytes, the original public
++receipt digest or its verified durable basis, and every retained public
++operation/key. Fingerprints exclude legitimate mutable runtime counters and
++fields newly added by migration. Missing audit capability remains unknown;
++changed retained evidence fails. The amended common program has 192 actions,
++including both added physical audits; all existing actions remain required.
++
++When both identifiers were retained, receipt inspection still requires the
++exact original four-field item and successful terminal. When an identifier was
++proved caller-only, the incomplete item must be omitted and the provider must
++report partial coverage or a bounded nonempty warning. This outcome is degraded
++only after the independent durable audit succeeds. Both paths require no effect,
++unchanged generation and forbidden fallback. Invented or changed items, silent
++loss, and changed durable records or receipts fail. Mixed evidence preserves
++complete items and omits only known incomplete items. Reports separately expose
++`legacy_delivery_identity` as `complete`, `degraded`, `unknown`, or `failed`;
++overall compatibility with expected degradation does not claim complete
++preservation of original delivery identifiers.
+ 
+ Common `trace` inspection uses exactly
+ `selector: { "stable_memory_ref": "<retained public target>" }`. Each item has

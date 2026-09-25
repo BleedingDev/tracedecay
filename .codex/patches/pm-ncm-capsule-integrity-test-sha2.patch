@@ -1,0 +1,40 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs
+@@ -376,11 +376,11 @@
+ #[cfg(test)]
+ #[allow(clippy::field_reassign_with_default, clippy::unwrap_used)]
+ mod tests {
++    use super::super::util::sha256_hex;
+     use crate::embedding::doubles::HashEncoder;
+     use crate::engine::{NcmEngine, ObserveRequest, Outcome, RecallRequest};
+     use crate::ports::{Deadline, StateRoot};
+     use serde_json::{Value, json};
+-    use sha2::{Digest, Sha256};
+     use std::sync::Arc;
+     use tempfile::TempDir;
+     use tracedecay_memory_ncm_core::types::{NcmConfig, RecordId, SourceId};
+@@ -420,7 +420,7 @@
+                 provenance: json!({
+                     "common_capsule": {
+                         "version": 1,
+-                        "sha256": format!("{:x}", Sha256::digest(&bytes)),
++                        "sha256": sha256_hex(&bytes),
+                         "bytes": bytes
+                     },
+                     "control": {"feedback": {"suppressed": suppressed}}
+--- a/crates/tracedecay-memory-ncm-runtime/tests/engine_transactions.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/engine_transactions.rs
+@@ -560,8 +560,12 @@
+     if common {
+         // Opaque bytes deliberately need not contain JSON or host schema.
+         let bytes = vec![255_u8, 0, 42];
++        let sha256 = Sha256::digest(&bytes)
++            .iter()
++            .map(|byte| format!("{byte:02x}"))
++            .collect::<String>();
+         request.provenance["common_capsule"] =
+-            json!({"version":1,"sha256":format!("{:x}",Sha256::digest(&bytes)),"bytes":bytes});
++            json!({"version":1,"sha256":sha256,"bytes":bytes});
+     }
+     request.payload_sha256 = request.canonical_payload_sha256().unwrap();
+     request

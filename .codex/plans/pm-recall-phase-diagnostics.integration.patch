@@ -1,0 +1,23 @@
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
+@@ -2592,7 +2592,9 @@
+         .unwrap_or_else(|| panic!("an active provider must contribute an advisory lane: {answer}"));
+     assert_eq!(
+         lane["state"], "answered",
+-        "the advisory lane must answer rather than report a refusal: {lane}"
++        "the advisory lane must answer rather than report a refusal (origin_session={}): {lane}; bounded Native diagnostics: {}",
++        recalled_session_id == journey.session_id(),
++        journey.native_recall_failure_diagnostics()
+     );
+     assert_history_degradation(&lane);
+     assert_eq!(
+@@ -2604,7 +2606,8 @@
+     assert_eq!(
+         candidates.len(),
+         2 * ROWS_PER_TURN,
+-        "the healthy journey must recall every admitted Claude message exactly once: {lane}; bounded Native diagnostics: {}",
++        "the healthy journey must recall every admitted Claude message exactly once (origin_session={}): {lane}; bounded Native diagnostics: {}",
++        recalled_session_id == journey.session_id(),
+         journey.native_recall_failure_diagnostics()
+     );
+     let retained_sources = assert_recalled_history_deliveries(

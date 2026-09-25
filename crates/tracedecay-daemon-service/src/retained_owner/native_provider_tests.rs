@@ -14,8 +14,8 @@ use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
     CanonicalObservationIdV1, Confidence, FactAssertionId, FactCategoryV1, FactId,
     FactIdentityMaterialV1, FactIdentitySourceV1, FactLineageEventKindV1, FactLineageEventV1,
-    FactOwnerV1, ProjectId, ProvenanceId, RefId, RepositoryId, RetrievalAnchorId, UtcMicros,
-    WorktreeId, derive_exact_observation_anchor_id,
+    FactOwnerV1, ProjectId, ProvenanceId, RefId, RepositoryId, RetrievalAnchorId, SessionId,
+    UserProfileId, UtcMicros, WorktreeId, derive_exact_observation_anchor_id,
 };
 use tracedecay_memory_provider_registry::{
     CancellationToken, CanonicalPayload, CommittedEffectState, CurrentSourceDisposition,
@@ -25,8 +25,8 @@ use tracedecay_memory_provider_registry::{
     NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeMemoryApplicationPort, NativeObservation,
     NativeObservationEnvelope, OBSERVATION_CONTRACT_ID, OperationControl, OriginScopeEvidence,
     OriginalSourceIdentity, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall,
-    ProviderCallParts, ProviderOperation, ProviderReply, RecordedValidity,
-    RestoreDispositionCheckpoint, SourceAttribution, SourceDisposition, TerminalCode,
+    ProviderCallParts, ProviderOperation, RecordedValidity, RestoreDispositionCheckpoint,
+    SourceAttribution, SourceDisposition, TerminalCode,
 };
 use tracedecay_session_memory::memory::{
     ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
@@ -147,7 +147,8 @@ fn commit_for(
 }
 
 fn call_for(project_id: &str) -> ProviderCall {
-    ProviderCall {
+    let bytes = vec![1];
+    ProviderCall::new(ProviderCallParts {
         operation: ProviderOperation::Observe,
         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
         registration_revision: 1,
@@ -167,15 +168,19 @@ fn call_for(project_id: &str) -> ProviderCall {
         expected_state_generation: 0,
         idempotency_key: Some("idempotency.native-bridge-test".to_owned()),
         control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
-        payload: CanonicalPayload {
-            contract_id: OwnedVersionedId::new(OBSERVATION_CONTRACT_ID)
-                .expect("valid observation contract"),
-            bytes: vec![1],
-            sha256: "b".repeat(64),
-        },
-        required_capabilities: BTreeSet::new(),
+        payload: CanonicalPayload::new(
+            OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("valid observation contract"),
+            bytes.clone(),
+            sha256_hex(&bytes),
+        )
+        .expect("valid observation payload"),
+        required_capabilities: vec![
+            OwnedVersionedId::new(ProviderOperation::Observe.capability_id())
+                .expect("observe capability"),
+        ],
         extensions: Vec::new(),
-    }
+    })
+    .expect("valid provider call")
 }
 
 fn valid_observation_call(project_id: &str, canonical_payload: &Value) -> ProviderCall {
@@ -302,7 +307,6 @@ async fn read_store_snapshot(
 ) -> (FactProjectionV1, ProjectMemoryFactHistoryV1) {
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let target = ProjectMemoryFactIdV1::new(owner.clone(), fact_id.clone())
         .expect("owner-bound project fact target");
@@ -392,7 +396,6 @@ async fn real_project_fixture() -> (
 async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: &str) -> FactV1 {
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let preflight = memory
         .preflight_project_memory_fact_add(
@@ -424,6 +427,9 @@ async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: 
         FactProjectionV1::Available { fact } => fact.as_ref().clone(),
         FactProjectionV1::Unavailable { .. } => {
             panic!("recall fixture fact must remain available")
+        }
+        FactProjectionV1::Superseded { .. } => {
+            panic!("new recall fixture fact cannot already be superseded")
         }
     }
 }
@@ -731,6 +737,65 @@ fn native_recall_failures_preserve_typed_terminal_states() {
 }
 
 #[test]
+fn native_recall_scope_requires_live_same_session_binding_without_history_grant() {
+    let project_id = "project.native-same-session-scope";
+    let scope = recall_resolved_scope(project_id);
+    let mount = NativeSessionRetrievalMountV1::for_project(
+        UserProfileId::new("profile.native-bridge-recall").expect("profile id"),
+        scope,
+    );
+    let call = valid_recall_call(project_id, recall_request_value(project_id));
+
+    assert!(matches!(
+        native_recall_retrieval_scope(&mount, &call.exact_scope, false),
+        Err(NativeReadFailure::RecallNotAuthorized)
+    ));
+
+    let canonical_session_id =
+        SessionId::new("session.native-same-session-scope").expect("session id");
+    let binding = mount
+        .bind_session(
+            call.exact_scope.agent_session_id.clone(),
+            canonical_session_id.clone(),
+        )
+        .expect("bind canonical session");
+    let second_binding = mount
+        .bind_session(
+            call.exact_scope.agent_session_id.clone(),
+            canonical_session_id.clone(),
+        )
+        .expect("bind the same canonical session concurrently");
+    assert!(matches!(
+        mount.bind_session(
+            call.exact_scope.agent_session_id.clone(),
+            SessionId::new("session.native-collision").expect("different session id"),
+        ),
+        Err(super::super::native_authority::NativeSessionBindingErrorV1::IdentityCollision)
+    ));
+    assert_eq!(
+        native_recall_retrieval_scope(&mount, &call.exact_scope, false)
+            .expect("same-session scope"),
+        SessionRetrievalScope::Session(canonical_session_id.clone())
+    );
+    assert_eq!(
+        native_recall_retrieval_scope(&mount, &call.exact_scope, true).expect("history scope"),
+        SessionRetrievalScope::AllSessionsInAuthorizedRoot
+    );
+
+    drop(binding);
+    assert_eq!(
+        native_recall_retrieval_scope(&mount, &call.exact_scope, false)
+            .expect("second holder preserves the same-session scope"),
+        SessionRetrievalScope::Session(canonical_session_id)
+    );
+    drop(second_binding);
+    assert!(matches!(
+        native_recall_retrieval_scope(&mount, &call.exact_scope, false),
+        Err(NativeReadFailure::RecallNotAuthorized)
+    ));
+}
+
+#[test]
 fn stale_session_projection_is_contract_valid_partial_recall() {
     let project_id = "project.native-bridge-stale";
     let call = valid_recall_call(project_id, recall_request_value(project_id));
@@ -817,7 +882,6 @@ async fn native_observe_verifies_real_store_without_writing() {
     };
     let memory = graph
         .project_memory_application()
-        .await
         .expect("project memory application");
     let preflight = memory
         .preflight_project_memory_fact_add(
@@ -849,6 +913,9 @@ async fn native_observe_verifies_real_store_without_writing() {
         FactProjectionV1::Available { fact } => fact.as_ref().clone(),
         FactProjectionV1::Unavailable { .. } => {
             panic!("real-store fixture fact must remain available")
+        }
+        FactProjectionV1::Superseded { .. } => {
+            panic!("new real-store fixture fact cannot already be superseded")
         }
     };
     let expected_commit = super::memory_mapping::commit_receipt(

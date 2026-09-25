@@ -103,7 +103,6 @@ async fn mcp_journey_fixture_inner(project: &str, mounted: bool) -> McpJourneyFi
         TraceDecay::init_test_fixture_with_registered_runtime(project_root, project_id.as_str())
             .await
             .expect("registered project fixture");
-    let runtime = Arc::new(runtime);
 
     // The mount and the server intentionally use separate graph handles, as
     // production does: both still resolve the same registered project owner.

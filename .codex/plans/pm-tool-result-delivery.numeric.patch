@@ -1,0 +1,207 @@
+diff --git a/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs b/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs
+--- a/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs
++++ b/crates/tracedecay-memory-evaluation/src/host_retrieval/tool_result.rs
+@@ -45,6 +45,65 @@
+             .checked_add(value?)
+             .ok_or_else(|| invalid("token sum overflow"))
+     })
++}
++
++/// Shared numeric domain: exact signed-i64/unsigned-u64 integer lexemes,
++/// including bare -0 normalized to integer 0. Fraction/exponent lexemes are
++/// finite IEEE-754 binary64. No integer can fall back to a rounded float.
++fn numeric_value(lexeme: &str) -> Result<Value> {
++    let bytes = lexeme.as_bytes();
++    let mut at = usize::from(bytes.first() == Some(&b'-'));
++    match bytes.get(at) {
++        Some(b'0') => at += 1,
++        Some(b'1'..=b'9') => {
++            at += 1;
++            while bytes.get(at).is_some_and(u8::is_ascii_digit) {
++                at += 1;
++            }
++        }
++        _ => return Err(invalid("invalid JSON number")),
++    }
++    let mut fractional = false;
++    if bytes.get(at) == Some(&b'.') {
++        fractional = true;
++        at += 1;
++        let start = at;
++        while bytes.get(at).is_some_and(u8::is_ascii_digit) {
++            at += 1;
++        }
++        check(at > start, "invalid JSON fraction")?;
++    }
++    if matches!(bytes.get(at), Some(b'e' | b'E')) {
++        fractional = true;
++        at += 1;
++        if matches!(bytes.get(at), Some(b'+' | b'-')) {
++            at += 1;
++        }
++        let start = at;
++        while bytes.get(at).is_some_and(u8::is_ascii_digit) {
++            at += 1;
++        }
++        check(at > start, "invalid JSON exponent")?;
++    }
++    check(at == bytes.len(), "invalid JSON numeric lexeme")?;
++    if fractional {
++        let number = lexeme
++            .parse::<f64>()
++            .map_err(|_| invalid("invalid binary64 number"))?;
++        serde_json::Number::from_f64(number)
++            .map(Value::Number)
++            .ok_or_else(|| invalid("nonfinite JSON number"))
++    } else if bytes.first() == Some(&b'-') {
++        lexeme
++            .parse::<i64>()
++            .map(Value::from)
++            .map_err(|_| invalid("integer JSON lexeme outside shared exact domain"))
++    } else {
++        lexeme
++            .parse::<u64>()
++            .map(Value::from)
++            .map_err(|_| invalid("integer JSON lexeme outside shared exact domain"))
++    }
+ }
+ 
+ #[derive(Debug)]
+@@ -171,8 +230,12 @@
+                 }) {
+                     self.at += 1;
+                 }
+-                serde_json::from_slice(&self.text.as_bytes()[start..self.at])
+-                    .map_err(|e| invalid(e.to_string()))?
++                match &self.text[start..self.at] {
++                    "true" => Value::Bool(true),
++                    "false" => Value::Bool(false),
++                    "null" => Value::Null,
++                    lexeme => numeric_value(lexeme)?,
++                }
+             }
+             None => return Err(invalid("missing JSON value")),
+         };
+@@ -812,6 +875,61 @@
+     }
+ 
+     #[test]
++    fn integer_boundaries_and_bare_negative_zero_have_exact_shared_semantics() -> Result<()> {
++        let parser = JsonSpans::parse(
++            "[-9223372036854775808,9223372036854775807,9223372036854775808,18446744073709551615,-0,0]",
++        )?;
++        assert_eq!(
++            json!([i64::MIN, i64::MAX, i64::MAX as u64 + 1, u64::MAX, 0, 0]),
++            parser.value
++        );
++        let node = parser
++            .nodes
++            .get("/4")
++            .ok_or_else(|| invalid("test zero pointer"))?;
++        let mut span = json!({"pointer":"/4","start":node.start,"end":node.end,"sha256":bytes_digest("-0"),"value":0});
++        assert_eq!("-0", parser.verify(&span, false)?);
++        span["value"] = json!(-0.0);
++        assert!(parser.verify(&span, false).is_err());
++        let node = parser
++            .nodes
++            .get("/3")
++            .ok_or_else(|| invalid("test maximum pointer"))?;
++        let wrong = json!({"pointer":"/3","start":node.start,"end":node.end,"sha256":bytes_digest("18446744073709551615"),"value":u64::MAX-1});
++        assert!(parser.verify(&wrong, false).is_err());
++        Ok(())
++    }
++
++    #[test]
++    fn adjacent_overflow_integer_lexemes_cannot_collapse_to_one_float() {
++        for lexeme in [
++            "-9223372036854775809",
++            "18446744073709551616",
++            "18446744073709551617",
++        ] {
++            assert!(JsonSpans::parse(&format!("{{\"number\":{lexeme}}}")).is_err());
++        }
++    }
++
++    #[test]
++    fn fractional_and_exponent_lexemes_use_finite_binary64() -> Result<()> {
++        let parser = JsonSpans::parse(
++            "[1.0,1e0,-0.0,-0e0,18446744073709551616.0,1.7976931348623157e308,5e-324,1e-9999]",
++        )?;
++        assert!(
++            array(&parser.value)?
++                .iter()
++                .all(|value| value.as_number().is_some_and(serde_json::Number::is_f64))
++        );
++        assert_eq!(Some(5e-324_f64), parser.value[6].as_f64());
++        assert_eq!(Some(0.0), parser.value[7].as_f64());
++        for lexeme in ["1e309", "-1e309", "01", "1.", "1e", "1.0.0", "+1"] {
++            assert!(JsonSpans::parse(lexeme).is_err());
++        }
++        Ok(())
++    }
++
++    #[test]
+     fn same_value_at_another_pointer_is_not_original_span_evidence() -> Result<()> {
+         let parser = JsonSpans::parse(r#"{"a":"same","b":"same"}"#)?;
+         let node = parser
+diff --git a/scripts/product/memory-comparison/delivery_evidence.py b/scripts/product/memory-comparison/delivery_evidence.py
+--- a/scripts/product/memory-comparison/delivery_evidence.py
++++ b/scripts/product/memory-comparison/delivery_evidence.py
+@@ -3,6 +3,9 @@
+ Offsets name original UTF-8 bytes in one decoded text block. JSON member spans
+ include the original key/colon/value, never bytes from a reserialization. The
+ Rust evaluator independently recounts all recorded o200k observations.
++Integer lexemes have exact [-2**63, 2**64-1] semantics; bare -0 normalizes to
++integer 0. Fraction/exponent lexemes use finite IEEE-754 binary64 semantics.
++Original numeric lexemes remain in the retained byte spans.
+ """
+ 
+ import hashlib
+@@ -115,6 +118,8 @@
+                 check(match is not None, "invalid JSON value")
+                 self.at = match.end()
+             value = json.loads(self.data[start:self.at])
++            check(type(value) is not int or -(2**63) <= value <= 2**64 - 1,
++                  "integer JSON lexeme outside shared exact domain")
+             check(not isinstance(value, float) or abs(value) != float("inf"), "nonfinite JSON number")
+         self.nodes[pointer] = (start, self.at, value)
+         return value
+diff --git a/scripts/product/memory-comparison/test_delivery_evidence.py b/scripts/product/memory-comparison/test_delivery_evidence.py
+--- a/scripts/product/memory-comparison/test_delivery_evidence.py
++++ b/scripts/product/memory-comparison/test_delivery_evidence.py
+@@ -122,6 +122,35 @@
+             with self.subTest(raw=raw), self.assertRaises((ValueError, UnicodeError)):
+                 LexicalJson(raw)
+ 
++    def test_exact_integer_domain_boundaries_and_bare_negative_zero(self):
++        raw = '[-9223372036854775808,9223372036854775807,9223372036854775808,18446744073709551615,-0,0]'
++        parser = LexicalJson(raw)
++        self.assertEqual([-(2**63), 2**63-1, 2**63, 2**64-1, 0, 0], parser.value)
++        self.assertTrue(all(type(value) is int for value in parser.value))
++        span = parser.span('/4')
++        self.assertEqual('-0', parser.verify(span))
++        self.assertEqual(sha('-0'), span['sha256'])
++        span['value'] = -0.0
++        with self.assertRaisesRegex(ValueError, 'span'): parser.verify(span)
++        maximum = parser.span('/3'); maximum['value'] -= 1
++        with self.assertRaisesRegex(ValueError, 'span'): parser.verify(maximum)
++
++    def test_overflow_integer_neighbors_are_rejected_before_semantic_projection(self):
++        for integer in ('-9223372036854775809', '18446744073709551616', '18446744073709551617'):
++            with self.subTest(integer=integer), self.assertRaisesRegex(ValueError, 'shared exact domain'):
++                LexicalJson('{"number":' + integer + '}')
++
++    def test_fraction_exponent_domain_is_finite_binary64_with_original_lexemes(self):
++        parser = LexicalJson('[1.0,1e0,-0.0,-0e0,18446744073709551616.0,1.7976931348623157e308,5e-324,1e-9999]')
++        self.assertTrue(all(type(value) is float for value in parser.value))
++        self.assertEqual(float(2**64), parser.value[4])
++        self.assertEqual('1e0', parser.verify(parser.span('/1')))
++        self.assertEqual('-0e0', parser.verify(parser.span('/3')))
++        self.assertEqual(5e-324, parser.value[6])
++        self.assertEqual(0.0, parser.value[7])
++        for number in ('1e309','-1e309'):
++            with self.assertRaisesRegex(ValueError, 'nonfinite'): LexicalJson(number)
++
+     def test_repeated_identical_values_do_not_authorize_a_different_pointer_or_offset(self):
+         parser = LexicalJson('{"a":"same","b":"same"}')
+         wrong = parser.span('/b')

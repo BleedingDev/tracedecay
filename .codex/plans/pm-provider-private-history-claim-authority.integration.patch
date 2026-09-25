@@ -1,0 +1,57 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_history.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_history.rs
+@@ -688,16 +688,22 @@
+             .map_err(advisory_error)?;
+         let payload: Value = serde_json::from_slice(&call.payload.bytes)
+             .map_err(|_| AdvisoryAdmissionError::Invalid("canonical advisory payload"))?;
+-        let claimed = payload
++        let payload_claimed = payload
+             .get("history_grant")
+             .filter(|value| !value.is_null())
+             .map(history_grant_from_json)
+             .transpose()
+             .map_err(advisory_error)?;
+-        if claimed
+-            .as_ref()
+-            .is_some_and(|grant| grant.destination_scope != call.exact_scope)
+-        {
++        // Both carriers are claims. Every accepted source is resolved again by
++        // the operation's existing canonical admission path below.
++        let claimed = match (call.history_grant(), payload_claimed.as_ref()) {
++            (Some(private), Some(payload)) if private != payload => {
++                return Err(AdvisoryAdmissionError::Denied("conflicting history grants"));
++            }
++            (Some(private), _) => Some(private),
++            (None, payload) => payload,
++        };
++        if claimed.is_some_and(|grant| grant.destination_scope != call.exact_scope) {
+             return Err(AdvisoryAdmissionError::Denied("history destination"));
+         }
+         match call.operation {
+@@ -767,7 +773,7 @@
+                     }
+                     return CurrentAdvisoryAdmission::new(call, Vec::new(), None);
+                 }
+-                let grant = claimed.as_ref().ok_or(AdvisoryAdmissionError::Denied(
++                let grant = claimed.ok_or(AdvisoryAdmissionError::Denied(
+                     "observation history grant missing",
+                 ))?;
+                 if grant.sources.len() != 1 {
+@@ -798,7 +804,7 @@
+                 CurrentAdvisoryAdmission::new(call, current.sources, None)
+             }
+             ProviderOperation::Replay => {
+-                let grant = claimed.as_ref().ok_or(AdvisoryAdmissionError::Denied(
++                let grant = claimed.ok_or(AdvisoryAdmissionError::Denied(
+                     "replay history grant missing",
+                 ))?;
+                 let items = payload
+@@ -1002,7 +1008,7 @@
+                     Some(grant) => {
+                         self.reader()
+                             .map_err(advisory_error)?
+-                            .refresh_grant(&grant, &call.control, true)
++                            .refresh_grant(grant, &call.control, true)
+                             .await
+                             .map_err(advisory_error)?
+                             .sources

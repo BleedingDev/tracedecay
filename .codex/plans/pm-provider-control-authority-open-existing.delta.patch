@@ -1,0 +1,126 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -283,12 +283,28 @@
+ }
+ 
+ impl RecallAdmissionLedgerV1 {
+-    pub(crate) fn open(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
+-        let connection =
+-            Connection::open(&path).map_err(|source| CognitiveRecallMountError::LedgerOpen {
++    fn open(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
++        Self::open_with_flags(path, rusqlite::OpenFlags::default())
++    }
++
++    /// Opens an existing host-owned ledger without creating a missing target.
++    pub(crate) fn open_existing(path: PathBuf) -> Result<Self, CognitiveRecallMountError> {
++        Self::open_with_flags(
++            path,
++            rusqlite::OpenFlags::default() & !rusqlite::OpenFlags::SQLITE_OPEN_CREATE,
++        )
++    }
++
++    fn open_with_flags(
++        path: PathBuf,
++        flags: rusqlite::OpenFlags,
++    ) -> Result<Self, CognitiveRecallMountError> {
++        let connection = Connection::open_with_flags(&path, flags).map_err(|source| {
++            CognitiveRecallMountError::LedgerOpen {
+                 path: path.clone(),
+                 source,
+-            })?;
++            }
++        })?;
+         connection
+             .execute_batch(
+                 "PRAGMA journal_mode = WAL;
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/authority.rs
+@@ -95,7 +95,7 @@
+                 Some(ledger)
+             }
+             None if existing_regular_file(&ledger_path)? => Some(Arc::new(
+-                RecallAdmissionLedgerV1::open(ledger_path).map_err(|_| {
++                RecallAdmissionLedgerV1::open_existing(ledger_path).map_err(|_| {
+                     ProviderHistoryErrorV1::Unavailable("existing retained recall ledger")
+                 })?,
+             )),
+@@ -125,7 +125,7 @@
+             )?;
+             let path = inputs.store_data_root.join(name);
+             if existing_regular_file(&path)? {
+-                let journal = SqliteObservationJournal::open(
++                let journal = SqliteObservationJournal::open_existing(
+                     path,
+                     ObservationJourneyPolicyV1::project_default().retention,
+                 )
+@@ -274,6 +274,27 @@
+     use super::*;
+ 
+     #[test]
++    fn existing_store_constructors_fail_without_creating_missing_files() {
++        let temporary = tempfile::tempdir().unwrap();
++        let ledger = temporary.path().join(LEDGER_FILE_NAME);
++        let journal = temporary
++            .path()
++            .join("memory-observation-ncm-journal-v1.sqlite3");
++        assert!(!ledger.exists());
++        assert!(!journal.exists());
++        assert!(RecallAdmissionLedgerV1::open_existing(ledger.clone()).is_err());
++        assert!(
++            SqliteObservationJournal::open_existing(
++                &journal,
++                ObservationJourneyPolicyV1::project_default().retention,
++            )
++            .is_err()
++        );
++        assert!(!ledger.exists());
++        assert!(!journal.exists());
++    }
++
++    #[test]
+     fn host_journal_names_are_fixed_and_missing_files_are_not_created() {
+         assert_eq!(
+             journal_file_name(&OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap()),
+--- a/crates/tracedecay-memory-observation/src/sqlite/mod.rs
++++ b/crates/tracedecay-memory-observation/src/sqlite/mod.rs
+@@ -130,14 +130,37 @@
+         path: impl AsRef<Path>,
+         policy: RetentionPolicyV1,
+     ) -> Result<Self, ObservationJournalError> {
+-        policy.validate()?;
+-        let mut connection = Connection::open_with_flags(
++        Self::open_with_flags(
+             path,
++            policy,
+             OpenFlags::SQLITE_OPEN_READ_WRITE
+                 | OpenFlags::SQLITE_OPEN_CREATE
+                 | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                 | OpenFlags::SQLITE_OPEN_URI,
+-        )?;
++        )
++    }
++
++    /// Opens and migrates an existing host journal without creating a missing file.
++    pub fn open_existing(
++        path: impl AsRef<Path>,
++        policy: RetentionPolicyV1,
++    ) -> Result<Self, ObservationJournalError> {
++        Self::open_with_flags(
++            path,
++            policy,
++            OpenFlags::SQLITE_OPEN_READ_WRITE
++                | OpenFlags::SQLITE_OPEN_NO_MUTEX
++                | OpenFlags::SQLITE_OPEN_URI,
++        )
++    }
++
++    fn open_with_flags(
++        path: impl AsRef<Path>,
++        policy: RetentionPolicyV1,
++        flags: OpenFlags,
++    ) -> Result<Self, ObservationJournalError> {
++        policy.validate()?;
++        let mut connection = Connection::open_with_flags(path, flags)?;
+         let resume_after = schema::initialize(&mut connection)?;
+         Ok(Self::mounted(connection, policy, resume_after))
+     }

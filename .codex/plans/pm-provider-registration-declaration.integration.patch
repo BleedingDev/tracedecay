@@ -1,0 +1,83 @@
+--- a/crates/tracedecay/src/daemon/project_composition.rs
++++ b/crates/tracedecay/src/daemon/project_composition.rs
+@@ -282,6 +282,22 @@
+ /// journal's idempotency key, which is why it may not be zero.
+ #[cfg(feature = "memory-provider-host")]
+ pub(super) const PROJECT_NATIVE_REGISTRATION_REVISION: u64 = 1;
++
++/// Product-owned revision supplied to the project NCM registration and journal.
++#[cfg(feature = "memory-provider-host")]
++pub(super) const PROJECT_NCM_REGISTRATION_REVISION: u64 = 1;
++
++/// Reads the exact composition declarations, without observing a running mount.
++#[cfg(all(feature = "memory-provider-host", feature = "test-helpers"))]
++pub(super) fn declared_project_provider_registration_revision_for_test(
++    provider_id: &str,
++) -> Option<u64> {
++    match provider_id {
++        NATIVE_PROVIDER_ID => Some(PROJECT_NATIVE_REGISTRATION_REVISION),
++        tracedecay_memory_provider_ncm::NCM_PROVIDER_ID => Some(PROJECT_NCM_REGISTRATION_REVISION),
++        _ => None,
++    }
++}
+ 
+ /// Product-owned in-flight budget for the project-scoped provider: one active
+ /// provider call at a time per checkout.
+@@ -432,7 +448,7 @@
+                     worker_binary.clone(), state_root.clone(), Arc::clone(ncm_worker_owner), profile_id.clone(),
+                 );
+                 match tokio::task::spawn_blocking(move || {
+-                    ncm_observer::construct_ncm_registration_with_authority(&owners, &profile_id, worker_binary, state_root, 1, mode, Some(admission_authority))
++                    ncm_observer::construct_ncm_registration_with_authority(&owners, &profile_id, worker_binary, state_root, PROJECT_NCM_REGISTRATION_REVISION, mode, Some(admission_authority))
+                 }).await {
+                     Ok(result) => result.map(|(registration, mount)| (
+                         registration,
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall/test_context_evidence.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall/test_context_evidence.rs
+@@ -16,9 +16,10 @@
+     TerminalCode,
+ };
+ 
+-/// Existing control and scope types for callers of this test-only facade.
++/// Existing control/scope types and common-profile policy for test-only callers.
+ pub use tracedecay_memory_provider_registry::{
+-    CancellationToken, OperationControl, OwnedExactScope,
++    COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES, CancellationToken,
++    OperationControl, OwnedExactScope,
+ };
+ 
+ use super::control_attribution::{
+@@ -54,6 +55,9 @@
+ pub struct ProviderNumericDeclarationForTestV1 {
+     /// Actual logical provider ID in the production descriptor.
+     pub provider_id: String,
++    /// Exact production composition declaration, usable only as a Health request
++    /// expectation until the fresh response validates the observed registration.
++    pub declared_registration_revision: u64,
+     /// Production instance identity expected in a successful health result.
+     pub declared_provider_instance_id: String,
+     /// Production descriptor's immutable implementation digest.
+@@ -73,6 +77,8 @@
+ /// eight-field effective-limits digest. Missing or mismatched evidence stays
+ /// explicitly unavailable; this function does not guess a negotiated minimum.
+ ///
++/// The declared registration revision can seed that Health request; it is kept
++/// separate from the observed revision until the full response binding succeeds.
+ /// Live state identity/generation come only from that same health response.
+ /// Descriptor registration-time generation is deliberately omitted here. Actual
+ /// executable/build hashes must be captured by the fixture from the running build.
+@@ -94,9 +100,14 @@
+         }
+         _ => return Ok(None),
+     };
++    let declared_registration_revision =
++        crate::daemon::project_composition::declared_project_provider_registration_revision_for_test(
++            descriptor.provider_id.as_str(),
++        ).ok_or(ContextEvidenceReadErrorV1::Invalid("production registration declaration"))?;
+     let limits = descriptor.limits;
+     Ok(Some(ProviderNumericDeclarationForTestV1 {
+         provider_id: descriptor.provider_id.as_str().to_owned(),
++        declared_registration_revision,
+         declared_provider_instance_id: instance,
+         declared_implementation_identity_digest: descriptor.implementation_identity_sha256,
+         declared_limits: ProviderDeclaredLimitsForTestV1 {

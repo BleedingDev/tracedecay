@@ -1,0 +1,49 @@
+diff --git a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+--- a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
++++ b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+@@ -1979,8 +1979,8 @@
+             "host snapshot cleanup state",
+         )?;
+         require(
+-            data.include_snapshots
+-                || cleanup.state == ProviderControlHostSnapshotCleanupStateV1::NotRequested,
++            (cleanup.state == ProviderControlHostSnapshotCleanupStateV1::NotRequested)
++                == !data.include_snapshots,
+             "host snapshot cleanup request",
+         )?;
+         require(
+@@ -2489,7 +2489,7 @@
+                 json!({"source":source(),"target":target(),"target_digest":"a".repeat(64),"correction_kind":"replace_content","affected_provider_effects":1,"receipt":receipt()})
+             }
+             2 => {
+-                json!({"source":source(),"target":target(),"mode":"remove_influence","include_snapshots":true,"host_snapshot_cleanup":{"state":"not_requested","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":0},"intent":{"fence_revision_before":0,"fence_revision_after":1,"host_receipt":host_receipt()},"erasure":{"state":"verified","postcondition":{"matched_effects":1,"removed_effects":1,"anonymized_effects":0,"retained_under_lock":0,"remaining_influence_count":0,"snapshots_examined":0,"snapshots_rewritten":0,"verification_query_digest":"a".repeat(64),"verification_state":"verified_absent"},"receipt":receipt()}})
++                json!({"source":source(),"target":target(),"mode":"remove_influence","include_snapshots":true,"host_snapshot_cleanup":{"state":"complete","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":0},"intent":{"fence_revision_before":0,"fence_revision_after":1,"host_receipt":host_receipt()},"erasure":{"state":"verified","postcondition":{"matched_effects":1,"removed_effects":1,"anonymized_effects":0,"retained_under_lock":0,"remaining_influence_count":0,"snapshots_examined":0,"snapshots_rewritten":0,"verification_query_digest":"a".repeat(64),"verification_state":"verified_absent"},"receipt":receipt()}})
+             }
+             3 => {
+                 json!({"provider_instance_id":"instance.1","implementation_identity_digest":"a".repeat(64),"state_identity_digest":"b".repeat(64),"state_generation":3,"scope_digest":scope().sha256(),"readiness":"ready","capability_states":[{"capability_id":"provider.health.v1","state":"available"}],"effective_limits_digest":"c".repeat(64),"backlog":0,"recovery_state":"ready"})
+@@ -2645,6 +2645,25 @@
+     }
+ 
+     #[test]
++    fn requested_host_cleanup_cannot_be_reported_as_not_requested_after_the_fence() {
++        let request = requests().remove(2);
++        let mut data = successful_data(2);
++        data["host_snapshot_cleanup"] = json!({"state":"not_requested","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":0});
++        let invalid: ProviderControlResultV1 =
++            serde_json::from_value(result_value(&request, data.clone(), "success"))
++                .expect("typed cleanup");
++        assert!(invalid.validate_for(&request).is_err());
++        data["erasure"] = json!({"state":"pending","reason_code":"provider_offline"});
++        data["host_snapshot_cleanup"] = json!({"state":"unverifiable","removed_snapshot_refs":[],"matched_count":0,"unverifiable_count":1});
++        let actual: ProviderControlResultV1 =
++            serde_json::from_value(result_value(&request, data, "provider_unavailable"))
++                .expect("unstarted requested cleanup");
++        actual
++            .validate_for(&request)
++            .expect("actual inability to start requested cleanup");
++    }
++
++    #[test]
+     fn maintenance_resume_cursor_is_optional_bounded_and_preserved() {
+         let mut request = requests().remove(5);
+         let ProviderControlRequestV1::Maintenance(data) = &mut request else {

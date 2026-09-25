@@ -1,0 +1,663 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -72,7 +72,8 @@
+ 
+ use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
+ use tracedecay_memory_provider_registry::recall_context_pack::{
+-    CanonicalHistoryReplayV1, ContextRecallControlRefV1, compile_context_pack_with_control_metadata,
++    CanonicalHistoryReplayV1, ContextRecallControlRefV1, ContextRecallTraceV1,
++    compile_context_pack_with_control_metadata,
+ };
+ use tracedecay_memory_provider_registry::{
+     HistoryGrant, HostEvidenceRefV1, HostProvenanceAuthority, OperationControl,
+@@ -4015,7 +4016,7 @@
+         host_items: &[HostContextItemV1],
+         control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
+     ) -> AdvisoryContextPackV1 {
+-        self.context_pack_with_control_metadata(render_form, host_items, control_refs, None)
++        self.context_pack_with_control_metadata(render_form, host_items, control_refs, None, None)
+     }
+ 
+     fn context_pack_with_control_metadata(
+@@ -4024,6 +4025,7 @@
+         host_items: &[HostContextItemV1],
+         control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
+         canonical_history_replay: Option<&CanonicalHistoryReplayV1>,
++        recall_trace: Option<&ContextRecallTraceV1>,
+     ) -> AdvisoryContextPackV1 {
+         let policy = match ContextPackPolicyV1::new(
+             ADVISORY_CONTEXT_PACK_TOTAL_TOKEN_BUDGET,
+@@ -4042,12 +4044,50 @@
+             &self.advisory_lane(),
+             control_refs,
+             canonical_history_replay,
++            recall_trace,
+         ) {
+             Ok(pack) => AdvisoryContextPackV1::Compiled(pack),
+             Err(error) => {
+                 AdvisoryContextPackV1::Refused(AdvisoryContextPackFailureV1::Compile(error))
+             }
+         }
++    }
++
++    fn provisional_recall_trace(&self) -> Option<ContextRecallTraceV1> {
++        let Self::Answered {
++            explain: Some(explain),
++            ..
++        } = self
++        else {
++            return None;
++        };
++        // This must run even when there are zero control bindings/candidates.
++        let (trace, metadata) = explain.prepare_trace(None, None)?;
++        Some(ContextRecallTraceV1 {
++            request_id: trace.request_id,
++            trace_ref: metadata?.trace_ref().as_str().to_owned(),
++        })
++    }
++
++    fn retained_recall_trace_matches(
++        &self,
++        pack: &ContextPackV1,
++        retained: Option<&control_attribution::PreparedRecallControlMetadataV1>,
++    ) -> bool {
++        let Some(emitted) = pack.recall_trace.as_ref() else {
++            return true;
++        };
++        let Self::Answered {
++            explain: Some(explain),
++            ..
++        } = self
++        else {
++            return false;
++        };
++        retained.is_some_and(|metadata| {
++            emitted.request_id == explain.report.request_id
++                && emitted.trace_ref == metadata.trace_ref().as_str()
++        })
+     }
+ 
+     fn retained_replay_metadata(&self) -> Option<&CanonicalHistoryReplayV1> {
+@@ -4176,11 +4216,13 @@
+             );
+             return result;
+         };
++        let recall_trace = self.provisional_recall_trace();
+         let delivery = match self.context_pack_with_control_metadata(
+             render_form,
+             &host_items,
+             &control_refs,
+             self.retained_replay_metadata(),
++            recall_trace.as_ref(),
+         ) {
+             AdvisoryContextPackV1::Compiled(pack) => {
+                 let delivery = merge_compiled_advisory(render_form, &text, &pack.rendered);
+@@ -4192,6 +4234,7 @@
+                         let retained = self.retain_explain_trace(Some(&pack), None);
+                         if !self.retained_control_refs_match(&pack, retained.as_ref())
+                             || !self.retained_replay_metadata_matches(&pack)
++                            || !self.retained_recall_trace_matches(&pack, retained.as_ref())
+                         {
+                             tracing::warn!(
+                                 event = "memory_recall_control_retention_failed",
+@@ -8356,6 +8399,125 @@
+         }
+     }
+ 
++    fn empty_control_output_fixture(
++        sink: Arc<dyn RecallExplainTraceSinkV1>,
++        request_id: &str,
++    ) -> (AdvisoryMemoryContextV1, OwnedExactScope) {
++        let (mut lane, scope, _) = control_output_fixture(sink, request_id);
++        let AdvisoryMemoryContextV1::Answered {
++            candidates,
++            explain: Some(explain),
++            ..
++        } = &mut lane
++        else {
++            panic!("controlled fixture");
++        };
++        candidates.clear();
++        explain.report.received_count = 0;
++        explain.report.received_candidate_ids.clear();
++        explain.report.admitted_count = 0;
++        explain.report.denied.clear();
++        explain.normalization = None;
++        explain.selection = None;
++        explain.host_withheld.clear();
++        explain.pack_identity_aliases.clear();
++        explain.explanations.clear();
++        explain.control_bindings.clear();
++        (lane, scope)
++    }
++
++    #[test]
++    fn empty_recall_publishes_only_its_actual_retained_trace_identity() {
++        for text in [
++            "{\"answer\":\"host evidence\"}",
++            "## Code Context\nhost evidence\n",
++        ] {
++            let temporary = tempfile::tempdir().unwrap();
++            let ledger = Arc::new(
++                RecallAdmissionLedgerV1::open(temporary.path().join("empty.sqlite3")).unwrap(),
++            );
++            let request_id = "recall.context.actual.empty";
++            let (lane, scope) = empty_control_output_fixture(ledger.clone(), request_id);
++            let provisional = lane.provisional_recall_trace().unwrap();
++            assert!(
++                ledger
++                    .explain_trace(provisional.trace_ref.rsplit(':').next().unwrap())
++                    .unwrap()
++                    .is_none()
++            );
++            let result = lane.appended_to(ToolResult::new(
++                json!({"content": [{"type": "text", "text": text}]}),
++                Vec::new(),
++            ));
++            let rendered = result.value["content"][0]["text"].as_str().unwrap();
++            let wire: ContextRecallTraceV1 = if let Ok(json) =
++                serde_json::from_str::<Value>(rendered)
++            {
++                serde_json::from_value(json[ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"].clone())
++                    .unwrap()
++            } else {
++                serde_json::from_str(
++                    rendered
++                        .lines()
++                        .find_map(|line| line.strip_prefix("recall_trace="))
++                        .unwrap(),
++                )
++                .unwrap()
++            };
++            assert_eq!(wire, provisional);
++            let retained = ledger
++                .explain_trace(wire.trace_ref.rsplit(':').next().unwrap())
++                .unwrap()
++                .unwrap();
++            assert_eq!(retained.trace.request_id, request_id);
++            assert_eq!(retained.exact_scope_sha256, scope.exact_scope_sha256());
++            assert_eq!(retained.trace.requested_count, 0);
++            assert!(retained.trace.items.is_empty());
++            let (form, host_items) = host_evidence(text);
++            let AdvisoryContextPackV1::Compiled(mut pack) = lane
++                .context_pack_with_control_metadata(
++                    form,
++                    &host_items,
++                    &BTreeMap::new(),
++                    None,
++                    Some(&provisional),
++                )
++            else {
++                panic!("pack");
++            };
++            let metadata = lane.retain_explain_trace(Some(&pack), None).unwrap();
++            assert!(lane.retained_recall_trace_matches(&pack, Some(&metadata)));
++            assert!(!lane.retained_recall_trace_matches(&pack, None));
++            pack.recall_trace
++                .as_mut()
++                .unwrap()
++                .request_id
++                .push_str(".swapped");
++            assert!(!lane.retained_recall_trace_matches(&pack, Some(&metadata)));
++            pack.recall_trace = Some(provisional);
++            pack.recall_trace.as_mut().unwrap().trace_ref =
++                format!("recall-trace-v1:{}:{}", "a".repeat(64), "b".repeat(64));
++            assert!(!lane.retained_recall_trace_matches(&pack, Some(&metadata)));
++        }
++    }
++
++    #[test]
++    fn empty_recall_failed_retention_preserves_the_original_result() {
++        let sink = Arc::new(RefusingControlOutputSink(
++            std::sync::atomic::AtomicUsize::new(0),
++        ));
++        let (lane, _) = empty_control_output_fixture(sink.clone(), "recall.context.empty.refused");
++        let host = ToolResult::new(
++            json!({"content": [{"type": "text", "text": "{\"answer\":\"host evidence\"}"}, {"type": "text", "text": "warning retained"}]}),
++            vec!["host.rs".to_owned()],
++        );
++        let delivered = lane.appended_to(host.clone());
++        assert_eq!(delivered.value, host.value);
++        assert_eq!(delivered.touched_files, host.touched_files);
++        assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1);
++        assert!(!delivered.value.to_string().contains("recall_trace"));
++    }
++
+     struct RefusingControlOutputSink(std::sync::atomic::AtomicUsize);
+     impl RecallExplainTraceSinkV1 for RefusingControlOutputSink {
+         fn record_explain_trace(
+@@ -8559,6 +8721,7 @@
+             &[],
+             &BTreeMap::new(),
+             Some(&metadata),
++            None,
+         ) else {
+             panic!("bounded replay lane metadata");
+         };
+--- a/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_context_pack.rs
+@@ -66,7 +66,7 @@
+ /// Revision of [`HOST_CONTEXT_PACK_POLICY_ID`]. Any change to section
+ /// priority, quota arithmetic, the exclusion vocabulary, or the pack-hash
+ /// encoding must increment this.
+-pub const HOST_CONTEXT_PACK_POLICY_REVISION: u64 = 5;
++pub const HOST_CONTEXT_PACK_POLICY_REVISION: u64 = 6;
+ 
+ /// Host authority label for accepted TraceDecay Native project-memory facts
+ /// carried in a context answer. Native stays the authority for accepted
+@@ -1012,6 +1012,22 @@
+     pub observation_count: u64,
+ }
+ 
++/// Actual retained recall correlation, independent of whether any candidate survived.
++/// The host publishes this value only after the final trace is retained.
++#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct ContextRecallTraceV1 {
++    /// Actual advisory recall request identity minted by the host.
++    pub request_id: String,
++    /// Exact scope and trace address in the host's retained ledger.
++    pub trace_ref: String,
++}
++
++struct PreparedContextRecallTraceV1<'a> {
++    metadata: &'a ContextRecallTraceV1,
++    json: String,
++}
++
+ /// One bounded serialization shared by framing, final rendering, and hashing.
+ struct PreparedCanonicalHistoryReplayV1<'a> {
+     metadata: &'a CanonicalHistoryReplayV1,
+@@ -1047,6 +1063,9 @@
+     /// lanes. Absent when the lane's complete framing did not fit its budget.
+     #[serde(default, skip_serializing_if = "Option::is_none")]
+     pub canonical_history_replay: Option<CanonicalHistoryReplayV1>,
++    /// Retained trace correlation admitted with the complete advisory framing.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub recall_trace: Option<ContextRecallTraceV1>,
+     /// Compiled sections in priority order. A section with no admitted item
+     /// is omitted.
+     pub sections: Vec<ContextPackSectionV1>,
+@@ -1189,6 +1208,7 @@
+         lane,
+         control_refs,
+         None,
++        None,
+     )
+ }
+ 
+@@ -1202,8 +1222,10 @@
+     lane: &AdvisoryLaneV1,
+     control_refs: &BTreeMap<String, ContextRecallControlRefV1>,
+     canonical_history_replay: Option<&CanonicalHistoryReplayV1>,
++    recall_trace: Option<&ContextRecallTraceV1>,
+ ) -> Result<ContextPackV1, ContextPackError> {
+     validate_control_refs(lane, control_refs)?;
++    let recall_trace = prepare_context_recall_trace(lane, recall_trace)?;
+     let canonical_history_replay =
+         prepare_canonical_history_replay(lane, canonical_history_replay)?;
+     if tokenizer.tokenizer_id() != CANONICAL_CONTEXT_TOKENIZER_ID
+@@ -1258,7 +1280,12 @@
+     // competes for the budget: a header, an identity line, and a bounded
+     // receipt are agent-visible tokens exactly like content is.
+     let host_framing_tokens = tokenizer.count_tokens(&host_framing_probe(form, lane));
+-    let lane_framing_text = lane_framing_text(form, lane, canonical_history_replay.as_ref());
++    let lane_framing_text = lane_framing_text(
++        form,
++        lane,
++        canonical_history_replay.as_ref(),
++        recall_trace.as_ref(),
++    );
+     let lane_framing_tokens = tokenizer.count_tokens(&lane_framing_text);
+     let lane_fits_quota = lane_framing_tokens <= policy.advisory_token_quota;
+     let framing_tokens = host_framing_tokens.saturating_add(if lane_fits_quota {
+@@ -1409,6 +1436,7 @@
+             host_items,
+             lane,
+             canonical_history_replay.as_ref(),
++            recall_trace.as_ref(),
+             lane_fits_quota,
+             &required_sections,
+             &advisory_items,
+@@ -1437,6 +1465,7 @@
+                 host_items,
+                 lane,
+                 canonical_history_replay.as_ref(),
++                recall_trace.as_ref(),
+                 false,
+                 &required_sections,
+                 &[],
+@@ -1483,6 +1512,7 @@
+     host_items: &[HostContextItemV1],
+     lane: &AdvisoryLaneV1,
+     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++    recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
+     lane_rendered: bool,
+     required_sections: &[ContextPackSectionV1],
+     advisory_items: &[ContextPackItemV1],
+@@ -1506,7 +1536,14 @@
+     } else {
+         None
+     };
+-    let pack_hash = pack_hash(policy, tokenizer, &sections, canonical_history_replay);
++    let recall_trace = if lane_rendered { recall_trace } else { None };
++    let pack_hash = pack_hash(
++        policy,
++        tokenizer,
++        &sections,
++        canonical_history_replay,
++        recall_trace,
++    );
+     let receipt = ContextPackReceiptV1 {
+         state: "compiled".to_owned(),
+         pack_hash: pack_hash.clone(),
+@@ -1556,6 +1593,7 @@
+         host_items,
+         lane,
+         canonical_history_replay,
++        recall_trace,
+         lane_rendered,
+         advisory_items,
+         &receipt,
+@@ -1572,6 +1610,7 @@
+             total_token_budget: policy.total_token_budget,
+             advisory_token_quota: policy.advisory_token_quota,
+             canonical_history_replay: canonical_history_replay.map(|value| value.metadata.clone()),
++            recall_trace: recall_trace.map(|value| value.metadata.clone()),
+             sections,
+             excluded_provider_items: excluded_provider_items.to_vec(),
+             framing_tokens,
+@@ -1668,6 +1707,46 @@
+         }
+     }
+     Ok(())
++}
++
++/// Validate the correlation's bounded render shape; durable identity belongs to
++/// the host's retention check after compilation.
++fn prepare_context_recall_trace<'a>(
++    lane: &AdvisoryLaneV1,
++    metadata: Option<&'a ContextRecallTraceV1>,
++) -> Result<Option<PreparedContextRecallTraceV1<'a>>, ContextPackError> {
++    let Some(metadata) = metadata else {
++        return Ok(None);
++    };
++    let invalid = || ContextPackError::ProviderAttributionInvalid {
++        field: "recall_trace",
++    };
++    if lane.contribution().is_none()
++        || metadata.request_id.is_empty()
++        || metadata.request_id.len() > 1_024
++        || metadata.request_id.trim() != metadata.request_id
++        || !is_contained_provider_label(&metadata.request_id)
++    {
++        return Err(invalid());
++    }
++    let Some((scope, trace)) = metadata
++        .trace_ref
++        .strip_prefix("recall-trace-v1:")
++        .and_then(|body| body.split_once(':'))
++    else {
++        return Err(invalid());
++    };
++    for digest in [scope, trace] {
++        if digest.len() != 64
++            || !digest
++                .bytes()
++                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++        {
++            return Err(invalid());
++        }
++    }
++    let json = serde_json::to_string(metadata).map_err(|_| invalid())?;
++    Ok(Some(PreparedContextRecallTraceV1 { metadata, json }))
+ }
+ 
+ /// Validate only bounded projection shape here. Current authorization, actual
+@@ -1993,18 +2072,19 @@
+     form: ContextPackRenderFormV1,
+     lane: &AdvisoryLaneV1,
+     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++    recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
+ ) -> String {
+     match (form, lane) {
+         (_, AdvisoryLaneV1::Absent) => String::new(),
+         (ContextPackRenderFormV1::Markdown, lane) => {
+-            let mut framing = lane_head_markdown(lane, canonical_history_replay);
++            let mut framing = lane_head_markdown(lane, canonical_history_replay, recall_trace);
+             if lane.contribution().is_some() {
+                 framing.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
+             }
+             framing
+         }
+         (ContextPackRenderFormV1::Json, lane) => {
+-            let scaffold = json_lane_head(lane, canonical_history_replay);
++            let scaffold = json_lane_head(lane, canonical_history_replay, recall_trace);
+             format!(",\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{scaffold}\"candidates\":[]}}",)
+         }
+     }
+@@ -2014,6 +2094,7 @@
+ fn json_lane_head(
+     lane: &AdvisoryLaneV1,
+     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++    recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
+ ) -> String {
+     let mut head = match lane {
+         AdvisoryLaneV1::Absent => String::new(),
+@@ -2042,6 +2123,9 @@
+     };
+     if let Some(replay) = canonical_history_replay {
+         let _ = write!(head, "\"canonical_history_replay\":{},", replay.json);
++    }
++    if let Some(trace) = recall_trace {
++        let _ = write!(head, "\"recall_trace\":{},", trace.json);
+     }
+     head
+ }
+@@ -2118,6 +2202,7 @@
+     host_items: &[HostContextItemV1],
+     lane: &AdvisoryLaneV1,
+     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++    recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
+     lane_rendered: bool,
+     advisory_items: &[ContextPackItemV1],
+     receipt: &ContextPackReceiptV1,
+@@ -2132,7 +2217,11 @@
+             }
+             let mut advisory_block = String::new();
+             if lane_rendered && !matches!(lane, AdvisoryLaneV1::Absent) {
+-                advisory_block.push_str(&lane_head_markdown(lane, canonical_history_replay));
++                advisory_block.push_str(&lane_head_markdown(
++                    lane,
++                    canonical_history_replay,
++                    recall_trace,
++                ));
+                 if lane.contribution().is_some() {
+                     if advisory_items.is_empty() {
+                         advisory_block.push_str(ADVISORY_MARKDOWN_EMPTY_LINE);
+@@ -2162,12 +2251,12 @@
+                     .join(",");
+                 advisory_block = format!(
+                     ",\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{}\"candidates\":[{candidates}]}}",
+-                    json_lane_head(lane, canonical_history_replay)
++                    json_lane_head(lane, canonical_history_replay, recall_trace)
+                 );
+                 members.push(format!(
+                     "\"{ADVISORY_CONTEXT_PACK_JSON_KEY}\":{{{}\"candidates\":[{candidates}],\
+                      \"context_pack\":{}}}",
+-                    json_lane_head(lane, canonical_history_replay),
++                    json_lane_head(lane, canonical_history_replay, recall_trace),
+                     serde_json::to_string(receipt).unwrap_or_default()
+                 ));
+             }
+@@ -2183,6 +2272,7 @@
+ fn lane_head_markdown(
+     lane: &AdvisoryLaneV1,
+     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++    recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
+ ) -> String {
+     let mut head = match lane {
+         AdvisoryLaneV1::Absent => String::new(),
+@@ -2208,6 +2298,9 @@
+     };
+     if let Some(replay) = canonical_history_replay {
+         let _ = writeln!(head, "canonical_history_replay={}", replay.json);
++    }
++    if let Some(trace) = recall_trace {
++        let _ = writeln!(head, "recall_trace={}", trace.json);
+     }
+     head
+ }
+@@ -2276,6 +2369,7 @@
+     tokenizer: &dyn ContextTokenizer,
+     sections: &[ContextPackSectionV1],
+     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
++    recall_trace: Option<&PreparedContextRecallTraceV1<'_>>,
+ ) -> String {
+     let mut hasher = Sha256::new();
+     absorb(&mut hasher, policy.policy_id.as_bytes());
+@@ -2289,6 +2383,10 @@
+         absorb(&mut hasher, b"canonical_history_replay");
+         absorb(&mut hasher, replay.json.as_bytes());
+     }
++    if let Some(trace) = recall_trace {
++        absorb(&mut hasher, b"recall_trace");
++        absorb(&mut hasher, trace.json.as_bytes());
++    }
+     for section in sections {
+         absorb(&mut hasher, section.section.label().as_bytes());
+         absorb(&mut hasher, &section.tokens.to_be_bytes());
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_context_pack.rs
+@@ -1739,6 +1739,7 @@
+             &lane,
+             &BTreeMap::new(),
+             Some(&metadata),
++            None,
+         )
+         .unwrap();
+         assert!(pack.items().next().is_none());
+@@ -1777,6 +1778,7 @@
+             &lane,
+             &BTreeMap::new(),
+             Some(&changed),
++            None,
+         )
+         .unwrap();
+         assert_ne!(pack.pack_hash, changed.pack_hash);
+@@ -1789,6 +1791,7 @@
+             &lane,
+             &BTreeMap::new(),
+             Some(&empty),
++            None,
+         )
+         .unwrap();
+         assert!(empty.canonical_history_replay.unwrap().batches.is_empty());
+@@ -1811,6 +1814,7 @@
+             &lane,
+             &BTreeMap::new(),
+             Some(&metadata),
++            None,
+         )
+         .unwrap();
+         let ordinary = compile_context_pack(roomy, &CANONICAL, &[], &lane).unwrap();
+@@ -1823,6 +1827,7 @@
+             &lane,
+             &BTreeMap::new(),
+             Some(&metadata),
++            None,
+         )
+         .unwrap();
+         assert!(withheld.canonical_history_replay.is_none());
+@@ -1839,6 +1844,7 @@
+             &lane,
+             &BTreeMap::new(),
+             Some(&changed),
++            None,
+         )
+         .unwrap();
+         assert!(changed.canonical_history_replay.is_none());
+@@ -1888,6 +1894,7 @@
+                 &lane,
+                 &BTreeMap::new(),
+                 Some(&metadata),
++                None,
+             )
+             .is_err()
+         );
+@@ -1900,6 +1907,7 @@
+             &NO_LANE,
+             &BTreeMap::new(),
+             Some(&settled_replay_metadata()),
++            None,
+         )
+         .is_err()
+     );
+@@ -1919,7 +1927,67 @@
+         &lane,
+         &BTreeMap::new(),
+         Some(&largest),
++        None,
+     )
+     .unwrap();
+     assert_eq!(large.canonical_history_replay.unwrap().batches.len(), 256);
+ }
++
++#[test]
++fn recall_correlation_roundtrips_and_obeys_the_whole_lane_budget() {
++    use std::collections::BTreeMap;
++    use tracedecay_memory_provider_registry::recall_context_pack::{
++        ContextRecallTraceV1, compile_context_pack_with_control_metadata,
++    };
++    let lane = lane(contribution(Vec::new()));
++    let trace = ContextRecallTraceV1 {
++        request_id: "recall.context.actual.empty".to_owned(),
++        trace_ref: format!("recall-trace-v1:{}:{}", "a".repeat(64), "b".repeat(64)),
++    };
++    for form in [ContextPackRenderFormV1::Json, MARKDOWN] {
++        let policy = ContextPackPolicyV1::new(12_000, 6_000, form).unwrap();
++        let compile = |policy, trace: &ContextRecallTraceV1| {
++            compile_context_pack_with_control_metadata(
++                policy,
++                &CANONICAL,
++                &[],
++                &lane,
++                &BTreeMap::new(),
++                None,
++                Some(trace),
++            )
++            .unwrap()
++        };
++        let pack = compile(policy, &trace);
++        assert!(pack.items().next().is_none());
++        assert_eq!(pack.recall_trace.as_ref(), Some(&trace));
++        let wire: serde_json::Value = if form == ContextPackRenderFormV1::Json {
++            let json: serde_json::Value = serde_json::from_str(&pack.rendered).unwrap();
++            json[tracedecay_memory_provider_registry::ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"].clone()
++        } else {
++            serde_json::from_str(
++                pack.rendered
++                    .lines()
++                    .find_map(|line| line.strip_prefix("recall_trace="))
++                    .unwrap(),
++            )
++            .unwrap()
++        };
++        assert_eq!(wire, serde_json::to_value(&trace).unwrap());
++        assert!(pack.rendered_tokens <= policy.total_token_budget());
++        assert!(pack.advisory_tokens() <= policy.advisory_token_quota());
++        let mut changed = trace.clone();
++        changed.request_id.push_str(".other");
++        assert_ne!(pack.pack_hash, compile(policy, &changed).pack_hash);
++        let ordinary = compile_context_pack(policy, &CANONICAL, &[], &lane).unwrap();
++        assert!(ordinary.recall_trace.is_none());
++        assert!(!ordinary.rendered.contains("recall_trace"));
++        assert!(pack.advisory_tokens() > ordinary.advisory_tokens());
++        let tight = ContextPackPolicyV1::new(12_000, ordinary.advisory_tokens(), form).unwrap();
++        let withheld = compile(tight, &trace);
++        assert!(withheld.recall_trace.is_none());
++        assert!(!withheld.rendered.contains("recall-trace-v1:"));
++        assert_eq!(withheld.advisory_tokens(), 0);
++        assert_eq!(withheld.pack_hash, compile(tight, &changed).pack_hash);
++    }
++}

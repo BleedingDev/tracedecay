@@ -4,7 +4,7 @@
 //! already-authorized query fallback. It never reconstructs the fallback
 //! subpayload: every outcome carries the exact same caller-owned [`Arc`].
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -21,7 +21,9 @@ use super::{
     SemanticQueryServiceError, SemanticQueryServiceOutcomeV1,
 };
 use crate::retrieval::AuthorizedQueryFallbackV1;
-use crate::retrieval::fusion::{CompositionKernel, CompositionOutputV1, FusionStageInput};
+use crate::retrieval::fusion::{
+    CompositionKernel, CompositionOutputV1, FusionStageInput, digest_candidate_set,
+};
 use crate::retrieval::rerank::BoundedRerankOutcomeV1;
 
 /// Invalid immutable configuration supplied to the composition authority.
@@ -106,7 +108,7 @@ impl SemanticCompositionExecutionAuthorityV1 {
     ///
     /// Typed semantic abstentions pass through unchanged. Composition failure
     /// becomes a typed lane abstention, while strict mode remains unavailable.
-    /// An authenticated continuation restores its frozen order and never
+    /// An authenticated continuation verifies the frozen composition and never
     /// invokes the current reranker. Live optional rerank is the caller's
     /// responsibility after this returns.
     #[hotpath::measure(label = "query.fusion.semantic")]
@@ -138,7 +140,7 @@ impl SemanticCompositionExecutionAuthorityV1 {
 
         let mut lanes = authorized_query.fallback_lanes.clone();
         lanes.push(semantic_lane);
-        let mut composition = match self.composition.compose_preserving_cap_incumbents(
+        let composition = match self.composition.compose_preserving_cap_incumbents(
             &FusionStageInput {
                 profile: self.profile.clone(),
                 lanes,
@@ -164,7 +166,7 @@ impl SemanticCompositionExecutionAuthorityV1 {
         {
             Some(continuation) => {
                 validate_restored_rerank_status(None, &continuation.rerank)?;
-                restore_frozen_semantic_order(continuation, &mut composition)?;
+                validate_frozen_semantic_composition(continuation, &composition)?;
                 continuation.rerank.clone()
             }
             None => OptionalStagePublicStatus::NotRequested,
@@ -194,40 +196,22 @@ pub fn apply_bounded_rerank_outcome(
     OptionalStagePublicStatus::Unavailable(SanitizedStageFailure::AuthorityUnavailable)
 }
 
-/// Restore the authenticated rerank order without rerunning an optional stage.
-pub fn restore_frozen_semantic_order(
+/// Verify the recomposed order against the authenticated frozen candidate digest.
+pub fn validate_frozen_semantic_composition(
     continuation: &SemanticRetrievalContinuationV1,
-    composition: &mut CompositionOutputV1,
+    composition: &CompositionOutputV1,
 ) -> Result<(), SemanticQueryServiceError> {
     continuation
         .validate()
         .map_err(|_| SemanticQueryServiceError::InvalidCursor)?;
-    let mut by_anchor = composition
-        .ranked_candidates
-        .drain(..)
-        .map(|candidate| (candidate.candidate.anchor_id.clone(), candidate))
-        .collect::<BTreeMap<_, _>>();
-    if by_anchor.len() != continuation.ordered_candidate_anchors.len() {
-        return Err(SemanticQueryServiceError::InvalidCursor);
-    }
-
-    let mut ordered = Vec::with_capacity(by_anchor.len());
-    for anchor in &continuation.ordered_candidate_anchors {
-        ordered.push(
-            by_anchor
-                .remove(anchor)
-                .ok_or(SemanticQueryServiceError::InvalidCursor)?,
-        );
-    }
-    if !by_anchor.is_empty() {
-        return Err(SemanticQueryServiceError::InvalidCursor);
-    }
-    for (ordinal, candidate) in ordered.iter_mut().enumerate() {
-        candidate.final_ordinal =
-            u32::try_from(ordinal).map_err(|_| SemanticQueryServiceError::InvalidCursor)?;
-    }
-    composition.ranked_candidates = ordered;
-    Ok(())
+    let candidate_count = u32::try_from(composition.ranked_candidates.len())
+        .map_err(|_| SemanticQueryServiceError::InvalidCursor)?;
+    let candidate_set_digest = digest_candidate_set(&composition.ranked_candidates)
+        .map_err(|_| SemanticQueryServiceError::InvalidCursor)?;
+    (candidate_count == continuation.candidate_count
+        && candidate_set_digest == continuation.candidate_set_digest)
+        .then_some(())
+        .ok_or(SemanticQueryServiceError::InvalidCursor)
 }
 
 fn validate_authority(
@@ -362,10 +346,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use tracedecay_domain::{
-        CalibrationProfileId, CandidateSetDigest, ExactClass, FusedCandidate, LogicalEvidenceId,
-        ManifestDigest, ProjectionKeyV1, ProjectionKindV1, PublicRetrieverStatus, QueryDigest,
-        QueryMac, RankingRevision, RetrievalAnchorId, RetrievalBudget, RetrieverBatch,
-        RetrieverCoverage, RetrieverOutcome, SanitizedBudgetUsage, SemanticSearchIndexProfileV1,
+        CalibrationProfileId, ExactClass, FusedCandidate, LogicalEvidenceId, ManifestDigest,
+        ProjectionKeyV1, ProjectionKindV1, PublicRetrieverStatus, QueryDigest, QueryMac,
+        RankingRevision, RetrievalAnchorId, RetrievalBudget, RetrieverBatch, RetrieverCoverage,
+        RetrieverOutcome, SanitizedBudgetUsage, SemanticSearchIndexProfileV1,
         SemanticSourceScopeV1, SourceFreshness, VectorGenerationIdV1,
     };
 
@@ -656,10 +640,13 @@ mod tests {
     }
 
     #[test]
-    fn frozen_continuation_restores_order_without_reexecution() {
+    fn frozen_continuation_accepts_unchanged_order_and_rejects_drift() {
         let mut composition = empty_composition(id("profile.semantic-execution.v1"));
         composition.ranked_candidates = vec![ranked("anchor.one", 0), ranked("anchor.two", 1)];
+        let candidate_set_digest =
+            digest_candidate_set(&composition.ranked_candidates).expect("candidate digest");
         let continuation = SemanticRetrievalContinuationV1 {
+            mode: tracedecay_domain::SemanticQueryModeV1::FallbackAllowed,
             profile_id: id("profile.semantic-execution.v1"),
             profile_digest: digest('c'),
             projection_key: ProjectionKeyV1 {
@@ -683,7 +670,7 @@ mod tests {
                 worktree_id: id("worktree.semantic-execution.v1"),
                 reference: Some(id("reference.semantic-execution.v1")),
             },
-            candidate_set_digest: digest::<CandidateSetDigest>('f'),
+            candidate_set_digest,
             public_lane_statuses: BTreeMap::from([(
                 RetrieverKind::Semantic,
                 PublicRetrieverStatus::Complete,
@@ -691,27 +678,17 @@ mod tests {
             lane_checkpoints: Vec::new(),
             ranking_revision: id::<RankingRevision>("ranking.semantic-execution.v1"),
             rerank: OptionalStagePublicStatus::NotRequested,
-            ordered_candidate_anchors: vec![id("anchor.two"), id("anchor.one")],
+            candidate_count: 2,
             next_ordinal: 1,
         };
 
-        restore_frozen_semantic_order(&continuation, &mut composition)
-            .expect("frozen order restores");
+        validate_frozen_semantic_composition(&continuation, &composition)
+            .expect("unchanged frozen order validates");
+
+        composition.ranked_candidates.swap(0, 1);
         assert_eq!(
-            composition
-                .ranked_candidates
-                .iter()
-                .map(|candidate| candidate.candidate.anchor_id.as_str())
-                .collect::<Vec<_>>(),
-            ["anchor.two", "anchor.one"]
-        );
-        assert_eq!(
-            composition
-                .ranked_candidates
-                .iter()
-                .map(|candidate| candidate.final_ordinal)
-                .collect::<Vec<_>>(),
-            [0, 1]
+            validate_frozen_semantic_composition(&continuation, &composition),
+            Err(SemanticQueryServiceError::InvalidCursor)
         );
     }
 

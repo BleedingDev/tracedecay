@@ -1,0 +1,344 @@
+diff --git a/crates/tracedecay-memory-provider-registry/src/recall_port.rs b/crates/tracedecay-memory-provider-registry/src/recall_port.rs
+index b4a5199861dbb1582d44d041749fc68c2628ee8e..e58e6e69e47be4480d11abf03f83b9bba73eec58 100644
+--- a/crates/tracedecay-memory-provider-registry/src/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/src/recall_port.rs
+@@ -79,7 +79,7 @@ use tracedecay_memory_provider_api::{
+     ProviderLimits, ProviderOperation, ProviderReply,
+ };
+ 
+-use crate::ProjectMemoryProviderComposition;
++use crate::{COMMON_ADVISORY_PROFILE_ID, ProjectMemoryProviderComposition};
+ use crate::provider_invocation::{
+     ProviderInvocationBoundaryV1, ProviderInvocationFaultV1, ProviderInvocationRequestV1,
+ };
+@@ -1182,15 +1182,33 @@ struct RecallCallPlan {
+ 
+ impl RecallCallPlan {
+     fn common_profile_for(&self, call: &ProviderCall) -> Result<bool, CognitiveRecallPortError> {
+-        self.registration_profiles
+-            .get(&call.provider_id)
+-            .filter(|(revision, _)| *revision == call.registration_revision)
+-            .map(|(_, required)| *required)
+-            .ok_or(CognitiveRecallPortError::Admission(
+-                RecallAdmissionError::OutcomeBinding {
+-                    field: "host registration profile",
+-                },
+-            ))
++        registered_common_profile(
++            &self.registration_profiles,
++            &call.provider_id,
++            call.registration_revision,
++        )
++        .map_err(CognitiveRecallPortError::Admission)
++    }
++
++    fn required_capabilities(
++        &self,
++        provider_id: &OwnedProviderId,
++        registration_revision: u64,
++    ) -> Result<Vec<OwnedVersionedId>, RecallRoutePlanError> {
++        let common_profile = registered_common_profile(
++            &self.registration_profiles,
++            provider_id,
++            registration_revision,
++        )
++        .map_err(RecallRoutePlanError::Admission)?;
++        let mut capabilities = vec![self.recall_capability.clone()];
++        if common_profile {
++            capabilities.push(
++                OwnedVersionedId::new(COMMON_ADVISORY_PROFILE_ID)
++                    .map_err(RecallRoutePlanError::Contract)?,
++            );
++        }
++        Ok(capabilities)
+     }
+ 
+     fn control(&self) -> OperationControl {
+@@ -1204,16 +1222,33 @@ impl RecallCallPlan {
+     }
+ }
+ 
++/// Bind readiness, dispatch, and admission to the same host registration.
++fn registered_common_profile(
++    registration_profiles: &BTreeMap<OwnedProviderId, (u64, bool)>,
++    provider_id: &OwnedProviderId,
++    registration_revision: u64,
++) -> Result<bool, RecallAdmissionError> {
++    registration_profiles
++        .get(provider_id)
++        .filter(|(revision, _)| *revision == registration_revision)
++        .map(|(_, required)| *required)
++        .ok_or(RecallAdmissionError::OutcomeBinding {
++            field: "host registration profile",
++        })
++}
++
+ impl ActiveCallPlan for RecallCallPlan {
+     type Error = RecallRoutePlanError;
+ 
+     fn handshake_request(&self, target: &RouteTarget) -> Result<HandshakeRequest, Self::Error> {
++        let required_capabilities =
++            self.required_capabilities(&target.provider_id, target.registration_revision)?;
+         HandshakeRequest::new(HandshakeRequestParts {
+             provider_id: target.provider_id.clone(),
+             registration_revision: target.registration_revision,
+             exact_scope: self.exact_scope.clone(),
+             request_id: format!("recall-readiness.{}", self.request_id),
+-            required_capabilities: vec![self.recall_capability.clone()],
++            required_capabilities,
+             host_limits: self.host_limits,
+             control: self.control(),
+             challenge_nonce: challenge_nonce()?,
+@@ -1222,6 +1257,8 @@ impl ActiveCallPlan for RecallCallPlan {
+     }
+ 
+     fn provider_call(&self, target: &ReadyRouteTarget) -> Result<ProviderCall, Self::Error> {
++        let required_capabilities =
++            self.required_capabilities(&target.provider_id, target.registration_revision)?;
+         // The request payload must echo exactly the control the call carries:
+         // the provider verifies the deadline and refuses a remaining budget
+         // larger than the one the host actually dispatched.
+@@ -1257,7 +1294,7 @@ impl ActiveCallPlan for RecallCallPlan {
+             idempotency_key: None,
+             control: call_control,
+             payload,
+-            required_capabilities: vec![self.recall_capability.clone()],
++            required_capabilities,
+             extensions: Vec::new(),
+         })
+         .map_err(RecallRoutePlanError::Contract)
+@@ -1525,6 +1562,31 @@ mod application_context_tests {
+         .unwrap()
+     }
+ 
++    #[test]
++    fn common_profile_binding_requires_the_exact_registered_target_revision() {
++        let provider_id = OwnedProviderId::new("provider.profile-binding").unwrap();
++        let unknown_provider = OwnedProviderId::new("provider.unregistered").unwrap();
++        for common_profile in [false, true] {
++            let profiles = BTreeMap::from([(provider_id.clone(), (31, common_profile))]);
++            assert_eq!(
++                registered_common_profile(&profiles, &provider_id, 31).unwrap(),
++                common_profile
++            );
++            for (target, revision) in [
++                (&provider_id, 30),
++                (&provider_id, 32),
++                (&unknown_provider, 31),
++            ] {
++                assert!(matches!(
++                    registered_common_profile(&profiles, target, revision),
++                    Err(RecallAdmissionError::OutcomeBinding {
++                        field: "host registration profile",
++                    })
++                ));
++            }
++        }
++    }
++
+     #[test]
+     fn explicit_temporal_modes_preserve_clock_flags_and_policy() {
+         let now = UtcMicros(1_740_000_000_000_000);
+diff --git a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+index af2d0ebea927317af4f62a2ad9f72557397f9f62..e04754f5ff1173a74ee124d0505450fd246bd549 100644
+--- a/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/recall_port.rs
+@@ -23,8 +23,8 @@ use tracedecay_domain::{ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId};
+ use tracedecay_memory_provider_api::contract::TerminalCode;
+ use tracedecay_memory_provider_api::{
+     CommittedEffectEvidence, FallbackDirective, HandshakeRequest, HandshakeResponse,
+-    OwnedExactScope, OwnedProviderId, PinnedFallbackPolicy, ProviderCall, ProviderDescriptor,
+-    ProviderOperation, ProviderReply, TerminalRecord,
++    OwnedExactScope, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy, ProviderCall,
++    ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
+ };
+ use tracedecay_memory_provider_native::{NativeMemoryApplicationPort, NativeObservation};
+ use tracedecay_memory_provider_registry::{
+@@ -2306,13 +2306,83 @@ async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_source
+     }
+ }
+ 
++/// Record the two dispatch envelopes while preserving the existing fixture's behavior.
++struct ProfileRecordingFixture {
++    inner: RecallFixturePort,
++    required_capabilities: Mutex<Vec<(ProviderOperation, Vec<OwnedVersionedId>)>>,
++}
++
++impl NativeMemoryApplicationPort for ProfileRecordingFixture {
++    fn descriptor(&self) -> ProviderDescriptor {
++        self.inner.descriptor()
++    }
++
++    fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
++        self.required_capabilities.lock().unwrap().push((
++            ProviderOperation::Handshake,
++            request.required_capabilities.clone(),
++        ));
++        self.inner.handshake(request)
++    }
++
++    fn recall(&self, call: &ProviderCall) -> ProviderReply {
++        self.required_capabilities.lock().unwrap().push((
++            ProviderOperation::Recall,
++            call.required_capabilities.clone(),
++        ));
++        self.inner.recall(call)
++    }
++
++    fn health(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.health(call)
++    }
++
++    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
++        self.inner.observe(observation)
++    }
++
++    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.feedback(call)
++    }
++
++    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.maintenance(call)
++    }
++
++    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.inspection(call)
++    }
++
++    fn correction(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.correction(call)
++    }
++
++    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.delete_by_source(call)
++    }
++
++    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.snapshot_export(call)
++    }
++
++    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.snapshot_restore(call)
++    }
++
++    fn replay(&self, call: &ProviderCall) -> ProviderReply {
++        self.inner.replay(call)
++    }
++}
++
+ /// Both paths use the exact same provider identity and capability declaration.
+ /// Only the actual host registration path decides the common-profile policy.
+ fn compose_profile_fixture(
+     mut fixture: RecallFixturePort,
+     common_profile: bool,
+-) -> Arc<ProjectMemoryProviderComposition> {
+-    use tracedecay_memory_provider_api::OwnedVersionedId;
++) -> (
++    Arc<ProjectMemoryProviderComposition>,
++    Arc<ProfileRecordingFixture>,
++) {
+     use tracedecay_memory_provider_native::NativeProvider;
+     use tracedecay_memory_provider_registry::{
+         COMMON_ADVISORY_PROFILE_ID, COMMON_ADVISORY_REQUIRED_CAPABILITIES,
+@@ -2327,7 +2397,10 @@ fn compose_profile_fixture(
+             .capabilities
+             .insert(OwnedVersionedId::new(capability).unwrap());
+     }
+-    let fixture = Arc::new(fixture);
++    let fixture = Arc::new(ProfileRecordingFixture {
++        inner: fixture,
++        required_capabilities: Mutex::new(Vec::new()),
++    });
+     let composition = if common_profile {
+         Arc::new(
+             ProjectMemoryProviderComposition::compose_registered(
+@@ -2337,7 +2410,7 @@ fn compose_profile_fixture(
+                         max_in_flight: 2,
+                     },
+                     registration: ProviderRegistrationV1 {
+-                        provider: Arc::new(NativeProvider::new(fixture).unwrap()),
++                        provider: Arc::new(NativeProvider::new(fixture.clone()).unwrap()),
+                         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).unwrap(),
+                         registration_revision: 31,
+                         mode: EnabledProviderMode::Active,
+@@ -2351,7 +2424,7 @@ fn compose_profile_fixture(
+             .unwrap(),
+         )
+     } else {
+-        compose_mode(fixture, EnabledProviderMode::Active)
++        compose_mode(fixture.clone(), EnabledProviderMode::Active)
+     };
+     assert_eq!(
+         composition
+@@ -2362,7 +2435,7 @@ fn compose_profile_fixture(
+             .requires_common_advisory_profile,
+         common_profile
+     );
+-    composition
++    (composition, fixture)
+ }
+ 
+ /// Host-dispatched canonical history fixture. The registry checks membership;
+@@ -2443,7 +2516,7 @@ async fn common_profile_denies_fact_projection_and_ungranted_sources_before_sele
+             observation_candidate_fields(&source, &exact),
+         );
+         let port = mount(
+-            compose_profile_fixture(fixture, true),
++            compose_profile_fixture(fixture, true).0,
+             Arc::new(LedgerObserver::default()),
+         )
+         .unwrap()
+@@ -2543,8 +2616,9 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
+         "observation".to_owned(),
+         observation_candidate_fields(&source, &exact),
+     );
++    let (common_composition, common_recording) = compose_profile_fixture(common, true);
+     let port = mount(
+-        compose_profile_fixture(common, true),
++        common_composition,
+         Arc::new(LedgerObserver::default()),
+     )
+     .unwrap();
+@@ -2564,8 +2638,10 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
+         "legacy-fact".to_owned(),
+         "retained canonical fact extension".to_owned(),
+     )]);
++    let (legacy_composition, legacy_recording) = compose_profile_fixture(legacy, false);
++    assert_eq!(common_recording.descriptor(), legacy_recording.descriptor());
+     let port = mount(
+-        compose_profile_fixture(legacy, false),
++        legacy_composition,
+         Arc::new(LedgerObserver::default()),
+     )
+     .unwrap();
+@@ -2591,4 +2667,30 @@ async fn registration_profile_is_not_inferred_from_provider_name_capabilities_or
+             .authorizes(ScopeBinding::ProfileFacts)
+     );
+     assert!(outcome.original_sources.is_empty());
++    let recall_capability = OwnedVersionedId::new(
++        tracedecay_memory_provider_registry::RECALL_QUERY_CAPABILITY_ID,
++    )
++    .unwrap();
++    let common_capabilities = vec![
++        recall_capability.clone(),
++        OwnedVersionedId::new(tracedecay_memory_provider_registry::COMMON_ADVISORY_PROFILE_ID)
++            .unwrap(),
++    ];
++    assert_eq!(
++        *common_recording.required_capabilities.lock().unwrap(),
++        vec![
++            (ProviderOperation::Handshake, common_capabilities.clone()),
++            (ProviderOperation::Recall, common_capabilities),
++        ],
++        "the pinned common profile must reach both dispatch envelopes even without a grant"
++    );
++    let legacy_capabilities = vec![recall_capability];
++    assert_eq!(
++        *legacy_recording.required_capabilities.lock().unwrap(),
++        vec![
++            (ProviderOperation::Handshake, legacy_capabilities.clone()),
++            (ProviderOperation::Recall, legacy_capabilities),
++        ],
++        "a legacy registration with the same descriptor and a grant remains recall-only"
++    );
+ }

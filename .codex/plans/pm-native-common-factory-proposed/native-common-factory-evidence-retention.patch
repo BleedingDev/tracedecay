@@ -1,0 +1,65 @@
+--- a/native_common_factory_tests.rs
++++ b/native_common_factory_tests.rs
+@@ -1781,9 +1781,12 @@
+         };
+         if let Err(error) = settled {
+             self.cleanup.error("fixture forced cleanup", error);
+-            if let Some(root) = self.root.take() {
+-                self.cleanup.preserve(root.keep());
+-            }
++        }
++        // The common runner drops scenario fixtures before validating its
++        // report. Keep nested evidence until the outer test has confirmed both
++        // behavioral success and child cleanup; the outer root owns deletion.
++        if let Some(root) = self.root.take() {
++            self.cleanup.preserve(root.keep());
+         }
+     }
+ }
+@@ -2368,6 +2371,7 @@
+     factory: NativeCommonFactory,
+     exact_scope: OwnedExactScope,
+     finished: bool,
++    behavior_passed: bool,
+ }
+ impl NativeTestEnvironment {
+     fn new() -> Self {
+@@ -2422,6 +2426,7 @@
+             factory,
+             exact_scope,
+             finished: false,
++            behavior_passed: false,
+         }
+     }
+     fn finish(&mut self) -> Result<(), String> {
+@@ -2446,6 +2451,7 @@
+         let cleanup_failed = self.finish().is_err();
+         let snapshot = self.factory.cleanup.snapshot();
+         if cleanup_failed
++            || !self.behavior_passed
+             || thread::panicking()
+             || !snapshot.fixture_failures.is_empty()
+             || snapshot
+@@ -2630,6 +2636,7 @@
+         .expect("actual child cleanup record");
+     assert!(reaped.confirmed_reaped && reaped.child_identity.is_some());
+     assert_eq!(reaped.pid, child.pid);
++    environment.behavior_passed = true;
+ }
+ 
+ #[test]
+@@ -2712,6 +2719,7 @@
+         .expect("actual child cleanup record");
+     assert!(reaped.confirmed_reaped && reaped.child_identity.is_some());
+     assert_eq!(reaped.pid, child.pid);
++    environment.behavior_passed = true;
+ }
+ 
+ #[test]
+@@ -2750,4 +2758,5 @@
+         report.denominators.planned,
+         report.denominators.passed + report.denominators.degraded
+     );
+-}
++    environment.behavior_passed = true;
++}

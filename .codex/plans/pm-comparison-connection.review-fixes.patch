@@ -1,0 +1,212 @@
+--- a/.codex/plans/pm-comparison-connection-proposed/scripts/product/memory-comparison/production_comparison.py
++++ b/.codex/plans/pm-comparison-connection-proposed/scripts/product/memory-comparison/production_comparison.py
+@@ -200,6 +200,10 @@
+                         raise ProtocolError("invalid finish envelope")
+                     if body.get("case_trial_id") != self.invocation["case_trial_id"]:
+                         raise ProtocolError("finish changed case identity")
++                    if next_index < len(self.invocation["actions"]):
++                        reason = body.get("reason")
++                        if body.get("status") not in ("unexecuted", "censored") or not isinstance(reason, str) or not reason.strip():
++                            raise ProtocolError("early finish requires explicit unexecuted/censored status and reason")
+                     self.finished = True
+                     return body
+                 if frame["kind"] != "action" or type(frame["action_index"]) is not int or frame["action_index"] != next_index:
+@@ -320,22 +324,36 @@
+             self.resources.sample()
+             identities.extend(ProcessIdentity(**row["identity"]) for row in self.resources.report()["processes"]
+                               if row["identity"] != asdict(self.identity))
+-        # A still-observed member also anchors the original group if the test
+-        # child has exited and a worker was reparented. No name search is used.
++        # A still-observed member anchors the original group after reparenting.
++        # Escaped descendants remain owned by their recorded PID/start identity;
++        # signal only that PID, never its new group or session.
++        sent = group_sent = False
+         for expected in identities:
+             try:
+                 actual = read_process_identity(expected.pid)
+-                if actual != expected or os.getpgid(actual.pid) != self.child.pid:
++                if actual != expected:
+                     continue
+-                os.killpg(self.child.pid, sig)
+-                self.signals.append({"signal": sig.name, "status": "sent", "anchor": asdict(actual),
+-                                     "process_group_id": self.child.pid})
+-                return True
++                group = os.getpgid(actual.pid)
++                if group == self.child.pid:
++                    if group_sent:
++                        continue
++                    os.killpg(self.child.pid, sig)
++                    self.signals.append({"signal": sig.name, "status": "sent", "anchor": asdict(actual),
++                                         "process_group_id": self.child.pid})
++                    group_sent = True
++                elif actual != self.identity:
++                    os.kill(actual.pid, sig)
++                    self.signals.append({"signal": sig.name, "status": "sent", "identity": asdict(actual),
++                                         "scope": "known_owned_descendant", "observed_process_group_id": group})
++                else:
++                    continue
++                sent = True
+             except (OSError, subprocess.SubprocessError):
+                 continue
+-        self.signals.append({"signal": sig.name, "status": "unexecuted",
+-                             "reason": "no observed owned identity still anchors the process group"})
+-        return False
++        if not sent:
++            self.signals.append({"signal": sig.name, "status": "unexecuted",
++                                 "reason": "no matching observed owned identity remains available"})
++        return sent
+ 
+     def _observed_survivors(self):
+         if self.resources is None:
+--- a/.codex/plans/pm-comparison-connection-proposed/scripts/product/memory-comparison/test_production_comparison.py
++++ b/.codex/plans/pm-comparison-connection-proposed/scripts/product/memory-comparison/test_production_comparison.py
+@@ -5,8 +5,10 @@
+ import json
+ import os
+ from pathlib import Path
++import signal
+ import socket
+ import struct
++import subprocess
+ import sys
+ import tempfile
+ import threading
+@@ -22,8 +24,9 @@
+ 
+ from event_log import JsonlEventSink
+ from runner import Capture
+-from production_comparison import (FramedChannel, MAX_FRAME_BYTES, PROTOCOL, ProductionFactory,
+-                                   ProtocolError, SocketSession, Timeouts)
++from production_comparison import (FramedChannel, MAX_FRAME_BYTES, PROTOCOL, ProcessIdentity,
++                                   ProductionFactory, ProductionFixture, ProtocolError, SocketSession,
++                                   Timeouts, read_process_identity)
+ 
+ 
+ NONCE = "9a" * 32
+@@ -268,19 +271,38 @@
+                 session.replay(INVOCATION, capture)
+ 
+     def test_premature_finish_preserves_missing_actions_without_fabrication(self):
+-        def peer(stream):
+-            self.handshake(stream)
+-            self.ack(stream, "metadata", emit(stream, "metadata", METADATA))
+-            emit(stream, "finish", {"case_trial_id": INVOCATION["case_trial_id"], "status": "unexecuted", "reason": "actual unavailable"})
+-        with peer_pair(peer) as stream:
+-            capture = Capture()
+-            result = SocketSession(FramedChannel(stream, NONCE), INVOCATION, FAST).replay(INVOCATION, capture)
+-            self.assertEqual(capture.action_results, [])
+-            self.assertNotIn("actions", result)
++        for status in ("unexecuted", "censored"):
++            with self.subTest(status=status):
++                def peer(stream):
++                    self.handshake(stream)
++                    self.ack(stream, "metadata", emit(stream, "metadata", METADATA))
++                    emit(stream, "finish", {"case_trial_id": INVOCATION["case_trial_id"], "status": status, "reason": "actual unavailable"})
++                with peer_pair(peer) as stream:
++                    capture = Capture()
++                    result = SocketSession(FramedChannel(stream, NONCE), INVOCATION, FAST).replay(INVOCATION, capture)
++                    self.assertEqual(capture.action_results, [])
++                    self.assertEqual(result["status"], status)
++                    self.assertNotIn("actions", result)
++
++    def test_early_completed_or_unexplained_finish_is_rejected(self):
++        for status, reason in (("completed", "unexpected stop"), ("unexecuted", None),
++                               ("censored", " \n"), ("unknown", "unexpected stop")):
++            with self.subTest(status=status, reason=reason):
++                def peer(stream):
++                    self.handshake(stream)
++                    self.ack(stream, "metadata", emit(stream, "metadata", METADATA))
++                    emit(stream, "finish", {"case_trial_id": INVOCATION["case_trial_id"], "status": status, "reason": reason})
++                    self.assertEqual(stream.recv(1), b"")
++                with peer_pair(peer) as stream:
++                    session = SocketSession(FramedChannel(stream, NONCE), INVOCATION, FAST)
++                    with self.assertRaisesRegex(ProtocolError, "early finish"):
++                        session.replay(INVOCATION, Capture())
++                    self.assertFalse(session.finished)
++                    self.assertTrue(session.broken)
+ 
+ 
+ FAKE_EXECUTABLE = r'''
+-import hashlib, json, os, signal, socket, struct, subprocess, time
++import hashlib, json, os, signal, socket, struct, subprocess, sys, time
+ s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+ s.connect(os.environ["TRACEDECAY_HOST_COMPARISON_SOCKET"])
+ n = os.environ["TRACEDECAY_HOST_COMPARISON_NONCE"]
+@@ -299,6 +321,16 @@
+     s.sendall(struct.pack(">Q", len(raw)) + raw)
+     return hashlib.sha256(raw).hexdigest()
+ assert receive()["kind"] == "hello"
++if os.environ.get("INDEPENDENT_SOCKET_TEST_MODE") == "detached":
++    child = subprocess.Popen([sys.executable, "-S", "-c", "import time; time.sleep(60)"],
++                             start_new_session=True, stdin=subprocess.DEVNULL,
++                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++    root = os.environ["TRACEDECAY_HOST_COMPARISON_ARTIFACT_ROOT"]
++    with open(os.path.join(root, "independent-detached-pid"), "x") as out: out.write(str(child.pid))
++    code = child.wait()
++    with open(os.path.join(root, "independent-detached-exit"), "x") as out: out.write(str(code))
++    raise SystemExit(4)
+ if os.environ.get("INDEPENDENT_SOCKET_TEST_MODE") == "hang":
+     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+     while True: time.sleep(1)
+@@ -407,6 +439,60 @@
+             self.assertEqual(cleanup["status"], "unmeasured")
+             self.assertTrue(cleanup["connector"]["test_child"]["joined"])
+ 
++    def test_detached_owned_descendant_is_terminated_without_signaling_unrelated_child(self):
++        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {"INDEPENDENT_SOCKET_TEST_MODE": "detached"}):
++            root = Path(directory)
++            unrelated = subprocess.Popen([sys.executable, "-S", "-c", "import time; time.sleep(60)"],
++                                         start_new_session=True, stdin=subprocess.DEVNULL,
++                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
++            fixture = detached = None
++            try:
++                fixture = self.make_factory(root).create(INVOCATION)
++                with self.capture(root) as capture:
++                    with self.assertRaises(TimeoutError):
++                        fixture.replay(INVOCATION, capture)
++                pid = int((fixture.artifacts / "independent-detached-pid").read_text())
++                detached = read_process_identity(pid)
++                self.assertEqual(os.getpgid(pid), pid)
++                self.assertNotEqual(os.getpgid(pid), fixture.child.pid)
++                cleanup = fixture.close()
++                self.assertEqual(cleanup["status"], "unmeasured")
++                self.assertTrue(cleanup["connector"]["test_child"]["joined"])
++                self.assertEqual((fixture.artifacts / "independent-detached-exit").read_text(), str(-signal.SIGTERM))
++                self.assertTrue(any(item.get("scope") == "known_owned_descendant" and
++                                    item.get("identity") == {"pid": detached.pid, "start_identity": detached.start_identity}
++                                    for item in cleanup["connector"]["signals"]))
++                self.assertIsNone(unrelated.poll())
++                with self.assertRaises(OSError):
++                    read_process_identity(detached.pid)
++            finally:
++                if fixture is not None:
++                    fixture.close()
++                if detached is not None:
++                    try:
++                        if read_process_identity(detached.pid) == detached:
++                            os.kill(detached.pid, signal.SIGKILL)
++                    except OSError:
++                        pass
++                unrelated.terminate()
++                unrelated.wait(timeout=2)
++
++    def test_replaced_known_identities_are_never_signaled(self):
++        fixture = object.__new__(ProductionFixture)
++        fixture.child = mock.Mock(pid=123)
++        fixture.identity = ProcessIdentity(123, "original root")
++        fixture.resources = mock.Mock()
++        fixture.resources.report.return_value = {"processes": [
++            {"identity": {"pid": 123, "start_identity": "original root"}},
++            {"identity": {"pid": 456, "start_identity": "original descendant"}}]}
++        fixture.signals = []
++        with mock.patch("production_comparison.read_process_identity", side_effect=lambda pid: ProcessIdentity(pid, "replacement")), \
++                mock.patch("production_comparison.os.kill") as kill, \
++                mock.patch("production_comparison.os.killpg") as killpg:
++            self.assertFalse(fixture._signal_owned(signal.SIGTERM))
++            kill.assert_not_called()
++            killpg.assert_not_called()
++
+     def test_factory_rejects_missing_or_relative_ownership_configuration(self):
+         with tempfile.TemporaryDirectory() as directory:
+             with self.assertRaises(ValueError):

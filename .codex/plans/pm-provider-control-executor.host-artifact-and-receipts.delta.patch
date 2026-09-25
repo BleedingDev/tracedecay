@@ -1,0 +1,226 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control.rs
+@@ -129,6 +129,12 @@
+         state: RetainedRecallControlScopeV1,
+         identity: ControlOperationIdentityV1,
+     },
++    /// A verified provider reply preceded a host artifact retention failure.
++    /// Preserve both pieces of evidence for the outer durability outcome.
++    PortabilityArtifact {
++        error: portability::PortabilityErrorV1,
++        dispatched: JourneyControlDispatchReplyV1,
++    },
+     Projection {
+         field: &'static str,
+         dispatched: JourneyControlDispatchReplyV1,
+@@ -149,6 +155,7 @@
+             ControlFailureStageV1::HostIntentUnknown { .. } => "host_intent_unknown",
+             ControlFailureStageV1::Dispatch { .. } => "dispatch",
+             ControlFailureStageV1::DispatchWorker { .. } => "dispatch_worker",
++            ControlFailureStageV1::PortabilityArtifact { .. } => "portability_artifact",
+             ControlFailureStageV1::Projection { .. } => "projection",
+         };
+         formatter
+@@ -517,6 +524,15 @@
+         selector: &ProviderControlStateSelectorV1,
+         invocation: &ControlInvocationV1<'_, '_>,
+     ) -> ControlResult<ResolvedControlStateV1> {
++        self.mount_for(self.resolve_retained_state(selector, invocation).await?)
++    }
++
++    /// Resolve actual scope authority independently of a live provider mount.
++    pub(super) async fn resolve_retained_state(
++        &self,
++        selector: &ProviderControlStateSelectorV1,
++        invocation: &ControlInvocationV1<'_, '_>,
++    ) -> ControlResult<RetainedRecallControlScopeV1> {
+         self.validate_invocation(invocation)?;
+         let authority = self.authority()?;
+         let retained = match selector {
+@@ -577,7 +593,7 @@
+             }
+         };
+         invocation.check()?;
+-        self.mount_for(retained)
++        Ok(retained)
+     }
+ 
+     pub(super) async fn resolve_source(
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
+@@ -11,7 +11,7 @@
+     AuthorizedControlSourceV1, CompletedProviderControlV1, ControlFailureStageV1, ControlFailureV1,
+     ControlInvocationV1, ControlResult, PROVIDER_CONTROL_POLICY_REVISION_V1,
+     ProjectProviderControlPortV1, ResolvedControlStateV1,
+-    projection::{HostControlEvidence, InspectionEvidenceV1, RetainedSnapshotV1},
++    projection::{HostControlEvidence, InspectionEvidenceV1},
+ };
+ 
+ pub(super) async fn health(
+@@ -88,10 +88,10 @@
+     invocation: &ControlInvocationV1<'_, '_>,
+     request: &ProviderInspectionRequestV1,
+ ) -> ControlResult<CompletedProviderControlV1> {
+-    let state = port.resolve_state(&request.state, invocation).await?;
+     match &request.selection {
+         ProviderControlInspectionSelectorV1::StateSummary
+         | ProviderControlInspectionSelectorV1::CapabilityStatus => {
++            let state = port.resolve_state(&request.state, invocation).await?;
+             let dispatched = port
+                 .dispatch(
+                     invocation,
+@@ -118,6 +118,7 @@
+         ProviderControlInspectionSelectorV1::SourceInfluence { source: selector }
+         | ProviderControlInspectionSelectorV1::Trace { source: selector }
+         | ProviderControlInspectionSelectorV1::DeliveryReceipt { source: selector } => {
++            let state = port.resolve_state(&request.state, invocation).await?;
+             let source = source_for_inspection(port, invocation, &state, selector).await?;
+             let delivery_key = if matches!(
+                 request.selection,
+@@ -162,7 +163,16 @@
+                     json!({"stable_memory_ref": stable})
+                 }
+                 ProviderControlInspectionSelectorV1::DeliveryReceipt { .. } => {
+-                    json!({"idempotency_key": delivery_key.as_deref()})
++                    let LifecycleTargetReference::StableMemoryRef(stable) =
++                        &source.target.reference
++                    else {
++                        return Err(ControlFailureV1::new(
++                            ControlFailureStageV1::InvalidBinding(
++                                "retained stable memory reference",
++                            ),
++                        ));
++                    };
++                    json!({"idempotency_key": delivery_key.as_deref(), "stable_memory_ref": stable})
+                 }
+                 _ => unreachable!("source inspection selection"),
+             };
+@@ -214,13 +224,17 @@
+             operation_id,
+             idempotency_key,
+         } => {
++            let state = port.resolve_state(&request.state, invocation).await?;
+             // These are provider outcome-query keys inside the authorized
+             // namespace. They confer no host receipt or mutation authority.
+             let dispatched = port
+                 .dispatch(
+                     invocation,
+                     &state,
+-                    inspection_body(request, json!({"idempotency_key": idempotency_key})),
++                    inspection_body(
++                        request,
++                        json!({"operation_id": operation_id, "idempotency_key": idempotency_key}),
++                    ),
+                     &invocation.identity,
+                     None,
+                 )
+@@ -235,8 +249,13 @@
+             )
+         }
+         ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref } => {
++            // Historical artifact metadata has its own host origin. No live
++            // provider mount, readiness handshake, or provider reply is involved.
++            let state = port
++                .resolve_retained_state(&request.state, invocation)
++                .await?;
+             let ledger = port.ledger()?;
+-            let retained = state.retained.clone();
++            let retained = state.clone();
+             let reference = snapshot_ref.clone();
+             let control = invocation.control.clone();
+             let artifact = invocation
+@@ -255,62 +274,39 @@
+                     .map_err(super::portability::control_failure)
+                 })
+                 .await?;
+-            port.authority()?
+-                .authorize_retained_source_inventory(
+-                    &state.retained,
+-                    artifact.original_sources(),
+-                    &invocation.control,
+-                )
+-                .await?;
+-            let carrier: Value =
+-                serde_json::from_slice(&artifact.carrier().bytes).map_err(|_| {
+-                    ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
+-                        "retained snapshot carrier",
+-                    ))
+-                })?;
+-            let snapshot_id = carrier
+-                .pointer("/identity/snapshot_id")
+-                .and_then(Value::as_str)
+-                .filter(|value| !value.is_empty())
+-                .ok_or_else(|| {
+-                    ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(
+-                        "retained snapshot identity",
+-                    ))
+-                })?;
+-            let dispatched = port
+-                .dispatch(
+-                    invocation,
+-                    &state,
+-                    inspection_body(request, json!({"snapshot_id": snapshot_id})),
+-                    &invocation.identity,
+-                    None,
+-                )
+-                .await?;
+-            if port
+-                .authority()?
+-                .authorize_retained_source_inventory(
+-                    &state.retained,
+-                    artifact.original_sources(),
+-                    &invocation.control,
+-                )
+-                .await
+-                .is_err()
++            if state.provider_id != artifact.export_scope().provider_id
++                || state.registration_revision != artifact.export_scope().registration_revision
+             {
+-                return Err(ControlFailureV1::new(ControlFailureStageV1::Projection {
+-                    field: "current snapshot source authority",
+-                    dispatched,
+-                }));
++                return Err(ControlFailureV1::new(
++                    ControlFailureStageV1::InvalidBinding("selected snapshot export owner"),
++                ));
+             }
+-            port.project(
+-                invocation,
+-                dispatched,
+-                HostControlEvidence::Inspection(InspectionEvidenceV1::SnapshotMetadata(
+-                    RetainedSnapshotV1 {
+-                        snapshot_ref: artifact.snapshot_ref(),
+-                        carrier: artifact.carrier(),
+-                    },
+-                )),
++            let inventory = invocation
++                .run_controlled(async {
++                    port.authority()?
++                        .authorize_retained_source_inventory(
++                            &state,
++                            artifact.original_sources(),
++                            &invocation.control,
++                        )
++                        .await
++                        .map_err(ControlFailureV1::from)
++                })
++                .await?;
++            invocation.check()?;
++            let result = super::projection::project_host_snapshot_metadata(
++                invocation.context.request_context,
++                request,
++                &state,
++                &invocation.identity,
++                &artifact,
++                &inventory,
+             )
++            .map_err(|field| ControlFailureV1::new(ControlFailureStageV1::InvalidBinding(field)))?;
++            Ok(CompletedProviderControlV1 {
++                result,
++                host_receipt: None,
++            })
+         }
+     }
+ }

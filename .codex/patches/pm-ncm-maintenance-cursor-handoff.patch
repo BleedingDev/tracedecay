@@ -1,0 +1,270 @@
+--- a/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
+@@ -177,7 +177,17 @@
+                     control["stable_memory_ref"] = json!(stable);
+                 }
+                 "source_influence" => {
+-                    fields(&value["selector"], &["source_key"])?;
++                    if let Some(stable) = selector.get("stable_memory_ref") {
++                        fields(&value["selector"], &["source_key", "stable_memory_ref"])?;
++                        let stable = string(stable)?;
++                        let digest = stable.strip_prefix("ncm-memory:")?;
++                        if !crate::NcmProviderAdapter::valid_sha256(digest) {
++                            return None;
++                        }
++                        control["stable_memory_ref"] = json!(stable);
++                    } else {
++                        fields(&value["selector"], &["source_key"])?;
++                    }
+                 }
+                 _ => {
+                     if !selector.is_empty() {
+@@ -210,17 +220,18 @@
+             });
+         }
+         ProviderOperation::Maintenance => {
+-            fields(
+-                value,
+-                &[
+-                    "common_request",
+-                    "task",
+-                    "maximum_items",
+-                    "maximum_bytes",
+-                    "maximum_duration_millis",
+-                    "dry_run",
+-                ],
+-            )?;
++            let mut names = vec![
++                "common_request",
++                "task",
++                "maximum_items",
++                "maximum_bytes",
++                "maximum_duration_millis",
++                "dry_run",
++            ];
++            if value.get("resume_cursor").is_some() {
++                names.push("resume_cursor");
++            }
++            fields(value, &names)?;
+             let task = string(&value["task"])?;
+             if ![
+                 "consolidate",
+@@ -247,6 +258,26 @@
+             }
+             control["task"] = json!(task);
+             control["dry_run"] = json!(value["dry_run"].as_bool()?);
++            control["resume_cursor"] = match value.get("resume_cursor") {
++                None | Some(Value::Null) => Value::Null,
++                Some(value) => {
++                    let cursor = string(value)?;
++                    if cursor.len() > 1024 {
++                        return None;
++                    }
++                    let prefix = format!(
++                        "ncm-maintenance:{}:{task}:{}:",
++                        namespace.as_str(),
++                        call.expected_state_generation
++                    );
++                    let after_text = cursor.strip_prefix(&prefix)?;
++                    let after = after_text.parse::<u64>().ok()?;
++                    if after > i64::MAX as u64 || after.to_string() != after_text {
++                        return None;
++                    }
++                    json!(cursor)
++                }
++            };
+         }
+         ProviderOperation::DeleteBySource => {
+             control["action"] = json!("delete_by_source");
+@@ -487,6 +518,16 @@
+             if row["stable_memory_ref"] != stable {
+                 return None;
+             }
++            if request["view"] == "source_influence" {
++                if source.source.source_key != request["selector"]["source_key"].as_str()? {
++                    return None;
++                }
++                if let Some(expected) = request["selector"].get("stable_memory_ref") {
++                    if expected.as_str()? != stable {
++                        return None;
++                    }
++                }
++            }
+             let item = if matches!(
+                 request["view"].as_str(),
+                 Some("delivery_receipt" | "maintenance_receipt")
+@@ -520,10 +561,29 @@
+                 if effect_summary.is_empty() || effect_summary.len() > 8192 {
+                     return None;
+                 }
++                let settled_feedback = if request["view"] == "source_influence" {
++                    let mut counts = json!({"helpful": 0, "harmful": 0, "ignored": 0, "corrected": 0, "superseded": 0});
++                    if let Some(stored) =
++                        row["provenance"].pointer("/control/feedback/settled_counts")
++                    {
++                        for (signal, count) in stored.as_object()? {
++                            counts.get(signal)?;
++                            counts[signal] = json!(count.as_u64()?);
++                        }
++                    }
++                    counts
++                } else {
++                    json!(
++                        row["provenance"]["control"]["feedback"]["settled_counts"]
++                            .as_object()
++                            .cloned()
++                            .unwrap_or_default()
++                    )
++                };
+                 json!({"target": {"provider_id": call.provider_id.as_str(), "registration_revision": call.registration_revision,
+                 "original_scope": original["origin_scope"], "delivery_scope": scope_value(&call.exact_scope), "source": original["source"],
+                 "reference": {"kind": "stable_memory_ref", "reference": stable}}, "source": original["source"], "active": row["active"],
+-                "disposition": row["disposition"], "settled_feedback": row["provenance"]["control"]["feedback"]["settled_counts"].as_object().cloned().unwrap_or_default(),
++                "disposition": row["disposition"], "settled_feedback": settled_feedback,
+                 "last_feedback_receipt": row["provenance"]["control"]["feedback"]["receipt"],
+                 "provider_local_effect_summary": effect_summary})
+             };
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/common_reads.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/common_reads.rs
+@@ -25,7 +25,54 @@
+             .as_u64()
+             .unwrap_or(1_048_576)
+             .min(1_073_741_824);
+-        let after = payload["after"].as_u64().unwrap_or(0);
++        let after = if action == "maintenance" {
++            let invalid = || {
++                EngineReply::rejected(
++                    RejectReason::InvalidRequest(
++                        "invalid maintenance control or cursor".to_owned(),
++                    ),
++                    0,
++                )
++            };
++            let Some(task) = payload["task"].as_str().filter(|task| {
++                matches!(
++                    *task,
++                    "consolidate"
++                        | "decay"
++                        | "prune_expired"
++                        | "validate_state"
++                        | "repair"
++                        | "compact"
++                )
++            }) else {
++                return invalid();
++            };
++            let Some(expected_generation) = payload["expected_generation"].as_u64() else {
++                return invalid();
++            };
++            if payload["dry_run"].as_bool().is_none() || payload.get("after").is_some() {
++                return invalid();
++            }
++            match payload.get("resume_cursor") {
++                None | Some(Value::Null) => 0,
++                Some(Value::String(cursor)) if !cursor.is_empty() && cursor.len() <= 1024 => {
++                    let prefix =
++                        format!("ncm-maintenance:{namespace}:{task}:{expected_generation}:");
++                    let Some(after_text) = cursor.strip_prefix(&prefix) else {
++                        return invalid();
++                    };
++                    let Some(after) = after_text.parse::<u64>().ok().filter(|after| {
++                        *after <= i64::MAX as u64 && after.to_string() == after_text
++                    }) else {
++                        return invalid();
++                    };
++                    after
++                }
++                _ => return invalid(),
++            }
++        } else {
++            payload["after"].as_u64().unwrap_or(0)
++        };
+         let mut namespaces = match self.namespace_lock() {
+             Ok(value) => value,
+             Err(reply) => return reply,
+@@ -33,6 +80,20 @@
+         let handle = match self.ensure_handle(&mut namespaces, namespace, false) {
+             Ok(Some(handle)) => handle,
+             Ok(None) => {
++                if action == "maintenance" {
++                    if payload["expected_generation"].as_u64() != Some(0) {
++                        return EngineReply::rejected(RejectReason::IdempotencyConflict, 0);
++                    }
++                    return EngineReply::new(
++                        Outcome::Success,
++                        0,
++                        json!({"common_control": "maintenance", "no_change": true,
++                            "task": payload["task"], "dry_run": payload["dry_run"],
++                            "state_generation_before": 0, "state_generation_after": 0,
++                            "scanned_items": 0, "changed_items": 0, "removed_items": 0,
++                            "partial": false, "resume_cursor": null, "warnings": []}),
++                    );
++                }
+                 return EngineReply::new(
+                     Outcome::Success,
+                     0,
+@@ -115,7 +176,11 @@
+                 continue;
+             };
+             let stable = stable_reference(namespace, capsule.record_id.0, digest);
+-            if payload["view"] == "trace" && payload["stable_memory_ref"] != stable {
++            if (payload["view"] == "trace"
++                || (payload["view"] == "source_influence"
++                    && payload.get("stable_memory_ref").is_some()))
++                && payload["stable_memory_ref"] != stable
++            {
+                 continue;
+             }
+             let suppressed = provenance
+@@ -148,7 +213,7 @@
+         let dry_run = payload["dry_run"].as_bool().unwrap_or(true);
+         let output = json!({"common_control": "maintenance", "no_change": true, "task": task, "dry_run": dry_run,
+             "state_generation_before": generation, "state_generation_after": generation, "scanned_items": scanned,
+-            "changed_items": 0, "removed_items": 0, "partial": partial, "resume_cursor": if partial { Some(cursor) } else { None }, "warnings": []});
++            "changed_items": 0, "removed_items": 0, "partial": partial, "resume_cursor": partial.then(|| format!("ncm-maintenance:{namespace}:{task}:{generation}:{cursor}")), "warnings": []});
+         if dry_run || task == "validate_state" || partial {
+             return EngineReply::new(Outcome::Success, generation, output);
+         }
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
+@@ -175,7 +175,12 @@
+             "state_generation_before": handle.commit_seq, "state_generation_after": handle.commit_seq.saturating_add(1), "warnings": []});
+         match action {
+             "feedback" => {
+-                let Some(signal) = payload["signal"].as_str() else {
++                let Some(signal) = payload["signal"].as_str().filter(|signal| {
++                    matches!(
++                        *signal,
++                        "helpful" | "harmful" | "ignored" | "corrected" | "superseded"
++                    )
++                }) else {
+                     return invalid("invalid feedback signal", handle.commit_seq);
+                 };
+                 let Some(weight) = payload["weight"]
+@@ -224,10 +229,22 @@
+                     .and_then(Value::as_u64)
+                     .unwrap_or(0)
+                     .saturating_add(1);
+-                let mut settled_counts = provenance
+-                    .pointer("/control/feedback/settled_counts")
+-                    .cloned()
+-                    .unwrap_or_else(|| json!({}));
++                let mut settled_counts = json!({"helpful": 0, "harmful": 0, "ignored": 0, "corrected": 0, "superseded": 0});
++                if let Some(stored) = provenance.pointer("/control/feedback/settled_counts") {
++                    let Some(stored) = stored.as_object() else {
++                        return EngineReply::new(Outcome::Corrupt, handle.commit_seq, Value::Null);
++                    };
++                    for (signal, count) in stored {
++                        if settled_counts.get(signal).is_none() || count.as_u64().is_none() {
++                            return EngineReply::new(
++                                Outcome::Corrupt,
++                                handle.commit_seq,
++                                Value::Null,
++                            );
++                        }
++                        settled_counts[signal] = count.clone();
++                    }
++                }
+                 settled_counts[signal] = json!(
+                     settled_counts[signal]
+                         .as_u64()

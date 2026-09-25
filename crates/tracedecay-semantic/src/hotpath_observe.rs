@@ -11,7 +11,6 @@ use crate::fastembed_adapter::EmbedError;
 use crate::fastembed_adapter::RuntimeFailureKindV1;
 use crate::model_lifecycle::ModelLifecycleErrorV1;
 use crate::session_pool::SessionAcquireError;
-use tracedecay_query::retrieval::rerank::LocalRerankFailureV1;
 use tracedecay_semantic_contracts::SemanticModelLifecycleStateV1;
 
 #[cfg(feature = "hotpath")]
@@ -39,6 +38,7 @@ pub(crate) fn lifecycle_error_class(error: &ModelLifecycleErrorV1) -> &'static s
         ModelLifecycleErrorV1::Catalog(_) => "catalog",
         ModelLifecycleErrorV1::StoreUnavailable => "store_unavailable",
         ModelLifecycleErrorV1::Rejected => "rejected",
+        ModelLifecycleErrorV1::AcquisitionUnavailable => "acquisition_unavailable",
         ModelLifecycleErrorV1::DownloadFailed
         | ModelLifecycleErrorV1::DownloadFailedWithReason(_) => "download_failed",
         ModelLifecycleErrorV1::VerificationFailed => "verification_failed",
@@ -221,14 +221,6 @@ pub(crate) fn record_session_error(error: &SessionAcquireError) {
 pub(crate) fn record_capability_error(error: &SemanticCapabilityDisabledV1) {
     #[cfg(feature = "hotpath")]
     record_model_failure(capability_disabled_class(error));
-    #[cfg(not(feature = "hotpath"))]
-    let _ = error;
-}
-
-#[inline(always)]
-pub(crate) fn record_rerank_error(error: &LocalRerankFailureV1) {
-    #[cfg(feature = "hotpath")]
-    record_model_failure(rerank_failure_class(error));
     #[cfg(not(feature = "hotpath"))]
     let _ = error;
 }

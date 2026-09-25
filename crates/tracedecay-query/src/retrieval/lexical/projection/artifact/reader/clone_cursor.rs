@@ -429,7 +429,8 @@ impl<'a> CloneCursorCodecV1<'a> {
         query_descriptor: &ManifestDigest,
         now: UtcMicros,
     ) -> Result<CloneArtifactCursorV2, CloneCursorErrorV1> {
-        let envelope = decode_envelope::<AuthenticatedCloneArtifactCursorV2>(encoded)?;
+        let (envelope, encoded_bytes) =
+            decode_envelope::<AuthenticatedCloneArtifactCursorV2>(encoded)?;
         let payload_bytes =
             serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
         self.verify(
@@ -437,6 +438,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload_bytes,
             &envelope.authentication,
         )?;
+        validate_canonical_envelope(&envelope, &encoded_bytes)?;
         let payload = envelope.payload;
         validate_common(
             &payload.operation,
@@ -488,7 +490,8 @@ impl<'a> CloneCursorCodecV1<'a> {
         snapshot_digest: &ManifestDigest,
         now: UtcMicros,
     ) -> Result<CloneArtifactCursorV2, CloneCursorErrorV1> {
-        let envelope = decode_envelope::<AuthenticatedCloneArtifactCursorV2>(encoded)?;
+        let (envelope, encoded_bytes) =
+            decode_envelope::<AuthenticatedCloneArtifactCursorV2>(encoded)?;
         let payload_bytes =
             serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
         self.verify(
@@ -496,6 +499,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload_bytes,
             &envelope.authentication,
         )?;
+        validate_canonical_envelope(&envelope, &encoded_bytes)?;
         let payload = envelope.payload;
         validate_common(
             &payload.operation,
@@ -571,7 +575,8 @@ impl<'a> CloneCursorCodecV1<'a> {
         query_descriptor: &ManifestDigest,
         now: UtcMicros,
     ) -> Result<CloneFamilyCursorV2, CloneCursorErrorV1> {
-        let envelope = decode_envelope::<AuthenticatedCloneFamilyCursorV2>(encoded)?;
+        let (envelope, encoded_bytes) =
+            decode_envelope::<AuthenticatedCloneFamilyCursorV2>(encoded)?;
         let payload_bytes =
             serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
         self.verify(
@@ -579,6 +584,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload_bytes,
             &envelope.authentication,
         )?;
+        validate_canonical_envelope(&envelope, &encoded_bytes)?;
         let payload = envelope.payload;
         validate_common(
             &payload.operation,
@@ -620,7 +626,8 @@ impl<'a> CloneCursorCodecV1<'a> {
         snapshot_digest: &ManifestDigest,
         now: UtcMicros,
     ) -> Result<CloneFamilyCursorV2, CloneCursorErrorV1> {
-        let envelope = decode_envelope::<AuthenticatedCloneFamilyCursorV2>(encoded)?;
+        let (envelope, encoded_bytes) =
+            decode_envelope::<AuthenticatedCloneFamilyCursorV2>(encoded)?;
         let payload_bytes =
             serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
         self.verify(
@@ -628,6 +635,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload_bytes,
             &envelope.authentication,
         )?;
+        validate_canonical_envelope(&envelope, &encoded_bytes)?;
         let payload = envelope.payload;
         validate_common(
             &payload.operation,
@@ -708,10 +716,9 @@ impl<'a> CloneCursorCodecV1<'a> {
         query_descriptor: &ManifestDigest,
         now: UtcMicros,
     ) -> Result<CloneRedundancyCursorV2, CloneCursorErrorV1> {
-        let envelope = decode_envelope_with_prefix::<AuthenticatedCloneRedundancyCursorV2>(
-            encoded,
-            CLONE_REDUNDANCY_CURSOR_PREFIX_V2,
-        )?;
+        let (envelope, encoded_bytes) = decode_envelope_with_prefix::<
+            AuthenticatedCloneRedundancyCursorV2,
+        >(encoded, CLONE_REDUNDANCY_CURSOR_PREFIX_V2)?;
         let payload_bytes =
             serde_json::to_vec(&envelope.payload).map_err(|_| CloneCursorErrorV1::Invalid)?;
         self.verify(
@@ -719,6 +726,7 @@ impl<'a> CloneCursorCodecV1<'a> {
             &payload_bytes,
             &envelope.authentication,
         )?;
+        validate_canonical_envelope(&envelope, &encoded_bytes)?;
         let payload = envelope.payload;
         validate_common(
             &payload.operation,
@@ -863,14 +871,17 @@ fn encode_envelope_with_prefix<T: Serialize>(
     Ok(format!("{prefix}{}", hex::encode(bytes)))
 }
 
-fn decode_envelope<T>(encoded: &str) -> Result<T, CloneCursorErrorV1>
+fn decode_envelope<T>(encoded: &str) -> Result<(T, Vec<u8>), CloneCursorErrorV1>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
     decode_envelope_with_prefix(encoded, CLONE_CURSOR_PREFIX_V2)
 }
 
-fn decode_envelope_with_prefix<T>(encoded: &str, prefix: &str) -> Result<T, CloneCursorErrorV1>
+fn decode_envelope_with_prefix<T>(
+    encoded: &str,
+    prefix: &str,
+) -> Result<(T, Vec<u8>), CloneCursorErrorV1>
 where
     T: for<'de> Deserialize<'de> + Serialize,
 {
@@ -885,10 +896,19 @@ where
         return Err(CloneCursorErrorV1::Invalid);
     }
     let envelope = serde_json::from_slice::<T>(&bytes).map_err(|_| CloneCursorErrorV1::Invalid)?;
-    if serde_json::to_vec(&envelope).map_err(|_| CloneCursorErrorV1::Invalid)? != bytes {
+    Ok((envelope, bytes))
+}
+
+fn validate_canonical_envelope<T: Serialize>(
+    envelope: &T,
+    encoded_bytes: &[u8],
+) -> Result<(), CloneCursorErrorV1> {
+    // Run this only after MAC verification: a well-shaped payload edit is
+    // tampering even when its JSON encoder also changed object-key order.
+    if serde_json::to_vec(envelope).map_err(|_| CloneCursorErrorV1::Invalid)? != encoded_bytes {
         return Err(CloneCursorErrorV1::Invalid);
     }
-    Ok(envelope)
+    Ok(())
 }
 
 fn map_authority_error(error: QueryAuthorityErrorV1) -> CloneCursorErrorV1 {

@@ -18,31 +18,8 @@ pub(super) fn canonical_table_schema_sql(table: &str) -> Option<&'static str> {
 pub(super) async fn install_schema(
     conn: &(impl Executor + ?Sized),
 ) -> Result<(), GitCorrelationError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS git_history_index_staged_spans (
-            source_rowid INTEGER NOT NULL,
-            segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0),
-            boundary INTEGER NOT NULL CHECK(boundary IN (0, 1)),
-            branch TEXT,
-            timestamp INTEGER NOT NULL,
-            PRIMARY KEY(source_rowid, segment_ordinal, boundary),
-            FOREIGN KEY(source_rowid, segment_ordinal)
-                REFERENCES git_history_index_segments(source_rowid, ordinal)
-                ON DELETE CASCADE
-        );
-        CREATE TABLE IF NOT EXISTS git_history_index_staged_commits (
-            source_rowid INTEGER NOT NULL,
-            segment_ordinal INTEGER NOT NULL CHECK(segment_ordinal >= 0),
-            oid TEXT NOT NULL,
-            branch TEXT,
-            committed_at INTEGER NOT NULL,
-            PRIMARY KEY(source_rowid, segment_ordinal, oid),
-            FOREIGN KEY(source_rowid, segment_ordinal)
-                REFERENCES git_history_index_segments(source_rowid, ordinal)
-                ON DELETE CASCADE
-        );",
-    )
-    .await?;
+    conn.execute_batch(STAGED_SPANS_SCHEMA_SQL).await?;
+    conn.execute_batch(STAGED_COMMITS_SCHEMA_SQL).await?;
     Ok(())
 }
 

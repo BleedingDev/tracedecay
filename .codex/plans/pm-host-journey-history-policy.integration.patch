@@ -1,0 +1,291 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -92,6 +92,20 @@
+     maximum_warnings: 8,
+     maximum_extensions_per_candidate: 8,
+ };
++
++/// Content-free diagnostics for the isolated CLI journey, never a product API.
++#[cfg(feature = "test-helpers")]
++fn emit_host_history_recall_test_diagnostic(build: impl FnOnce() -> Value) {
++    if std::env::var_os("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS").as_deref()
++        != Some(std::ffi::OsStr::new("1"))
++    {
++        return;
++    }
++    let encoded = build().to_string();
++    if encoded.len() <= 4096 {
++        eprintln!("[tracedecay] event=host_history_recall_test_diagnostic {encoded}");
++    }
++}
+ 
+ /// Typed failure of mounting the recall port or minting a session port.
+ #[derive(Debug, thiserror::Error)]
+@@ -495,6 +509,16 @@
+         transaction
+             .commit()
+             .map_err(RecallAdmissionLedgerError::Sqlite)?;
++        #[cfg(feature = "test-helpers")]
++        emit_host_history_recall_test_diagnostic(|| {
++            let mut reasons = BTreeMap::<&str, usize>::new();
++            for denied in &report.denied {
++                *reasons.entry(denied.reason.label()).or_default() += 1;
++            }
++            json!({"phase":"admission", "received":report.received_count,
++                "admitted":report.admitted_count, "denied":report.denied.len(),
++                "degraded":report.degraded, "denial_reasons":reasons})
++        });
+         Ok(RecallAdmissionLedgerWriteV1::Recorded)
+     }
+ 
+@@ -627,6 +651,30 @@
+         transaction
+             .commit()
+             .map_err(RecallAdmissionLedgerError::Sqlite)?;
++        #[cfg(feature = "test-helpers")]
++        emit_host_history_recall_test_diagnostic(|| {
++            let mut reasons = BTreeMap::<&str, usize>::new();
++            for item in &trace.items {
++                let code = match &item.host_decision {
++                    RecallExplainHostDecisionV1::HostWithheld { reason_code, .. } => {
++                        match reason_code.as_str() {
++                            "content_not_inline" => "content_not_inline",
++                            "provenance_claimed_unconfirmed" => "provenance_claimed_unconfirmed",
++                            "provenance_redacted" => "provenance_redacted",
++                            "provenance_unresolvable" => "provenance_unresolvable",
++                            "provenance_unknown" => "provenance_unknown",
++                            _ => "other_host_withheld",
++                        }
++                    }
++                    decision => decision.code(),
++                };
++                *reasons.entry(code).or_default() += 1;
++            }
++            let stages: BTreeMap<_, _> = trace.stage_counts().into_iter().collect();
++            json!({"phase":"trace", "received":trace.requested_count,
++                "items":trace.items.len(), "degraded":trace.degraded,
++                "stage_counts":stages, "reason_counts":reasons})
++        });
+         Ok(RecallAdmissionLedgerWriteV1::Recorded)
+     }
+ 
+@@ -1398,6 +1446,13 @@
+             .await?;
+         let partial_coverage =
+             page.has_more || page.has_older || page.withheld > 0 || page.unknown_revision > 0;
++        #[cfg(feature = "test-helpers")]
++        emit_host_history_recall_test_diagnostic(|| {
++            json!({"phase":"history_selection", "scanned":page.scanned,
++                "withheld":page.withheld, "unknown_revision":page.unknown_revision,
++                "has_older":page.has_older, "has_more":page.has_more,
++                "partial_coverage":partial_coverage})
++        });
+         tracing::debug!(
+             provider = selected.authority.provider_id.as_str(),
+             scanned = page.scanned,
+diff --git a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
+@@ -244,12 +244,47 @@
+             .expect("isolated daemon log");
+         let mut daemon = self
+             .cli(&["daemon", "run"])
++            .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
+             .stdout(Stdio::null())
+             .stderr(Stdio::from(log))
+             .spawn()
+             .expect("daemon should start");
+         wait_for_authority(&mut daemon, &daemon_authority_path(&self.profile));
+         self.daemon = Some(daemon);
++    }
++
++    /// Invoked only while formatting a failed populated-recall assertion.
++    /// Reads opt-in host counters, never ledger tables or raw log content.
++    fn native_recall_failure_diagnostics(&self) -> Value {
++        if self.active_provider != ActiveProvider::Native {
++            return Value::Null;
++        }
++        let missing = || json!({"availability":"no_readable_opt_in_diagnostics"});
++        let Ok(mut log) = fs::File::open(self.home.path().join("daemon.stderr.log")) else {
++            return missing();
++        };
++        let Ok(metadata) = log.metadata() else {
++            return missing();
++        };
++        let offset = metadata.len().saturating_sub(64 * 1024);
++        if std::io::Seek::seek(&mut log, std::io::SeekFrom::Start(offset)).is_err() {
++            return missing();
++        }
++        let mut tail = Vec::new();
++        if log.take(64 * 1024).read_to_end(&mut tail).is_err() {
++            return missing();
++        }
++        let summaries = String::from_utf8_lossy(&tail)
++            .lines()
++            .rev()
++            .filter_map(recall_diagnostic_summary)
++            .take(12)
++            .collect::<Vec<_>>();
++        if summaries.is_empty() {
++            missing()
++        } else {
++            json!({"order":"newest_first", "events":summaries})
++        }
+     }
+ 
+     fn stop_daemon(&mut self) {
+@@ -618,7 +653,14 @@
+             MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+             json!({
+                 "kind": "text",
+-                "value": json!({ "active_provider": self.active_provider.id() }).to_string(),
++                "value": json!({
++                    "active_provider": self.active_provider.id(),
++                    "degradation": {
++                        "policy_id": "policy.host-cli-journey.history.v1",
++                        "policy_revision": 1,
++                        "allowed_causes": ["partial", "stale"],
++                    },
++                }).to_string(),
+             }),
+             "configuration.idempotency.claude-cli-journey-routing",
+         );
+@@ -1511,6 +1553,74 @@
+         .cloned()
+ }
+ 
++/// Reconstruct only bounded counter fields from the dedicated host marker.
++fn recall_diagnostic_summary(line: &str) -> Option<Value> {
++    let encoded = line.strip_prefix("[tracedecay] event=host_history_recall_test_diagnostic ")?;
++    if encoded.len() > 4096 {
++        return None;
++    }
++    let value: Value = serde_json::from_str(encoded).ok()?;
++    let phase = value["phase"].as_str()?;
++    let (numbers, flags, maps): (&[&str], &[&str], &[&str]) = match phase {
++        "admission" => (
++            &["received", "admitted", "denied"],
++            &["degraded"],
++            &["denial_reasons"],
++        ),
++        "trace" => (
++            &["received", "items"],
++            &["degraded"],
++            &["stage_counts", "reason_counts"],
++        ),
++        "history_selection" => (
++            &["scanned", "withheld", "unknown_revision"],
++            &["has_older", "has_more", "partial_coverage"],
++            &[],
++        ),
++        _ => return None,
++    };
++    let mut summary = serde_json::Map::new();
++    summary.insert("phase".into(), json!(phase));
++    for field in numbers {
++        summary.insert((*field).into(), json!(value[*field].as_u64()?));
++    }
++    for field in flags {
++        summary.insert((*field).into(), json!(value[*field].as_bool()?));
++    }
++    for field in maps {
++        let counters = value[*field].as_object()?;
++        if counters.len() > 32 {
++            return None;
++        }
++        let mut bounded = serde_json::Map::new();
++        for (label, count) in counters {
++            if label.is_empty()
++                || label.len() > 64
++                || !label
++                    .bytes()
++                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
++            {
++                return None;
++            }
++            bounded.insert(label.clone(), json!(count.as_u64()?));
++        }
++        summary.insert((*field).into(), Value::Object(bounded));
++    }
++    Some(Value::Object(summary))
++}
++
++/// The pinned history policy allows useful Partial/Stale evidence. Keep the
++/// actual returned label; an accepted degraded answer is not a complete answer.
++fn assert_history_degradation(lane: &Value) {
++    let degradation = lane
++        .get("degradation")
++        .expect("an answered lane must retain its actual degradation metadata");
++    assert!(
++        degradation.is_null() || matches!(degradation.as_str(), Some("partial" | "stale")),
++        "the history journey only permits its pinned Partial/Stale degradations: {lane}"
++    );
++}
++
+ fn journey_task() -> String {
+     format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?")
+ }
+@@ -1846,7 +1956,7 @@
+         let lane = advisory_lane(&answer).expect("Native canonical fact recall lane");
+         assert_eq!(lane["state"], "answered", "{lane}");
+         assert_eq!(lane["provider_id"], CONFIGURED_PROVIDER_ID);
+-        assert_eq!(lane["degradation"], Value::Null, "{lane}");
++        assert_history_degradation(&lane);
+         let expected = format!("cited source record:{fact_id}");
+         let selected = lane["candidates"]
+             .as_array()
+@@ -1857,7 +1967,8 @@
+         assert_eq!(
+             selected.len(),
+             1,
+-            "the host must confirm this exact fact once: {lane}"
++            "the host must confirm this exact fact once: {lane}; bounded Native diagnostics: {}",
++            journey.native_recall_failure_diagnostics()
+         );
+         assert!(
+             selected[0]["content"]
+@@ -2265,11 +2376,7 @@
+         lane["state"], "answered",
+         "the advisory lane must answer rather than report a refusal: {lane}"
+     );
+-    assert_eq!(
+-        lane["degradation"],
+-        Value::Null,
+-        "a healthy route reports no degradation: {lane}"
+-    );
++    assert_history_degradation(&lane);
+     assert_eq!(
+         lane["provider_id"],
+         journey.active_provider.id(),
+@@ -2279,7 +2386,8 @@
+     assert_eq!(
+         candidates.len(),
+         2 * ROWS_PER_TURN,
+-        "the healthy journey must recall every admitted Claude message exactly once: {lane}"
++        "the healthy journey must recall every admitted Claude message exactly once: {lane}; bounded Native diagnostics: {}",
++        journey.native_recall_failure_diagnostics()
+     );
+     let retained_sources = assert_recalled_history_deliveries(
+         journey,
+@@ -2376,3 +2484,20 @@
+     identities.sort();
+     identities
+ }
++
++#[test]
++fn recall_failure_diagnostics_keep_only_bounded_counter_metadata() {
++    let marker = "[tracedecay] event=host_history_recall_test_diagnostic ";
++    let line = format!(
++        "{marker}{}",
++        json!({"phase":"admission", "received":4, "admitted":0,
++        "denied":4, "degraded":true, "denial_reasons":{"unknown_validity":4},
++        "request_id":"private-request", "content":"private-content"})
++    );
++    let summary = recall_diagnostic_summary(&line).expect("bounded host counters");
++    assert_eq!(summary["received"], 4);
++    assert_eq!(summary["denial_reasons"]["unknown_validity"], 4);
++    assert!(!summary.to_string().contains("private"));
++    assert!(recall_diagnostic_summary("unrelated private daemon line").is_none());
++    assert!(recall_diagnostic_summary(&format!("{marker}{}", "x".repeat(4097))).is_none());
++}

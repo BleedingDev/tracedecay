@@ -281,6 +281,8 @@ const MCP_TOOL_BINDING_SPECS: &[McpToolBinding] = &[
     McpToolBinding { name: "tracedecay_admin_cli", group: Some(McpToolDispatchGroup::Admin), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_admin_project", group: Some(McpToolDispatchGroup::Admin), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_dead_code", group: Some(McpToolDispatchGroup::Analysis), project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_unused_imports", group: Some(McpToolDispatchGroup::Analysis), project: RegisteredProjectAccess::ActiveProjectOnly },
+    McpToolBinding { name: "tracedecay_simplify_scan", group: Some(McpToolDispatchGroup::Analysis), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_circular", group: Some(McpToolDispatchGroup::Analysis), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_hotspots", group: Some(McpToolDispatchGroup::Analysis), project: RegisteredProjectAccess::ActiveProjectOnly },
     McpToolBinding { name: "tracedecay_unmounted_files", group: Some(McpToolDispatchGroup::Analysis), project: RegisteredProjectAccess::ActiveProjectOnly },
@@ -1032,6 +1034,22 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "a tool name is bound twice");
+    }
+
+    #[test]
+    fn dispatch_catalog_covers_every_maximal_public_definition() {
+        let catalog = mcp_dispatch_catalog().unwrap();
+        let missing = crate::get_maximal_tool_definitions()
+            .unwrap()
+            .into_iter()
+            .filter(|definition| catalog.contract(&definition.name).is_none())
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+
+        assert!(
+            missing.is_empty(),
+            "advertised MCP tools have no dispatch contract: {missing:?}"
+        );
     }
 
     #[test]

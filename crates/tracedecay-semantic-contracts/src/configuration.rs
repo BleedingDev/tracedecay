@@ -1,7 +1,6 @@
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tracedecay_domain::canonical_text::default_true;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{
     ComponentRevision, EmbeddingDocumentCompositionV1, ManifestDigest, host_cpu_target,
@@ -9,10 +8,9 @@ use tracedecay_domain::{
 
 use crate::manifest::ResourceCeilingV1;
 
-/// Catalog ids of the shipped embedding models. These name the catalog
-/// entries; whether a `selected_model` is actually cataloged is decided by
-/// the production catalog in `tracedecay-semantic`, not here — settings
-/// validation is provider-free and structural only.
+/// Catalog id of the one embedding model admitted by final-V2 configuration.
+/// Artifact identity, installation and activation remain owned by the model
+/// catalog and lifecycle rather than copied into configuration.
 pub const DEFAULT_FASTEMBED_MODEL_ID: &str = "JinaEmbeddingsV2BaseCode";
 /// Catalog id of the Model2Vec static code-embedding model.
 pub const MODEL2VEC_POTION_CODE_16M_V2_MODEL_ID: &str = "PotionCode16MV2";
@@ -162,108 +160,60 @@ pub struct RerankCompatibilityPinsV1 {
     pub runtime_compatibility_digest: ManifestDigest,
 }
 
-impl SemanticProfileSelection {
-    fn validate(&self) -> Result<()> {
-        self.accepted_profile_digest
-            .validate()
-            .map_err(|error| config_error(format!("semantic accepted profile digest: {error}")))?;
-        if self.profile_id.trim().is_empty() || self.profile_id.len() > 128 {
-            return Err(config_error(
-                "semantic profile_id must be non-empty and at most 128 bytes",
-            ));
-        }
-        if self.artifact_digest.len() != 64
-            || !self
-                .artifact_digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(config_error(
-                "semantic artifact_digest must be 64 lowercase hexadecimal characters",
-            ));
-        }
-        if !self.artifact_path.is_absolute()
-            || self
-                .artifact_path
-                .components()
-                .any(|component| matches!(component, Component::ParentDir))
-        {
-            return Err(config_error(
-                "semantic artifact_path must be an absolute normalized local path",
-            ));
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticConfig {
-    #[serde(default = "default_selected_fastembed_model")]
-    pub selected_model: Option<String>,
-    #[serde(default = "default_true")]
+    /// Whether the optional exact-flat CPU semantic lane is admitted for this
+    /// project. The only enabled model is the immutable shipped CPU Jina
+    /// catalog entry; configuration never selects a parallel model authority.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether project open may queue acquisition in the background. Query
+    /// execution never downloads model bytes.
+    #[serde(default)]
     pub auto_download: bool,
     #[serde(default)]
-    pub active_profile: Option<SemanticProfileSelection>,
-    #[serde(default)]
-    pub rollback_profile: Option<SemanticProfileSelection>,
-    #[serde(default)]
     pub resources: SemanticResourceCeilings,
-    /// How each chunk's embedding input is composed. Projection identity: a
-    /// change re-projects every generation under a new projection key, so the
-    /// header composition stays a measured candidate until the search-quality
-    /// harness has compared it against `SanitizedText`.
-    #[serde(default)]
+    /// How each chunk's embedding input is composed. This is projection
+    /// identity: changing it re-projects every generation under a new key.
+    /// The symbol context header is the measured CPU Jina production default
+    /// because it preserves exact symbol identity in the embedding input.
+    #[serde(default = "default_document_composition")]
     pub document_composition: EmbeddingDocumentCompositionV1,
 }
 
-fn default_selected_fastembed_model() -> Option<String> {
-    Some(DEFAULT_FASTEMBED_MODEL_ID.to_owned())
+fn default_document_composition() -> EmbeddingDocumentCompositionV1 {
+    EmbeddingDocumentCompositionV1::SymbolContextHeader
 }
 
 impl Default for SemanticConfig {
     fn default() -> Self {
         Self {
-            selected_model: default_selected_fastembed_model(),
-            auto_download: true,
-            active_profile: None,
-            rollback_profile: None,
+            enabled: false,
+            auto_download: false,
             resources: SemanticResourceCeilings::default(),
-            document_composition: EmbeddingDocumentCompositionV1::SanitizedText,
+            document_composition: default_document_composition(),
         }
     }
 }
 
 impl SemanticConfig {
-    /// Structural validation only: model-id shape, resource ceilings, profile
-    /// selection shape, and rollback invariants. Catalog membership of
-    /// `selected_model` is admitted where the catalog is declared
-    /// (`tracedecay-semantic`), so adding a model edits one declaration.
+    /// The one model selection admitted by this final-V2 configuration.
+    /// Lifecycle state owns the installed artifact and active/rollback
+    /// pointers; this setting only admits or disables the semantic lane.
+    #[must_use]
+    pub fn effective_model_id(&self) -> Option<&'static str> {
+        self.enabled.then_some(DEFAULT_FASTEMBED_MODEL_ID)
+    }
+
+    /// Structural validation of the runtime resource bounds.
     pub fn validate(&self) -> Result<()> {
+        if self.auto_download && !self.enabled {
+            return Err(config_error(
+                "semantic auto_download requires the semantic runtime to be enabled",
+            ));
+        }
         validate_semantic_resource_ceilings(self.resources)?;
-        if let Some(model_id) = self.selected_model.as_ref()
-            && (model_id.trim().is_empty() || model_id.len() > 128)
-        {
-            return Err(config_error(
-                "semantic selected_model must be a non-empty catalog id at most 128 bytes",
-            ));
-        }
-        if let Some(active) = self.active_profile.as_ref() {
-            active.validate()?;
-        }
-        if let Some(rollback) = self.rollback_profile.as_ref() {
-            rollback.validate()?;
-            if self.active_profile.is_none() {
-                return Err(config_error(
-                    "semantic rollback profile requires an active profile",
-                ));
-            }
-        }
-        if self.active_profile == self.rollback_profile && self.active_profile.is_some() {
-            return Err(config_error(
-                "semantic active and rollback profiles must be distinct",
-            ));
-        }
         Ok(())
     }
 }

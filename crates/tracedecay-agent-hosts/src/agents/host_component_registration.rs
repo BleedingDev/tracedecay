@@ -1688,8 +1688,7 @@ impl crate::agents::host_bundle::HostComponentSetRegistrationV1
         // foreign/malformed paths for Doctor remediation.
         if self.integration.id() == "cursor"
             && component_set.components.iter().any(|component| {
-                component.manifest.component
-                    == crate::agents::host_bundle::HostBundleComponentV1::Agent
+                component.manifest.component == crate::agents::host_bundle::HostComponentV1::Agent
             })
         {
             crate::agents::cursor::sweep_stale_cursor_native_extension_dirs(&self.context.home)

@@ -118,6 +118,7 @@ pub(super) async fn converge_released_project_schema(conn: &(impl Executor + Syn
     crate::db::retrieval_anchor_schema::install_retrieval_anchor_schema(conn, OPERATION).await?;
     crate::db::memory_v2::create_schema(conn, OPERATION).await?;
     crate::db::external_source::install_external_source_schema(conn, OPERATION).await?;
+    super::install_vector_authority_schema(conn, OPERATION).await?;
     if has_retired_external_sources {
         migrate_external_source(conn).await?;
     }

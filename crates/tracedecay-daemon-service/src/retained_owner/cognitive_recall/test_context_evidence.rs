@@ -225,6 +225,7 @@ pub fn native_cognitive_recall_mount_for_test(
         routing,
         host_limits: super::super::native_provider::native_provider_limits(),
         invocation_boundary,
+        native_session_retrieval_mount: None,
         locator_key: super::control_attribution::RecallLocatorKeyV1::for_test(),
     })
     .map_err(|error| format!("mount Native cognitive recall test route: {error}"))?;
@@ -387,7 +388,7 @@ pub fn read_retained_context_trace_for_test(
         let item_bytes = serde_json::to_vec(&item)?;
         let expected_item_mac = retained_item_bytes_mac(
             &locator_key,
-            scope_sha256,
+            &scope_sha256,
             reference.trace_id(),
             scope.provider_id.as_str(),
             scope.registration_revision,
@@ -428,7 +429,7 @@ pub fn read_retained_context_trace_for_test(
         || trace_mac
             != retained_trace_bytes_mac(
                 &locator_key,
-                scope_sha256,
+                &scope_sha256,
                 reference.trace_id(),
                 scope.provider_id.as_str(),
                 scope.registration_revision,

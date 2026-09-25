@@ -1,0 +1,46 @@
+--- a/crates/tracedecay-sessions/src/runtime/hosts/codex/observation.rs
++++ b/crates/tracedecay-sessions/src/runtime/hosts/codex/observation.rs
+@@ -701,7 +701,10 @@
+     let native_thread_id = parsed_meta.native_thread_id.clone();
+     let meta = parsed_meta.meta.clone();
+     if !admission_scope.accepts_session(&meta.session_id) {
+-        return Ok(CodexJsonlAdmissionProgress::default());
++        return Ok(CodexJsonlAdmissionProgress {
++            source_deferred: sealed_source.is_some(),
++            ..CodexJsonlAdmissionProgress::default()
++        });
+     }
+     let ordinary_source = ObservationSourceIdentityV1::for_provider(
+         ProviderId::new(PROVIDER)?,
+--- a/crates/tracedecay-sessions/src/runtime/observation/jsonl_observation_admission/tests.rs
++++ b/crates/tracedecay-sessions/src/runtime/observation/jsonl_observation_admission/tests.rs
+@@ -1858,6 +1858,7 @@
+         "fingerprint",
+         "source",
+         "scope",
++        "session",
+         "cancelled",
+     ] {
+         let (temp, path, _) = rollout_fixture();
+@@ -1884,7 +1885,7 @@
+                     crate::runtime::codex::codex_observation_source_v2("another-session").unwrap()
+             }
+             "scope" => bound.scope = ObservationScopeV1::Profile,
+-            "cancelled" => {}
++            "session" | "cancelled" => {}
+             _ => unreachable!(),
+         }
+         let spy = SeamSpyAdmission::default();
+@@ -1896,7 +1897,11 @@
+             &bound,
+             &project,
+             project_id.clone(),
+-            SESSION_ID,
++            if refusal == "session" {
++                "another-session"
++            } else {
++                SESSION_ID
++            },
+             &spy,
+             None,
+             &cancellation,

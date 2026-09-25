@@ -110,6 +110,7 @@ impl Drop for HookReplaySweepObservation {
 #[hotpath::measure(label = "daemon.hook_replay.sweep", future = true)]
 async fn drain_all_hosts(
     graph: &crate::project::TraceDecay,
+    server: &Arc<crate::mcp::McpServer>,
     data_root: &Path,
     delivery_settlements: &tracedecay_application::observability::DeliverySettlementAuthorityV1,
     project_sessions: &tracedecay_global_db::RegisteredGlobalDb,
@@ -160,6 +161,7 @@ async fn drain_all_hosts(
             worktree_id,
             now,
             graph,
+            server,
             project_sessions,
             background_cpu,
         ))
@@ -186,6 +188,7 @@ async fn drain_admitted_host_spool(
     worktree_id: [u8; 16],
     now: UtcMicros,
     graph: &crate::project::TraceDecay,
+    server: &Arc<crate::mcp::McpServer>,
     project_sessions: &tracedecay_global_db::RegisteredGlobalDb,
     background_cpu: &Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
 ) -> Option<HookReplayPassReportV1> {
@@ -225,7 +228,14 @@ async fn drain_admitted_host_spool(
                             .await
                         },
                         |envelope, native_session_id| async move {
-                            admit_hook_v2_replayed_envelope_with_lifecycle(
+                            let is_session_start = matches!(
+                                &envelope.event,
+                                tracedecay_hooks::HookEventV2::SessionBoundary {
+                                    boundary: tracedecay_hooks::HookBoundaryV1::Start,
+                                }
+                            );
+                            let session_route_id = native_session_id.clone();
+                            let outcome = admit_hook_v2_replayed_envelope_with_lifecycle(
                                 graph,
                                 &envelope,
                                 native_session_id,
@@ -234,7 +244,28 @@ async fn drain_admitted_host_spool(
                                 background_cpu,
                                 hook_replay_now(),
                             )
-                            .await
+                            .await;
+                            if matches!(
+                                &outcome,
+                                HookV2AdmissionOutcomeV1::Admitted { .. }
+                                    | HookV2AdmissionOutcomeV1::ExactDuplicate { .. }
+                            ) && is_session_start
+                            {
+                                let Some(session_id) = session_route_id else {
+                                    return HookV2AdmissionOutcomeV1::Backpressured;
+                                };
+                                if server
+                                    .publish_hook_v2_session_route(
+                                        graph.project_root(),
+                                        session_id.as_str(),
+                                    )
+                                    .await
+                                    .is_err()
+                                {
+                                    return HookV2AdmissionOutcomeV1::Backpressured;
+                                }
+                            }
+                            outcome
                         },
                     )
                     .await,
@@ -258,6 +289,7 @@ fn hook_replay_now() -> UtcMicros {
 
 struct RegisteredReplayConsumer {
     graph: Weak<crate::project::TraceDecay>,
+    server: Arc<StdMutex<Weak<crate::mcp::McpServer>>>,
     delivery_settlements:
         Weak<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -272,7 +304,12 @@ fn registered_replay_roots() -> &'static StdMutex<BTreeMap<PathBuf, RegisteredRe
 pub(crate) fn hook_v2_replay_consumer_registered(data_root: &Path) -> bool {
     registered_replay_roots().lock().is_ok_and(|roots| {
         roots.get(data_root).is_some_and(|consumer| {
-            consumer.graph.upgrade().is_some() && consumer.delivery_settlements.upgrade().is_some()
+            consumer.graph.upgrade().is_some()
+                && consumer
+                    .server
+                    .lock()
+                    .is_ok_and(|server| server.upgrade().is_some())
+                && consumer.delivery_settlements.upgrade().is_some()
         })
     })
 }
@@ -281,25 +318,31 @@ pub(crate) fn hook_v2_replay_consumer_registered(data_root: &Path) -> bool {
 /// Returns `false` when one is already running for this root.
 pub(crate) fn register_hook_v2_replay_consumer(
     graph: Arc<crate::project::TraceDecay>,
+    server: &Arc<crate::mcp::McpServer>,
     delivery_settlements: Arc<tracedecay_application::observability::DeliverySettlementAuthorityV1>,
     project_sessions: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     background_cpu: Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>,
 ) -> bool {
     let data_root = graph.hook_store_layout().data_root.clone();
     let graph = Arc::downgrade(&graph);
+    let server = Arc::downgrade(server);
     let delivery_settlements = Arc::downgrade(&delivery_settlements);
     match registered_replay_roots().lock() {
         Ok(mut roots) => {
-            if roots.get(&data_root).is_some_and(|consumer| {
-                consumer.graph.upgrade().is_some()
-                    && consumer.delivery_settlements.upgrade().is_some()
-            }) {
+            if let Some(consumer) = roots.get(&data_root)
+                && consumer.graph.upgrade().is_some()
+                && consumer.delivery_settlements.upgrade().is_some()
+                && let Ok(mut current_server) = consumer.server.lock()
+            {
+                *current_server = server;
                 return false;
             }
+            let server = Arc::new(StdMutex::new(server));
             roots.insert(
                 data_root.clone(),
                 RegisteredReplayConsumer {
                     graph: graph.clone(),
+                    server: server.clone(),
                     delivery_settlements: delivery_settlements.clone(),
                     task: None,
                 },
@@ -309,18 +352,38 @@ pub(crate) fn register_hook_v2_replay_consumer(
     }
     let task_data_root = data_root.clone();
     let task_graph = graph.clone();
+    let task_server = registered_replay_roots().lock().ok().and_then(|roots| {
+        roots
+            .get(&data_root)
+            .map(|consumer| Arc::clone(&consumer.server))
+    });
+    let Some(task_server) = task_server else {
+        return false;
+    };
     let task_delivery_settlements = delivery_settlements.clone();
     let task_project_sessions = project_sessions;
     let task_background_cpu = background_cpu;
     let task = tokio::spawn(async move {
         loop {
-            let (Some(graph_owner), Some(delivery_settlements)) =
-                (task_graph.upgrade(), task_delivery_settlements.upgrade())
-            else {
+            let Some(graph_owner) = task_graph.upgrade() else {
                 break;
+            };
+            let Some(delivery_settlements) = task_delivery_settlements.upgrade() else {
+                break;
+            };
+            let Some(server) = task_server.lock().ok().and_then(|server| server.upgrade()) else {
+                drop(graph_owner);
+                drop(delivery_settlements);
+                hotpath::future!(
+                    tokio::time::sleep(REPLAY_INTERVAL),
+                    label = "daemon.hook_replay.interval_wait"
+                )
+                .await;
+                continue;
             };
             Box::pin(drain_all_hosts(
                 &graph_owner,
+                &server,
                 &task_data_root,
                 delivery_settlements.as_ref(),
                 &task_project_sessions,
@@ -328,6 +391,7 @@ pub(crate) fn register_hook_v2_replay_consumer(
             ))
             .await;
             drop(graph_owner);
+            drop(server);
             drop(delivery_settlements);
             // Retained records wait exactly this interval for their next
             // delivery attempt; keep the pacing WAIT separate from sweep WORK.

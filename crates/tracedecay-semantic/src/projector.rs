@@ -1,5 +1,5 @@
 //! Consumes query fallback's canonical, generation-bound chunks and emits
-//! Plan 25 projection receipts plus a store-neutral vector-generation handoff.
+//! canonical projection receipts plus a store-neutral vector-generation handoff.
 //! It owns no scheduler, query path, profile activation, ANN, or quantization.
 
 #![forbid(unsafe_code)]
@@ -7,18 +7,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracedecay_domain::{
-    AdmittedEmbeddingProjectionKeyV1, ChangedCodeChunkSetV1, ChangedCodeChunkV1, CodeGenerationId,
-    CodeSearchChunkId, CodeSearchChunkV1, ContentDigest, EmbeddingProjectionKeyV1, ManifestDigest,
-    ProjectionBatchReceiptV1, ProjectionBatchRequestV1, ProjectionKeyV1, ProjectionOperationV1,
-    ProjectionOutcomeV1,
+    AdmittedEmbeddingProjectionKeyV1, ChangedCodeChunkSetV1, ChangedCodeChunkV1, CodeSearchChunkId,
+    CodeSearchChunkV1, ContentDigest, EmbeddingProjectionKeyV1, ProjectionBatchRequestV1,
+    ProjectionKeyV1, ProjectionOperationV1, ProjectionOutcomeV1,
 };
 
 use tracedecay_code_index::projection::{
     ChunkProjectionDecisionV1, ProjectionReceiptErrorV1, build_batch_receipt,
     expected_request_digest, verify_batch_receipt,
+};
+pub use tracedecay_vector_authority::{
+    PreparedVectorGenerationV1, ProjectedChunkVectorV1, VectorTombstoneV1,
 };
 
 /// How many encoder groups the projector keeps in flight at once, per unit of
@@ -136,78 +137,6 @@ pub enum SemanticProjectionErrorV1 {
     Receipt(#[from] ProjectionReceiptErrorV1),
 }
 
-/// One immutable vector row prepared from a canonical chunk.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectedChunkVectorV1 {
-    pub projection_key: ProjectionKeyV1,
-    pub source_generation: CodeGenerationId,
-    pub source_manifest_digest: ManifestDigest,
-    pub chunk_id: CodeSearchChunkId,
-    pub chunk_digest: ContentDigest,
-    pub values: Vec<f32>,
-    pub output_digest: ContentDigest,
-}
-
-impl ProjectedChunkVectorV1 {
-    fn new(
-        projection_key: ProjectionKeyV1,
-        source_generation: CodeGenerationId,
-        source_manifest_digest: ManifestDigest,
-        chunk: &CodeSearchChunkV1,
-        values: Vec<f32>,
-        dimensions: u32,
-    ) -> Result<Self, SemanticProjectionErrorV1> {
-        validate_vector(&chunk.id, &values, dimensions)?;
-        let output_digest =
-            vector_output_digest(&projection_key, &chunk.id, &chunk.content_digest, &values)?;
-        Ok(Self {
-            projection_key,
-            source_generation,
-            source_manifest_digest,
-            chunk_id: chunk.id.clone(),
-            chunk_digest: chunk.content_digest.clone(),
-            values,
-            output_digest,
-        })
-    }
-
-    pub fn validate(&self, dimensions: u32) -> Result<(), SemanticProjectionErrorV1> {
-        validate_vector(&self.chunk_id, &self.values, dimensions)?;
-        let expected = vector_output_digest(
-            &self.projection_key,
-            &self.chunk_id,
-            &self.chunk_digest,
-            &self.values,
-        )?;
-        if self.output_digest != expected {
-            return Err(SemanticProjectionErrorV1::VectorDigestMismatch {
-                chunk_id: self.chunk_id.clone(),
-            });
-        }
-        Ok(())
-    }
-}
-
-/// Deletion evidence carried into the immutable vector-generation manifest.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct VectorTombstoneV1 {
-    pub chunk_id: CodeSearchChunkId,
-    pub prior_chunk_digest: ContentDigest,
-}
-
-/// Store-neutral handoff for one complete Plan 25 projection batch.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedVectorGenerationV1 {
-    pub embedding_key: AdmittedEmbeddingProjectionKeyV1,
-    pub request: ProjectionBatchRequestV1,
-    pub receipt: ProjectionBatchReceiptV1,
-    pub vectors: Vec<ProjectedChunkVectorV1>,
-    pub tombstones: Vec<VectorTombstoneV1>,
-}
-
 /// Project one bounded request from canonical chunks. Only explicit
 /// `added_or_changed` chunks are supplied to the encoder. Projection-profile
 /// changes arrive pre-expanded with every current chunk in that partition and
@@ -288,14 +217,16 @@ pub fn prepare_vector_generation<E: CanonicalChunkVectorEncoderV1>(
         &chunks,
         |chunk_id| SemanticProjectionErrorV1::CanonicalChunkSetMismatch(chunk_id.clone()),
         |change, chunk, values| {
+            validate_vector(&chunk.id, &values, embedding_key.dimensions)?;
             let vector = ProjectedChunkVectorV1::new(
-                target_key.clone(),
+                admitted_projection,
                 request.changes.to_generation.clone(),
                 request.changes.manifest_digest.clone(),
-                chunk,
+                chunk.id.clone(),
+                chunk.content_digest.clone(),
                 values,
-                embedding_key.dimensions,
-            )?;
+            )
+            .map_err(|error| SemanticProjectionErrorV1::Contract(error.to_string()))?;
             decisions.push(ChunkProjectionDecisionV1 {
                 chunk_id: change.chunk_id.clone(),
                 prior_chunk_digest: change.prior_digest.clone(),
@@ -949,12 +880,13 @@ pub fn vector_output_digest(
 mod encoder_group_tests {
     use super::*;
     use tracedecay_domain::{
-        BoundedSanitizedText, ChunkerRevision, CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1,
-        EmbeddingDeviceClassV1, EmbeddingDocumentCompositionV1, EmbeddingExecutionProviderV1,
-        EmbeddingMetricV1, EmbeddingNormalizationV1, EmbeddingPoolingV1, EmbeddingPrecisionV1,
-        EmbeddingTruncationSideV1, FileOccurrenceId, LanguageDescriptorRevision, ManifestDigest,
-        PolicyRevisionId, PrivacyDomainId, ProjectionReplayReasonV1, SanitizerRevision,
-        SensitivityDecision, SensitivityLevelV1, SourceSpan,
+        BoundedSanitizedText, ChunkerRevision, CodeGenerationId, CodeSearchChunkAnchorV1,
+        CodeSearchChunkGrainV1, EmbeddingDeviceClassV1, EmbeddingDocumentCompositionV1,
+        EmbeddingExecutionProviderV1, EmbeddingMetricV1, EmbeddingNormalizationV1,
+        EmbeddingPoolingV1, EmbeddingPrecisionV1, EmbeddingTruncationSideV1, FileOccurrenceId,
+        LanguageDescriptorRevision, ManifestDigest, PolicyRevisionId, PrivacyDomainId,
+        ProjectionReplayReasonV1, SanitizerRevision, SensitivityDecision, SensitivityLevelV1,
+        SourceSpan,
     };
 
     const BATCH_SIZE: u32 = 32;

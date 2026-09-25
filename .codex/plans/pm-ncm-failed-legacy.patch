@@ -1,0 +1,179 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -274,6 +274,7 @@
+     active: bool,
+     identity_missing: bool,
+     preserve_state: bool,
++    retain_failed_legacy_evidence: bool,
+     final_confirmed: bool,
+     events: Vec<Value>,
+ }
+@@ -403,7 +404,7 @@
+         for worker in &workers {
+             let state = worker.state.lock().expect("worker cleanup state");
+             *preserve_roots.entry(worker.root.clone()).or_default() |=
+-                state.preserve_state || !confirmed;
++                state.preserve_state || state.retain_failed_legacy_evidence || !confirmed;
+         }
+         // Aggregate every physical owner of a scenario before removing its
+         // root, including replaced owners from FreshNamespace.
+@@ -416,7 +417,9 @@
+             .map(|worker| {
+                 let state = worker.state.lock().expect("worker cleanup state");
+                 json!({"root": worker.root, "final_confirmed": state.final_confirmed,
+-                "state_preserved": worker.root.exists(), "events": state.events})
++                "state_preserved": worker.root.exists(),
++                "intentional_failed_legacy_evidence": state.retain_failed_legacy_evidence,
++                "events": state.events})
+             })
+             .collect();
+         json!({"confirmed": confirmed, "unconfirmed_workers": unconfirmed_workers,
+@@ -868,12 +871,13 @@
+             );
+         }
+         let database = self.namespace_database();
+-        let metadata = sqlite_json(
++        let mut sqlite_evidence = Vec::new();
++        let metadata = self.legacy_sqlite_json(
+             &database,
++            "schema_version",
+             "SELECT CAST(value AS TEXT) AS schema_version FROM meta WHERE key = 'schema_version';",
+-            true,
+             deadline,
+-            &self.cleanup,
++            &mut sqlite_evidence,
+         )?;
+         if metadata.len() != 1 || metadata[0]["schema_version"] != "1" {
+             return Err("actual legacy writer did not retain its version 1 storage schema".into());
+@@ -883,19 +887,19 @@
+             .ok_or("stored schema version is not text")?
+             .parse()
+             .map_err(err)?;
+-        let rows = sqlite_json(
++        let rows = self.legacy_sqlite_json(
+             &database,
++            "capsules_and_journal",
+             "SELECT c.record_id, c.source_id, c.key_text, c.value_text, c.provenance, c.status, c.commit_seq, e.seq, e.kind, e.idempotency_key, e.payload_sha256, e.receipt FROM capsules AS c JOIN events AS e ON e.seq = c.commit_seq ORDER BY c.record_id;",
+-            true,
+             deadline,
+-            &self.cleanup,
++            &mut sqlite_evidence,
+         )?;
+-        let counts = sqlite_json(
++        let counts = self.legacy_sqlite_json(
+             &database,
++            "record_counts",
+             "SELECT (SELECT count(*) FROM capsules) AS capsules, (SELECT count(*) FROM events) AS events;",
+-            true,
+             deadline,
+-            &self.cleanup,
++            &mut sqlite_evidence,
+         )?;
+         if rows.len() != observations.len()
+             || counts.len() != 1
+@@ -1042,6 +1046,43 @@
+         })
+     }
+ 
++    fn legacy_sqlite_json(
++        &self,
++        database: &Path,
++        stage: &str,
++        sql: &str,
++        deadline: Instant,
++        evidence: &mut Vec<Value>,
++    ) -> Result<Vec<Value>, String> {
++        // Exactly three fixed audit queries call this wrapper. Store paths and
++        // metadata only in local evidence; never include record content.
++        let mut files = Vec::new();
++        for suffix in ["", "-wal", "-shm"] {
++            let mut path = database.as_os_str().to_os_string();
++            path.push(suffix);
++            files.push(sqlite_file_metadata(&PathBuf::from(path)));
++        }
++        evidence.push(json!({"stage": stage, "before_action": files, "outcome": "pending"}));
++        let audit_path = self.root.with_extension("legacy-sqlite-evidence.json");
++        write_synced(
++            &audit_path,
++            &serde_json::to_vec_pretty(evidence).map_err(err)?,
++        )?;
++        let result = sqlite_json(database, sql, true, deadline, &self.cleanup);
++        evidence.last_mut().expect("legacy SQLite stage")["outcome"] = match &result {
++            Ok(rows) => json!({"state": "success", "returned_rows": rows.len()}),
++            Err(reason) => json!({"state": "failed", "failure_stage": stage,
++                "reason": reason.chars().take(2048).collect::<String>()}),
++        };
++        write_synced(
++            &audit_path,
++            &serde_json::to_vec_pretty(evidence).map_err(err)?,
++        )?;
++        result.map_err(|_| {
++            format!("legacy SQLite audit failed at {stage}; exact error retained in local evidence")
++        })
++    }
++
+     fn corrupt_payload(&mut self, deadline: Instant) -> Result<FixtureEnvironmentEvidence, String> {
+         self.stop_current(deadline)?
+             .ok_or("cannot corrupt an unstarted provider")?;
+@@ -1189,7 +1230,17 @@
+                 })
+             }
+             FixtureEnvironmentAction::InstallLegacyV1 { observations } => {
+-                self.install_legacy(observations, deadline)
++                let result = self.install_legacy(observations, deadline);
++                if result.is_err()
++                    && let Some(worker) = &self.worker
++                {
++                    worker
++                        .state
++                        .lock()
++                        .expect("worker cleanup state")
++                        .retain_failed_legacy_evidence = true;
++                }
++                result
+             }
+             FixtureEnvironmentAction::CorruptPayloadPreservingDigest => {
+                 self.corrupt_payload(deadline)
+@@ -1448,6 +1499,41 @@
+         return Err("physical fixture has no single retained capsule".into());
+     }
+     Ok(rows.remove(0))
++}
++
++/// Records existence, type, size and the regular-file open stage without
++/// reading database content. Nonregular paths are never opened.
++fn sqlite_file_metadata(path: &Path) -> Value {
++    match fs::symlink_metadata(path) {
++        Ok(metadata) => {
++            let file_type = metadata.file_type();
++            let kind = if file_type.is_file() {
++                "regular_file"
++            } else if file_type.is_dir() {
++                "directory"
++            } else if file_type.is_symlink() {
++                "symlink"
++            } else {
++                "other"
++            };
++            let open_error = file_type
++                .is_file()
++                .then(|| {
++                    File::open(path).map(drop).map_err(|error| {
++                    json!({"stage": "read_only_file_open", "kind": format!("{:?}", error.kind()),
++                        "os_error": error.raw_os_error()})
++                }).err()
++                })
++                .flatten();
++            json!({"path": path, "exists": true, "type": kind, "bytes": metadata.len(),
++                "mode": metadata.mode(), "read_only_open_attempted": file_type.is_file(),
++                "open_error": open_error})
++        }
++        Err(error) => json!({"path": path,
++            "exists": if error.kind() == std::io::ErrorKind::NotFound { Some(false) } else { None },
++            "metadata_error": {"stage": "symlink_metadata", "kind": format!("{:?}", error.kind()),
++                "os_error": error.raw_os_error()}}),
++    }
+ }
+ 
+ fn sqlite_json(

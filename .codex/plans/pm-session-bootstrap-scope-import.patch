@@ -1,0 +1,19 @@
+--- a/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
++++ b/crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs
+@@ -1056,7 +1056,7 @@
+         use super::super::super::SessionAuthorities;
+         use super::super::admission::hook_v2_admit;
+         use super::super::ingest::ingest_transcript;
+-        use crate::host_admission::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
++        use crate::host_admission::HostAdmissionTestRuntimeV1;
+         use crate::tracedecay::TraceDecayOpenOptions;
+         use std::io::Write;
+         use std::sync::Arc;
+@@ -1064,6 +1064,7 @@
+         use tracedecay_hooks::admission_ledger::{
+             read_hook_live_origin_boundaries, read_hook_live_origin_proofs,
+         };
++        use tracedecay_sessions::admission::HostAdmissionScope;
+ 
+         let project = repository();
+         let project_root = fs::canonicalize(project.path()).unwrap();

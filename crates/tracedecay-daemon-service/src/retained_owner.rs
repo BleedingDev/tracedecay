@@ -447,7 +447,7 @@ impl ProjectMemoryProviderHostMountV1 {
         let Some(mount) = self.native_session_retrieval_mount.as_ref() else {
             return Ok(());
         };
-        mount.bind(retrieval).map_err(str::to_owned)
+        mount.bind(retrieval).map_err(|error| error.to_owned())
     }
 }
 
@@ -677,10 +677,10 @@ pub async fn mount_project_memory_provider_host(
     use tracedecay_domain::configuration::{MemoryProviderKindV1, MemoryProviderParticipationV1};
     use tracedecay_memory_provider_registry::{
         ConfiguredObservationProviderMountV1, EnabledProviderMode, FabricConfig,
-        NATIVE_RECALL_SCOPE_BINDINGS, NativeProvider, ObservationMountActivationV1,
-        ObservationMountRequirementV1, ProjectMemoryProviderComposition, ProviderExecutionShapeV1,
-        ProviderLifecycleOwnershipV1, ProviderRegistrationV1, RecallScopeBindingsV1,
-        SelectedProviderActivationV1,
+        NATIVE_RECALL_SCOPE_BINDINGS, NativeMemoryApplicationPort, NativeProvider,
+        ObservationMountActivationV1, ObservationMountRequirementV1,
+        ProjectMemoryProviderComposition, ProviderExecutionShapeV1, ProviderLifecycleOwnershipV1,
+        ProviderRegistrationV1, RecallScopeBindingsV1, SelectedProviderActivationV1,
     };
 
     if inputs.activation.is_disabled() {
@@ -694,7 +694,8 @@ pub async fn mount_project_memory_provider_host(
         }));
     }
 
-    let mut selected = None;
+    let mut selected_injected = None;
+    let mut selected_native_port: Option<Arc<dyn NativeMemoryApplicationPort>> = None;
     let mut observers = Vec::new();
     let mut observation_provider_mounts = Vec::new();
     let mut native_session_retrieval_mount = None;
@@ -720,7 +721,11 @@ pub async fn mount_project_memory_provider_host(
             dyn tracedecay_memory_provider_registry::AdvisoryAdmissionAuthority,
         > = history_mount.clone();
         let constructed: std::result::Result<
-            (ProviderRegistrationV1, ConfiguredObservationProviderMountV1),
+            (
+                ProviderRegistrationV1,
+                ConfiguredObservationProviderMountV1,
+                Option<Arc<dyn NativeMemoryApplicationPort>>,
+            ),
             String,
         > = match kind {
             MemoryProviderKindV1::Native => {
@@ -745,6 +750,7 @@ pub async fn mount_project_memory_provider_host(
                         Some(interpose) => interpose(port),
                         None => port,
                     };
+                    let selected_port = Arc::clone(&port);
                     let provider = Arc::new(NativeProvider::new(port).map_err(|error| {
                         format!("could not construct Native provider: {error}")
                     })?);
@@ -778,7 +784,7 @@ pub async fn mount_project_memory_provider_host(
                     // host retains this handle to bind the canonical session
                     // service after full application admission.
                     native_session_retrieval_mount = Some(session_retrieval);
-                    Ok((registration, mount))
+                    Ok((registration, mount, Some(selected_port)))
                 }
                 .await
             }
@@ -814,13 +820,21 @@ pub async fn mount_project_memory_provider_host(
                         requirement,
                         activation: ObservationMountActivationV1::AfterPublication,
                     },
+                    None,
                 ))
             }
         };
         match constructed {
-            Ok((registration, mount)) => {
+            Ok((registration, mount, native_port)) => {
                 if mode == EnabledProviderMode::Active {
-                    selected = Some(registration);
+                    match kind {
+                        MemoryProviderKindV1::Native => {
+                            selected_native_port = native_port;
+                        }
+                        MemoryProviderKindV1::Ncm => {
+                            selected_injected = Some(registration);
+                        }
+                    }
                 } else {
                     observers.push(registration);
                 }
@@ -837,26 +851,30 @@ pub async fn mount_project_memory_provider_host(
         }
     }
 
+    let fabric_config = FabricConfig {
+        max_registered_providers: observers.len()
+            + usize::from(selected_native_port.is_some() || selected_injected.is_some()),
+        max_in_flight: 1,
+    };
+    let selection = match (selected_native_port, selected_injected) {
+        (Some(port), None) => SelectedProviderActivationV1::Native {
+            fabric_config,
+            port,
+            registration_revision: 1,
+            mode: EnabledProviderMode::Active,
+        },
+        (None, Some(registration)) => SelectedProviderActivationV1::Injected {
+            fabric_config,
+            registration,
+        },
+        (None, None) => SelectedProviderActivationV1::ObserversOnly { fabric_config },
+        (Some(_), Some(_)) => {
+            return Err("multiple active memory providers were constructed".to_owned());
+        }
+    };
     let composition = Arc::new(
-        ProjectMemoryProviderComposition::compose_registered(
-            match selected {
-                Some(registration) => SelectedProviderActivationV1::Injected {
-                    fabric_config: FabricConfig {
-                        max_registered_providers: observers.len() + 1,
-                        max_in_flight: 1,
-                    },
-                    registration,
-                },
-                None => SelectedProviderActivationV1::ObserversOnly {
-                    fabric_config: FabricConfig {
-                        max_registered_providers: observers.len(),
-                        max_in_flight: 1,
-                    },
-                },
-            },
-            observers,
-        )
-        .map_err(|error| format!("could not compose project memory-provider host: {error}"))?,
+        ProjectMemoryProviderComposition::compose_registered(selection, observers)
+            .map_err(|error| format!("could not compose project memory-provider host: {error}"))?,
     );
 
     let locator_key = new_recall_locator_key()?;
@@ -887,6 +905,7 @@ pub async fn mount_project_memory_provider_host(
                     routing,
                     host_limits: registration.limits,
                     invocation_boundary: cognitive_recall::host_provider_invocation_boundary(1),
+                    native_session_retrieval_mount: native_session_retrieval_mount.clone(),
                     locator_key: locator_key.clone(),
                 },
             )

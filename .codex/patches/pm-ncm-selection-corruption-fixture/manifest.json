@@ -1,0 +1,17 @@
+{
+  "status": "frozen_unapplied",
+  "patch": "selection-corruption-fixture.patch",
+  "patch_sha256": "b3f46564eb39a475c6556450a7650a7ee360a7ae73627c58488dc5d7c7829d08",
+  "files": [
+    {
+      "path": "crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs",
+      "baseline_sha256": "21723e2dbcf486be6b7750d9064885ae2f7c4d061ae790d0195982a1fae7430c",
+      "proposed_sha256": "f75f34d17ffdb48ae560d90279badf687e71a0ef4498fc801a3235234dfc5d81"
+    },
+    {
+      "path": "crates/tracedecay-memory-ncm-runtime/src/store/mod.rs",
+      "baseline_sha256": "2ab77a578b1d5662d6da37e4ce9e9586a375970a315c8bcd736661a452fd5631",
+      "proposed_sha256": "e9531654ab5f64ed1eb11f13ad93b30781c9c9bab9634f009a4e8d8bb58a649c"
+    }
+  ]
+}

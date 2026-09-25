@@ -1,0 +1,52 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -6424,8 +6424,8 @@
+         );
+     }
+ 
+-    /// A cancelled caller never receives advisory content: the journey returns
+-    /// the typed `cancelled` lane instead of an empty-looking answer.
++    /// A cancelled caller never receives advisory content: cancellation before
++    /// provider dispatch remains an attributed history-stage unavailable lane.
+     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+     async fn advisory_context_recall_reports_a_cancelled_lane_without_content() {
+         let fixture = project_fixture().await;
+@@ -6452,19 +6452,25 @@
+         )
+         .await;
+ 
+-        let AdvisoryMemoryContextV1::Answered {
+-            degradation,
+-            candidates,
+-            ..
+-        } = advisory
+-        else {
+-            panic!("a cancelled recall is still an attributed answer: {advisory:?}");
+-        };
+-        assert_eq!(
+-            degradation,
+-            Some(tracedecay_contracts::memory::CognitiveRecallDegradation::Cancelled)
+-        );
+-        assert!(candidates.is_empty());
++        assert!(
++            matches!(
++                &advisory,
++                AdvisoryMemoryContextV1::Unavailable {
++                    provider_id,
++                    registration_revision: 1,
++                    outcome: AdvisoryRecallUnavailableV1::HistoryCancelled,
++                    ..
++                } if provider_id.as_str() == NATIVE_PROVIDER_ID
++            ),
++            "history cancellation must preserve the routed provider and revision: {advisory:?}"
++        );
++
++        let host_answer = "## Code Context\nthe canonical answer body\n";
++        let text = rendered_text_for_test(&advisory.appended_to(tool_result_for_test(host_answer)));
++        assert!(text.starts_with(host_answer), "{text}");
++        assert!(text.contains("advisory_history_cancelled"), "{text}");
++        assert!(text.contains(NATIVE_PROVIDER_ID), "{text}");
++        assert!(!text.contains(SEEDED_CONTENT), "{text}");
+         assert_eq!(mount.ledger.report_count(), 0);
+     }
+ 

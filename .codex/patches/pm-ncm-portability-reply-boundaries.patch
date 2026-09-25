@@ -1,0 +1,460 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs b/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/replay_boundary.rs
+@@ -36,26 +36,27 @@
+     terminal: TerminalCode,
+     effect: crate::CommittedEffectState,
+ ) -> Option<()> {
+-    fields(
+-        response,
+-        &[
+-            "common_portability",
+-            "first_source_sequence",
+-            "last_source_sequence",
+-            "acknowledged_sequence",
+-            "state_generation_before",
+-            "state_generation_after",
+-            "applied_observations",
+-            "duplicate_observations",
+-            "sources_already_applied",
+-            "rejected_observations",
+-            "effect_unknown_observations",
+-            "partial",
+-            "replayed",
+-            "warnings",
+-            "items",
+-        ],
+-    )?;
++    let mut response_fields = vec![
++        "common_portability",
++        "first_source_sequence",
++        "last_source_sequence",
++        "acknowledged_sequence",
++        "state_generation_before",
++        "state_generation_after",
++        "applied_observations",
++        "duplicate_observations",
++        "sources_already_applied",
++        "rejected_observations",
++        "effect_unknown_observations",
++        "partial",
++        "replayed",
++        "warnings",
++        "items",
++    ];
++    if response.get("page_delivery_capsule").is_some() {
++        response_fields.push("page_delivery_capsule");
++    }
++    fields(response, &response_fields)?;
+     if request["action"] != "replay" || response["common_portability"] != "replay" {
+         return None;
+     }
+@@ -69,6 +70,26 @@
+         return None;
+     }
+     let replayed = response["replayed"].as_bool()?;
++    match (
++        request.get("page_delivery_capsule"),
++        response.get("page_delivery_capsule"),
++    ) {
++        (None, None) => {}
++        (Some(request_capsule), Some(response_capsule)) => {
++            let requested = super::lifecycle::decode_receipt_capsule(request_capsule)?;
++            let retained = super::lifecycle::decode_receipt_capsule(response_capsule)?;
++            fields(&requested, &["operation_id", "idempotency_key"])?;
++            fields(&retained, &["operation_id", "idempotency_key"])?;
++            string(&requested["operation_id"])?;
++            string(&retained["operation_id"])?;
++            let requested_key = string(&requested["idempotency_key"])?;
++            let retained_key = string(&retained["idempotency_key"])?;
++            if requested_key != retained_key || (!replayed && request_capsule != response_capsule) {
++                return None;
++            }
++        }
++        _ => return None,
++    }
+     let partial = response["partial"].as_bool()?;
+     let stored_before = response["state_generation_before"].as_u64()?;
+     let stored_after = response["state_generation_after"].as_u64()?;
+@@ -197,6 +218,7 @@
+ }
+ 
+ #[cfg(test)]
++#[allow(clippy::unwrap_used)]
+ mod tests {
+     use super::*;
+ 
+@@ -211,6 +233,194 @@
+             "items":[{"source_sequence":1,"receipt_digest":receipt,"state":"applied","reason":null,"record_id":1,"state_generation":1},
+             {"source_sequence":2,"receipt_digest":receipt,"state":"effect_unknown","reason":"commit_unknown","record_id":null,"state_generation":1}]}),
+         )
++    }
++
++    fn receipt_capsule(identity: Value) -> Value {
++        let bytes = serde_json::to_vec(&identity).unwrap();
++        json!({"version":1,"sha256":hex_digest(&Sha256::digest(&bytes)),"bytes":bytes})
++    }
++
++    fn completed_page() -> (Value, Value) {
++        let (mut request, mut response) = fixture();
++        let capsule = receipt_capsule(json!({
++            "operation_id":"first-page-operation", "idempotency_key":"page-key"
++        }));
++        request["page_delivery_capsule"] = capsule.clone();
++        response["page_delivery_capsule"] = capsule;
++        response["acknowledged_sequence"] = json!(2);
++        response["state_generation_after"] = json!(3);
++        response["applied_observations"] = json!(2);
++        response["effect_unknown_observations"] = json!(0);
++        response["partial"] = json!(false);
++        response["items"][1]["state"] = json!("applied");
++        response["items"][1]["reason"] = Value::Null;
++        response["items"][1]["record_id"] = json!(2);
++        response["items"][1]["state_generation"] = json!(2);
++        (request, response)
++    }
++
++    #[test]
++    fn replay_page_receipt_binds_fresh_identity_and_retains_first_duplicate_identity() {
++        let (mut request, mut response) = completed_page();
++        assert!(
++            validate(
++                &request,
++                &response,
++                0,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Committed,
++            )
++            .is_some()
++        );
++        request["page_delivery_capsule"] = receipt_capsule(json!({
++            "operation_id":"retry-page-operation", "idempotency_key":"page-key"
++        }));
++        assert!(
++            validate(
++                &request,
++                &response,
++                0,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Committed,
++            )
++            .is_none()
++        );
++        response["replayed"] = json!(true);
++        assert!(
++            validate(
++                &request,
++                &response,
++                3,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Duplicate,
++            )
++            .is_some()
++        );
++        assert!(
++            validate(
++                &request,
++                &response,
++                3,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Committed,
++            )
++            .is_none()
++        );
++        request["page_delivery_capsule"] = receipt_capsule(json!({
++            "operation_id":"retry-page-operation", "idempotency_key":"other-page-key"
++        }));
++        assert!(
++            validate(
++                &request,
++                &response,
++                3,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Duplicate,
++            )
++            .is_none()
++        );
++    }
++
++    #[test]
++    fn replay_page_receipt_rejects_missing_malformed_and_extra_identity_fields() {
++        let (request, response) = completed_page();
++        for side in ["request", "response", "both"] {
++            for changed in [
++                "missing",
++                "null",
++                "digest",
++                "version",
++                "byte",
++                "oversized",
++                "outer_field",
++                "inner_field",
++                "empty_operation",
++                "empty_key",
++            ] {
++                if side == "both" && changed == "missing" {
++                    continue;
++                }
++                let mut request = request.clone();
++                let mut response = response.clone();
++                let value = if side != "response" {
++                    &mut request
++                } else {
++                    &mut response
++                };
++                match changed {
++                    "missing" => {
++                        value
++                            .as_object_mut()
++                            .unwrap()
++                            .remove("page_delivery_capsule");
++                    }
++                    "null" => value["page_delivery_capsule"] = Value::Null,
++                    "digest" => value["page_delivery_capsule"]["sha256"] = json!("f".repeat(64)),
++                    "version" => value["page_delivery_capsule"]["version"] = json!(2),
++                    "byte" => value["page_delivery_capsule"]["bytes"][0] = json!(256),
++                    "oversized" => {
++                        value["page_delivery_capsule"]["bytes"] = json!(vec![0_u8; 131_073])
++                    }
++                    "outer_field" => value["page_delivery_capsule"]["extra"] = json!(true),
++                    "inner_field" => {
++                        value["page_delivery_capsule"] = receipt_capsule(json!({
++                            "operation_id":"first-page-operation", "idempotency_key":"page-key", "extra":true
++                        }))
++                    }
++                    "empty_operation" => {
++                        value["page_delivery_capsule"] = receipt_capsule(json!({
++                            "operation_id":"", "idempotency_key":"page-key"
++                        }))
++                    }
++                    _ => {
++                        value["page_delivery_capsule"] = receipt_capsule(json!({
++                            "operation_id":"first-page-operation", "idempotency_key":""
++                        }))
++                    }
++                }
++                if side == "both" {
++                    response["page_delivery_capsule"] = request["page_delivery_capsule"].clone();
++                }
++                assert!(
++                    validate(
++                        &request,
++                        &response,
++                        0,
++                        3,
++                        TerminalCode::Success,
++                        crate::CommittedEffectState::Committed,
++                    )
++                    .is_none(),
++                    "accepted {changed} capsule on {side}"
++                );
++            }
++        }
++        let mut legacy_request = request;
++        let mut legacy_response = response;
++        legacy_request
++            .as_object_mut()
++            .unwrap()
++            .remove("page_delivery_capsule");
++        legacy_response
++            .as_object_mut()
++            .unwrap()
++            .remove("page_delivery_capsule");
++        assert!(
++            validate(
++                &legacy_request,
++                &legacy_response,
++                0,
++                3,
++                TerminalCode::Success,
++                crate::CommittedEffectState::Committed,
++            )
++            .is_some()
++        );
+     }
+ 
+     #[test]
+diff --git a/crates/tracedecay-memory-provider-ncm/src/common/portability.rs b/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
+--- a/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/portability.rs
+@@ -621,8 +621,13 @@
+             return None;
+         }
+     }
++    let response_limit = if call.operation == ProviderOperation::SnapshotExport {
++        limits.snapshot_bytes
++    } else {
++        limits.response_bytes
++    };
+     let bytes = serde_json::to_vec(&output).ok()?;
+-    if bytes.len() as u64 > limits.response_bytes {
++    if bytes.len() as u64 > response_limit {
+         return None;
+     }
+     reply.payload = Some(
+@@ -633,6 +638,11 @@
+         )
+         .ok()?,
+     );
++    if call.operation == ProviderOperation::SnapshotExport
++        && crate::encoded_response_bytes(call, reply) > response_limit
++    {
++        return None;
++    }
+     Some(())
+ }
+ 
+@@ -671,6 +681,148 @@
+         let snapshot = json!({"format":SNAPSHOT_FORMAT,"namespace":namespace.as_str(),"commit_seq":1,"capsules":[{"record_id":1,"source_id":opaque_surface_id(&namespace,b"forget-source-key","source-key"),
+             "key_text":"retained answer","value_text":"assistant: retained answer","status":"valid","provenance":provenance.to_string()}]});
+         (exact, namespace, snapshot, retained)
++    }
++
++    #[test]
++    fn snapshot_export_uses_snapshot_limit_for_body_and_complete_public_reply() {
++        use tracedecay_memory_provider_api::{
++            CancellationToken, CommittedEffectEvidence, FallbackDirective, OperationControl,
++            OwnedOpaqueExtension, OwnedVersionedId, ProviderCallParts, TerminalRecord,
++        };
++
++        let (exact, namespace, snapshot, _) = fixture();
++        let snapshot_bytes = serde_json::to_vec(&snapshot).unwrap();
++        let inventory = snapshot_inventory(&snapshot_bytes, &namespace, &exact).unwrap();
++        let extension_bytes = vec![b'x'; 2048];
++        let request_bytes = b"{}".to_vec();
++        let call = ProviderCall::new(ProviderCallParts {
++            operation: ProviderOperation::SnapshotExport,
++            provider_id: OwnedProviderId::new(crate::NCM_PROVIDER_ID).unwrap(),
++            registration_revision: 1,
++            ready_receipt_sha256: "ab".repeat(32),
++            exact_scope: exact,
++            request_id: "snapshot-boundary-request".to_owned(),
++            operation_id: "snapshot-boundary-operation".to_owned(),
++            expected_state_generation: 1,
++            idempotency_key: None,
++            control: OperationControl::new(i64::MAX, 60_000, CancellationToken::new()),
++            payload: CanonicalPayload::new(
++                OwnedVersionedId::new("tracedecay.memory.provider.snapshot-export.v1").unwrap(),
++                request_bytes.clone(),
++                hex_digest(&Sha256::digest(&request_bytes)),
++            )
++            .unwrap(),
++            required_capabilities: vec![OwnedVersionedId::new("snapshot.export.v1").unwrap()],
++            extensions: vec![
++                OwnedOpaqueExtension::new(
++                    OwnedVersionedId::new("vendor.snapshot-boundary.v1").unwrap(),
++                    1,
++                    false,
++                    hex_digest(&Sha256::digest(&extension_bytes)),
++                    extension_bytes,
++                )
++                .unwrap(),
++            ],
++        })
++        .unwrap();
++        let limits = ProviderLimits {
++            request_bytes: 1_048_576,
++            response_bytes: 1_048_576,
++            observation_batch_items: 16,
++            recall_candidates: 32,
++            concurrent_operations: 4,
++            operation_millis: 60_000,
++            snapshot_bytes: 268_435_456,
++            inspection_items: 64,
++        };
++        let descriptor = ProviderDescriptor::new(
++            call.provider_id.clone(),
++            "ab".repeat(32),
++            "ncm-state-v1",
++            1,
++            [
++                "provider.health.v1",
++                "observation.accept.v1",
++                "recall.query.v1",
++                "snapshot.export.v1",
++            ]
++            .into_iter()
++            .map(|id| OwnedVersionedId::new(id).unwrap()),
++            limits,
++        )
++        .unwrap();
++        let worker_bytes = serde_json::to_vec(&json!({
++            "common_portability":"snapshot_export", "bytes":snapshot_bytes, "warnings":[]
++        }))
++        .unwrap();
++        let worker_reply = ProviderReply {
++            terminal: TerminalRecord::new(
++                call.operation,
++                call.provider_id.clone(),
++                TerminalCode::Success,
++                CommittedEffectEvidence::none(Some(1)),
++                FallbackDirective::forbidden(),
++                call.operation_id.clone(),
++                call.exact_scope.exact_scope_sha256(),
++                None,
++            )
++            .unwrap(),
++            payload: Some(
++                CanonicalPayload::new(
++                    call.payload.contract_id.clone(),
++                    worker_bytes.clone(),
++                    hex_digest(&Sha256::digest(&worker_bytes)),
++                )
++                .unwrap(),
++            ),
++            warnings: Vec::new(),
++            extensions: Vec::new(),
++            state_generation: 1,
++        };
++        let mut baseline = worker_reply.clone();
++        reconstruct(&call, &mut baseline, &descriptor, limits).unwrap();
++        let body_bytes = baseline.payload.as_ref().unwrap().bytes.len() as u64;
++        let framed_bytes = crate::encoded_response_bytes(&call, &baseline);
++        assert!(framed_bytes > body_bytes + 2048);
++        let snapshot_limits = ProviderLimits {
++            response_bytes: body_bytes - 1,
++            snapshot_bytes: framed_bytes,
++            ..limits
++        };
++        snapshot_limits.validate().unwrap();
++        let mut exported = worker_reply.clone();
++        reconstruct(&call, &mut exported, &descriptor, snapshot_limits).unwrap();
++        assert_eq!(
++            crate::encoded_response_bytes(&call, &exported),
++            framed_bytes
++        );
++        let output: Value = serde_json::from_slice(&exported.payload.unwrap().bytes).unwrap();
++        assert_eq!(output["snapshot"]["bytes"], json!(snapshot_bytes));
++        assert_eq!(output["snapshot"]["sources"], json!(inventory.wire_sources));
++        assert_eq!(
++            output["snapshot"]["identity"]["content_sha256"],
++            hex_digest(&Sha256::digest(&snapshot_bytes))
++        );
++        assert_eq!(
++            output["snapshot"]["identity"]["byte_length"],
++            snapshot_bytes.len()
++        );
++        for snapshot_limit in [body_bytes - 1, framed_bytes - 1] {
++            let mut rejected = worker_reply.clone();
++            assert!(
++                reconstruct(
++                    &call,
++                    &mut rejected,
++                    &descriptor,
++                    ProviderLimits {
++                        snapshot_bytes: snapshot_limit,
++                        ..snapshot_limits
++                    },
++                )
++                .is_none(),
++                "accepted snapshot limit {snapshot_limit}"
++            );
++        }
+     }
+ 
+     #[test]

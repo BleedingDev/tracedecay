@@ -1,0 +1,21 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/state_controls.rs
+@@ -137,7 +137,16 @@
+             };
+             let selected = match &request.selection {
+                 ProviderControlInspectionSelectorV1::SourceInfluence { .. } => {
+-                    json!({"source_key": source.target.source.source_key})
++                    let LifecycleTargetReference::StableMemoryRef(stable) =
++                        &source.target.reference
++                    else {
++                        return Err(ControlFailureV1::new(
++                            ControlFailureStageV1::InvalidBinding(
++                                "retained stable memory reference",
++                            ),
++                        ));
++                    };
++                    json!({"stable_memory_ref": stable, "source_key": source.target.source.source_key})
+                 }
+                 ProviderControlInspectionSelectorV1::Trace { .. } => {
+                     let LifecycleTargetReference::StableMemoryRef(stable) =

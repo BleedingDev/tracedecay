@@ -1,0 +1,115 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+@@ -1209,6 +1209,16 @@
+                 finding_count,
+                 findings_digest,
+             } => {
++                #[cfg(feature = "test-helpers")]
++                if history.is_some() {
++                    super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
++                        serde_json::json!({
++                            "phase": "history_withheld",
++                            "source_sequence": record.source_sequence.0,
++                            "reason": reason.as_str(),
++                        })
++                    });
++                }
+                 // Digests and a typed reason only. The canonical evidence the
+                 // host settled is not touched; the withheld row advances the
+                 // replay cursor so a refused event is not re-emitted forever,
+@@ -1472,6 +1482,13 @@
+         }
+         let (admitted, state, receipt) = match evidence {
+             SourceDeliveryEvidenceV1::Missing => {
++                #[cfg(feature = "test-helpers")]
++                super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
++                    serde_json::json!({
++                        "phase": "history_delivery_missing",
++                        "source_sequence": source.attribution.source_sequence,
++                    })
++                });
+                 return Err(
+                     ProviderHistoryErrorV1::Ineligible("history source not admitted").into(),
+                 );
+@@ -3495,6 +3512,15 @@
+                 source_event_revision: 1,
+                 record: stored,
+             };
++            #[cfg(feature = "test-helpers")]
++            let (source_sequence, granted) = (
++                record.source_sequence.0,
++                adapter.grant.as_ref().is_some_and(|grant| {
++                    grant.sources.iter().any(|source| {
++                        source.attribution.source.observation_id == record.source_event_id
++                    })
++                }),
++            );
+             let report = match self
+                 .ingest_record_with_adapter(record, Arc::clone(&adapter), bounds)
+                 .await?
+@@ -3504,6 +3530,19 @@
+                     return Err(ObservationJourneyError::DeadlineExceeded { admitted });
+                 }
+             };
++            #[cfg(feature = "test-helpers")]
++            super::cognitive_recall::emit_host_history_recall_test_diagnostic(|| {
++                serde_json::json!({
++                    "phase": "history_ingress",
++                    "source_sequence": source_sequence,
++                    "granted": granted,
++                    "appended": report.appended,
++                    "duplicates": report.duplicates,
++                    "withheld": report.withheld,
++                    "non_messages": report.non_messages,
++                    "already_processed": report.already_processed,
++                })
++            });
+             admitted += u64::from(report.appended);
+             if let Some(stop) = report.stopped_on {
+                 return Err(match stop.reason {
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -104,7 +104,7 @@
+ 
+ /// Content-free diagnostics for the isolated CLI journey, never a product API.
+ #[cfg(feature = "test-helpers")]
+-fn emit_host_history_recall_test_diagnostic(build: impl FnOnce() -> Value) {
++pub(super) fn emit_host_history_recall_test_diagnostic(build: impl FnOnce() -> Value) {
+     if std::env::var_os("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS").as_deref()
+         != Some(std::ffi::OsStr::new("1"))
+     {
+--- a/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
++++ b/crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs
+@@ -1731,10 +1731,32 @@
+             &["has_older", "has_more", "partial_coverage"],
+             &[],
+         ),
++        "history_ingress" => (
++            &[
++                "source_sequence",
++                "appended",
++                "duplicates",
++                "withheld",
++                "non_messages",
++                "already_processed",
++            ],
++            &["granted"],
++            &[],
++        ),
++        "history_delivery_missing" | "history_withheld" => (&["source_sequence"], &[], &[]),
+         _ => return None,
+     };
+     let mut summary = serde_json::Map::new();
+     summary.insert("phase".into(), json!(phase));
++    if phase == "history_withheld" {
++        let reason = match value["reason"].as_str()? {
++            "secret_rejected" => "secret_rejected",
++            "quarantined" => "quarantined",
++            "unclassifiable_payload" => "unclassifiable_payload",
++            _ => return None,
++        };
++        summary.insert("reason".into(), json!(reason));
++    }
+     for field in numbers {
+         summary.insert((*field).into(), json!(value[*field].as_u64()?));
+     }

@@ -373,6 +373,7 @@ impl McpServer {
                 code_index_similar_executor: self.code_index_similar_executor.clone(),
                 code_index_redundancy_executor: self.code_index_redundancy_executor.clone(),
                 code_index_branch_diff_executor: self.code_index_branch_diff_executor.clone(),
+                semantic_admin_executor: self.semantic_admin_executor.clone(),
                 code_index_search_authority: self.code_index_search_authority.clone(),
                 admitted_project_scope: self.admitted_project_scope.clone(),
                 code_graph_projection_read_port: self.code_graph_projection_read_port.clone(),

@@ -1,0 +1,161 @@
+diff --git a/crates/tracedecay-memory-hygiene/Cargo.toml b/crates/tracedecay-memory-hygiene/Cargo.toml
+index 5155c7557f..27bd7ea94f 100644
+--- a/crates/tracedecay-memory-hygiene/Cargo.toml
++++ b/crates/tracedecay-memory-hygiene/Cargo.toml
+@@ -9,18 +9,11 @@ repository = "https://github.com/BleedingDev/tracedecay"
+ 
+ [features]
+ # Opt-in profiling (never in `default`). This crate instruments nothing itself;
+-# the triple exists only so a profiled build can forward through to the shared
+-# detector corpus in `tracedecay-runtime-core`.
+-hotpath = [
+-    "tracedecay-runtime-core/hotpath",
+-]
+-hotpath-alloc = [
+-    "hotpath",
+-    "tracedecay-runtime-core/hotpath-alloc",
+-]
+-hotpath-cpu = [
+-    "hotpath",
+-]
++# existing feature names forward to the shared detector owner. The binary
++# selects the allocation or CPU profiler backend, following upstream policy.
++hotpath = ["tracedecay-session-memory/hotpath"]
++hotpath-alloc = ["hotpath"]
++hotpath-cpu = ["hotpath"]
+ default = []
+ 
+ [dependencies]
+@@ -30,8 +23,9 @@ tracedecay-memory-provider-api = { path = "../tracedecay-memory-provider-api" }
+ tracedecay-domain = { path = "../tracedecay-domain", version = "0.1.0" }
+ # The single vendored credential corpus. Duplicating it here is precisely the
+ # failure this bead exists to prevent, so the detectors are reused through
+-# runtime-core's public surface rather than re-derived.
+-tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
++# the current upstream public owners rather than re-derived.
++tracedecay-session-memory = { path = "../tracedecay-session-memory", version = "0.1.0" }
++tracedecay-privacy = { path = "../tracedecay-privacy", version = "0.1.0" }
+ 
+ regex = "1.12.3"
+ serde = { version = "1", features = ["derive"] }
+diff --git a/crates/tracedecay-memory-hygiene/src/credentials.rs b/crates/tracedecay-memory-hygiene/src/credentials.rs
+index 08a5839cb7..caebc7b1e9 100644
+--- a/crates/tracedecay-memory-hygiene/src/credentials.rs
++++ b/crates/tracedecay-memory-hygiene/src/credentials.rs
+@@ -1,6 +1,6 @@
+ //! Every credential class one string carries, not just the first one.
+ //!
+-//! `tracedecay_runtime_core::memory::hygiene::detect_secret_like` is the single
++//! `tracedecay_session_memory::memory::hygiene::detect_secret_like` is the single
+ //! owner of the credential corpus, and this crate keeps it that way. Its public
+ //! answer, however, is `Option<String>`: the reason of the **first** pattern
+ //! that matched. A string such as an assignment whose value is a live issuer
+@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
+ use std::sync::OnceLock;
+ 
+ use regex::Regex;
+-use tracedecay_runtime_core::memory::hygiene::detect_secret_like;
++use tracedecay_session_memory::memory::hygiene::detect_secret_like;
+ 
+ use crate::policy::{HygieneClass, ObservationHygienePolicyV1, RejectFloorSignals};
+ 
+diff --git a/crates/tracedecay-memory-hygiene/src/lib.rs b/crates/tracedecay-memory-hygiene/src/lib.rs
+index 035632be11..8d69062dd7 100644
+--- a/crates/tracedecay-memory-hygiene/src/lib.rs
++++ b/crates/tracedecay-memory-hygiene/src/lib.rs
+@@ -66,7 +66,7 @@
+ //! # Where the rules come from
+ //!
+ //! The credential corpus has exactly one owner. This crate reuses
+-//! `tracedecay_runtime_core`'s public detectors rather than re-deriving them,
++//! `tracedecay_session_memory`'s public detectors rather than re-deriving them,
+ //! because two divergent gitleaks catalogues is precisely the failure this
+ //! pipeline exists to prevent. What that public surface cannot do is enumerate
+ //! *every* class one string carries — `detect_secret_like` answers with the
+@@ -92,7 +92,7 @@ pub use tracedecay_memory_provider_api::{
+     PayloadSanitizationReceiptParts, SanitizationDisposition, WithheldReason,
+     derive_withheld_receipt_id,
+ };
+-use tracedecay_runtime_core::privacy::{MemoryFactSanitizationV1, sanitize_memory_fact_payload};
++use tracedecay_privacy::{MemoryFactSanitizationV1, sanitize_memory_fact_payload};
+ 
+ mod credentials;
+ pub mod findings;
+@@ -142,7 +142,7 @@ const _: () = assert!(
+     "hygiene depth ceiling must clear the canonical store depth ceiling"
+ );
+ 
+-/// The exact replacement `tracedecay_runtime_core` writes over a value whose
++/// The exact replacement `tracedecay_privacy` writes over a value whose
+ /// object key proved it is a credential.
+ ///
+ /// It heads [`REDACTION_MARKERS`], the table that attributes a canonical
+@@ -772,7 +772,7 @@ pub fn attribute_sanitizer_output(
+     Ok(found)
+ }
+ 
+-/// The fixed replacement markers `tracedecay_runtime_core`'s redactor writes,
++/// The fixed replacement markers `tracedecay_privacy`'s redactor writes,
+ /// paired with the class each one proves.
+ ///
+ /// These are shared constants in effect but not in scope: the upstream
+diff --git a/crates/tracedecay-memory-hygiene/src/policy.rs b/crates/tracedecay-memory-hygiene/src/policy.rs
+index f7da024643..f206ec41b5 100644
+--- a/crates/tracedecay-memory-hygiene/src/policy.rs
++++ b/crates/tracedecay-memory-hygiene/src/policy.rs
+@@ -228,7 +228,7 @@ impl HygieneClass {
+     /// Maps a reason string from the canonical credential detector onto a class.
+     ///
+     /// The reasons are the exact strings
+-    /// `tracedecay_runtime_core::memory::hygiene::detect_secret_like` returns;
++    /// `tracedecay_session_memory::memory::hygiene::detect_secret_like` returns;
+     /// an unrecognised reason means the shared corpus grew a class this policy
+     /// has not yet ruled on, which is treated as detector unavailability so the
+     /// pipeline fails closed rather than silently admitting it.
+diff --git a/crates/tracedecay-memory-hygiene/src/transient.rs b/crates/tracedecay-memory-hygiene/src/transient.rs
+index 4c52c591d6..e68ad087f5 100644
+--- a/crates/tracedecay-memory-hygiene/src/transient.rs
++++ b/crates/tracedecay-memory-hygiene/src/transient.rs
+@@ -1,6 +1,6 @@
+ //! Transient-noise detection with byte spans.
+ //!
+-//! `tracedecay_runtime_core::memory::hygiene::detect_transient` answers whether
++//! `tracedecay_session_memory::memory::hygiene::detect_transient` answers whether
+ //! a string looks transient, which is all the curation planner needs. Redacting
+ //! a span needs the span, and the upstream span finder is crate-internal, so
+ //! this module owns the four transient patterns.
+@@ -9,7 +9,7 @@
+ //! here rather than reached for upstream because reaching for it would mean
+ //! moving roughly two thousand lines of the shared privacy corpus across a
+ //! crate boundary. FOLLOW-UP: unify the two transient corpora behind one public
+-//! span-returning surface in `tracedecay-runtime-core` once the upstream patch
++//! span-returning surface in `tracedecay-session-memory` once the upstream patch
+ //! budget allows the extraction; `transient_corpus_matches_runtime_core` in
+ //! `tests/transient_evidence.rs` keeps the two in agreement until then.
+ //!
+diff --git a/crates/tracedecay-memory-hygiene/tests/multi_signal_reject_floor.rs b/crates/tracedecay-memory-hygiene/tests/multi_signal_reject_floor.rs
+index d2ecb033ce..9cca3e808e 100644
+--- a/crates/tracedecay-memory-hygiene/tests/multi_signal_reject_floor.rs
++++ b/crates/tracedecay-memory-hygiene/tests/multi_signal_reject_floor.rs
+@@ -17,7 +17,7 @@ use serde_json::{Value, json};
+ use tracedecay_memory_hygiene::{
+     HygieneClass, ObservationAdmission, ObservationSanitizer, WithheldReason,
+ };
+-use tracedecay_runtime_core::memory::hygiene::detect_secret_like;
++use tracedecay_session_memory::memory::hygiene::detect_secret_like;
+ 
+ fn sanitizer() -> ObservationSanitizer {
+     ObservationSanitizer::new().expect("canonical hygiene policy")
+diff --git a/crates/tracedecay-memory-hygiene/tests/transient_evidence.rs b/crates/tracedecay-memory-hygiene/tests/transient_evidence.rs
+index d3f79db01b..562ce8eb7b 100644
+--- a/crates/tracedecay-memory-hygiene/tests/transient_evidence.rs
++++ b/crates/tracedecay-memory-hygiene/tests/transient_evidence.rs
+@@ -15,7 +15,7 @@ use tracedecay_memory_hygiene::{
+     HygieneAction, HygieneClass, ObservationAdmission, ObservationSanitizer,
+     SanitizationDisposition, canonical_payload_bytes, transient_matches,
+ };
+-use tracedecay_runtime_core::memory::hygiene::detect_transient;
++use tracedecay_session_memory::memory::hygiene::detect_transient;
+ 
+ const TRANSIENT_FACTS: &str = include_str!("fixtures/transient_facts.json");
+ 

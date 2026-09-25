@@ -1,0 +1,498 @@
+--- a/crates/tracedecay-memory-fabric/src/lib.rs
++++ b/crates/tracedecay-memory-fabric/src/lib.rs
+@@ -136,6 +136,8 @@
+     ProviderObserverOnly(String),
+     /// Observation routing was requested for a non-observation operation.
+     OperationNotObservation,
++    /// Control routing was requested for recall, observation or handshake.
++    OperationNotControl,
+     /// The registration does not declare a required capability.
+     MissingCapability(String),
+     /// The finite concurrent-call budget is exhausted.
+@@ -257,6 +259,9 @@
+             Self::OperationNotObservation => {
+                 formatter.write_str("observer delivery requires observation.accept.v1")
+             }
++            Self::OperationNotControl => {
++                formatter.write_str("provider control requires a lifecycle operation")
++            }
+             Self::MissingCapability(capability) => {
+                 write!(
+                     formatter,
+@@ -825,6 +830,40 @@
+ 
+     /// Invokes one operation that is allowed to influence active product flow.
+     pub fn invoke_active(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
++        self.invoke_registered(call, true)
++    }
++
++    /// Invokes an explicit provider-local lifecycle control against its pinned
++    /// provider and registration revision, including an enabled observer.
++    /// Recall, observation and handshake never enter this route, and no
++    /// selected-provider or fallback policy can redirect the call.
++    ///
++    /// The host must authorize the target and hold its supervised readiness
++    /// dispatch guard through this call. Quarantine belongs to that supervisor;
++    /// this boundary independently revalidates the live readiness receipt.
++    pub fn invoke_control(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
++        if !matches!(
++            call.operation,
++            ProviderOperation::Feedback
++                | ProviderOperation::Correction
++                | ProviderOperation::DeleteBySource
++                | ProviderOperation::Health
++                | ProviderOperation::Inspection
++                | ProviderOperation::Maintenance
++                | ProviderOperation::SnapshotExport
++                | ProviderOperation::SnapshotRestore
++                | ProviderOperation::Replay
++        ) {
++            return Err(FabricError::OperationNotControl);
++        }
++        self.invoke_registered(call, false)
++    }
++
++    fn invoke_registered(
++        &self,
++        call: &ProviderCall,
++        require_active: bool,
++    ) -> Result<ProviderReply, FabricError> {
+         call.validate()?;
+         let registration = self.registration(&call.provider_id)?;
+         let dispatch_gate = Arc::clone(&registration.dispatch_gate);
+@@ -835,6 +874,7 @@
+         Self::require_revision(&registration, call.registration_revision)?;
+         match registration.mode {
+             ProviderMode::Active => {}
++            ProviderMode::Observer if !require_active => {}
+             ProviderMode::Observer => {
+                 return Err(FabricError::ProviderObserverOnly(
+                     call.provider_id.as_str().to_owned(),
+@@ -850,7 +890,7 @@
+         let readiness = Self::require_readiness(&registration, call)?;
+         call.validate_request_bytes(readiness.effective_limits.request_bytes)?;
+         Self::preflight(&call.control)?;
+-        let _permit = self.active_permits.try_acquire()?;
++        let _permit = self.admission_lane(registration.mode).try_acquire()?;
+         let reply = registration.provider.invoke(call);
+         if let Err(error) = reply.validate(readiness.effective_limits.response_bytes) {
+             self.invalidate_matching_readiness(call)?;
+@@ -952,8 +992,8 @@
+     ///
+     /// Lane choice is the registration's own participation mode, never the
+     /// call route: an `Observer` registration draws from the observer lane
+-    /// for every contact it ever receives (handshake and observation
+-    /// delivery alike), so no observer — blocking, slow, or slow-failing —
++    /// for every contact it ever receives (handshake, observation delivery
++    /// and lifecycle control alike), so no observer — blocking, slow, or slow-failing —
+     /// can hold a permit an active call needs. A `Disabled` registration is
+     /// refused before this point; it is mapped to the observer lane so a
+     /// future caller that forgets the enabled check can still never reach
+--- a/crates/tracedecay-memory-provider-registry/src/lib.rs
++++ b/crates/tracedecay-memory-provider-registry/src/lib.rs
+@@ -406,6 +406,9 @@
+     pub registration_revision: u64,
+     /// Admitted participation mode.
+     pub mode: EnabledProviderMode,
++    /// Host composition's common-profile requirement, independent of provider
++    /// identity, descriptor claims and payload-carried history grants.
++    pub requires_common_advisory_profile: bool,
+     /// Actual validated descriptor limits.
+     pub limits: ProviderLimits,
+     /// Execution shape admitted by composition.
+@@ -1024,6 +1027,18 @@
+         self.fabric.invoke_active(call)
+     }
+ 
++    /// Invokes a host-authorized lifecycle control against the original
++    /// provider, registration revision and scope pinned by `call`.
++    /// Active and observer registrations may receive controls; recall remains
++    /// active-only. This route never consults selection or fallback policy.
++    ///
++    /// The caller must obtain and hold the target's supervised readiness
++    /// dispatch guard through this call, including its quarantine checks.
++    /// The fabric preserves all live receipt, capability and terminal checks.
++    pub fn invoke_control(&self, call: &ProviderCall) -> Result<ProviderReply, FabricError> {
++        self.fabric.invoke_control(call)
++    }
++
+     /// Routes one active call under an explicit host routing policy.
+     ///
+     /// The configured provider is refused before any contact unless it is
+@@ -1125,6 +1140,7 @@
+                 provider_id,
+                 registration_revision: registration.registration_revision,
+                 mode: registration.mode,
++                requires_common_advisory_profile: require_common_profile,
+                 limits: registered_descriptor.limits,
+                 execution_shape: registration.execution_shape,
+                 lifecycle: registration.lifecycle,
+--- a/crates/tracedecay-memory-fabric/tests/fabric.rs
++++ b/crates/tracedecay-memory-fabric/tests/fabric.rs
+@@ -3044,3 +3044,259 @@
+     assert_ne!(active_authority.state_digest(), quiescent_digest);
+     Ok(())
+ }
++
++#[test]
++fn lifecycle_controls_admit_active_and_observer_without_admitting_observer_recall()
++-> Result<(), Box<dyn Error>> {
++    const CONTROLS: [ProviderOperation; 9] = [
++        ProviderOperation::Feedback,
++        ProviderOperation::Correction,
++        ProviderOperation::DeleteBySource,
++        ProviderOperation::Health,
++        ProviderOperation::Inspection,
++        ProviderOperation::Maintenance,
++        ProviderOperation::SnapshotExport,
++        ProviderOperation::SnapshotRestore,
++        ProviderOperation::Replay,
++    ];
++    let extra: Vec<_> = CONTROLS
++        .iter()
++        .filter(|operation| **operation != ProviderOperation::Health)
++        .map(|operation| operation.capability_id())
++        .collect();
++    for mode in [ProviderMode::Active, ProviderMode::Observer] {
++        let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
++        let provider = Arc::new(TestProvider::new("provider.lifecycle", &extra)?);
++        fabric.register(
++            provider_id("provider.lifecycle")?,
++            1,
++            mode,
++            provider.clone(),
++        )?;
++        fabric.handshake(&handshake_request("provider.lifecycle")?)?;
++        for operation in CONTROLS {
++            let request = call(
++                "provider.lifecycle",
++                operation,
++                operation.mutates_provider_state().then_some(DIGEST),
++                &[operation.capability_id()],
++                OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
++            )?;
++            let reply = fabric.invoke_control(&request)?;
++            assert_eq!(reply.terminal.operation(), operation);
++            assert_eq!(reply.terminal.provider_id(), &request.provider_id);
++            assert_eq!(reply.terminal.operation_id(), request.operation_id);
++        }
++        assert_eq!(provider.invocation_count(), CONTROLS.len());
++        let recall = call(
++            "provider.lifecycle",
++            ProviderOperation::Recall,
++            None,
++            &["recall.query.v1"],
++            OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
++        )?;
++        assert_eq!(
++            fabric.invoke_control(&recall),
++            Err(FabricError::OperationNotControl)
++        );
++        if mode == ProviderMode::Observer {
++            assert_eq!(
++                fabric.invoke_active(&recall),
++                Err(FabricError::ProviderObserverOnly(
++                    "provider.lifecycle".to_owned()
++                ))
++            );
++            assert_eq!(provider.invocation_count(), CONTROLS.len());
++        } else {
++            fabric.invoke_active(&recall)?;
++            assert_eq!(provider.invocation_count(), CONTROLS.len() + 1);
++        }
++    }
++    Ok(())
++}
++
++#[test]
++fn control_refusals_never_contact_the_original_or_another_provider() -> Result<(), Box<dyn Error>> {
++    let fabric = MemoryFabric::new(FabricConfig::new(2, 2)?)?;
++    let original = Arc::new(TestProvider::new("provider.original", &[])?);
++    let other = Arc::new(TestProvider::new("provider.other", &[])?);
++    fabric.register(
++        provider_id("provider.original")?,
++        1,
++        ProviderMode::Observer,
++        original.clone(),
++    )?;
++    fabric.register(
++        provider_id("provider.other")?,
++        1,
++        ProviderMode::Active,
++        other.clone(),
++    )?;
++    let request = call(
++        "provider.original",
++        ProviderOperation::Health,
++        None,
++        &["provider.health.v1"],
++        OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
++    )?;
++    assert_eq!(
++        fabric.invoke_control(&request),
++        Err(FabricError::ProviderNotReady(
++            "provider.original".to_owned()
++        ))
++    );
++    fabric.handshake(&handshake_request("provider.original")?)?;
++    fabric.handshake(&handshake_request("provider.other")?)?;
++
++    let mut stale_revision = request.clone();
++    stale_revision.registration_revision = 2;
++    assert_eq!(
++        fabric.invoke_control(&stale_revision),
++        Err(FabricError::RegistrationRevisionMismatch {
++            accepted: 1,
++            requested: 2
++        })
++    );
++    let mut unknown = request.clone();
++    unknown.provider_id = provider_id("provider.absent")?;
++    assert_eq!(
++        fabric.invoke_control(&unknown),
++        Err(FabricError::ProviderUnknown("provider.absent".to_owned()))
++    );
++    let mut stale_receipt = request.clone();
++    stale_receipt.ready_receipt_sha256 = SECOND_DIGEST.to_owned();
++    assert_eq!(
++        fabric.invoke_control(&stale_receipt),
++        Err(FabricError::ReadyReceiptMismatch)
++    );
++    let mut wrong_scope = request.clone();
++    wrong_scope.exact_scope.worktree_identity = "other-worktree".to_owned();
++    assert_eq!(
++        fabric.invoke_control(&wrong_scope),
++        Err(FabricError::ReadyScopeMismatch)
++    );
++    let mut wrong_generation = request.clone();
++    wrong_generation.expected_state_generation = 1;
++    assert_eq!(
++        fabric.invoke_control(&wrong_generation),
++        Err(FabricError::ReadyStateGenerationMismatch {
++            ready: 0,
++            requested: 1
++        })
++    );
++    let cancellation = CancellationToken::new();
++    cancellation.cancel();
++    let mut cancelled = request.clone();
++    cancelled.control = OperationControl::new(i64::MAX, 1_000, cancellation);
++    assert_eq!(
++        fabric.invoke_control(&cancelled),
++        Err(FabricError::Cancelled)
++    );
++    let mut expired = request.clone();
++    expired.control = OperationControl::new(i64::MAX, 0, CancellationToken::new());
++    assert_eq!(
++        fabric.invoke_control(&expired),
++        Err(FabricError::DeadlineExceeded)
++    );
++    let correction = call(
++        "provider.original",
++        ProviderOperation::Correction,
++        Some(DIGEST),
++        &["correction.apply.v1"],
++        OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
++    )?;
++    assert_eq!(
++        fabric.invoke_control(&correction),
++        Err(FabricError::MissingCapability(
++            "correction.apply.v1".to_owned()
++        ))
++    );
++    let mut missing_key = correction;
++    missing_key.idempotency_key = None;
++    assert_eq!(
++        fabric.invoke_control(&missing_key),
++        Err(FabricError::Api(ApiError::MissingIdempotencyKey))
++    );
++
++    for operation in [
++        ProviderOperation::Recall,
++        ProviderOperation::Observe,
++        ProviderOperation::Handshake,
++    ] {
++        let forbidden = call(
++            "provider.original",
++            operation,
++            operation.mutates_provider_state().then_some(DIGEST),
++            &[operation.capability_id()],
++            OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
++        )?;
++        assert_eq!(
++            fabric.invoke_control(&forbidden),
++            Err(FabricError::OperationNotControl)
++        );
++    }
++    let mut bounded_handshake = handshake_request("provider.original")?;
++    bounded_handshake.host_limits.request_bytes = 128;
++    fabric.handshake(&bounded_handshake)?;
++    assert_eq!(
++        fabric.invoke_control(&request),
++        Err(FabricError::Api(ApiError::BoundaryBytesExceeded {
++            field: "request",
++            maximum: 128
++        }))
++    );
++    fabric.set_mode(
++        &provider_id("provider.original")?,
++        1,
++        ProviderMode::Disabled,
++    )?;
++    assert_eq!(
++        fabric.invoke_control(&request),
++        Err(FabricError::ProviderDisabled(
++            "provider.original".to_owned()
++        ))
++    );
++    assert_eq!(original.invocation_count(), 0);
++    assert_eq!(other.invocation_count(), 0);
++    assert_eq!(original.handshake_count(), 2);
++    assert_eq!(other.handshake_count(), 1);
++    Ok(())
++}
++
++#[test]
++fn control_terminal_mismatch_invalidates_readiness_before_another_dispatch()
++-> Result<(), Box<dyn Error>> {
++    let provider_name = "provider.control-terminal";
++    let reply = TestProvider::new(provider_name, &[])?
++        .default_recall_reply
++        .clone();
++    let provider = Arc::new(TestProvider::scripted(provider_name, reply)?);
++    let fabric = MemoryFabric::new(FabricConfig::new(1, 1)?)?;
++    fabric.register(
++        provider_id(provider_name)?,
++        1,
++        ProviderMode::Observer,
++        provider.clone(),
++    )?;
++    fabric.handshake(&handshake_request(provider_name)?)?;
++    let request = call(
++        provider_name,
++        ProviderOperation::Health,
++        None,
++        &["provider.health.v1"],
++        OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
++    )?;
++    assert_eq!(
++        fabric.invoke_control(&request),
++        Err(FabricError::ResponseOperationKindMismatch {
++            expected: ProviderOperation::Health,
++            returned: ProviderOperation::Recall
++        })
++    );
++    assert_eq!(
++        fabric.invoke_control(&request),
++        Err(FabricError::ProviderNotReady(provider_name.to_owned()))
++    );
++    assert_eq!(provider.invocation_count(), 1);
++    Ok(())
++}
+--- a/crates/tracedecay-memory-provider-registry/tests/selected_registration.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/selected_registration.rs
+@@ -197,6 +197,7 @@
+     let selected = registry.selected_registration().unwrap();
+     assert_eq!(selected.provider_id.as_str(), "ncm");
+     assert_eq!(selected.registration_revision, 19);
++    assert!(selected.requires_common_advisory_profile);
+     assert_eq!(selected.limits, provider.descriptor.limits);
+     assert_eq!(registry.statuses().unwrap().len(), 1);
+     assert!(
+@@ -529,3 +530,80 @@
+         Err(CompositionLifecycleError::ProviderNotRegistered)
+     ));
+ }
++
++#[test]
++fn controls_keep_the_original_provider_after_selection_changes() {
++    let original = FixtureProvider::new("vendor.original", true);
++    let previous = ProjectMemoryProviderComposition::compose_registered(
++        selection(registration(original.clone(), EnabledProviderMode::Active)),
++        vec![],
++    )
++    .unwrap();
++    assert_eq!(
++        previous
++            .registry()
++            .unwrap()
++            .selected_registration()
++            .unwrap()
++            .provider_id
++            .as_str(),
++        "vendor.original"
++    );
++    drop(previous);
++
++    let selected = FixtureProvider::new("vendor.selected", true);
++    let composition = ProjectMemoryProviderComposition::compose_registered(
++        selection(registration(selected.clone(), EnabledProviderMode::Active)),
++        vec![registration(
++            original.clone(),
++            EnabledProviderMode::Observer,
++        )],
++    )
++    .unwrap();
++    let registry = composition.registry().unwrap();
++    assert_eq!(
++        registry
++            .selected_registration()
++            .unwrap()
++            .provider_id
++            .as_str(),
++        "vendor.selected"
++    );
++    let original_id = OwnedProviderId::new("vendor.original").unwrap();
++    assert!(
++        !registry
++            .registration(&original_id)
++            .unwrap()
++            .requires_common_advisory_profile
++    );
++    assert!(registry.recall_scope_bindings(&original_id).is_none());
++    registry.handshake(&handshake("vendor.original")).unwrap();
++    let mut control = recall_call("vendor.original");
++    control.operation = ProviderOperation::Health;
++    control.operation_id = "health.original".to_owned();
++    control.required_capabilities = [OwnedVersionedId::new("provider.health.v1").unwrap()]
++        .into_iter()
++        .collect();
++    let reply = registry.invoke_control(&control).unwrap();
++    assert_eq!(reply.terminal.provider_id(), &original_id);
++    assert_eq!(reply.terminal.operation(), ProviderOperation::Health);
++    assert_eq!(reply.terminal.operation_id(), "health.original");
++    assert!(matches!(
++        registry.invoke_active(&recall_call("vendor.original")),
++        Err(FabricError::ProviderObserverOnly(_))
++    ));
++    assert_eq!(
++        registry.invoke_control(&recall_call("vendor.original")),
++        Err(FabricError::OperationNotControl)
++    );
++    control.registration_revision = 18;
++    assert_eq!(
++        registry.invoke_control(&control),
++        Err(FabricError::RegistrationRevisionMismatch {
++            accepted: 19,
++            requested: 18
++        })
++    );
++    assert_eq!(original.calls.load(Ordering::SeqCst), 2);
++    assert_eq!(selected.calls.load(Ordering::SeqCst), 0);
++}
+--- a/crates/tracedecay-memory-provider-registry/tests/registry.rs
++++ b/crates/tracedecay-memory-provider-registry/tests/registry.rs
+@@ -506,6 +506,13 @@
+         assert_eq!(statuses[0].provider_id.as_str(), NATIVE_PROVIDER_ID);
+         assert_eq!(statuses[0].registration_revision, registration_revision);
+         assert_eq!(statuses[0].mode, expected_mode);
++        assert!(
++            !registry
++                .selected_registration()
++                .expect("legacy Native registration")
++                .requires_common_advisory_profile,
++            "legacy Native composition preserves extension recall semantics"
++        );
+         assert_eq!(statuses[0].descriptor.limits, native_limits);
+         assert_eq!(
+             registry

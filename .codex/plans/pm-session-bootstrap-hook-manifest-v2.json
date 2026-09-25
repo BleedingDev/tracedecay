@@ -1,0 +1,48 @@
+{
+  "files": [
+    "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/admission.rs",
+    "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/envelope.rs",
+    "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs",
+    "crates/tracedecay-agent-hosts/src/hooks/claude.rs",
+    "crates/tracedecay-agent-hosts/src/hooks/codex.rs",
+    "crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs",
+    "crates/tracedecay-agent-hosts/src/hooks/dispatch.rs",
+    "crates/tracedecay-agent-hosts/src/hooks/mod.rs"
+  ],
+  "production_delta": {
+    "path": ".codex/plans/pm-session-bootstrap-hook-production-delta.patch",
+    "sha256": "fe76b8e898e7495ab755b8eed0131f96a539cc0e637b4293b8976ca3337c4a67",
+    "lines": 228
+  },
+  "tests": {
+    "path": ".codex/plans/pm-session-bootstrap-hook-tests.patch",
+    "sha256": "e02bd3787e90b00d4d0c2f957c197e31991aac0155fcdb27b140bf607d5ec739",
+    "lines": 616
+  },
+  "integration": {
+    "path": ".codex/plans/pm-session-bootstrap-hook-integration.patch",
+    "sha256": "685b6bcf3686eae9b4f96c5d4f62aabad7e9938fc54f253d5aa655aeebecf9ea",
+    "lines": 1528
+  },
+  "complete_production": {
+    "path": ".codex/plans/pm-session-bootstrap-hook-production-v2.patch",
+    "sha256": "2e83e7f47be1e79585117630c9cecb6642414a79e2e9a891144376e63860622d",
+    "lines": 916
+  },
+  "proposed_hashes": {
+    "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/admission.rs": "f722c2a2c202fdaa63a659ea9687ab80b0900e87d03ed031f65c5f08c6faf6e4",
+    "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/envelope.rs": "ae010f666a372bba0dcdf907349f60eafb245fa65505774e43058872539f6cf8",
+    "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs": "52a5f8894ba26c2f15b8f1f52d3d861c5016ef4f859b871ad1a6c9653d946e04",
+    "crates/tracedecay-agent-hosts/src/hooks/claude.rs": "c6ac24cc7fee943b8c47029f27f3bf2d62298dba994fe96494f4327f723538db",
+    "crates/tracedecay-agent-hosts/src/hooks/codex.rs": "b758cd73908d3b960a73b34eb1d1f743e5f5125c9210f333ffaa7fb085dd5a64",
+    "crates/tracedecay-agent-hosts/src/hooks/daemon_ports.rs": "d00db9938ab19e73d43f9cbde056f69f8c149f25e6039344546e816a25304867",
+    "crates/tracedecay-agent-hosts/src/hooks/dispatch.rs": "65febae9d339bd7e3661e05bf46cd66a47ce0cc983bdab9b8eb9de9d6b5832a2",
+    "crates/tracedecay-agent-hosts/src/hooks/mod.rs": "33aafb1948191d0b348717257f30e71218db8d789b51ae2ec9dd8a3be9ae2d31"
+  },
+  "verified": [
+    "live owned files exactly match frozen baseline",
+    "original production -> production delta -> tests applies cleanly to isolated copy and equals proposed",
+    "combined integration applies cleanly to live baseline",
+    "rustfmt passed; no Cargo or tests run"
+  ]
+}

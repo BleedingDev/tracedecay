@@ -1,0 +1,13 @@
+diff --git a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+index 29137017b..38943e929 100644
+--- a/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
++++ b/crates/tracedecay-agent-hosts/src/hooks/dispatch.rs
+@@ -790,7 +790,7 @@ fn prepare_bound_hook(
+         native_material(&native_fields, decoded.family(), event_json.as_bytes(), now)?;
+     if host == HookHostV1::ClaudeCode
+         && decoded.signal
+-            == tracedecay_hooks::NativeHookSignalV1::SessionBoundary(
++            == tracedecay_hooks::native::NativeHookSignalV1::SessionBoundary(
+                 tracedecay_hooks::HookBoundaryV1::TurnComplete,
+             )
+         && native_fields.event_key().is_none()

@@ -1,0 +1,459 @@
+--- a/crates/tracedecay-sessions/src/runtime/hosts/codex.rs
++++ b/crates/tracedecay-sessions/src/runtime/hosts/codex.rs
+@@ -1024,6 +1024,10 @@
+ }
+ 
+ const EXACT_HOOK_DISCOVERY_UNITS_PER_CALL: usize = 64;
++// Match one exact-hook slice's structural-work ceiling. Unlike retained
++// ingestion discovery, a live lookup must finish both roots before succeeding.
++const LIVE_SESSION_DISCOVERY_ENTRIES: usize =
++    EXACT_HOOK_DISCOVERY_UNITS_PER_CALL * (MAX_SCAN_DEPTH as usize + 2);
+ const MAX_EXACT_HOOK_SOURCE_AUTHORITIES: usize = 8;
+ const MAX_EXACT_HOOK_SESSION_REQUESTS: usize = 64;
+ 
+@@ -1032,6 +1036,46 @@
+     pub source_deferred: bool,
+     #[cfg(test)]
+     pub files_considered: u64,
++}
++
++/// A strict native locator and the source identity whose header was validated.
++/// This guard grants no history authority. The live origin caller must compare
++/// it again after capture and before registering the locator or live boundary.
++pub struct CodexLiveSessionTranscript {
++    path: PathBuf,
++    native_identity: crate::runtime::source::JsonlNativeFileIdentity,
++    source_identity: [u8; 32],
++}
++
++impl CodexLiveSessionTranscript {
++    pub fn path(&self) -> &Path {
++        &self.path
++    }
++
++    /// Compare the current no-follow source to the exact header validation
++    /// generation. The retained evidence includes native file identity, length,
++    /// mtime and ctime on Unix; a same-inode rewrite therefore invalidates it.
++    pub fn matches_current_source(
++        &self,
++        deadline: std::time::Instant,
++    ) -> TranscriptIngestResult<bool> {
++        check_live_codex_deadline(deadline)?;
++        let current = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&self.path)
++            .map_err(|error| {
++                live_codex_scan_io("reopen guarded live Codex source", &self.path, error)
++            })?;
++        let metadata = current.metadata().map_err(|error| {
++            live_codex_scan_io("stat guarded live Codex source", &self.path, error)
++        })?;
++        let matches = crate::runtime::source::jsonl_native_file_identity(&current, &metadata)
++            == Some(self.native_identity)
++            && codex_corpus_identity(&self.path, &metadata)? == self.source_identity
++            && std::fs::canonicalize(&self.path).map_err(|error| {
++                live_codex_scan_io("resolve guarded live Codex source", &self.path, error)
++            })? == self.path;
++        check_live_codex_deadline(deadline)?;
++        Ok(matches)
++    }
+ }
+ 
+ struct CodexExactSessionPathAuthority {
+@@ -1216,6 +1260,254 @@
+             sessions_dir: self.sessions_dir.clone(),
+             archived_sessions_dir: self.archived_sessions_dir.clone(),
+         }
++    }
++
++    /// Find a native SessionStart source without trusting an ingest row or a
++    /// filename as session identity. The caller owns the CPU permit and must
++    /// capture its live boundary separately, then revalidate the returned guard
++    /// before using the locator; a returned guard grants no history authority.
++    ///
++    /// Both configured native roots must be completely and stably enumerated
++    /// under `deadline`. This lock-free lookup intentionally does not use the
++    /// retained exact-hook cache: a cached hit can precede scan completion.
++    /// The walk allows at most 512 directory entries, plus their bounded parent
++    /// bookkeeping. Larger corpora can return `None` on every Start; this method
++    /// neither retains progress nor claims partial coverage is unique.
++    pub fn find_live_session_transcript(
++        &self,
++        native_session: &str,
++        project_root: &Path,
++        deadline: std::time::Instant,
++    ) -> TranscriptIngestResult<Option<CodexLiveSessionTranscript>> {
++        check_live_codex_deadline(deadline)?;
++        if native_session.is_empty()
++            || native_session.len() > 256
++            || !native_session
++                .bytes()
++                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
++            || !project_root.is_absolute()
++        {
++            return Ok(None);
++        }
++        let project_root = std::fs::canonicalize(project_root).map_err(|error| {
++            live_codex_scan_io("resolve live Codex project", project_root, error)
++        })?;
++        if !project_root.is_dir() {
++            return Ok(None);
++        }
++        let bounds =
++            TranscriptDiscoveryBounds::from_discovered_units(EXACT_HOOK_DISCOVERY_UNITS_PER_CALL);
++        let mut queued = VecDeque::new();
++        let mut roots = Vec::new();
++        let mut directories = Vec::new();
++        let mut work = 0_usize;
++        let mut charged = 0_u64;
++        let mut candidate = None;
++
++        for configured in [&self.sessions_dir, &self.archived_sessions_dir] {
++            check_live_codex_deadline(deadline)?;
++            match std::fs::symlink_metadata(configured) {
++                Ok(metadata) if metadata.file_type().is_dir() => {}
++                Ok(_) => return Ok(None),
++                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++                    roots.push((configured.clone(), None));
++                    continue;
++                }
++                Err(error) => {
++                    return Err(live_codex_scan_io(
++                        "stat live Codex root",
++                        configured,
++                        error,
++                    ));
++                }
++            };
++            let canonical = std::fs::canonicalize(configured).map_err(|error| {
++                live_codex_scan_io("resolve live Codex root", configured, error)
++            })?;
++            if path_byte_len(&canonical) > bounds.max_path_bytes {
++                return Ok(None);
++            }
++            roots.push((configured.clone(), Some(canonical.clone())));
++            queued.push_back((canonical.clone(), canonical, 0_u8));
++        }
++
++        while let Some((directory, root, depth)) = queued.pop_front() {
++            check_live_codex_deadline(deadline)?;
++            if directories.len() >= MAX_BUCKET_DIRS {
++                return Ok(None);
++            }
++            let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
++                live_codex_scan_io("stat live Codex directory", &directory, error)
++            })?;
++            if !metadata.file_type().is_dir()
++                || std::fs::canonicalize(&directory).map_err(|error| {
++                    live_codex_scan_io("resolve live Codex directory", &directory, error)
++                })? != directory
++            {
++                return Ok(None);
++            }
++            let identity = codex_corpus_identity(&directory, &metadata)?;
++            directories.push((directory.clone(), identity));
++            let mut entries = std::fs::read_dir(&directory).map_err(|error| {
++                live_codex_scan_io("enumerate live Codex directory", &directory, error)
++            })?;
++            loop {
++                check_live_codex_deadline(deadline)?;
++                // Never enumerate another entry after spending the full slice,
++                // even when the next entry might be EOF.
++                if work >= LIVE_SESSION_DISCOVERY_ENTRIES {
++                    return Ok(None);
++                }
++                let Some(entry) = entries.next() else { break };
++                work += 1;
++                let entry = entry.map_err(|error| {
++                    live_codex_scan_io("read live Codex entry", &directory, error)
++                })?;
++                let path = entry.path();
++                let charge =
++                    candidate_charge(&path, std::mem::size_of::<std::fs::Metadata>() as u64)?;
++                charged = charged.saturating_add(charge);
++                if path_byte_len(&path) > bounds.max_path_bytes
++                    || charged > bounds.max_discovery_bytes
++                {
++                    return Ok(None);
++                }
++                let kind = entry
++                    .file_type()
++                    .map_err(|error| live_codex_scan_io("stat live Codex entry", &path, error))?;
++                // A skipped link could hide a second locator. This strict walk
++                // cannot establish coverage of any tree containing one.
++                if kind.is_symlink() {
++                    return Ok(None);
++                }
++                if kind.is_dir() {
++                    if depth >= MAX_SCAN_DEPTH {
++                        return Ok(None);
++                    }
++                    queued.push_back((path, root.clone(), depth + 1));
++                    continue;
++                }
++                let matches = path
++                    .file_name()
++                    .and_then(|name| name.to_str())
++                    .is_some_and(|name| {
++                        name.strip_prefix("rollout-")
++                            .and_then(|stem| stem.strip_suffix(".jsonl"))
++                            .is_some_and(|stem| {
++                                stem == native_session
++                                    || stem
++                                        .strip_suffix(native_session)
++                                        .is_some_and(|prefix| prefix.ends_with('-'))
++                            })
++                    });
++                if matches {
++                    if !kind.is_file() || candidate.is_some() {
++                        return Ok(None);
++                    }
++                    candidate = Some((path, root.clone()));
++                }
++            }
++        }
++        let Some((path, root)) = candidate else {
++            return Ok(None);
++        };
++        check_live_codex_deadline(deadline)?;
++        if std::fs::canonicalize(&path)
++            .map_err(|error| live_codex_scan_io("resolve live Codex candidate", &path, error))?
++            != path
++            || !path.starts_with(&root)
++        {
++            return Ok(None);
++        }
++        let file = tracedecay_private_fs::framed_log::open_regular_read_no_follow(&path)
++            .map_err(|error| live_codex_scan_io("open live Codex candidate", &path, error))?;
++        let initial = file.metadata().map_err(|error| {
++            live_codex_scan_io("stat live Codex candidate handle", &path, error)
++        })?;
++        let Some(cwd) = meta::live_session_meta_cwd(&file, native_session, deadline)? else {
++            return Ok(None);
++        };
++        if !cwd.is_absolute() || path_byte_len(&cwd) > bounds.max_path_bytes {
++            return Ok(None);
++        }
++        check_live_codex_deadline(deadline)?;
++        let cwd = std::fs::canonicalize(&cwd)
++            .map_err(|error| live_codex_scan_io("resolve live Codex cwd", &cwd, error))?;
++        if !cwd.starts_with(&project_root) || !cwd.is_dir() {
++            return Ok(None);
++        }
++        // Prefix containment alone would admit a nested independent checkout.
++        // Bound ancestor checks as well as source enumeration; never invoke git.
++        let mut checkout_cwd = cwd.as_path();
++        let mut ancestors = 0_usize;
++        while checkout_cwd != project_root {
++            check_live_codex_deadline(deadline)?;
++            ancestors += 1;
++            if ancestors > LIVE_SESSION_DISCOVERY_ENTRIES {
++                return Ok(None);
++            }
++            let git_marker = checkout_cwd.join(".git");
++            match std::fs::symlink_metadata(&git_marker) {
++                Ok(_) => return Ok(None),
++                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
++                Err(error) => {
++                    return Err(live_codex_scan_io(
++                        "check live Codex checkout",
++                        &git_marker,
++                        error,
++                    ));
++                }
++            }
++            let Some(parent) = checkout_cwd.parent() else {
++                return Ok(None);
++            };
++            checkout_cwd = parent;
++        }
++
++        // Revalidate the full scanned namespace, including roots absent when
++        // enumeration began. New/moved sources make uniqueness unproven.
++        for (configured, canonical) in roots {
++            check_live_codex_deadline(deadline)?;
++            match (std::fs::symlink_metadata(&configured), canonical) {
++                (Err(error), None) if error.kind() == std::io::ErrorKind::NotFound => {}
++                (Ok(metadata), Some(canonical)) if metadata.file_type().is_dir() => {
++                    if std::fs::canonicalize(&configured).map_err(|error| {
++                        live_codex_scan_io("revalidate live Codex root", &configured, error)
++                    })? != canonical
++                    {
++                        return Ok(None);
++                    }
++                }
++                _ => return Ok(None),
++            }
++        }
++        for (directory, expected) in directories {
++            check_live_codex_deadline(deadline)?;
++            let metadata = std::fs::symlink_metadata(&directory).map_err(|error| {
++                live_codex_scan_io("revalidate live Codex directory", &directory, error)
++            })?;
++            if !metadata.file_type().is_dir()
++                || codex_corpus_identity(&directory, &metadata)? != expected
++            {
++                return Ok(None);
++            }
++        }
++        check_live_codex_deadline(deadline)?;
++        if !live_codex_candidate_unchanged(&path, &file, &initial, deadline)? {
++            return Ok(None);
++        }
++        let Some(native_identity) =
++            crate::runtime::source::jsonl_native_file_identity(&file, &initial)
++        else {
++            return Ok(None);
++        };
++        let source_identity = codex_corpus_identity(&path, &initial)?;
++        check_live_codex_deadline(deadline)?;
++        Ok(Some(CodexLiveSessionTranscript {
++            path,
++            native_identity,
++            source_identity,
++        }))
+     }
+ 
+     /// Advances one bounded retained discovery slice and resolves the exact
+@@ -2431,6 +2723,60 @@
+     })
+ }
+ 
++fn live_codex_candidate_unchanged(
++    path: &Path,
++    file: &std::fs::File,
++    initial: &std::fs::Metadata,
++    deadline: std::time::Instant,
++) -> TranscriptIngestResult<bool> {
++    check_live_codex_deadline(deadline)?;
++    let Some(native_identity) = crate::runtime::source::jsonl_native_file_identity(file, initial)
++    else {
++        return Ok(false);
++    };
++    let initial_identity = codex_corpus_identity(path, initial)?;
++    let final_metadata = file
++        .metadata()
++        .map_err(|error| live_codex_scan_io("revalidate live Codex handle", path, error))?;
++    let current = tracedecay_private_fs::framed_log::open_regular_read_no_follow(path)
++        .map_err(|error| live_codex_scan_io("reopen live Codex candidate", path, error))?;
++    let current_metadata = current
++        .metadata()
++        .map_err(|error| live_codex_scan_io("stat live Codex reopened handle", path, error))?;
++    if crate::runtime::source::jsonl_native_file_identity(&current, &current_metadata)
++        != Some(native_identity)
++        || codex_corpus_identity(path, &final_metadata)? != initial_identity
++        || codex_corpus_identity(path, &current_metadata)? != initial_identity
++        || std::fs::canonicalize(path)
++            .map_err(|error| live_codex_scan_io("revalidate live Codex path", path, error))?
++            != path
++    {
++        return Ok(false);
++    }
++    check_live_codex_deadline(deadline)?;
++    Ok(true)
++}
++
++fn live_codex_scan_io(
++    operation: &'static str,
++    path: &Path,
++    source: std::io::Error,
++) -> TranscriptIngestError {
++    TranscriptIngestError::ScanIo {
++        operation,
++        path: path.to_owned(),
++        source,
++    }
++}
++
++fn check_live_codex_deadline(deadline: std::time::Instant) -> TranscriptIngestResult<()> {
++    if std::time::Instant::now() >= deadline {
++        Err(TranscriptIngestError::Cancelled { provider: PROVIDER })
++    } else {
++        Ok(())
++    }
++}
++
+ fn retain_active_file(
+     files: &mut BinaryHeap<Reverse<CodexFileIdentity>>,
+     candidate: CodexFileIdentity,
+--- a/crates/tracedecay-sessions/src/runtime/hosts/codex/meta.rs
++++ b/crates/tracedecay-sessions/src/runtime/hosts/codex/meta.rs
+@@ -74,6 +74,80 @@
+ /// Read the leading `session_meta` line of a rollout for cwd/session-id/model.
+ pub(super) fn session_meta(path: &Path) -> Option<CodexMeta> {
+     session_meta_with_provenance(path).map(|parsed| parsed.meta)
++}
++
++struct LiveCodexHeaderReader<'a> {
++    file: &'a std::fs::File,
++    deadline: std::time::Instant,
++}
++
++impl std::io::Read for LiveCodexHeaderReader<'_> {
++    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
++        if std::time::Instant::now() >= self.deadline {
++            return Err(std::io::ErrorKind::TimedOut.into());
++        }
++        std::io::Read::read(&mut self.file, buffer)
++    }
++}
++
++/// Strict live bootstrap reads one complete native header. Historical ingest's
++/// four-frame search and filename-derived identity are deliberately unavailable.
++pub(super) fn live_session_meta_cwd(
++    file: &std::fs::File,
++    native_session: &str,
++    deadline: std::time::Instant,
++) -> crate::runtime::source::TranscriptIngestResult<Option<PathBuf>> {
++    use std::io::Read;
++
++    const MAX_LIVE_HEADER_BYTES: usize = 64 * 1024;
++    super::check_live_codex_deadline(deadline)?;
++    let reader = BufReader::with_capacity(
++        4096,
++        LiveCodexHeaderReader { file, deadline }.take((MAX_LIVE_HEADER_BYTES + 1) as u64),
++    );
++    let mut frames = RawJsonlFrameReader::new(reader, MAX_LIVE_HEADER_BYTES);
++    let frame = frames
++        .next_frame_with_budget((MAX_LIVE_HEADER_BYTES + 1) as u64)
++        .map_err(|error| {
++            if error.kind() == std::io::ErrorKind::TimedOut {
++                crate::runtime::source::TranscriptIngestError::Cancelled { provider: "codex" }
++            } else {
++                crate::runtime::source::TranscriptIngestError::InvalidFrameState {
++                    provider: "codex",
++                }
++            }
++        })?;
++    super::check_live_codex_deadline(deadline)?;
++    if !matches!(frame, RawJsonlFrame::Complete { .. }) {
++        return Ok(None);
++    }
++    let Ok(record) = serde_json::from_slice::<Value>(frames.record()) else {
++        return Ok(None);
++    };
++    super::check_live_codex_deadline(deadline)?;
++    if record.get("type").and_then(Value::as_str) != Some("session_meta") {
++        return Ok(None);
++    }
++    let Some(payload) = record.get("payload").filter(|payload| payload.is_object()) else {
++        return Ok(None);
++    };
++    // If both native fields are present they must agree. A missing, empty or
++    // wrongly typed id must never fall back to a matching rollout filename.
++    let id = payload.get("id");
++    let session_id = payload.get("session_id");
++    if id.is_none() && session_id.is_none()
++        || [id, session_id]
++            .into_iter()
++            .flatten()
++            .any(|value| value.as_str() != Some(native_session))
++    {
++        return Ok(None);
++    }
++    Ok(payload
++        .get("cwd")
++        .and_then(Value::as_str)
++        .filter(|cwd| !cwd.is_empty())
++        .map(PathBuf::from))
+ }
+ 
+ pub(super) fn session_meta_with_provenance(path: &Path) -> Option<CodexMetaWithProvenance> {

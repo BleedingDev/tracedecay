@@ -193,10 +193,12 @@ fn capture_live_origin_with_test_authorities(
         return None;
     };
     let branch_evidence = capture_branch_evidence(&marker.git_common_dir, repository, deadline)?;
-    let previous_observation = previous.filter(|previous| {
-        previous.observation.canonical_source_path == canonical_source_path
-            && previous.observation.source == source
-    });
+    let previous_observation = previous
+        .filter(|previous| {
+            previous.observation.canonical_source_path == canonical_source_path
+                && previous.observation.source == source
+        })
+        .map(|previous| &previous.observation);
     let checkpoint = previous_observation.map(|previous| previous.checkpoint);
     let resume = previous_observation.map(|previous| {
         let checkpoint = previous.checkpoint;
@@ -211,8 +213,8 @@ fn capture_live_origin_with_test_authorities(
                 file_identity: checkpoint.file_identity,
                 fingerprint: checkpoint.complete_prefix_fingerprint,
             },
-            physical_eof: previous.observation.physical_eof,
-            native_birth_witness: previous.observation.native_birth_witness,
+            physical_eof: previous.physical_eof,
+            native_birth_witness: previous.native_birth_witness,
         }
     });
     let scan = capture_live_jsonl_origin(
@@ -1672,7 +1674,7 @@ async fn source_selector_from_previous_session_cannot_accept_a_command_in_curren
     assert!(
         fixture
             .ledger
-            .retained_deletion_command(&operation_control())
+            .retained_deletion_command(&context, &operation_control())
             .is_err(),
         "cross-session selector must not leave an accepted command receipt"
     );

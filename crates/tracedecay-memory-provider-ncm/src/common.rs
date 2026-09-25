@@ -9,8 +9,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tracedecay_memory_provider_api::contract::{TemporalMode, TerminalCode, UnknownValidityPolicy};
 use tracedecay_memory_provider_api::{
-    CanonicalPayload, CurrentAdvisoryAdmission, OwnedExactScope, OwnedProviderId, ProviderCall,
-    ProviderReply,
+    CanonicalPayload, CurrentAdvisoryAdmission, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
+    ProviderCall, ProviderReply,
 };
 use tracedecay_memory_provider_api::{
     OriginScopeEvidence, OriginalSourceIdentity, OwnedRecallExclusions, OwnedTemporalQuery,
@@ -56,6 +56,9 @@ const EXCLUSIONS: &[&str] = &[
 /// selection budget coupled so a small caller budget is never widened at the
 /// adapter boundary.
 const MAX_RECALL_CANDIDATES: u64 = 16;
+
+/// Canonical host-facing outcome produced after reconstructing a worker recall.
+const RECALL_RESULT_CONTRACT_ID: &str = "tracedecay.memory.recall.query.outcome.v1";
 
 /// Maximum serialized size of any retained named capsule.
 ///
@@ -1025,7 +1028,7 @@ fn reconstruct_recall_inner(
     let bytes = serde_json::to_vec(&value).ok()?;
     reply.payload = Some(
         CanonicalPayload::new(
-            call.payload.contract_id.clone(),
+            OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID).ok()?,
             bytes.clone(),
             hex_digest(&Sha256::digest(&bytes)),
         )
@@ -2052,6 +2055,10 @@ mod recall_diagnostic_tests {
         let mut reply = worker_reply(&call, &worker);
         reconstruct_recall(&call, "ncm.instance.contract", &mut reply, None)
             .expect("reconstruction");
+        assert_eq!(
+            reply.payload.as_ref().unwrap().contract_id.as_str(),
+            RECALL_RESULT_CONTRACT_ID
+        );
         let output: Value = serde_json::from_slice(&reply.payload.as_ref().unwrap().bytes).unwrap();
         assert_eq!(output["request_identity"], json!(call.request_id));
         assert_eq!(

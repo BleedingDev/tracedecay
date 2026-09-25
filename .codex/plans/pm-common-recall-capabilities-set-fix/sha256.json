@@ -1,0 +1,9 @@
+{
+  "file": "crates/tracedecay-memory-provider-registry/tests/recall_port.rs",
+  "before_live_sha256": "5cf1bcb68b82ee9dd73434a4af2c7602f24ba1d8ac20319171e8b638b968c21e",
+  "before_index_sha256": "5cf1bcb68b82ee9dd73434a4af2c7602f24ba1d8ac20319171e8b638b968c21e",
+  "before_index_git_blob": "e04754f5ff1173a74ee124d0505450fd246bd549",
+  "after_live_sha256": "7077e6faaa5648bfda26170c0cad67586e359d0b5da8178e640224709e4f3906",
+  "after_index_sha256": "5cf1bcb68b82ee9dd73434a4af2c7602f24ba1d8ac20319171e8b638b968c21e",
+  "delta_patch_sha256": "7ff5e2e7e8ace5c74d18578cafeb921e7d0a1e08755c1e72ea001a2e4ca2c029"
+}

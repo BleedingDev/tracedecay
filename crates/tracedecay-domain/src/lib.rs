@@ -110,7 +110,7 @@ pub use configuration::{
     RedactedConfigurationChangeV1, RepositoryPlacementScopeV1, RequiredCheckExpectationV1,
     RequiredCheckV1, RestartRequirementV1, RestrictiveCapabilityResolutionV1, ReviewRequirementV1,
     ReviewTopologyKindV1, ReviewTopologyPolicyV1, RollbackModeV1, RuleEffect,
-    SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
+    SEMANTIC_RUNTIME_SETTING_KEY_V2, SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_INIT_SETTING_KEY,
     SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
     SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
@@ -361,10 +361,10 @@ pub use retrieval::{
     RetrievalCursorKeyId, RetrievalError, RetrievalFailure, RetrievalRequest, RetrievalScope,
     RetrievalSnapshot, RetrieverBatch, RetrieverContinuation, RetrieverCoverage, RetrieverKind,
     RetrieverOutcome, SanitizedBudgetUsage, SanitizedStageFailure, ScoreDomainCalibrationV1,
-    ScoreDomainId, SemanticRetrievalContinuationV1, SemanticSourceScopeV1, SessionOrThreadId,
-    SingleRootScopeV1, SourceFreshness, SourceInstanceKey, SourceNamespace, SourceOccurrenceId,
-    TemporalCandidateChannelV1, TemporalCandidateContributionV1, TemporalLaneEvidenceV1,
-    project_caller_deadline,
+    ScoreDomainId, SemanticQueryModeV1, SemanticRetrievalContinuationV1, SemanticSourceScopeV1,
+    SessionOrThreadId, SingleRootScopeV1, SourceFreshness, SourceInstanceKey, SourceNamespace,
+    SourceOccurrenceId, TemporalCandidateChannelV1, TemporalCandidateContributionV1,
+    TemporalLaneEvidenceV1, RETRIEVAL_CURSOR_MAX_ENVELOPE_BYTES, project_caller_deadline,
 };
 pub use session::{
     ByteRangeV1, ClosedUtcIntervalV1, CompactContextBundleV1, CompactContextConflictV1,

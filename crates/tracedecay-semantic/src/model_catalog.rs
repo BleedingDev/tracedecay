@@ -97,6 +97,17 @@ pub fn production_fastembed_catalog() -> FastEmbedModelCatalogV1 {
     FastEmbedModelCatalogV1::production()
 }
 
+/// Return the pinned embedding width for one production catalog model.
+///
+/// Runtime composition uses this narrow lookup to size projection admission
+/// without copying catalog identity or accepting an uncataloged model.
+pub fn production_model_dimensions(model_id: &str) -> Result<u32, CatalogErrorV1> {
+    FastEmbedModelCatalogV1::production()
+        .get(model_id)
+        .map(|model| model.expected_dimensions)
+        .ok_or(CatalogErrorV1::UnknownModel)
+}
+
 /// Admit a configured `selected_model` against the production catalog.
 pub fn admit_production_model_selection(
     selected_model: Option<&str>,
@@ -436,11 +447,12 @@ mod tests {
         let catalog = FastEmbedModelCatalogV1::production();
         for model_id in catalog.model_ids() {
             let config = SemanticConfig {
-                selected_model: Some(model_id.to_owned()),
+                enabled: true,
                 ..SemanticConfig::default()
             };
-            config.validate().expect("catalog id has valid shape");
-            admit_production_model_selection(config.selected_model.as_deref())
+            config.validate().expect("semantic configuration is valid");
+            assert_eq!(config.effective_model_id(), Some(model_id));
+            admit_production_model_selection(config.effective_model_id())
                 .expect("catalog id is admitted");
         }
         assert_eq!(
@@ -448,6 +460,22 @@ mod tests {
             Err(CatalogErrorV1::UnknownModel)
         );
         assert_eq!(admit_production_model_selection(None), Ok(()));
+    }
+
+    #[test]
+    fn production_dimensions_come_only_from_the_catalog_entry() {
+        let expected = FastEmbedModelCatalogV1::production()
+            .get(DEFAULT_FASTEMBED_MODEL_ID)
+            .expect("default model")
+            .expected_dimensions;
+        assert_eq!(
+            production_model_dimensions(DEFAULT_FASTEMBED_MODEL_ID),
+            Ok(expected)
+        );
+        assert_eq!(
+            production_model_dimensions("NotARealModel"),
+            Err(CatalogErrorV1::UnknownModel)
+        );
     }
 
     #[test]

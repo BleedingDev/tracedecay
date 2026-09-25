@@ -906,25 +906,25 @@ impl NcmProviderAdapter {
         }
     }
 
-    fn surface_identity_refresh_required(
+    fn surface_identity_refresh_generation(
         response: &NcmSurfaceHandshakeResponse,
         descriptor: &ProviderDescriptor,
-    ) -> bool {
+    ) -> Option<u64> {
         let effect = response.terminal.committed_effect();
-        let observed_generation = effect.state_generation_before();
-        response.terminal.terminal_code() == TerminalCode::StaleIdentity
+        let observed_generation = effect.state_generation_before()?;
+        (response.terminal.terminal_code() == TerminalCode::StaleIdentity
             && response.terminal.diagnostic_id() == Some(SURFACE_IDENTITY_REFRESH_DIAGNOSTIC)
             && effect.state() == CommittedEffectState::None
-            && observed_generation.is_some()
-            && observed_generation == effect.state_generation_after()
-            && observed_generation != Some(descriptor.state_generation)
+            && Some(observed_generation) == effect.state_generation_after()
+            && observed_generation != descriptor.state_generation
             && response.descriptor.is_none()
             && response.provider_instance_id.is_none()
             && response.namespace.is_none()
             && response.effective_limits.is_none()
             && response.ready_receipt_sha256.is_none()
             && response.challenge_response_sha256.is_none()
-            && response.warnings.is_empty()
+            && response.warnings.is_empty())
+        .then_some(observed_generation)
     }
 
     fn surface_metadata_is_scope_safe(
@@ -1198,7 +1198,7 @@ impl MemoryProvider for NcmProviderAdapter {
                 );
             }
         };
-        let descriptor = self.surface.descriptor();
+        let mut descriptor = self.surface.descriptor();
         if descriptor.validate().is_err() {
             return Self::handshake_failure(
                 request,
@@ -1289,7 +1289,9 @@ impl MemoryProvider for NcmProviderAdapter {
                 "ncm.surface_handshake_contract_violation",
             );
         }
-        if Self::surface_identity_refresh_required(&surface_response, &descriptor) {
+        if let Some(refreshed_generation) =
+            Self::surface_identity_refresh_generation(&surface_response, &descriptor)
+        {
             if let Err(code) = surface_request.control.snapshot() {
                 return Self::handshake_failure(request, code, "ncm.request_control_terminal");
             }
@@ -1297,6 +1299,7 @@ impl MemoryProvider for NcmProviderAdapter {
             // this bounded transition. One re-handshake can therefore bind
             // the new identity, while the final response still goes through
             // every normal scope, model, provider, and challenge check below.
+            descriptor.state_generation = refreshed_generation;
             surface_response = self.surface.handshake(&surface_request);
         }
         let surface_success = surface_response.terminal.terminal_code() == TerminalCode::Success;

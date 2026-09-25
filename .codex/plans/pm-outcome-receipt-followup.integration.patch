@@ -1,0 +1,139 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/outcome.rs
+@@ -55,8 +55,13 @@
+         )
+         && !verified_no_change(&completed.result)
+     {
++        // Retain the receipt the provider actually supplied before removing
++        // malformed operation data; a host observation is not a provider receipt.
++        let provider_receipt_digest = mutation_receipt(&completed.result.result)
++            .map(|receipt| receipt.provider_receipt_digest.clone());
+         completed.result.terminal = ProviderControlTerminalV1::ContractViolation;
+         completed.result.effect = unknown_effect();
++        completed.result.effect.provider_receipt_digest = provider_receipt_digest;
+         completed.result.result = absent_operation_result(request);
+         completed.result.warnings.truncate(31);
+         completed.result.warnings.push("host: successful provider no-effect reply lacked operation-specific no-change evidence; reconcile the same operation".to_owned());
+@@ -71,7 +76,7 @@
+         if completed.host_receipt.is_some() {
+             return Err(invalid_field("host effect on a provider read"));
+         }
+-        read_outcome(context, completed.result)
++        read_outcome(context, request, completed.result)
+     }
+ }
+ 
+@@ -708,8 +713,23 @@
+ 
+ fn read_outcome(
+     context: &RetainedSurfaceExecutionContextV1<'_>,
++    request: &ProviderControlRequestV1,
+     result: ProviderControlResultV1,
+ ) -> OutcomeResult<ApplicationOutcome<RetainedSurfaceResultV1>> {
++    let complete_initial_inspection = matches!(
++        (request, &result.result),
++        (
++            ProviderControlRequestV1::Inspection(request),
++            ProviderControlOperationResultV1::Inspection(Some(data)),
++        ) if request.cursor.is_none()
++            && data.coverage == ProviderControlInspectionCoverageV1::Complete
++            && data.next_cursor.is_none()
++            && data.redactions.is_empty()
++            && matches!(
++                result.terminal,
++                ProviderControlTerminalV1::Success | ProviderControlTerminalV1::SuccessZeroResults
++            )
++    );
+     let finished_at = now_micros();
+     let operation = result.operation();
+     let execution_terminal = read_termination(result.terminal);
+@@ -734,7 +754,11 @@
+         SortContractId::new(format!("sort.provider-control.{}.v1", operation.as_str()))
+             .map_err(invalid_outcome)?,
+         1,
+-        facts.total,
++        if complete_initial_inspection {
++            Some(facts.returned)
++        } else {
++            facts.total
++        },
+         facts.returned,
+     )
+     .map_err(invalid_outcome)?;
+@@ -1097,8 +1121,9 @@
+         committed.effect.state = ProviderControlEffectStateV1::Committed;
+         committed.effect.state_generation_before = Some(5);
+         committed.effect.state_generation_after = Some(6);
+-        committed.effect.committed_boundary = Some("maintenance:compacted".to_owned());
++        committed.effect.committed_boundary = None;
+         committed.effect.provider_receipt_digest = Some("c".repeat(64));
++        committed.effect.verification_digest = Some("e".repeat(64));
+         let committed = assembled(committed);
+         assert_eq!(committed.receipt.outcome, EffectTermination::Completed);
+         assert!(committed.receipt.committed_state.is_some());
+@@ -1111,6 +1136,7 @@
+     #[test]
+     fn malformed_success_after_contact_retains_operation_for_reconciliation() {
+         let mut result = unchanged_result();
++        result.diagnostic_id = Some("actual.provider.diagnostic".to_owned());
+         let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut result.result else {
+             unreachable!()
+         };
+@@ -1127,6 +1153,17 @@
+         );
+         assert_eq!(result.operation_id, identity().operation_id);
+         assert_eq!(result.idempotency_key, identity().idempotency_key);
++        assert_eq!(
++            result.diagnostic_id.as_deref(),
++            Some("actual.provider.diagnostic")
++        );
++        assert_eq!(result.effect.state, ProviderControlEffectStateV1::Unknown);
++        assert_eq!(result.effect.provider_receipt_digest, Some("c".repeat(64)));
++        assert_eq!(
++            result.effect.reconciliation_action.as_deref(),
++            Some("reconcile_same_operation")
++        );
++        assert!(result.effect.verification_digest.is_none());
+         assert!(matches!(
+             result.result,
+             ProviderControlOperationResultV1::Maintenance(None)
+@@ -1239,6 +1276,39 @@
+         let ProviderControlRequestV1::Inspection(inspection) = &mut request else {
+             unreachable!()
+         };
++        inspection.cursor = Some("cursor.capabilities.2".to_owned());
++        result.terminal = ProviderControlTerminalV1::Success;
++        let ProviderControlOperationResultV1::Inspection(Some(data)) = &mut result.result else {
++            unreachable!()
++        };
++        data.coverage = ProviderControlInspectionCoverageV1::Complete;
++        data.next_cursor = None;
++        let resumed = assemble_outcome(
++            &context,
++            &request,
++            Ok(CompletedProviderControlV1 {
++                result: result.clone(),
++                host_receipt: None,
++            }),
++            &configuration,
++        )
++        .unwrap();
++        let ApplicationOutcome::Evidence(resumed) = resumed else {
++            panic!("resumed inspection evidence")
++        };
++        assert_eq!(resumed.coverage.returned, 2);
++        assert_eq!(resumed.page.returned, 2);
++        assert_eq!(resumed.page.sort_revision, 1);
++        assert_eq!(resumed.page.total, None);
++        assert!(resumed.page.cursor.is_none());
++        assert_eq!(
++            resumed.payload,
++            Some(RetainedSurfaceResultV1::ProviderControl(result.clone()))
++        );
++
++        let ProviderControlRequestV1::Inspection(inspection) = &mut request else {
++            unreachable!()
++        };
+         inspection.maximum_items = 1;
+         assert!(
+             assemble_outcome(

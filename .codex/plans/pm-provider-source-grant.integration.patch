@@ -1,0 +1,402 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/source_controls.rs
+@@ -13,11 +13,13 @@
+ };
+ use tracedecay_memory_provider_registry::contract::DeletionMode;
+ use tracedecay_memory_provider_registry::{
+-    CanonicalPayload, OwnedExactScope, SourceAttribution, rfc3339_utc_micros,
++    CanonicalPayload, HistoryGrant, OwnedExactScope, SourceAttribution, rfc3339_utc_micros,
+ };
+ 
+ use super::super::cognitive_recall::control_attribution::RetainedRecallControlScopeV1;
+-use super::super::provider_history::{original_source_fence_digest, resolved_replay_observation};
++use super::super::provider_history::{
++    original_source_fence_digest, resolved_replay_observation, retained_history_source,
++};
+ use super::authority::ProviderSourceIntentActionErrorV1;
+ use super::feedback_receipt::{
+     AcceptedDeletionCommandV1, AcceptedFeedbackAssertionV1, HostSourceCommandErrorV1,
+@@ -77,7 +79,14 @@
+         Err(failure) => return Ok(accepted_failure(invocation, &retained, &identity, failure)),
+     };
+     let dispatched = match port
+-        .dispatch(invocation, &state, body, &identity, None)
++        .dispatch_with_source_grant(
++            invocation,
++            &state,
++            body,
++            &identity,
++            None,
++            Some(source.authorized.grant.clone()),
++        )
+         .await
+     {
+         Ok(dispatched) => dispatched,
+@@ -138,8 +147,18 @@
+         "evidence_refs": request.evidence_refs,
+     });
+     let change_evidence = change.evidence()?;
++    let history_grant = change
++        .history_grant(port, invocation, &state, &source)
++        .await?;
+     let dispatched = port
+-        .dispatch(invocation, &state, body, &invocation.identity, None)
++        .dispatch_with_source_grant(
++            invocation,
++            &state,
++            body,
++            &invocation.identity,
++            None,
++            Some(history_grant),
++        )
+         .await?;
+     port.project(
+         invocation,
+@@ -165,6 +184,52 @@
+ }
+ 
+ impl PreparedCorrectionV1<'_> {
++    async fn history_grant(
++        &self,
++        port: &ProjectProviderControlPortV1,
++        invocation: &ControlInvocationV1<'_, '_>,
++        state: &ResolvedControlStateV1,
++        target: &AuthorizedControlSourceV1,
++    ) -> ControlResult<HistoryGrant> {
++        let Self::Replacement {
++            source: replacement,
++            ..
++        } = self
++        else {
++            return Ok(target.authorized.grant.clone());
++        };
++        port.require_same_state(state, target)?;
++        port.require_same_state(state, replacement)?;
++        let mut originals = vec![target.authorized.retained.original_source.clone()];
++        if replacement.authorized.retained.original_source != originals[0] {
++            originals.push(replacement.authorized.retained.original_source.clone());
++        }
++        // Reuse the existing canonical inventory authority to derive one actual
++        // relation and checkpoint for both originals. The installed provider
++        // authority still treats this private per-call value as an untrusted
++        // claim and revalidates every full source immediately before use.
++        let inventory = port
++            .authority()?
++            .authorize_retained_source_inventory(&state.retained, &originals, &invocation.control)
++            .await?;
++        let grant = inventory
++            .grant
++            .ok_or_else(|| binding("replacement history inventory"))?;
++        if grant
++            .sources
++            .iter()
++            .any(|source| !retained_history_source(source.current_disposition.state))
++        {
++            return Err(
++                super::super::provider_history::ProviderHistoryErrorV1::Ineligible(
++                    "current correction source disposition",
++                )
++                .into(),
++            );
++        }
++        Ok(grant)
++    }
++
+     fn body(&self) -> ControlResult<Value> {
+         match self {
+             Self::Metadata(value) => Ok(value.clone()),
+@@ -475,7 +540,14 @@
+     };
+     let body = deletion_body(request, source_evidence.original_attribution);
+     let dispatched = match port
+-        .dispatch(invocation, &state, body, &identity, None)
++        .dispatch_with_source_grant(
++            invocation,
++            &state,
++            body,
++            &identity,
++            None,
++            Some(source.authorized.grant.clone()),
++        )
+         .await
+     {
+         Ok(dispatched) => dispatched,
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/tests/source_controls.rs
+@@ -25,7 +25,9 @@
+ use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
+ use tracedecay_memory_observation::{RecoveryTimeBudgetV1, SqliteObservationJournal};
+ use tracedecay_memory_provider_registry::{
+-    CancellationToken, OperationControl, OwnedProviderId, ProjectMemoryProviderComposition,
++    AdvisoryAdmissionAuthority, AdvisoryAdmissionError, CancellationToken,
++    CurrentAdvisoryAdmission, OperationControl, OwnedProviderId, OwnedVersionedId,
++    ProjectMemoryProviderComposition, ProviderCall, ProviderCallParts, ProviderOperation,
+     RecallExplainHostDecisionV1, RecallExplainItemV1, RecallExplainProviderExplanationV1,
+     RecallExplainTraceV1, RecallSourceAttributionV1,
+ };
+@@ -46,7 +48,8 @@
+ };
+ use crate::daemon::retained_owner::provider_history::{
+     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
+-    ProviderHistoryReaderV1, source_attribution_json,
++    ProviderHistoryAuthorityV1, ProviderHistoryReaderV1, history_grant_json,
++    source_attribution_json,
+ };
+ use crate::host_admission::HostAdmissionTestRuntimeV1;
+ use crate::mcp::tools::handlers::hook_runtime::capture_live_origin_for_control_test;
+@@ -61,6 +64,7 @@
+     port: ProjectProviderControlPortV1,
+     ledger: Arc<RecallAdmissionLedgerV1>,
+     journal: Arc<SqliteObservationJournal>,
++    history_authority: Arc<dyn AdvisoryAdmissionAuthority>,
+     selector: ProviderControlSourceSelectorV1,
+     attribution: SourceAttribution,
+     scope: ResolvedScope,
+@@ -127,6 +131,10 @@
+ 
+ impl OfflineSourceFixture {
+     async fn new() -> Self {
++        Self::for_delivery_session(SESSION).await
++    }
++
++    async fn for_delivery_session(delivery_session: &str) -> Self {
+         let temporary = TempDir::new().unwrap();
+         let project_root = temporary.path().join("repository");
+         std::fs::create_dir_all(&project_root).unwrap();
+@@ -341,21 +349,21 @@
+             )
+             .unwrap(),
+         );
+-        let original = MountedOriginalObservationAuthorityV1 {
++        let original = Arc::new(MountedOriginalObservationAuthorityV1 {
+             reader: origin_reader.clone(),
+             bridge: bridge.clone(),
+-        };
++        });
+         let observations = registered.observation_store();
+         let reader = ProviderHistoryReaderV1 {
+             bridge: bridge.as_ref(),
+             observations: &observations,
+             dispositions: dispositions.as_ref(),
+-            original_authority: &original,
++            original_authority: original.as_ref(),
+             journal: journal.as_ref(),
+             provider_id: &provider,
+             policy_revision: 1,
+         };
+-        let delivery = bridge.destination(SESSION).unwrap();
++        let delivery = bridge.destination(delivery_session).unwrap();
+         let page = reader
+             .select_recent_page(&delivery, 256, &operation_control())
+             .await
+@@ -419,6 +427,19 @@
+             item_ref: metadata.item_ref(0).unwrap().as_str().to_owned(),
+             observation_id: attribution.source.observation_id.clone(),
+         };
++        let history_authority: Arc<dyn AdvisoryAdmissionAuthority> =
++            Arc::new(ProviderHistoryAuthorityV1 {
++                mounted_scope: scope.clone(),
++                profile_id: profile.clone(),
++                registered_shard: registered.binding().shard_id.clone(),
++                observations: Arc::new(observations),
++                dispositions: dispositions.clone(),
++                original_authority: Some(original),
++                journal: journal.clone(),
++                provider_id: provider.clone(),
++                policy_revision: 1,
++                runtime: tokio::runtime::Handle::current(),
++            });
+         let authority = Arc::new(
+             ProviderControlAuthorityV1::from_mounted_data(
+                 ProviderControlAuthorityInputsV1 {
+@@ -458,6 +479,7 @@
+             port,
+             ledger,
+             journal,
++            history_authority,
+             selector,
+             attribution,
+             scope,
+@@ -530,6 +552,69 @@
+                 request,
+             )
+             .await
++    }
++
++    async fn admit_source_call(
++        &self,
++        call: ProviderCall,
++    ) -> Result<CurrentAdvisoryAdmission, AdvisoryAdmissionError> {
++        let authority = self.history_authority.clone();
++        tokio::task::spawn_blocking(move || {
++            // The installed synchronous authority requires the same absence of
++            // an entered Tokio context as its production dispatch thread.
++            std::thread::spawn(move || authority.admit(&call))
++                .join()
++                .unwrap()
++        })
++        .await
++        .unwrap()
++    }
++
++    fn deletion_authority_call(
++        &self,
++        request: &ProviderDeleteBySourceRequestV1,
++        context: &RequestContext,
++        accepted: &AcceptedDeletionCommandV1,
++        grant: HistoryGrant,
++    ) -> ProviderCall {
++        let control = operation_control();
++        let snapshot = control.snapshot().unwrap();
++        // This is an untrusted authority-admission request, never dispatched.
++        // The readiness digest is an input claim, not a fabricated ready receipt.
++        let readiness_claim = "a".repeat(64);
++        let mut payload = deletion_body(request, &self.attribution);
++        payload["common_request"] = json!({
++            "provider_id": "tracedecay.native",
++            "registration_revision": 1,
++            "ready_receipt_digest": readiness_claim,
++            "exact_scope_identity": projection::scope(&grant.destination_scope),
++            "operation_id": accepted.operation_id(),
++            "idempotency_key": accepted.idempotency_key(),
++            "expected_state_generation": 1,
++            "request_identity": context.request_id().as_str(),
++            "policy_revision": 1,
++            "deadline": {"deadline_utc_micros": control.deadline_utc_micros(), "remaining_millis":snapshot.remaining_millis},
++            "cancellation": "live", "extensions": [],
++        });
++        ProviderCall::new(ProviderCallParts {
++            operation: ProviderOperation::DeleteBySource,
++            provider_id: OwnedProviderId::new("tracedecay.native").unwrap(),
++            registration_revision: 1,
++            ready_receipt_sha256: readiness_claim,
++            exact_scope: grant.destination_scope.clone(),
++            request_id: context.request_id().as_str().to_owned(),
++            operation_id: accepted.operation_id().to_owned(),
++            expected_state_generation: 1,
++            idempotency_key: Some(accepted.idempotency_key().to_owned()),
++            control,
++            payload: authority_payload(&payload),
++            required_capabilities: vec![
++                OwnedVersionedId::new(ProviderOperation::DeleteBySource.capability_id()).unwrap(),
++            ],
++            extensions: Vec::new(),
++        })
++        .unwrap()
++        .with_history_grant(grant)
+     }
+ 
+     fn durable_intent(
+@@ -907,3 +992,110 @@
+     );
+     assert!(body.get("retention_lock_blocked").is_none());
+ }
++
++fn authority_payload(value: &Value) -> CanonicalPayload {
++    let bytes = tracedecay_domain::canonical_json_bytes(value).unwrap();
++    let digest = tracedecay_domain::canonical_text::sha256_hex(&bytes);
++    CanonicalPayload::new(
++        OwnedVersionedId::new("tracedecay.memory.provider.deletion-by-source.v1").unwrap(),
++        bytes,
++        digest,
++    )
++    .unwrap()
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn installed_authority_revalidates_cross_session_private_sources_and_post_fence_deletion() {
++    let fixture = OfflineSourceFixture::for_delivery_session("different-delivery-session").await;
++    let request = fixture.request();
++    let (context, cancellation) = fixture.context(&request, "request.private-source-authority");
++    let ProviderControlRequestV1::DeleteBySource(deletion) = &request else {
++        unreachable!()
++    };
++    let source = fixture
++        .port
++        .resolve_source(&fixture.selector, false, &operation_control())
++        .await
++        .unwrap();
++    let claim = source.authorized.grant.clone();
++    assert_eq!(
++        claim.relation,
++        tracedecay_memory_provider_registry::HistoryRelation::SameCheckout
++    );
++    assert_ne!(
++        claim.destination_scope.agent_session_id,
++        fixture
++            .attribution
++            .origin_scope
++            .recorded_scope()
++            .unwrap()
++            .agent_session_id
++    );
++    assert!(
++        fixture.attribution.source.source_revision.is_none(),
++        "the real Claude producer provides no canonical revision"
++    );
++    let accepted = fixture
++        .ledger
++        .accept_deletion_command(
++            &context,
++            deletion,
++            &source.target,
++            &fixture.attribution,
++            &operation_control(),
++        )
++        .unwrap();
++    let call = fixture.deletion_authority_call(deletion, &context, &accepted, claim.clone());
++    let admitted = fixture.admit_source_call(call.clone()).await.unwrap();
++    admitted.verify_for(&call).unwrap();
++    assert_eq!(admitted.history_sources.len(), 1);
++    assert_eq!(admitted.history_sources[0].attribution, fixture.attribution);
++    assert_eq!(
++        admitted.history_sources[0].current_disposition.state,
++        tracedecay_memory_provider_registry::SourceDisposition::Available
++    );
++
++    let mut false_attribution = claim.clone();
++    false_attribution.sources[0]
++        .attribution
++        .source
++        .content_sha256 = "f".repeat(64);
++    assert!(
++        fixture
++            .admit_source_call(call.clone().with_history_grant(false_attribution))
++            .await
++            .is_err()
++    );
++    let mut unequal_wire = claim.clone();
++    unequal_wire.authorization_ref.push_str(".different-claim");
++    let mut payload: Value = serde_json::from_slice(&call.payload.bytes).unwrap();
++    payload["history_grant"] = history_grant_json(&unequal_wire).unwrap();
++    let mut conflicting = call.clone();
++    conflicting.payload = authority_payload(&payload);
++    assert!(matches!(
++        fixture.admit_source_call(conflicting).await,
++        Err(AdvisoryAdmissionError::Denied("conflicting history grants"))
++    ));
++
++    let outcome = fixture
++        .execute(&request, &context, &cancellation)
++        .await
++        .unwrap();
++    let ApplicationOutcome::Effect(effect) = outcome else {
++        panic!("durable host intent")
++    };
++    assert_eq!(effect.receipt.outcome, EffectTermination::Completed);
++    assert!(!fixture.durable_intent(&accepted).provider_erasure_verified);
++    assert_eq!(
++        claim.sources[0].current_disposition.state,
++        tracedecay_memory_provider_registry::SourceDisposition::Available
++    );
++    let after = fixture.admit_source_call(call.clone()).await.unwrap();
++    after.verify_for(&call).unwrap();
++    assert_eq!(after.history_sources.len(), 1);
++    assert_eq!(after.history_sources[0].attribution, fixture.attribution);
++    assert_eq!(
++        after.history_sources[0].current_disposition.state,
++        tracedecay_memory_provider_registry::SourceDisposition::Deleted
++    );
++}

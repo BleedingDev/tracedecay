@@ -14,11 +14,11 @@ use tracedecay_domain::{
     PublicRetrieverStatus, QueryDigest, QueryFallbackSubpayload, QueryMac,
     QueryNormalizationRevision, RankedCandidate, RetrievalAnchorId, RetrievalBudget,
     RetrievalCursorKeyId, RetrievalRequest, RetrievalScope, RetrievalSnapshot, RetrieverBatch,
-    RetrieverContinuation, RetrieverCoverage, RetrieverKind, RetrieverOutcome, SanitizerRevision,
-    ScoreDomainCalibrationV1, ScoreDomainId, SemanticSearchIndexKeyV1,
-    SemanticSearchIndexProfileV1, SemanticSourceScopeV1, SingleRootScopeV1, SourceFreshness,
-    SourceNamespace, SourceOccurrenceId, TemporalModeV1, UtcMicros, VectorGenerationIdV1,
-    VectorWatermark, SEMANTIC_ANN_RECALL_POLICY_V1,
+    RetrieverContinuation, RetrieverCoverage, RetrieverKind, RetrieverOutcome,
+    SEMANTIC_ANN_RECALL_POLICY_V1, SanitizerRevision, ScoreDomainCalibrationV1, ScoreDomainId,
+    SemanticSearchIndexKeyV1, SemanticSearchIndexProfileV1, SemanticSourceScopeV1,
+    SingleRootScopeV1, SourceFreshness, SourceNamespace, SourceOccurrenceId, TemporalModeV1,
+    UtcMicros, VectorGenerationIdV1, VectorWatermark,
 };
 
 use super::*;
@@ -230,7 +230,7 @@ fn record(
             matched_term_kinds: Vec::new(),
             source_occurrence: source_occurrence_id,
         },
-        values,
+        values: values.into(),
     }
 }
 
@@ -1810,9 +1810,9 @@ fn every_non_ready_state_bypasses_semantic_authorities_and_preserves_query_bytes
         ),
     ] {
         let outcome = CalibratedSemanticQueryService::new(&lane)
-            .execute(
+            .execute_mode(
                 SemanticLaneReadinessV1::Unavailable(state),
-                SemanticQueryDecisionV1::UseFallback,
+                SemanticQueryModeV1::FallbackAllowed,
                 Arc::clone(&fallback),
             )
             .expect("ordinary search bypasses a non-ready semantic lane");
@@ -1825,9 +1825,9 @@ fn every_non_ready_state_bypasses_semantic_authorities_and_preserves_query_bytes
             fallback_bytes
         );
         assert!(matches!(
-            CalibratedSemanticQueryService::new(&lane).execute(
+            CalibratedSemanticQueryService::new(&lane).execute_mode(
                 SemanticLaneReadinessV1::Unavailable(state),
-                SemanticQueryDecisionV1::RejectUnavailable,
+                SemanticQueryModeV1::StrictSemantic,
                 Arc::clone(&fallback),
             ),
             Err(SemanticQueryServiceError::StrictUnavailable(ref reason)) if reason == &expected

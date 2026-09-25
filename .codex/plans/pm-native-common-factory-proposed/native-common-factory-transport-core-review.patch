@@ -1,0 +1,407 @@
+--- a/native_common_factory_tests.rs
++++ b/native_common_factory_tests.rs
+@@ -98,5 +105,6 @@
+-/// No blocking socket read, write, or mutex acquisition outlives the original
+-/// call control. Transport failure is a fixture failure, never a provider reply.
++/// Dispatch and ordinary response waiting share the original call control.
++/// A separate finite cleanup bound may only drain an already dispatched reply
++/// or terminate an unusable transport; it never extends provider execution.
+ struct WaitBound<'a> {
+     deadline: Instant,
+     control: Option<&'a OperationControl>,
+@@ -105,6 +113,12 @@
+     fn environment() -> Self {
+         Self {
+             deadline: Instant::now() + ENVIRONMENT_BUDGET,
++            control: None,
++        }
++    }
++    fn cleanup() -> Self {
++        Self {
++            deadline: Instant::now() + CLEANUP_BUDGET,
+             control: None,
+         }
+     }
+@@ -158,31 +172,88 @@
+     }
+     Ok(())
+ }
++fn encoded_frame<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
++    let payload = serde_json::to_vec(value).map_err(failure)?;
++    if payload.is_empty() || payload.len() > FRAME_MAXIMUM {
++        return Err("fixture frame length exceeded".into());
++    }
++    let mut frame = Vec::with_capacity(4 + payload.len());
++    frame.extend_from_slice(&u32::try_from(payload.len()).map_err(failure)?.to_be_bytes());
++    frame.extend_from_slice(&payload);
++    Ok(frame)
++}
+ fn write_frame<T: Serialize>(
+     stream: &mut TcpStream,
+     value: &T,
+     bound: &WaitBound<'_>,
+ ) -> Result<(), String> {
+-    let mut bytes = serde_json::to_vec(value).map_err(failure)?;
+-    if bytes.is_empty() || bytes.len() > FRAME_MAXIMUM {
+-        return Err("fixture frame length exceeded".into());
++    let mut frame = encoded_frame(value)?;
++    transfer(|bytes| stream.write(bytes), &mut frame, bound)
++}
++
++/// The sole owner of one response frame. Both offsets survive a control-ended
++/// return, so cleanup resumes the exact same header/body without a second reader.
++#[derive(Default)]
++struct FrameReader {
++    header: [u8; 4],
++    header_read: usize,
++    body: Vec<u8>,
++    body_read: usize,
++}
++impl FrameReader {
++    fn read<T: DeserializeOwned>(
++        &mut self,
++        stream: &mut TcpStream,
++        bound: &WaitBound<'_>,
++        mut probe: Option<&mut ParentProbe>,
++    ) -> Result<T, String> {
++        loop {
++            if let Some(probe) = probe.as_deref_mut() {
++                probe.poll(self, bound.control)?;
++            }
++            bound.check()?;
++            if self.header_read == self.header.len() && self.body.is_empty() {
++                let length = usize::try_from(u32::from_be_bytes(self.header)).map_err(failure)?;
++                if length == 0 || length > FRAME_MAXIMUM {
++                    return Err("fixture frame length exceeded".into());
++                }
++                self.body.resize(length, 0);
++            }
++            if !self.body.is_empty() && self.body_read == self.body.len() {
++                return serde_json::from_slice(&self.body).map_err(failure);
++            }
++            let reading_header = self.header_read < self.header.len();
++            let target = if reading_header {
++                &mut self.header[self.header_read..]
++            } else {
++                &mut self.body[self.body_read..]
++            };
++            match stream.read(target) {
++                Ok(0) => return Err("fixture transport closed mid-frame".into()),
++                Ok(count) => {
++                    if reading_header {
++                        self.header_read += count;
++                    } else {
++                        self.body_read += count;
++                    }
++                }
++                Err(error)
++                    if matches!(
++                        error.kind(),
++                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
++                    ) =>
++                {
++                    thread::sleep(POLL)
++                }
++                Err(error) => return Err(failure(error)),
++            }
++        }
+     }
+-    let mut header = u32::try_from(bytes.len()).map_err(failure)?.to_be_bytes();
+-    transfer(|bytes| stream.write(bytes), &mut header, bound)?;
+-    transfer(|bytes| stream.write(bytes), &mut bytes, bound)
+ }
+ fn read_frame<T: DeserializeOwned>(
+     stream: &mut TcpStream,
+     bound: &WaitBound<'_>,
+ ) -> Result<T, String> {
+-    let mut header = [0; 4];
+-    transfer(|bytes| stream.read(bytes), &mut header, bound)?;
+-    let length = usize::try_from(u32::from_be_bytes(header)).map_err(failure)?;
+-    if length == 0 || length > FRAME_MAXIMUM {
+-        return Err("fixture frame length exceeded".into());
+-    }
+-    let mut bytes = vec![0; length];
+-    transfer(|bytes| stream.read(bytes), &mut bytes, bound)?;
+-    serde_json::from_slice(&bytes).map_err(failure)
++    FrameReader::default().read(stream, bound, None)
+ }
+ 
+@@ -209,11 +467,9 @@
+ enum ChildRequest {
+     Descriptor,
+     Handshake {
+-        id: u64,
+         value: HandshakeRequestDto,
+     },
+     Invoke {
+-        id: u64,
+         value: ProviderCallDto,
+     },
+     RecordDisposition {
+@@ -222,6 +478,8 @@
+     },
+     SetAuthorityAvailable(bool),
+     LoseNextReply,
++    ArmProbe(TransportProbe),
++    ProbeEvidence,
+     Shutdown,
+ }
+ #[derive(Serialize, Deserialize)]
+@@ -237,7 +495,26 @@
+         reference: Option<String>,
+     },
+     LostReplyArmed,
++    ProbeArmed,
++    ProbeEvidence(ProbeWitness),
+     Stopped,
+     Error(String),
+ }
++#[derive(Serialize)]
++struct OutgoingRpc<'a> {
++    request_id: u64,
++    request: &'a ChildRequest,
++}
++#[derive(Deserialize)]
++#[serde(deny_unknown_fields)]
++struct IncomingRpc {
++    request_id: u64,
++    request: ChildRequest,
++}
++#[derive(Serialize, Deserialize)]
++#[serde(deny_unknown_fields)]
++struct ResponseFrame {
++    request_id: u64,
++    response: ChildResponse,
++}
+ 
+@@ -246,6 +523,10 @@
+     rpc: TcpStream,
+     cancellation: TcpStream,
+     identity: String,
++    launch_identity: String,
++    cleanup: CleanupLedger,
++    request_sequence: u64,
++    usable: bool,
+ }
+ impl OwnedChild {
+     fn exchange(
+@@ -253,40 +534,168 @@
+         request: &ChildRequest,
+         bound: &WaitBound<'_>,
+     ) -> Result<ChildResponse, String> {
+-        let result = write_frame(&mut self.rpc, request, bound)
+-            .and_then(|()| read_frame(&mut self.rpc, bound));
+-        if result.is_err()
+-            && bound
+-                .control
+-                .is_some_and(|control| control.snapshot().is_err())
+-        {
+-            let id = match request {
+-                ChildRequest::Handshake { id, .. } | ChildRequest::Invoke { id, .. } => Some(*id),
+-                _ => None,
+-            };
+-            if let Some(id) = id {
+-                // The independent stream remains readable while the child is in
+-                // Native invoke. Never reset or extend the ended caller control.
++        self.exchange_with_probe(request, bound, None)
++    }
++    fn exchange_with_probe(
++        &mut self,
++        request: &ChildRequest,
++        bound: &WaitBound<'_>,
++        mut probe: Option<&mut ParentProbe>,
++    ) -> Result<ChildResponse, String> {
++        if !self.usable {
++            return Err("Native RPC channel is permanently unusable".into());
++        }
++        bound.check()?;
++        self.request_sequence = self
++            .request_sequence
++            .checked_add(1)
++            .ok_or("fixture RPC sequence overflow")?;
++        let id = self.request_sequence;
++        if let Some(probe) = probe.as_deref_mut() {
++            probe.evidence.pid = Some(self.process.id());
++            probe.evidence.rpc_id = Some(id);
++        }
++        if let Err(error) = write_frame(
++            &mut self.rpc,
++            &OutgoingRpc {
++                request_id: id,
++                request,
++            },
++            bound,
++        ) {
++            // Never complete or retry a partially written request after its
++            // dispatch bound ends. Only teardown may follow this point.
++            return Err(self.invalidate(format!("RPC request write failed: {error}"), bound));
++        }
++        let mut reader = FrameReader::default();
++        let first: Result<ResponseFrame, String> =
++            reader.read(&mut self.rpc, bound, probe.as_deref_mut());
++        let response = match first {
++            Ok(response) => response,
++            Err(error)
++                if bound
++                    .control
++                    .is_some_and(|control| control.snapshot().is_err()) =>
++            {
++                // The operation remains under its original control in both
++                // processes. This independent finite budget only forwards the
++                // live cancel and drains the already dispatched actual reply.
++                let drain = WaitBound::cleanup();
+                 let cancel_bound = WaitBound {
+-                    deadline: Instant::now() + Duration::from_millis(20),
++                    deadline: drain
++                        .deadline
++                        .min(Instant::now() + Duration::from_millis(20)),
+                     control: None,
+                 };
+-                let mut bytes = id.to_be_bytes();
+-                let _ = transfer(
++                let mut cancellation = id.to_be_bytes();
++                if let Err(cancel_error) = transfer(
+                     |bytes| self.cancellation.write(bytes),
+-                    &mut bytes,
++                    &mut cancellation,
+                     &cancel_bound,
+-                );
+-            }
+-        }
+-        match result? {
+-            ChildResponse::Error(error) => Err(error),
++                ) {
++                    return Err(self.invalidate(
++                        format!("RPC ended ({error}); cancellation channel failed: {cancel_error}"),
++                        bound,
++                    ));
++                }
++                if let Some(probe) = probe.as_deref_mut() {
++                    probe.evidence.retained_header_bytes = reader.header_read;
++                    probe.evidence.retained_body_bytes = reader.body_read;
++                }
++                match reader.read::<ResponseFrame>(&mut self.rpc, &drain, None) {
++                    Ok(response) => {
++                        if let Some(probe) = probe.as_deref_mut() {
++                            probe.evidence.drained_actual_response = true;
++                        }
++                        response
++                    }
++                    Err(drain_error) => {
++                        return Err(self.invalidate(
++                            format!(
++                                "RPC ended ({error}); actual response drain failed: {drain_error}"
++                            ),
++                            bound,
++                        ));
++                    }
++                }
++            }
++            Err(error) => {
++                return Err(self.invalidate(format!("RPC response failed: {error}"), bound));
++            }
++        };
++        if response.request_id != id {
++            return Err(self.invalidate(
++                format!(
++                    "RPC response id {} did not match dispatched id {id}",
++                    response.request_id
++                ),
++                bound,
++            ));
++        }
++        if !matches!(&response.response, ChildResponse::Error(_))
++            && !matches!(
++                (request, &response.response),
++                (ChildRequest::Descriptor, ChildResponse::Descriptor(_))
++                    | (ChildRequest::Handshake { .. }, ChildResponse::Handshake(_))
++                    | (ChildRequest::Invoke { .. }, ChildResponse::Reply(_))
++                    | (
++                        ChildRequest::RecordDisposition { .. },
++                        ChildResponse::Authority { .. }
++                    )
++                    | (
++                        ChildRequest::SetAuthorityAvailable(_),
++                        ChildResponse::Authority { .. }
++                    )
++                    | (ChildRequest::LoseNextReply, ChildResponse::LostReplyArmed)
++                    | (ChildRequest::ArmProbe(_), ChildResponse::ProbeArmed)
++                    | (ChildRequest::ProbeEvidence, ChildResponse::ProbeEvidence(_))
++                    | (ChildRequest::Shutdown, ChildResponse::Stopped)
++            )
++        {
++            return Err(self.invalidate("RPC response kind differs from request".into(), bound));
++        }
++        match response.response {
++            ChildResponse::Error(error) => {
++                Err(self.invalidate(format!("child transport failure: {error}"), bound))
++            }
+             response => Ok(response),
++        }
++    }
++    fn invalidate(&mut self, error: String, bound: &WaitBound<'_>) -> String {
++        self.usable = false;
++        self.rpc.shutdown(Shutdown::Both).ok();
++        self.cancellation.shutdown(Shutdown::Both).ok();
++        self.cleanup.error(&self.launch_identity, error.clone());
++        // Operation teardown has its separately approved finite bound.
++        // Lifecycle/environment calls retain their existing absolute bound;
++        // a failed startup leaves its owned handle for supervisor cleanup.
++        let remaining = if bound.control.is_some() {
++            CLEANUP_BUDGET
++        } else {
++            bound.deadline.saturating_duration_since(Instant::now())
++        };
++        let cleanup = deadline_after(remaining).and_then(|deadline| self.kill_and_reap(deadline));
++        match cleanup {
++            Ok(()) => format!("{error}; owned child killed and reaped"),
++            Err(cleanup) => {
++                self.cleanup.error(&self.launch_identity, cleanup.clone());
++                format!("{error}; owned child cleanup unconfirmed: {cleanup}")
++            }
++        }
++    }
++    fn witnessed_exit(&mut self) -> Result<bool, String> {
++        match self.process.try_wait().map_err(failure)? {
++            Some(status) => {
++                self.cleanup
++                    .reaped(&self.launch_identity, self.process.id(), status);
++                Ok(true)
++            }
++            None => Ok(false),
+         }
+     }
+     fn confirm_exit(&mut self, deadline: i64) -> Result<bool, String> {
+         loop {
+-            if self.process.try_wait().map_err(failure)?.is_some() {
++            if self.witnessed_exit()? {
+                 return Ok(true);
+             }
+             if before_deadline(deadline).is_err() {
+@@ -296,7 +705,8 @@
+         }
+     }
+     fn kill_and_reap(&mut self, deadline: i64) -> Result<(), String> {
+-        if self.process.try_wait().map_err(failure)?.is_none() {
++        self.usable = false;
++        if !self.witnessed_exit()? {
+             self.process.kill().map_err(failure)?;
+         }
+         self.rpc.shutdown(Shutdown::Both).ok();
+@@ -309,10 +719,12 @@
+ }
+ impl Drop for OwnedChild {
+     fn drop(&mut self) {
+-        if self.process.try_wait().ok().flatten().is_none() {
+-            let deadline = deadline_after(Duration::from_secs(5)).expect("cleanup clock");
+-            self.kill_and_reap(deadline)
+-                .expect("owned Native child must be reaped during cleanup");
++        // Never panic while another fixture failure is unwinding. The final
++        // factory-owned ledger gate makes an unconfirmed reap a test failure.
++        let result =
++            deadline_after(CLEANUP_BUDGET).and_then(|deadline| self.kill_and_reap(deadline));
++        if let Err(error) = result {
++            self.cleanup.error(&self.launch_identity, error);
+         }
+     }
+ }

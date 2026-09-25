@@ -1677,6 +1677,58 @@ async fn current_final_store_is_admitted_without_mutation() {
 }
 
 #[tokio::test]
+async fn current_stamp_installs_vector_authority_schema_only_on_writer_open() {
+    let (_directory, path) = fresh_current_store().await;
+    tamper(
+        &path,
+        "DROP TABLE vector_authority_generation_blobs_v1;
+         DROP TABLE vector_authority_batches_v1;
+         DROP TABLE vector_authority_heads_v1;
+         DROP TABLE vector_authority_stages_v1;
+         DROP TABLE vector_authority_float_blobs_v1;
+         DROP TABLE vector_authority_generations_v1;",
+    );
+    let before = store_snapshot(&path);
+
+    let read_only_connection = TestConnection::open(&path);
+    let error = verify_final_schema_connection(&read_only_connection)
+        .await
+        .expect_err("read-only admission must report the additive vector schema step");
+    assert!(
+        error
+            .to_string()
+            .contains("vector-authority schema step is pending"),
+        "read-only refusal must name the pending writer step: {error}"
+    );
+    drop(read_only_connection);
+    assert_eq!(
+        store_snapshot(&path),
+        before,
+        "read-only admission must not install vector-authority tables"
+    );
+
+    let writer_connection = TestConnection::open(&path);
+    ensure_schema_current_connection(&writer_connection)
+        .await
+        .expect("writer open installs the additive vector-authority schema");
+    verify_final_schema_connection(&writer_connection)
+        .await
+        .expect("installed vector-authority schema is the exact final shape");
+    drop(writer_connection);
+
+    for table in tracedecay_rusqlite_runtime::repository::VECTOR_AUTHORITY_OBJECTS_V1 {
+        assert!(
+            object_sql(&path, "table", table).is_some(),
+            "writer install must create {table}"
+        );
+    }
+    assert_eq!(
+        store_snapshot(&path).user_version,
+        i64::from(SCHEMA_VERSION)
+    );
+}
+
+#[tokio::test]
 async fn automation_run_receipt_indexes_are_required_final_shape() {
     let (_directory, path) = fresh_current_store().await;
     for name in [

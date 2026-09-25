@@ -1,0 +1,10 @@
+--- a/crates/tracedecay-memory-provider-ncm/src/lib.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/lib.rs
+@@ -1311,6 +1311,7 @@
+                         call,
+                         match error {
+                             AdvisoryAdmissionError::Control(code) => code,
++                            AdvisoryAdmissionError::Denied(_) => TerminalCode::Unauthorized,
+                             AdvisoryAdmissionError::Unavailable(_) => {
+                                 TerminalCode::ProviderUnavailable
+                             }

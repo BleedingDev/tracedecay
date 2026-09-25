@@ -15,6 +15,7 @@ use tempfile::TempDir;
 use crate::common::{self, canonical_existing_path, tracedecay_command_with_home};
 
 #[cfg(unix)]
+#[path = "rmcp_test_support.rs"]
 mod rmcp_test_support;
 
 fn init_daemon_project(project: &Path, home: &Path, source: &str) {

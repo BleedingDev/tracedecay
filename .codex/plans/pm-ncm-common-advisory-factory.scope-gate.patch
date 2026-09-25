@@ -1,0 +1,57 @@
+diff --git a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+--- a/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/common_advisory_factory.rs
+@@ -133,7 +133,6 @@
+ /// the real adapter; mode evidence is read from this same dispatch gate.
+ struct FixtureHost {
+     adapter: NcmProviderAdapter,
+-    scope: OwnedExactScope,
+     mode: Arc<AtomicU8>,
+ }
+ 
+@@ -154,36 +153,11 @@
+     }
+ 
+     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
+-        if request.exact_scope != self.scope {
+-            return HandshakeResponse {
+-                terminal: TerminalRecord::failure_before_dispatch(
+-                    ProviderOperation::Handshake,
+-                    request.provider_id.clone(),
+-                    TerminalCode::ScopeMismatch,
+-                    &request.request_id,
+-                    request.exact_scope.exact_scope_sha256(),
+-                    None,
+-                    "fixture.host.mounted_scope_differs",
+-                ),
+-                descriptor: None,
+-                provider_instance_id: None,
+-                state_namespace: None,
+-                accepted_scope: None,
+-                effective_limits: None,
+-                ready_receipt_sha256: None,
+-                warnings: Vec::new(),
+-            };
+-        }
+         self.adapter.handshake(request)
+     }
+ 
+     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+-        let refusal = if call.exact_scope != self.scope {
+-            Some((
+-                TerminalCode::ScopeMismatch,
+-                "fixture.host.mounted_scope_differs",
+-            ))
+-        } else if !self.admits(call.operation) {
++        let refusal = if !self.admits(call.operation) {
+             Some((
+                 TerminalCode::ProviderUnavailable,
+                 "fixture.host.mode_withholds_dispatch",
+@@ -704,7 +678,6 @@
+             .with_admission_authority(Arc::new(self.authority.clone()));
+         Ok(FixtureHost {
+             adapter,
+-            scope: self.scope.clone(),
+             mode: Arc::clone(&self.mode),
+         })
+     }

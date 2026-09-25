@@ -1,0 +1,121 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -31,7 +31,7 @@
+ use std::collections::BTreeMap;
+ use std::fmt::Write as _;
+ use std::path::{Path, PathBuf};
+-use std::sync::{Arc, Mutex};
++use std::sync::{Arc, Mutex, OnceLock};
+ 
+ use rusqlite::{Connection, OptionalExtension, params};
+ use serde_json::{Value, json};
+@@ -1034,6 +1034,18 @@
+     pub(crate) invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
+ }
+ 
++/// The selected provider's existing canonical authority and observation owner.
++/// Bound together once after full composition admits the canonical session store.
++struct SelectedProviderHistoryV1 {
++    authority: Arc<
++        super::provider_history::ProviderHistoryAuthorityV1<
++            tracedecay_global_db::GlobalDbObservationStore,
++            tracedecay_runtime_core::db::Database,
++        >,
++    >,
++    journey: Arc<super::observation_journey::ProjectObservationJourneyV1>,
++}
++
+ /// One project's mounted cognitive-recall route.
+ pub struct ProjectCognitiveRecallMountV1 {
+     composition: Arc<ProjectMemoryProviderComposition>,
+@@ -1047,6 +1059,8 @@
+     graph: Arc<crate::tracedecay::TraceDecay>,
+     routing: ActiveRoutingPolicy,
+     host_limits: ProviderLimits,
++    /// Composition-time binding only; provider selection stays in the registry.
++    selected_history: OnceLock<SelectedProviderHistoryV1>,
+ }
+ 
+ impl std::fmt::Debug for ProjectCognitiveRecallMountV1 {
+@@ -1061,6 +1075,55 @@
+ }
+ 
+ impl ProjectCognitiveRecallMountV1 {
++    /// Retains the same authority already bound to the selected adapter and
++    /// journey. An observer, another checkout, or a second binding is refused.
++    pub(crate) fn bind_selected_history(
++        &self,
++        authority: Arc<
++            super::provider_history::ProviderHistoryAuthorityV1<
++                tracedecay_global_db::GlobalDbObservationStore,
++                tracedecay_runtime_core::db::Database,
++            >,
++        >,
++        journey: Arc<super::observation_journey::ProjectObservationJourneyV1>,
++    ) -> Result<(), super::observation_journey::ObservationJourneyError> {
++        use super::provider_history::ProviderHistoryErrorV1;
++        use tracedecay_memory_provider_registry::EnabledProviderMode;
++
++        let selected = self
++            .composition
++            .registry()
++            .and_then(|registry| registry.selected_registration())
++            .ok_or(ProviderHistoryErrorV1::ClaimMismatch(
++                "selected recall registration",
++            ))?;
++        if selected.mode != EnabledProviderMode::Active
++            || &selected.provider_id != self.routing.active_provider()
++            || selected.registration_revision != self.routing.registration_revision()
++            || authority.provider_id != selected.provider_id
++            || authority.profile_id != self.profile_id
++            || authority.mounted_scope != self.scope
++            || authority.policy_revision != PROJECT_RECALL_POLICY_REVISION
++        {
++            return Err(ProviderHistoryErrorV1::ClaimMismatch("selected recall history mount").into());
++        }
++        authority.validate_mount()?;
++        journey.validate_history_mount(
++            &selected.provider_id,
++            selected.registration_revision,
++            &self.profile_id,
++            &self.scope,
++        )?;
++        if !Arc::ptr_eq(&authority.journal, &journey.history_journal()) {
++            return Err(ProviderHistoryErrorV1::ClaimMismatch("selected recall history journal").into());
++        }
++        self.selected_history
++            .set(SelectedProviderHistoryV1 { authority, journey })
++            .map_err(|_| {
++                ProviderHistoryErrorV1::ClaimMismatch("selected recall history already bound").into()
++            })
++    }
++
+     /// Storage placement of the admission ledger.
+     #[must_use]
+     pub fn ledger_path(&self) -> &Path {
+@@ -2335,6 +2398,7 @@
+         graph: inputs.graph,
+         routing: inputs.routing,
+         host_limits: inputs.host_limits,
++        selected_history: OnceLock::new(),
+     }))
+ }
+ 
+diff --git a/crates/tracedecay/src/daemon/project_composition.rs b/crates/tracedecay/src/daemon/project_composition.rs
+--- a/crates/tracedecay/src/daemon/project_composition.rs
++++ b/crates/tracedecay/src/daemon/project_composition.rs
+@@ -1906,7 +1906,12 @@
+                     });
+                     authority.validate_mount()?;
+                     history_mount.bind(authority.clone())?;
+-                    journey.bind_history_authority(authority)?;
++                    journey.bind_history_authority(authority.clone())?;
++                    if let Some(recall) = core.cognitive_recall_mount.as_ref().filter(|recall| {
++                        recall.routing().active_provider() == &provider.provider_id
++                    }) {
++                        recall.bind_selected_history(authority, Arc::clone(&journey))?;
++                    }
+                     if configured.activation == ObservationMountActivationV1::BeforePublication {
+                         activate_required_with_startup_replay(
+                             journey,

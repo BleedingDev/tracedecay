@@ -1,0 +1,239 @@
+--- a/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
++++ b/crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs
+@@ -311,12 +311,6 @@
+                     return invalid("missing correction kind", handle.commit_seq);
+                 };
+                 if let (Some(request), Some(embeddings)) = (replacement, embeddings) {
+-                    if request.source != target.source_id {
+-                        return invalid(
+-                            "replacement source differs from target",
+-                            handle.commit_seq,
+-                        );
+-                    }
+                     if let Err(error) = handle
+                         .store
+                         .ensure_source_provenance_not_revoked(&request.source, &request.provenance)
+--- a/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
++++ b/crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs
+@@ -488,10 +488,10 @@
+                 ],
+             )?;
+             control["target"] = target(call, &value["target"], namespace)?;
++            let target_revision = string(&value["target"]["source"]["source_revision"])?;
++            // Retained target identity and the caller's revision CAS are independent.
++            // The runtime compares the latter with durable state under its lock.
+             let expected = string(&value["expected_target_revision"])?;
+-            if value["target"]["source"]["source_revision"].as_str()? != expected {
+-                return None;
+-            }
+             let reason = string(&value["reason"])?;
+             if reason.len() > 8192 || strings(&value["evidence_refs"])?.len() > 64 {
+                 return None;
+@@ -512,9 +512,7 @@
+                         value["replacement"].pointer("/source_identity/original_source")?;
+                     let replacement = attribution(original)?;
+                     let replacement_binding = source_binding(namespace, &replacement)?;
+-                    if replacement_binding.source_id != control["target"]["source"].as_str()?
+-                        || replacement.source.source_revision.as_deref()? == expected
+-                    {
++                    if replacement.source.source_revision.as_deref()? == target_revision {
+                         return None;
+                     }
+                     control["transition_time"] = json!(replacement.validity.valid_from_utc_nanos?);
+--- a/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
++++ b/crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs
+@@ -1349,6 +1349,194 @@
+     }
+ 
+     #[test]
++    fn canonical_correction_checks_actual_revision_and_retains_cross_source_history() {
++        use tracedecay_memory_provider_registry::recall_admission::{
++            AdmittedTemporalQuery, decode_recall_outcome,
++        };
++
++        let root = TestRoot::new("canonical-correction-revisions");
++        let exact = scope("canonical-correction-revisions");
++        let old_text = "The cache uses compiler version one.";
++        let new_text = "The cache uses compiler version two.";
++        let transition = "2025-01-04T00:00:00Z";
++        let before_transition = "2025-01-03T00:00:00Z";
++        let evaluation = "2025-02-01T00:00:00Z";
++        let adapter = NcmProviderAdapter::new(surface(&root))
++            .unwrap()
++            .with_admission_authority(Arc::new(FixtureHistoryAuthority(Vec::new())));
++        let mut original = canonical_observation(&exact, 1, old_text);
++        original["source_identity"]["original_source"]["source"]["source_key"] = json!("source/1");
++        let observed = invoke_after_handshake(
++            &adapter,
++            &exact,
++            ProviderOperation::Observe,
++            Some("correction-revision-seed"),
++            original.clone(),
++        );
++        assert_eq!(
++            observed.terminal.terminal_code(),
++            TerminalCode::Success,
++            "{observed:?}"
++        );
++        let old_ref = response_json(&observed)["stable_memory_ref"].clone();
++        let mut replacement = canonical_observation(&exact, 2, new_text);
++        replacement["source_identity"]["original_source"]["source"]["source_key"] =
++            json!("source/2");
++        replacement["source_identity"]["original_source"]["source"]["source_revision"] =
++            json!("cache_policy_r3");
++        replacement["source_identity"]["original_source"]["validity"]["valid_from"] =
++            json!(transition);
++        let source = &original["source_identity"]["original_source"];
++        let correction = json!({"target":{"provider_id":"ncm","registration_revision":1,
++            "original_scope":source["origin_scope"],
++            "delivery_scope":source["origin_scope"]["exact_scope_identity"],
++            "source":source["source"],"reference":{"kind":"stable_memory_ref","reference":old_ref}},
++            "correction_kind":"supersede","replacement":replacement,
++            "expected_target_revision":"cache_policy_r2","reason":"Settled compiler correction",
++            "evidence_refs":["test.compiler.revision-settled"]});
++        // The replacement revision may equal a stale CAS value; only equality
++        // with the actual retained target revision makes the replacement invalid.
++        for expected in ["99", "cache_policy_r3"] {
++            let mut stale = correction.clone();
++            stale["expected_target_revision"] = json!(expected);
++            let request = canonical_lifecycle_call(
++                &adapter,
++                &exact,
++                ProviderOperation::Correction,
++                Some(&format!("correction-stale-{expected}")),
++                stale,
++            );
++            let reply = adapter.invoke(&request);
++            assert_eq!(
++                reply.terminal.terminal_code(),
++                TerminalCode::Conflict,
++                "{reply:?}"
++            );
++            assert_eq!(
++                reply.terminal.committed_effect().state(),
++                CommittedEffectState::None
++            );
++            assert_eq!(reply.state_generation, observed.state_generation);
++            assert_eq!(
++                canonical_ready(&adapter, &exact).1,
++                observed.state_generation
++            );
++        }
++        let mut same_revision = correction.clone();
++        same_revision["expected_target_revision"] = json!("99");
++        same_revision["replacement"]["source_identity"]["original_source"]["source"]["source_revision"] =
++            json!("cache_policy_r2");
++        let mut wrong_target = correction.clone();
++        wrong_target["target"]["source"]["source_revision"] = json!("invented-target");
++        for (key, body) in [
++            ("correction-same-revision", same_revision),
++            ("correction-wrong-target", wrong_target),
++        ] {
++            let reply = adapter.invoke(&canonical_lifecycle_call(
++                &adapter,
++                &exact,
++                ProviderOperation::Correction,
++                Some(key),
++                body,
++            ));
++            assert_eq!(
++                reply.terminal.terminal_code(),
++                TerminalCode::InvalidRequest,
++                "{reply:?}"
++            );
++            assert_eq!(
++                reply.terminal.committed_effect().state(),
++                CommittedEffectState::None
++            );
++            assert_eq!(
++                canonical_ready(&adapter, &exact).1,
++                observed.state_generation
++            );
++        }
++        let corrected = adapter.invoke(&canonical_lifecycle_call(
++            &adapter,
++            &exact,
++            ProviderOperation::Correction,
++            Some("correction-source-two"),
++            correction,
++        ));
++        assert_eq!(
++            corrected.terminal.terminal_code(),
++            TerminalCode::Success,
++            "{corrected:?}"
++        );
++        assert_eq!(
++            corrected.terminal.committed_effect().state(),
++            CommittedEffectState::Committed
++        );
++        assert_eq!(corrected.state_generation, observed.state_generation + 1);
++        let new_ref = response_json(&corrected)["replacement_ref"].clone();
++        assert_ne!(new_ref, old_ref);
++        let mut superseded = source.clone();
++        superseded["validity"]["superseded_at"] = json!(transition);
++        superseded["validity"]["superseded_by"] = new_ref.clone();
++        drop(adapter);
++
++        let adapter = NcmProviderAdapter::new(surface(&root)).unwrap();
++        for (name, temporal, query, expected_source, expected_ref) in [
++            (
++                "current",
++                AdmittedTemporalQuery::current(evaluation).unwrap(),
++                new_text,
++                replacement["source_identity"]["original_source"].clone(),
++                new_ref,
++            ),
++            (
++                "as-of",
++                AdmittedTemporalQuery::as_of(evaluation, before_transition).unwrap(),
++                old_text,
++                superseded.clone(),
++                old_ref.clone(),
++            ),
++            (
++                "interval",
++                AdmittedTemporalQuery::interval(evaluation, before_transition, transition).unwrap(),
++                old_text,
++                superseded,
++                old_ref,
++            ),
++        ] {
++            let request = canonical_recall_call(
++                &adapter,
++                &exact,
++                query,
++                temporal,
++                &format!("correction-retained-{name}"),
++            );
++            let reply = adapter.invoke(&request);
++            assert_eq!(
++                reply.terminal.terminal_code(),
++                TerminalCode::Success,
++                "{name}: {reply:?}"
++            );
++            assert_eq!(reply.state_generation, corrected.state_generation);
++            let outcome = decode_recall_outcome(reply.payload.as_ref().unwrap()).unwrap();
++            assert_eq!(outcome.candidates.len(), 1, "{name}: {outcome:?}");
++            let candidate = &outcome.candidates[0];
++            assert_eq!(
++                candidate.stable_memory_ref.as_deref(),
++                expected_ref.as_str(),
++                "{name}"
++            );
++            assert_eq!(
++                candidate.provenance["original_sources"],
++                json!([expected_source]),
++                "{name}"
++            );
++            assert_eq!(
++                candidate.content.as_deref(),
++                Some(format!("assistant: {query}").as_str()),
++                "{name}"
++            );
++        }
++    }
++
++    #[test]
+     fn canonical_control_retries_keep_original_receipt_and_reject_changed_effects() {
+         let root = TestRoot::new("canonical-control-retries");
+         let exact = scope("canonical-control-retries");

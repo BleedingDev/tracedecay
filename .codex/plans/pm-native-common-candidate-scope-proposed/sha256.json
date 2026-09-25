@@ -1,0 +1,6 @@
+{
+  "file": "crates/tracedecay/src/daemon/retained_owner/native_provider.rs",
+  "baseline_sha256": "205c221a964aa298e88a2eb4c5a1d38607b661dd53c71ff09f33aeadb118f9f7",
+  "candidate_sha256": "6cc1d31dca975a0cbe88d9c360ad287ec19c0616bb498e89ae9c88de00bdf858",
+  "patch_sha256": "bb75308c67f6ce065e1ab9d0f939cc508c25c6bf149d7f49fa40e862e3956c19"
+}

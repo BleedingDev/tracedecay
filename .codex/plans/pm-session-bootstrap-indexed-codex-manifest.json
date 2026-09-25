@@ -1,0 +1,14 @@
+{
+  "file": "crates/tracedecay/src/mcp/tools/handlers/hook_runtime/origin.rs",
+  "patch": ".codex/plans/pm-session-bootstrap-indexed-codex.patch",
+  "patch_sha256": "2d6d1b3438daa5c6653b6dcba816c1945c8505cbcb98f96575177b0dde5e0d3c",
+  "baseline_sha256": "52a5f8894ba26c2f15b8f1f52d3d861c5016ef4f859b871ad1a6c9653d946e04",
+  "proposed_sha256": "1da87dede66aa44a7f4e61b544ad4ee46e573da3c7d15205074edcc65e570c62",
+  "lines": 53,
+  "checks": [
+    "draft rustfmt passed",
+    "git apply --check passed",
+    "live file equals baseline",
+    "no Cargo/tests/live apply"
+  ]
+}

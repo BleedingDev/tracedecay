@@ -131,10 +131,7 @@ async fn deliver_hook_event_until(
                     .get("result")
                     .is_some_and(|result| !result.is_null())
                 || error["code"] != serde_json::json!(-32603)
-                || !error
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(super::error_message_is_project_warming)
+                || !super::json_rpc_error_is_project_open_retryable(error)
             {
                 return HookEventNotifyOutcomeV1::Malformed;
             }

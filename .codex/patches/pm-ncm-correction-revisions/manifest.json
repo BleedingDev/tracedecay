@@ -1,0 +1,21 @@
+{
+  "status": "draft_only_unapplied",
+  "files": [
+    {
+      "path": "crates/tracedecay-memory-ncm-runtime/src/engine/runtime/control.rs",
+      "baseline_sha256": "368682fe10818652d6ee24a06a238be638148da6bc06525590b67469cebd2f3c",
+      "proposed_sha256": "8a47ec2e69deeec992b980964cad912b2887590ebeb4c2ae4307d06ca627100b"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/src/common/lifecycle.rs",
+      "baseline_sha256": "15cccc80a7f01b4f22b00233e72cca327cfc66e59b4dae04ce734d62834a08eb",
+      "proposed_sha256": "cd0af56661f58bc55456a1858a48dd96f9e44a236a1fe7c6cdc534a4d89b8001"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/tests/rust_backend.rs",
+      "baseline_sha256": "9a4701426694c118aa60f191e85f3fc9ab5e59f12a87ed976d48152b14acf35d",
+      "proposed_sha256": "35fe012e2db7fa99486c20c6fafd322ee5e3ced5ea9596ad274d127df0c0a360"
+    }
+  ],
+  "patch_sha256": "18e11ab2a2f9f3f54a5190d965e187281a11fc507bd4eb26c1399944b794ed24"
+}

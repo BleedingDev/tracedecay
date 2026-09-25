@@ -47,14 +47,13 @@ use self::session_pool::{
 };
 
 mod artifact_store;
+pub use artifact_store::ArtifactImportErrorV1;
 mod embedding_backend;
 // Paired with the `AdmittedProjectionArtifactV1` test-helper export: its
 // `runtime_family()` echo names this type.
 #[cfg(any(test, feature = "test-helpers"))]
 pub use embedding_backend::EmbeddingRuntimeFamilyV1;
 pub mod embedding_parallelism;
-#[cfg(all(feature = "semantic-fastembed", not(windows)))]
-mod execution_provider;
 mod fastembed_adapter;
 pub use fastembed_adapter::{SemanticExecutionAuthority, SemanticExecutionInterruptionV1};
 mod generation_resume;
@@ -62,16 +61,16 @@ mod hotpath_observe;
 pub use generation_resume::SemanticProjectionResumeOutcomeV1;
 use generation_resume::SemanticProjectionResumeV1;
 use generation_resume::{completed_batch_offset, install_candidate_on_success};
-mod model2vec_adapter;
 mod model_catalog;
 mod model_lifecycle;
 pub mod projector;
-pub mod rerank_adapter;
 mod runtime_query;
 mod runtime_service;
 mod semantic_evaluation;
 pub mod session_pool;
-pub use model_catalog::{CatalogErrorV1, admit_production_model_selection};
+pub use model_catalog::{
+    CatalogErrorV1, admit_production_model_selection, production_model_dimensions,
+};
 // Test-support constructors. Dependent crates opt in through `test-helpers`
 // exactly like the query kernel's `*_for_test` surface.
 #[cfg(any(test, feature = "test-helpers"))]

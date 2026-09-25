@@ -79,6 +79,7 @@ fn build_expected_final_shape() -> std::result::Result<SchemaInventory, String> 
         tracedecay_rusqlite_runtime::repository::GRAPH_PUBLICATION_SCHEMA_V1,
         tracedecay_rusqlite_runtime::handoff::HANDOFF_OPEN_SCHEMA_V1,
         tracedecay_rusqlite_runtime::runtime_ledger::RUNTIME_LEDGER_SCHEMA,
+        tracedecay_rusqlite_runtime::repository::VECTOR_AUTHORITY_SCHEMA_V1,
     ] {
         connection
             .execute_batch(schema)

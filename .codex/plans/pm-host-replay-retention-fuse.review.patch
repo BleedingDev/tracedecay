@@ -1,0 +1,234 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs
+@@ -1105,6 +1105,72 @@
+     pub(crate) invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
+ }
+ 
++/// Per-call ownership visible to the lane's outer timeout. This holds only
++/// the retention stage's original control, never a replacement token or budget.
++#[derive(Default)]
++struct RecallReplayRetentionActivityV1 {
++    active: Mutex<Option<OperationControl>>,
++}
++
++impl RecallReplayRetentionActivityV1 {
++    fn enter(&self, control: &OperationControl) -> RecallReplayRetentionGuardV1<'_> {
++        let mut active = self
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        debug_assert!(
++            active.is_none(),
++            "one recall may own only one retention stage"
++        );
++        *active = Some(control.clone());
++        RecallReplayRetentionGuardV1 { activity: self }
++    }
++
++    fn cancel_active(&self) -> bool {
++        let active = self
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner);
++        let Some(control) = active.as_ref() else {
++            return false;
++        };
++        control.cancellation().cancel();
++        true
++    }
++
++    async fn within_lane_fuse<T>(
++        &self,
++        wall_clock_budget: std::time::Duration,
++        recall: impl std::future::Future<Output = T>,
++    ) -> Result<T, tokio::time::error::Elapsed> {
++        tokio::pin!(recall);
++        match tokio::time::timeout(wall_clock_budget, &mut recall).await {
++            Ok(context) => Ok(context),
++            Err(_) if self.cancel_active() => {
++                // Retention still owns work. Its original stop reaches it,
++                // and the same future remains joined until its actual result.
++                // The inner lane records host_stopped before any provider recall.
++                Ok(recall.await)
++            }
++            Err(elapsed) => Err(elapsed),
++        }
++    }
++}
++
++struct RecallReplayRetentionGuardV1<'a> {
++    activity: &'a RecallReplayRetentionActivityV1,
++}
++
++impl Drop for RecallReplayRetentionGuardV1<'_> {
++    fn drop(&mut self) {
++        self.activity
++            .active
++            .lock()
++            .unwrap_or_else(std::sync::PoisonError::into_inner)
++            .take();
++    }
++}
++
+ /// One recall's linked controls. Dropping an outer timeout also cancels any
+ /// already-issued history work; this owns no worker or provider lifecycle.
+ struct RecallHistoryControlV1 {
+@@ -1168,8 +1234,10 @@
+     /// separately observes whether the host lane was stopped.
+     async fn run_replay_retention<T, E>(
+         &self,
++        activity: Option<&RecallReplayRetentionActivityV1>,
+         stage: impl std::future::Future<Output = Result<T, E>>,
+     ) -> (Result<T, E>, bool) {
++        let _owned_retention = activity.map(|activity| activity.enter(&self.operation));
+         tokio::pin!(stage);
+         let already_stopped = self.caller.is_cancelled()
+             || self.operation.snapshot().is_err()
+@@ -2112,7 +2180,8 @@
+         u64::try_from(deadline.expires_at.0.saturating_sub(now.0)).unwrap_or(0),
+     )
+     .saturating_add(ADVISORY_RECALL_LANE_GRACE);
+-    let recall = advisory_context_recall(
++    let retention = RecallReplayRetentionActivityV1::default();
++    let recall = advisory_context_recall_with_retention(
+         &port,
+         mount,
+         AdvisoryRecallInputsV1 {
+@@ -2123,8 +2192,9 @@
+             deadline,
+             cancellation,
+         },
++        Some(&retention),
+     );
+-    match tokio::time::timeout(wall_clock_budget, recall).await {
++    match retention.within_lane_fuse(wall_clock_budget, recall).await {
+         Ok(context) => Some(context),
+         Err(_) => unavailable(
+             AdvisoryRecallUnavailableV1::LaneDeadlineExceeded,
+@@ -2217,10 +2287,20 @@
+ /// and consume *only* admitted candidates, each carrying its provenance
+ /// label. Denied candidates never appear here; they remain visible only in
+ /// the mount's admission ledger.
++#[cfg(test)]
+ pub(crate) async fn advisory_context_recall(
+     port: &ProjectCognitiveRecallPortV1,
+     mount: &ProjectCognitiveRecallMountV1,
+     inputs: AdvisoryRecallInputsV1<'_>,
++) -> AdvisoryMemoryContextV1 {
++    advisory_context_recall_with_retention(port, mount, inputs, None).await
++}
++
++async fn advisory_context_recall_with_retention(
++    port: &ProjectCognitiveRecallPortV1,
++    mount: &ProjectCognitiveRecallMountV1,
++    inputs: AdvisoryRecallInputsV1<'_>,
++    retention: Option<&RecallReplayRetentionActivityV1>,
+ ) -> AdvisoryMemoryContextV1 {
+     use tracedecay_contracts::memory::CognitiveRecallProvenance;
+ 
+@@ -2321,7 +2401,7 @@
+     let retained_replay = match mount.selected_history.get() {
+         Some(selected) if selected.authority.original_authority.is_some() => {
+             let (retention, host_stopped) = history_control
+-                .run_replay_retention(async {
++                .run_replay_retention(retention, async {
+                     let delivery_scope = exact_scope_for_session(
+                         &mount.profile_id,
+                         &mount.scope,
+@@ -8280,7 +8360,7 @@
+                 })
+                 .await
+             };
+-            let (actual, host_stopped) = control.run_replay_retention(stage).await;
++            let (actual, host_stopped) = control.run_replay_retention(None, stage).await;
+             assert_eq!(actual, Ok(17));
+             assert!(host_stopped);
+             assert!(completed.load(std::sync::atomic::Ordering::Acquire));
+@@ -8397,4 +8477,85 @@
+         assert_eq!(pack.canonical_history_replay, Some(metadata));
+         assert!(!lane.retained_replay_metadata_matches(&pack));
+     }
+-}
++
++    #[tokio::test]
++    async fn outer_lane_fuse_joins_active_retention_and_prevents_provider_continuation() {
++        use std::future::Future;
++        use std::task::Poll;
++        let now = try_now_micros().unwrap();
++        let signal = tracedecay_contracts::CancellationSignal::active("replay.outer-fuse").unwrap();
++        let deadline =
++            tracedecay_contracts::Deadline::new(tracedecay_domain::UtcMicros(now.0 + 60_000_000))
++                .unwrap();
++        let control = RecallHistoryControlV1::new(&deadline, &signal).unwrap();
++        let original = control.operation.clone();
++        let activity = RecallReplayRetentionActivityV1::default();
++        let completed = std::sync::atomic::AtomicBool::new(false);
++        let provider_continued = std::sync::atomic::AtomicBool::new(false);
++        let recall = async {
++            let stage = std::future::poll_fn(|context| {
++                if original.cancellation().is_cancelled() {
++                    completed.store(true, std::sync::atomic::Ordering::Release);
++                    Poll::Ready(Ok::<_, ()>(23_u64))
++                } else {
++                    context.waker().wake_by_ref();
++                    Poll::Pending
++                }
++            });
++            let (actual, host_stopped) = control.run_replay_retention(Some(&activity), stage).await;
++            if !host_stopped {
++                provider_continued.store(true, std::sync::atomic::Ordering::Release);
++            }
++            (actual, host_stopped)
++        };
++        tokio::pin!(recall);
++        // Enter the real retention wrapper before firing the outer fuse.
++        // One explicit poll establishes ownership without a timing sleep.
++        std::future::poll_fn(|context| match recall.as_mut().poll(context) {
++            Poll::Pending => Poll::Ready(()),
++            Poll::Ready(_) => panic!("retention finished before the outer fuse"),
++        })
++        .await;
++        assert!(!original.cancellation().is_cancelled());
++        assert!(!completed.load(std::sync::atomic::Ordering::Acquire));
++        let actual = activity
++            .within_lane_fuse(std::time::Duration::ZERO, recall)
++            .await
++            .unwrap();
++        assert_eq!(actual, (Ok(23), true));
++        assert!(completed.load(std::sync::atomic::Ordering::Acquire));
++        assert!(!provider_continued.load(std::sync::atomic::Ordering::Acquire));
++        assert!(original.cancellation().is_cancelled());
++        assert_eq!(
++            control.operation.deadline_utc_micros(),
++            original.deadline_utc_micros()
++        );
++        assert_eq!(
++            control.operation.remaining_millis(),
++            original.remaining_millis()
++        );
++        assert!(
++            !activity.cancel_active(),
++            "completed retention must release its ownership slot"
++        );
++    }
++
++    #[tokio::test]
++    async fn outer_lane_fuse_still_stops_when_no_retention_work_is_owned() {
++        let activity = RecallReplayRetentionActivityV1::default();
++        assert_eq!(
++            activity
++                .within_lane_fuse(std::time::Duration::from_secs(1), async { 7 })
++                .await
++                .unwrap(),
++            7,
++        );
++        assert!(
++            activity
++                .within_lane_fuse(std::time::Duration::ZERO, std::future::pending::<()>(),)
++                .await
++                .is_err()
++        );
++        assert!(!activity.cancel_active());
++    }
++}

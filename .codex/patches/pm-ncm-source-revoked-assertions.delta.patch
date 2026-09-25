@@ -1,0 +1,47 @@
+--- a/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
++++ b/crates/tracedecay-memory-ncm-runtime/tests/source_identity.rs
+@@ -333,11 +333,9 @@
+         let reopened = engine(&directory);
+         let before = inspect(&reopened);
+         let refused = reopened.observe(&namespace(), A.observation("a-future", "A future", true));
+-        assert!(
+-            matches!(
+-                refused.outcome,
+-                Outcome::Rejected(RejectReason::InvalidRequest(_))
+-            ),
++        assert_eq!(
++            refused.outcome,
++            Outcome::Rejected(RejectReason::SourceRevoked),
+             "{refused:?}"
+         );
+         assert_eq!(inspect(&reopened), before);
+@@ -423,11 +421,9 @@
+                 &namespace(),
+                 source.observation("future", "future input", true),
+             );
+-            assert!(
+-                matches!(
+-                    refused.outcome,
+-                    Outcome::Rejected(RejectReason::InvalidRequest(_))
+-                ),
++            assert_eq!(
++                refused.outcome,
++                Outcome::Rejected(RejectReason::SourceRevoked),
+                 "{refused:?}"
+             );
+         }
+@@ -515,11 +511,9 @@
+ 
+     assert_eq!(deleted.outcome, Outcome::Success, "{deleted:?}");
+     assert_eq!(deleted.payload["postcondition"]["matched_effects"], 0);
+-    assert!(
+-        matches!(
+-            refused.outcome,
+-            Outcome::Rejected(RejectReason::InvalidRequest(_))
+-        ),
++    assert_eq!(
++        refused.outcome,
++        Outcome::Rejected(RejectReason::SourceRevoked),
+         "{refused:?}"
+     );
+     assert_eq!(inspect(&live), after_delete);

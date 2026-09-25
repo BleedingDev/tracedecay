@@ -1,0 +1,22 @@
+{
+  "patch": "recall-trace-budgets.patch",
+  "patch_sha256": "6edd253b90b593aaa9115e64f5ffb20efbd79118a09be9659444aa19308dae4d",
+  "status": "frozen_unapplied",
+  "files": [
+    {
+      "path": "crates/tracedecay-memory-ncm-runtime/src/engine/runtime/selection.rs",
+      "baseline_sha256": "f6e06f7adf6cf2109f9cec512ba236be3e5e81c308a863fb9b65351f32d5f307",
+      "proposed_sha256": "21723e2dbcf486be6b7750d9064885ae2f7c4d061ae790d0195982a1fae7430c"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/src/common/source_binding.rs",
+      "baseline_sha256": "2538a30eef06154cde81f68dd2b9e848cbc03bc6372dba93cfcf0e27d8883611",
+      "proposed_sha256": "a7e49c2a32c30fb98eb7ba665bbbeb6364dee23e17082e4874891adf9b4ae857"
+    },
+    {
+      "path": "crates/tracedecay-memory-provider-ncm/src/common.rs",
+      "baseline_sha256": "64201dcf9b4bf8e92f465b170ca78d233ae54537bfa979b41b497be2872f850f",
+      "proposed_sha256": "cde28dca9a4207595d136985fce6b57d37e3a7c93c7b79615ac8f8485404fcc3"
+    }
+  ]
+}

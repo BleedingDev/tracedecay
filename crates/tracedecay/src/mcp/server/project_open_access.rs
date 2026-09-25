@@ -3,7 +3,7 @@
 use tracedecay_contracts::ResolvedScope;
 use tracedecay_query::code_search::{CodeIndexSearchAuthorityV1, CodeIndexSimilarExecutor};
 
-use super::{CodeGraphProjectionReadPort, CodeIndexIgnoredDependencyAdmissionPort, McpServer};
+use super::{CodeGraphProjectionReadPort, McpServer};
 
 impl McpServer {
     pub(crate) fn daemon_invocation_service(
@@ -26,12 +26,6 @@ impl McpServer {
 
     pub(crate) fn admitted_project_scope(&self) -> Option<ResolvedScope> {
         self.admitted_project_scope.clone()
-    }
-
-    pub(crate) fn code_index_ignored_dependency_admission(
-        &self,
-    ) -> Option<CodeIndexIgnoredDependencyAdmissionPort> {
-        self.code_index_ignored_dependency_admission.clone()
     }
 
     pub(crate) fn install_generation_census_reader(

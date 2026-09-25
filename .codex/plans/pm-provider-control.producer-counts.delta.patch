@@ -1,0 +1,82 @@
+diff --git a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+--- a/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
++++ b/crates/tracedecay-contracts/src/retained_surfaces/provider_control.rs
+@@ -860,6 +860,9 @@
+     pub effective_limits_digest: String,
+     pub backlog: ProviderControlEvidenceV1,
+     pub recovery_state: ProviderControlEvidenceV1,
++    /// Actual provider-reported row count; omission is not a reported zero.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub staged_rows: Option<u64>,
+ }
+ 
+ #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+@@ -944,6 +947,10 @@
+     pub scanned_items: u64,
+     pub changed_items: u64,
+     pub removed_items: u64,
++    /// Provider-reported proposals, distinct from changes actually applied.
++    /// A provider may propose multiple actions for one scanned item.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub proposed_changes: Option<u64>,
+     pub partial: bool,
+     pub resume_cursor: Option<String>,
+     pub receipt: ProviderControlMutationReceiptV1,
+@@ -1009,6 +1016,9 @@
+     pub snapshot_ref: String,
+     pub snapshot_id: String,
+     pub restored_observation_sequence: u64,
++    /// Actual restored row count, independent of the restored sequence watermark.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub restored_rows: Option<u64>,
+     pub receipt: ProviderControlMutationReceiptV1,
+ }
+ 
+@@ -2392,6 +2402,47 @@
+     }
+ 
+     #[test]
++    fn optional_provider_counts_preserve_native_values_and_ncm_omissions() {
++        let requests = requests();
++        for (index, field, count) in [
++            (3, "staged_rows", 9_u64),
++            (5, "proposed_changes", 3),
++            (7, "restored_rows", 2),
++        ] {
++            for actual in [None, Some(0), Some(count)] {
++                let mut data = successful_data(index);
++                if let Some(count) = actual {
++                    data[field] = json!(count);
++                }
++                let result: ProviderControlResultV1 =
++                    serde_json::from_value(result_value(&requests[index], data, "success"))
++                        .expect("typed provider count");
++                result
++                    .validate_for(&requests[index])
++                    .expect("provider count does not invent a cross-field bound");
++                let data =
++                    serde_json::to_value(&result.result).expect("result wire")["data"].clone();
++                match actual {
++                    Some(count) => assert_eq!(data[field], json!(count)),
++                    None => assert!(data.get(field).is_none()),
++                }
++            }
++            for invalid in [json!(-1), json!(1.5), json!("3")] {
++                let mut data = successful_data(index);
++                data[field] = invalid;
++                assert!(
++                    serde_json::from_value::<ProviderControlResultV1>(result_value(
++                        &requests[index],
++                        data,
++                        "success"
++                    ))
++                    .is_err()
++                );
++            }
++        }
++    }
++
++    #[test]
+     fn provider_control_requests_are_closed_bounded_and_keep_host_authority_out() {
+         for request in requests() {
+             request.validate_at(UtcMicros(20)).expect("valid request");

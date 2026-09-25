@@ -560,6 +560,7 @@ async fn production_project_server_inner(
                     &empty_activation,
                     &resolved,
                     None,
+                    FailedUpgradeRouteDisposition::RetireAttempt,
                     error,
                 ))
                 .await
@@ -593,23 +594,34 @@ async fn production_project_server_inner(
                             // mounted. In particular, dropping the provider
                             // bundle alone does not stop an already-started
                             // observation worker.
-                            Err(error) => Err((error, Some(full))),
+                            Err(error) => {
+                                let disposition = failed_upgrade_route_disposition(&error);
+                                Err((error, Some(full), disposition))
+                            }
                         }
                     }
-                    Err(error) => Err((error, Some(full))),
+                    Err(error) => Err((
+                        error,
+                        Some(full),
+                        FailedUpgradeRouteDisposition::RetainAdmittedCore,
+                    )),
                 }
             }
-            Err(error) => Err((error, None)),
+            Err(error) => {
+                let disposition = failed_upgrade_route_disposition(&error);
+                Err((error, None, disposition))
+            }
         };
         match upgrade {
             Ok(full_server) => resolved = full_server,
-            Err((error, published_full_server)) => {
+            Err((error, published_full_server, disposition)) => {
                 Box::pin(inputs.settle_failed_full_upgrade(
                     &opened,
                     &core,
                     &activation,
                     &resolved,
                     published_full_server,
+                    disposition,
                     error,
                 ))
                 .await?;
@@ -780,6 +792,7 @@ impl ComposedCoreServer {
             .with_code_index_similar_executor(Arc::clone(&code_index.similar_executor))
             .with_code_index_redundancy_executor(Arc::clone(&code_index.redundancy_executor))
             .with_code_index_branch_diff_executor(Arc::clone(&code_index.branch_diff_executor))
+            .with_semantic_admin_executor(Arc::clone(&code_index.semantic_admin_executor))
             .with_code_graph_projection_read_port(Arc::clone(
                 &code_index.graph_projection_read_port,
             ))
@@ -857,6 +870,33 @@ struct PublishedFullServer {
     #[cfg(feature = "memory-provider-host")]
     provider_full_mount:
         Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailedUpgradeRouteDisposition {
+    RetainAdmittedCore,
+    RetireAttempt,
+}
+
+struct FailedProjectOpenSettlement {
+    publication_is_current: bool,
+    publication_attempt_present: bool,
+    retain_core: bool,
+}
+
+const PROVIDER_FULL_UPGRADE_UNAVAILABLE_REASON: &str = "provider_full_upgrade_unavailable";
+
+fn provider_full_upgrade_unavailable(detail: impl Into<String>) -> TraceDecayError {
+    TraceDecayError::project_route(PROVIDER_FULL_UPGRADE_UNAVAILABLE_REASON, true, detail)
+}
+
+fn failed_upgrade_route_disposition(error: &TraceDecayError) -> FailedUpgradeRouteDisposition {
+    match error.project_route_context() {
+        Some((PROVIDER_FULL_UPGRADE_UNAVAILABLE_REASON, _, _)) => {
+            FailedUpgradeRouteDisposition::RetainAdmittedCore
+        }
+        _ => FailedUpgradeRouteDisposition::RetireAttempt,
+    }
 }
 
 impl ProjectOpenInputs<'_> {
@@ -1094,7 +1134,9 @@ impl ProjectOpenInputs<'_> {
             project_id: code_index.project_id.clone(),
             project_root: self.canonical_project_path.to_path_buf(),
             store_root: code_index_store_root.clone(),
+            profile_root: profile_identity.profile_root().to_path_buf(),
             native_graph_activation: runtime_configuration.config().native_graph_activation,
+            semantic_config: runtime_configuration.config().semantic.clone(),
             scope: code_index.scope.clone(),
             route_registered: Arc::clone(&route_registered),
             cancellation: route_cancellation.clone(),
@@ -1651,27 +1693,6 @@ impl ProjectOpenInputs<'_> {
             .store_administration
             .profile_session_refresh_service(&user_session_db)
             .await;
-        #[cfg(feature = "memory-provider-host")]
-        let provider_full_mount =
-            tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
-                &core.memory_provider_host,
-                tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountInputsV1 {
-                    graph: Arc::clone(cg),
-                    canonical_project_path: self.canonical_project_path.to_path_buf(),
-                    profile_id: core.profile_identity.profile_id().clone(),
-                    brain_id: core.profile_identity.brain_id().clone(),
-                    scope: code_index.scope.clone(),
-                    authoritative_project_id: code_index.project_id.clone(),
-                    session_db: session_db.clone(),
-                    configuration_digest: runtime_configuration
-                        .snapshot()
-                        .effective_behavior_digest
-                        .clone(),
-                },
-                self.cancellation,
-            )
-            .await
-            .map_err(|error| TraceDecayError::Config { message: error })?;
         let full_context = core
             .publish_route_ports(
                 crate::mcp::server::McpServerConstructionContext::daemon_owned(
@@ -1712,6 +1733,46 @@ impl ProjectOpenInputs<'_> {
             .with_remote_operational_status(remote_operational_status)
             .with_dashboard_doctor_report_reader(doctor_report_reader)
             .with_startup_catch_up_enabled(self.runtime.startup_catch_up());
+        let session_retrieval = full_context
+            .project_session_application_retrieval_service(&code_index.scope)
+            .await?;
+        project_open_owners::register_project_open_core_read_owners(
+            self.invocation,
+            self.canonical_project_path,
+            code_index.project_id.as_str(),
+            Arc::clone(cg),
+            Arc::clone(&code_index.graph_projection_read_port),
+            Arc::clone(&code_index.ignored_dependency_admission),
+            session_db.clone(),
+            session_retrieval,
+        )
+        .await?;
+        self.log_phase("core_read_owners_registered", None, self.started);
+        #[cfg(feature = "memory-provider-host")]
+        let provider_full_mount =
+            tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
+                &core.memory_provider_host,
+                tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountInputsV1 {
+                    graph: Arc::clone(cg),
+                    canonical_project_path: self.canonical_project_path.to_path_buf(),
+                    profile_id: core.profile_identity.profile_id().clone(),
+                    brain_id: core.profile_identity.brain_id().clone(),
+                    scope: code_index.scope.clone(),
+                    authoritative_project_id: code_index.project_id.clone(),
+                    session_db: session_db.clone(),
+                    configuration_digest: runtime_configuration
+                        .snapshot()
+                        .effective_behavior_digest
+                        .clone(),
+                },
+                self.cancellation,
+            )
+            .await
+            .map_err(|error| {
+                provider_full_upgrade_unavailable(format!(
+                    "memory provider full mount is unavailable: {error}"
+                ))
+            })?;
         #[cfg(feature = "memory-provider-host")]
         let full_context = provider_full_mount
             .observation_journeys()
@@ -1741,7 +1802,9 @@ impl ProjectOpenInputs<'_> {
                     )
                     .await;
                     full_candidate.shutdown().await;
-                    return Err(error);
+                    return Err(provider_full_upgrade_unavailable(format!(
+                        "memory provider session retrieval is unavailable: {error}"
+                    )));
                 }
             };
             if let Err(error) = core.memory_provider_host.bind_session_retrieval(retrieval) {
@@ -1751,7 +1814,9 @@ impl ProjectOpenInputs<'_> {
                 )
                 .await;
                 full_candidate.shutdown().await;
-                return Err(TraceDecayError::Config { message: error });
+                return Err(provider_full_upgrade_unavailable(format!(
+                    "memory provider session retrieval binding is unavailable: {error}"
+                )));
             }
         }
         if full_candidate
@@ -1798,7 +1863,7 @@ impl ProjectOpenInputs<'_> {
         &self,
         opened: &OpenedProjectGraph,
         core: &ComposedCoreServer,
-        full_server: &crate::mcp::McpServer,
+        full_server: &Arc<crate::mcp::McpServer>,
         session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
         core_source_edit_mutation: Option<
             Arc<tracedecay_daemon_service::project_owner_registration::SourceEditMutationGate>,
@@ -1885,6 +1950,21 @@ impl ProjectOpenInputs<'_> {
         let mut registry_published = false;
         let result = async {
             self.log_phase("session_capabilities_prepared", None, self.started);
+            #[cfg(feature = "memory-provider-host")]
+            full.provider_full_mount
+                .activate_after_publication(full.session_db.observation_store(), self.cancellation)
+                .await
+                .map_err(|error| {
+                    provider_full_upgrade_unavailable(format!(
+                        "memory provider activation is unavailable: {error}"
+                    ))
+                })?;
+            self.phase_checkpoint(ProjectOpenFailurePhase::ProviderActivated)
+                .map_err(|error| {
+                    provider_full_upgrade_unavailable(format!(
+                        "memory provider activation did not complete: {error}"
+                    ))
+                })?;
             full.session_holder_database_paths = self
                 .invocation
                 .service
@@ -1897,17 +1977,11 @@ impl ProjectOpenInputs<'_> {
             Box::pin(self.mount_full_server_owners(
                 opened,
                 core,
-                full.server.as_ref(),
+                &full.server,
                 full.session_db.clone(),
                 activation.core_source_edit_mutation.clone(),
             ))
             .await?;
-            #[cfg(feature = "memory-provider-host")]
-            full.provider_full_mount
-                .activate_after_publication(full.session_db.observation_store(), self.cancellation)
-                .await
-                .map_err(|error| TraceDecayError::Config { message: error })?;
-            self.phase_checkpoint(ProjectOpenFailurePhase::ProviderActivated)?;
             if *core.current_key.lock().await != opened.key {
                 return Err(TraceDecayError::Config {
                     message: "project changed branch during full capability admission".to_owned(),
@@ -2020,10 +2094,10 @@ impl ProjectOpenInputs<'_> {
         result
     }
 
-    /// Unwind a failed full publication as one transaction. The core is only a
-    /// provisional route for this attempt; keeping it after a failed owner
-    /// mount would leave runtime owners, provider workers, and HTTP reachability
-    /// behind for the next retry.
+    /// Unwind a failed full publication as one transaction. Provider-only
+    /// failures may retain the already-admitted core after every full-only
+    /// owner has been retired. Admission, owner-mount, cancellation, rekey, and
+    /// replacement failures retire the complete attempt.
     #[hotpath::measure(label = "daemon.project.compose.settle_failed_upgrade", future = true)]
     async fn settle_failed_full_upgrade(
         &self,
@@ -2032,8 +2106,20 @@ impl ProjectOpenInputs<'_> {
         activation: &CoreRouteActivation,
         resolved: &Arc<crate::mcp::McpServer>,
         published_full_server: Option<PublishedFullServer>,
+        disposition: FailedUpgradeRouteDisposition,
         error: TraceDecayError,
     ) -> Result<()> {
+        let failed_key = core.current_key.lock().await.clone();
+        let retain_core = disposition == FailedUpgradeRouteDisposition::RetainAdmittedCore
+            && !self.cancellation.is_cancelled()
+            && failed_key == opened.key
+            && self
+                .store_administration
+                .project_servers()
+                .lock()
+                .await
+                .get_ready(&failed_key)
+                .is_some_and(|current| Arc::ptr_eq(current, resolved));
         if let Some(mutation) = &activation.core_source_edit_mutation {
             mutation.mark_failed();
         }
@@ -2050,21 +2136,34 @@ impl ProjectOpenInputs<'_> {
                         .project_runtimes
                         .mark_publication_failed(attempt)
                 });
-        retire_failed_project_open_owner(
+        let core_retained = retire_failed_project_open_owner(
             self.store_administration,
             self.invocation,
             self.http_application_registry,
             self.canonical_project_path,
             opened,
-            &opened.key,
+            &failed_key,
             resolved,
             published_full_server,
             activation.http_route_attempt.as_ref(),
             &core.route_registered,
-            publication_is_current,
+            FailedProjectOpenSettlement {
+                publication_is_current,
+                publication_attempt_present: activation.publication_attempt.is_some(),
+                retain_core,
+            },
         )
         .await;
-        Err(error)
+        if core_retained {
+            self.log_phase(
+                "full_upgrade_degraded",
+                Some(("error", error.to_string())),
+                self.started,
+            );
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -2114,6 +2213,7 @@ struct ProjectCodeIndexAuthorities {
     similar_executor: crate::mcp::server::CodeIndexSimilarExecutor,
     redundancy_executor: crate::mcp::server::CodeIndexRedundancyExecutor,
     branch_diff_executor: crate::mcp::server::CodeIndexBranchDiffExecutor,
+    semantic_admin_executor: crate::mcp::server::SemanticAdminExecutorV1,
 }
 
 /// Resolve the project's search identity and bind every code-index read port to
@@ -2204,6 +2304,8 @@ fn project_code_index_authorities(
         read_admission_provider,
         tracedecay_code_index_runtime::mcp_admission::RegisteredProjectScopeResolverV1,
     );
+    let semantic_admin_executor =
+        project_semantic_admin_executor(invocation.code_index_schedulers.clone(), scope.clone());
     Ok(ProjectCodeIndexAuthorities {
         publication_identity,
         project_id,
@@ -2217,7 +2319,222 @@ fn project_code_index_authorities(
         similar_executor,
         redundancy_executor,
         branch_diff_executor,
+        semantic_admin_executor,
     })
+}
+
+fn project_semantic_admin_executor(
+    schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
+    scope: tracedecay_contracts::ResolvedScope,
+) -> crate::mcp::server::SemanticAdminExecutorV1 {
+    Arc::new(move |request, deadline, cancellation| {
+        let schedulers = schedulers.clone();
+        let scope = scope.clone();
+        Box::pin(async move {
+            ensure_semantic_admin_request_live(&deadline, &cancellation)?;
+            let runtime = schedulers.semantic_runtime_for_scope(&scope).await;
+            ensure_semantic_admin_request_live(&deadline, &cancellation)?;
+
+            use tracedecay_mcp::handlers::admin_project::{
+                SemanticAdminRequestV1, SemanticAdminResponseV1,
+            };
+            match request {
+                SemanticAdminRequestV1::Status => Ok(SemanticAdminResponseV1::Status {
+                    lifecycle: runtime.as_ref().map(|runtime| runtime.model_status()),
+                    runtime: runtime.as_ref().map(|runtime| runtime.status()),
+                }),
+                SemanticAdminRequestV1::Acquire => {
+                    let runtime = require_semantic_admin_runtime(runtime)?;
+                    begin_semantic_admin_effect(&deadline, &cancellation)?;
+                    let acquisition = runtime.acquire_model().map_err(|error| {
+                        semantic_admin_lifecycle_error("semantic_model_acquisition_failed", error)
+                    })?;
+                    Ok(SemanticAdminResponseV1::Acquisition {
+                        queued: acquisition.queued,
+                        lifecycle: acquisition.lifecycle,
+                    })
+                }
+                SemanticAdminRequestV1::Import { manifest, source } => {
+                    let runtime = require_semantic_admin_runtime(runtime)?;
+                    let now_unix = semantic_admin_now_unix()?;
+                    begin_semantic_admin_effect(&deadline, &cancellation)?;
+                    let imported = tokio::task::spawn_blocking(move || {
+                        let source = canonical_semantic_import_source(&source)?;
+                        runtime
+                            .import_model(&manifest, &source, now_unix)
+                            .map_err(|error| {
+                                semantic_admin_lifecycle_error(
+                                    "semantic_model_import_failed",
+                                    error,
+                                )
+                            })
+                    })
+                    .await
+                    .map_err(|_| {
+                        TraceDecayError::project_route(
+                            "semantic_model_import_task_failed",
+                            true,
+                            "semantic model import task failed while joining",
+                        )
+                    })??;
+                    Ok(SemanticAdminResponseV1::Import {
+                        lifecycle: imported,
+                    })
+                }
+            }
+        })
+    })
+}
+
+fn semantic_admin_lifecycle_error(
+    reason_code: &'static str,
+    error: tracedecay_application::semantic_runtime::ModelLifecycleErrorV1,
+) -> TraceDecayError {
+    use tracedecay_application::semantic_runtime::ModelLifecycleErrorV1;
+
+    if matches!(&error, ModelLifecycleErrorV1::Cancelled) {
+        return tracedecay_contracts::ApplicationProblem::cancelled_before_admission().into();
+    }
+    let retryable = semantic_admin_lifecycle_error_retryable(&error);
+    TraceDecayError::project_route(reason_code, retryable, error.to_string())
+}
+
+fn semantic_admin_lifecycle_error_retryable(
+    error: &tracedecay_application::semantic_runtime::ModelLifecycleErrorV1,
+) -> bool {
+    use tracedecay_application::semantic_runtime::{ArtifactImportErrorV1, ModelLifecycleErrorV1};
+
+    matches!(
+        error,
+        ModelLifecycleErrorV1::StoreUnavailable
+            | ModelLifecycleErrorV1::DownloadFailed
+            | ModelLifecycleErrorV1::DownloadFailedWithReason(_)
+            | ModelLifecycleErrorV1::WorkerJoinFailed
+            | ModelLifecycleErrorV1::ArtifactImport(
+                ArtifactImportErrorV1::StoreBusy
+                    | ArtifactImportErrorV1::SourceInterrupted
+                    | ArtifactImportErrorV1::StorageFailure
+            )
+    )
+}
+
+fn canonical_semantic_import_source(source: &Path) -> Result<PathBuf> {
+    if !source.is_absolute() {
+        return Err(TraceDecayError::Config {
+            message: "semantic artifact source must be an absolute path".to_owned(),
+        });
+    }
+    let source_metadata =
+        std::fs::symlink_metadata(source).map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "cannot inspect semantic artifact source '{}': {error}",
+                source.display()
+            ),
+        })?;
+    if source_metadata.file_type().is_symlink() {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "semantic artifact source '{}' must not be a symbolic link",
+                source.display()
+            ),
+        });
+    }
+    let canonical = std::fs::canonicalize(source).map_err(|error| TraceDecayError::Config {
+        message: format!(
+            "cannot resolve semantic artifact source '{}': {error}",
+            source.display()
+        ),
+    })?;
+    if !canonical.is_dir() {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "semantic artifact source '{}' is not a directory",
+                canonical.display()
+            ),
+        });
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod semantic_admin_error_tests {
+    use super::semantic_admin_lifecycle_error_retryable;
+    use tracedecay_application::semantic_runtime::{ArtifactImportErrorV1, ModelLifecycleErrorV1};
+
+    #[test]
+    fn artifact_import_retryability_preserves_only_transient_failures() {
+        for error in [
+            ArtifactImportErrorV1::StoreBusy,
+            ArtifactImportErrorV1::SourceInterrupted,
+            ArtifactImportErrorV1::StorageFailure,
+        ] {
+            assert!(semantic_admin_lifecycle_error_retryable(
+                &ModelLifecycleErrorV1::ArtifactImport(error)
+            ));
+        }
+        for error in [
+            ArtifactImportErrorV1::DigestMismatch,
+            ArtifactImportErrorV1::LengthMismatch,
+            ArtifactImportErrorV1::UnsafePackageEntry,
+        ] {
+            assert!(!semantic_admin_lifecycle_error_retryable(
+                &ModelLifecycleErrorV1::ArtifactImport(error)
+            ));
+        }
+        assert!(!semantic_admin_lifecycle_error_retryable(
+            &ModelLifecycleErrorV1::AcquisitionUnavailable
+        ));
+    }
+}
+
+fn require_semantic_admin_runtime(
+    runtime: Option<Arc<tracedecay_application::semantic_runtime::ProjectSemanticRuntimeV1>>,
+) -> Result<Arc<tracedecay_application::semantic_runtime::ProjectSemanticRuntimeV1>> {
+    runtime.ok_or_else(|| {
+        TraceDecayError::project_route(
+            "semantic_runtime_unavailable",
+            true,
+            "semantic runtime is not mounted for this project checkout",
+        )
+    })
+}
+
+fn ensure_semantic_admin_request_live(
+    deadline: &tracedecay_contracts::Deadline,
+    cancellation: &tracedecay_contracts::CancellationSignal,
+) -> Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission().into());
+    }
+    if deadline.is_elapsed_at(tracedecay_contracts::now_micros()) {
+        return Err(tracedecay_contracts::ApplicationProblem::timed_out_before_admission().into());
+    }
+    Ok(())
+}
+
+fn begin_semantic_admin_effect(
+    deadline: &tracedecay_contracts::Deadline,
+    cancellation: &tracedecay_contracts::CancellationSignal,
+) -> Result<()> {
+    ensure_semantic_admin_request_live(deadline, cancellation)?;
+    if !cancellation.try_begin_commit() {
+        return Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission().into());
+    }
+    Ok(())
+}
+
+fn semantic_admin_now_unix() -> Result<u64> {
+    let now = tracedecay_contracts::try_now_micros().map_err(|error| {
+        TraceDecayError::project_route("semantic_admin_clock_unavailable", true, error.to_string())
+    })?;
+    let micros = u64::try_from(now.0).map_err(|_| {
+        TraceDecayError::project_route(
+            "semantic_admin_clock_unavailable",
+            true,
+            "semantic admin clock is before the Unix epoch",
+        )
+    })?;
+    Ok(micros / 1_000_000)
 }
 
 /// Dashboard-facing freshness reader for this route's code-index schedulers.
@@ -2351,8 +2668,14 @@ async fn retire_failed_project_open_owner(
     published_full_server: Option<PublishedFullServer>,
     http_route_attempt: Option<&http_application::ProjectHttpRouteAttempt>,
     route_registered: &Arc<AtomicBool>,
-    publication_is_current: bool,
-) {
+    settlement: FailedProjectOpenSettlement,
+) -> bool {
+    let FailedProjectOpenSettlement {
+        publication_is_current,
+        publication_attempt_present,
+        retain_core,
+    } = settlement;
+    let retain_core = retain_core && (publication_is_current || !publication_attempt_present);
     let full_server = published_full_server
         .as_ref()
         .map(|full| Arc::clone(&full.server));
@@ -2360,25 +2683,35 @@ async fn retire_failed_project_open_owner(
         .as_ref()
         .map(|full| full.session_holder_database_paths.clone())
         .unwrap_or_default();
-    let removed = store_administration
-        .project_servers()
-        .lock()
-        .await
-        .remove_if(failed_key, |server| {
-            Arc::ptr_eq(server, resolved)
-                || full_server
-                    .as_ref()
-                    .is_some_and(|full| Arc::ptr_eq(server, full))
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
+    let (owns_registry, removed) = {
+        let mut servers = store_administration.project_servers().lock().await;
+        if retain_core {
+            (
+                servers
+                    .get_ready(failed_key)
+                    .is_some_and(|server| Arc::ptr_eq(server, resolved)),
+                Vec::new(),
+            )
+        } else {
+            let removed = servers
+                .remove_if(failed_key, |server| {
+                    Arc::ptr_eq(server, resolved)
+                        || full_server
+                            .as_ref()
+                            .is_some_and(|full| Arc::ptr_eq(server, full))
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            (!removed.is_empty(), removed)
+        }
+    };
     // Registry removal is the attempt's owner-registry CAS. If a newer
     // generation already replaced this key, leave its route and shared owner
     // state untouched. The immutable runtime token below gives the same CAS
     // guarantee for publication state.
-    let owns_registry = !removed.is_empty();
-    let owns_attempt = owns_registry && (publication_is_current || http_route_attempt.is_none());
-    if owns_registry {
+    let owns_attempt = owns_registry && (publication_is_current || !publication_attempt_present);
+    let core_retained = retain_core && owns_registry;
+    if owns_registry && !core_retained {
         route_registered.store(false, Ordering::Release);
     }
     if let Some(attempt) = http_route_attempt
@@ -2394,11 +2727,13 @@ async fn retire_failed_project_open_owner(
     let full_is_removed = full_server
         .as_ref()
         .is_some_and(|full| removed.iter().any(|server| Arc::ptr_eq(server, full)));
-    if owns_registry {
+    if owns_attempt && !core_retained {
         store_administration
             .session_temporal_refresh_schedulers()
             .retire_project(&failed_key.owner)
             .await;
+    }
+    if !removed.is_empty() {
         super::project_server_lifecycle::retire_project_servers(
             removed,
             Some(Arc::clone(route_registered)),
@@ -2417,6 +2752,13 @@ async fn retire_failed_project_open_owner(
             full.server.revoke_project_server_responses();
             full.server.shutdown().await;
         }
+    }
+    // Eligible provider failures happen before any full-only invocation owner
+    // is mounted. The core route therefore keeps its core read owners and the
+    // session authorities they were built from; only the private full MCP and
+    // provider candidate above require retirement.
+    if core_retained {
+        return true;
     }
 
     let project_sessions_path = failed_key
@@ -2518,7 +2860,9 @@ async fn retire_failed_project_open_owner(
     let telemetry_sampling = store_administration.store_telemetry_sampling();
     if owns_attempt {
         telemetry_sampling.release_retained_handle(&project_sessions_path);
-        telemetry_sampling.release_retained_handle(&failed_key.owner.graph_db_path);
+        if !core_retained {
+            telemetry_sampling.release_retained_handle(&failed_key.owner.graph_db_path);
+        }
     }
     if owns_attempt
         && let Some(project_id) = project_id.as_ref()
@@ -2538,4 +2882,5 @@ async fn retire_failed_project_open_owner(
         .service
         .unmount_session_holder_databases(session_holder_database_paths)
         .await;
+    core_retained
 }

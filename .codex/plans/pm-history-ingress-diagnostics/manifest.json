@@ -1,0 +1,17 @@
+[
+  {
+    "path": "crates/tracedecay/src/daemon/retained_owner/observation_journey.rs",
+    "index_before_sha256": "ab81dc1bc5ff7e8885f3fd8e7378d52a1fe0f7682069cbe7a73c91310c01f74c",
+    "live_after_sha256": "93a1c2f67ffe35099848eb9e3e8132a585de7414b5d4b514bde653beb707af55"
+  },
+  {
+    "path": "crates/tracedecay/src/daemon/retained_owner/cognitive_recall.rs",
+    "index_before_sha256": "5621f023dd7d01936d60b3a995b61e3eb7bdb6f583dfa72175b8c087d202b0b6",
+    "live_after_sha256": "d0a369010b1f8d3c09357cb77dd3e926167649229dba71e7129c6bb180072fa8"
+  },
+  {
+    "path": "crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs",
+    "index_before_sha256": "7785616209c426c468b01d778698d82169dc9edd30c73cf3f5ea7ba7d854253a",
+    "live_after_sha256": "da5bb41b24eb3dd096c8f95cd6895c5b9866c4b05f80661ad89997d2e8a18385"
+  }
+]

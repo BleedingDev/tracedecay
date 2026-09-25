@@ -38,6 +38,7 @@ impl_future_size!(A, B, C, D, E, F, G);
 impl_future_size!(A, B, C, D, E, F, G, H);
 impl_future_size!(A, B, C, D, E, F, G, H, I);
 impl_future_size!(A, B, C, D, E, F, G, H, I, J);
+impl_future_size!(A, B, C, D, E, F, G, H, I, J, K);
 
 /// Size in bytes of the future an `async fn` returns, without constructing it.
 fn future_size<Args, Fun: FutureSize<Args>>(function: Fun) -> usize {

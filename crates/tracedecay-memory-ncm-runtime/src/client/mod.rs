@@ -1995,7 +1995,7 @@ mod tests {
                     Err(RecvTimeoutError::Disconnected) => break,
                 };
                 owner_queued_bytes.fetch_sub(command.queued_bytes, Ordering::AcqRel);
-                if command.cancelled() {
+                if (command.cancelled)() {
                     let _ = command.response.send(Err(ClientError::Cancelled));
                     continue;
                 }
@@ -2357,7 +2357,9 @@ mod tests {
             )),
             crate::engine::Outcome::Rejected(crate::engine::RejectReason::SourceRevoked),
             crate::engine::Outcome::Rejected(crate::engine::RejectReason::IdempotencyConflict),
-            crate::engine::Outcome::Rejected(crate::engine::RejectReason::UnknownRecord(7)),
+            crate::engine::Outcome::Rejected(crate::engine::RejectReason::UnknownRecord(
+                tracedecay_memory_ncm_core::RecordId(7),
+            )),
         ] {
             let _ = update_unknown(&client, &request, &Ok(wire_reply(outcome)));
             assert!(
@@ -2679,7 +2681,7 @@ mod tests {
         let mut oversized = mutating_request("namespace-a", "bounded-bytes");
         oversized.payload["padding"] = Value::String("x".repeat(MAX_RETAINED_UNKNOWN_BYTES + 1));
         assert!(matches!(
-            bytes_client.admit_unknown(&oversized, &oversized, None),
+            bytes_client.admit_unknown(&oversized, &oversized, None, None),
             Err(ClientError::UnknownRetentionLimit { op_id }) if op_id == oversized.id
         ));
         assert_eq!(

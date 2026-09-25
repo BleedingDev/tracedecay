@@ -1,0 +1,12 @@
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/provider_history.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/provider_history.rs
+@@ -1513,7 +1513,8 @@
+         ))
+     ));
+     wrong = expected.clone();
+-    wrong.source.observation_id = "observation.missing".to_owned();
++    wrong.source.observation_id = format!("sha256:{}", "f".repeat(64));
++    assert_ne!(wrong.source.observation_id, expected.source.observation_id);
+     assert!(matches!(
+         reader
+             .authorize_retained_source(&destination, &wrong, &control(), true)

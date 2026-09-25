@@ -1179,6 +1179,158 @@ async fn hook_request_acknowledges_only_after_processing_and_publishes_route() {
 }
 
 #[tokio::test]
+async fn admitted_hook_v2_session_start_publishes_explicit_session_route() {
+    let (cg, _project, authority) = init_indexed_repo().await;
+    let binding = {
+        let host = tracedecay_hooks::HookHostV1::ClaudeCode;
+        let binding = tracedecay_hooks::HookScopeBindingV1 {
+            host,
+            project_id: [1; 16],
+            repository_id: [2; 16],
+            worktree_id: [3; 16],
+            worktree_epoch: 1,
+            binding_token: [4; 32],
+            capabilities: vec![tracedecay_hooks::HookCapabilityV1 {
+                family: tracedecay_hooks::HookEventFamily::SessionBoundary,
+                support: tracedecay_hooks::stock_event_support(
+                    host,
+                    tracedecay_hooks::HookEventFamily::SessionBoundary,
+                ),
+            }],
+        };
+        tracedecay_hooks::HookConfigurationPublisherV1::new(
+            tracedecay_hooks::HookConfigurationFileWriterV1::new(
+                tracedecay_hooks::hook_configuration_path(
+                    &cg.hook_store_layout().data_root,
+                    binding.worktree_id,
+                    host,
+                ),
+            ),
+        )
+        .publish(tracedecay_hooks::HookConfigurationSnapshotV1 {
+            schema_version: tracedecay_hooks::HOOK_CONFIGURATION_SCHEMA_VERSION,
+            revision: 1,
+            published_at: tracedecay_domain::UtcMicros(1),
+            expires_at: tracedecay_domain::UtcMicros(i64::MAX),
+            binding: binding.clone(),
+        })
+        .expect("publish canonical Hook V2 binding");
+        binding
+    };
+    let spool = TempDir::new().unwrap();
+    let runtime = HostAdmissionRuntime::open(spool.path(), SpoolBounds::default())
+        .unwrap()
+        .0;
+    let broker = Arc::new(HostAdmissionBroker::new(runtime));
+    let server = server_with_broker(cg, &authority, broker, success_reconcile_sink()).await;
+
+    let session_id = "session-v2-route-test";
+    let envelope = tracedecay_hooks::HookEventEnvelopeV2 {
+        schema_version: tracedecay_hooks::HOOK_EVENT_SCHEMA_VERSION,
+        event_id: [5; 16],
+        producer: binding.host,
+        protected_session_id: tracedecay_agent_hosts::hooks::protected_native_session_id(
+            session_id,
+        ),
+        project_id: binding.project_id,
+        repository_id: binding.repository_id,
+        worktree_id: binding.worktree_id,
+        worktree_epoch: binding.worktree_epoch,
+        binding_token: binding.binding_token,
+        ordering: tracedecay_hooks::HookOrderingV1::Unknown,
+        observed_at: tracedecay_domain::UtcMicros(2),
+        event: tracedecay_hooks::HookEventV2::SessionBoundary {
+            boundary: tracedecay_hooks::HookBoundaryV1::Start,
+        },
+    };
+    for (request_id, expected_status) in [("v2-start", "accepted"), ("v2-retry", "exact_duplicate")]
+    {
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: Some(json!(request_id)),
+            method: "tools/call".to_owned(),
+            params: Some(json!({
+                "name": "tracedecay_hook_runtime",
+                "arguments": {
+                    "action": "hook_v2_admit",
+                    "envelope": envelope,
+                    "native_session_id": session_id,
+                    "format": "json"
+                }
+            })),
+        };
+        let response = server
+            .handle_request(&request)
+            .await
+            .expect("tools/call response");
+        assert!(
+            response.error.is_none(),
+            "Hook V2 call failed: {response:?}"
+        );
+        let payload = response
+            .result
+            .as_ref()
+            .and_then(|result| result["content"][0]["text"].as_str())
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .expect("Hook V2 JSON response");
+        assert_eq!(payload["status"], expected_status);
+    }
+
+    let mut arguments = json!({"session_id": session_id});
+    crate::mcp::project_route::protect_tool_structural_ids(&mut arguments)
+        .expect("protect route identity");
+    let routes = server
+        .hook_project_routes
+        .snapshot()
+        .expect("shared route cache snapshot");
+    assert!(matches!(
+        routes.workspace_route_for_arguments(&arguments),
+        Some(crate::mcp::project_route::WorkspaceProjectRoute::Resolved(
+            _
+        ))
+    ));
+
+    let mismatched_session = "session-v2-route-mismatch";
+    let mut mismatched_envelope = envelope;
+    mismatched_envelope.event_id = [6; 16];
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_owned(),
+        id: Some(json!("v2-mismatch")),
+        method: "tools/call".to_owned(),
+        params: Some(json!({
+            "name": "tracedecay_hook_runtime",
+            "arguments": {
+                "action": "hook_v2_admit",
+                "envelope": mismatched_envelope,
+                "native_session_id": mismatched_session,
+                "format": "json"
+            }
+        })),
+    };
+    let response = server
+        .handle_request(&request)
+        .await
+        .expect("mismatched tools/call response");
+    assert!(
+        response.error.is_none(),
+        "Hook V2 call failed: {response:?}"
+    );
+    let mut mismatched_arguments = json!({"session_id": mismatched_session});
+    crate::mcp::project_route::protect_tool_structural_ids(&mut mismatched_arguments)
+        .expect("protect mismatched route identity");
+    let routes = server
+        .hook_project_routes
+        .snapshot()
+        .expect("shared route cache snapshot");
+    assert!(
+        routes
+            .workspace_route_for_arguments(&mismatched_arguments)
+            .is_none()
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn hook_notification_remains_response_free() {
     let (cg, project, authority) = init_indexed_repo().await;
     let spool = TempDir::new().unwrap();

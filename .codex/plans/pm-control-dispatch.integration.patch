@@ -1,0 +1,1119 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey.rs
+@@ -111,6 +111,8 @@
+ use tracedecay_store::{
+     ObservationAdmissionPort, ObservationReplayRequest, ObservationStoreError, StoredObservation,
+ };
++
++pub(crate) mod control_dispatch;
+ 
+ /// File name of the project-owned observation journal inside the canonical
+ /// store layout. Placement only; never an identity input.
+@@ -2797,6 +2799,29 @@
+     where
+         T: Send + 'static,
+     {
++        self.call_within_with_shutdown(budget_millis, cancellation, None, false, work)
++    }
++
++    /// Runs the same bounded engine while synchronously forwarding journey
++    /// shutdown to the original provider token at its existing checkpoints.
++    /// No additional worker, relay task, token or timeout budget is created.
++    fn call_within_with_shutdown<T>(
++        &self,
++        budget_millis: u64,
++        cancellation: &CancellationToken,
++        stopping: Option<&HostCancellationToken>,
++        preserve_settled_result: bool,
++        work: impl FnOnce() -> T + Send + 'static,
++    ) -> Result<T, BoundedCallRefusalV1>
++    where
++        T: Send + 'static,
++    {
++        let is_cancelled = || {
++            if stopping.is_some_and(HostCancellationToken::is_cancelled) {
++                cancellation.cancel();
++            }
++            cancellation.is_cancelled()
++        };
+         // Consent that is already withdrawn is checked before a slot is
+         // claimed and before a worker is borrowed, so a caller that has
+         // nothing to wait for never reaches the provider at all. Checking only
+@@ -2804,7 +2829,7 @@
+         // the finite ceiling, still handed the provider work the host no
+         // longer wanted, and — if the provider was quick — still had its
+         // answer accepted.
+-        if cancellation.is_cancelled() {
++        if is_cancelled() {
+             return Err(BoundedCallRefusalV1::Cancelled);
+         }
+         let maximum = self.max_abandoned;
+@@ -2863,24 +2888,19 @@
+             let wait = remaining.min(slice);
+             match inbox.recv_timeout(wait) {
+                 Ok(Ok(answer)) => {
+-                    // Cancellation wins over an answer that arrives after it,
+-                    // however narrow the margin: the worker releases its slot
+-                    // before it sends, so there is nothing to abandon here —
+-                    // only an answer the host no longer has consent to act on.
+-                    // Without this, a provider that ignores cancellation could
+-                    // still settle a delivery by being fast enough to beat the
+-                    // next polling slice.
+-                    if cancellation.is_cancelled() {
+-                        return Err(BoundedCallRefusalV1::Cancelled);
+-                    }
+-                    return Ok(answer);
++                    return Self::settled_answer(
++                        cancellation,
++                        stopping,
++                        preserve_settled_result,
++                        answer,
++                    );
+                 }
+                 Ok(Err(_)) => {
+                     // Shutdown owns classification once it has fired, even if
+                     // the contained worker reports its panic on the same edge.
+                     // The worker already diagnosed the crash independently of
+                     // this attempt's terminal outcome.
+-                    if cancellation.is_cancelled() {
++                    if is_cancelled() {
+                         return Err(BoundedCallRefusalV1::Cancelled);
+                     }
+                     return Err(BoundedCallRefusalV1::Unavailable(
+@@ -2894,7 +2914,7 @@
+                 }
+                 Err(RecvTimeoutError::Timeout) => {
+                     remaining = remaining.saturating_sub(wait);
+-                    if cancellation.is_cancelled() {
++                    if is_cancelled() {
+                         // The caller walks away while the worker is still
+                         // inside the provider: the boundary says so instead of
+                         // quietly forgetting a thread it still owns.
+@@ -2910,6 +2930,24 @@
+                 }
+             }
+         }
++    }
++
++    /// A received control answer may contain committed effects. Forward stop
++    /// into the original token, but never discard that witnessed evidence.
++    /// Observation calls retain their existing cancellation-wins policy.
++    fn settled_answer<T>(
++        cancellation: &CancellationToken,
++        stopping: Option<&HostCancellationToken>,
++        preserve_settled_result: bool,
++        answer: T,
++    ) -> Result<T, BoundedCallRefusalV1> {
++        if stopping.is_some_and(HostCancellationToken::is_cancelled) {
++            cancellation.cancel();
++        }
++        if !preserve_settled_result && cancellation.is_cancelled() {
++            return Err(BoundedCallRefusalV1::Cancelled);
++        }
++        Ok(answer)
+     }
+ }
+ 
+@@ -5345,6 +5383,8 @@
+         "2222222222222222222222222222222222222222222222222222222222222222";
+     const EFFECT_DIGEST: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+ 
++    mod control_dispatch;
++
+     /// Seeded crash and restart fuzzing of this mount (`tdmem-5lc`). It lives
+     /// beside the journey's own suite because it reuses these fixtures to
+     /// build the very same mount, and kills it in a child process at every
+@@ -7485,6 +7525,7 @@
+         observe_calls: AtomicUsize,
+         delivered: Mutex<Vec<DeliveredObservation>>,
+         handshake_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
++        health_hook: Mutex<Option<Box<dyn Fn(&ProviderCall) -> ProviderReply + Send + Sync>>>,
+     }
+ 
+     impl JourneyNativePort {
+@@ -7518,6 +7559,7 @@
+                 observe_calls: AtomicUsize::new(0),
+                 delivered: Mutex::new(Vec::new()),
+                 handshake_hook: Mutex::new(None),
++                health_hook: Mutex::new(None),
+             }
+         }
+ 
+@@ -7526,6 +7568,11 @@
+         /// point inside record admission a test can act from.
+         fn on_handshake(&self, hook: impl Fn() + Send + Sync + 'static) {
+             *self.handshake_hook.lock().unwrap() = Some(Box::new(hook));
++        }
++
++        /// Holds or answers a control through the same mounted provider port.
++        fn on_health(&self, hook: impl Fn(&ProviderCall) -> ProviderReply + Send + Sync + 'static) {
++            *self.health_hook.lock().unwrap() = Some(Box::new(hook));
+         }
+ 
+         fn unexpected<T>() -> T {
+@@ -7568,8 +7615,11 @@
+             }
+         }
+ 
+-        fn health(&self, _call: &ProviderCall) -> ProviderReply {
+-            Self::unexpected()
++        fn health(&self, call: &ProviderCall) -> ProviderReply {
++            match self.health_hook.lock().unwrap().as_ref() {
++                Some(hook) => hook(call),
++                None => Self::unexpected(),
++            }
+         }
+ 
+         fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/control_dispatch.rs
+@@ -0,0 +1,553 @@
++//! Synchronous lifecycle control through the mounted journey's existing owners.
++//!
++//! The caller authorizes the original attribution and supplies its original
++//! request control. This seam owns only bounded dispatch; it neither authorizes
++//! history nor interprets a terminal as proof that source erasure completed.
++
++use std::collections::BTreeSet;
++
++use serde_json::{Value, json};
++use tracedecay_memory_provider_registry::ProviderReply;
++
++use super::{
++    ApiError, Arc, BoundedCallRefusalV1, CanonicalPayload, ObservationJourneyError,
++    OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
++    ProjectObservationJourneyV1, ProviderCall, ProviderCallParts, ProviderOperation,
++    ReadinessEvidenceV1, SupervisedReadinessError, TerminalCode, readiness_handshake_request,
++};
++
++/// One already-authorized control pinned to its original provider and scope.
++#[derive(Clone, Debug)]
++pub(crate) struct JourneyControlDispatchRequestV1 {
++    pub(crate) provider_id: OwnedProviderId,
++    pub(crate) registration_revision: u64,
++    /// The full original delivery scope, never reconstructed from selection.
++    pub(crate) exact_scope: OwnedExactScope,
++    pub(crate) operation: ProviderOperation,
++    pub(crate) request_id: String,
++    pub(crate) operation_id: String,
++    pub(crate) idempotency_key: Option<String>,
++    /// Already-authorized operation fields, with no caller-supplied host header.
++    pub(crate) operation_body: Value,
++    /// The host policy revision that authorized this control.
++    pub(crate) policy_revision: u64,
++    /// Cloning this preserves its running monotonic budget and live token.
++    pub(crate) control: OperationControl,
++    /// A caller's explicit guard, including restore/replay, must remain intact.
++    /// Absence uses the generation from this dispatch's readiness evidence.
++    pub(crate) expected_state_generation: Option<u64>,
++}
++
++/// Actual dispatch evidence for the host's operation-specific validation.
++#[derive(Debug)]
++pub(crate) struct JourneyControlDispatchReplyV1 {
++    pub(crate) call: ProviderCall,
++    pub(crate) reply: ProviderReply,
++    /// Validated before dispatch. Its actual ready generation is independent
++    /// of the call's explicit expected guard and the reply's resulting generation.
++    pub(crate) readiness_evidence: ReadinessEvidenceV1,
++    /// Capabilities from this original registration's accepted descriptor.
++    pub(crate) registered_capabilities: BTreeSet<OwnedVersionedId>,
++}
++
++/// Why the requested control did not reach registry invocation.
++///
++/// A readiness handshake may already have run and recovered pending provider
++/// privacy work. This classification concerns the requested control only; it
++/// does not assert that all provider state stayed unchanged.
++#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
++pub(crate) enum JourneyControlNotDispatchedV1 {
++    #[error("control does not target this journey's original provider")]
++    ProviderMismatch,
++    #[error("control does not target this journey's registration revision")]
++    RegistrationRevisionMismatch,
++    #[error("the original provider's observation journey is stopping")]
++    Stopping,
++    #[error("operation is not a lifecycle control: {0:?}")]
++    UnsupportedOperation(ProviderOperation),
++    #[error("original request control refused dispatch: {0:?}")]
++    Control(TerminalCode),
++    #[error("the original provider composition is disabled")]
++    CompositionDisabled,
++    #[error("the original provider is unavailable in this registry")]
++    ProviderUnavailable,
++    #[error("control operation body must be an object")]
++    OperationBodyNotObject,
++    #[error("control operation body supplied a host authority header: {0}")]
++    SuppliedAuthorityHeader(&'static str),
++    #[error("control policy revision must be positive")]
++    InvalidPolicyRevision,
++    #[error("replay body generation does not match the original expected generation guard")]
++    ReplayGenerationMismatch,
++}
++
++/// Dispatch stages stay typed without claiming an absent reply means no effect.
++#[derive(Debug, thiserror::Error)]
++pub(crate) enum JourneyControlDispatchErrorV1 {
++    #[error("requested provider control was not dispatched: {0}")]
++    NotDispatched(#[from] JourneyControlNotDispatchedV1),
++    #[error("provider control contract was refused: {0}")]
++    Contract(#[source] ApiError),
++    #[error("provider control payload could not be canonically encoded: {0}")]
++    PayloadEncoding(#[source] super::HygieneError),
++    #[error("provider control readiness request could not be constructed: {0}")]
++    ReadinessRequest(#[source] ObservationJourneyError),
++    #[error("provider control readiness was refused: {0}")]
++    Readiness(#[source] SupervisedReadinessError),
++    /// Fabric may reject either admission or the provider's returned terminal.
++    /// An error alone does not prove that a mutation had no committed effect.
++    #[error("provider control was refused by the fabric: {0}")]
++    Fabric(#[source] super::FabricError),
++    /// Cancellation, abandonment and an unavailable/panicking worker may occur
++    /// after contact. Preserve that uncertainty for reconciliation; never retry
++    /// a mutation here or project these variants as verified non-commitment.
++    #[error("provider control produced no answer inside its original bound: {0}")]
++    Isolation(#[source] BoundedCallRefusalV1),
++}
++
++impl JourneyControlDispatchRequestV1 {
++    fn validate_control(&self, stopping: bool) -> Result<u64, JourneyControlDispatchErrorV1> {
++        if stopping {
++            return Err(JourneyControlNotDispatchedV1::Stopping.into());
++        }
++        self.control
++            .snapshot()
++            .map(|snapshot| snapshot.remaining_millis)
++            .map_err(|terminal| JourneyControlNotDispatchedV1::Control(terminal).into())
++    }
++
++    fn validate_before_readiness(
++        &self,
++        provider_id: &str,
++        registration_revision: u64,
++        stopping: bool,
++    ) -> Result<(), JourneyControlDispatchErrorV1> {
++        if self.provider_id.as_str() != provider_id {
++            return Err(JourneyControlNotDispatchedV1::ProviderMismatch.into());
++        }
++        if self.registration_revision != registration_revision {
++            return Err(JourneyControlNotDispatchedV1::RegistrationRevisionMismatch.into());
++        }
++        self.validate_control(stopping)?;
++        self.payload_contract_id()?;
++        self.exact_scope
++            .validate()
++            .map_err(JourneyControlDispatchErrorV1::Contract)?;
++        if self.policy_revision == 0 {
++            return Err(JourneyControlNotDispatchedV1::InvalidPolicyRevision.into());
++        }
++        let body = self
++            .operation_body
++            .as_object()
++            .ok_or(JourneyControlNotDispatchedV1::OperationBodyNotObject)?;
++        for field in [
++            "common_request",
++            "provider_id",
++            "registration_revision",
++            "ready_receipt_digest",
++            "exact_scope_identity",
++            "operation_id",
++            "idempotency_key",
++            "expected_state_generation",
++            "request_identity",
++            "policy_revision",
++            "deadline",
++            "cancellation",
++            "extensions",
++        ] {
++            // Replay canonically carries its own generation assertion. It is
++            // preserved and compared below, never replaced with ready state.
++            if field == "expected_state_generation" && self.operation == ProviderOperation::Replay {
++                continue;
++            }
++            if body.contains_key(field) {
++                return Err(JourneyControlNotDispatchedV1::SuppliedAuthorityHeader(field).into());
++            }
++        }
++        Ok(())
++    }
++
++    fn payload_contract_id(&self) -> Result<&'static str, JourneyControlDispatchErrorV1> {
++        match self.operation {
++            ProviderOperation::Health => Ok("tracedecay.memory.provider.health.v1"),
++            ProviderOperation::Feedback => Ok("tracedecay.memory.provider.feedback.v1"),
++            ProviderOperation::Correction => Ok("tracedecay.memory.provider.correction.v1"),
++            ProviderOperation::DeleteBySource => {
++                Ok("tracedecay.memory.provider.deletion-by-source.v1")
++            }
++            ProviderOperation::Inspection => Ok("tracedecay.memory.provider.inspection.v1"),
++            ProviderOperation::Maintenance => Ok("tracedecay.memory.provider.maintenance.v1"),
++            ProviderOperation::SnapshotExport => {
++                Ok("tracedecay.memory.provider.snapshot-export.v1")
++            }
++            ProviderOperation::SnapshotRestore => {
++                Ok("tracedecay.memory.provider.snapshot-restore.v1")
++            }
++            ProviderOperation::Replay => Ok("tracedecay.memory.provider.replay.v1"),
++            ProviderOperation::Handshake
++            | ProviderOperation::Observe
++            | ProviderOperation::Recall => {
++                Err(JourneyControlNotDispatchedV1::UnsupportedOperation(self.operation).into())
++            }
++        }
++    }
++
++    /// Refuse an oversized serialized body before acquiring readiness or
++    /// borrowing a provider worker. Final envelope bytes are still checked by
++    /// the fabric against the actual negotiated request limit.
++    fn validate_body_bytes(&self, maximum: u64) -> Result<(), JourneyControlDispatchErrorV1> {
++        let bytes = super::canonical_payload_bytes(&self.operation_body)
++            .map_err(JourneyControlDispatchErrorV1::PayloadEncoding)?;
++        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > maximum {
++            return Err(JourneyControlDispatchErrorV1::Contract(
++                ApiError::BoundaryBytesExceeded {
++                    field: "control.operation_body",
++                    maximum,
++                },
++            ));
++        }
++        Ok(())
++    }
++
++    /// Add the host header only after fresh readiness. Every operation-body
++    /// field retains its original value; no supplied authority field is repaired.
++    fn canonical_payload(
++        &self,
++        ready_receipt_sha256: &str,
++        expected_state_generation: u64,
++        deadline_utc_micros: i64,
++        remaining_millis: u64,
++    ) -> Result<CanonicalPayload, JourneyControlDispatchErrorV1> {
++        if self.operation == ProviderOperation::Replay
++            && self.operation_body["expected_state_generation"].as_u64()
++                != Some(expected_state_generation)
++        {
++            return Err(JourneyControlNotDispatchedV1::ReplayGenerationMismatch.into());
++        }
++        let mut payload = self.operation_body.clone();
++        let body = payload
++            .as_object_mut()
++            .ok_or(JourneyControlNotDispatchedV1::OperationBodyNotObject)?;
++        // Preflight rejected this field before readiness; preserve that rule
++        // even if this helper is called independently in a future refactor.
++        if body.contains_key("common_request") {
++            return Err(
++                JourneyControlNotDispatchedV1::SuppliedAuthorityHeader("common_request").into(),
++            );
++        }
++        let scope = &self.exact_scope;
++        body.insert(
++            "common_request".to_owned(),
++            json!({
++                "provider_id": self.provider_id.as_str(),
++                "registration_revision": self.registration_revision,
++                "ready_receipt_digest": ready_receipt_sha256,
++                "exact_scope_identity": {
++                    "profile_id": scope.profile_id,
++                    "project_id": scope.project_id,
++                    "repository_identity": scope.repository_identity,
++                    "worktree_identity": scope.worktree_identity,
++                    "branch_identity": scope.branch_identity,
++                    "agent_session_id": scope.agent_session_id,
++                    "resolved_scope_digest": scope.resolved_scope_digest,
++                },
++                "operation_id": self.operation_id,
++                "idempotency_key": self.idempotency_key,
++                "expected_state_generation": expected_state_generation,
++                "request_identity": self.request_id,
++                "policy_revision": self.policy_revision,
++                "deadline": {
++                    "deadline_utc_micros": deadline_utc_micros,
++                    "remaining_millis": remaining_millis,
++                },
++                "cancellation": "live",
++                "extensions": [],
++            }),
++        );
++        let bytes = super::canonical_payload_bytes(&payload)
++            .map_err(JourneyControlDispatchErrorV1::PayloadEncoding)?;
++        let digest = tracedecay_domain::canonical_text::sha256_hex(&bytes);
++        CanonicalPayload::new(
++            OwnedVersionedId::new(self.payload_contract_id()?)
++                .map_err(JourneyControlDispatchErrorV1::Contract)?,
++            bytes,
++            digest,
++        )
++        .map_err(JourneyControlDispatchErrorV1::Contract)
++    }
++}
++
++impl ProjectObservationJourneyV1 {
++    /// Checks this fixed mount identity without readiness or provider contact.
++    /// The executor must require exactly one matching mount before dispatch.
++    pub(crate) fn matches_control_owner(
++        &self,
++        provider_id: &OwnedProviderId,
++        registration_revision: u64,
++    ) -> bool {
++        self.provider_id == provider_id.as_str()
++            && self.registration_revision == registration_revision
++    }
++
++    /// Dispatches once from an existing caller blocking pool, using this
++    /// journey's isolation ceiling and its registration-wide readiness guard.
++    ///
++    /// The caller must first authorize the original attribution and record any
++    /// required durable deletion intent. No selected-provider lookup or fallback
++    /// occurs here. Remaining envelope fields are checked by `ProviderCall::new`
++    /// before registry invocation, after bounded readiness has been established.
++    /// The bounded wait forwards shutdown into the caller's original live
++    /// token, including while readiness or control is in flight. Its original
++    /// deadline and running budget remain unchanged.
++    pub(crate) fn dispatch_control(
++        &self,
++        request: JourneyControlDispatchRequestV1,
++    ) -> Result<JourneyControlDispatchReplyV1, JourneyControlDispatchErrorV1> {
++        request.validate_before_readiness(
++            &self.provider_id,
++            self.registration_revision,
++            self.stopping.is_cancelled(),
++        )?;
++        request.validate_body_bytes(self.delivery.limits.request_bytes)?;
++        let delivery = Arc::clone(&self.delivery);
++        let stopping = self.stopping.clone();
++        let cancellation = request.control.cancellation();
++        // Snapshot immediately before isolation: remaining_millis() returns the
++        // original budget, whereas snapshot subtracts time already consumed.
++        let remaining_millis = request.validate_control(stopping.is_cancelled())?;
++        self.provider_isolation
++            .call_within_with_shutdown(
++                remaining_millis,
++                &cancellation,
++                Some(&self.stopping),
++                true,
++                move || {
++                    request.validate_before_readiness(
++                        delivery.provider_id.as_str(),
++                        delivery.registration_revision,
++                        stopping.is_cancelled(),
++                    )?;
++                    let registry = delivery
++                        .composition
++                        .registry()
++                        .ok_or(JourneyControlNotDispatchedV1::CompositionDisabled)?;
++                    let registration = registry
++                        .registration(&request.provider_id)
++                        .ok_or(JourneyControlNotDispatchedV1::ProviderUnavailable)?;
++                    if registration.registration_revision != request.registration_revision {
++                        return Err(
++                            JourneyControlNotDispatchedV1::RegistrationRevisionMismatch.into()
++                        );
++                    }
++                    let capability = OwnedVersionedId::new(request.operation.capability_id())
++                        .map_err(JourneyControlDispatchErrorV1::Contract)?;
++                    let readiness_request = readiness_handshake_request(
++                        &request.provider_id,
++                        &request.exact_scope,
++                        request.registration_revision,
++                        delivery.limits,
++                        capability.clone(),
++                        request.control.clone(),
++                    )
++                    .map_err(|error| match error {
++                        ObservationJourneyError::Contract(source) => {
++                            JourneyControlDispatchErrorV1::Contract(source)
++                        }
++                        error => JourneyControlDispatchErrorV1::ReadinessRequest(error),
++                    })?;
++                    // Acquire and retain the !Send guard inside the existing worker.
++                    // Copying its receipt out first would let another scope replace
++                    // the fabric's readiness between this handshake and invocation.
++                    let dispatch = delivery
++                        .readiness
++                        .ready_dispatch_with_evidence(
++                            &readiness_request,
++                            tracedecay_contracts::now_micros().0,
++                        )
++                        .map_err(JourneyControlDispatchErrorV1::Readiness)?;
++                    let readiness_evidence = dispatch.evidence().clone();
++                    // Read immutable registered capabilities while the same guard
++                    // still binds the original provider/revision. Do this before
++                    // invocation so an unavailable status cannot erase a result.
++                    let registered_status = registry
++                        .statuses()
++                        .map_err(JourneyControlDispatchErrorV1::Fabric)?
++                        .into_iter()
++                        .find(|status| status.provider_id == request.provider_id)
++                        .ok_or(JourneyControlNotDispatchedV1::ProviderUnavailable)?;
++                    if registered_status.registration_revision != request.registration_revision {
++                        return Err(
++                            JourneyControlNotDispatchedV1::RegistrationRevisionMismatch.into()
++                        );
++                    }
++                    let registered_capabilities = registered_status.descriptor.capabilities;
++                    if stopping.is_cancelled() {
++                        return Err(JourneyControlNotDispatchedV1::Stopping.into());
++                    }
++                    let snapshot = request
++                        .control
++                        .snapshot()
++                        .map_err(JourneyControlNotDispatchedV1::Control)?;
++                    let expected_state_generation = request
++                        .expected_state_generation
++                        .unwrap_or_else(|| readiness_evidence.state_generation());
++                    let ready_receipt_sha256 = dispatch.target().ready_receipt_sha256().to_owned();
++                    let payload = request.canonical_payload(
++                        &ready_receipt_sha256,
++                        expected_state_generation,
++                        snapshot.deadline_utc_micros,
++                        snapshot.remaining_millis,
++                    )?;
++                    let call = ProviderCall::new(ProviderCallParts {
++                        operation: request.operation,
++                        provider_id: request.provider_id,
++                        registration_revision: request.registration_revision,
++                        ready_receipt_sha256,
++                        exact_scope: request.exact_scope,
++                        request_id: request.request_id,
++                        operation_id: request.operation_id,
++                        expected_state_generation,
++                        idempotency_key: request.idempotency_key,
++                        control: request.control,
++                        payload,
++                        required_capabilities: vec![capability],
++                        extensions: Vec::new(),
++                    })
++                    .map_err(JourneyControlDispatchErrorV1::Contract)?;
++                    let reply = registry
++                        .invoke_control(&call)
++                        .map_err(JourneyControlDispatchErrorV1::Fabric)?;
++                    drop(dispatch);
++                    Ok(JourneyControlDispatchReplyV1 {
++                        call,
++                        reply,
++                        readiness_evidence,
++                        registered_capabilities,
++                    })
++                },
++            )
++            .map_err(JourneyControlDispatchErrorV1::Isolation)?
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    #![allow(clippy::expect_used)]
++
++    use super::*;
++    use crate::daemon::retained_owner::observation_journey::CancellationToken;
++
++    fn request(operation: ProviderOperation) -> JourneyControlDispatchRequestV1 {
++        JourneyControlDispatchRequestV1 {
++            provider_id: OwnedProviderId::new("control.original").expect("provider id"),
++            registration_revision: 7,
++            exact_scope: OwnedExactScope::new(
++                "original-profile",
++                "original-project",
++                "original-repository",
++                "original-worktree",
++                "original-branch",
++                "original-session",
++                format!("sha256:{}", "1".repeat(64)),
++            )
++            .expect("original delivery scope"),
++            operation,
++            request_id: "control-request".to_owned(),
++            operation_id: "control-operation".to_owned(),
++            idempotency_key: Some("original-control-key".to_owned()),
++            operation_body: json!({}),
++            policy_revision: 1,
++            control: OperationControl::new(
++                tracedecay_contracts::now_micros()
++                    .0
++                    .saturating_add(60_000_000),
++                60_000,
++                CancellationToken::new(),
++            ),
++            expected_state_generation: Some(3),
++        }
++    }
++
++    #[test]
++    fn preflight_admits_only_the_nine_lifecycle_controls() {
++        for operation in [
++            ProviderOperation::Feedback,
++            ProviderOperation::Correction,
++            ProviderOperation::DeleteBySource,
++            ProviderOperation::Health,
++            ProviderOperation::Inspection,
++            ProviderOperation::Maintenance,
++            ProviderOperation::SnapshotExport,
++            ProviderOperation::SnapshotRestore,
++            ProviderOperation::Replay,
++        ] {
++            request(operation)
++                .validate_before_readiness("control.original", 7, false)
++                .expect("lifecycle control");
++        }
++        for operation in [
++            ProviderOperation::Handshake,
++            ProviderOperation::Observe,
++            ProviderOperation::Recall,
++        ] {
++            assert!(matches!(
++                request(operation).validate_before_readiness("control.original", 7, false),
++                Err(JourneyControlDispatchErrorV1::NotDispatched(
++                    JourneyControlNotDispatchedV1::UnsupportedOperation(actual)
++                )) if actual == operation
++            ));
++        }
++    }
++
++    #[test]
++    fn preflight_refuses_another_provider_revision_stopping_or_incomplete_scope() {
++        let mut request = request(ProviderOperation::DeleteBySource);
++        assert!(matches!(
++            request.validate_before_readiness("control.selected-new", 7, false),
++            Err(JourneyControlDispatchErrorV1::NotDispatched(
++                JourneyControlNotDispatchedV1::ProviderMismatch
++            ))
++        ));
++        assert!(matches!(
++            request.validate_before_readiness("control.original", 8, false),
++            Err(JourneyControlDispatchErrorV1::NotDispatched(
++                JourneyControlNotDispatchedV1::RegistrationRevisionMismatch
++            ))
++        ));
++        assert!(matches!(
++            request.validate_before_readiness("control.original", 7, true),
++            Err(JourneyControlDispatchErrorV1::NotDispatched(
++                JourneyControlNotDispatchedV1::Stopping
++            ))
++        ));
++        request.exact_scope.agent_session_id.clear();
++        assert!(matches!(
++            request.validate_before_readiness("control.original", 7, false),
++            Err(JourneyControlDispatchErrorV1::Contract(_))
++        ));
++    }
++
++    #[test]
++    fn preflight_keeps_the_original_live_cancellation_and_expired_deadline() {
++        let mut request = request(ProviderOperation::SnapshotRestore);
++        let original_control = request.control.clone();
++        original_control.cancellation().cancel();
++        assert!(matches!(
++            request.validate_before_readiness("control.original", 7, false),
++            Err(JourneyControlDispatchErrorV1::NotDispatched(
++                JourneyControlNotDispatchedV1::Control(TerminalCode::Cancelled)
++            ))
++        ));
++        request.control = OperationControl::new(
++            tracedecay_contracts::now_micros().0.saturating_sub(1),
++            60_000,
++            CancellationToken::new(),
++        );
++        assert!(matches!(
++            request.validate_before_readiness("control.original", 7, false),
++            Err(JourneyControlDispatchErrorV1::NotDispatched(
++                JourneyControlNotDispatchedV1::Control(TerminalCode::DeadlineExceeded)
++            ))
++        ));
++    }
++}
+diff --git a/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/tracedecay/src/daemon/retained_owner/observation_journey/tests/control_dispatch.rs
+@@ -0,0 +1,388 @@
++//! Shutdown reaches an actual control through the existing mounted fixture.
++
++use super::*;
++use crate::daemon::retained_owner::observation_journey::control_dispatch::{
++    JourneyControlDispatchErrorV1, JourneyControlDispatchRequestV1,
++};
++use tracedecay_memory_conformance::ReleaseLatchV1;
++
++fn successful_health_reply(call: &ProviderCall) -> ProviderReply {
++    ProviderReply {
++        terminal: TerminalRecord::new(
++            ProviderOperation::Health,
++            call.provider_id.clone(),
++            TerminalCode::Success,
++            CommittedEffectEvidence::none(Some(call.expected_state_generation)),
++            FallbackDirective::forbidden(),
++            call.operation_id.clone(),
++            call.exact_scope.exact_scope_sha256(),
++            None,
++        )
++        .expect("health terminal"),
++        payload: None,
++        warnings: Vec::new(),
++        extensions: Vec::new(),
++        state_generation: call.expected_state_generation,
++    }
++}
++
++fn health_request(
++    fixture: &RecoveryJourneyFixture,
++    control: OperationControl,
++) -> JourneyControlDispatchRequestV1 {
++    JourneyControlDispatchRequestV1 {
++        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
++        registration_revision: 1,
++        exact_scope: exact_scope_for_session(
++            &fixture.profile_id,
++            &fixture.resolved_scope,
++            "session.control-shutdown",
++        )
++        .expect("original delivery scope"),
++        operation: ProviderOperation::Health,
++        request_id: "control-shutdown-request".to_owned(),
++        operation_id: "control-shutdown-operation".to_owned(),
++        idempotency_key: None,
++        operation_body: serde_json::json!({"requested_checks": ["state"]}),
++        policy_revision: 7,
++        control,
++        expected_state_generation: None,
++    }
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn shutdown_cancels_an_in_flight_control_and_retains_its_worker_until_return() {
++    let temp = TempDir::new().expect("temporary journey root");
++    let port = Arc::new(JourneyNativePort::new());
++    let fixture = mount_journey_over_port(
++        &temp,
++        "project.control-shutdown",
++        "profile.control-shutdown",
++        Arc::clone(&port),
++    )
++    .await;
++    let held = ReleaseLatchV1::new();
++    let blocked = held.clone();
++    let (entered, entry) = tokio::sync::oneshot::channel();
++    let entered = Mutex::new(Some(entered));
++    port.on_health(move |call| {
++        entered
++            .lock()
++            .unwrap()
++            .take()
++            .expect("only one control may be invoked")
++            .send(call.clone())
++            .expect("control entry receiver");
++        blocked.wait();
++        successful_health_reply(call)
++    });
++    let original_control = OperationControl::new(
++        tracedecay_contracts::now_micros()
++            .0
++            .saturating_add(30_000_000),
++        30_000,
++        CancellationToken::new(),
++    );
++    let request = health_request(&fixture, original_control.clone());
++    let journey = Arc::clone(&fixture.journey);
++    let mut dispatch = tokio::task::spawn_blocking(move || journey.dispatch_control(request));
++    let entered = tokio::time::timeout(Duration::from_secs(2), entry).await;
++    if !matches!(&entered, Ok(Ok(_))) {
++        held.release();
++    }
++    let actual = entered
++        .expect("control never reached health")
++        .expect("control entry");
++
++    let journey = Arc::clone(&fixture.journey);
++    let shutdown = tokio::spawn(async move {
++        journey
++            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
++            .await
++    });
++    // The original operation has thirty seconds. Shutdown must hand its caller
++    // back while the provider is still held, rather than waiting for that budget.
++    let answer = tokio::time::timeout(Duration::from_millis(500), &mut dispatch).await;
++    let census_while_held = fixture.journey.provider_call_census();
++    let original_cancelled = original_control.cancellation().is_cancelled();
++    let provider_cancelled = actual.control.cancellation().is_cancelled();
++    let provider_was_held = !held.is_released();
++    // Release before any assertions so a failed regression never strands a test
++    // worker. The snapshots above are all from the still-held provider call.
++    held.release();
++    if answer.is_err() {
++        let _ = tokio::time::timeout(Duration::from_secs(2), &mut dispatch).await;
++    }
++    let failures = shutdown.await.expect("journey shutdown task");
++    let isolation = Arc::clone(&fixture.journey.provider_isolation);
++    let reclaimed = tokio::task::spawn_blocking(move || {
++        isolation.wait_for_census(Duration::from_secs(2), |census| {
++            census == BoundedCallCensusV1::default()
++        })
++    })
++    .await
++    .expect("worker reclamation waiter");
++
++    assert!(
++        matches!(
++            answer,
++            Ok(Ok(Err(JourneyControlDispatchErrorV1::Isolation(
++                BoundedCallRefusalV1::Cancelled
++            ))))
++        ),
++        "shutdown did not cancel the still-running control: {answer:?}"
++    );
++    assert!(provider_was_held);
++    assert!(original_cancelled && provider_cancelled);
++    assert_eq!(
++        actual.control.deadline_utc_micros(),
++        original_control.deadline_utc_micros()
++    );
++    assert_eq!(
++        actual.control.remaining_millis(),
++        original_control.remaining_millis()
++    );
++    assert_eq!(
++        census_while_held,
++        BoundedCallCensusV1 {
++            live: 0,
++            abandoned: 1
++        }
++    );
++    assert!(failures.is_empty(), "{failures:?}");
++    assert_eq!(reclaimed, Ok(BoundedCallCensusV1::default()));
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn injected_headers_and_oversized_bodies_are_refused_before_provider_contact() {
++    let temp = TempDir::new().expect("temporary journey root");
++    let port = Arc::new(JourneyNativePort::new());
++    let fixture = mount_journey_over_port(
++        &temp,
++        "project.control-preflight",
++        "profile.control-preflight",
++        Arc::clone(&port),
++    )
++    .await;
++    let contacts = Arc::new(AtomicUsize::new(0));
++    let handshakes = Arc::clone(&contacts);
++    port.on_handshake(move || {
++        handshakes.fetch_add(1, Ordering::AcqRel);
++    });
++    let controls = Arc::clone(&contacts);
++    port.on_health(move |call| {
++        controls.fetch_add(1, Ordering::AcqRel);
++        successful_health_reply(call)
++    });
++    let original_control = OperationControl::new(
++        tracedecay_contracts::now_micros()
++            .0
++            .saturating_add(30_000_000),
++        30_000,
++        CancellationToken::new(),
++    );
++    for field in [
++        "common_request",
++        "provider_id",
++        "registration_revision",
++        "ready_receipt_digest",
++        "exact_scope_identity",
++        "operation_id",
++        "idempotency_key",
++        "expected_state_generation",
++        "request_identity",
++        "policy_revision",
++        "deadline",
++        "cancellation",
++        "extensions",
++    ] {
++        let mut request = health_request(&fixture, original_control.clone());
++        request.operation_body[field] = serde_json::json!({"untrusted": true});
++        let journey = Arc::clone(&fixture.journey);
++        let result = tokio::task::spawn_blocking(move || journey.dispatch_control(request))
++            .await
++            .expect("preflight caller");
++        assert!(
++            matches!(
++                result,
++                Err(JourneyControlDispatchErrorV1::NotDispatched(
++                    super::super::control_dispatch::JourneyControlNotDispatchedV1::SuppliedAuthorityHeader(actual)
++                )) if actual == field
++            ),
++            "supplied {field} was not rejected before readiness"
++        );
++    }
++    let mut request = health_request(&fixture, original_control);
++    let maximum = fixture.journey.delivery.limits.request_bytes;
++    request.operation_body = serde_json::json!({
++        "requested_checks": ["x".repeat(usize::try_from(maximum).expect("request bound") + 1)]
++    });
++    let journey = Arc::clone(&fixture.journey);
++    let result = tokio::task::spawn_blocking(move || journey.dispatch_control(request))
++        .await
++        .expect("oversized preflight caller");
++    assert!(matches!(
++        result,
++        Err(JourneyControlDispatchErrorV1::Contract(ApiError::BoundaryBytesExceeded {
++            field: "control.operation_body", maximum: actual
++        })) if actual == maximum
++    ));
++    assert_eq!(contacts.load(Ordering::Acquire), 0);
++    let failures = fixture
++        .journey
++        .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
++        .await;
++    assert!(failures.is_empty(), "{failures:?}");
++}
++
++#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++async fn canonical_health_header_uses_actual_guard_call_and_original_control() {
++    let temp = TempDir::new().expect("temporary journey root");
++    let port = Arc::new(JourneyNativePort::with_state_generation(5));
++    let fixture = mount_journey_over_port(
++        &temp,
++        "project.control-header",
++        "profile.control-header",
++        Arc::clone(&port),
++    )
++    .await;
++    port.on_health(successful_health_reply);
++    let original_control = OperationControl::new(
++        tracedecay_contracts::now_micros()
++            .0
++            .saturating_add(30_000_000),
++        30_000,
++        CancellationToken::new(),
++    );
++    let mut request = health_request(&fixture, original_control.clone());
++    request.operation_body = serde_json::json!({"requested_checks": ["scope", "state"]});
++    let original_body = request.operation_body.clone();
++    let journey = Arc::clone(&fixture.journey);
++    let dispatched = tokio::task::spawn_blocking(move || journey.dispatch_control(request))
++        .await
++        .expect("health caller")
++        .expect("actual health dispatch");
++    let payload: Value =
++        serde_json::from_slice(&dispatched.call.payload.bytes).expect("canonical health payload");
++    let header = &payload["common_request"];
++    let scope = &dispatched.call.exact_scope;
++    assert_eq!(
++        dispatched.call.payload.contract_id.as_str(),
++        "tracedecay.memory.provider.health.v1"
++    );
++    assert_eq!(
++        payload["requested_checks"],
++        original_body["requested_checks"]
++    );
++    assert_eq!(payload.as_object().expect("body object").len(), 2);
++    assert_eq!(dispatched.readiness_evidence.state_generation(), 5);
++    assert_eq!(dispatched.call.expected_state_generation, 5);
++    assert_eq!(dispatched.reply.state_generation, 5);
++    assert_eq!(
++        dispatched.call.ready_receipt_sha256,
++        dispatched.readiness_evidence.ready_receipt_sha256()
++    );
++    let remaining = header["deadline"]["remaining_millis"]
++        .as_u64()
++        .expect("live remaining");
++    assert!(remaining > 0 && remaining <= original_control.remaining_millis());
++    assert_eq!(
++        header,
++        &serde_json::json!({
++            "provider_id": dispatched.call.provider_id.as_str(),
++            "registration_revision": dispatched.call.registration_revision,
++            "ready_receipt_digest": dispatched.readiness_evidence.ready_receipt_sha256(),
++            "exact_scope_identity": {
++                "profile_id": scope.profile_id,
++                "project_id": scope.project_id,
++                "repository_identity": scope.repository_identity,
++                "worktree_identity": scope.worktree_identity,
++                "branch_identity": scope.branch_identity,
++                "agent_session_id": scope.agent_session_id,
++                "resolved_scope_digest": scope.resolved_scope_digest,
++            },
++            "operation_id": dispatched.call.operation_id,
++            "idempotency_key": dispatched.call.idempotency_key,
++            "expected_state_generation": dispatched.call.expected_state_generation,
++            "request_identity": dispatched.call.request_id,
++            "policy_revision": 7,
++            "deadline": {
++                "deadline_utc_micros": original_control.deadline_utc_micros(),
++                "remaining_millis": remaining,
++            },
++            "cancellation": "live",
++            "extensions": [],
++        })
++    );
++    assert_eq!(
++        dispatched.call.payload.bytes,
++        canonical_payload_bytes(&payload).expect("canonical bytes")
++    );
++    assert!(dispatched.call.extensions.is_empty());
++    assert!(!original_control.cancellation().is_cancelled());
++    let failures = fixture
++        .journey
++        .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
++        .await;
++    assert!(failures.is_empty(), "{failures:?}");
++}
++
++#[test]
++fn witnessed_committed_control_answer_survives_caller_cancellation_and_journey_stop() {
++    let original_reply = ProviderReply {
++        terminal: TerminalRecord::new(
++            ProviderOperation::Feedback,
++            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
++            TerminalCode::Success,
++            CommittedEffectEvidence::committed(
++                5,
++                6,
++                vec!["feedback:committed-control".to_owned()],
++                PROVIDER_RECEIPT,
++                EFFECT_DIGEST,
++            )
++            .expect("actual committed evidence"),
++            FallbackDirective::forbidden(),
++            "committed-control-operation",
++            "4".repeat(64),
++            None,
++        )
++        .expect("committed feedback terminal"),
++        payload: None,
++        warnings: vec!["committed-control-warning".to_owned()],
++        extensions: Vec::new(),
++        state_generation: 6,
++    };
++    for stop_journey in [false, true] {
++        let cancellation = CancellationToken::new();
++        let stopping = HostCancellationToken::new();
++        // This is the exact branch entered after recv_timeout produced an
++        // answer. Fire cancellation before it classifies that known reply;
++        // no scheduler timing can turn this into the no-answer timeout path.
++        let witnessed_reply = original_reply.clone();
++        if stop_journey {
++            stopping.cancel();
++            assert!(!cancellation.is_cancelled());
++        } else {
++            cancellation.cancel();
++        }
++        let retained = ThreadBoundedProviderCallV1::settled_answer(
++            &cancellation,
++            Some(&stopping),
++            true,
++            witnessed_reply,
++        )
++        .expect("a witnessed control reply must retain its committed evidence");
++        assert_eq!(retained, original_reply);
++        assert!(cancellation.is_cancelled());
++    }
++
++    // The ordinary observation policy still refuses an answer when its
++    // caller has already cancelled, even though that answer is available.
++    let cancellation = CancellationToken::new();
++    cancellation.cancel();
++    assert!(matches!(
++        ThreadBoundedProviderCallV1::settled_answer(&cancellation, None, false, original_reply),
++        Err(BoundedCallRefusalV1::Cancelled)
++    ));
++}

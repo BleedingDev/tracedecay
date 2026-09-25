@@ -19,6 +19,14 @@ type SemanticRuntimeInstallV1 = Box<
         + Send
         + 'static,
 >;
+type SemanticRuntimeInstallFailureV1 = Box<
+    dyn FnOnce(
+            &SemanticGenerationPointerV1,
+            &SemanticRuntimeScheduleFailureV1,
+        ) -> Result<(), SemanticRuntimeScheduleFailureV1>
+        + Send
+        + 'static,
+>;
 type SemanticRuntimePublishedV1 = Box<
     dyn FnOnce(SemanticGenerationPointerV1, u64) -> SemanticRuntimePublishedFutureV1
         + Send
@@ -120,6 +128,7 @@ impl SemanticExecutionAuthority for SemanticRuntimeScheduleCancellationV1 {
 pub struct PreparedSemanticRuntimeCommitV1 {
     commit: Box<dyn FnOnce() -> SemanticRuntimeCommitFutureV1 + Send + 'static>,
     install: Option<SemanticRuntimeInstallV1>,
+    install_failure: Option<SemanticRuntimeInstallFailureV1>,
     published: Option<SemanticRuntimePublishedV1>,
 }
 
@@ -134,6 +143,7 @@ impl PreparedSemanticRuntimeCommitV1 {
         Self {
             commit: Box::new(move || Box::pin(commit())),
             install: None,
+            install_failure: None,
             published: None,
         }
     }
@@ -144,6 +154,7 @@ impl PreparedSemanticRuntimeCommitV1 {
         (
             SemanticGenerationPointerV1,
             Option<SemanticRuntimeInstallV1>,
+            Option<SemanticRuntimeInstallFailureV1>,
             Option<SemanticRuntimePublishedV1>,
         ),
         SemanticRuntimeScheduleFailureV1,
@@ -151,9 +162,12 @@ impl PreparedSemanticRuntimeCommitV1 {
         let Self {
             commit,
             install,
+            install_failure,
             published,
         } = self;
-        commit().await.map(|pointer| (pointer, install, published))
+        commit()
+            .await
+            .map(|pointer| (pointer, install, install_failure, published))
     }
 
     pub fn on_success<Install>(mut self, install: Install) -> Self
@@ -163,6 +177,22 @@ impl PreparedSemanticRuntimeCommitV1 {
             + 'static,
     {
         self.install = Some(Box::new(install));
+        self
+    }
+
+    /// Compensate a durable publication when the warmed query runtime cannot
+    /// be installed. The callback must compare-and-swap against `pointer` so a
+    /// newer publication is never overwritten.
+    pub fn on_install_failure<Compensate>(mut self, compensate: Compensate) -> Self
+    where
+        Compensate: FnOnce(
+                &SemanticGenerationPointerV1,
+                &SemanticRuntimeScheduleFailureV1,
+            ) -> Result<(), SemanticRuntimeScheduleFailureV1>
+            + Send
+            + 'static,
+    {
+        self.install_failure = Some(Box::new(compensate));
         self
     }
 
@@ -299,6 +329,7 @@ impl SemanticRuntimeShutdownReceiptV1 {
 pub struct SemanticRuntimeSchedulingHandleV1 {
     state: Arc<Mutex<SemanticRuntimeSchedulingStateV1>>,
     workers: Arc<Mutex<BTreeMap<u64, JoinHandle<()>>>>,
+    commit_completions: tokio::sync::watch::Sender<u64>,
 }
 
 struct SemanticGenerationActiveGaugeV1;
@@ -318,9 +349,11 @@ impl Drop for SemanticGenerationActiveGaugeV1 {
 
 impl Default for SemanticRuntimeSchedulingHandleV1 {
     fn default() -> Self {
+        let (commit_completions, _receiver) = tokio::sync::watch::channel(0);
         Self {
             state: Arc::new(Mutex::new(SemanticRuntimeSchedulingStateV1::default())),
             workers: Arc::new(Mutex::new(BTreeMap::new())),
+            commit_completions,
         }
     }
 }
@@ -328,6 +361,21 @@ impl Default for SemanticRuntimeSchedulingHandleV1 {
 impl SemanticRuntimeSchedulingHandleV1 {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Observe completion of a serialized publication commit.
+    ///
+    /// A caller refused while a commit is in progress subscribes once and
+    /// retries its still-current source only after this epoch advances. The
+    /// signal is not emitted for resource refusal, so it cannot create a
+    /// failure retry loop.
+    pub fn commit_completions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.commit_completions.subscribe()
+    }
+
+    fn notify_commit_completed(&self) {
+        self.commit_completions
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
     /// Start one bounded preparation task without waiting for artifact I/O,
@@ -416,16 +464,28 @@ impl SemanticRuntimeSchedulingHandleV1 {
                             || !state.accepting_work
                         {
                             state.committing = false;
+                            drop(state);
+                            handle.notify_commit_completed();
                             return;
                         }
                         let published = match committed {
-                            Ok((pointer, install, published)) => {
+                            Ok((pointer, install, install_failure, published)) => {
                                 if let Some(install) = install
-                                    && let Err(reason) = hotpath::measure_block!(
+                                    && let Err(install_reason) = hotpath::measure_block!(
                                         "semantic.runtime.generation.install",
                                         install(&pointer)
                                     )
                                 {
+                                    let reason = match install_failure {
+                                        Some(compensate) => match hotpath::measure_block!(
+                                            "semantic.runtime.generation.compensate_install",
+                                            compensate(&pointer, &install_reason)
+                                        ) {
+                                            Ok(()) => install_reason,
+                                            Err(compensation_reason) => compensation_reason,
+                                        },
+                                        None => install_reason,
+                                    };
                                     state.committing = false;
                                     state.cancellation = None;
                                     state.status = SemanticRuntimeScheduleStatusV1::Failed {
@@ -435,6 +495,8 @@ impl SemanticRuntimeSchedulingHandleV1 {
                                             .as_ref()
                                             .map(|pointer| pointer.generation.clone()),
                                     };
+                                    drop(state);
+                                    handle.notify_commit_completed();
                                     return;
                                 }
                                 state.current = Some(pointer.clone());
@@ -459,6 +521,7 @@ impl SemanticRuntimeSchedulingHandleV1 {
                         state.cancellation = None;
                         published
                     };
+                    handle.notify_commit_completed();
                     if let Some((published, pointer)) = published {
                         hotpath::future!(
                             published(pointer, sequence),
@@ -737,6 +800,7 @@ impl SemanticRuntimeSchedulingHandleV1 {
     fn finish_worker_terminated(&self, sequence: u64) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.sequence == sequence {
+            let was_committing = state.committing;
             state.committing = false;
             state.cancellation = None;
             state.status = SemanticRuntimeScheduleStatusV1::Failed {
@@ -746,11 +810,16 @@ impl SemanticRuntimeSchedulingHandleV1 {
                     .as_ref()
                     .map(|pointer| pointer.generation.clone()),
             };
+            drop(state);
+            if was_committing {
+                self.notify_commit_completed();
+            }
         }
     }
 
     fn normalize_shutdown_terminal(&self, reason: SemanticRuntimeScheduleFailureV1) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let was_committing = state.committing;
         state.committing = false;
         state.cancellation = None;
         state.status = SemanticRuntimeScheduleStatusV1::Failed {
@@ -760,10 +829,18 @@ impl SemanticRuntimeSchedulingHandleV1 {
                 .as_ref()
                 .map(|pointer| pointer.generation.clone()),
         };
+        drop(state);
+        if was_committing {
+            self.notify_commit_completed();
+        }
     }
 }
 
 impl crate::DaemonSemanticRuntimeHandleV1 {
+    pub fn schedule_commit_completions(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.scheduling.commit_completions()
+    }
+
     /// Capture the scheduler's opaque publication token for an exact pointer.
     /// Callers that may outlive the callback must retain this token alongside
     /// the lifecycle artifact identity before another schedule can publish.
@@ -853,6 +930,7 @@ async fn join_next_worker(workers: &mut Vec<(u64, JoinHandle<()>)>) -> bool {
 #[cfg(test)]
 mod schedule_failure_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tracedecay_domain::{ManifestDigest, VectorGenerationIdV1};
 
     fn same_pointer() -> SemanticGenerationPointerV1 {
@@ -912,5 +990,105 @@ mod schedule_failure_tests {
         assert_eq!(handle.current(), Some(pointer));
 
         release_tx.send(()).expect("release replacement callback");
+    }
+
+    #[tokio::test]
+    async fn failed_runtime_install_compensates_before_preserving_previous_generation() {
+        let handle =
+            crate::DaemonSemanticRuntimeHandleV1::new(1, 8, 1 << 20).expect("semantic handle");
+        let previous = same_pointer();
+        handle.scheduling.restore_current(previous.clone());
+        let next = SemanticGenerationPointerV1 {
+            generation: VectorGenerationIdV1::new(
+                ManifestDigest::new(format!("sha256:{}", "b".repeat(64)))
+                    .expect("vector generation digest"),
+            ),
+            source_generation: CodeGenerationId::new("schedule-install-failure-source")
+                .expect("source generation"),
+            projection_key: previous.projection_key.clone(),
+        };
+        let compensated = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&compensated);
+        let scheduled = next.clone();
+
+        assert!(handle.schedule(SemanticRuntimeWorkV1::new_with_projection(
+            next.source_generation.clone(),
+            next.projection_key.clone(),
+            1,
+            move |_cancellation| async move {
+                Ok(
+                    PreparedSemanticRuntimeCommitV1::new(move || async move { Ok(scheduled) })
+                        .on_success(|_| Err(SemanticRuntimeScheduleFailureV1::Runtime))
+                        .on_install_failure(move |pointer, reason| {
+                            assert_eq!(pointer, &next);
+                            assert_eq!(reason, &SemanticRuntimeScheduleFailureV1::Runtime);
+                            observed.store(true, Ordering::Release);
+                            Ok(())
+                        }),
+                )
+            },
+        )));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !matches!(
+                handle.status(),
+                SemanticRuntimeScheduleStatusV1::Failed { .. }
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed installation reaches a terminal state");
+
+        assert!(compensated.load(Ordering::Acquire));
+        assert_eq!(handle.current(), Some(previous));
+    }
+
+    #[tokio::test]
+    async fn refused_during_commit_is_signalled_only_after_commit_finishes() {
+        let handle =
+            crate::DaemonSemanticRuntimeHandleV1::new(1, 8, 1 << 20).expect("semantic handle");
+        let mut completions = handle.schedule_commit_completions();
+        let (commit_started_tx, commit_started_rx) = tokio::sync::oneshot::channel();
+        let (release_commit_tx, release_commit_rx) = tokio::sync::oneshot::channel();
+        let first = same_pointer();
+        let installed = first.clone();
+
+        assert!(handle.schedule(SemanticRuntimeWorkV1::new_with_projection(
+            first.source_generation.clone(),
+            first.projection_key.clone(),
+            1,
+            move |_cancellation| async move {
+                Ok(PreparedSemanticRuntimeCommitV1::new(move || async move {
+                    let _ = commit_started_tx.send(());
+                    let _ = release_commit_rx.await;
+                    Ok(installed)
+                }))
+            },
+        )));
+        commit_started_rx.await.expect("first commit started");
+
+        let refused = same_pointer();
+        assert!(!handle.schedule(SemanticRuntimeWorkV1::new_with_projection(
+            refused.source_generation.clone(),
+            refused.projection_key.clone(),
+            1,
+            move |_cancellation| async move {
+                Ok(PreparedSemanticRuntimeCommitV1::new(move || async move {
+                    Ok(refused)
+                }))
+            },
+        )));
+        assert!(matches!(completions.has_changed(), Ok(false)));
+
+        release_commit_tx.send(()).expect("release first commit");
+        tokio::time::timeout(Duration::from_secs(1), completions.changed())
+            .await
+            .expect("commit completion was signalled")
+            .expect("scheduler still owns completion sender");
+        assert!(matches!(
+            handle.status(),
+            SemanticRuntimeScheduleStatusV1::Current { .. }
+        ));
     }
 }

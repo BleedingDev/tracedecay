@@ -1,0 +1,927 @@
+diff --git a/crates/tracedecay/src/daemon/retained_owner/provider_control/projection.rs b/crates/tracedecay/src/daemon/retained_owner/provider_control/projection.rs
+--- a/crates/tracedecay/src/daemon/retained_owner/provider_control/projection.rs
++++ b/crates/tracedecay/src/daemon/retained_owner/provider_control/projection.rs
+@@ -19,11 +19,20 @@
+ };
+ 
+ use super::super::{
+-    cognitive_recall::control_attribution::RecallControlTraceRefV1,
++    cognitive_recall::control_attribution::{
++        RecallControlTraceRefV1, RetainedRecallControlScopeV1,
++    },
+     observation_journey::control_dispatch::JourneyControlDispatchReplyV1,
+     provider_history::source_attribution_json,
+ };
+-use super::feedback_receipt::{AcceptedDeletionCommandV1, AcceptedFeedbackAssertionV1};
++use super::{
++    ControlOperationIdentityV1,
++    authority::AuthorizedCanonicalControlInventoryV1,
++    feedback_receipt::{AcceptedDeletionCommandV1, AcceptedFeedbackAssertionV1},
++    portability::{
++        HostSnapshotCleanupResultV1, HostSnapshotCleanupStateV1, RetainedSnapshotArtifactV1,
++    },
++};
+ 
+ pub(super) type ProjectionResult<T> = Result<T, &'static str>;
+ 
+@@ -105,6 +114,7 @@
+         source: ResolvedControlSourceV1<'a>,
+         command: &'a AcceptedDeletionCommandV1,
+         intent: &'a ProviderControlDeletionIntentV1,
++        cleanup: &'a HostSnapshotCleanupResultV1,
+     },
+     Health,
+     Inspection(InspectionEvidenceV1<'a>),
+@@ -142,6 +152,148 @@
+         field,
+         actual_reply: &input.dispatched.reply,
+     })
++}
++
++/// The same actual cleanup mapping is used for post-fence provider failures.
++/// A partial host removal never establishes the provider erasure postcondition.
++pub(super) fn host_snapshot_cleanup(
++    cleanup: &HostSnapshotCleanupResultV1,
++) -> ProviderControlHostSnapshotCleanupV1 {
++    ProviderControlHostSnapshotCleanupV1 {
++        state: match cleanup.state {
++            HostSnapshotCleanupStateV1::NotRequested => {
++                ProviderControlHostSnapshotCleanupStateV1::NotRequested
++            }
++            HostSnapshotCleanupStateV1::Complete => {
++                ProviderControlHostSnapshotCleanupStateV1::Complete
++            }
++            HostSnapshotCleanupStateV1::Partial => {
++                ProviderControlHostSnapshotCleanupStateV1::Partial
++            }
++            HostSnapshotCleanupStateV1::Unverifiable => {
++                ProviderControlHostSnapshotCleanupStateV1::Unverifiable
++            }
++        },
++        removed_snapshot_refs: cleanup.removed_snapshot_refs.clone(),
++        matched_count: cleanup.matched_count,
++        unverifiable_count: cleanup.unverifiable_count,
++    }
++}
++
++/// Reads immutable metadata from an already-verified host artifact. The authority
++/// owner freshly resolved the selected namespace and complete canonical inventory;
++/// this helper never mounts, probes, or manufactures a provider runtime reply.
++pub(super) fn project_host_snapshot_metadata(
++    context: &RequestContext,
++    request: &ProviderInspectionRequestV1,
++    state: &RetainedRecallControlScopeV1,
++    operation_identity: &ControlOperationIdentityV1,
++    artifact: &RetainedSnapshotArtifactV1,
++    inventory: &AuthorizedCanonicalControlInventoryV1,
++) -> ProjectionResult<ProviderControlResultV1> {
++    context.validate().map_err(|_| "authenticated context")?;
++    require(
++        artifact.export_scope() == state && &inventory.scope == state,
++        "snapshot export owner binding",
++    )?;
++    validate_resolved_state_selector(
++        &request.state,
++        &state.provider_id,
++        state.registration_revision,
++        &state.delivery_scope,
++    )?;
++    require(
++        matches!(&request.selection, ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref } if snapshot_ref == artifact.snapshot_ref())
++            && request.cursor.is_none()
++            && request.maximum_items >= 1
++            && operation_identity.idempotency_key.is_none(),
++        "host snapshot metadata request",
++    )?;
++    inventory
++        .checkpoint
++        .validate_for(&state.delivery_scope)
++        .map_err(|_| "snapshot current disposition checkpoint")?;
++    let carrier = payload(artifact.carrier())?;
++    closed(&carrier, &["identity", "bytes", "sources"])?;
++    let identity = snapshot_identity(field(&carrier, "identity")?)?;
++    let bytes: Vec<u8> = decode(field(&carrier, "bytes")?, "snapshot bytes")?;
++    require(
++        &identity == artifact.identity()
++            && identity.provider_id == state.provider_id.as_str()
++            && identity.exact_scope_digest == state.delivery_scope.exact_scope_sha256()
++            && identity.byte_length == bytes.len() as u64
++            && identity.byte_length <= MAX_PROVIDER_CONTROL_SNAPSHOT_BYTES
++            && identity.content_sha256 == digest(&bytes),
++        "host snapshot carrier binding",
++    )?;
++    require(
++        inventory.sources().len() == artifact.original_sources().len(),
++        "snapshot canonical inventory count",
++    )?;
++    let mut sources = Vec::with_capacity(artifact.original_sources().len());
++    for (current, original) in inventory.sources().iter().zip(artifact.original_sources()) {
++        let original = original
++            .to_owned_attribution()
++            .map_err(|_| "snapshot original attribution")?;
++        current
++            .current_disposition
++            .validate()
++            .map_err(|_| "snapshot source disposition")?;
++        require(
++            current.attribution == original
++                && !matches!(
++                    current.current_disposition.state,
++                    SourceDisposition::Deleted
++                        | SourceDisposition::Redacted
++                        | SourceDisposition::Expired
++                        | SourceDisposition::Unknown
++                ),
++            "snapshot fresh source visibility",
++        )?;
++        sources.push(source_attribution_json(&original)
++            .map_err(|_| "snapshot source identity encoding")?["source"].clone());
++    }
++    eq_field(&carrier, "sources", &Value::Array(sources))?;
++    let result = ProviderControlResultV1 {
++        provider_id: state.provider_id.as_str().to_owned(),
++        registration_revision: artifact.export_scope().registration_revision,
++        scope: scope(&state.delivery_scope),
++        operation_id: operation_identity.operation_id.clone(),
++        idempotency_key: None,
++        terminal: ProviderControlTerminalV1::Success,
++        diagnostic_id: None,
++        domain_detail: None,
++        effect: ProviderControlEffectV1 {
++            state: ProviderControlEffectStateV1::None,
++            committed_boundary: None,
++            state_generation_before: None,
++            state_generation_after: None,
++            committed_item_refs: Vec::new(),
++            uncommitted_item_refs: Vec::new(),
++            provider_receipt_digest: None,
++            reconciliation_action: None,
++            verification_digest: None,
++            duplicate_of_idempotency_key: None,
++            duplicate_of_operation_id: None,
++        },
++        result: ProviderControlOperationResultV1::Inspection(Some(ProviderInspectionResultV1 {
++            selection: request.selection.clone(),
++            evidence_origin: ProviderControlInspectionEvidenceOriginV1::HostSnapshotArtifact {
++                snapshot_ref: artifact.snapshot_ref().to_owned(),
++                export_registration_revision: artifact.export_scope().registration_revision,
++            },
++            items: ProviderControlInspectionItemsV1::SnapshotMetadata(vec![identity]),
++            coverage: ProviderControlInspectionCoverageV1::Complete,
++            next_cursor: None,
++            redactions: Vec::new(),
++            state_generation: None,
++        })),
++        warnings: Vec::new(),
++    };
++    result
++        .validate_for(&ProviderControlRequestV1::Inspection(request.clone()))
++        .map_err(|_| "host snapshot metadata result invariants")?;
++    Ok(result)
+ }
+ 
+ fn project(
+@@ -338,6 +490,7 @@
+                 source,
+                 command,
+                 intent,
++                cleanup,
+             },
+         ) => {
+             bind_source(source, &public.source, call)?;
+@@ -398,6 +551,7 @@
+                 mode: public.mode,
+                 include_snapshots: public.include_snapshots,
+                 intent: intent.clone(),
++                host_snapshot_cleanup: host_snapshot_cleanup(cleanup),
+                 erasure,
+             }))
+         }
+@@ -410,42 +564,8 @@
+             let data = response
+                 .as_ref()
+                 .map(|value| -> ProjectionResult<_> {
+-                    closed(
+-                        value,
+-                        &[
+-                            "provider_id",
+-                            "provider_instance_id",
+-                            "implementation_identity_digest",
+-                            "state_identity_digest",
+-                            "state_generation",
+-                            "scope_digest",
+-                            "readiness",
+-                            "capability_states",
+-                            "effective_limits_digest",
+-                            "backlog",
+-                            "recovery_state",
+-                            "warnings",
+-                            "state_generation_before",
+-                            "state_generation_after",
+-                            "provider_receipt_digest",
+-                        ],
+-                    )?;
+                     eq_field(value, "provider_id", &json!(call.provider_id.as_str()))?;
+-                    let data: ProviderHealthResultV1 = decode_selected(
+-                        value,
+-                        &[
+-                            "provider_instance_id",
+-                            "implementation_identity_digest",
+-                            "state_identity_digest",
+-                            "state_generation",
+-                            "scope_digest",
+-                            "readiness",
+-                            "capability_states",
+-                            "effective_limits_digest",
+-                            "backlog",
+-                            "recovery_state",
+-                        ],
+-                    )?;
++                    let data = health_data(value)?;
+                     require(
+                         data.provider_instance_id == readiness.provider_instance_id()
+                             && data.implementation_identity_digest
+@@ -486,6 +606,7 @@
+             ProviderControlOperationResultV1::Inspection(data)
+         }
+         (ProviderControlRequestV1::Maintenance(public), HostControlEvidence::Maintenance) => {
++            eq_field(&request, "resume_cursor", &json!(public.resume_cursor))?;
+             for (name, expected) in [
+                 ("task", wire(&public.task)?),
+                 ("maximum_items", json!(public.maximum_items)),
+@@ -570,29 +691,7 @@
+             let data = response
+                 .as_ref()
+                 .map(|value| -> ProjectionResult<_> {
+-                    closed(
+-                        value,
+-                        &[
+-                            "snapshot_id",
+-                            "state_generation_before",
+-                            "state_generation_after",
+-                            "restored_observation_sequence",
+-                            "provider_receipt_digest",
+-                            "warnings",
+-                        ],
+-                    )?;
+-                    eq_field(value, "snapshot_id", &json!(identity.snapshot_id))?;
+-                    eq_field(
+-                        value,
+-                        "restored_observation_sequence",
+-                        &json!(identity.observation_sequence),
+-                    )?;
+-                    Ok(ProviderSnapshotRestoreResultV1 {
+-                        snapshot_ref: retained.snapshot_ref.to_owned(),
+-                        snapshot_id: identity.snapshot_id,
+-                        restored_observation_sequence: identity.observation_sequence,
+-                        receipt: mutation_receipt(value, call, reply)?,
+-                    })
++                    snapshot_restore_data(value, retained.snapshot_ref, &identity, call, reply)
+                 })
+                 .transpose()?;
+             ProviderControlOperationResultV1::SnapshotRestore(data)
+@@ -773,6 +872,21 @@
+             && valid_digest(&receipt.provider_receipt_digest),
+         "mutation receipt shape",
+     )?;
++    let dry_run_read = call.operation == ProviderOperation::Maintenance
++        && effect.state() == CommittedEffectState::None
++        && payload(&call.payload)?
++            .get("dry_run")
++            .and_then(Value::as_bool)
++            == Some(true);
++    if !call.operation.mutates_provider_state() || dry_run_read {
++        require(
++            effect.state() == CommittedEffectState::None
++                && receipt.state_generation_before == receipt.state_generation_after
++                && receipt.state_generation_after == reply.state_generation,
++            "unchanged read receipt generation",
++        )?;
++        return Ok(());
++    }
+     if effect.state() == CommittedEffectState::Duplicate {
+         // Historical payload evidence keeps the original operation's generation.
+         require(
+@@ -854,6 +968,7 @@
+             "maximum_bytes",
+             "maximum_duration_millis",
+             "dry_run",
++            "resume_cursor",
+         ],
+         ProviderOperation::SnapshotExport => &["common_request"],
+         ProviderOperation::SnapshotRestore => &[
+@@ -936,6 +1051,19 @@
+     selector: &ProviderControlStateSelectorV1,
+     call: &ProviderCall,
+ ) -> ProjectionResult<()> {
++    validate_resolved_state_selector(
++        selector,
++        &call.provider_id,
++        call.registration_revision,
++        &call.exact_scope,
++    )
++}
++fn validate_resolved_state_selector(
++    selector: &ProviderControlStateSelectorV1,
++    actual_provider_id: &OwnedProviderId,
++    actual_registration_revision: u64,
++    actual_scope: &OwnedExactScope,
++) -> ProjectionResult<()> {
+     match selector {
+         ProviderControlStateSelectorV1::CanonicalSession {
+             provider_id,
+@@ -950,9 +1078,9 @@
+             // The registered canonical-provider/session pair is resolved by the host;
+             // coding scope has no canonical transcript-provider field to invent.
+             require(
+-                provider_id == call.provider_id.as_str()
+-                    && *registration_revision == call.registration_revision
+-                    && session_id == &call.exact_scope.agent_session_id,
++                provider_id == actual_provider_id.as_str()
++                    && *registration_revision == actual_registration_revision
++                    && session_id == &actual_scope.agent_session_id,
+                 "state selector binding",
+             )
+         }
+@@ -965,7 +1093,7 @@
+                 .ok_or("retained scope address")?;
+             let (scope_digest, _) = address.split_once(':').ok_or("retained scope address")?;
+             require(
+-                scope_digest == call.exact_scope.exact_scope_sha256(),
++                scope_digest == actual_scope.exact_scope_sha256(),
+                 "retained state scope binding",
+             )
+         }
+@@ -1242,6 +1370,81 @@
+         }),
+     }
+ }
++fn health_data(value: &Value) -> ProjectionResult<ProviderHealthResultV1> {
++    closed(
++        value,
++        &[
++            "provider_id",
++            "provider_instance_id",
++            "implementation_identity_digest",
++            "state_identity_digest",
++            "state_generation",
++            "scope_digest",
++            "readiness",
++            "capability_states",
++            "effective_limits_digest",
++            "backlog",
++            "recovery_state",
++            "staged_rows",
++            "warnings",
++            "state_generation_before",
++            "state_generation_after",
++            "provider_receipt_digest",
++        ],
++    )?;
++    let mut data: ProviderHealthResultV1 = decode_selected(
++        value,
++        &[
++            "provider_instance_id",
++            "implementation_identity_digest",
++            "state_identity_digest",
++            "state_generation",
++            "scope_digest",
++            "readiness",
++            "capability_states",
++            "effective_limits_digest",
++            "backlog",
++            "recovery_state",
++        ],
++    )?;
++    data.staged_rows = optional_count(value, "staged_rows")?;
++    Ok(data)
++}
++
++fn snapshot_restore_data(
++    value: &Value,
++    snapshot_ref: &str,
++    identity: &ProviderControlSnapshotIdentityV1,
++    call: &ProviderCall,
++    reply: &ProviderReply,
++) -> ProjectionResult<ProviderSnapshotRestoreResultV1> {
++    closed(
++        value,
++        &[
++            "snapshot_id",
++            "state_generation_before",
++            "state_generation_after",
++            "restored_observation_sequence",
++            "restored_rows",
++            "provider_receipt_digest",
++            "warnings",
++        ],
++    )?;
++    eq_field(value, "snapshot_id", &json!(identity.snapshot_id))?;
++    eq_field(
++        value,
++        "restored_observation_sequence",
++        &json!(identity.observation_sequence),
++    )?;
++    Ok(ProviderSnapshotRestoreResultV1 {
++        snapshot_ref: snapshot_ref.to_owned(),
++        snapshot_id: identity.snapshot_id.clone(),
++        restored_observation_sequence: identity.observation_sequence,
++        restored_rows: optional_count(value, "restored_rows")?,
++        receipt: mutation_receipt(value, call, reply)?,
++    })
++}
++
+ fn maintenance(
+     value: &Value,
+     call: &ProviderCall,
+@@ -1255,6 +1458,8 @@
+             "scanned_items",
+             "changed_items",
+             "removed_items",
++            "proposed_changes",
++            "state_changed",
+             "partial",
+             "resume_cursor",
+             "state_generation_before",
+@@ -1269,6 +1474,8 @@
+         scanned_items: number(value, "scanned_items")?,
+         changed_items: number(value, "changed_items")?,
+         removed_items: number(value, "removed_items")?,
++        proposed_changes: optional_count(value, "proposed_changes")?,
++        state_changed: optional_boolean(value, "state_changed")?,
+         partial: boolean(value, "partial")?,
+         resume_cursor: decode(field(value, "resume_cursor")?, "maintenance cursor")?,
+         receipt: mutation_receipt(value, call, reply)?,
+@@ -1312,7 +1519,7 @@
+             InspectionEvidenceV1::SourceInfluence(resolved),
+         ) => {
+             bind_source(*resolved, source, call)?;
+-            json!({"source_key":resolved.target.source.source_key})
++            json!({"stable_memory_ref":stable_ref(resolved.target)?,"source_key":resolved.target.source.source_key})
+         }
+         (
+             ProviderControlInspectionSelectorV1::Trace { source },
+@@ -1333,7 +1540,7 @@
+                 !idempotency_key.is_empty() && idempotency_key.len() <= 256,
+                 "delivery receipt key",
+             )?;
+-            json!({"idempotency_key":idempotency_key})
++            json!({"idempotency_key":idempotency_key,"stable_memory_ref":stable_ref(resolved.target)?})
+         }
+         (
+             ProviderControlInspectionSelectorV1::MaintenanceReceipt {
+@@ -1349,7 +1556,7 @@
+                 operation_id == selected_operation && idempotency_key == selected_key,
+                 "maintenance receipt selector",
+             )?;
+-            json!({"idempotency_key":idempotency_key})
++            json!({"operation_id":operation_id,"idempotency_key":idempotency_key})
+         }
+         (
+             ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref },
+@@ -1410,7 +1617,9 @@
+     )?;
+     if !matches!(
+         evidence,
+-        InspectionEvidenceV1::StateSummary | InspectionEvidenceV1::CapabilityStatus
++        InspectionEvidenceV1::StateSummary
++            | InspectionEvidenceV1::CapabilityStatus
++            | InspectionEvidenceV1::SourceInfluence(_)
+     ) {
+         require(raw.len() <= 1, "inspection singleton query")?;
+     }
+@@ -1499,12 +1708,19 @@
+                 let original = field(item, "original_source")?;
+                 let original_source = match &content {
+                     Some(content) => {
+-                        require(
+-                            !privacy_withheld(*source)
+-                                && content.len() <= 8192
+-                                && content_sha256.as_deref()
+-                                    == Some(digest(content.as_bytes()).as_str()),
+-                            "trace content privacy and hash",
++                        require(!privacy_withheld(*source), "trace content privacy")?;
++                        validate_trace_content(
++                            content,
++                            content_sha256.as_deref(),
++                            public
++                                .maximum_bytes
++                                .min(
++                                    dispatch
++                                        .readiness_evidence
++                                        .effective_limits()
++                                        .response_bytes,
++                                )
++                                .min(MAX_PROVIDER_CONTROL_RESPONSE_BYTES as u64),
+                         )?;
+                         require(
+                             original
+@@ -1551,6 +1767,10 @@
+             operation_id,
+             idempotency_key,
+         } => {
++            for item in raw {
++                optional_count(field(item, "outcome")?, "proposed_changes")?;
++                optional_boolean(field(item, "outcome")?, "state_changed")?;
++            }
+             let data: Vec<ProviderControlMaintenanceReceiptItemV1> =
+                 decode(&Value::Array(raw.clone()), "maintenance receipt items")?;
+             require(
+@@ -1574,13 +1794,52 @@
+     };
+     Ok(ProviderInspectionResultV1 {
+         selection: public.selection.clone(),
++        evidence_origin: ProviderControlInspectionEvidenceOriginV1::ProviderRuntime,
+         items,
+         coverage: decode(field(value, "coverage")?, "inspection coverage")?,
+         next_cursor: decode(field(value, "next_cursor")?, "inspection cursor")?,
+         redactions: decode(field(value, "redactions")?, "inspection redactions")?,
+-        state_generation: dispatch.reply.state_generation,
++        state_generation: Some(dispatch.reply.state_generation),
+     })
+ }
++fn validate_trace_content(
++    content: &str,
++    content_sha256: Option<&str>,
++    maximum_bytes: u64,
++) -> ProjectionResult<()> {
++    require(
++        content.len() as u64 <= maximum_bytes
++            && content_sha256 == Some(digest(content.as_bytes()).as_str()),
++        "trace content budget and hash",
++    )
++}
++
++fn snapshot_identity(value: &Value) -> ProjectionResult<ProviderControlSnapshotIdentityV1> {
++    closed(
++        value,
++        &[
++            "snapshot_id",
++            "provider_id",
++            "implementation_identity_digest",
++            "state_schema_version",
++            "exact_scope_digest",
++            "state_generation",
++            "observation_sequence",
++            "parent_snapshot_id",
++            "content_sha256",
++            "byte_length",
++            "created_at",
++        ],
++    )?;
++    // Serde Option alone accepts an omitted field. Canonical carriers require
++    // an explicit null or the actual parent identifier.
++    field(value, "parent_snapshot_id")?;
++    let identity: ProviderControlSnapshotIdentityV1 = decode(value, "snapshot identity")?;
++    DateTime::parse_from_rfc3339(&identity.created_at)
++        .map_err(|_| "snapshot creation timestamp")?;
++    Ok(identity)
++}
++
+ fn snapshot(
+     retained: RetainedSnapshotV1<'_>,
+     dispatch: &JourneyControlDispatchReplyV1,
+@@ -1591,8 +1850,7 @@
+     )?;
+     let carrier = payload(retained.carrier)?;
+     closed(&carrier, &["identity", "bytes", "sources"])?;
+-    let identity: ProviderControlSnapshotIdentityV1 =
+-        decode(field(&carrier, "identity")?, "snapshot identity")?;
++    let identity = snapshot_identity(field(&carrier, "identity")?)?;
+     let bytes: Vec<u8> = decode(field(&carrier, "bytes")?, "snapshot bytes")?;
+     let readiness = &dispatch.readiness_evidence;
+     require(
+@@ -1726,6 +1984,23 @@
+ fn field<'a>(value: &'a Value, name: &'static str) -> ProjectionResult<&'a Value> {
+     value.get(name).ok_or(name)
+ }
++/// Provider omission is the only representation of an unreported count.
++/// A present null, string, signed-negative or fractional value is malformed.
++fn optional_count(value: &Value, name: &'static str) -> ProjectionResult<Option<u64>> {
++    value
++        .get(name)
++        .map(|value| value.as_u64().ok_or(name))
++        .transpose()
++}
++
++/// Optional boolean evidence has the same omission-only rule as counts.
++fn optional_boolean(value: &Value, name: &'static str) -> ProjectionResult<Option<bool>> {
++    value
++        .get(name)
++        .map(|value| value.as_bool().ok_or(name))
++        .transpose()
++}
++
+ fn number(value: &Value, name: &'static str) -> ProjectionResult<u64> {
+     field(value, name)?.as_u64().ok_or(name)
+ }
+@@ -1803,9 +2078,13 @@
+     };
+ 
+     fn call(generation: u64) -> ProviderCall {
+-        let bytes = b"{}".to_vec();
++        call_for(ProviderOperation::Feedback, generation, json!({}))
++    }
++
++    fn call_for(operation: ProviderOperation, generation: u64, body: Value) -> ProviderCall {
++        let bytes = serde_json::to_vec(&body).expect("canonical test body");
+         ProviderCall::new(ProviderCallParts {
+-            operation: ProviderOperation::Feedback,
++            operation,
+             provider_id: OwnedProviderId::new("native").expect("provider"),
+             registration_revision: 7,
+             ready_receipt_sha256: "a".repeat(64),
+@@ -1822,16 +2101,17 @@
+             request_id: "request.projection".to_owned(),
+             operation_id: "01993262-4d00-7000-8000-000000000001".to_owned(),
+             expected_state_generation: generation,
+-            idempotency_key: Some("d".repeat(64)),
++            idempotency_key: operation.mutates_provider_state().then(|| "d".repeat(64)),
+             control: OperationControl::new(i64::MAX, 1000, CancellationToken::new()),
+             payload: CanonicalPayload::new(
+-                OwnedVersionedId::new("tracedecay.memory.provider.feedback.v1").expect("contract"),
++                OwnedVersionedId::new(operation_contract_id(operation).expect("control contract"))
++                    .expect("contract"),
+                 bytes.clone(),
+                 digest(&bytes),
+             )
+             .expect("payload"),
+             required_capabilities: vec![
+-                OwnedVersionedId::new("provider.feedback.v1").expect("capability"),
++                OwnedVersionedId::new(operation.capability_id()).expect("capability"),
+             ],
+             extensions: Vec::new(),
+         })
+@@ -1864,6 +2144,145 @@
+     }
+ 
+     #[test]
++    fn native_health_staged_rows_and_ncm_omission_are_distinct() {
++        let mut value = json!({"provider_id":"native","provider_instance_id":"instance.actual","implementation_identity_digest":"a".repeat(64),"state_identity_digest":"b".repeat(64),"state_generation":5,"scope_digest":"c".repeat(64),"readiness":"ready","capability_states":[{"capability_id":"provider.health.v1","state":"available"}],"effective_limits_digest":"d".repeat(64),"backlog":0,"recovery_state":"complete","staged_rows":17,"warnings":[],"state_generation_before":5,"state_generation_after":5,"provider_receipt_digest":"e".repeat(64)});
++        assert_eq!(
++            health_data(&value)
++                .expect("actual Native health")
++                .staged_rows,
++            Some(17)
++        );
++        value["staged_rows"] = json!(0);
++        assert_eq!(
++            health_data(&value).expect("reported zero").staged_rows,
++            Some(0)
++        );
++        value.as_object_mut().expect("object").remove("staged_rows");
++        assert_eq!(
++            health_data(&value).expect("NCM omitted count").staged_rows,
++            None
++        );
++        for invalid in [Value::Null, json!(-1), json!(1.5), json!("17")] {
++            value["staged_rows"] = invalid;
++            assert!(health_data(&value).is_err());
++        }
++    }
++
++    #[test]
++    fn native_dry_run_preserves_proposed_changes_without_claiming_applied_changes() {
++        let call = call_for(ProviderOperation::Maintenance, 3, json!({"dry_run":true}));
++        let actual = reply(
++            &call,
++            TerminalCode::Success,
++            CommittedEffectEvidence::none(Some(5)),
++            5,
++        );
++        let mut value = json!({"task":"decay","dry_run":true,"scanned_items":7,"changed_items":0,"removed_items":0,"proposed_changes":4,"partial":false,"resume_cursor":null,"state_generation_before":5,"state_generation_after":5,"provider_receipt_digest":"b".repeat(64),"warnings":[]});
++        let data = maintenance(&value, &call, &actual).expect("actual Native dry run");
++        assert_eq!(data.proposed_changes, Some(4));
++        assert_eq!(data.changed_items, 0);
++        assert_eq!(data.receipt.state_generation_before, 5);
++        value
++            .as_object_mut()
++            .expect("object")
++            .remove("proposed_changes");
++        assert_eq!(
++            maintenance(&value, &call, &actual)
++                .expect("NCM omitted proposals")
++                .proposed_changes,
++            None
++        );
++        for invalid in [Value::Null, json!(-1), json!(1.5), json!("4")] {
++            value["proposed_changes"] = invalid;
++            assert!(maintenance(&value, &call, &actual).is_err());
++        }
++    }
++
++    #[test]
++    fn native_restore_count_is_independent_from_sequence_and_ncm_can_omit_it() {
++        let call = call_for(ProviderOperation::SnapshotRestore, 3, json!({}));
++        let actual = reply(
++            &call,
++            TerminalCode::Success,
++            CommittedEffectEvidence::committed(3, 4, Vec::new(), "b".repeat(64), "c".repeat(64))
++                .expect("committed"),
++            4,
++        );
++        let identity: ProviderControlSnapshotIdentityV1 = decode(&json!({"snapshot_id":"snapshot.actual","provider_id":"native","implementation_identity_digest":"a".repeat(64),"state_schema_version":"native-staged-v2","exact_scope_digest":call.exact_scope.exact_scope_sha256(),"state_generation":3,"observation_sequence":17,"parent_snapshot_id":null,"content_sha256":"b".repeat(64),"byte_length":42,"created_at":"2026-09-10T00:00:00Z"}),"identity").expect("actual identity");
++        let mut value = json!({"snapshot_id":"snapshot.actual","restored_observation_sequence":17,"restored_rows":2,"state_generation_before":3,"state_generation_after":4,"provider_receipt_digest":"b".repeat(64),"warnings":[]});
++        let data = snapshot_restore_data(&value, "host.snapshot", &identity, &call, &actual)
++            .expect("actual Native restore");
++        assert_eq!(data.restored_rows, Some(2));
++        assert_eq!(data.restored_observation_sequence, 17);
++        value
++            .as_object_mut()
++            .expect("object")
++            .remove("restored_rows");
++        assert_eq!(
++            snapshot_restore_data(&value, "host.snapshot", &identity, &call, &actual)
++                .expect("NCM omitted row count")
++                .restored_rows,
++            None
++        );
++        for invalid in [Value::Null, json!(-1), json!(1.5), json!("2")] {
++            value["restored_rows"] = invalid;
++            assert!(
++                snapshot_restore_data(&value, "host.snapshot", &identity, &call, &actual).is_err()
++            );
++        }
++    }
++
++    #[test]
++    fn read_receipts_bind_actual_unchanged_generation_without_weakening_mutation_cas() {
++        let raw = json!({"state_generation_before":5,"state_generation_after":5,"provider_receipt_digest":"b".repeat(64)});
++        for operation in [
++            ProviderOperation::Health,
++            ProviderOperation::Inspection,
++            ProviderOperation::SnapshotExport,
++        ] {
++            let call = call_for(operation, 3, json!({}));
++            let actual = reply(
++                &call,
++                TerminalCode::Success,
++                CommittedEffectEvidence::none(Some(5)),
++                5,
++            );
++            validate_optional_receipt(&raw, &call, &actual).expect("actual read generation");
++            let mut stale = raw.clone();
++            stale["state_generation_before"] = json!(3);
++            assert!(validate_optional_receipt(&stale, &call, &actual).is_err());
++            stale["state_generation_before"] = json!(4);
++            stale["state_generation_after"] = json!(4);
++            assert!(validate_optional_receipt(&stale, &call, &actual).is_err());
++        }
++        let mutation = call_for(ProviderOperation::Maintenance, 3, json!({"dry_run":false}));
++        let actual = reply(
++            &mutation,
++            TerminalCode::SuccessZeroResults,
++            CommittedEffectEvidence::none(Some(5)),
++            5,
++        );
++        assert!(validate_optional_receipt(&raw, &mutation, &actual).is_err());
++        let malformed = call_for(ProviderOperation::Maintenance, 3, json!({"dry_run":"true"}));
++        let actual = reply(
++            &malformed,
++            TerminalCode::SuccessZeroResults,
++            CommittedEffectEvidence::none(Some(5)),
++            5,
++        );
++        assert!(validate_optional_receipt(&raw, &malformed, &actual).is_err());
++    }
++
++    #[test]
++    fn trace_content_above_8192_uses_actual_byte_budget_and_exact_hash() {
++        let content = "x".repeat(10_000);
++        let hash = digest(content.as_bytes());
++        validate_trace_content(&content, Some(&hash), 16_384).expect("within actual request limit");
++        assert!(validate_trace_content(&content, Some(&hash), 8192).is_err());
++        assert!(validate_trace_content(&content, Some(&"a".repeat(64)), 16_384).is_err());
++    }
++
++    #[test]
+     fn duplicate_keeps_original_receipt_generations_and_original_operation() {
+         let call = call(10);
+         let original_operation = "01993262-4d00-7000-8000-000000000000";
+@@ -2119,6 +2538,126 @@
+     }
+ 
+     #[test]
++    fn source_influence_query_binds_shared_lineage_to_the_exact_retained_revision() {
++        use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
++        let call = call_for(ProviderOperation::Inspection, 3, json!({}));
++        for revision in [1, 2] {
++            let selector = ProviderControlSourceSelectorV1 {
++                trace_ref: "trace.retained".to_owned(),
++                item_ref: "item.retained".to_owned(),
++                observation_id: format!("observation.{revision}"),
++            };
++            let original: RecallSourceAttributionV1 = serde_json::from_value(json!({
++                "source":{"canonical_provider_id":"codex","canonical_session_id":"session-1","source_key":"shared.lineage","stable_record_id":null,"observation_id":selector.observation_id,"source_revision":format!("revision.{revision}"),"content_sha256":"c".repeat(64)},
++                "origin_scope":{"state":"recorded","exact_scope_identity":scope(&call.exact_scope),"authority_ref":"host-original:test"},
++                "source_sequence":revision,"occurred_at":null,"ingested_at":"2026-09-10T00:00:00Z",
++                "validity":{"valid_from":null,"valid_until":null,"superseded_at":null,"superseded_by":null,"revoked_at":null}
++            })).expect("retained source");
++            let original = original.to_owned_attribution().expect("attribution");
++            let target = LifecycleTarget {
++                provider_id: call.provider_id.clone(),
++                registration_revision: call.registration_revision,
++                original_scope: original.origin_scope.clone(),
++                delivery_scope: call.exact_scope.clone(),
++                source: original.source.clone(),
++                reference: LifecycleTargetReference::StableMemoryRef(format!("memory.{revision}")),
++            };
++            let disposition = CurrentSourceDisposition {
++                state: SourceDisposition::Available,
++                authority_ref: "canonical.disposition".to_owned(),
++                authority_revision: Some(1),
++                checked_at_utc_nanos: 1,
++            };
++            let resolved = ResolvedControlSourceV1 {
++                selector: &selector,
++                target: &target,
++                original_attribution: &original,
++                current_disposition: &disposition,
++            };
++            let public = ProviderControlInspectionSelectorV1::SourceInfluence {
++                source: selector.clone(),
++            };
++            let evidence = InspectionEvidenceV1::SourceInfluence(resolved);
++            validate_inspection_selector(&public, &evidence,
++                &json!({"source_key":"shared.lineage","stable_memory_ref":format!("memory.{revision}")}), &call)
++                .expect("both retained revisions resolve independently");
++            for wrong in [
++                json!({"source_key":"shared.lineage"}),
++                json!({"source_key":"shared.lineage","stable_memory_ref":format!("memory.{}",3-revision)}),
++                json!({"source_key":"other.lineage","stable_memory_ref":format!("memory.{revision}")}),
++            ] {
++                assert!(validate_inspection_selector(&public, &evidence, &wrong, &call).is_err());
++            }
++        }
++    }
++
++    #[test]
++    fn snapshot_identity_requires_explicit_parent_and_actual_timestamp() {
++        let call = call_for(ProviderOperation::SnapshotExport, 3, json!({}));
++        let actual = json!({"snapshot_id":"snapshot.actual","provider_id":"native","implementation_identity_digest":"a".repeat(64),"state_schema_version":"native-staged-v2","exact_scope_digest":call.exact_scope.exact_scope_sha256(),"state_generation":3,"observation_sequence":1,"parent_snapshot_id":null,"content_sha256":digest(b""),"byte_length":0,"created_at":"2026-09-10T00:00:00.123456789Z"});
++        assert_eq!(
++            snapshot_identity(&actual)
++                .expect("actual identity")
++                .state_generation,
++            3
++        );
++        let mut omitted = actual.clone();
++        omitted
++            .as_object_mut()
++            .expect("identity")
++            .remove("parent_snapshot_id");
++        assert!(snapshot_identity(&omitted).is_err());
++        for (field, replacement) in [
++            ("parent_snapshot_id", json!(false)),
++            ("created_at", json!("yesterday")),
++            ("unregistered_claim", json!(true)),
++        ] {
++            let mut changed = actual.clone();
++            changed[field] = replacement;
++            assert!(snapshot_identity(&changed).is_err());
++        }
++    }
++
++    #[test]
++    fn maintenance_state_changed_preserves_false_and_rejects_malformed_presence() {
++        assert_eq!(optional_boolean(&json!({}), "state_changed"), Ok(None));
++        for actual in [false, true] {
++            assert_eq!(
++                optional_boolean(&json!({"state_changed":actual}), "state_changed"),
++                Ok(Some(actual))
++            );
++        }
++        for invalid in [Value::Null, json!("false"), json!(0), json!([])] {
++            assert!(optional_boolean(&json!({"state_changed":invalid}), "state_changed").is_err());
++        }
++    }
++
++    #[test]
++    fn host_cleanup_mapping_keeps_actual_partial_removals() {
++        let actual = HostSnapshotCleanupResultV1 {
++            state: HostSnapshotCleanupStateV1::Partial,
++            removed_snapshot_refs: vec!["snapshot.removed.1".to_owned()],
++            matched_count: 2,
++            unverifiable_count: 1,
++        };
++        let projected = host_snapshot_cleanup(&actual);
++        assert_eq!(
++            projected.state,
++            ProviderControlHostSnapshotCleanupStateV1::Partial
++        );
++        assert_eq!(
++            projected.removed_snapshot_refs,
++            actual.removed_snapshot_refs
++        );
++        assert_eq!(projected.matched_count, 2);
++        assert_eq!(projected.unverifiable_count, 1);
++        assert_eq!(
++            host_snapshot_cleanup(&HostSnapshotCleanupResultV1::not_requested()).state,
++            ProviderControlHostSnapshotCleanupStateV1::NotRequested
++        );
++    }
++
++    #[test]
+     fn affected_reference_array_must_include_original_and_not_repeat() {
+         assert_eq!(
+             affected_count(&json!(["memory:old", "memory:new"]), "memory:old"),
