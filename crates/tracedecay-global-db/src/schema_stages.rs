@@ -2858,6 +2858,19 @@ mod tests {
         .await;
     }
 
+    /// A final-shape registry that lost its read indexes is not the exact
+    /// final inventory; admission refuses it instead of reinstalling them.
+    #[tokio::test]
+    async fn code_project_missing_read_indexes_requires_reset_without_mutation() {
+        assert_code_projects_drift_requires_reset_without_mutation(
+            "DROP INDEX idx_code_projects_last_seen_project;
+             DROP INDEX idx_code_projects_git_common_dir;
+             DROP INDEX idx_code_projects_canonical_root_project;",
+            "unexpected attached index, trigger, or view",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn code_project_attached_view_reference_requires_reset_without_mutation() {
         assert_code_projects_drift_requires_reset_without_mutation(
