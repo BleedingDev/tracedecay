@@ -1129,32 +1129,7 @@ pub(super) fn reconcile_session_rows(
     if actual.provider != expected.provider || actual.session_id != expected.session_id {
         return None;
     }
-    let project_key = if actual.project_key == expected.project_key {
-        actual.project_key.clone()
-    } else if actual.project_key == "user" {
-        expected.project_key.clone()
-    } else if expected.project_key == "user" {
-        actual.project_key.clone()
-    } else if actual.project_key == actual.project_path
-        && actual.project_path == expected.project_path
-    {
-        expected.project_key.clone()
-    } else if expected.project_key == expected.project_path
-        && expected.project_path == actual.project_path
-    {
-        actual.project_key.clone()
-    } else {
-        return None;
-    };
-    let project_path = if actual.project_path == expected.project_path {
-        actual.project_path.clone()
-    } else if actual.project_path == actual.project_key {
-        expected.project_path.clone()
-    } else if expected.project_path == expected.project_key {
-        actual.project_path.clone()
-    } else {
-        return None;
-    };
+    let (project_key, project_path) = reconcile_session_location(actual, expected)?;
     Some(SessionRecord {
         provider: actual.provider.clone(),
         session_id: actual.session_id.clone(),
@@ -1190,6 +1165,69 @@ pub(super) fn reconcile_session_rows(
         )
         .ok()?,
     })
+}
+
+/// Resolve the project identity and location of one session seen by two
+/// writers. Transcript ingest records the checkout path as both key and path;
+/// observation projection records the typed project id as the key and may
+/// only know that id as a placeholder path. Both rows live in the same
+/// project-scoped store, so the merge keeps the typed key and the real path.
+fn reconcile_session_location(
+    actual: &SessionRecord,
+    expected: &SessionRecord,
+) -> Option<(String, String)> {
+    let path_keyed =
+        |row: &SessionRecord| row.project_key == row.project_path && row.project_key != "user";
+    if path_keyed(actual) && path_keyed(expected) && actual.project_path != expected.project_path {
+        return match (
+            is_durable_filesystem_path(&actual.project_path),
+            is_durable_filesystem_path(&expected.project_path),
+        ) {
+            (true, false) => Some((expected.project_key.clone(), actual.project_path.clone())),
+            (false, true) => Some((actual.project_key.clone(), expected.project_path.clone())),
+            _ => None,
+        };
+    }
+    let project_key = if actual.project_key == expected.project_key {
+        actual.project_key.clone()
+    } else if actual.project_key == "user" {
+        expected.project_key.clone()
+    } else if expected.project_key == "user" {
+        actual.project_key.clone()
+    } else if actual.project_key == actual.project_path
+        && actual.project_path == expected.project_path
+    {
+        expected.project_key.clone()
+    } else if expected.project_key == expected.project_path
+        && expected.project_path == actual.project_path
+    {
+        actual.project_key.clone()
+    } else {
+        return None;
+    };
+    let project_path = if actual.project_path == expected.project_path {
+        actual.project_path.clone()
+    } else if actual.project_path == actual.project_key {
+        expected.project_path.clone()
+    } else if expected.project_path == expected.project_key {
+        actual.project_path.clone()
+    } else {
+        return None;
+    };
+    Some((project_key, project_path))
+}
+
+/// Whether a stored project path names a filesystem location rather than an
+/// opaque project identity. Stored paths are already normalized by
+/// [`durable_project_path_key`]: Unix and UNC paths begin with `/`, and drive
+/// paths use a lowercase letter followed by `:/`.
+fn is_durable_filesystem_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_lowercase()
+            && bytes[1] == b':'
+            && bytes[2] == b'/')
 }
 
 #[derive(Debug)]

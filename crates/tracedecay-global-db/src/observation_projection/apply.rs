@@ -2092,4 +2092,74 @@ mod tests {
         };
         assert!(reconcile_session_rows(&forward, &conflicting).is_none());
     }
+
+    #[test]
+    fn transcript_ingest_and_projection_rows_merge_to_typed_key_and_real_path() {
+        let ingested = SessionRecord {
+            provider: "claude".to_owned(),
+            session_id: "session.fixture".to_owned(),
+            project_key: "/workspace/project".to_owned(),
+            project_path: "/workspace/project".to_owned(),
+            title: None,
+            started_at: None,
+            ended_at: None,
+            transcript_path: Some("/home/.claude/projects/p/session.fixture.jsonl".to_owned()),
+            metadata_json: None,
+            parent_session_id: None,
+            is_subagent: false,
+            agent_id: None,
+            parent_tool_use_id: None,
+        };
+        let projected = SessionRecord {
+            project_key: "proj_fixture".to_owned(),
+            project_path: "proj_fixture".to_owned(),
+            started_at: Some(10),
+            ended_at: Some(10),
+            transcript_path: None,
+            ..ingested.clone()
+        };
+
+        let merged = reconcile_session_rows(&ingested, &projected)
+            .expect("one session seen by ingest and projection");
+        assert_eq!(merged.project_key, "proj_fixture");
+        assert_eq!(merged.project_path, "/workspace/project");
+        assert_eq!(merged.transcript_path, ingested.transcript_path);
+        assert_eq!(merged.started_at, Some(10));
+        assert_eq!(
+            Some(merged),
+            reconcile_session_rows(&projected, &ingested),
+            "the merge is commutative"
+        );
+
+        let drive = SessionRecord {
+            project_key: "c:/workspace/project".to_owned(),
+            project_path: "c:/workspace/project".to_owned(),
+            ..ingested.clone()
+        };
+        assert_eq!(
+            reconcile_session_rows(&drive, &projected)
+                .expect("drive paths are filesystem locations")
+                .project_path,
+            "c:/workspace/project"
+        );
+
+        let other_checkout = SessionRecord {
+            project_key: "/workspace/other".to_owned(),
+            project_path: "/workspace/other".to_owned(),
+            ..ingested.clone()
+        };
+        assert!(
+            reconcile_session_rows(&ingested, &other_checkout).is_none(),
+            "two different checkout paths still collide"
+        );
+        let other_project = SessionRecord {
+            project_key: "proj_other".to_owned(),
+            project_path: "proj_other".to_owned(),
+            ..projected.clone()
+        };
+        assert!(
+            reconcile_session_rows(&projected, &other_project).is_none(),
+            "two different typed projects still collide"
+        );
+    }
 }

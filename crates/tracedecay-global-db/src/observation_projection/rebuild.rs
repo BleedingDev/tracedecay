@@ -2192,17 +2192,53 @@ async fn retire_projection_predecessor_output_ownership(
     .map_err(|error| storage("retire predecessor projection provenance", error))
 }
 
+/// SQL form of `state::is_durable_filesystem_path` for one stored
+/// project path expression.
+fn durable_filesystem_path_sql(path: &str) -> String {
+    format!(
+        "({path} LIKE '/%' OR (substr({path}, 2, 2) = ':/' \
+         AND unicode(substr({path}, 1, 1)) BETWEEN 97 AND 122))"
+    )
+}
+
+/// SQL form of the ingest/projection split handled by
+/// `reconcile_session_location`: both rows record key == path, neither is the
+/// profile sentinel, and exactly one path is a filesystem location.
+fn split_session_location_sql(
+    active_key: &str,
+    active_path: &str,
+    staged_key: &str,
+    staged_path: &str,
+) -> String {
+    let active_location = durable_filesystem_path_sql(active_path);
+    let staged_location = durable_filesystem_path_sql(staged_path);
+    format!(
+        "({active_key} = {active_path} AND {staged_key} = {staged_path} \
+         AND {active_key} <> 'user' AND {staged_key} <> 'user' \
+         AND {active_path} <> {staged_path} \
+         AND {active_location} <> {staged_location})"
+    )
+}
+
 async fn activate_rebuild_sessions(
     conn: &impl Executor,
     generation: &str,
 ) -> ProjectionStoreResult<()> {
+    let split = split_session_location_sql(
+        "active.project_key",
+        "active.project_path",
+        "json_extract(staged.session_json, '$.project_key')",
+        "json_extract(staged.session_json, '$.project_path')",
+    );
     let mut conflicts = conn
         .query(
+            &format!(
             "SELECT staged.provider, staged.session_id
              FROM observation_projection_rebuild_sessions AS staged
              JOIN sessions AS active
                ON active.provider = staged.provider AND active.session_id = staged.session_id
              WHERE staged.projector_version = ?1 AND staged.generation = ?2
+               AND NOT {split}
                AND (
                  (active.project_key <> json_extract(staged.session_json, '$.project_key')
                    AND active.project_key <> 'user'
@@ -2240,7 +2276,8 @@ async fn activate_rebuild_sessions(
                      )
                    ))
                )
-             LIMIT 1",
+             LIMIT 1"
+            ),
             params![SESSION_MESSAGE_PROJECTOR_VERSION, generation],
         )
         .await
@@ -2263,6 +2300,13 @@ async fn activate_rebuild_sessions(
     }
     drop(conflicts);
     let session_extracts = json_extract_select_list(SESSION_JSON_COLUMN, SESSION_JSON_FIELDS);
+    let split = split_session_location_sql(
+        "sessions.project_key",
+        "sessions.project_path",
+        "excluded.project_key",
+        "excluded.project_path",
+    );
+    let active_path_is_location = durable_filesystem_path_sql("sessions.project_path");
     conn.execute(
         &format!(
             "INSERT INTO sessions (
@@ -2277,8 +2321,10 @@ async fn activate_rebuild_sessions(
          ON CONFLICT(provider, session_id) DO UPDATE SET
             project_key = CASE
               WHEN sessions.project_key = 'user' THEN excluded.project_key
+              WHEN {split} AND {active_path_is_location} THEN excluded.project_key
               ELSE sessions.project_key END,
             project_path = CASE
+              WHEN {split} AND {active_path_is_location} THEN sessions.project_path
               WHEN sessions.project_path = sessions.project_key THEN excluded.project_path
               ELSE sessions.project_path END,
             title = COALESCE(sessions.title, excluded.title),
