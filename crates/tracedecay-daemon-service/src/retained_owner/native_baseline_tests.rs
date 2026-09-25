@@ -49,6 +49,13 @@ async fn project_fixture() -> StoreFixture {
     let fixture_root = temporary.path().join("baseline-workspaces");
     std::fs::create_dir_all(&project_root).expect("project root");
     std::fs::create_dir_all(&profile_root).expect("profile root");
+    // The profile identity authority admits only a private root.
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &profile_root,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private profile root");
     tracedecay_runtime_core::storage::pin_fixture_repository_identity(
         &project_root,
         CORPUS_PROJECT_ID,

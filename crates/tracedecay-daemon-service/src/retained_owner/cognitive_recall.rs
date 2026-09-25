@@ -5824,6 +5824,13 @@ mod tests {
         let ledger_root = temporary.path().join("ledger");
         std::fs::create_dir_all(&project_root).expect("project root");
         std::fs::create_dir_all(&profile_root).expect("profile root");
+        // The profile identity authority admits only a private root.
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &profile_root,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("private profile root");
         std::fs::create_dir_all(&ledger_root).expect("ledger root");
         tracedecay_runtime_core::storage::pin_fixture_repository_identity(&project_root, project)
             .expect("project enrollment");

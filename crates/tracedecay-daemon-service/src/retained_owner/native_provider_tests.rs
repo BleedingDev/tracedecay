@@ -375,6 +375,13 @@ async fn real_project_fixture() -> (
     let profile_root = temporary.path().join("profile");
     std::fs::create_dir_all(&project_root).expect("project root");
     std::fs::create_dir_all(&profile_root).expect("profile root");
+    // The profile identity authority admits only a private root.
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &profile_root,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private profile root");
     let graph = Arc::new(
         TraceDecay::init_with_options(
             &project_root,
@@ -865,6 +872,13 @@ async fn native_observe_verifies_real_store_without_writing() {
     let profile_root = temporary.path().join("profile");
     std::fs::create_dir_all(&project_root).expect("project root");
     std::fs::create_dir_all(&profile_root).expect("profile root");
+    // The profile identity authority admits only a private root.
+    #[cfg(unix)]
+    std::fs::set_permissions(
+        &profile_root,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .expect("private profile root");
     let graph = Arc::new(
         TraceDecay::init_with_options(
             &project_root,
