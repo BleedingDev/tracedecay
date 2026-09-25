@@ -175,6 +175,13 @@ pub enum CognitiveRecallMountError {
          no cognitive recall route"
     )]
     NoActiveProviderConfigured,
+    /// An active provider is configured, but the project server answering
+    /// this call is the early core route. Recall stays closed until the full
+    /// composition binds canonical session retrieval and replaces it.
+    #[error(
+        "the selected memory provider is still mounting; recall opens when project open completes"
+    )]
+    FullCompositionPending,
     /// The mount inputs disagree with the authoritative project identity.
     #[error(
         "cognitive recall mount inputs disagree with the authoritative scope on {field}: \
@@ -219,6 +226,7 @@ impl CognitiveRecallMountError {
         match self {
             Self::CompositionDisabled => "recall_mount_composition_disabled",
             Self::NoActiveProviderConfigured => "recall_mount_no_active_provider",
+            Self::FullCompositionPending => "recall_mount_full_composition_pending",
             Self::ScopeDisagreement { .. } => "recall_mount_scope_disagreement",
             Self::SessionIdentityInvalid => "recall_mount_session_identity_invalid",
             Self::SessionBindingUnavailable => "recall_mount_session_binding_unavailable",
@@ -7921,6 +7929,57 @@ mod tests {
             )
             .await
             .is_none()
+        );
+    }
+
+    /// While project open still serves the early core route, a configured
+    /// provider is reported as mounting rather than silently absent, and no
+    /// provider is contacted before session retrieval is bound.
+    ///
+    /// Real defect this catches: the first context call after a daemon start
+    /// omitting the advisory lane entirely, indistinguishable from a project
+    /// with no provider configured.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_full_composition_is_a_typed_lane_that_names_the_routed_provider() {
+        let fixture = project_fixture().await;
+        seed_fixture(&fixture).await;
+        let mount = production_mount(&fixture, EnabledProviderMode::Active, MOUNTED_WORKTREE);
+        let call = advisory_context_call(
+            ADVISORY_RECALL_CONTEXT_TOOL,
+            &serde_json::json!({ "task": "cognitive recall ledger" }),
+            Some(
+                &RequestId::new("request.mcp.instancecc-c1.0123456789abcdef0123456789abcdef")
+                    .unwrap(),
+            ),
+            Some(&Deadline::new(UtcMicros(now_micros().0.saturating_add(60_000_000))).unwrap()),
+            Some(&live_signal()),
+        )
+        .expect("the call is admitted");
+        let advisory = advisory_memory_context_for_call(
+            Err(CognitiveRecallMountError::FullCompositionPending),
+            Some(mount.as_ref()),
+            call,
+            None,
+        )
+        .await
+        .expect("a configured provider always yields a lane");
+        assert!(
+            matches!(
+                advisory,
+                AdvisoryMemoryContextV1::Unavailable {
+                    outcome: AdvisoryRecallUnavailableV1::MountRefused {
+                        mount_code: "recall_mount_full_composition_pending"
+                    },
+                    ..
+                }
+            ),
+            "{advisory:?}"
+        );
+        assert_eq!(advisory.provider_id(), NATIVE_PROVIDER_ID);
+        assert_eq!(
+            mount.ledger.report_count(),
+            0,
+            "a mounting provider is never contacted"
         );
     }
 

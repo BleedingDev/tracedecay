@@ -423,11 +423,13 @@ impl McpServer {
         // that fails leaves the canonical result exactly as produced. Running
         // here also keeps a coalesced read free of this caller's candidates.
         #[cfg(feature = "memory-provider-host")]
+        let advisory_routing_mount = self.advisory_routing_mount();
+        #[cfg(feature = "memory-provider-host")]
         let dispatched = match (dispatched, advisory_call) {
             (Ok(result), Some(call)) => Ok(
                 match tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
                     self.cognitive_recall_port_for_session(call.canonical_session_id()),
-                    self.cognitive_recall_mount.as_deref(),
+                    advisory_routing_mount.as_deref(),
                     call,
                     result.context_memory_contribution(),
                 )

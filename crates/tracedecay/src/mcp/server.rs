@@ -1328,15 +1328,28 @@ impl McpServer {
         use tracedecay_daemon_service::retained_owner::CognitiveRecallMountError;
         match self.cognitive_recall_mount.as_ref() {
             Some(mount) => mount.port_for_session(canonical_session_id),
-            None if self
-                ._memory_provider_host_mount
-                .as_ref()
-                .is_some_and(|mount| mount.registry().is_some()) =>
-            {
-                Err(CognitiveRecallMountError::NoActiveProviderConfigured)
-            }
-            None => Err(CognitiveRecallMountError::CompositionDisabled),
+            None => match self._memory_provider_host_mount.as_ref() {
+                Some(host) if host.cognitive_recall_mount().is_some() => {
+                    Err(CognitiveRecallMountError::FullCompositionPending)
+                }
+                Some(host) if host.registry().is_some() => {
+                    Err(CognitiveRecallMountError::NoActiveProviderConfigured)
+                }
+                _ => Err(CognitiveRecallMountError::CompositionDisabled),
+            },
         }
+    }
+
+    /// The recall route whose routing identity labels this server's advisory
+    /// lane. The early core route has no session port, but still names the
+    /// provider the host generation selected so a pending lane is truthful.
+    #[cfg(feature = "memory-provider-host")]
+    pub(crate) fn advisory_routing_mount(&self) -> Option<CognitiveRecallMount> {
+        self.cognitive_recall_mount.clone().or_else(|| {
+            self._memory_provider_host_mount
+                .as_ref()
+                .and_then(|host| host.cognitive_recall_mount())
+        })
     }
 
     #[cfg(all(test, feature = "memory-provider-host"))]
