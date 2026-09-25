@@ -399,9 +399,6 @@ async fn revision_three_store() -> (tempfile::TempDir, TestConnection) {
 async fn store_carrying_the_retired_default_collection_entry_fails_closed_typed() {
     let (_directory, connection) = revision_three_store().await;
 
-    // The SQL shape is unchanged between registry revisions 3 and 4, so
-    // schema admission still passes; the reset must come from the retired
-    // entry itself, not from a DDL mismatch.
     assert!(
         crate::configuration::schema::fresh_configuration_store_evidence(&*connection)
             .await
@@ -409,6 +406,24 @@ async fn store_carrying_the_retired_default_collection_entry_fails_closed_typed(
             .is_none(),
         "a populated revision-3 store must not present as fresh"
     );
+    // The verbatim revision-3 dump still carries the retired semantic
+    // retrieval tables, so schema admission already refuses it.
+    assert!(matches!(
+        crate::configuration::schema::admit_configuration_schema(&*connection, None).await,
+        Err(crate::configuration::schema::ConfigurationSchemaError::ResetRequired { .. })
+    ));
+    // Strip those tables so the SQL shape is the exact final shape; the reset
+    // must then come from the retired entry itself, not from a DDL mismatch.
+    connection
+        .execute_batch(
+            "DROP TABLE configuration_semantic_retrieval_state_v1;
+             DROP TABLE configuration_semantic_retrieval_pending_v1;
+             DROP TABLE configuration_semantic_retrieval_inventory_v1;
+             DROP TABLE configuration_semantic_accepted_profiles_v1;
+             DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;",
+        )
+        .await
+        .unwrap();
     crate::configuration::schema::admit_configuration_schema(&*connection, None)
         .await
         .unwrap();

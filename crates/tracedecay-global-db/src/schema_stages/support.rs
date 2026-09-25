@@ -552,6 +552,7 @@ pub(crate) fn install_released_v066_registry_and_workflow_fixture(
 pub(crate) struct ReleasedProfileFixture {
     pub(crate) observation_id: String,
     pub(crate) receipt_id: String,
+    pub(crate) payload_digest: String,
 }
 
 /// Seeds one complete released profile/global row set through the raw SQLite
@@ -1154,5 +1155,6 @@ fn seed_released_profile_fixture_with_mode(
     ReleasedProfileFixture {
         observation_id,
         receipt_id,
+        payload_digest,
     }
 }

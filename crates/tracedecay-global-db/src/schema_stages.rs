@@ -1786,12 +1786,14 @@ mod tests {
         install_registered_schema(&database_path).await;
         let expected_observation;
         let expected_receipt;
+        let expected_payload_digest;
         {
             let connection = rusqlite::Connection::open(&database_path).unwrap();
             install_released_v066_registry_and_workflow_fixture(&connection);
             let fixture = seed_released_legacy_profile_fixture(&connection);
             expected_observation = fixture.observation_id;
             expected_receipt = fixture.receipt_id;
+            expected_payload_digest = fixture.payload_digest;
             let mut rows = connection
                 .prepare(
                     "SELECT COUNT(*) FROM sqlite_schema
@@ -2176,7 +2178,7 @@ mod tests {
         let observation_payload_digest = row.get::<String>(2).unwrap();
         let observation_receipt_id = row.get::<String>(3).unwrap();
         assert_eq!(observation_receipt_id, expected_receipt);
-        assert_eq!(observation_payload_digest.len(), 64);
+        assert_eq!(observation_payload_digest, expected_payload_digest);
         assert!(row.get::<String>(4).unwrap().contains("released-row"));
         assert!(row.get::<String>(5).unwrap().contains("released-row"));
         drop(rows);

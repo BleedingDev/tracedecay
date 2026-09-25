@@ -240,13 +240,18 @@ async fn workflow_table_strict_or_foreign_key_drift_requires_reset_without_mutat
     let mut schema = String::new();
     for table in WORKFLOW_TABLE_CONTRACTS_V1 {
         let sql = if table.name == "workflow_fan_out_census_journal" {
-            table
+            let drifted = table
                 .sql
                 .replace(
-                    "    FOREIGN KEY (run_id, workflow_sequence)\n        REFERENCES workflow_run_journal (run_id, sequence)\n",
-                    "",
+                    ",\n    FOREIGN KEY (run_id, workflow_sequence)\n        REFERENCES workflow_run_journal (run_id, sequence)\n",
+                    "\n",
                 )
-                .replace(") STRICT", ")")
+                .replace(") STRICT", ")");
+            assert!(
+                !drifted.contains("FOREIGN KEY") && !drifted.contains("STRICT"),
+                "fixture must remove both the foreign key and STRICT: {drifted}"
+            );
+            drifted
         } else {
             table.sql.to_owned()
         };

@@ -463,11 +463,12 @@ async fn pre_residue_final_configuration_shape_requires_reset_without_mutation()
     assert_eq!(
         count(
             &*connection,
-            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'configuration_credential_references'"
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'configuration_semantic_%'"
         )
         .await,
-        1,
-        "released credential table remains available for an explicit reset"
+        5,
+        "retired semantic tables remain available for an explicit reset"
     );
     assert_eq!(
         count(
