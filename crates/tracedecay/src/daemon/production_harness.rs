@@ -1215,7 +1215,9 @@ async fn shutdown_production_project_harness(mut resources: ProductionProjectHar
     )
     .await;
     hotpath::future!(
-        resources.invocation.shutdown(),
+        resources.invocation.shutdown_until(
+            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE
+        ),
         label = "daemon.harness.shutdown_invocation"
     )
     .await;
