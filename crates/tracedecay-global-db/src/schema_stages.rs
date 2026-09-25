@@ -527,12 +527,6 @@ async fn classify_registered_schema_authorities(
                 global_db_operation_error("inspect configuration schema freshness", error)
             }
         })?;
-    // The only additive registry migration is the released 8-column
-    // `code_projects` shape. Validate that shape before configuration
-    // admission or any schema transaction can write, so an unknown column,
-    // type, key, or hidden column cannot be partially repaired on refusal.
-    support::require_admissible_code_projects_shape(connection, configuration_fresh.is_some())
-        .await?;
     let temporal_admission = session_temporal_schema::require_admissible_session_temporal_schema(
         connection,
         configuration_fresh.as_ref(),
@@ -556,6 +550,15 @@ async fn classify_registered_schema_authorities(
         )),
         error => global_db_operation_error("inspect workflow index schema admission", error),
     })?;
+    // The only additive registry migration is the released 8-column
+    // `code_projects` shape. Validate that shape before configuration
+    // admission or any schema transaction can write, so an unknown column,
+    // type, key, or hidden column cannot be partially repaired on refusal.
+    // It runs after the session-temporal and workflow classifiers so a store
+    // whose own authority schema is foreign reports that authority instead of
+    // the registry table it never received.
+    support::require_admissible_code_projects_shape(connection, configuration_fresh.is_some())
+        .await?;
     configuration::admit_configuration_schema(connection, configuration_fresh.as_ref())
         .await
         .map_err(|error| match error {
