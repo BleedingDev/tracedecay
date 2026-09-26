@@ -15,6 +15,9 @@ use tracedecay_memory_ncm_runtime::client::{ClientError, WorkerClient};
 use tracedecay_memory_ncm_runtime::engine::{Outcome, RejectReason};
 pub use tracedecay_memory_ncm_runtime::ports::StateRoot;
 use tracedecay_memory_ncm_runtime::wire::{Operation, Reply, Request};
+use tracedecay_memory_ncm_runtime::worker_artifact::{
+    current_target_triple, trusted_worker_manifest,
+};
 use tracedecay_memory_provider_api::contract::TerminalCode;
 use tracedecay_memory_provider_api::{
     CanonicalPayload, CommittedEffectEvidence, FallbackDirective, OwnedProviderId,
@@ -39,10 +42,6 @@ const IMPLEMENTATION_DOMAIN: &[u8] = b"tracedecay.ncm.rust-worker-implementation
 const IMPLEMENTATION_DOMAIN_V2: &[u8] = b"tracedecay.ncm.rust-worker-implementation.v2\0";
 const IDENTITY_REVISION_V1: u16 = 1;
 const IDENTITY_REVISION_V2: u16 = 2;
-const WORKER_MANIFEST: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../product/ncm/reference/worker-manifest.json"
-));
 const MODEL_REVISION_RECEIPT: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
@@ -1048,7 +1047,7 @@ fn verify_model_revision_provenance(
 }
 
 fn production_worker_identity() -> Result<WorkerIdentity, RustNcmError> {
-    let manifest: Value = serde_json::from_str(WORKER_MANIFEST).map_err(|error| {
+    let manifest: Value = serde_json::from_str(trusted_worker_manifest()).map_err(|error| {
         RustNcmError::HandshakeIdentity(format!("parse worker manifest: {error}"))
     })?;
     let current = current_target_identity();
@@ -1090,17 +1089,7 @@ fn production_worker_identity() -> Result<WorkerIdentity, RustNcmError> {
 
 fn current_target_identity() -> WorkerTargetIdentity {
     WorkerTargetIdentity {
-        triple: option_env!("TRACEDECAY_NCM_TARGET_TRIPLE")
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                let platform = match std::env::consts::OS {
-                    "macos" => "apple-darwin",
-                    "windows" => "pc-windows-msvc",
-                    "linux" => "unknown-linux-gnu",
-                    other => other,
-                };
-                format!("{}-{platform}", std::env::consts::ARCH)
-            }),
+        triple: current_target_triple().to_owned(),
         os: std::env::consts::OS.to_owned(),
         arch: std::env::consts::ARCH.to_owned(),
         family: std::env::consts::FAMILY.to_owned(),

@@ -15,7 +15,22 @@ WORKER_MANIFEST_PATH = "product/ncm/reference/worker-manifest.json"
 MODEL_ACQUISITION_MANIFEST_PATH = "product/ncm/release/model-acquisition-manifest.json"
 WORKER_MANIFEST_NAME = "worker-manifest.json"
 MODEL_ACQUISITION_MANIFEST_NAME = "model-acquisition-manifest.json"
-EXPLICIT_INTEL_MAC_TARGET = "x86_64-apple-darwin"
+
+
+def target_platform(triple: str) -> tuple[str, str, str]:
+    """Return Rust's ``(OS, ARCH, FAMILY)`` constants for a worker target triple."""
+
+    parts = triple.split("-")
+    if len(parts) < 3 or not all(parts):
+        raise WorkerPlatformPolicyError(f"invalid Rust target triple: {triple!r}")
+    arch = parts[0]
+    if triple.endswith("-apple-darwin"):
+        return "macos", arch, "unix"
+    if "-pc-windows-" in triple:
+        return "windows", arch, "windows"
+    if "-linux-" in triple:
+        return "linux", arch, "unix"
+    raise WorkerPlatformPolicyError(f"unsupported NCM worker target: {triple}")
 
 
 def _load_object(path: Path, label: str) -> dict[str, Any]:
@@ -40,9 +55,11 @@ def _required_positive_int(value: Any, label: str) -> int:
     return value
 
 
-def _entries(value: Any, label: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list) or not value:
-        raise WorkerPlatformPolicyError(f"{label} must be a non-empty list")
+def _entries(value: Any, label: str, *, allow_empty: bool = False) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not (value or allow_empty):
+        raise WorkerPlatformPolicyError(
+            f"{label} must be a list" if allow_empty else f"{label} must be a non-empty list"
+        )
     entries: list[dict[str, Any]] = []
     for index, item in enumerate(value):
         if not isinstance(item, dict):
@@ -73,13 +90,17 @@ def validate_worker_platform_policy(
     *,
     worker_manifest_path: Path | None = None,
     release_target_manifest_path: Path | None = None,
+    require_release_pins: bool = False,
 ) -> dict[str, Any]:
-    """Validate the policy against the pinned worker and release matrices.
+    """Validate the policy against a worker manifest and the release matrix.
 
-    The returned object is the parsed policy. Validation intentionally requires
-    the supported target set to equal the pinned worker manifest target set;
-    adding a worker artifact without updating this policy is therefore a
-    release-check failure instead of an accidental capability advertisement.
+    The returned object is the parsed policy. ``supported_targets`` lists the
+    targets that may carry a pinned worker; a pin is supplied at build time
+    through ``TRACEDECAY_NCM_WORKER_MANIFEST``, so the checked-in manifest pins
+    none. Every pin in the given worker manifest must be a supported target,
+    which keeps an unreviewed platform from being advertised. With
+    ``require_release_pins`` (a release build's manifest), every release row
+    that publishes an NCM sidecar must also be pinned.
     """
 
     policy = _load_object(policy_path, "worker platform policy")
@@ -152,63 +173,30 @@ def validate_worker_platform_policy(
         )
 
     for index, entry in enumerate(supported):
-        release_name = _required_string(
-            entry.get("release_name"), f"supported_targets[{index}].release_name"
-        )
         if entry.get("status") != "supported":
             raise WorkerPlatformPolicyError(
                 f"supported_targets[{index}].status must be 'supported'"
             )
+        if "release_name" in entry:
+            raise WorkerPlatformPolicyError(
+                f"supported_targets[{index}] must not bind a release name; "
+                "release rows own the name-to-target mapping"
+            )
     for index, entry in enumerate(unsupported):
         _required_string(entry.get("reason"), f"unsupported_targets[{index}].reason")
-    if EXPLICIT_INTEL_MAC_TARGET not in unsupported_targets:
-        raise WorkerPlatformPolicyError(
-            "Intel macOS must have an explicit unsupported NCM policy row"
-        )
+    for target in supported_targets | unsupported_targets:
+        target_platform(target)
 
-    worker_manifest = _load_object(
-        worker_manifest_path
-        or policy_path.parent / "worker-manifest.json",
-        "worker manifest",
+    pinned_targets = pinned_worker_targets(
+        worker_manifest_path or policy_path.parent / WORKER_MANIFEST_NAME,
+        worker_name=worker_name,
     )
-    if worker_manifest.get("worker") != worker_name:
+    unadvertised = sorted(pinned_targets - supported_targets)
+    if unadvertised:
         raise WorkerPlatformPolicyError(
-            "worker platform policy.worker does not match worker manifest.worker"
+            "worker manifest pins targets without NCM policy support: "
+            + ", ".join(unadvertised)
         )
-    if worker_manifest.get("schema_version") != 1:
-        raise WorkerPlatformPolicyError("worker manifest schema_version must be 1")
-    if worker_manifest.get("protocol_version") != 1:
-        raise WorkerPlatformPolicyError("worker manifest protocol_version must be 1")
-    if worker_manifest.get("protocol_identity") != "tracedecay.ncm.worker.v1":
-        raise WorkerPlatformPolicyError(
-            "worker manifest protocol_identity must be 'tracedecay.ncm.worker.v1'"
-        )
-    worker_targets = _entries(worker_manifest.get("targets"), "worker manifest.targets")
-    for index, entry in enumerate(worker_targets):
-        _required_string(entry.get("triple"), f"worker manifest.targets[{index}].triple")
-        _required_string(entry.get("os"), f"worker manifest.targets[{index}].os")
-        _required_string(entry.get("arch"), f"worker manifest.targets[{index}].arch")
-        _required_string(entry.get("family"), f"worker manifest.targets[{index}].family")
-        _required_positive_int(entry.get("bytes"), f"worker manifest.targets[{index}].bytes")
-        digest = _required_string(
-            entry.get("sha256"), f"worker manifest.targets[{index}].sha256"
-        )
-        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-            raise WorkerPlatformPolicyError(
-                f"worker manifest.targets[{index}].sha256 must be lowercase hexadecimal"
-            )
-    worker_target_triples = _unique_targets(
-        worker_targets, "worker manifest.targets", field="triple"
-    )
-    if worker_target_triples != supported_targets:
-        missing = sorted(worker_target_triples - supported_targets)
-        extra = sorted(supported_targets - worker_target_triples)
-        details: list[str] = []
-        if missing:
-            details.append("unadvertised pinned targets: " + ", ".join(missing))
-        if extra:
-            details.append("supported targets without pins: " + ", ".join(extra))
-        raise WorkerPlatformPolicyError("worker target policy mismatch: " + "; ".join(details))
 
     release_entries = _entries(policy.get("release_targets"), "release_targets")
     release_names: set[str] = set()
@@ -227,11 +215,15 @@ def validate_worker_platform_policy(
             )
         if status == "supported" and target not in supported_targets:
             raise WorkerPlatformPolicyError(
-                f"release target {name} advertises NCM without a pinned worker target"
+                f"release target {name} publishes an NCM sidecar for an unsupported target"
             )
-        if status == "native-only" and target not in unsupported_targets:
+        if status == "supported" and require_release_pins and target not in pinned_targets:
             raise WorkerPlatformPolicyError(
-                f"release target {name} lacks an explicit NCM unsupported entry"
+                f"release target {name} publishes an NCM sidecar without a pinned worker"
+            )
+        if status == "native-only" and target not in supported_targets | unsupported_targets:
+            raise WorkerPlatformPolicyError(
+                f"release target {name} lacks an explicit NCM policy entry"
             )
 
     release_target_manifest = _load_release_targets(
@@ -285,40 +277,64 @@ def validate_worker_platform_policy(
             raise WorkerPlatformPolicyError(
                 "NCM platform policy names unknown release targets: " + ", ".join(extra)
             )
-    supported_release_names = {entry["release_name"] for entry in supported}
-    release_supported_names = {
-        entry["name"] for entry in release_entries if entry["ncm"] == "supported"
-    }
-    if supported_release_names != release_supported_names:
-        missing = sorted(supported_release_names - release_supported_names)
-        extra = sorted(release_supported_names - supported_release_names)
-        details: list[str] = []
-        if missing:
-            details.append(
-                "supported targets without supported release entries: " + ", ".join(missing)
-            )
-        if extra:
-            details.append(
-                "supported release entries without supported targets: " + ", ".join(extra)
-            )
-        raise WorkerPlatformPolicyError("NCM supported release mismatch: " + "; ".join(details))
-    for entry in supported:
-        release_name = entry["release_name"]
-        if release_targets_by_name[release_name]["target"] != entry["target"]:
-            raise WorkerPlatformPolicyError(
-                f"supported target {entry['target']} differs from release target {release_name}"
-            )
 
     return policy
 
 
-def worker_platform_capability(policy: dict[str, Any], target: str) -> dict[str, str]:
-    """Return the published capability for one Rust target triple."""
+def pinned_worker_targets(path: Path, *, worker_name: str) -> set[str]:
+    """Validate a worker manifest and return the target triples it pins.
+
+    An empty ``targets`` list is the unpinned source trust root. Each pin must
+    carry the exact Rust ``OS``/``ARCH``/``FAMILY`` constants of its triple,
+    which the Rust verifier compares against the running target.
+    """
+
+    worker_manifest = _load_object(path, "worker manifest")
+    if worker_manifest.get("worker") != worker_name:
+        raise WorkerPlatformPolicyError(
+            "worker platform policy.worker does not match worker manifest.worker"
+        )
+    if worker_manifest.get("schema_version") != 1:
+        raise WorkerPlatformPolicyError("worker manifest schema_version must be 1")
+    if worker_manifest.get("protocol_version") != 1:
+        raise WorkerPlatformPolicyError("worker manifest protocol_version must be 1")
+    if worker_manifest.get("protocol_identity") != "tracedecay.ncm.worker.v1":
+        raise WorkerPlatformPolicyError(
+            "worker manifest protocol_identity must be 'tracedecay.ncm.worker.v1'"
+        )
+    worker_targets = _entries(
+        worker_manifest.get("targets"), "worker manifest.targets", allow_empty=True
+    )
+    for index, entry in enumerate(worker_targets):
+        triple = _required_string(entry.get("triple"), f"worker manifest.targets[{index}].triple")
+        _required_positive_int(entry.get("bytes"), f"worker manifest.targets[{index}].bytes")
+        digest = _required_string(
+            entry.get("sha256"), f"worker manifest.targets[{index}].sha256"
+        )
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise WorkerPlatformPolicyError(
+                f"worker manifest.targets[{index}].sha256 must be lowercase hexadecimal"
+            )
+        if (entry.get("os"), entry.get("arch"), entry.get("family")) != target_platform(triple):
+            raise WorkerPlatformPolicyError(
+                f"worker manifest.targets[{index}] platform metadata does not match {triple}"
+            )
+    return _unique_targets(worker_targets, "worker manifest.targets", field="triple")
+
+
+def worker_platform_capability(
+    policy: dict[str, Any], target: str, *, pinned_targets: set[str]
+) -> dict[str, str]:
+    """Return the capability of one Rust target triple under a worker manifest.
+
+    A target is supported only when the policy allows it and the worker
+    manifest the host binaries trust pins it.
+    """
 
     _required_string(target, "target")
     supported = {
         entry["target"] for entry in policy["supported_targets"]
     }
-    if target in supported:
+    if target in supported and target in pinned_targets:
         return {"target": target, "status": "supported", "fallback": "ncm-worker"}
     return {"target": target, "status": "unsupported", "fallback": "native-only"}

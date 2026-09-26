@@ -11,13 +11,47 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
-/// The executable name admitted by the NCM worker manifest.
+/// The logical worker name recorded in the NCM worker manifest.
+///
+/// Use [`WORKER_EXECUTABLE_NAME`] when building a filesystem path.
 pub const WORKER_NAME: &str = "tracedecay-ncm-worker";
+/// The worker executable file name on the compilation target.
+///
+/// This is [`WORKER_NAME`] followed by [`std::env::consts::EXE_SUFFIX`].
+#[cfg(windows)]
+pub const WORKER_EXECUTABLE_NAME: &str = "tracedecay-ncm-worker.exe";
+/// The worker executable file name on the compilation target.
+///
+/// This is [`WORKER_NAME`] followed by [`std::env::consts::EXE_SUFFIX`].
+#[cfg(not(windows))]
+pub const WORKER_EXECUTABLE_NAME: &str = "tracedecay-ncm-worker";
+/// The manifest file name expected beside an installed worker executable.
+pub const WORKER_MANIFEST_NAME: &str = "worker-manifest.json";
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
-const REFERENCE_MANIFEST: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../product/ncm/reference/worker-manifest.json"
-));
+const TRUSTED_MANIFEST: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/trusted-worker-manifest.json"));
+const CURRENT_TARGET_TRIPLE: &str = env!("TRACEDECAY_NCM_TARGET_TRIPLE");
+
+/// Returns the worker manifest this build trusts.
+///
+/// The build script selects it from the absolute path in
+/// `TRACEDECAY_NCM_WORKER_MANIFEST` or, when that variable is unset, from the
+/// checked-in `product/ncm/reference/worker-manifest.json`, which pins no
+/// worker. A target that the returned manifest does not pin has no admissible
+/// worker: staging fails with [`WorkerIntegrityError::UnsupportedTarget`] and
+/// [`crate::platform::current_worker_platform_capability`] reports the target
+/// as unsupported. Consumers must use this text instead of reading a manifest
+/// file so that one build has exactly one trust root.
+#[must_use]
+pub fn trusted_worker_manifest() -> &'static str {
+    TRUSTED_MANIFEST
+}
+
+/// Returns the Rust target triple this crate was compiled for.
+#[must_use]
+pub fn current_target_triple() -> &'static str {
+    CURRENT_TARGET_TRIPLE
+}
 
 /// A checked-in executable identity could not be established or matched.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,17 +135,18 @@ struct WorkerTarget {
     sha256: String,
 }
 
-struct CurrentTarget {
-    triple: String,
-    os: &'static str,
-    arch: &'static str,
-    family: &'static str,
+/// Platform identity that a pinned manifest target must match exactly.
+pub(crate) struct CurrentTarget {
+    pub(crate) triple: &'static str,
+    pub(crate) os: &'static str,
+    pub(crate) arch: &'static str,
+    pub(crate) family: &'static str,
 }
 
 pub(crate) struct WorkerArtifactIdentity {
     pub(crate) sha256: String,
     pub(crate) bytes: u64,
-    pub(crate) triple: String,
+    pub(crate) triple: &'static str,
     pub(crate) os: &'static str,
     pub(crate) arch: &'static str,
     pub(crate) family: &'static str,
@@ -167,8 +202,9 @@ impl VerifiedWorkerArtifact {
     }
 }
 
-/// Verifies the configured worker against the checked-in offline manifest and
-/// seals the exact hashed bytes into a private launch artifact.
+/// Verifies the configured worker against the build's trusted manifest (see
+/// [`trusted_worker_manifest`]) and seals the exact hashed bytes into a
+/// private launch artifact.
 ///
 /// This function performs only local reads, hashing, and private staging. It
 /// does not resolve, download, or replace an executable or any model artifact.
@@ -176,7 +212,7 @@ pub fn stage_verified_worker_binary(
     path: &Path,
 ) -> Result<VerifiedWorkerArtifact, WorkerIntegrityError> {
     let manifest_path = manifest_path(path)?;
-    stage_verified_worker_binary_at(path, &manifest_path, REFERENCE_MANIFEST)
+    stage_verified_worker_binary_at(path, &manifest_path, TRUSTED_MANIFEST)
 }
 
 fn stage_verified_worker_binary_at(
@@ -184,9 +220,9 @@ fn stage_verified_worker_binary_at(
     manifest_path: &Path,
     trusted_manifest_text: &str,
 ) -> Result<VerifiedWorkerArtifact, WorkerIntegrityError> {
-    let trusted_manifest = parse_manifest(trusted_manifest_text, "embedded reference manifest")?;
+    let trusted_manifest = parse_manifest(trusted_manifest_text, "embedded trusted manifest")?;
     validate_manifest(&trusted_manifest)?;
-    let manifest_text = open_worker_manifest(&manifest_path)?;
+    let manifest_text = open_worker_manifest(manifest_path)?;
     let manifest = parse_manifest(&manifest_text, &manifest_path.display().to_string())?;
     validate_manifest(&manifest)?;
     let expected_manifest_digest = canonical_manifest_digest(trusted_manifest_text)?;
@@ -196,18 +232,7 @@ fn stage_verified_worker_binary_at(
             "manifest is stale or not sourced from the trusted build root: expected {expected_manifest_digest}, got {actual_manifest_digest}"
         )));
     }
-    let current = current_target();
-    let target = manifest
-        .targets
-        .iter()
-        .find(|target| target.triple == current.triple)
-        .ok_or_else(|| WorkerIntegrityError::UnsupportedTarget(current.triple.to_owned()))?;
-    if target.os != current.os || target.arch != current.arch || target.family != current.family {
-        return Err(WorkerIntegrityError::Manifest(format!(
-            "target metadata for {} does not match the current target",
-            current.triple
-        )));
-    }
+    let target = pinned_target(&manifest, &current_target())?;
 
     let file = open_worker_binary(path)?;
     let mut artifact = stage_verified_file(file, target)?;
@@ -235,7 +260,7 @@ fn stage_verified_file(
     // staged worker so the artifact remains owner-private for its lifetime.
     tracedecay_private_fs::make_private_directory(staging.path())
         .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
-    let staged_path = staging.path().join(WORKER_NAME);
+    let staged_path = staging.path().join(WORKER_EXECUTABLE_NAME);
     let mut staged = tracedecay_private_fs::create_private_file(&staged_path)
         .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
     let identity = measure_open_worker(file, bytes, &mut staged)?;
@@ -341,13 +366,13 @@ fn open_worker_binary(path: &Path) -> Result<File, WorkerIntegrityError> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
-        return match options.open(path) {
+        match options.open(path) {
             Ok(file) => Ok(file),
             Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
                 Err(WorkerIntegrityError::NotRegularFile)
             }
             Err(error) => Err(WorkerIntegrityError::Read(error.to_string())),
-        };
+        }
     }
     #[cfg(not(unix))]
     {
@@ -391,7 +416,7 @@ fn open_worker_manifest(path: &Path) -> Result<String, WorkerIntegrityError> {
         let mut text = String::new();
         file.read_to_string(&mut text)
             .map_err(|error| WorkerIntegrityError::Read(error.to_string()))?;
-        return Ok(text);
+        Ok(text)
     }
     #[cfg(not(unix))]
     {
@@ -437,7 +462,7 @@ fn seal_staged_worker(file: &File) -> Result<(), WorkerIntegrityError> {
 fn manifest_path(binary: &Path) -> Result<PathBuf, WorkerIntegrityError> {
     let sibling = binary
         .parent()
-        .map(|parent| parent.join("worker-manifest.json"))
+        .map(|parent| parent.join(WORKER_MANIFEST_NAME))
         .ok_or_else(|| {
             WorkerIntegrityError::Manifest(
                 "worker path has no parent for manifest binding".to_owned(),
@@ -487,13 +512,19 @@ fn validate_manifest(manifest: &WorkerManifest) -> Result<(), WorkerIntegrityErr
             manifest.protocol_identity
         )));
     }
-    if manifest.targets.is_empty() {
-        return Err(WorkerIntegrityError::Manifest(
-            "manifest has no supported targets".to_owned(),
-        ));
-    }
+    // An empty target list is a trust root that pins no worker; `pinned_target`
+    // then reports every target as unsupported.
     let mut triples = HashSet::new();
     for target in &manifest.targets {
+        if target.triple.is_empty()
+            || target.os.is_empty()
+            || target.arch.is_empty()
+            || target.family.is_empty()
+        {
+            return Err(WorkerIntegrityError::Manifest(
+                "manifest target has empty platform metadata".to_owned(),
+            ));
+        }
         if !triples.insert(&target.triple) {
             return Err(WorkerIntegrityError::Manifest(format!(
                 "manifest repeats target {}",
@@ -536,59 +567,43 @@ fn canonical_manifest_digest(text: &str) -> Result<String, WorkerIntegrityError>
     Ok(hex_digest(&Sha256::digest(bytes)))
 }
 
-fn current_target() -> CurrentTarget {
+/// Selects the manifest entry that pins `current`, requiring its platform
+/// metadata to match exactly.
+fn pinned_target<'manifest>(
+    manifest: &'manifest WorkerManifest,
+    current: &CurrentTarget,
+) -> Result<&'manifest WorkerTarget, WorkerIntegrityError> {
+    let target = manifest
+        .targets
+        .iter()
+        .find(|target| target.triple == current.triple)
+        .ok_or_else(|| WorkerIntegrityError::UnsupportedTarget(current.triple.to_owned()))?;
+    if target.os != current.os || target.arch != current.arch || target.family != current.family {
+        return Err(WorkerIntegrityError::Manifest(format!(
+            "target metadata for {} does not match the current target",
+            current.triple
+        )));
+    }
+    Ok(target)
+}
+
+/// Checks that `manifest_text` is a valid worker manifest that pins `current`.
+pub(crate) fn manifest_pins_target(
+    manifest_text: &str,
+    current: &CurrentTarget,
+) -> Result<(), WorkerIntegrityError> {
+    let manifest = parse_manifest(manifest_text, "embedded trusted manifest")?;
+    validate_manifest(&manifest)?;
+    pinned_target(&manifest, current).map(drop)
+}
+
+pub(crate) fn current_target() -> CurrentTarget {
     CurrentTarget {
-        triple: current_target_triple(),
+        triple: CURRENT_TARGET_TRIPLE,
         os: std::env::consts::OS,
         arch: std::env::consts::ARCH,
         family: std::env::consts::FAMILY,
     }
-}
-
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const CURRENT_TARGET_TRIPLE: &str = "aarch64-apple-darwin";
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-const CURRENT_TARGET_TRIPLE: &str = "x86_64-apple-darwin";
-#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"))]
-const CURRENT_TARGET_TRIPLE: &str = "aarch64-unknown-linux-gnu";
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
-const CURRENT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-gnu";
-#[cfg(all(target_os = "linux", target_arch = "aarch64", target_env = "musl"))]
-const CURRENT_TARGET_TRIPLE: &str = "aarch64-unknown-linux-musl";
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "musl"))]
-const CURRENT_TARGET_TRIPLE: &str = "x86_64-unknown-linux-musl";
-#[cfg(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
-    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
-    all(target_os = "linux", target_arch = "aarch64", target_env = "musl"),
-    all(target_os = "linux", target_arch = "x86_64", target_env = "musl")
-))]
-fn current_target_triple() -> String {
-    CURRENT_TARGET_TRIPLE.to_owned()
-}
-
-#[cfg(not(any(
-    all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "macos", target_arch = "x86_64"),
-    all(target_os = "linux", target_arch = "aarch64", target_env = "gnu"),
-    all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"),
-    all(target_os = "linux", target_arch = "aarch64", target_env = "musl"),
-    all(target_os = "linux", target_arch = "x86_64", target_env = "musl")
-)))]
-fn current_target_triple() -> String {
-    option_env!("TRACEDECAY_NCM_TARGET_TRIPLE")
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            let platform = match std::env::consts::OS {
-                "macos" => "apple-darwin",
-                "windows" => "pc-windows-msvc",
-                "linux" => "unknown-linux-gnu",
-                other => other,
-            };
-            format!("{}-{platform}", std::env::consts::ARCH)
-        })
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -596,26 +611,166 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
-    fn fixture_manifest(bytes: &[u8]) -> String {
-        let current = current_target();
+    const CHECKED_IN_MANIFEST: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../product/ncm/reference/worker-manifest.json"
+    ));
+
+    fn manifest_with_targets(targets: Value) -> String {
         serde_json::to_string_pretty(&serde_json::json!({
             "schema_version": MANIFEST_SCHEMA_VERSION,
             "worker": WORKER_NAME,
             "protocol_version": PROTOCOL_VERSION,
             "protocol_identity": PROTOCOL_IDENTITY,
-            "targets": [{
-                "triple": current.triple,
-                "os": current.os,
-                "arch": current.arch,
-                "family": current.family,
-                "bytes": bytes.len(),
-                "sha256": hex_digest(&Sha256::digest(bytes)),
-            }]
+            "targets": targets,
         }))
         .expect("fixture worker manifest serializes")
+    }
+
+    fn fixture_target(bytes: &[u8]) -> Value {
+        let current = current_target();
+        serde_json::json!({
+            "triple": current.triple,
+            "os": current.os,
+            "arch": current.arch,
+            "family": current.family,
+            "bytes": bytes.len(),
+            "sha256": hex_digest(&Sha256::digest(bytes)),
+        })
+    }
+
+    fn fixture_manifest(bytes: &[u8]) -> String {
+        manifest_with_targets(Value::Array(vec![fixture_target(bytes)]))
+    }
+
+    fn validate_text(text: &str) -> Result<(), WorkerIntegrityError> {
+        validate_manifest(&parse_manifest(text, "fixture").expect("fixture manifest parses"))
+    }
+
+    #[test]
+    fn executable_name_carries_the_target_executable_suffix() {
+        assert_eq!(
+            WORKER_EXECUTABLE_NAME,
+            format!("{WORKER_NAME}{}", std::env::consts::EXE_SUFFIX)
+        );
+    }
+
+    #[test]
+    fn build_embeds_the_selected_trust_root() {
+        // Mirrors build.rs: an absolute override path wins, otherwise the
+        // checked-in trust root is embedded verbatim.
+        let expected = match option_env!("TRACEDECAY_NCM_WORKER_MANIFEST") {
+            Some(path) => fs::read_to_string(path).expect("read build-time trust root"),
+            None => CHECKED_IN_MANIFEST.to_owned(),
+        };
+        assert_eq!(trusted_worker_manifest(), expected);
+        // Every NCM release triple starts with its `std::env::consts::ARCH`.
+        assert!(
+            current_target_triple().starts_with(std::env::consts::ARCH),
+            "compile-time triple {} does not name {}",
+            current_target_triple(),
+            std::env::consts::ARCH
+        );
+    }
+
+    #[test]
+    fn checked_in_trust_root_pins_no_worker_and_rejects_every_target() {
+        let manifest = parse_manifest(CHECKED_IN_MANIFEST, "checked-in").expect("parse");
+        validate_manifest(&manifest).expect("checked-in trust root is valid");
+        assert!(
+            manifest.targets.is_empty(),
+            "source builds must pin no worker"
+        );
+        assert_eq!(
+            manifest_pins_target(CHECKED_IN_MANIFEST, &current_target()),
+            Err(WorkerIntegrityError::UnsupportedTarget(
+                current_target_triple().to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn empty_trust_root_reports_the_current_target_unsupported_before_hashing() {
+        let root = TempDir::new().expect("fixture root");
+        let worker = root.path().join(WORKER_EXECUTABLE_NAME);
+        let manifest_path = root.path().join(WORKER_MANIFEST_NAME);
+        let manifest = manifest_with_targets(Value::Array(Vec::new()));
+        executable(&worker, b"fixture worker bytes");
+        fs::write(&manifest_path, &manifest).expect("write fixture manifest");
+
+        assert!(matches!(
+            stage_verified_worker_binary_at(&worker, &manifest_path, &manifest),
+            Err(WorkerIntegrityError::UnsupportedTarget(target))
+                if target == current_target_triple()
+        ));
+    }
+
+    #[test]
+    fn manifest_validation_rejects_duplicate_and_malformed_targets() {
+        let target = fixture_target(b"fixture worker bytes");
+        assert_eq!(
+            validate_text(&manifest_with_targets(Value::Array(Vec::new()))),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_text(&manifest_with_targets(Value::Array(vec![
+                target.clone(),
+                target.clone()
+            ]))),
+            Err(WorkerIntegrityError::Manifest(detail)) if detail.contains("repeats target")
+        ));
+        for (field, value) in [
+            ("triple", serde_json::json!("")),
+            ("os", serde_json::json!("")),
+            ("bytes", serde_json::json!(0)),
+            ("sha256", serde_json::json!("A".repeat(64))),
+            ("sha256", serde_json::json!("0".repeat(63))),
+        ] {
+            let mut malformed = target.clone();
+            malformed[field] = value;
+            assert!(
+                matches!(
+                    validate_text(&manifest_with_targets(Value::Array(vec![malformed]))),
+                    Err(WorkerIntegrityError::Manifest(_))
+                ),
+                "malformed {field} was accepted"
+            );
+        }
+        let mut unknown_field = target;
+        unknown_field["signature"] = serde_json::json!("unsigned");
+        assert!(matches!(
+            parse_manifest(
+                &manifest_with_targets(Value::Array(vec![unknown_field])),
+                "fixture"
+            ),
+            Err(WorkerIntegrityError::Manifest(_))
+        ));
+    }
+
+    #[test]
+    fn pinned_triple_with_foreign_platform_metadata_is_rejected() {
+        let mut target = fixture_target(b"fixture worker bytes");
+        target["family"] = serde_json::json!(if std::env::consts::FAMILY == "unix" {
+            "windows"
+        } else {
+            "unix"
+        });
+        let manifest = manifest_with_targets(Value::Array(vec![target]));
+        assert!(matches!(
+            manifest_pins_target(&manifest, &current_target()),
+            Err(WorkerIntegrityError::Manifest(detail)) if detail.contains("does not match")
+        ));
+        assert_eq!(
+            manifest_pins_target(
+                &fixture_manifest(b"fixture worker bytes"),
+                &current_target()
+            ),
+            Ok(())
+        );
     }
 
     fn executable(path: &Path, bytes: &[u8]) {
@@ -725,7 +880,7 @@ mod tests {
     #[test]
     fn sibling_manifest_symlink_is_rejected_before_artifact_hashing() {
         let root = TempDir::new().expect("fixture root");
-        let worker = root.path().join(WORKER_NAME);
+        let worker = root.path().join(WORKER_EXECUTABLE_NAME);
         let manifest_path = root.path().join("worker-manifest.json");
         let trusted_path = root.path().join("trusted-worker-manifest.json");
         let bytes = b"fixture worker bytes";
@@ -745,7 +900,7 @@ mod tests {
     #[test]
     fn trusted_manifest_accepts_an_immutable_pinned_fixture() {
         let root = TempDir::new().expect("fixture root");
-        let worker = root.path().join(WORKER_NAME);
+        let worker = root.path().join(WORKER_EXECUTABLE_NAME);
         let manifest_path = root.path().join("worker-manifest.json");
         let bytes = b"fixture worker bytes";
         let manifest = fixture_manifest(bytes);
@@ -763,7 +918,7 @@ mod tests {
     #[test]
     fn trusted_manifest_reports_a_digest_mismatch_after_size_matches() {
         let root = TempDir::new().expect("fixture root");
-        let worker = root.path().join(WORKER_NAME);
+        let worker = root.path().join(WORKER_EXECUTABLE_NAME);
         let manifest_path = root.path().join("worker-manifest.json");
         let expected = b"fixture worker bytes";
         let actual = b"fixture worker byteX";
@@ -780,7 +935,7 @@ mod tests {
     #[test]
     fn stale_sibling_manifest_is_rejected_before_artifact_hashing() {
         let root = TempDir::new().expect("fixture root");
-        let worker = root.path().join(WORKER_NAME);
+        let worker = root.path().join(WORKER_EXECUTABLE_NAME);
         let manifest_path = root.path().join("worker-manifest.json");
         let bytes = b"fixture worker bytes";
         let trusted = fixture_manifest(bytes);
@@ -800,7 +955,7 @@ mod tests {
     fn installed_manifest_resolution_rejects_ancestor_fallback() {
         let root = TempDir::new().expect("fixture root");
         let bundle = root.path().join("bundle");
-        let worker = bundle.join("bin").join(WORKER_NAME);
+        let worker = bundle.join("bin").join(WORKER_EXECUTABLE_NAME);
         fs::create_dir_all(worker.parent().expect("worker parent")).expect("create worker parent");
         fs::create_dir_all(bundle.join("product/ncm/reference")).expect("create ancestor root");
         fs::write(

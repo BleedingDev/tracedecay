@@ -1163,7 +1163,7 @@ fn worker_arg(args: &[String]) -> BenchResult<PathBuf> {
     let inferred = std::env::current_exe()
         .ok()
         .and_then(|path| path.parent().and_then(Path::parent).map(Path::to_path_buf))
-        .map(|path| path.join("tracedecay-ncm-worker"));
+        .map(|path| path.join(tracedecay_memory_ncm_runtime::worker_artifact::WORKER_EXECUTABLE_NAME));
     let worker = explicit
         .or(environment)
         .or(inferred)

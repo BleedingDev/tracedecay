@@ -108,7 +108,6 @@ pub fn uninstall(root: &StateRoot) -> Result<(), EncoderError> {
         operation_id,
         operation: Operation::Uninstall,
         phase: Phase::Prepared,
-        target: acquisition.target.clone(),
         revision: acquisition.revision.clone(),
         staging_name: None,
         backup_name: Some(backup_name.clone()),
@@ -195,7 +194,6 @@ fn install_or_update(
             operation_id,
             operation,
             phase: Phase::Prepared,
-            target: acquisition.target.clone(),
             revision: acquisition.revision.clone(),
             staging_name: Some(staging_name.clone()),
             backup_name: Some(backup_name.clone()),
@@ -1357,7 +1355,6 @@ struct LifecycleJournal {
     operation_id: String,
     operation: Operation,
     phase: Phase,
-    target: String,
     revision: String,
     staging_name: Option<String>,
     backup_name: Option<String>,
@@ -1640,8 +1637,6 @@ struct ModelAcquisitionReceipt {
     operation_id: String,
     operation: Operation,
     outcome: String,
-    target: String,
-    release_name: String,
     model: String,
     repository: String,
     revision: String,
@@ -1716,8 +1711,6 @@ fn validate_acquisition_receipt(
         || receipt.operation_id != operation_id
         || !is_valid_operation_id(&receipt.operation_id, operation)
         || receipt.outcome != outcome
-        || receipt.target != acquisition.target
-        || receipt.release_name != acquisition.release_name
         || receipt.model != MODEL_NAME
         || receipt.repository != MODEL_REPOSITORY
         || receipt.revision != MODEL_REVISION
@@ -1824,8 +1817,6 @@ fn write_and_verify_acquisition_receipt(
         operation_id: operation_id.to_owned(),
         operation,
         outcome: outcome.to_owned(),
-        target: acquisition.target.clone(),
-        release_name: acquisition.release_name.clone(),
         model: acquisition.model.clone(),
         repository: acquisition.repository.clone(),
         revision: acquisition.revision.clone(),
@@ -1905,7 +1896,6 @@ fn write_and_verify_acquisition_receipt(
 fn validate_journal(journal: &LifecycleJournal) -> Result<(), EncoderError> {
     if journal.schema_version != JOURNAL_SCHEMA_VERSION
         || !is_valid_operation_id(&journal.operation_id, journal.operation)
-        || journal.target != crate::platform::PINNED_WORKER_TARGET
         || journal.revision != MODEL_REVISION
     {
         return Err(EncoderError::ArtifactMismatch(
@@ -2506,7 +2496,6 @@ mod tests {
             operation_id,
             operation: Operation::Update,
             phase: Phase::BackedUp,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(staging_name.clone()),
             backup_name: Some(backup_name.clone()),
@@ -2551,7 +2540,6 @@ mod tests {
             operation_id,
             operation: Operation::Update,
             phase: Phase::Staged,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(staging_name.clone()),
             backup_name: Some(backup_name.clone()),
@@ -2596,7 +2584,6 @@ mod tests {
             operation_id,
             operation: Operation::Update,
             phase: Phase::Published,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(staging_name),
             backup_name: Some(backup_name.clone()),
@@ -2641,7 +2628,6 @@ mod tests {
             operation_id,
             operation: Operation::Update,
             phase: Phase::BackedUp,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(staging_name.clone()),
             backup_name: Some(backup_name.clone()),
@@ -2674,7 +2660,6 @@ mod tests {
             operation_id: operation_id.clone(),
             operation: Operation::Update,
             phase: Phase::Prepared,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(format!("{STAGING_PREFIX}{operation_id}")),
             backup_name: Some(format!("{BACKUP_PREFIX}{operation_id}")),
@@ -2749,7 +2734,6 @@ mod tests {
             operation_id,
             operation: Operation::Update,
             phase: Phase::Prepared,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(staging_name.clone()),
             backup_name: Some(backup_name),
@@ -2781,7 +2765,6 @@ mod tests {
             operation_id,
             operation: Operation::Install,
             phase: Phase::BackedUp,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(staging_name.clone()),
             backup_name: Some(backup_name),
@@ -2806,7 +2789,6 @@ mod tests {
             operation_id: operation_id.clone(),
             operation: Operation::Update,
             phase: Phase::Prepared,
-            target: crate::platform::PINNED_WORKER_TARGET.to_owned(),
             revision: MODEL_REVISION.to_owned(),
             staging_name: Some(format!("{STAGING_PREFIX}{operation_id}")),
             backup_name: Some(format!("{BACKUP_PREFIX}{operation_id}")),

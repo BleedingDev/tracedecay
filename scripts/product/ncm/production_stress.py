@@ -70,8 +70,6 @@ MODEL_REQUIRED_FILES = (
     "tokenizer_config.json",
 )
 MODEL_CACHE_REPOSITORY = "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2"
-MODEL_TARGET = "aarch64-apple-darwin"
-MODEL_RELEASE_NAME = "aarch64-macos"
 MODEL_BASE_URL = (
     "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/"
     "resolve/2c4055b12046f11709e9df2c122e59ffbdc2f900/"
@@ -89,8 +87,6 @@ ACQUISITION_MANIFEST_FIELDS = {
     "manifest_type",
     "provider_id",
     "worker",
-    "target",
-    "release_name",
     "embedding_manifest",
     "embedding_manifest_sha256",
     "model_root",
@@ -114,8 +110,6 @@ ACQUISITION_RECEIPT_FIELDS = {
     "operation_id",
     "operation",
     "outcome",
-    "target",
-    "release_name",
     "model",
     "repository",
     "revision",
@@ -3445,10 +3439,8 @@ def _acquisition_manifest_path(repository: Path) -> Path:
 def _validate_acquisition_manifest(
     repository: Path,
     model_identity: dict[str, Any],
-    *,
-    worker_target: str | None,
 ) -> tuple[Path, dict[str, Any], str]:
-    """Validate the canonical acquisition descriptor and its source pins."""
+    """Validate the target-independent acquisition descriptor and its pins."""
 
     path = _acquisition_manifest_path(repository)
     manifest = _read_json_object(
@@ -3465,8 +3457,6 @@ def _validate_acquisition_manifest(
         "manifest_type": "ncm-model-acquisition",
         "provider_id": "ncm",
         "worker": "tracedecay-ncm-worker",
-        "target": MODEL_TARGET,
-        "release_name": MODEL_RELEASE_NAME,
         "embedding_manifest": "product/ncm/reference/embedding-manifest.json",
         "model_root": "models",
         "cache_repository": MODEL_CACHE_REPOSITORY,
@@ -3484,11 +3474,6 @@ def _validate_acquisition_manifest(
         require(
             manifest.get(field) == value,
             f"model acquisition manifest {field} was stale",
-        )
-    if worker_target is not None:
-        require(
-            manifest.get("target") == worker_target,
-            "model acquisition manifest target did not match the admitted worker",
         )
     embedding_digest = model_identity.get("manifest_sha256")
     require(
@@ -3580,7 +3565,7 @@ def _validate_acquisition_manifest(
         and isinstance(required_receipt_fields, list)
         and all(isinstance(field, str) for field in required_receipt_fields)
         and ACQUISITION_RECEIPT_FIELDS
-        - {"release_name", "acquisition_manifest_sha256", "root", "tree_sha256"}
+        - {"acquisition_manifest_sha256", "root", "tree_sha256"}
         <= set(required_receipt_fields),
         "model acquisition manifest receipt contract drifted",
     )
@@ -3592,7 +3577,6 @@ def validate_model_acquisition_receipt(
     model_root: Path,
     model_identity: dict[str, Any],
     *,
-    worker_target: str | None = None,
     acquisition_manifest_path: Path | None = None,
 ) -> dict[str, Any]:
     """Require the installed receipt to bind the exact model tree and manifest."""
@@ -3606,7 +3590,6 @@ def validate_model_acquisition_receipt(
     manifest_path, manifest, acquisition_digest = _validate_acquisition_manifest(
         repository,
         model_identity,
-        worker_target=worker_target,
     )
     receipt_path = model_root / MODEL_ACQUISITION_RECEIPT_RELATIVE
     receipt = _read_json_object(
@@ -3633,8 +3616,6 @@ def validate_model_acquisition_receipt(
     )
     require(
         receipt.get("schema_version") == 1
-        and receipt.get("target") == manifest["target"]
-        and receipt.get("release_name") == manifest["release_name"]
         and receipt.get("model") == manifest["model"]
         and receipt.get("repository") == manifest["repository"]
         and receipt.get("revision") == manifest["revision"]
@@ -4268,7 +4249,6 @@ def preflight(
             repository,
             model_root,
             model_identity,
-            worker_target=verified_worker["target"],
         )
     except Exception as error:
         verified_worker.close()
@@ -4295,7 +4275,6 @@ def preflight(
             repository,
             campaign_root,
             staged_model_identity,
-            worker_target=verified_worker["target"],
         )
         for field in (
             "model",

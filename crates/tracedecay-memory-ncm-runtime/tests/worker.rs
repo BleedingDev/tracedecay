@@ -17,18 +17,18 @@ use tracedecay_memory_ncm_runtime::embedding::doubles::HashEncoder;
 use tracedecay_memory_ncm_runtime::engine::{
     FaultPoint, NcmEngine, ObserveRequest, Outcome, RejectReason,
 };
+use tracedecay_memory_ncm_runtime::platform::current_worker_platform_capability;
 use tracedecay_memory_ncm_runtime::ports::{Deadline, StateRoot};
 use tracedecay_memory_ncm_runtime::wire::{
     self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION,
     Reply, Request,
 };
+use tracedecay_memory_ncm_runtime::worker_artifact::{
+    WORKER_EXECUTABLE_NAME, WORKER_MANIFEST_NAME, current_target_triple, trusted_worker_manifest,
+};
 
 const BINARY: &str = env!("CARGO_BIN_EXE_tracedecay-ncm-worker");
 const CALL_DEADLINE: Duration = Duration::from_secs(5);
-const REFERENCE_WORKER_MANIFEST_PATH: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../product/ncm/reference/worker-manifest.json"
-);
 
 fn namespace(index: u8) -> String {
     format!("{index:02x}{}", "0".repeat(62))
@@ -298,16 +298,16 @@ fn process_exists(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn reference_worker_manifest() -> &'static Path {
-    Path::new(REFERENCE_WORKER_MANIFEST_PATH)
-}
-
-fn install_reference_worker_manifest(binary: &Path) {
+fn install_trusted_worker_manifest(binary: &Path) {
     let destination = binary
         .parent()
         .expect("worker fixture has a parent")
-        .join("worker-manifest.json");
-    fs::copy(reference_worker_manifest(), destination).expect("copy trusted worker manifest");
+        .join(WORKER_MANIFEST_NAME);
+    fs::write(destination, trusted_worker_manifest()).expect("write trusted worker manifest");
+}
+
+fn current_target_is_pinned() -> bool {
+    current_worker_platform_capability().is_supported()
 }
 
 #[test]
@@ -1771,11 +1771,11 @@ fn protocol_and_handshake_identity_mismatches_fail_closed() {
 }
 
 #[test]
-fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
+fn production_worker_admission_rejects_unpinned_or_tampered_bytes_before_spawn() {
     let root = TempDir::new().expect("temp root");
     let tampered = root.path().join("tampered-worker");
     fs::copy(BINARY, &tampered).expect("copy worker for tampering");
-    install_reference_worker_manifest(&tampered);
+    install_trusted_worker_manifest(&tampered);
     let mut file = fs::OpenOptions::new()
         .append(true)
         .open(&tampered)
@@ -1788,8 +1788,18 @@ fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
         Request::new(206, 0, Operation::Health, "", json!({})),
         CALL_DEADLINE,
     );
+    // A pinned target rejects the altered bytes; an unpinned target has no
+    // admissible worker at all. Either way nothing is spawned.
+    let expected = if current_target_is_pinned() {
+        "mismatch".to_owned()
+    } else {
+        format!(
+            "worker target is not supported: {}",
+            current_target_triple()
+        )
+    };
     assert!(
-        matches!(result, Err(ClientError::Unavailable(ref detail)) if detail.contains("mismatch")),
+        matches!(result, Err(ClientError::Unavailable(ref detail)) if detail.contains(&expected)),
         "unexpected result: {result:?}"
     );
     assert_eq!(client.pid(), None);
@@ -1799,15 +1809,17 @@ fn production_worker_digest_mismatch_is_typed_unavailable_before_spawn() {
 fn installed_worker_manifest_must_be_sibling_and_ancestor_manifest_is_ignored() {
     let root = TempDir::new().expect("temp root");
     let bundle = root.path().join("bundle");
-    let bin = bundle.join("bin").join("tracedecay-ncm-worker");
+    let bin = bundle.join("bin").join(WORKER_EXECUTABLE_NAME);
     fs::create_dir_all(bundle.join("product/ncm/reference")).expect("create ancestor fixture");
     fs::create_dir_all(bin.parent().expect("fixture bin parent")).expect("create bin fixture");
     fs::copy(BINARY, &bin).expect("copy worker fixture");
-    fs::copy(
-        reference_worker_manifest(),
-        bundle.join("product/ncm/reference/worker-manifest.json"),
+    fs::write(
+        bundle
+            .join("product/ncm/reference")
+            .join(WORKER_MANIFEST_NAME),
+        trusted_worker_manifest(),
     )
-    .expect("copy decoy ancestor manifest");
+    .expect("write decoy ancestor manifest");
 
     let client = WorkerClient::spawn(&bin, root.path(), WorkerOptions::default())
         .expect("client owner starts lazily");
@@ -1825,18 +1837,30 @@ fn installed_worker_manifest_must_be_sibling_and_ancestor_manifest_is_ignored() 
 #[test]
 fn installed_worker_manifest_stale_pin_is_unavailable_before_spawn() {
     let root = TempDir::new().expect("temp root");
-    let binary = root.path().join("tracedecay-ncm-worker");
+    let binary = root.path().join(WORKER_EXECUTABLE_NAME);
     fs::copy(BINARY, &binary).expect("copy worker fixture");
-    install_reference_worker_manifest(&binary);
+    install_trusted_worker_manifest(&binary);
     let manifest_path = binary
         .parent()
         .expect("worker fixture has a parent")
-        .join("worker-manifest.json");
+        .join(WORKER_MANIFEST_NAME);
     let mut manifest: Value = serde_json::from_str(
         &fs::read_to_string(&manifest_path).expect("read worker fixture manifest"),
     )
     .expect("decode worker fixture manifest");
-    manifest["targets"][0]["sha256"] = json!("0".repeat(64));
+    // A well-formed extra pin the build never trusted makes the sibling stale
+    // whether or not the trust root pins any target.
+    manifest["targets"]
+        .as_array_mut()
+        .expect("worker manifest targets")
+        .push(json!({
+            "triple": "stale-fixture-target",
+            "os": "stale",
+            "arch": "stale",
+            "family": "stale",
+            "bytes": 1,
+            "sha256": "0".repeat(64),
+        }));
     fs::write(
         &manifest_path,
         serde_json::to_vec_pretty(&manifest).expect("encode stale worker manifest"),
@@ -1856,17 +1880,53 @@ fn installed_worker_manifest_stale_pin_is_unavailable_before_spawn() {
     assert_eq!(client.pid(), None);
 }
 
+/// Without `TRACEDECAY_NCM_WORKER_MANIFEST` the checked-in trust root pins no
+/// worker, so even the Cargo-built worker beside its copied manifest is
+/// refused. With it, the manifest must be a bundle from
+/// `scripts/product/ncm/build-worker-bundle.py` whose worker sits beside it,
+/// and that exact worker is admitted and answers health.
 #[test]
-#[cfg(feature = "real-encoder")]
-fn production_worker_digest_pin_allows_the_current_artifact() {
+fn build_time_trust_root_admits_exactly_its_pinned_bundle_worker() {
     let root = TempDir::new().expect("temp root");
-    let client = WorkerClient::spawn(BINARY, root.path(), WorkerOptions::default())
+    let Some(bundle_manifest) = option_env!("TRACEDECAY_NCM_WORKER_MANIFEST") else {
+        assert!(!current_target_is_pinned());
+        let client = WorkerClient::spawn(BINARY, root.path(), WorkerOptions::default())
+            .expect("client owner starts lazily");
+        let result = client.call(
+            Request::new(207, 0, Operation::Health, "", json!({})),
+            CALL_DEADLINE,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(ClientError::Unavailable(ref detail))
+                    if detail.contains("worker target is not supported")
+                        && detail.contains(current_target_triple())
+            ),
+            "unexpected result: {result:?}"
+        );
+        assert_eq!(client.pid(), None);
+        return;
+    };
+    assert!(
+        current_target_is_pinned(),
+        "build-time trust root {bundle_manifest} does not pin {}",
+        current_target_triple()
+    );
+    let worker = Path::new(bundle_manifest)
+        .parent()
+        .expect("bundle manifest has a parent")
+        .join(WORKER_EXECUTABLE_NAME);
+    let client = WorkerClient::spawn(&worker, root.path(), WorkerOptions::default())
         .expect("client owner starts lazily");
     let result = client.call(
         Request::new(207, 0, Operation::Health, "", json!({})),
         CALL_DEADLINE,
     );
-    assert!(matches!(result, Ok(reply) if reply.outcome == Outcome::Success));
+    assert!(
+        matches!(result, Ok(ref reply) if reply.outcome == Outcome::Success),
+        "unexpected result: {result:?}"
+    );
     assert!(client.pid().is_some());
 }
 

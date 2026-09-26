@@ -200,17 +200,18 @@ NCM_POLICY = {
         "model_acquisition_manifest_sidecar_required": True,
     },
     "supported_targets": [
-        {
-            "target": "aarch64-apple-darwin",
-            "release_name": "aarch64-macos",
-            "status": "supported",
-        }
+        {"target": target, "status": "supported"}
+        for target in (
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-gnu",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-pc-windows-msvc",
+            "x86_64-pc-windows-msvc",
+        )
     ],
     "unsupported_targets": [
-        {"target": "x86_64-apple-darwin", "reason": "no-pinned-worker-artifact"},
-        {"target": "x86_64-unknown-linux-gnu", "reason": "no-pinned-worker-artifact"},
-        {"target": "aarch64-unknown-linux-gnu", "reason": "no-pinned-worker-artifact"},
-        {"target": "x86_64-pc-windows-msvc", "reason": "no-pinned-worker-artifact"},
+        {"target": "x86_64-unknown-linux-musl", "reason": "no-prebuilt-onnxruntime"},
     ],
     "release_targets": [
         {
@@ -241,16 +242,7 @@ NCM_WORKER_MANIFEST = {
     "worker": "tracedecay-ncm-worker",
     "protocol_version": 1,
     "protocol_identity": "tracedecay.ncm.worker.v1",
-    "targets": [
-        {
-            "triple": "aarch64-apple-darwin",
-            "os": "macos",
-            "arch": "aarch64",
-            "family": "unix",
-            "bytes": 1,
-            "sha256": "a" * 64,
-        }
-    ],
+    "targets": [],
 }
 
 NCM_MODEL_MANIFEST = {
@@ -281,8 +273,6 @@ NCM_MODEL_ACQUISITION_MANIFEST = {
     "manifest_type": "ncm-model-acquisition",
     "provider_id": "ncm",
     "worker": "tracedecay-ncm-worker",
-    "target": "aarch64-apple-darwin",
-    "release_name": "aarch64-macos",
     "embedding_manifest": "product/ncm/reference/embedding-manifest.json",
     "embedding_manifest_sha256": hashlib.sha256(
         json.dumps(NCM_MODEL_MANIFEST).encode("utf-8")
@@ -327,7 +317,6 @@ NCM_MODEL_ACQUISITION_MANIFEST = {
             "operation_id",
             "operation",
             "outcome",
-            "target",
             "model",
             "repository",
             "revision",
@@ -711,6 +700,12 @@ def main() -> int:
     extra_supported_policy = ncm_with_extra_supported_target["policy.json"]
     assert isinstance(extra_supported_policy, dict)
     extra_supported_policy["release_targets"][1]["ncm"] = "supported"
+    extra_supported_release = ncm_with_extra_supported_target["release-targets.json"]
+    assert isinstance(extra_supported_release, dict)
+    extra_supported_release["include"][1]["ncm"] = "supported"
+    extra_supported_release["include"][1]["sidecar"] = dict(
+        extra_supported_release["include"][0]["sidecar"]
+    )
     extra_supported_target = run_fixture(
         root_source=NCM_ROOT_MANIFEST,
         root_packaged=NCM_ROOT_MANIFEST,
@@ -718,10 +713,52 @@ def main() -> int:
     )
     if extra_supported_target.returncode == 0:
         raise SystemExit("non-macOS release target claiming NCM was accepted")
-    if "without a pinned worker target" not in extra_supported_target.stderr:
+    if "must declare NCM 'native-only'" not in extra_supported_target.stderr:
         raise SystemExit(
             "extra NCM target failed for an unexpected reason: "
             + extra_supported_target.stderr
+        )
+
+    ncm_with_checked_in_pin = ncm_fixture()
+    pinned_worker = ncm_with_checked_in_pin["worker.json"]
+    assert isinstance(pinned_worker, dict)
+    pinned_worker["targets"] = [
+        {
+            "triple": "aarch64-apple-darwin",
+            "os": "macos",
+            "arch": "aarch64",
+            "family": "unix",
+            "bytes": 1,
+            "sha256": "a" * 64,
+        }
+    ]
+    checked_in_pin = run_fixture(
+        root_source=NCM_ROOT_MANIFEST,
+        root_packaged=NCM_ROOT_MANIFEST,
+        ncm_files=ncm_with_checked_in_pin,
+    )
+    if checked_in_pin.returncode == 0:
+        raise SystemExit("a checked-in worker pin was accepted as the source trust root")
+    if "must pin no worker" not in checked_in_pin.stderr:
+        raise SystemExit(
+            "checked-in worker pin failed for an unexpected reason: " + checked_in_pin.stderr
+        )
+
+    ncm_with_target_bound_model = ncm_fixture()
+    target_bound_model = ncm_with_target_bound_model["model-acquisition.json"]
+    assert isinstance(target_bound_model, dict)
+    target_bound_model["target"] = "aarch64-apple-darwin"
+    target_bound = run_fixture(
+        root_source=NCM_ROOT_MANIFEST,
+        root_packaged=NCM_ROOT_MANIFEST,
+        ncm_files=ncm_with_target_bound_model,
+    )
+    if target_bound.returncode == 0:
+        raise SystemExit("a target-bound model acquisition manifest was accepted")
+    if "target-independent" not in target_bound.stderr:
+        raise SystemExit(
+            "target-bound model acquisition failed for an unexpected reason: "
+            + target_bound.stderr
         )
 
     ncm_without_artifact_policy = ncm_fixture()

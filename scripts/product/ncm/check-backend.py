@@ -50,6 +50,11 @@ TEST_DOUBLE_MARKER = b"test-double/hash"
 REAL_ARTIFACT_MARKERS = (b"fastembed", b"onnxruntime")
 WORKER_MANIFEST_SCHEMA_VERSION = 1
 WORKER_NAME = "tracedecay-ncm-worker"
+# Mirrors `WORKER_EXECUTABLE_NAME` in worker_artifact.rs.
+WORKER_EXECUTABLE_NAME = WORKER_NAME + (".exe" if os.name == "nt" else "")
+# Mirrors the ncm-runtime build script: an absolute path here replaces the
+# checked-in trust root, which pins no worker.
+WORKER_MANIFEST_ENV = "TRACEDECAY_NCM_WORKER_MANIFEST"
 WORKER_PROTOCOL_VERSION = 1
 WORKER_PROTOCOL_IDENTITY = "tracedecay.ncm.worker.v1"
 
@@ -176,8 +181,7 @@ def target_dir(repo: Path, environment: dict[str, str]) -> Path:
 
 def worker_path(repo: Path, environment: dict[str, str]) -> Path:
     """Return the debug production worker built by this gate."""
-    name = "tracedecay-ncm-worker.exe" if os.name == "nt" else "tracedecay-ncm-worker"
-    return target_dir(repo, environment) / "debug" / name
+    return target_dir(repo, environment) / "debug" / WORKER_EXECUTABLE_NAME
 
 
 def current_worker_target() -> tuple[str, str, str, str]:
@@ -198,7 +202,25 @@ def current_worker_target() -> tuple[str, str, str, str]:
         libc = platform.libc_ver()[0].lower()
         family = "musl" if "musl" in libc else "gnu"
         return f"{arch}-unknown-linux-{family}", "linux", arch, "unix"
+    if sys.platform == "win32":
+        if machine in {"arm64", "aarch64"}:
+            arch = "aarch64"
+        elif machine in {"x86_64", "amd64"}:
+            arch = "x86_64"
+        else:
+            raise GateFailure(f"worker target is unsupported on this machine: {machine}")
+        return f"{arch}-pc-windows-msvc", "windows", arch, "windows"
     raise GateFailure(f"worker target is unsupported on this platform: {sys.platform}")
+
+
+def trusted_worker_manifest_path(repo: Path, environment: dict[str, str]) -> Path:
+    """Return the trust root the ncm-runtime build script embeds."""
+    override = environment.get(WORKER_MANIFEST_ENV)
+    if override is None:
+        return repo / "product" / "ncm" / "reference" / "worker-manifest.json"
+    path = Path(override)
+    require(path.is_absolute(), f"{WORKER_MANIFEST_ENV} must be an absolute path: {override}")
+    return path
 
 
 def worker_manifest_path(path: Path) -> Path:
@@ -397,7 +419,7 @@ def _stage_worker_bytes(
     except Exception:
         os.close(source_descriptor)
         raise
-    staged_path = staging_dir / WORKER_NAME
+    staged_path = staging_dir / WORKER_EXECUTABLE_NAME
     try:
         try:
             source_metadata = os.fstat(source_descriptor)
@@ -538,7 +560,9 @@ def validate_worker_manifest(manifest: dict[str, Any], *, target: tuple[str, str
         f"worker manifest protocol identity is unsupported: {manifest['protocol_identity']}",
     )
     targets = manifest["targets"]
-    require(isinstance(targets, list) and bool(targets), "worker manifest has no supported targets")
+    # An empty list is the unpinned source trust root: every target is then
+    # reported unsupported below, exactly as worker_artifact.rs does.
+    require(isinstance(targets, list), "worker manifest targets must be a list")
     seen: set[str] = set()
     for item in targets:
         require(isinstance(item, dict), "worker manifest target is not an object")
@@ -580,15 +604,22 @@ def read_worker_manifest(path: Path, *, label: str) -> dict[str, Any]:
     return _read_worker_manifest(path, label=label)[0]
 
 
-def verify_worker_artifact(path: Path, *, repo: Path) -> VerifiedWorkerArtifact:
+def verify_worker_artifact(
+    path: Path, *, repo: Path, environment: dict[str, str] | None = None
+) -> VerifiedWorkerArtifact:
     """Prove real native inference is linked into the worker artifact.
 
     The same artifact serves production and ``--test-double`` launches (task
     017 froze the double as a launch flag, not a build), so the hash identity
     literal is necessarily present in the bytes. Which encoder is active is
     proven per launch by the handshake identity check in ``worker_identity``.
+    The trust root is the one the worker build embedded: the absolute path in
+    ``TRACEDECAY_NCM_WORKER_MANIFEST`` or the checked-in manifest, which pins
+    no worker and therefore reports the current target as unsupported.
     """
-    trusted_manifest_path = repo / "product" / "ncm" / "reference" / "worker-manifest.json"
+    trusted_manifest_path = trusted_worker_manifest_path(
+        repo, dict(os.environ) if environment is None else environment
+    )
     try:
         trusted_manifest_metadata = trusted_manifest_path.lstat()
     except FileNotFoundError as error:
@@ -1376,7 +1407,11 @@ def main() -> int:
     commands.append(build)
     try:
         run(build, cwd=repo, environment=production_environment)
-        artifact = verify_worker_artifact(worker_path(repo, production_environment), repo=repo)
+        artifact = verify_worker_artifact(
+            worker_path(repo, production_environment),
+            repo=repo,
+            environment=production_environment,
+        )
         if not all(artifact["required_markers"].values()):
             blockers.append(
                 f"backend_artifact_identity_test: worker lacks real encoder markers: {artifact['required_markers']}"

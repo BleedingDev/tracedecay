@@ -26,34 +26,37 @@
   "supported_targets": [
     {
       "target": "aarch64-apple-darwin",
-      "release_name": "aarch64-macos",
+      "status": "supported"
+    },
+    {
+      "target": "x86_64-apple-darwin",
+      "status": "supported"
+    },
+    {
+      "target": "aarch64-unknown-linux-gnu",
+      "status": "supported"
+    },
+    {
+      "target": "x86_64-unknown-linux-gnu",
+      "status": "supported"
+    },
+    {
+      "target": "aarch64-pc-windows-msvc",
+      "status": "supported"
+    },
+    {
+      "target": "x86_64-pc-windows-msvc",
       "status": "supported"
     }
   ],
   "unsupported_targets": [
     {
-      "target": "x86_64-apple-darwin",
-      "reason": "no-pinned-worker-artifact"
-    },
-    {
-      "target": "aarch64-unknown-linux-gnu",
-      "reason": "no-pinned-worker-artifact"
-    },
-    {
-      "target": "x86_64-unknown-linux-gnu",
-      "reason": "no-pinned-worker-artifact"
-    },
-    {
       "target": "aarch64-unknown-linux-musl",
-      "reason": "no-pinned-worker-artifact"
+      "reason": "no-prebuilt-onnxruntime"
     },
     {
       "target": "x86_64-unknown-linux-musl",
-      "reason": "no-pinned-worker-artifact"
-    },
-    {
-      "target": "x86_64-pc-windows-msvc",
-      "reason": "no-pinned-worker-artifact"
+      "reason": "no-prebuilt-onnxruntime"
     }
   ],
   "release_targets": [

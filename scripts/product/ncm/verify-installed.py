@@ -40,8 +40,6 @@ import uuid
 import zipfile
 
 
-SUPPORTED_TARGET = "aarch64-apple-darwin"
-SUPPORTED_RELEASE_NAME = "aarch64-macos"
 WORKER_NAME = "tracedecay-ncm-worker"
 WORKER_MANIFEST_NAME = "worker-manifest.json"
 MODEL_ACQUISITION_MANIFEST_NAME = "model-acquisition-manifest.json"
@@ -72,6 +70,21 @@ MODEL_REQUIRED_FILES = (
 # The release verifier's acquisition receipt remains a separate Python-owned
 # evidence file because the Rust owner intentionally emits no release receipt.
 JOURNAL_FILENAME = "ncm-model-lifecycle-v1.json"
+# The Rust lifecycle journal rejects unknown fields, so a journal written here
+# must carry exactly the fields of `LifecycleJournal` in model_lifecycle.rs.
+JOURNAL_FIELDS = frozenset(
+    {
+        "schema_version",
+        "operation_id",
+        "operation",
+        "phase",
+        "revision",
+        "staging_name",
+        "backup_name",
+        "before_digest",
+        "after_digest",
+    }
+)
 RECEIPT_FILENAME = "ncm-model-acquisition-v1.json"
 STAGING_PREFIX = ".ncm-model-staging-"
 BACKUP_PREFIX = ".ncm-model-backup-"
@@ -104,6 +117,29 @@ def _require(condition: bool, message: str) -> None:
 def _require_string(value: Any, label: str) -> str:
     _require(isinstance(value, str) and bool(value), f"{label} must be a non-empty string")
     return value
+
+
+def target_platform(triple: str) -> tuple[str, str, str]:
+    """Return Rust's ``(OS, ARCH, FAMILY)`` constants for a worker target triple.
+
+    The worker manifest records these constants beside each pinned triple and
+    the Rust verifier requires them to match the running target exactly.
+    """
+    parts = _require_string(triple, "worker target triple").split("-")
+    _require(len(parts) >= 3 and all(parts), f"invalid Rust target triple: {triple!r}")
+    arch = parts[0]
+    if triple.endswith("-apple-darwin"):
+        return "macos", arch, "unix"
+    if "-pc-windows-" in triple:
+        return "windows", arch, "windows"
+    if "-linux-" in triple:
+        return "linux", arch, "unix"
+    raise VerificationFailure(f"unsupported NCM worker target: {triple}")
+
+
+def worker_executable_name(triple: str) -> str:
+    """Return the worker file name, including the target executable suffix."""
+    return WORKER_NAME + (".exe" if target_platform(triple)[2] == "windows" else "")
 
 
 def _require_digest(value: Any, label: str) -> str:
@@ -367,18 +403,18 @@ def _model_file_entries(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def validate_acquisition_manifest(
     manifest: dict[str, Any],
     *,
-    target: str = SUPPORTED_TARGET,
-    release_name: str = SUPPORTED_RELEASE_NAME,
     embedding_manifest: Path | None = None,
     revision_receipt: Path | None = None,
 ) -> dict[str, Any]:
-    """Validate the release descriptor and its target-bound model identity."""
+    """Validate the target-independent release descriptor and model identity."""
     _require(manifest.get("schema_version") == 1, "model acquisition schema_version must be 1")
     _require(manifest.get("manifest_type") == "ncm-model-acquisition", "invalid model acquisition manifest type")
     _require(manifest.get("provider_id") == "ncm", "model acquisition provider_id must be ncm")
     _require(manifest.get("worker") == WORKER_NAME, "model acquisition worker is not the NCM worker")
-    _require(manifest.get("target") == target, f"model acquisition target is not bound to {target}")
-    _require(manifest.get("release_name") == release_name, f"model acquisition release name is not {release_name}")
+    _require(
+        "target" not in manifest and "release_name" not in manifest,
+        "model acquisition manifest must be target-independent",
+    )
     _require(manifest.get("embedding_manifest") == "product/ncm/reference/embedding-manifest.json", "model acquisition embedding manifest path drifted")
     _require_digest(manifest.get("embedding_manifest_sha256"), "model acquisition embedding_manifest_sha256")
     _require(manifest.get("model_root") == "models", "model acquisition model_root must be models")
@@ -433,7 +469,6 @@ def validate_acquisition_manifest(
             "operation_id",
             "operation",
             "outcome",
-            "target",
             "model",
             "repository",
             "revision",
@@ -444,6 +479,10 @@ def validate_acquisition_manifest(
         }
         <= required,
         "model acquisition receipt omits identity fields",
+    )
+    _require(
+        not required & {"target", "release_name"},
+        "model acquisition receipt must not bind a worker target",
     )
 
     if embedding_manifest is not None:
@@ -568,13 +607,21 @@ def _model_file_entries_without_url(manifest: dict[str, Any]) -> dict[str, dict[
 
 
 def _worker_manifest(manifest: dict[str, Any], *, target: str) -> dict[str, Any]:
+    """Return the pin for ``target`` from a worker manifest of any pin count."""
+    targets = _worker_manifest_targets(manifest)
+    selected = next((entry for entry in targets if entry["triple"] == target), None)
+    _require(selected is not None, f"worker manifest has no target pin for {target}")
+    return selected
+
+
+def _worker_manifest_targets(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate every pin; an empty list is the unpinned source trust root."""
     _require(manifest.get("schema_version") == 1, "worker manifest schema_version must be 1")
     _require(manifest.get("worker") == WORKER_NAME, "worker manifest names an unexpected worker")
     _require(manifest.get("protocol_version") == 1, "worker manifest protocol_version must be 1")
     _require(manifest.get("protocol_identity") == "tracedecay.ncm.worker.v1", "worker manifest protocol identity drifted")
     targets = manifest.get("targets")
-    _require(isinstance(targets, list) and len(targets) == 1, "worker manifest must contain exactly one target pin")
-    selected: dict[str, Any] | None = None
+    _require(isinstance(targets, list), "worker manifest targets must be a list")
     seen: set[str] = set()
     for entry in targets:
         _require(isinstance(entry, dict), "worker manifest target must be an object")
@@ -583,11 +630,11 @@ def _worker_manifest(manifest: dict[str, Any], *, target: str) -> dict[str, Any]
         seen.add(triple)
         _require_positive_int(entry.get("bytes"), f"worker manifest target {triple}.bytes")
         _require_digest(entry.get("sha256"), f"worker manifest target {triple}.sha256")
-        if triple == target:
-            selected = entry
-    _require(selected is not None, f"worker manifest has no target pin for {target}")
-    _require(selected.get("os") == "macos" and selected.get("arch") == "aarch64" and selected.get("family") == "unix", "worker manifest target metadata drifted")
-    return selected
+        _require(
+            (entry.get("os"), entry.get("arch"), entry.get("family")) == target_platform(triple),
+            f"worker manifest target metadata does not match {triple}",
+        )
+    return targets
 
 
 def _safe_archive_name(name: str) -> str:
@@ -680,7 +727,13 @@ def _verify_executable_format(path: Path, *, target: str) -> None:
             cpu_type = int.from_bytes(prefix[4:8], "little", signed=False)
         else:
             cpu_type = int.from_bytes(prefix[4:8], "big", signed=False)
-        expected_cpu = 0x0100000C if target == SUPPORTED_TARGET else 0x01000007
+        expected_cpu = {"aarch64": 0x0100000C, "x86_64": 0x01000007}.get(
+            target.split("-", 1)[0]
+        )
+        _require(
+            expected_cpu is not None,
+            f"CLI executable target architecture is unsupported: {target}",
+        )
         _require(
             cpu_type == expected_cpu,
             f"CLI executable CPU type {cpu_type:#x} is not pinned for {target}",
@@ -1064,15 +1117,17 @@ def verify_installed_e2e(
     worker_manifest_path: Path,
     revision_receipt: Path,
     target: str,
-    release_name: str,
     profile: str,
     expected_version: str | None,
     expected_source_sha: str | None,
     expected_binary_sha256: str | None,
 ) -> dict[str, Any]:
-    """Exercise CLI install, service restart, and a production worker handshake."""
-    _require(target == SUPPORTED_TARGET, "installed NCM E2E requires the supported arm64 macOS target")
-    _require(release_name == SUPPORTED_RELEASE_NAME, "installed NCM E2E release name is unsupported")
+    """Exercise CLI install, service restart, and a production worker handshake.
+
+    The target must be pinned by the trusted worker manifest that the release
+    host binaries were built with; its pin is checked against the sidecar.
+    """
+    target_platform(target)
     _require(profile in {"stable", "beta"}, "installed NCM E2E release profile is invalid")
     binary = binary.absolute()
     model_root = model_root.absolute()
@@ -1139,9 +1194,9 @@ def verify_installed_e2e(
             environment.pop(key, None)
         _initialize_e2e_project(project, environment=environment)
         names = _extract_tar(worker_archive, worker_root)
-        expected_names = [WORKER_NAME, WORKER_MANIFEST_NAME, MODEL_ACQUISITION_MANIFEST_NAME]
+        expected_names = [worker_executable_name(target), WORKER_MANIFEST_NAME, MODEL_ACQUISITION_MANIFEST_NAME]
         _require(names == expected_names, f"installed NCM E2E sidecar entries differ: {names}")
-        worker = worker_root / WORKER_NAME
+        worker = worker_root / worker_executable_name(target)
         worker_manifest = worker_root / WORKER_MANIFEST_NAME
         model_manifest = worker_root / MODEL_ACQUISITION_MANIFEST_NAME
         sidecar_worker_data, _ = _load_json(worker_manifest, "E2E sidecar worker manifest")
@@ -1453,7 +1508,7 @@ def verify_installed_binary(
 def verify_worker_archive(
     path: Path,
     *,
-    target: str = SUPPORTED_TARGET,
+    target: str,
     worker_manifest_path: Path | None = None,
     model_manifest_path: Path | None = None,
     revision_receipt_path: Path | None = None,
@@ -1473,9 +1528,9 @@ def verify_worker_archive(
     with tempfile.TemporaryDirectory(prefix="ncm-release-worker-") as directory:
         root = Path(directory)
         names = _extract_tar(path, root)
-        expected_names = [WORKER_NAME, WORKER_MANIFEST_NAME, MODEL_ACQUISITION_MANIFEST_NAME]
+        expected_names = [worker_executable_name(target), WORKER_MANIFEST_NAME, MODEL_ACQUISITION_MANIFEST_NAME]
         _require(names == expected_names, f"NCM sidecar must contain exactly {expected_names}; got {names}")
-        worker = root / WORKER_NAME
+        worker = root / worker_executable_name(target)
         worker_manifest = root / WORKER_MANIFEST_NAME
         model_manifest = root / MODEL_ACQUISITION_MANIFEST_NAME
         worker_metadata = _lstat_regular(worker, "sidecar worker")
@@ -1505,8 +1560,6 @@ def verify_worker_archive(
         acquisition, acquisition_bytes = _load_json(model_manifest, "sidecar model acquisition manifest")
         validate_acquisition_manifest(
             acquisition,
-            target=target,
-            release_name=SUPPORTED_RELEASE_NAME,
             embedding_manifest=None,
             revision_receipt=revision_receipt_path,
         )
@@ -1739,6 +1792,10 @@ def _read_journal(root: Path) -> dict[str, Any] | None:
         return None
     value, _ = _load_json(path, "model lifecycle journal", MAX_RECEIPT_BYTES)
     _require(value.get("schema_version") == 1, "unsupported model lifecycle journal schema")
+    _require(
+        set(value) == JOURNAL_FIELDS,
+        "model lifecycle journal fields differ from the Rust lifecycle owner",
+    )
     for name_key in ("staging_name", "backup_name"):
         name = value.get(name_key)
         if name is not None:
@@ -1762,10 +1819,6 @@ def _read_journal(root: Path) -> dict[str, Any] | None:
         is not None
         and operation_id.endswith(f"-{operation}"),
         "model lifecycle journal operation_id is invalid",
-    )
-    _require(
-        value.get("target") == SUPPORTED_TARGET,
-        "model lifecycle journal target is not the pinned NCM target",
     )
     _require(
         value.get("revision") == MODEL_REVISION,
@@ -1965,7 +2018,6 @@ def acquire_model(
         "operation_id": operation_id,
         "operation": operation,
         "phase": "prepared",
-        "target": manifest["target"],
         "revision": manifest["revision"],
         "staging_name": staging_name,
         "backup_name": backup_name,
@@ -2050,8 +2102,6 @@ def _receipt(manifest: dict[str, Any], operation: str, outcome: str, root: Path,
         "operation_id": operation_id,
         "operation": operation,
         "outcome": outcome,
-        "target": manifest["target"],
-        "release_name": manifest["release_name"],
         "model": manifest["model"],
         "repository": manifest["repository"],
         "revision": manifest["revision"],
@@ -2096,8 +2146,12 @@ def _validate_installed_receipt(
         )
     _require(receipt.get("operation") in {"install", "update"}, "installed model acquisition receipt operation is invalid")
     _require(receipt.get("outcome") in {"committed", "already_present"}, "installed model acquisition receipt outcome is invalid")
-    for key in ("target", "model", "repository", "revision"):
+    for key in ("model", "repository", "revision"):
         _require(receipt.get(key) == manifest[key], f"installed model acquisition receipt {key} differs from the release pin")
+    _require(
+        "target" not in receipt and "release_name" not in receipt,
+        "installed model acquisition receipt must not bind a worker target",
+    )
     _require(
         receipt.get("manifest_sha256") == manifest["embedding_manifest_sha256"],
         "installed model acquisition receipt manifest digest differs from the canonical model manifest",
@@ -2171,7 +2225,12 @@ def verify_release_contract(repo: Path) -> dict[str, Any]:
         revision_receipt=revision_receipt_path,
     )
     worker, worker_raw = _load_json(worker_path, "trusted worker manifest")
-    _worker_manifest(worker, target=SUPPORTED_TARGET)
+    # Source builds trust no worker; release builds select a pinned manifest
+    # through TRACEDECAY_NCM_WORKER_MANIFEST at build time.
+    _require(
+        _worker_manifest_targets(worker) == [],
+        "checked-in worker manifest must be the unpinned source trust root",
+    )
     checker_path = repo / "scripts/check-release-artifacts.py"
     _lstat_regular(checker_path, "release artifact checker")
     spec = importlib.util.spec_from_file_location(
@@ -2184,15 +2243,9 @@ def verify_release_contract(repo: Path) -> dict[str, Any]:
         targets = checker.target_matrix(release_targets_path, worker_platforms_path)
     except (SystemExit, OSError, ValueError) as error:
         raise VerificationFailure(f"release target matrix is invalid: {error}") from error
-    _require(
-        any(
-            target.get("name") == SUPPORTED_RELEASE_NAME
-            and target.get("target") == SUPPORTED_TARGET
-            and target.get("ncm") == "supported"
-            for target in targets
-        ),
-        "release target matrix does not support the pinned NCM worker target",
-    )
+    ncm_targets = [target["target"] for target in targets if target.get("ncm") == "supported"]
+    for ncm_target in ncm_targets:
+        target_platform(ncm_target)
     _require(raw, "release model acquisition manifest is empty")
     return {
         "manifest": str(manifest_path),
@@ -2202,7 +2255,7 @@ def verify_release_contract(repo: Path) -> dict[str, Any]:
             _read_regular(revision_receipt_path, "trusted model revision receipt")
         ),
         "worker_manifest_sha256": sha256_bytes(worker_raw),
-        "target": SUPPORTED_TARGET,
+        "ncm_targets": ncm_targets,
         "release_targets": [target["name"] for target in targets],
     }
 
@@ -2215,8 +2268,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--embedding-manifest", type=Path, default=repo_default / "product/ncm/reference/embedding-manifest.json")
     parser.add_argument("--worker-manifest", type=Path, default=repo_default / "product/ncm/reference/worker-manifest.json")
     parser.add_argument("--revision-receipt", type=Path, default=repo_default / MODEL_REVISION_RECEIPT_PATH)
-    parser.add_argument("--target", default=SUPPORTED_TARGET)
-    parser.add_argument("--release-name", default=SUPPORTED_RELEASE_NAME)
+    parser.add_argument(
+        "--target",
+        help="Rust target triple of the verified archives, binary, or worker; model operations are target-independent",
+    )
     parser.add_argument("--profile", choices=("stable", "beta"), default="stable")
     parser.add_argument("--binary-archive", type=Path)
     parser.add_argument("--worker-archive", type=Path)
@@ -2254,6 +2309,15 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.operation in {"install", "verify"},
                 "--installed-e2e requires --operation install or verify",
             )
+        _require(
+            arguments.target is not None
+            or (
+                arguments.binary is None
+                and arguments.binary_archive is None
+                and arguments.worker_archive is None
+            ),
+            "--target is required to verify a binary, CLI archive, or worker archive",
+        )
         if arguments.binary_archive is None and arguments.worker_archive is None and arguments.binary is None and arguments.model_root is None and arguments.operation == "verify":
             result = verify_release_contract(arguments.repo.resolve())
             print(json.dumps(result, indent=2))
@@ -2265,12 +2329,12 @@ def main(argv: list[str] | None = None) -> int:
             model_manifest, model_raw = _load_json(arguments.manifest, "model acquisition manifest")
             validate_acquisition_manifest(
                 model_manifest,
-                target=arguments.target,
-                release_name=arguments.release_name,
                 embedding_manifest=arguments.embedding_manifest,
                 revision_receipt=arguments.revision_receipt,
             )
-        result: dict[str, Any] = {"schema_version": 1, "target": arguments.target}
+        result: dict[str, Any] = {"schema_version": 1}
+        if arguments.target is not None:
+            result["target"] = arguments.target
         if model_raw is not None:
             result["manifest_sha256"] = sha256_bytes(model_raw)
         installed_binary_result: dict[str, Any] | None = None
@@ -2354,7 +2418,6 @@ def main(argv: list[str] | None = None) -> int:
                 worker_manifest_path=arguments.worker_manifest,
                 revision_receipt=arguments.revision_receipt,
                 target=arguments.target,
-                release_name=arguments.release_name,
                 profile=arguments.profile,
                 expected_version=arguments.expected_version,
                 expected_source_sha=arguments.expected_source_sha,

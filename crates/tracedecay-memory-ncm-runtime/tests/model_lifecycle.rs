@@ -57,7 +57,7 @@ fn recovers_interrupted_staged_transaction_using_release_manifest_shape() {
         manifest
             .canonical_sha256()
             .expect("canonical release manifest digest"),
-        "f6cadee05372c3a0ac3e9fdc37177a092e1c84deb809f56c72678672e66f184d"
+        "516be9008292934546811020cd6e4ad6d1f256e45482d406d8e69b9af6e5db69"
     );
     assert_eq!(manifest.transaction.journal, JOURNAL_FILENAME);
     assert_eq!(manifest.transaction.staging_prefix, STAGING_PREFIX);
@@ -79,7 +79,6 @@ fn recovers_interrupted_staged_transaction_using_release_manifest_shape() {
         "operation_id",
         "operation",
         "outcome",
-        "target",
         "model",
         "repository",
         "revision",
@@ -96,6 +95,15 @@ fn recovers_interrupted_staged_transaction_using_release_manifest_shape() {
                 .any(|item| item == field)
         );
     }
+    // Model acquisition is target-independent: one descriptor serves every
+    // worker platform, so receipts must not be bound to a target.
+    assert!(
+        !manifest
+            .receipt
+            .required_fields
+            .iter()
+            .any(|item| item == "target" || item == "release_name")
+    );
 
     let temporary = tempfile::tempdir().expect("create lifecycle root");
     let root = StateRoot::new(temporary.path()).expect("temporary root is absolute");
@@ -114,7 +122,6 @@ fn recovers_interrupted_staged_transaction_using_release_manifest_shape() {
         "operation_id": operation_id,
         "operation": "update",
         "phase": "staged",
-        "target": manifest.target,
         "revision": manifest.revision,
         "staging_name": staging_name,
         "backup_name": backup_name,

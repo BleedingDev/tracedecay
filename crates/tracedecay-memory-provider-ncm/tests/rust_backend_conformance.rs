@@ -116,7 +116,9 @@ mod enabled {
                     .status()
                     .expect("build test-double worker");
                 assert!(status.success(), "worker build must succeed");
-                target_dir().join("debug").join("tracedecay-ncm-worker")
+                target_dir().join("debug").join(
+                    tracedecay_memory_ncm_runtime::worker_artifact::WORKER_EXECUTABLE_NAME,
+                )
             })
             .clone()
     }

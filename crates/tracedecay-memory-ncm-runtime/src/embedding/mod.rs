@@ -165,14 +165,13 @@ const MODEL_REVISION_RECEIPT: &[u8] = include_bytes!(concat!(
     "/../../product/ncm/receipts/backend/2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"
 ));
 
-/// Filename used by a worker sidecar for the target-bound acquisition contract.
+/// Filename used by a worker sidecar for the model acquisition contract.
 pub const MODEL_ACQUISITION_MANIFEST_FILENAME: &str = "model-acquisition-manifest.json";
 /// Relative path of the durable model acquisition receipt below a state root.
 pub const MODEL_ACQUISITION_RECEIPT_PATH: &str = "receipts/ncm-model-acquisition-v1.json";
-const MODEL_RELEASE_NAME: &str = "aarch64-macos";
 const MODEL_BASE_URL: &str = "https://huggingface.co/Xenova/paraphrase-multilingual-MiniLM-L12-v2/resolve/2c4055b12046f11709e9df2c122e59ffbdc2f900/";
 
-/// One artifact entry in the target-bound model acquisition manifest.
+/// One artifact entry in the model acquisition manifest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelAcquisitionFile {
@@ -214,7 +213,7 @@ pub struct ModelAcquisitionReceiptContract {
     pub required_fields: Vec<String>,
 }
 
-/// Target-bound release descriptor for NCM model acquisition.
+/// Target-independent release descriptor for NCM model acquisition.
 ///
 /// The descriptor is compiled into the worker from the checked-in release
 /// file. [`Self::reference`] validates every field, including the source
@@ -231,10 +230,6 @@ pub struct ModelAcquisitionManifest {
     pub provider_id: String,
     /// Worker executable this descriptor accompanies.
     pub worker: String,
-    /// Rust target triple bound by the release descriptor.
-    pub target: String,
-    /// Human-readable release target name.
-    pub release_name: String,
     /// Repository path of the source embedding manifest.
     pub embedding_manifest: String,
     /// SHA-256 digest of the exact source embedding manifest bytes.
@@ -290,8 +285,6 @@ impl ModelAcquisitionManifest {
             || self.manifest_type != "ncm-model-acquisition"
             || self.provider_id != "ncm"
             || self.worker != "tracedecay-ncm-worker"
-            || self.target != crate::platform::PINNED_WORKER_TARGET
-            || self.release_name != MODEL_RELEASE_NAME
             || self.embedding_manifest != "product/ncm/reference/embedding-manifest.json"
             || self.model_root != "models"
             || self.cache_repository != CACHE_REPOSITORY_DIR
@@ -387,7 +380,6 @@ impl ModelAcquisitionManifest {
             "operation_id",
             "operation",
             "outcome",
-            "target",
             "model",
             "repository",
             "revision",

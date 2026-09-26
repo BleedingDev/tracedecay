@@ -41,6 +41,17 @@ def run_checker(*arguments: str, expect: int = 0) -> str:
     return completed.stdout
 
 
+def pin(triple: str, os_name: str, arch: str, family: str) -> dict[str, object]:
+    return {
+        "triple": triple,
+        "os": os_name,
+        "arch": arch,
+        "family": family,
+        "bytes": 1,
+        "sha256": "0" * 64,
+    }
+
+
 def main() -> int:
     module = load_policy_module()
     policy = module.validate_worker_platform_policy(
@@ -48,21 +59,22 @@ def main() -> int:
         worker_manifest_path=WORKER_MANIFEST,
         release_target_manifest_path=RELEASE_TARGETS,
     )
-    assert module.worker_platform_capability(policy, "aarch64-apple-darwin") == {
-        "target": "aarch64-apple-darwin",
-        "status": "supported",
-        "fallback": "ncm-worker",
+    source_pins = module.pinned_worker_targets(WORKER_MANIFEST, worker_name=policy["worker"])
+    assert source_pins == set(), source_pins
+    owner_targets = {
+        "aarch64-apple-darwin",
+        "x86_64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "x86_64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc",
+        "x86_64-pc-windows-msvc",
     }
-    assert module.worker_platform_capability(policy, "x86_64-unknown-linux-gnu") == {
-        "target": "x86_64-unknown-linux-gnu",
-        "status": "unsupported",
-        "fallback": "native-only",
-    }
-    assert module.worker_platform_capability(policy, "x86_64-apple-darwin") == {
-        "target": "x86_64-apple-darwin",
-        "status": "unsupported",
-        "fallback": "native-only",
-    }
+    assert {entry["target"] for entry in policy["supported_targets"]} == owner_targets
+    # The checked-in trust root pins nothing, so no target is supported yet.
+    for target in owner_targets:
+        assert module.worker_platform_capability(
+            policy, target, pinned_targets=source_pins
+        ) == {"target": target, "status": "unsupported", "fallback": "native-only"}
 
     output = run_checker(
         "--policy",
@@ -73,19 +85,16 @@ def main() -> int:
         str(RELEASE_TARGETS),
     )
     assert "consistent" in output
-    capability = json.loads(
-        run_checker(
-            "--policy",
-            str(POLICY),
-            "--worker-manifest",
-            str(WORKER_MANIFEST),
-            "--release-targets",
-            str(RELEASE_TARGETS),
-            "--target",
-            "x86_64-pc-windows-msvc",
-        )
+    run_checker(
+        "--policy",
+        str(POLICY),
+        "--worker-manifest",
+        str(WORKER_MANIFEST),
+        "--release-targets",
+        str(RELEASE_TARGETS),
+        "--require-release-pins",
+        expect=2,
     )
-    assert capability["status"] == "unsupported"
     run_checker(
         "--policy",
         str(POLICY),
@@ -107,73 +116,70 @@ def main() -> int:
         policy_value = json.loads(POLICY.read_text(encoding="utf-8"))
         worker_value = json.loads(WORKER_MANIFEST.read_text(encoding="utf-8"))
         release_value = json.loads(RELEASE_TARGETS.read_text(encoding="utf-8"))
-        worker_value["targets"].append(
-            {
-                "triple": "x86_64-unknown-linux-gnu",
-                "os": "linux",
-                "arch": "x86_64",
-                "family": "unix",
-                "bytes": 1,
-                "sha256": "0" * 64,
-            }
-        )
-        worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
         policy_path.write_text(json.dumps(policy_value), encoding="utf-8")
         release_path.write_text(json.dumps(release_value), encoding="utf-8")
-        run_checker(
+        common = (
             "--policy",
             str(policy_path),
             "--worker-manifest",
             str(worker_path),
             "--release-targets",
             str(release_path),
-            expect=2,
         )
 
-        policy_value = json.loads(POLICY.read_text(encoding="utf-8"))
-        policy_value["unsupported_targets"] = [
-            entry
-            for entry in policy_value["unsupported_targets"]
-            if entry["target"] != "x86_64-apple-darwin"
+        # A build-time multi-target manifest supports exactly its pins.
+        worker_value["targets"] = [
+            pin("aarch64-apple-darwin", "macos", "aarch64", "unix"),
+            pin("x86_64-pc-windows-msvc", "windows", "x86_64", "windows"),
+            pin("aarch64-unknown-linux-gnu", "linux", "aarch64", "unix"),
         ]
-        policy_path.write_text(json.dumps(policy_value), encoding="utf-8")
-        run_checker(
-            "--policy",
-            str(policy_path),
-            "--worker-manifest",
-            str(worker_path),
-            "--release-targets",
-            str(release_path),
-            expect=2,
+        worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
+        run_checker(*common, "--require-release-pins")
+        pinned = module.pinned_worker_targets(worker_path, worker_name=policy["worker"])
+        for target in owner_targets:
+            capability = module.worker_platform_capability(
+                policy, target, pinned_targets=pinned
+            )
+            assert (capability["status"] == "supported") == (target in pinned), capability
+        capability = json.loads(
+            run_checker(*common, "--target", "x86_64-pc-windows-msvc", "--require-supported")
         )
+        assert capability["status"] == "supported", capability
 
-        worker_value["targets"] = worker_value["targets"][:1]
+        # Pins for targets outside the policy are rejected.
+        worker_value["targets"].append(
+            pin("x86_64-unknown-linux-musl", "linux", "x86_64", "unix")
+        )
+        worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
+        run_checker(*common, expect=2)
+        worker_value["targets"].pop()
+
+        # Pins whose platform metadata contradicts the triple are rejected.
+        worker_value["targets"][1]["family"] = "unix"
+        worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
+        run_checker(*common, expect=2)
+        worker_value["targets"][1]["family"] = "windows"
+
+        # Duplicate and empty-artifact pins are rejected.
+        duplicate = dict(worker_value, targets=[*worker_value["targets"], worker_value["targets"][0]])
+        worker_path.write_text(json.dumps(duplicate), encoding="utf-8")
+        run_checker(*common, expect=2)
         worker_value["targets"][0]["bytes"] = 0
         worker_path.write_text(json.dumps(worker_value), encoding="utf-8")
-        run_checker(
-            "--policy",
-            str(policy_path),
-            "--worker-manifest",
-            str(worker_path),
-            "--release-targets",
-            str(release_path),
-            expect=2,
-        )
+        run_checker(*common, expect=2)
 
         worker_path.write_text(
             WORKER_MANIFEST.read_text(encoding="utf-8"), encoding="utf-8"
         )
+        run_checker(*common)
+        policy_value["supported_targets"][0]["release_name"] = "aarch64-macos"
+        policy_path.write_text(json.dumps(policy_value), encoding="utf-8")
+        run_checker(*common, expect=2)
+        del policy_value["supported_targets"][0]["release_name"]
+
         policy_value["packaging"]["standard_cli_archive_includes_worker"] = True
         policy_path.write_text(json.dumps(policy_value), encoding="utf-8")
-        run_checker(
-            "--policy",
-            str(policy_path),
-            "--worker-manifest",
-            str(worker_path),
-            "--release-targets",
-            str(release_path),
-            expect=2,
-        )
+        run_checker(*common, expect=2)
     print("NCM worker platform policy tests passed")
     return 0
 

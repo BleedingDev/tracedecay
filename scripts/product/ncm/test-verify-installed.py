@@ -114,27 +114,90 @@ def pe_fixture(*, machine: int, pe_offset: int = 0x40) -> bytes:
     return bytes(payload)
 
 
-def macho_fixture() -> bytes:
-    """Build the minimal arm64 Mach-O header used by sidecar fixtures."""
-    return b"\xcf\xfa\xed\xfe" + (0x0100000C).to_bytes(4, "little")
+def macho_fixture(cpu_type: int = 0x0100000C) -> bytes:
+    """Build a minimal Mach-O header; the default CPU type is arm64."""
+    return b"\xcf\xfa\xed\xfe" + cpu_type.to_bytes(4, "little")
+
+
+def worker_pin(triple: str, payload: bytes) -> dict[str, object]:
+    os_name, arch, family = MODULE.target_platform(triple)
+    return {
+        "triple": triple,
+        "os": os_name,
+        "arch": arch,
+        "family": family,
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+    }
+
+
+def worker_manifest_with(pins: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "worker": MODULE.WORKER_NAME,
+        "protocol_version": 1,
+        "protocol_identity": "tracedecay.ncm.worker.v1",
+        "targets": pins,
+    }
 
 
 class VerifyInstalledTest(unittest.TestCase):
-    def test_checked_in_release_contract_is_target_bound(self) -> None:
+    def test_checked_in_release_contract_is_unpinned_and_target_independent(self) -> None:
         result = MODULE.verify_release_contract(REPO)
-        self.assertEqual(result["target"], MODULE.SUPPORTED_TARGET)
+        self.assertNotIn("target", result)
+        self.assertIsInstance(result["ncm_targets"], list)
         self.assertEqual(
             result["embedding_manifest_sha256"],
             MODULE.sha256_bytes(
                 (REPO / "product/ncm/reference/embedding-manifest.json").read_bytes()
             ),
         )
+        trusted = json.loads(
+            (REPO / "product/ncm/reference/worker-manifest.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(MODULE._worker_manifest_targets(trusted), [])
+        with self.assertRaisesRegex(MODULE.VerificationFailure, "no target pin"):
+            MODULE._worker_manifest(trusted, target="aarch64-unknown-linux-gnu")
 
-    def test_target_drift_is_rejected(self) -> None:
+    def test_model_acquisition_rejects_any_target_binding(self) -> None:
+        MODULE.validate_acquisition_manifest(fixture_manifest())
+        for field, value in (
+            ("target", "x86_64-unknown-linux-gnu"),
+            ("release_name", "x86_64-linux"),
+        ):
+            manifest = fixture_manifest()
+            manifest[field] = value
+            with self.assertRaisesRegex(MODULE.VerificationFailure, "target-independent"):
+                MODULE.validate_acquisition_manifest(manifest)
         manifest = fixture_manifest()
-        manifest["target"] = "x86_64-unknown-linux-gnu"
-        with self.assertRaisesRegex(MODULE.VerificationFailure, "target"):
+        manifest["receipt"]["required_fields"].append("target")
+        with self.assertRaisesRegex(MODULE.VerificationFailure, "must not bind a worker target"):
             MODULE.validate_acquisition_manifest(manifest)
+
+    def test_worker_manifest_accepts_any_consistently_pinned_target(self) -> None:
+        linux = worker_pin("aarch64-unknown-linux-gnu", b"linux worker")
+        windows = worker_pin("x86_64-pc-windows-msvc", b"windows worker")
+        manifest = worker_manifest_with([linux, windows])
+        self.assertEqual(
+            MODULE._worker_manifest(manifest, target="x86_64-pc-windows-msvc"), windows
+        )
+        self.assertEqual(
+            MODULE._worker_manifest(manifest, target="aarch64-unknown-linux-gnu"), linux
+        )
+        with self.assertRaisesRegex(MODULE.VerificationFailure, "no target pin"):
+            MODULE._worker_manifest(manifest, target="aarch64-apple-darwin")
+        with self.assertRaisesRegex(MODULE.VerificationFailure, "repeats target"):
+            MODULE._worker_manifest_targets(worker_manifest_with([linux, linux]))
+        foreign = dict(windows, family="unix")
+        with self.assertRaisesRegex(MODULE.VerificationFailure, "metadata does not match"):
+            MODULE._worker_manifest_targets(worker_manifest_with([foreign]))
+        self.assertEqual(
+            MODULE.worker_executable_name("aarch64-pc-windows-msvc"),
+            "tracedecay-ncm-worker.exe",
+        )
+        self.assertEqual(
+            MODULE.worker_executable_name("x86_64-apple-darwin"), "tracedecay-ncm-worker"
+        )
 
     def test_model_install_update_and_failed_update_are_transactional(self) -> None:
         manifest = fixture_manifest()
@@ -151,7 +214,8 @@ class VerifyInstalledTest(unittest.TestCase):
             self.assertTrue(receipt.is_file())
             receipt_value = json.loads(receipt.read_text(encoding="utf-8"))
             self.assertEqual(receipt_value["revision"], MODULE.MODEL_REVISION)
-            self.assertEqual(receipt_value["target"], MODULE.SUPPORTED_TARGET)
+            self.assertNotIn("target", receipt_value)
+            self.assertNotIn("release_name", receipt_value)
             verified = MODULE.verify_model_tree(root, manifest)
             valid_receipt = receipt.read_bytes()
 
@@ -228,13 +292,19 @@ class VerifyInstalledTest(unittest.TestCase):
                 "operation_id": operation_id,
                 "operation": "install",
                 "phase": "published",
-                "target": MODULE.SUPPORTED_TARGET,
                 "revision": MODULE.MODEL_REVISION,
                 "staging_name": None,
                 "backup_name": None,
                 "before_digest": None,
                 "after_digest": MODULE._tree_digest(root / "models"),
             }
+            # The Rust owner rejects unknown journal fields, including the
+            # retired worker target binding.
+            (root / MODULE.JOURNAL_FILENAME).write_text(
+                json.dumps(dict(journal, target="aarch64-apple-darwin")), encoding="utf-8"
+            )
+            with self.assertRaisesRegex(MODULE.VerificationFailure, "journal fields"):
+                MODULE.recover_model(root, manifest, revision_receipt=revision_receipt)
             (root / MODULE.JOURNAL_FILENAME).write_text(
                 json.dumps(journal), encoding="utf-8"
             )
@@ -275,73 +345,85 @@ class VerifyInstalledTest(unittest.TestCase):
             self.assertEqual(result["outcome"], "committed")
             self.assertFalse((root / MODULE.JOURNAL_FILENAME).exists())
 
-    def test_worker_sidecar_carries_both_target_bound_manifests(self) -> None:
+    def test_worker_sidecar_carries_the_trusted_manifest_for_any_pinned_target(self) -> None:
         model = fixture_manifest()
-        worker_payload = macho_fixture()
-        worker_manifest = {
-            "schema_version": 1,
-            "worker": MODULE.WORKER_NAME,
-            "protocol_version": 1,
-            "protocol_identity": "tracedecay.ncm.worker.v1",
-            "targets": [
-                {
-                    "triple": MODULE.SUPPORTED_TARGET,
-                    "os": "macos",
-                    "arch": "aarch64",
-                    "family": "unix",
-                    "bytes": len(worker_payload),
-                    "sha256": hashlib.sha256(worker_payload).hexdigest(),
-                }
-            ],
+        payloads = {
+            "aarch64-apple-darwin": macho_fixture(),
+            "x86_64-apple-darwin": macho_fixture(0x01000007),
+            "aarch64-unknown-linux-gnu": elf_fixture(machine=0x00B7),
+            "x86_64-pc-windows-msvc": pe_fixture(machine=0x8664),
         }
-        with tempfile.TemporaryDirectory(prefix="ncm-installed-sidecar-") as directory:
-            root = Path(directory)
-            trusted_worker = root / MODULE.WORKER_MANIFEST_NAME
-            trusted_model = root / MODULE.MODEL_ACQUISITION_MANIFEST_NAME
-            trusted_worker.write_text(json.dumps(worker_manifest), encoding="utf-8")
-            trusted_model.write_text(json.dumps(model, indent=2) + "\n", encoding="utf-8")
-            archive_path = root / "worker.tar.gz"
-            with tarfile.open(archive_path, "w:gz") as archive:
-                write_tar_entry(archive, MODULE.WORKER_NAME, worker_payload, 0o755)
-                write_tar_entry(archive, MODULE.WORKER_MANIFEST_NAME, trusted_worker.read_bytes(), 0o644)
-                write_tar_entry(archive, MODULE.MODEL_ACQUISITION_MANIFEST_NAME, trusted_model.read_bytes(), 0o644)
-            checksum = root / "worker.tar.gz.sha256"
-            checksum.write_text(
-                f"{hashlib.sha256(archive_path.read_bytes()).hexdigest()}  {archive_path.name}\n",
-                encoding="utf-8",
-            )
-            result = MODULE.verify_worker_archive(
-                archive_path,
-                worker_manifest_path=trusted_worker,
-                model_manifest_path=trusted_model,
-                checksum_path=checksum,
-            )
-            self.assertEqual(result["target"], MODULE.SUPPORTED_TARGET)
-            self.assertEqual(result["worker"]["bytes"], len(worker_payload))
-
-            with self.assertRaisesRegex(MODULE.VerificationFailure, "trusted worker manifest"):
-                MODULE.verify_worker_archive(
-                    archive_path,
-                    model_manifest_path=trusted_model,
-                    checksum_path=checksum,
+        # One multi-target trust root ships beside every sidecar because the
+        # host binaries embed exactly this manifest.
+        worker_manifest = worker_manifest_with(
+            [worker_pin(triple, payload) for triple, payload in payloads.items()]
+        )
+        for target, worker_payload in payloads.items():
+            with self.subTest(target=target), tempfile.TemporaryDirectory(
+                prefix="ncm-installed-sidecar-"
+            ) as directory:
+                root = Path(directory)
+                trusted_worker = root / MODULE.WORKER_MANIFEST_NAME
+                trusted_model = root / MODULE.MODEL_ACQUISITION_MANIFEST_NAME
+                trusted_worker.write_text(json.dumps(worker_manifest), encoding="utf-8")
+                trusted_model.write_text(json.dumps(model, indent=2) + "\n", encoding="utf-8")
+                archive_path = root / "worker.tar.gz"
+                with tarfile.open(archive_path, "w:gz") as archive:
+                    write_tar_entry(
+                        archive, MODULE.worker_executable_name(target), worker_payload, 0o755
+                    )
+                    write_tar_entry(archive, MODULE.WORKER_MANIFEST_NAME, trusted_worker.read_bytes(), 0o644)
+                    write_tar_entry(archive, MODULE.MODEL_ACQUISITION_MANIFEST_NAME, trusted_model.read_bytes(), 0o644)
+                checksum = root / "worker.tar.gz.sha256"
+                checksum.write_text(
+                    f"{hashlib.sha256(archive_path.read_bytes()).hexdigest()}  {archive_path.name}\n",
+                    encoding="utf-8",
                 )
-            with self.assertRaisesRegex(MODULE.VerificationFailure, "checksum is required"):
-                MODULE.verify_worker_archive(
+                result = MODULE.verify_worker_archive(
                     archive_path,
-                    worker_manifest_path=trusted_worker,
-                    model_manifest_path=trusted_model,
-                )
-
-            tampered = json.loads(trusted_model.read_text(encoding="utf-8"))
-            tampered["target"] = "x86_64-unknown-linux-gnu"
-            trusted_model.write_text(json.dumps(tampered), encoding="utf-8")
-            with self.assertRaises(MODULE.VerificationFailure):
-                MODULE.verify_worker_archive(
-                    archive_path,
+                    target=target,
                     worker_manifest_path=trusted_worker,
                     model_manifest_path=trusted_model,
                     checksum_path=checksum,
                 )
+                self.assertEqual(result["target"], target)
+                self.assertEqual(result["worker"]["bytes"], len(worker_payload))
+
+                unpinned = "aarch64-pc-windows-msvc"
+                with self.assertRaises(MODULE.VerificationFailure):
+                    MODULE.verify_worker_archive(
+                        archive_path,
+                        target=unpinned,
+                        worker_manifest_path=trusted_worker,
+                        model_manifest_path=trusted_model,
+                        checksum_path=checksum,
+                    )
+                with self.assertRaisesRegex(MODULE.VerificationFailure, "trusted worker manifest"):
+                    MODULE.verify_worker_archive(
+                        archive_path,
+                        target=target,
+                        model_manifest_path=trusted_model,
+                        checksum_path=checksum,
+                    )
+                with self.assertRaisesRegex(MODULE.VerificationFailure, "checksum is required"):
+                    MODULE.verify_worker_archive(
+                        archive_path,
+                        target=target,
+                        worker_manifest_path=trusted_worker,
+                        model_manifest_path=trusted_model,
+                    )
+
+                tampered = json.loads(trusted_model.read_text(encoding="utf-8"))
+                tampered["target"] = target
+                trusted_model.write_text(json.dumps(tampered), encoding="utf-8")
+                with self.assertRaises(MODULE.VerificationFailure):
+                    MODULE.verify_worker_archive(
+                        archive_path,
+                        target=target,
+                        worker_manifest_path=trusted_worker,
+                        model_manifest_path=trusted_model,
+                        checksum_path=checksum,
+                    )
 
     def test_cli_archive_is_smoked_after_safe_extraction(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ncm-installed-cli-") as directory:
@@ -360,7 +442,7 @@ class VerifyInstalledTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.VerificationFailure, "Mach-O"):
                 MODULE.verify_binary_archive(
                     archive_path,
-                    target=MODULE.SUPPORTED_TARGET,
+                    target="aarch64-apple-darwin",
                     expected_version=version,
                     expected_source_sha=source_sha,
                     expected_archive_sha256=archive_digest,
@@ -377,7 +459,7 @@ class VerifyInstalledTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.VerificationFailure, "Mach-O"):
                 MODULE.verify_binary_archive(
                     archive_path,
-                    target=MODULE.SUPPORTED_TARGET,
+                    target="aarch64-apple-darwin",
                     expected_version=version,
                     expected_source_sha="b" * 40,
                     expected_archive_sha256=archive_digest,
@@ -386,7 +468,7 @@ class VerifyInstalledTest(unittest.TestCase):
             with mock.patch.object(MODULE, "_verify_executable_format"):
                 verified_archive = MODULE.verify_binary_archive(
                     archive_path,
-                    target=MODULE.SUPPORTED_TARGET,
+                    target="aarch64-apple-darwin",
                     expected_version=version,
                     expected_source_sha=source_sha,
                     expected_archive_sha256=archive_digest,
@@ -401,7 +483,7 @@ class VerifyInstalledTest(unittest.TestCase):
                 ):
                     MODULE.verify_binary_archive(
                         archive_path,
-                        target=MODULE.SUPPORTED_TARGET,
+                        target="aarch64-apple-darwin",
                         expected_version=version,
                         expected_source_sha=source_sha,
                         expected_archive_sha256=archive_digest,
@@ -414,7 +496,7 @@ class VerifyInstalledTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.VerificationFailure, "Mach-O"):
                 MODULE.verify_installed_binary(
                     installed,
-                    target=MODULE.SUPPORTED_TARGET,
+                    target="aarch64-apple-darwin",
                     expected_version=version,
                     expected_source_sha=source_sha,
                     expected_binary_sha256=hashlib.sha256(binary).hexdigest(),
@@ -423,7 +505,7 @@ class VerifyInstalledTest(unittest.TestCase):
             with self.assertRaisesRegex(MODULE.VerificationFailure, "expected installed CLI SHA-256"):
                 MODULE.verify_installed_binary(
                     installed,
-                    target=MODULE.SUPPORTED_TARGET,
+                    target="aarch64-apple-darwin",
                     expected_version=version,
                     expected_source_sha=source_sha,
                 )

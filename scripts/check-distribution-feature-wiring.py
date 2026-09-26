@@ -64,7 +64,6 @@ REQUIRED_CLI_FEATURE_MEMBERS = {
 # native providers. Keep this matrix in the distribution gate so a new release
 # target cannot accidentally inherit the host's NCM capability claim.
 NCM_SUPPORTED_TARGET = "aarch64-apple-darwin"
-NCM_SUPPORTED_RELEASE = "aarch64-macos"
 NCM_RUNTIME_POLICY = {
     "provider_package": "tracedecay-memory-provider-ncm",
     "provider_feature": "rust-backend",
@@ -380,24 +379,25 @@ def _require_ncm_target_matrix(
     policy: dict[str, Any], release_target_manifest: dict[str, Any]
 ) -> None:
     supported = policy.get("supported_targets")
-    if not isinstance(supported, list) or len(supported) != 1:
-        _ncm_failure(
-            "distribution matrix must have exactly one supported target: arm64 macOS V2"
-        )
-    supported_entry = supported[0]
-    if not isinstance(supported_entry, dict):
-        _ncm_failure("supported_targets[0] must be an object")
-    expected_supported = {
-        "target": NCM_SUPPORTED_TARGET,
-        "release_name": NCM_SUPPORTED_RELEASE,
-        "status": "supported",
-    }
-    for key, expected in expected_supported.items():
-        if supported_entry.get(key) != expected:
+    if not isinstance(supported, list) or not supported:
+        _ncm_failure("distribution matrix must list the NCM-supported worker targets")
+    supported_targets: set[str] = set()
+    for index, entry in enumerate(supported):
+        if not isinstance(entry, dict) or set(entry) != {"target", "status"}:
             _ncm_failure(
-                f"supported_targets[0].{key} must be {expected!r} for the verified "
-                "arm64 macOS sidecar"
+                f"supported_targets[{index}] must be exactly a target and status; "
+                "worker pins are selected at build time"
             )
+        if entry["status"] != "supported":
+            _ncm_failure(f"supported_targets[{index}].status must be 'supported'")
+        supported_targets.add(
+            _ncm_required_string(entry["target"], f"supported_targets[{index}].target")
+        )
+    if NCM_SUPPORTED_TARGET not in supported_targets:
+        _ncm_failure(
+            f"supported_targets must include {NCM_SUPPORTED_TARGET}, the release "
+            "target that publishes the verified arm64 macOS sidecar"
+        )
 
     release_entries = policy.get("release_targets")
     if not isinstance(release_entries, list) or not release_entries:
@@ -459,30 +459,14 @@ def _require_ncm_worker_artifact(
     worker_name = policy.get("worker")
     if worker_name != "tracedecay-ncm-worker":
         _ncm_failure("worker policy must name tracedecay-ncm-worker")
-    targets = worker_manifest.get("targets")
-    if not isinstance(targets, list) or len(targets) != 1:
+    # The checked-in manifest is the source trust root and pins no worker.
+    # Release builds embed a pinned manifest through
+    # TRACEDECAY_NCM_WORKER_MANIFEST (scripts/product/ncm/build-worker-bundle.py).
+    if worker_manifest.get("targets") != []:
         _ncm_failure(
-            "worker artifact policy must pin exactly one verified arm64 macOS sidecar"
+            "checked-in worker manifest must pin no worker; release pins are "
+            "selected at build time through TRACEDECAY_NCM_WORKER_MANIFEST"
         )
-    target = targets[0]
-    if not isinstance(target, dict):
-        _ncm_failure("worker manifest target must be an object")
-    expected = {
-        "triple": NCM_SUPPORTED_TARGET,
-        "os": "macos",
-        "arch": "aarch64",
-        "family": "unix",
-    }
-    for key, value in expected.items():
-        if target.get(key) != value:
-            _ncm_failure(
-                f"worker manifest target {key} must be {value!r} for the verified "
-                "arm64 macOS sidecar"
-            )
-    _ncm_required_positive_int(target.get("bytes"), "worker manifest target bytes")
-    digest = _ncm_required_string(target.get("sha256"), "worker manifest target sha256")
-    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-        _ncm_failure("worker manifest target sha256 must be lowercase hexadecimal")
 
 
 def _require_ncm_release_workflow(path: Path) -> None:
@@ -576,14 +560,14 @@ def _require_ncm_model_acquisition_contract(
     embedding_manifest_path: Path,
     model_revision_receipt_path: Path | None = None,
 ) -> None:
-    """Keep the target-specific release descriptor tied to the model pin."""
+    """Keep the target-independent release descriptor tied to the model pin."""
+    if "target" in acquisition_manifest or "release_name" in acquisition_manifest:
+        _ncm_failure("model acquisition manifest must be target-independent")
     expected = {
         "schema_version": 1,
         "manifest_type": "ncm-model-acquisition",
         "provider_id": "ncm",
         "worker": "tracedecay-ncm-worker",
-        "target": NCM_SUPPORTED_TARGET,
-        "release_name": NCM_SUPPORTED_RELEASE,
         "embedding_manifest": "product/ncm/reference/embedding-manifest.json",
         "model_root": "models",
         "cache_repository": "models--Xenova--paraphrase-multilingual-MiniLM-L12-v2",
@@ -666,7 +650,6 @@ def _require_ncm_model_acquisition_contract(
         "operation_id",
         "operation",
         "outcome",
-        "target",
         "model",
         "repository",
         "revision",
