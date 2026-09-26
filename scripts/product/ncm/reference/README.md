@@ -84,15 +84,17 @@ report 9 passing tests.
 
 ## Worker platform policy
 
-`../worker-manifest.json` records the executable identity for the one worker target currently
-pinned in this checkout. `../worker-platforms.json` is the release-facing capability descriptor:
-it cross-checks that pin against `.github/release-targets.json`, advertises only
-`aarch64-macos`, and records Native-only fallback for every other release target. Run
-`python3 scripts/product/ncm/check-worker-platform.py` from the repository root before changing
-the worker distribution matrix. A new target is not supported until its actual executable bytes,
-size, digest, manifest entry, and package journey all exist. The policy treats the worker as a
-separate sidecar: standard CLI archives do not include it, and an installed sidecar must carry its
-matching manifest beside the executable.
+`../worker-manifest.json` is the source trust root and pins no worker (`"targets": []`), so a
+plain source build reports NCM as unsupported on every target. A release pins workers at build
+time: `scripts/product/ncm/build-worker-bundle.py` builds the worker for one target and writes a
+bundle whose `worker-manifest.json` pins those exact bytes (`--merge` combines per-target
+manifests), and the host binaries are built with `TRACEDECAY_NCM_WORKER_MANIFEST=<that manifest>`.
+`../worker-platforms.json` lists the targets allowed to carry a pin and cross-checks the release
+rows in `.github/release-targets.json`. Run `python3 scripts/product/ncm/check-worker-platform.py`
+(add `--worker-manifest <release manifest> --require-release-pins` for a release) before changing
+the worker distribution matrix. The policy treats the worker as a separate sidecar: standard CLI
+archives do not include it, and an installed sidecar must carry the exact trusted manifest beside
+the executable.
 
 ## Fixtures
 
