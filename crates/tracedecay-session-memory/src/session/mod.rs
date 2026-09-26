@@ -1,6 +1,5 @@
 mod hotpath_observe;
 pub mod lcm;
-mod ports;
 mod refresh;
 mod refresh_service;
 mod retrieval;
@@ -8,14 +7,10 @@ mod retrieval;
 mod tests;
 mod types;
 
-pub use ports::{
-    AuthorizedTemporalExecutionRequest, SessionTemporalExecutionError,
-    SessionTemporalExecutionPort, SessionTemporalExecutionReport, TemporalExecutionFuture,
-};
 pub use refresh::{
     SessionRefreshConfiguration, SessionRefreshDigest, SessionRefreshHandle, SessionRefreshOutcome,
     SessionRefreshRequestError, SessionRefreshSchedulerError, SessionRefreshService,
-    SessionRefreshTarget,
+    SessionRefreshTarget, SessionRefreshUnavailable,
 };
 pub use refresh_service::{
     SessionRefreshAction, SessionRefreshCommand, SessionRefreshCoverageView,
@@ -30,6 +25,10 @@ pub use retrieval::{
 pub use tracedecay_contracts::retrieval::{
     SessionRetrievalBudgetAccountingV1, SessionRetrievalBudgetObservationV1,
     SessionRetrievalBudgetStageV1,
+};
+pub use tracedecay_session_temporal_store::execution::{
+    AuthorizedTemporalExecutionRequest, SessionTemporalExecutionError,
+    SessionTemporalExecutionReport,
 };
 pub use types::{
     AuthorizationGrantId, AuthorizedSessionScope, SessionAccess, SessionAuthorizationError,

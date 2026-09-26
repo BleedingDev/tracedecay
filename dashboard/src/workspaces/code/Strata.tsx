@@ -1,5 +1,5 @@
 /**
- * STRATA — `GET /api/plugins/graph/strata`.
+ * STRATA. `GET /api/plugins/graph/strata`.
  *
  * The graph's dependency layering: how deep the import/dependency chains run,
  * and which directories form the clusters those chains cross. Where the spine
@@ -11,7 +11,7 @@
  * computes both, and the gap between them is the amount of layering the graph
  * has beyond what its own structure requires.
  *
- * Truthfulness. This is a BUDGETED scan — `scan` carries the file and edge caps
+ * Truthfulness. This is a BUDGETED scan, `scan` carries the file and edge caps
  * it ran under, how many it actually examined, and whether the answer came from
  * cache. A depth computed over a truncated file set is a floor, not a depth, so
  * a capped scan says so on the same line as the number rather than underneath
@@ -40,7 +40,7 @@ export function Strata() {
         <span aria-hidden className="td-rule" />
       </div>
       {strata.isPending ? (
-        <p className="text-2xs text-state-loading">scanning…</p>
+        <p className="text-2xs text-state-loading">reading…</p>
       ) : strata.data === undefined ? (
         <p className="text-2xs text-state-unknown">no response recorded</p>
       ) : strata.data.outcome !== 'measured' ? (
@@ -55,11 +55,6 @@ export function Strata() {
 }
 
 function StrataReading({ measurement }: { measurement: StrataMeasurementV1 }) {
-  const { scan } = measurement;
-  const filesCapped = scan.files_examined >= scan.max_files;
-  const edgesCapped = scan.dependency_edges_examined >= scan.max_dependency_edges;
-  const capped = filesCapped || edgesCapped;
-
   // Directories that leak the most: boundary edges are the ones a change
   // inside the cluster can propagate through.
   const leakiest = [...measurement.clusters]
@@ -77,7 +72,7 @@ function StrataReading({ measurement }: { measurement: StrataMeasurementV1 }) {
               {measurement.max_depth}
             </span>
             <span className="td-unit whitespace-nowrap">
-              {capped ? 'or more' : `of ${measurement.ideal_depth} ideal`}
+              of {measurement.ideal_depth} ideal
             </span>
           </span>
         </span>
@@ -100,19 +95,6 @@ function StrataReading({ measurement }: { measurement: StrataMeasurementV1 }) {
           </span>
         </span>
       </div>
-
-      {capped ? (
-        <p className="text-3xs leading-snug text-state-unknown">
-          the scan stopped at its budget —{' '}
-          {filesCapped ? `${scan.max_files.toLocaleString()} files` : null}
-          {filesCapped && edgesCapped ? ' and ' : null}
-          {edgesCapped
-            ? `${scan.max_dependency_edges.toLocaleString()} dependency edges`
-            : null}{' '}
-          in {scan.budget_ms} ms — so the depth above is a floor and these clusters are
-          the ones it reached, not all of them
-        </p>
-      ) : null}
 
       {leakiest.length > 0 ? (
         <div className="flex flex-col gap-1">
@@ -157,7 +139,7 @@ function StrataReading({ measurement }: { measurement: StrataMeasurementV1 }) {
 
       <p className="text-3xs leading-snug text-text-muted">
         {measurement.algorithm} over {measurement.dependency_edge_kinds.join(', ')} edges ·
-        ordered by {measurement.cluster_ordering} · cache {scan.cache_state}
+        ordered by {measurement.cluster_ordering} · cache {measurement.scan.cache_state}
       </p>
     </div>
   );

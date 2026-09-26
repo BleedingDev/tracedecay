@@ -20,7 +20,7 @@ mod common;
 /// registered as a durable authority in profile '...'"). The hermetic escape
 /// hatch (`TraceDecay::standalone_test_open_options`) is
 /// `cfg(test)`/`test-transport` gated, so it is inactive for this integration
-/// binary — the fixture must pin the profile itself, the same shape
+/// binary, the fixture must pin the profile itself, the same shape
 /// `tests/automation_runner_test::support::fixture_open_options` uses.
 ///
 /// The shard lives under the project's own `.tracedecay/` marker directory so
@@ -32,7 +32,7 @@ mod common;
 mod fixture_profile {
     use std::path::Path;
 
-    use tracedecay::project::TraceDecayOpenOptions;
+    use tracedecay_project::project::TraceDecayOpenOptions;
 
     pub(crate) fn open_options(project_root: &Path) -> TraceDecayOpenOptions {
         let profile_root = project_root.join(".tracedecay").join("fixture-profile");

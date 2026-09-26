@@ -44,7 +44,7 @@ use tracedecay_application::pr_tracking::{
     prepare_pr_worktree, resolve_branch_head, save_state,
 };
 #[cfg(test)]
-use tracedecay_application::pr_tracking::{managed_summary, try_acquire_manual_branch_lifecycle};
+use tracedecay_application::pr_tracking::{acquire_manual_branch_lifecycle, managed_summary};
 use tracedecay_domain::ProjectId;
 use tracedecay_domain::errors::TraceDecayError;
 
@@ -77,14 +77,14 @@ pub(super) use runtime::spawn_with_administration;
 #[derive(Clone, Copy)]
 struct PrStoreAdministration<'a> {
     schedulers: Option<&'a CodeIndexSchedulerRegistryV1>,
-    graph: Option<&'a Arc<crate::project::TraceDecay>>,
+    graph: Option<&'a Arc<tracedecay_project::project::TraceDecay>>,
     command_control: &'a PrCommandControl,
 }
 
 impl<'a> PrStoreAdministration<'a> {
     fn with_control(
         schedulers: &'a CodeIndexSchedulerRegistryV1,
-        graph: &'a Arc<crate::project::TraceDecay>,
+        graph: &'a Arc<tracedecay_project::project::TraceDecay>,
         command_control: &'a PrCommandControl,
     ) -> Self {
         Self {
@@ -136,7 +136,7 @@ fn log_pr_skip(repo_root: &Path, branch_label: Option<&str>, pr: Option<u64>, re
 #[cfg(test)]
 pub(crate) async fn activate_manual_branch_head(
     repo_root: &Path,
-    graph: &Arc<crate::project::TraceDecay>,
+    graph: &Arc<tracedecay_project::project::TraceDecay>,
     schedulers: Option<&CodeIndexSchedulerRegistryV1>,
     branch: &str,
 ) -> std::result::Result<ManualBranchActivation, ManualBranchActivationError> {
@@ -145,7 +145,8 @@ pub(crate) async fn activate_manual_branch_head(
             "code-index scheduler authority is unavailable for branch activation",
         ));
     }
-    let lifecycle = try_acquire_manual_branch_lifecycle(&graph.store_layout().data_root, branch)?;
+    let lifecycle =
+        acquire_manual_branch_lifecycle(&graph.store_layout().data_root, branch).await?;
     activate_manual_branch_head_with_lifecycle(
         repo_root,
         graph,
@@ -160,7 +161,7 @@ pub(crate) async fn activate_manual_branch_head(
 #[hotpath::measure(label = "daemon.pr_autotrack.activate", future = true)]
 pub(crate) async fn activate_manual_branch_head_with_lifecycle(
     repo_root: &Path,
-    graph: &Arc<crate::project::TraceDecay>,
+    graph: &Arc<tracedecay_project::project::TraceDecay>,
     schedulers: Option<&CodeIndexSchedulerRegistryV1>,
     branch: &str,
     lifecycle: &ManualBranchLifecycleLeaseV1,
@@ -190,9 +191,12 @@ pub(crate) async fn activate_manual_branch_head_with_lifecycle(
 }
 
 #[hotpath::measure(label = "daemon.pr_autotrack.activate_manual_branch", future = true)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Activation holds the lifecycle lease across resolve-checkout-index so a lease change aborts before any durable branch state is published."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Activation holds the lifecycle lease across resolve-checkout-index so a lease change aborts before any durable branch state is published."
+    )
 )]
 async fn activate_manual_branch_with_administration(
     repo_root: &Path,
@@ -534,9 +538,12 @@ pub(crate) async fn retire_worktree_mount(
 }
 
 #[hotpath::measure(label = "daemon.pr_autotrack.reconcile", future = true)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Closed-PR removals run only on a complete discovery; a partial listing never untracks still-open PRs."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Closed-PR removals run only on a complete discovery; a partial listing never untracks still-open PRs."
+    )
 )]
 async fn reconcile_project_with_administration(
     repo_root: &Path,
@@ -548,9 +555,21 @@ async fn reconcile_project_with_administration(
     let mut state = load_state(data_root)?;
     let mut report = ReconcileReport {
         skipped_forks: discovery.skipped_forks.clone(),
+        reset_stale: std::mem::take(&mut state.stale),
         ..Default::default()
     };
-    let mut state_dirty = false;
+    let mut state_dirty = !report.reset_stale.is_empty();
+    for stale in &report.reset_stale {
+        log_daemon_event(
+            "pr_autotrack",
+            &[
+                ("project", repo_root.display().to_string()),
+                ("action", "reset_stale".to_string()),
+                ("branch", stale.label.clone()),
+                ("reason", stale.detail.clone()),
+            ],
+        );
+    }
 
     // Desired label → discovered PR.
     let desired: BTreeMap<String, &DiscoveredPr> = discovery
@@ -559,7 +578,7 @@ async fn reconcile_project_with_administration(
         .map(|pr| (pr_label(pr.number), pr))
         .collect();
 
-    // Removals first (cheap, unblocks disk) — managed entries no longer open.
+    // Removals first (cheap, unblocks disk), managed entries no longer open.
     // Suppress them entirely when the discovery is `partial`: an incomplete
     // listing must never be read as "these PRs closed", or a truncated `gh`
     // page (or gh↔ls-remote flapping) would churn-untrack still-open PRs.
@@ -630,7 +649,7 @@ async fn reconcile_project_with_administration(
         if is_new && added >= cap {
             // The cap bounds only *new* tracks. `continue` (not `break`) so a
             // later entry that is already managed but has a changed head_sha
-            // still gets its refresh — otherwise a burst of new PRs would starve
+            // still gets its refresh, otherwise a burst of new PRs would starve
             // head updates for existing managed PRs, serving stale graphs.
             report.capped = true;
             continue;
@@ -833,7 +852,7 @@ async fn track_pr(
 #[hotpath::measure(label = "daemon.pr_autotrack.activate_worktree", future = true)]
 async fn activate_linked_worktree(
     schedulers: &CodeIndexSchedulerRegistryV1,
-    graph: &crate::project::TraceDecay,
+    graph: &tracedecay_project::project::TraceDecay,
     worktree: &Path,
 ) -> std::result::Result<(), String> {
     let project_id = graph
@@ -903,7 +922,6 @@ async fn remove_pr_store(
 fn pr_number_from_label(label: &str) -> Option<u64> {
     label
         .strip_prefix("tracedecay/autotrack/pr/")
-        .or_else(|| label.strip_prefix("pr/"))
         .and_then(|number| number.parse().ok())
 }
 
@@ -925,7 +943,6 @@ async fn cleanup_failed_track(
                 data_root,
                 pr,
                 head_sha,
-                true,
                 administration.command_control.clone(),
             )
             .await
@@ -951,14 +968,11 @@ async fn untrack_pr(
     managed: &ManagedPr,
     administration: PrStoreAdministration<'_>,
 ) -> std::result::Result<(), String> {
-    let expected_label = pr_label(managed.pr);
-    let legacy_label = format!("pr/{}", managed.pr);
-    let is_legacy = label == legacy_label;
     let expected_worktree = data_root
         .join("pr-worktrees")
         .join(format!("pr-{}", managed.pr));
     let expected_ref = pr_tracking_ref(managed.pr);
-    if (label != expected_label && !is_legacy)
+    if label != pr_label(managed.pr)
         || managed.worktree != expected_worktree
         || managed.tracking_ref != expected_ref
     {
@@ -970,7 +984,6 @@ async fn untrack_pr(
         data_root,
         managed.pr,
         &managed.head_sha,
-        !is_legacy,
         administration.command_control.clone(),
     )
     .await
@@ -1033,7 +1046,6 @@ async fn sweep_orphan_pr_worktrees(
                     data_root,
                     number,
                     "",
-                    true,
                     administration.command_control.clone(),
                 )
                 .await

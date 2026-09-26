@@ -21,12 +21,12 @@ use super::scheduler_automation_effect;
 use crate::daemon::DaemonEngine;
 use tracedecay_automation_runtime::automation::effect_runtime::AutomationSettledTerminal;
 
-use crate::project::TraceDecay;
 use tracedecay_automation_runtime::automation::effect_runtime::settlement::{
     AutomationEffectAdmission, AutomationEffectAuthority, DeferredProblemSettlementRequest,
     DeferredRunSettlementRequest, DeferredSettlementOutcome, DeferredSettlementRequest,
 };
 use tracedecay_domain::errors::Result;
+use tracedecay_project::project::TraceDecay;
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 pub(super) enum CombinedEffectAdmission {
@@ -800,7 +800,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use fs2::FileExt;
     use tempfile::TempDir;
     use tracedecay_application::observability::RegisteredObservabilityPortV1;
     use tracedecay_automation_runtime::automation::AutomationRunControl;
@@ -857,7 +856,7 @@ mod tests {
             let memory = Arc::new(
                 TraceDecay::init_with_options_for_test(
                     &project_root,
-                    crate::project::TraceDecayOpenOptions {
+                    tracedecay_project::project::TraceDecayOpenOptions {
                         profile_root: Some(profile_root.clone()),
                         global_db_path: Some(profile_root.join("global.db")),
                     },
@@ -1067,6 +1066,10 @@ mod tests {
         > {
             self.calls.fetch_add(1, Ordering::SeqCst);
             panic!("a disabled scheduler run must not invoke its backend")
+        }
+
+        fn executable(&self) -> Option<&std::path::Path> {
+            None
         }
     }
 
@@ -1336,7 +1339,7 @@ mod tests {
             ))
             .expect("open current skill journal lock");
         journal_lock
-            .lock_exclusive()
+            .lock()
             .expect("block current skill abandonment");
         let mut first_error = None;
         let mut effect = Box::pin(run_combined_scheduler_effect(
@@ -1392,7 +1395,9 @@ mod tests {
         assert_eq!(exact_spool_files(&fixture.dashboard_root), spool_before);
         assert_eq!(pending_journal_files(&fixture.dashboard_root).len(), 1);
 
-        FileExt::unlock(&journal_lock).expect("release current skill abandonment");
+        journal_lock
+            .unlock()
+            .expect("release current skill abandonment");
         assert_eq!((&mut effect).await, CombinedEffectOutcome::Handled);
         drop(effect);
         assert!(first_error.is_none());

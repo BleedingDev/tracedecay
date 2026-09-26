@@ -53,6 +53,13 @@ pub(super) fn application_contract_error_response(error: ApplicationContractErro
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
+fn invalid_surface_request_problem(message: String) -> ApplicationProblem {
+    ApplicationProblem::invalid_request_without_action(
+        "application.surface.invalid_request",
+        message,
+    )
+}
+
 pub(super) fn http_adapter_problem(
     contract: ResultContractRef,
     request_id: RequestId,
@@ -62,16 +69,11 @@ pub(super) fn http_adapter_problem(
         ApplicationSurfaceAdapterError::UnknownOrNotAuthorized => {
             ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never)
         }
-        ApplicationSurfaceAdapterError::InvalidRequestHandle
-        | ApplicationSurfaceAdapterError::InvalidSurfaceRequest => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic {
-                    code: "application.surface.invalid_request".to_owned(),
-                    message: "The application request is invalid".to_owned(),
-                },
-                retry: RetryDirective::Never,
-                legal_actions: Vec::new(),
-            }
+        ApplicationSurfaceAdapterError::InvalidRequestHandle => {
+            invalid_surface_request_problem("The application request is invalid".to_owned())
+        }
+        ApplicationSurfaceAdapterError::InvalidSurfaceRequest { detail } => {
+            invalid_surface_request_problem(format!("The application request is invalid: {detail}"))
         }
         // Catalog composition is derived from `const` application specs, so
         // these failures are deterministic for the lifetime of the process.
@@ -116,12 +118,15 @@ pub(super) fn http_adapter_problem(
 /// The refusal settles before any project server exists, so the MCP boundary
 /// cannot route the call to its handler; the truthful answer for the named
 /// operation is the reset-required terminal under its own mounted MCP result
-/// contract. Returns `None` for tools without a mounted application binding.
+/// contract, naming `reset_command`, the exact command that performs the one
+/// legal action, so the agent can relay it. Returns `None` for tools without
+/// a mounted application binding.
 pub fn mcp_project_open_reset_refusal(
     tool_name: &str,
     request_id: RequestId,
     authority: &str,
     reason: &str,
+    reset_command: &str,
 ) -> Option<ApplicationProblemEnvelope> {
     let operation = ApplicationSurfaceOperation::from_tool_name(tool_name)?;
     let catalog = application_surface_catalog_ref().ok()?;
@@ -130,7 +135,9 @@ pub fn mcp_project_open_reset_refusal(
     let contract = ResultContractRef::from_schema(&binding.result_schema);
     let problem = ApplicationProblem::reset_required(SafeDiagnostic {
         code: "application.surface.reset_required".to_owned(),
-        message: format!("The {authority} requires an explicit reset: {reason}"),
+        message: format!(
+            "The {authority} requires an explicit reset: {reason}. Reset it with `{reset_command}`"
+        ),
     });
     ApplicationProblemEnvelope::new(contract, request_id, problem)
         .ok()
@@ -139,46 +146,7 @@ pub fn mcp_project_open_reset_refusal(
 
 pub(crate) fn current_micros() -> Result<UtcMicros, ApplicationSurfaceAdapterError> {
     tracedecay_contracts::clock::try_now_micros()
-        .map_err(|_| ApplicationSurfaceAdapterError::InvalidSurfaceRequest)
-}
-
-pub(super) fn invocation_problem(
-    problem: tracedecay_daemon_protocol::DaemonInvocationProblem,
-) -> Result<ApplicationProblem, ApplicationSurfaceAdapterError> {
-    Ok(match problem {
-        tracedecay_daemon_protocol::DaemonInvocationProblem::InvalidRequest
-        | tracedecay_daemon_protocol::DaemonInvocationProblem::UnsupportedRevision => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic::new(
-                    "application.surface.invalid_request",
-                    "The daemon rejected the application request",
-                )?,
-                retry: RetryDirective::Never,
-                legal_actions: Vec::new(),
-            }
-        }
-        tracedecay_daemon_protocol::DaemonInvocationProblem::NotFoundOrNotAuthorized => {
-            ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never)
-        }
-        tracedecay_daemon_protocol::DaemonInvocationProblem::ResetRequired => {
-            ApplicationProblem::reset_required(SafeDiagnostic::new(
-                "application.surface.reset_required",
-                "The application store requires an explicit reset",
-            )?)
-        }
-        tracedecay_daemon_protocol::DaemonInvocationProblem::ApplicationContractViolation => {
-            ApplicationProblem::unavailable(SafeDiagnostic::new(
-                "application.surface.contract_violation",
-                "The application result violated its canonical contract",
-            )?)
-        }
-        tracedecay_daemon_protocol::DaemonInvocationProblem::Unavailable => {
-            ApplicationProblem::unavailable(SafeDiagnostic::new(
-                "application.surface.unavailable",
-                "The application service for this operation is unavailable",
-            )?)
-        }
-    })
+        .map_err(ApplicationSurfaceAdapterError::invalid_request)
 }
 
 pub(super) fn invocation_contract_problem(
@@ -195,23 +163,15 @@ pub(super) fn invocation_contract_problem(
             ApplicationProblem::timed_out_before_admission()
         }
         tracedecay_contracts::InvocationError::InvalidRequest => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic::new(
-                    "application.surface.invalid_request",
-                    "The daemon rejected the application request",
-                )?,
-                retry: RetryDirective::Never,
-                legal_actions: Vec::new(),
-            }
+            ApplicationProblem::invalid_request_without_action(
+                "application.surface.invalid_request",
+                "The daemon rejected the application request",
+            )
         }
-        tracedecay_contracts::InvocationError::Conflict => ApplicationProblem::Conflict {
-            diagnostic: SafeDiagnostic::new(
-                "application.surface.conflict",
-                "The application request conflicts with current state",
-            )?,
-            retry: RetryDirective::AfterRevalidate,
-            legal_actions: vec![LegalAction::Refresh],
-        },
+        tracedecay_contracts::InvocationError::Conflict => ApplicationProblem::conflict(
+            "application.surface.conflict",
+            "The application request conflicts with current state",
+        ),
         tracedecay_contracts::InvocationError::Unavailable => {
             ApplicationProblem::unavailable(SafeDiagnostic::new(
                 "application.surface.unavailable",

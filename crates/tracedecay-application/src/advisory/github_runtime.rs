@@ -43,7 +43,10 @@ use tracedecay_domain::{ManifestDigest, canonical_sha256};
 
 use super::{GitHubReadOnlyTransport, GitHubRestDescriptorV1, context_allows_feedback_operation};
 
-pub use access::ConfiguredGitHubSourceAccessAuthorityV1;
+pub use access::{
+    ConfiguredGitHubSourceAccessAuthorityV1, DAEMON_GITHUB_ORIGIN_SOURCE_BINDING_ID,
+    daemon_owned_github_source_binding_v1, github_repository_from_remote_v1,
+};
 pub use anchors::{
     GitHubReviewBodyEvidenceAuthorityV1, GitHubReviewBodyEvidenceV1, GitHubReviewBodyReadOutcomeV1,
     ProjectGitHubAnchorAuthorityV1, ProjectGitHubRegistrarAuthoritiesV1,
@@ -60,7 +63,8 @@ pub use decoder::{
 };
 pub use discovery::{
     GitHubDiscoveryControlV1, GitHubExactCommitDiscoveryOutcomeV1, GitHubExactCommitPullRequestV1,
-    discover_exact_commit_pull_request_v1,
+    GitHubPullRequestDiscoveryKindV1, GitHubSourceStateV1, GitHubSourceStatusV1,
+    discover_exact_commit_pull_request_v1, github_source_status_v1, record_github_source_status_v1,
 };
 pub use dto::{
     GitHubActionsCheckRunOutputV1, GitHubActionsCheckRunV1, GitHubActionsCheckSuiteRefV1,
@@ -110,7 +114,7 @@ pub use store::{
 
 /// Appends hotpath's ureq middleware to a GitHub agent config builder so
 /// outbound requests are timed and reported in the `http` report, keyed by
-/// normalized endpoint (method + host/path only — no query string, fragment,
+/// normalized endpoint (method + host/path only, no query string, fragment,
 /// or credential ever crosses into the recorded key). A no-op with the
 /// `hotpath` feature disabled, so every call site compiles identically both
 /// ways.
@@ -356,6 +360,7 @@ where
             resume.etag = None;
         }
         let mut items = BTreeMap::new();
+        let mut quarantined = BTreeMap::new();
         let mut visited_cursors = std::collections::BTreeSet::new();
         for _ in 0..MAX_GITHUB_REFRESH_SCAN_PAGES_V1 {
             if !context_allows_feedback_operation(
@@ -408,9 +413,19 @@ where
             let mut response = *response;
             let next_cursor = response.checkpoint.next_cursor.clone();
             for item in response.ingress.items.drain(..) {
-                if items
-                    .insert(item.comment_id.as_str().to_owned(), item)
-                    .is_some()
+                if quarantined.contains_key(item.comment_id.as_str())
+                    || items
+                        .insert(item.comment_id.as_str().to_owned(), item)
+                        .is_some()
+                {
+                    return GitHubReviewReadPortOutcomeV1::Unavailable;
+                }
+            }
+            for item in response.ingress.quarantined.drain(..) {
+                if items.contains_key(item.comment_id.as_str())
+                    || quarantined
+                        .insert(item.comment_id.as_str().to_owned(), item)
+                        .is_some()
                 {
                     return GitHubReviewReadPortOutcomeV1::Unavailable;
                 }
@@ -428,12 +443,13 @@ where
                 };
                 continue;
             }
-            if !items.is_empty()
+            if !(items.is_empty() && quarantined.is_empty())
                 && response.ingress.outcome != GitHubReviewIngressProviderOutcomeV1::Complete
             {
                 return GitHubReviewReadPortOutcomeV1::Unavailable;
             }
             response.ingress.items = items.into_values().collect();
+            response.ingress.quarantined = quarantined.into_values().collect();
             for item in &mut response.ingress.items {
                 item.provider_outcome = response.ingress.outcome;
             }
@@ -770,6 +786,7 @@ fn normalize_refresh_attempt(
         }
     }
     let mut items = BTreeMap::new();
+    let mut quarantined = BTreeMap::new();
     let previous_partial = previous
         .map(|state| &state.latest_attempt)
         .filter(|response| {
@@ -781,9 +798,17 @@ fn normalize_refresh_attempt(
             item.provider_outcome = latest.ingress.outcome;
             items.insert(item.comment_id.as_str().to_owned(), item);
         }
+        for item in previous_partial.ingress.quarantined.clone() {
+            quarantined.insert(item.comment_id.as_str().to_owned(), item);
+        }
     }
     for item in latest.ingress.items.drain(..) {
+        quarantined.remove(item.comment_id.as_str());
         items.insert(item.comment_id.as_str().to_owned(), item);
+    }
+    for item in latest.ingress.quarantined.drain(..) {
+        items.remove(item.comment_id.as_str());
+        quarantined.insert(item.comment_id.as_str().to_owned(), item);
     }
 
     if latest.ingress.outcome == GitHubReviewIngressProviderOutcomeV1::Complete
@@ -803,6 +828,7 @@ fn normalize_refresh_attempt(
                         tracedecay_domain::feedback::GitHubReviewLifecycleV1::Edited;
                 }
                 Some(_) => {}
+                None if quarantined.contains_key(prior.comment_id.as_str()) => {}
                 None => {
                     let mut deleted = prior.clone();
                     deleted.lifecycle =
@@ -815,6 +841,7 @@ fn normalize_refresh_attempt(
         }
     }
     latest.ingress.items = items.into_values().collect();
+    latest.ingress.quarantined = quarantined.into_values().collect();
     if previous_partial.is_some() {
         // A collection ETag is specific to the page URL that emitted it.
         // Never retain a continuation-page ETag as authority for page one of
@@ -1404,6 +1431,7 @@ mod tests {
                     outcome,
                     coverage,
                     items: Vec::new(),
+                    quarantined: Vec::new(),
                     pull_request: None,
                     fetched_at: UtcMicros(10),
                 })
@@ -1618,6 +1646,7 @@ mod tests {
                 outcome: GitHubReviewIngressProviderOutcomeV1::Complete,
                 coverage: GitHubReviewCoverageV1::Complete,
                 items: Vec::new(),
+                quarantined: Vec::new(),
                 pull_request: None,
                 fetched_at: UtcMicros(11),
             },

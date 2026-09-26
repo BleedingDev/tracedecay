@@ -1,6 +1,8 @@
 //! Projectless client handling: tool calls served without a mounted project
 //! (user-scoped LCM, message search, dashboard, doctor, version).
 
+use std::sync::Arc;
+
 use serde_json::json;
 
 use tracedecay_daemon_identity::authority;
@@ -16,11 +18,10 @@ use tracedecay_mcp::{
     explore_call_budget, project_catalog_discovery_scope, tool_error_response,
     tool_result_has_semantic_error,
 };
-use tracedecay_session_runtime::session_retrieval::DaemonSessionRetrievalRoot;
-use tracedecay_sessions::runtime::user_sessions_db_path;
-use tracedecay_store::StoreShardIdV1;
+use tracedecay_sessions::serving::SessionRefreshWorkerPort;
 
 use super::*;
+use tracedecay_daemon_service::shutdown::DaemonLifecycle;
 
 type ProjectlessPhaseFutureV1<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
@@ -36,10 +37,9 @@ where
 }
 
 /// Authenticated durable identity pinned once for a projectless connection.
-/// Request grants are issued only after the adapter supplies exact controls.
 struct ProjectlessConnectionStateV1 {
     client_identity: DaemonClientIdentity,
-    profile_authority: tracedecay_session_runtime::retained::ProfileRetainedConnectionAuthorityV1,
+    active_project_root: Option<PathBuf>,
 }
 
 /// Two profile roots name the same profile when they resolve to the same
@@ -50,7 +50,7 @@ struct ProjectlessConnectionStateV1 {
 /// carries whatever path the host process derived from its own environment,
 /// which is never canonicalized on the wire. A byte comparison therefore
 /// refuses a connection that is in fact addressing the very same directory
-/// whenever any component of the client's profile root is a symlink — the
+/// whenever any component of the client's profile root is a symlink, the
 /// default on macOS, where the per-user temporary root and anything under
 /// `/var` resolve through `/var -> /private/var`. Project routing already
 /// canonicalizes this exact field before it compares
@@ -87,45 +87,27 @@ fn admit_projectless_connection(
         });
     }
     let pinned_profile_root = profile_identity.profile_root().to_path_buf();
-    let shard = StoreShardIdV1::profile_sessions(
-        profile_identity.brain_id().clone(),
-        profile_identity.profile_id().clone(),
-    );
-    let serving_db = user_sessions_db_path(&pinned_profile_root);
-    let serving = tracedecay_session_runtime::retained::profile_session_retrieval_serving_identity(
-        profile_identity,
-        &shard,
-        &serving_db,
-    )
-    .ok_or_else(|| TraceDecayError::Config {
-        message: "projectless profile session identity is unavailable".to_owned(),
-    })?;
-    let profile_session_root =
-        DaemonSessionRetrievalRoot::profile(serving).ok_or_else(|| TraceDecayError::Config {
-            message: "projectless profile session authority is unavailable".to_owned(),
-        })?;
-    let profile_authority =
-        tracedecay_session_runtime::retained::profile_retained_connection_authority(
-            profile_identity,
-            profile_session_root.identity(),
-        )?;
     Ok(ProjectlessConnectionStateV1 {
         client_identity: DaemonClientIdentity::new(
             pinned_profile_root.clone(),
             pinned_profile_root.join("global.db"),
         ),
-        profile_authority,
+        active_project_root: None,
     })
 }
 
+/// `active_project_root` is the handshake's project, used only to mark that
+/// project active in registry reads; it never mounts or opens the project.
 pub(super) async fn serve_projectless_client(
     transport: &mut (impl McpTransport + Send),
     client_identity: &DaemonClientIdentity,
+    active_project_root: Option<PathBuf>,
     timings_enabled: bool,
     lifecycle: &DaemonLifecycle,
     store_administration: &StoreAdministration,
 ) -> Result<()> {
-    let connection = admit_projectless_connection(client_identity, store_administration)?;
+    let mut connection = admit_projectless_connection(client_identity, store_administration)?;
+    connection.active_project_root = active_project_root;
     loop {
         let line = tokio::select! {
             result = read_line_handling_wire_oversized(transport) => result?,
@@ -167,7 +149,7 @@ async fn projectless_response(
 ) -> Option<tracedecay_mcp::JsonRpcResponse> {
     let id = request.id.clone()?;
     match request.method.as_str() {
-        "initialize" => Some(match crate::version::build_version() {
+        "initialize" => Some(match tracedecay_project::version::build_version() {
             Ok(version) => JsonRpcResponse::success(
                 id,
                 json!({
@@ -202,7 +184,7 @@ async fn projectless_response(
             );
             Some(response)
         }
-        "ping" | "logging/setLevel" => Some(JsonRpcResponse::success(id, json!({}))),
+        "ping" => Some(JsonRpcResponse::success(id, json!({}))),
         _ => Some(JsonRpcResponse::error(
             id,
             ErrorCode::MethodNotFound,
@@ -355,9 +337,15 @@ async fn projectless_tools_call_response_with_connection(
             )),
             tool_name @ ("tracedecay_project_list"
             | "tracedecay_project_search"
-            | "tracedecay_project_context") => boxed_projectless_phase(
-                projectless_registry_response(id, tool_name, arguments, store_administration),
-            ),
+            | "tracedecay_project_context") => {
+                boxed_projectless_phase(projectless_registry_response(
+                    id,
+                    tool_name,
+                    arguments,
+                    connection.active_project_root.as_deref(),
+                    store_administration,
+                ))
+            }
             _ => {
                 // `projectless_tool_is_discoverable` admitted the name above,
                 // so any remaining tool is a retained profile operation.
@@ -371,7 +359,6 @@ async fn projectless_tools_call_response_with_connection(
                     tool_name,
                     operation,
                     arguments,
-                    connection,
                     store_administration,
                 ))
             }
@@ -390,12 +377,14 @@ fn requires_project_error(id: serde_json::Value, tool_name: &str) -> JsonRpcResp
 /// Registry reads are profile-scoped: they answer from the authenticated
 /// profile's project registry, the same authority `tracedecay projects`
 /// reads, so a connection without a mounted project still gets the real
-/// listing (possibly empty). No project is marked active. A registry that
-/// cannot be opened is a typed tool error, never an empty listing.
+/// listing (possibly empty). Only the handshake's project, if any, is marked
+/// active. A registry that cannot be opened is a typed tool error, never an
+/// empty listing.
 async fn projectless_registry_response(
     id: serde_json::Value,
     tool_name: &str,
     arguments: serde_json::Value,
+    active_project_root: Option<&Path>,
     store_administration: &StoreAdministration,
 ) -> tracedecay_mcp::JsonRpcResponse {
     let registry =
@@ -407,7 +396,7 @@ async fn projectless_registry_response(
     let result = match tool_name {
         "tracedecay_project_list" => {
             tracedecay_mcp::handlers::info::handle_project_list(
-                None,
+                active_project_root,
                 arguments,
                 Some(&registry_reads),
             )
@@ -415,7 +404,7 @@ async fn projectless_registry_response(
         }
         "tracedecay_project_search" => {
             tracedecay_mcp::handlers::info::handle_project_search(
-                None,
+                active_project_root,
                 arguments,
                 Some(&registry_reads),
             )
@@ -423,6 +412,7 @@ async fn projectless_registry_response(
         }
         "tracedecay_project_context" => {
             tracedecay_mcp::handlers::info::handle_project_context(
+                active_project_root,
                 None,
                 arguments,
                 Some(&registry_reads),
@@ -558,6 +548,7 @@ async fn projectless_hook_runtime_response(
             ),
     )
     .await;
+    let user_refresh: Arc<dyn SessionRefreshWorkerPort> = Arc::new(refresh_wake.clone());
     match boxed_projectless_phase(
         tracedecay_mcp::handlers::hook_runtime::handle_projectless_hook_runtime(
             arguments.clone(),
@@ -572,6 +563,7 @@ async fn projectless_hook_runtime_response(
                         .background_cpu(),
                 ),
             host_admission_broker,
+            Arc::clone(&user_refresh),
         ),
     )
     .await
@@ -582,7 +574,6 @@ async fn projectless_hook_runtime_response(
         Ok(result) => match boxed_projectless_phase(join_required_live_transcript_refresh(
             "tracedecay_hook_runtime",
             &arguments,
-            false,
             None,
             Some(&refresh_wake),
         ))
@@ -642,95 +633,43 @@ async fn projectless_profile_retained_response(
     tool_name: &str,
     operation: tracedecay_contracts::RetainedSurfaceOperation,
     arguments: serde_json::Value,
-    connection: &ProjectlessConnectionStateV1,
     store_administration: &StoreAdministration,
 ) -> tracedecay_mcp::JsonRpcResponse {
-    let is_lcm =
-        tool_name.starts_with("tracedecay_lcm_") || tool_name == "tracedecay_message_search";
-    let is_session_refresh = matches!(
-        operation,
-        tracedecay_contracts::RetainedSurfaceOperation::SessionRefreshBegin
-            | tracedecay_contracts::RetainedSurfaceOperation::SessionRefreshStatus
-            | tracedecay_contracts::RetainedSurfaceOperation::SessionRefreshCancel
-    );
-    let user_scope_requested = if is_session_refresh {
-        crate::mcp::tools::session_refresh_profile_scope_requested(tool_name, &arguments)
-    } else if is_lcm {
-        arguments
-            .get("storage_scope")
-            .and_then(serde_json::Value::as_str)
-            == Some("user")
-    } else {
-        arguments
-            .get("memory_scope")
-            .and_then(serde_json::Value::as_str)
-            == Some("user")
-    };
-    if !user_scope_requested {
-        return JsonRpcResponse::error(
-            id,
-            ErrorCode::InvalidParams,
-            "projectless retained dispatch requires an explicit user scope".to_string(),
-        );
+    match crate::mcp::tools::retained_tool_target(operation, &arguments) {
+        Ok(tracedecay_contracts::InvocationTarget::Profile) => {}
+        Ok(_) => {
+            return JsonRpcResponse::error(
+                id,
+                ErrorCode::InvalidParams,
+                "projectless retained dispatch requires an explicit user scope".to_string(),
+            );
+        }
+        Err(error) => return tool_error_response(id, tool_name, &error),
     }
-    if is_lcm
-        && let Err(error) =
-            boxed_projectless_phase(await_user_profile_host_admission_replay_for_identity(
-                store_administration,
-                &connection.client_identity,
-            ))
-            .await
-    {
-        return JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string());
-    }
-    let runtime_registry =
-        match boxed_projectless_phase(store_administration.registered_runtime_registry()).await {
-            Ok(registry) => registry,
-            Err(error) => {
-                return tool_error_response(id, tool_name, &error);
-            }
-        };
-    // The profile refresh service is daemon-wide so a handle begun here also
-    // resolves through a project-connected MCP server, and vice versa.
-    let session_refresh = if is_session_refresh {
-        let database = match boxed_projectless_phase(
-            store_administration.registered_profile_session_database(),
-        )
-        .await
-        {
-            Ok(database) => database,
-            Err(error) => {
-                return tool_error_response(id, tool_name, &error);
-            }
-        };
-        Some(
-            boxed_projectless_phase(
-                store_administration.profile_session_refresh_service(&database),
-            )
-            .await,
-        )
-    } else {
-        None
+    let Some(application) =
+        tracedecay_tool_catalog::ApplicationSurfaceOperation::from_tool_name(tool_name)
+    else {
+        return requires_project_error(id, tool_name);
     };
-    let result = boxed_projectless_phase(crate::mcp::tools::execute_profile_retained_mcp_tool(
-        operation,
-        tool_name,
+    let executor = super::profile_retained::ProfileRetainedExecutor {
+        store_administration: store_administration.clone(),
+    };
+    let result = boxed_projectless_phase(crate::mcp::tools::run_retained_surface_tool(
+        None,
+        tracedecay_tool_catalog::BindingSurface::Mcp,
+        application,
         arguments,
-        runtime_registry.as_ref(),
-        &connection.profile_authority,
-        None,
-        session_refresh.as_deref().map(|service| {
-            service as &dyn tracedecay_session_runtime::retained::RetainedSessionRefreshPortV1
-        }),
-        None,
-        None,
+        Some(&executor),
         None,
         None,
         None,
     ))
     .await;
     match result {
-        Ok(result) => JsonRpcResponse::success(id, result.value),
+        Ok(mut result) => {
+            tracedecay_mcp::tool_errors::mark_semantic_tool_error(&mut result);
+            JsonRpcResponse::success(id, result.value)
+        }
         Err(error) => tool_error_response(id, tool_name, &error),
     }
 }
@@ -751,7 +690,10 @@ pub(super) fn projectless_tool_call(
     Ok((tool_name, arguments))
 }
 
-pub(super) fn projectless_user_session_request(request: Option<&JsonRpcRequest>) -> bool {
+/// Whether a first request is served by the projectless dispatcher even when
+/// the handshake names a project: profile-session reads and profile registry
+/// reads never depend on that project's open or warm-up.
+pub(super) fn projectless_first_request(request: Option<&JsonRpcRequest>) -> bool {
     let Some(request) = request else {
         return false;
     };
@@ -761,12 +703,29 @@ pub(super) fn projectless_user_session_request(request: Option<&JsonRpcRequest>)
     let Ok((tool_name, arguments)) = projectless_tool_call(request.params.as_ref()) else {
         return false;
     };
-    ((tool_name.starts_with("tracedecay_lcm_") || tool_name == "tracedecay_message_search")
-        && arguments
-            .get("storage_scope")
-            .and_then(serde_json::Value::as_str)
-            == Some("user"))
-        || crate::mcp::tools::session_refresh_profile_scope_requested(tool_name, &arguments)
+    use tracedecay_contracts::RetainedSurfaceOperation as Op;
+    // Profile session and LCM reads never wait on the handshake's project;
+    // profile memory stays on the project connection.
+    matches!(
+        tool_name,
+        "tracedecay_project_list" | "tracedecay_project_search" | "tracedecay_project_context"
+    ) || matches!(
+        Op::from_tool_name(tool_name),
+        Some(
+            operation @ (Op::LcmStatus
+                | Op::LcmDoctor
+                | Op::LcmLoadSession
+                | Op::LcmGrep
+                | Op::LcmDescribe
+                | Op::LcmExpand
+                | Op::LcmExpandQuery
+                | Op::MessageSearch
+                | Op::SessionRefreshBegin
+                | Op::SessionRefreshStatus
+                | Op::SessionRefreshCancel)
+        ) if crate::mcp::tools::retained_tool_target(operation, &arguments)
+            .is_ok_and(|target| target == tracedecay_contracts::InvocationTarget::Profile)
+    )
 }
 
 /// Selects the retained project server named by route-only session/thread
@@ -911,8 +870,8 @@ mod projectless_admission_tests {
             std::fs::set_permissions(&foreign_root, std::fs::Permissions::from_mode(0o700))
                 .expect("restrict foreign profile root");
         }
-        crate::product_runtime::register_fixture_product_runtime();
-        crate::test_support::host_admission::ensure_process_background_cpu_authority()
+        tracedecay_project::product_runtime::register_fixture_product_runtime();
+        tracedecay_project::test_support::host_admission::ensure_process_background_cpu_authority()
             .expect("install fixture worker authority");
         let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&real_root)
             .expect("pin profile identity");
@@ -980,8 +939,8 @@ mod projectless_admission_tests {
     async fn removed_client_profile_symlink_keeps_retained_codex_path_pinned() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (real_root, linked_root) = linked_profile_root(temp.path());
-        crate::product_runtime::register_fixture_product_runtime();
-        crate::test_support::host_admission::ensure_process_background_cpu_authority()
+        tracedecay_project::product_runtime::register_fixture_product_runtime();
+        tracedecay_project::test_support::host_admission::ensure_process_background_cpu_authority()
             .expect("install fixture worker authority");
         let identity = tracedecay_daemon_identity::profile_identity::load_or_create(&real_root)
             .expect("pin profile identity");

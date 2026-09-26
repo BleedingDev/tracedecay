@@ -11,19 +11,14 @@ use tracedecay_domain::{
 };
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationStore, ObservationWrite,
-    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
+    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
 };
 
 use super::*;
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
 
-fn id<T: TryFrom<String>>(value: &str) -> T
-where
-    T::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).unwrap()
-}
+use tracedecay_domain::test_fixtures::id;
 
 fn complete_native_observation() -> CanonicalObservationEnvelopeV1 {
     let relations = CanonicalObservationRelationsV1::new(id::<SessionId>("session.native.codex"))
@@ -102,7 +97,7 @@ fn durable_native_observation(project_id: &ProjectId) -> AnchoredObservationWrit
     let projection_generation = ProjectionGenerationId::new("projection.native-test.v1").unwrap();
     let authorization =
         build_observation_resolution_authorization_v1(write.observation(), "native-test").unwrap();
-    let anchor = build_observation_retrieval_anchor_v2(
+    let anchor = build_observation_retrieval_anchor(
         write.observation(),
         projection_generation.clone(),
         UtcMicros(1),
@@ -116,7 +111,7 @@ fn durable_native_observation(project_id: &ProjectId) -> AnchoredObservationWrit
 /// runtime scope gate.
 ///
 /// This is only ever correct for staging state the store contract
-/// forbids — a row scoped to another project — so that the reader-side
+/// forbids, a row scoped to another project, so that the reader-side
 /// guards can be exercised against it. Everything else must go through
 /// [`ObservationStore::persist_observation`].
 async fn stage_foreign_scoped_observation(

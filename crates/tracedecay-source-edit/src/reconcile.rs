@@ -46,7 +46,7 @@ where
     let original_operation =
         source_edit_operation(request.kind).map_err(application_contract_error)?;
     let durability = SourceEditDurability::for_graph(graph);
-    let _lock = durability.lock()?;
+    let _lock = durability.lock().await?;
     if let Some(stored) =
         recover_reconciliation_attempt(&durability, &request, &attempt_input_digest)?
     {
@@ -261,9 +261,7 @@ fn reconcile_prepared_source_edit_controlled(
     let (_outcome, record) = match request.disposition.clone() {
         SourceEditReconciliationDispositionV1::ConfirmCommitted { committed_state } => {
             let predicted_state = journal.predicted_state.as_ref().ok_or_else(|| {
-                config_error(
-                    "source edit committed state cannot be proven from this legacy journal",
-                )
+                config_error("source edit committed state cannot be proven without a prediction")
             })?;
             if &committed_state != predicted_state || observed_state != *predicted_state {
                 return Err(config_error(
@@ -370,7 +368,7 @@ pub(super) async fn recover_source_edit_transaction(
     // never finalized. But the edit primitive publishes every file to disk
     // BEFORE the journal advances to `Applied`, so the worktree may already hold
     // the finished edit. Inspect the on-disk state before touching a single
-    // byte — a crash after a successful write must never silently roll that
+    // byte, a crash after a successful write must never silently roll that
     // written edit back to its preimage. This mirrors the client-timeout path,
     // which surfaces `EffectUnknown` and lets `source_edit_reconcile` decide,
     // rather than destroying bytes.
@@ -379,9 +377,8 @@ pub(super) async fn recover_source_edit_transaction(
     // (i) Roll forward. The worktree already holds the exact previewed result,
     //     so the write succeeded and only the bookkeeping was lost. Finalize the
     //     commit and keep every byte; the client-timeout `ConfirmCommitted`
-    //     disposition reaches the same durable record. `recovery_files` is only
-    //     ever populated alongside `predicted_state` (see `execute.rs`), so a
-    //     present predicted state is guaranteed here.
+    //     disposition reaches the same durable record. Loading a persisted
+    //     journal rejects one without a predicted state.
     if journal.predicted_state.as_ref() == Some(&observed_state) {
         hotpath::measure_block!(
             "usecases.edit.recover.commit",
@@ -399,8 +396,8 @@ pub(super) async fn recover_source_edit_transaction(
 
     // (ii)/(iii) The write did not complete. When the worktree is still fully at
     //     the preimage (ii) the write never landed and rollback is a no-op. When
-    //     it is a torn partial multi-file write (iii) — some files published,
-    //     others not — rolling back to a consistent pre-edit state lets the whole
+    //     it is a torn partial multi-file write (iii), some files published,
+    //     others not, rolling back to a consistent pre-edit state lets the whole
     //     atomic plan be retried, but it discards the bytes of the files that did
     //     publish, so we WARN first. `rollback_planned_source_edit_files` restores
     //     per file and REFUSES any foreign bytes outright, so it can only ever
@@ -581,6 +578,23 @@ mod tests {
         durability.persist_journal(&journal).unwrap();
 
         assert!(durability.load_journal().is_err());
+    }
+
+    #[test]
+    fn journal_without_predicted_state_is_rejected() {
+        let directory = tempdir().unwrap();
+        let durability = SourceEditDurability {
+            root: directory.path().to_path_buf(),
+        };
+        let request = fixture_request();
+        let mut journal = fixture_journal(&request, SourceEditJournalStateV1::Prepared);
+        durability.persist_journal(&journal).unwrap();
+        assert!(durability.load_journal().unwrap().is_some());
+
+        journal.predicted_state = None;
+        durability.persist_journal(&journal).unwrap();
+        let error = durability.load_journal().unwrap_err().to_string();
+        assert!(error.contains("no predicted state"), "{error}");
     }
 
     #[test]

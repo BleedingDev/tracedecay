@@ -232,8 +232,7 @@ impl TraceDecay {
 
     /// Initializes a new `TraceDecay` project at the given root.
     ///
-    /// Initializes the graph and its durable configuration revision. It never
-    /// creates or rewrites legacy `config.json`.
+    /// Initializes the graph and its durable configuration revision.
     #[hotpath::skip]
     pub async fn init(project_root: &Path) -> Result<Self> {
         Self::init_with_options(project_root, TraceDecayOpenOptions::default()).await
@@ -301,7 +300,7 @@ impl TraceDecay {
         let project_id = storage::registered_project_id(&store_layout)?;
         // Persist the minted identity in the sanctioned repo-adjacent anchor:
         // the `.git/` repository identity marker. A non-git root persists
-        // nothing here — its identity is deterministic from the canonical
+        // nothing here, its identity is deterministic from the canonical
         // path and durably owned by the profile registry. TraceDecay never
         // creates files inside a project's working tree.
         tracedecay_runtime_core::storage::write_repository_identity_marker(
@@ -389,16 +388,14 @@ impl TraceDecay {
         .into_parts();
         let (configuration_runtime, _) = ProjectConfigurationRuntime::open(opened)?;
         let configuration_runtime = Arc::new(configuration_runtime);
-        if store_layout.storage_mode == storage::StorageMode::ProfileSharded {
-            storage::write_store_manifest(&store_layout)?;
-        }
+        storage::write_store_manifest(&store_layout)?;
 
         // Bootstrap branch metadata if we can detect a default branch
         let default_branch = active_branch.as_ref().and_then(|_| {
             branch::detect_default_branch(project_root).or_else(|| active_branch.clone())
         });
         if let Some(ref default) = default_branch {
-            let meta = BranchMeta::new_for_dir(&store_layout.data_root, default);
+            let meta = BranchMeta::new(default);
             let _ = branch_meta::save_branch_meta(&store_layout.data_root, &meta);
         }
 
@@ -433,13 +430,7 @@ impl TraceDecay {
             let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 ts.db.clone(),
                 project_id,
-                tracedecay_domain::UtcMicros(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(1, |duration| {
-                            duration.as_micros().min(i64::MAX as u128) as i64
-                        }),
-                ),
+                tracedecay_runtime_core::tracedecay::utc_now_or_one(),
                 None,
             )
             .await;
@@ -660,13 +651,7 @@ impl TraceDecay {
             let _ = tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1::startup(
                 ts.db.clone(),
                 project_id,
-                tracedecay_domain::UtcMicros(
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(1, |duration| {
-                            duration.as_micros().min(i64::MAX as u128) as i64
-                        }),
-                ),
+                tracedecay_runtime_core::tracedecay::utc_now_or_one(),
                 None,
             )
             .await;
@@ -713,11 +698,6 @@ impl TraceDecay {
     /// sentinels, clear markers, or rewrite corrupted DBs. It is intended for
     /// status/verification commands that must be able to inspect read-only
     /// stores without mutating them.
-    #[hotpath::skip]
-    pub async fn open_read_only(project_root: &Path) -> Result<Self> {
-        Self::open_read_only_with_options(project_root, TraceDecayOpenOptions::default()).await
-    }
-
     #[hotpath::skip]
     pub async fn open_read_only_with_options(
         project_root: &Path,
@@ -866,7 +846,7 @@ fn configuration_runtime_unavailable() -> TraceDecayError {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use tracedecay_agent_hosts::agents::context_scout::ports::{
+    use tracedecay_agent_hosts::agents::context_scout::address_registry::{
         AdmittedContextScoutHookV1, ContextScoutAddressBindOutcomeV1, ContextScoutAuthorityPinV1,
         ContextScoutConfigurationPinV1, ContextScoutLifecycleAddressV1,
         ProjectContextScoutAddressRegistryV1,
@@ -875,6 +855,7 @@ mod tests {
         CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
         RequestId, ResolvedScope,
     };
+    use tracedecay_domain::NativeHostIdentityV1;
     use tracedecay_domain::canonical_sha256;
     use tracedecay_domain::configuration::{
         CONTEXT_SCOUT_SETTINGS_SETTING_KEY, CandidateDispositionV1, ConfigurationCandidateV1,
@@ -885,23 +866,18 @@ mod tests {
     use tracedecay_domain::{ActorId, RepositoryId, UtcMicros, WorktreeId};
     use tracedecay_global_db::configuration::contracts::ConfigurationCurrentStateV1;
     use tracedecay_hooks::{
-        HookCapabilityV1, HookEventFamily, HookHostV1, HookScopeBindingV1,
-        NativeEnvelopeMaterialV1, decode_bound_native_hook_event, stock_event_support,
+        HookCapabilityV1, HookEventFamily, HookScopeBindingV1, NativeEnvelopeMaterialV1,
+        decode_bound_native_hook_event, stock_event_support,
     };
     use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
     async fn mount_verified_reopen_claim(
         owner: &tracedecay_agent_hosts::agents::context_scout::owner::ProjectContextScoutOwnerV1,
     ) -> (
-        tracedecay_agent_hosts::agents::context_scout::ports::ContextScoutLifecycleAddressV1,
+        ContextScoutLifecycleAddressV1,
         tracedecay_contracts::context_scout::ContextScoutAddressV1,
     ) {
-        fn id<T: TryFrom<String>>(value: &str) -> T
-        where
-            T::Error: std::fmt::Debug,
-        {
-            T::try_from(value.to_owned()).unwrap()
-        }
+        use tracedecay_domain::test_fixtures::id;
 
         let observed_at = UtcMicros(10);
         let project_id = id::<tracedecay_domain::ProjectId>("project.scout.fixture");
@@ -976,7 +952,7 @@ mod tests {
         )
         .expect("authority pin");
         let binding = HookScopeBindingV1 {
-            host: HookHostV1::ClaudeCode,
+            host: NativeHostIdentityV1::ClaudeCode,
             project_id: [1; 16],
             repository_id: [2; 16],
             worktree_id: [3; 16],
@@ -992,12 +968,12 @@ mod tests {
             .into_iter()
             .map(|family| HookCapabilityV1 {
                 family,
-                support: stock_event_support(HookHostV1::ClaudeCode, family),
+                support: stock_event_support(NativeHostIdentityV1::ClaudeCode, family),
             })
             .collect(),
         };
         let envelope = decode_bound_native_hook_event(
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             include_bytes!(
                 "../../../../../tests/fixtures/packaged_host_events/claude/post_tool_use_write.json"
             ),
@@ -1164,15 +1140,11 @@ mod tests {
         let db_path = initialized.store_layout().graph_db_path.clone();
         initialized.close();
         let connection = rusqlite::Connection::open(&db_path).expect("open graph fixture");
-        // Not `SCHEMA_VERSION - 1`: that stamp is
-        // `PAYLOAD_DIGEST_STEP_SOURCE_VERSION`, the one sanctioned step this
-        // binary carries forward in place, so an open of it upgrades instead
-        // of refusing. Age the store one step past the sanctioned source.
         connection
             .pragma_update(
                 None,
                 "user_version",
-                tracedecay_runtime_core::db::migrations::PAYLOAD_DIGEST_STEP_SOURCE_VERSION - 1,
+                tracedecay_runtime_core::db::migrations::SCHEMA_VERSION - 1,
             )
             .expect("stamp incompatible graph schema");
         drop(connection);

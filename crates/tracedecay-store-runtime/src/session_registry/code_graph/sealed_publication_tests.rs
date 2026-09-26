@@ -17,7 +17,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use tracedecay_code_index_retention::code_index_generations::DurablePublicationPointerV1;
+use tracedecay_code_index_retention::code_index_generations::{
+    DurablePublicationPointerV1, code_generation_segments_root,
+};
 use tracedecay_domain::{
     CodeGenerationId, ProjectId, RefId, RepositoryId, WorktreeId, canonical_sha256,
     sha256_hex_suffix,
@@ -94,7 +96,7 @@ fn with_publication_context<T>(
         cancellation,
     };
     // 2020-01-01T00:00:00Z in micros. A seconds-scale stamp (~1.8e9) fails
-    // this bound — the 1970-era seconds-as-micros regression this pins.
+    // this bound, the 1970-era seconds-as-micros regression this pins.
     assert!(
         control.requested_at.0 > 1_577_836_800_000_000,
         "requested_at must be micros-scale, got {}",
@@ -351,7 +353,7 @@ async fn unreadable_pending_replay_is_discarded_before_fresh_publication() {
         .join("../tracedecay-code-index/tests/fixtures/partitioned_pre_paging");
     let historical_digest = "6fece830a4b12904018853a467e404edc60ea76e2cab48d4645fbbb4132bd6af";
     let generations_root = scoped_store.join("code-generations-v1");
-    let segments_root = scoped_store.join("code-generation-segments-v1");
+    let segments_root = code_generation_segments_root(&scoped_store);
     std::fs::create_dir_all(&segments_root).expect("historical segment root");
     std::fs::copy(
         historical_fixture.join("manifest.json"),
@@ -425,7 +427,7 @@ async fn unreadable_pending_replay_is_discarded_before_fresh_publication() {
         projector_revision,
     };
     // The historical fixture is sealed at the retired manifest revision seven,
-    // so the current reader refuses it at the revision gate — before the row
+    // so the current reader refuses it at the revision gate, before the row
     // evidence it also predates, and before the source-commitment check. The
     // code-index suite pins the same refusal against these bytes.
     let refused = runtime
@@ -653,7 +655,7 @@ async fn sealed_generation_publishes_and_republishes_without_eager_replay_payloa
         .expect("restore source before active replay completion");
 
     // The issue-765 wedge shape: the journal above already carries this
-    // publication's active replay — the debris an interrupted publisher
+    // publication's active replay, the debris an interrupted publisher
     // leaves behind. First activation must resume that journaled replay and
     // publish in ONE call, regardless of sealed artifact size: no
     // manufactured stage-boundary `DeadlineExceeded`, no scheduler retry
@@ -867,21 +869,25 @@ async fn sealed_generation_publishes_and_republishes_without_eager_replay_payloa
     );
 }
 
-/// The sealed read bundle journey over the production seal/open path:
-///
-/// - sealing (first successful publication) writes the bundle manifest and
-///   the interactive-catalog artifact next to the sealed generation;
-/// - open loads the digest-verified catalog and installs it WITHOUT running
-///   the projection warm scan (the scan counter proves no warm work ran);
-/// - a tampered artifact is the typed `Stale` state, a removed bundle is the
-///   typed `Absent` state, and in both cases the explicit fallback — the
-///   projection warm scan — still serves the catalog;
-/// - retirement removes every bundle file for the generation's digest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sealed_read_bundle_serves_catalog_without_warm_and_degrades_typed() {
-    use tracedecay_code_index::graph_projection::CodeGraphProjectionStore;
-    use tracedecay_graph_db::SealedReadBundleArtifactStateV1;
+/// One committed single-file project sealed into a code generation, with the
+/// daemon registry and retained graph runtime that publish its graph. Fields
+/// drop in declaration order, so the runtime goes before its registry, scope,
+/// and directory.
+struct SealedGenerationFixture {
+    runtime: RetainedCodeGraphRuntimeV1,
+    project_database: Arc<tracedecay_runtime_core::db::Database>,
+    registry: DaemonSessionRuntimeRegistryV1,
+    project_id: ProjectId,
+    latest: tracedecay_code_index_runtime::code_index_scheduler::LatestCompleteCodeIndexV1,
+    generation_id: CodeGenerationId,
+    scoped_store: PathBuf,
+    generations_root: PathBuf,
+    digest_hex: String,
+    _database_scope: tracedecay_runtime_core::db::DaemonDatabaseScope,
+    _temporary: tempfile::TempDir,
+}
 
+async fn sealed_generation_fixture(project: &str, source: &str) -> SealedGenerationFixture {
     let temporary = tempfile::tempdir().expect("temporary fixture parent");
     let root = temporary
         .path()
@@ -896,14 +902,13 @@ async fn sealed_read_bundle_serves_catalog_without_warm_and_degrades_typed() {
         &project_root,
         &["config", "user.email", "tracedecay@example.invalid"],
     );
-    std::fs::write(
-        project_root.join("src/lib.rs"),
-        "pub fn sealed_bundle_value() -> usize { 43 }\n",
-    )
-    .expect("project source");
+    std::fs::write(project_root.join("src/lib.rs"), source).expect("project source");
     git(&project_root, &["add", "."]);
-    git(&project_root, &["commit", "-qm", "sealed bundle fixture"]);
-    let project_id = ProjectId::new("project.sealed-read-bundle").expect("project id");
+    git(
+        &project_root,
+        &["commit", "-qm", "sealed generation fixture"],
+    );
+    let project_id = ProjectId::new(project).expect("project id");
     tracedecay_runtime_core::storage::pin_fixture_repository_identity(
         &project_root,
         project_id.as_str(),
@@ -939,15 +944,12 @@ async fn sealed_read_bundle_serves_catalog_without_warm_and_degrades_typed() {
     let digest_hex = sha256_hex_suffix(&pointer.state_digest)
         .expect("sha256 state digest")
         .to_owned();
-    let bundle_manifest_path = generations_root.join(format!("read-bundle-{digest_hex}.json"));
-    let bundle_catalog_path =
-        generations_root.join(format!("read-bundle-{digest_hex}.interactive-catalog.bin"));
 
     let identity = profile_identity::load_or_create(&profile_root).expect("profile identity");
     let _database_scope = tracedecay_runtime_core::db::enter_daemon_database_scope(
         &profile_root,
         44,
-        "sealed read bundle",
+        "sealed generation fixture",
     )
     .expect("daemon database scope");
     let registry = DaemonSessionRuntimeRegistryV1::open(identity)
@@ -967,104 +969,284 @@ async fn sealed_read_bundle_serves_catalog_without_warm_and_degrades_typed() {
             Arc::clone(&project_database),
             CodeGraphReplayBindingV1 {
                 generations_root: generations_root.clone(),
-                sealed_state_digest: sealed_state_digest.clone(),
+                sealed_state_digest,
             },
             None,
         )
         .await
         .expect("retain code graph runtime");
+    SealedGenerationFixture {
+        runtime,
+        project_database,
+        registry,
+        project_id,
+        latest,
+        generation_id,
+        scoped_store,
+        generations_root,
+        digest_hex,
+        _database_scope,
+        _temporary: temporary,
+    }
+}
 
-    assert!(
-        !bundle_manifest_path.exists(),
-        "no bundle may exist before the generation's graph is sealed"
-    );
-    let snapshot = runtime
-        .publish_verified_snapshot(latest.generation(), Arc::new(AtomicBool::new(false)))
+/// The graph store is the only owner of symbol, file, and import records:
+/// sealing writes no second copy of them beside the generation, and the
+/// interactive catalog is derived from the sealed projection itself.
+///
+/// Fails if a seal writes a read-bundle manifest or artifact next to the
+/// generation and its segments, or if the catalog cannot answer a qualified
+/// name from the projection alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sealing_keeps_symbol_records_only_in_the_graph_store() {
+    let fixture = sealed_generation_fixture(
+        "project.graph-record-owner",
+        "pub fn sealed_record_value() -> usize { 43 }\n",
+    )
+    .await;
+    let snapshot = fixture
+        .runtime
+        .publish_verified_snapshot(
+            fixture.latest.generation(),
+            Arc::new(AtomicBool::new(false)),
+        )
         .expect("seal the code graph");
 
-    // Seal produced the bundle.
-    assert!(
-        bundle_manifest_path.is_file(),
-        "sealing must write the read bundle manifest"
-    );
-    assert!(
-        bundle_catalog_path.is_file(),
-        "sealing must write the interactive-catalog artifact"
-    );
-
-    // Open of a bundled generation loads the catalog and skips the warm.
-    let loaded = runtime
-        .load_sealed_read_bundle_catalog(&Arc::new(AtomicBool::new(false)))
-        .expect("load the bundle catalog");
-    let SealedReadBundleArtifactStateV1::Loaded { artifact, bytes } = loaded else {
-        panic!("a freshly sealed bundle must load, got {loaded:?}");
+    let file_names = |root: &Path| {
+        std::fs::read_dir(root)
+            .expect("list sealed root")
+            .map(|entry| {
+                entry
+                    .expect("sealed root entry")
+                    .file_name()
+                    .into_string()
+                    .expect("utf-8 file name")
+            })
+            .collect::<BTreeSet<_>>()
     };
-    assert_eq!(artifact.name, "interactive-catalog");
-    let store = CodeGraphProjectionStore::from_verified_snapshot(snapshot, generation_id.clone())
+    assert_eq!(
+        file_names(&fixture.generations_root),
+        BTreeSet::from([format!("generation-{}.json", fixture.digest_hex)]),
+        "the generations root holds the sealed generation and nothing derived from its graph"
+    );
+    let segment_prefixes = file_names(&code_generation_segments_root(&fixture.scoped_store))
+        .into_iter()
+        .map(|name| name.split('-').next().unwrap_or_default().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(segment_prefixes, BTreeSet::from(["segment".to_owned()]));
+
+    let store =
+        tracedecay_code_index::graph_projection::CodeGraphProjectionStore::from_verified_snapshot(
+            snapshot,
+            fixture.generation_id.clone(),
+        )
         .expect("projection store over the sealed snapshot");
     store
-        .install_interactive_catalog_artifact(&bytes, Arc::new(tracedecay_graph_db::NeverCancelled))
-        .expect("install the bundled catalog");
-    assert!(
-        store
-            .interactive_catalog_is_warm()
-            .expect("catalog state readable"),
-        "a bundled generation opens with a ready catalog"
-    );
-    assert_eq!(
-        store.interactive_catalog_scan_builds(),
-        0,
-        "opening a bundled generation must not run the projection warm scan"
-    );
-
-    // A tampered artifact is the typed stale state, never a silent load.
-    let intact_artifact = std::fs::read(&bundle_catalog_path).expect("read catalog artifact");
-    std::fs::write(&bundle_catalog_path, b"tampered").expect("tamper catalog artifact");
-    let stale = runtime
-        .load_sealed_read_bundle_catalog(&Arc::new(AtomicBool::new(false)))
-        .expect("stale load is a typed state, not an error");
-    assert!(
-        matches!(stale, SealedReadBundleArtifactStateV1::Stale { .. }),
-        "tampered artifact bytes must be typed stale, got {stale:?}"
-    );
-    std::fs::write(&bundle_catalog_path, &intact_artifact).expect("restore catalog artifact");
-
-    // Retirement removes the bundle with its generation; the generation then
-    // reads as an old, bundle-less seal: typed absent, served by the explicit
-    // warm fallback.
-    tracedecay_graph_db::retire_sealed_read_bundle(&generations_root, &sealed_state_digest)
-        .expect("retire the read bundle");
-    assert!(!bundle_manifest_path.exists());
-    assert!(!bundle_catalog_path.exists());
-    let absent = runtime
-        .load_sealed_read_bundle_catalog(&Arc::new(AtomicBool::new(false)))
-        .expect("absent load is a typed state, not an error");
-    assert!(
-        matches!(absent, SealedReadBundleArtifactStateV1::Absent { .. }),
-        "a bundle-less generation must be typed absent, got {absent:?}"
-    );
-    let fallback_snapshot = runtime
-        .publish_verified_snapshot(latest.generation(), Arc::new(AtomicBool::new(false)))
-        .expect("republish resumes the verified head");
-    let fallback_store =
-        CodeGraphProjectionStore::from_verified_snapshot(fallback_snapshot, generation_id.clone())
-            .expect("projection store for the fallback");
-    fallback_store
         .mark_interactive_catalog_warming()
         .expect("mark warming");
-    fallback_store
+    store
+        .warm_serving_engine()
+        .expect("warm the serving engine");
+    store
         .warm_interactive_catalog_with_cancellation(Arc::new(tracedecay_graph_db::NeverCancelled))
-        .expect("the old-generation fallback warm must still serve");
+        .expect("derive the catalog from the sealed projection");
+    let resolved = store
+        .interactive_reader_with_cancellation(
+            &fixture.generation_id,
+            Arc::new(tracedecay_graph_db::NeverCancelled),
+        )
+        .expect("interactive reader")
+        .resolve_qualified_name(
+            "src/lib.rs::sealed_record_value",
+            None,
+            4,
+            Arc::new(tracedecay_graph_db::NeverCancelled),
+        )
+        .expect("resolve a qualified name");
+    let resolved = resolved
+        .iter()
+        .map(|summary| {
+            let metadata = summary
+                .metadata
+                .as_ref()
+                .expect("production symbol metadata");
+            (
+                metadata.simple_name.as_str(),
+                metadata.kind.as_str(),
+                summary
+                    .binding
+                    .as_ref()
+                    .and_then(|binding| binding.logical_path.as_deref()),
+            )
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        fallback_store.interactive_catalog_scan_builds(),
-        1,
-        "the fallback path is the explicit projection re-derivation"
+        resolved,
+        vec![("sealed_record_value", "function", Some("src/lib.rs"))]
+    );
+}
+
+/// Graph reads are latency bounded. A read that reaches a generation whose
+/// graph engine is not open, here stepped down by the production staging
+/// release sweep, gets the typed warming answer at once and leaves the
+/// corpus-sized open to the serving owner's background warm. Once warmed, the
+/// generation's one open engine serves every read and survives the sweeps
+/// that run between them.
+///
+/// Fails if a reader pays the cold open on the request path again, or if the
+/// sweep steps the warmed serving engine down so the next read is refused as
+/// warming.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn graph_reads_during_engine_warm_up_are_typed_pending_and_warmed_reads_survive_sweeps() {
+    use tracedecay_code_index::graph_projection::{
+        CodeGraphProjectionError, CodeGraphProjectionStore,
+    };
+
+    let fixture = sealed_generation_fixture(
+        "project.graph-engine-warm-up",
+        "pub fn warm_up_value() -> usize { 7 }\n",
+    )
+    .await;
+    let snapshot = fixture
+        .runtime
+        .publish_verified_snapshot(
+            fixture.latest.generation(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("seal the code graph");
+    let store =
+        CodeGraphProjectionStore::from_verified_snapshot(snapshot, fixture.generation_id.clone())
+            .expect("projection store over the sealed snapshot");
+    let sweep = || async {
+        fixture
+            .registry
+            .release_one_sealed_generation_staging_rows(
+                fixture.project_id.clone(),
+                &fixture.project_database,
+                &tracedecay_runtime_core::cancellation::CancellationToken::new(),
+                None,
+            )
+            .await
+            .expect("staging release sweep");
+    };
+    sweep().await;
+
+    let read = || {
+        store.interactive_reader_with_cancellation(
+            &fixture.generation_id,
+            Arc::new(tracedecay_graph_db::NeverCancelled),
+        )
+    };
+    let is_warming = |outcome: &Result<_, CodeGraphProjectionError>| {
+        matches!(
+            outcome,
+            Err(CodeGraphProjectionError::Unavailable(detail)) if detail.contains("warming")
+        )
+    };
+    let started = Instant::now();
+    let pending = read();
+    assert!(
+        is_warming(&pending),
+        "a read of a swept, unwarmed generation must be the typed warming answer, got {pending:?}"
     );
     assert!(
-        fallback_store
-            .interactive_catalog_is_warm()
-            .expect("fallback catalog state readable"),
-        "an old generation without a bundle still serves via the warm"
+        started.elapsed() < Duration::from_secs(1),
+        "the warming answer must not wait on the engine open"
+    );
+    let still_pending = read();
+    assert!(
+        is_warming(&still_pending),
+        "a refused read must not open the engine for the next one, got {still_pending:?}"
+    );
+
+    store.warm_serving_engine().expect("background warm");
+    for round in 0..3 {
+        read().unwrap_or_else(|error| {
+            panic!("round {round}: the warmed generation must serve after the sweep: {error:?}")
+        });
+        sweep().await;
+    }
+    read().expect("the last sweep must leave the warmed serving engine open for the next read");
+}
+
+/// A released serving engine gives its memory back and comes back on its own:
+/// the store reports the engine's bytes while pinned, none once released,
+/// the first read after release is the typed re-warming answer, and a later
+/// read is served again without anyone re-running activation.
+///
+/// Fails if release leaves the engine open, or if a released generation
+/// needs activation (or a restart) before its graph serves again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_released_serving_engine_closes_and_rewarms_on_the_next_read() {
+    use tracedecay_code_index::graph_projection::{
+        CodeGraphEngineReleaseV1, CodeGraphProjectionError, CodeGraphProjectionStore,
+    };
+
+    let fixture = sealed_generation_fixture(
+        "project.graph-engine-release",
+        "pub fn released_value() -> usize { 11 }\n",
+    )
+    .await;
+    let snapshot = fixture
+        .runtime
+        .publish_verified_snapshot(
+            fixture.latest.generation(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("seal the code graph");
+    let store =
+        CodeGraphProjectionStore::from_verified_snapshot(snapshot, fixture.generation_id.clone())
+            .expect("projection store over the sealed snapshot");
+    let read = || {
+        store.interactive_reader_with_cancellation(
+            &fixture.generation_id,
+            Arc::new(tracedecay_graph_db::NeverCancelled),
+        )
+    };
+    assert_eq!(
+        store.serving_engine_bytes().expect("engine bytes"),
+        None,
+        "nothing is pinned before the warm"
+    );
+    store.warm_serving_engine().expect("background warm");
+    read().expect("the warmed engine serves");
+    let pinned_bytes = store
+        .serving_engine_bytes()
+        .expect("engine bytes")
+        .expect("a pinned engine reports its bytes");
+
+    assert_eq!(
+        store.release_serving_engine().expect("release"),
+        CodeGraphEngineReleaseV1::Released {
+            bytes: Some(pinned_bytes)
+        }
+    );
+    assert_eq!(store.serving_engine_bytes().expect("engine bytes"), None);
+    assert!(matches!(
+        read(),
+        Err(CodeGraphProjectionError::Unavailable(detail)) if detail.contains("re-warming")
+    ));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if read().is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the released engine re-warms on its own"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        store.serving_engine_bytes().expect("engine bytes"),
+        Some(pinned_bytes),
+        "the re-warmed engine is pinned again with the same contents"
+    );
+    assert_eq!(
+        store.release_serving_engine().expect("second release"),
+        CodeGraphEngineReleaseV1::Released {
+            bytes: Some(pinned_bytes)
+        }
     );
 }
 
@@ -1937,7 +2119,7 @@ const PUBLICATION_FIRST_SCOPE_RETAINED_LIMIT: u64 = 448 * 1024 * 1024;
 /// This is the number #830 is about. The builds are serialized by the permit,
 /// so a scope that released everything it built would add only its served
 /// state. Before the sealed-generation and permit-boundary release work this
-/// marginal cost was ~0.59 GB per scope — a whole build's worth, retained.
+/// marginal cost was ~0.59 GB per scope, a whole build's worth, retained.
 /// It is now ~0.15 GB, which is still above the served-index size and is
 /// tracked as remaining work; the bound is set to catch a regression back
 /// toward build-sized retention, not to certify the residue as correct.
@@ -2130,7 +2312,7 @@ async fn concurrent_worktree_scopes_publish_with_one_corpus_build_and_bounded_rs
             sealed_source: scoped_store
                 .join("code-generations-v1")
                 .join(format!("generation-{digest}.json")),
-            segments_source_root: scoped_store.join("code-generation-segments-v1"),
+            segments_source_root: code_generation_segments_root(&scoped_store),
             sealed_state_digest: tracedecay_graph_db::SealedGraphStateDigest::try_from(
                 pointer.state_digest,
             )
@@ -2350,7 +2532,7 @@ async fn concurrent_worktree_scopes_publish_with_one_corpus_build_and_bounded_rs
          marginal per additional scope); observed {retained_bytes} bytes"
     );
     // Peak bound. With the permit serializing builds, the peak is one build's
-    // transient on top of what the finished scopes retain — never one
+    // transient on top of what the finished scopes retain, never one
     // transient per scope.
     let peak_growth = rss_peak_sampled.saturating_sub(rss_before);
     let peak_ceiling = PUBLICATION_SINGLE_BUILD_TRANSIENT_LIMIT + retained_ceiling;

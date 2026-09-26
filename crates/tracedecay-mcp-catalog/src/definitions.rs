@@ -15,7 +15,7 @@ use std::sync::LazyLock;
 use tracedecay_contracts::RetainedSurfaceOperation;
 use tracedecay_tool_catalog::{
     ApplicationSurfaceOperation, BindingSurface, CapabilityManifestV1, CatalogContributionV1,
-    ExecutableBindingRegistryV1, ScopeDimension,
+    CatalogValidationError, ExecutableBindingRegistryV1, OperationId, ScopeDimension,
 };
 
 use crate::McpCatalogError;
@@ -29,13 +29,11 @@ mod application_schema;
 pub mod ast_grep;
 mod edit;
 mod git;
-mod git_scope;
 mod graph;
 mod lcm;
 mod memory;
 mod multi_root;
 mod session;
-mod simplify;
 mod skills;
 mod testing;
 mod work;
@@ -52,9 +50,7 @@ use git::*;
 use graph::*;
 pub use graph::{SEARCH_MAX_LEXICAL_ANCHOR_BYTES, SEARCH_MAX_LEXICAL_ANCHORS};
 use lcm::*;
-use memory::*;
 use multi_root::*;
-use simplify::*;
 use skills::*;
 use testing::*;
 
@@ -125,10 +121,6 @@ fn required_object_schema(properties: Value, required: &[&str]) -> Value {
     schema
 }
 
-fn def_object(name: &str, title: &str, description: &str, properties: Value) -> ToolDefinition {
-    def(name, title, description, object_schema(properties))
-}
-
 fn def_required_object(
     name: &str,
     title: &str,
@@ -149,51 +141,6 @@ fn string_property(description: &str) -> Value {
         "type": "string",
         "description": description
     })
-}
-
-fn number_property(description: &str) -> Value {
-    json!({
-        "type": "number",
-        "description": description
-    })
-}
-
-fn def_path_limit_tool(
-    name: &str,
-    title: &str,
-    description: &str,
-    path_description: &str,
-    limit_description: &str,
-) -> ToolDefinition {
-    def_object(
-        name,
-        title,
-        description,
-        json!({
-            "path": string_property(path_description),
-            "limit": number_property(limit_description)
-        }),
-    )
-}
-
-fn def_path_flag_tool(
-    name: &str,
-    title: &str,
-    description: &str,
-    path_description: &str,
-    flag_name: &str,
-    flag_description: &str,
-) -> ToolDefinition {
-    let mut properties = serde_json::Map::new();
-    properties.insert("path".to_string(), string_property(path_description));
-    properties.insert(
-        flag_name.to_string(),
-        json!({
-            "type": "boolean",
-            "description": flag_description
-        }),
-    );
-    def_object(name, title, description, Value::Object(properties))
 }
 
 fn project_selector_properties() -> Value {
@@ -339,9 +286,6 @@ pub fn apply_context_warming_budget(defs: &mut [ToolDefinition], budget: u8) {
 /// Tools whose backing dependency is missing on the current host are
 /// filtered out so the model never sees a tool that will immediately
 /// fail when called. The host `ast-grep` CLI gates rewrite support.
-/// `tracedecay_outline` remains advertised and reports its runtime
-/// `ast-grep outline` requirement from the handler, because the Cursor
-/// plugin docs/rules intentionally teach agents to start there.
 pub fn get_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogError> {
     let mut definitions = get_maximal_tool_definitions()?;
     retain_host_available_tool_definitions(&mut definitions);
@@ -360,7 +304,7 @@ pub(super) static MAXIMAL_DEFINITION_BUILDS: std::sync::atomic::AtomicUsize =
 ///
 /// Every input is static for the life of the process: the application catalog
 /// is a `LazyLock` snapshot and `ast_grep_available()` is a `OnceLock` host
-/// probe. Nothing session-scoped is frozen here — the per-session passes
+/// probe. Nothing session-scoped is frozen here, the per-session passes
 /// (`apply_context_budget`, `apply_context_warming_budget`, and the
 /// profile/capability filtering in
 /// `get_catalog_filtered_tool_definitions_with_budget`) all run on the *clone*
@@ -395,10 +339,11 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
     };
     let retained_contribution = tracedecay_contracts::retained_surface_catalog_contribution()
         .map_err(|error| McpCatalogError::Initialization(error.to_string()))?;
-    let retained_registry = tracedecay_contracts::retained_surface_executable_binding_registry()
-        .map_err(|error| McpCatalogError::Initialization(error.to_string()))?;
+    // Provider-control retained operations are projected into the MCP
+    // application registry with the other retained contributions; only their
+    // routing text is read from the retained contribution.
     let provider_definition = |operation| {
-        retained_provider_definition(operation, &retained_contribution, &retained_registry)
+        retained_provider_definition(operation, &retained_contribution, application_registry)
     };
     let mut definitions = vec![
         def_search(),
@@ -406,8 +351,6 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_ast_grep_search(),
         def_retrieve(),
         def_context(request_schema("context")?),
-        def_callers(),
-        def_callees(request_schema("callees")?),
         def_impact(request_schema("impact")?),
         def_node(request_schema("node")?),
         def_status(),
@@ -421,32 +364,29 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_multi_root_execute()?,
         def_remote_status_read(),
         def_affected(),
-        def_dead_code(),
-        def_unused_imports(),
+        def_dead_code(request_schema("dead_code")?),
         def_diff_context(),
-        def_circular(),
-        def_hotspots(),
+        def_circular(request_schema("circular")?),
+        def_hotspots(request_schema("hotspots")?),
         def_similar(request_schema("similar")?),
         def_redundancy(request_schema("redundancy")?),
         def_rename_preview(request_schema("rename_preview")?),
-        def_unmounted_files(),
-        def_rank(),
-        def_largest(),
-        def_coupling(),
-        def_inheritance_depth(),
-        def_distribution(),
-        def_recursion(),
-        def_simplify_scan(),
-        def_complexity(),
-        def_doc_coverage(),
-        def_god_class(),
+        def_unmounted_files(request_schema("unmounted_files")?),
+        def_rank(request_schema("rank")?),
+        def_largest(request_schema("largest")?),
+        def_coupling(request_schema("coupling")?),
+        def_inheritance_depth(request_schema("inheritance_depth")?),
+        def_distribution(request_schema("distribution")?),
+        def_recursion(request_schema("recursion")?),
+        def_complexity(request_schema("complexity")?),
+        def_doc_coverage(request_schema("doc_coverage")?),
+        def_god_class(request_schema("god_class")?),
         def_changelog(),
         def_port_status(request_schema("port_status")?),
         def_port_order(request_schema("port_order")?),
         def_commit_context(),
         def_pr_context(),
-        def_test_map(),
-        def_type_hierarchy(),
+        def_test_map(request_schema("test_map")?),
         def_branch_search(),
         def_branch_diff(),
         def_branch_list(),
@@ -454,35 +394,21 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_multi_str_replace(),
         def_insert_at(),
         def_ast_grep_rewrite(),
-        def_gini(),
-        def_dependency_depth(),
-        def_health(),
+        def_gini(request_schema("gini")?),
+        def_dependency_depth(request_schema("dependency_depth")?),
+        def_health(request_schema("health")?),
         def_runtime(),
-        def_dsm(),
-        def_test_risk(),
-        def_body(),
+        def_dsm(request_schema("dsm")?),
+        def_test_risk(request_schema("test_risk")?),
         def_todos(request_schema("todos")?),
-        def_callers_for(),
         def_by_qualified_name(),
         def_signature(),
-        def_impls(),
-        def_diagnose(),
+        def_diagnose(request_schema("diagnose")?),
         def_derives(),
         def_run_affected_tests(),
-        def_fact_store_add(request_schema("fact_store_add")?),
-        def_fact_store_search(request_schema("fact_store_search")?),
-        def_fact_store_probe(request_schema("fact_store_probe")?),
-        def_fact_store_related(request_schema("fact_store_related")?),
-        def_fact_store_reason(request_schema("fact_store_reason")?),
-        def_fact_store_contradict(request_schema("fact_store_contradict")?),
-        def_fact_store_get(request_schema("fact_store_get")?),
-        def_fact_store_update(request_schema("fact_store_update")?),
-        def_fact_store_remove(request_schema("fact_store_remove")?),
-        def_fact_store_supersede(request_schema("fact_store_supersede")?),
-        def_fact_store_list(request_schema("fact_store_list")?),
-        def_fact_feedback(request_schema("fact_feedback")?),
-        def_memory_status(request_schema("memory_status")?),
-        def_fact_store_curate(request_schema("fact_store_curate")?),
+    ];
+    definitions.extend(memory::memory_definitions(&request_schema)?);
+    definitions.extend([
         provider_definition(RetainedSurfaceOperation::ProviderFeedback)?,
         provider_definition(RetainedSurfaceOperation::ProviderCorrection)?,
         provider_definition(RetainedSurfaceOperation::ProviderDeleteBySource)?,
@@ -513,14 +439,10 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_lcm_describe(),
         def_lcm_expand(),
         def_lcm_expand_query(),
-        def_read(),
-        def_outline(),
-        def_implementations(),
-        def_unsafe_patterns(),
+        def_unsafe_patterns(request_schema("unsafe_patterns")?),
         def_config(),
-        def_signature_search(),
-        def_constructors(),
-        def_field_sites(),
+        def_constructors(request_schema("constructors")?),
+        def_field_sites(request_schema("field_sites")?),
         def_replace_symbol(),
         def_insert_at_symbol(),
         def_move_symbol(),
@@ -528,7 +450,7 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
         def_source_edit_reconcile(),
         def_source_edit_rollback(),
         def_find_exact_symbol(),
-    ];
+    ]);
     definitions.extend(application_definitions()?);
     let work = work_worker.join().map_err(|_| {
         McpCatalogError::Initialization(
@@ -549,6 +471,52 @@ fn build_maximal_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogErr
     add_lcm_storage_scope_property(&mut definitions);
     add_format_property(&mut definitions)?;
     Ok(definitions)
+}
+
+pub(super) struct FamilyOperation {
+    pub operation_id: String,
+    pub name: String,
+    pub title: String,
+    pub description: String,
+}
+
+/// Project one executable registry into MCP tools. Callers own the transport
+/// prefix, title, and description; the registry owns the schema and effect.
+pub(super) fn project_executable_family(
+    registry: &ExecutableBindingRegistryV1,
+    operations: &[FamilyOperation],
+    incomplete: (&'static str, &'static str),
+    identity: (&'static str, &'static str),
+    missing: (&'static str, &'static str),
+) -> Result<Vec<ToolDefinition>, McpCatalogError> {
+    if registry.iter().count() != operations.len() {
+        return Err(catalog_invalid(incomplete.0, incomplete.1));
+    }
+    operations
+        .iter()
+        .map(|operation| {
+            let operation_id = OperationId::new(operation.operation_id.clone())
+                .map_err(|_| catalog_invalid(identity.0, identity.1))?;
+            let binding = registry
+                .get(&operation_id)
+                .and_then(|availability| availability.binding())
+                .ok_or_else(|| catalog_invalid(missing.0, missing.1))?;
+            Ok(ToolDefinition {
+                name: operation.name.clone(),
+                description: operation.description.clone(),
+                input_schema: binding.request_schema().body().clone(),
+                annotations: Some(json!({
+                    "readOnlyHint": binding.effect().is_read_only(),
+                    "title": operation.title,
+                })),
+                meta: None,
+            })
+        })
+        .collect()
+}
+
+fn catalog_invalid(field: &'static str, reason: &'static str) -> McpCatalogError {
+    CatalogValidationError::InvalidValue { field, reason }.into()
 }
 
 fn spawn_definition_worker(
@@ -695,19 +663,14 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_grep",
     "tracedecay_ast_grep_search",
     "tracedecay_context",
-    "tracedecay_callers",
-    "tracedecay_callees",
     "tracedecay_impact",
     "tracedecay_node",
     "tracedecay_similar",
     "tracedecay_redundancy",
     "tracedecay_rename_preview",
-    "tracedecay_implementations",
-    "tracedecay_callers_for",
     "tracedecay_find_exact_symbol",
     "tracedecay_by_qualified_name",
     "tracedecay_signature",
-    "tracedecay_impls",
     "tracedecay_derives",
     // info
     "tracedecay_status",
@@ -715,12 +678,8 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_project_search",
     "tracedecay_project_context",
     "tracedecay_files",
-    "tracedecay_body",
     "tracedecay_todos",
-    "tracedecay_read",
-    "tracedecay_outline",
     "tracedecay_config",
-    "tracedecay_signature_search",
     "tracedecay_port_status",
     "tracedecay_port_order",
     // git
@@ -739,7 +698,6 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_remote_status",
     // analysis
     "tracedecay_dead_code",
-    "tracedecay_unused_imports",
     "tracedecay_circular",
     "tracedecay_hotspots",
     "tracedecay_unmounted_files",
@@ -749,7 +707,6 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_inheritance_depth",
     "tracedecay_distribution",
     "tracedecay_recursion",
-    "tracedecay_simplify_scan",
     "tracedecay_complexity",
     "tracedecay_doc_coverage",
     "tracedecay_god_class",
@@ -828,7 +785,6 @@ const FORMAT_CAPABLE_NON_APPLICATION_TOOL_NAMES: &[&str] = &[
     "tracedecay_dashboard",
     "tracedecay_retrieve",
     "tracedecay_analytics",
-    "tracedecay_type_hierarchy",
 ];
 
 static FORMAT_CAPABLE_TOOL_NAMES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
@@ -865,10 +821,8 @@ pub fn tool_defaults_to_markdown(tool_name: &str) -> bool {
             | "tracedecay_fact_store_supersede"
             | "tracedecay_fact_store_list"
             | "tracedecay_files"
-            | "tracedecay_read"
             | "tracedecay_skill_list"
             | "tracedecay_skill_view"
-            | "tracedecay_type_hierarchy"
     )
 }
 
@@ -900,6 +854,7 @@ fn add_format_property(definitions: &mut [ToolDefinition]) -> Result<(), McpCata
             json!({
                 "type": "string",
                 "enum": ["markdown", "json"],
+                "default": "markdown",
                 "description": "Output format. Default 'markdown' (compact, LLM-optimized; no tables). 'json' for machine-readable output."
             }),
         );

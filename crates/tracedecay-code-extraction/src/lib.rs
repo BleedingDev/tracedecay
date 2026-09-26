@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 mod types;
 
-// Lite — always available (no cfg needed)
+// Lite. Always available (no cfg needed)
 mod astro_extractor;
 mod c_extractor;
 mod clone_body;
@@ -84,6 +84,8 @@ mod gwbasic_extractor;
 mod haskell_extractor;
 #[cfg(feature = "lang-hlsl")]
 mod hlsl_extractor;
+#[cfg(feature = "lang-json")]
+mod json_extractor;
 #[cfg(feature = "lang-julia")]
 mod julia_extractor;
 #[cfg(feature = "lang-lean")]
@@ -92,9 +94,6 @@ mod lean_extractor;
 mod lua_extractor;
 #[cfg(feature = "lang-markdown")]
 mod markdown_extractor;
-/// Grammar-free; always compiled so the retrieval layer can read section
-/// structure without linking a tree-sitter bundle.
-pub mod markdown_structure;
 #[cfg(feature = "lang-metal")]
 mod metal_extractor;
 #[cfg(feature = "lang-msbasic2")]
@@ -122,14 +121,15 @@ mod wgsl_extractor;
 #[cfg(feature = "lang-zig")]
 mod zig_extractor;
 
-// Lite — always available (no cfg needed)
+// Lite. Always available (no cfg needed)
 pub use astro_extractor::AstroExtractor;
 pub use c_extractor::CExtractor;
 pub use clone_body::{
     CONSERVATIVE_CLONE_NORMALIZATION_REVISION_V1, CloneBodyEligibilityV1, CloneBodyRenameIssueV1,
     CloneBodyRenameStatusV1, CloneBodyTokenizationIssueV1, CloneBodyTokenizationStatusV1,
-    ConservativeCloneTokenV1, ExtractedCloneBodyV1, MIN_AUTOMATIC_CLONE_BODY_TOKENS_V1,
-    RENAME_CLONE_NORMALIZATION_REVISION_V1,
+    CloneTokenIterV1, CloneTokenStreamErrorV1, CloneTokenStreamV1, ConservativeCloneTokenV1,
+    ExtractedCloneBodyV1, MAX_AUTOMATIC_CLONE_BODY_BYTES_V1, MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1,
+    MIN_AUTOMATIC_CLONE_BODY_TOKENS_V1, RENAME_CLONE_NORMALIZATION_REVISION_V1,
 };
 pub use cpp_extractor::CppExtractor;
 pub use csharp_extractor::CSharpExtractor;
@@ -147,7 +147,7 @@ pub use rust_extractor::RustExtractor;
 pub use scala_extractor::ScalaExtractor;
 pub use svelte_extractor::SvelteExtractor;
 pub use swift_extractor::SwiftExtractor;
-pub use typescript_extractor::TypeScriptExtractor;
+pub use typescript_extractor::{TypeScriptExtractor, is_test_framework_call_signature};
 
 // Medium
 #[cfg(feature = "lang-bash")]
@@ -194,6 +194,8 @@ pub use gwbasic_extractor::GwBasicExtractor;
 pub use haskell_extractor::HaskellExtractor;
 #[cfg(feature = "lang-hlsl")]
 pub use hlsl_extractor::HlslExtractor;
+#[cfg(feature = "lang-json")]
+pub use json_extractor::JsonExtractor;
 #[cfg(feature = "lang-julia")]
 pub use julia_extractor::JuliaExtractor;
 #[cfg(feature = "lang-lean")]
@@ -244,6 +246,13 @@ pub trait LanguageExtractor: Send + Sync {
 
     /// Human-readable language name.
     fn language_name(&self) -> &str;
+
+    /// Whether this extractor indexes configuration documents: manifest and
+    /// settings keys that resolvers read, not executable code that calls or
+    /// is called.
+    fn indexes_configuration(&self) -> bool {
+        matches!(self.language_name(), "JSON" | "TOML")
+    }
 
     /// Grammar key used by the shared retained parser for this path.
     fn retained_grammar_key(&self, file_path: &str) -> String {
@@ -345,12 +354,6 @@ pub trait LanguageExtractor: Send + Sync {
             crate::hotpath_observe::ExtractOutputCounts::from_artifact,
         )
     }
-
-    /// Nodes, edges, and unresolved refs of the whole document, parsed with
-    /// this extractor's own grammar.
-    fn extract(&self, file_path: &str, source: &str) -> ExtractionResult {
-        self.extract_artifact(file_path, source).result
-    }
 }
 
 /// Registry of all available language extractors.
@@ -364,12 +367,21 @@ pub struct LanguageRegistry {
     by_extension: HashMap<String, usize>,
 }
 
+/// Required by `clippy::new_without_default` for the argument-less `new`
+/// below, so this is API surface the lint owns rather than an uncalled entry
+/// point a dead-surface pass may drop.
+impl Default for LanguageRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LanguageRegistry {
     /// Creates a new registry with all built-in language extractors.
     pub fn new() -> Self {
         #[allow(unused_mut)]
         let mut extractors: Vec<Box<dyn LanguageExtractor>> = vec![
-            // Lite — always available
+            // Lite. Always available
             Box::new(RustExtractor),
             Box::new(GoExtractor),
             Box::new(JavaExtractor),
@@ -442,6 +454,8 @@ impl LanguageRegistry {
         extractors.push(Box::new(MetalExtractor));
         #[cfg(feature = "lang-markdown")]
         extractors.push(Box::new(MarkdownExtractor));
+        #[cfg(feature = "lang-json")]
+        extractors.push(Box::new(JsonExtractor));
         #[cfg(feature = "lang-r")]
         extractors.push(Box::new(RExtractor));
         #[cfg(feature = "lang-sql")]
@@ -481,12 +495,6 @@ impl LanguageRegistry {
         }
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
-    #[doc(hidden)]
-    pub fn from_extractors_for_test(extractors: Vec<Box<dyn LanguageExtractor>>) -> Self {
-        Self::from_extractors(extractors)
-    }
-
     /// Returns the extractor for a file path based on its extension.
     pub fn extractor_for_file(&self, path: &str) -> Option<&dyn LanguageExtractor> {
         let extractor = path.rsplit('.').next().and_then(|ext| {
@@ -500,17 +508,17 @@ impl LanguageRegistry {
         extractor
     }
 
+    /// Whether `path` is a configuration document rather than code.
+    pub fn is_configuration_file(&self, path: &str) -> bool {
+        self.extractor_for_file(path)
+            .is_some_and(|extractor| extractor.indexes_configuration())
+    }
+
     /// Returns all supported file extensions across all extractors.
     pub fn supported_extensions(&self) -> Vec<&str> {
         self.extractors
             .iter()
             .flat_map(|e| e.extensions().iter().copied())
             .collect()
-    }
-}
-
-impl Default for LanguageRegistry {
-    fn default() -> Self {
-        Self::new()
     }
 }

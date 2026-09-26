@@ -23,8 +23,7 @@ use tracedecay_contracts::{
 use tracedecay_domain::configuration::ConfigurationValueV1;
 use tracedecay_domain::feedback::FeedbackContentIdentityV1;
 use tracedecay_domain::{
-    CodeGenerationId, ComponentVersion, ManifestDigest, ProjectId, RefId, RetrievalAnchorId,
-    TemporalModeV1,
+    CodeGenerationId, ComponentVersion, ProjectId, RefId, RetrievalAnchorId, TemporalModeV1,
 };
 use tracedecay_runtime_core::cancellation::CancellationToken;
 
@@ -50,9 +49,7 @@ where
     T::try_from(value.to_owned()).unwrap()
 }
 
-fn digest(character: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn configured_model_evidence(marker: u8) -> ContextScoutEvidenceEnvelopeV1 {
     let scope = ResolvedScope::new(
@@ -257,9 +254,16 @@ async fn project_open_edit_stop_and_explicit_feedback_preserve_privacy_and_super
     let pin = configured_model_pin();
     let control = pin.control();
     let owner = test_scout_owner(&temporary).await;
-    install_project_open_context_scout_configuration(owner.as_ref(), pin, &model_config)
-        .await
-        .expect("install project-open Scout configuration");
+    install_project_open_context_scout_configuration(
+        owner.as_ref(),
+        pin,
+        tracedecay_agent_hosts::agents::context_scout::model::ContextScoutModelConfig {
+            automation: &model_config,
+            codex: &tracedecay_domain::configuration::LcmSummarizerExecutableV1::Unconfigured,
+        },
+    )
+    .await
+    .expect("install project-open Scout configuration");
     let now = UtcMicros(
         i64::try_from(
             std::time::SystemTime::now()
@@ -511,9 +515,16 @@ async fn claim_refuses_work_from_a_displaced_configuration_revision() {
     let first_pin = configured_model_pin_with_timeout("revision.scout.claim.first", 30);
     let first_control = first_pin.control();
     let owner = test_scout_owner(&temporary).await;
-    install_project_open_context_scout_configuration(owner.as_ref(), first_pin, &model_config)
-        .await
-        .expect("install first Scout configuration");
+    install_project_open_context_scout_configuration(
+        owner.as_ref(),
+        first_pin,
+        tracedecay_agent_hosts::agents::context_scout::model::ContextScoutModelConfig {
+            automation: &model_config,
+            codex: &tracedecay_domain::configuration::LcmSummarizerExecutableV1::Unconfigured,
+        },
+    )
+    .await
+    .expect("install first Scout configuration");
     let now = UtcMicros(1_000_000);
     let input = configured_model_input_at(
         first_control.configuration_revision,
@@ -538,7 +549,10 @@ async fn claim_refuses_work_from_a_displaced_configuration_revision() {
     install_project_open_context_scout_configuration(
         owner.as_ref(),
         configured_model_pin_with_timeout("revision.scout.claim.second", 31),
-        &model_config,
+        tracedecay_agent_hosts::agents::context_scout::model::ContextScoutModelConfig {
+            automation: &model_config,
+            codex: &tracedecay_domain::configuration::LcmSummarizerExecutableV1::Unconfigured,
+        },
     )
     .await
     .expect("install replacement Scout configuration");
@@ -618,7 +632,11 @@ async fn stock_disabled_configuration_produces_nothing() {
     install_project_open_context_scout_configuration(
         owner.as_ref(),
         pin,
-        &tracedecay_automation_runtime::automation::config::AutomationConfig::default(),
+        tracedecay_agent_hosts::agents::context_scout::model::ContextScoutModelConfig {
+            automation:
+                &tracedecay_automation_runtime::automation::config::AutomationConfig::default(),
+            codex: &tracedecay_domain::configuration::LcmSummarizerExecutableV1::Unconfigured,
+        },
     )
     .await
     .expect("install disabled Scout configuration");
@@ -647,7 +665,7 @@ async fn stock_disabled_configuration_produces_nothing() {
                 &tracedecay_hooks::HookEventEnvelopeV2 {
                     schema_version: tracedecay_hooks::HOOK_EVENT_SCHEMA_VERSION,
                     event_id: [64; 16],
-                    producer: tracedecay_hooks::HookHostV1::Codex,
+                    producer: tracedecay_domain::NativeHostIdentityV1::Codex,
                     protected_session_id: input.address.protected_session_id,
                     project_id: input.address.project_id,
                     repository_id: [61; 16],

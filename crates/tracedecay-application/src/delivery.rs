@@ -21,7 +21,8 @@ use tracedecay_domain::feedback::{
     CiFailureKindV1, CiFailureRunIdentityV1, FeedbackScopeV1, GitHubPullRequestSnapshotV1,
     GitHubPullRequestStateV1, GitHubReviewCommentIdV1, GitHubReviewCoverageV1,
     GitHubReviewIngressProviderOutcomeV1, GitHubReviewItemV1, GitHubReviewLifecycleV1,
-    GitHubReviewRateLimitCheckpointV1, GitHubReviewReadCheckpointV1, GitHubReviewReadOperationV1,
+    GitHubReviewQuarantinedItemV1, GitHubReviewRateLimitCheckpointV1, GitHubReviewReadCheckpointV1,
+    GitHubReviewReadOperationV1,
 };
 use tracedecay_domain::{
     CanonicalObservationIdV1, CodeGenerationId, CommitId, ManifestDigest, ProjectId, ProviderId,
@@ -34,7 +35,7 @@ use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 use crate::advisory::github_runtime::GitHubSourceAccessAuthorityV1;
 use crate::advisory::{
     CiRetainedObservationManifestLoadOutcomeV1, GitHubActionsConclusionV1, GitHubActionsStatusV1,
-    GitHubCiAnnotationLevelV1, GitHubCiCheckAnnotationV1, GitHubCiRepositoryTargetV1,
+    GitHubCheckAnnotationLevelV1, GitHubCheckAnnotationV1, GitHubCiRepositoryTargetV1,
     GitHubHttpReadConfigV1, GitHubReleaseReadControlV1, GitHubReviewBodyEvidenceAuthorityV1,
     GitHubReviewBodyReadOutcomeV1, GitHubReviewStoreManifestLoadOutcomeV1,
     ProjectCiRetainedObservationStoreV1, ProjectGitHubReleaseAuthorityOpenOutcomeV1,
@@ -94,6 +95,8 @@ pub struct ProjectDeliveryGitHubOperationSnapshotV1 {
     pub merge_base_commit_id: CommitId,
     pub outcome: GitHubReviewIngressProviderOutcomeV1,
     pub coverage: GitHubReviewCoverageV1,
+    /// Comments this read observed but withheld from ingest.
+    pub quarantined: Vec<GitHubReviewQuarantinedItemV1>,
     pub fetched_at: UtcMicros,
     pub checkpoint: GitHubReviewReadCheckpointV1,
 }
@@ -354,7 +357,8 @@ pub enum ProjectDeliveryReadOutcomeV1 {
     },
     Denied,
     /// Project-open resolved no GitHub provider for this checkout; the exact
-    /// typed gate tells "configure a token" apart from "broken".
+    /// typed gate tells a checkout without a GitHub remote or with a refused
+    /// credential apart from a broken authority.
     NotMounted {
         gate: ProjectDeliveryProviderMountGateV1,
     },
@@ -367,9 +371,6 @@ pub enum ProjectDeliveryReadOutcomeV1 {
 pub enum ProjectDeliveryProviderMountGateV1 {
     /// The admitted checkout has no recognizable GitHub remote.
     NoGitRemote,
-    /// No GitHub read-only credential is configured for this profile and
-    /// repository, and the repository is not registered as public.
-    GitHubCredentialNotConfigured,
     /// A credential configuration exists but was refused (rejected, missing
     /// at resolution, or write-capable), so reads stay unmounted.
     GitHubAccessRefused,
@@ -448,7 +449,7 @@ pub struct ProjectDeliveryInboxSourceV1 {
     /// Attention join input from the daemon's proximity read authority.
     /// Callers mount a real `FeedbackProximityReadResultV1` (via
     /// [`project_delivery_proximity_attention_source_from_read_v1`]) so the
-    /// server-owned inbox is the one join authority — never a client re-join.
+    /// server-owned inbox is the one join authority, never a client re-join.
     pub proximity: ProjectDeliveryProximityAttentionSourceV1,
 }
 
@@ -480,7 +481,7 @@ impl From<&FeedbackProximityRelationV1> for ProjectDeliveryProximityRelationV1 {
 impl ProjectDeliveryProximityRelationV1 {
     /// The Delivery attention source this relation can settle, if any.
     /// Neighborhood and shared-code candidates carry clone/neighborhood
-    /// evidence only — they do not prove divergence — so they leave
+    /// evidence only, they do not prove divergence, so they leave
     /// `DivergentSharedImplementation` unsettled.
     pub fn attention_source(self) -> Option<ProjectDeliveryAttentionSourceV1> {
         match self {
@@ -951,9 +952,7 @@ fn delivery_inbox_provider(
             },
         ),
         ProjectDeliveryReadOutcomeV1::NotMounted {
-            gate:
-                ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured
-                | ProjectDeliveryProviderMountGateV1::NoGitRemote,
+            gate: ProjectDeliveryProviderMountGateV1::NoGitRemote,
         } => (
             ProjectDeliveryProviderStateV1::NotConfigured,
             None,
@@ -1898,6 +1897,7 @@ fn github_operation_snapshot(
         merge_base_commit_id: response.ingress.merge_base_commit_id.clone(),
         outcome: response.ingress.outcome,
         coverage: response.ingress.coverage,
+        quarantined: response.ingress.quarantined.clone(),
         fetched_at: response.ingress.fetched_at,
         checkpoint: response.checkpoint.clone(),
     }
@@ -2046,15 +2046,15 @@ fn delivery_ci_conclusion(conclusion: &GitHubActionsConclusionV1) -> ProjectDeli
     }
 }
 
-fn delivery_ci_annotation(annotation: &GitHubCiCheckAnnotationV1) -> ProjectDeliveryCiAnnotationV1 {
+fn delivery_ci_annotation(annotation: &GitHubCheckAnnotationV1) -> ProjectDeliveryCiAnnotationV1 {
     ProjectDeliveryCiAnnotationV1 {
         path: annotation.path.clone(),
         start_line: annotation.start_line,
         end_line: annotation.end_line,
         level: match annotation.annotation_level {
-            GitHubCiAnnotationLevelV1::Notice => ProjectDeliveryCiAnnotationLevelV1::Notice,
-            GitHubCiAnnotationLevelV1::Warning => ProjectDeliveryCiAnnotationLevelV1::Warning,
-            GitHubCiAnnotationLevelV1::Failure => ProjectDeliveryCiAnnotationLevelV1::Failure,
+            GitHubCheckAnnotationLevelV1::Notice => ProjectDeliveryCiAnnotationLevelV1::Notice,
+            GitHubCheckAnnotationLevelV1::Warning => ProjectDeliveryCiAnnotationLevelV1::Warning,
+            GitHubCheckAnnotationLevelV1::Failure => ProjectDeliveryCiAnnotationLevelV1::Failure,
         },
         title: annotation.title.clone(),
     }
@@ -2120,12 +2120,13 @@ fn review_body_preview(body: &str) -> ProjectDeliveryReviewBodyPreviewV1 {
             truncated: false,
         };
     }
-    let mut cut = MAX_PROJECT_DELIVERY_REVIEW_BODY_PREVIEW_BYTES_V1;
-    while !body.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let text = tracedecay_domain::utf8_prefix_at_or_before(
+        body,
+        MAX_PROJECT_DELIVERY_REVIEW_BODY_PREVIEW_BYTES_V1,
+    )
+    .to_owned();
     ProjectDeliveryReviewBodyPreviewV1 {
-        text: body[..cut].to_owned(),
+        text,
         truncated: true,
     }
 }
@@ -2220,8 +2221,25 @@ mod tests {
     };
     use tracedecay_runtime_core::db::{DatabaseAuthority, TestDatabaseRuntimeMode};
 
+    use serde_json::json;
+    use tracedecay_contracts::feedback::FeedbackPortFuture;
+    use tracedecay_domain::feedback::{
+        GitHubReviewCurrentBranchRemapV1, GitHubReviewImmutableAnchorV1,
+        GitHubReviewQuarantineReasonV1,
+    };
+    use tracedecay_domain::{ContentDigest, FileOccurrenceId};
+
     use super::*;
-    use crate::advisory::{CiRetainedProviderObservationAuthorityV1, GitHubCiProviderRecordV1};
+    use crate::advisory::{
+        CiRetainedProviderObservationAuthorityV1, GitHubCanonicalReviewAnchorAuthorityV1,
+        GitHubCanonicalReviewAnchorsV1, GitHubCiProviderRecordV1, GitHubCurrentBranchRemapper,
+        GitHubGraphQlReadRequestV1, GitHubOfficialResponseDecoderV1, GitHubProviderLifecycleV1,
+        GitHubReadNetworkMetadataV1, GitHubReadNetworkOutcomeV1, GitHubReadNetworkResponseV1,
+        GitHubReadNetworkStatusV1, GitHubReadOnlyConnector, GitHubReadOnlyDescriptorSetV1,
+        GitHubReadOnlyNetworkAuthorityV1, GitHubReadOnlyRuntimeTransportV1, GitHubRestDescriptorV1,
+        GitHubRestReadRequestV1, GitHubReviewAnchorSeedV1, GitHubReviewProviderIdentityV1,
+        GitHubReviewRefreshCoordinatorV1, GitHubReviewRefreshOutcomeV1,
+    };
 
     fn test_scope(
         fixture: &crate::advisory::fixtures::AdvisorySourceBackedCompositeFixtureV1,
@@ -2299,6 +2317,7 @@ mod tests {
                 outcome,
                 coverage,
                 items: Vec::new(),
+                quarantined: Vec::new(),
                 pull_request: None,
                 fetched_at: UtcMicros(11),
             },
@@ -2320,6 +2339,7 @@ mod tests {
             merge_base_commit_id: CommitId::new("commit.delivery.inbox.merge-base").unwrap(),
             outcome: GitHubReviewIngressProviderOutcomeV1::Complete,
             coverage: GitHubReviewCoverageV1::Complete,
+            quarantined: Vec::new(),
             fetched_at: UtcMicros(20),
             checkpoint: GitHubReviewReadCheckpointV1 {
                 etag: None,
@@ -2595,7 +2615,22 @@ mod tests {
                     && item.coverage == ProjectDeliveryInboxCoverageV1::Unsupported
             })
             .collect::<Vec<_>>();
-        assert!(!unsupported.is_empty());
+        assert_eq!(
+            unsupported
+                .iter()
+                .map(|item| item.source)
+                .collect::<Vec<_>>(),
+            [
+                ProjectDeliveryAttentionSourceV1::Contradiction,
+                ProjectDeliveryAttentionSourceV1::UnsafePattern,
+                ProjectDeliveryAttentionSourceV1::TestRisk,
+                ProjectDeliveryAttentionSourceV1::UnreviewedChangedCode,
+                ProjectDeliveryAttentionSourceV1::WeakEvidence,
+                ProjectDeliveryAttentionSourceV1::OverlappingEdit,
+                ProjectDeliveryAttentionSourceV1::ConfirmedConflict,
+                ProjectDeliveryAttentionSourceV1::DivergentSharedImplementation,
+            ]
+        );
         assert!(unsupported.iter().all(|item| {
             item.evidence.is_empty()
                 && item.coverage == ProjectDeliveryInboxCoverageV1::Unsupported
@@ -2682,7 +2717,7 @@ mod tests {
             },
         );
         not_configured.delivery = ProjectDeliveryReadOutcomeV1::NotMounted {
-            gate: ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured,
+            gate: ProjectDeliveryProviderMountGateV1::NoGitRemote,
         };
         let mut denied = inbox_source(
             "project.delivery-denied",
@@ -2860,7 +2895,7 @@ mod tests {
             "commit.delivery.proximity",
         );
         // Shared-code candidates name the indexed head but must not promote
-        // to DivergentSharedImplementation — clone evidence alone is not
+        // to DivergentSharedImplementation, clone evidence alone is not
         // divergence proof.
         let shared_candidate = proximity_encounter(
             "c",
@@ -3081,7 +3116,7 @@ mod tests {
         let context = test_context(&scope);
         let handle = gated_project_delivery_read_handle_v1(
             scope.clone(),
-            ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured,
+            ProjectDeliveryProviderMountGateV1::NoGitRemote,
         );
         let request = ProjectDeliveryReadRequestV1 {
             kind: ProjectDeliveryReadKindV1::Overview,
@@ -3096,7 +3131,7 @@ mod tests {
         assert_eq!(
             handle.read(&context, &request, &control).await,
             ProjectDeliveryReadOutcomeV1::NotMounted {
-                gate: ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured,
+                gate: ProjectDeliveryProviderMountGateV1::NoGitRemote,
             }
         );
 
@@ -3280,6 +3315,317 @@ mod tests {
         config.graphql_uri = "https://api.github.com/graphql".to_owned();
         assert!(!github_http_is_official(&config));
         assert!(github_http_is_official(&GitHubHttpReadConfigV1::default()));
+    }
+
+    /// Answers every read with one captured GitHub body.
+    struct CapturedReviewNetwork(Vec<u8>);
+
+    impl CapturedReviewNetwork {
+        fn answer(&self) -> FeedbackPortFuture<'_, GitHubReadNetworkOutcomeV1> {
+            let body = self.0.clone();
+            Box::pin(async move {
+                GitHubReadNetworkOutcomeV1::Response(GitHubReadNetworkResponseV1 {
+                    metadata: GitHubReadNetworkMetadataV1 {
+                        status: GitHubReadNetworkStatusV1::Ok,
+                        etag: None,
+                        next_cursor: None,
+                        rate_limit: None,
+                        retry_at: None,
+                    },
+                    body,
+                })
+            })
+        }
+    }
+
+    impl GitHubReadOnlyNetworkAuthorityV1 for CapturedReviewNetwork {
+        fn get<'a>(
+            &'a self,
+            _context: &'a RequestContext,
+            _request: &'a GitHubRestReadRequestV1,
+        ) -> FeedbackPortFuture<'a, GitHubReadNetworkOutcomeV1> {
+            self.answer()
+        }
+
+        fn query<'a>(
+            &'a self,
+            _context: &'a RequestContext,
+            _request: &'a GitHubGraphQlReadRequestV1,
+        ) -> FeedbackPortFuture<'a, GitHubReadNetworkOutcomeV1> {
+            self.answer()
+        }
+    }
+
+    struct ReviewAnchors;
+
+    impl GitHubCanonicalReviewAnchorAuthorityV1 for ReviewAnchors {
+        fn resolve<'a>(
+            &'a self,
+            request: &'a GitHubReviewReadRequestV1,
+            seed: &'a GitHubReviewAnchorSeedV1,
+        ) -> FeedbackPortFuture<'a, Option<GitHubCanonicalReviewAnchorsV1>> {
+            Box::pin(async move {
+                let anchor = |kind: &str| {
+                    RetrievalAnchorId::new(format!(
+                        "anchor.delivery.{kind}.{}",
+                        seed.comment_id.as_str()
+                    ))
+                    .ok()
+                };
+                let original = GitHubReviewImmutableAnchorV1 {
+                    repository_id: request.scope.repository_id.clone(),
+                    commit_id: seed.original_commit_id.clone(),
+                    retrieval_anchor_id: anchor("original")?,
+                    file: FileOccurrenceId::new("file.delivery.workflow").ok()?,
+                    content_digest: ContentDigest::new(format!("sha256:{}", "c".repeat(64)))
+                        .ok()?,
+                    span: None,
+                    symbol: None,
+                };
+                Some(GitHubCanonicalReviewAnchorsV1 {
+                    initial_remap: GitHubReviewCurrentBranchRemapV1::unmapped(
+                        original.clone(),
+                        request.scope.clone(),
+                    )
+                    .ok()?,
+                    original,
+                    author_anchor: anchor("author")?,
+                    body_anchor: anchor("body")?,
+                    safe_url_anchor: anchor("url"),
+                })
+            })
+        }
+    }
+
+    struct NoRemap;
+
+    impl GitHubCurrentBranchRemapper for NoRemap {
+        fn remap<'a>(
+            &'a self,
+            _context: &'a RequestContext,
+            _current_scope: &'a FeedbackScopeV1,
+            _original: &'a GitHubReviewImmutableAnchorV1,
+        ) -> FeedbackPortFuture<'a, Option<GitHubReviewCurrentBranchRemapV1>> {
+            Box::pin(async { None })
+        }
+    }
+
+    struct ReadySourceAccess;
+
+    impl GitHubSourceAccessAuthorityV1 for ReadySourceAccess {
+        fn authorize<'a>(
+            &'a self,
+            _context: &'a RequestContext,
+            _request: &'a GitHubReviewReadRequestV1,
+        ) -> FeedbackPortFuture<'a, GitHubProviderLifecycleV1> {
+            Box::pin(async { GitHubProviderLifecycleV1::Ready })
+        }
+    }
+
+    fn github_review_context(scope: &FeedbackScopeV1) -> RequestContext {
+        let resolved_scope = ResolvedScope::new(
+            scope.project_id.clone(),
+            scope.repository_id.clone(),
+            scope.worktree_id.clone(),
+            Some(RefId::new(scope.branch_ref.clone()).unwrap()),
+        )
+        .unwrap();
+        let grant = CapabilityGrantSnapshot::new(
+            CapabilityGrantId::new("grant.delivery-review-quarantine").unwrap(),
+            1,
+            ManifestDigest::new(
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            ActorId::new("actor.delivery-review-quarantine.issuer").unwrap(),
+            UtcMicros(1),
+            UtcMicros(i64::MAX),
+            resolved_scope.clone(),
+            BTreeSet::from([CapabilityId::new(GITHUB_REVIEW_INGEST_CAPABILITY_ID_V1).unwrap()]),
+            BTreeSet::from([UseCaseId::new(GITHUB_REVIEW_INGEST_USE_CASE_ID_V1).unwrap()]),
+            DisclosureClass::Evidence,
+        )
+        .unwrap();
+        RequestContext::new(
+            ActorId::new("actor.delivery-review-quarantine").unwrap(),
+            resolved_scope,
+            grant,
+            RequestId::new("request.delivery-review-quarantine").unwrap(),
+            Deadline::new(UtcMicros(i64::MAX - 1)).unwrap(),
+            CancellationContext::active("cancel.delivery-review-quarantine").unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// Refreshes one captured rust-lang/log#741 review read through the
+    /// production decoder, runtime transport, refresh coordinator and store,
+    /// then reads the Delivery pull-request lane.
+    async fn delivered_review_lane(
+        operation: GitHubReviewReadOperationV1,
+        response: &serde_json::Value,
+    ) -> (GitHubReviewRefreshOutcomeV1, ProjectDeliveryGitHubSourceV1) {
+        let scope = FeedbackScopeV1 {
+            project_id: ProjectId::new("project.delivery-review-lane").unwrap(),
+            repository_id: RepositoryId::new("repository.delivery-review-lane").unwrap(),
+            worktree_id: WorktreeId::new("worktree.delivery-review-lane").unwrap(),
+            branch_ref: "refs/heads/ci/msrv-build-vs-test".to_owned(),
+            head_commit_id: CommitId::new("1a4b67cfc41237e673dafd0dfc414577f0b5d327").unwrap(),
+        };
+        let context = github_review_context(&scope);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("delivery-review-lane.db");
+        crate::register_test_schema_installer();
+        let database_authority =
+            DatabaseAuthority::acquire_test(&path, "delivery-review-lane").unwrap();
+        let (database, _) = Database::publish_test_runtime(
+            &path,
+            &database_authority,
+            TestDatabaseRuntimeMode::Initialize,
+        )
+        .await
+        .unwrap();
+        let store = ProjectGitHubReviewStoreV1::new(database.clone(), scope.clone()).unwrap();
+        let base = CommitId::new("8034743dd9d7f7583bd9a670271483d176130911").unwrap();
+        let decoder = GitHubOfficialResponseDecoderV1::new(
+            GitHubReviewProviderIdentityV1 {
+                provider: ProviderId::new("provider.github").unwrap(),
+                repository_owner: "rust-lang".to_owned(),
+                repository_name: "log".to_owned(),
+                pull_request_number: 741,
+                base_commit_id: base.clone(),
+                head_commit_id: scope.head_commit_id.clone(),
+                merge_base_commit_id: base,
+            },
+            ReviewAnchors,
+        )
+        .unwrap();
+        let transport = GitHubReadOnlyRuntimeTransportV1::new(
+            store.clone(),
+            CapturedReviewNetwork(serde_json::to_vec(response).unwrap()),
+            decoder,
+        );
+        let connector = GitHubReadOnlyConnector::new(
+            GitHubReadOnlyDescriptorSetV1::new(vec![GitHubRestDescriptorV1 {
+                operation: GitHubReviewReadOperationV1::RestListPullRequestReviewComments,
+            }])
+            .unwrap(),
+            transport,
+            NoRemap,
+        )
+        .unwrap();
+        let coordinator =
+            GitHubReviewRefreshCoordinatorV1::new(connector, store, ReadySourceAccess);
+        let request = GitHubReviewReadRequestV1 {
+            operation,
+            scope: scope.clone(),
+            pull_request_id: GitHubPullRequestIdV1::new("2797381726").unwrap(),
+        };
+        let refresh = coordinator.refresh(&context, &request).await;
+
+        let authority = ProjectDeliveryReadAuthorityV1 {
+            profile_id: UserProfileId::new("profile.delivery-review-lane").unwrap(),
+            scope: scope.clone(),
+            github_reviews: ProjectGitHubReviewStoreV1::new(database.clone(), scope.clone())
+                .unwrap(),
+            ci_checks: ProjectCiRetainedObservationStoreV1::new(database, scope.clone()).unwrap(),
+            releases: ProjectDeliveryReleaseMountV1::Unavailable,
+            review_bodies: None,
+        };
+        let read = ProjectDeliveryReadRequestV1 {
+            kind: ProjectDeliveryReadKindV1::Overview,
+            expected_head_commit_id: scope.head_commit_id.clone(),
+            max_pull_requests: 1,
+            max_review_items: 8,
+            max_ci_checks: 1,
+            max_releases: 1,
+        };
+        let control = GitHubReleaseReadControlV1::bounded(Instant::now() + Duration::from_secs(1));
+        let ProjectDeliveryReadOutcomeV1::Ready { snapshot } =
+            authority.read(&context, &read, &control).await
+        else {
+            panic!("the delivery read must answer for its own scope");
+        };
+        (refresh, snapshot.github_reviews)
+    }
+
+    /// rust-lang/log#741 as GitHub served it, with the reply body replaced
+    /// by one the privacy sanitizer must refuse.
+    #[tokio::test]
+    async fn one_quarantined_review_body_leaves_the_rest_of_the_pull_request_published() {
+        let mut capture: serde_json::Value = serde_json::from_str(include_str!(
+            "advisory/fixtures/rust_lang_log_741_review_threads.graphql.json"
+        ))
+        .unwrap();
+        let mut response = capture["response"].take();
+        let mut comments = response["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|thread| thread["comments"]["nodes"].as_array_mut().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(comments.len(), 3);
+        let reply = comments
+            .iter_mut()
+            .find(|comment| comment["databaseId"] == 4_069_777_906_u64)
+            .unwrap();
+        reply["bodyText"] = json!("vault_passphrase: ordinary-value\n  broken: [unclosed\n");
+
+        let (refresh, lane) = delivered_review_lane(
+            GitHubReviewReadOperationV1::GraphQlQueryPullRequestReviewThreads,
+            &response,
+        )
+        .await;
+        let ProjectDeliveryGitHubSourceV1::Ready { timeline } = lane else {
+            panic!("the pull-request lane must publish: {lane:?} after refresh {refresh:?}");
+        };
+        assert!(matches!(refresh, GitHubReviewRefreshOutcomeV1::Stored(_)));
+        assert_eq!(
+            timeline
+                .review_items
+                .iter()
+                .map(|item| item.comment_id.as_str())
+                .collect::<Vec<_>>(),
+            ["4069686687", "4069691901"]
+        );
+        let snapshot = timeline.pull_requests[0].operations[0]
+            .latest_attempt
+            .as_ref()
+            .unwrap();
+        assert_eq!(snapshot.coverage, GitHubReviewCoverageV1::Complete);
+        assert_eq!(
+            snapshot.quarantined,
+            [GitHubReviewQuarantinedItemV1 {
+                comment_id: GitHubReviewCommentIdV1::new("4069777906").unwrap(),
+                reason: GitHubReviewQuarantineReasonV1::PrivacySanitizer,
+            }]
+        );
+    }
+
+    /// An anonymously read public repository ingests its review comments
+    /// through REST, which GitHub serves without a credential.
+    #[tokio::test]
+    async fn anonymous_rest_review_comments_publish_the_pull_request_lane() {
+        let capture: serde_json::Value = serde_json::from_str(include_str!(
+            "advisory/fixtures/rust_lang_log_741_review_comments.rest.json"
+        ))
+        .unwrap();
+
+        let (refresh, lane) = delivered_review_lane(
+            GitHubReviewReadOperationV1::RestListPullRequestReviewComments,
+            &capture["response"],
+        )
+        .await;
+        let ProjectDeliveryGitHubSourceV1::Ready { timeline } = lane else {
+            panic!("the pull-request lane must publish: {lane:?} after refresh {refresh:?}");
+        };
+        assert_eq!(
+            timeline
+                .review_items
+                .iter()
+                .map(|item| item.comment_id.as_str())
+                .collect::<Vec<_>>(),
+            ["4069686687", "4069691901", "4069777906"]
+        );
     }
 
     #[tokio::test]

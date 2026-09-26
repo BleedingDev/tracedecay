@@ -5,7 +5,9 @@
 //! and a draining daemon never starts a new one.
 
 use super::*;
+use tracedecay_daemon_service::shutdown::DaemonLifecycle;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::path_safety::same_canonical_path;
 
 /// Bounds how long a foreground request waits for a route's background open.
 /// The open task itself is deliberately left running after the deadline.
@@ -17,13 +19,11 @@ pub(super) async fn wait_for_project_open_publication<Publication, Output>(
 where
     Publication: std::future::Future<Output = Result<Output>>,
 {
-    // The bound is a plain deadline: a waiter resumed after it elapsed still
-    // needs one more await — `route_bound_project_server` — before its
-    // publication loop can read the route's terminal state, so an elapsed
-    // deadline preempts a failure that was already recorded and the caller
-    // would see warming for a route that is no longer opening. Callers repair
-    // that with `prefer_recorded_open_failure` against the claim's own watch
-    // channel instead of weakening the bound.
+    // The bound is a plain deadline, measured from the open claim. A waiter
+    // resumed after it elapsed may still be inside `route_bound_project_server`
+    // and would otherwise answer warming for a refusal already on the watch.
+    // Callers repair that with `prefer_recorded_open_failure` against the
+    // claim's own watch channel instead of weakening the bound.
     hotpath::future!(
         tokio::time::timeout_at(deadline, publication),
         label = "daemon.project.open.publication_wait"
@@ -66,9 +66,18 @@ where
         // mid-statement. The lifecycle activity remains held until the task
         // reports its terminal outcome and shutdown explicitly joins it.
         let result = Box::pin(open_project_server(cancellation.clone())).await;
+        if cancellation.is_cancelled() {
+            log_daemon_event(
+                "project_server_warmup",
+                &[
+                    ("outcome", "cancelled".to_string()),
+                    ("project", project_path.display().to_string()),
+                ],
+            );
+            return Err(result.err().unwrap_or_else(project_open_cancellation_error));
+        }
         match result {
             Ok(server) => {
-                project_open_cancellation_checkpoint(&cancellation)?;
                 if let Some(initialize_request) = initialize_request {
                     // Preserve the regular initialize side effect that records
                     // the negotiated MCP client name on the real server.
@@ -80,9 +89,6 @@ where
                 Ok(())
             }
             Err(error) => {
-                if cancellation.is_cancelled() {
-                    return Err(error);
-                }
                 log_daemon_event(
                     "project_server_warmup",
                     &[
@@ -121,9 +127,12 @@ pub(super) fn spawn_lifecycle_automation_scheduler_activation<ActivationFuture>(
 }
 
 #[hotpath::measure(label = "daemon.project.enroll.route", future = true)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Registered route ensure is one lookup-or-open for the admitted project."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Registered route ensure is one lookup-or-open for the admitted project."
+    )
 )]
 pub(super) async fn ensure_registered_project_route(
     store_administration: &StoreAdministration,
@@ -164,10 +173,8 @@ pub(super) async fn ensure_registered_project_route(
                 tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
                     identity,
                 ) => {
-                    let requested = project_path
-                        .canonicalize()
-                        .unwrap_or_else(|_| project_path.to_path_buf());
-                    requested_path_is_repository_root = identity.worktree_root == requested;
+                    requested_path_is_repository_root =
+                        same_canonical_path(&identity.worktree_root, project_path);
                     repository_common_dir = Some(identity.common_dir);
                     identity.worktree_root
                 }
@@ -270,7 +277,7 @@ fn remote_deleted_project_route_error(identity: &str) -> TraceDecayError {
 /// manufacturing a new identity.
 ///
 /// The profile registry is a *derived* index: the authoritative identity chain
-/// in [`crate::project::TraceDecay::resolve_registered_configuration_layout`]
+/// in [`tracedecay_project::project::TraceDecay::resolve_registered_configuration_layout`]
 /// consults the project's own enrollment marker (and the repository-identity
 /// marker) BEFORE it ever asks the registry, and a successful open republishes
 /// the registry rows via `register_project_store_in_global_registry`. A guard
@@ -280,8 +287,8 @@ fn remote_deleted_project_route_error(identity: &str) -> TraceDecayError {
 /// That is exactly what strands a profile after an interrupted migration:
 /// recovery can bring the daemon up on a fresh registry while
 /// every project keeps its in-repo enrollment marker and its profile store, and
-/// the first daemon-brokered call — including the post-update startup-health
-/// probe, which cannot pass `allow_init` — was rejected as "not enrolled". The
+/// the first daemon-brokered call, including the post-update startup-health
+/// probe, which cannot pass `allow_init`, was rejected as "not enrolled". The
 /// existing store is required to be present on disk, so an ambient directory
 /// (a bare `$HOME`, a checkout whose store really is gone) is still rejected
 /// and no path-derived authority is minted here.
@@ -315,13 +322,16 @@ pub(super) async fn durable_enrollment_resolves_existing_store(
 }
 
 fn unenrolled_project_route_error(project_path: &Path) -> TraceDecayError {
-    TraceDecayError::Config {
-        message: format!(
+    TraceDecayError::project_route(
+        PROJECT_NOT_ENROLLED_REASON_CODE,
+        false,
+        format!(
             "no TraceDecay index found at '{}': project is not enrolled in the authenticated \
-             profile; run 'tracedecay init' first",
+             profile; run 'tracedecay init' in that directory, or start the MCP server with \
+             'tracedecay serve --path <project>'",
             project_path.display()
         ),
-    }
+    )
 }
 
 #[cfg(any(not(unix), test))]
@@ -483,7 +493,6 @@ pub(super) async fn portable_project_server_for_request(
     // warm-up runs. The open task remains tracked and continues in the
     // background after this bounded wait expires.
     let mut retry_init = handshake.allow_init;
-    let publication_deadline = tokio::time::Instant::now() + PROJECT_OPEN_REQUEST_DEADLINE;
     loop {
         let claim = Box::pin(begin_portable_project_open(
             lifecycle.clone(),
@@ -499,6 +508,10 @@ pub(super) async fn portable_project_server_for_request(
             project_open_attempts.clone(),
         ))
         .await;
+        // The bound starts here, after the open is claimed. Starting it at
+        // connection arrival let route enrollment spend it, and the request
+        // then answered warming for a refusal already on the watch.
+        let publication_deadline = project_open_publication_deadline(tokio::time::Instant::now());
         let result = match claim {
             ProjectOpenTaskClaim::InFlight(state) => {
                 let recorded = state.clone();

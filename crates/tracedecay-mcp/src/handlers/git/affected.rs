@@ -1,4 +1,4 @@
-//! `tracedecay_affected` — breadth-first reverse-dependency traversal from changed files to the tests that cover them.
+//! `tracedecay_affected`, breadth-first reverse-dependency traversal from changed files to the tests that cover them.
 
 use super::*;
 use tracedecay_application::primitives::{
@@ -42,7 +42,10 @@ impl AffectedTestDependents for VerifiedAffectedTestDependents<'_> {
         Box::pin(async move {
             let mut dependents = FileDependentsByFile::new();
             for file in files {
-                dependents.insert(file.clone(), self.query.get_file_dependents(file).await?);
+                dependents.insert(
+                    file.clone(),
+                    self.query.get_file_dependents(file).await?.files,
+                );
             }
             Ok(dependents)
         })
@@ -185,7 +188,7 @@ pub async fn handle_affected(
     );
 
     Ok(generic_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         &args,
         &output,
         touched_files,

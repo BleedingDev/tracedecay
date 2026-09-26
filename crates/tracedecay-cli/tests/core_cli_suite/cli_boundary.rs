@@ -17,6 +17,10 @@ fn shipped_binary_stops_quietly_when_a_pipeline_reader_exits() {
     let output = Command::new("sh")
         .args(["-c", r#""$TRACEDECAY_BIN" tool | head -n 4"#])
         .env("TRACEDECAY_BIN", env!("CARGO_BIN_EXE_tracedecay"))
+        // A hotpath-enabled binary binds its metrics port on start; when a
+        // sibling test's daemon already holds it, the bind failure lands on
+        // stderr and breaks the quiet-pipeline assertion below.
+        .env("HOTPATH_METRICS_SERVER_OFF", "true")
         .output()
         .expect("tracedecay tool pipeline should run");
 
@@ -65,8 +69,22 @@ fn compiled_hotpath_profiles_without_a_runtime_environment_gate() {
         .expect("run feature-on profiling binary");
 
     assert!(output.status.success(), "{output:?}");
-    let bytes = std::fs::read(&report).expect("feature-on binary must write a report");
-    assert!(!bytes.is_empty(), "Hotpath report must not be empty");
+    let text = std::fs::read_to_string(&report).expect("feature-on binary must write a report");
+    let report: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("Hotpath report is not JSON: {error}\n{text}"));
+    let measured = report
+        .pointer("/functions_timing/data")
+        .and_then(serde_json::Value::as_array)
+        .unwrap_or_else(|| panic!("report has no functions_timing data: {report}"))
+        .iter()
+        .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    assert!(
+        measured
+            .iter()
+            .any(|name| name.contains("cli.hotpath.install_shutdown_finalizer")),
+        "process guard installation must be measured: {measured:?}"
+    );
 }
 
 #[cfg(feature = "hotpath")]

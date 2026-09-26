@@ -787,22 +787,6 @@ pub struct ObservationSourceCursorV1 {
 }
 
 impl ObservationSourceCursorV1 {
-    /// Constructs the legacy-compatible file-byte cursor.
-    pub fn new(
-        source: ObservationSourceIdentityV1,
-        scope: ObservationScopeV1,
-        generation: ObservationSourceGenerationV1,
-        byte_offset: u64,
-    ) -> Result<Self, ObservationContractError> {
-        Self::for_ordering(
-            source,
-            scope,
-            generation,
-            ObservationOrderingDomainV1::FileBytes,
-            byte_offset,
-        )
-    }
-
     pub fn for_ordering(
         source: ObservationSourceIdentityV1,
         scope: ObservationScopeV1,
@@ -877,6 +861,19 @@ impl ObservationSourceCursorV1 {
             return Err(ObservationContractError::CursorOrderingDomainMismatch);
         }
         Ok(self.byte_offset.cmp(&other.byte_offset))
+    }
+
+    /// Whether this cursor already owns `frontier` on the same ordering authority.
+    ///
+    /// Progress is the position. Resume fingerprints are checkpoints, not
+    /// coverage, so two owners of the same bytes can disagree there without
+    /// either being behind the frontier.
+    #[must_use]
+    pub fn reached(&self, frontier: &Self) -> bool {
+        matches!(
+            self.checked_cmp(frontier),
+            Ok(Ordering::Equal | Ordering::Greater)
+        )
     }
 }
 
@@ -1074,9 +1071,9 @@ fn visit_structure_value(values: &mut usize, depth: usize) -> Result<(), Structu
     Ok(())
 }
 
-/// Counts the JSON values `serde_json` serialization would produce — with the
+/// Counts the JSON values `serde_json` serialization would produce, with the
 /// same per-node accounting as [`validate_value_structure`] over the
-/// materialized tree — without building that tree.
+/// materialized tree, without building that tree.
 ///
 /// Each `serialize_*` case mirrors how `serde_json::value::Serializer`
 /// constructs a `Value`: scalars are one value, sequences and maps are one
@@ -1085,6 +1082,36 @@ fn visit_structure_value(values: &mut usize, depth: usize) -> Result<(), Structu
 struct StructureLimitSerializer<'count> {
     values: &'count mut usize,
     depth: usize,
+}
+
+impl<'count> StructureLimitSerializer<'count> {
+    fn count_node(self) -> Result<(), StructureLimitError> {
+        visit_structure_value(self.values, self.depth)
+    }
+
+    fn descend(
+        self,
+        extra_ancestor: bool,
+    ) -> Result<StructureLimitCompound<'count>, StructureLimitError> {
+        visit_structure_value(self.values, self.depth)?;
+        if extra_ancestor {
+            visit_structure_value(self.values, self.depth + 1)?;
+        }
+        Ok(StructureLimitCompound {
+            values: self.values,
+            child_depth: self.depth + 1 + usize::from(extra_ancestor),
+        })
+    }
+}
+
+macro_rules! count_scalar {
+    ($($name:ident ( $($params:tt)* );)*) => {
+        $(
+            fn $name(self, $($params)*) -> Result<(), StructureLimitError> {
+                self.count_node()
+            }
+        )*
+    };
 }
 
 impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
@@ -1099,64 +1126,30 @@ impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
     type SerializeStruct = StructureLimitCompound<'count>;
     type SerializeStructVariant = StructureLimitCompound<'count>;
 
-    fn serialize_bool(self, _value: bool) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_i8(self, _value: i8) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_i16(self, _value: i16) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_i32(self, _value: i32) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_i64(self, _value: i64) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_i128(self, _value: i128) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_u8(self, _value: u8) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_u16(self, _value: u16) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_u32(self, _value: u32) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_u64(self, _value: u64) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_u128(self, _value: u128) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_f32(self, _value: f32) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_f64(self, _value: f64) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_char(self, _value: char) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_str(self, _value: &str) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
+    count_scalar! {
+        serialize_bool(_value: bool);
+        serialize_i8(_value: i8);
+        serialize_i16(_value: i16);
+        serialize_i32(_value: i32);
+        serialize_i64(_value: i64);
+        serialize_i128(_value: i128);
+        serialize_u8(_value: u8);
+        serialize_u16(_value: u16);
+        serialize_u32(_value: u32);
+        serialize_u64(_value: u64);
+        serialize_u128(_value: u128);
+        serialize_f32(_value: f32);
+        serialize_f64(_value: f64);
+        serialize_char(_value: char);
+        serialize_str(_value: &str);
+        serialize_none();
+        serialize_unit();
+        serialize_unit_struct(_name: &'static str);
+        serialize_unit_variant(
+            _name: &'static str,
+            _variant_index: u32,
+            _variant: &'static str
+        );
     }
 
     fn serialize_bytes(self, value: &[u8]) -> Result<(), StructureLimitError> {
@@ -1168,32 +1161,11 @@ impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
         Ok(())
     }
 
-    fn serialize_none(self) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
     fn serialize_some<T>(self, value: &T) -> Result<(), StructureLimitError>
     where
         T: ?Sized + Serialize,
     {
         value.serialize(self)
-    }
-
-    fn serialize_unit(self) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
-    }
-
-    fn serialize_unit_variant(
-        self,
-        _name: &'static str,
-        _variant_index: u32,
-        _variant: &'static str,
-    ) -> Result<(), StructureLimitError> {
-        visit_structure_value(self.values, self.depth)
     }
 
     fn serialize_newtype_struct<T>(
@@ -1228,11 +1200,7 @@ impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
         self,
         _len: Option<usize>,
     ) -> Result<StructureLimitCompound<'count>, StructureLimitError> {
-        visit_structure_value(self.values, self.depth)?;
-        Ok(StructureLimitCompound {
-            values: self.values,
-            child_depth: self.depth + 1,
-        })
+        self.descend(false)
     }
 
     fn serialize_tuple(
@@ -1257,23 +1225,14 @@ impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
         _variant: &'static str,
         _len: usize,
     ) -> Result<StructureLimitCompound<'count>, StructureLimitError> {
-        visit_structure_value(self.values, self.depth)?;
-        visit_structure_value(self.values, self.depth + 1)?;
-        Ok(StructureLimitCompound {
-            values: self.values,
-            child_depth: self.depth + 2,
-        })
+        self.descend(true)
     }
 
     fn serialize_map(
         self,
         _len: Option<usize>,
     ) -> Result<StructureLimitCompound<'count>, StructureLimitError> {
-        visit_structure_value(self.values, self.depth)?;
-        Ok(StructureLimitCompound {
-            values: self.values,
-            child_depth: self.depth + 1,
-        })
+        self.descend(false)
     }
 
     fn serialize_struct(
@@ -1281,11 +1240,7 @@ impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
         _name: &'static str,
         _len: usize,
     ) -> Result<StructureLimitCompound<'count>, StructureLimitError> {
-        visit_structure_value(self.values, self.depth)?;
-        Ok(StructureLimitCompound {
-            values: self.values,
-            child_depth: self.depth + 1,
-        })
+        self.descend(false)
     }
 
     fn serialize_struct_variant(
@@ -1295,19 +1250,14 @@ impl<'count> serde::Serializer for StructureLimitSerializer<'count> {
         _variant: &'static str,
         _len: usize,
     ) -> Result<StructureLimitCompound<'count>, StructureLimitError> {
-        visit_structure_value(self.values, self.depth)?;
-        visit_structure_value(self.values, self.depth + 1)?;
-        Ok(StructureLimitCompound {
-            values: self.values,
-            child_depth: self.depth + 2,
-        })
+        self.descend(true)
     }
 
     fn collect_str<T>(self, _value: &T) -> Result<(), StructureLimitError>
     where
         T: ?Sized + fmt::Display,
     {
-        visit_structure_value(self.values, self.depth)
+        self.count_node()
     }
 }
 
@@ -1330,69 +1280,30 @@ impl StructureLimitCompound<'_> {
     }
 }
 
-impl serde::ser::SerializeSeq for StructureLimitCompound<'_> {
-    type Ok = ();
-    type Error = StructureLimitError;
+macro_rules! impl_structure_limit_compound {
+    ($trait:path, $method:ident, ($($extra:tt)*)) => {
+        impl $trait for StructureLimitCompound<'_> {
+            type Ok = ();
+            type Error = StructureLimitError;
 
-    fn serialize_element<T>(&mut self, value: &T) -> Result<(), StructureLimitError>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.child(value)
-    }
+            fn $method<T>(&mut self, $($extra)* value: &T) -> Result<(), StructureLimitError>
+            where
+                T: ?Sized + Serialize,
+            {
+                self.child(value)
+            }
 
-    fn end(self) -> Result<(), StructureLimitError> {
-        Ok(())
-    }
+            fn end(self) -> Result<(), StructureLimitError> {
+                Ok(())
+            }
+        }
+    };
 }
 
-impl serde::ser::SerializeTuple for StructureLimitCompound<'_> {
-    type Ok = ();
-    type Error = StructureLimitError;
-
-    fn serialize_element<T>(&mut self, value: &T) -> Result<(), StructureLimitError>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.child(value)
-    }
-
-    fn end(self) -> Result<(), StructureLimitError> {
-        Ok(())
-    }
-}
-
-impl serde::ser::SerializeTupleStruct for StructureLimitCompound<'_> {
-    type Ok = ();
-    type Error = StructureLimitError;
-
-    fn serialize_field<T>(&mut self, value: &T) -> Result<(), StructureLimitError>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.child(value)
-    }
-
-    fn end(self) -> Result<(), StructureLimitError> {
-        Ok(())
-    }
-}
-
-impl serde::ser::SerializeTupleVariant for StructureLimitCompound<'_> {
-    type Ok = ();
-    type Error = StructureLimitError;
-
-    fn serialize_field<T>(&mut self, value: &T) -> Result<(), StructureLimitError>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.child(value)
-    }
-
-    fn end(self) -> Result<(), StructureLimitError> {
-        Ok(())
-    }
-}
+impl_structure_limit_compound!(serde::ser::SerializeSeq, serialize_element, ());
+impl_structure_limit_compound!(serde::ser::SerializeTuple, serialize_element, ());
+impl_structure_limit_compound!(serde::ser::SerializeTupleStruct, serialize_field, ());
+impl_structure_limit_compound!(serde::ser::SerializeTupleVariant, serialize_field, ());
 
 impl serde::ser::SerializeMap for StructureLimitCompound<'_> {
     type Ok = ();
@@ -1418,45 +1329,16 @@ impl serde::ser::SerializeMap for StructureLimitCompound<'_> {
     }
 }
 
-impl serde::ser::SerializeStruct for StructureLimitCompound<'_> {
-    type Ok = ();
-    type Error = StructureLimitError;
-
-    fn serialize_field<T>(
-        &mut self,
-        _key: &'static str,
-        value: &T,
-    ) -> Result<(), StructureLimitError>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.child(value)
-    }
-
-    fn end(self) -> Result<(), StructureLimitError> {
-        Ok(())
-    }
-}
-
-impl serde::ser::SerializeStructVariant for StructureLimitCompound<'_> {
-    type Ok = ();
-    type Error = StructureLimitError;
-
-    fn serialize_field<T>(
-        &mut self,
-        _key: &'static str,
-        value: &T,
-    ) -> Result<(), StructureLimitError>
-    where
-        T: ?Sized + Serialize,
-    {
-        self.child(value)
-    }
-
-    fn end(self) -> Result<(), StructureLimitError> {
-        Ok(())
-    }
-}
+impl_structure_limit_compound!(
+    serde::ser::SerializeStruct,
+    serialize_field,
+    (_key: &'static str,)
+);
+impl_structure_limit_compound!(
+    serde::ser::SerializeStructVariant,
+    serialize_field,
+    (_key: &'static str,)
+);
 
 struct ByteLimitWriter {
     written: usize,
@@ -1510,6 +1392,10 @@ pub struct CanonicalObservationRelationsV1 {
     agent_id: Option<ObservationId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent_agent_id: Option<ObservationId>,
+    /// The host's id of the parent-session tool call that spawned this
+    /// session, as recorded by the host on the child side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent_tool_use_id: Option<ObservationId>,
 }
 
 impl CanonicalObservationRelationsV1 {
@@ -1523,6 +1409,7 @@ impl CanonicalObservationRelationsV1 {
             parent_message_id: None,
             agent_id: None,
             parent_agent_id: None,
+            parent_tool_use_id: None,
         }
     }
 
@@ -1568,6 +1455,12 @@ impl CanonicalObservationRelationsV1 {
         self
     }
 
+    #[must_use]
+    pub fn with_parent_tool_use_id(mut self, parent_tool_use_id: ObservationId) -> Self {
+        self.parent_tool_use_id = Some(parent_tool_use_id);
+        self
+    }
+
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
     }
@@ -1600,6 +1493,10 @@ impl CanonicalObservationRelationsV1 {
         self.parent_agent_id.as_ref()
     }
 
+    pub fn parent_tool_use_id(&self) -> Option<&ObservationId> {
+        self.parent_tool_use_id.as_ref()
+    }
+
     fn validate(&self) -> Result<(), ObservationContractError> {
         self.session_id
             .validate()
@@ -1616,6 +1513,7 @@ impl CanonicalObservationRelationsV1 {
             self.parent_message_id.as_ref(),
             self.agent_id.as_ref(),
             self.parent_agent_id.as_ref(),
+            self.parent_tool_use_id.as_ref(),
         ]
         .into_iter()
         .flatten()
@@ -1715,6 +1613,20 @@ pub enum CanonicalMessageRoleV1 {
     Unknown,
 }
 
+impl CanonicalMessageRoleV1 {
+    /// Role label written into canonical projections. It is the serde name so
+    /// projection and the wire encoding cannot drift.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::System => "system",
+            Self::Tool => "tool",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CanonicalReasoningVisibilityV1 {
@@ -1722,6 +1634,69 @@ pub enum CanonicalReasoningVisibilityV1 {
     Redacted,
     Unavailable,
     NotApplicable,
+}
+
+impl CanonicalMessageRoleV1 {
+    /// Exact canonical role label. Host aliases (`developer`, `model`,
+    /// `_system_prompt`) stay at the host boundary so a foreign alias cannot
+    /// become a role for every provider.
+    pub fn from_known_label(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "assistant" => Some(Self::Assistant),
+            "system" => Some(Self::System),
+            "tool" => Some(Self::Tool),
+            _ => None,
+        }
+    }
+
+    /// `from_known_label`, with every other label recorded as [`Self::Unknown`]
+    /// instead of refused.
+    pub fn from_wire_label(value: &str) -> Self {
+        match Self::from_known_label(value) {
+            Some(role) => role,
+            None => Self::Unknown,
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_message_role_label_tests {
+    use super::CanonicalMessageRoleV1;
+
+    #[test]
+    fn known_labels_parse_and_foreign_aliases_stay_unknown() {
+        assert_eq!(
+            CanonicalMessageRoleV1::from_known_label("user"),
+            Some(CanonicalMessageRoleV1::User)
+        );
+        assert_eq!(
+            CanonicalMessageRoleV1::from_known_label("assistant"),
+            Some(CanonicalMessageRoleV1::Assistant)
+        );
+        assert_eq!(
+            CanonicalMessageRoleV1::from_known_label("system"),
+            Some(CanonicalMessageRoleV1::System)
+        );
+        assert_eq!(
+            CanonicalMessageRoleV1::from_known_label("tool"),
+            Some(CanonicalMessageRoleV1::Tool)
+        );
+        assert_eq!(CanonicalMessageRoleV1::from_known_label("unknown"), None);
+        assert_eq!(CanonicalMessageRoleV1::from_known_label("developer"), None);
+        assert_eq!(
+            CanonicalMessageRoleV1::from_wire_label("user"),
+            CanonicalMessageRoleV1::User
+        );
+        assert_eq!(
+            CanonicalMessageRoleV1::from_wire_label("developer"),
+            CanonicalMessageRoleV1::Unknown
+        );
+        assert_eq!(
+            CanonicalMessageRoleV1::from_wire_label(""),
+            CanonicalMessageRoleV1::Unknown
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2709,8 +2684,6 @@ impl<'de> Deserialize<'de> for DurableObservationV1 {
     }
 }
 
-pub type DurableClaudeObservationV1 = DurableObservationV1;
-
 /// Relationship between an existing record and a candidate retry.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
@@ -2983,8 +2956,8 @@ fn domain_digest(
 /// first. Element zero is the only one ever written; the rest exist so rows
 /// committed under an earlier derivation stay decodable.
 ///
-/// A stored row carries this digest under two names — `observation_id` and its
-/// `idempotency_key` alias, see [`DurableObservationV1::idempotency_key`] — so
+/// A stored row carries this digest under two names. `observation_id` and its
+/// `idempotency_key` alias, see [`DurableObservationV1::idempotency_key`], so
 /// the two fields must accept exactly the same set. Accepting an older entry
 /// grants nothing: every one digests the same identity material under a domain
 /// separator, so a row still binds to its own evidence. Rejecting them makes

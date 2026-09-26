@@ -7,7 +7,7 @@ import { budgetAnchors, budgetCoverage, latencyDimensions, outcomeDimensions, pe
  * `performance-budgets` binds to `/api/observatory`, which carries two of the
  * budget dimensions Plan 26 requires. The tests pin both halves: that the two
  * measured ones read from the wire, and that the eleven unprojected ones stay
- * explicitly unavailable rather than collapsing into zeroes — which is the
+ * explicitly unavailable rather than collapsing into zeroes, which is the
  * failure the plan's "unavailable rather than zero" rule names.
  */
 
@@ -15,9 +15,14 @@ const NOW = 1_753_003_600_000_000;
 
 describe('latency dimensions', () => {
   it('reads the p95 the wire publishes', () => {
-    const dimensions = latencyDimensions(model([metric('operation_latency_p95', 43_250)]));
-    const p95 = dimensions.find((dimension) => dimension.id === 'latency_p95');
-    expect(p95?.reading.kind).toBe('measured');
+    const read = model([metric('operation_latency_p95', 43_250)]);
+    const p95 = latencyDimensions(read).find((dimension) => dimension.id === 'latency_p95')!;
+    expect(planDimensionPresentation(p95, budgetAnchors(read))).toMatchObject({
+      available: true,
+      figure: '43.25',
+      unit: 'ms',
+      exact: '43,250 µs',
+    });
   });
 
   it('keeps p50 and p99 unpublished rather than repeating the p95 figure', () => {
@@ -48,7 +53,6 @@ describe('latency dimensions', () => {
     for (const dimension of latencyDimensions(model([]))) {
       const presented = planDimensionPresentation(dimension, anchors);
       expect(presented.figure).toBe(NO_FIGURE);
-      expect(presented.figure).not.toBe('0');
       expect(presented.unit).toBeNull();
     }
   });
@@ -85,7 +89,7 @@ describe('budget bands and coverage', () => {
   it('reports nothing measured when the read model carries no measurements', () => {
     const bands = performanceBudgetBands(model([]));
     expect(budgetCoverage(bands).measured).toBe(0);
-    // Thirteen requirements, none answered — stated as such, not as a page of
+    // Thirteen requirements, none answered, stated as such, not as a page of
     // zeroes.
     expect(budgetCoverage(bands).unprojected).toBe(13);
   });

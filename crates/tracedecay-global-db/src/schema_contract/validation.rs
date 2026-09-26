@@ -7,8 +7,7 @@ use super::super::{global_db_operation_error, global_db_operation_message};
 use super::definitions::{
     Column, INDEX_DESCENDING_COLUMNS, INDEX_EXPRESSION_COLUMN, INDEXES, Index,
     REGISTRY_TABLE_NAMES, SESSION_RELATION_RECEIPTS_RECOVERY_DUE_INDEX,
-    SESSION_RELATION_RECEIPTS_WITHOUT_RECOVERY, SESSION_TEMPORAL_PROJECTION_RECEIPTS_V3, TABLES,
-    Table,
+    SESSION_RELATION_RECEIPTS_WITHOUT_RECOVERY, TABLES, Table,
 };
 use super::pragma::{
     ActualColumn, ActualForeignKey, ActualIndex, ActualTableMetadata, read_table_metadata,
@@ -180,7 +179,7 @@ fn validate_table(
 }
 
 fn column_metadata_matches(actual: &ActualColumn, expected: &Column) -> bool {
-    actual.hidden == 0
+    actual.hidden == expected.hidden
         && actual
             .declared_type
             .eq_ignore_ascii_case(expected.declared_type)
@@ -215,43 +214,43 @@ fn index_matches(actual: &ActualIndex, expected: &Index) -> bool {
             || name.eq_ignore_ascii_case("idx_session_refresh_operations_one_running")
             || name.eq_ignore_ascii_case("idx_observations_valid_session_sequence")
     });
-    expected
+    if expected
         .name
-        .is_none_or(|name| actual.name.eq_ignore_ascii_case(name))
-        && actual.unique == expected.unique
-        && actual.origin.eq_ignore_ascii_case(expected.origin)
-        && actual.partial == expected_partial
-        && actual.columns.len() == expected.columns.len()
-        && actual
-            .columns
+        .is_some_and(|name| !actual.name.eq_ignore_ascii_case(name))
+        || actual.unique != expected.unique
+        || !actual.origin.eq_ignore_ascii_case(expected.origin)
+        || actual.partial != expected_partial
+        || actual.columns.len() != expected.columns.len()
+    {
+        return false;
+    }
+    let descending = expected.name.and_then(|name| {
+        INDEX_DESCENDING_COLUMNS
             .iter()
-            .zip(expected.columns)
-            .all(|(actual, expected_column)| {
-                if expected_column.eq_ignore_ascii_case(INDEX_EXPRESSION_COLUMN) {
-                    actual.cid == -2 && actual.name.is_none()
-                } else {
-                    actual.cid >= 0
-                        && actual.descending
-                            == expected
-                                .name
-                                .and_then(|name| {
-                                    INDEX_DESCENDING_COLUMNS
-                                        .iter()
-                                        .find(|(index, _)| index.eq_ignore_ascii_case(name))
-                                        .map(|(_, columns)| *columns)
-                                })
-                                .is_some_and(|columns| {
-                                    columns
-                                        .iter()
-                                        .any(|column| column.eq_ignore_ascii_case(expected_column))
-                                })
-                        && actual.collation.eq_ignore_ascii_case("BINARY")
-                        && actual
-                            .name
-                            .as_deref()
-                            .is_some_and(|name| name.eq_ignore_ascii_case(expected_column))
-                }
-            })
+            .find(|(index, _)| index.eq_ignore_ascii_case(name))
+            .map(|(_, columns)| *columns)
+    });
+    actual
+        .columns
+        .iter()
+        .zip(expected.columns)
+        .all(|(actual, expected_column)| {
+            if expected_column.eq_ignore_ascii_case(INDEX_EXPRESSION_COLUMN) {
+                return actual.cid == -2 && actual.name.is_none();
+            }
+            actual.cid >= 0
+                && actual.descending
+                    == descending.is_some_and(|columns| {
+                        columns
+                            .iter()
+                            .any(|column| column.eq_ignore_ascii_case(expected_column))
+                    })
+                && actual.collation.eq_ignore_ascii_case("BINARY")
+                && actual
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(expected_column))
+        })
 }
 
 fn primary_key_index_columns(contract: &Table) -> Option<Vec<&str>> {
@@ -493,13 +492,7 @@ pub async fn validate_session_temporal_schema_contract(
     validate_named_tables_and_indexes(conn, table_names).await
 }
 
-pub async fn validate_released_v3_temporal_projection_receipt_contract(
-    conn: &impl QueryExecutor,
-) -> tracedecay_domain::errors::Result<()> {
-    validate_contracts(conn, &[&SESSION_TEMPORAL_PROJECTION_RECEIPTS_V3]).await
-}
-
-/// Validates the exact v4 session_relation_receipts shape persisted before
+/// Validates the exact v4 `session_relation_receipts` shape persisted before
 /// receipt recovery: the final columns minus the recovery columns, and the
 /// final index inventory minus the recovery-due index.
 pub async fn validate_session_relation_receipts_without_recovery_contract(

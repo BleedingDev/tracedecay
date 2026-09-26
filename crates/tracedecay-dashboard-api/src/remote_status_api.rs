@@ -1,9 +1,9 @@
-//! `GET /api/remote/status` — Remote Brain operational plane for Settings.
+//! `GET /api/remote/status`. Remote Brain operational plane for Settings.
 //!
 //! An admitted daemon owner injects the canonical operational read into
 //! [`DashboardState`]. This module maps that one application shape onto a
 //! schemars-typed dashboard DTO. A dashboard opened without an admitted
-//! reader remains explicitly unavailable — never an empty success.
+//! reader remains explicitly unavailable, never an empty success.
 
 use axum::Json;
 use axum::extract::State;
@@ -187,7 +187,6 @@ pub enum RemoteOperationalStatusPayloadV1 {
         authority: RemoteAuthoritySummaryV1,
         spool: RemoteSpoolSummaryV1,
         replay_coverage_complete: bool,
-        current_backup_verified: bool,
         failover_in_progress: bool,
         recovery_required: bool,
         observed_at: UtcMicros,
@@ -212,7 +211,6 @@ impl RemoteOperationalStatusPayloadV1 {
             authority: RemoteAuthoritySummaryV1::from_state(status.authority),
             spool: RemoteSpoolSummaryV1::from_status(status.spool),
             replay_coverage_complete: status.replay_coverage_complete,
-            current_backup_verified: status.current_backup_verified,
             failover_in_progress: status.failover_in_progress,
             recovery_required: status.recovery_required,
             observed_at: status.observed_at,

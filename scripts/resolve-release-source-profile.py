@@ -10,24 +10,9 @@ import sys
 import tomllib
 
 
+# The verified NCM worker and pinned model are distributed only for the arm64
+# macOS release; every other target ships the Native-only production profile.
 NCM_SUPPORTED_TARGET = "aarch64-apple-darwin"
-
-
-def production_release_features(
-    features: dict[str, object], target: str | None
-) -> tuple[str, ...]:
-    """Return the artifact feature set for a production-capable source tag."""
-    # Hotpath 0.24 uses Cargo features as its process-wide activation
-    # authority. Feature-enabled gauges, futures, and instrumented locks start
-    # collectors independently of TraceDecay's process guard, so a release
-    # executable cannot truthfully make those facilities dormant at runtime.
-    # The verified NCM worker and pinned model are distributed only for the
-    # arm64 macOS release. Older production tags predate the opt-in host, so
-    # keep their historical profile valid even when this resolver is replayed
-    # against one of them.
-    if target == NCM_SUPPORTED_TARGET and "memory-provider-host" in features:
-        return ("production", "memory-provider-host")
-    return ("production",)
 
 
 def expand_local_features(
@@ -87,9 +72,17 @@ def main() -> int:
             check=True,
         )
         profile = "production"
-        cargo_features = ",".join(
-            production_release_features(features, arguments.target)
-        )
+        # Hotpath uses Cargo features as its process-wide activation authority,
+        # so a release binary does not carry them and then try to switch them
+        # off at runtime.
+        cargo_features = "production"
+        # Older production tags predate the opt-in memory-provider host, so
+        # only add it when the replayed source actually declares the feature.
+        if (
+            arguments.target == NCM_SUPPORTED_TARGET
+            and "memory-provider-host" in features
+        ):
+            cargo_features = "production,memory-provider-host"
         cargo_args = f"--no-default-features --features {cargo_features}"
     else:
         resolved_defaults = expand_local_features(features, defaults)

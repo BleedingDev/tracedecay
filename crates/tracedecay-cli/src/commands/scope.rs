@@ -4,7 +4,7 @@
 //! daemon-brokered project registry, into the transport-neutral
 //! `tracedecay_contracts::ResolvedScope`. Every failure state is explicit:
 //! an unregistered exact root, an unusable selector, a malformed registry
-//! response, or a sibling-root resolution fails closed — the CLI never
+//! response, or a sibling-root resolution fails closed, the CLI never
 //! substitutes another project (no CWD or sibling fallback).
 //!
 //! This module owns only the CLI-specific brokering: the daemon handshake,
@@ -205,6 +205,7 @@ mod tests {
     use std::process::Command;
 
     use serde_json::Value;
+    use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
     use super::{ResolvedCliScope, scope_from_registry_payload};
 
@@ -255,7 +256,7 @@ mod tests {
     #[test]
     fn exact_root_resolves_same_project_and_scope_via_application_type() {
         let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_existing_identity(temp.path()).unwrap();
         git_init(&root);
         write_identity_marker(&root, "project.cli-scope-test");
 
@@ -272,7 +273,7 @@ mod tests {
     #[test]
     fn subdirectory_request_converges_to_registered_canonical_root() {
         let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_existing_identity(temp.path()).unwrap();
         git_init(&root);
         write_identity_marker(&root, "project.cli-scope-test");
         let subdir = root.join("src/deep");
@@ -329,8 +330,8 @@ mod tests {
             "git worktree add failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let registered = registered.canonicalize().unwrap();
-        let linked = linked.canonicalize().unwrap();
+        let registered = canonical_existing_identity(&registered).unwrap();
+        let linked = canonical_existing_identity(&linked).unwrap();
         write_identity_marker(&registered, "project.cli-scope-test");
 
         let resolved = scope_from_registry_payload(&linked, &ok_payload(&registered)).unwrap();
@@ -404,7 +405,7 @@ mod tests {
     #[test]
     fn ok_payload_with_missing_project_fields_fails_closed() {
         let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_existing_identity(temp.path()).unwrap();
         for payload in [
             serde_json::json!({
                 "status": "ok",
@@ -433,7 +434,7 @@ mod tests {
     #[test]
     fn missing_profile_identity_fails_closed() {
         let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_existing_identity(temp.path()).unwrap();
         let mut payload = ok_payload(&root);
         payload
             .as_object_mut()
@@ -451,7 +452,7 @@ mod tests {
     #[test]
     fn noncanonical_project_id_fails_closed_without_normalization() {
         let temp = tempfile::TempDir::new().unwrap();
-        let root = temp.path().canonicalize().unwrap();
+        let root = canonical_existing_identity(temp.path()).unwrap();
         let mut payload = ok_payload(&root);
         payload["project"]["project_id"] = Value::String(" project.cli-scope-test".to_string());
 

@@ -46,9 +46,9 @@ pub use attachment::{
     PhysicalRuntimeAttachment, PhysicalRuntimeSnapshot, PhysicalWriterRuntimeSnapshot,
     PublishedShardRuntime,
 };
-pub use capacity::StoreRuntimeRegistryConfig;
 #[cfg(test)]
-pub(crate) use capacity::{DEFAULT_PROJECT_CODE_OPEN_RUNTIMES, MAX_PROJECT_CODE_OPEN_RUNTIMES};
+pub(crate) use capacity::MAX_PROJECT_CODE_OPEN_RUNTIMES;
+pub use capacity::StoreRuntimeRegistryConfig;
 pub use close::ClosedStoreRuntime;
 pub use destructive::{DestructiveMaintenanceReservation, DestructiveMaintenanceTarget};
 pub use graph::{
@@ -823,17 +823,6 @@ impl tracedecay_rusqlite_runtime::exact_sql::ExactSqlWriteAuthority
             tracedecay_rusqlite_runtime::exact_sql::ExactSqlWriteIntent::ExecuteBatch => {
                 "execute registered exact SQL statement batch"
             }
-            tracedecay_rusqlite_runtime::exact_sql::ExactSqlWriteIntent::Vacuum => {
-                if self.authority.role() != crate::db::DatabaseAuthorityRole::Maintenance {
-                    return Err(
-                        tracedecay_rusqlite_runtime::exact_sql::ExactSqlError::AuthorityDenied(
-                            "whole-database vacuum requires exclusive maintenance authority"
-                                .to_owned(),
-                        ),
-                    );
-                }
-                "vacuum registered database under exclusive maintenance"
-            }
             tracedecay_rusqlite_runtime::exact_sql::ExactSqlWriteIntent::BeginTransaction => {
                 "begin registered exact SQL transaction"
             }
@@ -988,53 +977,6 @@ impl StoreRuntimeClientLease {
         Ok(outcome)
     }
 
-    #[hotpath::skip]
-    pub async fn snapshot_to(
-        &self,
-        destination: PathBuf,
-        authority: crate::db::DatabaseAuthority,
-    ) -> Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt, StoreRuntimeRegistryFailure> {
-        let opened_file_identity = self
-            .validate_database_write_authority(&authority, "authorize registered online backup")?;
-        let authority = Arc::new(RuntimeDatabaseWriteAuthority {
-            canonical_path: authority.canonical_database_path().to_path_buf(),
-            authority,
-            opened_file_identity,
-        });
-        let receipt = self
-            .inner
-            .attachment
-            .snapshot_to(destination, authority)
-            .await?;
-        self.validate_opened_file_identity("complete registered online backup")?;
-        Ok(receipt)
-    }
-
-    #[hotpath::skip]
-    pub async fn snapshot_to_interruptible(
-        &self,
-        destination: PathBuf,
-        probe: Arc<dyn tracedecay_store::RuntimeRequestProbeV1>,
-        authority: crate::db::DatabaseAuthority,
-    ) -> Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt, StoreRuntimeRegistryFailure> {
-        let opened_file_identity = self.validate_database_write_authority(
-            &authority,
-            "authorize registered interruptible online backup",
-        )?;
-        let authority = Arc::new(RuntimeDatabaseWriteAuthority {
-            canonical_path: authority.canonical_database_path().to_path_buf(),
-            authority,
-            opened_file_identity,
-        });
-        let receipt = self
-            .inner
-            .attachment
-            .snapshot_to_interruptible(destination, probe, authority)
-            .await?;
-        self.validate_opened_file_identity("complete registered interruptible online backup")?;
-        Ok(receipt)
-    }
-
     fn exact_sql_handle_unchecked(
         &self,
     ) -> Result<tracedecay_rusqlite_runtime::exact_sql::ExactSqlHandle, StoreRuntimeRegistryFailure>
@@ -1181,24 +1123,6 @@ impl StoreRuntimeClientLease {
         }
         self.validate_opened_file_identity("authorize registered runtime read")?;
         self.inner.attachment.dispatch_read(request, probe)
-    }
-}
-
-impl tracedecay_store::StorageRuntimeReadPort for StoreRuntimeClientLease {
-    fn dispatch_read<'a>(
-        &'a self,
-        request: tracedecay_store::RuntimeReadRequestV1,
-        probe: &'a dyn tracedecay_store::RuntimeRequestProbeV1,
-    ) -> tracedecay_store::StorageRuntimePortFutureV1<'a, tracedecay_store::RuntimeReadOutcomeV1>
-    {
-        Box::pin(async move {
-            StoreRuntimeClientLease::dispatch_read(self, request, probe).map_err(|_| {
-                tracedecay_store::StorageRuntimeErrorV1::Infrastructure {
-                    operation: "dispatch registered runtime read".to_owned(),
-                }
-                .into()
-            })
-        })
     }
 }
 

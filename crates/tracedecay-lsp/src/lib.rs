@@ -60,6 +60,13 @@ pub use capabilities::{
     LSP_PROTOCOL_VERSION, PositionEncoding, SemanticCapability, TextDocumentSync,
     UpstreamCapabilities, negotiate_capabilities,
 };
+pub use compile_diagnostics::tsconfig::{
+    SearchedTsconfig, TypeScriptFileOwner, TypeScriptProject, typescript_file_owner,
+    typescript_install_command, typescript_projects,
+};
+pub use compile_diagnostics::typescript::{
+    TYPESCRIPT_INSTALL_COMMAND, run_compiler as run_typescript_compiler,
+};
 pub use compile_diagnostics::{
     Diagnostic, DiagnosticsCache, Driver, Scope, is_rust_diagnostics_cold, run_all,
     rust_diagnostics_target_dir, spawn_rust_diagnostics_prewarm,

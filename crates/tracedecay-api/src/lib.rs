@@ -11,6 +11,9 @@
 //!
 #![forbid(unsafe_code)]
 
+#[macro_use]
+mod mounted_operation;
+
 pub mod assets;
 pub mod configuration;
 pub mod doctor;
@@ -45,19 +48,16 @@ pub use handoff::{
 pub use http::{
     HttpApplicationControls, HttpApplicationInvocationFuture, HttpApplicationOwnerKind,
     HttpApplicationOwners, HttpApplicationRequest, HttpRouteDocumentV1, adapter_problem_response,
-    application_problem_response, application_router, configuration_application_router,
-    feedback_application_router, http_application_full_route_path, http_application_owner_kind,
-    http_application_route_path, http_route_documents, is_http_application_operation_exposed,
+    application_problem_response, application_problem_status, application_router,
+    configuration_application_router, feedback_application_router,
+    http_application_full_route_path, http_application_owner_kind, http_application_route_path,
+    http_route_documents, is_http_application_operation_exposed,
 };
 pub use multi_root::{
     MultiRootApplicationOwner, MultiRootHttpOperation, MultiRootHttpRequest,
     MultiRootInvocationFuture, multi_root_application_router,
 };
-pub use retained::{
-    RetainedApplicationOwner, RetainedHttpRequest, RetainedInvocationFuture,
-    retained_application_route_path, retained_application_router,
-    retained_invalid_request_response, retained_operation_id, retained_route_path,
-};
+pub use retained::{retained_invalid_request_response, retained_route_path};
 pub use sse::sse_response;
 pub use work::{
     WorkApplicationOwner, WorkHttpRequest, WorkInvocationFuture, WorkOperation,
@@ -315,7 +315,7 @@ mod tests {
     fn http_operations_dispatch_to_concrete_owner_families() {
         assert_eq!(
             http_application_owner_kind(ApplicationSurfaceOperation::DiagnosticsRead),
-            HttpApplicationOwnerKind::Primitive
+            Some(HttpApplicationOwnerKind::Primitive)
         );
         for operation in [
             "multi_root_scope_set_read",
@@ -525,7 +525,8 @@ mod tests {
         for (index, operation) in ApplicationSurfaceOperation::ALL
             .into_iter()
             .filter(|operation| {
-                http_application_owner_kind(*operation) == HttpApplicationOwnerKind::Configuration
+                http_application_owner_kind(*operation)
+                    == Some(HttpApplicationOwnerKind::Configuration)
             })
             .enumerate()
         {

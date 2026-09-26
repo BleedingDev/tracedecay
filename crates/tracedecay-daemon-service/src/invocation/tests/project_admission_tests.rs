@@ -44,7 +44,7 @@ async fn project_quiescence_denies_git_cached_routes() {
         .await
         .expect("quiesce project runtime");
     let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
-    let now = current_micros();
+    let now = now_micros();
     let deadline = Deadline::new(UtcMicros(now.0.saturating_add(30_000_000))).expect("deadline");
     let request = DaemonInvocationRequest {
         protocol: tracedecay_daemon_protocol::DAEMON_INVOCATION_PROTOCOL.to_owned(),
@@ -137,7 +137,7 @@ async fn admitted_storage_status_stays_retryable_while_owners_are_warming() {
         problem
             .diagnostic()
             .map(|diagnostic| diagnostic.code.as_str()),
-        Some("application.surface.unavailable")
+        Some(tracedecay_contracts::RUNTIME_MOUNTING_REASON_CODE)
     );
 }
 
@@ -227,7 +227,7 @@ async fn storage_status_admits_an_owner_registered_under_a_windows_verbatim_root
         problem
             .diagnostic()
             .map(|diagnostic| diagnostic.code.as_str()),
-        Some("application.surface.unavailable")
+        Some(tracedecay_contracts::RUNTIME_MOUNTING_REASON_CODE)
     );
 }
 
@@ -271,7 +271,7 @@ async fn admit_project_without_retained_runtime(
 
 /// The retained runtime registers in the full server's owner phase, after the
 /// core route is already admitted. A retained request that lands in that
-/// window must read as the owner still mounting — retryable — never as a scope
+/// window must read as the owner still mounting, retryable, never as a scope
 /// with no retained runtime.
 #[tokio::test]
 async fn retained_request_stays_retryable_while_owners_are_warming() {
@@ -300,7 +300,10 @@ async fn retained_request_stays_retryable_while_owners_are_warming() {
     let diagnostic = problem
         .diagnostic()
         .expect("a mounting retained owner carries a diagnostic");
-    assert_eq!(diagnostic.code, "application.surface.unavailable");
+    assert_eq!(
+        diagnostic.code,
+        tracedecay_contracts::RUNTIME_MOUNTING_REASON_CODE
+    );
     assert!(
         !diagnostic
             .message
@@ -477,7 +480,7 @@ fn retained_provider_request(
     request_id: &str,
     request: tracedecay_contracts::retained_surfaces::ProviderControlRequestV1,
 ) -> DaemonInvocationRequest {
-    let now = current_micros();
+    let now = now_micros();
     DaemonInvocationRequest::retained_application(
         request_id,
         tracedecay_contracts::retained_surfaces::RetainedSurfaceRequestV1::ProviderControl(request),
@@ -763,8 +766,8 @@ async fn unscoped_retained_dispatch_rejects_provider_controls_without_contact() 
     );
 }
 
-/// Two routes of one project — a linked worktree, or a reopen of a route whose
-/// ports were rebuilt — must alias one retained runtime. Keying the
+/// Two routes of one project, a linked worktree, or a reopen of a route whose
+/// ports were rebuilt, must alias one retained runtime. Keying the
 /// registration on the ports object instead refused every second route.
 #[tokio::test]
 async fn same_authority_routes_alias_one_retained_runtime() {
@@ -859,8 +862,8 @@ impl tracedecay_graph_query::CodeGraphProjectionReadPort for UnavailableCodeGrap
     }
 }
 
-/// Two routes of one project — a linked worktree, or a reopen through the
-/// retained canonical runtime — each build their own source-edit owner. The
+/// Two routes of one project, a linked worktree, or a reopen through the
+/// retained canonical runtime, each build their own source-edit owner. The
 /// registration is keyed on the authorized scope, as the retained runtime is:
 /// the same scope aliases the incumbent, a foreign scope is refused, and
 /// neither replaces what is registered.
@@ -999,7 +1002,7 @@ async fn missing_work_owner_stops_retrying_after_publication() {
                     .mark_publication_ready(&publication)
             );
         }
-        let now = current_micros();
+        let now = now_micros();
         let request = DaemonInvocationRequest::work_application(
             "request.work.unmounted",
             tracedecay_daemon_protocol::WorkApplicationInvocationV1::Topology(

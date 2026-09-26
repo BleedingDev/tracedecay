@@ -98,23 +98,6 @@ fn managed_skills_are_dashboard_controllable_and_persistent() {
         assert_eq!(status, 200);
         assert_eq!(listed["count"], 1);
         assert_eq!(listed["skills"][0]["metadata"]["id"], "repo-hygiene");
-        assert_eq!(listed["usage_summaries"][0]["view_count"], 0);
-        assert_eq!(listed["usage_summaries"][0]["use_count"], 1);
-        assert_eq!(
-            listed["usage_summaries"][0]["targets"],
-            serde_json::json!(["codex", "cursor"])
-        );
-        assert_eq!(listed["stale_recommendations"][0]["skill_id"], "repo-hygiene");
-        assert_eq!(listed["stale_recommendations"][0]["stale"], false);
-        assert_eq!(listed["stale_recommendations"][0]["recommendation"], "keep");
-        assert_eq!(
-            listed["improvement_recommendations"][0]["skill_id"],
-            "repo-hygiene"
-        );
-        assert_eq!(
-            listed["improvement_recommendations"][0]["recommendation"],
-            "none"
-        );
 
         let skill_url = format!("{base_url}/api/automation/skills/repo-hygiene");
         let (status, viewed) = get_json(&agent, &skill_url);
@@ -125,6 +108,10 @@ fn managed_skills_are_dashboard_controllable_and_persistent() {
         );
         assert_eq!(viewed["usage_summary"]["use_count"], 1);
         assert_eq!(viewed["usage_summary"]["view_count"], 0);
+        assert_eq!(
+            viewed["usage_summary"]["targets"],
+            serde_json::json!(["codex", "cursor"])
+        );
         assert_eq!(viewed["stale_recommendation"]["recommendation"], "keep");
         assert_eq!(viewed["improvement_recommendation"]["recommendation"], "none");
 
@@ -219,9 +206,7 @@ fn managed_skills_are_dashboard_controllable_with_direct_activation() {
     let runtime = create_runtime();
     runtime.block_on(async {
         let tmp = tempdir_or_panic();
-        let tmp_root = tmp
-            .path()
-            .canonicalize()
+        let tmp_root = canonical_existing_identity(tmp.path())
             .unwrap_or_else(|err| panic!("failed to canonicalize temp root: {err}"));
         let project_root = tmp_root.join("project");
         let global_db_path = tmp_root.join("global").join("global.db");
@@ -241,7 +226,7 @@ fn managed_skills_are_dashboard_controllable_with_direct_activation() {
         let mut server = spawn_dashboard_server_with_host_runtime(
             cg,
             host_runtime,
-            dashboard::DashboardTestProjectGraphsV1::default(),
+            tracedecay_dashboard_api::DashboardTestProjectGraphsV1::default(),
             port,
         );
         wait_for_dashboard(&agent, &base_url).await;
@@ -385,9 +370,7 @@ fn managed_skill_dashboard_api_applies_updates_immediately() {
     let runtime = create_runtime();
     runtime.block_on(async {
         let tmp = tempdir_or_panic();
-        let tmp_root = tmp
-            .path()
-            .canonicalize()
+        let tmp_root = canonical_existing_identity(tmp.path())
             .unwrap_or_else(|err| panic!("failed to canonicalize temp root: {err}"));
         let project_root = tmp_root.join("project");
         let global_db_path = tmp_root.join("global").join("global.db");
@@ -407,7 +390,7 @@ fn managed_skill_dashboard_api_applies_updates_immediately() {
         let mut server = spawn_dashboard_server_with_host_runtime(
             cg,
             host_runtime,
-            dashboard::DashboardTestProjectGraphsV1::default(),
+            tracedecay_dashboard_api::DashboardTestProjectGraphsV1::default(),
             port,
         );
         wait_for_dashboard(&agent, &base_url).await;

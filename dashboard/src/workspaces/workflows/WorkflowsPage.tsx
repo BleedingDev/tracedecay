@@ -22,7 +22,7 @@ import {
 } from './workflowQueries.ts';
 
 /**
- * Workflows — channel fourteen: the definition lifecycle ledger.
+ * Workflows, channel fourteen: the definition lifecycle ledger.
  *
  * Three regions over the canonical `/application/workflow` routes. The
  * registry (list-definitions) names every stable identity and folds its
@@ -98,8 +98,8 @@ export function WorkflowsPage() {
         <Corners />
         <Ticks />
 
-        {/* Three bays at desktop width; one column when the viewport — or a
-          * 200% zoom — cannot pay for three, so registry, detail and run stay
+        {/* Three bays at desktop width; one column when the viewport, or a
+          * 200% zoom, cannot pay for three, so registry, detail and run stay
           * independently addressable rather than clipped. */}
         <div className="grid min-w-0 gap-3 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)_minmax(20rem,26rem)]">
           <div className="flex min-w-0 flex-col gap-3">
@@ -122,7 +122,7 @@ export function WorkflowsPage() {
           <div className="flex min-w-0 flex-col gap-3">
             {selectedDefinition === null || selectedEntry === null ? (
               <Panel legend="Selected definition" bodyClassName="p-3">
-                <p className="text-3xs text-text-muted">
+                <p className="text-sm text-text-muted">
                   {listed === null
                     ? 'The selected definition, its version track and its decoded steps appear here once the registry has answered.'
                     : listed.length === 0
@@ -163,7 +163,7 @@ export function WorkflowsPage() {
             />
             {selectedDefinition === null ? (
               <Panel legend="Lifecycle · daemon-validated CAS" bodyClassName="p-3">
-                <p className="text-3xs text-text-muted">
+                <p className="text-sm text-text-muted">
                   Activate, retire and reject act on one selected immutable version. Nothing is
                   offered until a definition is selected.
                 </p>

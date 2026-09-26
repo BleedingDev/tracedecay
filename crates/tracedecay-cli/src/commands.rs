@@ -12,7 +12,7 @@ mod storage;
 pub(crate) use bench::handle_bench;
 pub(crate) use branch::handle_branch_action;
 pub(crate) use daemon::{
-    daemon_tool_json, daemon_tool_json_until, recover_truncated_mcp_result,
+    client_handshake, daemon_tool_json, daemon_tool_json_until, recover_truncated_mcp_result,
     reject_truncation_envelope, retained_effect_payload, retained_tool_payload,
 };
 pub use gain::handle_gain;
@@ -29,6 +29,6 @@ pub(crate) use settings::{
     report_configuration_receipt,
 };
 pub(crate) use storage::{
-    ProfileOfflineAuthority, handle_list, handle_wipe, join_outcome_and_restore,
-    take_profile_offline, try_admit_profile_registry,
+    ProfileOfflineAuthority, annotate_reset_required, handle_list, handle_wipe,
+    join_outcome_and_restore, take_profile_offline, try_admit_profile_registry,
 };

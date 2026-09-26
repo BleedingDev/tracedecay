@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use tracedecay_session_temporal_store::SessionTemporalAccess;
+
 use super::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
 
 impl HostAdmissionTestRuntimeV1 {
@@ -10,7 +12,7 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         scope: HostAdmissionScope,
     ) -> tracedecay_domain::errors::Result<tracedecay_domain::SignedCursorKeyRefV1> {
-        self.session_database_for_test(scope)?
+        SessionTemporalAccess::new(self.session_database_for_test(scope)?)
             .ensure_active_session_cursor_key_result()
             .await
             .map_err(
@@ -301,14 +303,28 @@ impl HostAdmissionTestRuntimeV1 {
                 message: "test facade requires an exact provider".to_owned(),
             })?;
         let database = self.session_database_for_test(scope)?;
-        let scoped_ids = tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
-            .session_ids_for_scope(git_filter)
-            .map_err(
-                |error| tracedecay_domain::errors::TraceDecayError::Database {
-                    operation: "resolve registered git-scoped sessions".to_owned(),
-                    message: error.to_string(),
-                },
-            )?;
+        let resolve_error =
+            |message: String| tracedecay_domain::errors::TraceDecayError::Database {
+                operation: "resolve registered git-scoped sessions".to_owned(),
+                message,
+            };
+        let scoped_ids = match tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
+            .session_ids_for_scope(git_filter, None)
+            .await
+        {
+            Ok(Some(ids)) => ids,
+            Ok(None) => {
+                return Err(resolve_error(
+                    "Git scope resolution requires a non-empty filter".to_owned(),
+                ));
+            }
+            // A project that never recorded Git evidence has no session in
+            // any Git scope.
+            Err(
+                tracedecay_sessions::runtime::git_correlation::GitCorrelationError::Unavailable(_),
+            ) => Vec::new(),
+            Err(error) => return Err(resolve_error(error.to_string())),
+        };
         let mut results = self
             .search_session_messages_filtered_for_test(
                 scope,
@@ -338,7 +354,7 @@ impl HostAdmissionTestRuntimeV1 {
         let writer = self.session_database_for_test(scope)?.writer_connection()?;
         let statement = if enabled {
             "CREATE TRIGGER fail_session_message_projection
-             BEFORE INSERT ON session_messages
+             BEFORE INSERT ON lcm_raw_messages
              BEGIN
                 SELECT RAISE(ABORT, 'projection failure');
              END;"
@@ -599,7 +615,7 @@ impl HostAdmissionTestRuntimeV1 {
     ) -> tracedecay_domain::errors::Result<()> {
         let statement = if enabled {
             "CREATE TRIGGER fail_session_message_projection
-             BEFORE INSERT ON session_messages
+             BEFORE INSERT ON lcm_raw_messages
              BEGIN
                 SELECT RAISE(ABORT, 'projection failure');
              END;"

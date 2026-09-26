@@ -15,6 +15,7 @@ use tracedecay_contracts::project_open::{
     ProjectOpenStatusReasonV1, ProjectOpenStatusStateV1, ProjectOpenStatusV1,
 };
 use tracedecay_daemon_identity::authority;
+use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ProjectServerKey {
@@ -76,7 +77,6 @@ struct ProjectOpenTaskRegistry {
     routes: HashMap<ProjectRouteKey, ProjectOpenTaskEntry>,
     retiring: HashMap<ProjectRouteKey, ProjectOpenTaskEntry>,
     closed_profiles: BTreeSet<PathBuf>,
-    quiesced_projects: BTreeSet<ProjectOpenIdentityV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -84,20 +84,6 @@ struct ProjectOpenIdentityV1 {
     profile_root: PathBuf,
     project_id: String,
     project_roots: BTreeSet<PathBuf>,
-}
-
-pub(super) struct ProjectOpenIdentityQuiescenceV1 {
-    tasks: ProjectOpenTasks,
-    identity: ProjectOpenIdentityV1,
-}
-
-impl Drop for ProjectOpenIdentityQuiescenceV1 {
-    fn drop(&mut self) {
-        self.tasks
-            .lock_registry()
-            .quiesced_projects
-            .remove(&self.identity);
-    }
 }
 
 struct ProjectOpenTaskEntry {
@@ -168,8 +154,7 @@ struct RefusedStoreFileIdentityV1 {
 }
 
 /// Every graph database the refused project store carried when the refusal
-/// was recorded: the root graph DB plus the per-branch graph DBs under
-/// `branches/`. Comparing the whole map catches deletions, replacements, and
+/// was recorded. Comparing the whole map catches deletions, replacements, and
 /// newly recreated databases alike.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RefusedStoreFingerprintV1 {
@@ -206,16 +191,6 @@ fn refused_store_fingerprint(route: &ProjectRouteKey) -> Option<RefusedStoreFing
     if let Some(identity) = refused_store_file_identity(&layout.graph_db_path) {
         graph_dbs.insert(layout.graph_db_path.clone(), identity);
     }
-    if let Ok(entries) = std::fs::read_dir(layout.data_root.join("branches")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("db")
-                && let Some(identity) = refused_store_file_identity(&path)
-            {
-                graph_dbs.insert(path, identity);
-            }
-        }
-    }
     Some(RefusedStoreFingerprintV1 { graph_dbs })
 }
 
@@ -229,6 +204,11 @@ pub(super) enum ProjectOpenTypedFailure {
     ResetRequired {
         authority: String,
         reason: String,
+    },
+    ProjectRoute {
+        reason_code: String,
+        retryable: bool,
+        detail: String,
     },
 }
 
@@ -348,15 +328,11 @@ pub(super) fn project_open_retry_backoff(error: &TraceDecayError) -> Option<Dura
         {
             Some(PROJECT_OPEN_FAILURE_RETRY_BACKOFF)
         }
-        TraceDecayError::Config { message } => (message.contains("identity cutover conflict")
-            || message.contains("ambiguous legacy profile stores")
-            || message.contains("enrollment marker did not resolve a profile store"))
-        .then_some(PROJECT_OPEN_FAILURE_RETRY_BACKOFF),
         // This audit's whole job is to read persisted rows and judge them, so
         // its verdict is a property of the stored data: a row rejected now is
         // rejected identically 250ms from now. Back off for the whole family
         // and name the exceptions, rather than listing the failures that
-        // deserve a backoff — that ordering meant every newly surfaced
+        // deserve a backoff, that ordering meant every newly surfaced
         // invariant message spun warm-up at the debounce cadence until someone
         // noticed the CPU. Decode failures and column-versus-JSON
         // disagreements both land here without being enumerated.
@@ -429,28 +405,45 @@ impl ProjectOpenFailure {
                 None => ProjectOpenStatusReasonV1::Unavailable,
             },
         };
-        Self {
-            message: error.to_string(),
-            retry_at,
-            reason,
-            typed: match error {
-                TraceDecayError::ProfileResetRequired {
-                    component,
-                    found_version,
-                    required_version,
-                } => Some(ProjectOpenTypedFailure::ProfileResetRequired {
+        let (message, typed) = match error {
+            TraceDecayError::ProfileResetRequired {
+                component,
+                found_version,
+                required_version,
+            } => (
+                error.to_string(),
+                Some(ProjectOpenTypedFailure::ProfileResetRequired {
                     component,
                     found_version: *found_version,
                     required_version: *required_version,
                 }),
-                TraceDecayError::ResetRequired { authority, reason } => {
-                    Some(ProjectOpenTypedFailure::ResetRequired {
-                        authority: authority.clone(),
-                        reason: reason.clone(),
-                    })
-                }
-                _ => None,
-            },
+            ),
+            TraceDecayError::ResetRequired { authority, reason } => (
+                error.to_string(),
+                Some(ProjectOpenTypedFailure::ResetRequired {
+                    authority: authority.clone(),
+                    reason: reason.clone(),
+                }),
+            ),
+            TraceDecayError::ProjectRoute {
+                reason_code,
+                retryable,
+                detail,
+            } => (
+                detail.clone(),
+                Some(ProjectOpenTypedFailure::ProjectRoute {
+                    reason_code: reason_code.clone(),
+                    retryable: *retryable,
+                    detail: detail.clone(),
+                }),
+            ),
+            _ => (error.to_string(), None),
+        };
+        Self {
+            message,
+            retry_at,
+            reason,
+            typed,
             refused_store: None,
         }
     }
@@ -504,6 +497,17 @@ impl ProjectOpenFailure {
                     authority: authority.clone(),
                     reason: reason.clone(),
                 };
+            }
+            Some(ProjectOpenTypedFailure::ProjectRoute {
+                reason_code,
+                retryable,
+                detail,
+            }) => {
+                return TraceDecayError::project_route(
+                    reason_code.clone(),
+                    *retryable,
+                    detail.clone(),
+                );
             }
             None => {}
         }
@@ -614,19 +618,6 @@ impl ProjectOpenTasks {
             hotpath::gauge!("daemon.project.open.refused.profile_closed").inc(1.0);
             return ProjectOpenTaskClaim::Failed(ProjectOpenFailure::untyped(
                 "project open denied: authenticated profile was remotely deleted".to_owned(),
-            ));
-        }
-        if registry.quiesced_projects.iter().any(|identity| {
-            project_route_matches_identity(
-                &route,
-                &identity.profile_root,
-                &identity.project_id,
-                &identity.project_roots,
-            )
-        }) {
-            hotpath::gauge!("daemon.project.open.refused.project_quiesced").inc(1.0);
-            return ProjectOpenTaskClaim::Failed(ProjectOpenFailure::untyped(
-                "project open temporarily unavailable during remote recovery".to_owned(),
             ));
         }
         if let Some(entry) = registry.retiring.get(&route) {
@@ -886,6 +877,14 @@ impl ProjectOpenTasks {
         }
     }
 
+    /// Signals every admitted open to stop at its next cancellation boundary
+    /// without waiting; `shutdown` joins them.
+    pub(super) fn cancel_all(&self) {
+        for entry in self.lock_registry().routes.values() {
+            entry.cancellation.cancel();
+        }
+    }
+
     #[hotpath::skip]
     pub(super) async fn shutdown(&self) -> bool {
         self.shutdown_with_deadline(DAEMON_TASK_ABORT_DEADLINE, DAEMON_TASK_ABORT_DEADLINE)
@@ -906,38 +905,6 @@ impl ProjectOpenTasks {
             DAEMON_TASK_ABORT_DEADLINE,
         )
         .await
-    }
-
-    #[hotpath::measure(label = "daemon.project.admit.quiesce", future = true)]
-    pub(super) async fn quiesce_project_identity(
-        &self,
-        profile_root: &Path,
-        project_id: &str,
-        project_roots: &BTreeSet<PathBuf>,
-    ) -> Option<ProjectOpenIdentityQuiescenceV1> {
-        let identity = ProjectOpenIdentityV1 {
-            profile_root: profile_root.to_path_buf(),
-            project_id: project_id.to_owned(),
-            project_roots: project_roots.clone(),
-        };
-        let routes = {
-            let mut registry = self.lock_registry();
-            if !registry.quiesced_projects.insert(identity.clone()) {
-                return None;
-            }
-            project_routes_for_retirement(&mut registry, &identity)
-        };
-        if !self
-            .drain_retiring_routes(routes, DAEMON_TASK_ABORT_DEADLINE)
-            .await
-        {
-            self.lock_registry().quiesced_projects.remove(&identity);
-            return None;
-        }
-        Some(ProjectOpenIdentityQuiescenceV1 {
-            tasks: self.clone(),
-            identity,
-        })
     }
 
     #[hotpath::measure(label = "daemon.project.admit.shutdown_identity", future = true)]
@@ -1161,7 +1128,9 @@ impl ProjectRouteKey {
             global_db_path: authority::canonical_identity_path(
                 &handshake.client_identity.global_db_path,
             )?,
-            project_path: authority::canonical_identity_path(project_path)?,
+            project_path: tracedecay_runtime_core::path_safety::canonical_root_identity(
+                project_path,
+            ),
             scope_prefix: handshake.scope_prefix.clone(),
         })
     }
@@ -1169,7 +1138,7 @@ impl ProjectRouteKey {
 
 impl ProjectServerKey {
     pub(super) fn from_open_project(
-        cg: &crate::project::TraceDecay,
+        cg: &tracedecay_project::project::TraceDecay,
         handshake: &DaemonHandshake,
     ) -> Result<Self> {
         let layout = cg.store_layout();
@@ -1204,6 +1173,27 @@ mod typed_failure_tests {
             } if authority == "workflow" && reason == "partial workflow schema"
         ));
     }
+
+    #[test]
+    fn cached_project_open_failure_preserves_capacity_reason() {
+        let error = super::super::project_server_capacity_error();
+        let failure = ProjectOpenFailure::from_error(&error);
+        let replayed = failure.to_error();
+
+        assert_eq!(
+            replayed
+                .project_route_context()
+                .map(|(reason, retryable, _)| (reason, retryable)),
+            error
+                .project_route_context()
+                .map(|(reason, retryable, _)| (reason, retryable)),
+        );
+        assert!(super::super::error_is_project_open_retryable(&replayed));
+        let Some((_, _, detail)) = error.project_route_context() else {
+            panic!("capacity refusal is a project route");
+        };
+        assert_eq!(failure.message, detail);
+    }
 }
 
 #[cfg(test)]
@@ -1228,7 +1218,7 @@ mod refused_store_invalidation_tests {
     fn seed_refused_store(profile_root: &Path, project_root: &Path) -> PathBuf {
         let data_root = store_data_root(profile_root, project_root);
         std::fs::create_dir_all(&data_root).unwrap();
-        let db_path = data_root.join(crate::config::db_filename(&data_root));
+        let db_path = data_root.join(tracedecay_runtime_core::config::DB_FILENAME);
         std::fs::write(&db_path, b"refused-store-stand-in").unwrap();
         db_path
     }
@@ -1290,32 +1280,6 @@ mod refused_store_invalidation_tests {
             panic!("the reset store must admit a fresh open without a daemon restart");
         };
         ProjectOpenTasks::wait_for_completion(state).await.unwrap();
-    }
-
-    /// Per-branch graph DBs are part of the refused store's fingerprint, so
-    /// a reset that removes only `branches/*.db` also clears the refusal.
-    #[tokio::test]
-    async fn branch_graph_db_reset_invalidates_the_cached_refusal() {
-        let temp = tempfile::TempDir::new().unwrap();
-        let profile_root = temp.path().join("profile");
-        let project_root = temp.path().join("project");
-        std::fs::create_dir_all(&project_root).unwrap();
-        seed_refused_store(&profile_root, &project_root);
-        let branches_dir = store_data_root(&profile_root, &project_root).join("branches");
-        std::fs::create_dir_all(&branches_dir).unwrap();
-        let branch_db = branches_dir.join("develop.db");
-        std::fs::write(&branch_db, b"refused-branch-stand-in").unwrap();
-        let route = route_for(&profile_root, &project_root);
-        let tasks = ProjectOpenTasks::default();
-        record_reset_required_failure(&tasks, route.clone()).await;
-        assert!(tasks.cached_failure(&route).is_some());
-
-        std::fs::remove_file(&branch_db).unwrap();
-
-        assert!(
-            tasks.cached_failure(&route).is_none(),
-            "a branch graph DB reset must invalidate the cached refusal"
-        );
     }
 
     /// The invalidation is scoped to typed `ResetRequired` refusals: other
@@ -1437,5 +1401,3 @@ mod status_tests {
 
 #[cfg(test)]
 mod lsp_upgrade_tests;
-#[cfg(test)]
-mod quiescence_tests;

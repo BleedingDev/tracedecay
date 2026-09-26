@@ -3,27 +3,69 @@ use serde_json::{Value, json};
 #[cfg(feature = "test-transport")]
 use std::fmt::Write as _;
 use std::fs;
-#[path = "retrieve_truncation_support.rs"]
-mod retrieve_truncation_support;
+
+fn retrieve_json_arguments(handle: &str) -> Value {
+    json!({ "format": "json", "handle": handle })
+}
+
 #[cfg(feature = "test-transport")]
-use retrieve_truncation_support::call_production_tool;
+async fn retrieve_all_json_pages(fixture: &ProductionCompositionFixture, handle: &str) -> String {
+    let mut offset = 0usize;
+    let mut content = String::new();
+    loop {
+        let page = call_production_tool(
+            fixture,
+            "tracedecay_retrieve",
+            json!({"format": "json", "handle": handle, "offset": offset}),
+        )
+        .await;
+        let page: Value =
+            serde_json::from_str(extract_text(&page.value)).expect("retrieve page JSON");
+        let page_content = page["content"].as_str().expect("retrieve page content");
+        content.push_str(page_content);
+        if !page["has_more"].as_bool().expect("retrieve has_more") {
+            return content;
+        }
+        offset = page["next_offset"].as_u64().expect("retrieve next_offset") as usize;
+    }
+}
+
 #[cfg(feature = "test-transport")]
-use retrieve_truncation_support::retrieve_all_json_pages;
-use retrieve_truncation_support::retrieve_json_arguments;
+async fn call_production_tool(
+    fixture: &ProductionCompositionFixture,
+    tool_name: &str,
+    arguments: Value,
+) -> tracedecay_mcp::ToolResult {
+    let response = fixture
+        .harness
+        .call_tool(&fixture.project_root, tool_name, arguments)
+        .await
+        .unwrap_or_else(|error| panic!("{tool_name} production invocation failed: {error}"));
+    assert!(
+        response.error.is_none(),
+        "{tool_name} returned a production MCP error: {:?}",
+        response.error.as_ref().map(|error| &error.message)
+    );
+    tracedecay_mcp::ToolResult::new(
+        response
+            .result
+            .unwrap_or_else(|| panic!("{tool_name} returned no production MCP result")),
+        Vec::new(),
+    )
+}
 
 #[tokio::test]
 async fn retrieve_tool_returns_full_stored_response() {
     let (cg, _env, _dir) = setup_empty_project().await;
     let original = "{\"items\":[{\"id\":1,\"name\":\"alpha\"}]}";
     let stored = tracedecay_mcp::response_handles::store_response_handle(
-        cg.project_root(),
+        &cg.store_layout().response_handle_root,
         original,
-        tracedecay::project::current_timestamp(),
+        tracedecay_runtime_core::tracedecay::current_timestamp(),
     )
     .unwrap();
 
-    let response_handle_root =
-        tracedecay_runtime_core::storage::resolve_response_handle_root(cg.project_root()).unwrap();
+    let response_handle_root = &cg.store_layout().response_handle_root;
     let stored_payload: Value = serde_json::from_str(
         &fs::read_to_string(response_handle_root.join(format!("{}.json", stored.handle))).unwrap(),
     )
@@ -95,9 +137,9 @@ async fn retrieve_pages_reconstruct_large_and_multibyte_handles_with_bounded_fra
 
     for original in cases {
         let stored = tracedecay_mcp::response_handles::store_response_handle(
-            cg.project_root(),
+            &cg.store_layout().response_handle_root,
             &original,
-            tracedecay::project::current_timestamp(),
+            tracedecay_runtime_core::tracedecay::current_timestamp(),
         )
         .unwrap();
         let mut offset = 0usize;
@@ -152,9 +194,9 @@ async fn retrieve_pages_reconstruct_large_and_multibyte_handles_with_bounded_fra
 async fn retrieve_offset_beyond_content_returns_typed_reason() {
     let (cg, _env, _dir) = setup_empty_project().await;
     let stored = tracedecay_mcp::response_handles::store_response_handle(
-        cg.project_root(),
+        &cg.store_layout().response_handle_root,
         "short",
-        tracedecay::project::current_timestamp(),
+        tracedecay_runtime_core::tracedecay::current_timestamp(),
     )
     .unwrap();
 
@@ -209,9 +251,9 @@ async fn retrieve_tool_reports_missing_and_expired_handles_actionably() {
     );
 
     let expired = tracedecay_mcp::response_handles::store_response_handle(
-        cg.project_root(),
+        &cg.store_layout().response_handle_root,
         "{\"items\":[42]}",
-        tracedecay::project::current_timestamp()
+        tracedecay_runtime_core::tracedecay::current_timestamp()
             - tracedecay_mcp::response_handles::RESPONSE_HANDLE_TTL_SECS
             - 5,
     )
@@ -245,13 +287,12 @@ async fn retrieve_tool_reports_missing_and_expired_handles_actionably() {
             .contains("Re-run the original MCP tool")
     );
 
-    let identity_path =
-        tracedecay_runtime_core::storage::repository_identity_path(cg.project_root()).unwrap();
-    fs::write(
-        &identity_path,
-        r#"{"schema_version":1,"project_id":"../operator-private"}"#,
-    )
-    .unwrap();
+    // An unreadable record fails closed without disclosing local paths.
+    let unreadable = cg
+        .store_layout()
+        .response_handle_root
+        .join("rh_0123456789abcdef01234567.json");
+    fs::create_dir_all(&unreadable).unwrap();
     let unavailable = handle_tool_call(
         &cg,
         "tracedecay_retrieve",
@@ -260,11 +301,11 @@ async fn retrieve_tool_reports_missing_and_expired_handles_actionably() {
         None,
     )
     .await
-    .expect_err("invalid storage identity must fail closed");
+    .expect_err("an unreadable handle record must fail closed");
     let public = unavailable.to_string();
     assert!(public.contains("response-handle cache is unavailable"));
     assert!(!public.contains(cg.project_root().to_string_lossy().as_ref()));
-    assert!(!public.contains(identity_path.to_string_lossy().as_ref()));
+    assert!(!public.contains(unreadable.to_string_lossy().as_ref()));
 }
 
 #[cfg(feature = "test-transport")]

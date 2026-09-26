@@ -4,7 +4,7 @@
 //! A reconcile fans per-file work across the indexing pool over arbitrary user
 //! source. A panic there aborts the pass and surfaces as an opaque `JoinError`
 //! on the worker loop. The loop then restored the pending arrival and waited
-//! for the next wake — and because the offending input is still on disk, the
+//! for the next wake, and because the offending input is still on disk, the
 //! next wake reproduced the identical panic. One malformed file therefore
 //! blocked a project's entire code index indefinitely, retrying forever with
 //! no backoff and no terminal state.
@@ -14,7 +14,8 @@
 //! the worker stops re-attempting until the input actually changes (the
 //! code-index control epoch advances) or a pass makes progress. The shape
 //! mirrors the sealed-generation activation backoff already used by the
-//! registry worker; tests shrink the clock, not the shape.
+//! registry worker; tests shrink the clock, not the shape. A typed failure
+//! the same input reproduces shares the quarantine without the backoff.
 
 use std::time::Duration;
 
@@ -108,6 +109,16 @@ impl ReconcilePanicGuardV1 {
             .saturating_mul(2)
             .min(RECONCILE_PANIC_BACKOFF_CEILING);
         ReconcilePanicDecisionV1::RetryAfter(delay)
+    }
+
+    /// Quarantine after one pass: a deterministic failure over unchanged
+    /// input reproduces byte-for-byte, so backoff retries would only repeat
+    /// the whole build. `epoch` is the control epoch the failing pass began
+    /// under; any later advance is new input and lifts the quarantine.
+    pub fn quarantine_unchanged_input(&mut self, epoch: u64) {
+        self.quarantined = true;
+        self.quarantined_at_epoch = epoch;
+        self.next_attempt_at = None;
     }
 
     /// Consecutive panics observed since the last progressing pass. Reported
@@ -267,8 +278,8 @@ mod tests {
 ///
 /// The retry is deliberately narrow. A panicking or permanently refused pass
 /// reproduces on every attempt, so retrying it forever is the failure this
-/// module exists to prevent; only a failure that is *transient by construction*
-/// — capacity another holder will release — earns a re-arm, and even that is
+/// module exists to prevent; only a failure that is *transient by construction*,
+/// capacity another holder will release, earns a re-arm, and even that is
 /// capped so a genuinely undersized budget degrades to stale instead of
 /// spinning.
 pub const RECONCILE_CAPACITY_RETRY_FLOOR: Duration = if cfg!(any(test, feature = "test-helpers")) {

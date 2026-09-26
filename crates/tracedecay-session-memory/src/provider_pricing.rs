@@ -143,7 +143,7 @@ pub fn cost_of_usage(
     cost.is_finite().then_some(cost)
 }
 
-/// Reads a price field that `OpenRouter` serves as a per-token decimal string
+/// Reads a price field that `OpenRouter` returns as a per-token decimal string
 /// (sometimes a bare number) and converts it to USD per million tokens.
 fn price_per_mtok(pricing: &Value, key: &str) -> Option<f64> {
     let raw = pricing.get(key)?;
@@ -224,7 +224,7 @@ pub fn load_table() -> &'static PriceTable {
     })
 }
 
-/// JSON payload for `GET /api/plugins/savings/pricing`.
+/// Bundled pricing provenance and per-model rates as JSON.
 pub fn pricing_payload() -> Value {
     let table = load_table();
     let mut models = Map::new();

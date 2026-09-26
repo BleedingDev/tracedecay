@@ -2,43 +2,42 @@
 //! `search`, `context`, `similar`, `find_exact_symbol`, `rename_preview`.
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::future::Future;
 use std::path::Path;
 
 use serde_json::{Value, json};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
+use tracedecay_contracts::InvocationAnalyticsV1;
+use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{
-    ContextCodeBlockV1, ContextMemoryContributionV1, ContextModeV1, ContextResultV1,
-    ContextSearchMatchV1, ContextSurfaceRequestV1, RedundancyScopeV1, RedundancySurfaceRequestV1,
-    RenamePreviewNodeV1, RenamePreviewPrimitiveRequestV1, RenamePreviewPrimitiveResultV1,
-    RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1, SimilarAlignedDifferenceV1,
-    SimilarAlignmentAnchorV1, SimilarAlignmentV1, SimilarContainmentV1, SimilarCoverageV1,
-    SimilarFamilyV1, SimilarMatchClassV1, SimilarNearCoverageV1, SimilarNearMatchV1,
-    SimilarNearPartialReasonV1, SimilarNearResultV1, SimilarNearUnavailableReasonV1,
-    SimilarOccurrenceV1, SimilarResultV1, SimilarSourceExtentV1, SimilarSurfaceRequestV1,
-    SimilarTargetV1, SimilarTokenSpanV1,
+    ContextCodeBlockV1, ContextLexicalAnchorV1, ContextModeV1, ContextResultV1,
+    ContextRetrievalPlanV1, ContextSearchMatchV1, ContextStageV1, ContextSurfaceRequestV1,
+    LexicalAnchorDropReasonV1, RedundancyScopeV1, RedundancySurfaceRequestV1, RenamePreviewNodeV1,
+    RenamePreviewPrimitiveOutcomeV1, RenamePreviewPrimitiveRequestV1,
+    RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1,
+    SimilarCoverageV1, SimilarFamilyV1, SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1,
+    SimilarSurfaceRequestV1, SimilarTargetV1,
 };
 use tracedecay_domain::ExactClass;
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_query::retrieval::lexical::LexicalAnchorOutcomeV1;
 #[cfg(test)]
 use tracedecay_query::retrieval::lexical::LexicalRoutingV1;
 
+#[cfg(test)]
 use crate::context_headings::CONTEXT_SEEN_NODE_IDS_LABEL;
 use crate::handlers::dependency_hints;
 use crate::handlers::support::{
-    CONTEXT_MEMORY_ANALYTICS_KEY, decode_primitive_request, generic_tool_result as support_generic,
-    rendered_tool_result as support_rendered, retrieval_cursor,
-    take_internal_context_memory_analytics, text_tool_result, unique_file_paths,
+    decode_primitive_request, generic_tool_result as support_generic,
+    rendered_tool_result as support_rendered, retrieval_cursor, unique_file_paths,
 };
 use crate::tools::render::{self, Md};
 use crate::{McpToolContext, ToolResult};
 
-use super::context_markdown::{append_verified_plan_context, verified_context_markdown};
+use super::context_markdown::verified_plan_context;
 use super::context_support::{
-    ContextMemoryOutcome, context_markdown_lane_preview, context_memory_analytics_value,
-    context_memory_matches, context_memory_options, context_memory_outcome,
-    context_memory_read_control, insert_context_memory_section,
+    ContextMemoryOutcome, context_memory_analytics, context_memory_matches, context_memory_options,
+    context_memory_outcome, context_memory_read_control, context_memory_stage,
 };
 use super::primitive_surface::{
     search_coverage as primitive_search_coverage, symbol_location as primitive_symbol_location,
@@ -52,13 +51,13 @@ use super::search_freshness::{
 use super::verified::CODE_SYMBOL_EVIDENCE_PREFIX;
 use super::{
     graph_occurrence_id, graph_symbol_end_line, graph_symbol_paths, graph_symbols_in_scope,
-    line_for_byte_offset, node_not_found as node_not_found_result, required_graph_file_path,
-    required_graph_metadata, single_graph_adjacency_batch,
+    graph_tool_completion, line_for_byte_offset, node_not_found_result, required_graph_file_path,
+    required_graph_metadata, single_graph_adjacency_batch, user_line,
 };
 use super::{lexical_routing, search_evidence};
 
 #[cfg(test)]
-use super::context_support::context_memory_section;
+use super::context_support::{context_markdown_lane_preview, context_memory_section};
 
 async fn execute_code_index_search(
     executor: Option<&tracedecay_query::code_search::CodeIndexSearchExecutor>,
@@ -102,11 +101,36 @@ fn preserve_complete_search_after_lazy_admission(result: Result<()>) -> Result<(
 /// response, including the successful ones, because "no matches" and "the
 /// matching lane was not running" are otherwise indistinguishable.
 fn coverage_value(coverage: &tracedecay_query::code_search::CodeIndexSearchCoverageV1) -> Value {
-    json!(primitive_search_coverage(coverage))
-}
+    fn lane(status: &tracedecay_query::code_search::CodeIndexLaneStatusV1) -> Value {
+        match status {
+            tracedecay_query::code_search::CodeIndexLaneStatusV1::Complete => json!("complete"),
+            tracedecay_query::code_search::CodeIndexLaneStatusV1::Stale { generation } => json!({
+                "status": "stale",
+                "generation": generation,
+            }),
+            tracedecay_query::code_search::CodeIndexLaneStatusV1::Partial {
+                generation,
+                reason,
+            } => {
+                json!({
+                    "status": "partial",
+                    "generation": generation,
+                    "reason": reason,
+                })
+            }
+            tracedecay_query::code_search::CodeIndexLaneStatusV1::Unavailable { reason } => json!({
+                "status": "unavailable",
+                "reason": reason,
+            }),
+        }
+    }
 
-fn user_line(line: u32) -> u32 {
-    line.saturating_add(1)
+    json!({
+        "exact": lane(&coverage.exact),
+        "lexical": lane(&coverage.lexical),
+        "graph": lane(&coverage.graph),
+        "recall": if coverage.is_degraded() { "partial" } else { "full" },
+    })
 }
 
 fn rendered_tool_result<F>(
@@ -119,7 +143,13 @@ fn rendered_tool_result<F>(
 where
     F: FnOnce() -> String,
 {
-    support_rendered(Some(ctx.project_root()), args, value, touched_files, md)
+    support_rendered(
+        Some(&ctx.store_layout().response_handle_root),
+        args,
+        value,
+        touched_files,
+        md,
+    )
 }
 
 /// [`rendered_tool_result`] with the default [`render::generic_md`] body.
@@ -129,35 +159,12 @@ fn generic_tool_result(
     value: &Value,
     touched_files: Vec<String>,
 ) -> ToolResult {
-    support_generic(Some(ctx.project_root()), args, value, touched_files)
-}
-
-fn rendered_context_tool_result(
-    project_root: &Path,
-    args: &Value,
-    mut value: Value,
-    touched_files: Vec<String>,
-    full_markdown: String,
-    preview_markdown: Option<&str>,
-    memory_contribution: ContextMemoryContributionV1,
-) -> ToolResult {
-    let internal_analytics = take_internal_context_memory_analytics(&mut value);
-    let text = if render::wants_json(args) {
-        render::finalize(Some(project_root), args, &value, || full_markdown)
-    } else {
-        render::markdown_preview_with_handle(
-            Some(project_root),
-            &full_markdown,
-            preview_markdown.unwrap_or(&full_markdown),
-        )
-    };
-    let result = text_tool_result(&text, touched_files)
-        .with_context_memory_contribution(memory_contribution);
-    if let Some(internal_analytics) = internal_analytics {
-        result.with_internal_analytics(internal_analytics)
-    } else {
-        result
-    }
+    support_generic(
+        Some(&ctx.store_layout().response_handle_root),
+        args,
+        value,
+        touched_files,
+    )
 }
 
 #[hotpath::measure(label = "mcp.graph.search.total")]
@@ -398,7 +405,17 @@ where
             if let Some(unavailable_graph) = graph_evidence.unavailable() {
                 output["verified_graph_evidence"] = unavailable_graph.clone();
             }
-            let failure = format!("code-index search unavailable: {reason}");
+            let failure = match freshness
+                .indexing
+                .as_ref()
+                .and_then(|indexing| indexing.parked.as_ref())
+            {
+                Some(parked) => format!(
+                    "code-index search unavailable: parked: {}; remedy: {}",
+                    parked.reason, parked.remediation
+                ),
+                None => format!("code-index search unavailable: {reason}"),
+            };
             Ok(rendered_tool_result(ctx, &args, &output, Vec::new(), || {
                 format!(
                     "{}{}",
@@ -414,7 +431,7 @@ where
 /// Warns, in the human-facing body, that a result list is short because a lane
 /// was missing. A degraded page is otherwise indistinguishable from a thorough
 /// one, which is exactly how a partial answer gets trusted as a complete one.
-fn append_coverage_md(md: &mut Md, value: &Value) {
+pub(super) fn append_coverage_md(md: &mut Md, value: &Value) {
     let Some(coverage) = value.get("coverage") else {
         return;
     };
@@ -450,7 +467,7 @@ fn append_coverage_md(md: &mut Md, value: &Value) {
     }
     md.blank()
         .heading(3, "Coverage")
-        .line("Partial recall — some retrieval lanes did not answer:");
+        .line("Partial recall. Some retrieval lanes did not answer:");
     for note in notes {
         md.bullet(&note);
     }
@@ -483,13 +500,13 @@ fn render_search_md(value: &Value) -> String {
                         let name = render::field_str(display, "name");
                         let kind = render::field_str(display, "kind");
                         md.bullet(&format!(
-                            "**{name}** ({kind}, {exact_class}) — rank {} · utility {utility}{via}",
+                            "**{name}** ({kind}, {exact_class}), rank {} · utility {utility}{via}",
                             ordinal.saturating_add(1)
                         ));
                         md.line(&format!("  anchor_id: `{anchor}`"));
                     } else {
                         md.bullet(&format!(
-                            "**{anchor}** ({exact_class}) — rank {} · utility {utility}{via}",
+                            "**{anchor}** ({exact_class}), rank {} · utility {utility}{via}",
                             ordinal.saturating_add(1)
                         ));
                     }
@@ -507,7 +524,7 @@ fn render_search_md(value: &Value) -> String {
                 let id = render::field_str(it, "id");
                 let score = it.get("score").and_then(Value::as_f64).unwrap_or(0.0);
                 md.bullet(&format!(
-                    "**{name}** ({kind}) — {file}:{line} · score {score:.1}"
+                    "**{name}** ({kind}), {file}:{line} · score {score:.1}"
                 ));
                 let sig = render::field_str(it, "signature");
                 if sig.is_empty() {
@@ -545,7 +562,7 @@ fn render_search_md(value: &Value) -> String {
 /// every edge, then discard all but `max_nodes`. That walk is CPU-bound and
 /// shows no warm benefit. Cap examination at a small multiple of the kept
 /// page. Semantic kind lives on the edge entity (not the physical
-/// SOURCE/TARGET relation type), so the page is all-kinds — the same
+/// SOURCE/TARGET relation type), so the page is all-kinds, the same
 /// neighborhood the previous complete walk returned, just a prefix.
 fn context_related_relation_budget(max_nodes: usize) -> usize {
     max_nodes.saturating_mul(4).clamp(16, 64)
@@ -555,6 +572,8 @@ fn context_related_relation_budget(max_nodes: usize) -> usize {
 struct ContextGraphProjection {
     selected: Vec<CodeGraphSymbolSummaryV1>,
     related: Vec<CodeGraphSymbolSummaryV1>,
+    /// A relation walk or the `max_nodes` cap stopped the related symbols.
+    related_truncated: bool,
     code_blocks: Vec<ContextCodeBlockV1>,
     touched_files: Vec<String>,
 }
@@ -588,6 +607,46 @@ fn context_search_matches(
                 rank: ranked.final_ordinal.saturating_add(1),
                 utility_micros: ranked.candidate.utility_micros,
             })
+        })
+        .collect()
+}
+
+/// The kernel's per-anchor receipts in the context wire shape, counted
+/// against the search matches this context carries: a served site outside
+/// `scope_prefix` is dropped as out of scope.
+fn context_lexical_anchors(
+    complete: &tracedecay_query::code_search::CodeIndexSearchCompletedV1,
+    scope_prefix: Option<&str>,
+) -> Vec<ContextLexicalAnchorV1> {
+    let mut receipt = complete.lexical_routes.clone();
+    if let Some(prefix) = scope_prefix {
+        receipt.reconcile_served(|site| {
+            complete
+                .display_by_anchor
+                .get(site)
+                .filter(|display| !display.path.starts_with(prefix))
+                .map(|_| LexicalAnchorDropReasonV1::OutOfScope)
+        });
+    }
+    receipt
+        .anchors
+        .into_iter()
+        .map(|receipt| {
+            let anchor = receipt.anchor.as_str().to_owned();
+            match receipt.outcome {
+                LexicalAnchorOutcomeV1::Matched {
+                    matched,
+                    admitted,
+                    dropped,
+                } => ContextLexicalAnchorV1::Matched {
+                    anchor,
+                    matched,
+                    admitted,
+                    dropped,
+                },
+                LexicalAnchorOutcomeV1::Unmatched => ContextLexicalAnchorV1::Unmatched { anchor },
+                LexicalAnchorOutcomeV1::NotServed => ContextLexicalAnchorV1::NotServed { anchor },
+            }
         })
         .collect()
 }
@@ -627,12 +686,14 @@ fn context_graph_projection(
         .map(|symbol| symbol.occurrence.clone())
         .collect::<Vec<_>>();
     let mut related = Vec::new();
+    let mut related_truncated = false;
     if !seeds.is_empty() {
         let related_budget = context_related_relation_budget(max_nodes);
         for batches in [
             graph.callers_truncated(&seeds, &[], related_budget)?,
             graph.callees_truncated(&seeds, &[], related_budget)?,
         ] {
+            related_truncated |= batches.iter().map(Vec::len).sum::<usize>() >= related_budget;
             for edge in batches.into_iter().flatten() {
                 if !seeds.contains(&edge.neighbor.occurrence)
                     && !related.iter().any(|existing: &CodeGraphSymbolSummaryV1| {
@@ -644,6 +705,7 @@ fn context_graph_projection(
             }
         }
     }
+    related_truncated |= related.len() > max_nodes;
     related.truncate(max_nodes);
 
     let mut all_symbols = selected.clone();
@@ -676,7 +738,7 @@ fn context_graph_projection(
                 file: file_path.to_owned(),
                 start_line: user_line(metadata.start_line),
                 end_line: user_line(graph_symbol_end_line(metadata)?),
-                code: crate::handlers::info::extract_lines(
+                code: extract_lines(
                     source,
                     metadata.start_line,
                     graph_symbol_end_line(metadata)?,
@@ -687,36 +749,42 @@ fn context_graph_projection(
     Ok(ContextGraphProjection {
         selected,
         related,
+        related_truncated,
         code_blocks,
         touched_files,
     })
 }
 
-fn append_context_search_matches(output: &mut String, matches: &[ContextSearchMatchV1]) {
-    if matches.is_empty() {
-        return;
+/// Extract the source spanning tree-sitter rows `start_line..=end_line`
+/// (0-based, inclusive) from `source`. Node line fields are stored as the
+/// raw tree-sitter row index, so the caller passes them through unchanged.
+/// Returns the empty string if the range is out of bounds.
+fn extract_lines(source: &str, start_line: u32, end_line: u32) -> String {
+    let start = start_line as usize;
+    let end_exclusive = (end_line as usize).saturating_add(1);
+    if start >= end_exclusive {
+        return String::new();
     }
-    output.push_str("\n### Available Code Search Matches\n");
-    for search_match in matches {
-        let _ = writeln!(
-            output,
-            "- **{}** ({}) — `{}` · rank {} · utility {}",
-            search_match.name,
-            search_match.kind,
-            search_match.file,
-            search_match.rank,
-            search_match.utility_micros,
-        );
+    let mut selected = source.lines().skip(start).take(end_exclusive - start);
+    let Some(first) = selected.next() else {
+        return String::new();
+    };
+    let mut body = String::with_capacity(first.len());
+    body.push_str(first);
+    for line in selected {
+        body.push('\n');
+        body.push_str(line);
     }
+    body
 }
 
 #[hotpath::measure(label = "mcp.graph.context.total")]
-pub async fn handle_context<F>(
+pub async fn compute_context<F>(
     ctx: &McpToolContext<'_>,
     graph: F,
     args: Value,
     scope_prefix: Option<&str>,
-) -> Result<ToolResult>
+) -> Result<GraphToolCompletionV1>
 where
     F: Future<Output = Result<tracedecay_graph_query::VerifiedGraphQuery>>,
 {
@@ -725,10 +793,6 @@ where
     let deadline = ctx.deadline().cloned();
     let cancellation = ctx.cancellation().cloned();
     let request: ContextSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_context")?;
-    let strict_semantic_requested = matches!(
-        request.semantic_mode,
-        Some(tracedecay_contracts::retrieval::SemanticQueryModeV1::StrictSemantic)
-    );
     let memory_policy_admitted_at =
         tracedecay_contracts::try_now_micros().map_err(|error| TraceDecayError::Config {
             message: format!("context memory policy admission clock unavailable: {error}"),
@@ -747,8 +811,9 @@ where
     let max_code_blocks = request
         .max_code_blocks
         .map_or(5, |value| value.clamp(1, 20) as usize);
+    let requested_anchors = request.lexical_anchors.clone().unwrap_or_default();
     let lexical_routing = lexical_routing::routing_from_parts(
-        request.lexical_anchors.clone().unwrap_or_default(),
+        requested_anchors.clone(),
         request.prefer_symbol.unwrap_or(false),
     )?;
     let memory_options = context_memory_options(&request);
@@ -785,48 +850,53 @@ where
     // state at serve time, not a snapshot taken before the lanes ran.
     let freshness_payload = ctx.freshness().await;
     let worktree_freshness = worktree_freshness_from_payload(freshness_payload.as_ref());
-    let mut strict_failure = None;
-    let (complete, code_generation, coverage, freshness, search_matches) = match outcome {
-        tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(complete) => {
-            let search_matches = context_search_matches(&complete, scope_prefix);
-            let code_generation = Some(complete.code_generation.clone());
-            let coverage = primitive_search_coverage(&complete.coverage);
-            let freshness = search_freshness(
-                ServedGenerationV1::Served(&complete.code_generation),
-                &complete.coverage,
-                &worktree_freshness,
-            );
-            (
-                Some(complete),
-                code_generation,
-                coverage,
-                freshness,
-                search_matches,
-            )
-        }
-        tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(unavailable) => {
-            let reason = unavailable.reason.as_str();
-            if strict_semantic_requested {
-                strict_failure = Some(format!("code-index context unavailable: {reason}"));
+    let (complete, code_generation, coverage, freshness, search_matches, lexical_anchors) =
+        match outcome {
+            tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(complete) => {
+                let search_matches = context_search_matches(&complete, scope_prefix);
+                let lexical_anchors = context_lexical_anchors(&complete, scope_prefix);
+                let code_generation = Some(complete.code_generation.clone());
+                let coverage = primitive_search_coverage(&complete.coverage);
+                let freshness = search_freshness(
+                    ServedGenerationV1::Served(&complete.code_generation),
+                    &complete.coverage,
+                    &worktree_freshness,
+                );
+                (
+                    Some(complete),
+                    code_generation,
+                    coverage,
+                    freshness,
+                    search_matches,
+                    lexical_anchors,
+                )
             }
-            (
+            tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Unavailable(unavailable) => (
                 None,
                 unavailable.code_generation,
                 primitive_search_coverage(&unavailable.coverage),
                 search_freshness(
-                    ServedGenerationV1::Unavailable { reason },
+                    ServedGenerationV1::Unavailable {
+                        reason: unavailable.reason.as_str(),
+                    },
                     &unavailable.coverage,
                     &worktree_freshness,
                 ),
                 Vec::new(),
-            )
-        }
-    };
+                requested_anchors
+                    .iter()
+                    .map(|anchor| ContextLexicalAnchorV1::NotServed {
+                        anchor: anchor.clone(),
+                    })
+                    .collect(),
+            ),
+        };
     let graph = match complete.as_ref() {
         Some(complete) => bind_verified_graph_to_search(graph, &complete.code_generation),
         None => graph,
     };
-    let (graph, projection, verified_graph_evidence) = match (graph, complete.as_ref()) {
+    let (graph, projection, verified_graph_evidence, graph_stage) = match (graph, complete.as_ref())
+    {
         (Ok(graph), Some(complete)) => match hotpath::measure_block!(
             "mcp.graph.context.graph",
             context_graph_projection(
@@ -839,19 +909,61 @@ where
                 max_code_blocks,
             )
         ) {
-            Ok(projection) => (Some(graph), projection, None),
+            Ok(projection) => {
+                let stage = ContextStageV1::ran(max_nodes, projection.selected.len(), false);
+                (Some(graph), projection, None, stage)
+            }
             Err(error) => (
                 None,
                 ContextGraphProjection::default(),
                 Some(dependency_hints::unavailable_evidence(&error)),
+                ContextStageV1::Unavailable,
             ),
         },
-        (Ok(graph), None) => (Some(graph), ContextGraphProjection::default(), None),
+        (Ok(graph), None) => (
+            Some(graph),
+            ContextGraphProjection::default(),
+            None,
+            ContextStageV1::Skipped,
+        ),
         (Err(error), _) => (
             None,
             ContextGraphProjection::default(),
             Some(dependency_hints::unavailable_evidence(&error)),
+            ContextStageV1::Unavailable,
         ),
+    };
+    let retrieval = ContextRetrievalPlanV1 {
+        search: match complete.as_ref() {
+            Some(complete) => ContextStageV1::ran(
+                max_nodes,
+                search_matches.len(),
+                complete.next_cursor.is_some(),
+            ),
+            None => ContextStageV1::Unavailable,
+        },
+        graph: graph_stage,
+        related: if projection.selected.is_empty() {
+            ContextStageV1::Skipped
+        } else {
+            ContextStageV1::ran(
+                max_nodes,
+                projection.related.len(),
+                projection.related_truncated,
+            )
+        },
+        code: if !include_code {
+            ContextStageV1::NotRequested
+        } else if projection.selected.is_empty() {
+            ContextStageV1::Skipped
+        } else {
+            ContextStageV1::ran(
+                max_code_blocks,
+                projection.code_blocks.len(),
+                projection.selected.len() > max_code_blocks,
+            )
+        },
+        memory: ContextStageV1::NotRequested,
     };
     let ContextMemoryOutcome {
         hits: memory_matches,
@@ -859,113 +971,22 @@ where
         temporal_coverage: memory_temporal_coverage,
         error: memory_matches_error,
     } = memory_outcome;
-    let seeds = projection
-        .selected
-        .iter()
-        .map(|symbol| symbol.occurrence.clone())
-        .collect::<Vec<_>>();
-    let symbol_values = projection
+    let symbols = projection
         .selected
         .iter()
         .map(primitive_symbol_location)
         .collect::<Result<Vec<_>>>()?;
-    let related_values = projection
+    let related_symbols = projection
         .related
         .iter()
         .map(primitive_symbol_location)
         .collect::<Result<Vec<_>>>()?;
-    let symbol_render_values = symbol_values
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let related_render_values = related_values
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let code_render_values = projection
-        .code_blocks
-        .iter()
-        .map(serde_json::to_value)
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let mut output = freshness_lines(&freshness);
-    output.push_str(&verified_context_markdown(
-        task,
-        &symbol_render_values,
-        &related_render_values,
-        &code_render_values,
-    )?);
-    if symbol_values.is_empty() {
-        append_context_search_matches(&mut output, &search_matches);
-    }
-    insert_context_memory_section(
-        &mut output,
-        &memory_matches,
-        memory_matches_error.as_deref(),
-        memory_temporal_coverage,
-    );
-    if mode == ContextModeV1::Plan
-        && let Some(graph) = graph.as_ref()
-    {
-        append_verified_plan_context(graph, &projection.selected, &mut output)?;
-    }
-
-    if !seeds.is_empty() {
-        let _ = write!(
-            output,
-            "\n{} {}\n",
-            CONTEXT_SEEN_NODE_IDS_LABEL,
-            serde_json::to_string(&seeds)?
-        );
-    }
-
-    let memory_contribution = ContextMemoryContributionV1::from_matches(
-        &request,
-        &memory_matches,
-        memory_graph_coverage,
-        memory_temporal_coverage,
-        memory_policy_admitted_at,
-    )
-    .map_err(|error| TraceDecayError::Config {
-        message: format!("invalid canonical context memory contribution: {error}"),
-    })?;
-    let result = ContextResultV1 {
-        task: request.task,
-        mode,
-        freshness,
-        code_generation,
-        search_matches: search_matches.clone(),
-        symbols: symbol_values,
-        related_symbols: related_values,
-        code: projection.code_blocks,
-        coverage,
-        memory_matches: memory_matches.clone(),
-        memory_graph_coverage,
-        memory_temporal_coverage,
-        memory_matches_error: memory_matches_error.clone(),
-        verified_graph_evidence,
+    let plan = match (mode, graph.as_ref()) {
+        (ContextModeV1::Plan, Some(graph)) => {
+            Some(verified_plan_context(graph, &projection.selected)?)
+        }
+        _ => None,
     };
-    let mut value =
-        hotpath::measure_block!("mcp.graph.context.serialize", serde_json::to_value(result)?);
-    if let Some(object) = value.as_object_mut() {
-        object.insert(
-            CONTEXT_MEMORY_ANALYTICS_KEY.to_string(),
-            json!({
-                "context_memory": context_memory_analytics_value(
-                    &memory_options,
-                    &memory_matches,
-                    memory_matches_error.as_deref()
-                ),
-            }),
-        );
-    }
-    let mut degradation = Md::new();
-    append_coverage_md(&mut degradation, &value);
-    search_evidence::append_verified_graph_evidence_md(&mut degradation, &value);
-    let degradation = degradation.render();
-    if !degradation.is_empty() {
-        output.push('\n');
-        output.push_str(&degradation);
-    }
     let touched_files = unique_file_paths(
         projection.touched_files.iter().map(String::as_str).chain(
             search_matches
@@ -973,25 +994,50 @@ where
                 .map(|search_match| search_match.file.as_str()),
         ),
     );
-    let preview = (!render::wants_json(&args)).then(|| context_markdown_lane_preview(&output));
-    let result = rendered_context_tool_result(
-        ctx.project_root(),
-        &args,
-        value,
+    let analytics = InvocationAnalyticsV1 {
+        context_memory: Some(context_memory_analytics(
+            &memory_options,
+            &memory_matches,
+            memory_matches_error.as_deref(),
+        )),
+    };
+    let retrieval = ContextRetrievalPlanV1 {
+        memory: context_memory_stage(
+            &memory_options,
+            &memory_matches,
+            memory_matches_error.as_deref(),
+        ),
+        ..retrieval
+    };
+    let result = ContextResultV1 {
+        task: request.task,
+        mode,
+        freshness,
+        code_generation,
+        search_matches,
+        lexical_anchors,
+        symbols,
+        related_symbols,
+        code: projection.code_blocks,
+        coverage,
+        memory_matches,
+        memory_graph_coverage,
+        memory_temporal_coverage,
+        memory_matches_error,
+        verified_graph_evidence,
+        plan,
+        retrieval,
+    };
+    Ok(GraphToolCompletionV1 {
+        result: GraphToolResultV1::Context(Box::new(result)),
         touched_files,
-        output,
-        preview.as_deref(),
-        memory_contribution,
-    );
-    Ok(match strict_failure {
-        Some(failure) => result
-            .with_semantic_error(true)
-            .with_failure_message(failure),
-        None => result,
+        code_graph: None,
+        analytics: Some(analytics),
+        cost: None,
     })
 }
 
-/// Bare-name lookup against `idx_nodes_name` — no BM25 scoring, no fuzzy
+/// Bare-name lookup against `idx_nodes_name`, no BM25 scoring, no fuzzy
 /// match, no qualified-name suffix walk. Returns every node whose `name`
 /// column equals the query exactly. Useful when you already know the symbol
 /// and want the apples-to-apples cost of an index hit instead of
@@ -1068,23 +1114,11 @@ pub async fn handle_find_exact_symbol(
 }
 
 #[hotpath::measure(label = "mcp.graph.similar.total")]
-pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<ToolResult> {
+pub async fn compute_similar(
+    ctx: &McpToolContext<'_>,
+    args: Value,
+) -> Result<GraphToolCompletionV1> {
     let request: SimilarSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_similar")?;
-    if request.project_id != ctx.admitted_scope().project_id
-        || request.repository_id != ctx.admitted_scope().repository_id
-    {
-        return Err(TraceDecayError::ProjectRoute {
-            reason_code: "similar-repository-not-authorized".to_owned(),
-            retryable: false,
-            detail: "the selected repository is outside the authorized repository scope".to_owned(),
-        });
-    }
-    let source_extent =
-        request
-            .validated_source_extent()
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("invalid arguments for tracedecay_similar: {error}"),
-            })?;
     let project_id = request.project_id;
     let repository_id = request.repository_id;
     let target = match request.target {
@@ -1109,6 +1143,14 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
             }
         })
         .collect();
+    let cursor = request
+        .cursor
+        .as_deref()
+        .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::decode)
+        .transpose()
+        .map_err(|error| TraceDecayError::Config {
+            message: format!("invalid tracedecay_similar cursor: {error}"),
+        })?;
     let executor = ctx.code_index_similar_executor().ok_or_else(|| {
         clone_lane_unavailable_error(
             "similarity",
@@ -1118,11 +1160,10 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
     let similar = match executor(tracedecay_query::code_search::CodeIndexSimilarRequestV1 {
         project_root: ctx.project_root().to_path_buf(),
         target,
-        source_extent: code_index_source_extent(&source_extent)?,
         match_classes,
         result_limit: request.result_limit as usize,
         work_limit: request.work_limit as usize,
-        cursor: request.cursor,
+        cursor,
         authority: ctx.code_index_search_authority().cloned(),
         deadline: ctx.deadline().cloned(),
         cancellation: ctx.cancellation().cloned(),
@@ -1153,8 +1194,6 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
     let source = similar_occurrence(&similar.source.occurrence);
     let mut touched_files = vec![source.path.clone()];
     let mut complete = true;
-    let mut remaining_wire_occurrences = request.result_limit as usize;
-    let mut wire_limit_reached = false;
     let families = similar
         .exact_groups
         .into_iter()
@@ -1168,27 +1207,27 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
                     SimilarMatchClassV1::RenameNormalizedExact
                 }
             };
-            let mut members = Vec::new();
-            let mut group_members_omitted = false;
-            for member in group.members {
-                if member.occurrence.project_id != project_id
-                    || member.occurrence.repository_id != repository_id
-                {
-                    continue;
-                }
-                if remaining_wire_occurrences == 0 {
-                    group_members_omitted = true;
-                    wire_limit_reached = true;
-                    continue;
-                }
-                let occurrence = similar_occurrence(&member.occurrence);
-                touched_files.push(occurrence.path.clone());
-                members.push(occurrence);
-                remaining_wire_occurrences = remaining_wire_occurrences.saturating_sub(1);
-            }
-            if group_members_omitted {
-                complete = false;
-            }
+            let members = group
+                .members
+                .into_iter()
+                .filter(|member| {
+                    member.occurrence.project_id == project_id
+                        && member.occurrence.repository_id == repository_id
+                })
+                .map(|member| {
+                    let occurrence = similar_occurrence(&member.occurrence);
+                    touched_files.push(occurrence.path.clone());
+                    occurrence
+                })
+                .collect::<Vec<_>>();
+            let next_cursor = group
+                .next_cursor
+                .as_ref()
+                .map(tracedecay_query::retrieval::lexical::CloneArtifactCursorV1::encode)
+                .transpose()
+                .map_err(|error| TraceDecayError::Config {
+                    message: format!("failed to encode tracedecay_similar cursor: {error}"),
+                })?;
             Ok(SimilarFamilyV1 {
                 match_class,
                 normalization_revision: group.key.normalization_revision,
@@ -1196,29 +1235,15 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
                 representative_payload_digest: similar.source.payload.payload_digest.clone(),
                 member_count: members.len(),
                 members,
-                complete: group.complete && !group_members_omitted,
-                next_cursor: group.next_cursor,
+                complete: group.complete,
+                next_cursor,
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let (near, near_touched_files, near_wire_limit_reached) = similar_near_result(
-        &similar.source,
-        source_extent,
-        similar.near,
-        project_id.clone(),
-        repository_id.clone(),
-        &mut remaining_wire_occurrences,
-    )?;
-    ensure_similar_near_continuation(&near, near_wire_limit_reached)?;
-    wire_limit_reached |= near_wire_limit_reached;
-    complete &= matches!(near.coverage, SimilarNearCoverageV1::Complete);
-    touched_files.extend(near_touched_files);
     touched_files.sort();
     touched_files.dedup();
     let coverage = match similar.source.occurrence.eligibility {
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
-            if complete && !wire_limit_reached =>
-        {
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible if complete => {
             SimilarCoverageV1::Complete
         }
         tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible => {
@@ -1227,6 +1252,13 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
         tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooSmall {
             minimum_tokens,
         } => SimilarCoverageV1::ExcludedTooSmall { minimum_tokens },
+        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooLarge {
+            maximum_tokens,
+            maximum_bytes,
+        } => SimilarCoverageV1::ExcludedTooLarge {
+            maximum_tokens,
+            maximum_bytes,
+        },
         tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedIncompleteTokenization => {
             SimilarCoverageV1::ExcludedIncompleteTokenization
         }
@@ -1236,381 +1268,11 @@ pub async fn handle_similar(ctx: &McpToolContext<'_>, args: Value) -> Result<Too
         source,
         families,
         coverage,
-        near: Some(near),
     };
-    let value =
-        hotpath::measure_block!("mcp.graph.similar.serialize", serde_json::to_value(result)?);
-    Ok(generic_tool_result(ctx, &args, &value, touched_files))
-}
-
-fn ensure_similar_near_continuation(
-    near: &SimilarNearResultV1,
-    wire_limit_reached: bool,
-) -> Result<()> {
-    if wire_limit_reached && near.next_cursor.is_none() {
-        return Err(TraceDecayError::ProjectRoute {
-            reason_code: "similar-pagination-unavailable".to_owned(),
-            retryable: true,
-            detail: "verified similar near results omitted occurrences without an authenticated continuation".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-fn code_index_source_extent(
-    extent: &SimilarSourceExtentV1,
-) -> Result<tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1> {
-    Ok(match extent {
-        SimilarSourceExtentV1::WholeBody => {
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody
-        }
-        SimilarSourceExtentV1::SelectedTokenRange { start, end } => {
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-                start: usize::try_from(*start).map_err(|_| TraceDecayError::Config {
-                    message: "invalid arguments for tracedecay_similar: source token range start is too large"
-                        .to_owned(),
-                })?,
-                end: usize::try_from(*end).map_err(|_| TraceDecayError::Config {
-                    message: "invalid arguments for tracedecay_similar: source token range end is too large"
-                        .to_owned(),
-                })?,
-            }
-        }
-    })
-}
-
-fn similar_near_result(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    extent: SimilarSourceExtentV1,
-    near: tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
-    project_id: tracedecay_domain::ProjectId,
-    repository_id: tracedecay_domain::RepositoryId,
-    remaining_wire_occurrences: &mut usize,
-) -> Result<(SimilarNearResultV1, Vec<String>, bool)> {
-    let mut touched_files = Vec::new();
-    let mut matches = Vec::new();
-    let mut wire_limit_reached = false;
-    let coverage;
-    let next_cursor;
-    match near {
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) => {
-            if !matches!(&extent, SimilarSourceExtentV1::WholeBody) {
-                return Err(TraceDecayError::Config {
-                    message: "verified similar near read extent does not match its request"
-                        .to_owned(),
-                });
-            }
-            coverage = similar_near_coverage(
-                read.source_eligibility,
-                &read.partial_reasons,
-                read.coverage.unknown > 0 || read.coverage.capped > 0,
-            );
-            next_cursor = read.page.next_cursor;
-            for pair in read.page.members {
-                let match_class = similar_match_class(pair.class);
-                let alignment = SimilarAlignmentV1 {
-                    shared_token_count: pair.shared_ordered_token_count,
-                    anchors: pair
-                        .ordered_anchors
-                        .into_iter()
-                        .map(|anchor| similar_alignment_anchor(anchor, 0))
-                        .collect(),
-                };
-                let differences = pair
-                    .differences
-                    .into_iter()
-                    .map(similar_difference)
-                    .collect::<Vec<_>>();
-                for occurrence in pair.occurrences {
-                    if occurrence.project_id != project_id
-                        || occurrence.repository_id != repository_id
-                    {
-                        continue;
-                    }
-                    if *remaining_wire_occurrences == 0 {
-                        wire_limit_reached = true;
-                        continue;
-                    }
-                    touched_files.push(occurrence.path.clone());
-                    matches.push(SimilarNearMatchV1 {
-                        candidate: similar_occurrence(&occurrence),
-                        match_class,
-                        extent: SimilarSourceExtentV1::WholeBody,
-                        source_coverage_millionths: pair.source_coverage_millionths,
-                        candidate_coverage_millionths: pair.candidate_coverage_millionths,
-                        alignment: alignment.clone(),
-                        differences: differences.clone(),
-                        containment: None,
-                    });
-                    *remaining_wire_occurrences = (*remaining_wire_occurrences).saturating_sub(1);
-                }
-            }
-        }
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(read) => {
-            coverage = similar_near_coverage(
-                source.occurrence.eligibility,
-                &read.partial_reasons,
-                read.coverage.unknown > 0 || read.coverage.capped > 0,
-            );
-            next_cursor = read.page.next_cursor;
-            let (source_offset, selected_token_count) = match &extent {
-                SimilarSourceExtentV1::WholeBody => {
-                    return Err(TraceDecayError::Config {
-                        message: "verified selected similar near read has no selected token range"
-                            .to_owned(),
-                    });
-                }
-                SimilarSourceExtentV1::SelectedTokenRange { start, end } => {
-                    (*start, u64::from(end.saturating_sub(*start)))
-                }
-            };
-            let match_class = similar_match_class(read.stream.class);
-            for candidate in read.page.members {
-                let containment = similar_containment(candidate.containment);
-                let candidate_token_count = u64::from(candidate.payload.token_count);
-                let shared_token_count = match containment {
-                    SimilarContainmentV1::SelectedRangeContainsCandidate => {
-                        selected_token_count.min(candidate_token_count)
-                    }
-                    SimilarContainmentV1::Equal
-                    | SimilarContainmentV1::CandidateContainsSelectedRange => {
-                        candidate_token_count.min(selected_token_count)
-                    }
-                };
-                let alignment = SimilarAlignmentV1 {
-                    shared_token_count: u32::try_from(shared_token_count).unwrap_or(u32::MAX),
-                    anchors: candidate
-                        .anchors
-                        .iter()
-                        .copied()
-                        .map(|anchor| similar_alignment_anchor(anchor, source_offset))
-                        .collect(),
-                };
-                for occurrence in candidate.occurrences {
-                    if occurrence.project_id != project_id
-                        || occurrence.repository_id != repository_id
-                    {
-                        continue;
-                    }
-                    if *remaining_wire_occurrences == 0 {
-                        wire_limit_reached = true;
-                        continue;
-                    }
-                    touched_files.push(occurrence.path.clone());
-                    matches.push(SimilarNearMatchV1 {
-                        candidate: similar_occurrence(&occurrence),
-                        match_class,
-                        extent: extent.clone(),
-                        source_coverage_millionths: directional_coverage(
-                            shared_token_count,
-                            selected_token_count,
-                        ),
-                        candidate_coverage_millionths: directional_coverage(
-                            shared_token_count,
-                            candidate_token_count,
-                        ),
-                        alignment: alignment.clone(),
-                        differences: Vec::new(),
-                        containment: Some(containment),
-                    });
-                    *remaining_wire_occurrences = (*remaining_wire_occurrences).saturating_sub(1);
-                }
-            }
-        }
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(reason) => {
-            coverage = SimilarNearCoverageV1::Unavailable {
-                reason: similar_unavailable_reason(reason),
-            };
-            next_cursor = None;
-        }
-    }
-    // The artifact reader pages candidate bodies, while the MCP surface
-    // pages grouped occurrences. If the wire budget is exhausted and the
-    // reader retained a cursor, expose the truncation so the response stays
-    // partial even when the reader itself completed its body comparison.
-    wire_limit_reached |= next_cursor.is_some() && *remaining_wire_occurrences == 0;
-    touched_files.sort();
-    touched_files.dedup();
-    Ok((
-        SimilarNearResultV1 {
-            extent,
-            matches,
-            coverage,
-            next_cursor,
-        },
+    Ok(graph_tool_completion(
+        GraphToolResultV1::Similar(result),
         touched_files,
-        wire_limit_reached,
     ))
-}
-
-fn similar_near_coverage(
-    eligibility: tracedecay_code_index::clones::CloneBodyEligibilityV1,
-    partial_reasons: &[tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1],
-    interrupted_or_capped: bool,
-) -> SimilarNearCoverageV1 {
-    match eligibility {
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedTooSmall {
-            minimum_tokens,
-        } => SimilarNearCoverageV1::ExcludedTooSmall { minimum_tokens },
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::ExcludedIncompleteTokenization => {
-            SimilarNearCoverageV1::ExcludedIncompleteTokenization
-        }
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
-            if partial_reasons.is_empty() && !interrupted_or_capped =>
-        {
-            SimilarNearCoverageV1::Complete
-        }
-        tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible => {
-            let mut reasons = partial_reasons
-                .iter()
-                .copied()
-                .map(similar_partial_reason)
-                .collect::<Vec<_>>();
-            if reasons.is_empty() {
-                reasons.push(SimilarNearPartialReasonV1::VerificationWorkBudget);
-            }
-            reasons.sort_by_key(|reason| *reason as u8);
-            reasons.dedup();
-            SimilarNearCoverageV1::Partial { reasons }
-        }
-    }
-}
-
-fn similar_match_class(
-    class: tracedecay_code_index::clones::CloneNormalizationClassV1,
-) -> SimilarMatchClassV1 {
-    match class {
-        tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative => {
-            SimilarMatchClassV1::ConservativeExact
-        }
-        tracedecay_code_index::clones::CloneNormalizationClassV1::Rename => {
-            SimilarMatchClassV1::RenameNormalizedExact
-        }
-    }
-}
-
-fn similar_alignment_anchor(
-    anchor: tracedecay_code_index::clones::CloneTokenAnchorV1,
-    source_offset: u32,
-) -> SimilarAlignmentAnchorV1 {
-    SimilarAlignmentAnchorV1 {
-        fingerprint: anchor.fingerprint,
-        source_token_position: anchor.left_token_position.saturating_add(source_offset),
-        candidate_token_position: anchor.right_token_position,
-    }
-}
-
-fn similar_difference(
-    difference: tracedecay_code_index::clones::CloneAlignedDifferenceV1,
-) -> SimilarAlignedDifferenceV1 {
-    SimilarAlignedDifferenceV1 {
-        source_span: SimilarTokenSpanV1 {
-            start: difference.left_span.start,
-            end: difference.left_span.end,
-        },
-        candidate_span: SimilarTokenSpanV1 {
-            start: difference.right_span.start,
-            end: difference.right_span.end,
-        },
-        source_token_count: difference.left_tokens.len().min(u32::MAX as usize) as u32,
-        candidate_token_count: difference.right_tokens.len().min(u32::MAX as usize) as u32,
-    }
-}
-
-fn similar_containment(
-    containment: tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1,
-) -> SimilarContainmentV1 {
-    match containment {
-        tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::Equal => {
-            SimilarContainmentV1::Equal
-        }
-        tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::CandidateContainsSelectedBlock => {
-            SimilarContainmentV1::CandidateContainsSelectedRange
-        }
-        tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::SelectedBlockContainsCandidate => {
-            SimilarContainmentV1::SelectedRangeContainsCandidate
-        }
-    }
-}
-
-fn similar_partial_reason(
-    reason: tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1,
-) -> SimilarNearPartialReasonV1 {
-    match reason {
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::PostingRowBudget => {
-            SimilarNearPartialReasonV1::PostingRowBudget
-        }
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::CandidateBodyBudget => {
-            SimilarNearPartialReasonV1::CandidateBodyBudget
-        }
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::HotPostings => {
-            SimilarNearPartialReasonV1::HotPostings
-        }
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::VerificationBodyBudget => {
-            SimilarNearPartialReasonV1::VerificationBodyBudget
-        }
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::VerificationWorkBudget => {
-            SimilarNearPartialReasonV1::VerificationWorkBudget
-        }
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::Cancelled => {
-            SimilarNearPartialReasonV1::Cancelled
-        }
-        tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1::DeadlineExceeded => {
-            SimilarNearPartialReasonV1::DeadlineExceeded
-        }
-    }
-}
-
-fn similar_unavailable_reason(
-    reason: tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1,
-) -> SimilarNearUnavailableReasonV1 {
-    match reason {
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable
-        | tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::SemanticUnavailable => {
-            SimilarNearUnavailableReasonV1::CapabilityUnavailable
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable => {
-            SimilarNearUnavailableReasonV1::AuthorityUnavailable
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::LinkedWorktreeDisabled => {
-            SimilarNearUnavailableReasonV1::LinkedWorktreeDisabled
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Cancelled => {
-            SimilarNearUnavailableReasonV1::Cancelled
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::TimedOut => {
-            SimilarNearUnavailableReasonV1::TimedOut
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapacityUnavailable => {
-            SimilarNearUnavailableReasonV1::CapacityUnavailable
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable => {
-            SimilarNearUnavailableReasonV1::GenerationUnavailable
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified => {
-            SimilarNearUnavailableReasonV1::GenerationUnverified
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest => {
-            SimilarNearUnavailableReasonV1::InvalidRequest
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired => {
-            SimilarNearUnavailableReasonV1::CorruptionResetRequired
-        }
-        tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::Internal => {
-            SimilarNearUnavailableReasonV1::Internal
-        }
-    }
-}
-
-fn directional_coverage(shared: u64, total: u64) -> u32 {
-    if total == 0 {
-        return 0;
-    }
-    shared
-        .saturating_mul(1_000_000)
-        .checked_div(total)
-        .unwrap_or_default()
-        .min(1_000_000) as u32
 }
 
 /// The one clone-family unavailable wire shape. `tracedecay_similar` and
@@ -1637,7 +1299,10 @@ fn clone_lane_unavailable_error(
 }
 
 #[hotpath::measure(label = "mcp.graph.redundancy.total")]
-pub async fn handle_redundancy(ctx: &McpToolContext<'_>, args: Value) -> Result<ToolResult> {
+pub async fn compute_redundancy(
+    ctx: &McpToolContext<'_>,
+    args: Value,
+) -> Result<GraphToolCompletionV1> {
     let request: RedundancySurfaceRequestV1 =
         decode_primitive_request(&args, "tracedecay_redundancy")?;
     if request.project_id != ctx.admitted_scope().project_id
@@ -1721,11 +1386,10 @@ pub async fn handle_redundancy(ctx: &McpToolContext<'_>, args: Value) -> Result<
         .collect::<Vec<_>>();
     touched_files.sort();
     touched_files.dedup();
-    let value = hotpath::measure_block!(
-        "mcp.graph.redundancy.serialize",
-        serde_json::to_value(outcome)?
-    );
-    Ok(generic_tool_result(ctx, &args, &value, touched_files))
+    Ok(graph_tool_completion(
+        GraphToolResultV1::Redundancy(outcome),
+        touched_files,
+    ))
 }
 
 fn similar_occurrence(
@@ -1827,23 +1491,23 @@ struct RenameReferenceSiteInput {
     evidence_start_byte: u64,
 }
 
-/// READ-ONLY: reports what a rename of the given symbol WOULD touch — the
+/// READ-ONLY: reports what a rename of the given symbol WOULD touch, the
 /// declaration site and every graph reference site (incoming edges; outgoing
 /// edges reference other symbols and so are excluded), each with a
 /// current-text snippet, plus a per-file count of literal name occurrences
-/// that are NOT backed by a graph edge ("text-only matches — review
+/// that are NOT backed by a graph edge ("text-only matches, review
 /// manually"). Nothing is rewritten.
 #[hotpath::measure(label = "mcp.graph.rename_preview.total")]
-pub async fn handle_rename_preview(
+pub async fn compute_rename_preview(
     ctx: &McpToolContext<'_>,
     graph: &tracedecay_graph_query::VerifiedGraphQuery,
     args: Value,
-) -> Result<ToolResult> {
+) -> Result<GraphToolCompletionV1> {
     let request: RenamePreviewPrimitiveRequestV1 =
         decode_primitive_request(&args, "tracedecay_rename_preview")?;
 
     let occurrence = graph_occurrence_id(&request.node_id)?;
-    // Graph occurrences per file (declaration + reference sites) — subtracted
+    // Graph occurrences per file (declaration + reference sites), subtracted
     // from the literal textual count to isolate the text-only matches.
     let mut graph_counts: HashMap<String, usize> = HashMap::new();
     let mut touched: Vec<String> = Vec::new();
@@ -1852,7 +1516,12 @@ pub async fn handle_rename_preview(
     let (mut declaration, declaration_line, symbol_name, reference_inputs) =
         hotpath::measure_block!("mcp.graph.rename_preview.graph", {
             let Some(node) = graph.symbol_summary(&occurrence)? else {
-                return node_not_found_result(&request.node_id);
+                return Ok(graph_tool_completion(
+                    GraphToolResultV1::RenamePreview(RenamePreviewPrimitiveOutcomeV1::NotFound(
+                        node_not_found_result(&request.node_id),
+                    )),
+                    Vec::new(),
+                ));
             };
             let node_metadata = required_graph_metadata(&node)?;
             let node_file = required_graph_file_path(&node)?;
@@ -1951,7 +1620,7 @@ pub async fn handle_rename_preview(
             // Text-only matches per touched file: literal identifier occurrences
             // of the name minus the graph occurrences already accounted for.
             // These are the comments/strings/dynamic-dispatch/unresolved sites a
-            // graph-only rename would miss — the scan is bounded to files that
+            // graph-only rename would miss, the scan is bounded to files that
             // already appear in the preview, so occurrences in wholly unrelated
             // files are not counted.
             let mut text_only_matches = Vec::<RenamePreviewTextOnlyMatchV1>::new();
@@ -1969,7 +1638,7 @@ pub async fn handle_rename_preview(
                     text_only_matches.push(RenamePreviewTextOnlyMatchV1 {
                         file: file.clone(),
                         text_only_count: text_only,
-                        note: "text-only matches — review manually".to_owned(),
+                        note: "text-only matches, review manually".to_owned(),
                     });
                 }
             }
@@ -1984,26 +1653,25 @@ pub async fn handle_rename_preview(
     })??;
     declaration.snippet = decl_snippet;
 
-    let output = hotpath::measure_block!(
-        "mcp.graph.rename_preview.serialize",
-        serde_json::to_value(RenamePreviewPrimitiveResultV1 {
-            read_only: true,
-            note: "Preview only — nothing is edited. 'references' are graph reference sites \
+    let result = RenamePreviewPrimitiveResultV1 {
+        read_only: true,
+        note: "Preview only. Nothing is edited. 'references' are graph reference sites \
                (the declaration is reported separately in 'node'); 'text_only_matches' are \
                literal name occurrences NOT backed by a graph edge (comments, strings, \
                dynamic dispatch, unresolved refs) and must be reviewed by hand. Graph \
                call-edge coverage improves as the resolver does."
-                .to_owned(),
-            symbol: symbol_name,
-            new_name: request.new_name,
-            node: declaration,
-            reference_count: references.len(),
-            references,
-            text_only_matches,
-        })?
-    );
-
-    Ok(generic_tool_result(ctx, &args, &output, touched_files))
+            .to_owned(),
+        symbol: symbol_name,
+        new_name: request.new_name,
+        node: declaration,
+        reference_count: references.len(),
+        references,
+        text_only_matches,
+    };
+    Ok(graph_tool_completion(
+        GraphToolResultV1::RenamePreview(RenamePreviewPrimitiveOutcomeV1::Preview(result)),
+        touched_files,
+    ))
 }
 
 #[cfg(test)]
@@ -2015,56 +1683,50 @@ mod tests {
     fn clone_lanes_report_one_unavailable_wire_protocol() {
         use tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1 as Reason;
 
-        // Retired branch-local opaque tokens — never shipped on master; must
-        // stay absent from the shared mapper wire (migrate-then-delete, not
-        // one-release alias). Request-schema / catalog `alias_of` for these
-        // tools lives on #1433 and is separable.
-        const RETIRED_OPAQUE_REASON_CODES: &[&str] = &[
-            "verified-code-redundancy-unavailable",
-            "verified-code-similarity-unavailable",
-        ];
-
-        for reason in [
-            Reason::CapabilityUnavailable,
-            Reason::AuthorityUnavailable,
-            Reason::LinkedWorktreeDisabled,
-            Reason::Cancelled,
-            Reason::TimedOut,
-            Reason::CapacityUnavailable,
-            Reason::GenerationUnavailable,
-            Reason::GenerationUnverified,
-            Reason::InvalidRequest,
-            Reason::CorruptionResetRequired,
-            Reason::Internal,
+        for (reason, code, retryable) in [
+            (
+                Reason::CapabilityUnavailable,
+                "code_index_unavailable",
+                false,
+            ),
+            (Reason::AuthorityUnavailable, "authority_unavailable", false),
+            (
+                Reason::LinkedWorktreeDisabled,
+                "linked_worktree_disabled",
+                false,
+            ),
+            (Reason::Cancelled, "cancelled", true),
+            (Reason::TimedOut, "timed_out", true),
+            (
+                Reason::CapacityUnavailable,
+                "search_capacity_unavailable",
+                true,
+            ),
+            (
+                Reason::GenerationUnavailable,
+                "generation_unavailable",
+                true,
+            ),
+            (Reason::GenerationUnverified, "generation_unverified", true),
+            (Reason::InvalidRequest, "invalid_request", false),
+            (
+                Reason::CorruptionResetRequired,
+                "index_corruption_reset_required",
+                false,
+            ),
+            (Reason::Internal, "search_failed", false),
         ] {
-            let similarity = clone_lane_unavailable_error("similarity", reason);
-            let family = clone_lane_unavailable_error("family", reason);
-            let (similarity_code, similarity_retryable, similarity_detail) = similarity
-                .project_route_context()
-                .expect("clone lane failures are typed project-route errors");
-            let (family_code, family_retryable, family_detail) = family
-                .project_route_context()
-                .expect("clone lane failures are typed project-route errors");
-            assert_eq!(similarity_code, reason.as_str());
-            assert_eq!(family_code, reason.as_str());
-            assert_eq!(similarity_retryable, reason.is_retryable());
-            assert_eq!(family_retryable, reason.is_retryable());
-            for retired in RETIRED_OPAQUE_REASON_CODES {
-                assert_ne!(
-                    similarity_code, *retired,
-                    "similarity lane must not re-emit retired opaque reason"
-                );
-                assert_ne!(
-                    family_code, *retired,
-                    "family lane must not re-emit retired opaque reason"
-                );
-                assert!(
-                    !similarity_detail.contains(retired),
-                    "similarity detail must not mention retired opaque reason"
-                );
-                assert!(
-                    !family_detail.contains(retired),
-                    "family detail must not mention retired opaque reason"
+            for lane in ["similarity", "family"] {
+                let error = clone_lane_unavailable_error(lane, reason);
+                assert_eq!(
+                    error
+                        .project_route_context()
+                        .expect("clone lane failures are typed project-route errors"),
+                    (
+                        code,
+                        retryable,
+                        format!("the maintained clone {lane} lane is unavailable: {code}").as_str(),
+                    )
                 );
             }
         }
@@ -2111,68 +1773,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn near_alignment_preserves_direction_and_offsets_selected_source_positions() {
-        let anchor = tracedecay_code_index::clones::CloneTokenAnchorV1 {
-            fingerprint: 17,
-            left_token_position: 2,
-            right_token_position: 9,
-        };
-        assert_eq!(
-            similar_alignment_anchor(anchor, 11),
-            SimilarAlignmentAnchorV1 {
-                fingerprint: 17,
-                source_token_position: 13,
-                candidate_token_position: 9,
-            }
-        );
-        assert_eq!(directional_coverage(7, 10), 700_000);
-        assert_eq!(directional_coverage(10, 0), 0);
-    }
-
-    #[test]
-    fn near_coverage_distinguishes_complete_partial_and_excluded() {
-        use tracedecay_code_index::clones::CloneBodyEligibilityV1;
-        use tracedecay_query::retrieval::lexical::CloneFingerprintPartialReasonV1;
-
-        assert_eq!(
-            similar_near_coverage(CloneBodyEligibilityV1::Eligible, &[], false),
-            SimilarNearCoverageV1::Complete
-        );
-        assert_eq!(
-            similar_near_coverage(
-                CloneBodyEligibilityV1::Eligible,
-                &[CloneFingerprintPartialReasonV1::HotPostings],
-                false,
-            ),
-            SimilarNearCoverageV1::Partial {
-                reasons: vec![SimilarNearPartialReasonV1::HotPostings]
-            }
-        );
-        assert_eq!(
-            similar_near_coverage(
-                CloneBodyEligibilityV1::ExcludedTooSmall { minimum_tokens: 14 },
-                &[],
-                false,
-            ),
-            SimilarNearCoverageV1::ExcludedTooSmall { minimum_tokens: 14 }
-        );
-    }
-
-    #[test]
-    fn near_unavailable_reason_remains_typed_at_the_mcp_boundary() {
-        assert_eq!(
-            similar_unavailable_reason(
-                tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
-            ),
-            SimilarNearUnavailableReasonV1::GenerationUnverified
-        );
-        assert_eq!(
-            similar_match_class(tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,),
-            SimilarMatchClassV1::RenameNormalizedExact
-        );
-    }
-
     #[tokio::test]
     async fn similar_unavailable_wire_preserves_reason_and_retryability() {
         let temp = tempfile::tempdir().expect("temp root");
@@ -2216,7 +1816,7 @@ mod tests {
                 },
             })
             .expect("admitted similar binding");
-            let result = handle_similar(
+            let result = compute_similar(
                 &ctx,
                 json!({
                     "project_id": admitted.project_id,
@@ -2242,170 +1842,6 @@ mod tests {
             assert_eq!(wire["error"]["data"]["reason_code"], reason_code);
             assert_eq!(wire["error"]["data"]["retryable"], retryable);
         }
-    }
-
-    fn similar_test_digest(fill: char) -> tracedecay_domain::ManifestDigest {
-        tracedecay_domain::ManifestDigest::new(format!("sha256:{}", fill.to_string().repeat(64)))
-            .expect("fixture digest")
-    }
-
-    fn similar_test_payload(fill: char) -> tracedecay_code_index::clones::CloneBodyPayloadV1 {
-        use tracedecay_code_extraction::{
-            CloneBodyRenameStatusV1, CloneBodyTokenizationStatusV1, ConservativeCloneTokenV1,
-        };
-
-        let token = ConservativeCloneTokenV1::Syntax {
-            syntax_kind: "identifier".to_owned(),
-            text: "fixture".to_owned(),
-        };
-        let tokens = vec![token; 8];
-        tracedecay_code_index::clones::CloneBodyPayloadV1 {
-            payload_digest: similar_test_digest(fill),
-            language: "rust".to_owned(),
-            symbol_kind: "function".to_owned(),
-            body_digest: similar_test_digest(fill),
-            token_count: tokens.len() as u32,
-            conservative_normalization_revision: 1,
-            conservative_digest: similar_test_digest(fill),
-            conservative_tokens: tokens.clone(),
-            tokenization_status: CloneBodyTokenizationStatusV1::Complete,
-            tokenization_issues: Vec::new(),
-            rename_normalization_revision: Some(1),
-            rename_digest: Some(similar_test_digest(fill)),
-            rename_tokens: Some(tokens),
-            rename_coverage: CloneBodyRenameStatusV1::Complete,
-            rename_issues: Vec::new(),
-        }
-    }
-
-    fn similar_test_occurrence(
-        project_id: &str,
-        repository_id: &str,
-        symbol_occurrence_id: &str,
-        path: &str,
-        payload_digest: tracedecay_domain::ManifestDigest,
-    ) -> tracedecay_code_index::clones::CloneBodyOccurrenceV1 {
-        tracedecay_code_index::clones::CloneBodyOccurrenceV1 {
-            project_id: tracedecay_domain::ProjectId::new(project_id).expect("fixture project"),
-            repository_id: tracedecay_domain::RepositoryId::new(repository_id)
-                .expect("fixture repository"),
-            worktree_id: None,
-            source_generation: tracedecay_domain::CodeGenerationId::new("generation.similar")
-                .expect("fixture generation"),
-            snapshot_digest: similar_test_digest('a'),
-            symbol_occurrence_id: tracedecay_domain::SymbolOccurrenceId::new(symbol_occurrence_id)
-                .expect("fixture symbol occurrence"),
-            path: path.to_owned(),
-            body_span: tracedecay_domain::SourceSpan {
-                start_byte: 0,
-                end_byte: 80,
-            },
-            payload_digest,
-            eligibility: tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible,
-        }
-    }
-
-    #[test]
-    fn near_wire_truncation_keeps_the_authenticated_cursor_for_omitted_occurrences() {
-        let project = "project.similar-pagination";
-        let repository = "repository.similar-pagination";
-        let source_payload = similar_test_payload('a');
-        let candidate_payload = similar_test_payload('b');
-        let source = tracedecay_code_index::clones::CodeIndexCloneBodyV1 {
-            payload: std::sync::Arc::new(source_payload),
-            occurrence: similar_test_occurrence(
-                project,
-                repository,
-                "symbol.source",
-                "src/source.rs",
-                similar_test_digest('a'),
-            ),
-        };
-        let candidate_a = similar_test_occurrence(
-            project,
-            repository,
-            "symbol.candidate.a",
-            "src/candidate-a.rs",
-            similar_test_digest('b'),
-        );
-        let candidate_b = similar_test_occurrence(
-            project,
-            repository,
-            "symbol.candidate.b",
-            "src/candidate-b.rs",
-            similar_test_digest('b'),
-        );
-        let candidate =
-            tracedecay_query::retrieval::lexical::CloneSelectedBlockArtifactCandidateV1 {
-                payload: candidate_payload,
-                occurrences: vec![candidate_a.clone(), candidate_b],
-                anchors: Vec::new(),
-                containment:
-                    tracedecay_query::retrieval::lexical::CloneSelectedBlockContainmentClassV1::Equal,
-            };
-        let near = tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
-            tracedecay_query::retrieval::lexical::AuthenticatedCloneSelectedBlockArtifactReadV1 {
-                page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
-                    members: vec![candidate],
-                    next_cursor: Some("ccclone2.authenticated-occurrence-tail".to_owned()),
-                },
-                stream: tracedecay_query::retrieval::lexical::CloneFingerprintStreamDescriptorV1 {
-                    language: "rust".to_owned(),
-                    class: tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,
-                    normalization_revision: 1,
-                    rename_tier_unavailable: None,
-                },
-                coverage: tracedecay_domain::RetrieverCoverage::default(),
-                partial_reasons: Vec::new(),
-                accounting:
-                    tracedecay_query::retrieval::lexical::CloneFingerprintReadAccountingV1::default(
-                    ),
-            },
-        );
-        let mut remaining = 1;
-        let (result, touched_files, wire_limit_reached) = similar_near_result(
-            &source,
-            SimilarSourceExtentV1::SelectedTokenRange { start: 0, end: 8 },
-            near,
-            tracedecay_domain::ProjectId::new(project).expect("fixture project"),
-            tracedecay_domain::RepositoryId::new(repository).expect("fixture repository"),
-            &mut remaining,
-        )
-        .expect("near page flattens");
-
-        assert!(wire_limit_reached);
-        assert_eq!(remaining, 0);
-        assert_eq!(result.matches.len(), 1);
-        assert_eq!(
-            result.matches[0].candidate.symbol_occurrence_id.as_str(),
-            "symbol.candidate.a"
-        );
-        assert_eq!(
-            result.next_cursor.as_deref(),
-            Some("ccclone2.authenticated-occurrence-tail")
-        );
-        assert_eq!(touched_files, vec!["src/candidate-a.rs"]);
-    }
-
-    #[test]
-    fn near_wire_truncation_without_a_cursor_fails_closed() {
-        let near = SimilarNearResultV1 {
-            extent: SimilarSourceExtentV1::WholeBody,
-            matches: Vec::new(),
-            coverage: SimilarNearCoverageV1::Complete,
-            next_cursor: None,
-        };
-
-        let error = ensure_similar_near_continuation(&near, true)
-            .expect_err("omitted near occurrences require a continuation");
-        assert_eq!(
-            error.project_route_context(),
-            Some((
-                "similar-pagination-unavailable",
-                true,
-                "verified similar near results omitted occurrences without an authenticated continuation",
-            ))
-        );
     }
 
     #[tokio::test]
@@ -2449,7 +1885,7 @@ mod tests {
                 },
             })
             .expect("admitted redundancy binding");
-            let result = handle_redundancy(
+            let result = compute_redundancy(
                 &ctx,
                 json!({
                     "project_id": admitted.project_id,
@@ -2497,7 +1933,7 @@ mod tests {
             .as_str();
 
         // Admit the sibling lane so the request is authorized, then omit the
-        // lane under test — the Codex P2 gap (opaque missing-executor tokens).
+        // lane under test, the Codex P2 gap (opaque missing-executor tokens).
         let similar_stub: tracedecay_query::code_search::CodeIndexSimilarExecutor =
             std::sync::Arc::new(|_| {
                 Box::pin(async {
@@ -2515,7 +1951,7 @@ mod tests {
             },
         })
         .expect("admitted similar-only binding");
-        let redundancy_err = handle_redundancy(
+        let redundancy_err = compute_redundancy(
             &redundancy_ctx,
             json!({
                 "project_id": admitted.project_id,
@@ -2558,7 +1994,7 @@ mod tests {
             },
         })
         .expect("admitted redundancy-only binding");
-        let similar_err = handle_similar(
+        let similar_err = compute_similar(
             &similar_ctx,
             json!({
                 "project_id": admitted.project_id,
@@ -2799,9 +2235,9 @@ mod tests {
         let outcome = execute_code_index_search(
             Some(&executor),
             tracedecay_query::code_search::CodeIndexSearchRequestV1 {
-                semantic_mode: None,
                 project_root: std::path::PathBuf::from("/fixture"),
                 query: "fixture".to_owned(),
+                semantic_mode: None,
                 source_revision: None,
                 source_tree: None,
                 source_reference: None,
@@ -2832,9 +2268,9 @@ mod tests {
         let outcome = execute_code_index_search(
             None,
             tracedecay_query::code_search::CodeIndexSearchRequestV1 {
-                semantic_mode: None,
                 project_root: std::path::PathBuf::from("/fixture"),
                 query: "fixture".to_owned(),
+                semantic_mode: None,
                 source_revision: None,
                 source_tree: None,
                 source_reference: None,
@@ -2916,95 +2352,6 @@ mod tests {
     }
 
     #[test]
-    fn canonical_fact_identity_and_source_survive_both_context_renderings() {
-        use tracedecay_contracts::memory::{FactCommitOwnerV1, FactIdentitySourceResultV1};
-        use tracedecay_domain::{
-            FactAssertionId, FactEventId, LocatorDigest, ProjectId, RetrievalAnchorId, UtcMicros,
-        };
-
-        let profile_hit = context_memory_hit("profile content");
-        let mut project_hit = context_memory_hit("project content");
-        project_hit.fact.owner = FactCommitOwnerV1::Project {
-            project_id: ProjectId::new("project.context-memory").expect("project identity"),
-        };
-        project_hit.fact.active_assertion_id =
-            FactAssertionId::new("assertion.project-context").expect("assertion identity");
-        project_hit.fact.last_event_id =
-            FactEventId::new("event.project-context").expect("event identity");
-        project_hit.fact.source = FactIdentitySourceResultV1::Evidence {
-            anchor_id: RetrievalAnchorId::new("retrieval.source.context").expect("source anchor"),
-            stable_key: LocatorDigest::new(format!("sha256:{}", "a".repeat(64)))
-                .expect("stable locator"),
-        };
-        let hits = vec![profile_hit, project_hit];
-        let request: ContextSurfaceRequestV1 =
-            serde_json::from_value(json!({"task": "context"})).expect("request");
-        let contribution =
-            ContextMemoryContributionV1::from_matches(&request, &hits, None, None, UtcMicros(20))
-                .expect("canonical contribution");
-        assert!(
-            ContextMemoryContributionV1::from_matches(
-                &request,
-                &vec![hits[0].clone(); 11],
-                None,
-                None,
-                UtcMicros(20)
-            )
-            .is_err()
-        );
-        let history_request: ContextSurfaceRequestV1 = serde_json::from_value(json!({
-            "task": "history", "temporal_query": tracedecay_contracts::memory::CognitiveRecallTemporalQuery::current(UtcMicros(10)).with_history()
-        })).expect("history request");
-        for (supplied_hits, supplied_mode) in [
-            (
-                hits.as_slice(),
-                tracedecay_contracts::memory::CognitiveRecallTemporalMode::History,
-            ),
-            (
-                &[][..],
-                tracedecay_contracts::memory::CognitiveRecallTemporalMode::AsOf,
-            ),
-        ] {
-            assert!(ContextMemoryContributionV1::from_matches(
-                &history_request,
-                supplied_hits,
-                None,
-                Some(tracedecay_contracts::retrieval::ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
-                    requested_mode: supplied_mode,
-                }),
-                UtcMicros(20)
-            ).is_err());
-        }
-        for args in [json!({}), json!({"format": "json"})] {
-            let result = rendered_context_tool_result(
-                Path::new("."),
-                &args,
-                json!({"memory_matches": hits}),
-                Vec::new(),
-                "### Memory Matches\nRendered summary with no identity parsing.\n".to_owned(),
-                None,
-                contribution.clone(),
-            );
-            let carried = result
-                .context_memory_contribution()
-                .expect("typed context sidecar");
-            assert_eq!(carried.facts().len(), hits.len());
-            for (carried, hit) in carried.facts().iter().zip(&hits) {
-                assert_eq!(carried.owner, hit.fact.owner);
-                assert_eq!(carried.fact_id, hit.fact.fact_id);
-                assert_eq!(carried.last_event_id, hit.fact.last_event_id);
-                assert_eq!(carried.active_assertion_id, hit.fact.active_assertion_id);
-                assert_eq!(carried.source, hit.fact.source);
-            }
-            assert!(result.value.get("context_memory_contribution").is_none());
-            let rendered = result.value["content"][0]["text"]
-                .as_str()
-                .expect("rendered context text");
-            assert!(!rendered.contains("context_memory_contribution"));
-        }
-    }
-
-    #[test]
     fn context_memory_section_keeps_full_content_for_retrieval_handle() {
         let content = format!("{}tail-marker", "long memory body ".repeat(100));
         let hit = context_memory_hit(&content);
@@ -3017,19 +2364,6 @@ mod tests {
         assert!(section.contains("tail-marker"));
         assert!(!section.contains("..."));
         assert!(section.contains("tracedecay_fact_feedback"));
-    }
-
-    #[test]
-    fn context_memory_section_compacts_multiline_content() {
-        let hit = context_memory_hit("first line\n# heading\n- item");
-
-        let Some(section) = context_memory_section(&[hit], None, None) else {
-            panic!("memory hit should render");
-        };
-
-        assert!(section.contains("first line # heading - item"));
-        assert!(!section.contains("\n# heading"));
-        assert!(!section.contains("\n- item"));
     }
 
     #[test]

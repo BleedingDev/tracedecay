@@ -1,9 +1,7 @@
 #![cfg(unix)]
 
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
-use std::process::Command;
 
 use tempfile::TempDir;
 use tracedecay_contracts::retained_surfaces::{MemoryStatusRequestV1, RetainedSurfaceRequestV1};
@@ -29,26 +27,6 @@ use tracedecay_daemon_protocol::WorkApplicationInvocationV1;
 use tracedecay_daemon_service::{
     DaemonInvocationProblem, ProjectRuntimePublicationStateV1, RegisteredRetainedRuntime,
 };
-
-static PROJECT_OPEN_FAILURE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-struct ProjectOpenFailureReset;
-
-impl Drop for ProjectOpenFailureReset {
-    fn drop(&mut self) {
-        super::super::project_composition::clear_project_open_failure();
-    }
-}
-
-fn git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .status()
-        .expect("run Git fixture command");
-    assert!(status.success(), "git {args:?}");
-}
 
 async fn committed_fixture(
     label: &str,
@@ -84,14 +62,14 @@ async fn unopened_committed_fixture(
         .expect("committed invocation source");
     let client_identity = test_client_identity_for(profile_root.clone());
     initialize_test_project(&project, &client_identity).await;
-    git(&project, &["init", "--quiet"]);
-    git(&project, &["config", "user.name", "TraceDecay Test"]);
-    git(
+    super::git(&project, &["init", "--quiet"]);
+    super::git(&project, &["config", "user.name", "TraceDecay Test"]);
+    super::git(
         &project,
         &["config", "user.email", "tracedecay@example.invalid"],
     );
-    git(&project, &["add", "."]);
-    git(&project, &["commit", "--quiet", "-m", "base"]);
+    super::git(&project, &["add", "."]);
+    super::git(&project, &["commit", "--quiet", "-m", "base"]);
     let project_alias = temp.path().join("project-alias");
     std::os::unix::fs::symlink(&project, &project_alias).expect("committed project alias");
     let handshake = DaemonHandshake {
@@ -198,7 +176,7 @@ fn assert_work_routes_mounted<'a>(
         // verified version identity requires a real event sequence, so there
         // is no representable empty current graph to answer with: the mounted
         // owner answers the authorized absence as a concealed
-        // not-found-or-not-authorized. That still proves routing — an
+        // not-found-or-not-authorized. That still proves routing, an
         // unmounted owner never reaches the Work application and answers
         // `Problem::Unavailable` instead, exactly as the unregistered-project
         // test below asserts.
@@ -364,9 +342,9 @@ fn memory_status_request(request_id: &str) -> DaemonInvocationRequest {
 }
 
 /// The core route is admitted before the full server's owner phase registers
-/// the retained runtime. Hold that phase open — the configuration registration
+/// the retained runtime. Hold that phase open, the configuration registration
 /// pause sits in the same owner phase, just ahead of the retained registration
-/// — and prove that a retained request landing in the window reads as the
+///, and prove that a retained request landing in the window reads as the
 /// owner still mounting, retryable, and never as a scope that has no retained
 /// runtime. Once the phase completes the same request is answered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -431,7 +409,10 @@ async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
     let diagnostic = problem
         .diagnostic()
         .expect("a mounting retained owner carries a diagnostic");
-    assert_eq!(diagnostic.code, "application.surface.unavailable");
+    assert_eq!(
+        diagnostic.code,
+        tracedecay_contracts::RUNTIME_MOUNTING_REASON_CODE
+    );
     assert!(
         !diagnostic
             .message
@@ -477,298 +458,6 @@ async fn retained_invocation_while_owners_mount_is_retryable_not_unmounted() {
     assert!(
         shutdown.project_servers.is_clean(),
         "the retained owner must shut down cleanly: {shutdown:?}"
-    );
-}
-
-/// Provider preparation and activation happen after the exact core route is
-/// ready. Either failure must retire the private full candidate and its owners
-/// while leaving that core route usable and truthfully marked degraded.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn provider_upgrade_failure_retains_the_admitted_core_route() {
-    let _failure_lock = PROJECT_OPEN_FAILURE_TEST_LOCK.lock().await;
-    let _failure_reset = ProjectOpenFailureReset;
-
-    for (phase, label, expected_publication) in [
-        (
-            super::super::project_composition::ProjectOpenFailurePhase::ProviderMount,
-            "provider-mount-failure-retains-core",
-            Some(ProjectRuntimePublicationStateV1::Failed),
-        ),
-        (
-            super::super::project_composition::ProjectOpenFailurePhase::ProviderActivated,
-            "provider-activation-failure-retains-core",
-            Some(ProjectRuntimePublicationStateV1::Failed),
-        ),
-    ] {
-        let (_temp, _database_scope, engine, handshake) = unopened_committed_fixture(label).await;
-        let canonical_project = handshake
-            .project_path
-            .as_deref()
-            .expect("project alias")
-            .canonicalize()
-            .expect("canonical project root");
-        let route = super::super::ProjectRouteKey::from_handshake(&canonical_project, &handshake)
-            .expect("project route");
-        let holder_count_before = engine
-            .invocation
-            .service
-            .session_holder_database_count()
-            .await;
-
-        super::super::project_composition::fail_project_open_after(phase);
-        let core = engine
-            .project_server(&handshake)
-            .await
-            .unwrap_or_else(|error| panic!("{phase:?} must degrade to the admitted core: {error}"));
-
-        let registered_key = {
-            let servers = engine.store_administration.project_servers().lock().await;
-            let (key, registered) = servers
-                .get_route(&route)
-                .expect("the exact core route remains registered");
-            assert_eq!(
-                servers
-                    .servers
-                    .get(key)
-                    .expect("registered core entry")
-                    .publication,
-                super::super::project_open_admission::ProjectServerPublication::Core,
-                "{phase:?} must not fabricate full publication"
-            );
-            assert!(
-                std::sync::Arc::ptr_eq(registered, &core),
-                "{phase:?} must return the exact retained core"
-            );
-            key.clone()
-        };
-        assert_eq!(
-            engine
-                .invocation
-                .service
-                .project_runtimes
-                .publication_state(&canonical_project),
-            expected_publication,
-            "{phase:?} must preserve the publication boundary reached before degradation"
-        );
-        assert!(
-            !engine
-                .invocation
-                .service
-                .project_runtimes
-                .holds::<RegisteredRetainedRuntime>(&canonical_project)
-                .await,
-            "{phase:?} must retire the failed full retained owner"
-        );
-        assert_eq!(
-            engine
-                .invocation
-                .service
-                .session_holder_database_count()
-                .await,
-            holder_count_before,
-            "{phase:?} must release full-candidate session-holder leases"
-        );
-
-        let observed_at = tracedecay_contracts::clock::now_micros();
-        assert_primitive_routes_mounted(
-            &engine,
-            &handshake,
-            observed_at,
-            Deadline::new(UtcMicros(observed_at.0.saturating_add(30_000_000)))
-                .expect("daemon invocation deadline"),
-            CancellationContext::active(format!("cancel.{label}"))
-                .expect("daemon invocation cancellation"),
-        )
-        .await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            engine
-                .automation_config_probe_attempts
-                .load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "{phase:?} must not start full-owner automation against a core-only route"
-        );
-        assert!(
-            !engine
-                .store_administration
-                .automation_schedulers()
-                .lock()
-                .await
-                .contains_key(&registered_key),
-            "{phase:?} must not publish a full-owner automation scheduler"
-        );
-
-        let shutdown = engine.shutdown_all().await;
-        assert!(
-            shutdown.project_servers.is_clean(),
-            "retained core must shut down cleanly after {phase:?}: {shutdown:?}"
-        );
-        super::super::project_composition::clear_project_open_failure();
-    }
-}
-
-/// A failure after dependent owner registration must remove every owner the
-/// attempt mounted before the next open. In particular, runtime retirement is
-/// reopenable here: terminal retirement would leave the root fenced and make
-/// the final retry fail before it could publish a new runtime.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_full_publication_unwinds_every_owner_before_retry() {
-    let _failure_lock = PROJECT_OPEN_FAILURE_TEST_LOCK.lock().await;
-    let _failure_reset = ProjectOpenFailureReset;
-    let (_temp, _database_scope, engine, handshake) =
-        unopened_committed_fixture("failed-full-publication-retry").await;
-    let canonical_project = handshake
-        .project_path
-        .as_deref()
-        .expect("project alias")
-        .canonicalize()
-        .expect("canonical project root");
-    let route = super::super::ProjectRouteKey::from_handshake(&canonical_project, &handshake)
-        .expect("project route");
-    let project_id = engine
-        .store_administration
-        .registered_profile_database()
-        .await
-        .expect("profile database")
-        .project_registry_context_by_alias(&canonical_project)
-        .await
-        .expect("project registry context")
-        .expect("registered project context")
-        .project
-        .project_id;
-    let holder_count_before = engine
-        .invocation
-        .service
-        .session_holder_database_count()
-        .await;
-
-    super::super::project_composition::fail_project_open_after(
-        super::super::project_composition::ProjectOpenFailurePhase::DependentOwners,
-    );
-    let failure = match engine.project_server(&handshake).await {
-        Ok(_) => panic!("injected dependent-owner failure must reject the open"),
-        Err(error) => error,
-    };
-    assert!(
-        failure
-            .to_string()
-            .contains("injected project-open failure"),
-        "the test must stop at the requested publication phase: {failure}"
-    );
-
-    assert!(
-        engine
-            .store_administration
-            .project_servers()
-            .lock()
-            .await
-            .get_route(&route)
-            .is_none(),
-        "failed publication must remove the MCP route before retry"
-    );
-    assert!(
-        engine
-            .http_application_registry
-            .resolve(&project_id)
-            .await
-            .expect("failed HTTP route resolution")
-            .is_none(),
-        "failed publication must leave the HTTP route unreachable"
-    );
-    assert_eq!(
-        engine
-            .invocation
-            .service
-            .project_runtimes
-            .publication_state(&canonical_project),
-        None,
-        "failed publication must remove its runtime publication"
-    );
-    assert!(
-        !engine
-            .invocation
-            .service
-            .project_runtimes
-            .holds::<RegisteredRetainedRuntime>(&canonical_project)
-            .await,
-        "failed publication must remove the retained runtime owner"
-    );
-    assert!(
-        engine
-            .invocation
-            .service
-            .lsp_owner(Some(&canonical_project))
-            .await
-            .is_none(),
-        "failed publication must remove the LSP owner"
-    );
-    assert!(
-        engine
-            .invocation
-            .service
-            .feedback_cycle(Some(&canonical_project))
-            .await
-            .is_none(),
-        "failed publication must remove the feedback owner"
-    );
-    assert_eq!(
-        engine
-            .invocation
-            .service
-            .session_holder_database_count()
-            .await,
-        holder_count_before,
-        "failed publication must release every session-holder lease it added"
-    );
-
-    let retried = engine
-        .project_server(&handshake)
-        .await
-        .expect("same project must retry after transactional rollback");
-    assert_eq!(
-        engine
-            .invocation
-            .service
-            .project_runtimes
-            .publication_state(&canonical_project),
-        Some(ProjectRuntimePublicationStateV1::Ready),
-        "retry must reach the full Ready publication"
-    );
-    assert!(
-        engine
-            .store_administration
-            .project_servers()
-            .lock()
-            .await
-            .get_route(&route)
-            .is_some_and(|(_, server)| std::sync::Arc::ptr_eq(server, &retried)),
-        "retry must publish its new full server in the MCP registry"
-    );
-    assert!(
-        engine
-            .http_application_registry
-            .resolve(&project_id)
-            .await
-            .expect("retry HTTP route resolution")
-            .is_some(),
-        "retry must mount the HTTP route after full publication"
-    );
-    assert!(
-        engine
-            .invocation
-            .service
-            .session_holder_database_count()
-            .await
-            > holder_count_before,
-        "retry must remount its session-holder leases"
-    );
-
-    let shutdown = engine.shutdown_all().await;
-    assert!(
-        shutdown.project_servers.is_clean(),
-        "retry publication must shut down cleanly: {shutdown:?}"
     );
 }
 

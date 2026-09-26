@@ -8,8 +8,9 @@ use tracedecay_contracts::retained_surfaces::{
     LcmDoctorHealthV1, LcmDoctorProjectionStateV1, LcmDoctorProjectionV1, LcmDoctorRequestV1,
     LcmDoctorResultV1, LcmExpandQueryRequestV1, LcmExpandRequestV1, LcmGrepRequestV1,
     LcmLifecycleStatusV1, LcmLoadSessionRequestV1, LcmPayloadCoverageStateV1, LcmPayloadCoverageV1,
-    LcmPayloadGcStatusV1, LcmPayloadStatusV1, LcmRedactionStatusV1, LcmRoleV1, LcmStatusRequestV1,
-    LcmStatusResultV1, LcmStatusV1, LcmStoreStatusV1, LcmStoreTokenCoverageV1, LcmTemporalModeV1,
+    LcmPayloadGcStatusV1, LcmPayloadStatusV1, LcmRedactionStatusV1, LcmStatusRequestV1,
+    LcmStatusResultV1, LcmStatusV1, LcmStoreStatusV1, LcmStoreTokenCoverageV1,
+    LcmSummaryConvergenceReasonV1, LcmSummaryConvergenceStateV1, LcmSummaryConvergenceStatusV1,
     MessageRelationshipScopeV1, MessageTypeFilterV1, RetainedOutcomeStatusV1,
     RetainedSurfaceOperation, RetainedSurfaceResultV1, RetainedTimeFilterV1,
     RetrievalWorkerStatusV1,
@@ -19,8 +20,9 @@ use tracedecay_contracts::{
     RetainedLcmRequestV1, RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
     RetainedSurfaceExecutionFutureV1,
 };
-use tracedecay_domain::{SessionId, TemporalModeV1, UtcMicros};
+use tracedecay_domain::SessionId;
 use tracedecay_lcm::LcmStatus;
+use tracedecay_lcm::summary_convergence::LcmSummaryConvergenceQueueState;
 use tracedecay_lcm::types::LcmPayloadCoverageState;
 use tracedecay_session_memory::session::lcm::{
     LcmAuthorityOperation, LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest,
@@ -527,22 +529,7 @@ impl<'a> DirectRetainedLcmPortV1<'a> {
         })?;
         let health = lcm_doctor_health(report);
         let projection = self.projection_serving_status().map(lcm_doctor_projection);
-        let status = match health.status {
-            // A healthy store whose projection is still converging (or has no
-            // serving worker) is partial evidence: nothing is wrong with the
-            // schema, but what it serves is not yet the preserved history.
-            LcmDoctorHealthStatusV1::Complete
-                if projection.as_ref().is_some_and(|projection| {
-                    projection.state != LcmDoctorProjectionStateV1::Current
-                }) =>
-            {
-                RetainedOutcomeStatusV1::Partial
-            }
-            LcmDoctorHealthStatusV1::Complete => RetainedOutcomeStatusV1::Complete,
-            LcmDoctorHealthStatusV1::Partial => RetainedOutcomeStatusV1::Partial,
-            LcmDoctorHealthStatusV1::Unavailable => RetainedOutcomeStatusV1::Unavailable,
-            LcmDoctorHealthStatusV1::Locked => RetainedOutcomeStatusV1::Locked,
-        };
+        let status = lcm_doctor_outcome_status(&health, projection.as_ref());
         // The health reason (a failed probe and its storage error, or a path
         // API refusal) is the operator's only pointer to why diagnosis did
         // not complete, so the result carries it at the top as well.
@@ -569,6 +556,36 @@ impl<'a> DirectRetainedLcmPortV1<'a> {
                 retrieval.projection_serving_status()
             }
             DirectRetainedLcmAuthority::Profile { .. } => None,
+        }
+    }
+}
+
+fn lcm_doctor_outcome_status(
+    health: &LcmDoctorHealthV1,
+    projection: Option<&LcmDoctorProjectionV1>,
+) -> RetainedOutcomeStatusV1 {
+    match health.status {
+        // A healthy store whose projection is still converging (or has no
+        // serving worker) is partial evidence: nothing is wrong with the
+        // schema, but what it serves is not yet the preserved history.
+        LcmDoctorHealthStatusV1::Complete
+            if projection.is_some_and(|projection| {
+                projection.state != LcmDoctorProjectionStateV1::Current
+            }) =>
+        {
+            RetainedOutcomeStatusV1::Partial
+        }
+        LcmDoctorHealthStatusV1::Complete => RetainedOutcomeStatusV1::Complete,
+        LcmDoctorHealthStatusV1::Partial
+        | LcmDoctorHealthStatusV1::Unavailable
+        | LcmDoctorHealthStatusV1::Locked => {
+            // The doctor ran and observed this state. Projecting its diagnostic
+            // payload as an authority-unavailable pre-admission problem made
+            // the CLI reconnect every 250 ms until its 120 s deadline and
+            // discarded the only explanation (for example, the synchronous
+            // size budget). Preserve the exact health state/reason in the
+            // payload and mark the evidence itself partial.
+            RetainedOutcomeStatusV1::Partial
         }
     }
 }
@@ -710,7 +727,6 @@ const fn lcm_unavailable_reason(reason: LcmAuthorityUnavailableReason) -> &'stat
     match reason {
         LcmAuthorityUnavailableReason::StoreAuthorityUnavailable => "store_authority_unavailable",
         LcmAuthorityUnavailableReason::HostProtocolUnavailable => "host_protocol_unavailable",
-        LcmAuthorityUnavailableReason::HostPayloadUnavailable => "host_payload_unavailable",
     }
 }
 
@@ -823,10 +839,42 @@ fn lcm_status(value: LcmStatus) -> LcmStatusV1 {
             last_finalized_session_id: value.lifecycle.last_finalized_session_id,
             last_finalized_frontier_store_id: value.lifecycle.last_finalized_frontier_store_id,
         },
+        summary_convergence: LcmSummaryConvergenceStatusV1 {
+            pending_session_count: value.summary_convergence.pending_session_count,
+            retryable_session_count: value.summary_convergence.retryable_session_count,
+            current_session_count: value.summary_convergence.current_session_count,
+            unavailable_session_count: value.summary_convergence.unavailable_session_count,
+            permanent_session_count: value.summary_convergence.permanent_session_count,
+            reasons: value
+                .summary_convergence
+                .reasons
+                .into_iter()
+                .map(|reason| LcmSummaryConvergenceReasonV1 {
+                    state: match reason.state {
+                        LcmSummaryConvergenceQueueState::Pending => {
+                            LcmSummaryConvergenceStateV1::Pending
+                        }
+                        LcmSummaryConvergenceQueueState::Retryable => {
+                            LcmSummaryConvergenceStateV1::Retryable
+                        }
+                        LcmSummaryConvergenceQueueState::Current => {
+                            LcmSummaryConvergenceStateV1::Current
+                        }
+                        LcmSummaryConvergenceQueueState::Unavailable => {
+                            LcmSummaryConvergenceStateV1::Unavailable
+                        }
+                        LcmSummaryConvergenceQueueState::Permanent => {
+                            LcmSummaryConvergenceStateV1::Permanent
+                        }
+                    },
+                    reason: reason.reason,
+                    session_count: reason.session_count,
+                })
+                .collect(),
+        },
         redaction: LcmRedactionStatusV1 {
             enabled: value.redaction.enabled,
             lossy_records: value.redaction.lossy_records,
-            legacy_truncated_count: value.redaction.legacy_truncated_count,
         },
     }
 }
@@ -963,49 +1011,12 @@ pub(super) fn unsigned_i64(
         .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)
 }
 
-pub(super) fn temporal_mode(
-    mode: Option<LcmTemporalModeV1>,
-    as_of: Option<u64>,
-    default: TemporalModeV1,
-) -> Result<TemporalModeV1, RetainedSurfaceExecutionErrorV1> {
-    match mode {
-        None => Ok(default),
-        Some(LcmTemporalModeV1::Current) => Ok(TemporalModeV1::Current),
-        Some(LcmTemporalModeV1::Evolution) => Ok(TemporalModeV1::Evolution),
-        Some(LcmTemporalModeV1::Forensic) => Ok(TemporalModeV1::Forensic),
-        Some(LcmTemporalModeV1::AsOf) => Ok(TemporalModeV1::AsOf {
-            cutoff: UtcMicros(
-                i64::try_from(as_of.ok_or(RetainedSurfaceExecutionErrorV1::InvalidRequest)?)
-                    .map_err(|_| RetainedSurfaceExecutionErrorV1::InvalidRequest)?,
-            ),
-        }),
-    }
-}
-
 pub(super) fn relationship_scope(value: Option<MessageRelationshipScopeV1>) -> SessionSearchScope {
-    match value.unwrap_or(MessageRelationshipScopeV1::All) {
-        MessageRelationshipScopeV1::All => SessionSearchScope::All,
-        MessageRelationshipScopeV1::ParentsOnly => SessionSearchScope::ParentsOnly,
-        MessageRelationshipScopeV1::SubagentsOnly => SessionSearchScope::SubagentsOnly,
-    }
+    SessionSearchScope::from(value.unwrap_or(MessageRelationshipScopeV1::All))
 }
 
 pub(super) fn message_type(value: Option<MessageTypeFilterV1>) -> SessionMessageType {
-    match value.unwrap_or(MessageTypeFilterV1::All) {
-        MessageTypeFilterV1::All => SessionMessageType::All,
-        MessageTypeFilterV1::DirectUser => SessionMessageType::DirectUser,
-        MessageTypeFilterV1::ToolResult => SessionMessageType::ToolResult,
-    }
-}
-
-pub(super) const fn role_name(value: LcmRoleV1) -> &'static str {
-    match value {
-        LcmRoleV1::System => "system",
-        LcmRoleV1::User => "user",
-        LcmRoleV1::Assistant => "assistant",
-        LcmRoleV1::Tool => "tool",
-        LcmRoleV1::Unknown => "unknown",
-    }
+    SessionMessageType::from(value.unwrap_or(MessageTypeFilterV1::All))
 }
 
 pub(super) fn time_filter(
@@ -1035,4 +1046,42 @@ pub(super) fn time_filter(
     parsed
         .map(Some)
         .ok_or(RetainedSurfaceExecutionErrorV1::InvalidRequest)
+}
+
+#[cfg(test)]
+mod tests {
+    use tracedecay_contracts::retained_surfaces::{
+        LcmAuthorityOutcomeV1, LcmDoctorHealthStatusV1, LcmDoctorHealthV1, LcmDoctorResultV1,
+        RetainedOutcomeStatusV1, RetainedSurfaceResultV1,
+    };
+
+    use super::lcm_doctor_outcome_status;
+
+    #[test]
+    fn diagnosed_unavailable_health_remains_a_partial_doctor_result() {
+        for health_status in [
+            LcmDoctorHealthStatusV1::Unavailable,
+            LcmDoctorHealthStatusV1::Locked,
+        ] {
+            let health = LcmDoctorHealthV1 {
+                status: health_status,
+                findings: Vec::new(),
+                reason: Some("synchronous_diagnosis_size_budget_exceeded".to_owned()),
+            };
+            let status = lcm_doctor_outcome_status(&health, None);
+            let result = RetainedSurfaceResultV1::LcmDoctor(LcmDoctorResultV1 {
+                status,
+                authority_outcome: LcmAuthorityOutcomeV1::Ready,
+                health: Some(health),
+                projection: None,
+                reason: Some("synchronous_diagnosis_size_budget_exceeded".to_owned()),
+            });
+
+            assert_eq!(status, RetainedOutcomeStatusV1::Partial);
+            assert!(
+                result.evidence_facts().is_ok(),
+                "the observed health state is the doctor's diagnostic payload, not an unmounted authority"
+            );
+        }
+    }
 }

@@ -1,6 +1,6 @@
 use schemars::JsonSchema;
 use tracedecay_tool_catalog::{
-    ApplicationSurfaceOperation, AvailabilityContract, BindingId, BindingStatus, BindingSurface,
+    ApplicationSurfaceOperation, AvailabilityContract, BindingId, BindingSurface,
     CancellationContract, CancellationPoint, CapabilityId, CatalogContributionInputV1,
     CatalogContributionV1, ContributionContractRef, ContributionId, CoverageContractRef,
     DeadlineBehavior, DeadlineContract, DeniedDisclosurePolicy, EffectClass,
@@ -19,12 +19,31 @@ use crate::capability_manifest::{
 use crate::error::ApplicationContractError;
 use crate::handlers::{ApplicationHandlerDescriptor, ApplicationOperation};
 use crate::result::ResultContractRef;
+use crate::retrieval::DependencyDepthResultV1;
+use crate::retrieval::analysis_report_surface::{
+    CircularResultV1, CircularSurfaceRequestV1, ComplexityReportV1, ComplexitySurfaceRequestV1,
+    ConstructorsResultV1, ConstructorsSurfaceRequestV1, CouplingResultV1, CouplingSurfaceRequestV1,
+    DeadCodeResultV1, DeadCodeSurfaceRequestV1, DistributionResultV1, DistributionSurfaceRequestV1,
+    DocCoverageResultV1, DocCoverageSurfaceRequestV1, FieldSitesResultV1,
+    FieldSitesSurfaceRequestV1, GodClassResultV1, GodClassSurfaceRequestV1, HotspotsResultV1,
+    HotspotsSurfaceRequestV1, InheritanceDepthResultV1, InheritanceDepthSurfaceRequestV1,
+    LargestResultV1, LargestSurfaceRequestV1, RankResultV1, RankSurfaceRequestV1,
+    RecursionResultV1, RecursionSurfaceRequestV1, UnmountedFilesResultV1,
+    UnmountedFilesSurfaceRequestV1, UnsafePatternsResultV1, UnsafePatternsSurfaceRequestV1,
+};
+use crate::retrieval::callable_code_catalog::CALLABLE_CODE_DEFAULT_PAGE_SIZE;
+use crate::retrieval::graph_report_surface::{
+    DependencyDepthSurfaceRequestV1, DiagnoseResultV1, DiagnoseSurfaceRequestV1, DsmResultV1,
+    DsmSurfaceRequestV1, GiniResultV1, GiniSurfaceRequestV1, HealthResultV1,
+    HealthSurfaceRequestV1, TestMapResultV1, TestMapSurfaceRequestV1, TestRiskResultV1,
+    TestRiskSurfaceRequestV1,
+};
 use crate::retrieval::primitive_surface::{
-    CalleesResultV1, CalleesSurfaceRequestV1, ContextResultV1, ContextSurfaceRequestV1,
-    ImpactResultV1, ImpactSurfaceRequestV1, NodeResultV1, NodeSurfaceRequestV1, PortOrderResultV1,
-    PortOrderSurfaceRequestV1, PortStatusResultV1, PortStatusSurfaceRequestV1, RedundancyResultV1,
-    RedundancySurfaceRequestV1, RenamePreviewPrimitiveOutcomeV1, RenamePreviewPrimitiveRequestV1,
-    SimilarResultV1, SimilarSurfaceRequestV1, TodosResultV1, TodosSurfaceRequestV1,
+    ContextResultV1, ContextSurfaceRequestV1, ImpactResultV1, NodeDepthSurfaceRequestV1,
+    NodeResultV1, NodeSurfaceRequestV1, PortOrderResultV1, PortOrderSurfaceRequestV1,
+    PortStatusResultV1, PortStatusSurfaceRequestV1, RedundancyResultV1, RedundancySurfaceRequestV1,
+    RenamePreviewPrimitiveOutcomeV1, RenamePreviewPrimitiveRequestV1, SimilarResultV1,
+    SimilarSurfaceRequestV1, TodosResultV1, TodosSurfaceRequestV1,
 };
 use crate::retrieval::requests::{
     CallChainPrimitiveRequest, CallChainPrimitiveResult, DiagnosticsPrimitiveRequest,
@@ -37,7 +56,8 @@ use crate::retrieval::requests::{
     StorageStatusPrimitiveResult,
 };
 use crate::retrieval::symbol_graph::{
-    SymbolGraphPage, SymbolPrimitiveRecord, SymbolRelationRecord, TypeHierarchyRecord,
+    ImplementationRecord, SymbolGraphPage, SymbolPrimitiveRecord, SymbolRelationRecord,
+    TypeHierarchyRecord,
 };
 use crate::surface_contracts::{
     CodeCallersSurfaceRequest, CodeImplementationsSurfaceRequest,
@@ -87,13 +107,16 @@ pub fn application_catalog_contributions()
 /// Resolves the page size an omitted transport control receives from the
 /// canonical primitive descriptor.
 ///
-/// Operations outside this primitive family retain the inert page envelope's
-/// established value of 10.
+/// Operations outside this primitive family, the callable-code queries
+/// included, retain the inert page envelope's established value of
+/// [`CALLABLE_CODE_DEFAULT_PAGE_SIZE`].
 pub fn application_operation_default_page_size(operation: ApplicationSurfaceOperation) -> u32 {
     PRIMITIVE_READ_SPECS
         .iter()
         .find(|spec| spec.operation == operation.as_str())
-        .map_or(10, |spec| spec.default_page_size)
+        .map_or(CALLABLE_CODE_DEFAULT_PAGE_SIZE, |spec| {
+            spec.default_page_size
+        })
 }
 
 struct PrimitiveReadSpec {
@@ -101,6 +124,10 @@ struct PrimitiveReadSpec {
     capability: &'static str,
     use_case: &'static str,
     default_page_size: u32,
+    /// Bounded reads continue through `meta.cursor`; whole-project reports
+    /// answer in one response and advertise no pagination.
+    paginated: bool,
+    deadline_millis: u64,
 }
 
 fn primitive_profile_ids(operation: &str) -> &'static [&'static str] {
@@ -147,13 +174,14 @@ fn primitive_lsp_methods(operation: &str) -> &'static [&'static str] {
 }
 
 const PRIMITIVE_READ_SPECS: &[PrimitiveReadSpec] = &[
-    primitive_spec("code_signature_search"),
-    primitive_spec("code_implementations"),
-    primitive_spec("code_type_hierarchy"),
-    primitive_spec("code_callers"),
+    // MCP and CLI callers cannot choose a page size, so these navigation reads
+    // default to a page that holds a typical answer; `meta.cursor` continues.
+    primitive_spec_with_default_page_size("code_signature_search", 50),
+    primitive_spec_with_default_page_size("code_implementations", 20),
+    primitive_spec_with_default_page_size("code_type_hierarchy", 100),
+    primitive_spec_with_default_page_size("code_callers", 100),
     primitive_spec("context"),
     primitive_spec("node"),
-    primitive_spec("callees"),
     primitive_spec("impact"),
     primitive_spec("similar"),
     primitive_spec("redundancy"),
@@ -161,6 +189,29 @@ const PRIMITIVE_READ_SPECS: &[PrimitiveReadSpec] = &[
     primitive_spec("port_status"),
     primitive_spec("port_order"),
     primitive_spec("todos"),
+    graph_report_spec("test_map"),
+    graph_report_spec("test_risk"),
+    graph_report_spec("gini"),
+    graph_report_spec("dependency_depth"),
+    graph_report_spec("health"),
+    graph_report_spec("dsm"),
+    graph_report_spec("diagnose"),
+    graph_report_spec("dead_code"),
+    graph_report_spec("circular"),
+    graph_report_spec("hotspots"),
+    graph_report_spec("unmounted_files"),
+    graph_report_spec("rank"),
+    graph_report_spec("largest"),
+    graph_report_spec("coupling"),
+    graph_report_spec("inheritance_depth"),
+    graph_report_spec("distribution"),
+    graph_report_spec("recursion"),
+    graph_report_spec("complexity"),
+    graph_report_spec("doc_coverage"),
+    graph_report_spec("god_class"),
+    graph_report_spec("unsafe_patterns"),
+    graph_report_spec("constructors"),
+    graph_report_spec("field_sites"),
     primitive_spec("session_lookup"),
     primitive_spec("qualified_name"),
     primitive_spec("call_chain"),
@@ -192,18 +243,23 @@ const DASHBOARD_PRIMITIVE_SURFACES: [BindingSurface; 4] = [
 
 fn primitive_read_surfaces(spec: &PrimitiveReadSpec) -> &'static [BindingSurface] {
     match spec.operation {
-        // These established tool handlers retain their current wire schemas
-        // and rendering across the generic CLI fallback and MCP, while using
-        // this operation identity for canonical code-graph read admission.
-        "context" | "node" | "callees" | "impact" | "similar" | "redundancy" | "rename_preview"
-        | "port_status" | "port_order" | "todos" => &CLI_MCP_PRIMITIVE_SURFACES,
+        // The project's graph-tool owner answers these for the tool surfaces
+        // only; their typed results render as the established tool output.
+        "context" | "node" | "impact" | "similar" | "redundancy" | "rename_preview"
+        | "port_status" | "port_order" | "todos" | "test_map" | "test_risk" | "gini"
+        | "dependency_depth" | "health" | "dsm" | "diagnose" | "dead_code" | "circular"
+        | "hotspots" | "unmounted_files" | "rank" | "largest" | "coupling"
+        | "inheritance_depth" | "distribution" | "recursion" | "complexity" | "doc_coverage"
+        | "god_class" | "unsafe_patterns" | "constructors" | "field_sites" => {
+            &CLI_MCP_PRIMITIVE_SURFACES
+        }
         "health_read" | "storage_status" | "diagnostics_read" => &DASHBOARD_PRIMITIVE_SURFACES,
         _ => &PRE_DASHBOARD_PRIMITIVE_SURFACES,
     }
 }
 
 /// Similar and redundancy expose one current family schema. Callers already
-/// use that schema, so the binding is the current protocol revision only —
+/// use that schema, so the binding is the current protocol revision only,
 /// not a revision window for a retired request shape. Do not mint a second
 /// binding for the same spelling; `index_bindings` rejects duplicate
 /// surface-operation keys.
@@ -229,8 +285,6 @@ fn clone_family_surface_bindings(
             operation: SurfaceOperationName::new(operation)?,
             protocol_revisions: ProtocolRevisionRange::new(1, 1)?,
             required_features: Vec::new(),
-            status: BindingStatus::Current,
-            alias_of: None,
         })?);
         binding_ids.push(binding_id);
     }
@@ -240,16 +294,16 @@ fn clone_family_surface_bindings(
 fn primitive_read_description(operation: &str) -> &'static str {
     match operation {
         "code_signature_search" => {
-            "Find functions and methods by return type, parameter substrings, or async status. Use code_symbol_search for name or concept searches; this tool requires at least one signature filter."
+            "Find functions and methods by signature shape: `returns` (return-type substring), `params` (substrings that must all appear in the parameter list), or `is_async`; narrow with `scope.path_prefix`. At least one filter is required. Use symbol search for name or concept searches."
         }
         "code_implementations" => {
-            "Find types implementing a named trait, or functions and methods with a selected method name. Use code_type_hierarchy to traverse extends and implements relationships from a known node ID."
+            "Find every type implementing a trait (`selector: {\"selector\": \"trait\", \"name\": ...}`) or every function or method with a name (`selector: {\"selector\": \"method\", \"name\": ...}`). Each match carries its exact source body. Use type_hierarchy to traverse extends and implements relationships from a known node ID."
         }
         "code_type_hierarchy" => {
-            "Traverse extends and implements relationships from a symbol node ID returned by code_symbol_search or another graph read. Use code_implementations when starting from a trait or method name."
+            "Use for trait, interface, or class hierarchy questions before grepping `impl X for` or `extends X`: traverses the implementors and extenders of a type node ID up to `maximum_depth` (default 5). Use implementations when starting from a trait or method name."
         }
         "code_callers" => {
-            "Find symbols that call a known symbol node ID, up to the requested depth. Use call_chain when you need the shortest call path between two known node IDs."
+            "Who calls this: find references, usages, and call sites of a known symbol node ID up to `maximum_depth` (default 3). Coverage is partial when a call target cannot be resolved exactly. Use call_chain for the shortest call path between two known node IDs."
         }
         "redundancy" => {
             "Report bounded, token-verified exact and rename-normalized implementation families in the admitted repository. Results rank review candidates by repeated source bytes."
@@ -290,6 +344,61 @@ fn primitive_read_description(operation: &str) -> &'static str {
         "diagnostics_read" => {
             "Read retained diagnostics for the current indexed generation, scoped to the workspace or one file. This does not run a compiler or refresh diagnostics; use the project's build or typecheck when fresh post-edit results are required."
         }
+        "test_map" => {
+            "Map a source file's or symbol's callables to the tests that reach them within three call-graph hops. Coverage is static attribution, not executed coverage."
+        }
+        "test_risk" => {
+            "Rank source symbols with weak or no static test attribution by complexity, fan-in, and churn."
+        }
+        "gini" => {
+            "Measure how unevenly a metric (complexity, lines, fan-in, fan-out, or members) is distributed across files or symbols, with the top outliers."
+        }
+        "dependency_depth" => {
+            "Report the longest file-level dependency chains and how far the deepest exceeds the ideal depth."
+        }
+        "health" => {
+            "Score code health (0-10000) as the geometric mean of acyclicity, depth, equality, redundancy, modularity, and coverage discipline."
+        }
+        "dsm" => {
+            "Summarize the file dependency design-structure matrix: density, directory clusters, and optionally the matrix itself."
+        }
+        "diagnose" => {
+            "Map raw cargo, clippy, or rustc diagnostics to the smallest containing graph symbol and its callers, and publish them to the managed diagnostics store."
+        }
+        "dead_code" => {
+            "List functions and methods with no indexed incoming reference, excluding entry points, tests, and (by default) public items."
+        }
+        "circular" => {
+            "Report file-level dependency cycles, largest first, each bounded to its listed members with its true size stated."
+        }
+        "hotspots" => "Rank symbols by total incoming plus outgoing graph relations.",
+        "unmounted_files" => {
+            "Find source files on disk that no compiler, bundler, or test runner reaches from its entry points, per ecosystem, with each ecosystem's verdict and blind spots."
+        }
+        "rank" => "Rank symbols by how many relations of one edge kind they receive or originate.",
+        "largest" => "Rank symbols by their line span.",
+        "coupling" => {
+            "Rank files by how many other files depend on them (fan-in) or they depend on (fan-out)."
+        }
+        "inheritance_depth" => "Rank classes and interfaces by the depth of their extends chain.",
+        "distribution" => "Count symbols by kind per file, or across every matching file.",
+        "recursion" => "Report self-recursive and mutually recursive call cycles, shortest first.",
+        "complexity" => {
+            "Rank symbols by lines plus weighted fan-out and fan-in, with their extraction-time branch, loop, and nesting counters."
+        }
+        "doc_coverage" => {
+            "List public symbols without documentation, grouped by file, after verifying the indexed sources still match the files on disk."
+        }
+        "god_class" => "Rank classes and structs by their contained methods plus fields.",
+        "unsafe_patterns" => {
+            "Find unwrap, expect, panic, todo, unimplemented, and unsafe sites in indexed source, with each site's enclosing symbol and test scope."
+        }
+        "constructors" => {
+            "Find struct-literal construction sites of a named struct and the fields each site sets, updates, or omits."
+        }
+        "field_sites" => {
+            "Find read and write sites of a named field, optionally narrowed to one owner's field."
+        }
         _ => "Read bounded data from the admitted project's current retained state.",
     }
 }
@@ -307,6 +416,22 @@ const fn primitive_spec_with_default_page_size(
         capability: operation,
         use_case: operation,
         default_page_size,
+        paginated: true,
+        deadline_millis: 10_000,
+    }
+}
+
+/// A whole-project graph report. It keeps the two-minute interactive ceiling
+/// these reports have always dispatched under: a report over every file in a
+/// large repository is not a ten-second primitive read.
+const fn graph_report_spec(operation: &'static str) -> PrimitiveReadSpec {
+    PrimitiveReadSpec {
+        operation,
+        capability: operation,
+        use_case: operation,
+        default_page_size: CALLABLE_CODE_DEFAULT_PAGE_SIZE,
+        paginated: false,
+        deadline_millis: 120_000,
     }
 }
 
@@ -408,8 +533,6 @@ pub fn primitive_read_contribution() -> Result<CatalogContributionV1, Applicatio
                 operation: SurfaceOperationName::new(*method)?,
                 protocol_revisions: ProtocolRevisionRange::new(1, 1)?,
                 required_features: Vec::new(),
-                status: BindingStatus::Current,
-                alias_of: None,
             })?);
             binding_ids.push(binding_id);
         }
@@ -439,12 +562,19 @@ pub fn primitive_read_contribution() -> Result<CatalogContributionV1, Applicatio
                     CancellationPoint::BeforeRead,
                     CancellationPoint::DuringRead,
                 ])?,
-                deadline: DeadlineContract::new(10_000, DeadlineBehavior::ReturnOperationReceipt)?,
-                pagination: Some(PaginationContract::new(
-                    spec.default_page_size,
-                    1_000,
-                    60_000,
-                )?),
+                deadline: DeadlineContract::new(
+                    spec.deadline_millis,
+                    DeadlineBehavior::ReturnOperationReceipt,
+                )?,
+                pagination: if spec.paginated {
+                    Some(PaginationContract::new(
+                        spec.default_page_size,
+                        1_000,
+                        60_000,
+                    )?)
+                } else {
+                    None
+                },
                 inverse: None,
                 authority_revalidation: RevalidationContract::required(vec![
                     RevalidationPoint::Authority,
@@ -565,7 +695,7 @@ fn primitive_executable_schemas(
     add!(
         "code_implementations",
         CodeImplementationsSurfaceRequest,
-        SymbolGraphPage<SymbolRelationRecord>
+        SymbolGraphPage<ImplementationRecord>
     );
     add!(
         "code_type_hierarchy",
@@ -578,8 +708,7 @@ fn primitive_executable_schemas(
         SymbolGraphPage<SymbolRelationRecord>
     );
     add!("context", ContextSurfaceRequestV1, ContextResultV1);
-    add!("callees", CalleesSurfaceRequestV1, CalleesResultV1);
-    add!("impact", ImpactSurfaceRequestV1, ImpactResultV1);
+    add!("impact", NodeDepthSurfaceRequestV1, ImpactResultV1);
     add!("node", NodeSurfaceRequestV1, NodeResultV1);
     add!("similar", SimilarSurfaceRequestV1, SimilarResultV1);
     add!("redundancy", RedundancySurfaceRequestV1, RedundancyResultV1);
@@ -595,6 +724,61 @@ fn primitive_executable_schemas(
     );
     add!("port_order", PortOrderSurfaceRequestV1, PortOrderResultV1);
     add!("todos", TodosSurfaceRequestV1, TodosResultV1);
+    add!("test_map", TestMapSurfaceRequestV1, TestMapResultV1);
+    add!("test_risk", TestRiskSurfaceRequestV1, TestRiskResultV1);
+    add!("gini", GiniSurfaceRequestV1, GiniResultV1);
+    add!(
+        "dependency_depth",
+        DependencyDepthSurfaceRequestV1,
+        DependencyDepthResultV1
+    );
+    add!("health", HealthSurfaceRequestV1, HealthResultV1);
+    add!("dsm", DsmSurfaceRequestV1, DsmResultV1);
+    add!("diagnose", DiagnoseSurfaceRequestV1, DiagnoseResultV1);
+    add!("dead_code", DeadCodeSurfaceRequestV1, DeadCodeResultV1);
+    add!("circular", CircularSurfaceRequestV1, CircularResultV1);
+    add!("hotspots", HotspotsSurfaceRequestV1, HotspotsResultV1);
+    add!(
+        "unmounted_files",
+        UnmountedFilesSurfaceRequestV1,
+        UnmountedFilesResultV1
+    );
+    add!("rank", RankSurfaceRequestV1, RankResultV1);
+    add!("largest", LargestSurfaceRequestV1, LargestResultV1);
+    add!("coupling", CouplingSurfaceRequestV1, CouplingResultV1);
+    add!(
+        "inheritance_depth",
+        InheritanceDepthSurfaceRequestV1,
+        InheritanceDepthResultV1
+    );
+    add!(
+        "distribution",
+        DistributionSurfaceRequestV1,
+        DistributionResultV1
+    );
+    add!("recursion", RecursionSurfaceRequestV1, RecursionResultV1);
+    add!("complexity", ComplexitySurfaceRequestV1, ComplexityReportV1);
+    add!(
+        "doc_coverage",
+        DocCoverageSurfaceRequestV1,
+        DocCoverageResultV1
+    );
+    add!("god_class", GodClassSurfaceRequestV1, GodClassResultV1);
+    add!(
+        "unsafe_patterns",
+        UnsafePatternsSurfaceRequestV1,
+        UnsafePatternsResultV1
+    );
+    add!(
+        "constructors",
+        ConstructorsSurfaceRequestV1,
+        ConstructorsResultV1
+    );
+    add!(
+        "field_sites",
+        FieldSitesSurfaceRequestV1,
+        FieldSitesResultV1
+    );
     Ok(schemas)
 }
 
@@ -688,8 +872,6 @@ pub fn symbol_search_contribution() -> Result<CatalogContributionV1, Application
         operation: SurfaceOperationName::new("workspace/symbol")?,
         protocol_revisions: ProtocolRevisionRange::new(1, 1)?,
         required_features: Vec::new(),
-        status: BindingStatus::Current,
-        alias_of: None,
     })?);
     binding_ids.push(lsp_binding_id);
     let capability = application_capability_manifest(ApplicationCapabilityManifestInput {
@@ -814,10 +996,9 @@ fn symbol_search_scope() -> Result<ScopeRequirement, ApplicationContractError> {
 mod tests {
     use super::*;
 
-    const ESTABLISHED_TOOL_PRIMITIVES: [&str; 10] = [
+    const ESTABLISHED_TOOL_PRIMITIVES: [&str; 9] = [
         "context",
         "node",
-        "callees",
         "impact",
         "similar",
         "redundancy",

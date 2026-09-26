@@ -18,7 +18,7 @@
 //! [`HookAdmissionLedgerLimitsV1::max_records`] live entries per host and
 //! nothing older than [`HookAdmissionLedgerLimitsV1::max_age_micros`]. Beyond
 //! either bound the oldest entries are dropped, so idempotency converges within
-//! that window and no further — a replay older than the window is admitted
+//! that window and no further, a replay older than the window is admitted
 //! again rather than silently believed to be new forever.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -33,13 +33,15 @@ use tracedecay_domain::{
     RepositoryProvenanceV1, UserProfileId, UtcMicros, canonical_json_bytes,
     framed_log::checksum as frame_checksum,
 };
+use tracedecay_private_fs::FileLease;
 use tracedecay_private_fs::framed_log::{
     DirectorySyncPolicy, append_durable, atomic_write as shared_atomic_write,
     read_bounded as shared_read_bounded, sync_directory as shared_sync_directory,
     truncate_file as shared_truncate_file, validate_regular_or_missing as shared_validate_regular,
 };
 
-use crate::{HookEventEnvelopeV2, HookHostV1, MAX_SPOOL_AGE_MICROS, MAX_SPOOL_RECORDS_PER_HOST};
+use crate::{HookEventEnvelopeV2, MAX_SPOOL_AGE_MICROS, MAX_SPOOL_RECORDS_PER_HOST};
+use tracedecay_domain::NativeHostIdentityV1;
 
 const LEDGER_MAGIC: &[u8; 4] = b"TDL1";
 const LEDGER_FORMAT_VERSION: u16 = 1;
@@ -120,7 +122,7 @@ pub struct HookLiveOriginAdmissionV1 {
     pub digest: [u8; 32],
     pub order: u64,
     pub admitted_at: UtcMicros,
-    pub host: HookHostV1,
+    pub host: NativeHostIdentityV1,
     pub protected_session_id: [u8; 32],
     pub project_id: [u8; 16],
     pub repository_id: [u8; 16],
@@ -292,8 +294,8 @@ pub fn hook_admission_digest(
 #[derive(Debug)]
 pub struct HookAdmissionLedgerV1 {
     root: PathBuf,
-    _writer_lock: fs::File,
-    host: HookHostV1,
+    _writer_lock: FileLease,
+    host: NativeHostIdentityV1,
     limits: HookAdmissionLedgerLimitsV1,
     entries: BTreeMap<[u8; IDENTITY_BYTES], LedgerEntry>,
     completed_work: BTreeSet<[u8; IDENTITY_BYTES]>,
@@ -301,18 +303,12 @@ pub struct HookAdmissionLedgerV1 {
     next_order: u64,
 }
 
-impl Drop for HookAdmissionLedgerV1 {
-    fn drop(&mut self) {
-        let _ = self._writer_lock.unlock();
-    }
-}
-
 impl HookAdmissionLedgerV1 {
     /// Open (and bounded-recover) the ledger for one host.
     #[hotpath::measure(label = "hooks.admission.open")]
     pub fn open(
         root: impl Into<PathBuf>,
-        host: HookHostV1,
+        host: NativeHostIdentityV1,
         limits: HookAdmissionLedgerLimitsV1,
         now: UtcMicros,
     ) -> Result<(Self, HookAdmissionLedgerOpenReportV1), HookAdmissionLedgerError> {
@@ -403,7 +399,7 @@ impl HookAdmissionLedgerV1 {
         Ok((ledger, report))
     }
 
-    pub fn host(&self) -> HookHostV1 {
+    pub fn host(&self) -> NativeHostIdentityV1 {
         self.host
     }
 
@@ -582,9 +578,6 @@ impl HookAdmissionLedgerV1 {
         envelope: &HookEventEnvelopeV2,
         now: UtcMicros,
     ) -> Result<HookAdmissionLedgerReceiptV1, HookAdmissionLedgerError> {
-        if envelope.producer != self.host {
-            return Err(HookAdmissionLedgerError::InvalidIdentity);
-        }
         let identity = envelope.event_id;
         if identity == [0; IDENTITY_BYTES] {
             return Err(HookAdmissionLedgerError::InvalidIdentity);
@@ -643,9 +636,6 @@ impl HookAdmissionLedgerV1 {
         &mut self,
         envelope: &HookEventEnvelopeV2,
     ) -> Result<bool, HookAdmissionLedgerError> {
-        if envelope.producer != self.host {
-            return Err(HookAdmissionLedgerError::InvalidIdentity);
-        }
         let identity = envelope.event_id;
         let Some(entry) = self.entries.get(&identity) else {
             return Err(HookAdmissionLedgerError::InvalidIdentity);
@@ -761,26 +751,33 @@ impl HookAdmissionLedgerV1 {
 /// separate persisted roots, but both are the supported `cursor` source alias.
 /// Keeping this match explicit means a new host needs a deliberate provider
 /// mapping before it can authorize persisted origin metadata.
-fn source_provider_for_host(host: HookHostV1) -> Option<&'static str> {
+fn source_provider_for_host(host: NativeHostIdentityV1) -> Option<&'static str> {
     match host {
-        HookHostV1::ClaudeCode => Some("claude"),
-        HookHostV1::Codex => Some("codex"),
-        HookHostV1::CursorDesktop | HookHostV1::CursorCloud => Some("cursor"),
-        HookHostV1::Hermes => Some("hermes"),
-        HookHostV1::Kiro => Some("kiro"),
-        HookHostV1::Cline => Some("cline"),
-        HookHostV1::RooCode => Some("roo-code"),
-        HookHostV1::Kilo => Some("kilo"),
-        HookHostV1::KimiCode => Some("kimi"),
-        HookHostV1::OpenCode => Some("opencode"),
+        NativeHostIdentityV1::ClaudeCode => Some("claude"),
+        NativeHostIdentityV1::Codex => Some("codex"),
+        NativeHostIdentityV1::CursorDesktop | NativeHostIdentityV1::CursorCloud => Some("cursor"),
+        NativeHostIdentityV1::Hermes => Some("hermes"),
+        NativeHostIdentityV1::Kiro => Some("kiro"),
+        NativeHostIdentityV1::Cline => Some("cline"),
+        NativeHostIdentityV1::RooCode => Some("roo-code"),
+        NativeHostIdentityV1::Kilo => Some("kilo"),
+        NativeHostIdentityV1::KimiCode => Some("kimi"),
+        NativeHostIdentityV1::OpenCode => Some("opencode"),
+        NativeHostIdentityV1::Pi | NativeHostIdentityV1::FactoryDroid => None,
     }
 }
 
-fn source_provider_matches_host(host: HookHostV1, source: &ObservationSourceIdentityV1) -> bool {
+fn source_provider_matches_host(
+    host: NativeHostIdentityV1,
+    source: &ObservationSourceIdentityV1,
+) -> bool {
     source_provider_for_host(host).is_some_and(|expected| expected == source.provider().as_str())
 }
 
-fn valid_origin_observation(host: HookHostV1, value: &HookLiveOriginObservationV1) -> bool {
+fn valid_origin_observation(
+    host: NativeHostIdentityV1,
+    value: &HookLiveOriginObservationV1,
+) -> bool {
     let repository = &value.scope.repository;
     source_provider_matches_host(host, &value.source)
         && value.source.validate().is_ok()
@@ -993,7 +990,7 @@ fn write_live_origin_metadata(
 /// Missing or pruned admissions cannot be reconstructed from origin metadata.
 pub fn read_hook_live_origin_proofs(
     root: &Path,
-    host: HookHostV1,
+    host: NativeHostIdentityV1,
     now: UtcMicros,
 ) -> Result<Vec<HookLiveOriginProofV1>, HookAdmissionLedgerError> {
     read_validated_live_origin_metadata(root, host, now).map(|metadata| metadata.proofs)
@@ -1003,7 +1000,7 @@ pub fn read_hook_live_origin_proofs(
 /// any complete new source frames. Its exact retained receipt still matters.
 pub fn read_hook_live_origin_boundaries(
     root: &Path,
-    host: HookHostV1,
+    host: NativeHostIdentityV1,
     now: UtcMicros,
 ) -> Result<Vec<HookLiveOriginBoundaryV1>, HookAdmissionLedgerError> {
     read_validated_live_origin_metadata(root, host, now).map(|metadata| metadata.baselines)
@@ -1011,7 +1008,7 @@ pub fn read_hook_live_origin_boundaries(
 
 fn read_validated_live_origin_metadata(
     root: &Path,
-    host: HookHostV1,
+    host: NativeHostIdentityV1,
     now: UtcMicros,
 ) -> Result<LiveOriginMetadata, HookAdmissionLedgerError> {
     let mut metadata = read_live_origin_metadata(root)?;
@@ -1053,7 +1050,7 @@ fn lock_path(root: &Path) -> PathBuf {
     root.join(LOCK_FILE)
 }
 
-fn acquire_writer_lock(root: &Path) -> Result<fs::File, HookAdmissionLedgerError> {
+fn acquire_writer_lock(root: &Path) -> Result<FileLease, HookAdmissionLedgerError> {
     let path = lock_path(root);
     shared_validate_regular(&path).map_err(|_| HookAdmissionLedgerError::UnsafePath)?;
     let file = fs::OpenOptions::new()
@@ -1064,7 +1061,7 @@ fn acquire_writer_lock(root: &Path) -> Result<fs::File, HookAdmissionLedgerError
         .open(&path)
         .map_err(|_| HookAdmissionLedgerError::Io)?;
     match file.try_lock() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(FileLease::held(file, "hooks.admission.writer")),
         Err(std::fs::TryLockError::WouldBlock) => {
             hotpath::gauge!("hooks.admission.lock.contended").inc(1);
             Err(HookAdmissionLedgerError::Busy)
@@ -1230,7 +1227,7 @@ mod tests {
         HookEventEnvelopeV2 {
             schema_version: HOOK_EVENT_SCHEMA_VERSION,
             event_id: [event_id; 16],
-            producer: HookHostV1::ClaudeCode,
+            producer: NativeHostIdentityV1::ClaudeCode,
             protected_session_id: [7; 32],
             project_id: [1; 16],
             repository_id: [2; 16],
@@ -1248,7 +1245,7 @@ mod tests {
     fn open(root: &Path, now: UtcMicros) -> HookAdmissionLedgerV1 {
         HookAdmissionLedgerV1::open(
             root,
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             HookAdmissionLedgerLimitsV1::stock(),
             now,
         )
@@ -1377,7 +1374,7 @@ mod tests {
                 HookLiveOriginOutcomeV1::Sealed
             );
             first_proofs =
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                     .unwrap();
             assert_eq!(first_proofs.len(), 1);
             let proof = &first_proofs[0];
@@ -1396,7 +1393,7 @@ mod tests {
         }
         let mut ledger = open(root.path(), UtcMicros(11));
         assert_eq!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap(),
             first_proofs
         );
@@ -1410,7 +1407,7 @@ mod tests {
             HookLiveOriginOutcomeV1::Sealed
         );
         let proofs =
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap();
         assert_eq!(proofs.len(), 2);
         assert_eq!(proofs[0], first_proofs[0], "retained proof is immutable");
@@ -1473,7 +1470,7 @@ mod tests {
                 "{change}"
             );
             assert!(
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                     .unwrap()
                     .is_empty(),
                 "{change}"
@@ -1510,7 +1507,7 @@ mod tests {
                 HookLiveOriginOutcomeV1::Sealed
             );
             let proofs =
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                     .unwrap();
             assert_eq!(proofs.len(), 1);
             assert_eq!(proofs[0].baseline.start.admission.event_id, [10; 16]);
@@ -1538,7 +1535,7 @@ mod tests {
                 HookLiveOriginOutcomeV1::Sealed
             );
             proofs =
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                     .unwrap();
             assert_eq!(proofs.len(), 1);
             assert!(
@@ -1549,7 +1546,7 @@ mod tests {
         }
         let ledger = open(root.path(), UtcMicros(11));
         assert_eq!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap(),
             proofs
         );
@@ -1573,7 +1570,7 @@ mod tests {
             HookLiveOriginOutcomeV1::Baseline
         );
         assert!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(9))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(9))
                 .unwrap()
                 .is_empty()
         );
@@ -1583,7 +1580,7 @@ mod tests {
             HookLiveOriginOutcomeV1::Sealed
         );
         let proofs =
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                 .unwrap();
         assert_eq!(proofs.len(), 1);
         assert_eq!(
@@ -1607,7 +1604,7 @@ mod tests {
             record_origin(&mut ledger, 9, Some(baseline.clone()));
             record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[125, 150])));
             expected =
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                     .unwrap();
             assert_eq!(expected.len(), 1);
             assert_eq!(expected[0].frames.len(), 2);
@@ -1622,12 +1619,12 @@ mod tests {
         }
         let mut ledger = open(root.path(), UtcMicros(11));
         assert_eq!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap(),
             expected
         );
         assert_eq!(
-            read_hook_live_origin_boundaries(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_boundaries(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap()[0]
                 .observation
                 .checkpoint
@@ -1639,7 +1636,7 @@ mod tests {
             HookLiveOriginOutcomeV1::Duplicate
         );
         assert_eq!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap(),
             expected
         );
@@ -1669,7 +1666,7 @@ mod tests {
                 HookLiveOriginOutcomeV1::Sealed
             );
             let proofs =
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                     .unwrap();
             assert_eq!(proofs.len(), 1);
             let starts = proofs[0]
@@ -1709,7 +1706,7 @@ mod tests {
         record_origin(&mut ledger, 11, Some(partial.clone()));
         record_origin(&mut ledger, 12, Some(origin_append(&partial, &[160])));
         let proofs =
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(12))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(12))
                 .unwrap();
         assert_eq!(proofs.len(), 2);
         assert_eq!(proofs[1].baseline.start.physical_eof, 100);
@@ -1768,7 +1765,7 @@ mod tests {
                 "{change}"
             );
             assert!(
-                read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+                read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                     .unwrap()
                     .is_empty(),
                 "{change}"
@@ -1804,7 +1801,7 @@ mod tests {
             HookLiveOriginOutcomeV1::Baseline
         );
         assert!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap()
                 .is_empty()
         );
@@ -1818,19 +1815,19 @@ mod tests {
         record_origin(&mut ledger, 9, Some(baseline.clone()));
         record_origin(&mut ledger, 10, Some(origin_append(&baseline, &[150])));
         assert_eq!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                 .unwrap()
                 .len(),
             1
         );
         let expired = UtcMicros(10 + HookAdmissionLedgerLimitsV1::stock().max_age_micros);
         assert!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, expired)
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, expired)
                 .unwrap()
                 .is_empty()
         );
         assert!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::Codex, UtcMicros(10))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::Codex, UtcMicros(10))
                 .unwrap()
                 .is_empty()
         );
@@ -1841,13 +1838,13 @@ mod tests {
         bytes.extend_from_slice(&encode_record([10; 16], seal.digest, seal.admitted_at));
         fs::write(records_path(root.path()), bytes).unwrap();
         assert!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                 .unwrap()
                 .is_empty()
         );
         fs::remove_file(records_path(root.path())).unwrap();
         assert!(
-            read_hook_live_origin_boundaries(root.path(), HookHostV1::ClaudeCode, UtcMicros(10))
+            read_hook_live_origin_boundaries(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10))
                 .unwrap()
                 .is_empty()
         );
@@ -1868,7 +1865,7 @@ mod tests {
         .unwrap();
         let (mut ledger, report) = HookAdmissionLedgerV1::open(
             root.path(),
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             HookAdmissionLedgerLimitsV1::stock(),
             UtcMicros(10),
         )
@@ -1891,7 +1888,7 @@ mod tests {
             HookLiveOriginOutcomeV1::Baseline
         );
         assert!(
-            read_hook_live_origin_proofs(root.path(), HookHostV1::ClaudeCode, UtcMicros(11))
+            read_hook_live_origin_proofs(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(11))
                 .unwrap()
                 .is_empty()
         );
@@ -1900,17 +1897,17 @@ mod tests {
     #[test]
     fn host_source_provider_mapping_accepts_canonical_hook_aliases() {
         let supported = [
-            (HookHostV1::ClaudeCode, "claude"),
-            (HookHostV1::Codex, "codex"),
-            (HookHostV1::CursorDesktop, "cursor"),
-            (HookHostV1::CursorCloud, "cursor"),
-            (HookHostV1::Hermes, "hermes"),
-            (HookHostV1::Kiro, "kiro"),
-            (HookHostV1::Cline, "cline"),
-            (HookHostV1::RooCode, "roo-code"),
-            (HookHostV1::Kilo, "kilo"),
-            (HookHostV1::KimiCode, "kimi"),
-            (HookHostV1::OpenCode, "opencode"),
+            (NativeHostIdentityV1::ClaudeCode, "claude"),
+            (NativeHostIdentityV1::Codex, "codex"),
+            (NativeHostIdentityV1::CursorDesktop, "cursor"),
+            (NativeHostIdentityV1::CursorCloud, "cursor"),
+            (NativeHostIdentityV1::Hermes, "hermes"),
+            (NativeHostIdentityV1::Kiro, "kiro"),
+            (NativeHostIdentityV1::Cline, "cline"),
+            (NativeHostIdentityV1::RooCode, "roo-code"),
+            (NativeHostIdentityV1::Kilo, "kilo"),
+            (NativeHostIdentityV1::KimiCode, "kimi"),
+            (NativeHostIdentityV1::OpenCode, "opencode"),
         ];
         for (host, provider) in supported {
             assert_eq!(source_provider_for_host(host), Some(provider));
@@ -1924,31 +1921,17 @@ mod tests {
         )
         .unwrap();
         assert!(source_provider_matches_host(
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             &claude_source
         ));
         assert!(source_provider_matches_host(
-            HookHostV1::Codex,
+            NativeHostIdentityV1::Codex,
             &codex_source
         ));
         assert!(!source_provider_matches_host(
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             &codex_source
         ));
-    }
-
-    #[test]
-    fn cross_host_envelopes_are_rejected_by_the_bound_ledger() {
-        let root = TestDir::new("cross-host-envelope");
-        let mut ledger = open(root.path(), UtcMicros(1));
-        let mut cross_host = envelope(9, 5);
-        cross_host.producer = HookHostV1::Codex;
-
-        assert_eq!(
-            ledger.admit_with_receipt(&cross_host, UtcMicros(2)),
-            Err(HookAdmissionLedgerError::InvalidIdentity)
-        );
-        assert_eq!(ledger.live_records(), 0);
     }
 
     #[test]
@@ -1997,7 +1980,7 @@ mod tests {
 
         let (ledger, report) = HookAdmissionLedgerV1::open(
             root.path(),
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             HookAdmissionLedgerLimitsV1::stock(),
             UtcMicros(10),
         )
@@ -2012,7 +1995,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            read_hook_live_origin_boundaries(root.path(), HookHostV1::ClaudeCode, UtcMicros(10)),
+            read_hook_live_origin_boundaries(root.path(), NativeHostIdentityV1::ClaudeCode, UtcMicros(10)),
             Err(HookAdmissionLedgerError::RecordUndecodable)
         );
     }
@@ -2039,7 +2022,7 @@ mod tests {
 
         let (ledger, report) = HookAdmissionLedgerV1::open(
             root.path(),
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             HookAdmissionLedgerLimitsV1::stock(),
             UtcMicros(10),
         )
@@ -2138,7 +2121,7 @@ mod tests {
                 "contended" => assert!(matches!(
                     HookAdmissionLedgerV1::open(
                         &root,
-                        HookHostV1::ClaudeCode,
+                        NativeHostIdentityV1::ClaudeCode,
                         HookAdmissionLedgerLimitsV1::stock(),
                         UtcMicros(2),
                     ),
@@ -2147,7 +2130,7 @@ mod tests {
                 "released" => {
                     HookAdmissionLedgerV1::open(
                         &root,
-                        HookHostV1::ClaudeCode,
+                        NativeHostIdentityV1::ClaudeCode,
                         HookAdmissionLedgerLimitsV1::stock(),
                         UtcMicros(3),
                     )
@@ -2277,10 +2260,14 @@ mod tests {
             max_records: 8,
             max_age_micros: MAX_SPOOL_AGE_MICROS,
         };
-        let mut ledger =
-            HookAdmissionLedgerV1::open(root.path(), HookHostV1::ClaudeCode, limits, UtcMicros(1))
-                .unwrap()
-                .0;
+        let mut ledger = HookAdmissionLedgerV1::open(
+            root.path(),
+            NativeHostIdentityV1::ClaudeCode,
+            limits,
+            UtcMicros(1),
+        )
+        .unwrap()
+        .0;
         for index in 1..=9u8 {
             assert_eq!(
                 ledger
@@ -2293,10 +2280,14 @@ mod tests {
         assert!(ledger.live_records() <= 8);
         // The newest identity is still deduplicated after eviction + reopen.
         drop(ledger);
-        let mut reopened =
-            HookAdmissionLedgerV1::open(root.path(), HookHostV1::ClaudeCode, limits, UtcMicros(20))
-                .unwrap()
-                .0;
+        let mut reopened = HookAdmissionLedgerV1::open(
+            root.path(),
+            NativeHostIdentityV1::ClaudeCode,
+            limits,
+            UtcMicros(20),
+        )
+        .unwrap()
+        .0;
         assert_eq!(
             reopened.admit(&envelope(9, 5), UtcMicros(21)).unwrap(),
             HookAdmissionDecisionV1::ExactDuplicate
@@ -2317,7 +2308,7 @@ mod tests {
 
         let (mut ledger, report) = HookAdmissionLedgerV1::open(
             root.path(),
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             HookAdmissionLedgerLimitsV1::stock(),
             UtcMicros(3),
         )

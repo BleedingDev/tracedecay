@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,7 +13,6 @@ use super::backend::{
     BackendRetryPolicy, run_agent_task_with_retry_report,
 };
 use super::config::AutomationConfig;
-use super::host_io::HostIo;
 use super::lifecycle::{
     AgentRunFinalizer, AutomationCommittedReceipt, AutomationRunControl, AutomationRunError,
     AutomationRunLedgerPublication, AutomationRunResult, BackendTaskRun, SchedulerGate,
@@ -27,8 +25,7 @@ use super::skill_writer::{
     activation_policy as skill_writer_activation_policy, validate_and_apply_skill_proposals,
     validate_skill_proposals,
 };
-use crate::ports::project_runtime::{AutomationProjectContext, ProfileRuntime};
-use crate::ports::session_store::AutomationSessionStore;
+use crate::ports::project_runtime::AutomationProjectContext;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_policy::CurationApplyAuthorityV1;
@@ -41,56 +38,46 @@ mod evidence;
 mod retrieval;
 mod session_reflector;
 mod skill_writer;
-mod user_evidence_preflight;
-#[cfg(test)]
-mod user_scope_tests;
-
 use curation::{combined_review_output, evaluate_skill_curation};
 use evidence::{
     SessionReflectorEvidenceBundle, SessionReflectorEvidenceOutcome, SkillWriterEvidenceBundle,
     SkillWriterEvidenceOutcome, build_session_reflector_evidence, build_skill_writer_evidence,
     canonical_evidence_hash,
 };
-use retrieval::{production_user_automation_retrieval, unavailable_automation_retrieval};
+use retrieval::unavailable_automation_retrieval;
 use session_reflector::{
     ProposedAgentOutput, SessionReflectorFinalization, build_session_reflector_prompt,
     finalize_session_reflector_success, validate_session_fact_candidates,
 };
 use skill_writer::{
     ProposedSkillOutput, SkillWriterFinalization, build_skill_writer_prompt,
-    finalize_skill_writer_success, run_user_skill_writer_with_backend_and_retrieval,
+    finalize_skill_writer_success,
 };
 
 pub use super::lifecycle::{
     AutomationRunSettlementGuard, RetainedAutomationRun, RetainedAutomationSettlementDisposition,
     ReusedSchedulerSkip,
 };
+pub use super::memory_curator::{
+    CURATION_DEFAULT_FACT_REVIEW_LIMIT, CURATION_DEFAULT_MIN_CONFIDENCE,
+    MemoryCuratorAutomationOptions, MemoryCuratorAutomationRun, run_memory_curator_with_backend,
+    run_memory_curator_with_backend_for_retained_settlement,
+};
 pub use evidence::{AutomationTemporalEvidence, AutomationTemporalEvidenceItem};
 pub use retrieval::registered_project_automation_retrieval;
 pub use retrieval::{
-    AuthorizedAutomationSessionRetrieval, AutomationSessionRetrieval,
-    AutomationSessionRetrievalFuture, AutomationTemporalRetrieval,
+    AutomationSessionRetrieval, AutomationSessionRetrievalFuture, AutomationTemporalRetrieval,
 };
 pub use session_reflector::{
     SessionFactCurationOutcome, SessionFactCurationReceipt, SessionReflectorAutomationOptions,
     SessionReflectorAutomationRun, run_session_reflector_with_backend,
     run_session_reflector_with_backend_and_retrieval,
     run_session_reflector_with_backend_and_retrieval_for_retained_settlement,
-    run_session_reflector_with_backend_for_retained_settlement,
 };
 pub use skill_writer::{
     SkillWriterAutomationOptions, SkillWriterAutomationRun, run_skill_writer_with_backend,
     run_skill_writer_with_backend_and_retrieval,
     run_skill_writer_with_backend_and_retrieval_for_retained_settlement,
-    run_skill_writer_with_backend_for_retained_settlement,
-};
-pub(crate) use user_evidence_preflight::run_user_session_reflector_with_backend_and_retrieval;
-
-pub(crate) use super::memory_curator::run_user_memory_curator_with_backend;
-pub use super::memory_curator::{
-    CURATION_DEFAULT_FACT_REVIEW_LIMIT, CURATION_DEFAULT_MIN_CONFIDENCE,
-    MemoryCuratorAutomationOptions, MemoryCuratorAutomationRun, run_memory_curator_with_backend,
-    run_memory_curator_with_backend_for_retained_settlement,
 };
 
 const USER_AUTOMATION_DIR: &str = "user-automation";
@@ -122,33 +109,6 @@ fn project_curation_authority(
     })
 }
 
-fn profile_curation_authority(
-    runtime: &dyn ProfileRuntime,
-    actor: &'static str,
-    configuration_revision_id: &ConfigurationRevisionId,
-) -> Result<CurationApplyAuthorityV1> {
-    let actor_id = ActorId::new(actor).map_err(|error| TraceDecayError::Config {
-        message: format!("invalid curation actor identity: {error}"),
-    })?;
-    Ok(CurationApplyAuthorityV1 {
-        actor_id,
-        project_id: None,
-        profile_id: runtime.profile_id().clone(),
-        configuration_revision_id: configuration_revision_id.clone(),
-    })
-}
-
-/// One callable projectless post-session review suitable for host hooks.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct UserSessionAutomationOptions {
-    #[serde(default)]
-    pub session_reflector: SessionReflectorAutomationOptions,
-    #[serde(default)]
-    pub memory_curator: MemoryCuratorAutomationOptions,
-    #[serde(default)]
-    pub skill_writer: SkillWriterAutomationOptions,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserSessionAutomationRun {
     pub session_reflector: SessionReflectorAutomationRun,
@@ -169,84 +129,6 @@ struct CombinedReviewPublication<'a> {
     ledger: AutomationRunLedgerPublication,
     reflector_guard: Option<&'a AutomationRunSettlementGuard>,
     skill_guard: Option<&'a AutomationRunSettlementGuard>,
-}
-
-#[hotpath::measure(future = true, label = "automation.run.user_session")]
-pub async fn run_user_session_automation_with_backend(
-    host_io: HostIo,
-    profile_root: &std::path::Path,
-    session_registry: Arc<dyn ProfileRuntime>,
-    config: &AutomationConfig,
-    configuration_revision_id: &ConfigurationRevisionId,
-    backend: &dyn AgentTaskBackend,
-    options: UserSessionAutomationOptions,
-    run_control: &AutomationRunControl,
-) -> AutomationRunResult<UserSessionAutomationRun> {
-    let _run = super::scheduler_metrics::RunningGuard::enter();
-    let _duration = super::scheduler_metrics::DurationGuard::run();
-    let retrieval = production_user_automation_retrieval(profile_root).await;
-    run_user_session_automation_with_backend_and_retrieval(
-        host_io,
-        profile_root,
-        session_registry,
-        config,
-        configuration_revision_id,
-        AutomationTaskIo {
-            backend,
-            retrieval: retrieval.as_ref(),
-        },
-        options,
-        run_control,
-    )
-    .await
-}
-
-pub(crate) async fn run_user_session_automation_with_backend_and_retrieval(
-    host_io: HostIo,
-    profile_root: &std::path::Path,
-    session_registry: Arc<dyn ProfileRuntime>,
-    config: &AutomationConfig,
-    configuration_revision_id: &ConfigurationRevisionId,
-    io: AutomationTaskIo<'_>,
-    options: UserSessionAutomationOptions,
-    run_control: &AutomationRunControl,
-) -> AutomationRunResult<UserSessionAutomationRun> {
-    let session_reflector = run_user_session_reflector_with_backend_and_retrieval(
-        profile_root,
-        Arc::clone(&session_registry),
-        config,
-        run_control,
-        configuration_revision_id,
-        io,
-        options.session_reflector,
-    )
-    .await?;
-    let memory_curator = run_user_memory_curator_with_backend(
-        profile_root,
-        Arc::clone(&session_registry),
-        config,
-        configuration_revision_id,
-        io.backend,
-        options.memory_curator,
-        run_control,
-    )
-    .await?;
-    let skill_writer = run_user_skill_writer_with_backend_and_retrieval(
-        host_io,
-        profile_root,
-        session_registry,
-        config,
-        configuration_revision_id,
-        io.backend,
-        io.retrieval,
-        options.skill_writer,
-    )
-    .await?;
-    Ok(UserSessionAutomationRun {
-        session_reflector,
-        memory_curator,
-        skill_writer,
-    })
 }
 
 /// Options for the scheduler-only combined reflector+skill pass. Manual
@@ -405,8 +287,8 @@ impl RetainedCombinedReviewRun {
 /// whole combined run) and both evidence bundles must be available;
 /// otherwise the dispatch reports `NotCombined` and the caller runs the
 /// tasks sequentially as before. On a combined run, two ledger records are
-/// appended — one per task, so per-task last-run bookkeeping and the
-/// dashboard scheduler status stay coherent — sharing the combined request's
+/// appended, one per task, so per-task last-run bookkeeping and the
+/// dashboard scheduler status stay coherent, sharing the combined request's
 /// `input_hash` and a `combined_run_id` correlation in `report_ref`, with
 /// `prompt_version` set to the combined contract's version.
 #[hotpath::measure(label = "automation.run.combined_review", future = true)]
@@ -463,27 +345,6 @@ pub async fn run_combined_review_with_backend_and_retrieval(
     .await
 }
 
-pub async fn run_combined_review_with_backend_for_retained_settlement(
-    cg: &AutomationProjectContext,
-    config: &AutomationConfig,
-    configuration_revision_id: &ConfigurationRevisionId,
-    backend: &dyn AgentTaskBackend,
-    options: CombinedReviewAutomationOptions,
-    run_control: &AutomationRunControl,
-) -> RetainedCombinedReviewRun {
-    let retrieval = unavailable_automation_retrieval("session_evidence_retrieval_unavailable");
-    run_combined_review_with_backend_and_retrieval_for_retained_settlement(
-        cg,
-        config,
-        configuration_revision_id,
-        backend,
-        retrieval.as_ref(),
-        options,
-        run_control,
-    )
-    .await
-}
-
 #[allow(clippy::too_many_arguments)]
 pub async fn run_combined_review_with_backend_and_retrieval_for_retained_settlement(
     cg: &AutomationProjectContext,
@@ -520,6 +381,7 @@ pub async fn run_combined_review_with_backend_and_retrieval_for_retained_settlem
 /// `Ok(Err(dispatch))` is the not-due answer the caller returns verbatim.
 async fn acquire_combined_task_lock(
     config: &AutomationConfig,
+    executable: Option<&Path>,
     dashboard_root: &Path,
     sessions_db: &RegisteredGlobalDb,
     task: AgentTaskKind,
@@ -531,6 +393,7 @@ async fn acquire_combined_task_lock(
         Some(guard) => {
             task_run_gate_for_retained_settlement(
                 config,
+                executable,
                 dashboard_root,
                 sessions_db,
                 task,
@@ -539,7 +402,17 @@ async fn acquire_combined_task_lock(
             )
             .await?
         }
-        None => task_run_gate(config, dashboard_root, sessions_db, task, trigger).await?,
+        None => {
+            task_run_gate(
+                config,
+                executable,
+                dashboard_root,
+                sessions_db,
+                task,
+                trigger,
+            )
+            .await?
+        }
     };
     Ok(match gate {
         SchedulerGate::Proceed(lock) => Ok(lock),
@@ -632,6 +505,7 @@ fn run_combined_review_for_retrieval_inner<'a>(
         let sessions_db = project_automation_sessions(cg);
         let _reflector_lock = match acquire_combined_task_lock(
             config,
+            backend.executable(),
             &dashboard_root,
             sessions_db.as_ref(),
             AgentTaskKind::SessionReflector,
@@ -646,6 +520,7 @@ fn run_combined_review_for_retrieval_inner<'a>(
         };
         let _skill_lock = match acquire_combined_task_lock(
             config,
+            backend.executable(),
             &dashboard_root,
             sessions_db.as_ref(),
             AgentTaskKind::SkillWriter,
@@ -736,6 +611,7 @@ fn run_combined_review_for_retrieval_inner<'a>(
             &reflector_run_id,
             options.trigger,
             config,
+            backend.executable(),
             AgentTaskKind::SessionReflector,
             &started_at,
             input_hash.clone(),
@@ -747,6 +623,7 @@ fn run_combined_review_for_retrieval_inner<'a>(
             &skill_run_id,
             options.trigger,
             config,
+            backend.executable(),
             AgentTaskKind::SkillWriter,
             &started_at,
             input_hash,

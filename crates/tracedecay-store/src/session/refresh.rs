@@ -7,7 +7,7 @@ use tracedecay_domain::{
     SessionId, SessionRefreshKeyV1, SessionRefreshOperationIdV1, SessionSourceCoverageReceiptV1,
     SessionTemporalCoverageRequestV1, TemporalCoverageCountsV1, TemporalModeV1, UtcMicros,
 };
-use tracedecay_temporal_query::ports::ExecutionControl;
+use tracedecay_temporal_query::execution::ExecutionControl;
 
 use super::common::{
     SessionRefreshBeginOrJoinPermit, SessionRefreshCancelPermit, SessionRefreshCompletePermit,
@@ -71,6 +71,11 @@ impl SessionRefreshBeginOrJoinRequestV1 {
             refresh_key: None,
             coverage_request: SessionTemporalCoverageRequestV1::new(TemporalModeV1::Current),
         }
+    }
+
+    pub fn with_target_frontier(mut self, target_frontier: SessionRefreshFrontierV1) -> Self {
+        self.target_frontier = target_frontier;
+        self
     }
 
     pub fn with_refresh_key(mut self, refresh_key: SessionRefreshKeyV1) -> Self {
@@ -282,8 +287,13 @@ impl SessionRefreshProgressV1 {
         }
         let current = self.coverage;
         let candidate = next.coverage;
+        // The durable guard admits a successor only when it strictly advances
+        // the committed frontier. Accepting an equal frontier here let a
+        // producer submit a row the trigger then refused as a SQLite
+        // constraint abort, which the worker read as transient storage and
+        // resubmitted forever. Refuse it as typed state instead.
         if self.frontier.observed_through != next.frontier.observed_through
-            || next.frontier.committed_through < self.frontier.committed_through
+            || next.frontier.committed_through <= self.frontier.committed_through
             || next.committed_batches < self.committed_batches
             || next.committed_records < self.committed_records
             || candidate.visible < current.visible

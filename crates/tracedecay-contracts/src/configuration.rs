@@ -119,8 +119,6 @@ pub struct ConfigurationRollbackPreviewRequestV1 {
     pub mode: RollbackModeV1,
 }
 
-pub type ConfigurationRollbackApplyRequestV1 = ConfigurationProtectedApplyRequestV1;
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigurationAuditRequestV1 {
@@ -199,14 +197,14 @@ pub enum ConfigurationWireRequestV1 {
     ProtectedPreview(ConfigurationProtectedPreviewRequestV1),
     ProtectedApply(ConfigurationProtectedApplyRequestV1),
     RollbackPreview(ConfigurationRollbackPreviewRequestV1),
-    RollbackApply(ConfigurationRollbackApplyRequestV1),
+    RollbackApply(ConfigurationProtectedApplyRequestV1),
     Audit(ConfigurationAuditRequestV1),
 }
 
 /// Decode an envelope-stripped configuration invocation payload.
 ///
-/// Callers send the operation's inner request body — the same shape every
-/// surface parser accepts — not the adjacently tagged `operation`/`request`
+/// Callers send the operation's inner request body, the same shape every
+/// surface parser accepts, not the adjacently tagged `operation`/`request`
 /// envelope [`ConfigurationWireRequestV1`] uses on the daemon contract. The
 /// envelope form fails admission because the inner request structs deny
 /// unknown fields (`operation` is not a member of those structs).
@@ -515,7 +513,7 @@ fn configuration_executable_schemas(
     );
     add!(
         "configuration_rollback_apply",
-        ConfigurationRollbackApplyRequestV1,
+        ConfigurationProtectedApplyRequestV1,
         ConfigurationMutationReceipt
     );
     add!(

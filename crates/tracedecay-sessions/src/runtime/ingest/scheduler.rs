@@ -4,7 +4,7 @@ use tracedecay_store::ParseOffset;
 
 use crate::admission::DEFAULT_MAX_RECORDS;
 use crate::runtime::SessionProvider;
-use crate::runtime::codex::CodexDiscoveryFrontier;
+use crate::runtime::hosts::codex::CodexDiscoveryFrontier;
 use crate::runtime::snapshot_observation::MAX_SNAPSHOT_CAPTURE_UNIT_BYTES;
 use crate::runtime::source::{MAX_JSONL_RECORD_BYTES, TranscriptIngestResult};
 use crate::runtime::store_port::TranscriptIngestStore;
@@ -88,6 +88,7 @@ pub(super) const USER_CATCH_UP_PROVIDERS: &[SessionProvider] = &[
     SessionProvider::Kiro,
     SessionProvider::Kimi,
     SessionProvider::OpenCode,
+    SessionProvider::Pi,
     SessionProvider::Cline,
     SessionProvider::RooCode,
     SessionProvider::Kilo,
@@ -218,7 +219,7 @@ mod tests {
     use crate::runtime::git_correlation::{CommitSessionRecord, SpanObservation};
     use crate::runtime::source::TranscriptDiscoveryBounds;
     use crate::runtime::store_port::TranscriptIngestStore;
-    use crate::runtime::{SessionRecord, codex};
+    use crate::runtime::{SessionRecord, hosts::codex};
 
     use super::{read_codex_discovery_frontier, write_codex_discovery_frontier};
 

@@ -74,7 +74,7 @@ pub struct NativeCandidateGenerationIdentityV1 {
 /// A refused file produces no sanitization receipt and no sanitized bytes, so
 /// there is nothing a snapshot entry could truthfully carry for it: it is
 /// withheld from the generation and named here instead. The distinction that
-/// matters is scope — a refusal is evidence about *one file*, never about the
+/// matters is scope, a refusal is evidence about *one file*, never about the
 /// tree, so it must not be allowed to cost every other file its index.
 #[derive(Debug)]
 pub struct WithheldSourceV1 {
@@ -277,7 +277,8 @@ impl DaemonCodeIndexPublicationStoreV1 {
         let Some(reference) = generation.snapshot().reference.as_ref() else {
             return Ok(None);
         };
-        let repository = gix::open(&self.project_root).map_err(Self::unavailable)?;
+        let repository = tracedecay_runtime_core::git_open::open(&self.project_root)
+            .map_err(Self::unavailable)?;
         let identity =
             identity::IndexingIdentityV1::resolve(&self.project_root).map_err(Self::unavailable)?;
         if generation.snapshot().repository != *identity.repository_id()
@@ -285,8 +286,8 @@ impl DaemonCodeIndexPublicationStoreV1 {
         {
             return Ok(None);
         }
-        // The reference must exist — evidence naming a ref this repository does
-        // not have is provenance we cannot stand behind — but it is *only* the
+        // The reference must exist, evidence naming a ref this repository does
+        // not have is provenance we cannot stand behind, but it is *only* the
         // provenance name. The commit is resolved by its own object id, because
         // demanding the reference still peel to this revision silently dropped
         // the Git evidence of every generation sealed at a revision the branch
@@ -324,7 +325,8 @@ impl DaemonCodeIndexPublicationStoreV1 {
         revision: &str,
         expected_tree: &str,
     ) -> Result<(), CodeIndexPublicationStoreErrorV1> {
-        let repository = gix::open(&self.project_root).map_err(Self::unavailable)?;
+        let repository = tracedecay_runtime_core::git_open::open(&self.project_root)
+            .map_err(Self::unavailable)?;
         let object_id =
             gix::hash::ObjectId::from_hex(revision.as_bytes()).map_err(Self::unavailable)?;
         let commit = repository
@@ -333,7 +335,7 @@ impl DaemonCodeIndexPublicationStoreV1 {
             .try_into_commit()
             .map_err(Self::unavailable)?;
         let actual_tree = commit.tree_id().map_err(Self::unavailable)?;
-        if actual_tree.to_string() != expected_tree {
+        if actual_tree != expected_tree {
             return Err(Self::unavailable(
                 "durable code-generation index commit tree does not match Git",
             ));
@@ -351,13 +353,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         reason: String,
     ) -> Result<WithheldSourceV1, CodeIndexSchedulerErrorV1> {
         let digest = content_digest(raw_bytes);
-        let occurrence = omitted_file_occurrence_id(
-            &self.repository_id,
-            &self.worktree_id,
-            logical_path,
-            &digest,
-            disposition,
-        )?;
+        let occurrence =
+            omitted_file_occurrence_id(&self.repository_id, logical_path, &digest, disposition)?;
         Ok(WithheldSourceV1 {
             logical_path: logical_path.to_owned(),
             file: Some(SanitizedCodeFileV1 {
@@ -399,13 +396,8 @@ impl CodeIndexWorktreeSchedulerV1 {
                 privacy::sanitize_code_file(&descriptor.language, raw_bytes)?;
             let (digest, shared) = self.byte_pool.intern(sanitized_bytes);
             let retained_reservation = self.reserve_snapshot_memory(&digest, shared.len())?;
-            let occurrence = file_occurrence_id(
-                &self.repository_id,
-                &self.worktree_id,
-                logical_path,
-                &digest,
-                &receipt_id,
-            )?;
+            let occurrence =
+                file_occurrence_id(&self.repository_id, logical_path, &digest, &receipt_id)?;
             Ok(Some(CapturedCandidateV1 {
                 file: SanitizedCodeFileV1 {
                     file_occurrence_id: occurrence.clone(),
@@ -440,7 +432,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         control: &branch_generations::BranchGenerationReadControlV1,
     ) -> Result<CapturedSnapshotV1, CodeIndexSearchUnavailableReasonV1> {
         control.termination().map_or(Ok(()), Err)?;
-        let repository = gix::open(&self.project_root)
+        let repository = tracedecay_runtime_core::git_open::open(&self.project_root)
             .map_err(|_| CodeIndexSearchUnavailableReasonV1::GenerationUnavailable)?;
         if repository
             .try_find_reference(source.reference.as_str())
@@ -459,7 +451,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         let tree = commit
             .tree()
             .map_err(|_| CodeIndexSearchUnavailableReasonV1::GenerationUnavailable)?;
-        if tree.id().to_string() != source.tree.as_str() {
+        if tree.id() != source.tree.as_str() {
             return Err(CodeIndexSearchUnavailableReasonV1::GenerationUnavailable);
         }
         let mut entries = tree
@@ -699,7 +691,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         source: &ExactGitTreeSourceV1,
         control: &branch_generations::BranchGenerationReadControlV1,
     ) -> Result<LatestCompleteCodeIndexV1, CodeIndexSearchUnavailableReasonV1> {
-        self.ensure_worker_plan()
+        let _workers = self
+            .ensure_worker_plan()
             .map_err(|_| CodeIndexSearchUnavailableReasonV1::Internal)?;
         let _worker_memory = self.reserve_worker_memory().map_err(|error| match error {
             CodeIndexSchedulerErrorV1::WorkerMemoryAdmission(_) => {
@@ -728,7 +721,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         let requested_scope = CodeIndexGenerationScopeV1::for_snapshot(&snapshot);
         // Retained-history generations live inside the active publication
         // pointer, so they need an active generation to ride on. A store with
-        // no publication at all has no such anchor — there the mint itself
+        // no publication at all has no such anchor, there the mint itself
         // establishes the pointer, and every later exact mint (including the
         // second half of a both-sides miss in one call) rides it as history.
         let publication = match self
@@ -878,7 +871,8 @@ impl CodeIndexWorktreeSchedulerV1 {
         let merge_base = self.exact_git_tree_generation(&sources.merge_base, control)?;
         let source = self.exact_git_tree_generation(&sources.source, control)?;
         let destination = self.exact_git_tree_generation(&sources.destination, control)?;
-        self.ensure_worker_plan()
+        let _workers = self
+            .ensure_worker_plan()
             .map_err(|_| CodeIndexSearchUnavailableReasonV1::Internal)?;
         let _worker_memory = self.reserve_worker_memory().map_err(|error| match error {
             CodeIndexSchedulerErrorV1::WorkerMemoryAdmission(_) => {
@@ -1142,7 +1136,7 @@ mod tests {
 
     /// A revision the branch has already moved past is still an immutable
     /// commit, and capturing it is the only way a base whose ref advanced
-    /// mid-request — or a merge-base, or a deliberately pinned commit — ever
+    /// mid-request, or a merge-base, or a deliberately pinned commit, ever
     /// gets indexed. The capture used to peel the reference and refuse every
     /// revision that was not its current tip, so all of those were permanently
     /// uncapturable while the reference itself carried no information the

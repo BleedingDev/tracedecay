@@ -2,6 +2,7 @@
 
 use super::*;
 use tracedecay_runtime_core::cancellation::CancellationToken;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
 /// Upper bound for the size of the `DaemonInvocationService::invoke` future.
@@ -89,7 +90,7 @@ impl DaemonInvocationService {
         let canonical_root = match canonical_root {
             Some(canonical_root) => Some(canonical_root),
             None => {
-                resolved = project_root.canonicalize().ok();
+                resolved = canonical_existing_identity(project_root).ok();
                 resolved.as_deref()
             }
         };
@@ -307,7 +308,7 @@ impl DaemonInvocationService {
                 .project_runtimes
                 .request_runtimes_with_admission(project_root, project_admission),
             _ => {
-                let canonical_root = project_root.and_then(|root| root.canonicalize().ok());
+                let canonical_root = project_root.and_then(|root| canonical_existing_identity(root).ok());
                 hotpath::future!(
                     self.project_runtimes
                         .request_runtimes(project_root, canonical_root.as_deref()),
@@ -324,7 +325,7 @@ impl DaemonInvocationService {
             .as_ref()
             .map(|runtime| runtime.source_observation_port());
         // Validate before deriving an operation label. Wire frames with a
-        // foreign `surface_operation` must fail closed as InvalidRequest —
+        // foreign `surface_operation` must fail closed as InvalidRequest,
         // never reach a panic path while labeling the request.
         let validated =
             hotpath::measure_block!("daemon.service.invocation.validate", request.validate());
@@ -338,7 +339,7 @@ impl DaemonInvocationService {
                 emit_invocation_observation(
                     observations.as_ref(),
                     observation_subject.as_ref(),
-                    current_micros(),
+                    now_micros(),
                     FeedbackSourceEventV1::SurfaceArgumentRejected {
                         operation: feedback_observation_operation(operation),
                         route: delivery_route,
@@ -384,7 +385,7 @@ impl DaemonInvocationService {
                 DaemonInvocationProblem::Unavailable,
             );
         }
-        let dispatched_at = current_micros();
+        let dispatched_at = now_micros();
         if is_observable_operation(operation) {
             emit_invocation_observation(
                 observations.as_ref(),
@@ -417,6 +418,7 @@ impl DaemonInvocationService {
         });
         let lsp_owner = runtimes.lsp_owner;
         let source_edit_owner = runtimes.source_edit;
+        let graph_tool_owner = runtimes.graph_tool;
 
         let response = match request.payload {
             DaemonInvocationPayload::GitRead {
@@ -600,6 +602,18 @@ impl DaemonInvocationService {
                 deadline,
                 cancellation,
             } => {
+                let advisory_cycle = match advisory_cycle {
+                    Some(owner) if owner.service.mount().await == DaemonAdvisoryCycleMountV1::Answers => {
+                        Some(owner)
+                    }
+                    _ => {
+                        self.answering_advisory_cycle_owner(
+                            registered_project_root.as_deref(),
+                            &deadline,
+                        )
+                        .await
+                    }
+                };
                 execute_feedback_advisory_cycle(
                     request_id,
                     advisory_cycle,
@@ -693,6 +707,7 @@ impl DaemonInvocationService {
                     request_id,
                     ApplicationSurfaceOperation::FeedbackImpact,
                     PrimitiveRequest::Impact(request),
+                    None,
                     observed_at,
                     deadline,
                     cancellation,
@@ -712,6 +727,7 @@ impl DaemonInvocationService {
                     request_id,
                     ApplicationSurfaceOperation::AffectedTests,
                     PrimitiveRequest::AffectedFileTests(request),
+                    None,
                     observed_at,
                     deadline,
                     cancellation,
@@ -731,6 +747,7 @@ impl DaemonInvocationService {
                     request_id,
                     ApplicationSurfaceOperation::TestResults,
                     PrimitiveRequest::RecentTestResults(page),
+                    None,
                     observed_at,
                     deadline,
                     cancellation,
@@ -740,6 +757,7 @@ impl DaemonInvocationService {
             DaemonInvocationPayload::PrimitiveRead {
                 surface_operation,
                 request,
+                resolved_scope,
                 observed_at,
                 deadline,
                 cancellation,
@@ -751,6 +769,7 @@ impl DaemonInvocationService {
                     request_id,
                     surface_operation,
                     request,
+                    resolved_scope.as_ref(),
                     observed_at,
                     deadline,
                     cancellation,
@@ -761,6 +780,7 @@ impl DaemonInvocationService {
                 surface_operation,
                 request,
                 page,
+                resolved_scope,
                 observed_at,
                 deadline,
                 cancellation,
@@ -788,6 +808,7 @@ impl DaemonInvocationService {
                     request_id,
                     surface_operation,
                     request,
+                    resolved_scope.as_ref(),
                     observed_at,
                     deadline,
                     cancellation,
@@ -798,6 +819,7 @@ impl DaemonInvocationService {
                 surface_operation,
                 request,
                 page,
+                resolved_scope,
                 observed_at,
                 deadline,
                 cancellation,
@@ -810,6 +832,7 @@ impl DaemonInvocationService {
                     surface_operation,
                     request,
                     page,
+                    resolved_scope.as_ref(),
                     observed_at,
                     deadline,
                     cancellation,
@@ -890,6 +913,27 @@ impl DaemonInvocationService {
                 ))
                 .await
             }
+            DaemonInvocationPayload::GraphTool {
+                surface_operation,
+                arguments,
+                observed_at: _,
+                deadline,
+                cancellation,
+            } => {
+                let Some(owner) = graph_tool_owner else {
+                    return missing_registered_owner_problem(publication, request_id);
+                };
+                Box::pin(execute_graph_tool(
+                    request_id,
+                    owner,
+                    surface_operation,
+                    arguments,
+                    deadline,
+                    cancellation,
+                    request_cancellation,
+                ))
+                .await
+            }
             DaemonInvocationPayload::RetainedApplication {
                 request,
                 observed_at,
@@ -910,9 +954,12 @@ impl DaemonInvocationService {
                 ))
                 .await
             }
+            // Multi-root routes and the profile's retained stores belong to the
+            // daemon composition root, which serves them before this service.
             DaemonInvocationPayload::MultiRootScopeSetRead { .. }
             | DaemonInvocationPayload::MultiRootScopeSetCompareAndSwap { .. }
-            | DaemonInvocationPayload::MultiRootExecute { .. } => {
+            | DaemonInvocationPayload::MultiRootExecute { .. }
+            | DaemonInvocationPayload::ProfileRetainedApplication { .. } => {
                 DaemonInvocationResponse::problem(
                     request_id,
                     DaemonInvocationProblem::InvalidRequest,

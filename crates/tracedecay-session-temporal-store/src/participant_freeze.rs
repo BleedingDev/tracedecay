@@ -8,12 +8,13 @@ use tracedecay_contracts::retrieval::{
 };
 use tracedecay_domain::{SessionId, SignedCursorKeyRefV1};
 use tracedecay_runtime_core::db::engine::params;
-use tracedecay_temporal_query::ports::{
-    BindingDigest, MAX_TEMPORAL_PARTICIPANTS, TemporalAuthorizedRoot,
-    TemporalParticipantAuthorization, TemporalParticipantGeneration, TemporalParticipantManifest,
-    TemporalPreparedCandidateCohort, TemporalRetrievalScope, TemporalSourceAccess,
+use tracedecay_temporal_query::execution::BindingDigest;
+use tracedecay_temporal_query::snapshot::{
+    MAX_TEMPORAL_PARTICIPANTS, TemporalParticipantAuthorization, TemporalParticipantGeneration,
+    TemporalParticipantManifest, TemporalPreparedCandidateCohort, TemporalSourceAccess,
     TemporalWatermarks,
 };
+use tracedecay_temporal_query::snapshot::{TemporalAuthorizedRoot, TemporalRetrievalScope};
 
 use super::execution::{
     AuthorizedTemporalExecutionRequest, SessionDataFreshness, SessionTemporalExecutionError,
@@ -523,11 +524,10 @@ mod tests {
     use tracedecay_runtime_core::db::engine::{Executor, TestConnection};
     use tracedecay_temporal_query::candidates::CandidateChannel;
     use tracedecay_temporal_query::context::{ContextBudget, TokenPolicy, VersionedTokenEstimator};
-    use tracedecay_temporal_query::ports::{
-        ExecutionControl, ExecutionLimits, TemporalCandidatePopulationCount,
-        TemporalSnapshotRequest,
-    };
+    use tracedecay_temporal_query::execution::{ExecutionControl, ExecutionLimits};
     use tracedecay_temporal_query::ranking::DiversityLimits;
+    use tracedecay_temporal_query::snapshot::TemporalCandidatePopulationCount;
+    use tracedecay_temporal_query::snapshot::TemporalSnapshotRequest;
 
     fn root(project_id: Option<&str>) -> TemporalAuthorizedRoot {
         match project_id {
@@ -539,9 +539,7 @@ mod tests {
         .expect("valid authorized root")
     }
 
-    fn digest(byte: char) -> String {
-        format!("sha256:{}", byte.to_string().repeat(64))
-    }
+    use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
     fn execution_request() -> AuthorizedTemporalExecutionRequest {
         let snapshot = TemporalSnapshotRequest::new(
@@ -748,7 +746,7 @@ mod tests {
             "root-fixture",
         )
         .expect("resolution authorization");
-        let anchor = tracedecay_store::build_observation_retrieval_anchor_v2(
+        let anchor = tracedecay_store::build_observation_retrieval_anchor(
             &observation,
             projection_generation,
             UtcMicros(1),
@@ -918,8 +916,7 @@ mod tests {
                          session_id, generation, occurrence_id, source_observation_id,
                          source_provider, projection_output_ordinal, retrieval_anchor_id,
                          message_id, turn_id, role, knowledge_at, valid_time_json,
-                         evidence_json, sanitized_content_digest, sanitized_content_bytes,
-                         snippet_text, index_text
+                         evidence_json, sanitized_content_digest, sanitized_content_bytes, index_text
                      ) VALUES (?1, 1, ?2, ?3, 'codex', 0, ?4, ?5, ?6, 'user', ?7,
                                '{\"kind\":\"unknown\"}',
                                '{\"authority\":\"provider_native\",
@@ -930,7 +927,7 @@ mod tests {
                                     \"sanitizer_version\":\"root-sanitizer\"
                                  }}',
                                '0000000000000000000000000000000000000000000000000000000000000000',
-                               14, ?8, ?8)",
+                               14, ?8)",
                     params![
                         session_id.as_str(),
                         occurrence_id.as_str(),
@@ -1025,8 +1022,7 @@ mod tests {
                          session_id, generation, occurrence_id, source_observation_id,
                          source_provider, projection_output_ordinal, retrieval_anchor_id,
                          message_id, turn_id, role, knowledge_at, valid_time_json,
-                         evidence_json, sanitized_content_digest, sanitized_content_bytes,
-                         snippet_text, index_text
+                         evidence_json, sanitized_content_digest, sanitized_content_bytes, index_text
                      ) VALUES ('session.000', 1, ?1, 'observation.000', 'codex', ?2,
                                ?4, ?3, 'turn.000', 'user', ?2,
                                '{\"kind\":\"unknown\"}',
@@ -1038,7 +1034,7 @@ mod tests {
                                     \"sanitizer_version\":\"root-sanitizer\"
                                  }}',
                                '0000000000000000000000000000000000000000000000000000000000000000',
-                               14, ?5, ?5)",
+                               14, ?5)",
                     params![
                         occurrence_id.as_str(),
                         i64::try_from(extra + 1).expect("member ordinal"),
@@ -1232,8 +1228,8 @@ mod tests {
         assert!(report.result().next_cursor.is_none());
     }
 
-    /// A strict tier that is verified empty — scanned to exhaustion under these
-    /// filters and this snapshot — takes exactly one named step down the ladder,
+    /// A strict tier that is verified empty, scanned to exhaustion under these
+    /// filters and this snapshot, takes exactly one named step down the ladder,
     /// and the answer says which tier produced it.
     #[tokio::test]
     async fn a_verified_zero_strict_tier_relaxes_one_named_step() {
@@ -1324,7 +1320,7 @@ mod tests {
 
     /// The refusal this reproduces: one rare hit across 300 sessions, wrapped in a
     /// span whose membership dwarfs `record_limit`. The query must return its hit
-    /// under the unchanged ceiling, because a group costs its bounds — not its
+    /// under the unchanged ceiling, because a group costs its bounds, not its
     /// census.
     #[tokio::test]
     async fn root_rare_hit_executes_under_the_unchanged_record_ceiling() {

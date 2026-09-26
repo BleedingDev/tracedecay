@@ -10,16 +10,74 @@ tmpdir="$(mktemp -d)"
 trap 'rm -rf "$tmpdir"' EXIT
 mkdir -p "$tmpdir/archive" "$tmpdir/bin" "$tmpdir/install"
 
-cat >"$tmpdir/archive/tracedecay" <<'SH'
+# Default install path resolves the newest *complete* release via the
+# releases API, including prereleases. Fixture tag uses the beta prefix
+# release-beta.yml publishes.
+BETA_TAG=v9.8.7-beta.1
+BETA_ASSET="tracedecay-beta-${BETA_TAG}-x86_64-linux.tar.gz"
+STABLE_TAG=v9.8.7
+STABLE_ASSET="tracedecay-${STABLE_TAG}-x86_64-linux.tar.gz"
+# Newer prerelease that Release Please published before assets uploaded.
+INCOMPLETE_TAG=v9.8.8-beta.1
+
+stage_release_archive() {
+  local version=$1
+  local asset=$2
+  local sums=$3
+  cat >"$tmpdir/archive/tracedecay" <<SH
 #!/usr/bin/env bash
-printf 'tracedecay 9.8.7\n'
+printf 'tracedecay ${version}\n'
 SH
-chmod +x "$tmpdir/archive/tracedecay"
-tar -czf "$tmpdir/tracedecay-v9.8.7-x86_64-linux.tar.gz" -C "$tmpdir/archive" tracedecay
-(
-  cd "$tmpdir"
-  sha256sum tracedecay-v9.8.7-x86_64-linux.tar.gz >SHA256SUMS
-)
+  chmod +x "$tmpdir/archive/tracedecay"
+  tar -czf "$tmpdir/${asset}" -C "$tmpdir/archive" tracedecay
+  (
+    cd "$tmpdir"
+    sha256sum "$asset" >"$sums"
+  )
+}
+
+stage_release_archive "9.8.7-beta.1" "$BETA_ASSET" SHA256SUMS
+stage_release_archive "9.8.7" "$STABLE_ASSET" STABLE_SHA256SUMS
+
+# Incomplete first, complete beta second: default latest must skip the empty
+# prerelease and install the beta that already lists archive + SHA256SUMS.
+cat >"$tmpdir/releases.json" <<JSON
+[
+  {
+    "tag_name": "${INCOMPLETE_TAG}",
+    "prerelease": true,
+    "assets": []
+  },
+  {
+    "tag_name": "${BETA_TAG}",
+    "prerelease": true,
+    "assets": [
+      {
+        "name": "${BETA_ASSET}",
+        "browser_download_url": "https://github.com/ScriptedAlchemy/tracedecay/releases/download/${BETA_TAG}/${BETA_ASSET}"
+      },
+      {
+        "name": "SHA256SUMS",
+        "browser_download_url": "https://github.com/ScriptedAlchemy/tracedecay/releases/download/${BETA_TAG}/SHA256SUMS"
+      }
+    ]
+  },
+  {
+    "tag_name": "${STABLE_TAG}",
+    "prerelease": false,
+    "assets": [
+      {
+        "name": "${STABLE_ASSET}",
+        "browser_download_url": "https://github.com/ScriptedAlchemy/tracedecay/releases/download/${STABLE_TAG}/${STABLE_ASSET}"
+      },
+      {
+        "name": "SHA256SUMS",
+        "browser_download_url": "https://github.com/ScriptedAlchemy/tracedecay/releases/download/${STABLE_TAG}/SHA256SUMS"
+      }
+    ]
+  }
+]
+JSON
 
 cat >"$tmpdir/bin/uname" <<'SH'
 #!/usr/bin/env bash
@@ -36,10 +94,15 @@ set -euo pipefail
 
 output=
 url=
+write_out=
 while (($#)); do
   case "$1" in
     -o)
       output=$2
+      shift 2
+      ;;
+    -w)
+      write_out=$2
       shift 2
       ;;
     http*)
@@ -53,32 +116,100 @@ while (($#)); do
 done
 
 case "$url" in
-  */releases/latest) printf '%s\n' 'https://github.com/ScriptedAlchemy/tracedecay/releases/tag/v9.8.7' ;;
-  */SHA256SUMS) cp "$TEST_CHECKSUMS" "$output" ;;
-  *.tar.gz) cp "$TEST_ARCHIVE" "$output" ;;
-  *) exit 2 ;;
+  */api.github.com/repos/*/releases*)
+    cat "$TEST_RELEASES_JSON"
+    ;;
+  */releases/latest)
+    if [[ -n $write_out ]]; then
+      printf '%s' 'https://github.com/ScriptedAlchemy/tracedecay/releases/tag/v9.8.7'
+    else
+      printf '%s\n' 'https://github.com/ScriptedAlchemy/tracedecay/releases/tag/v9.8.7'
+    fi
+    ;;
+  */download/v9.8.7-beta.1/SHA256SUMS)
+    cp "$TEST_CHECKSUMS" "$output"
+    ;;
+  */download/v9.8.7/SHA256SUMS)
+    cp "$TEST_STABLE_CHECKSUMS" "$output"
+    ;;
+  */download/v9.8.7-beta.1/*.tar.gz)
+    cp "$TEST_ARCHIVE" "$output"
+    ;;
+  */download/v9.8.7/*.tar.gz)
+    cp "$TEST_STABLE_ARCHIVE" "$output"
+    ;;
+  *)
+    exit 2
+    ;;
 esac
 SH
 chmod +x "$tmpdir/bin/uname" "$tmpdir/bin/curl"
 
-PATH="$tmpdir/bin:$PATH" \
-TRACEDECAY_INSTALL_DIR="$tmpdir/install" \
-TEST_ARCHIVE="$tmpdir/tracedecay-v9.8.7-x86_64-linux.tar.gz" \
-TEST_CHECKSUMS="$tmpdir/SHA256SUMS" \
-  "$INSTALLER"
+run_installer() {
+  PATH="$tmpdir/bin:$PATH" \
+  TRACEDECAY_INSTALL_DIR="$tmpdir/install" \
+  TEST_RELEASES_JSON="${INSTALLER_RELEASES_JSON:-$tmpdir/releases.json}" \
+  TEST_ARCHIVE="$tmpdir/${BETA_ASSET}" \
+  TEST_CHECKSUMS="${INSTALLER_CHECKSUMS:-$tmpdir/SHA256SUMS}" \
+  TEST_STABLE_ARCHIVE="$tmpdir/${STABLE_ASSET}" \
+  TEST_STABLE_CHECKSUMS="$tmpdir/STABLE_SHA256SUMS" \
+    "$@"
+}
 
-[[ "$("$tmpdir/install/tracedecay")" == "tracedecay 9.8.7" ]]
+rm -rf "$tmpdir/install"
+mkdir -p "$tmpdir/install"
+run_installer "$INSTALLER"
+[[ "$("$tmpdir/install/tracedecay")" == "tracedecay 9.8.7-beta.1" ]]
 [[ "$(ls -A "$tmpdir/install")" == "tracedecay" ]]
+
+rm -rf "$tmpdir/install"
+mkdir -p "$tmpdir/install"
+run_installer env TRACEDECAY_VERSION=stable "$INSTALLER"
+[[ "$("$tmpdir/install/tracedecay")" == "tracedecay 9.8.7" ]]
+
+# The live releases payload is hundreds of KB of pretty-printed lines. With the
+# asset URLs near the front and many lines after them, an early-exiting matcher
+# fed by a pipe leaves the writer to die of SIGPIPE under pipefail.
+write_large_releases() {
+  local path=$1
+  local assets=$2
+  {
+    printf '[\n  {\n    "tag_name": "%s",\n    "prerelease": true,\n' "$BETA_TAG"
+    printf '    "assets": [%s],\n    "padding": [\n' "$assets"
+    printf '      "%064d",\n' $(seq 16000)
+    printf '      ""\n    ]\n  }\n]\n'
+  } >"$path"
+  (($(wc -c <"$path") > 1048576))
+}
+
+write_large_releases "$tmpdir/large-releases.json" "$(
+  printf '{"browser_download_url": "https://github.com/ScriptedAlchemy/tracedecay/releases/download/%s/%s"},' \
+    "$BETA_TAG" "$BETA_ASSET"
+  printf '{"browser_download_url": "https://github.com/ScriptedAlchemy/tracedecay/releases/download/%s/SHA256SUMS"}' \
+    "$BETA_TAG"
+)"
+rm -rf "$tmpdir/install"
+mkdir -p "$tmpdir/install"
+INSTALLER_RELEASES_JSON="$tmpdir/large-releases.json" run_installer "$INSTALLER"
+[[ "$("$tmpdir/install/tracedecay")" == "tracedecay 9.8.7-beta.1" ]]
+
+write_large_releases "$tmpdir/large-releases-without-assets.json" ""
+rm -rf "$tmpdir/install"
+mkdir -p "$tmpdir/install"
+if INSTALLER_RELEASES_JSON="$tmpdir/large-releases-without-assets.json" \
+  run_installer "$INSTALLER" >"$tmpdir/no-assets.log" 2>&1; then
+  echo "installer accepted a release without install assets" >&2
+  exit 1
+fi
+grep -Fq "no published release has install assets for x86_64-linux" \
+  "$tmpdir/no-assets.log"
+[[ -z "$(ls -A "$tmpdir/install")" ]]
 
 expect_installer_failure() {
   local checksums=$1
   local expected_message=$2
   local output="$tmpdir/installer-failure.log"
-  if PATH="$tmpdir/bin:$PATH" \
-    TRACEDECAY_INSTALL_DIR="$tmpdir/install" \
-    TEST_ARCHIVE="$tmpdir/tracedecay-v9.8.7-x86_64-linux.tar.gz" \
-    TEST_CHECKSUMS="$checksums" \
-      "$INSTALLER" >"$output" 2>&1
+  if INSTALLER_CHECKSUMS="$checksums" run_installer "$INSTALLER" >"$output" 2>&1
   then
     echo "installer unexpectedly accepted invalid release inputs" >&2
     exit 1
@@ -86,11 +217,11 @@ expect_installer_failure() {
   grep -Fq "$expected_message" "$output"
 }
 
-printf '%064d  tracedecay-v9.8.7-x86_64-linux.tar.gz\n' 0 \
+printf '%064d  %s\n' 0 "$BETA_ASSET" \
   >"$tmpdir/mismatched-SHA256SUMS"
 expect_installer_failure \
   "$tmpdir/mismatched-SHA256SUMS" \
-  "checksum mismatch for tracedecay-v9.8.7-x86_64-linux.tar.gz"
+  "checksum mismatch for ${BETA_ASSET}"
 
 {
   cat "$tmpdir/SHA256SUMS"
@@ -98,10 +229,51 @@ expect_installer_failure \
 } >"$tmpdir/duplicate-SHA256SUMS"
 expect_installer_failure \
   "$tmpdir/duplicate-SHA256SUMS" \
-  "SHA256SUMS must contain exactly one entry for tracedecay-v9.8.7-x86_64-linux.tar.gz"
+  "SHA256SUMS must contain exactly one entry for ${BETA_ASSET}"
 
-printf 'not-a-digest  tracedecay-v9.8.7-x86_64-linux.tar.gz\n' \
+printf 'not-a-digest  %s\n' "$BETA_ASSET" \
   >"$tmpdir/invalid-SHA256SUMS"
 expect_installer_failure \
   "$tmpdir/invalid-SHA256SUMS" \
-  "SHA256SUMS has an invalid digest for tracedecay-v9.8.7-x86_64-linux.tar.gz"
+  "SHA256SUMS has an invalid digest for ${BETA_ASSET}"
+
+# The published binary has already been through release strip: its ad-hoc
+# identifier is the deps filename (`tracedecay-<hash>`), not the installed
+# name. install.sh signs the installed file.
+deps_hash=3d1e6be7cae777a9
+printf '\xcf\xfa\xed\xfe' >"$tmpdir/archive/tracedecay"
+printf 'rest' >>"$tmpdir/archive/tracedecay"
+chmod +x "$tmpdir/archive/tracedecay"
+cat >"$tmpdir/bin/codesign" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ ${1:-} == -d || ${1:-} == -dv || ${1:-} == --display ]]; then
+  printf '%s\n' "${CODESIGN_REPORT:-}"
+  exit 0
+fi
+printf '%s\n' "$*" >>"${CODESIGN_LOG:?}"
+SH
+chmod +x "$tmpdir/bin/codesign"
+codesign_log=$tmpdir/codesign.log
+: >"$codesign_log"
+PATH="$tmpdir/bin:$PATH" \
+  CODESIGN_LOG="$codesign_log" \
+  codesign --force --sign - --identifier "tracedecay-${deps_hash}" \
+  "$tmpdir/archive/tracedecay"
+tar -czf "$tmpdir/${BETA_ASSET}" -C "$tmpdir/archive" tracedecay
+(
+  cd "$tmpdir"
+  sha256sum "$BETA_ASSET" >SHA256SUMS
+)
+rm -rf "$tmpdir/install"
+mkdir -p "$tmpdir/install"
+CODESIGN_LOG="$codesign_log" \
+  CODESIGN_REPORT=$'Identifier=tracedecay-'"${deps_hash}"$'\nSignature=adhoc\nTeamIdentifier=not set\n' \
+  run_installer env TRACEDECAY_ASSUME_DARWIN=1 "$INSTALLER" \
+  >"$tmpdir/macho-install.log"
+strip_line=$(head -n 1 "$codesign_log")
+stable_line=$(tail -n 1 "$codesign_log")
+[[ $strip_line == "--force --sign - --identifier tracedecay-${deps_hash} ${tmpdir}/archive/tracedecay" ]]
+[[ $stable_line == "--force --sign - --identifier dev.tracedecay.cli -r=designated => identifier \"dev.tracedecay.cli\" ${tmpdir}/install/tracedecay" ]]
+[[ $strip_line != "$stable_line" ]]
+grep -Fq "Installed tracedecay ${BETA_TAG#v}" "$tmpdir/macho-install.log"

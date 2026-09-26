@@ -15,8 +15,9 @@ use crate::runtime::source::{
     run_blocking_transcript_section,
 };
 use crate::runtime::{
-    SessionProvider, claude, claude_observation, cline_like, codex, cursor, cursor_composer,
-    hermes, kimi, kiro, opencode, vibe,
+    SessionProvider, hosts::claude, hosts::claude_observation, hosts::cline_like, hosts::codex,
+    hosts::cursor, hosts::cursor_composer, hosts::hermes, hosts::kimi, hosts::kiro,
+    hosts::opencode, hosts::pi, hosts::vibe,
 };
 
 use super::failure::{
@@ -30,6 +31,7 @@ pub(super) const PROJECT_CATCH_UP_PROVIDERS: &[SessionProvider] = &[
     SessionProvider::Kiro,
     SessionProvider::Kimi,
     SessionProvider::OpenCode,
+    SessionProvider::Pi,
     SessionProvider::Cline,
     SessionProvider::RooCode,
     SessionProvider::Kilo,
@@ -79,9 +81,9 @@ fn merge_cursor_sweep_outcome(
     outcome.bytes_consumed = outcome
         .bytes_consumed
         .saturating_add(sweep.stats.bytes_consumed);
-    outcome.add_deferred_units(u64::from(
+    outcome.add_deferred_units(sweep.coverage.deferred_sessions().max(u64::from(
         sweep.stats.source_deferred || sweep.stats.bytes_consumed > remaining,
-    ));
+    )));
 }
 
 fn claude_provider_run_outcome(
@@ -173,6 +175,7 @@ impl<'a> ProjectProviderRun<'a> {
                     ProjectProviderRunResult::provider(self.run_hermes().await)
                 }
                 SessionProvider::Vibe => ProjectProviderRunResult::provider(self.run_vibe().await),
+                SessionProvider::Pi => ProjectProviderRunResult::provider(self.run_pi().await),
             }
         })
     }
@@ -260,7 +263,7 @@ impl<'a> ProjectProviderRun<'a> {
         let mut deferred = discovery.is_truncated();
         let mut frontier_committable = true;
         let mut outcome = ProviderRunOutcome::bounded(TranscriptIngestStats::default(), 0, false);
-        for (path_index, path) in discovery.paths.iter().enumerate() {
+        for path in &discovery.paths {
             if remaining == 0 {
                 deferred = true;
                 frontier_committable = false;
@@ -287,10 +290,15 @@ impl<'a> ProjectProviderRun<'a> {
                     frontier_committable &=
                         !progress.source_deferred && progress.bytes_consumed <= remaining;
                     remaining = remaining.saturating_sub(progress.bytes_consumed);
-                    if progress.bytes_consumed > 0
-                        && (progress.source_deferred
-                            || path_index.saturating_add(1) < discovery.paths.len())
-                    {
+                    // Only a source the admission left mid-window ends the
+                    // pass: it owns the next one, and no discovery frontier may
+                    // commit past it. An exhausted source must not, or a pass
+                    // admits at most one source however much budget is left,
+                    // never commits a frontier, and the next pass rediscovers
+                    // and re-reads every source it already finished. The byte
+                    // budget above is the pass bound here, exactly as it is in
+                    // the profile-scope loop.
+                    if progress.source_deferred {
                         deferred = true;
                         frontier_committable = false;
                         break;
@@ -460,6 +468,66 @@ impl<'a> ProjectProviderRun<'a> {
                         "coverage",
                         &coverage_error,
                         "project Kimi coverage persistence failed",
+                    ));
+                }
+                run
+            }
+        }
+    }
+
+    #[hotpath::measure(label = "sessions.ingest.project.pi", future = true)]
+    async fn run_pi(self) -> ProviderRunOutcome {
+        let Some(source) = pi::PiSource::new() else {
+            return ProviderRunOutcome::skipped();
+        };
+        match pi::capture_pi_observations(
+            self.facade,
+            &source,
+            self.project_root,
+            self.scope.clone(),
+            Some(self.max_new_bytes),
+            self.cancellation,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let mut run = ProviderRunOutcome::bounded(
+                    TranscriptIngestStats::default(),
+                    outcome.bytes_consumed,
+                    outcome.deferred,
+                );
+                if outcome.discovery_failures > 0 {
+                    run.add_failure(TranscriptCatchUpFailure::source_discovery_partial("pi"));
+                }
+                run
+            }
+            Err(error) => {
+                if let Some(cancelled) = cancelled_provider_outcome(&error) {
+                    return cancelled;
+                }
+                let mut run = ProviderRunOutcome::failed(
+                    warn_transcript_catch_up_failure(
+                        "pi",
+                        "observation",
+                        &error,
+                        "project Pi observation catch-up failed",
+                    ),
+                    0,
+                );
+                if let Err(coverage_error) = persist_host_provider_coverage(
+                    self.facade,
+                    self.scope,
+                    "pi",
+                    HostProviderCoverage::Unavailable,
+                    1,
+                )
+                .await
+                {
+                    run.add_failure(warn_transcript_catch_up_failure(
+                        "pi",
+                        "coverage",
+                        &coverage_error,
+                        "project Pi coverage persistence failed",
                     ));
                 }
                 run
@@ -813,11 +881,13 @@ async fn ingest_project_claude_observations(
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::runtime::claude_observation::{
+    use crate::runtime::hosts::claude_observation::{
         ClaudeObservationIngestError, ClaudeObservationIngestStats,
     };
-    use crate::runtime::cursor::{CursorSweepIngestOutcome, CursorTranscriptIngestStats};
-    use crate::runtime::cursor_composer::CursorComposerSweepOutcome;
+    use crate::runtime::hosts::cursor::{
+        CursorSweepCoverage, CursorSweepIngestOutcome, CursorTranscriptIngestStats,
+    };
+    use crate::runtime::hosts::cursor_composer::CursorComposerSweepOutcome;
     use crate::runtime::shared::TranscriptIngestStats;
     use crate::runtime::source::TranscriptIngestError;
 
@@ -826,7 +896,7 @@ mod tests {
         codex_source_failure_saturates_pass, cursor_composer_run_outcome, hermes_run_outcome,
         merge_cursor_sweep_outcome,
     };
-    use crate::runtime::hermes::HermesSweepOutcome;
+    use crate::runtime::hosts::hermes::HermesSweepOutcome;
 
     #[test]
     fn codex_source_failures_bound_each_provider_pass() {
@@ -923,8 +993,11 @@ mod tests {
                 messages_upserted: 3,
                 bytes_consumed: 4,
                 source_deferred: true,
+                observations_committed: 0,
+                exact_duplicate: false,
             },
             session_ids: BTreeSet::from(["shared-session".to_string()]),
+            coverage: CursorSweepCoverage::Complete,
         };
 
         merge_cursor_sweep_outcome(&mut outcome, &mut session_ids, sweep, 10);
@@ -933,6 +1006,26 @@ mod tests {
         assert_eq!(outcome.stats.messages_upserted, 5);
         assert_eq!(outcome.bytes_consumed, 14);
         assert_eq!(outcome.deferred_units, 1);
+    }
+
+    #[test]
+    fn project_cursor_run_defers_every_session_the_sweep_lap_has_not_reached() {
+        let mut outcome = ProviderRunOutcome::bounded(TranscriptIngestStats::default(), 0, false);
+        let sweep = CursorSweepIngestOutcome {
+            stats: CursorTranscriptIngestStats {
+                source_deferred: true,
+                ..CursorTranscriptIngestStats::default()
+            },
+            session_ids: BTreeSet::new(),
+            coverage: CursorSweepCoverage::Continuing {
+                resume_at: 4096,
+                total: 8553,
+            },
+        };
+
+        merge_cursor_sweep_outcome(&mut outcome, &mut BTreeSet::new(), sweep, 10);
+
+        assert_eq!(outcome.deferred_units, 8553 - 4096);
     }
 
     #[test]

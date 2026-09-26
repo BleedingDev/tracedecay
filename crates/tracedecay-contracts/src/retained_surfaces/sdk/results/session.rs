@@ -1,5 +1,8 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use tracedecay_domain::{
+    HydrationStateV1, SessionSourceCoverageReasonV1, SessionSourceCoverageStateV1, TemporalModeV1,
+};
 
 use super::{RetainedErrorV1, RetainedOutcomeStatusV1};
 
@@ -95,7 +98,22 @@ pub enum HydrationStateResultV1 {
     RetentionExpired,
     Unauthorized,
     Locked,
-    UnverifiableLegacy,
+    Unverifiable,
+}
+
+impl From<HydrationStateV1> for HydrationStateResultV1 {
+    fn from(value: HydrationStateV1) -> Self {
+        match value {
+            HydrationStateV1::Available => Self::Available,
+            HydrationStateV1::RetainedButUnavailable => Self::RetainedButUnavailable,
+            HydrationStateV1::Redacted => Self::Redacted,
+            HydrationStateV1::Deleted => Self::Deleted,
+            HydrationStateV1::RetentionExpired => Self::RetentionExpired,
+            HydrationStateV1::Unauthorized => Self::Unauthorized,
+            HydrationStateV1::Locked => Self::Locked,
+            HydrationStateV1::Unverifiable => Self::Unverifiable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -139,16 +157,7 @@ pub struct SessionSourceCoverageV1 {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionCoverageRequestV1 {
-    pub mode: SessionCoverageModeV1,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionCoverageModeV1 {
-    Current,
-    AsOf { cutoff: i64 },
-    Evolution,
-    Forensic,
+    pub mode: TemporalModeV1,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -161,6 +170,20 @@ pub enum SessionCoverageStateV1 {
     Redacted,
     RetentionWithheld,
     Unavailable,
+}
+
+impl From<SessionSourceCoverageStateV1> for SessionCoverageStateV1 {
+    fn from(value: SessionSourceCoverageStateV1) -> Self {
+        match value {
+            SessionSourceCoverageStateV1::Fresh => Self::Fresh,
+            SessionSourceCoverageStateV1::Stale => Self::Stale,
+            SessionSourceCoverageStateV1::Partial => Self::Partial,
+            SessionSourceCoverageStateV1::Locked => Self::Locked,
+            SessionSourceCoverageStateV1::Redacted => Self::Redacted,
+            SessionSourceCoverageStateV1::RetentionWithheld => Self::RetentionWithheld,
+            SessionSourceCoverageStateV1::Unavailable => Self::Unavailable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -202,6 +225,31 @@ pub enum SessionCoverageReasonV1 {
     Redacted,
     RetentionWithheld,
     Unavailable,
+}
+
+impl From<&SessionSourceCoverageReasonV1> for SessionCoverageReasonV1 {
+    fn from(value: &SessionSourceCoverageReasonV1) -> Self {
+        match value {
+            SessionSourceCoverageReasonV1::CaughtUp => Self::CaughtUp,
+            SessionSourceCoverageReasonV1::ProjectionBehindSource { lag } => {
+                Self::ProjectionBehindSource { lag: *lag }
+            }
+            SessionSourceCoverageReasonV1::SourceBehindTarget { lag } => {
+                Self::SourceBehindTarget { lag: *lag }
+            }
+            SessionSourceCoverageReasonV1::ProjectionAndSourceBehind {
+                projection_lag,
+                source_lag,
+            } => Self::ProjectionAndSourceBehind {
+                projection_lag: *projection_lag,
+                source_lag: *source_lag,
+            },
+            SessionSourceCoverageReasonV1::Locked => Self::Locked,
+            SessionSourceCoverageReasonV1::Redacted => Self::Redacted,
+            SessionSourceCoverageReasonV1::RetentionWithheld => Self::RetentionWithheld,
+            SessionSourceCoverageReasonV1::Unavailable => Self::Unavailable,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -248,44 +296,10 @@ pub struct RetrievalWorkerStatusV1 {
     pub retry_class: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageSearchFreshnessV1 {
-    Fresh,
-    Stored,
-    Partial,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MessageSearchRootV1 {
-    pub project_id: String,
-    pub root: String,
-    pub status: RetainedOutcomeStatusV1,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub freshness: Option<MessageSearchFreshnessV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub omitted: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct MessageSearchSkipV1 {
-    pub project_id: String,
-    pub reason: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageSearchResultV1 {
-    pub catch_up: bool,
-    pub catch_up_failures: Vec<String>,
-    pub catch_up_performed: bool,
-    pub catch_up_provider: String,
+    pub require_fresh: bool,
     pub count: Option<usize>,
     pub goals: bool,
     pub include_subagents: bool,
@@ -314,21 +328,7 @@ pub struct MessageSearchResultV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omitted: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_truncated: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub roots: Option<Vec<MessageSearchRootV1>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub searched_project_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selected_project_root: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service_status: Option<RetrievalWorkerStatusV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skipped: Option<Vec<MessageSearchSkipV1>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skipped_project_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -594,4 +594,44 @@ pub struct WorkflowsResultV1 {
     pub runs: Option<Vec<WorkflowRunV1>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+}
+
+#[cfg(test)]
+mod coverage_projection_tests {
+    use tracedecay_domain::{
+        HydrationStateV1, SessionSourceCoverageReasonV1, SessionSourceCoverageStateV1,
+        TemporalModeV1, UtcMicros,
+    };
+
+    use super::{
+        HydrationStateResultV1, SessionCoverageReasonV1, SessionCoverageRequestV1,
+        SessionCoverageStateV1,
+    };
+
+    #[test]
+    fn coverage_projection_keeps_mode_cutoff_and_status_labels() {
+        assert_eq!(
+            serde_json::to_value(SessionCoverageRequestV1 {
+                mode: TemporalModeV1::AsOf {
+                    cutoff: UtcMicros(7),
+                },
+            })
+            .expect("coverage request serializes"),
+            serde_json::json!({"mode": {"kind": "as_of", "cutoff": 7}})
+        );
+        assert_eq!(
+            SessionCoverageStateV1::from(SessionSourceCoverageStateV1::RetentionWithheld),
+            SessionCoverageStateV1::RetentionWithheld
+        );
+        assert_eq!(
+            SessionCoverageReasonV1::from(&SessionSourceCoverageReasonV1::ProjectionBehindSource {
+                lag: 4
+            }),
+            SessionCoverageReasonV1::ProjectionBehindSource { lag: 4 }
+        );
+        assert_eq!(
+            HydrationStateResultV1::from(HydrationStateV1::Unverifiable),
+            HydrationStateResultV1::Unverifiable
+        );
+    }
 }

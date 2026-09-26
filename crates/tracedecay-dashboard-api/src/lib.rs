@@ -1,11 +1,11 @@
-//! `tracedecay dashboard` — local HTTP server for the dashboard UIs.
+//! `tracedecay dashboard`, local HTTP server for the dashboard UIs.
 //!
 //! Serves TraceDecay's embedded dashboard and its project-scoped JSON APIs:
 //!
 //! - `/api/plugins/holographic/*`  → canonical project facts, verified Grafeo
 //!   topology, and deterministic FHRR projections derived on read
 //! - `/api/plugins/hermes-lcm/*`   → LCM session store
-//!   (`lcm_raw_messages` / `lcm_summary_nodes` in the resolved active project
+//!   (`lcm_raw_messages` / `session_summary_nodes` in the resolved active project
 //!   store where transcript ingest writes; see [`resolve_lcm_store`] for the
 //!   fail-closed authority selection)
 //!
@@ -37,7 +37,7 @@ pub use tracedecay::DashboardProjectContext;
 /// `Database::publish_test_runtime` materialises a profile-scoped sidecar shard
 /// that the kernel initialises through
 /// `tracedecay_runtime_core::ports::registered_schema`. That port fails closed
-/// until the real schema — owned by `tracedecay-global-db` — is registered.
+/// until the real schema, owned by `tracedecay-global-db`, is registered.
 /// Production wires it from the daemon composition root; this crate's test
 /// target reuses the identical installer through its `test-helpers`
 /// dev-dependency. Idempotent: the port keeps the first registration, so every
@@ -73,11 +73,11 @@ pub(crate) mod test_support {
             Vec::new()
         }
 
-        fn write_text(path: &Path, contents: &str, _: Option<&Path>) -> Result<()> {
+        fn write_text(path: &Path, contents: &str) -> Result<()> {
             Ok(std::fs::write(path, contents)?)
         }
 
-        fn write_json(path: &Path, value: &serde_json::Value, _: Option<&Path>) -> Result<()> {
+        fn write_json(path: &Path, value: &serde_json::Value) -> Result<()> {
             Ok(std::fs::write(path, serde_json::to_vec_pretty(value)?)?)
         }
 
@@ -132,6 +132,7 @@ pub mod code_read_api;
 pub mod config;
 #[doc(hidden)]
 pub mod contract_schema;
+mod delivery_agent_usage;
 mod delivery_api;
 pub use delivery_api::{
     DashboardDeliveryProjectV1, DashboardDeliveryReadFutureV1, DashboardDeliveryReadPortV1,
@@ -145,7 +146,6 @@ pub mod feedback_api;
 mod graph_api;
 mod graph_service;
 mod graph_structure_api;
-pub mod hooks;
 mod lcm_api;
 mod remote_status_api;
 pub use lcm_api::{
@@ -171,6 +171,11 @@ mod projects;
 mod read_model;
 mod request_deadline;
 mod savings_api;
+mod session_authority;
+pub use session_authority::{
+    DashboardSessionAuthoritiesV1, DashboardSessionAuthorityStateV1, DashboardSessionMountV1,
+    DashboardSessionResolutionV1, DashboardSessionResolveFuture, DashboardSessionResolverV1,
+};
 mod snapshot_cache;
 use tracedecay_session_memory::provider_pricing as savings_pricing;
 pub mod scope;
@@ -181,7 +186,6 @@ pub use settings_api::{
     DashboardCodeIndexWorkerSettingsFuture, DashboardProfileCodeIndexWorkerSettingsPort,
     PrAutoTrackManagedSummaryEntryV1, PrAutoTrackManagedSummaryReader,
 };
-mod storage_findings_api;
 mod storage_telemetry_api;
 mod token_count;
 mod util;
@@ -211,7 +215,7 @@ use tracedecay_automation_runtime::automation::backend;
 use tracedecay_automation_runtime::automation::config::{AutomationBackend, AutomationHostMode};
 use tracedecay_automation_runtime::automation::host_io::HostIo;
 use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader;
-use tracedecay_contracts::doctor::DoctorReportV1;
+use tracedecay_contracts::doctor::{DoctorReportV1, LanguageServerReadV1};
 use tracedecay_contracts::storage::{SchemaConvergenceFindingV1, TableGrowthDoctorEvidenceV1};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
@@ -322,16 +326,15 @@ pub struct DashboardStateCompositionV1 {
     /// Exact-project shared-family and revision-pair reads composed from the
     /// daemon's verified code-index authorities.
     pub code_read_authority: Option<code_read_api::DashboardCodeReadAuthorityV1>,
-    pub registered_project_session_db: Option<RegisteredGlobalDbLeaseV1>,
+    /// The project's session store with its LCM and Git-correlation reads,
+    /// or the resolver that mounts them once a still-opening project admits
+    /// its session store.
+    pub project_sessions: DashboardSessionMountV1,
     /// Exact ProfileSessions read/mutation capability for the daemon-wide
     /// code-index worker preference. This never aliases the project settings
     /// control plane: it has its own profile revision and CAS boundary.
     pub profile_code_index_worker_settings:
         Option<Arc<dyn DashboardProfileCodeIndexWorkerSettingsPort>>,
-    pub lcm_read_authority: Option<Arc<dyn DashboardLcmReadPortV1>>,
-    /// Daemon-owned typed read over the verified session-git-evidence graph
-    /// projection. Loom's git sources report unavailable without it.
-    pub git_correlation_read_authority: Option<Arc<dyn DashboardGitCorrelationReadPortV1>>,
     /// Daemon-wide Delivery projection over exact registered project targets.
     /// The adapter owns application admission and provider/store access; HTTP
     /// receives only bounded typed source outcomes.
@@ -370,6 +373,9 @@ pub struct AdmittedDoctorReportV1 {
     pub report: DoctorReportV1,
     pub table_growth_evidence: Vec<TableGrowthDoctorEvidenceV1>,
     pub schema_convergences: Vec<SchemaConvergenceFindingV1>,
+    /// The daemon owner's per-analyzer read behind the `LanguageServer`
+    /// finding, so `lsp servers` lists exactly what Doctor graded.
+    pub language_servers: LanguageServerReadV1,
 }
 
 impl AdmittedDoctorReportV1 {
@@ -378,7 +384,13 @@ impl AdmittedDoctorReportV1 {
             report,
             table_growth_evidence: Vec::new(),
             schema_convergences: Vec::new(),
+            language_servers: LanguageServerReadV1::Unknown,
         }
+    }
+
+    pub fn with_language_servers(mut self, read: LanguageServerReadV1) -> Self {
+        self.language_servers = read;
+        self
     }
 
     pub fn with_table_growth_evidence(
@@ -451,11 +463,17 @@ pub struct DashboardState {
     pub lcm_db_path: String,
     /// Storage scope of the retained legacy session store.
     pub lcm_scope: String,
+    /// Whether the session authorities above are mounted, still opening, or
+    /// unavailable for this state.
+    pub session_authority: DashboardSessionAuthorityStateV1,
+    /// Present only while [`Self::session_authority`] is opening; the
+    /// active-project gateway re-asks it until the authorities mount.
+    pub(crate) session_resolver: Option<DashboardSessionResolverV1>,
     /// Daemon-owned canonical session retrieval authority used by LCM browse
     /// routes. Those routes never retain or open a session database.
     pub lcm_read_authority: Option<Arc<dyn DashboardLcmReadPortV1>>,
-    /// Daemon-owned typed read over the verified session-git-evidence graph
-    /// projection, serving Loom's session↔commit and branch/worktree sources.
+    /// Daemon-owned typed read over the session Git evidence rows, serving
+    /// Loom's session↔commit and branch/worktree sources.
     pub git_correlation_read_authority: Option<Arc<dyn DashboardGitCorrelationReadPortV1>>,
     /// Daemon-wide Delivery projection over exact registered project targets.
     pub delivery_read_authority: Option<Arc<dyn DashboardDeliveryReadPortV1>>,
@@ -478,8 +496,6 @@ pub struct DashboardState {
     pub storage_mode: String,
     /// Resolved active project store root.
     pub store_root: PathBuf,
-    /// Resolved `config.json` path for the active project store.
-    pub config_path: PathBuf,
     /// Resolved dashboard sidecar root inside the active project store.
     pub dashboard_root: PathBuf,
     /// Retention policy resolved with the owning runtime configuration.
@@ -547,6 +563,7 @@ pub struct DashboardHostAdmissionTestAuthorityV1 {
         Option<Arc<dyn DashboardProfileCodeIndexWorkerSettingsPort>>,
     application_invocation_executor: Option<Arc<dyn DashboardApplicationRuntime>>,
     pr_autotrack_reader: Option<PrAutoTrackManagedSummaryReader>,
+    opening_project_sessions: Option<DashboardSessionResolverV1>,
 }
 
 #[cfg(feature = "test-transport")]
@@ -575,6 +592,26 @@ impl DashboardHostAdmissionTestAuthorityV1 {
             profile_code_index_worker_settings: None,
             application_invocation_executor: None,
             pr_autotrack_reader: None,
+            opening_project_sessions: None,
+        }
+    }
+
+    /// Composes the dashboard as the daemon does for a project that is still
+    /// opening: the session authorities mount only once `resolver` answers
+    /// ready.
+    #[must_use]
+    pub fn with_opening_project_sessions(mut self, resolver: DashboardSessionResolverV1) -> Self {
+        self.opening_project_sessions = Some(resolver);
+        self
+    }
+
+    /// The session authorities this runtime admits, as the resolver of an
+    /// opening project hands them over.
+    pub fn project_session_authorities(&self) -> DashboardSessionAuthoritiesV1 {
+        DashboardSessionAuthoritiesV1 {
+            project_sessions: self.project_sessions.clone(),
+            lcm_read_authority: self.lcm_read_authority.clone(),
+            git_correlation_read_authority: self.git_correlation_read_authority.clone(),
         }
     }
 
@@ -741,6 +778,16 @@ impl DashboardState {
         self.doctor_report_reader = doctor_report_reader;
         self.remote_operational_status_reader = remote_operational_status_reader;
     }
+
+    fn mount_session_authorities(&mut self, authorities: DashboardSessionAuthoritiesV1) {
+        self.lcm_db_path = authorities.project_sessions.db_path().display().to_string();
+        self.lcm_db = Some(authorities.project_sessions);
+        self.lcm_scope.clone_from(&self.storage_mode);
+        self.lcm_read_authority = authorities.lcm_read_authority;
+        self.git_correlation_read_authority = authorities.git_correlation_read_authority;
+        self.session_authority = DashboardSessionAuthorityStateV1::Ready;
+        self.session_resolver = None;
+    }
 }
 
 /// The retained session store for legacy dashboard routes.
@@ -777,7 +824,6 @@ fn resolve_lcm_store_for_layout(
 
 pub fn storage_mode_label(mode: &StorageMode) -> &'static str {
     match mode {
-        StorageMode::ProjectLocal => "project_local",
         StorageMode::ProfileSharded => "profile_sharded",
     }
 }
@@ -821,10 +867,8 @@ async fn build_state_inner(
         code_graph_read_admission,
         code_graph_projection_read_port,
         code_read_authority,
-        registered_project_session_db,
+        project_sessions,
         profile_code_index_worker_settings,
-        lcm_read_authority,
-        git_correlation_read_authority,
         delivery_read_authority,
         registered_savings_db,
         automation_authority,
@@ -842,10 +886,37 @@ async fn build_state_inner(
     } = composition;
     let (mem_db_path, mem_db) = resolve_project_memory_store(cg);
     let memory_owner = project_memory_owner(cg)?;
-    let lcm = resolve_lcm_store(cg, registered_project_session_db).await;
+    let (session_authorities, session_authority, session_resolver) = match project_sessions {
+        DashboardSessionMountV1::Ready(authorities) => (
+            Some(authorities),
+            DashboardSessionAuthorityStateV1::Ready,
+            None,
+        ),
+        DashboardSessionMountV1::Opening(resolver) => (
+            None,
+            DashboardSessionAuthorityStateV1::Opening,
+            Some(resolver),
+        ),
+        DashboardSessionMountV1::Unavailable => {
+            (None, DashboardSessionAuthorityStateV1::Unavailable, None)
+        }
+    };
+    let (lcm_read_authority, git_correlation_read_authority) =
+        session_authorities
+            .as_ref()
+            .map_or((None, None), |authorities| {
+                (
+                    authorities.lcm_read_authority.clone(),
+                    authorities.git_correlation_read_authority.clone(),
+                )
+            });
+    let lcm = resolve_lcm_store(
+        cg,
+        session_authorities.map(|authorities| authorities.project_sessions),
+    )
+    .await;
     let dashboard_root = cg.store_layout.dashboard_root.clone();
     let store_root = cg.store_layout.data_root.clone();
-    let config_path = cg.store_layout.config_path.clone();
     let storage_mode = storage_mode_label(&cg.store_layout.storage_mode).to_string();
     let code_diagnostics_authority = match (
         code_diagnostics_broker,
@@ -897,6 +968,8 @@ async fn build_state_inner(
         lcm_db: lcm.lcm_db,
         lcm_db_path: lcm.path,
         lcm_scope: lcm.scope,
+        session_authority,
+        session_resolver,
         lcm_read_authority,
         git_correlation_read_authority,
         delivery_read_authority,
@@ -908,7 +981,6 @@ async fn build_state_inner(
         pr_autotrack_reader,
         storage_mode,
         store_root,
-        config_path,
         dashboard_root,
         retention_config: cg.retention_config.clone(),
         user_settings: Arc::clone(&cg.user_settings_client),
@@ -965,13 +1037,11 @@ pub async fn build_selected_project_state(
             code_graph_read_admission: None,
             code_graph_projection_read_port: None,
             code_read_authority: None,
-            registered_project_session_db: None,
+            project_sessions: DashboardSessionMountV1::Unavailable,
             // This capability is profile-global and its route is deliberately
             // unscoped, so selected projects reuse the active dashboard's
             // exact ProfileSessions authority. It is not a project write.
             profile_code_index_worker_settings: active.profile_code_index_worker_settings.clone(),
-            lcm_read_authority: None,
-            git_correlation_read_authority: None,
             delivery_read_authority: active.delivery_read_authority.clone(),
             registered_savings_db: active.savings_db.clone(),
             automation_authority: active.automation_authority.clone(),
@@ -1112,14 +1182,15 @@ where
                 .and_then(|authority| authority.code_graph_projection_read_port.clone()),
             code_read_authority: test_authority
                 .and_then(|authority| authority.code_read_authority.clone()),
-            registered_project_session_db: test_authority
-                .map(|authority| authority.project_sessions.clone()),
+            project_sessions: match test_authority {
+                Some(authority) => match &authority.opening_project_sessions {
+                    Some(resolver) => DashboardSessionMountV1::Opening(Arc::clone(resolver)),
+                    None => DashboardSessionMountV1::Ready(authority.project_session_authorities()),
+                },
+                None => DashboardSessionMountV1::Unavailable,
+            },
             profile_code_index_worker_settings: test_authority
                 .and_then(|authority| authority.profile_code_index_worker_settings.clone()),
-            lcm_read_authority: test_authority
-                .and_then(|authority| authority.lcm_read_authority.clone()),
-            git_correlation_read_authority: test_authority
-                .and_then(|authority| authority.git_correlation_read_authority.clone()),
             delivery_read_authority: test_authority
                 .and_then(|authority| authority.delivery_read_authority.clone()),
             registered_savings_db: test_authority
@@ -1525,12 +1596,12 @@ impl ActiveProjectApplicationRoutes {
 /// Builds the complete dashboard router shared by direct and daemon-managed
 /// startup. The supplied state is the active writable project authority.
 ///
-/// `spa_routes` carries the embedded single-page-app surface — the app index,
+/// `spa_routes` carries the embedded single-page-app surface, the app index,
 /// `/static/{*tail}`, and the SPA fallback for unmatched non-API client routes
 /// (`/brain?scope=…` deep links). It is built by the owning binary because the
 /// bundle is generated into `OUT_DIR` by that crate's `build.rs`. It must be a
 /// stateless `axum::Router` (it is merged after `.with_state(…)`), it must set
-/// its own `.fallback(…)`, and it must not define any `/api/**` route — axum
+/// its own `.fallback(…)`, and it must not define any `/api/**` route, axum
 /// panics on overlapping paths. Pass `Router::new()` to serve the JSON API
 /// with no UI.
 pub async fn router(
@@ -1541,7 +1612,7 @@ pub async fn router(
     // application primitive routes are bound to the active-project daemon. When the
     // daemon authority record is unavailable (standalone `tracedecay dashboard`
     // or the in-process test server), mounting them would otherwise fail the
-    // whole server before it binds. Degrade gracefully instead — serve the core
+    // whole server before it binds. Degrade gracefully instead, serve the core
     // dashboard and skip the `/api/application` surface.
     let application = match ActiveProjectApplicationRoutes::for_active_project(
         cg,
@@ -1634,7 +1705,6 @@ fn project_api_router() -> Router<DashboardState> {
         )
         .route("/api/feedback/status", get(feedback_api::status))
         // Holographic memory plugin API (mirrors holographic_plus plugin_api.py)
-        .route("/api/plugins/holographic/", get(memory_api::overview))
         .route("/api/plugins/holographic", get(memory_api::overview))
         .route("/api/plugins/holographic/status", get(memory_api::status))
         .route(
@@ -1801,10 +1871,7 @@ fn project_api_router() -> Router<DashboardState> {
         // Savings & Cost API (savings ledger + session cost accounting)
         .route("/api/plugins/savings/overview", get(savings_api::overview))
         .route("/api/costs", get(savings_api::costs))
-        .route("/api/plugins/savings/ledger", get(savings_api::ledger))
-        .route("/api/plugins/savings/sessions", get(savings_api::sessions))
         .route("/api/plugins/savings/models", get(savings_api::models))
-        .route("/api/plugins/savings/pricing", get(savings_api::pricing))
         // Settings API (aggregated project/user config + read-only env gates)
         .route("/api/settings", get(settings_api::get_settings))
         .route(
@@ -1834,7 +1901,7 @@ fn project_api_router() -> Router<DashboardState> {
         )
         .route("/api/loom/temporal", get(loom_api::temporal))
         // V2 read-model surfaces (DashboardEnvelope<T>). Doctor finding
-        // family, storage telemetry/findings, code-index freshness, and
+        // family, storage telemetry, code-index freshness, and
         // the typed SSE stream. See `read_model` for the normative envelope.
         // Read-only Doctor/health paths come from the API-owned descriptors in
         // `tracedecay_api::doctor` so the mount cannot drift from them.
@@ -1845,10 +1912,6 @@ fn project_api_router() -> Router<DashboardState> {
         .route(
             "/api/storage/telemetry",
             get(storage_telemetry_api::telemetry),
-        )
-        .route(
-            tracedecay_api::doctor::STORAGE_FINDINGS_ROUTE_PATH,
-            get(storage_findings_api::findings),
         )
         .route(
             "/api/code-index/freshness",
@@ -1868,7 +1931,12 @@ async fn active_api_gateway(
     State(runtime): State<projects::DashboardRuntime>,
     req: Request<Body>,
 ) -> Response {
-    forward_project_request(runtime.project_api_router(), runtime.active_state(), req).await
+    forward_project_request(
+        runtime.project_api_router(),
+        runtime.active_state().await,
+        req,
+    )
+    .await
 }
 
 async fn project_scoped_api_gateway(
@@ -1889,7 +1957,7 @@ async fn project_scoped_api_gateway(
     }
     let application_read = selected_project_application_read(req.method(), &tail);
     let event_delivery_ack = is_selected_project_event_delivery_ack(req.method(), &tail);
-    if runtime.active_project_id() != Some(project_id.as_str())
+    if runtime.active_project_id().as_deref() != Some(project_id.as_str())
         && !matches!(req.method(), &Method::GET | &Method::HEAD)
         && application_read.is_none()
         && !event_delivery_ack
@@ -1908,7 +1976,7 @@ async fn project_scoped_api_gateway(
     let selected = match runtime.selected_project_state(&project_id).await {
         Ok(selected) => selected,
         Err(err) if projects::is_registry_unavailable_error(&err) => {
-            return projects::registry_unavailable_response(&runtime.active_state(), &err)
+            return projects::registry_unavailable_response(&runtime.active_state().await, &err)
                 .into_response();
         }
         Err(err) => {
@@ -1941,32 +2009,34 @@ async fn project_scoped_api_gateway(
             )
                 .into_response();
         };
-        let application_runtime = if runtime.active_project_id() == Some(project_id.as_str()) {
-            selected.state.application_invocation_executor.clone()
-        } else {
-            match selected_project_application_runtime(
-                runtime
-                    .active_state()
-                    .application_invocation_executor
-                    .as_ref(),
-                &project_graph.store_layout.project_root,
-            ) {
-                Ok(application_runtime) => application_runtime,
-                Err(err) => {
-                    return (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({
-                            "status": "unavailable",
-                            "detail": format!(
-                                "selected project {read} authority is unavailable: {err}"
-                            ),
-                            "project_id": project_id,
-                        })),
-                    )
-                        .into_response();
+        let application_runtime =
+            if runtime.active_project_id().as_deref() == Some(project_id.as_str()) {
+                selected.state.application_invocation_executor.clone()
+            } else {
+                match selected_project_application_runtime(
+                    runtime
+                        .active_state()
+                        .await
+                        .application_invocation_executor
+                        .as_ref(),
+                    &project_graph.store_layout.project_root,
+                ) {
+                    Ok(application_runtime) => application_runtime,
+                    Err(err) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "status": "unavailable",
+                                "detail": format!(
+                                    "selected project {read} authority is unavailable: {err}"
+                                ),
+                                "project_id": project_id,
+                            })),
+                        )
+                            .into_response();
+                    }
                 }
-            }
-        };
+            };
         let application = match ActiveProjectApplicationRoutes::for_active_project(
             project_graph,
             application_runtime,
@@ -2151,7 +2221,7 @@ async fn capabilities(
     let has_lcm = state.lcm_read_authority.is_some();
     let automation = automation_config_api::effective_automation_config(&state);
     let (automation_configured, automation_mode, automation_payload) = match automation {
-        Ok((configuration_revision_id, config)) => {
+        Ok((configuration_revision_id, config, codex)) => {
             let backend_supported = matches!(config.backend, AutomationBackend::CodexAppServer);
             let configured = config.enabled && backend_supported;
             let mode = if !configured {
@@ -2171,7 +2241,7 @@ async fn capabilities(
                     "mode": mode,
                     "backend": config.backend,
                     "host_mode": config.host_mode,
-                    "availability": backend::backend_availability(&config),
+                    "availability": backend::backend_availability(&config, &codex),
                 }),
             )
         }
@@ -2206,6 +2276,7 @@ async fn capabilities(
         "graph_db": state.graph_db_path,
         "lcm_db": state.lcm_db_path,
         "lcm_scope": state.lcm_scope,
+        "session_authority": state.session_authority.as_str(),
         "multi_root": multi_root,
         "features": {
             "memory": true,
@@ -2516,10 +2587,7 @@ mod authority_tests {
             let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
                 &project_root,
                 &profile_root,
-                &tracedecay_runtime_core::storage::EnrollmentMarker {
-                    project_id: project_id.to_owned(),
-                    storage_mode: StorageMode::ProfileSharded,
-                },
+                project_id,
             )
             .expect("dashboard store layout");
             std::fs::create_dir_all(
@@ -2568,6 +2636,8 @@ mod authority_tests {
                 lcm_db: None,
                 lcm_db_path: layout.sessions_db_path.display().to_string(),
                 lcm_scope: "unavailable".to_owned(),
+                session_authority: crate::DashboardSessionAuthorityStateV1::Unavailable,
+                session_resolver: None,
                 lcm_read_authority: None,
                 git_correlation_read_authority: None,
                 delivery_read_authority: None,
@@ -2579,7 +2649,6 @@ mod authority_tests {
                 pr_autotrack_reader: None,
                 storage_mode: storage_mode_label(&layout.storage_mode).to_owned(),
                 store_root: layout.data_root.clone(),
-                config_path: layout.config_path.clone(),
                 dashboard_root: layout.dashboard_root.clone(),
                 retention_config: tracedecay_configuration::RetentionConfig::default(),
                 user_settings: Arc::new(
@@ -2738,18 +2807,18 @@ mod authority_tests {
         let similarity_warm =
             memory_service::similarity_payload(&fixture.state, 0.5, 100, &control).await;
 
-        assert_eq!(projection_before["points"].as_array().unwrap().len(), 0);
-        assert_eq!(similarity_before["count"], 0);
-        assert_eq!(projection_after["scan"]["cache_state"], "miss");
-        assert_eq!(projection_after["scan"]["vector_rows_read"], 1);
-        assert_eq!(projection_after["points"].as_array().unwrap().len(), 1);
-        assert_eq!(similarity_after["scan"]["cache_state"], "miss");
-        assert_eq!(similarity_after["scan"]["vector_rows_read"], 1);
-        assert_eq!(similarity_after["count"], 1);
-        assert_eq!(projection_warm["scan"]["cache_state"], "hit");
-        assert_eq!(projection_warm["scan"]["vector_rows_read"], 0);
-        assert_eq!(similarity_warm["scan"]["cache_state"], "hit");
-        assert_eq!(similarity_warm["scan"]["vector_rows_read"], 0);
+        assert_eq!(projection_before.points.len(), 0);
+        assert_eq!(similarity_before.count, 0);
+        assert_eq!(projection_after.scan.as_ref().unwrap().cache_state, "miss");
+        assert_eq!(projection_after.scan.as_ref().unwrap().vector_rows_read, 1);
+        assert_eq!(projection_after.points.len(), 1);
+        assert_eq!(similarity_after.scan.as_ref().unwrap().cache_state, "miss");
+        assert_eq!(similarity_after.scan.as_ref().unwrap().vector_rows_read, 1);
+        assert_eq!(similarity_after.count, 1);
+        assert_eq!(projection_warm.scan.as_ref().unwrap().cache_state, "hit");
+        assert_eq!(projection_warm.scan.as_ref().unwrap().vector_rows_read, 0);
+        assert_eq!(similarity_warm.scan.as_ref().unwrap().cache_state, "hit");
+        assert_eq!(similarity_warm.scan.as_ref().unwrap().vector_rows_read, 0);
     }
 
     #[tokio::test]
@@ -2762,10 +2831,10 @@ mod authority_tests {
             memory_service::projection_payload(&fixture.state, "", 2_000, &control).await;
         let similarity =
             memory_service::similarity_payload(&fixture.state, 0.5, 100, &control).await;
-        assert_eq!(projection["scan"]["cache_state"], "miss");
-        assert_eq!(projection["points"].as_array().unwrap().len(), 3);
-        assert_eq!(similarity["scan"]["cache_state"], "miss");
-        assert_eq!(similarity["count"], 3);
+        assert_eq!(projection.scan.as_ref().unwrap().cache_state, "miss");
+        assert_eq!(projection.points.len(), 3);
+        assert_eq!(similarity.scan.as_ref().unwrap().cache_state, "miss");
+        assert_eq!(similarity.count, 3);
 
         // The populated caches are owned by the state (and its clones), not by
         // the process: once the last handle to this store's dashboard state is
@@ -2853,11 +2922,13 @@ mod authority_tests {
                 .await;
                 projection_cold.push(started.elapsed());
                 projection_cold_rows.push(
-                    projection["scan"]["vector_rows_read"]
-                        .as_u64()
-                        .expect("projection cold row count"),
+                    projection
+                        .scan
+                        .as_ref()
+                        .expect("projection cold row count")
+                        .vector_rows_read,
                 );
-                assert_eq!(projection["scan"]["cache_state"], "miss");
+                assert_eq!(projection.scan.as_ref().unwrap().cache_state, "miss");
 
                 let started = Instant::now();
                 let (similarity, heartbeat) = if index == 0 {
@@ -2879,11 +2950,13 @@ mod authority_tests {
                 };
                 similarity_cold.push(started.elapsed());
                 similarity_cold_rows.push(
-                    similarity["scan"]["vector_rows_read"]
-                        .as_u64()
-                        .expect("similarity cold row count"),
+                    similarity
+                        .scan
+                        .as_ref()
+                        .expect("similarity cold row count")
+                        .vector_rows_read,
                 );
-                assert_eq!(similarity["scan"]["cache_state"], "miss");
+                assert_eq!(similarity.scan.as_ref().unwrap().cache_state, "miss");
                 if heartbeat.is_some() {
                     similarity_cold_heartbeat = heartbeat;
                 }
@@ -2906,11 +2979,13 @@ mod authority_tests {
                 .await;
                 projection_warm.push(started.elapsed());
                 projection_warm_rows.push(
-                    projection["scan"]["vector_rows_read"]
-                        .as_u64()
-                        .expect("projection warm row count"),
+                    projection
+                        .scan
+                        .as_ref()
+                        .expect("projection warm row count")
+                        .vector_rows_read,
                 );
-                assert_eq!(projection["scan"]["cache_state"], "hit");
+                assert_eq!(projection.scan.as_ref().unwrap().cache_state, "hit");
             }
 
             let ((similarity_warm, similarity_warm_rows), similarity_warm_heartbeat) =
@@ -2931,11 +3006,13 @@ mod authority_tests {
                         .await;
                         timings.push(started.elapsed());
                         rows.push(
-                            similarity["scan"]["vector_rows_read"]
-                                .as_u64()
-                                .expect("similarity warm row count"),
+                            similarity
+                                .scan
+                                .as_ref()
+                                .expect("similarity warm row count")
+                                .vector_rows_read,
                         );
-                        assert_eq!(similarity["scan"]["cache_state"], "hit");
+                        assert_eq!(similarity.scan.as_ref().unwrap().cache_state, "hit");
                     }
                     (timings, rows)
                 })
@@ -3476,8 +3553,8 @@ mod authority_tests {
     }
 
     /// The V2 read-model routes must be reachable through both
-    /// router construction paths — the active-project gateway (`/api/…`) and the
-    /// project-scoped gateway (`/api/projects/{id}/…`) — mirroring how the
+    /// router construction paths, the active-project gateway (`/api/…`) and the
+    /// project-scoped gateway (`/api/projects/{id}/…`), mirroring how the
     /// existing families are exposed.
     #[tokio::test]
     async fn v2_read_models_are_reachable_through_both_gateways() {
@@ -3491,7 +3568,6 @@ mod authority_tests {
         for tail in [
             "doctor/findings",
             "storage/telemetry",
-            "storage/findings",
             "code-index/freshness",
             "feedback/status",
         ] {
@@ -3539,7 +3615,7 @@ mod authority_tests {
     }
 
     /// Graph reads are served only from an admitted, verified projection, so a
-    /// dashboard that never mounted one cannot answer `ready` — it must answer
+    /// dashboard that never mounted one cannot answer `ready`, it must answer
     /// an enveloped `unknown` naming the missing registry, and must never
     /// fabricate totals from the raw store connection the state still holds.
     ///

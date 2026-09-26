@@ -21,9 +21,12 @@ use tracedecay_project::project::TraceDecay;
 const MEMORY_CURATOR_REQUEST_TIMEOUT_SECS: u64 = 80;
 
 #[hotpath::measure(label = "daemon.dashboard.automation.curate", future = true)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Curation pins the live configuration digest and admits one effect before the curator backend runs; a failed pin never starts a run."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Curation pins the live configuration digest and admits one effect before the curator backend runs; a failed pin never starts a run."
+    )
 )]
 pub async fn execute_retained_memory_curator(
     cg: &TraceDecay,
@@ -48,7 +51,10 @@ pub async fn execute_retained_memory_curator(
     })?;
     let min_confidence = f64::from(request.min_confidence_millionths) / 1_000_000.0;
     config.timeout_secs = config.timeout_secs.min(MEMORY_CURATOR_REQUEST_TIMEOUT_SECS);
-    let backend = CodexAppServerBackend::from_automation_config(&config);
+    let backend = CodexAppServerBackend::from_automation_config(
+        &config,
+        &pinned.config().lcm_summarizers.codex,
+    );
     let configuration_digest =
         tracedecay_automation_runtime::automation::effect_runtime::pinned_automation_configuration_digest(
             pinned.revision_id(),

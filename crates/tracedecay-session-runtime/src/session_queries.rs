@@ -125,14 +125,14 @@ pub async fn sessions_for(
             result.observed_count = Some(observed_count);
             result.observed_sessions = Some(observed.into_iter().map(correlation_hit).collect());
             result.message = Some(format!(
-                "no producing sessions; {observed_count} session(s) observed this commit — pass relation=observed to list them",
+                "no producing sessions; {observed_count} session(s) observed this commit. Pass relation=observed to list them",
             ));
         } else {
             result.message = Some(if index_empty {
                 if matches!(&query.git_ref, GitRefFilter::Commit(_)) {
-                    "no commit evidence indexed yet — run `tracedecay sync` to ingest direct host/tool evidence; `tracedecay sessions git-sync` adds weaker historical overlap evidence".to_owned()
+                    "no commit evidence indexed yet. Run `tracedecay sync` to ingest direct host/tool evidence; `tracedecay sessions git-sync` adds weaker historical overlap evidence".to_owned()
                 } else {
-                    "correlation index empty (no git spans recorded yet) — it will converge on the next daemon startup, or run `tracedecay sessions git-sync` to schedule it now".to_owned()
+                    "correlation index empty (no git spans recorded yet). It will converge on the next daemon startup, or run `tracedecay sessions git-sync` to schedule it now".to_owned()
                 }
             } else {
                 "no sessions matched this git ref".to_owned()
@@ -276,15 +276,7 @@ fn map_git_error(error: GitCorrelationError) -> RetainedSurfaceExecutionErrorV1 
         GitCorrelationError::InvalidArgument(_) | GitCorrelationError::Contract(_) => {
             RetainedSurfaceExecutionErrorV1::InvalidRequest
         }
-        GitCorrelationError::Corrupt(_) | GitCorrelationError::ResetRequired { .. } => {
-            RetainedSurfaceExecutionErrorV1::ProjectResetRequired
-        }
-        GitCorrelationError::Cancelled => RetainedSurfaceExecutionErrorV1::Cancelled(
-            tracedecay_contracts::CancellationStage::DuringRead,
-        ),
-        GitCorrelationError::BudgetExhausted => RetainedSurfaceExecutionErrorV1::TimedOut(
-            tracedecay_contracts::CancellationStage::DuringRead,
-        ),
+        GitCorrelationError::Corrupt(_) => RetainedSurfaceExecutionErrorV1::ProjectResetRequired,
         error @ (GitCorrelationError::Db(_) | GitCorrelationError::Unavailable(_)) => {
             RetainedSurfaceExecutionErrorV1::unavailable(error.to_string())
         }

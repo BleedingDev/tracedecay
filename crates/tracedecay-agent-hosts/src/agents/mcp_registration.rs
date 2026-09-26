@@ -84,12 +84,11 @@ enum McpUninstallOutcome {
 /// Remove the tracedecay MCP entry under `root_key` from a host config.
 ///
 /// Runs under the host-file write lock like [`install_mcp_server_entry`]. A
-/// config that exists but cannot be parsed is a typed error — reporting a
-/// clean uninstall over a corrupt config would fabricate state — and callers
+/// config that exists but cannot be parsed is a typed error, reporting a
+/// clean uninstall over a corrupt config would fabricate state, and callers
 /// decide whether to keep going across the remaining hosts. Every rewrite or
-/// removal of the existing file leaves a `.bak` (issue #63) and publishes
-/// through the durable conditional write/remove shared by every host-file
-/// transaction.
+/// removal publishes through the durable conditional write/remove shared by
+/// every host-file transaction.
 #[hotpath::measure(label = "agent_hosts.agents.mcp.uninstall")]
 pub fn uninstall_mcp_server_entry(
     config_path: &Path,
@@ -191,7 +190,7 @@ pub struct McpDoctorLabels<'a> {
     pub product: &'a str,
     /// Subject of the pass line, rendered as "{registered} in {path}".
     pub registered: &'a str,
-    /// Subject of the fail line, rendered as "{missing} in {path} — run ...".
+    /// Subject of the fail line, rendered as "{missing} in {path}, run ...".
     pub missing: &'a str,
 }
 
@@ -243,7 +242,7 @@ pub fn report_mcp_registration(
         ));
     } else {
         dc.fail(&format!(
-            "{} in {} — run `tracedecay install --agent {}`",
+            "{} in {}, run `tracedecay install --agent {}`",
             labels.missing,
             config_path.display(),
             labels.agent_id
@@ -264,7 +263,7 @@ pub fn doctor_check_mcp_registration(
 ) -> Option<serde_json::Value> {
     if !config_path.exists() {
         dc.warn(&format!(
-            "{} not found — run `tracedecay install --agent {}` if you use {}",
+            "{} not found, run `tracedecay install --agent {}` if you use {}",
             config_path.display(),
             labels.agent_id,
             labels.product
@@ -300,7 +299,7 @@ pub(crate) fn doctor_check_prompt_contains_tracedecay(
         dc.pass(&format!("{subject} contains tracedecay rules"));
     } else {
         dc.fail(&format!(
-            "{subject} missing tracedecay rules — run `tracedecay install --agent {agent_id}`"
+            "{subject} missing tracedecay rules, run `tracedecay install --agent {agent_id}`"
         ));
     }
 }
@@ -320,13 +319,5 @@ pub fn read_only_tool_names() -> tracedecay_domain::errors::Result<Vec<String>> 
         .into_iter()
         .filter(|tool| tool.read_only)
         .map(|tool| tool.name)
-        .collect())
-}
-
-/// Legacy-namespace permission entries for every advertised tool.
-pub fn expected_tool_perms() -> tracedecay_domain::errors::Result<Vec<String>> {
-    Ok(advertised_tools()?
-        .iter()
-        .map(|tool| format!("{}{}", crate::tool_name::LEGACY_TOOL_PREFIX, tool.name))
         .collect())
 }

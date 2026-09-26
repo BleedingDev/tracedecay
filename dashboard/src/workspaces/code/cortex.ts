@@ -108,8 +108,8 @@ export function cortexRegister(payload: {
       label: 'layout',
       reading: {
         kind: 'measured',
-        value: 'force-directed',
-        note: 'ForceAtlas2, settled once',
+        value: 'module-packed',
+        note: 'directories packed by shared relations',
       },
     },
     {
@@ -169,7 +169,7 @@ export interface RelationSide {
   readonly sites: number;
   /**
    * The wire filled its row budget, so both counts above are floors: more
-   * sites — and possibly more neighbours — may exist beyond the cut.
+   * sites, and possibly more neighbours, may exist beyond the cut.
    */
   readonly capped: boolean;
   readonly limit: number;
@@ -179,7 +179,7 @@ export interface RelationSide {
  * `neighbors_payload` emits ONE ROW PER CALL EDGE: a caller with four call
  * sites appears four times with the same node columns and a different
  * `edge_line`. The inspector lists each neighbour once and counts its sites,
- * and never prints a decimal beside the pair — the count of sites is the
+ * and never prints a decimal beside the pair, the count of sites is the
  * whole of what the wire knows about the strength of the relation.
  */
 export function groupNeighbors(rows: readonly GraphNodeV1[], limit: number): RelationSide {
@@ -245,17 +245,14 @@ export type StrataReading =
       idealDepth: number;
       directory: string;
       sccSize: number;
-      /** The depth is a floor: the scan stopped at its budget. */
-      capped: boolean;
     }
   | {
       /** The scan laid out files in this symbol's directory but not this file. */
       kind: 'directory_only';
       directory: string;
       depths: readonly number[];
-      capped: boolean;
     }
-  | { kind: 'not_in_scan'; filesLaidOut: number; capped: boolean }
+  | { kind: 'not_in_scan'; filesLaidOut: number }
   | { kind: 'no_path' };
 
 /** Where a symbol's file sits in the dependency layering, by exact path, then
@@ -266,10 +263,6 @@ export function strataForPath(
   filePath: string | null | undefined,
 ): StrataReading {
   if (!filePath) return { kind: 'no_path' };
-  const { scan } = measurement;
-  const capped =
-    scan.files_examined >= scan.max_files ||
-    scan.dependency_edges_examined >= scan.max_dependency_edges;
   const exact = measurement.files.find((file) => file.path === filePath);
   if (exact) {
     return {
@@ -279,7 +272,6 @@ export function strataForPath(
       idealDepth: measurement.ideal_depth,
       directory: directoryOf(exact.path),
       sccSize: exact.scc_size,
-      capped,
     };
   }
   const directory = directoryOf(filePath);
@@ -289,10 +281,9 @@ export function strataForPath(
       kind: 'directory_only',
       directory,
       depths: [...new Set(siblings.map((file) => file.depth))].sort((a, b) => a - b),
-      capped,
     };
   }
-  return { kind: 'not_in_scan', filesLaidOut: measurement.files.length, capped };
+  return { kind: 'not_in_scan', filesLaidOut: measurement.files.length };
 }
 
 /* ---- diagnostics --------------------------------------------------------- */
@@ -304,7 +295,7 @@ export interface FileDiagnostics {
 }
 
 /** The broker's diagnostics that sit in one file. Matched on the path the
- * broker reported, by equality or by the graph path ending the broker's —
+ * broker reported, by equality or by the graph path ending the broker's,
  * the broker may report an absolute path where the index holds a relative one. */
 export function diagnosticsForFile(
   snapshot: DiagnosticsSnapshot,

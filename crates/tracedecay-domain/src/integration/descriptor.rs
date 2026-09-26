@@ -19,6 +19,8 @@ pub enum NativeHostIdentityV1 {
     Kilo,
     KimiCode,
     OpenCode,
+    Pi,
+    FactoryDroid,
 }
 
 impl NativeHostIdentityV1 {
@@ -35,6 +37,8 @@ impl NativeHostIdentityV1 {
             Self::Kilo => HostKindV1::Kilo,
             Self::KimiCode => HostKindV1::KimiCode,
             Self::OpenCode => HostKindV1::OpenCode,
+            Self::Pi => HostKindV1::Pi,
+            Self::FactoryDroid => HostKindV1::FactoryDroid,
         }
     }
 
@@ -55,6 +59,8 @@ impl NativeHostIdentityV1 {
             Self::Kilo => "kilo",
             Self::KimiCode => "kimi",
             Self::OpenCode => "opencode",
+            Self::Pi => "pi",
+            Self::FactoryDroid => "droid",
         }
     }
 }
@@ -206,6 +212,8 @@ impl HostKindV1 {
             Self::Kilo => Some(NativeHostIdentityV1::Kilo),
             Self::KimiCode => Some(NativeHostIdentityV1::KimiCode),
             Self::OpenCode => Some(NativeHostIdentityV1::OpenCode),
+            Self::Pi => Some(NativeHostIdentityV1::Pi),
+            Self::FactoryDroid => Some(NativeHostIdentityV1::FactoryDroid),
         }
     }
 
@@ -392,7 +400,7 @@ pub fn host_descriptor_v1(host: HostKindV1) -> HostDescriptorV1 {
         // `~/.copilot/mcp-config.json` itself. The one managed artifact is the
         // receipt-owned component descriptor under `.copilot/tracedecay/`,
         // which is why the assets are `ManagedEmbedded` and the activation is
-        // `Managed` — exactly Kiro's shape, for exactly Kiro's reason.
+        // `Managed`, exactly Kiro's shape, for exactly Kiro's reason.
         //
         // The project registration path is `Unavailable`: Copilot exposes no
         // project-scoped registry command, and the workspace surface that does
@@ -404,6 +412,31 @@ pub fn host_descriptor_v1(host: HostKindV1) -> HostDescriptorV1 {
             "copilot",
             NotApplicable,
             vec![ContextMcp],
+            ManagedEmbedded,
+            Managed,
+            HostProjectRegistrationPathV1::Unavailable,
+        ),
+        // Pi registers tools, hooks, and skills through its extension API in
+        // `~/.pi/agent/extensions`; there is no MCP route, so the component
+        // set is Core + Agent only. The extension forwards its lifecycle
+        // events to `hook-pi-event`. There is no project-local route.
+        HostKindV1::Pi => (
+            "pi",
+            "pi",
+            Native(NativeHostIdentityV1::Pi),
+            vec![Core, Agent],
+            ManagedEmbedded,
+            Managed,
+            HostProjectRegistrationPathV1::Unavailable,
+        ),
+        // Factory Droid's `droid mcp add|remove` registry owns the MCP
+        // document; TraceDecay drives the commands and owns only the
+        // receipt-backed component descriptor, Copilot's shape exactly.
+        HostKindV1::FactoryDroid => (
+            "droid",
+            "factory-droid",
+            Native(NativeHostIdentityV1::FactoryDroid),
+            vec![Core, ContextMcp],
             ManagedEmbedded,
             Managed,
             HostProjectRegistrationPathV1::Unavailable,

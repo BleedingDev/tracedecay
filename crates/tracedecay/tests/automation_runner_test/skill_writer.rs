@@ -378,15 +378,7 @@ async fn skill_writer_runner_repairs_then_activates_validated_create() {
         run.report["created_skills"][0]["metadata"]["state"],
         json!("active")
     );
-    assert_eq!(
-        run.report["created_skills"][0]["proposal_action"],
-        json!("create")
-    );
     assert_eq!(run.report["created_skills"][0]["action"], json!("create"));
-    assert_eq!(
-        run.report["created_skills"][0]["proposal_reason"],
-        json!("Session evidence repeats automation workflow outcome review.")
-    );
     assert_eq!(
         run.report["created_skills"][0]["reason"],
         json!("Session evidence repeats automation workflow outcome review.")
@@ -577,7 +569,9 @@ async fn skill_writer_evidence_imports_project_skill_usage_analytics_before_summ
     global_db
         .append_profile_analytics_event_for_test(&tracedecay_global_db::AnalyticsEventInsert {
             provider: "codex".to_string(),
-            project_id: HostAdmissionTestRuntimeV1::canonical_project_key(cg.project_root()),
+            project_id: tracedecay_global_db::RegisteredGlobalDb::canonical_project_key(
+                cg.project_root(),
+            ),
             session_id: Some("skill-writer-analytics".to_string()),
             timestamp: 1_715_000_111,
             event_kind: "tool".to_string(),
@@ -733,10 +727,6 @@ async fn skill_writer_runner_activates_validated_skills() {
         run.report["created_skills"][0]["activation_status"],
         json!("active")
     );
-    assert_eq!(
-        run.report["updated_skills"][0]["proposal_action"],
-        json!("update")
-    );
     assert_eq!(run.report["updated_skills"][0]["action"], json!("update"));
     assert_eq!(
         run.report["updated_skills"][0]["activation_status"],
@@ -843,7 +833,7 @@ async fn skill_writer_runner_updates_existing_skills_with_checksum_precondition(
                 "reason": "Session evidence repeats automation workflow outcome review."
             },
             {
-                "action": "patch",
+                "action": "update",
                 "id": "automation-run-review",
                 "base_checksum": "sha256:stale",
                 "summary": "Stale patch should be rejected."
@@ -906,15 +896,7 @@ async fn skill_writer_runner_updates_existing_skills_with_checksum_precondition(
         run.report["updated_skills"][0]["metadata"]["state"],
         json!("active")
     );
-    assert_eq!(
-        run.report["updated_skills"][0]["proposal_action"],
-        json!("update")
-    );
     assert_eq!(run.report["updated_skills"][0]["action"], json!("update"));
-    assert_eq!(
-        run.report["updated_skills"][0]["proposal_reason"],
-        json!("Session evidence repeats automation workflow outcome review.")
-    );
     assert_eq!(
         run.report["updated_skills"][0]["reason"],
         json!("Session evidence repeats automation workflow outcome review.")
@@ -1107,7 +1089,7 @@ async fn skill_writer_runner_records_noop_fallback_when_backend_run_task_fails()
     .unwrap();
 
     // The backend failure is transient, but this test pins the noop-fallback
-    // record, not retry semantics (covered by backend.rs retry tests) —
+    // record, not retry semantics (covered by backend.rs retry tests),
     // timeout_secs: 1 short-circuits the backoff so the test stays fast.
     assert_eq!(backend.calls(), 1);
     assert_noop_fallback_record(

@@ -1,6 +1,6 @@
 //! The Work product graph authority, end to end over the registered store.
 //!
-//! This suite drives the REAL composition — the application's
+//! This suite drives the REAL composition, the application's
 //! `WorkProductMutationServiceV1` and `WorkProductReadServiceV1` over the
 //! registered exact-SQL storage, with no port doubles. A suite that
 //! substituted its own port would not prove the registered-store path.
@@ -20,13 +20,13 @@ use tracedecay_contracts::{
     AddWorkTaskRequestV1, CancellationContext, CapabilityGrantSnapshot, CreateWorkProductRequestV1,
     Deadline, DisclosureClass, RequestContext, RequestId, ResolvedScope, WorkGraphReadRequestV1,
     WorkGraphReadV1, WorkGraphSelectionCoverageV1, WorkProductApplicationErrorV1,
-    WorkProductBindingV1, WorkProductExpectedAuthorityV1, WorkProductMutationIdentityV1,
-    WorkProductMutationServiceV1, WorkProductReadServiceV1, WorkProductRevisionPinsV1,
-    WorkProductSelectionScopeV1, WorkRelationScopeV1,
+    WorkProductAuthorizedRelationScopeV1, WorkProductBindingV1, WorkProductExpectedAuthorityV1,
+    WorkProductMutationIdentityV1, WorkProductMutationServiceV1, WorkProductReadServiceV1,
+    WorkProductRevisionPinsV1, WorkProductSelectionScopeV1,
 };
 use tracedecay_domain::{
     AcceptanceCriterionId, ActorId, CatalogGenerationId, ConfigurationRevisionId, InitiativeId,
-    ManifestDigest, MilestoneId, PolicyRevisionId, ProjectId, RepositoryId, TaskId, UtcMicros,
+    MilestoneId, PolicyRevisionId, ProjectId, RepositoryId, TaskId, UtcMicros,
     WorkAcceptanceCriterionV1, WorkCommandId, WorkGraphVersionV1, WorkHierarchyV1,
     WorkInitiativeV1, WorkItemInputV1, WorkItemV1, WorkMilestoneV1, WorkPlanId, WorkPlanV1,
     WorkProductEventPayloadV1, WorkProductEventSequenceV1, WorkProductGraphV1,
@@ -43,17 +43,9 @@ const REPOSITORY: &str = "repository.work-product.fixture";
 /// `occurred_at`, so a projection is never asked to describe its own future.
 const PROJECTED_AT: UtcMicros = UtcMicros(400);
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).unwrap()
-}
+use tracedecay_domain::test_fixtures::id;
 
-fn digest(byte: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn binding() -> WorkProductBindingV1 {
     WorkProductBindingV1::new(
@@ -63,10 +55,12 @@ fn binding() -> WorkProductBindingV1 {
 }
 
 fn repository_selection() -> WorkProductSelectionScopeV1 {
-    WorkProductSelectionScopeV1::relations(BTreeSet::from([WorkRelationScopeV1::Repository {
-        project_id: id(PROJECT),
-        repository_id: id(REPOSITORY),
-    }]))
+    WorkProductSelectionScopeV1::relations(BTreeSet::from([
+        WorkProductAuthorizedRelationScopeV1::Repository {
+            project_id: id(PROJECT),
+            repository_id: id(REPOSITORY),
+        },
+    ]))
     .unwrap()
 }
 
@@ -492,15 +486,24 @@ fn current_read_at_an_earlier_observation_excludes_later_published_versions() {
 }
 
 #[test]
-fn an_owner_with_no_journal_has_no_current_graph_but_an_explicitly_empty_timeline() {
+fn an_owner_with_no_journal_has_an_absent_current_graph_and_an_explicitly_empty_timeline() {
     let store = RegisteredWorkStore::start("work-product-empty");
 
     // A point read of a version that was never published is an absence, not a
     // zero: a verified version identity requires a real event sequence, so
-    // there is no representable empty current graph to answer with.
+    // there is no representable empty current graph. The caller is
+    // authorized, so the absence is an answer under its scope, not a denial.
+    let WorkGraphReadV1::Absent {
+        authorized_scope,
+        selection_coverage,
+    } = read_current(&store).expect("an authorized read of no graph is answered")
+    else {
+        panic!("an unpublished graph must read as absent");
+    };
+    assert_eq!(authorized_scope.selection(), &repository_selection());
     assert_eq!(
-        read_current(&store).expect_err("an unpublished graph has no current version"),
-        WorkProductApplicationErrorV1::NotFoundOrNotAuthorized
+        selection_coverage,
+        WorkGraphSelectionCoverageV1::Complete { covered_events: 0 }
     );
 
     // A range read's zero state IS representable, so it is answered as an
@@ -534,11 +537,11 @@ fn a_selection_naming_another_project_is_refused_rather_than_narrowed() {
     .expect("create the work product");
 
     let foreign = WorkProductSelectionScopeV1::relations(BTreeSet::from([
-        WorkRelationScopeV1::Repository {
+        WorkProductAuthorizedRelationScopeV1::Repository {
             project_id: id(PROJECT),
             repository_id: id(REPOSITORY),
         },
-        WorkRelationScopeV1::Project {
+        WorkProductAuthorizedRelationScopeV1::Project {
             project_id: id::<ProjectId>("project.someone-else"),
         },
     ]))
@@ -571,8 +574,9 @@ fn a_selection_that_covers_no_event_has_no_current_version() {
     // The journal was written under a repository relation scope from its very
     // first event, so a no-Git selection covers none of it. `Current` is a
     // point read of a version and there is no version inside this selection to
-    // read, which is exactly the absence an empty journal reports.
-    let refused = reads(&store)
+    // read, which is the absence an empty journal reports, disclosing the
+    // excluded event so it cannot be mistaken for an empty journal.
+    let read = reads(&store)
         .read_graph(
             &context(),
             WorkGraphReadRequestV1::current(
@@ -580,18 +584,28 @@ fn a_selection_that_covers_no_event_has_no_current_version() {
                 PROJECTED_AT,
             ),
         )
-        .expect_err("a selection covering no event has no current version");
+        .expect("a selection covering no event is answered");
+    let WorkGraphReadV1::Absent {
+        selection_coverage, ..
+    } = read
+    else {
+        panic!("a selection covering no event has no current version: {read:?}");
+    };
     assert_eq!(
-        refused,
-        WorkProductApplicationErrorV1::NotFoundOrNotAuthorized
+        selection_coverage,
+        WorkGraphSelectionCoverageV1::Partial {
+            covered_events: 0,
+            excluded_events: 1,
+            first_excluded_sequence: WorkProductEventSequenceV1::new(1).unwrap(),
+        }
     );
 }
 
 /// The no-Git poisoning defect, stated as the contract that replaced it.
 ///
 /// A profile owner creates work with no Git relation, and later an authority
-/// that can only act under a repository scope — attempt admission is the real
-/// one — appends a repository-scoped event to the same owner journal. The old
+/// that can only act under a repository scope, attempt admission is the real
+/// one, appends a repository-scoped event to the same owner journal. The old
 /// rule refused the entire no-Git read from that moment on, permanently, so
 /// work the caller was plainly authorized for became unreadable because of an
 /// event admitted beside it.
@@ -675,7 +689,7 @@ fn a_scoped_event_beside_no_git_work_does_not_poison_the_no_git_selection() {
     assert_eq!(snapshot.projections().workload().total_effort(), 2);
 
     // A repository selection covers the scope-free events too, so the same
-    // journal reads whole under it — with a `Complete` disclosure. That is the
+    // journal reads whole under it, with a `Complete` disclosure. That is the
     // remedy the mutation refusal names, proven to actually work.
     let whole = reads(&store)
         .read_graph(
@@ -691,7 +705,7 @@ fn a_scoped_event_beside_no_git_work_does_not_poison_the_no_git_selection() {
 
 /// Reads answer over a covered slice; mutations do not. A prepared change pins
 /// the head it read, and under partial coverage that head is the slice's head,
-/// not the journal's — so the refusal is kept, but typed by its actual cause
+/// not the journal's, so the refusal is kept, but typed by its actual cause
 /// with the selection remedy in it, instead of the concealed
 /// `not_found_or_not_authorized` the old rule produced.
 #[test]
@@ -847,9 +861,10 @@ fn a_tampered_journal_without_its_verified_version_is_not_readable() {
             .expect("drop the published version");
     });
 
+    // Not absent either: events exist, so "no graph yet" would be untrue.
     assert_eq!(
         read_current(&store).expect_err("an unverified event is not a readable graph"),
-        WorkProductApplicationErrorV1::NotFoundOrNotAuthorized
+        WorkProductApplicationErrorV1::GraphAuthorityUnavailable
     );
     assert_eq!(store.count("work_product_events_v1"), 1);
 }

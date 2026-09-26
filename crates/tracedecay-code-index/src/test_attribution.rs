@@ -7,6 +7,7 @@
 //! upgraded to proof of execution or correctness.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -149,7 +150,10 @@ pub enum GenerationTestJoinDispositionV1 {
 pub struct GenerationTestJoinRecordV1 {
     pub attribution: GenerationTestAttributionV1,
     pub test_occurrence: Option<TestAttributionOccurrenceV1>,
-    pub covered_occurrences: Vec<TestAttributionOccurrenceV1>,
+    /// Shared with every other record covering the same occurrence: a test
+    /// covers its whole transitive closure, so owning each occurrence per
+    /// record made the join quadratic in resident strings.
+    pub covered_occurrences: Vec<Arc<TestAttributionOccurrenceV1>>,
     pub disposition: GenerationTestJoinDispositionV1,
 }
 
@@ -180,6 +184,51 @@ pub enum GenerationTestJoinErrorV1 {
 }
 
 impl GenerationTestJoinV1 {
+    /// Bytes this join holds: record slots, each record's attribution
+    /// identifiers and covered-occurrence handles, and the shared occurrence
+    /// copies once each.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        use std::collections::BTreeSet;
+        use std::mem::size_of;
+        let occurrence_bytes = |occurrence: &TestAttributionOccurrenceV1| {
+            size_of::<TestAttributionOccurrenceV1>()
+                .saturating_add(occurrence.occurrence_id.as_str().len())
+                .saturating_add(occurrence.file_occurrence_id.as_str().len())
+                .saturating_add(occurrence.content_digest.as_str().len())
+        };
+        let mut shared = BTreeSet::new();
+        let bytes = self.records.iter().fold(0_usize, |bytes, record| {
+            let covered_ids =
+                record
+                    .attribution
+                    .covered_occurrences
+                    .iter()
+                    .fold(0_usize, |bytes, id| {
+                        bytes
+                            .saturating_add(size_of::<SymbolOccurrenceId>())
+                            .saturating_add(id.as_str().len())
+                    });
+            let covered_shared =
+                record
+                    .covered_occurrences
+                    .iter()
+                    .fold(0_usize, |bytes, covered| {
+                        let first = shared.insert(Arc::as_ptr(covered));
+                        bytes
+                            .saturating_add(size_of::<Arc<TestAttributionOccurrenceV1>>())
+                            .saturating_add(if first { occurrence_bytes(covered) } else { 0 })
+                    });
+            bytes
+                .saturating_add(size_of::<GenerationTestJoinRecordV1>())
+                .saturating_add(record.attribution.test_occurrence.as_str().len())
+                .saturating_add(record.test_occurrence.as_ref().map_or(0, occurrence_bytes))
+                .saturating_add(covered_ids)
+                .saturating_add(covered_shared)
+        });
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
+
     /// Join canonical test-attribution records to one exact code generation.
     pub fn join(
         generation: &CodeGenerationManifestV1,
@@ -212,13 +261,18 @@ impl GenerationTestJoinV1 {
                 }]
             }
         };
+        let shared_occurrences: BTreeMap<&SymbolOccurrenceId, Arc<TestAttributionOccurrenceV1>> =
+            occurrence_by_id
+                .iter()
+                .map(|(id, occurrence)| (*id, Arc::new((*occurrence).clone())))
+                .collect();
         let mut records = Vec::with_capacity(attributions.len());
         for attribution in attributions {
             let test_occurrence = occurrence_by_id.get(&attribution.test_occurrence).copied();
-            let covered_occurrences: Vec<TestAttributionOccurrenceV1> = attribution
+            let covered_occurrences = attribution
                 .covered_occurrences
                 .iter()
-                .filter_map(|occurrence| occurrence_by_id.get(occurrence).copied().cloned())
+                .filter_map(|occurrence| shared_occurrences.get(occurrence).map(Arc::clone))
                 .collect();
             let disposition = disposition_for(
                 generation,

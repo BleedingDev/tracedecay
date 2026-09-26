@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use tracedecay_domain::{
-    AccessPolicyDigest, AnchorDurabilityClass, AnchorLineageRefV2, AnchorProvenanceRelationV2,
-    AnchorSourceGenerationV2, CapabilityId, CheckSnapshotAnchorRefV1, CiFailureBranchEvidenceV1,
+    AccessPolicyDigest, AnchorDurabilityClass, AnchorLineageRef, AnchorProvenanceRelation,
+    AnchorSourceGeneration, CapabilityId, CheckSnapshotAnchorRefV1, CiFailureBranchEvidenceV1,
     CiFailureCoverageV1, CiFailureGenerationEvidenceV1, CiFailureKindV1,
     CiFailureLocalizationResultV1, CiFailureLocalizationStateV1, CiFailureParserIdentityV1,
     CiFailureRunIdentityV1, CommitId, CoverageReportV1, EvidenceAvailabilityV1, EvidenceClass,
@@ -15,35 +15,25 @@ use tracedecay_domain::{
     GitIndexTransactionId, GitIndexTransactionOperationV1, GitIndexTransactionReceiptV1,
     GitObjectFormatV1, GitOidV1, GitOperationStateV1, GitTopologyAnchorTargetV1,
     GitTopologyGenerationRefV1, GitTopologySourceRoleV1, IntegrationReceiptAnchorRefV1,
-    ManifestDigest, NativeGitObjectAnchorRefV1, NativeGitObjectKindV1, ObservationScopeV1,
-    PayloadAccessState, PreflightPreviewAnchorRefV1, PrivacyDomainBoundLocatorDigest,
-    PrivacyDomainId, ProjectId, ProjectionGenerationId, PullRequestSnapshotAnchorRefV1, RefId,
-    RefSnapshotAnchorRefV1, RefSnapshotKindV1, RepositoryCaptureAnchorRefV1,
-    RepositoryDirtyStateV1, RepositoryEvidenceV1, RepositoryId, RepositoryIndexSnapshotV1,
-    RepositoryIndexStateV1, RepositoryProvenanceV1, RepositoryRemoteIdentityV1,
-    RepositoryStateSnapshotV1, RepositoryWorkingTreeSnapshotV1, RepositoryWorkingTreeStateV1,
-    ResolutionAuthorizationV1, RetentionClass, RetrievalAnchorRecordV2,
-    RetrievalAnchorRecordV2Parts, RetrievalAnchorTargetV2, ScopeResolutionId, ShardId, UtcMicros,
+    NativeGitObjectAnchorRefV1, NativeGitObjectKindV1, ObservationScopeV1, PayloadAccessState,
+    PreflightPreviewAnchorRefV1, PrivacyDomainBoundLocatorDigest, PrivacyDomainId, ProjectId,
+    ProjectionGenerationId, PullRequestSnapshotAnchorRefV1, RefId, RefSnapshotAnchorRefV1,
+    RefSnapshotKindV1, RepositoryCaptureAnchorRefV1, RepositoryDirtyStateV1, RepositoryEvidenceV1,
+    RepositoryId, RepositoryIndexSnapshotV1, RepositoryIndexStateV1, RepositoryProvenanceV1,
+    RepositoryRemoteIdentityV1, RepositoryStateSnapshotV1, RepositoryWorkingTreeSnapshotV1,
+    RepositoryWorkingTreeStateV1, ResolutionAuthorizationV1, RetentionClass, RetrievalAnchorRecord,
+    RetrievalAnchorRecordParts, RetrievalAnchorTarget, ScopeResolutionId, ShardId, UtcMicros,
     VectorWatermark, WorktreeCaptureAnchorRefV1, WorktreeId, canonical_sha256,
     derive_git_topology_anchor_id,
 };
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    <T as TryFrom<String>>::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).expect("fixture id is canonical")
-}
+use tracedecay_domain::test_fixtures::id;
 
 fn oid(byte: char) -> GitOidV1 {
     GitOidV1::new(byte.to_string().repeat(40)).expect("fixture oid is canonical")
 }
 
-fn digest(byte: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64)))
-        .expect("fixture digest is canonical")
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn snapshot(epoch: u64, head: char) -> RepositoryStateSnapshotV1 {
     RepositoryStateSnapshotV1::new(
@@ -123,7 +113,7 @@ fn authorization() -> ResolutionAuthorizationV1 {
     }
 }
 
-fn record(target: GitTopologyAnchorTargetV1) -> RetrievalAnchorRecordV2 {
+fn record(target: GitTopologyAnchorTargetV1) -> RetrievalAnchorRecord {
     let owner = ObservationScopeV1::Project {
         project_id: id("project.fixture"),
     };
@@ -133,17 +123,17 @@ fn record(target: GitTopologyAnchorTargetV1) -> RetrievalAnchorRecordV2 {
         .ordered_sources()
         .iter()
         .map(|source| {
-            AnchorLineageRefV2::new(
-                AnchorProvenanceRelationV2::Observed,
+            AnchorLineageRef::new(
+                AnchorProvenanceRelation::Observed,
                 source.anchor_id.clone(),
                 owner.clone(),
             )
             .expect("ordered source lineage is canonical")
         })
         .collect();
-    RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
-        source_generation: AnchorSourceGenerationV2::GitTopology(target.generation()),
-        target: RetrievalAnchorTargetV2::GitTopology(Box::new(target)),
+    RetrievalAnchorRecord::new(RetrievalAnchorRecordParts {
+        source_generation: AnchorSourceGeneration::GitTopology(target.generation()),
+        target: RetrievalAnchorTarget::GitTopology(Box::new(target)),
         owner,
         aliases: vec![],
         occurred_at: None,
@@ -191,7 +181,7 @@ fn worktree_snapshot_anchor_rekeys_on_exact_generation_change() {
     let mut tampered = serde_json::to_value(&first_record).unwrap();
     tampered["source_generation"]["generation"]["binding"]["snapshot_id"] =
         serde_json::to_value(second_snapshot_id).unwrap();
-    assert!(serde_json::from_value::<RetrievalAnchorRecordV2>(tampered).is_err());
+    assert!(serde_json::from_value::<RetrievalAnchorRecord>(tampered).is_err());
 }
 
 #[test]
@@ -400,6 +390,7 @@ fn github_stack_layer(
         outcome: GitHubReviewIngressProviderOutcomeV1::Complete,
         coverage: GitHubReviewCoverageV1::Complete,
         items: vec![],
+        quarantined: Vec::new(),
         pull_request: Some(GitHubPullRequestSnapshotV1 {
             title: "stack layer fixture".to_owned(),
             state: GitHubPullRequestStateV1::Open,

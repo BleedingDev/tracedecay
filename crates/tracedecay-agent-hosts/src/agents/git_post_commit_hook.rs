@@ -11,166 +11,21 @@ use super::host_config_io::{home_dir, quote_posix_command_arg};
 
 /// The marker comment used to identify tracedecay's section in a hook script.
 ///
-/// V1 hooks used the same marker, which lets update and reinstall replace the
-/// managed command with the exact binary that just ran while preserving other
-/// hook content.
+/// NOTE: Legacy hooks written by the old "tracedecay" binary used the marker
+/// "# tracedecay: auto-sync". Those are not detected by this constant, so
+/// existing tracedecay git hooks will not be treated as already-present and a
+/// second tracedecay block may be appended on offer. This is intentional
+/// (install path only writes new identity), users can manually remove the
+/// old block.
 const HOOK_MARKER: &str = "# tracedecay: auto-sync";
 
 /// The hook snippet appended to (or written as) the post-commit script.
 fn post_commit_snippet(tracedecay_bin: &str) -> String {
-    format!(
-        "{HOOK_MARKER}\n{}\n",
-        post_commit_command_line(tracedecay_bin)
-    )
-}
-
-fn post_commit_command_line(tracedecay_bin: &str) -> String {
     let bin = quote_posix_command_arg(&tracedecay_bin.replace('\\', "/"));
-    format!("{bin} sync >/dev/null 2>&1 &")
-}
-
-/// Reconcile an existing managed post-commit block to the exact binary that
-/// just ran, preserving every foreign line in the hook. A stale block can be
-/// left behind when an operator upgrades from a V1 install while the old
-/// binary remains first on `PATH`; the marker identifies our block, while the
-/// command shape check prevents us from deleting a user's command that was
-/// inserted immediately after it.
-fn reconcile_post_commit_contents(contents: &str, tracedecay_bin: &str) -> Option<String> {
-    let newline = if contents.contains("\r\n") {
-        "\r\n"
-    } else {
-        "\n"
-    };
-    let had_trailing_newline = contents.ends_with('\n');
-    let lines: Vec<&str> = contents.lines().collect();
-    let replacement = post_commit_command_line(tracedecay_bin);
-    let mut output = String::new();
-    let mut found_marker = false;
-    let mut first_line = true;
-    let mut index = 0;
-
-    while index < lines.len() {
-        if !first_line {
-            output.push_str(newline);
-        }
-        first_line = false;
-        let line = lines[index].trim_end_matches('\r');
-        output.push_str(line);
-        if line.trim() == HOOK_MARKER {
-            found_marker = true;
-            let next = lines.get(index + 1).copied().unwrap_or_default();
-            if is_managed_post_commit_command(next) {
-                output.push_str(newline);
-                output.push_str(&replacement);
-                index += 1;
-            } else {
-                // Keep a foreign command that happens to follow our marker;
-                // place the reconciled command alongside it.
-                output.push_str(newline);
-                output.push_str(&replacement);
-            }
-        }
-        index += 1;
-    }
-
-    if !found_marker {
-        return None;
-    }
-    if had_trailing_newline {
-        output.push_str(newline);
-    }
-    Some(output)
-}
-
-fn is_managed_post_commit_command(line: &str) -> bool {
-    let command = line
-        .trim()
-        .strip_suffix(" sync >/dev/null 2>&1 &")
-        .map(str::trim)
-        .unwrap_or_default();
-    if command.is_empty() {
-        return false;
-    }
-    let executable = command
-        .strip_prefix('\'')
-        .and_then(|command| command.strip_suffix('\''))
-        .or_else(|| {
-            command
-                .strip_prefix('"')
-                .and_then(|command| command.strip_suffix('"'))
-        })
-        .unwrap_or(command);
-    Path::new(executable)
-        .file_stem()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| {
-            if cfg!(windows) {
-                name.eq_ignore_ascii_case("tracedecay")
-            } else {
-                name == "tracedecay"
-            }
-        })
-}
-
-/// Update every existing managed global post-commit block to `tracedecay_bin`.
-/// This is intentionally non-interactive and does not create a hook: update
-/// and reinstall may repair a stale managed path, but only an explicit install
-/// `--git-hook` install may opt an operator into a new global hook.
-pub fn reconcile_git_post_commit_hook(tracedecay_bin: &str) {
-    let Some(home) = home_dir() else { return };
-    match reconcile_git_post_commit_hook_at(&home, tracedecay_bin) {
-        Ok(true) => {
-            eprintln!("  \x1b[32m✔\x1b[0m Refreshed TraceDecay global git post-commit hook");
-        }
-        Ok(false) => {}
-        Err(error) => {
-            eprintln!("  \x1b[33mwarning:\x1b[0m {error}");
-        }
-    }
-}
-
-fn reconcile_git_post_commit_hook_at(
-    home: &Path,
-    tracedecay_bin: &str,
-) -> std::result::Result<bool, String> {
-    let hooks_dir = read_global_hooks_path(home)
-        .unwrap_or_else(|| home.join(".config").join("git").join("hooks"));
-    let hook_path = hooks_dir.join("post-commit");
-    let metadata = match std::fs::symlink_metadata(&hook_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(format!(
-                "failed to inspect global git hook {}: {error}",
-                hook_path.display()
-            ));
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "refusing to reconcile unsafe global git hook {}",
-            hook_path.display()
-        ));
-    }
-    let contents = std::fs::read_to_string(&hook_path).map_err(|error| {
-        format!(
-            "failed to read global git hook {}: {error}",
-            hook_path.display()
-        )
-    })?;
-    let Some(updated) = reconcile_post_commit_contents(&contents, tracedecay_bin) else {
-        return Ok(false);
-    };
-    if updated == contents {
-        return Ok(false);
-    }
-    std::fs::write(&hook_path, updated).map_err(|error| {
-        format!(
-            "failed to refresh global git post-commit hook {}: {error}",
-            hook_path.display()
-        )
-    })?;
-    Ok(true)
+    format!(
+        "{HOOK_MARKER}\n\
+         {bin} sync >/dev/null 2>&1 &\n"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +71,7 @@ pub fn install_git_post_commit_hook(tracedecay_bin: &str) -> std::result::Result
     let home = home_dir().ok_or_else(|| "could not determine home directory".to_string())?;
     match install_git_post_commit_hook_at(&home, tracedecay_bin)? {
         GitPostCommitHookInstall::AlreadyPresent => {
-            eprintln!("  Global git post-commit hook already contains tracedecay");
+            eprintln!("  Global git post-commit hook already contains tracedecay, skipping");
         }
         GitPostCommitHookInstall::Installed { hooks_path_set } => {
             if hooks_path_set {
@@ -241,7 +96,6 @@ pub(crate) fn install_git_post_commit_hook_at(
     };
     let hook_path = hooks_dir.join("post-commit");
     if hook_contains_marker(&hook_path) {
-        reconcile_git_post_commit_hook_at(home, tracedecay_bin)?;
         return Ok(GitPostCommitHookInstall::AlreadyPresent);
     }
     write_git_post_commit_hook(
@@ -439,7 +293,7 @@ fn insert_gitconfig_value(contents: &str, section: &str, key: &str, value: &str)
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             if in_section {
-                // We've hit the next section — insert before it.
+                // We've hit the next section, insert before it.
                 section_end = Some(i);
                 break;
             }
@@ -472,7 +326,7 @@ fn insert_gitconfig_value(contents: &str, section: &str, key: &str, value: &str)
             result.push(&entry);
         }
     } else {
-        // Section doesn't exist — append it.
+        // Section doesn't exist, append it.
         for line in &lines {
             result.push(line);
         }
@@ -522,32 +376,6 @@ mod tests {
         let snippet = post_commit_snippet("/tmp/bin with spaces/tracedecay");
 
         assert!(snippet.contains("'/tmp/bin with spaces/tracedecay' sync"));
-    }
-
-    #[test]
-    fn reconcile_updates_stale_binary_and_preserves_foreign_hook_content() {
-        let old = "/stable/v1/tracedecay";
-        let current = "/workspace/target/debug/tracedecay";
-        let contents = format!(
-            "#!/bin/sh\n# foreign before\necho foreign\n{HOOK_MARKER}\n{old} sync >/dev/null 2>&1 &\n# foreign after\n"
-        );
-
-        let updated = reconcile_post_commit_contents(&contents, current).unwrap();
-
-        assert!(updated.contains("# foreign before\necho foreign"));
-        assert!(updated.contains(&format!("{current} sync >/dev/null 2>&1 &")));
-        assert!(updated.contains("# foreign after"));
-        assert!(!updated.contains(&format!("{old} sync >/dev/null 2>&1 &")));
-    }
-
-    #[test]
-    fn reconcile_keeps_foreign_command_after_marker() {
-        let contents = format!("{HOOK_MARKER}\necho operator-owned\n");
-
-        let updated = reconcile_post_commit_contents(&contents, "/current/tracedecay").unwrap();
-
-        assert!(updated.contains("echo operator-owned"));
-        assert!(updated.contains("/current/tracedecay sync >/dev/null 2>&1 &"));
     }
 
     #[test]
@@ -614,34 +442,5 @@ mod tests {
             git_post_commit_hook_status(home.path()),
             GitPostCommitHookStatus::Present
         );
-    }
-
-    #[test]
-    fn install_reconciles_an_existing_v1_hook_at_the_supplied_home() {
-        let home = tempfile::tempdir().unwrap();
-        let hooks = home.path().join("hooks");
-        std::fs::create_dir_all(&hooks).unwrap();
-        std::fs::write(
-            home.path().join(".gitconfig"),
-            format!("[core]\n\thooksPath = {}\n", hooks.display()),
-        )
-        .unwrap();
-        let hook = hooks.join("post-commit");
-        std::fs::write(
-            &hook,
-            format!(
-                "#!/bin/sh\n# foreign\n{HOOK_MARKER}\n/stable/v1/tracedecay sync >/dev/null 2>&1 &\n"
-            ),
-        )
-        .unwrap();
-
-        let result =
-            install_git_post_commit_hook_at(home.path(), "/current/v2/tracedecay").unwrap();
-
-        assert_eq!(result, GitPostCommitHookInstall::AlreadyPresent);
-        let contents = std::fs::read_to_string(hook).unwrap();
-        assert!(contents.contains("# foreign"));
-        assert!(contents.contains("/current/v2/tracedecay sync >/dev/null 2>&1 &"));
-        assert!(!contents.contains("/stable/v1/tracedecay sync >/dev/null 2>&1 &"));
     }
 }

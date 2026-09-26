@@ -19,6 +19,8 @@ pub(crate) struct DaemonFeedbackInvocationRequest {
 pub struct DaemonFeedbackInvocationResult {
     pub(crate) scope: ResolvedScope,
     pub(crate) evidence: EvidencePacket<serde_json::Value>,
+    pub(crate) touched_files: Vec<String>,
+    pub(crate) cost: Option<tracedecay_contracts::RequestCostReceiptV1>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,11 +108,27 @@ pub type DaemonFeedbackProximityInvocationFuture<'a> = Pin<
     >,
 >;
 
+/// Whether an advisory-cycle owner answers for its project now, or stands in
+/// for a full cycle a ready sealed generation is mounting.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonAdvisoryCycleMountV1 {
+    Answers,
+    Mounting,
+}
+
+pub type DaemonAdvisoryCycleMountFuture<'a> =
+    Pin<Box<dyn Future<Output = DaemonAdvisoryCycleMountV1> + Send + 'a>>;
+
 pub trait DaemonAdvisoryCycleInvocationPort: Send + Sync {
     fn invoke(
         &self,
         request: DaemonAdvisoryCycleInvocationRequest,
     ) -> DaemonAdvisoryCycleInvocationFuture<'_>;
+
+    /// A mounted cycle answers; only a pre-mount owner reports `Mounting`.
+    fn mount(&self) -> DaemonAdvisoryCycleMountFuture<'_> {
+        Box::pin(async { DaemonAdvisoryCycleMountV1::Answers })
+    }
 
     fn invoke_proximity(
         &self,
@@ -204,14 +222,10 @@ where
                     .await
                 }
                 _ => {
-                    return Err(ApplicationProblem::InvalidRequest {
-                        diagnostic: SafeDiagnostic {
-                            code: "feedback.invalid_operation".to_owned(),
-                            message: "The feedback read operation is invalid".to_owned(),
-                        },
-                        retry: RetryDirective::Never,
-                        legal_actions: Vec::new(),
-                    });
+                    return Err(ApplicationProblem::invalid_request_without_action(
+                        "feedback.invalid_operation",
+                        "The feedback read operation is invalid",
+                    ));
                 }
             }
             .map_err(feedback_owner_problem)?;
@@ -269,7 +283,9 @@ fn feedback_invocation_result_with<T>(
     let application = result.map_err(|problem| problem.problem.into_source())?;
     let evidence = match application.outcome {
         ApplicationOutcome::Evidence(packet) => packet,
-        ApplicationOutcome::Preview(_) | ApplicationOutcome::Effect(_) => {
+        ApplicationOutcome::Preview(_)
+        | ApplicationOutcome::Effect(_)
+        | ApplicationOutcome::Result(_) => {
             return Err(ApplicationProblem::unavailable(SafeDiagnostic {
                 code: "feedback.invalid_owner_result".to_owned(),
                 message: "The feedback read owner returned an invalid outcome".to_owned(),
@@ -296,6 +312,8 @@ fn feedback_invocation_result_with<T>(
             execution: evidence.execution,
             payload,
         },
+        touched_files: application.touched_files,
+        cost: application.cost,
     })
 }
 
@@ -373,7 +391,9 @@ pub(super) async fn execute_feedback(
                 wire_request_id,
                 DaemonInvocationOutcome::Feedback {
                     scope: result.scope,
-                    result: DaemonFeedbackResult::from_application(result.evidence),
+                    result: DaemonFeedbackResult::from_application(result.evidence)
+                        .with_touched_files(result.touched_files)
+                        .with_cost(result.cost),
                 },
             )
         }
@@ -392,7 +412,7 @@ pub fn advisory_cycle_invocation_result(
     use tracedecay_application::advisory::AdvisoryCycleOutcome;
     use tracedecay_domain::feedback::FeedbackCycleTerminationV1;
 
-    let ended_at = current_micros();
+    let ended_at = now_micros();
     let policy_digest = canonical_sha256(&(
         "tracedecay.daemon.feedback-advisory-policy",
         context.scope(),
@@ -607,6 +627,8 @@ pub fn advisory_cycle_invocation_result(
             execution,
             payload,
         },
+        touched_files: Vec::new(),
+        cost: None,
     })
 }
 
@@ -620,7 +642,7 @@ pub fn feedback_proximity_invocation_result(
     result
         .validate()
         .map_err(|_| feedback_proximity_contract_problem())?;
-    let ended_at = current_micros();
+    let ended_at = now_micros();
     let (termination, completeness, returned, omission_reason) = match &result {
         FeedbackProximityReadResultV1::Complete { page } => (
             OperationTermination::Completed,
@@ -740,6 +762,8 @@ pub fn feedback_proximity_invocation_result(
             execution,
             payload: Some(payload),
         },
+        touched_files: Vec::new(),
+        cost: None,
     })
 }
 
@@ -806,7 +830,7 @@ pub(super) async fn execute_feedback_advisory_cycle(
             ApplicationProblem::cancelled_before_admission(),
         );
     }
-    if deadline.is_elapsed_at(observed_at) || deadline.is_elapsed_at(current_micros()) {
+    if deadline.is_elapsed_at(observed_at) || deadline.is_elapsed_at(now_micros()) {
         return application_problem(
             wire_request_id,
             ApplicationProblem::timed_out_before_admission(),
@@ -827,7 +851,9 @@ pub(super) async fn execute_feedback_advisory_cycle(
                 wire_request_id,
                 DaemonInvocationOutcome::Feedback {
                     scope: result.scope,
-                    result: DaemonFeedbackResult::from_application(result.evidence),
+                    result: DaemonFeedbackResult::from_application(result.evidence)
+                        .with_touched_files(result.touched_files)
+                        .with_cost(result.cost),
                 },
             )
         }
@@ -876,7 +902,9 @@ pub(super) async fn execute_feedback_proximity(
                 wire_request_id,
                 DaemonInvocationOutcome::Feedback {
                     scope: result.scope,
-                    result: DaemonFeedbackResult::from_application(result.evidence),
+                    result: DaemonFeedbackResult::from_application(result.evidence)
+                        .with_touched_files(result.touched_files)
+                        .with_cost(result.cost),
                 },
             )
         }
@@ -927,6 +955,40 @@ impl DaemonInvocationService {
         self.project_runtimes
             .read::<DaemonAdvisoryCycleInvocationOwner, _, _>(project_root?, Clone::clone)
             .await
+    }
+
+    /// The owner that answers an advisory-cycle request for `project_root`.
+    ///
+    /// A reopened project serves its first requests while project open is
+    /// still publishing owners, and then while a ready sealed generation
+    /// mounts the full cycle behind a placeholder. Those requests wait for the
+    /// publication within their own deadline instead of failing a call a
+    /// retry would answer. A finished publication without an owner, or an
+    /// owner that answers, returns at once.
+    #[hotpath::measure(label = "daemon.service.feedback.advisory_owner_wait", future = true)]
+    pub(super) async fn answering_advisory_cycle_owner(
+        &self,
+        project_root: Option<&Path>,
+        deadline: &Deadline,
+    ) -> Option<DaemonAdvisoryCycleInvocationOwner> {
+        let project_root = project_root?;
+        loop {
+            let (owner, publication, mut changed) =
+                self.project_runtimes.advisory_cycle_view(project_root);
+            let waits = match &owner {
+                Some(owner) => owner.service.mount().await == DaemonAdvisoryCycleMountV1::Mounting,
+                None => publication == Some(ProjectRuntimePublicationStateV1::Warming),
+            };
+            let remaining_micros = deadline.expires_at.0.saturating_sub(now_micros().0);
+            if !waits || remaining_micros <= 0 {
+                return owner;
+            }
+            let remaining = Duration::from_micros(remaining_micros.unsigned_abs());
+            match tokio::time::timeout(remaining, changed.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) | Err(_) => return owner,
+            }
+        }
     }
 
     #[hotpath::skip]

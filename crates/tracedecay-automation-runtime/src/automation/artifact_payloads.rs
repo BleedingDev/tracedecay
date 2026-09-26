@@ -458,7 +458,7 @@ pub(super) fn codex_handoff_payload(
             "commands": [ctx.policy.eval_replay_command()],
             "application": automatic_application,
         },
-        "next_actions": ctx.policy.next_actions(ctx.record),
+        "next_actions": ctx.policy.next_actions(ctx.record.accepted_count),
         "tests_to_run": [ctx.policy.handoff_test()],
     })
 }
@@ -591,6 +591,7 @@ mod tests {
             rejected_count: 0,
             skipped_count: 0,
             fallback_status: None,
+            session_evidence_budget_stage: None,
             error: None,
             error_classification: None,
             error_retryable: None,

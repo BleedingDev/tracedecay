@@ -1,10 +1,9 @@
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::lock_admission::{LockAdmissionError, lock_until};
-
 use tracedecay_domain::UtcMicros;
+use tracedecay_private_fs::{FileLease, LockAdmissionError, lock_until};
 
 use super::types::HookSpoolWriterLeaseV1;
 use super::{HookSpoolError, HookSpoolV1, lease_path, next_token, validate_regular_or_missing};
@@ -43,7 +42,7 @@ pub(super) fn acquire_lease(
     root: &Path,
     lease_duration_micros: i64,
     now: UtcMicros,
-) -> Result<(HookSpoolWriterLeaseV1, File), HookSpoolError> {
+) -> Result<(HookSpoolWriterLeaseV1, FileLease), HookSpoolError> {
     acquire_lease_bounded(root, lease_duration_micros, now, None)
 }
 
@@ -55,7 +54,7 @@ pub(super) fn acquire_lease_bounded(
     lease_duration_micros: i64,
     now: UtcMicros,
     wait_budget: Option<Duration>,
-) -> Result<(HookSpoolWriterLeaseV1, File), HookSpoolError> {
+) -> Result<(HookSpoolWriterLeaseV1, FileLease), HookSpoolError> {
     let expires_at = UtcMicros(
         now.0
             .checked_add(lease_duration_micros)
@@ -82,7 +81,7 @@ pub(super) fn acquire_lease_bounded(
         Some(wait_budget) => {
             lock_until(&file, Instant::now() + wait_budget).map_err(|error| match error {
                 LockAdmissionError::TimedOut => HookSpoolError::AdmissionTimedOut,
-                LockAdmissionError::Io => HookSpoolError::Io,
+                LockAdmissionError::Io(_) => HookSpoolError::Io,
             })?;
         }
         None => file.try_lock().map_err(map_try_lock_error)?,
@@ -93,7 +92,7 @@ pub(super) fn acquire_lease_bounded(
     // persisting advisory ownership would add a durability barrier without
     // strengthening exclusion, while records, metadata and replay cursors keep
     // their independent fsync-before-return contracts.
-    Ok((candidate, file))
+    Ok((candidate, FileLease::held(file, "hooks.spool.writer")))
 }
 
 pub(super) fn map_try_lock_error(error: std::fs::TryLockError) -> HookSpoolError {

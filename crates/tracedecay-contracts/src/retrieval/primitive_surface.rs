@@ -15,7 +15,7 @@ use tracedecay_domain::{
     WorktreeId,
 };
 
-use crate::code_index_freshness::CodeIndexStalenessStateV1;
+use crate::code_index_freshness::{CodeIndexConvergenceParkedV1, CodeIndexStalenessStateV1};
 use crate::error::ApplicationContractError;
 use crate::memory::{
     CognitiveRecallExclusions, CognitiveRecallTemporalMode, CognitiveRecallTemporalQuery,
@@ -65,9 +65,14 @@ pub struct ContextSurfaceRequestV1 {
     /// not invent a mapping from provider references to canonical fact identities.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusions: Option<CognitiveRecallExclusions>,
-    /// Exact identifiers or technical terms ranked through the lexical lane as
-    /// additional routes fused with the task text. Bounded and validated by
-    /// the retrieval kernel; a violation is a typed request rejection.
+    /// Exact identifiers or technical terms the answer must be about. Each
+    /// runs as its own lexical route: hits carrying an anchor outrank hits
+    /// carrying none, exact hits included, every anchor with matches keeps at
+    /// least its best sites through the lane cap, and `lexical_anchors` in the
+    /// result reports each anchor's outcome: the sites this result returns
+    /// and, by reason, the admitted sites it could not carry. Bounded and
+    /// validated by the retrieval kernel; a
+    /// violation is a typed request rejection.
     pub lexical_anchors: Option<Vec<String>>,
     /// Add a symbol-name lexical route for the identifier-shaped words of the
     /// task text.
@@ -249,6 +254,10 @@ pub struct PrimitiveIndexingStateV1 {
     pub stale_lanes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The park holding convergence until the operator applies its remedy.
+    /// No wake retries it, so repeating the request cannot change the answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parked: Option<CodeIndexConvergenceParkedV1>,
 }
 
 /// Freshness verdict carried by every search and context response. `indexing`
@@ -266,16 +275,6 @@ pub struct PrimitiveSearchFreshnessV1 {
 pub struct NodeDepthSurfaceRequestV1 {
     pub node_id: String,
     pub max_depth: Option<u32>,
-}
-
-pub type ImpactSurfaceRequestV1 = NodeDepthSurfaceRequestV1;
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CalleesSurfaceRequestV1 {
-    pub node_id: String,
-    pub max_depth: Option<u32>,
-    pub resolve_dispatch: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -303,95 +302,17 @@ pub enum SimilarMatchClassV1 {
     RenameNormalizedExact,
 }
 
-/// The source extent compared by the verified shared-code lane.
-///
-/// The field on [`SimilarSurfaceRequestV1`] is optional for wire
-/// compatibility; an omitted value means [`Self::WholeBody`]. A selected
-/// extent is measured in the canonical normalized token stream, so mutable
-/// source line numbers never become part of the comparison request.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SimilarSourceExtentV1 {
-    WholeBody,
-    SelectedTokenRange { start: u32, end: u32 },
-}
-
-impl SimilarSourceExtentV1 {
-    /// A missing wire value retains the pre-extent whole-body behavior.
-    pub fn or_whole_body(value: Option<Self>) -> Self {
-        value.unwrap_or(Self::WholeBody)
-    }
-
-    /// Reject an empty or reversed token range before it reaches a serving
-    /// owner. The upper bound is exclusive, matching Rust range semantics.
-    pub fn validate(&self) -> Result<(), ApplicationContractError> {
-        if let Self::SelectedTokenRange { start, end } = self
-            && start >= end
-        {
-            return Err(ApplicationContractError::InvalidRange {
-                field: "similar source token range",
-            });
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SimilarSurfaceRequestV1 {
     pub project_id: ProjectId,
     pub repository_id: RepositoryId,
     pub target: SimilarTargetV1,
-    /// Verified exact/near classes requested by this read. A continuation
-    /// keeps the complete class set from the first page; the authenticated
-    /// cursor selects the lane position, so a cursor is valid even when this
-    /// vector contains both classes.
     pub match_classes: Vec<SimilarMatchClassV1>,
     /// Preferred result page size.
     pub result_limit: u32,
     pub work_limit: u32,
-    /// Opaque authenticated lane continuation. The serving owner authenticates
-    /// and binds it to the admitted request; this contract only rejects an
-    /// empty token before it reaches the owner.
     pub cursor: Option<String>,
-    /// Optional source extent. Omitted means the complete verified body.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_extent: Option<SimilarSourceExtentV1>,
-}
-
-impl SimilarSurfaceRequestV1 {
-    /// Validate request fields that are independent of a mounted generation.
-    ///
-    /// The class list is intentionally allowed to contain both exact classes
-    /// on a continuation. The cursor carries the authenticated lane position;
-    /// requiring a single class here would reject a valid second page after
-    /// an initial request that asked for exact and near evidence together.
-    pub fn validate(&self) -> Result<(), ApplicationContractError> {
-        if self.match_classes.is_empty() {
-            return Err(ApplicationContractError::ZeroValue {
-                field: "similar match classes",
-            });
-        }
-        if self
-            .cursor
-            .as_deref()
-            .is_some_and(|cursor| cursor.trim().is_empty())
-        {
-            return Err(ApplicationContractError::InvalidIdentifier {
-                field: "similar cursor",
-            });
-        }
-        Ok(())
-    }
-
-    pub fn validated_source_extent(
-        &self,
-    ) -> Result<SimilarSourceExtentV1, ApplicationContractError> {
-        self.validate()?;
-        let extent = SimilarSourceExtentV1::or_whole_body(self.source_extent.clone());
-        extent.validate()?;
-        Ok(extent)
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -552,6 +473,76 @@ pub struct PrimitiveSearchCoverageV1 {
     pub recall: PrimitiveRecallV1,
 }
 
+/// A public trait or interface among the context's selected symbols.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextExtensionPointV1 {
+    pub name: String,
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    pub implementor_count: usize,
+}
+
+/// Why a site the lexical lane admitted for a caller anchor is absent from
+/// the response.
+#[derive(
+    Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum LexicalAnchorDropReasonV1 {
+    /// Collapsed as a duplicate or held back by the per-file diversity cap.
+    DiversityCap,
+    /// Ranked, but outside the returned page: an earlier page, or behind
+    /// `next_cursor`.
+    OutsidePage,
+    /// On the page, but late hydration returned no source for it.
+    NotHydrated,
+    /// Outside the caller's scope prefix.
+    OutOfScope,
+}
+
+/// Anchor sites one serving stage removed from the response.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LexicalAnchorDropV1 {
+    pub reason: LexicalAnchorDropReasonV1,
+    pub sites: u64,
+}
+
+/// What one caller `lexical_anchors` entry contributed to the response, in
+/// caller order.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContextLexicalAnchorV1 {
+    /// `matched` indexed rows carried the anchor; `admitted` result sites
+    /// carrying it are in this response, and `dropped` counts the sites the
+    /// lexical lane admitted that a later stage removed, by reason.
+    Matched {
+        anchor: String,
+        matched: u64,
+        admitted: u64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        dropped: Vec<LexicalAnchorDropV1>,
+    },
+    /// No indexed row carries the anchor.
+    Unmatched { anchor: String },
+    /// The anchor's route did not serve; `coverage` names the lane state.
+    NotServed { anchor: String },
+}
+
+/// Plan-mode enrichment: where the selected code can be extended and which
+/// test files reach it.
+#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextPlanV1 {
+    pub extension_points: Vec<ContextExtensionPointV1>,
+    /// Test files calling the selected symbols within two hops; absent when
+    /// no symbol was selected to trace from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_files: Option<Vec<String>>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextResultV1 {
@@ -564,6 +555,10 @@ pub struct ContextResultV1 {
     pub code_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub search_matches: Vec<ContextSearchMatchV1>,
+    /// Outcome of every caller `lexical_anchors` entry; empty when none
+    /// were supplied.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lexical_anchors: Vec<ContextLexicalAnchorV1>,
     pub symbols: Vec<PrimitiveSymbolLocationV1>,
     pub related_symbols: Vec<PrimitiveSymbolLocationV1>,
     pub code: Vec<ContextCodeBlockV1>,
@@ -578,6 +573,67 @@ pub struct ContextResultV1 {
     pub memory_matches_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verified_graph_evidence: Option<PrimitiveUnavailableEvidenceV1>,
+    /// Present in plan mode when the verified graph answered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<ContextPlanV1>,
+    pub retrieval: ContextRetrievalPlanV1,
+}
+
+/// What one `context` stage ran with and kept.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum ContextStageV1 {
+    /// The request did not ask for this stage.
+    NotRequested,
+    /// A stage this one reads from produced nothing to work on.
+    Skipped,
+    /// The stage's authority could not answer.
+    Unavailable,
+    /// The stage admitted `admitted` entries under `budget`. `truncated` is
+    /// true when it stopped at that budget, so more entries may exist.
+    Ran {
+        budget: u32,
+        admitted: u32,
+        truncated: bool,
+    },
+}
+
+impl ContextStageV1 {
+    pub fn ran(budget: usize, admitted: usize, truncated: bool) -> Self {
+        Self::Ran {
+            budget: u32::try_from(budget).unwrap_or(u32::MAX),
+            admitted: u32::try_from(admitted).unwrap_or(u32::MAX),
+            truncated,
+        }
+    }
+
+    pub fn is_truncated(self) -> bool {
+        matches!(
+            self,
+            Self::Ran {
+                truncated: true,
+                ..
+            }
+        )
+    }
+}
+
+/// The retrieval plan `context` executed: which stages ran, what each
+/// admitted, and where a budget bounded the answer. Lane-level serving state
+/// stays in `coverage`.
+#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextRetrievalPlanV1 {
+    /// Ranked code-index candidates, bounded by `max_nodes`.
+    pub search: ContextStageV1,
+    /// Candidates resolved to verified graph symbols.
+    pub graph: ContextStageV1,
+    /// Callers and callees of the selected symbols, bounded by `max_nodes`.
+    pub related: ContextStageV1,
+    /// Source bodies for selected symbols, bounded by `max_code_blocks`.
+    pub code: ContextStageV1,
+    /// Project memory facts, bounded by `memory_limit`.
+    pub memory: ContextStageV1,
 }
 
 impl ContextResultV1 {
@@ -593,24 +649,6 @@ impl ContextResultV1 {
         self.memory_graph_coverage
     }
 }
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CalleeV1 {
-    pub node_id: String,
-    pub name: String,
-    pub kind: String,
-    pub file: String,
-    pub line: u32,
-    pub edge_kind: String,
-    pub dispatch_via_trait: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub depth: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatch_from: Option<String>,
-}
-
-pub type CalleesResultV1 = Vec<CalleeV1>;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -707,121 +745,18 @@ pub struct SimilarFamilyV1 {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SimilarNearPartialReasonV1 {
-    PostingRowBudget,
-    CandidateBodyBudget,
-    HotPostings,
-    VerificationBodyBudget,
-    VerificationWorkBudget,
-    Cancelled,
-    DeadlineExceeded,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SimilarNearUnavailableReasonV1 {
-    CapabilityUnavailable,
-    AuthorityUnavailable,
-    LinkedWorktreeDisabled,
-    Cancelled,
-    TimedOut,
-    CapacityUnavailable,
-    GenerationUnavailable,
-    GenerationUnverified,
-    InvalidRequest,
-    CorruptionResetRequired,
-    Internal,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SimilarNearCoverageV1 {
-    Complete,
-    Partial {
-        reasons: Vec<SimilarNearPartialReasonV1>,
-    },
-    Unavailable {
-        reason: SimilarNearUnavailableReasonV1,
-    },
-    ExcludedTooSmall {
-        minimum_tokens: u32,
-    },
-    ExcludedIncompleteTokenization,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimilarTokenSpanV1 {
-    pub start: u32,
-    pub end: u32,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimilarAlignmentAnchorV1 {
-    pub fingerprint: u64,
-    pub source_token_position: u32,
-    pub candidate_token_position: u32,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimilarAlignmentV1 {
-    pub shared_token_count: u32,
-    pub anchors: Vec<SimilarAlignmentAnchorV1>,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimilarAlignedDifferenceV1 {
-    pub source_span: SimilarTokenSpanV1,
-    pub candidate_span: SimilarTokenSpanV1,
-    pub source_token_count: u32,
-    pub candidate_token_count: u32,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SimilarContainmentV1 {
-    Equal,
-    CandidateContainsSelectedRange,
-    SelectedRangeContainsCandidate,
-}
-
-/// One candidate supported by verified fingerprint anchors. Directional
-/// coverage is reported separately for source and candidate; no scalar score
-/// is meaningful for a directional code comparison and none is emitted.
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimilarNearMatchV1 {
-    pub candidate: SimilarOccurrenceV1,
-    pub match_class: SimilarMatchClassV1,
-    pub extent: SimilarSourceExtentV1,
-    pub source_coverage_millionths: u32,
-    pub candidate_coverage_millionths: u32,
-    pub alignment: SimilarAlignmentV1,
-    pub differences: Vec<SimilarAlignedDifferenceV1>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub containment: Option<SimilarContainmentV1>,
-}
-
-#[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SimilarNearResultV1 {
-    pub extent: SimilarSourceExtentV1,
-    pub matches: Vec<SimilarNearMatchV1>,
-    pub coverage: SimilarNearCoverageV1,
-    pub next_cursor: Option<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SimilarCoverageV1 {
     Complete,
     Partial,
-    ExcludedTooSmall { minimum_tokens: u32 },
+    ExcludedTooSmall {
+        minimum_tokens: u32,
+    },
+    ExcludedTooLarge {
+        maximum_tokens: u32,
+        maximum_bytes: u64,
+    },
     ExcludedIncompleteTokenization,
 }
 
@@ -832,10 +767,6 @@ pub struct SimilarResultV1 {
     pub families: Vec<SimilarFamilyV1>,
     pub source_generation: CodeGenerationId,
     pub coverage: SimilarCoverageV1,
-    /// Additive verified near/contained evidence. `None` is retained for
-    /// callers constructing the exact-family-only compatibility response.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub near: Option<SimilarNearResultV1>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
@@ -1071,11 +1002,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        ContextModeV1, ContextResultV1, ContextSurfaceRequestV1, PrimitiveFreshnessStateV1,
-        PrimitiveIndexingStateV1, PrimitiveLaneCompleteV1, PrimitiveLaneStatusV1,
-        PrimitiveRecallV1, PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1,
-        RedundancySurfaceRequestV1, SimilarNearCoverageV1, SimilarNearPartialReasonV1,
-        SimilarNearUnavailableReasonV1, SimilarSourceExtentV1, SimilarSurfaceRequestV1,
+        ContextModeV1, ContextResultV1, ContextRetrievalPlanV1, ContextStageV1,
+        ContextSurfaceRequestV1, PrimitiveFreshnessStateV1, PrimitiveIndexingStateV1,
+        PrimitiveLaneCompleteV1, PrimitiveLaneStatusV1, PrimitiveRecallV1,
+        PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1, RedundancySurfaceRequestV1,
+        SimilarSurfaceRequestV1,
     };
     use crate::code_index_freshness::CodeIndexStalenessStateV1;
     use crate::memory::{FactSearchGraphCoverageV1, FactSearchGraphDegradationV1};
@@ -1243,6 +1174,7 @@ mod tests {
             },
             code_generation: Some("generation.test".to_owned()),
             search_matches: vec![],
+            lexical_anchors: vec![],
             symbols: vec![],
             related_symbols: vec![],
             code: vec![],
@@ -1258,7 +1190,35 @@ mod tests {
             memory_temporal_coverage: None,
             memory_matches_error: None,
             verified_graph_evidence: None,
+            plan: None,
+            retrieval: ContextRetrievalPlanV1 {
+                search: ContextStageV1::ran(20, 0, false),
+                graph: ContextStageV1::Skipped,
+                related: ContextStageV1::Skipped,
+                code: ContextStageV1::NotRequested,
+                memory: ContextStageV1::NotRequested,
+            },
         }
+    }
+
+    #[test]
+    fn context_retrieval_plan_names_each_stage_and_its_budget() {
+        let mut result = context_result();
+        result.retrieval.code = ContextStageV1::ran(5, 5, true);
+        let wire = serde_json::to_value(&result).expect("context result serializes");
+        assert_eq!(
+            wire["retrieval"],
+            json!({
+                "search": {"state": "ran", "budget": 20, "admitted": 0, "truncated": false},
+                "graph": {"state": "skipped"},
+                "related": {"state": "skipped"},
+                "code": {"state": "ran", "budget": 5, "admitted": 5, "truncated": true},
+                "memory": {"state": "not_requested"},
+            })
+        );
+        let decoded: ContextResultV1 = serde_json::from_value(wire).expect("round trip");
+        assert!(decoded.retrieval.code.is_truncated());
+        assert!(!decoded.retrieval.search.is_truncated());
     }
 
     #[test]
@@ -1344,6 +1304,7 @@ mod tests {
                 rebuild_in_flight: Some(true),
                 stale_lanes: vec!["lexical".to_owned()],
                 reason: None,
+                parked: None,
             }),
         };
         let stale = serde_json::to_value(stale).expect("context result serializes");
@@ -1365,154 +1326,6 @@ mod tests {
                 .is_some_and(|required| required.contains(&Value::String("freshness".to_owned()))),
             "freshness is part of every context result"
         );
-    }
-
-    #[test]
-    fn similar_source_extent_defaults_to_whole_body_and_rejects_empty_ranges() {
-        assert_eq!(
-            SimilarSourceExtentV1::or_whole_body(None),
-            SimilarSourceExtentV1::WholeBody
-        );
-        assert!(SimilarSourceExtentV1::WholeBody.validate().is_ok());
-        assert!(
-            SimilarSourceExtentV1::SelectedTokenRange { start: 4, end: 4 }
-                .validate()
-                .is_err()
-        );
-        assert!(
-            SimilarSourceExtentV1::SelectedTokenRange { start: 5, end: 4 }
-                .validate()
-                .is_err()
-        );
-        assert!(
-            SimilarSourceExtentV1::SelectedTokenRange { start: 4, end: 9 }
-                .validate()
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn similar_request_keeps_extent_optional_for_existing_callers() {
-        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
-            "project_id": "project.similar",
-            "repository_id": "repository.similar",
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": "symbol.similar"
-            },
-            "match_classes": ["conservative_exact"],
-            "result_limit": 10,
-            "work_limit": 100,
-            "cursor": null
-        }))
-        .expect("legacy similar request decodes");
-        assert_eq!(request.source_extent, None);
-        assert_eq!(
-            request.validated_source_extent().expect("default extent"),
-            SimilarSourceExtentV1::WholeBody
-        );
-
-        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
-            "project_id": "project.similar",
-            "repository_id": "repository.similar",
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": "symbol.similar"
-            },
-            "match_classes": ["conservative_exact"],
-            "result_limit": 10,
-            "work_limit": 100,
-            "source_extent": {
-                "kind": "selected_token_range",
-                "start": 8,
-                "end": 21
-            }
-        }))
-        .expect("selected extent request decodes");
-        assert_eq!(
-            request.validated_source_extent().expect("selected extent"),
-            SimilarSourceExtentV1::SelectedTokenRange { start: 8, end: 21 }
-        );
-        assert_eq!(
-            serde_json::to_value(&request).expect("request JSON")["source_extent"],
-            json!({"kind": "selected_token_range", "start": 8, "end": 21})
-        );
-    }
-
-    #[test]
-    fn similar_continuation_preserves_multiple_match_classes() {
-        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
-            "project_id": "project.similar",
-            "repository_id": "repository.similar",
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": "symbol.similar"
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 2,
-            "cursor": "ccclone2.authenticated"
-        }))
-        .expect("multi-class continuation decodes");
-
-        request
-            .validate()
-            .expect("multi-class continuation is a valid request shape");
-        request
-            .validated_source_extent()
-            .expect("multi-class continuation keeps the default extent");
-    }
-
-    #[test]
-    fn similar_request_rejects_empty_continuation_before_serving() {
-        let request: SimilarSurfaceRequestV1 = serde_json::from_value(json!({
-            "project_id": "project.similar",
-            "repository_id": "repository.similar",
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": "symbol.similar"
-            },
-            "match_classes": ["conservative_exact"],
-            "result_limit": 1,
-            "work_limit": 2,
-            "cursor": ""
-        }))
-        .expect("empty continuation decodes as opaque wire input");
-
-        assert!(request.validate().is_err());
-    }
-
-    #[test]
-    fn similar_near_coverage_is_typed_and_does_not_expose_a_score() {
-        let partial = serde_json::to_value(SimilarNearCoverageV1::Partial {
-            reasons: vec![SimilarNearPartialReasonV1::VerificationWorkBudget],
-        })
-        .expect("partial near coverage JSON");
-        assert_eq!(
-            partial,
-            json!({
-                "status": "partial",
-                "reasons": ["verification_work_budget"]
-            })
-        );
-        assert_eq!(
-            serde_json::to_value(SimilarNearCoverageV1::Unavailable {
-                reason: SimilarNearUnavailableReasonV1::GenerationUnverified,
-            })
-            .expect("unavailable near coverage JSON"),
-            json!({"status": "unavailable", "reason": "generation_unverified"})
-        );
-        assert_eq!(
-            serde_json::to_value(SimilarNearCoverageV1::Complete)
-                .expect("complete near coverage JSON"),
-            json!({"status": "complete"})
-        );
-
-        let schema = serde_json::to_value(schema_for!(super::SimilarNearMatchV1))
-            .expect("near match schema");
-        assert!(schema["properties"]["source_coverage_millionths"].is_object());
-        assert!(schema["properties"]["candidate_coverage_millionths"].is_object());
-        assert!(schema["properties"].get("score").is_none());
     }
 
     #[test]

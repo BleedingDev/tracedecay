@@ -10,7 +10,7 @@
 //! `payload_route` is part of the key because a provider can be reached two
 //! ways: `TraceDecay` scanning the host's own on-disk sources, or the host
 //! inlining a turn's messages in the request. Both are capture routes and both
-//! belong in the registry — expressing the second one as a branch above the
+//! belong in the registry, expressing the second one as a branch above the
 //! lookup is what previously let it skip admission entirely.
 
 use std::future::Future;
@@ -25,20 +25,15 @@ use tracedecay_domain::errors::Result;
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::HostAdmissionFacade;
 use tracedecay_project::project::TraceDecay;
-use tracedecay_session_memory::session::lcm::{
-    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmAuthorityResponse,
-    LcmTranscriptIngestCommand,
-};
-use tracedecay_sessions::admission::{HostAdmissionOutcome, HostAdmissionStatus};
+use tracedecay_sessions::admission::HostAdmissionStatus;
 use tracedecay_sessions::observation::ObservationCancellation;
-use tracedecay_sessions::runtime::claude_observation::ClaudeObservationIngestStats;
-use tracedecay_sessions::runtime::hermes::HermesSweepOutcome;
+use tracedecay_sessions::runtime::hosts::claude_observation::ClaudeObservationIngestStats;
+use tracedecay_sessions::runtime::hosts::hermes::HermesSweepOutcome;
 use tracedecay_sessions::runtime::snapshot_observation::SnapshotCaptureOutcome;
 
 use super::super::{required_str, required_user_db};
 use super::{
-    admit_codex_project_rollouts, compaction_unavailable_reason,
-    drain_host_observation_projections, project_observation_id,
+    admit_codex_project_rollouts, drain_host_observation_projections, project_observation_id,
 };
 use crate::handlers::SessionAuthorities;
 use crate::{
@@ -79,7 +74,6 @@ pub(super) struct TranscriptCaptureContext<'a> {
     pub(super) facade: &'a HostAdmissionFacade<'a>,
     pub(super) max_new_bytes: Option<u64>,
     pub(super) cancellation: &'a ObservationCancellation,
-    pub(super) codex_stop_bound: Option<&'a super::CodexStopSourceBound>,
 }
 
 impl<'a> TranscriptCaptureContext<'a> {
@@ -122,12 +116,19 @@ pub(super) struct TranscriptCaptureOutcome {
     pub(super) snapshot: Option<SnapshotCaptureOutcome>,
     pub(super) claude_observation: Option<ClaudeObservationIngestStats>,
     pub(super) source_deferred: bool,
-    /// Set by routes that commit through the LCM authority instead of a source
-    /// scan; rendered as `authority_outcome` and `committed_state`.
-    pub(super) lcm_receipt: Option<LcmAuthorityResponse>,
-    /// Set when the route's own authority refused the pass. Replaces the
-    /// replay-completion admission so one status vocabulary reaches the host.
-    pub(super) route_admission: Option<HostAdmissionOutcome>,
+    /// Observations the route durably admitted, whoever later projects them.
+    /// `messages_upserted` counts only the projections this pass drained
+    /// itself, which a peer drainer can legitimately take first.
+    pub(super) observations_committed: u64,
+    /// This route's admission tally is the commit. The projection drain is a
+    /// shared per-scope queue, so its residual must not enter the terminal
+    /// status. Routes that have no admission tally leave this false and keep
+    /// using their own message counts.
+    pub(super) admission_owns_commit: bool,
+    /// The route committed nothing because its observations were already
+    /// durable. Kept apart from `messages_upserted == 0`, which cannot tell an
+    /// already-committed replay from a pass that captured nothing.
+    pub(super) exact_duplicate: bool,
 }
 
 type TranscriptCaptureFuture<'a> =
@@ -157,7 +158,6 @@ macro_rules! transcript_capture_kernels {
 
 transcript_capture_kernels! {
     ClaudeProfileKernelV1 => capture_claude_profile,
-    ClaudeProjectKernelV1 => capture_claude_project,
     CodexProfileKernelV1 => capture_codex_profile,
     CursorProfileKernelV1 => capture_cursor_profile,
     HermesProfileKernelV1 => capture_hermes_profile,
@@ -166,6 +166,7 @@ transcript_capture_kernels! {
     CursorProjectKernelV1 => capture_cursor_project,
     HermesProjectKernelV1 => capture_hermes_project,
     KiroProjectKernelV1 => capture_kiro_project,
+    PiProjectKernelV1 => capture_pi_project,
     HermesCallbackKernelV1 => capture_hermes_callback,
 }
 
@@ -207,12 +208,6 @@ const TRANSCRIPT_CAPTURE_KERNELS: &[(
         &KiroProfileKernelV1,
     ),
     (
-        "claude",
-        false,
-        TranscriptPayloadRouteV1::SourceScan,
-        &ClaudeProjectKernelV1,
-    ),
-    (
         "codex",
         false,
         TranscriptPayloadRouteV1::SourceScan,
@@ -235,6 +230,12 @@ const TRANSCRIPT_CAPTURE_KERNELS: &[(
         false,
         TranscriptPayloadRouteV1::SourceScan,
         &KiroProjectKernelV1,
+    ),
+    (
+        "pi",
+        false,
+        TranscriptPayloadRouteV1::SourceScan,
+        &PiProjectKernelV1,
     ),
     (
         "hermes",
@@ -273,13 +274,13 @@ async fn capture_claude_profile(
     required_user_db(&ctx.session_authorities)?;
     let roots = registered_project_roots(global_db).await?;
     let stats =
-        tracedecay_sessions::runtime::claude_observation::ingest_user_sessions_with_admission(
+        tracedecay_sessions::runtime::hosts::claude_observation::ingest_user_sessions_with_admission(
             profile_root,
             Some(session_id),
             roots,
             ctx.facade,
             Some(ctx.max_new_bytes.unwrap_or(
-                tracedecay_sessions::runtime::claude_observation::CLAUDE_HOOK_MAX_NEW_BYTES,
+                tracedecay_sessions::runtime::hosts::claude_observation::CLAUDE_HOOK_MAX_NEW_BYTES,
             )),
             ctx.cancellation.clone(),
         )
@@ -287,51 +288,6 @@ async fn capture_claude_profile(
         .map_err(|error| map_claude_observation_ingest_error(&error))?;
     Ok(TranscriptCaptureOutcome {
         messages_upserted: stats.transcript.messages_upserted,
-        claude_observation: Some(stats),
-        ..TranscriptCaptureOutcome::default()
-    })
-}
-
-/// Project-scoped Claude catch-up: scans this project's own Claude transcript
-/// sources and commits their frames as canonical *project* observations.
-///
-/// Why this route has to exist beside [`capture_claude_profile`]: the profile
-/// kernel narrows its source with `ClaudeSource::for_user_scope`, which keeps
-/// exactly the rows that belong to **no** registered project. A Claude session
-/// running inside a registered project is therefore invisible to it. Without
-/// this kernel that session's frames reach the canonical observation store
-/// only when the daemon's own session-sync pass next runs, so anything reading
-/// the project's observations -- the advisory memory lane included -- lags a
-/// whole daemon lifetime behind the session that produced them.
-///
-/// The pass is the same one the session-sync worker runs for this provider
-/// (`ingest_source_with_observations_with_admission` under
-/// `ObservationScopeV1::Project`), bounded by the caller's byte budget, so a
-/// hook-driven catch-up and a scheduled sweep converge on identical state
-/// through content-derived idempotency rather than racing each other.
-async fn capture_claude_project(
-    ctx: TranscriptCaptureContext<'_>,
-) -> Result<TranscriptCaptureOutcome> {
-    let cg = ctx.project()?;
-    let source = tracedecay_sessions::runtime::claude::ClaudeSource::new()
-        .ok_or_else(|| config_error("Claude transcript source is unavailable"))?;
-    let project_id = project_observation_id(cg)?;
-    let stats =
-        tracedecay_sessions::runtime::claude_observation::ingest_source_with_observations_with_admission(
-            &source,
-            cg.project_root(),
-            ObservationScopeV1::Project { project_id },
-            ctx.facade,
-            Some(ctx.max_new_bytes.unwrap_or(
-                tracedecay_sessions::runtime::claude_observation::CLAUDE_HOOK_MAX_NEW_BYTES,
-            )),
-            ctx.cancellation.clone(),
-        )
-        .await
-        .map_err(|error| map_claude_observation_ingest_error(&error))?;
-    Ok(TranscriptCaptureOutcome {
-        messages_upserted: stats.transcript.messages_upserted,
-        source_deferred: stats.deferred_sources > 0,
         claude_observation: Some(stats),
         ..TranscriptCaptureOutcome::default()
     })
@@ -351,8 +307,9 @@ async fn capture_codex_profile(
             roots,
             ctx.facade,
             Some(
-                ctx.max_new_bytes
-                    .unwrap_or(tracedecay_sessions::runtime::codex::CODEX_HOOK_MAX_NEW_BYTES),
+                ctx.max_new_bytes.unwrap_or(
+                    tracedecay_sessions::runtime::hosts::codex::CODEX_HOOK_MAX_NEW_BYTES,
+                ),
             ),
         )
         .await
@@ -372,7 +329,7 @@ async fn capture_cursor_profile(
     let event_json = required_str(ctx.args, "event_json")?;
     let roots = registered_project_roots(global_db).await?;
     let stats =
-        tracedecay_sessions::runtime::cursor::try_ingest_cursor_user_transcript_event_capped_with_admission(
+        tracedecay_sessions::runtime::hosts::cursor::try_ingest_cursor_user_transcript_event_capped_with_admission(
             event_json,
             ctx.facade,
             ctx.max_new_bytes,
@@ -389,14 +346,15 @@ async fn capture_hermes_profile(
     ctx.profile_root()?;
     let global_db = ctx.global_db()?;
     let roots = registered_project_roots(global_db).await?;
-    let outcome = tracedecay_sessions::runtime::hermes::ingest_user_sessions_capped_with_admission(
-        ctx.facade,
-        &roots,
-        ctx.max_new_bytes,
-        ctx.cancellation,
-    )
-    .await
-    .ok_or_else(|| config_error("Hermes transcript source is unavailable"))?;
+    let outcome =
+        tracedecay_sessions::runtime::hosts::hermes::ingest_user_sessions_capped_with_admission(
+            ctx.facade,
+            &roots,
+            ctx.max_new_bytes,
+            ctx.cancellation,
+        )
+        .await
+        .ok_or_else(|| config_error("Hermes transcript source is unavailable"))?;
     hermes_capture_outcome(&outcome)
 }
 
@@ -405,11 +363,11 @@ async fn capture_kiro_profile(
 ) -> Result<TranscriptCaptureOutcome> {
     let profile_root = ctx.profile_root()?;
     let global_db = ctx.global_db()?;
-    let source = tracedecay_sessions::runtime::kiro::KiroSource::new()
+    let source = tracedecay_sessions::runtime::hosts::kiro::KiroSource::new()
         .ok_or_else(|| config_error("Kiro transcript source is unavailable"))?;
     let roots = registered_project_roots(global_db).await?;
     let source = source.for_user_scope(roots);
-    let capture = tracedecay_sessions::runtime::kiro::capture_kiro_snapshot_observations(
+    let capture = tracedecay_sessions::runtime::hosts::kiro::capture_kiro_snapshot_observations(
         ctx.facade,
         &source,
         profile_root,
@@ -436,7 +394,7 @@ async fn capture_hermes_project(
     ctx: TranscriptCaptureContext<'_>,
 ) -> Result<TranscriptCaptureOutcome> {
     let project = ctx.project()?;
-    let outcome = tracedecay_sessions::runtime::hermes::ingest_for_project_capped_with_admission_and_cancellation(
+    let outcome = tracedecay_sessions::runtime::hosts::hermes::ingest_for_project_capped_with_admission_and_cancellation(
         project.project_root(),
         project_observation_id(project)?,
         ctx.facade,
@@ -452,39 +410,29 @@ async fn capture_codex_project(
     ctx: TranscriptCaptureContext<'_>,
 ) -> Result<TranscriptCaptureOutcome> {
     let cg = ctx.project()?;
+    let source = tracedecay_sessions::runtime::hosts::codex::CodexSource::new()
+        .ok_or_else(|| config_error("Codex transcript source is unavailable"))?;
     let project_id = project_observation_id(cg)?;
     let scope = ObservationScopeV1::Project {
         project_id: project_id.clone(),
     };
-    let source_deferred = match ctx.codex_stop_bound {
-        Some(super::CodexStopSourceBound::Deferred) => true,
-        Some(super::CodexStopSourceBound::Sealed(bound)) => {
-            let session_id = required_str(ctx.args, "session_id")?;
-            tracedecay_sessions::runtime::codex::try_admit_codex_jsonl_observations_for_project_through_sealed_source(
-                bound, cg.project_root(), project_id, session_id,
-                ctx.facade, ctx.max_new_bytes, ctx.cancellation,
-            ).await.map_err(|error| map_transcript_ingest_error(&error))?.source_deferred
-        }
-        None => {
-            let source = tracedecay_sessions::runtime::codex::CodexSource::new()
-                .ok_or_else(|| config_error("Codex transcript source is unavailable"))?;
-            admit_codex_project_rollouts(
-                ctx.facade,
-                &source,
-                cg.project_root(),
-                project_id,
-                ctx.args.get("session_id").and_then(Value::as_str),
-                ctx.max_new_bytes,
-                ctx.cancellation,
-            )
-            .await?
-        }
-    };
+    let admitted = admit_codex_project_rollouts(
+        ctx.facade,
+        &source,
+        cg.project_root(),
+        project_id,
+        ctx.max_new_bytes,
+        ctx.cancellation,
+    )
+    .await?;
     let messages_upserted =
         drain_host_observation_projections(ctx.facade, &scope, ctx.cancellation).await?;
     Ok(TranscriptCaptureOutcome {
         messages_upserted,
-        source_deferred,
+        source_deferred: admitted.deferred,
+        observations_committed: admitted.observations_committed,
+        exact_duplicate: admitted.exact_duplicate,
+        admission_owns_commit: true,
         ..TranscriptCaptureOutcome::default()
     })
 }
@@ -494,7 +442,7 @@ async fn capture_cursor_project(
 ) -> Result<TranscriptCaptureOutcome> {
     let cg = ctx.project()?;
     let event_json = required_str(ctx.args, "event_json")?;
-    let stats = tracedecay_sessions::runtime::cursor::try_ingest_cursor_transcript_event_capped_with_admission(
+    let stats = tracedecay_sessions::runtime::hosts::cursor::try_ingest_cursor_transcript_event_capped_with_admission(
         event_json,
         project_observation_id(cg)?,
         ctx.facade,
@@ -506,11 +454,14 @@ async fn capture_cursor_project(
 }
 
 fn cursor_capture_outcome(
-    stats: tracedecay_sessions::runtime::cursor::CursorTranscriptIngestStats,
+    stats: tracedecay_sessions::runtime::hosts::cursor::CursorTranscriptIngestStats,
 ) -> TranscriptCaptureOutcome {
     TranscriptCaptureOutcome {
         messages_upserted: stats.messages_upserted,
         source_deferred: stats.source_deferred,
+        observations_committed: stats.observations_committed,
+        exact_duplicate: stats.exact_duplicate,
+        admission_owns_commit: true,
         ..TranscriptCaptureOutcome::default()
     }
 }
@@ -539,11 +490,10 @@ fn hermes_capture_outcome(outcome: &HermesSweepOutcome) -> Result<TranscriptCapt
 
 /// Commits one Hermes turn the host inlined in the request.
 ///
-/// The messages are already in hand, so there is no source to scan: the turn
-/// goes to the LCM authority and the authority's disposition is reported
-/// through the same outcome every scanning kernel uses. `messages_upserted`
-/// is the number of turn messages handed to the authority, which is what makes
-/// the shared assembly report a committed replay.
+/// The messages are already in hand, so there is no source to scan: each one
+/// is admitted through the observation authority a `state.db` sweep row goes
+/// through, and the scope's projection drain turns it into the raw LCM rows
+/// the temporal refresh the caller joins then projects for retrieval.
 async fn capture_hermes_callback(
     ctx: TranscriptCaptureContext<'_>,
 ) -> Result<TranscriptCaptureOutcome> {
@@ -553,82 +503,49 @@ async fn capture_hermes_callback(
         .get("messages")
         .and_then(Value::as_array)
         .filter(|messages| !messages.is_empty())
-        .ok_or_else(|| config_error("Hermes turn callback requires non-empty messages"))?
-        .clone();
-    let message_count = u64::try_from(messages.len()).unwrap_or(u64::MAX);
-    let authority = if ctx.user_scope {
-        ctx.session_authorities.profile_lcm
+        .ok_or_else(|| config_error("Hermes turn callback requires non-empty messages"))?;
+    let (scope, project_root) = if ctx.user_scope {
+        (ObservationScopeV1::Profile, None)
     } else {
-        ctx.session_authorities.project_lcm
+        let project = ctx.project()?;
+        (
+            ObservationScopeV1::Project {
+                project_id: project_observation_id(project)?,
+            },
+            Some(project.project_root()),
+        )
     };
-    let Some(authority) = authority else {
-        return Ok(lcm_authority_unavailable());
-    };
-    let event_digest = tracedecay_domain::canonical_sha256(&(&"hermes", &session_id, &messages))
-        .map_err(|error| config_error(format!("digest Hermes turn failed: {error}")))?;
-    let request = LcmAuthorityRequest::Ingest(LcmTranscriptIngestCommand {
-        preflight: tracedecay_lcm::LcmPreflightRequest {
-            provider: "hermes".to_owned(),
-            session_id: session_id.to_owned(),
-            messages,
-            current_tokens: None,
-            ignore_session_patterns: Vec::new(),
-            stateless_session_patterns: Vec::new(),
-            threshold_tokens: None,
-            max_assembly_tokens: None,
-            leaf_chunk_tokens: None,
-            max_source_messages: None,
-            summary_fan_in: None,
-            incremental_max_depth: None,
-            fresh_tail_count: None,
-            dynamic_leaf_chunk_enabled: None,
-            dynamic_leaf_chunk_max: None,
-            context_length: None,
-            reserve_tokens_floor: None,
-        },
-        protocol_revision: "hermes.turn-completed.v1".to_owned(),
-        event_digest,
-    });
-    let Some(response) = authority.execute(request).await else {
-        return Ok(lcm_authority_unavailable());
-    };
-    if response.outcome == LcmAuthorityOutcome::Ready
-        && matches!(response.payload, Some(LcmAuthorityPayload::Ingest(_)))
-    {
-        return Ok(TranscriptCaptureOutcome {
-            messages_upserted: message_count,
-            lcm_receipt: Some(response),
-            ..TranscriptCaptureOutcome::default()
-        });
-    }
-    let reason = compaction_unavailable_reason(&response.outcome);
+    let admitted = tracedecay_sessions::runtime::hosts::hermes::capture_turn_callback(
+        ctx.facade,
+        &scope,
+        project_root,
+        session_id,
+        messages,
+        ctx.cancellation,
+    )
+    .await
+    .map_err(|error| map_transcript_ingest_error(&error))?;
+    drain_host_observation_projections(ctx.facade, &scope, ctx.cancellation).await?;
     Ok(TranscriptCaptureOutcome {
-        route_admission: Some(HostAdmissionOutcome::retained_unavailable(reason)),
-        lcm_receipt: Some(response),
+        messages_upserted: admitted.committed,
+        observations_committed: admitted.committed,
+        exact_duplicate: admitted.committed == 0 && admitted.duplicates > 0,
+        admission_owns_commit: true,
         ..TranscriptCaptureOutcome::default()
     })
-}
-
-fn lcm_authority_unavailable() -> TranscriptCaptureOutcome {
-    TranscriptCaptureOutcome {
-        route_admission: Some(HostAdmissionOutcome::retained_unavailable(
-            "lcm_daemon_authority_unavailable",
-        )),
-        ..TranscriptCaptureOutcome::default()
-    }
 }
 
 async fn capture_kiro_project(
     ctx: TranscriptCaptureContext<'_>,
 ) -> Result<TranscriptCaptureOutcome> {
     let cg = ctx.project()?;
-    let source = tracedecay_sessions::runtime::kiro::KiroSource::new()
+    let source = tracedecay_sessions::runtime::hosts::kiro::KiroSource::new()
         .ok_or_else(|| config_error("Kiro transcript source is unavailable"))?;
     let project_id = project_observation_id(cg)?;
     let scope = ObservationScopeV1::Project {
         project_id: project_id.clone(),
     };
-    let capture = tracedecay_sessions::runtime::kiro::capture_kiro_snapshot_observations(
+    let capture = tracedecay_sessions::runtime::hosts::kiro::capture_kiro_snapshot_observations(
         ctx.facade,
         &source,
         cg.project_root(),
@@ -647,6 +564,59 @@ async fn capture_kiro_project(
     })
 }
 
+/// Lands the one Pi session a lifecycle event names into the project store.
+/// A session file whose header cannot be admitted is a typed partial scan,
+/// never an empty success.
+async fn capture_pi_project(ctx: TranscriptCaptureContext<'_>) -> Result<TranscriptCaptureOutcome> {
+    let cg = ctx.project()?;
+    let event: Value = serde_json::from_str(required_str(ctx.args, "event_json")?)
+        .map_err(|error| config_error(format!("invalid Pi event: {error}")))?;
+    let event_str = |key: &str| {
+        event
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| config_error(format!("Pi event omitted `{key}`")))
+    };
+    let session_id = event_str("session_id")?;
+    let cwd = Path::new(event_str("cwd")?);
+    let source = tracedecay_sessions::runtime::hosts::pi::PiSource::new()
+        .ok_or_else(|| config_error("Pi transcript source is unavailable"))?;
+    let scope = ObservationScopeV1::Project {
+        project_id: project_observation_id(cg)?,
+    };
+    let capture = tracedecay_sessions::runtime::hosts::pi::capture_pi_session(
+        ctx.facade,
+        &source,
+        cg.project_root(),
+        cwd,
+        session_id,
+        scope.clone(),
+        ctx.max_new_bytes,
+        ctx.cancellation,
+    )
+    .await
+    .map_err(|error| map_transcript_ingest_error(&error))?;
+    if capture.discovery_failures > 0 {
+        return Err(hook_admission_error(
+            HostAdmissionStatus::Unavailable,
+            "source_discovery_partial",
+            true,
+            format!(
+                "Pi session source was refused for {} file(s)",
+                capture.discovery_failures
+            ),
+        ));
+    }
+    let messages_upserted =
+        drain_host_observation_projections(ctx.facade, &scope, ctx.cancellation).await?;
+    Ok(TranscriptCaptureOutcome {
+        messages_upserted,
+        source_deferred: capture.deferred,
+        ..TranscriptCaptureOutcome::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,7 +624,7 @@ mod tests {
     #[test]
     fn cursor_capture_preserves_deferred_projection() {
         let outcome = cursor_capture_outcome(
-            tracedecay_sessions::runtime::cursor::CursorTranscriptIngestStats {
+            tracedecay_sessions::runtime::hosts::cursor::CursorTranscriptIngestStats {
                 messages_upserted: 3,
                 source_deferred: true,
                 ..Default::default()
@@ -695,6 +665,5 @@ mod tests {
         };
 
         assert!(outcome.source_deferred);
-        assert!(outcome.route_admission.is_none());
     }
 }

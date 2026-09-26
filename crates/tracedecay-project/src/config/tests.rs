@@ -1,37 +1,6 @@
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
-use tracedecay_configuration::{TraceDecayConfig, get_config_path, save_config_to_path};
-
-#[test]
-fn memory_provider_native_enabled_round_trips_and_defaults_off() {
-    let config = TraceDecayConfig::default();
-    assert!(
-        !config.memory_provider_native_enabled,
-        "provider must default off so disabled projects construct no provider fabric"
-    );
-    let json = serde_json::to_string(&config).unwrap();
-    let parsed: TraceDecayConfig = serde_json::from_str(&json).unwrap();
-    assert!(!parsed.memory_provider_native_enabled);
-
-    // Explicit true round-trips, and old configs without the key default off.
-    let mut on = config.clone();
-    on.memory_provider_native_enabled = true;
-    let parsed: TraceDecayConfig =
-        serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
-    assert!(parsed.memory_provider_native_enabled);
-
-    let legacy = r#"{
-        "version": 1,
-        "root_dir": "/tmp/proj",
-        "exclude": [],
-        "max_file_size": 1048576,
-        "extract_docstrings": true,
-        "track_call_sites": true
-    }"#;
-    let parsed: TraceDecayConfig = serde_json::from_str(legacy).unwrap();
-    assert!(!parsed.memory_provider_native_enabled);
-}
 
 #[test]
 fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates() {
@@ -40,33 +9,16 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
         MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
     };
 
-    let config = TraceDecayConfig::default();
+    let closed = MemoryProviderRecallRoutingV1::default();
     assert_eq!(
-        config.memory_provider_recall_routing,
-        MemoryProviderRecallRoutingV1::default(),
+        closed.active_provider, None,
         "no provider may answer recall unless the routing gate names it"
     );
-    assert_eq!(config.memory_provider_recall_routing.active_provider, None);
-    assert_eq!(config.memory_provider_recall_routing.fallback, None);
-    assert_eq!(config.memory_provider_recall_routing.degradation, None);
-
-    // Legacy configs without the key default to the closed gate.
-    let legacy = r#"{
-        "version": 1,
-        "root_dir": "/tmp/proj",
-        "exclude": [],
-        "max_file_size": 1048576,
-        "extract_docstrings": true,
-        "track_call_sites": true,
-        "memory_provider_native_enabled": true
-    }"#;
-    let parsed: TraceDecayConfig = serde_json::from_str(legacy).unwrap();
-    assert!(parsed.memory_provider_native_enabled);
-    assert_eq!(parsed.memory_provider_recall_routing.active_provider, None);
+    assert_eq!(closed.fallback, None);
+    assert_eq!(closed.degradation, None);
 
     // An explicit pin round-trips.
-    let mut pinned = config.clone();
-    pinned.memory_provider_recall_routing = MemoryProviderRecallRoutingV1 {
+    let pinned = MemoryProviderRecallRoutingV1 {
         active_provider: Some("tracedecay.native".to_owned()),
         fallback: Some(MemoryProviderRecallFallbackV1 {
             policy_id: "policy.memory-failover".to_owned(),
@@ -82,13 +34,10 @@ fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates()
             ],
         }),
     };
-    pinned.memory_provider_recall_routing.validate().unwrap();
-    let parsed: TraceDecayConfig =
+    pinned.validate().unwrap();
+    let parsed: MemoryProviderRecallRoutingV1 =
         serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
-    assert_eq!(
-        parsed.memory_provider_recall_routing,
-        pinned.memory_provider_recall_routing
-    );
+    assert_eq!(parsed, pinned);
 
     // Contradictory or incomplete gates fail closed.
     let self_target = MemoryProviderRecallRoutingV1 {
@@ -197,10 +146,7 @@ async fn discover_project_root_with_identity_does_not_open_registry_only_store()
     let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &project_root,
         &profile_root,
-        &tracedecay_runtime_core::storage::EnrollmentMarker {
-            project_id: project_id.to_string(),
-            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
-        },
+        project_id,
     )
     .unwrap();
     fs::create_dir_all(layout.graph_db_path.parent().unwrap()).unwrap();
@@ -214,7 +160,7 @@ async fn discover_project_root_with_identity_does_not_open_registry_only_store()
     assert!(status.success(), "git init failed");
 
     assert!(
-        super::discover_project_root(&project_root).is_none(),
+        tracedecay_runtime_core::config::discover_project_root(&project_root).is_none(),
         "sync discover_project_root must not see a global-only store"
     );
 
@@ -244,7 +190,7 @@ async fn discover_project_root_with_identity_does_not_open_registry_only_store()
 }
 
 #[tokio::test]
-async fn config_path_with_identity_does_not_open_registry_without_enrollment() {
+async fn store_layout_for_identity_does_not_open_registry_without_enrollment() {
     let _profile = super::PinnedUserDataDir::new();
     let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
     let gdb =
@@ -287,32 +233,15 @@ async fn config_path_with_identity_does_not_open_registry_without_enrollment() {
     let identity_layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &project_root,
         &profile_root,
-        &tracedecay_runtime_core::storage::EnrollmentMarker {
-            project_id: project_id.to_string(),
-            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
-        },
-    )
-    .unwrap();
-    save_config_to_path(
-        &identity_layout.config_path,
-        &TraceDecayConfig {
-            root_dir: "identity-config".to_string(),
-            ..TraceDecayConfig::default()
-        },
+        project_id,
     )
     .unwrap();
 
-    assert_eq!(
-        super::get_config_path_with_identity(&project_root).await,
-        get_config_path(&project_root)
-    );
-    assert_eq!(
-        super::load_config_with_identity(&project_root)
-            .await
-            .unwrap()
-            .root_dir,
-        project_root.to_string_lossy()
-    );
+    if let Ok(selected) =
+        crate::project::TraceDecay::resolve_store_layout_for_identity(&project_root).await
+    {
+        assert_ne!(selected.data_root, identity_layout.data_root);
+    }
 }
 
 #[tokio::test]
@@ -345,10 +274,7 @@ async fn discover_project_root_with_identity_does_not_bind_non_git_child_to_pare
     let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &parent_root,
         &profile_root,
-        &tracedecay_runtime_core::storage::EnrollmentMarker {
-            project_id: project_id.to_string(),
-            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
-        },
+        project_id,
     )
     .unwrap();
     fs::create_dir_all(layout.graph_db_path.parent().unwrap()).unwrap();
@@ -370,15 +296,22 @@ async fn discover_project_root_with_identity_preserves_sync_fast_path() {
     let project_dir = TempDir::new().unwrap();
     let project_root = project_dir.path().canonicalize().unwrap();
 
-    let db_dir = super::get_tracedecay_dir(&project_root);
-    fs::create_dir_all(&db_dir).unwrap();
-    fs::write(super::get_project_db_path(&project_root), b"").unwrap();
+    let store = tracedecay_runtime_core::storage::default_profile_sharded_layout(
+        &project_root,
+        &tracedecay_runtime_core::config::user_data_dir().unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(&store.data_root).unwrap();
+    fs::write(&store.graph_db_path, b"").unwrap();
 
-    let sync = super::discover_project_root(&project_root);
-    assert!(sync.is_some(), "sync resolver must see a repo-local db");
+    assert_eq!(
+        tracedecay_runtime_core::config::discover_project_root(&project_root),
+        Some(project_root.clone()),
+        "sync resolver must see the path-local store"
+    );
     assert_eq!(
         super::discover_project_root_with_identity(&project_root).await,
-        sync,
+        Some(project_root),
         "identity wrapper fast path must equal the sync result"
     );
 }
@@ -390,6 +323,7 @@ mod runtime_configuration_cutover {
     use std::collections::BTreeMap;
 
     use tempfile::TempDir;
+    use tracedecay_application::advisory::github_runtime::daemon_owned_github_source_binding_v1;
     use tracedecay_domain::configuration::{
         AuthorityRef, ConfigurationGrantId, ConfigurationGrantReceiptId,
         ConfigurationIdempotencyKey, ConfigurationLayerIdV1, ConfigurationMutationEffectV1,
@@ -398,19 +332,21 @@ mod runtime_configuration_cutover {
         DIAGNOSTICS_PREWARM_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
         MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY,
         SYNC_AUTO_WATCH_SETTING_KEY, ScopeSourceBinding, SettingKey, SourceBindingId,
+        SourceKindV1,
     };
     use tracedecay_domain::{AccessPolicyDigest, ActorId, ProjectId, UtcMicros};
 
     use crate::config::registry::ConfigurationRegistry;
     use crate::config::resolver::{ConfigurationLayerV1, resolve_configuration};
     use crate::config::{
-        DaemonRuntimeConfiguration, RuntimeConfigurationCache, RuntimeConfigurationTarget,
-        cached_runtime_configuration, cached_sync_config, cached_telemetry_config,
-        install_pinned_runtime_configuration, runtime_configuration_for_layout,
+        RuntimeConfigurationCache, RuntimeConfigurationTarget, cached_runtime_configuration,
+        cached_sync_config, cached_telemetry_config, install_pinned_runtime_configuration,
+        runtime_configuration_for_layout,
     };
     use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
     use tracedecay_configuration::ProjectConfigurationRuntime;
-    use tracedecay_configuration::TraceDecayConfig;
+    use tracedecay_configuration::SyncConfig;
+    use tracedecay_configuration::config::PinnedRuntimeConfiguration;
     use tracedecay_global_db::configuration::contracts::{
         ConfigurationControlStore, ConfigurationMutationAuthority, DirectConfigurationMutation,
     };
@@ -445,7 +381,7 @@ mod runtime_configuration_cutover {
         )
         .expect("explicit settings layer resolves")
         .snapshot;
-        let pinned = DaemonRuntimeConfiguration::new(
+        let pinned = PinnedRuntimeConfiguration::new(
             RuntimeConfigurationTarget {
                 project_id,
                 project_root: root.path().to_path_buf(),
@@ -479,15 +415,15 @@ mod runtime_configuration_cutover {
         assert_eq!(
             cached_runtime_configuration(root.path())
                 .expect("cache lookup")
-                .config
-                .root_dir,
-            root.path().to_string_lossy().to_string(),
-            "root metadata comes from the non-authoritative published route"
+                .target()
+                .project_root,
+            root.path(),
+            "the root comes from the non-authoritative published route"
         );
     }
 
     #[test]
-    fn runtime_cache_retargets_legacy_root_metadata_per_cached_root() {
+    fn runtime_cache_retargets_the_route_per_cached_root() {
         let project_id = project_id("project.runtime-cache-retarget");
         let root = TempDir::new().expect("temporary project root");
         let first_root = root.path().join("first-worktree");
@@ -503,7 +439,7 @@ mod runtime_configuration_cutover {
         let revision_id = revision_id("revision.runtime-cache-retarget");
         let cache = RuntimeConfigurationCache::default();
         cache.insert(
-            DaemonRuntimeConfiguration::new(
+            PinnedRuntimeConfiguration::new(
                 RuntimeConfigurationTarget {
                     project_id: project_id.clone(),
                     project_root: first_root.clone(),
@@ -514,7 +450,7 @@ mod runtime_configuration_cutover {
             .expect("first snapshot materializes"),
         );
         cache.insert(
-            DaemonRuntimeConfiguration::new(
+            PinnedRuntimeConfiguration::new(
                 RuntimeConfigurationTarget {
                     project_id: project_id.clone(),
                     project_root: second_root.clone(),
@@ -531,7 +467,6 @@ mod runtime_configuration_cutover {
         assert_eq!(second.target().project_id, project_id);
         assert_eq!(first.target().project_root, first_root);
         assert_eq!(second.target().project_root, second_root);
-        assert_ne!(first.config.root_dir, second.config.root_dir);
     }
 
     #[tokio::test]
@@ -687,7 +622,7 @@ mod runtime_configuration_cutover {
         assert!(!root_pin.config().diagnostics_prewarm);
         assert_eq!(
             root_pin.config().sync.auto_watch,
-            TraceDecayConfig::default().sync.auto_watch,
+            SyncConfig::default().auto_watch,
             "daemon-only settings materialize from the same snapshot"
         );
 
@@ -747,7 +682,7 @@ mod runtime_configuration_cutover {
         assert!(root_pin.config().diagnostics_prewarm);
         assert_eq!(
             root_pin.config().sync.auto_watch,
-            TraceDecayConfig::default().sync.auto_watch,
+            SyncConfig::default().auto_watch,
             "an unrelated change must not disturb daemon-only settings"
         );
         assert_eq!(
@@ -772,9 +707,9 @@ mod runtime_configuration_cutover {
         // Write the opposite of the typed registry default so the stale input
         // stays distinguishable from the canonical resolution regardless of
         // the default's polarity.
-        let stale_auto_watch = !TraceDecayConfig::default().sync.auto_watch;
+        let stale_auto_watch = !SyncConfig::default().auto_watch;
         std::fs::write(
-            &layout.config_path,
+            layout.data_root.join("config.json"),
             format!(r#"{{"sync":{{"auto_watch":{stale_auto_watch}}},"max_file_size":7}}"#),
         )
         .expect("write stale config.json input");
@@ -805,13 +740,13 @@ mod runtime_configuration_cutover {
             "fresh stores publish the sole canonical initial revision"
         );
         assert_eq!(
-            pinned.config.sync.auto_watch,
-            TraceDecayConfig::default().sync.auto_watch,
+            pinned.config().sync.auto_watch,
+            SyncConfig::default().auto_watch,
             "stale config.json input must not enter the final configuration authority"
         );
-        assert_eq!(
-            pinned.config.max_file_size,
-            TraceDecayConfig::default().max_file_size,
+        assert_ne!(
+            pinned.config().max_file_size,
+            7,
             "fresh initialization uses the typed registry, not config.json"
         );
         assert!(
@@ -939,8 +874,8 @@ mod runtime_configuration_cutover {
             .await
             .expect("registered default must converge before runtime materialization");
         assert_ne!(converged.revision_id(), initial.revision_id());
-        assert!(converged.config.native_graph_activation);
-        assert!(!converged.config.memory_provider_native_enabled);
+        assert!(converged.config().native_graph_activation);
+        assert!(!converged.config().memory_provider_native_enabled);
         assert_eq!(
             converged.snapshot().effective_values.get(&settings[0]),
             Some(&ConfigurationValueV1::Boolean(true))
@@ -1098,6 +1033,109 @@ mod runtime_configuration_cutover {
             )
             .expect("linked binding"),
         );
+    }
+
+    fn github_source_bindings(
+        configuration: &PinnedRuntimeConfiguration,
+    ) -> Vec<(String, tracedecay_domain::LocatorDigest)> {
+        let key = SettingKey::new(SOURCE_BINDINGS_SETTING_KEY).expect("source bindings key");
+        let Some(ConfigurationValueV1::SourceBindings(bindings)) =
+            configuration.snapshot().effective_values.get(&key)
+        else {
+            panic!("configuration carries no source bindings");
+        };
+        bindings
+            .iter()
+            .filter(|binding| binding.source_kind == SourceKindV1::GitHub)
+            .map(|binding| {
+                (
+                    binding.binding_id.as_str().to_owned(),
+                    binding.source_locator_digest.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// A fresh init binds the checkout's `origin` as the project's GitHub
+    /// source; the binding follows `origin` when the remote changes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fresh_open_binds_the_github_origin_as_the_project_github_source() {
+        let _profile = crate::config::PinnedUserDataDir::new();
+        let root = TempDir::new().expect("temporary root");
+        let checkout = root.path().join("anyhow");
+        std::fs::create_dir_all(&checkout).expect("create checkout");
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(&checkout)
+                .output()
+                .expect("run git");
+            assert!(output.status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-b", "fix/462-new-with-backtrace", "--quiet"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/dtolnay/anyhow.git",
+        ]);
+        let project_id = project_id("proj_runtime_github_origin");
+        tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+            &checkout,
+            project_id.as_str(),
+        )
+        .expect("write enrollment marker");
+        let layout =
+            tracedecay_runtime_core::storage::resolve_layout_for_current_profile(&checkout)
+                .expect("resolve store layout");
+        std::fs::create_dir_all(&layout.data_root).expect("create data root");
+        let runtime = HostAdmissionTestRuntimeV1::project(
+            tracedecay_runtime_core::storage::default_profile_root().unwrap(),
+            &checkout,
+            project_id.clone(),
+        )
+        .await
+        .expect("open retained project runtime");
+        let expected = |owner: &str, repository: &str| {
+            let binding = daemon_owned_github_source_binding_v1(&project_id, owner, repository)
+                .expect("GitHub origin binding");
+            vec![(
+                binding.binding_id.as_str().to_owned(),
+                binding.source_locator_digest,
+            )]
+        };
+
+        let initial = runtime
+            .ensure_runtime_configuration_for_test(&checkout, &layout)
+            .await
+            .expect("fresh open");
+        assert_eq!(
+            github_source_bindings(&initial),
+            expected("dtolnay", "anyhow")
+        );
+        assert_eq!(
+            github_source_bindings(&initial)[0].0,
+            "binding.tracedecay-daemon.github-origin"
+        );
+
+        let reopened = runtime
+            .ensure_runtime_configuration_for_test(&checkout, &layout)
+            .await
+            .expect("reopen");
+        assert_eq!(reopened.revision_id(), initial.revision_id());
+
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:rust-lang/log.git",
+        ]);
+        let moved = runtime
+            .ensure_runtime_configuration_for_test(&checkout, &layout)
+            .await
+            .expect("open after the remote moved");
+        assert_eq!(github_source_bindings(&moved), expected("rust-lang", "log"));
     }
 
     /// Moving or renaming a checkout changes only the path-derived locator
@@ -1266,7 +1304,7 @@ mod runtime_configuration_cutover {
         std::fs::create_dir_all(&layout.data_root).expect("create data root");
 
         // A freshly registered project has no pinned snapshot in this process's
-        // cache — exactly the state a daemon is in for a project it has not yet
+        // cache, exactly the state a daemon is in for a project it has not yet
         // opened, or for any project after a restart. The fail-closed hook-path
         // lookup rejects it.
         assert!(
@@ -1365,7 +1403,7 @@ mod runtime_configuration_cutover {
         }
 
         // Materialize the durable store schema without ever seeding a
-        // configuration revision — the state a consolidated destination store is
+        // configuration revision, the state a consolidated destination store is
         // left in after a repository move, when its configuration authority was
         // never migrated in.
         let runtime = HostAdmissionTestRuntimeV1::project(

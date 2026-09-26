@@ -21,7 +21,6 @@ use super::{host_bundle_error, host_kind_for_agent, load_host_lifecycle_user_con
 enum FeedbackRollbackCliStatus {
     Prepared,
     Applied,
-    Restored,
 }
 
 const FEEDBACK_ROLLBACK_STATE_SCHEMA_VERSION: u16 = 6;
@@ -171,12 +170,6 @@ struct FeedbackPreviewStorage;
 impl tracedecay_agent_hosts::agents::host_bundle::HostBundleLifecycleStorageV1
     for FeedbackPreviewStorage
 {
-    fn recover_lifecycle(
-        &mut self,
-    ) -> Result<(), tracedecay_agent_hosts::agents::host_bundle::HostBundleError> {
-        Ok(())
-    }
-
     fn execute_lifecycle<
         V: tracedecay_agent_hosts::agents::host_bundle::HostBundleVerificationAdapterV1,
     >(
@@ -219,7 +212,6 @@ pub(crate) async fn handle_feedback_rollback_command(
 
 fn feedback_rollback_inputs(
     agent_id: &str,
-    tracedecay_bin: &str,
 ) -> tracedecay_domain::errors::Result<(
     PathBuf,
     PathBuf,
@@ -248,11 +240,10 @@ fn feedback_rollback_inputs(
         })?;
     let component = selected_feedback_component(&previous)?;
     let mut target =
-        tracedecay_agent_hosts::agents::host_bundle_registry::verified_embedded_host_bundle_with_tracedecay_bin(
+        tracedecay_agent_hosts::agents::host_bundle_registry::verified_embedded_host_bundle(
             host,
             component,
             0,
-            tracedecay_bin,
             crate::product_runtime::PRODUCT_FULL_SHA,
         )
         .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
@@ -744,7 +735,6 @@ fn restore_feedback_registration(
                 tracedecay_agent_hosts::agents::safe_write_bytes_file_with_metadata(
                     path,
                     contents,
-                    None,
                     file.metadata.as_ref(),
                 )?;
                 if file.metadata.is_none()
@@ -1015,22 +1005,22 @@ fn restore_feedback_file_permissions(
             ),
         })?
         .permissions();
+    let restore_error =
+        |error: std::io::Error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "could not restore feedback registration permissions {}: {error}",
+                path.display()
+            ),
+        };
+    let file = open_permission_restore_handle(path, &permissions).map_err(restore_error)?;
     #[cfg(unix)]
     if let Some(mode) = state.unix_mode {
         permissions.set_mode(mode);
     }
     #[cfg(not(unix))]
     permissions.set_readonly(state.readonly);
-    fs::set_permissions(path, permissions).map_err(|error| {
-        tracedecay_domain::errors::TraceDecayError::Config {
-            message: format!(
-                "could not restore feedback registration permissions {}: {error}",
-                path.display()
-            ),
-        }
-    })?;
-    fs::File::open(path)
-        .and_then(|file| file.sync_all())
+    file.set_permissions(permissions).map_err(restore_error)?;
+    file.sync_all()
         .and_then(|()| sync_parent_directory(path, DirectorySyncPolicy::TolerateUnsupported))
         .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
@@ -1038,6 +1028,29 @@ fn restore_feedback_file_permissions(
                 path.display()
             ),
         })
+}
+
+#[cfg(unix)]
+fn open_permission_restore_handle(
+    path: &Path,
+    _current: &fs::Permissions,
+) -> std::io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+/// Windows flushes only through a writable handle. A read-only file refuses
+/// that open.
+#[cfg(not(unix))]
+fn open_permission_restore_handle(
+    path: &Path,
+    current: &fs::Permissions,
+) -> std::io::Result<fs::File> {
+    if current.readonly() {
+        let mut writable = current.clone();
+        writable.set_readonly(false);
+        fs::set_permissions(path, writable)?;
+    }
+    fs::OpenOptions::new().write(true).open(path)
 }
 
 fn write_feedback_state(
@@ -1109,9 +1122,7 @@ fn persist_feedback_state(
 }
 
 fn feedback_rollback_dry_run(agent_id: &str) -> tracedecay_domain::errors::Result<()> {
-    let tracedecay_bin = super::lifecycle_tracedecay_bin()?;
-    let (home, _lifecycle_root, aggregate, target) =
-        feedback_rollback_inputs(agent_id, &tracedecay_bin)?;
+    let (home, _lifecycle_root, aggregate, target) = feedback_rollback_inputs(agent_id)?;
     let (previous, previous_receipt) = live_feedback_receipt(&home, &aggregate)?;
     let verifier = feedback_pair_verifier(&previous, &target.manifest)?;
     let request = feedback_request(
@@ -1155,11 +1166,9 @@ fn feedback_rollback_apply(
     agent_id: &str,
     state_path: &Path,
 ) -> tracedecay_domain::errors::Result<()> {
-    let tracedecay_bin = super::lifecycle_tracedecay_bin()?;
     let dashboard_enabled =
         load_host_lifecycle_user_config()?.dashboard_enabled_for_agent(agent_id);
-    let (home, lifecycle_root, aggregate, target) =
-        feedback_rollback_inputs(agent_id, &tracedecay_bin)?;
+    let (home, lifecycle_root, aggregate, target) = feedback_rollback_inputs(agent_id)?;
     let (previous, _previous_receipt) = live_feedback_receipt(&home, &aggregate)?;
     let previous_contents = read_feedback_repair_contents(&home, &previous)?;
     let artifact_permissions = snapshot_feedback_artifact_permissions(&home, &previous)?;
@@ -1239,11 +1248,8 @@ fn feedback_rollback_apply(
 
     let context = tracedecay_agent_hosts::agents::InstallContext {
         home: home.clone(),
-        // Feedback rollback is a lifecycle mutation too: its registration
-        // restore must render hooks/MCP commands from the exact binary that
-        // launched this command, never a different version found on PATH.
-        tracedecay_bin,
-        tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()?,
+        tracedecay_bin: tracedecay_agent_hosts::agents::which_tracedecay()
+            .unwrap_or_else(|| "tracedecay".to_string()),
         project_root: None,
         dashboard: state.dashboard_enabled,
     };
@@ -1319,7 +1325,6 @@ fn feedback_rollback_apply(
 
 #[hotpath::measure(label = "cli.agent.feedback")]
 fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Result<()> {
-    let tracedecay_bin = super::lifecycle_tracedecay_bin()?;
     let bytes = fs::read(state_path).map_err(|error| {
         tracedecay_domain::errors::TraceDecayError::Config {
             message: format!(
@@ -1387,9 +1392,7 @@ fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Re
             Some(&state.registration_intent_root),
         )?;
         read_feedback_contents(&home, &state.previous_manifest)?;
-        state.status = FeedbackRollbackCliStatus::Restored;
-        persist_feedback_state(state_path, &lifecycle_root, &state)?;
-        return Ok(());
+        return retire_feedback_state(state_path, &lifecycle_root, &state);
     }
     if !state.compensation_preserves_registration {
         validate_feedback_registration_restore(
@@ -1531,9 +1534,7 @@ fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Re
             )?;
             read_feedback_contents(&home, &state.previous_manifest)?;
             restore_feedback_artifact_permissions(&home, &state.artifact_permissions)?;
-            state.status = FeedbackRollbackCliStatus::Restored;
-            persist_feedback_state(state_path, &lifecycle_root, &state)?;
-            return Ok(());
+            return retire_feedback_state(state_path, &lifecycle_root, &state);
         }
     };
     let verifier = feedback_pair_verifier(&state.previous_manifest, &state.target_manifest)?;
@@ -1597,8 +1598,8 @@ fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Re
     let mut writer = lifecycle.into_storage();
     let context = tracedecay_agent_hosts::agents::InstallContext {
         home,
-        tracedecay_bin,
-        tool_permissions: tracedecay_agent_hosts::agents::expected_tool_perms()?,
+        tracedecay_bin: tracedecay_agent_hosts::agents::which_tracedecay()
+            .unwrap_or_else(|| "tracedecay".to_string()),
         project_root: None,
         dashboard: state.dashboard_enabled,
     };
@@ -1624,12 +1625,47 @@ fn feedback_rollback_restore(state_path: &Path) -> tracedecay_domain::errors::Re
     writer
         .publish_feedback_component_set_receipt(&state.previous_manifest, &restore.restore_receipt)
         .map_err(host_bundle_error)?;
-    state.status = FeedbackRollbackCliStatus::Restored;
-    persist_feedback_state(state_path, &lifecycle_root, &state)?;
+    retire_feedback_state(state_path, &lifecycle_root, &state)?;
     println!(
-        "\x1b[32m✔\x1b[0m {} feedback route restored; state {}",
-        state.agent_id,
-        state_path.display()
+        "\x1b[32m✔\x1b[0m {} feedback route restored",
+        state.agent_id
     );
     Ok(())
+}
+
+/// A completed restore leaves nothing behind: the state file holds copies of
+/// the prior route and host registration bytes, which serve only an
+/// unfinished restore.
+fn retire_feedback_state(
+    state_path: &Path,
+    lifecycle_root: &Path,
+    state: &FeedbackRollbackCliState,
+) -> tracedecay_domain::errors::Result<()> {
+    for path in [
+        state_path.to_path_buf(),
+        feedback_doctor_state_path(lifecycle_root, &state.agent_id),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(tracedecay_domain::errors::TraceDecayError::Config {
+                    message: format!(
+                        "could not remove feedback rollback state {}: {error}",
+                        path.display()
+                    ),
+                });
+            }
+        }
+    }
+    match fs::remove_dir_all(&state.registration_intent_root) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!(
+                "could not remove feedback registration intents {}: {error}",
+                state.registration_intent_root.display()
+            ),
+        }),
+    }
 }

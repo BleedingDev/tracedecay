@@ -74,11 +74,12 @@ use tracedecay_policy::{
 use tracedecay_tool_catalog::{CapabilityId, EffectClass, SortContractId, UseCaseId};
 
 use crate::project_runtime::{
-    FeedbackCyclePublicationError, ProjectRuntimeAlreadyRegistered, ProjectRuntimeRegistryError,
-    ProjectRuntimeRegistryV1, RegisteredObservabilityProducerV1, StoreObservabilityMountErrorV1,
-    StoreObservabilityMountV1, StoreObservabilityRegistryV1,
+    FeedbackCyclePublicationError, ProjectRuntimeAlreadyRegistered,
+    ProjectRuntimePublicationStateV1, ProjectRuntimeRegistryError, ProjectRuntimeRegistryV1,
+    RegisteredObservabilityProducerV1, StoreObservabilityMountErrorV1, StoreObservabilityMountV1,
+    StoreObservabilityRegistryV1,
 };
-use tracedecay_agent_hosts::agents::context_scout::ports::{
+use tracedecay_agent_hosts::agents::context_scout::address_registry::{
     AdmittedContextScoutHookV1, ContextScoutLifecycleAddressV1,
     ProjectContextScoutAddressRegistryV1,
 };
@@ -181,6 +182,7 @@ mod observability_producer;
 mod observatory;
 mod primitive;
 pub use primitive::callable_code_request_context;
+mod graph_tool;
 mod recovery_schedule;
 mod registrars;
 mod retained;
@@ -193,12 +195,16 @@ mod work_attempt_exec;
 mod work_blocked_interval_recovery;
 mod work_routing;
 
-use clock::now_micros;
-pub use clock::{current_micros, now_millis};
+pub use clock::now_millis;
 use configuration::*;
 use feedback::*;
 use git::*;
 use github_stack_signal::execute_github_stack_signal_expand;
+use graph_tool::execute_graph_tool;
+pub use graph_tool::{
+    DaemonGraphToolOwnerRegistrationError, GraphToolFuture, GraphToolInvocationV1,
+    ProjectGraphToolPortV1, RegisteredGraphToolOwnerV1,
+};
 use handoff::*;
 use invocation_observability::{
     emit_invocation_observation, feedback_observation_operation, invocation_observation_subject,
@@ -217,6 +223,7 @@ use retained::*;
 use source_edit::{
     execute_source_edit, execute_source_edit_reconcile, execute_source_edit_rollback,
 };
+use tracedecay_contracts::now_micros;
 use types::*;
 use work::*;
 pub use work_routing::DaemonWorkProposalRoutingAuthorityV1;
@@ -224,9 +231,10 @@ pub use work_routing::DaemonWorkProposalRoutingAuthorityV1;
 pub use feedback::{
     DaemonAdvisoryCycleInvocationFuture, DaemonAdvisoryCycleInvocationOwner,
     DaemonAdvisoryCycleInvocationPort, DaemonAdvisoryCycleInvocationRequest,
-    DaemonFeedbackInvocationOwner, DaemonFeedbackProximityInvocationFuture,
-    DaemonFeedbackProximityInvocationRequest, advisory_cycle_invocation_result,
-    daemon_operation_event_authority, feedback_proximity_invocation_result,
+    DaemonAdvisoryCycleMountFuture, DaemonAdvisoryCycleMountV1, DaemonFeedbackInvocationOwner,
+    DaemonFeedbackProximityInvocationFuture, DaemonFeedbackProximityInvocationRequest,
+    advisory_cycle_invocation_result, daemon_operation_event_authority,
+    feedback_proximity_invocation_result,
 };
 pub use primitive::{
     DaemonContextScoutRuntimeRegistrar, DaemonContextScoutRuntimeRegistrationError,

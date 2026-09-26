@@ -32,7 +32,7 @@ const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 128;
 ///
 /// A checkpoint returns WAL *contents* to the database; it does not return the
 /// WAL file's blocks. `journal_size_limit` is the only control that does, and
-/// SQLite's default (`-1`) never shrinks the file — so an isolated write burst
+/// SQLite's default (`-1`) never shrinks the file, so an isolated write burst
 /// pins the WAL at its high-water mark for the life of the database. This
 /// runtime is more exposed than most, because it sets `wal_autocheckpoint = 0`
 /// and drives every checkpoint from [`crate::checkpoint`]: SQLite will not
@@ -77,26 +77,6 @@ impl OpenedDatabaseFile {
     pub(crate) fn create_new(path: &Path) -> Result<Self, OpenedDatabaseFileError> {
         let file = create_pinned_database(path).map_err(|_| OpenedDatabaseFileError::Create)?;
         Self::adopt(file)
-    }
-
-    /// Creates and pins `path`, reporting a name collision as `Ok(None)` so a
-    /// staging allocator can retry under a fresh name instead of reading a
-    /// typed failure as a real filesystem fault.
-    ///
-    /// The pin keeps the creator's read/write handle. [`Self::pin`] reopens
-    /// read-only, which is all an identity fence needs, but a staging file is
-    /// also *flushed* through its pin, and Windows `FlushFileBuffers` requires
-    /// the handle to carry write access: it answers a read-only handle with
-    /// `ERROR_ACCESS_DENIED` on every call, where Unix `fsync` accepts a
-    /// read-only descriptor.
-    pub(crate) fn create_new_or_conflict(
-        path: &Path,
-    ) -> Result<Option<Self>, OpenedDatabaseFileError> {
-        match create_pinned_database(path) {
-            Ok(file) => Self::adopt(file).map(Some),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-            Err(_) => Err(OpenedDatabaseFileError::Create),
-        }
     }
 
     /// Takes ownership of an already-open handle and records its identity.
@@ -181,7 +161,7 @@ impl OpenedDatabaseFile {
     /// The pinned-descriptor ABA fence is unaffected: the reader worker still
     /// runs `verify_connection` (pathname inode identity plus
     /// `SQLITE_FCNTL_HAS_MOVED`, rechecked afterwards) and re-pins the file
-    /// before it reports startup — the same fence that already makes the
+    /// before it reports startup, the same fence that already makes the
     /// writer's canonical-path open safe on these hosts.
     pub(crate) fn reader_open_path(
         &self,
@@ -196,26 +176,6 @@ impl OpenedDatabaseFile {
         _canonical_path: &Path,
     ) -> Result<PathBuf, OpenedDatabaseFileError> {
         Err(OpenedDatabaseFileError::Unsupported)
-    }
-
-    pub(crate) fn clone_file(&self) -> Result<File, OpenedDatabaseFileError> {
-        self.file
-            .try_clone()
-            .map_err(|_| OpenedDatabaseFileError::Open)
-    }
-
-    /// Flushes the pinned file through the pinned handle.
-    ///
-    /// Only a handle that carries write access can answer this on Windows, so
-    /// callers that need durability must pin through
-    /// [`Self::create_new`] or [`Self::create_new_or_conflict`] rather than
-    /// [`Self::pin`], whose handle is read-only.
-    pub(crate) fn sync_all(&self) -> Result<(), OpenedDatabaseFileError> {
-        hotpath::measure_block!("rusqlite.sync_all", {
-            self.file
-                .sync_all()
-                .map_err(|_| OpenedDatabaseFileError::Inspect)
-        })
     }
 
     pub(crate) fn verify_current_path(&self, path: &Path) -> Result<(), OpenedDatabaseFileError> {
@@ -593,7 +553,7 @@ fn open_raw(
 
 /// Configuration is measured apart from the raw open: `journal_mode = WAL`
 /// and the verification pragmas read and can write the database, so under a
-/// held write lock this phase — not the file open — is where a slow
+/// held write lock this phase, not the file open, is where a slow
 /// startup's time goes.
 fn finish_open(
     connection: Connection,

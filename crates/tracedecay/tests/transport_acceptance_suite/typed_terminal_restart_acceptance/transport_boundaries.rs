@@ -1,9 +1,9 @@
 //! The HTTP, MCP-host, and Rust SDK legs of the typed-terminal journey.
 //!
 //! The CLI leg lives in this target's root module. It induces both terminals
-//! through real production mechanisms — a fact that commits durably and then
+//! through real production mechanisms, a fact that commits durably and then
 //! outlives its caller's request deadline at the daemon's own commit boundary,
-//! and a project store whose relational shape this binary refuses — and proves
+//! and a project store whose relational shape this binary refuses, and proves
 //! each survives a physical daemon kill and respawn.
 //!
 //! This module drives those same two genuinely-induced terminals through the
@@ -29,8 +29,8 @@
 //!   generated typed operations. Its `OperationRequestOptions::deadline_micros`
 //!   is the SDK's own name for the same header.
 //!
-//! Every leg asserts the terminal's kind, its legal actions, and — for
-//! `PartialEffect` — the committed receipt, then the daemon process is replaced
+//! Every leg asserts the terminal's kind, its legal actions, and, for
+//! `PartialEffect`, the committed receipt, then the daemon process is replaced
 //! and the same contract is re-asserted against the new process over the same
 //! on-disk state.
 
@@ -105,25 +105,77 @@ fn http_mount(home: &Path) -> HttpMount {
     }
 }
 
+/// Posts to the daemon's HTTP mount, repeating while the daemon answers with a
+/// pre-admission problem whose own retry directive is `after_delay`.
+///
+/// The authority record can be published before a restarted daemon has opened
+/// the project, and the reply for that window is a typed, retryable
+/// `unavailable`, not a verdict on the project. The first observation a
+/// journey asserts on is the first one the daemon *admitted*, which is what a
+/// production client that honours the directive sees.
+fn post_application_once_admitted(
+    mount: &HttpMount,
+    project_id: &str,
+    route: &str,
+    body: &Value,
+) -> (u16, Value) {
+    let deadline = Instant::now() + AUTHORITY_TIMEOUT;
+    loop {
+        let (status, payload) = post_application(mount, project_id, route, body, None);
+        let problem = [&payload, &payload["value"], &payload["data"]]
+            .into_iter()
+            .map(|candidate| &candidate["problem"])
+            .find(|problem| problem.is_object())
+            .filter(|problem| problem["terminality"] == "pre_admission")
+            .filter(|problem| problem["retry"] == "after_delay");
+        match problem {
+            Some(problem) if Instant::now() < deadline => {
+                let millis = problem["retry_after_millis"].as_u64().unwrap_or(250);
+                std::thread::sleep(Duration::from_millis(millis));
+            }
+            _ => return (status, payload),
+        }
+    }
+}
+
 /// Opens the exact project through the same daemon-owned route as a production
 /// CLI client and returns the identity the daemon admitted. HTTP cannot infer
 /// this identity locally: its route accepts only the daemon's public ID.
 fn admitted_project_id(home: &Path, project: &Path) -> String {
     let project_arg = project.to_string_lossy().into_owned();
-    let output = tracedecay_command_with_home(home)
-        .current_dir(project)
-        .args([
-            "tool",
-            "--project",
-            project_arg.as_str(),
-            "storage_status",
-            "--args",
-            r#"{"include_details":false}"#,
-            "--json",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .expect("read daemon-admitted project identity");
+    let deadline = Instant::now() + AUTHORITY_TIMEOUT;
+    let output = loop {
+        let output = tracedecay_command_with_home(home)
+            .current_dir(project)
+            .args([
+                "tool",
+                "--project",
+                project_arg.as_str(),
+                "storage_status",
+                "--args",
+                r#"{"include_details":false}"#,
+                "--json",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .expect("read daemon-admitted project identity");
+        // Right after `init` the daemon can still be mounting the project's
+        // query authority; it says so with a pre-admission problem whose own
+        // retry directive is `after_delay`. Honour that directive, as a
+        // production client would, instead of treating it as a verdict.
+        let problem = serde_json::from_slice::<Value>(&output.stdout)
+            .ok()
+            .map(|envelope| envelope["problem"].clone())
+            .filter(|problem| problem["terminality"] == "pre_admission")
+            .filter(|problem| problem["retry"] == "after_delay");
+        match problem {
+            Some(problem) if !output.status.success() && Instant::now() < deadline => {
+                let millis = problem["retry_after_millis"].as_u64().unwrap_or(250);
+                std::thread::sleep(Duration::from_millis(millis));
+            }
+            _ => break output,
+        }
+    };
     assert!(
         output.status.success(),
         "storage_status failed while admitting the fixture project\nstdout:\n{}\nstderr:\n{}",
@@ -307,22 +359,80 @@ fn mcp_payload(response: &Value) -> Value {
 
 /// Normalizes any transport's payload to `{ "problem": ... }`.
 ///
-/// The transports wrap the canonical problem envelope differently — a bare
-/// envelope, a `value` body, an `outcome.value` — but the envelope itself is
-/// the contract under test, so the journey asserts against it wherever the
-/// transport parked it rather than hard-coding one wrapper.
+/// The transports wrap the canonical problem envelope differently, a bare
+/// envelope, a `value` body, an `outcome.value`, MCP `structuredContent`, but
+/// the envelope itself is the contract under test, so the journey asserts
+/// against it wherever the transport parked it rather than hard-coding one
+/// wrapper.
 fn problem_envelope(payload: &Value, context: &str) -> Value {
     for candidate in [
         payload.clone(),
         payload["value"].clone(),
         payload["data"].clone(),
         payload["outcome"]["value"].clone(),
+        payload["structuredContent"].clone(),
     ] {
         if candidate["problem"].is_object() {
             return json!({ "problem": candidate["problem"].clone() });
         }
     }
     panic!("{context}: no typed problem envelope in the payload: {payload}")
+}
+
+/// True when the daemon has not published the project open yet.
+///
+/// The open wait on a connection is 500 ms. Past that, the surface answers
+/// `unavailable` / `after_delay` and leaves the open running. The CLI rides
+/// that refusal out; a raw HTTP or SDK call does not. A restart's first packet
+/// can therefore be warming even when the store's recorded terminal is
+/// `reset_required`.
+fn retryable_pre_admission_unavailable(payload: &Value) -> bool {
+    let problem = &payload["problem"];
+    problem["kind"] == "unavailable"
+        && problem["retry"] == "after_delay"
+        && problem["terminality"] == "pre_admission"
+}
+
+/// Polls until the open publishes a non-retryable problem, then returns it.
+///
+/// Bounded by the same 15 s a CLI tool call gives a cold open. A refusal that
+/// stays retryable past that bound is a real failure, not a slow open.
+fn await_settled_problem(context: &str, mut fetch: impl FnMut() -> Value) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let payload = fetch();
+        if !retryable_pre_admission_unavailable(&payload) {
+            return payload;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context}: project open stayed retryable unavailable past the open grace: {payload}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn await_sdk_reset_problem(
+    context: &str,
+    client: &Client,
+    request: &<ApplicationStorageStatus as tracedecay_sdk::operations::TypedOperation>::Request,
+) -> (String, Value) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let error = client
+            .execute::<ApplicationStorageStatus>(request)
+            .expect_err("a refused store must not read as a healthy status");
+        let (kind, envelope) = sdk_problem(error, context);
+        let payload = problem_envelope(&envelope, context);
+        if !retryable_pre_admission_unavailable(&payload) {
+            return (kind, envelope);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{context}: project open stayed retryable unavailable past the open grace: {payload}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Arms the daemon's one-shot fact-commit barrier, runs `request` on its own
@@ -333,16 +443,18 @@ fn problem_envelope(payload: &Value, context: &str) -> Value {
 /// starts its deadline clock itself: arrival is strictly after that clock
 /// started, so holding a full budget plus a margin beyond arrival always
 /// outlives it.
-fn park_at_commit_barrier<T, F>(barrier_dir: &Path, request: F) -> T
+fn park_at_commit_barrier<T, F>(barrier_dir: &Path, content: &str, request: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
     // The barrier is one-shot per directory: clear a previous park's markers
     // so the same daemon process can serve more than one parked request.
-    for marker in ["armed", "claimed", "arrived", "release"] {
+    for marker in ["armed", "claimed", "arrived", "release", "expect_content"] {
         let _ = std::fs::remove_file(barrier_dir.join(marker));
     }
+    std::fs::write(barrier_dir.join("expect_content"), content.as_bytes())
+        .expect("pin the fact commit barrier to the parked content");
     std::fs::write(barrier_dir.join("armed"), b"armed\n").expect("arm the fact commit barrier");
 
     let started = Instant::now();
@@ -425,7 +537,7 @@ fn partial_effect_survives_http_mcp_and_rust_sdk_across_restart() {
         token: mount.token.clone(),
     };
     let http_identity = identity.clone();
-    let (http_status, http_body) = park_at_commit_barrier(&barrier_path, move || {
+    let (http_status, http_body) = park_at_commit_barrier(&barrier_path, HTTP_MARKER, move || {
         post_application(
             &http_mount_for_request,
             &http_identity,
@@ -447,7 +559,7 @@ fn partial_effect_survives_http_mcp_and_rust_sdk_across_restart() {
     // the `_meta` object on `tools/call`.
     let mcp_home = home_path.clone();
     let mcp_project = project_path.clone();
-    let mcp_response = park_at_commit_barrier(&barrier_path, move || {
+    let mcp_response = park_at_commit_barrier(&barrier_path, MCP_MARKER, move || {
         mcp_tool_call(
             &mcp_home,
             &mcp_project,
@@ -469,7 +581,7 @@ fn partial_effect_survives_http_mcp_and_rust_sdk_across_restart() {
         token: mount.token.clone(),
     };
     let sdk_identity = identity.clone();
-    let sdk_error = park_at_commit_barrier(&barrier_path, move || {
+    let sdk_error = park_at_commit_barrier(&barrier_path, SDK_MARKER, move || {
         let client = sdk_client(&sdk_mount, &sdk_identity);
         let request =
             serde_json::from_value(fact_add_body(SDK_MARKER)).expect("canonical fact-add request");
@@ -546,7 +658,7 @@ fn partial_effect_survives_http_mcp_and_rust_sdk_across_restart() {
         token: mount.token.clone(),
     };
     let restart_identity = identity.clone();
-    let (_, restart_body) = park_at_commit_barrier(&barrier_path, move || {
+    let (_, restart_body) = park_at_commit_barrier(&barrier_path, POST_RESTART_MARKER, move || {
         post_application(
             &restart_mount,
             &restart_identity,
@@ -596,12 +708,11 @@ fn reset_required_survives_http_mcp_and_rust_sdk_across_restart() {
 
     let storage_status_body = json!({ "include_details": false });
 
-    let (http_status, http_body) = post_application(
+    let (http_status, http_body) = post_application_once_admitted(
         &mount,
         &identity,
         STORAGE_STATUS_ROUTE,
         &storage_status_body,
-        None,
     );
     super::assert_reset_required(
         &problem_envelope(&http_body, "HTTP reset required"),
@@ -612,25 +723,23 @@ fn reset_required_survives_http_mcp_and_rust_sdk_across_restart() {
         "a typed HTTP terminal must not be reported as success: status {http_status}, body {http_body}"
     );
 
-    let mcp_response = mcp_tool_call(
-        &home_path,
-        &project_path,
-        "tracedecay_storage_status",
-        &storage_status_body,
-        None,
-    );
-    super::assert_reset_required(
-        &problem_envelope(&mcp_payload(&mcp_response), "MCP reset required"),
-        "MCP stdio host, first observation",
-    );
+    let mcp_problem = await_settled_problem("MCP stdio host, first observation", || {
+        let mcp_response = mcp_tool_call(
+            &home_path,
+            &project_path,
+            "tracedecay_storage_status",
+            &storage_status_body,
+            None,
+        );
+        problem_envelope(&mcp_payload(&mcp_response), "MCP reset required")
+    });
+    super::assert_reset_required(&mcp_problem, "MCP stdio host, first observation");
 
     let client = sdk_client(&mount, &identity);
     let request =
         serde_json::from_value(storage_status_body.clone()).expect("canonical storage status");
-    let sdk_error = client
-        .execute::<ApplicationStorageStatus>(&request)
-        .expect_err("a refused store must not read as a healthy status");
-    let (sdk_kind, sdk_envelope) = sdk_problem(sdk_error, "Rust SDK reset required");
+    let (sdk_kind, sdk_envelope) =
+        await_sdk_reset_problem("Rust SDK, first observation", &client, &request);
     assert_eq!(
         sdk_kind, "reset_required",
         "the Rust SDK must classify the terminal as reset required: {sdk_envelope}"
@@ -655,36 +764,37 @@ fn reset_required_survives_http_mcp_and_rust_sdk_across_restart() {
     );
     let mount = http_mount(&home_path);
 
-    let (_, http_body_after) = post_application(
-        &mount,
-        &identity,
-        STORAGE_STATUS_ROUTE,
-        &storage_status_body,
-        None,
-    );
-    super::assert_reset_required(
-        &problem_envelope(&http_body_after, "HTTP reset required after restart"),
-        "HTTP mount, after a physical restart",
-    );
+    let http_problem_after = await_settled_problem("HTTP mount, after a physical restart", || {
+        let (_, body) = post_application(
+            &mount,
+            &identity,
+            STORAGE_STATUS_ROUTE,
+            &storage_status_body,
+            None,
+        );
+        problem_envelope(&body, "HTTP reset required after restart")
+    });
+    super::assert_reset_required(&http_problem_after, "HTTP mount, after a physical restart");
 
-    let mcp_after = mcp_tool_call(
-        &home_path,
-        &project_path,
-        "tracedecay_storage_status",
-        &storage_status_body,
-        None,
-    );
+    let mcp_problem_after =
+        await_settled_problem("MCP stdio host, after a physical restart", || {
+            let mcp_after = mcp_tool_call(
+                &home_path,
+                &project_path,
+                "tracedecay_storage_status",
+                &storage_status_body,
+                None,
+            );
+            problem_envelope(&mcp_payload(&mcp_after), "MCP reset required after restart")
+        });
     super::assert_reset_required(
-        &problem_envelope(&mcp_payload(&mcp_after), "MCP reset required after restart"),
+        &mcp_problem_after,
         "MCP stdio host, after a physical restart",
     );
 
     let client = sdk_client(&mount, &identity);
-    let sdk_error_after = client
-        .execute::<ApplicationStorageStatus>(&request)
-        .expect_err("a refused store must not read as a healthy status after a restart");
     let (sdk_kind_after, sdk_envelope_after) =
-        sdk_problem(sdk_error_after, "Rust SDK reset required after restart");
+        await_sdk_reset_problem("Rust SDK reset required after restart", &client, &request);
     assert_eq!(
         sdk_kind_after, "reset_required",
         "the Rust SDK must keep classifying the terminal as reset required: {sdk_envelope_after}"

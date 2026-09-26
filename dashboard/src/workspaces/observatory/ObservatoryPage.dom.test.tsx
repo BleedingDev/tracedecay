@@ -53,8 +53,8 @@ describe('ObservatoryPage store telemetry', () => {
     // Unset: a missing setting, named exactly, and never "unsupported".
     const unsetRow = document.querySelector('[data-dimension-state="unset"]');
     expect(unsetRow?.textContent).toContain(`no budget configured · set ${SETTING_KEY}`);
-    // The setting is a mono token, so a missing setting is structurally — not
-    // only chromatically — distinct from an undetermined read.
+    // The setting is a mono token, so a missing setting is distinct in structure
+    // and color from an undetermined read.
     expect(unsetRow?.querySelector(`[data-setting-key="${SETTING_KEY}"]`)).toBeTruthy();
     expect(screen.queryByText(/budget.*unsupported/i)).toBeNull();
 
@@ -246,7 +246,7 @@ describe('ObservatoryPage store telemetry', () => {
     stubTelemetry({ ...telemetryPayload(), stores: [byteOnlyStore()] });
     renderObservatory('telemetry');
 
-    // The size is a real measurement and is printed as one — on the overview
+    // The size is a real measurement and is printed as one, on the overview
     // row and again on the exact store card.
     expect((await screen.findAllByText('40.0 MiB')).length).toBeGreaterThan(0);
     // The capacity bar is drawn for this store rather than withheld, and says
@@ -303,6 +303,7 @@ describe('ObservatoryPage store telemetry', () => {
         hot_postings_skipped: 0,
         hot_posting_rows_skipped: 0,
         excluded_too_small_bodies: 0,
+        excluded_too_large_bodies: 0,
         excluded_incomplete_tokenization_bodies: 0,
         rename_partial_bodies: 0,
         rename_unsupported_bodies: 0,
@@ -340,7 +341,7 @@ describe('ObservatoryPage store telemetry', () => {
     expect(panel.textContent).toContain('0 / 0');
   });
 
-  it('keeps partial, backfilling, stale, and unavailable clone states distinct', async () => {
+  it('keeps partial, stale, and unavailable clone states distinct', async () => {
     const ready = readyCodeIndexFreshnessEnvelope();
     const observation = cloneIndexObservation();
     stubTelemetry(telemetryPayload(), emptyStorageFindingsPayload(), {
@@ -365,24 +366,7 @@ describe('ObservatoryPage store telemetry', () => {
                   near_fingerprint_postings: null,
                 },
               },
-              omission_reasons: ['positional fingerprint successor is missing'],
-            },
-          },
-          {
-            ...ready.payload.worktrees[0],
-            worktree_root: '/worktrees/backfilling',
-            clone_index: {
-              state: 'backfilling',
-              observation: {
-                ...observation,
-                coverage: {
-                  ...observation.coverage,
-                  completed_source_pages: 2,
-                  total_source_pages: 5,
-                  near_fingerprint_bodies: null,
-                  near_fingerprint_postings: null,
-                },
-              },
+              omission_reasons: ['positional fingerprints do not cover every eligible body'],
             },
           },
           {
@@ -407,12 +391,13 @@ describe('ObservatoryPage store telemetry', () => {
     });
     renderObservatory('pipeline');
 
-    await screen.findByText('positional fingerprint successor is missing');
-    for (const state of ['partial', 'backfilling', 'stale', 'unavailable']) {
+    await screen.findByText('positional fingerprints do not cover every eligible body');
+    for (const state of ['partial', 'stale', 'unavailable']) {
       expect(document.querySelector(`[data-clone-index-state="${state}"]`)).toBeTruthy();
     }
-    expect(screen.getByText('positional fingerprint successor is missing')).toBeTruthy();
-    expect(screen.getByText('2 / 5 sealed pages')).toBeTruthy();
+    expect(
+      screen.getByText('positional fingerprints do not cover every eligible body'),
+    ).toBeTruthy();
     expect(screen.getByText('the sealed lexical artifact is unreadable')).toBeTruthy();
     // Said on the overview rail and again in the exact readiness list.
     expect(screen.getAllByText('unavailable · graph artifact unreadable').length).toBeGreaterThan(0);
@@ -420,7 +405,7 @@ describe('ObservatoryPage store telemetry', () => {
 });
 
 /** Opens the page with one authority selected (`?inspect=`), so its exact
- * read model is mounted beneath the grid — every assertion in this file is
+ * read model is mounted beneath the grid, every assertion in this file is
  * about that exact evidence, not the overview summary. */
 function renderObservatory(inspect: EvidenceSourceId) {
   const client = new QueryClient({
@@ -452,7 +437,7 @@ function stubTelemetry(
       const url = String(input);
       const route = url.replace(/^\/api\/projects\/[^/]+/, '/api');
       if (route === '/api/storage/telemetry') return jsonResponse(envelope(payload));
-      if (route === '/api/storage/findings') {
+      if (route === '/api/doctor/findings?family=storage') {
         return jsonResponse(envelope(findingsPayload));
       }
       if (route === '/api/code-index/freshness') {
@@ -470,13 +455,14 @@ function stubTelemetry(
             report_coverage: null,
             known_families: ['storage'],
             schema_convergences: [],
+            storage_kind_statuses: [],
             note: 'no admitted Doctor report source is available for this dashboard scope',
           }),
         );
       }
       // The other authorities the overview reads are not under test here.
       // They answer as an unreachable source, which the page must render as a
-      // typed absence — never as a crash and never as an empty success.
+      // typed absence, never as a crash and never as an empty success.
       if (
         route === '/api/observatory' ||
         route === '/api/plugins/analytics/diagnostics' ||
@@ -619,11 +605,10 @@ function cloneIndexObservation() {
       hot_postings_skipped: 1,
       hot_posting_rows_skipped: 1_025,
       excluded_too_small_bodies: 1,
+      excluded_too_large_bodies: 0,
       excluded_incomplete_tokenization_bodies: 1,
       rename_partial_bodies: 1,
       rename_unsupported_bodies: 1,
-      completed_source_pages: 2,
-      total_source_pages: 2,
     },
     budgets: {
       posting_rows: 16_384,
@@ -651,14 +636,14 @@ function emptyStorageFindingsPayload() {
     known_families: ['storage'],
     schema_convergences: [],
     note: 'canonical Doctor storage family contained no entries',
-    kind_statuses: sourceStatuses(),
+    storage_kind_statuses: sourceStatuses(),
   };
 }
 
 function sourceStatusFindingsPayload() {
   return {
     ...emptyStorageFindingsPayload(),
-    kind_statuses: sourceStatuses({
+    storage_kind_statuses: sourceStatuses({
       over_budget_store: {
         state: 'partial',
         observed_entries: 0,
@@ -940,7 +925,7 @@ function telemetryPayload() {
   };
 }
 
-/** A store whose size read produced a byte total with no page-level sample —
+/** A store whose size read produced a byte total with no page-level sample,
  * the one read kind that has a real size and no free-page figure at all. */
 function byteOnlyStore() {
   return {
@@ -1054,7 +1039,7 @@ describe('ObservatoryPage duplicate finding identities', () => {
    * The live regression: a real report can carry two findings of one kind
    * whose first evidence names the same reference (observed live: repeated
    * retention_backlog rows for one store). Both must render as cards, under
-   * unique React keys — the old `kind:reference` key collided and React
+   * unique React keys, the old `kind:reference` key collided and React
    * warned about two children with the same key.
    */
   it('renders same-kind same-reference findings as distinct cards with unique keys', async () => {
@@ -1080,7 +1065,7 @@ describe('ObservatoryPage duplicate finding identities', () => {
     });
     renderObservatory('findings');
 
-    // One card per entry, told apart by their coverage statements — the label
+    // One card per entry, told apart by their coverage statements, the label
     // text alone also appears in the source-status strip.
     expect(await screen.findByText('first reading')).toBeTruthy();
     expect(await screen.findByText('second reading')).toBeTruthy();

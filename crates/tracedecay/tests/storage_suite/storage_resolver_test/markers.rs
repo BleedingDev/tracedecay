@@ -4,7 +4,7 @@ use tempfile::TempDir;
 
 /// A retired legacy enrollment file is never an identity authority for the
 /// synchronous walk: discovery and initialization answer through the `.git/`
-/// marker, the profile store, or the registry — never a working-tree file.
+/// marker, the profile store, or the registry, never a working-tree file.
 #[test]
 fn legacy_enrollment_marker_alone_is_not_discovered() {
     let dir = TempDir::new().unwrap();
@@ -29,22 +29,6 @@ fn repository_identity_marker_is_discovered_without_graph_db() {
 
     assert_eq!(discover_project_root(&child), Some(root.clone()));
     assert!(TraceDecay::is_initialized(&root));
-}
-
-#[test]
-fn invalid_legacy_enrollment_marker_is_not_treated_as_initialized() {
-    let dir = TempDir::new().unwrap();
-    let root = dir.path();
-    fs::create_dir_all(root.join(".tracedecay")).unwrap();
-    fs::write(
-        root.join(".tracedecay/enrollment.json"),
-        r#"{"project_id":"../bad","storage_mode":"profile_sharded"}"#,
-    )
-    .unwrap();
-
-    assert_eq!(discover_project_root(root), None);
-    assert!(!TraceDecay::is_initialized(root));
-    assert!(read_legacy_enrollment_marker(root).is_err());
 }
 
 #[test]
@@ -80,12 +64,7 @@ fn profile_sharded_layout_rejects_dot_and_hidden_project_ids() {
     fs::create_dir_all(&project).unwrap();
 
     for project_id in [".", ".hidden"] {
-        let marker = EnrollmentMarker {
-            project_id: project_id.to_string(),
-            storage_mode: StorageMode::ProfileSharded,
-        };
-
-        let err = profile_sharded_layout(&project, &profile, &marker).unwrap_err();
+        let err = profile_sharded_layout(&project, &profile, project_id).unwrap_err();
 
         assert!(
             err.to_string().contains("single safe path segment"),
@@ -100,12 +79,8 @@ fn profile_sharded_layout_maps_marker_to_profile_store_paths() {
     let project = dir.path().join("repo");
     let profile = dir.path().join("profile");
     fs::create_dir_all(&project).unwrap();
-    let marker = EnrollmentMarker {
-        project_id: "proj_123".to_string(),
-        storage_mode: StorageMode::ProfileSharded,
-    };
 
-    let layout = profile_sharded_layout(&project, &profile, &marker).unwrap();
+    let layout = profile_sharded_layout(&project, &profile, "proj_123").unwrap();
 
     let data_root = profile.join("projects/proj_123");
     assert_eq!(layout.project_root, project);
@@ -115,10 +90,6 @@ fn profile_sharded_layout_maps_marker_to_profile_store_paths() {
     assert_eq!(
         layout.graph_db_path,
         profile.join("projects/proj_123/tracedecay.db")
-    );
-    assert_eq!(
-        layout.config_path,
-        profile.join("projects/proj_123/config.json")
     );
     assert_eq!(
         layout.branch_meta_path,
@@ -144,7 +115,6 @@ fn profile_sharded_layout_maps_marker_to_profile_store_paths() {
         layout.manifest_path,
         Some(profile.join(format!("projects/proj_123/{STORE_MANIFEST_FILENAME}")))
     );
-    assert_eq!(layout.dirty_path, profile.join("projects/proj_123/dirty"));
     assert_eq!(
         layout.sync_lock_path,
         profile.join("projects/proj_123/sync.lock")

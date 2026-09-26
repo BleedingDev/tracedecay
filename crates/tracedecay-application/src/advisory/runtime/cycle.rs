@@ -103,7 +103,7 @@ where
         context: &RequestContext,
         mut control: AdvisoryCycleControl,
         request: AdvisoryCycleRequest,
-    ) -> Result<AdvisoryCycleOutcome, ApplicationContractError> {
+    ) -> Result<AdvisoryCycleOutcome, FeedbackCycleRuntimeError> {
         if let Err(error) = request.validate_for(&self.feedback_scope) {
             self.observations.observe_source_event(
                 &request.feedback.input,
@@ -112,7 +112,7 @@ where
                     outcome: FeedbackOutcomeV1::Rejected,
                 },
             );
-            return Err(error);
+            return Err(error.into());
         }
         let mut contributions = AdvisoryContributionsV1::absent();
         mark_unrequested_remote_providers(
@@ -165,18 +165,18 @@ where
                     }
                 };
                 // Retain the allowlisted pull-request identity read beside a
-                // usable thread refresh so Delivery can serve PR title, state,
+                // usable review refresh so Delivery can serve PR title, state,
                 // and diff shape. It contributes no advisory findings and a
-                // rate-limited or denied thread refresh never spends a second
+                // rate-limited or denied review refresh never spends a second
                 // provider read.
-                if provider_request.operation
-                    == GitHubReviewReadOperationV1::GraphQlQueryPullRequestReviewThreads
-                    && matches!(
-                        outcome,
-                        GitHubReviewRefreshOutcomeV1::Stored(_)
-                            | GitHubReviewRefreshOutcomeV1::Stale
-                    )
-                {
+                if matches!(
+                    provider_request.operation,
+                    GitHubReviewReadOperationV1::GraphQlQueryPullRequestReviewThreads
+                        | GitHubReviewReadOperationV1::RestListPullRequestReviewComments
+                ) && matches!(
+                    outcome,
+                    GitHubReviewRefreshOutcomeV1::Stored(_) | GitHubReviewRefreshOutcomeV1::Stale
+                ) {
                     let identity_request = GitHubReviewReadRequestV1 {
                         operation: GitHubReviewReadOperationV1::RestGetPullRequest,
                         scope: provider_request.scope.clone(),
@@ -705,7 +705,7 @@ where
         context: &RequestContext,
         request: FeedbackCycleExecutionRequest,
         contributions: AdvisoryContributionsV1,
-    ) -> Result<AdvisoryCycleOutcome, ApplicationContractError> {
+    ) -> Result<AdvisoryCycleOutcome, FeedbackCycleRuntimeError> {
         let observation_input = request.input.clone();
         let advisory = contributions.as_feedback_cycle_advisory()?;
         self.observe_provider_states(&observation_input, &contributions);

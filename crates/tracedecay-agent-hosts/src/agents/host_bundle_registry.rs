@@ -22,7 +22,7 @@ const FIRST_PARTY_COMPONENT_SCHEMA_VERSION: u16 = 1;
 /// Canonical hosts whose first-party component lifecycle can publish durable
 /// ownership receipts. Discovery-only and evidence-unadmitted hosts stay in
 /// `HostKindV1::ALL`, but never enter install/update/uninstall sweeps.
-pub const RECEIPT_BACKED_HOST_KINDS: [HostKindV1; 16] = [
+pub const RECEIPT_BACKED_HOST_KINDS: [HostKindV1; 18] = [
     HostKindV1::ClaudeCode,
     HostKindV1::CursorDesktop,
     HostKindV1::Codex,
@@ -39,6 +39,8 @@ pub const RECEIPT_BACKED_HOST_KINDS: [HostKindV1; 16] = [
     HostKindV1::Cline,
     HostKindV1::RooCode,
     HostKindV1::Kilo,
+    HostKindV1::Pi,
+    HostKindV1::FactoryDroid,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,7 +133,11 @@ pub fn unsupported_host_component_set_reason(
         // native hook/plugin surfaces remain evidence-gated.
         | HostKindV1::Cline
         | HostKindV1::RooCode
-        | HostKindV1::Kilo => None,
+        | HostKindV1::Kilo
+        | HostKindV1::Pi => None,
+        // Factory Droid's `droid mcp add|remove` registry is its whole
+        // integration surface.
+        | HostKindV1::FactoryDroid => None,
         // Cursor cloud exposes no host registration API to install into. Its
         // presence in the host enum and capability catalog is not support
         // evidence, so it stays typed unavailable until a real component set
@@ -185,6 +191,10 @@ pub fn default_components(host: HostKindV1) -> Vec<HostComponentV1> {
         | HostKindV1::Kilo => {
             vec![HostComponentV1::ContextMcp]
         }
+        HostKindV1::FactoryDroid => {
+            vec![HostComponentV1::Core, HostComponentV1::ContextMcp]
+        }
+        HostKindV1::Pi => vec![HostComponentV1::Core, HostComponentV1::Agent],
         HostKindV1::CursorCloud | HostKindV1::ClineFamily => Vec::new(),
     }
 }
@@ -532,7 +542,7 @@ fn component_assets(
     // directory, exactly as Claude Code's marketplace source feeds
     // `claude plugin install`. Render it through the integration's own
     // renderer so the bytes the transaction deploys are byte-identical to the
-    // ones staging writes and the doctor reads — two renderers here would let
+    // ones staging writes and the doctor reads, two renderers here would let
     // an install and a repair disagree about what was staged.
     if (host, component) == (HostKindV1::Gemini, HostComponentV1::ContextMcp) {
         let files = super::gemini::rendered_extension_files(tracedecay_bin)
@@ -581,6 +591,28 @@ fn component_assets(
             rendered.push((format!("{prefix}/{path}"), contents.into_bytes()));
         }
         return Ok(rendered);
+    }
+
+    // Pi loads its extension and skill from `~/.pi/agent`; the rendered bytes
+    // are the receipt-owned artifacts, the OpenCode plugin shape. A relocated
+    // agent directory is mirrored from these by the Pi activation.
+    if host == HostKindV1::Pi && matches!(component, HostComponentV1::Core | HostComponentV1::Agent)
+    {
+        let files = if component == HostComponentV1::Core {
+            super::pi::rendered_core_files(tracedecay_bin)
+                .map_err(|_| HostBundleRegistryError::Incompatible)?
+        } else {
+            super::pi::rendered_agent_files()
+        };
+        return Ok(files
+            .into_iter()
+            .map(|(relative, body)| {
+                (
+                    format!("{}/{relative}", super::pi::PI_AGENT_RELATIVE),
+                    body.into_bytes(),
+                )
+            })
+            .collect());
     }
 
     let (prefix, files) = match (host, component) {
@@ -678,6 +710,32 @@ fn component_assets(
             vec![(
                 "context-mcp.json",
                 r#"{"host":"kilo","registration":"../kilo.jsonc","registrar":"tracedecay managed merge","route":"mcp","server":{"command":["__TRACEDECAY_BIN__","serve"]}}"#,
+            )],
+        ),
+        // Factory Droid's `~/.factory/mcp.json` is written by
+        // `droid mcp add`, never by TraceDecay, so it must never be a managed
+        // artifact: owning it here would put the transaction's own write in
+        // the middle of the host command's registry merge, the exact failure
+        // Kiro's and Copilot's comments record. Own a receipt descriptor
+        // under `.factory/tracedecay` instead. It names the registry document
+        // the host CLI owns so a receipt reader can find it without the
+        // catalog ever claiming to write it.
+        (HostKindV1::FactoryDroid, HostComponentV1::ContextMcp) => (
+            ".factory/tracedecay",
+            vec![(
+                "context-mcp.json",
+                r#"{"host":"droid","registration":"mcp.json","registrar":"droid mcp add|remove","route":"mcp","server":{"command":"__TRACEDECAY_BIN__","args":["serve"],"type":"stdio"}}"#,
+            )],
+        ),
+        // The Core descriptor names the host-owned hooks document; the
+        // activation adapter merges the SessionStart / Stop entries into
+        // `~/.factory/hooks.json` and retains the byte snapshot, exactly the
+        // Cline MCP merge shape for a host-owned configuration file.
+        (HostKindV1::FactoryDroid, HostComponentV1::Core) => (
+            ".factory/tracedecay",
+            vec![(
+                "core.json",
+                r#"{"host":"droid","registration":"../hooks.json","registrar":"tracedecay managed merge","route":"hooks","server":{"command":"__TRACEDECAY_BIN__","args":["hook-droid-event"]}}"#,
             )],
         ),
         (HostKindV1::OpenCode, HostComponentV1::Agent) => (
@@ -874,7 +932,7 @@ mod tests {
     }
 
     /// Both writers must agree even when the running binary is not the
-    /// installed one — `./target/release/tracedecay reinstall` is exactly the
+    /// installed one. `./target/release/tracedecay reinstall` is exactly the
     /// case that corrupted the `OpenCode` transaction and wedged the shared
     /// component-set journal.
     #[test]
@@ -937,7 +995,7 @@ mod tests {
     }
 
     /// Both writers must agree even when the running binary is not the
-    /// installed one — `./target/release/tracedecay reinstall` is exactly the
+    /// installed one. `./target/release/tracedecay reinstall` is exactly the
     /// case that corrupted the Hermes transaction and left a pending
     /// `component-set-journal.hermes.v1.json` behind.
     #[test]
@@ -1180,7 +1238,7 @@ mod tests {
     /// descriptor, never Copilot's own `mcp-config.json`: that document is
     /// written by the host command, and owning it here would make the
     /// transaction's artifact write race the host's registry merge. Core is
-    /// refused through the capability matrix, not through a missing arm — the
+    /// refused through the capability matrix, not through a missing arm, the
     /// host reports no hook route to install.
     #[test]
     fn copilot_packages_only_the_mcp_route_its_host_cli_registers() {
@@ -1242,7 +1300,7 @@ mod tests {
     /// `gemini extensions install` adopts. Core is refused because the staged
     /// extension declares no hook and the capability matrix reports none, and
     /// the deployed bytes must be exactly what the integration's own staging
-    /// writes — otherwise install and repair would stage two different
+    /// writes, otherwise install and repair would stage two different
     /// extensions.
     #[test]
     fn gemini_packages_the_extension_source_its_host_cli_installs() {
@@ -1394,7 +1452,14 @@ mod tests {
             .find(|asset| asset.relative_path.ends_with("plugins/tracedecay.ts"))
             .map(|asset| String::from_utf8(asset.bytes.clone()).unwrap())
             .expect("OpenCode set includes Hook V2 plugin");
-        assert!(!plugin.is_empty(), "OpenCode set includes a plugin payload");
+        for marker in [
+            r#"dispatchAfterAck("hook-opencode-event", event, deliver)"#,
+            r#"dispatchAfterAck("hook-opencode-tool-after", { input, output }, deliver)"#,
+            r#""tool.execute.after": ("#,
+            r#"id: "tracedecay-hooks""#,
+        ] {
+            assert!(plugin.contains(marker), "OpenCode plugin lacks {marker}");
+        }
     }
 
     #[test]

@@ -48,23 +48,20 @@ mod sql;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
 
 use tracedecay_contracts::retrieval::{
     SessionRetrievalBudgetAccountingV1, SessionRetrievalBudgetObservationV1,
     SessionRetrievalBudgetStageV1,
 };
 use tracedecay_domain::{HydrationStateV1, RetrievalAnchorId, SessionId, SignedCursorKeyRefV1};
-use tracedecay_graph_db::{GraphNamespace, NeverCancelled};
 
 use self::execution::{
     AuthorizedTaskSessionExecutionRequestV1, AuthorizedTemporalExecutionRequest,
-    SessionDataFreshness, SessionTemporalExecutionError, SessionTemporalExecutionPort,
-    SessionTemporalExecutionReport, TaskSessionExecutionOmissionReasonV1,
-    TaskSessionExecutionOmissionV1, TaskSessionRankSelectorV1, TaskSessionReauthorizationStageV1,
-    TaskSessionSelectionCallbackErrorV1, TaskSessionTemporalExecutionFutureV1,
-    TaskSessionTemporalExecutionOutcomeV1, TaskSessionTemporalExecutionPortV1,
-    TaskSessionTemporalExecutionReportV1, TemporalExecutionFuture,
+    SessionDataFreshness, SessionTemporalExecutionError, SessionTemporalExecutionReport,
+    TaskSessionExecutionOmissionReasonV1, TaskSessionExecutionOmissionV1,
+    TaskSessionRankSelectorV1, TaskSessionReauthorizationStageV1,
+    TaskSessionSelectionCallbackErrorV1, TaskSessionTemporalExecutionOutcomeV1,
+    TaskSessionTemporalExecutionReportV1,
 };
 use self::render::{CanonicalLcmSourceHydration, apply_canonical_summary_source_content};
 use tracedecay_lcm::contracts::{
@@ -77,26 +74,24 @@ use tracedecay_query::retrieval::evidence_lanes::{
 };
 use tracedecay_runtime_core::db::engine::Error as EngineError;
 use tracedecay_sessions::runtime::git_correlation::{
-    GitCorrelationError, GitEvidenceGraphHead, GitScopeFilter, git_evidence_projection_identity,
-    open_git_evidence_graph_view,
+    GitCorrelationError, GitScopeFilter, open_git_evidence_view,
 };
 use tracedecay_store::{SessionMessageRecord, SessionRecord};
 use tracedecay_temporal_query::context::VersionedTokenEstimator;
 use tracedecay_temporal_query::cursor::{CursorError, StableSortKey, encode_cursor, verify_cursor};
+use tracedecay_temporal_query::execution::{BindingDigest, ExecutionControl};
 use tracedecay_temporal_query::hydrate_temporal_candidate_selection;
 use tracedecay_temporal_query::hydration::hydrate_selected;
-use tracedecay_temporal_query::ports::{
-    BindingDigest, ExecutionControl, KernelVersions, TemporalExecutionSnapshot,
-    TemporalRetrievalScope,
-};
 use tracedecay_temporal_query::resolution::ValidatedAuthorization;
+use tracedecay_temporal_query::snapshot::TemporalRetrievalScope;
+use tracedecay_temporal_query::snapshot::{KernelVersions, TemporalExecutionSnapshot};
 use tracedecay_temporal_query::{execute_temporal_candidate_export, execute_temporal_kernel};
 
 pub use self::cursor_keys::{
     SessionTemporalCursorKeyProvider, SessionTemporalCursorKeyProviderError,
 };
 pub use self::direct::ResolvedDirectAnchor;
-use self::hydration::GlobalDbTemporalHydrationPort;
+use self::hydration::SessionTemporalHydrationAdapter;
 use self::participant_freeze::{
     freeze_participants, freeze_prepared_candidate_participants, root_readiness,
 };
@@ -112,27 +107,29 @@ pub use refresh::{SessionRefreshRecoveryV1, SessionRefreshRestartStateV1};
 pub use store::SessionTemporalStore;
 
 impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
-    /// Resolves a Git filter through the verified Git-evidence graph.
+    /// Resolves a Git filter through the store's Git evidence rows.
     ///
     /// `None` means the request is unscoped. A non-empty filter always returns
-    /// `Some`, including an authoritative empty set when the graph has no
-    /// matching sessions.
-    pub fn git_scope_session_ids(
+    /// `Some`, including an authoritative empty set when no recorded session
+    /// matches. A store that never recorded Git evidence answers typed
+    /// unavailable: it cannot prove that no durable session matches.
+    pub async fn git_scope_session_ids(
         &self,
         filter: &GitScopeFilter,
     ) -> Result<Option<Vec<(String, String)>>, GitCorrelationError> {
-        self.git_scope_session_ids_with_bound(filter, None)
+        self.git_scope_session_ids_with_bound(filter, None).await
     }
 
-    pub fn git_scope_session_ids_bounded(
+    pub async fn git_scope_session_ids_bounded(
         &self,
         filter: &GitScopeFilter,
         maximum: usize,
     ) -> Result<Option<Vec<(String, String)>>, GitCorrelationError> {
         self.git_scope_session_ids_with_bound(filter, Some(maximum))
+            .await
     }
 
-    fn git_scope_session_ids_with_bound(
+    async fn git_scope_session_ids_with_bound(
         &self,
         filter: &GitScopeFilter,
         maximum: Option<usize>,
@@ -140,34 +137,18 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         if filter.is_empty() {
             return Ok(None);
         }
-        let runtime = self.project_graph_runtime().ok_or_else(|| {
-            GitCorrelationError::Unavailable(
-                "registered project graph runtime is not mounted".to_owned(),
-            )
-        })?;
-        let identity = git_evidence_projection_identity(GraphNamespace::new("project")?)?;
-        // Absence is not an authoritative empty projection. Until Git
-        // evidence has been published, callers cannot prove that no durable
-        // session holds a matching worktree.
-        let view = match open_git_evidence_graph_view(runtime, &identity, Arc::new(NeverCancelled))?
-        {
-            GitEvidenceGraphHead::Indexed(view) => view,
-            GitEvidenceGraphHead::Unpublished => {
-                return Err(GitCorrelationError::Unavailable(
-                    "verified Git-evidence projection has not been published".to_owned(),
-                ));
-            }
-            // A pre-index head cannot be scoped through the graph either; its
-            // next publication re-projects it.
-            GitEvidenceGraphHead::Legacy { generation } => {
-                return Err(GitCorrelationError::Unavailable(format!(
-                    "verified Git-evidence generation `{generation}` predates the indexed projector"
-                )));
-            }
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| GitCorrelationError::Db(error.to_string()))?;
+        let Some(view) = open_git_evidence_view(&snapshot).await? else {
+            return Err(GitCorrelationError::Unavailable(
+                "Git evidence has not been recorded for this project".to_owned(),
+            ));
         };
         let session_ids = match maximum {
-            Some(maximum) => view.session_ids_for_scope_bounded(filter, maximum),
-            None => view.session_ids_for_scope(filter),
+            Some(maximum) => view.session_ids_for_scope_bounded(filter, maximum).await,
+            None => view.session_ids_for_scope(filter).await,
         }?
         .ok_or_else(|| {
             GitCorrelationError::Contract(
@@ -205,8 +186,8 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
     /// no writer transaction. Only `ActiveKeyMissing` enters the provisioning
     /// transaction, which rechecks under the writer so concurrent first-use
     /// callers mint exactly one key; the provider is then built from a fresh
-    /// read view that includes it. Every other read-side refusal — multiple
-    /// active keys, invalid id/version/material, retention — is returned as is
+    /// read view that includes it. Every other read-side refusal, multiple
+    /// active keys, invalid id/version/material, retention, is returned as is
     /// and never becomes a reason to mint a replacement.
     #[hotpath::skip]
     pub async fn load_session_cursor_key_provider_result(
@@ -670,9 +651,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
                     HydrationStateV1::Unauthorized => SessionTemporalExecutionError::Denied,
                     HydrationStateV1::Available
                     | HydrationStateV1::RetainedButUnavailable
-                    | HydrationStateV1::UnverifiableLegacy => {
-                        SessionTemporalExecutionError::Unavailable
-                    }
+                    | HydrationStateV1::Unverifiable => SessionTemporalExecutionError::Unavailable,
                 });
             }
         };
@@ -706,15 +685,15 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         let control = snapshot.request().execution_control();
         let mut checkpoint = || {
             control.checkpoint().map_err(|error| match error {
-                tracedecay_temporal_query::ports::TemporalPortError::Cancelled => {
+                tracedecay_temporal_query::execution::TemporalPortError::Cancelled => {
                     LcmError::Cancelled
                 }
-                tracedecay_temporal_query::ports::TemporalPortError::DeadlineExceeded => {
+                tracedecay_temporal_query::execution::TemporalPortError::DeadlineExceeded => {
                     LcmError::DeadlineExceeded
                 }
-                tracedecay_temporal_query::ports::TemporalPortError::BudgetExceeded { .. } => {
-                    LcmError::BudgetExhausted
-                }
+                tracedecay_temporal_query::execution::TemporalPortError::BudgetExceeded {
+                    ..
+                } => LcmError::BudgetExhausted,
                 _ => LcmError::Db("temporal verification control failed".to_string()),
             })
         };
@@ -790,7 +769,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
         }
         let storage_root = self.payload_storage_root()?;
         let (relation_scope, relation_store) = self.relation_authority()?;
-        let authority = GlobalDbTemporalHydrationPort::for_registered_snapshot_with_relations(
+        let authority = SessionTemporalHydrationAdapter::for_registered_snapshot_with_relations(
             &read_snapshot,
             storage_root,
             &relation_scope,
@@ -1003,7 +982,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
     }
 
     #[hotpath::measure(future = true, label = "session_temporal.execution.execute")]
-    async fn execute<E>(
+    pub async fn execute<E>(
         &self,
         request: AuthorizedTemporalExecutionRequest,
         estimator: &E,
@@ -1030,7 +1009,7 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
             &relation_scope,
             relation_store.clone(),
         );
-        let hydration = GlobalDbTemporalHydrationPort::for_registered_snapshot_with_relations(
+        let hydration = SessionTemporalHydrationAdapter::for_registered_snapshot_with_relations(
             &read_snapshot,
             storage_root,
             &relation_scope,
@@ -1059,160 +1038,142 @@ impl<'db, D: SessionTemporalRegisteredDb + Sync>
     }
 }
 
-impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalExecutionPort
-    for RegisteredGlobalDbSessionTemporalExecution<'_, D>
-{
-    fn execute<'a, E>(
-        &'a self,
-        request: AuthorizedTemporalExecutionRequest,
-        estimator: &'a E,
-    ) -> TemporalExecutionFuture<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a,
-    {
-        Box::pin(self.execute(request, estimator))
-    }
-}
-
-impl<D: SessionTemporalRegisteredDb + Sync> TaskSessionTemporalExecutionPortV1
-    for RegisteredGlobalDbSessionTemporalExecution<'_, D>
-{
-    fn execute_task_session<'a, E>(
-        &'a self,
+impl<D: SessionTemporalRegisteredDb + Sync> RegisteredGlobalDbSessionTemporalExecution<'_, D> {
+    pub async fn execute_task_session<E>(
+        &self,
         request: AuthorizedTaskSessionExecutionRequestV1,
-        selector: &'a dyn TaskSessionRankSelectorV1,
-        estimator: &'a E,
-    ) -> TaskSessionTemporalExecutionFutureV1<'a>
+        selector: &dyn TaskSessionRankSelectorV1,
+        estimator: &E,
+    ) -> Result<TaskSessionTemporalExecutionOutcomeV1, SessionTemporalExecutionError>
     where
-        E: VersionedTokenEstimator + Sync + 'a,
+        E: VersionedTokenEstimator + Sync,
     {
-        Box::pin(async move {
-            hotpath::gauge!("session_temporal.execution").inc(1u32);
-            let (read_snapshot, snapshot, _) = self.freeze(request.temporal()).await?;
-            let authenticator = SessionTemporalCursorKeyProvider::from_registered_snapshot(
-                &read_snapshot,
-                &snapshot,
-            )
-            .await
-            .map_err(|error| {
-                SessionTemporalExecutionError::storage("resolve cursor signing authority", error)
-            })?;
-            let storage_root = self.payload_storage_root()?;
-            let relation_authority = self.db.session_relation_store().ok();
-            let kernel_request = request.temporal().clone().into_kernel_request(snapshot);
-            let read = match &relation_authority {
-                Some((scope, store)) => SessionTemporalReadPort::new_registered_with_relations(
-                    &read_snapshot,
-                    scope,
-                    store.clone(),
-                ),
-                None => SessionTemporalReadPort::new_registered(&read_snapshot),
-            };
-            let hydration = match &relation_authority {
-                Some((scope, store)) => {
-                    GlobalDbTemporalHydrationPort::for_registered_snapshot_with_relations(
-                        &read_snapshot,
-                        storage_root,
-                        scope,
-                        store.clone(),
+        hotpath::gauge!("session_temporal.execution").inc(1u32);
+        let (read_snapshot, snapshot, _) = self.freeze(request.temporal()).await?;
+        let authenticator =
+            SessionTemporalCursorKeyProvider::from_registered_snapshot(&read_snapshot, &snapshot)
+                .await
+                .map_err(|error| {
+                    SessionTemporalExecutionError::storage(
+                        "resolve cursor signing authority",
+                        error,
                     )
-                }
-                None => GlobalDbTemporalHydrationPort::for_registered_snapshot(
+                })?;
+        let storage_root = self.payload_storage_root()?;
+        let relation_authority = self.db.session_relation_store().ok();
+        let kernel_request = request.temporal().clone().into_kernel_request(snapshot);
+        let read = match &relation_authority {
+            Some((scope, store)) => SessionTemporalReadPort::new_registered_with_relations(
+                &read_snapshot,
+                scope,
+                store.clone(),
+            ),
+            None => SessionTemporalReadPort::new_registered(&read_snapshot),
+        };
+        let hydration = match &relation_authority {
+            Some((scope, store)) => {
+                SessionTemporalHydrationAdapter::for_registered_snapshot_with_relations(
                     &read_snapshot,
                     storage_root,
-                ),
-            };
-            let export = execute_temporal_candidate_export(&kernel_request, &read, &authenticator)
-                .await
-                .map_err(map_kernel_execution_error)?;
-            let plan23 = TaskSessionPlan23BindingV1::from_export(&export)
-                .map_err(|error| task_session_callback_contract(error.to_string()))?;
-            let candidate_port = CanonicalTaskSessionCandidateExportPortV1::new(
-                &export,
-                request.retriever_revision().clone(),
-                request.score_domain().clone(),
-                request.policy_revision().clone(),
-            );
-            let lane_request = TaskSessionLaneRequestV1::new(
-                request.retrieval(),
-                request.query(),
-                request.binding(),
-                &plan23,
-                request.control(),
-            );
-            let lane_outcome = TaskSessionLaneRetrieverV1::new(&candidate_port)
-                .execute(&lane_request)
-                .map_err(|error| task_session_callback_contract(error.to_string()))?;
-
-            if let Some(omission) = task_session_reauthorize(
-                selector,
-                request.binding(),
-                TaskSessionReauthorizationStageV1::BeforeSelection,
-            )? {
-                return Ok(TaskSessionTemporalExecutionOutcomeV1::Omitted(omission));
+                    scope,
+                    store.clone(),
+                )
             }
-            let selection = match selector.select(
-                request.binding(),
-                request.retrieval(),
-                request.query(),
-                &lane_outcome,
-            ) {
-                Ok(selection) => selection,
-                Err(error) => {
-                    if let Some(omission) = task_session_callback_omission(
-                        TaskSessionReauthorizationStageV1::BeforeSelection,
-                        error,
-                    )? {
-                        return Ok(TaskSessionTemporalExecutionOutcomeV1::Omitted(omission));
-                    }
-                    return Err(task_session_callback_contract(
-                        "task/session selector returned no outcome".to_owned(),
-                    ));
-                }
-            };
-            if selection.selected_anchors().len()
-                > request.retrieval().budget.max_hydrated_results as usize
-            {
-                return Err(SessionTemporalExecutionError::BudgetExhausted {
-                    stage: SessionRetrievalBudgetStageV1::RequestHydrationLimit,
-                    accounting: Some(SessionRetrievalBudgetAccountingV1 {
-                        limit: u64::from(request.retrieval().budget.max_hydrated_results),
-                        observed: SessionRetrievalBudgetObservationV1::Requested {
-                            units: selection.selected_anchors().len() as u64,
-                        },
-                    }),
-                });
-            }
-            if let Some(omission) = task_session_reauthorize(
-                selector,
-                request.binding(),
-                TaskSessionReauthorizationStageV1::BeforeHydration,
-            )? {
-                return Ok(TaskSessionTemporalExecutionOutcomeV1::Omitted(omission));
-            }
-            let result = hydrate_temporal_candidate_selection(
-                &kernel_request,
-                export,
-                selection.selected_anchors(),
-                &hydration,
-                estimator,
-            )
+            None => SessionTemporalHydrationAdapter::for_registered_snapshot(
+                &read_snapshot,
+                storage_root,
+            ),
+        };
+        let export = execute_temporal_candidate_export(&kernel_request, &read, &authenticator)
             .await
             .map_err(map_kernel_execution_error)?;
-            let source_coverage = result.snapshot.source_coverage().map_err(|error| {
-                SessionTemporalExecutionError::storage("derive source coverage receipt", error)
-            })?;
-            Ok(TaskSessionTemporalExecutionOutcomeV1::Complete(Box::new(
-                TaskSessionTemporalExecutionReportV1 {
-                    binding: request.binding().clone(),
-                    selection,
-                    temporal: SessionTemporalExecutionReport::from_source_coverage(
-                        result,
-                        source_coverage,
-                    ),
-                },
-            )))
-        })
+        let plan23 = TaskSessionPlan23BindingV1::from_export(&export)
+            .map_err(|error| task_session_callback_contract(error.to_string()))?;
+        let candidate_port = CanonicalTaskSessionCandidateExportPortV1::new(
+            &export,
+            request.retriever_revision().clone(),
+            request.score_domain().clone(),
+            request.policy_revision().clone(),
+        );
+        let lane_request = TaskSessionLaneRequestV1::new(
+            request.retrieval(),
+            request.query(),
+            request.binding(),
+            &plan23,
+            request.control(),
+        );
+        let lane_outcome = TaskSessionLaneRetrieverV1::new(&candidate_port)
+            .execute(&lane_request)
+            .map_err(|error| task_session_callback_contract(error.to_string()))?;
+
+        if let Some(omission) = task_session_reauthorize(
+            selector,
+            request.binding(),
+            TaskSessionReauthorizationStageV1::BeforeSelection,
+        )? {
+            return Ok(TaskSessionTemporalExecutionOutcomeV1::Omitted(omission));
+        }
+        let selection = match selector.select(
+            request.binding(),
+            request.retrieval(),
+            request.query(),
+            &lane_outcome,
+        ) {
+            Ok(selection) => selection,
+            Err(error) => {
+                if let Some(omission) = task_session_callback_omission(
+                    TaskSessionReauthorizationStageV1::BeforeSelection,
+                    error,
+                )? {
+                    return Ok(TaskSessionTemporalExecutionOutcomeV1::Omitted(omission));
+                }
+                return Err(task_session_callback_contract(
+                    "task/session selector returned no outcome".to_owned(),
+                ));
+            }
+        };
+        if selection.selected_anchors().len()
+            > request.retrieval().budget.max_hydrated_results as usize
+        {
+            return Err(SessionTemporalExecutionError::BudgetExhausted {
+                stage: SessionRetrievalBudgetStageV1::RequestHydrationLimit,
+                accounting: Some(SessionRetrievalBudgetAccountingV1 {
+                    limit: u64::from(request.retrieval().budget.max_hydrated_results),
+                    observed: SessionRetrievalBudgetObservationV1::Requested {
+                        units: selection.selected_anchors().len() as u64,
+                    },
+                }),
+            });
+        }
+        if let Some(omission) = task_session_reauthorize(
+            selector,
+            request.binding(),
+            TaskSessionReauthorizationStageV1::BeforeHydration,
+        )? {
+            return Ok(TaskSessionTemporalExecutionOutcomeV1::Omitted(omission));
+        }
+        let result = hydrate_temporal_candidate_selection(
+            &kernel_request,
+            export,
+            selection.selected_anchors(),
+            &hydration,
+            estimator,
+        )
+        .await
+        .map_err(map_kernel_execution_error)?;
+        let source_coverage = result.snapshot.source_coverage().map_err(|error| {
+            SessionTemporalExecutionError::storage("derive source coverage receipt", error)
+        })?;
+        Ok(TaskSessionTemporalExecutionOutcomeV1::Complete(Box::new(
+            TaskSessionTemporalExecutionReportV1 {
+                binding: request.binding().clone(),
+                selection,
+                temporal: SessionTemporalExecutionReport::from_source_coverage(
+                    result,
+                    source_coverage,
+                ),
+            },
+        )))
     }
 }
 
@@ -1335,38 +1296,38 @@ async fn session_record_from_frozen_read(
 }
 
 fn map_control_error(
-    error: tracedecay_temporal_query::ports::TemporalPortError,
+    error: tracedecay_temporal_query::execution::TemporalPortError,
 ) -> SessionTemporalExecutionError {
     match error {
-        tracedecay_temporal_query::ports::TemporalPortError::Cancelled => {
+        tracedecay_temporal_query::execution::TemporalPortError::Cancelled => {
             SessionTemporalExecutionError::Cancelled
         }
-        tracedecay_temporal_query::ports::TemporalPortError::DeadlineExceeded => {
+        tracedecay_temporal_query::execution::TemporalPortError::DeadlineExceeded => {
             SessionTemporalExecutionError::DeadlineExceeded
         }
-        tracedecay_temporal_query::ports::TemporalPortError::BudgetExceeded {
+        tracedecay_temporal_query::execution::TemporalPortError::BudgetExceeded {
             resource,
             accounting,
         } => SessionTemporalExecutionError::BudgetExhausted {
             stage: SessionRetrievalBudgetStageV1::for_port_budget_resource(resource),
             accounting: accounting.map(execution::port_budget_accounting),
         },
-        tracedecay_temporal_query::ports::TemporalPortError::ResetRequired { .. } => {
+        tracedecay_temporal_query::execution::TemporalPortError::ResetRequired { .. } => {
             SessionTemporalExecutionError::ResetRequired
         }
-        error @ (tracedecay_temporal_query::ports::TemporalPortError::ParticipantLimitExceeded {
+        error @ (tracedecay_temporal_query::execution::TemporalPortError::ParticipantLimitExceeded {
             ..
-        } | tracedecay_temporal_query::ports::TemporalPortError::ParticipantManifestBytesExceeded {
+        } | tracedecay_temporal_query::execution::TemporalPortError::ParticipantManifestBytesExceeded {
             ..
         }) => SessionTemporalExecutionError::Kernel(
             tracedecay_temporal_query::TemporalKernelError::Port(error),
         ),
         // The caller distinguishes a genuinely source-free root from sources
         // that exist but have not published a searchable generation.
-        tracedecay_temporal_query::ports::TemporalPortError::EmptyParticipantManifest => {
+        tracedecay_temporal_query::execution::TemporalPortError::EmptyParticipantManifest => {
             SessionTemporalExecutionError::Unavailable
         }
-        tracedecay_temporal_query::ports::TemporalPortError::Read { operation, message } => {
+        tracedecay_temporal_query::execution::TemporalPortError::Read { operation, message } => {
             SessionTemporalExecutionError::Storage {
                 operation,
                 detail: message,

@@ -5,11 +5,12 @@ use tracedecay_domain::{
     TemporalAssertionKindV1, TemporalModeV1, TemporalValidityV1,
 };
 
-use super::super::ports::{ExecutionControl, TemporalPortError};
+use super::super::execution::ExecutionControl;
 use super::types::{
     ResolutionAssertion, ResolutionCheckpoint, ResolutionLineageEdge, ResolutionLineageEdgeKind,
     ResolutionOccurrence, ResolvedOccurrence, TemporalResolution,
 };
+use crate::execution::TemporalPortError;
 
 fn checkpoint(
     control: &ExecutionControl,
@@ -125,7 +126,7 @@ struct SccFrame {
 /// Nodes that lie on a cycle within the subgraph induced by `nodes`.
 ///
 /// A node reaches itself iff it belongs to a strongly connected component of
-/// size greater than one, or it carries a self-edge — precisely the set the
+/// size greater than one, or it carries a self-edge, precisely the set the
 /// former per-node reachability DFS ([`cycle_members_among_reference`])
 /// computed, but in a single linear O(V + E) Tarjan pass instead of
 /// O(V * (V + E)). Recursion is expressed with an explicit work stack so deep

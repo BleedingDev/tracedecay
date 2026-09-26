@@ -3,12 +3,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tracedecay_domain::{
-    FreshnessVectorDigest, RetrievalRequest, RetrievalScope, RetrievalSnapshot, SingleRootScopeV1,
-    TemporalModeV1, VectorWatermark,
-};
-use tracedecay_query::code_search;
+use tracedecay_contracts::retrieval::LexicalAnchorDropReasonV1;
+use tracedecay_query::code_search::{self, CodeIndexSearchDisplayV1};
 use tracedecay_query::retrieval::RetrievalPortError;
+use tracedecay_query::retrieval::lexical::LexicalRouteReceiptV1;
 
 use crate::code_index_scheduler;
 use crate::code_index_task_support;
@@ -131,7 +129,7 @@ impl<A> McpRetrievalExecutionControlV1<A> {
         )
     }
 
-    /// Resolves with this request's terminal reason once it settles — the
+    /// Resolves with this request's terminal reason once it settles, the
     /// async twin of [`Self::request_termination`].
     ///
     /// `request_termination` only answers where something asks it, and the
@@ -141,7 +139,7 @@ impl<A> McpRetrievalExecutionControlV1<A> {
     /// on the in-flight decode. A request that settles inside that window has
     /// no checkpoint to unwind at, so the single execution permit stayed held
     /// by work no caller was waiting for, and every following search was
-    /// refused `search_capacity_unavailable` — a refusal the dispatch contract
+    /// refused `search_capacity_unavailable`, a refusal the dispatch contract
     /// advertises as retryable while guaranteeing the retry fails too.
     /// Awaiting this alongside the execution drops the abandoned work at its
     /// current await point and releases the permit with it.
@@ -197,8 +195,8 @@ async fn mcp_search_request_settlement(
 
 /// Await `work` under the request's own deadline and cancellation.
 ///
-/// Every scheduler read an admitted search takes — authority resolution before
-/// the execution permit, text-serving and cursor resolution after it — parks
+/// Every scheduler read an admitted search takes, authority resolution before
+/// the execution permit, text-serving and cursor resolution after it, parks
 /// on the scheduler's mounted map, and none of them consults a request
 /// control while parked. A daemon holding that map across a mount, retire, or
 /// shutdown is exactly the window a settled request waited out with its caller
@@ -239,14 +237,14 @@ async fn settled_or<F: std::future::Future>(
 /// The permit bounds how many scans run at once, not how many requests may
 /// exist. Refusing the loser of a permit race outright answered it with
 /// `CapacityUnavailable`, the same reason a genuinely oversized bounded read is
-/// refused with — so two dashboard family reads fired together made the loser
+/// refused with, so two dashboard family reads fired together made the loser
 /// report that a retained generation exceeded the bounded-read limits. A
 /// request that carries a deadline or a cancellation has said how long it can
 /// wait: it queues on the permit up to that bound and settles with the typed
 /// `TimedOut` or `Cancelled` state if the permit never comes. The semaphore is
 /// tokio's, so the wait parks a future rather than a runtime worker. A request
 /// that carries neither declared no wait budget and is still refused at once
-/// rather than parked behind a holder nothing bounds — the same rule the exact
+/// rather than parked behind a holder nothing bounds, the same rule the exact
 /// scheduler reads apply.
 pub(crate) async fn acquire_execution_permit(
     execution_admission: Arc<tokio::sync::Semaphore>,
@@ -302,76 +300,6 @@ fn search_terminated<A: CodeIndexMcpReadAdmissionV1>(
             "route_revoked",
         )
     })
-}
-
-fn similar_outcome_from_search_termination(
-    outcome: code_search::CodeIndexSearchOutcomeV1,
-) -> code_search::CodeIndexSimilarOutcomeV1 {
-    match outcome {
-        code_search::CodeIndexSearchOutcomeV1::Unavailable(unavailable) => {
-            code_search::CodeIndexSimilarOutcomeV1::Unavailable(unavailable.reason)
-        }
-        // `search_terminated` only emits `Unavailable`; keep this arm explicit so a
-        // future change cannot accidentally publish a search result as similarity.
-        code_search::CodeIndexSearchOutcomeV1::Complete(_) => {
-            code_search::CodeIndexSimilarOutcomeV1::Unavailable(
-                code_search::CodeIndexSearchUnavailableReasonV1::Internal,
-            )
-        }
-    }
-}
-
-fn similar_search_terminated<A: CodeIndexMcpReadAdmissionV1>(
-    control: &McpRetrievalExecutionControlV1<A>,
-    admission_provider: &A,
-) -> Option<code_search::CodeIndexSimilarOutcomeV1> {
-    search_terminated(control, admission_provider, None)
-        .map(similar_outcome_from_search_termination)
-}
-
-fn similar_publication_is_authorized<A, S>(
-    control: &McpRetrievalExecutionControlV1<A>,
-    admission_provider: &A,
-    scope_resolver: &S,
-    project_root: &std::path::Path,
-    project_id: &tracedecay_domain::ProjectId,
-    initial_scope: &tracedecay_contracts::ResolvedScope,
-    expected_authority: &code_search::CodeIndexSearchAuthorityV1,
-) -> Option<code_search::CodeIndexSimilarOutcomeV1>
-where
-    A: CodeIndexMcpReadAdmissionV1,
-    S: CodeIndexScopeResolverV1,
-{
-    if let Some(outcome) = similar_search_terminated(control, admission_provider) {
-        return Some(outcome);
-    }
-    let terminal_scope = match scope_resolver.resolved_scope_for_project(project_root, project_id) {
-        Ok(scope) if scope == *initial_scope => scope,
-        _ => {
-            return Some(code_search::CodeIndexSimilarOutcomeV1::Unavailable(
-                code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-            ));
-        }
-    };
-    let terminal_admission = match admission_provider.admit_current(&terminal_scope) {
-        Ok(admission) => admission,
-        Err(_) => {
-            return Some(code_search::CodeIndexSimilarOutcomeV1::Unavailable(
-                code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-            ));
-        }
-    };
-    let terminal_authority = terminal_admission.search_authority();
-    if terminal_authority != *expected_authority
-        || terminal_admission
-            .authorize(&terminal_scope, Some(&terminal_authority))
-            .is_err()
-    {
-        return Some(code_search::CodeIndexSimilarOutcomeV1::Unavailable(
-            code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-        ));
-    }
-    None
 }
 
 struct CodeIndexSearchHydrationSourceV1<A, P, H> {
@@ -789,7 +717,7 @@ impl<A: CodeIndexMcpReadAdmissionV1> tracedecay_query::retrieval::ports::Retriev
     }
 
     fn elapsed_micros(&self) -> u64 {
-        u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX)
+        tracedecay_runtime_core::tracedecay::saturating_duration_micros(self.started.elapsed())
     }
 }
 
@@ -1089,9 +1017,9 @@ where
                         // The permit follows request settlement, not this
                         // work's natural completion. `work` is polled first, so
                         // an unsettled request behaves exactly as before; a
-                        // settled one is dropped where it stands — including
+                        // settled one is dropped where it stands, including
                         // mid-`mounted.lock()` or mid-decode, the awaits that
-                        // no checkpoint covers — and `_execution_permit` is
+                        // no checkpoint covers, and `_execution_permit` is
                         // released with the task. `settle_owned_blocking_task`
                         // below normally names the precise terminal reason
                         // first; this only keeps the typed state when it did
@@ -1174,7 +1102,8 @@ where
                             ),
                         )
                         | QuerySearchExecutionErrorV1::Retrieval(
-                            tracedecay_query::retrieval::RetrievalPortError::AuthorityUnavailable(_),
+                            tracedecay_query::retrieval::RetrievalPortError::AuthorityUnavailable(_)
+                            | tracedecay_query::retrieval::RetrievalPortError::ResidentMemoryRefused(_),
                         ) => (
                             code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
                             code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable
@@ -1276,6 +1205,14 @@ where
                         "authorization_changed_before_publication",
                     );
                 }
+                // Additive only: the generation-bound lanes all ran against the
+                // admitted generation here, so warm coverage restates what the
+                // existing candidates already mean. Ranking identity, fallback
+                // bytes, and the cursor are untouched. When query admission had to
+                // fall back to the last complete generation because no current one
+                // was admissible, the same lanes are reported stale against the
+                // generation that actually answered. The dense semantic lane, when
+                // requested, records its own coverage entry below.
                 let mut coverage =
                     code_search::CodeIndexSearchCoverageV1::from_fallback_lane_coverage(
                         &executed.authorized.fallback.public_fallback_lane_coverage,
@@ -1619,6 +1556,13 @@ where
                         "authorization_changed_during_publication",
                     );
                 }
+                let mut lexical_routes = executed.lexical_routes;
+                reconcile_served_anchor_sites(
+                    &mut lexical_routes,
+                    &executed.authorized.composition.ranked_candidates,
+                    &ordered_candidates,
+                    &display_by_anchor,
+                );
                 code_search::CodeIndexSearchOutcomeV1::Complete(
                     code_search::CodeIndexSearchCompletedV1 {
                         code_generation: executed.generation.as_str().to_owned(),
@@ -1627,13 +1571,41 @@ where
                         display_by_anchor,
                         next_cursor,
                         coverage,
-                        lexical_routes: executed.lexical_routes,
+                        lexical_routes,
                     },
                 )
             },
             label = "daemon.code_index.search"
         ))
     })
+}
+
+/// Count each caller anchor against the sites this response carries: a
+/// lane-admitted site absent from the hydrated page was removed by the
+/// diversity cap, fell outside the page, or was not hydrated.
+fn reconcile_served_anchor_sites(
+    lexical_routes: &mut LexicalRouteReceiptV1,
+    ranked: &[tracedecay_domain::RankedCandidate],
+    page: &[tracedecay_domain::RankedCandidate],
+    display_by_anchor: &HashMap<tracedecay_domain::RetrievalAnchorId, CodeIndexSearchDisplayV1>,
+) {
+    let contains = |candidates: &[tracedecay_domain::RankedCandidate],
+                    site: &tracedecay_domain::RetrievalAnchorId| {
+        candidates
+            .iter()
+            .any(|ranked| ranked.candidate.anchor_id == *site)
+    };
+    lexical_routes.reconcile_served(|site| {
+        if display_by_anchor.contains_key(site) {
+            None
+        } else if contains(page, site) {
+            Some(LexicalAnchorDropReasonV1::NotHydrated)
+        } else if contains(ranked, site) {
+            Some(LexicalAnchorDropReasonV1::OutsidePage)
+        } else {
+            Some(LexicalAnchorDropReasonV1::DiversityCap)
+        }
+    });
 }
 
 pub fn code_index_similar_executor<A, S>(
@@ -1657,7 +1629,15 @@ where
         let execution_admission = Arc::clone(&execution_admission);
         Box::pin(async move {
             let unavailable = |reason| code_search::CodeIndexSimilarOutcomeV1::Unavailable(reason);
-            if !similar_request_is_valid(&request) {
+            if request.result_limit == 0
+                || request.result_limit
+                    > tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1
+                || request.work_limit < 2
+                || request.work_limit
+                    > tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1 + 1
+                || request.match_classes.is_empty()
+                || (request.cursor.is_some() && request.match_classes.len() != 1)
+            {
                 return unavailable(
                     code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest,
                 );
@@ -1687,30 +1667,22 @@ where
                     );
                 }
             };
-            let terminal_expected_authority =
-                match admission.authorize(&scope, request.authority.as_ref()) {
-                    Ok(authority) => authority,
-                    // The scope is resolved from live daemon state. If the route's
-                    // open-time authority is stale after a checkout, bind this read
-                    // to the authority just admitted, matching the search lane.
-                    Err(CodeIndexMcpAdmissionUnavailableV1::AuthorizationStale) => {
-                        admission.search_authority()
-                    }
-                    Err(_) => {
-                        return unavailable(
-                            code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-                        );
-                    }
-                };
-            let project_root = request.project_root.clone();
+            if admission
+                .authorize(&scope, request.authority.as_ref())
+                .is_err()
+            {
+                return unavailable(
+                    code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
+                );
+            }
             let control = Arc::new(McpRetrievalExecutionControlV1 {
                 started: std::time::Instant::now(),
-                admission_provider: admission_provider.clone(),
+                admission_provider,
                 deadline: request.deadline.clone(),
                 cancellation: request.cancellation.clone(),
             });
-            if let Some(outcome) = similar_search_terminated(&control, &admission_provider) {
-                return outcome;
+            if let Some(reason) = control.request_termination() {
+                return unavailable(reason);
             }
             let permit = match acquire_execution_permit(
                 execution_admission,
@@ -1737,9 +1709,6 @@ where
                     code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
                 );
             };
-            if let Some(outcome) = similar_search_terminated(&control, &admission_provider) {
-                return outcome;
-            }
             match generation.finish_query_owner_warmup_for_request(control.as_ref()) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1747,206 +1716,46 @@ where
                         code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
                     );
                 }
-                Err(error) => return unavailable(map_similar_retrieval_error(error)),
-            }
-            // Clone backfill is retained-worker work after the seat. Kick that
-            // wake before any inline slice so a quiet daemon does not strand
-            // the successor on this request thread. Match the admission —
-            // terminal Corrupt must fail closed before the inline slice.
-            match schedulers.request_query_background_reconcile(&scope).await {
-                code_index_scheduler::CodeIndexReconcileAdmissionV1::Accepted
-                | code_index_scheduler::CodeIndexReconcileAdmissionV1::Unavailable => {}
-                code_index_scheduler::CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(
-                    _,
-                ) => {
-                    return unavailable(
-                        code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired,
-                    );
+                Err(_) => {
+                    return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
                 }
             }
-            match generation.finish_clone_similarity_warmup_for_request(control.as_ref()) {
-                Ok(code_index_scheduler::CloneSimilarityWarmupForRequestV1::Ready) => {}
-                Ok(code_index_scheduler::CloneSimilarityWarmupForRequestV1::Pending) => {
-                    // One bounded slice ran; retained worker owns the rest.
-                    // Surface warming — not a hard GenerationUnavailable miss.
-                    return unavailable(
-                        code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
-                    );
-                }
-                Err(error) => return unavailable(map_similar_retrieval_error(error)),
-            }
-            let query_authority = match schedulers.query_authority_for_scope(&scope).await {
-                Some(authority) => authority,
-                None => {
-                    return unavailable(
-                        code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-                    );
-                }
-            };
-            let metadata = generation.metadata();
-            let manifest = metadata.manifest();
-            let snapshot = metadata.snapshot();
-            if snapshot.repository != scope.repository_id
-                || snapshot.worktree.as_ref() != Some(&scope.worktree_id)
-            {
-                return unavailable(
-                    code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
-                );
-            }
-            let freshness_digest =
-                match FreshnessVectorDigest::new(manifest.snapshot_digest.as_str()) {
-                    Ok(digest) => digest,
-                    Err(_) => {
-                        return unavailable(
-                            code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
-                        );
-                    }
-                };
-            let retrieval_request = RetrievalRequest {
-                principal: terminal_expected_authority.principal.clone(),
-                scope: RetrievalScope {
-                    privacy_domain: manifest.privacy_domain.clone(),
-                    root: SingleRootScopeV1 {
-                        repository: snapshot.repository.clone(),
-                        worktree: snapshot.worktree.clone(),
-                        reference: snapshot.reference.clone(),
-                    },
-                },
-                temporal_mode: TemporalModeV1::Current,
-                snapshot: RetrievalSnapshot {
-                    watermarks: VectorWatermark::default(),
-                    freshness_digest,
-                    authorization_revision: terminal_expected_authority
-                        .authorization_revision
-                        .clone(),
-                    captured_at: manifest.seal.sealed_at,
-                },
-                profile_id: query_authority.profile().profile_id.clone(),
-                budget: query_authority.profile().retrieval_budget,
-            };
-            let snapshot_digest = manifest.snapshot_digest.clone();
-            let now = tracedecay_contracts::clock::now_micros();
             let owners = match generation.production_query_owners_with_budget(
                 &code_index_scheduler::queries::maximum_retrieval_budget(),
             ) {
                 Ok(owners) => owners,
-                Err(error) => return unavailable(map_similar_retrieval_error(error)),
-            };
-            let runtime = tokio::runtime::Handle::current();
-            let execution_control = Arc::clone(&control);
-            let settlement_control = Arc::clone(&control);
-            let query_authority_for_read = Arc::clone(&query_authority);
-            let execution = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                runtime.block_on(async move {
-                    let work = async move {
-                        owners.similar(
-                            &request,
-                            query_authority_for_read.as_ref(),
-                            &retrieval_request,
-                            &snapshot_digest,
-                            now,
-                            execution_control.as_ref(),
-                        )
-                    };
-                    tokio::pin!(work);
-                    tokio::select! {
-                        biased;
-                        output = &mut work => output,
-                        settlement_reason = settlement_control.settled() => {
-                            Err(match settlement_reason {
-                                code_search::CodeIndexSearchUnavailableReasonV1::TimedOut => {
-                                    RetrievalPortError::BudgetExceeded
-                                }
-                                _ => RetrievalPortError::Cancelled,
-                            })
-                        }
-                    }
-                })
-            });
-            let read = match code_index_task_support::settle_owned_blocking_task(
-                execution,
-                std::time::Duration::from_millis(10),
-                || search_terminated(&control, &admission_provider, None),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(_)) => {
-                    return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
+                Err(_) => {
+                    return unavailable(
+                        code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
+                    );
                 }
-                Err(outcome) => return similar_outcome_from_search_termination(outcome),
             };
-            if let Some(outcome) = similar_publication_is_authorized(
-                &control,
-                &admission_provider,
-                &scope_resolver,
-                &project_root,
-                &project_id,
-                &scope,
-                &terminal_expected_authority,
-            ) {
-                return outcome;
+            let read_control = Arc::clone(&control);
+            let read = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                owners.similar(&request, read_control.as_ref())
+            })
+            .await;
+            if let Some(reason) = control.request_termination() {
+                return unavailable(reason);
             }
             match read {
-                Ok(Some(result)) => {
+                Ok(Ok(Some(result))) => {
                     code_search::CodeIndexSimilarOutcomeV1::Complete(Box::new(result))
                 }
-                Ok(None) => code_search::CodeIndexSimilarOutcomeV1::NotFound,
-                Err(error) => unavailable(map_similar_retrieval_error(error)),
+                Ok(Ok(None)) => code_search::CodeIndexSimilarOutcomeV1::NotFound,
+                Ok(Err(RetrievalPortError::Cancelled)) => {
+                    unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Cancelled)
+                }
+                Ok(Err(RetrievalPortError::BudgetExceeded)) => {
+                    unavailable(code_search::CodeIndexSearchUnavailableReasonV1::TimedOut)
+                }
+                Ok(Err(_)) | Err(_) => {
+                    unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal)
+                }
             }
         })
     })
-}
-
-/// Validate the portion of a similar request that can be checked before a
-/// generation is admitted. A cursor is an authenticated lane position, so its
-/// presence does not narrow the request to one match class; the continuation
-/// must retain the complete class set used by its first page.
-fn similar_request_is_valid(request: &code_search::CodeIndexSimilarRequestV1) -> bool {
-    request.result_limit > 0
-        && request.result_limit
-            <= tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1
-        && request.work_limit >= 2
-        && request.work_limit
-            <= tracedecay_query::retrieval::lexical::MAX_CLONE_EXACT_PAGE_MEMBERS_V1 + 1
-        && !request.match_classes.is_empty()
-        && request
-            .cursor
-            .as_deref()
-            .is_none_or(|cursor| !cursor.trim().is_empty())
-}
-
-/// Preserve the typed terminal state emitted by the verified similarity lane.
-///
-/// Similarity is a blocking read, so the executor owns the translation from
-/// the query port's domain to the MCP-facing unavailable reason. Every known
-/// port failure has a retry or caller-actionable meaning; `Internal` is kept
-/// for an unexpected task failure such as a `JoinError`.
-fn map_similar_retrieval_error(
-    error: RetrievalPortError,
-) -> code_search::CodeIndexSearchUnavailableReasonV1 {
-    match error {
-        RetrievalPortError::CapabilityManifestRejected => {
-            code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable
-        }
-        RetrievalPortError::AuthorityUnavailable(_) => {
-            code_search::CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable
-        }
-        RetrievalPortError::GenerationMismatch | RetrievalPortError::StaleEvidence => {
-            code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnavailable
-        }
-        RetrievalPortError::IncompatibleProjection => {
-            code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified
-        }
-        RetrievalPortError::Cancelled => code_search::CodeIndexSearchUnavailableReasonV1::Cancelled,
-        RetrievalPortError::BudgetExceeded => {
-            code_search::CodeIndexSearchUnavailableReasonV1::TimedOut
-        }
-        RetrievalPortError::Contract(_) => {
-            code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest
-        }
-    }
 }
 
 pub fn code_index_redundancy_executor<A, S>(
@@ -2085,28 +1894,6 @@ where
                     return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
                 }
             }
-            match schedulers.request_query_background_reconcile(&scope).await {
-                code_index_scheduler::CodeIndexReconcileAdmissionV1::Accepted
-                | code_index_scheduler::CodeIndexReconcileAdmissionV1::Unavailable => {}
-                code_index_scheduler::CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(
-                    _,
-                ) => {
-                    return unavailable(
-                        code_search::CodeIndexSearchUnavailableReasonV1::CorruptionResetRequired,
-                    );
-                }
-            }
-            match generation.finish_clone_similarity_warmup_for_request(control.as_ref()) {
-                Ok(code_index_scheduler::CloneSimilarityWarmupForRequestV1::Ready) => {}
-                Ok(code_index_scheduler::CloneSimilarityWarmupForRequestV1::Pending) => {
-                    return unavailable(
-                        code_search::CodeIndexSearchUnavailableReasonV1::GenerationUnverified,
-                    );
-                }
-                Err(_) => {
-                    return unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Internal);
-                }
-            }
             let owners = match generation.production_query_owners_with_budget(
                 &code_index_scheduler::queries::maximum_retrieval_budget(),
             ) {
@@ -2117,11 +1904,15 @@ where
                     );
                 }
             };
+            let read_control = Arc::clone(&control);
             let read = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                owners.redundancy(&request, control.as_ref())
+                owners.redundancy(&request, read_control.as_ref())
             })
             .await;
+            if let Some(reason) = control.request_termination() {
+                return unavailable(reason);
+            }
             match read {
                 Ok(Ok(outcome)) => Ok(outcome),
                 Ok(Err(
@@ -2131,6 +1922,9 @@ where
                 ),
                 Ok(Err(RetrievalPortError::Cancelled)) => {
                     unavailable(code_search::CodeIndexSearchUnavailableReasonV1::Cancelled)
+                }
+                Ok(Err(RetrievalPortError::BudgetExceeded)) => {
+                    unavailable(code_search::CodeIndexSearchUnavailableReasonV1::TimedOut)
                 }
                 Ok(Err(RetrievalPortError::Contract(_))) => {
                     unavailable(code_search::CodeIndexSearchUnavailableReasonV1::InvalidRequest)
@@ -2145,7 +1939,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
     use std::sync::atomic::AtomicBool;
 
@@ -2153,7 +1947,7 @@ mod tests {
     use tracedecay_domain::{AuthorizationRevision, PrincipalId, ProjectId};
     use tracedecay_query::code_search::{
         CodeIndexSearchAuthorityV1, CodeIndexSearchOutcomeV1, CodeIndexSearchRequestV1,
-        CodeIndexSearchUnavailableReasonV1, CodeIndexSimilarRequestV1, CodeIndexSimilarTargetV1,
+        CodeIndexSearchUnavailableReasonV1,
     };
     use tracedecay_runtime_core::cancellation::CancellationToken;
 
@@ -2226,118 +2020,6 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-    }
-
-    fn similar_page_request(cursor: Option<&str>) -> CodeIndexSimilarRequestV1 {
-        CodeIndexSimilarRequestV1 {
-            project_root: PathBuf::from("/repo"),
-            target: CodeIndexSimilarTargetV1::SymbolOccurrence(
-                tracedecay_domain::SymbolOccurrenceId::new("symbol.similar")
-                    .expect("symbol occurrence id"),
-            ),
-            source_extent: tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody,
-            match_classes: vec![
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,
-            ],
-            result_limit: 2,
-            work_limit: 3,
-            cursor: cursor.map(str::to_owned),
-            authority: None,
-            deadline: None,
-            cancellation: None,
-        }
-    }
-
-    #[test]
-    fn similar_first_page_accepts_exact_and_near_match_classes() {
-        assert!(similar_request_is_valid(&similar_page_request(None)));
-    }
-
-    #[test]
-    fn similar_second_page_keeps_all_match_classes_with_a_cursor() {
-        let request = similar_page_request(Some("ccclone2.authenticated"));
-        assert!(similar_request_is_valid(&request));
-        assert_eq!(request.match_classes.len(), 2);
-    }
-
-    #[test]
-    fn similar_empty_cursor_is_rejected_before_generation_admission() {
-        assert!(!similar_request_is_valid(&similar_page_request(Some(" "))));
-    }
-
-    #[test]
-    fn similar_stale_generation_is_retryable_generation_unavailable() {
-        for error in [
-            RetrievalPortError::StaleEvidence,
-            RetrievalPortError::GenerationMismatch,
-        ] {
-            assert_eq!(
-                map_similar_retrieval_error(error),
-                CodeIndexSearchUnavailableReasonV1::GenerationUnavailable
-            );
-        }
-    }
-
-    #[test]
-    fn similar_wrong_domain_preserves_authority_unavailable() {
-        assert_eq!(
-            map_similar_retrieval_error(RetrievalPortError::AuthorityUnavailable(
-                "similar source repository authority is unavailable".to_owned(),
-            )),
-            CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable
-        );
-    }
-
-    #[test]
-    fn similar_tampered_cursor_is_invalid_request() {
-        assert_eq!(
-            map_similar_retrieval_error(RetrievalPortError::Contract(
-                "clone cursor authentication failed".to_owned(),
-            )),
-            CodeIndexSearchUnavailableReasonV1::InvalidRequest
-        );
-    }
-
-    #[test]
-    fn similar_cursor_query_mismatch_is_invalid_request() {
-        assert_eq!(
-            map_similar_retrieval_error(RetrievalPortError::Contract(
-                "clone exact cursor does not match its artifact, key, or authority".to_owned(),
-            )),
-            CodeIndexSearchUnavailableReasonV1::InvalidRequest
-        );
-    }
-
-    #[test]
-    fn similar_bounded_interruptions_keep_their_public_reason() {
-        assert_eq!(
-            map_similar_retrieval_error(RetrievalPortError::Cancelled),
-            CodeIndexSearchUnavailableReasonV1::Cancelled
-        );
-        assert_eq!(
-            map_similar_retrieval_error(RetrievalPortError::BudgetExceeded),
-            CodeIndexSearchUnavailableReasonV1::TimedOut
-        );
-    }
-
-    #[test]
-    fn similar_termination_reuses_search_lifecycle_reason() {
-        for reason in [
-            CodeIndexSearchUnavailableReasonV1::Cancelled,
-            CodeIndexSearchUnavailableReasonV1::TimedOut,
-            CodeIndexSearchUnavailableReasonV1::AuthorityUnavailable,
-            CodeIndexSearchUnavailableReasonV1::GenerationUnavailable,
-        ] {
-            let outcome = similar_outcome_from_search_termination(code_index_search_unavailable(
-                reason,
-                "similar_terminated",
-            ));
-            assert!(matches!(
-                outcome,
-                code_search::CodeIndexSimilarOutcomeV1::Unavailable(observed) if observed == reason
-            ));
-        }
     }
 
     #[tokio::test]

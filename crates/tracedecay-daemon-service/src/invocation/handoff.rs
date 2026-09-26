@@ -41,7 +41,7 @@ impl HandoffOpenTargetPort for DaemonHandoffOpenTargets {
                 } => {
                     let selection = tracedecay_contracts::WorkProductSelectionScopeV1::relations(
                         std::collections::BTreeSet::from([
-                            tracedecay_contracts::WorkRelationScopeV1::Repository {
+                            tracedecay_contracts::WorkProductAuthorizedRelationScopeV1::Repository {
                                 project_id: context.scope().project_id.clone(),
                                 repository_id: context.scope().repository_id.clone(),
                             },
@@ -71,7 +71,7 @@ impl HandoffOpenTargetPort for DaemonHandoffOpenTargets {
                             Ok(snapshot.graph().item(task_id).is_some()
                                 && snapshot.graph().version().get() == version.get())
                         }
-                        Err(tracedecay_contracts::WorkProductApplicationErrorV1::NotFoundOrNotAuthorized) => Ok(false),
+                        Ok(tracedecay_contracts::WorkGraphReadV1::Absent { .. }) => Ok(false),
                         Ok(
                             tracedecay_contracts::WorkGraphReadV1::AsOf { .. }
                             | tracedecay_contracts::WorkGraphReadV1::Evolution { .. }
@@ -161,9 +161,9 @@ fn current_feedback_finding(
             .payload
             .ok_or(HandoffOpenTargetError::Unavailable)
             .map(|result| Some(result.finding)),
-        ApplicationOutcome::Preview(_) | ApplicationOutcome::Effect(_) => {
-            Err(HandoffOpenTargetError::Unavailable)
-        }
+        ApplicationOutcome::Preview(_)
+        | ApplicationOutcome::Effect(_)
+        | ApplicationOutcome::Result(_) => Err(HandoffOpenTargetError::Unavailable),
     }
 }
 
@@ -470,7 +470,7 @@ fn complete_handoff_effect(
 /// `EffectId`, an idempotency key and a `DurableEffect` receipt, all of which
 /// assert a committed state change. This operation reads the grant store and
 /// leaves it byte-identical, so it carries an operation receipt and a coverage
-/// claim instead — and the coverage claim is only `Complete` when the
+/// claim instead, and the coverage claim is only `Complete` when the
 /// enumeration did not hit its ceiling.
 fn handoff_evidence(
     registered: &RegisteredWorkRuntime,

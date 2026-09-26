@@ -26,9 +26,9 @@ use tracedecay_domain::configuration::{
 use tracedecay_global_db::configuration::contracts::types::DirectConfigurationMutation;
 use tracedecay_tool_catalog::ApplicationSurfaceOperation;
 
-use crate::project::TraceDecay;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_project::project::TraceDecay;
 
 use tracedecay_mcp::ToolResult;
 use tracedecay_mcp::handlers::dashboard_lcm::DashboardLcmReadAdapter;
@@ -43,8 +43,9 @@ use tracedecay_dashboard_api::{
     DashboardCodeIndexWorkerSettingsFuture, DashboardConfigurationApplyError,
     DashboardConfigurationApplyFuture, DashboardDaemonReadUnavailableV1,
     DashboardHttpRequestControlV1, DashboardProfileCodeIndexWorkerSettingsPort,
-    DashboardScopeSetReadFuture, DashboardStateCompositionV1, bind_dashboard,
-    build_state_with_automation_reconciler, router, validate_dashboard_host,
+    DashboardScopeSetReadFuture, DashboardSessionAuthoritiesV1, DashboardSessionMountV1,
+    DashboardSessionResolutionV1, DashboardSessionResolverV1, DashboardStateCompositionV1,
+    bind_dashboard, build_state_with_automation_reconciler, router, validate_dashboard_host,
 };
 
 #[derive(Clone)]
@@ -92,7 +93,7 @@ impl DashboardProfileCodeIndexWorkerSettingsPort
         let database = self.database.clone();
         let profile_id = self.profile_id.clone();
         Box::pin(async move {
-            crate::config::read_or_initialize_profile_code_index_worker_configuration(
+            tracedecay_project::config::read_or_initialize_profile_code_index_worker_configuration(
                 database,
                 &profile_id,
             )
@@ -134,7 +135,7 @@ impl DashboardProfileCodeIndexWorkerSettingsPort
                 }),
                 Err(_) => {
                     let current =
-                        crate::config::read_or_initialize_profile_code_index_worker_configuration(
+                        tracedecay_project::config::read_or_initialize_profile_code_index_worker_configuration(
                             database,
                             &profile_id,
                         )
@@ -495,7 +496,7 @@ struct RunningDashboard {
     addr: std::net::SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<Result<()>>,
-    completed: Arc<tokio::sync::Notify>,
+    completed: Arc<tokio::sync::Semaphore>,
 }
 
 impl RunningDashboard {
@@ -506,11 +507,20 @@ impl RunningDashboard {
     }
 }
 
-struct DashboardTaskCompletion(Arc<tokio::sync::Notify>);
+/// Closes [`RunningDashboard::completed`] when the serving task's body is
+/// dropped, whether it returned or was cancelled.
+///
+/// The signal is level triggered on purpose. A `Notify::notify_waiters` only
+/// wakes the waiters already registered, and the drop runs strictly before
+/// the runtime marks the `JoinHandle` finished, so a stop that registered in
+/// between observed neither the wake nor `is_finished` and then slept until
+/// its deadline. A closed semaphore is observable by every later waiter:
+/// `is_closed` reports it synchronously and `acquire` resolves at once.
+struct DashboardTaskCompletion(Arc<tokio::sync::Semaphore>);
 
 impl Drop for DashboardTaskCompletion {
     fn drop(&mut self) {
-        self.0.notify_waiters();
+        self.0.close();
     }
 }
 
@@ -532,7 +542,7 @@ async fn take_finished_dashboard_for(project_root: &Path) -> Option<RunningDashb
     let mut manager = get_manager().lock().await;
     if manager
         .get(project_root)
-        .is_some_and(|dashboard| dashboard.task.is_finished())
+        .is_some_and(|dashboard| dashboard.completed.is_closed())
     {
         manager.remove(project_root)
     } else {
@@ -584,19 +594,13 @@ pub(crate) async fn shutdown_dashboard_for_until(
             };
             Arc::clone(&dashboard.completed)
         };
-        let notified = completed.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        if let Some(dashboard) = take_finished_dashboard_for(project_root).await {
-            return join_dashboard(dashboard, exceeded_deadline).await;
-        }
         if exceeded_deadline {
-            notified.as_mut().await;
+            let _ = completed.acquire().await;
             continue;
         }
         tokio::select! {
             biased;
-            () = notified.as_mut() => {}
+            _ = completed.acquire() => {}
             () = tokio::time::sleep_until(deadline) => {
                 let mut manager = get_manager().lock().await;
                 if let Some(dashboard) = manager.get_mut(project_root) {
@@ -648,7 +652,67 @@ pub(crate) async fn shutdown_dashboard() -> Result<()> {
 }
 
 fn dashboard_tool_result(cg: &TraceDecay, args: &Value, payload: &Value) -> ToolResult {
-    generic_tool_result(Some(cg.project_root()), args, payload, vec![])
+    generic_tool_result(
+        Some(&cg.store_layout().response_handle_root),
+        args,
+        payload,
+        vec![],
+    )
+}
+
+/// The session authorities a project server admits; `None` for the core
+/// server of a project whose session store is not admitted yet.
+fn dashboard_session_authorities(
+    project_sessions: Option<RegisteredGlobalDbLeaseV1>,
+    retrieval: Option<(
+        Arc<dyn tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1>,
+        tracedecay_session_memory::context::ResolvedSessionIdentity,
+    )>,
+) -> Option<DashboardSessionAuthoritiesV1> {
+    let project_sessions = project_sessions?;
+    let lcm_read_authority = retrieval
+        .and_then(|(retrieval, identity)| DashboardLcmReadAdapter::new(retrieval, identity))
+        .map(|adapter| {
+            Arc::new(adapter) as Arc<dyn tracedecay_dashboard_api::DashboardLcmReadPortV1>
+        });
+    // Loom's git sources read the session Git evidence rows of the same
+    // registered store.
+    let git_correlation_read_authority = Arc::new(
+        tracedecay_mcp::handlers::dashboard_git_correlation::DashboardGitCorrelationReadAdapter::new(
+            project_sessions.clone(),
+        ),
+    ) as Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>;
+    Some(DashboardSessionAuthoritiesV1 {
+        project_sessions,
+        lcm_read_authority,
+        git_correlation_read_authority: Some(git_correlation_read_authority),
+    })
+}
+
+fn opening_project_sessions(
+    resolver: crate::mcp::server::RetainedProjectServerResolver,
+    project_root: PathBuf,
+) -> DashboardSessionResolverV1 {
+    Arc::new(move || {
+        let resolver = Arc::clone(&resolver);
+        let project_root = project_root.clone();
+        Box::pin(async move {
+            let request =
+                tracedecay_dashboard_api::project_graph::RetainedProjectGraphRequest::for_mounted_root(
+                    project_root,
+                );
+            match resolver(request).await {
+                Ok(Some(server)) => match dashboard_session_authorities(
+                    server.project_session_db(),
+                    server.project_session_retrieval(),
+                ) {
+                    Some(authorities) => DashboardSessionResolutionV1::Ready(authorities),
+                    None => DashboardSessionResolutionV1::Opening,
+                },
+                Ok(None) | Err(_) => DashboardSessionResolutionV1::Unavailable,
+            }
+        })
+    })
 }
 
 #[hotpath::measure(label = "mcp.dashboard.open.total")]
@@ -656,9 +720,12 @@ fn dashboard_tool_result(cg: &TraceDecay, args: &Value, payload: &Value) -> Tool
     clippy::too_many_arguments,
     reason = "Dashboard mounting composes independently optional provider authorities; their absence must remain explicit"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Dashboard handling is one action match onto the composed dashboard readers."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Dashboard handling is one action match onto the composed dashboard readers."
+    )
 )]
 pub(super) async fn handle_dashboard(
     cg: &TraceDecay,
@@ -768,7 +835,7 @@ pub(super) async fn handle_dashboard(
                     "stopping"
                 };
                 // The lookup is keyed by this project's own canonicalized
-                // root, so the reused server always serves *this* project —
+                // root, so the reused server always serves *this* project,
                 // only the host/port the caller asked for may differ from
                 // what is actually bound. `port == 0` means "any port is
                 // fine", so it can never be dishonored.
@@ -789,7 +856,7 @@ pub(super) async fn handle_dashboard(
             }
 
             // Shared construction with the CLI path: resolved LCM/session store
-            // selection included. No catch-up ingest spawn here — the host
+            // selection included. No catch-up ingest spawn here, the host
             // MCP server already swept hookless transcripts at startup.
             let retained_server_resolver =
                 retained_project_server_resolver.as_ref().ok_or_else(|| {
@@ -799,7 +866,7 @@ pub(super) async fn handle_dashboard(
                     }
                 })?;
             let retained_server = retained_server_resolver(
-                crate::mcp::server::RetainedProjectGraphRequest::for_mounted_root(
+                tracedecay_dashboard_api::project_graph::RetainedProjectGraphRequest::for_mounted_root(
                     cg.project_root().to_path_buf(),
                 ),
             )
@@ -898,24 +965,19 @@ pub(super) async fn handle_dashboard(
                         .map(|adapter| Arc::new(adapter) as Arc<dyn DashboardApplicationRuntime>)
                 })
                 .transpose()?;
-            let lcm_read_authority = session_retrieval
-                .zip(session_identity)
-                .and_then(|(retrieval, identity)| DashboardLcmReadAdapter::new(retrieval, identity))
-                .map(|adapter| {
-                    Arc::new(adapter) as Arc<dyn tracedecay_dashboard_api::DashboardLcmReadPortV1>
-                });
-            // Loom's git sources read the verified session-git-evidence
-            // projection through the same registered store; a state composed
-            // without it reports those sources unavailable.
-            let git_correlation_read_authority =
-                registered_project_session_db.as_ref().map(|database| {
-                    Arc::new(
-                        tracedecay_mcp::handlers::dashboard_git_correlation::DashboardGitCorrelationReadAdapter::new(
-                            database.clone(),
-                        ),
-                    )
-                        as Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>
-                });
+            // A request answered by the core server of a project that is still
+            // opening carries no session store; the dashboard then re-asks
+            // the retained server until the full server publishes it.
+            let project_sessions = match dashboard_session_authorities(
+                registered_project_session_db,
+                session_retrieval.zip(session_identity),
+            ) {
+                Some(authorities) => DashboardSessionMountV1::Ready(authorities),
+                None => DashboardSessionMountV1::Opening(opening_project_sessions(
+                    Arc::clone(retained_server_resolver),
+                    requested_root.clone(),
+                )),
+            };
             let code_read_authority = retained_server
                 .admitted_project_scope()
                 .zip(retained_server.code_index_search_authority())
@@ -943,7 +1005,7 @@ pub(super) async fn handle_dashboard(
             crate::hooks::install_dashboard_hook_readiness_projection()?;
             // One fetch covers the served bundle and the advertised build
             // version; both come from the registered product runtime.
-            let product_runtime = crate::product_runtime::product_runtime()?;
+            let product_runtime = tracedecay_project::product_runtime::product_runtime()?;
             let state = build_state_with_automation_reconciler(
                 retained_cg.clone(),
                 DashboardStateCompositionV1 {
@@ -952,10 +1014,8 @@ pub(super) async fn handle_dashboard(
                     code_graph_read_admission,
                     code_graph_projection_read_port,
                     code_read_authority,
-                    registered_project_session_db,
+                    project_sessions,
                     profile_code_index_worker_settings,
-                    lcm_read_authority,
-                    git_correlation_read_authority,
                     delivery_read_authority,
                     registered_savings_db,
                     automation_scheduler_reconciler,
@@ -977,7 +1037,7 @@ pub(super) async fn handle_dashboard(
             let app = router(
                 retained_cg.as_ref(),
                 state,
-                crate::dashboard::spa_router(product_runtime.dashboard()),
+                tracedecay_api::static_dashboard_router(Arc::new(product_runtime.dashboard())),
             )
             .await?;
             let (listener, addr) = bind_dashboard(&host, port).await?;
@@ -985,7 +1045,7 @@ pub(super) async fn handle_dashboard(
             let url = format!("http://{addr}/");
 
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let completed = Arc::new(tokio::sync::Notify::new());
+            let completed = Arc::new(tokio::sync::Semaphore::new(0));
             let task_completion = DashboardTaskCompletion(Arc::clone(&completed));
             let task = tokio::spawn(async move {
                 let _completion = task_completion;

@@ -8,12 +8,8 @@ use serde_json::Value;
 #[cfg(feature = "test-transport")]
 use serde_json::json;
 use std::ffi::OsString;
-#[cfg(feature = "test-transport")]
-use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-#[cfg(feature = "test-transport")]
-use std::process::Command;
 #[cfg(feature = "test-transport")]
 use std::sync::Arc;
 #[cfg(feature = "test-transport")]
@@ -21,16 +17,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "test-transport")]
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::sync::{Mutex, MutexGuard};
 #[cfg(feature = "test-transport")]
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
 #[cfg(feature = "test-transport")]
 use tracedecay::mcp::McpServer;
-use tracedecay::project::TraceDecay;
-#[cfg(feature = "test-transport")]
-use tracedecay::test_support::host_admission::{
-    HostAdmissionTestRuntimeV1, ProjectScopedTestRuntimeV1,
-};
 #[cfg(feature = "test-transport")]
 use tracedecay_domain::errors::TraceDecayError;
 #[cfg(feature = "test-transport")]
@@ -42,13 +32,18 @@ use tracedecay_domain::{
     ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
     ObservationSourceRangeV1, PayloadAccessState, PayloadReferenceV1, ProjectId,
     ProjectionGenerationId, ProjectionOutputOrdinalV1, ProviderId, RetentionClass,
-    RetrievalAnchorRecordV2, RetrievalAnchorRecordV2Parts, SanitizationReceiptId,
+    RetrievalAnchorRecord, RetrievalAnchorRecordParts, SanitizationReceiptId,
     SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
     SessionId, SessionProjectionGenerationV1, UtcMicros, derive_exact_observation_anchor_id,
 };
 #[cfg(feature = "test-transport")]
 use tracedecay_mcp::McpTransport;
 use tracedecay_mcp::ToolResult;
+use tracedecay_project::project::TraceDecay;
+#[cfg(feature = "test-transport")]
+use tracedecay_project::test_support::host_admission::{
+    HostAdmissionTestRuntimeV1, ProjectScopedTestRuntimeV1,
+};
 use tracedecay_runtime_core::storage::PrivateStoreIo;
 #[cfg(feature = "test-transport")]
 use tracedecay_sessions::admission::HostAdmissionScope;
@@ -60,12 +55,51 @@ use tracedecay_store::{
     SessionFrozenWatermarksV1, SessionGenerationActivationRequestV1,
     SessionGenerationRebuildRequestV1, SessionTemporalCapabilitiesV1, SessionTemporalCapabilityV1,
     SessionTemporalProjectionBatchV1, SessionTemporalProjectionStore, SessionTemporalSnapshotV1,
-    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
+    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
 };
 #[cfg(feature = "test-transport")]
-use tracedecay_temporal_query::ports::ExecutionControl;
+use tracedecay_temporal_query::execution::ExecutionControl;
 
-pub(crate) static GLOBAL_DB_ENV_LOCK: Mutex<()> = Mutex::const_new(());
+pub(crate) use crate::common::{ProcessEnvGuard, lock_process_env};
+
+/// `HOME` is one slot shared by every test in this binary, and the two
+/// fixtures that pin it ([`HomeEnvGuard`] and `common::IsolatedEnv`) both
+/// prove they hold `common::PROCESS_ENV_LOCK` to do so. A raw `set_var`
+/// bypasses that proof: the suite once pinned `HOME` under a second, private
+/// mutex and the Hermes bridge read a sibling fixture's home out of `$HOME`.
+#[test]
+fn home_is_pinned_only_through_the_process_env_guard() {
+    let suite = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("mcp_suite");
+    let mut pending = vec![suite.clone()];
+    let mut offenders = Vec::new();
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("read mcp_suite directory") {
+            let path = entry.expect("mcp_suite directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|extension| extension == "rs")
+                && path != suite.join("support.rs")
+            {
+                let source = std::fs::read_to_string(&path).expect("read mcp_suite source");
+                if ["set_var(\"HOME\"", "set_var(\"USERPROFILE\""]
+                    .iter()
+                    .any(|needle| source.contains(needle))
+                {
+                    offenders.push(path);
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "pin HOME through HomeEnvGuard or common::IsolatedEnv, which hold \
+         common::PROCESS_ENV_LOCK; these set it directly: {offenders:?}"
+    );
+}
 
 #[cfg(feature = "test-transport")]
 pub(crate) const MCP_TEST_RESPONSE_CHAR_LIMIT: usize = tracedecay_mcp::MAX_RESPONSE_CHARS;
@@ -87,7 +121,7 @@ const SOURCE_EDIT_TOOL_NAMES: &[&str] = &[
 #[cfg(feature = "test-transport")]
 #[derive(Default)]
 pub(crate) struct CaptureTransport {
-    incoming: Option<String>,
+    pub(crate) incoming: Option<String>,
     pub(crate) output: String,
 }
 
@@ -199,7 +233,7 @@ pub(crate) fn retained_envelope_payload(text: &str) -> Option<Value> {
 ///
 /// Handlers that return `Err` are mapped to a JSON-RPC error rather than an
 /// `isError` tool result (see `crate::mcp::server::tool_errors`), so tests
-/// asserting on infrastructure failures need the envelope, not just `result`.
+/// asserting on infrastructure failures need the full JSON-RPC envelope.
 #[cfg(feature = "test-transport")]
 pub(crate) async fn handle_real_server_tool_call_raw(
     server: &McpServer,
@@ -211,6 +245,20 @@ pub(crate) async fn handle_real_server_tool_call_raw(
             .entry("format".to_string())
             .or_insert_with(|| json!("json"));
     }
+    dispatch_mcp_tool_call(server, tool_name, arguments).await
+}
+
+/// JSON-RPC `tools/call` with the caller's arguments left intact.
+///
+/// [`handle_real_server_tool_call_raw`] inserts `format: "json"` when the
+/// caller omitted it. Production default is markdown, so a journey that
+/// proves that default must dispatch the arguments as the client sent them.
+#[cfg(feature = "test-transport")]
+pub(crate) async fn dispatch_mcp_tool_call(
+    server: &McpServer,
+    tool_name: &str,
+    arguments: Value,
+) -> Value {
     let request = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -253,108 +301,163 @@ pub(crate) async fn warm_code_index_search(server: &McpServer, query: &str) {
     wait_for_code_index_generation(server, query).await;
 }
 
-/// Poll `tracedecay_status` and `tracedecay_search` until the current
-/// worktree generation is sealed and the exact, lexical, and graph lanes
-/// report complete coverage — the same terminal signal daemon journeys
-/// wait on. Ranked matches are not stable while a required lane is still
-/// warming or the search generation has not caught the sealed worktree.
+/// One `tracedecay_status` read held by `wait_for` until the index reaches
+/// `state`; panics unless it ends `reached`.
 #[cfg(feature = "test-transport")]
-pub(crate) async fn wait_for_code_index_generation(server: &McpServer, query: &str) {
-    let mut last_search = Value::Null;
-    let mut last_status = Value::Null;
-    for _ in 0..60 {
-        let status = handle_real_server_tool_call(
-            server,
+pub(crate) async fn wait_for_readiness(server: &McpServer, state: &str, budget: Duration) -> Value {
+    let status = handle_real_server_tool_call(
+        server,
+        "tracedecay_status",
+        json!({
+            "include_branch_diagnostics": false,
+            "include_storage_health": false,
+            "include_session_ingest": false,
+            "include_staleness": false,
+            "wait_for": {
+                "state": state,
+                "timeout_ms": u64::try_from(budget.as_millis()).expect("budget fits u64"),
+            },
+        }),
+    )
+    .await;
+    let status: Value =
+        serde_json::from_str(extract_real_server_text(&status)).expect("typed project status JSON");
+    assert_eq!(
+        status["wait"],
+        json!({ "outcome": "reached" }),
+        "code index never became {state}: {status}"
+    );
+    status
+}
+
+/// [`wait_for_readiness`] over a production composition harness.
+#[cfg(feature = "test-transport")]
+pub(crate) async fn harness_wait_for_readiness(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project_root: &Path,
+    state: &str,
+    budget: Duration,
+) -> Value {
+    let response = harness
+        .call_tool(
+            project_root,
             "tracedecay_status",
             json!({
+                "format": "json",
                 "include_branch_diagnostics": false,
                 "include_storage_health": false,
                 "include_session_ingest": false,
                 "include_staleness": false,
+                "wait_for": {
+                    "state": state,
+                    "timeout_ms": u64::try_from(budget.as_millis()).expect("budget fits u64"),
+                },
             }),
         )
-        .await;
-        last_status = serde_json::from_str(extract_real_server_text(&status))
-            .expect("typed project status JSON");
-        let freshness = &last_status["code_index_freshness"];
-        let status_generation = freshness["worktree"]["latest_generation_id"].as_str();
-
-        let result =
-            handle_real_server_tool_call(server, "tracedecay_search", json!({ "query": query }))
-                .await;
-        last_search =
-            serde_json::from_str(extract_real_server_text(&result)).expect("search payload JSON");
-        let incomplete = common::incomplete_code_index_query_lanes(&last_search);
-        if freshness["status"] == "current"
-            && last_search["reason"].as_str() != Some("authority_unavailable")
-            && last_search["code_generation"].as_str() == status_generation
-            && status_generation.is_some()
-            && incomplete.is_empty()
-        {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    let incomplete = common::incomplete_code_index_query_lanes(&last_search);
-    panic!(
-        "code-index search did not complete lane coverage within the polling budget: incomplete lanes={incomplete:?}; status={last_status}; search={last_search}"
+        .await
+        .expect("production status call");
+    assert!(
+        response.error.is_none(),
+        "status failed: {:?}",
+        response.error
     );
+    let result = response.result.expect("status result");
+    let status: Value = serde_json::from_str(
+        result["content"][0]["text"]
+            .as_str()
+            .expect("status text content"),
+    )
+    .expect("typed project status JSON");
+    assert_eq!(
+        status["wait"],
+        json!({ "outcome": "reached" }),
+        "code index never became {state}: {status}"
+    );
+    status
 }
 
-/// Poll `tracedecay_status` until the exact generation is current and its
-/// native code graph is serving.
-///
-/// `code_index_freshness.status = current` permits a graph that is still
-/// pending or unavailable, so graph-facing fixtures must also observe the
-/// canonical `code_graph_serving.state = ready` publication boundary.
+/// Wait until the current worktree generation serves its native graph, then
+/// require `query` to answer from that generation with every lane complete
+/// and a fresh seat, the same terminal signal daemon journeys use.
+#[cfg(feature = "test-transport")]
+pub(crate) async fn wait_for_code_index_generation(server: &McpServer, query: &str) {
+    let status = wait_for_readiness(server, "ready", Duration::from_secs(30)).await;
+    let generation = status["code_index_freshness"]["worktree"]["latest_generation_id"].as_str();
+    let result =
+        handle_real_server_tool_call(server, "tracedecay_search", json!({ "query": query })).await;
+    let search: Value =
+        serde_json::from_str(extract_real_server_text(&result)).expect("search payload JSON");
+    assert_eq!(search["code_generation"].as_str(), generation, "{search}");
+    assert_eq!(
+        common::incomplete_code_index_query_lanes(&search),
+        Vec::<&str>::new(),
+        "a ready generation left search lanes incomplete: {search}"
+    );
+    assert_eq!(search["freshness"], json!({ "state": "fresh" }), "{search}");
+}
+
+/// Wait until the exact generation is current and its native code graph is
+/// serving.
 #[cfg(feature = "test-transport")]
 pub(crate) async fn wait_for_current_graph(server: &McpServer) {
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let status = handle_real_server_tool_call(
-                server,
-                "tracedecay_status",
-                json!({
-                    "include_branch_diagnostics": false,
-                    "include_storage_health": false,
-                    "include_session_ingest": false,
-                    "include_staleness": false,
-                }),
-            )
-            .await;
-            let status: Value = serde_json::from_str(extract_real_server_text(&status))
-                .expect("typed project status JSON");
-            let freshness = &status["code_index_freshness"];
-            let serving = &freshness["worktree"]["code_graph_serving"];
-            match (
-                freshness["status"].as_str(),
-                serving["state"].as_str(),
-                serving["reason"].as_str(),
-                freshness["worktree"]["staleness_state"].as_str(),
-            ) {
-                (Some("current"), Some("ready"), _, _) => break,
-                (Some("warming"), _, _, _)
-                | (Some("stale"), Some("ready"), _, Some("verifying"))
-                | (_, Some("pending"), _, _)
-                | (_, Some("unavailable"), Some("generation_unavailable"), _) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                (_, Some("refused"), _, _) | (_, _, Some("activation_disabled"), _) => {
-                    panic!("graph readiness was refused: {status}");
-                }
-                actual => panic!("graph readiness became {actual:?}: {status}"),
-            }
-        }
-    })
-    .await
-    .expect("graph did not become current within the publication budget");
+    wait_for_readiness(server, "ready", Duration::from_secs(20)).await;
 }
 
 #[cfg(feature = "test-transport")]
 pub(crate) struct ProductionCompositionFixture {
     pub(crate) harness: ProductionProjectCompositionHarnessV1,
     pub(crate) project_root: PathBuf,
+    _data_dir_guard: common::EnvVarGuard,
+    _global_db_guard: common::EnvVarGuard,
+    _environment: common::IsolatedEnv,
     _isolation: TestTempDir,
+}
+
+#[cfg(feature = "test-transport")]
+impl ProductionCompositionFixture {
+    pub(crate) async fn shutdown(self) {
+        self.harness.shutdown().await;
+    }
+
+    pub(crate) async fn reopen(self) -> Self {
+        let Self {
+            harness,
+            project_root,
+            _data_dir_guard,
+            _global_db_guard,
+            _environment,
+            _isolation,
+        } = self;
+        harness.shutdown().await;
+        drop(_data_dir_guard);
+        drop(_global_db_guard);
+        drop(_environment);
+
+        let (environment, _) = common::IsolatedEnv::acquire().await;
+        let harness = Box::pin(ProductionProjectCompositionHarnessV1::open(
+            _isolation.path(),
+            vec![project_root.clone()],
+        ))
+        .await
+        .expect("reopen production composition");
+        let (data_dir_guard, global_db_guard) = pin_production_composition_profile(&harness);
+        Self {
+            harness,
+            project_root,
+            _data_dir_guard: data_dir_guard,
+            _global_db_guard: global_db_guard,
+            _environment: environment,
+            _isolation,
+        }
+    }
+}
+
+/// `git init`, stage everything, and commit. Identity, hooks, and gc come
+/// from the shared fixture git config so each suite does not fork its own.
+pub(crate) fn commit_worktree(project: &Path, message: &str) {
+    crate::common::fixture::git_run(project, &["init", "-q"]);
+    crate::common::fixture::git_run(project, &["add", "."]);
+    crate::common::fixture::git_run(project, &["commit", "-qm", message]);
 }
 
 #[cfg(feature = "test-transport")]
@@ -369,47 +472,71 @@ pub(crate) async fn production_composition_fixture() -> ProductionCompositionFix
 pub(crate) async fn production_composition_fixture_with_sources(
     write_sources: impl FnOnce(&Path),
 ) -> ProductionCompositionFixture {
+    let (environment, _) = common::IsolatedEnv::acquire().await;
     let isolation = test_temp_dir();
-    let project_root = isolation.path().join("project");
-    fs::create_dir_all(&project_root).expect("production composition project");
-    write_sources(&project_root);
-    let init = Command::new(common::git_program())
-        .args(["init", "-q"])
-        .current_dir(&project_root)
-        .status()
-        .expect("git init");
-    assert!(init.success(), "git init must succeed");
-    let add = Command::new(common::git_program())
-        .args(["add", "."])
-        .current_dir(&project_root)
-        .status()
-        .expect("git add");
-    assert!(add.success(), "git add must succeed");
-    let commit = Command::new(common::git_program())
-        .args([
-            "-c",
-            "user.name=TraceDecay Test",
-            "-c",
-            "user.email=tracedecay@example.invalid",
-            "commit",
-            "-qm",
-            "production composition fixture",
-        ])
-        .current_dir(&project_root)
-        .status()
-        .expect("git commit");
-    assert!(commit.success(), "git commit must succeed");
+    let project_root = seed_production_composition_project(isolation.path(), write_sources);
     let harness = Box::pin(ProductionProjectCompositionHarnessV1::open(
         isolation.path(),
         vec![project_root.clone()],
     ))
     .await
     .expect("production composition harness");
+    let (data_dir_guard, global_db_guard) = pin_production_composition_profile(&harness);
     ProductionCompositionFixture {
         harness,
         project_root,
+        _data_dir_guard: data_dir_guard,
+        _global_db_guard: global_db_guard,
+        _environment: environment,
         _isolation: isolation,
     }
+}
+
+/// Opens a second composition, with its own project and profile, inside the
+/// environment `owner` holds. A second fixture would wait forever on the
+/// process env lock `owner` keeps for its whole lifetime.
+#[cfg(feature = "test-transport")]
+pub(crate) async fn peer_production_composition(
+    _owner: &ProductionCompositionFixture,
+) -> (ProductionProjectCompositionHarnessV1, TestTempDir) {
+    let isolation = test_temp_dir();
+    let project_root = seed_production_composition_project(
+        isolation.path(),
+        fixture::write_indexed_fixture_sources,
+    );
+    let harness = Box::pin(ProductionProjectCompositionHarnessV1::open(
+        isolation.path(),
+        vec![project_root],
+    ))
+    .await
+    .expect("peer production composition harness");
+    (harness, isolation)
+}
+
+#[cfg(feature = "test-transport")]
+fn seed_production_composition_project(
+    isolation_root: &Path,
+    write_sources: impl FnOnce(&Path),
+) -> PathBuf {
+    let project_root = isolation_root.join("project");
+    std::fs::create_dir_all(&project_root).expect("production composition project");
+    write_sources(&project_root);
+    commit_worktree(&project_root, "production composition fixture");
+    project_root
+}
+
+#[cfg(feature = "test-transport")]
+fn pin_production_composition_profile(
+    harness: &ProductionProjectCompositionHarnessV1,
+) -> (common::EnvVarGuard, common::EnvVarGuard) {
+    let profile_root = harness.profile_root();
+    let data_dir_guard = common::EnvVarGuard::set(
+        tracedecay_runtime_core::config::USER_DATA_DIR_ENV,
+        profile_root,
+    );
+    let global_db_guard =
+        common::EnvVarGuard::set(common::GLOBAL_DB_ENV, profile_root.join("global.db"));
+    (data_dir_guard, global_db_guard)
 }
 
 /// Production-mounted source-edit fixture for projects whose exact sources are
@@ -423,49 +550,21 @@ pub(crate) struct ProductionSourceEditFixture {
 #[cfg(feature = "test-transport")]
 pub(crate) async fn init_production_source_edit_project(
     project_root: &Path,
-) -> (ProductionSourceEditFixture, ()) {
+) -> ProductionSourceEditFixture {
     let isolation_root = project_root
         .parent()
         .expect("source-edit project has an isolation parent");
-    let init = Command::new(common::git_program())
-        .args(["init", "-q"])
-        .current_dir(project_root)
-        .status()
-        .expect("git init source-edit fixture");
-    assert!(init.success(), "git init must succeed");
-    let add = Command::new(common::git_program())
-        .args(["add", "."])
-        .current_dir(project_root)
-        .status()
-        .expect("git add source-edit fixture");
-    assert!(add.success(), "git add must succeed");
-    let commit = Command::new(common::git_program())
-        .args([
-            "-c",
-            "user.name=TraceDecay Test",
-            "-c",
-            "user.email=tracedecay@example.invalid",
-            "commit",
-            "-qm",
-            "source edit fixture",
-        ])
-        .current_dir(project_root)
-        .status()
-        .expect("git commit source-edit fixture");
-    assert!(commit.success(), "git commit must succeed");
+    commit_worktree(project_root, "source edit fixture");
     let harness = Box::pin(ProductionProjectCompositionHarnessV1::open(
         isolation_root,
         [project_root.to_path_buf()],
     ))
     .await
     .expect("production source-edit composition");
-    (
-        ProductionSourceEditFixture {
-            harness,
-            project_root: project_root.to_path_buf(),
-        },
-        (),
-    )
+    ProductionSourceEditFixture {
+        harness,
+        project_root: project_root.to_path_buf(),
+    }
 }
 
 #[cfg(feature = "test-transport")]
@@ -581,8 +680,8 @@ pub(crate) async fn handle_tool_call(
     //
     // Every retained-surface tool (LCM, message search, fact store, session
     // and workflow reads) executes through the daemon retained owner in
-    // production, so dispatch it through the registered test server — which
-    // mounts that owner in process — rather than the bare registry path whose
+    // production, so dispatch it through the registered test server, which
+    // mounts that owner in process, rather than the bare registry path whose
     // missing executor truthfully reports the transport as unavailable.
     #[cfg(feature = "test-transport")]
     if tracedecay_contracts::RetainedSurfaceOperation::from_tool_name(tool_name).is_some() {
@@ -960,17 +1059,21 @@ pub(crate) struct HomeEnvGuard {
 }
 
 impl HomeEnvGuard {
-    pub(crate) fn set(home: &Path) -> Self {
+    /// Takes the process-env lock by reference: `HOME` is one process-wide
+    /// slot, so a caller that pins it without holding the lock every other
+    /// fixture holds reads a sibling's home instead of its own.
+    pub(crate) fn set(_process_env: &ProcessEnvGuard, home: &Path) -> Self {
         let previous_home = std::env::var_os("HOME");
         let previous_userprofile = std::env::var_os("USERPROFILE");
-        let previous_data_dir = std::env::var_os(tracedecay::config::USER_DATA_DIR_ENV);
+        let previous_data_dir =
+            std::env::var_os(tracedecay_runtime_core::config::USER_DATA_DIR_ENV);
         let home = canonicalize_test_dir(home);
         unsafe {
             std::env::set_var("HOME", &home);
             std::env::set_var("USERPROFILE", &home);
             std::env::set_var(
-                tracedecay::config::USER_DATA_DIR_ENV,
-                home.join(tracedecay::config::TRACEDECAY_DIR),
+                tracedecay_runtime_core::config::USER_DATA_DIR_ENV,
+                home.join(tracedecay_runtime_core::config::TRACEDECAY_DIR),
             );
         }
         Self {
@@ -993,8 +1096,10 @@ impl Drop for HomeEnvGuard {
                 None => std::env::remove_var("USERPROFILE"),
             }
             match self.previous_data_dir.take() {
-                Some(value) => std::env::set_var(tracedecay::config::USER_DATA_DIR_ENV, value),
-                None => std::env::remove_var(tracedecay::config::USER_DATA_DIR_ENV),
+                Some(value) => {
+                    std::env::set_var(tracedecay_runtime_core::config::USER_DATA_DIR_ENV, value)
+                }
+                None => std::env::remove_var(tracedecay_runtime_core::config::USER_DATA_DIR_ENV),
             }
         }
     }
@@ -1021,18 +1126,18 @@ pub(crate) fn canonicalize_test_db_path(path: &Path) -> PathBuf {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Shared setup
-// ---------------------------------------------------------------------------
 pub(crate) struct TestTempDir {
-    pub(crate) dir: Option<TempDir>,
+    dir: TempDir,
 }
 
 impl TestTempDir {
     pub(crate) fn new() -> Self {
-        Self {
-            dir: Some(TempDir::new().unwrap()),
-        }
+        // Keep fixture paths aligned with macOS's canonical /private/var project roots.
+        #[cfg(target_os = "macos")]
+        let dir = TempDir::new_in(canonicalize_test_dir(&std::env::temp_dir())).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        let dir = TempDir::new().unwrap();
+        Self { dir }
     }
 }
 
@@ -1040,16 +1145,7 @@ impl std::ops::Deref for TestTempDir {
     type Target = TempDir;
 
     fn deref(&self) -> &Self::Target {
-        self.dir.as_ref().expect("test temp dir already kept")
-    }
-}
-
-impl Drop for TestTempDir {
-    fn drop(&mut self) {
-        #[cfg(windows)]
-        if let Some(dir) = self.dir.take() {
-            let _ = dir.keep();
-        }
+        &self.dir
     }
 }
 
@@ -1062,7 +1158,7 @@ pub(crate) struct TestEnv {
     pub(crate) _global_db_guard: GlobalDbEnvGuard,
     // Drop order = declaration order: the env lock must outlive the guards
     // above so their env restores happen while the lock is still held.
-    pub(crate) _env_lock: MutexGuard<'static, ()>,
+    pub(crate) _env_lock: ProcessEnvGuard,
 }
 
 pub(crate) struct TestTraceDecay {
@@ -1152,9 +1248,9 @@ pub(crate) async fn close_test_graph(cg: TestTraceDecay) {
 }
 
 pub(crate) async fn init_test_project(project: &Path) -> (TestTraceDecay, TestEnv) {
-    let env_lock = GLOBAL_DB_ENV_LOCK.lock().await;
+    let env_lock = lock_process_env().await;
     let home = project.join("home");
-    let home_guard = HomeEnvGuard::set(&home);
+    let home_guard = HomeEnvGuard::set(&env_lock, &home);
     let global_db_guard = GlobalDbEnvGuard::set(&home.join(".tracedecay/global.db"));
     let cg = fixture::init_project_from_template(project).await.unwrap();
     (
@@ -1742,14 +1838,14 @@ pub(crate) async fn persist_temporal_lcm_observation_with_access(
     let authorization =
         build_observation_resolution_authorization_v1(&observation, "observation-capture.v1")
             .unwrap();
-    let base_anchor = build_observation_retrieval_anchor_v2(
+    let base_anchor = build_observation_retrieval_anchor(
         &observation,
         projection_generation.clone(),
         ingested_at,
         authorization,
     )
     .unwrap();
-    let anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
+    let anchor = RetrievalAnchorRecord::new(RetrievalAnchorRecordParts {
         target: base_anchor.target().clone(),
         owner: base_anchor.owner().clone(),
         aliases: base_anchor.aliases().to_vec(),
@@ -1825,11 +1921,6 @@ pub(crate) async fn persist_temporal_lcm_observation_with_access(
 }
 
 #[cfg(feature = "test-transport")]
-pub(crate) async fn project_lcm_conn(cg: &TraceDecay) -> Arc<HostAdmissionTestRuntimeV1> {
-    open_active_project_session_db(cg).await
-}
-
-#[cfg(feature = "test-transport")]
 pub(crate) async fn lcm_raw_store_id(cg: &TraceDecay, message_id: &str) -> i64 {
     lcm_raw_store_id_for_provider(cg, "cursor", message_id).await
 }
@@ -1840,7 +1931,7 @@ pub(crate) async fn lcm_raw_store_id_for_provider(
     provider: &str,
     message_id: &str,
 ) -> i64 {
-    project_lcm_conn(cg)
+    open_active_project_session_db(cg)
         .await
         .lcm_load_raw_message_for_test(provider, message_id)
         .await

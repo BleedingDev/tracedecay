@@ -62,13 +62,16 @@ def assert_actions_pinned(name: str, job: dict[str, Any]) -> None:
             fail(f"'{name}' uses unpinned action {uses!r}")
 
 
-def assert_release_trigger(workflow: dict[str, Any]) -> None:
+def assert_master_dispatch_trigger(workflow: dict[str, Any]) -> None:
     triggers = workflow.get("on", workflow.get(True, {}))
-    if not isinstance(triggers, dict) or set(triggers) != {"release", "workflow_dispatch"}:
-        fail("npm publication must ride the GitHub Release trigger plus tag recovery only")
-    release = triggers.get("release")
-    if not isinstance(release, dict) or release.get("types") != ["published"]:
-        fail("the release trigger must fire on published releases only")
+    # A run whose ref is the release tag cannot restore the previous release's
+    # Actions cache. release-please dispatches this workflow on master after
+    # the immutable tag exists, so a `release` trigger is not an allowed path.
+    if not isinstance(triggers, dict) or set(triggers) != {"workflow_dispatch"}:
+        fail(
+            "npm publication must be dispatched on master after the immutable "
+            "tag exists; a tag-ref run cannot restore the release cache"
+        )
     dispatch = triggers.get("workflow_dispatch")
     inputs = dispatch.get("inputs") if isinstance(dispatch, dict) else None
     if not isinstance(inputs, dict) or set(inputs) != {"release_tag"}:
@@ -86,10 +89,10 @@ def assert_build_job(job: dict[str, Any]) -> None:
     steps = job_steps(job)
     for required in (
         "npm install -g npm@12.0.2",
-        "npm ci",
-        "scripts/check-sdk-codegen.sh",
-        "npm run typecheck",
-        "npm test",
+        "pnpm install --frozen-lockfile",
+        "pnpm run contracts:check",
+        "pnpm run typecheck",
+        "pnpm test",
         "npm pack --dry-run --json --ignore-scripts",
         "npm pack --json --ignore-scripts",
         "npm pack npm@12.0.2 --ignore-scripts",
@@ -101,9 +104,9 @@ def assert_build_job(job: dict[str, Any]) -> None:
         if find_step(steps, required) is None:
             fail(f"'{BUILD_JOB}' is missing {required!r}")
 
-    parity_index = find_step(steps, "scripts/check-sdk-codegen.sh")
-    typecheck_index = find_step(steps, "npm run typecheck")
-    tests_index = find_step(steps, "npm test")
+    parity_index = find_step(steps, "pnpm run contracts:check")
+    typecheck_index = find_step(steps, "pnpm run typecheck")
+    tests_index = find_step(steps, "pnpm test")
     dry_run_index = find_step(steps, "npm pack --dry-run --json --ignore-scripts")
     pack_index = find_step(steps, "npm pack --json --ignore-scripts")
     conformance_index = find_step(steps, "TRACEDECAY_SDK_TARBALL")
@@ -204,7 +207,7 @@ def main() -> None:
             )
 
     workflow = yaml.safe_load(text)
-    assert_release_trigger(workflow)
+    assert_master_dispatch_trigger(workflow)
 
     if workflow.get("permissions") != {"contents": "read"}:
         fail("top-level permissions must grant contents: read only")

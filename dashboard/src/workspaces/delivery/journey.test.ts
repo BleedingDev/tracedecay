@@ -1,13 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { DeliveryOverviewV1 } from '../../contracts/generated.ts';
-import { INBOX, OVERVIEW_ALPHA, OVERVIEW_LOCAL_ONLY, T0 } from '../../test/deliveryFixtures.ts';
-import {
-  JOURNEY_GUTTER_WIDTH,
-  JOURNEY_LANES,
-  buildJourney,
-  laneServes,
-  layoutJourney,
-} from './journey.ts';
+import { HEAD_ALPHA, INBOX, OVERVIEW_ALPHA, OVERVIEW_LOCAL_ONLY, T0 } from '../../test/deliveryFixtures.ts';
+import { JOURNEY_LANES, buildJourney, laneServes } from './journey.ts';
 
 const ROW_42 = INBOX.pull_requests[0]!;
 const EDGES_42 = INBOX.membership_edges.filter(
@@ -37,6 +31,42 @@ describe('buildJourney', () => {
     });
   });
 
+  it('counts a quarantined review comment on its provider read with the reason', () => {
+    const pullRequest = OVERVIEW_ALPHA.pull_requests.state === 'ready' ? OVERVIEW_ALPHA.pull_requests.value.items[0]! : null;
+    const read = pullRequest!.operations[0]!;
+    const threadsRead = {
+      operation: 'review_threads' as const,
+      latest_attempt: null,
+      last_complete: {
+        ...read.last_complete!,
+        quarantined: [{ comment_id: '4069777906', reason: 'privacy_sanitizer' as const }],
+      },
+    };
+    const overview: DeliveryOverviewV1 = {
+      ...OVERVIEW_ALPHA,
+      pull_requests: {
+        state: 'ready',
+        value: {
+          expected_head_commit: HEAD_ALPHA,
+          retained_head_commit: HEAD_ALPHA,
+          total_retained: 1,
+          truncated: false,
+          items: [{ ...pullRequest!, operations: [read, threadsRead] }],
+        },
+      },
+    };
+    const lane = buildJourney(overview, { row: ROW_42, edges: EDGES_42 }).lanes.find(
+      (candidate) => candidate.id === 'pull_request',
+    )!;
+    expect(lane.episodes.slice(1).map((episode) => [episode.label, episode.detail])).toEqual([
+      ['pull request read', `complete · complete · head ${HEAD_ALPHA.slice(0, 12)}`],
+      [
+        'review threads read',
+        `complete · complete · 1 quarantined (privacy sanitizer) · head ${HEAD_ALPHA.slice(0, 12)}`,
+      ],
+    ]);
+  });
+
   it('places membership-joined records in the undated gutter with their own grade', () => {
     const model = buildJourney(OVERVIEW_ALPHA, { row: ROW_42, edges: EDGES_42 });
     const byLane = new Map(model.lanes.map((lane) => [lane.id, lane]));
@@ -52,19 +82,75 @@ describe('buildJourney', () => {
       at: null,
       href: '/loom?loomSession=session.alpha.1',
     });
-    expect(model.undated).toBe(2);
+    // Objective, session, and the two agent-usage rows carry no event time.
+    expect(model.undated).toBe(4);
   });
 
   it('keeps an unjoined lane as a typed absence, not an empty success', () => {
-    const model = buildJourney(OVERVIEW_ALPHA, { row: ROW_42, edges: [] });
+    const model = buildJourney(
+      {
+        ...OVERVIEW_ALPHA,
+        agent_usage: {
+          state: 'not_published',
+          reason: 'no session has recorded a Git branch span yet',
+          required_authority: 'session-Git correlation index',
+        },
+      },
+      { row: ROW_42, edges: [] },
+    );
     const agents = model.lanes.find((lane) => lane.id === 'agents')!;
-    expect(agents.state.kind).toBe('unavailable');
+    expect(agents.state).toMatchObject({
+      kind: 'not_published',
+      requiredAuthority: 'session-Git correlation index',
+    });
     expect(laneServes(agents.state)).toBe(false);
+    expect(agents.episodes).toEqual([]);
     const releases = model.lanes.find((lane) => lane.id === 'releases')!;
     expect(releases.state).toMatchObject({
       kind: 'not_published',
       requiredAuthority: 'github_read_authority',
     });
+  });
+
+  it("puts per-agent token and tool-call counts on the pull request's branch", () => {
+    const model = buildJourney(OVERVIEW_ALPHA, { row: ROW_42, edges: [] });
+    const agents = model.lanes.find((lane) => lane.id === 'agents')!;
+    expect(agents.state.kind).toBe('served');
+    expect(agents.episodes.map((episode) => [episode.label, episode.detail, episode.grade])).toEqual([
+      ['planner', 'claude · 2 sessions · 21,500 tokens · 41 tool calls', 'inferred'],
+      // A session without provider usage keeps its tool calls and says so,
+      // rather than printing zero tokens.
+      ['Unattributed codex sessions', 'codex · 1 session · tokens not reported · 6 tool calls', 'inferred'],
+    ]);
+  });
+
+  it('does not attribute usage read for another branch to this pull request', () => {
+    const model = buildJourney(OVERVIEW_ALPHA, {
+      row: { ...ROW_42, branch_ref: 'refs/heads/feature/retry' },
+      edges: [],
+    });
+    const agents = model.lanes.find((lane) => lane.id === 'agents')!;
+    expect(agents.episodes).toEqual([]);
+    expect(agents.state.kind).toBe('unavailable');
+    expect(agents.state.detail).toMatch(/read for the checkout's branch feature\/delivery, not this pull request's head feature\/retry/);
+  });
+
+  it('names why agent usage is partial', () => {
+    const usage = OVERVIEW_ALPHA.agent_usage.state === 'ready' ? OVERVIEW_ALPHA.agent_usage.value : null;
+    const model = buildJourney(
+      {
+        ...OVERVIEW_ALPHA,
+        agent_usage: { state: 'partial', value: { ...usage!, usage_coverage: 'unavailable', truncated: true } },
+      },
+      { row: ROW_42, edges: [] },
+    );
+    const agents = model.lanes.find((lane) => lane.id === 'agents')!;
+    expect(agents.state).toEqual({
+      kind: 'partial',
+      detail:
+        'Agent usage: the correlation read reached its session ceiling; provider usage coverage is unavailable, so token counts are lower bounds',
+    });
+    expect(agents.episodes).toHaveLength(2);
   });
 
   it('reports the selected pull request missing from the head-bound page as a gap', () => {
@@ -99,84 +185,5 @@ describe('buildJourney', () => {
       releases: 'not_published',
     });
     expect(model.span).toEqual({ start: T0 + 3_600_000_000, end: T0 + 3 * 3_600_000_000 });
-  });
-});
-
-describe('layoutJourney', () => {
-  it('is deterministic and never invents a timestamp for an undated record', () => {
-    const model = buildJourney(OVERVIEW_ALPHA, { row: ROW_42, edges: EDGES_42 });
-    const first = layoutJourney(model, { width: 900 });
-    const second = layoutJourney(model, { width: 900 });
-    expect(second).toEqual(first);
-    expect(first.gutterWidth).toBe(JOURNEY_GUTTER_WIDTH);
-    for (const point of first.points) {
-      if (point.episode.at === null) {
-        expect(point.x).toBeLessThan(first.gutterWidth);
-      } else {
-        expect(point.x).toBeGreaterThanOrEqual(first.gutterWidth);
-      }
-    }
-  });
-
-  it('orders dated points by recorded time and keeps lane rows fixed', () => {
-    const model = buildJourney(OVERVIEW_ALPHA, { row: ROW_42, edges: [] });
-    const layout = layoutJourney(model, { width: 900 });
-    expect(layout.gutterWidth).toBe(0);
-    const dated = layout.points
-      .filter((point) => point.episode.at !== null)
-      .sort((left, right) => (left.episode.at as number) - (right.episode.at as number));
-    for (let index = 1; index < dated.length; index += 1) {
-      expect(dated[index]!.x).toBeGreaterThanOrEqual(dated[index - 1]!.x);
-    }
-    const commitsRow = layout.rows.find((row) => row.lane.id === 'commits')!;
-    for (const point of layout.points.filter((p) => p.episode.lane === 'commits')) {
-      expect(point.y).toBe(commitsRow.y);
-    }
-    expect(layout.ticks.length).toBeGreaterThan(1);
-    expect(layout.ticks.length).toBeLessThanOrEqual(9);
-  });
-
-  it('fans out same-instant marks on one lane instead of overprinting them', () => {
-    const layout = layoutJourney(buildJourney(OVERVIEW_ALPHA, { row: ROW_42, edges: [] }), { width: 900 });
-    const reviews = layout.points.filter((point) => point.episode.lane === 'reviews');
-    const row = layout.rows.find((candidate) => candidate.lane.id === 'reviews')!;
-    expect(reviews).toHaveLength(2);
-    expect(reviews[0]!.x).toBe(reviews[1]!.x);
-    expect(new Set(reviews.map((point) => point.y)).size).toBe(2);
-    expect(reviews.map((point) => Math.abs(point.y - row.y)).sort()).toEqual([0, 9]);
-    for (const tick of layout.ticks.slice(1)) {
-      const previous = layout.ticks[layout.ticks.indexOf(tick) - 1]!;
-      expect(tick.x - previous.x).toBeGreaterThanOrEqual(44);
-    }
-  });
-
-  it('compresses long empty time into a visible break', () => {
-    const late: DeliveryOverviewV1 = {
-      ...OVERVIEW_ALPHA,
-      releases: {
-        state: 'ready',
-        value: {
-          truncated: false,
-          items: [
-            {
-              id: 'release.v1',
-              label: 'v1.0.0',
-              name: 'v1.0.0',
-              tag: 'v1.0.0',
-              draft: false,
-              prerelease: false,
-              release_id: 1,
-              source_url: 'https://github.com/example/alpha/releases/v1.0.0',
-              created_at_micros: T0 + 400 * 3_600_000_000,
-              published_at_micros: T0 + 400 * 3_600_000_000,
-              assets: [],
-            },
-          ],
-        },
-      },
-    };
-    const layout = layoutJourney(buildJourney(late, { row: ROW_42, edges: [] }), { width: 900 });
-    expect(layout.breaks).toHaveLength(1);
-    expect(layout.breaks[0]!.toMicros).toBe(T0 + 400 * 3_600_000_000);
   });
 });

@@ -18,6 +18,7 @@ import {
   fittedWindowFor,
   layoutTemporalScene,
 } from '../../viz/temporal/layout.ts';
+import { densityIndex, layoutDensity, membershipKey } from '../../viz/temporal/density.ts';
 import { glyphLabel } from '../../viz/temporal/glyphs.tsx';
 import { TemporalScene } from '../../viz/temporal/TemporalScene.tsx';
 import type {
@@ -55,7 +56,7 @@ import {
 } from '../../contracts/generated.ts';
 
 /**
- * Loom — the temporal execution field.
+ * Loom, the temporal execution field.
  *
  * Time runs left to right. Hierarchy runs down: provider rail, root session,
  * then subagents under their recorded parent. Every coordinate is produced by
@@ -63,10 +64,12 @@ import {
  * field on every reload and in every renderer; the scene only paints it.
  *
  * What is drawn is what an authority served: session extents from the store,
- * parentage from the subagent tree, commits and branch spans from the durable
+ * parentage from each session row's own parent columns cross-checked against
+ * the subagent tree, commits, timed edits and branch spans from the durable
  * relation rows, the selected session's turns from its loaded transcript page.
- * Handoffs, results and rejoins have no session-bound authority in this read,
- * so branches end at their recorded extent and the legend says so.
+ * Handoffs and results have no session-bound authority in this read; a join
+ * is drawn only where a child ends inside its parent's measured extent, and
+ * it is graded inferred.
  */
 export function LoomPage() {
   const scope = useScope((state) => state.scope);
@@ -247,6 +250,12 @@ function TemporalBody({
       }),
     [projection, width, window, zoom, collapsed, expanded, selectedLane, playback.active, playback.state.followLive, playback.reveal, hiddenKinds],
   );
+  // The index reads only the page, the bundle membership (keyed, since
+  // `model` changes with every window), the filters and the cursor; a window
+  // change re-bins it and nothing more.
+  const membership = membershipKey(model);
+  const index = useMemo(() => densityIndex(projection, model, { reveal: playback.reveal, hiddenKinds }), [projection, membership, playback.reveal, hiddenKinds]);
+  const density = useMemo(() => layoutDensity(index, model), [index, model]);
 
   const update = (mutate: (next: URLSearchParams) => void) => {
     const next = new URLSearchParams(params);
@@ -264,10 +273,9 @@ function TemporalBody({
   const toggleBranch = (laneId: string) =>
     update((search) => {
       const lane = model.lanes.find((candidate) => candidate.id === laneId);
-      const dense = model.denseDefault;
-      const isRoot = (projection.lanes.find((candidate) => candidate.id === laneId)?.depth ?? 0) === 0;
-      if (dense && isRoot) {
-        // On a dense page a root starts collapsed; the explicit sets record
+      const depth = projection.lanes.find((candidate) => candidate.id === laneId)?.depth ?? 0;
+      if (model.denseDepth !== null && depth === model.denseDepth) {
+        // On a dense page this level starts collapsed; the explicit sets record
         // the reader's departure from that default in either direction.
         const currentlyCollapsed = lane?.kind === 'bundle';
         const nextExpanded = new Set(expanded);
@@ -316,6 +324,7 @@ function TemporalBody({
       case 'session_start':
       case 'session_end':
       case 'commit':
+      case 'file_edit':
         if (node.laneId !== selectedLane?.id) onSelect(node.laneId);
         return;
       default: {
@@ -426,7 +435,7 @@ function TemporalBody({
             <TemporalScene
               model={model}
               ariaLabel={fieldDescription(projection, model)}
-              tailLabel="LOADED END"
+              density={density}
               fullWindow={fullWindow}
               reducedMotion={reduced}
               onMeasure={setWidth}
@@ -443,9 +452,13 @@ function TemporalBody({
                 : !hierarchy?.available || hierarchy.error
                   ? 'unavailable'
                   : `${hierarchy.truncated ? 'partial' : 'loaded'} · ${hierarchy.missing_parent_count} missing parents · ${hierarchy.cycle_count} cycles`}
-              . Spawn curves leave the parent at the child session&apos;s recorded start;
-              no handoff, result or rejoin is drawn because no session-bound authority
-              serves one in this read. Only this temporal page is drawn.
+              . A fork leaves the parent on its spawning tool call, graded exact, when the
+              host recorded that call and the parent&apos;s transcript is selected; otherwise
+              it leaves at the child session&apos;s recorded start, graded inferred. A
+              session row and the subagent tree that disagree are both drawn, ambiguous.
+              A join is inferred only where a child ends inside its parent&apos;s measured
+              extent; no handoff or result authority serves one. Only this temporal page
+              is drawn.
             </p>
 
             {selectedJourneyLane ? (
@@ -597,7 +610,7 @@ function FieldControls({
   const { counts } = model;
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border border-edge-subtle px-2 py-1 text-3xs">
-      <div className="flex items-center gap-2" role="group" aria-label="Loaded tail">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1" role="group" aria-label="Loaded tail">
         {following ? (
           <span className="border border-accent/40 px-1.5 py-0.5 td-legend text-accent" data-follow="following">
             following loaded tail
@@ -612,9 +625,9 @@ function FieldControls({
             RETURN TO LOADED TAIL
           </button>
         )}
-        <span className="text-text-muted">LOADED END = newest record in this page · not a live stream</span>
+        <span className="text-text-muted max-sm:basis-full">NOW = newest record in this loaded page · not a live stream</span>
       </div>
-      <div className="flex items-center gap-1" role="group" aria-label="Semantic zoom">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1" role="group" aria-label="Semantic zoom">
         <span className="td-legend">zoom</span>
         {(['workstream', 'agent'] as const).map((level) => (
           <button
@@ -624,7 +637,7 @@ function FieldControls({
             disabled={selected}
             onClick={() => onZoom(level)}
             className={cn(
-              'td-hit border px-1.5 td-legend',
+              'td-hit border px-2 td-legend',
               zoom === level ? 'border-accent/60 text-accent' : 'border-edge-subtle text-text-secondary',
               selected && 'text-text-muted',
             )}
@@ -632,7 +645,7 @@ function FieldControls({
             {level}
           </button>
         ))}
-        <span className="text-text-muted">{selected ? 'event · selected session expanded, others compressed' : zoom === 'workstream' ? 'bundles per root session' : 'one lane per session'}</span>
+        <span className="text-text-muted max-sm:basis-full">{selected ? 'event · selected session expanded, others compressed' : zoom === 'workstream' ? 'bundles where the work first fans out' : 'one lane per session'}</span>
       </div>
       <fieldset className="flex flex-wrap items-center gap-1" aria-label="Event filters">
         <legend className="sr-only">Event filters</legend>
@@ -727,7 +740,7 @@ function freshnessKind(
 
 /** The field, printed. A reader cannot infer from the picture what each axis
  * and line style encodes, so both are stated in the same words the layout
- * uses — and the counts come from the same model, not a second tally. */
+ * uses, and the counts come from the same model, not a second tally. */
 function FieldCaption({
   projection,
   model,
@@ -759,20 +772,21 @@ function FieldCaption({
         sits under its recorded parent in preorder. Thickness is the session&apos;s
         message count on a log scale. A lane drawn solid to its right edge has a
         served end; a lane ending in a dashed segment ends at its last message
-        observation; a lane ending in a dotted stub has no measured extent —{' '}
+        observation; a lane ending in a dotted stub has no measured extent, {' '}
         <span className="text-text-secondary">
           {stats.openEnded} of {stats.lanes} sessions have no recorded end or later
           message observation.
         </span>{' '}
         {stats.hollow > 0
-          ? `${stats.hollow} ${stats.hollow === 1 ? 'is a session the store reports' : 'are sessions the store reports'} at zero messages — a reading, not a gap. `
+          ? `${stats.hollow} ${stats.hollow === 1 ? 'is a session the store reports' : 'are sessions the store reports'} at zero messages, a reading, not a gap. `
           : ''}
         {stats.undated > 0
           ? `${stats.undated} ${stats.undated === 1 ? 'row' : 'rows'} carried no usable start time and ${stats.undated === 1 ? 'is' : 'are'} not on the field at all. `
           : ''}
-        A spawn curve leaves a parent lane at the child&apos;s recorded start and is
-        drawn only for a recorded parent identity in this page; handoffs, results
-        and rejoins are unavailable in this read. {model.counts.lanesCollapsed > 0
+        A fork leaves a parent lane at the child&apos;s recorded start and is drawn
+        only for a recorded parent identity in this page; a join is inferred only
+        from a child ending inside its parent&apos;s measured extent, and handoffs
+        and results are unavailable in this read. {model.counts.lanesCollapsed > 0
           ? `${model.counts.lanesCollapsed} ${model.counts.lanesCollapsed === 1 ? 'branch is' : 'branches are'} collapsed into bundles whose counts include every descendant session. `
           : ''}
         Lane spacing is presentation only.
@@ -785,7 +799,7 @@ function fieldDescription(projection: JourneyProjection, model: TemporalSceneMod
   const providers = projection.stats.providers
     .map((provider) => `${provider.lanes} on ${provider.id}`)
     .join(', ');
-  return `Temporal execution field: ${projection.stats.lanes} sessions as horizontal lanes, time running left to right, hierarchy down by provider rail and recorded parent; providers ${providers || 'none'}. ${projection.stats.openEnded} have no recorded extent and are drawn open. ${projection.relations.length} recorded spawn relations are drawn as curves at the child's start; handoff and rejoin remain unavailable. ${model.counts.lanesCollapsed} branches are collapsed into bundles. The branch navigator table below is the accessible equivalent.`;
+  return `Temporal execution field: ${projection.stats.lanes} sessions as horizontal lanes, time running left to right, hierarchy down by provider rail and recorded parent; providers ${providers || 'none'}. ${projection.stats.openEnded} have no recorded extent and are drawn open. ${projection.relations.filter((relation) => relation.kind === 'spawn').length} recorded forks are drawn on the spawning tool call when the loaded parent transcript carries it, otherwise at the child's start, and ${projection.relations.filter((relation) => relation.kind === 'rejoin').length} inferred joins where a child ends inside its parent; handoff and result remain unavailable. ${model.counts.lanesCollapsed} branches are collapsed into bundles. The branch navigator table below is the accessible equivalent.`;
 }
 
 /** Composed empty state: the frame stays, so an empty field reads as an
@@ -804,7 +818,7 @@ function EmptyField({ undated, rows }: { undated: number; rows: number }) {
         <p className="text-xs leading-relaxed text-text-muted">
           {rows === 0
             ? 'The session store answered and holds no sessions in this scope.'
-            : `The store returned ${rows} ${rows === 1 ? 'session' : 'sessions'}, but ${undated} carried no usable start time — there is no honest position on the time axis for a session that never recorded when it began.`}{' '}
+            : `The store returned ${rows} ${rows === 1 ? 'session' : 'sessions'}, but ${undated} carried no usable start time, there is no honest position on the time axis for a session that never recorded when it began.`}{' '}
           <span className="text-text-secondary">
             Lanes appear as soon as the store records a start time.
           </span>

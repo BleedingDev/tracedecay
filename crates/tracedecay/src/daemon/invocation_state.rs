@@ -5,6 +5,7 @@
 //! explicitly, including the `multi_root_family_allows` kill-switch.
 
 use std::sync::Arc;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 use serde_json::Value;
 use tracedecay_code_index_runtime::code_index_scheduler;
@@ -30,6 +31,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_store_runtime::ShutdownStatus;
 
 use super::*;
+use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 mod project_invocation;
@@ -109,10 +111,11 @@ impl DaemonInvocationState {
         database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
         profile_id: &tracedecay_domain::configuration::UserProfileId,
     ) -> Result<tracedecay_code_index::parallelism::InstalledCodeIndexWorkerPlanV1> {
-        let configured = crate::config::read_or_initialize_profile_code_index_worker_selection(
-            database, profile_id,
-        )
-        .await?;
+        let configured =
+            tracedecay_project::config::read_or_initialize_profile_code_index_worker_selection(
+                database, profile_id,
+            )
+            .await?;
         self.install_worker_selection(store_administration, configured)
     }
 
@@ -135,8 +138,8 @@ impl DaemonInvocationState {
 
     /// Charge one already-resolved worker selection against this daemon's own
     /// resident-memory authority, then mount the process resources session
-    /// preparation meters against — that same resident-memory authority and
-    /// the background CPU authority the plan installed — into the store
+    /// preparation meters against, that same resident-memory authority and
+    /// the background CPU authority the plan installed, into the store
     /// administration's session runtimes. Keeping both steps here means the
     /// persisted-profile path, the production harness, and every in-process
     /// test engine install the exact same plan for the same selection and can
@@ -360,9 +363,9 @@ impl DaemonInvocationState {
         graph_publication_database: Arc<tracedecay_runtime_core::db::Database>,
     ) -> Result<()> {
         // Code-index identity is anchored on the project root's own git
-        // repository (`IndexingIdentityV1::resolve` uses `gix::open` on the
+        // repository (`IndexingIdentityV1::resolve` uses `git_open::open` on the
         // root, no upward discovery). A non-git project has no code-index
-        // identity by design: skip mounting instead of failing project open —
+        // identity by design: skip mounting instead of failing project open,
         // every non-code-index surface stays available.
         let git_control = project_root.join(".git");
         if !git_control.is_dir() && !git_control.is_file() {
@@ -376,8 +379,7 @@ impl DaemonInvocationState {
             hotpath::gauge!("daemon.invocation_state.code_index_mount.skipped_total").inc(1_u64);
             return Ok(());
         }
-        let canonical_project_root = project_root
-            .canonicalize()
+        let canonical_project_root = canonical_existing_identity(project_root)
             .unwrap_or_else(|_| project_root.to_path_buf());
         self.code_index_schedulers
             .mount_worktree_with_graph_runtime(
@@ -438,9 +440,12 @@ impl DaemonInvocationState {
 
     #[allow(clippy::too_many_arguments)]
     #[hotpath::measure(label = "daemon.invocation_state.multi_root_execute", future = true)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Multi-root execute is one scoped dispatch across the admitted root set."
+    #[cfg_attr(
+        not(feature = "hotpath"),
+        expect(
+            clippy::too_many_lines,
+            reason = "Multi-root execute is one scoped dispatch across the admitted root set."
+        )
     )]
     pub(super) async fn execute_multi_root_for_project(
         &self,
@@ -632,7 +637,9 @@ impl DaemonInvocationState {
             // scope; resolving only by project id aliases every linked scope
             // back to the project's primary checkout.
             let root = locator.canonical_root.clone();
-            if !root.is_absolute() || root.canonicalize().ok().as_ref() != Some(&root) {
+            if !root.is_absolute()
+                || canonical_existing_identity(&root).ok().as_ref() != Some(&root)
+            {
                 let Ok(generation) = unavailable_root_generation(
                     scope,
                     tracedecay_domain::ScopeUnavailableReasonV1::RootMissing,
@@ -1046,7 +1053,7 @@ impl DaemonInvocationState {
 
     /// Close every invocation admission gate that can be closed without
     /// awaiting, so no new provider, code-index, or project-runtime work is
-    /// admitted once shutdown has been *requested* — not merely once this
+    /// admitted once shutdown has been *requested*, not merely once this
     /// owner's drain phase is reached.
     ///
     /// The invocation owner sits behind the producer phase in the daemon
@@ -1096,7 +1103,7 @@ impl DaemonInvocationState {
         // unwinding. The registry retains its worker until a retry joins it;
         // an incomplete sweep must keep the outer shutdown receipt unclean.
         let schedulers_timed_out = tokio::time::timeout(
-            super::DAEMON_TASK_ABORT_DEADLINE,
+            DAEMON_TASK_ABORT_DEADLINE,
             self.code_index_schedulers.shutdown(),
         )
         .await

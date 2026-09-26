@@ -46,7 +46,8 @@ pub use results::{
     LcmPayloadGcStatusV1, LcmPayloadStatusV1, LcmRawMessageMetadataV1, LcmRawMessageOverviewV1,
     LcmRawMessageV1, LcmRedactionStatusV1, LcmRetrievalOutcomeV1, LcmSourcePaginationV1,
     LcmSourceRefV1, LcmStatusResultV1, LcmStatusV1, LcmStorageKindV1, LcmStoreStatusV1,
-    LcmStoreTokenCoverageV1, LcmSummaryNodeOverviewV1, LcmSummaryNodeV1, LcmTemporalFieldsV1,
+    LcmStoreTokenCoverageV1, LcmSummaryConvergenceReasonV1, LcmSummaryConvergenceStateV1,
+    LcmSummaryConvergenceStatusV1, LcmSummaryNodeOverviewV1, LcmSummaryNodeV1, LcmTemporalFieldsV1,
     MemoryAlgebraV1, MemoryAutomationCurationAddDispositionV1,
     MemoryAutomationCurationLinkDispositionV1, MemoryAutomationCurationMergeV1,
     MemoryAutomationCurationOperationEffectV1, MemoryAutomationCurationReceiptV1,
@@ -62,10 +63,9 @@ pub use results::{
     MemoryAutomationFactReceiptV1, MemoryAutomationFactRequestV1, MemoryAutomationFactStateV1,
     MemoryAutomationFactTargetV1, MemoryAutomationFactValidationStatusV1,
     MemoryAutomationFactValidationV1, MemoryFeedbackFunnelV1, MemoryStatusResultV1, MemoryStatusV1,
-    MessageSearchFreshnessV1, MessageSearchHitV1, MessageSearchResultV1, MessageSearchRootV1,
-    MessageSearchSkipV1, RetainedErrorV1, RetainedNextActionV1, RetainedOutcomeStatusV1,
-    RetainedSurfaceResultV1, RetrievalWorkerStatusV1, SessionCorrelationHitV1,
-    SessionCoverageIntervalV1, SessionCoverageModeV1, SessionCoverageReasonV1,
+    MessageSearchHitV1, MessageSearchResultV1, RetainedErrorV1, RetainedNextActionV1,
+    RetainedOutcomeStatusV1, RetainedSurfaceResultV1, RetrievalWorkerStatusV1,
+    SessionCorrelationHitV1, SessionCoverageIntervalV1, SessionCoverageReasonV1,
     SessionCoverageRequestV1, SessionCoverageStateV1, SessionMessageV1, SessionRecordV1,
     SessionRefreshBeginResultV1, SessionRefreshCancelResultV1, SessionRefreshFrontierResultV1,
     SessionRefreshProgressV1, SessionRefreshReceiptV1, SessionRefreshStatusResultV1,
@@ -78,19 +78,9 @@ pub use results::{
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tracedecay_domain::{FactEventId, FactId, ProjectId};
+use tracedecay_domain::{FactEventId, FactId, ProjectId, TemporalModeV1};
 
 use super::{ProviderControlRequestV1, RetainedSurfaceOperation};
-
-/// Output formatting accepted by legacy MCP calls. SDK and HTTP callers use
-/// JSON, but accepting this field keeps the schema aligned with the mounted
-/// MCP request form while the transport discards presentation-only controls.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RetainedOutputFormatV1 {
-    Markdown,
-    Json,
-}
 
 /// Exact registered-project selector shared by retained reads.
 ///
@@ -178,12 +168,132 @@ pub enum MessageRelationshipScopeV1 {
     SubagentsOnly,
 }
 
+impl MessageRelationshipScopeV1 {
+    /// Advertised order for MCP schemas and the CLI parser. Labels are the
+    /// serde `snake_case` names.
+    pub const WIRE: [&'static str; 3] = [
+        Self::All.as_str(),
+        Self::ParentsOnly.as_str(),
+        Self::SubagentsOnly.as_str(),
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::ParentsOnly => "parents_only",
+            Self::SubagentsOnly => "subagents_only",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "parents_only" => Some(Self::ParentsOnly),
+            "subagents_only" => Some(Self::SubagentsOnly),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod relationship_scope_wire_tests {
+    use serde_json::json;
+
+    use super::MessageRelationshipScopeV1;
+
+    #[test]
+    fn scope_labels_match_serde() {
+        let scopes = [
+            MessageRelationshipScopeV1::All,
+            MessageRelationshipScopeV1::ParentsOnly,
+            MessageRelationshipScopeV1::SubagentsOnly,
+        ];
+        let labels: Vec<&str> = scopes
+            .iter()
+            .copied()
+            .map(MessageRelationshipScopeV1::as_str)
+            .collect();
+        assert_eq!(labels.as_slice(), MessageRelationshipScopeV1::WIRE);
+        for scope in scopes {
+            assert_eq!(
+                serde_json::to_value(scope).expect("scope serializes"),
+                json!(scope.as_str())
+            );
+            assert_eq!(
+                MessageRelationshipScopeV1::parse(scope.as_str()),
+                Some(scope)
+            );
+        }
+        assert_eq!(MessageRelationshipScopeV1::parse(" all"), None);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageTypeFilterV1 {
     All,
     DirectUser,
     ToolResult,
+}
+
+impl MessageTypeFilterV1 {
+    /// Advertised order for MCP schemas and the CLI parser. Labels are the
+    /// serde `snake_case` names.
+    pub const WIRE: [&'static str; 3] = [
+        Self::All.as_str(),
+        Self::DirectUser.as_str(),
+        Self::ToolResult.as_str(),
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::DirectUser => "direct_user",
+            Self::ToolResult => "tool_result",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "all" => Some(Self::All),
+            "direct_user" => Some(Self::DirectUser),
+            "tool_result" => Some(Self::ToolResult),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod message_type_wire_tests {
+    use serde_json::json;
+
+    use super::MessageTypeFilterV1;
+
+    #[test]
+    fn message_type_labels_match_serde() {
+        let types = [
+            MessageTypeFilterV1::All,
+            MessageTypeFilterV1::DirectUser,
+            MessageTypeFilterV1::ToolResult,
+        ];
+        let labels: Vec<&str> = types
+            .iter()
+            .copied()
+            .map(MessageTypeFilterV1::as_str)
+            .collect();
+        assert_eq!(labels.as_slice(), MessageTypeFilterV1::WIRE);
+        for message_type in types {
+            assert_eq!(
+                serde_json::to_value(message_type).expect("message type serializes"),
+                json!(message_type.as_str())
+            );
+            assert_eq!(
+                MessageTypeFilterV1::parse(message_type.as_str()),
+                Some(message_type)
+            );
+        }
+        assert_eq!(MessageTypeFilterV1::parse("tool"), None);
+    }
 }
 
 /// Exact public input accepted by `tracedecay_message_search`.
@@ -196,26 +306,22 @@ pub struct MessageSearchRequestV1 {
     pub provider: Option<String>,
     pub project_key: Option<String>,
     pub include_subagents: Option<bool>,
-    pub catch_up: Option<bool>,
+    /// Freshness precondition: stale or partial coverage returns
+    /// `refresh_required` instead of stored evidence. The read never refreshes.
+    pub require_fresh: Option<bool>,
     pub cursor: Option<String>,
     pub parent_session_id: Option<String>,
     pub since: Option<RetainedTimeFilterV1>,
     pub until: Option<RetainedTimeFilterV1>,
-    pub time_from: Option<RetainedTimeFilterV1>,
-    pub time_to: Option<RetainedTimeFilterV1>,
     pub scope: Option<MessageRelationshipScopeV1>,
     pub message_type: Option<MessageTypeFilterV1>,
     pub limit: Option<u64>,
     pub project_selector: Option<RetainedProjectSelectorV1>,
-    pub project_id: Option<String>,
-    pub project_path: Option<String>,
-    pub project_scope: Option<String>,
     pub branch: Option<String>,
     pub worktree: Option<String>,
     pub commit: Option<String>,
     pub workflow_run: Option<String>,
     pub workflow_agent: Option<String>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -243,7 +349,6 @@ pub struct SessionsForRequestV1 {
     pub until: Option<RetainedTimeFilterV1>,
     pub relation: Option<SessionGitRelationV1>,
     pub limit: Option<u64>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -256,7 +361,6 @@ pub struct WorkflowsRequestV1 {
     pub worktree: Option<String>,
     pub commit: Option<String>,
     pub limit: Option<u64>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -268,8 +372,6 @@ pub struct LcmStatusRequestV1 {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deep: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[cfg(test)]
@@ -284,7 +386,6 @@ mod lcm_status_request_tests {
             provider: None,
             session_id: Some("stock-check-session".to_owned()),
             deep: None,
-            format: None,
         };
 
         assert_eq!(
@@ -298,23 +399,13 @@ mod lcm_status_request_tests {
 #[serde(deny_unknown_fields)]
 pub struct LcmDoctorRequestV1 {}
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum LcmTemporalModeV1 {
-    Current,
-    AsOf,
-    Evolution,
-    Forensic,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LcmLoadSessionRequestV1 {
     pub provider: Option<String>,
     pub session_id: String,
     pub cursor: Option<String>,
-    pub temporal_mode: Option<LcmTemporalModeV1>,
-    pub as_of_micros: Option<u64>,
+    pub temporal_mode: Option<TemporalModeV1>,
     pub limit: Option<u64>,
     pub role: Option<String>,
     pub roles: Option<Vec<String>>,
@@ -322,7 +413,6 @@ pub struct LcmLoadSessionRequestV1 {
     pub end_time: Option<u64>,
     pub content_offset: Option<u64>,
     pub content_limit: Option<u64>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -351,6 +441,68 @@ pub enum LcmRoleV1 {
     Unknown,
 }
 
+impl LcmRoleV1 {
+    /// Advertised order for MCP schemas. Labels are [`Self::as_str`], which is
+    /// the serde `snake_case` name, so the catalog cannot drift from the wire.
+    pub const WIRE: [&'static str; 5] = [
+        Self::System.as_str(),
+        Self::User.as_str(),
+        Self::Assistant.as_str(),
+        Self::Tool.as_str(),
+        Self::Unknown.as_str(),
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::Tool => "tool",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "system" => Some(Self::System),
+            "user" => Some(Self::User),
+            "assistant" => Some(Self::Assistant),
+            "tool" => Some(Self::Tool),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod lcm_role_wire_tests {
+    use serde_json::json;
+
+    use super::LcmRoleV1;
+
+    #[test]
+    fn role_labels_match_serde_and_reject_host_aliases() {
+        let roles = [
+            LcmRoleV1::System,
+            LcmRoleV1::User,
+            LcmRoleV1::Assistant,
+            LcmRoleV1::Tool,
+            LcmRoleV1::Unknown,
+        ];
+        let labels: Vec<&str> = roles.iter().copied().map(LcmRoleV1::as_str).collect();
+        assert_eq!(labels.as_slice(), LcmRoleV1::WIRE);
+        for role in roles {
+            assert_eq!(
+                serde_json::to_value(role).expect("role serializes"),
+                json!(role.as_str())
+            );
+            assert_eq!(LcmRoleV1::parse(role.as_str()), Some(role));
+        }
+        assert_eq!(LcmRoleV1::parse("developer"), None);
+        assert_eq!(LcmRoleV1::parse(" model"), None);
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LcmGrepRequestV1 {
@@ -370,12 +522,10 @@ pub struct LcmGrepRequestV1 {
     pub until: Option<RetainedTimeFilterV1>,
     pub limit: Option<u64>,
     pub cursor: Option<String>,
-    pub temporal_mode: Option<LcmTemporalModeV1>,
-    pub as_of_micros: Option<u64>,
+    pub temporal_mode: Option<TemporalModeV1>,
     pub branch: Option<String>,
     pub worktree: Option<String>,
     pub commit: Option<String>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -392,7 +542,6 @@ pub struct LcmDescribeRequestV1 {
     pub provider: String,
     pub session_id: String,
     pub target: Option<LcmDescribeTargetV1>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -414,7 +563,6 @@ pub struct LcmExpandRequestV1 {
     pub content_limit: Option<u64>,
     pub source_limit: Option<u64>,
     pub cursor: Option<String>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -436,7 +584,6 @@ pub struct LcmExpandQueryRequestV1 {
     pub max_tokens: Option<u64>,
     pub context_max_tokens: Option<u64>,
     pub cursor: Option<String>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -482,15 +629,6 @@ pub struct SessionRefreshSourceV1 {
     pub scope: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SessionRefreshTemporalModeV1 {
-    Current,
-    AsOf { cutoff: u64 },
-    Evolution,
-    Forensic,
-}
-
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionRefreshGrainV1 {
@@ -513,7 +651,7 @@ pub struct SessionRefreshFrontierV1 {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRefreshTargetV1 {
-    pub temporal_mode: SessionRefreshTemporalModeV1,
+    pub temporal_mode: TemporalModeV1,
     pub grain: SessionRefreshGrainV1,
     pub frontier: SessionRefreshFrontierV1,
 }
@@ -531,7 +669,6 @@ pub struct SessionRefreshActionRequestV1 {
     pub source: SessionRefreshSourceV1,
     pub target: SessionRefreshTargetV1,
     pub handle: Option<String>,
-    pub format: Option<RetainedOutputFormatV1>,
 }
 
 /// Operation-selected request used by the canonical application owner.
@@ -580,8 +717,7 @@ mod session_refresh_request_tests {
                 "grain": "session",
                 "frontier": { "observed_through": 0, "committed_through": 0 }
             },
-            "handle": null,
-            "format": "json"
+            "handle": null
         })
     }
 
@@ -650,10 +786,12 @@ mod session_refresh_request_tests {
         body["target"]["temporal_mode"] = json!({ "kind": "as_of", "cutoff": 42 });
         let request = serde_json::from_value::<SessionRefreshRequestV1>(body)
             .expect("canonical as-of request");
-        assert!(matches!(
+        assert_eq!(
             request.request.target.temporal_mode,
-            super::SessionRefreshTemporalModeV1::AsOf { cutoff: 42 }
-        ));
+            tracedecay_domain::TemporalModeV1::AsOf {
+                cutoff: tracedecay_domain::UtcMicros(42)
+            }
+        );
     }
 }
 

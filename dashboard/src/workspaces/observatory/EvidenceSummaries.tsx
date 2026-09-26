@@ -9,10 +9,9 @@ import type {
   DoctorFindingsPayloadV1,
   ExecutionTopologyMetricsV1,
   ObservatoryReadModelV1,
-  StorageFindingsPayloadV1,
   StorageTelemetryPayloadV1,
 } from '../../contracts/generated.ts';
-import type { EnvelopeResult } from '../../data/query/envelope.ts';
+import { envelopePayload } from '../../data/query/useEnvelope.ts';
 import { cn } from '../../ui/cn.ts';
 import { MeterRow } from '../../ui/instrument.tsx';
 import { humanizeMetric } from '../../ui/metricModel.ts';
@@ -52,10 +51,6 @@ import { formatBytes, storageFindingLabel } from './storageModel.ts';
  * em dash and an empty track, never a bar at zero; a read that produced no
  * payload is the daemon's word, not a skeleton that looks like data.
  */
-
-function envelopePayload<T>(result: EnvelopeResult<T> | undefined): T | null {
-  return result?.outcome === 'envelope' ? result.envelope.payload : null;
-}
 
 function Rows({ children, label }: { children: ReactNode; label: string }) {
   return (
@@ -162,7 +157,7 @@ export function AdoptionBody({
       <Rows label="Adoption dimensions">
         {dimensionRows(bands.flatMap((band) => band.dimensions), anchors, 6)}
       </Rows>
-      <p className="mt-2 flex flex-wrap items-center gap-1.5 text-3xs text-text-muted">
+      <p className="mt-2 flex flex-wrap items-center gap-1.5 text-sm text-text-muted">
         <span className="td-legend">record counts</span>
         <EvidenceChip state={window.state} detail={window.detail} />
       </p>
@@ -189,11 +184,11 @@ export function RetrievalBody({
       <Rows label="Retrieval dimensions">
         {dimensionRows(bands.flatMap((band) => band.dimensions), anchors, 6)}
       </Rows>
-      <p className="mt-2 flex flex-wrap items-center gap-1.5 text-3xs text-text-muted">
+      <p className="mt-2 flex flex-wrap items-center gap-1.5 text-sm text-text-muted">
         <span className="td-legend">record counts</span>
         <EvidenceChip state={window.state} detail={window.detail} />
       </p>
-      <p className="mt-1 text-3xs text-text-muted">
+      <p className="mt-1 text-sm text-text-muted">
         no time series is published for these dimensions · figures are the current read only
       </p>
     </>
@@ -213,7 +208,7 @@ export function BudgetsBody({
   const dimensions = performanceBudgetBands(model).flatMap((band) => band.dimensions).slice(0, 7);
   return (
     <>
-      <table className="w-full border-collapse text-2xs" aria-label="Budget ledger">
+      <table className="w-full border-collapse text-sm" aria-label="Budget ledger">
         <thead>
           <tr className="td-legend border-b border-edge-subtle text-left">
             <th scope="col" className="py-0.5 pr-2 font-normal">
@@ -250,7 +245,7 @@ export function BudgetsBody({
           })}
         </tbody>
       </table>
-      <p className="mt-2 text-3xs text-text-muted">
+      <p className="mt-2 text-sm text-text-muted">
         comparison · {model.comparison.disposition.replaceAll('_', ' ')} · no budget threshold or
         7-day baseline is published, so no delta is drawn
       </p>
@@ -296,7 +291,7 @@ export function DoctorBody({
             <div
               key={family}
               role="listitem"
-              className="flex items-baseline justify-between gap-2 text-2xs"
+              className="flex items-baseline justify-between gap-2 text-body"
               data-doctor-family={family}
               data-doctor-family-consultation={consultation?.status ?? 'unpublished'}
             >
@@ -320,7 +315,7 @@ export function DoctorBody({
         />
       ) : null}
       {payload.schema_convergences.length > 0 ? (
-        <p className="mt-2 text-3xs text-text-muted">
+        <p className="mt-2 text-sm text-text-muted">
           {payload.schema_convergences.length} schema convergence
           {payload.schema_convergences.length === 1 ? '' : 's'} reported
         </p>
@@ -363,7 +358,7 @@ function FindingRows({
               data-evidence-finding={entry.index}
               aria-pressed={isSelected}
               className={cn(
-                'td-hit flex w-full items-center gap-2 border px-2 text-left text-2xs',
+                'td-hit flex w-full items-center gap-2 border px-2 text-left text-body',
                 isSelected
                   ? 'border-edge-strong bg-surface-3'
                   : 'border-transparent hover:border-edge-subtle hover:bg-surface-2',
@@ -371,8 +366,8 @@ function FindingRows({
               onClick={() => onSelect(entry.index)}
             >
               <span aria-hidden className={cn('size-1.5 shrink-0', presentation.dotClass)} />
-              <span className="min-w-0 flex-1 truncate text-text-primary">{entry.title}</span>
-              <span className={cn('td-legend shrink-0', presentation.tokenClass)}>
+              <span className="min-w-16 flex-1 truncate text-text-primary">{entry.title}</span>
+              <span className={cn('td-legend min-w-0 truncate', presentation.tokenClass)}>
                 {presentation.label}
               </span>
               <span className="td-legend shrink-0 tabular">{entry.citations} cit.</span>
@@ -414,7 +409,7 @@ export function PipelineBody({
   if (!payload) return <BlockedBody summary={summary} />;
   if (payload.worktrees.length === 0) {
     return (
-      <p className="text-2xs text-text-muted" data-evidence-blocked="empty">
+      <p className="text-body text-text-muted" data-evidence-blocked="empty">
         no mounted code-index worktree · the stage rail has nothing to place
       </p>
     );
@@ -447,7 +442,7 @@ function WorktreeRail({ worktree }: { worktree: CodeIndexWorktreeFreshnessV1 }) 
       data-pipeline-worktree={worktree.worktree_root}
       data-pipeline-phase={progress?.phase ?? (worktree.latest_generation_id ? 'sealed' : 'none')}
     >
-      <p className="flex items-baseline justify-between gap-2 text-2xs">
+      <p className="flex items-baseline justify-between gap-2 text-body">
         <span className="min-w-0 truncate font-mono text-text-secondary" title={worktree.worktree_root}>
           {worktree.worktree_root}
         </span>
@@ -489,7 +484,7 @@ function WorktreeRail({ worktree }: { worktree: CodeIndexWorktreeFreshnessV1 }) 
           );
         })}
       </ol>
-      <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-3xs sm:grid-cols-4">
+      <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-sm sm:grid-cols-4">
         <dt className="text-text-muted">files</dt>
         <dd className="td-value text-right text-text-secondary" data-cell="numeric">
           {progress ? `${progress.completed_files.toLocaleString()} / ${progress.total_files.toLocaleString()}` : '—'}
@@ -510,7 +505,7 @@ function WorktreeRail({ worktree }: { worktree: CodeIndexWorktreeFreshnessV1 }) 
         </dd>
       </dl>
       {progress?.blocked_reason ? (
-        <p className="text-3xs text-alert">blocked · {progress.blocked_reason.replaceAll('_', ' ')}</p>
+        <p className="text-sm text-alert">blocked · {progress.blocked_reason.replaceAll('_', ' ')}</p>
       ) : null}
     </div>
   );
@@ -542,11 +537,11 @@ export function HooksBody({
       {!payload ? (
         <BlockedBody summary={summary} />
       ) : !payload.available ? (
-        <p className="text-2xs text-text-muted">
+        <p className="text-body text-text-muted">
           unavailable · {payload.error ?? 'the hint analytics source is unavailable'}
         </p>
       ) : categories.length === 0 ? (
-        <p className="text-2xs text-text-muted">measured · no hook hints recorded in the window</p>
+        <p className="text-body text-text-muted">measured · no hook hints recorded in the window</p>
       ) : (
         <Rows label="Hook hint categories">
           {categories.map((category) => (
@@ -563,13 +558,13 @@ export function HooksBody({
       )}
       <Kicker tone="text-alert">rejected arguments</Kicker>
       {!rejected ? (
-        <p className="text-2xs text-text-muted">canonical read model unavailable · no rejection figures</p>
+        <p className="text-body text-text-muted">canonical read model unavailable · no rejection figures</p>
       ) : rejected.rejected_total == null ? (
-        <p className="text-2xs text-text-muted" data-rejected-arguments="unavailable">
+        <p className="text-body text-text-muted" data-rejected-arguments="unavailable">
           unavailable · {rejected.unavailable_reason?.replaceAll('_', ' ') ?? 'no reason published'}
         </p>
       ) : (
-        <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-2xs" data-rejected-arguments="measured">
+        <dl className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-body" data-rejected-arguments="measured">
           <dt className="text-text-muted">rejected</dt>
           <dd className="td-value text-right" data-cell="numeric">
             {rejected.rejected_total.toLocaleString()}
@@ -627,9 +622,9 @@ export function TopologyBody({
         ))}
       </Rows>
       {groups.size === 0 ? (
-        <p className="text-2xs text-text-muted">the projection returned no measurement cells</p>
+        <p className="text-body text-text-muted">the projection returned no measurement cells</p>
       ) : null}
-      <p className="mt-2 text-3xs text-text-muted">
+      <p className="mt-2 text-sm text-text-muted">
         {model.coverage.state} family coverage · {model.coverage.observed.toLocaleString()} observed ·{' '}
         {model.coverage.censored.toLocaleString()} censored · no node topology is published, so
         none is drawn
@@ -649,7 +644,7 @@ export function AnalyticsBody({
 }: {
   summary: EvidenceSummary;
   observatory: EvidenceRead<ObservatoryReadModelV1>;
-  findings: EvidenceRead<StorageFindingsPayloadV1>;
+  findings: EvidenceRead<DoctorFindingsPayloadV1>;
 }) {
   const model = envelopePayload(observatory.result);
   if (!model) return <BlockedBody summary={summary} />;
@@ -658,7 +653,7 @@ export function AnalyticsBody({
   const staging = shareStagingReading(model.metrics);
   const findingsPayload = envelopePayload(findings.result);
   const retention = findingsPayload
-    ? retentionBacklogReading(findingsPayload.kind_statuses)
+    ? retentionBacklogReading(findingsPayload.storage_kind_statuses)
     : null;
   const rows: { label: string; word: string; state: DomainStateKind; attr: string }[] = [
     { label: 'collection mode', word: mode.label, state: mode.state, attr: 'mode' },
@@ -691,7 +686,7 @@ export function AnalyticsBody({
         <div
           key={row.attr}
           role="listitem"
-          className="flex items-center justify-between gap-2 text-2xs"
+          className="flex items-center justify-between gap-2 text-body"
           data-analytics-control={row.attr}
         >
           <span className="truncate text-text-primary">{row.label}</span>
@@ -716,7 +711,7 @@ export function TelemetryBody({
   const payload = envelopePayload(telemetry.result);
   if (!payload) return <BlockedBody summary={summary} />;
   if (payload.stores.length === 0) {
-    return <p className="text-2xs text-text-muted">telemetry payload contained no stores</p>;
+    return <p className="text-body text-text-muted">telemetry payload contained no stores</p>;
   }
   const sized = payload.stores.filter((store) => store.total_bytes != null);
   const largest = Math.max(0, ...sized.map((store) => store.total_bytes ?? 0));
@@ -762,7 +757,7 @@ export function FindingsBody({
   onSelectFinding,
 }: {
   summary: EvidenceSummary;
-  findings: EvidenceRead<StorageFindingsPayloadV1>;
+  findings: EvidenceRead<DoctorFindingsPayloadV1>;
   selectedFinding: number | null;
   onSelectFinding: (index: number) => void;
 }) {
@@ -771,11 +766,11 @@ export function FindingsBody({
   return (
     <>
       <Rows label="Storage finding producers">
-        {payload.kind_statuses.map((status) => (
+        {payload.storage_kind_statuses.map((status) => (
           <div
             key={status.kind}
             role="listitem"
-            className="flex items-baseline justify-between gap-2 text-2xs"
+            className="flex items-baseline justify-between gap-2 text-body"
             data-finding-producer={status.kind}
             data-finding-producer-state={status.state}
           >
@@ -788,7 +783,7 @@ export function FindingsBody({
         ))}
       </Rows>
       {payload.entries.length === 0 ? (
-        <p className="mt-2 text-3xs text-text-muted">{payload.note}</p>
+        <p className="mt-2 text-sm text-text-muted">{payload.note}</p>
       ) : (
         <FindingRows
           label="Storage findings"

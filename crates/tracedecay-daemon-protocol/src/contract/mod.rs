@@ -11,9 +11,9 @@
 //! means a caller depends on the protocol, not on the server that happens to
 //! implement it.
 //!
-//! Behavior stays with the daemon. Anything that interprets a request —
-//! authority minting, scope resolution, dispatch — remains in
-//! `tracedecay-daemon-service`; only construction, validation, and the
+//! Behavior stays with the daemon. Anything that interprets a request remains
+//! in `tracedecay-daemon-service`. That includes authority minting, scope
+//! resolution, and dispatch. Only construction, validation, and the
 //! application-DTO conversions travel with the types they belong to.
 
 mod feedback;
@@ -74,6 +74,14 @@ fn valid_printable(value: &str, max_len: usize) -> bool {
 
 fn valid_lsp_control(deadline: &Deadline, cancellation: &CancellationContext) -> bool {
     deadline.expires_at.0 > 0 && cancellation.token_id.as_str().len() <= MAX_OPAQUE_HANDLE_BYTES
+}
+
+fn valid_observation_window(
+    observed_at: &UtcMicros,
+    deadline: &Deadline,
+    cancellation: &CancellationContext,
+) -> bool {
+    observed_at.0 > 0 && valid_lsp_control(deadline, cancellation)
 }
 
 /// Stable discriminator for the closed post-handshake invocation protocol.
@@ -403,6 +411,7 @@ pub enum DaemonInvocationOperation {
     ContextScout,
     ObservatoryRead,
     RetainedApplication,
+    ProfileRetainedApplication,
     MultiRootScopeSetRead,
     MultiRootScopeSetCompareAndSwap,
     MultiRootExecute,
@@ -418,6 +427,7 @@ pub enum DaemonInvocationOperation {
     SourceEdit,
     SourceEditReconcile,
     SourceEditRollback,
+    GraphTool,
 }
 
 impl DaemonInvocationOperation {
@@ -468,6 +478,7 @@ impl DaemonInvocationOperation {
             Self::ContextScout => "context_scout",
             Self::ObservatoryRead => "observatory_read",
             Self::RetainedApplication => "retained_application",
+            Self::ProfileRetainedApplication => "profile_retained_application",
             Self::MultiRootScopeSetRead => "multi_root_scope_set_read",
             Self::MultiRootScopeSetCompareAndSwap => "multi_root_scope_set_compare_and_swap",
             Self::MultiRootExecute => "multi_root_execute",
@@ -483,6 +494,7 @@ impl DaemonInvocationOperation {
             Self::SourceEdit => "source_edit",
             Self::SourceEditReconcile => "source_edit_reconcile",
             Self::SourceEditRollback => "source_edit_rollback",
+            Self::GraphTool => "graph_tool",
         }
     }
 }
@@ -610,6 +622,8 @@ pub enum DaemonInvocationPayload {
     PrimitiveRead {
         surface_operation: ApplicationSurfaceOperation,
         request: PrimitiveRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_scope: Option<ResolvedScope>,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
@@ -618,6 +632,8 @@ pub enum DaemonInvocationPayload {
         surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_contracts::PrimitiveCodeSurfaceRequest,
         page: PageRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_scope: Option<ResolvedScope>,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
@@ -626,6 +642,8 @@ pub enum DaemonInvocationPayload {
         surface_operation: ApplicationSurfaceOperation,
         request: tracedecay_contracts::CallableCodeSurfaceRequest,
         page: PageRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_scope: Option<ResolvedScope>,
         observed_at: UtcMicros,
         deadline: Deadline,
         cancellation: CancellationContext,
@@ -655,6 +673,14 @@ pub enum DaemonInvocationPayload {
         cancellation: CancellationContext,
     },
     RetainedApplication {
+        request: tracedecay_contracts::retained_surfaces::RetainedSurfaceRequestV1,
+        observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    },
+    /// A retained request against the authenticated profile's own stores. It
+    /// names no project: the daemon composition root owns the profile.
+    ProfileRetainedApplication {
         request: tracedecay_contracts::retained_surfaces::RetainedSurfaceRequestV1,
         observed_at: UtcMicros,
         deadline: Deadline,
@@ -747,9 +773,39 @@ pub enum DaemonInvocationPayload {
         deadline: Deadline,
         cancellation: CancellationContext,
     },
+    GraphTool {
+        surface_operation: ApplicationSurfaceOperation,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    },
 }
 
 impl DaemonInvocationRequest {
+    pub fn graph_tool(
+        request_id: impl Into<String>,
+        surface_operation: ApplicationSurfaceOperation,
+        arguments: serde_json::Map<String, serde_json::Value>,
+        observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    ) -> Self {
+        Self {
+            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
+            revision: DAEMON_INVOCATION_REVISION,
+            request_id: request_id.into(),
+            delivery_route: None,
+            payload: DaemonInvocationPayload::GraphTool {
+                surface_operation,
+                arguments,
+                observed_at,
+                deadline,
+                cancellation,
+            },
+        }
+    }
+
     /// One typed constructor for the whole Plan 36 native-integration journey.
     ///
     /// The transport carries exact typed identity only; it contains no Git
@@ -913,6 +969,81 @@ impl DaemonInvocationRequest {
             | ApplicationSurfaceOperation::ContextScoutFeedback => {
                 unreachable!("Context Scout operations use their typed constructor")
             }
+            ApplicationSurfaceOperation::StrReplace
+            | ApplicationSurfaceOperation::MultiStrReplace
+            | ApplicationSurfaceOperation::InsertAt
+            | ApplicationSurfaceOperation::AstGrepRewrite
+            | ApplicationSurfaceOperation::ReplaceSymbol
+            | ApplicationSurfaceOperation::InsertAtSymbol
+            | ApplicationSurfaceOperation::MoveSymbol
+            | ApplicationSurfaceOperation::RenameSymbol
+            | ApplicationSurfaceOperation::SourceEditReconcile
+            | ApplicationSurfaceOperation::SourceEditRollback => {
+                unreachable!("source-edit operations use their typed constructors")
+            }
+            ApplicationSurfaceOperation::Context
+            | ApplicationSurfaceOperation::Node
+            | ApplicationSurfaceOperation::Impact
+            | ApplicationSurfaceOperation::Similar
+            | ApplicationSurfaceOperation::Redundancy
+            | ApplicationSurfaceOperation::RenamePreview
+            | ApplicationSurfaceOperation::PortStatus
+            | ApplicationSurfaceOperation::PortOrder
+            | ApplicationSurfaceOperation::Todos
+            | ApplicationSurfaceOperation::TestMap
+            | ApplicationSurfaceOperation::TestRisk
+            | ApplicationSurfaceOperation::Gini
+            | ApplicationSurfaceOperation::DependencyDepth
+            | ApplicationSurfaceOperation::Health
+            | ApplicationSurfaceOperation::Dsm
+            | ApplicationSurfaceOperation::Diagnose
+            | ApplicationSurfaceOperation::DeadCode
+            | ApplicationSurfaceOperation::Circular
+            | ApplicationSurfaceOperation::Hotspots
+            | ApplicationSurfaceOperation::UnmountedFiles
+            | ApplicationSurfaceOperation::Rank
+            | ApplicationSurfaceOperation::Largest
+            | ApplicationSurfaceOperation::Coupling
+            | ApplicationSurfaceOperation::InheritanceDepth
+            | ApplicationSurfaceOperation::Distribution
+            | ApplicationSurfaceOperation::Recursion
+            | ApplicationSurfaceOperation::Complexity
+            | ApplicationSurfaceOperation::DocCoverage
+            | ApplicationSurfaceOperation::GodClass
+            | ApplicationSurfaceOperation::UnsafePatterns
+            | ApplicationSurfaceOperation::Constructors
+            | ApplicationSurfaceOperation::FieldSites => {
+                unreachable!("graph-tool operations use their typed constructor")
+            }
+            ApplicationSurfaceOperation::FactStoreCurate
+            | ApplicationSurfaceOperation::FactStoreAdd
+            | ApplicationSurfaceOperation::FactStoreSearch
+            | ApplicationSurfaceOperation::FactStoreProbe
+            | ApplicationSurfaceOperation::FactStoreRelated
+            | ApplicationSurfaceOperation::FactStoreReason
+            | ApplicationSurfaceOperation::FactStoreContradict
+            | ApplicationSurfaceOperation::FactStoreGet
+            | ApplicationSurfaceOperation::FactStoreUpdate
+            | ApplicationSurfaceOperation::FactStoreRemove
+            | ApplicationSurfaceOperation::FactStoreSupersede
+            | ApplicationSurfaceOperation::FactStoreList
+            | ApplicationSurfaceOperation::FactFeedback
+            | ApplicationSurfaceOperation::MemoryStatus
+            | ApplicationSurfaceOperation::SessionRefreshStatus
+            | ApplicationSurfaceOperation::SessionRefreshCancel
+            | ApplicationSurfaceOperation::SessionRefreshBegin
+            | ApplicationSurfaceOperation::MessageSearch
+            | ApplicationSurfaceOperation::SessionsFor
+            | ApplicationSurfaceOperation::Workflows
+            | ApplicationSurfaceOperation::LcmStatus
+            | ApplicationSurfaceOperation::LcmDoctor
+            | ApplicationSurfaceOperation::LcmLoadSession
+            | ApplicationSurfaceOperation::LcmGrep
+            | ApplicationSurfaceOperation::LcmDescribe
+            | ApplicationSurfaceOperation::LcmExpand
+            | ApplicationSurfaceOperation::LcmExpandQuery => {
+                unreachable!("retained operations use their typed constructor")
+            }
         };
         Self {
             protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
@@ -1067,6 +1198,7 @@ impl DaemonInvocationRequest {
             ) => DaemonInvocationPayload::PrimitiveRead {
                 surface_operation,
                 request,
+                resolved_scope: None,
                 observed_at,
                 deadline,
                 cancellation,
@@ -1142,6 +1274,27 @@ impl DaemonInvocationRequest {
             request_id: request_id.into(),
             delivery_route: None,
             payload: DaemonInvocationPayload::RetainedApplication {
+                request,
+                observed_at,
+                deadline,
+                cancellation,
+            },
+        }
+    }
+
+    pub fn profile_retained_application(
+        request_id: impl Into<String>,
+        request: tracedecay_contracts::retained_surfaces::RetainedSurfaceRequestV1,
+        observed_at: UtcMicros,
+        deadline: Deadline,
+        cancellation: CancellationContext,
+    ) -> Self {
+        Self {
+            protocol: DAEMON_INVOCATION_PROTOCOL.to_owned(),
+            revision: DAEMON_INVOCATION_REVISION,
+            request_id: request_id.into(),
+            delivery_route: None,
+            payload: DaemonInvocationPayload::ProfileRetainedApplication {
                 request,
                 observed_at,
                 deadline,
@@ -1344,6 +1497,7 @@ impl DaemonInvocationRequest {
                 surface_operation,
                 request,
                 page,
+                resolved_scope: None,
                 observed_at,
                 deadline,
                 cancellation,
@@ -1369,6 +1523,7 @@ impl DaemonInvocationRequest {
                 surface_operation,
                 request,
                 page,
+                resolved_scope: None,
                 observed_at,
                 deadline,
                 cancellation,
@@ -1516,7 +1671,10 @@ impl DaemonInvocationRequest {
             (
                 DaemonInvocationPayload::FeedbackGet { resolved_scope, .. }
                 | DaemonInvocationPayload::Configuration { resolved_scope, .. }
-                | DaemonInvocationPayload::ObservatoryRead { resolved_scope, .. },
+                | DaemonInvocationPayload::ObservatoryRead { resolved_scope, .. }
+                | DaemonInvocationPayload::PrimitiveRead { resolved_scope, .. }
+                | DaemonInvocationPayload::PrimitiveCode { resolved_scope, .. }
+                | DaemonInvocationPayload::CallableCode { resolved_scope, .. },
                 scope,
             ) => {
                 *resolved_scope = scope;
@@ -1693,6 +1851,9 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::RetainedApplication { .. } => {
                 DaemonInvocationOperation::RetainedApplication
             }
+            DaemonInvocationPayload::ProfileRetainedApplication { .. } => {
+                DaemonInvocationOperation::ProfileRetainedApplication
+            }
             DaemonInvocationPayload::MultiRootScopeSetRead { .. } => {
                 DaemonInvocationOperation::MultiRootScopeSetRead
             }
@@ -1726,6 +1887,7 @@ impl DaemonInvocationRequest {
             DaemonInvocationPayload::SourceEditRollback { .. } => {
                 DaemonInvocationOperation::SourceEditRollback
             }
+            DaemonInvocationPayload::GraphTool { .. } => DaemonInvocationOperation::GraphTool,
         }
     }
 
@@ -1786,6 +1948,7 @@ impl DaemonInvocationRequest {
                 | DaemonInvocationOperation::SourceEdit
                 | DaemonInvocationOperation::SourceEditReconcile
                 | DaemonInvocationOperation::SourceEditRollback
+                | DaemonInvocationOperation::GraphTool
         )
     }
 
@@ -1823,9 +1986,7 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                if !valid_observation_window(observed_at, deadline, cancellation)
                     || MultiRootScopeSetReadRequestV1::new(request.scope_set_id.clone()).is_err()
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
@@ -1837,9 +1998,7 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                if !valid_observation_window(observed_at, deadline, cancellation)
                     || request.validate().is_err()
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
@@ -1851,9 +2010,7 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                if !valid_observation_window(observed_at, deadline, cancellation)
                     || request.validate().is_err()
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
@@ -1866,10 +2023,7 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
+                if !valid_observation_window(observed_at, deadline, cancellation) {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
                 let expected = match &request.request {
@@ -1900,10 +2054,7 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
+                if !valid_observation_window(observed_at, deadline, cancellation) {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
                 let expected = match request {
@@ -2027,9 +2178,19 @@ impl DaemonInvocationRequest {
                 cancellation,
                 ..
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                if !valid_observation_window(observed_at, deadline, cancellation) {
+                    return Err(DaemonInvocationProblem::InvalidRequest);
+                }
+            }
+            DaemonInvocationPayload::GraphTool {
+                surface_operation,
+                observed_at,
+                deadline,
+                cancellation,
+                ..
+            } => {
+                if !valid_observation_window(observed_at, deadline, cancellation)
+                    || !surface_operation.is_graph_tool()
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
@@ -2042,9 +2203,7 @@ impl DaemonInvocationRequest {
                 ..
             } => {
                 if !(1..=365).contains(&request.window_days)
-                    || observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                    || !valid_observation_window(observed_at, deadline, cancellation)
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
@@ -2055,10 +2214,7 @@ impl DaemonInvocationRequest {
                 cancellation,
                 ..
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
+                if !valid_observation_window(observed_at, deadline, cancellation) {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
             }
@@ -2069,11 +2225,12 @@ impl DaemonInvocationRequest {
                 observed_at,
                 deadline,
                 cancellation,
+                ..
             } => {
                 if observed_at.0 <= 0
                     || deadline.expires_at.0 <= 0
                     || PageRequest::new(page.page_size, page.cursor.clone()).is_err()
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                    || !valid_lsp_control(deadline, cancellation)
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
@@ -2107,11 +2264,12 @@ impl DaemonInvocationRequest {
                 observed_at,
                 deadline,
                 cancellation,
+                ..
             } => {
                 if observed_at.0 <= 0
                     || deadline.expires_at.0 <= 0
                     || PageRequest::new(page.page_size, page.cursor.clone()).is_err()
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                    || !valid_lsp_control(deadline, cancellation)
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
@@ -2155,9 +2313,7 @@ impl DaemonInvocationRequest {
                 cancellation,
                 ..
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                if !valid_observation_window(observed_at, deadline, cancellation)
                     || !request.matches(*surface_operation)
                     || matches!(
                         request,
@@ -2174,11 +2330,14 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
                 ..
+            }
+            | DaemonInvocationPayload::ProfileRetainedApplication {
+                observed_at,
+                deadline,
+                cancellation,
+                ..
             } => {
-                if observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
+                if !valid_observation_window(observed_at, deadline, cancellation) {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
             }
@@ -2220,9 +2379,7 @@ impl DaemonInvocationRequest {
                 cancellation,
             } => {
                 if !valid_token(request_handle, MAX_OPAQUE_HANDLE_BYTES)
-                    || observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                    || !valid_observation_window(observed_at, deadline, cancellation)
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
@@ -2234,9 +2391,7 @@ impl DaemonInvocationRequest {
                 cancellation,
             } => {
                 if !valid_printable(document_uri, MAX_ROOT_HINT_BYTES)
-                    || observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
+                    || !valid_observation_window(observed_at, deadline, cancellation)
                 {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
@@ -2246,10 +2401,7 @@ impl DaemonInvocationRequest {
                 deadline,
                 cancellation,
             } => {
-                if request.observed_at.0 <= 0
-                    || deadline.expires_at.0 <= 0
-                    || cancellation.token_id.as_str().len() > MAX_OPAQUE_HANDLE_BYTES
-                {
+                if !valid_observation_window(&request.observed_at, deadline, cancellation) {
                     return Err(DaemonInvocationProblem::InvalidRequest);
                 }
             }
@@ -2771,6 +2923,10 @@ pub enum DaemonInvocationOutcome {
     SourceEdit {
         scope: ResolvedScope,
         result: tracedecay_contracts::source_edit::SourceEditSurfaceResultV1,
+    },
+    GraphTool {
+        scope: ResolvedScope,
+        completion: tracedecay_contracts::graph_tool::GraphToolCompletionV1,
     },
     Problem {
         problem: DaemonInvocationProblem,

@@ -16,8 +16,8 @@ use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
 use super::harness::{EXTERNAL_PAYLOAD, INLINE_PAYLOAD, PROJECT_ID, RegisteredTemporalHarness};
 use crate::context::{
-    BranchId, CancellationToken, CapabilityDigest, ConfigurationDigest, PolicyDigest, ProfileId,
-    RequestBudgets, ResolvedGitRoute, ResolvedSessionIdentity, SessionRootId, SessionStoreId,
+    BranchId, CapabilityDigest, ConfigurationDigest, PolicyDigest, ProfileId, RequestBudgets,
+    ResolvedGitRoute, ResolvedSessionIdentity, SessionRootId, SessionStoreId,
     application_observed_at, session_application_grant_digest,
 };
 use crate::session::{
@@ -26,6 +26,7 @@ use crate::session::{
     SessionRetrievalScope, SessionRetrievalService, SessionScopeAuthorizationRequest,
     SessionScopeAuthorizer, SessionTemporalQuery,
 };
+use tracedecay_runtime_core::cancellation::CancellationToken;
 
 const DIGEST: [u8; 32] = [0x5a; 32];
 
@@ -70,7 +71,7 @@ async fn registered_root_scope_isolated_and_provider_filtered() {
     let execution = RegisteredGlobalDbSessionTemporalExecution::new(harness.registered.as_ref());
     let service = SessionRetrievalService::new(
         AllowAuthorizer,
-        &execution,
+        execution,
         Words,
         SessionRetrievalConfiguration::new(3, 5).unwrap(),
     );
@@ -178,7 +179,7 @@ async fn registered_root_cursor_survives_service_restart_and_rejects_scope_drift
     let execution = RegisteredGlobalDbSessionTemporalExecution::new(harness.registered.as_ref());
     let service = SessionRetrievalService::new(
         AllowAuthorizer,
-        &execution,
+        execution,
         Words,
         SessionRetrievalConfiguration::new(3, 5).unwrap(),
     );
@@ -200,7 +201,7 @@ async fn registered_root_cursor_survives_service_restart_and_rejects_scope_drift
         RegisteredGlobalDbSessionTemporalExecution::new(harness.registered.as_ref());
     let restarted = SessionRetrievalService::new(
         AllowAuthorizer,
-        &restarted_execution,
+        restarted_execution,
         Words,
         SessionRetrievalConfiguration::new(3, 5).unwrap(),
     );
@@ -267,7 +268,7 @@ async fn registered_occurrence_hydrates_inline_and_external_payloads_without_wri
     let execution = RegisteredGlobalDbSessionTemporalExecution::new(harness.registered.as_ref());
     let service = SessionRetrievalService::new(
         AllowAuthorizer,
-        &execution,
+        execution,
         Words,
         SessionRetrievalConfiguration::new(3, 5).unwrap(),
     );
@@ -333,7 +334,7 @@ async fn registered_complete_zero_preserves_the_authoritative_store() {
     let execution = RegisteredGlobalDbSessionTemporalExecution::new(harness.registered.as_ref());
     let service = SessionRetrievalService::new(
         AllowAuthorizer,
-        &execution,
+        execution,
         Words,
         SessionRetrievalConfiguration::new(3, 5).unwrap(),
     );

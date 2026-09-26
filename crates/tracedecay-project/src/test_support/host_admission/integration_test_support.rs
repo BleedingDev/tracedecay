@@ -37,10 +37,13 @@ impl HostAdmissionTestRuntimeV1 {
         })
     }
 
-    /// Runs workflow ingestion through this runtime's exact ProjectSessions mount.
+    /// Runs workflow ingestion through this runtime's exact ProjectSessions
+    /// mount, reading Claude transcripts under the isolated `home` only. The
+    /// operator's real home is never consulted.
     #[doc(hidden)]
     pub async fn ingest_workflows_for_test(
         &self,
+        home: &Path,
         project_root: &Path,
     ) -> Result<tracedecay_sessions::runtime::workflow_ingest::WorkflowIngestStats> {
         let project_id = self
@@ -51,11 +54,6 @@ impl HostAdmissionTestRuntimeV1 {
                 message: "project session authority is unavailable".to_owned(),
             })?;
         let database = self.project_database_for_test()?;
-        let Some(home) = tracedecay_sessions::runtime::home_dir() else {
-            return Ok(
-                tracedecay_sessions::runtime::workflow_ingest::WorkflowIngestStats::default(),
-            );
-        };
         let store = tracedecay_global_db::GlobalDbWorkflowStore::new(database);
         Ok(
             tracedecay_sessions::runtime::workflow_ingest::ingest_workflow_runs_with_sink(
@@ -163,12 +161,11 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
-    pub async fn run_incremental_git_backfill_for_test(
+    pub async fn converge_git_evidence_for_test(
         &self,
         git: &dyn tracedecay_sessions::runtime::git_correlation::GitReflogSource,
-        limit_sessions: usize,
     ) -> std::result::Result<
-        tracedecay_sessions::runtime::git_correlation::BackfillStats,
+        tracedecay_sessions::runtime::git_correlation::GitEvidencePassOutcome,
         tracedecay_sessions::runtime::git_correlation::GitCorrelationError,
     > {
         let database = self.project_database_for_test().map_err(|error| {
@@ -177,7 +174,24 @@ impl HostAdmissionTestRuntimeV1 {
             )
         })?;
         tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
-            .run_incremental_backfill(git, limit_sessions)
+            .converge_session_git_evidence(git)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn git_correlation_health_for_test(
+        &self,
+    ) -> std::result::Result<
+        tracedecay_sessions::runtime::git_correlation::CorrelationIndexHealth,
+        tracedecay_sessions::runtime::git_correlation::GitCorrelationError,
+    > {
+        let database = self.project_database_for_test().map_err(|error| {
+            tracedecay_sessions::runtime::git_correlation::GitCorrelationError::Db(
+                error.to_string(),
+            )
+        })?;
+        tracedecay_global_db::GlobalDbGitCorrelationStore::new(database)
+            .correlation_index_health()
             .await
     }
 
@@ -266,7 +280,7 @@ impl HostAdmissionTestRuntimeV1 {
             retryable: false,
             reason_code: Some("project_authority_unbound"),
             recovery: None,
-            storage_cause: None,
+            cause: None,
         })?;
         self.facade()
             .get_source_cursor(
@@ -283,8 +297,10 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         scope: HostAdmissionScope,
         observation: &tracedecay_store::ObservationCommitReceipt,
-    ) -> std::result::Result<Option<tracedecay_store::SourceCommitReceiptV1>, HostAdmissionOutcome>
-    {
+    ) -> std::result::Result<
+        Option<tracedecay_store::SourceCommitReceiptSummaryV1>,
+        HostAdmissionOutcome,
+    > {
         let database = self.registered_database(scope).ok_or_else(|| {
             HostAdmissionOutcome::retained_unavailable("registered_authority_unavailable")
         })?;

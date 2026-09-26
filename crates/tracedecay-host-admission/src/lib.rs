@@ -37,7 +37,8 @@ use tracedecay_sessions::observation::{
 };
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_sessions::runtime::git_correlation::{
-    canonical_observation_git_evidence, enqueue_git_evidence_publication,
+    DEFAULT_SPAN_MERGE_GAP_SECS, GitEvidenceBatch, GitEvidenceWriter,
+    canonical_observation_git_evidence,
 };
 
 mod authorities;
@@ -215,7 +216,7 @@ pub(crate) const fn admission_outcome(
         retryable,
         reason_code,
         recovery: None,
-        storage_cause: None,
+        cause: None,
     }
 }
 
@@ -553,12 +554,15 @@ impl<'a> HostAdmissionFacade<'a> {
             )
             .await
             .map_err(|error| classify_error(&error))?;
-        project_captured_outcome(
+        let mut projected = project_captured_outcomes(
             database,
             self.authorities.repository_provenance.as_ref(),
-            outcome,
+            vec![outcome],
         )
-        .await
+        .await?;
+        projected.pop().ok_or_else(|| {
+            HostAdmissionOutcome::retained_unavailable("external_source_commit_failed")
+        })
     }
 
     /// Sanitize then persist a bounded window through one store-owned batch.
@@ -905,6 +909,9 @@ const fn projection_error_outcome(error: &ProjectionStoreError) -> HostAdmission
         ProjectionStoreError::OutputCollision { .. } => {
             HostAdmissionOutcome::degraded("projection_output_collision")
         }
+        ProjectionStoreError::SessionOutputCollision { .. } => {
+            HostAdmissionOutcome::degraded("projection_session_collision")
+        }
         ProjectionStoreError::Contract(_) => {
             HostAdmissionOutcome::degraded("projection_contract_rejected")
         }
@@ -981,38 +988,6 @@ fn classify_external_source_error(
     }
 }
 
-async fn project_captured_outcome(
-    database: &RegisteredGlobalDb,
-    repository_provenance: Option<&RepositoryProvenanceAdmissionContext>,
-    outcome: CaptureObservationOutcome,
-) -> Result<CaptureObservationOutcome, HostAdmissionOutcome> {
-    let CaptureObservationOutcome::Persisted {
-        outcome: persisted, ..
-    } = &outcome
-    else {
-        return Ok(outcome);
-    };
-    let projection =
-        tracedecay_session_memory::external_source_store::RuntimeExternalSourceStore::new(
-            database.runtime_client(),
-        )
-        .capture_host_observation(persisted.receipt())
-        .await
-        .map_err(classify_external_source_error)?;
-    publish_canonical_git_evidence(
-        database,
-        repository_provenance,
-        std::slice::from_ref(&outcome),
-    )
-    .await?;
-    let outcome = if let tracedecay_session_memory::external_source_store::RuntimeSourceCaptureOutcomeV1::ProjectionPending(receipt) = projection {
-        accepted_for_external_source_replay(outcome, receipt)?
-    } else {
-        outcome
-    };
-    Ok(outcome)
-}
-
 async fn project_captured_outcomes(
     database: &RegisteredGlobalDb,
     repository_provenance: Option<&RepositoryProvenanceAdmissionContext>,
@@ -1077,12 +1052,13 @@ async fn publish_canonical_git_evidence(
     let Some(repository_provenance) = repository_provenance else {
         return Ok(());
     };
-    let mut publications = Vec::new();
+    let mut batch = GitEvidenceBatch {
+        merge_gap_secs: DEFAULT_SPAN_MERGE_GAP_SECS,
+        ..GitEvidenceBatch::default()
+    };
     for outcome in outcomes {
         let CaptureObservationOutcome::Persisted {
-            outcome: persisted,
-            sanitized_record,
-            ..
+            sanitized_record, ..
         } = outcome
         else {
             continue;
@@ -1092,33 +1068,27 @@ async fn publish_canonical_git_evidence(
             repository_provenance.admitted_project_root(),
         )
         .map_err(classify_git_evidence_error)?;
-        if commit_records.is_empty() && span_observations.is_empty() {
-            continue;
-        }
-        publications.push((
-            format!(
-                "canonical-observation:{}",
-                persisted.receipt().observation().observation_id().as_str()
-            ),
-            commit_records,
-            span_observations,
-        ));
+        batch.commits.extend(commit_records);
+        batch.observations.extend(span_observations);
     }
-    if publications.is_empty() {
+    if batch.commits.is_empty() && batch.observations.is_empty() {
         return Ok(());
     }
     let transaction = database.begin_write_transaction().await.map_err(|error| {
-        tracing::warn!(%error, "canonical Git evidence outbox transaction failed");
-        HostAdmissionOutcome::retained_unavailable("git_evidence_outbox_unavailable")
+        tracing::warn!(%error, "canonical Git evidence transaction failed");
+        HostAdmissionOutcome::retained_unavailable("git_evidence_write_unavailable")
     })?;
-    for (prefix, commit_records, span_observations) in &publications {
-        enqueue_git_evidence_publication(&transaction, prefix, commit_records, span_observations)
-            .await
-            .map_err(classify_git_evidence_error)?;
-    }
+    let mut writer = GitEvidenceWriter::open(&transaction)
+        .await
+        .map_err(classify_git_evidence_error)?;
+    writer
+        .apply(batch)
+        .await
+        .map_err(classify_git_evidence_error)?;
+    writer.finish().await.map_err(classify_git_evidence_error)?;
     transaction.commit().await.map_err(|error| {
-        tracing::warn!(%error, "canonical Git evidence outbox commit failed");
-        HostAdmissionOutcome::retained_unavailable("git_evidence_outbox_unavailable")
+        tracing::warn!(%error, "canonical Git evidence commit failed");
+        HostAdmissionOutcome::retained_unavailable("git_evidence_write_unavailable")
     })?;
     Ok(())
 }
@@ -1126,16 +1096,15 @@ async fn publish_canonical_git_evidence(
 fn classify_git_evidence_error(
     error: tracedecay_sessions::runtime::git_correlation::GitCorrelationError,
 ) -> HostAdmissionOutcome {
-    tracing::warn!(%error, "canonical Git evidence publication failed");
-    let mut outcome =
-        HostAdmissionOutcome::retained_unavailable("git_evidence_publication_unavailable");
-    outcome.storage_cause = Some(error.to_string());
+    tracing::warn!(%error, "canonical Git evidence write failed");
+    let mut outcome = HostAdmissionOutcome::retained_unavailable("git_evidence_write_unavailable");
+    outcome.cause = Some(error.to_string());
     outcome
 }
 
 fn accepted_for_external_source_replay(
     outcome: CaptureObservationOutcome,
-    receipt: tracedecay_store::SourceCommitReceiptV1,
+    receipt: tracedecay_store::SourceCommitReceiptSummaryV1,
 ) -> Result<CaptureObservationOutcome, HostAdmissionOutcome> {
     let CaptureObservationOutcome::Persisted {
         outcome,
@@ -1150,7 +1119,7 @@ fn accepted_for_external_source_replay(
     };
     let durable_observation_id = outcome.receipt().observation().observation_id().clone();
     let retry_handle = ExternalSourceProjectionRetryHandleV1::new(
-        receipt.source_frontier().binding().clone(),
+        receipt.binding().clone(),
         receipt.receipt_digest().clone(),
     );
     Ok(CaptureObservationOutcome::AcceptedForReplay {
@@ -1165,13 +1134,11 @@ fn accepted_for_external_source_replay(
 }
 
 fn classify_store_error(error: &ObservationStoreError) -> HostAdmissionOutcome {
-    match error {
-        ObservationStoreError::BatchRequiresScalarFallback { cause } => {
-            return HostAdmissionOutcome::batch_requires_scalar_fallback(*cause);
-        }
+    let reason_code = match error {
         ObservationStoreError::ObservationCollision { .. } => {
-            return HostAdmissionOutcome::deterministic_content_refusal(
+            return HostAdmissionOutcome::deterministic_content_refusal_with_cause(
                 "observation_identity_collision",
+                error,
             );
         }
         ObservationStoreError::SanitizationReceiptCollision => {
@@ -1184,9 +1151,9 @@ fn classify_store_error(error: &ObservationStoreError) -> HostAdmissionOutcome {
                 "observation_retrieval_anchor_alias_collision",
             );
         }
-        _ => {}
-    }
-    let reason_code = match error {
+        ObservationStoreError::CursorConflict { .. } | ObservationStoreError::Storage { .. } => {
+            unreachable!("retryable store failures are classified before static reason mapping")
+        }
         ObservationStoreError::CursorObservationMismatch => "observation_cursor_mismatch",
         ObservationStoreError::CursorCoverageMismatch => "observation_cursor_coverage_mismatch",
         ObservationStoreError::CursorAdvanceCollision => "observation_cursor_advance_collision",
@@ -1195,10 +1162,6 @@ fn classify_store_error(error: &ObservationStoreError) -> HostAdmissionOutcome {
         }
         ObservationStoreError::CursorSanitizationReceiptMismatch => {
             "observation_cursor_sanitization_receipt_mismatch"
-        }
-        ObservationStoreError::ObservationCollision { .. } => "observation_identity_collision",
-        ObservationStoreError::SanitizationReceiptCollision => {
-            "observation_sanitization_receipt_collision"
         }
         ObservationStoreError::RetrievalAnchorObservationMismatch => {
             "observation_retrieval_anchor_observation_mismatch"
@@ -1228,14 +1191,8 @@ fn classify_store_error(error: &ObservationStoreError) -> HostAdmissionOutcome {
         ObservationStoreError::RepositoryProvenanceContract(_) => {
             "observation_repository_provenance_contract_invalid"
         }
-        ObservationStoreError::RetrievalAnchorAliasCollision { .. } => {
-            "observation_retrieval_anchor_alias_collision"
-        }
         ObservationStoreError::InvalidReplayLimit { .. } => "observation_replay_limit_invalid",
         ObservationStoreError::Contract(_) => "observation_store_contract_invalid",
-        ObservationStoreError::CursorConflict { .. } | ObservationStoreError::Storage { .. } => {
-            unreachable!("retryable store failures are classified before static reason mapping")
-        }
         _ => "observation_store_failed",
     };
     admission_outcome(HostAdmissionStatus::Degraded, false, Some(reason_code))
@@ -1251,7 +1208,7 @@ fn classify_error(error: &ObservationApplicationError) -> HostAdmissionOutcome {
         // A worker that stopped before finishing left the batch unapplied
         // without saying anything about the observations themselves, so this
         // is an availability failure the caller re-drives once a worker is
-        // back — not a rejection of the payload.
+        // back, not a rejection of the payload.
         ObservationApplicationError::PreparationWorkerStopped => admission_outcome(
             HostAdmissionStatus::Unavailable,
             true,
@@ -1282,7 +1239,7 @@ fn classify_error(error: &ObservationApplicationError) -> HostAdmissionOutcome {
                 true,
                 Some("authority_write_failed"),
             );
-            outcome.storage_cause = Some(format!("{operation}: {source}"));
+            outcome.cause = Some(format!("{operation}: {source}"));
             outcome
         }
         ObservationApplicationError::Contract(_) => {
@@ -1295,8 +1252,11 @@ fn classify_error(error: &ObservationApplicationError) -> HostAdmissionOutcome {
             true,
             Some("privacy_authority_unavailable"),
         ),
-        ObservationApplicationError::Privacy(_) => {
-            HostAdmissionOutcome::deterministic_content_refusal("privacy_boundary_failed")
+        ObservationApplicationError::Privacy(error) => {
+            HostAdmissionOutcome::deterministic_content_refusal_with_cause(
+                "privacy_boundary_failed",
+                error,
+            )
         }
         ObservationApplicationError::Store(error) => classify_store_error(error),
     }

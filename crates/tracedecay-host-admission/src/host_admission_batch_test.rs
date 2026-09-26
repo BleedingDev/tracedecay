@@ -16,12 +16,12 @@ use tracedecay_domain::{
     SensitivityV1, SessionId, UtcMicros,
 };
 use tracedecay_global_db::tests::harness::HostAdmissionTestRuntimeV1;
-use tracedecay_privacy::{ClaudeRecordParseErrorV1, parse_normalized_observation_record_v1};
+use tracedecay_privacy::{ObservationRecordParseErrorV1, parse_normalized_observation_record_v1};
 use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
 use tracedecay_sessions::admission::{HostAdmission, HostAdmissionScope};
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationPersistOutcome, ObservationWrite,
-    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
+    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
 };
 
 use super::*;
@@ -116,7 +116,7 @@ fn sequential_capture_requests(
                     }],
                     CanonicalObservationEvidenceV1::new(ordering_domain, range),
                 )
-                .map_err(|_| ClaudeRecordParseErrorV1::NormalizationFailed)
+                .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)
             },
         )
         .unwrap();
@@ -217,8 +217,10 @@ fn run_git(project: &std::path::Path, args: &[&str]) {
     );
 }
 
+/// Canonical Git evidence is recorded as rows in the project sessions store
+/// itself, in the capture's own transaction: no graph runtime is involved.
 #[tokio::test]
-async fn canonical_message_projection_succeeds_while_git_graph_is_unavailable() {
+async fn canonical_capture_records_git_evidence_rows_without_a_graph_runtime() {
     let tmp = TempDir::new().unwrap();
     let project = tmp.path().join("source-graph-unavailable");
     std::fs::create_dir_all(&project).unwrap();
@@ -244,7 +246,6 @@ async fn canonical_message_projection_succeeds_while_git_graph_is_unavailable() 
     let database = runtime
         .registered_database(HostAdmissionScope::Project)
         .unwrap();
-    assert!(database.project_graph_runtime().is_none());
     let provenance = RepositoryProvenanceAdmissionContext::from_authoritative_project_marker(
         &project,
         &project_id,
@@ -314,7 +315,7 @@ async fn canonical_message_projection_succeeds_while_git_graph_is_unavailable() 
                     )
                     .with_native_timestamp(1_785_000_000),
                 )
-                .map_err(|_| ClaudeRecordParseErrorV1::NormalizationFailed)
+                .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)
             }
         },
     )
@@ -322,9 +323,11 @@ async fn canonical_message_projection_succeeds_while_git_graph_is_unavailable() 
     let scope = ObservationScopeV1::Project {
         project_id: project_id.clone(),
     };
-    let source =
-        ObservationSourceIdentityV1::for_provider(ProviderId::new("codex").unwrap(), session_id)
-            .unwrap();
+    let source = ObservationSourceIdentityV1::for_provider(
+        ProviderId::new("codex").unwrap(),
+        session_id.clone(),
+    )
+    .unwrap();
     let request = CaptureObservationRequest::new(
         parsed,
         ObservationIdentityMaterialV1::for_native_record(
@@ -351,20 +354,35 @@ async fn canonical_message_projection_succeeds_while_git_graph_is_unavailable() 
         .drain_projection_queue("codex", &scope, &ObservationCancellation::default(), 1)
         .await
         .unwrap();
-    assert!(drained.deferred);
+    assert!(!drained.deferred);
     assert!(
         facade
             .has_session_message(&scope, "codex", message_id.as_str())
             .await
             .unwrap()
     );
-    assert_eq!(
-        tracedecay_sessions::runtime::git_correlation::pending_git_evidence_publication_count(
-            database
+    let correlation = tracedecay_global_db::GlobalDbGitCorrelationStore::new(database);
+    let health = correlation.correlation_index_health().await.unwrap();
+    assert_eq!((health.span_count, health.commit_count), (1, 0));
+    let hits = correlation
+        .sessions_for_with_relation(
+            &tracedecay_sessions::runtime::git_correlation::SessionsForQuery {
+                git_ref: tracedecay_sessions::runtime::git_correlation::GitRefFilter::Branch(
+                    "capture-branch".to_owned(),
+                ),
+                since: None,
+                until: None,
+                limit: 5,
+            },
+            tracedecay_sessions::runtime::git_correlation::CommitRelationFilter::Produced,
         )
         .await
-        .unwrap(),
-        1
+        .unwrap();
+    assert_eq!(
+        hits.iter()
+            .map(|hit| hit.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![session_id.as_str()]
     );
 }
 
@@ -487,7 +505,7 @@ fn anchored_write(
     let authorization =
         build_observation_resolution_authorization_v1(write.observation(), "host-admission-batch")
             .unwrap();
-    let anchor = build_observation_retrieval_anchor_v2(
+    let anchor = build_observation_retrieval_anchor(
         write.observation(),
         projection_generation.clone(),
         UtcMicros(1),

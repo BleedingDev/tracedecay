@@ -12,10 +12,11 @@ import sys
 import time
 
 from lib.process_control import terminate
+from lib.portable_process import dies_with_this_process
 
 
 # Default MCP Inspector pin, shared with scripts/mcp-conformance-smoke.sh
-# via scripts/lib/inspector_version — override both through INSPECTOR_VERSION.
+# via scripts/lib/inspector_version, override both through INSPECTOR_VERSION.
 INSPECTOR_VERSION = os.environ.get(
     "INSPECTOR_VERSION",
     Path(__file__)
@@ -187,6 +188,7 @@ def main() -> int:
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        preexec_fn=dies_with_this_process(),
     )
     try:
         wait_for_daemon(daemon, binary, fixture, environment)

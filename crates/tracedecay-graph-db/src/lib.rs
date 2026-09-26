@@ -1,6 +1,5 @@
 mod adjacency_id_index;
-mod backup;
-mod bundle;
+mod corrupt_store;
 mod epoch_cache;
 mod error;
 mod generation;
@@ -16,24 +15,20 @@ mod projection;
 mod projection_identity_index;
 mod projection_read;
 mod publication;
+mod read_meter;
 mod recovery;
 mod registry;
 mod runtime;
 mod schema;
 mod sealed_store;
 mod state;
-mod store_quarantine;
 mod traversal;
 mod verified_marker;
 
-pub use backup::GraphBackupReceipt;
-pub use bundle::{
-    MAX_SEALED_READ_BUNDLE_ARTIFACT_BYTES_V1, SEALED_READ_BUNDLE_FORMAT_V1,
-    SealedReadBundleArtifactStateV1, SealedReadBundleArtifactV1, SealedReadBundleManifestV1,
-    SealedReadBundleWriterV1, load_sealed_read_bundle_artifact, retire_sealed_read_bundle,
-    sweep_aborted_sealed_read_bundle_temporaries,
+pub use error::{
+    GraphBudgetKind, GraphConflictContextV1, GraphDbError, GraphStoreFailureClass,
+    classify_graph_store_error,
 };
-pub use error::{GraphBudgetKind, GraphConflictContextV1, GraphDbError};
 pub use generation::{
     GraphEntityRef, GraphGenerationDependency, GraphGenerationManifest,
     GraphGenerationManifestIdentity, GraphGenerationManifestProvider, GraphGenerationRelation,
@@ -83,11 +78,10 @@ pub use publication::{
 pub(crate) use publication::{
     GraphPublication, GraphPublicationDigest, GraphPublicationInputDigest, GraphPublicationReceipt,
 };
+pub use read_meter::{GraphReadCost, GraphReadMeter};
 pub use recovery::VerifiedGraphCommit;
 pub use registry::{
-    CODE_GRAPH_SHARD_NAMESPACE_PREFIX, LEGACY_PER_GENERATION_CODE_GRAPH_NAMESPACE_PREFIX,
-    code_graph_shard_namespace, is_code_graph_shard_namespace,
-    is_legacy_per_generation_code_graph_namespace,
+    CODE_GRAPH_SHARD_NAMESPACE_PREFIX, code_graph_shard_namespace, is_code_graph_shard_namespace,
 };
 pub use registry::{
     GraphDbOwnerRegistrationV1, GraphDbRegistration, GraphDbRegistry, GraphDbRegistryCapacity,
@@ -95,7 +89,8 @@ pub use registry::{
     GraphDbRetirementOutcome, GraphDbRetirementRefusal, GraphDbRetirementReservation,
     GraphPublicationPreparationV1, ProvenGraphPublicationV1,
 };
-pub use runtime::{GraphDb, GraphDbRuntimeState, GraphSnapshot};
+pub use runtime::{GraphDb, GraphDbRuntimeState, GraphServingEnginePin, GraphSnapshot};
+pub use schema::graph_stable_identity;
 pub use sealed_store::{SealedStoreCensusV1, census_sealed_store};
 
 /// What hydration decoded on **this thread** since the last take.

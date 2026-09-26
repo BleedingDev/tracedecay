@@ -3,14 +3,14 @@
 //!
 //! History is the one Work product read that returns no projection at all. The
 //! events are the record, so this authority hands back the stored
-//! `WorkProductEventV1` rows unchanged — it does not summarise them, does not
+//! `WorkProductEventV1` rows unchanged, it does not summarise them, does not
 //! reorder them, and never synthesises an event that was not appended.
 //!
 //! Three bounds shape what a page contains.
 //!
 //! 1. **The selection bounds the journal to its covered prefix.** An event
 //!    records the relation scopes it was admitted under, and an event outside
-//!    the selection falls outside the slice the read was authorized over — it
+//!    the selection falls outside the slice the read was authorized over, it
 //!    does not poison the events inside it. So the page is served over the
 //!    covered prefix (see [`covered_prefix`](super::covered_prefix) for why the
 //!    covered slice is always a prefix) and carries a
@@ -31,8 +31,8 @@
 
 use tracedecay_contracts::{
     OpaqueCursor, WorkHistoryCoverageV1, WorkHistoryReadPortV1, WorkHistoryRequestV1,
-    WorkHistoryV1, WorkProductApplicationErrorV1, WorkProductPortContextV1,
-    WorkProductSelectionScopeV1, WorkRelationScopeV1,
+    WorkHistoryV1, WorkProductApplicationErrorV1, WorkProductAuthorizedRelationScopeV1,
+    WorkProductPortContextV1, WorkProductSelectionScopeV1,
 };
 
 use super::{covered_prefix, load_journal};
@@ -108,7 +108,9 @@ impl WorkHistoryReadPortV1 for WorkSqliteStorage {
 ///
 /// This mirrors the set the application re-derives when it checks the answer,
 /// so an event that would fail that check is never returned in the first place.
-fn selected_relation_scopes(selection: &WorkProductSelectionScopeV1) -> Vec<WorkRelationScopeV1> {
+fn selected_relation_scopes(
+    selection: &WorkProductSelectionScopeV1,
+) -> Vec<WorkProductAuthorizedRelationScopeV1> {
     selection
         .relation_scopes()
         .map_or_else(Vec::new, |relations| relations.iter().cloned().collect())

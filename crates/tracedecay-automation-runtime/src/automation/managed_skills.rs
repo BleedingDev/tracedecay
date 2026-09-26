@@ -4,11 +4,15 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::config_error;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tracedecay_automation::run_labels::SKILL_OVERLAP_REMOVAL_TOMBSTONE;
-use tracedecay_domain::errors::Result;
+use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_private_fs::FileLease;
 use tracedecay_private_fs::framed_log::DirectorySyncPolicy;
+
+/// Typed reset authority for the profile's `agent_managed` skill and usage
+/// records.
+pub(crate) const MANAGED_SKILL_STORE_AUTHORITY: &str = "managed skill store";
 
 pub use tracedecay_automation::managed_skills::validate_managed_support_files;
 pub use tracedecay_automation::managed_skills::{
@@ -20,60 +24,6 @@ pub use tracedecay_automation::managed_skills::{
 use tracedecay_automation::managed_skills::{
     validate_managed_skill, validate_managed_skill_update, validate_skill_id,
 };
-
-/// Decode the retained summary-only format without mutating inspection state.
-fn decode_retained_skill(bytes: &[u8]) -> Result<(ManagedSkill, bool)> {
-    let mut value: serde_json::Value = serde_json::from_slice(bytes)?;
-    let metadata = value
-        .get_mut("metadata")
-        .and_then(serde_json::Value::as_object_mut)
-        .ok_or_else(|| config_error("managed skill metadata must be an object"))?;
-    let legacy = !metadata.contains_key("routing_description");
-    if legacy {
-        let summary = metadata
-            .get("summary")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| config_error("retained managed skill summary is required"))?;
-        let routing =
-            tracedecay_automation::managed_skills::legacy_managed_skill_routing_description(
-                summary,
-            );
-        metadata.insert(
-            "routing_description".to_owned(),
-            serde_json::Value::String(routing),
-        );
-    }
-    let skill: ManagedSkill = serde_json::from_value(value)?;
-    validate_managed_skill(&skill)?;
-    Ok((skill, legacy))
-}
-
-/// Upgrade retained routing metadata before authoring evidence is captured.
-/// Inspection reads use the decoder only; this explicit mutation uses the same
-/// journal and lock as skill edits, without changing authored timestamps or provenance.
-pub async fn migrate_managed_skill_routing(profile_root: &Path) -> Result<()> {
-    if !managed_skill_root(profile_root).exists() {
-        return Ok(());
-    }
-    let _lock = lock_skill_store_async(profile_root).await?;
-    let root = managed_skill_root(profile_root);
-    let mut migrated = Vec::new();
-    for entry in std::fs::read_dir(&root)? {
-        let path = entry?.path().join("skill.json");
-        if !path.is_file() {
-            continue;
-        }
-        let (mut skill, legacy) = decode_retained_skill(&std::fs::read(path)?)?;
-        if legacy {
-            skill.refresh_checksum();
-            migrated.push(skill);
-        }
-    }
-    if !migrated.is_empty() {
-        persist_skill_transaction_unlocked(profile_root, &migrated.iter().collect::<Vec<_>>())?;
-    }
-    Ok(())
-}
 
 pub fn managed_skill_root(profile_root: &Path) -> PathBuf {
     profile_root.join("agent_managed").join("skills")
@@ -103,15 +53,7 @@ impl SkillConsolidationKind<'_> {
     }
 }
 
-struct SkillStoreLock(File);
-
-impl Drop for SkillStoreLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.0);
-    }
-}
-
-fn lock_skill_store(profile_root: &Path) -> Result<SkillStoreLock> {
+fn lock_skill_store(profile_root: &Path) -> Result<FileLease> {
     let root = managed_skill_root(profile_root);
     std::fs::create_dir_all(&root).map_err(|e| {
         config_error(format!(
@@ -132,17 +74,18 @@ fn lock_skill_store(profile_root: &Path) -> Result<SkillStoreLock> {
                 path.display()
             ))
         })?;
-    file.lock_exclusive().map_err(|e| {
+    file.lock().map_err(|e| {
         config_error(format!(
             "failed to lock skill store '{}': {e}",
             path.display()
         ))
     })?;
+    let lock = FileLease::held(file, "automation.managed_skills.store");
     recover_skill_transaction(&root)?;
-    Ok(SkillStoreLock(file))
+    Ok(lock)
 }
 
-async fn lock_skill_store_async(profile_root: &Path) -> Result<SkillStoreLock> {
+async fn lock_skill_store_async(profile_root: &Path) -> Result<FileLease> {
     let profile_root = profile_root.to_path_buf();
     tokio::task::spawn_blocking(move || lock_skill_store(&profile_root))
         .await
@@ -606,17 +549,45 @@ fn load_managed_skill_unlocked(profile_root: &Path, id: &str) -> Result<ManagedS
             ))
         }
     })?;
-    let mut skill: ManagedSkill = decode_retained_skill(&bytes)
-        .map(|(skill, _)| skill)
-        .map_err(|e| {
-            config_error(format!(
-                "failed to parse managed skill record '{}': {e}",
-                path.display()
-            ))
-        })?;
-    skill.normalize_timestamps();
-    validate_managed_skill(&skill)?;
+    decode_managed_skill_record(&path, &bytes)
+}
+
+/// A stored record that fails to parse or validate is one typed `Config`
+/// failure naming the file, whichever check rejected it. The released
+/// summary-only shape (metadata without `routing_description`) is a typed
+/// reset instead: this binary never derives routing from a summary.
+fn decode_managed_skill_record(path: &Path, bytes: &[u8]) -> Result<ManagedSkill> {
+    let invalid = |e: &dyn std::fmt::Display| {
+        config_error(format!(
+            "invalid managed skill record '{}': {e}",
+            path.display()
+        ))
+    };
+    let skill: ManagedSkill = serde_json::from_slice(bytes).map_err(|error| {
+        if is_summary_only_record(bytes) {
+            TraceDecayError::reset_required(
+                MANAGED_SKILL_STORE_AUTHORITY,
+                format!(
+                    "managed skill record '{}' is the released summary-only shape",
+                    path.display()
+                ),
+            )
+        } else {
+            invalid(&error)
+        }
+    })?;
+    validate_managed_skill(&skill).map_err(|e| invalid(&e))?;
     Ok(skill)
+}
+
+fn is_summary_only_record(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|record| {
+            let metadata = record.get("metadata")?.as_object()?;
+            Some(metadata.contains_key("summary") && !metadata.contains_key("routing_description"))
+        })
+        .unwrap_or(false)
 }
 
 #[hotpath::measure(label = "automation.managed_skill.list", future = true)]
@@ -659,20 +630,34 @@ fn list_managed_skills_unlocked(profile_root: &Path) -> Result<Vec<ManagedSkill>
                 path.display()
             ))
         })?;
-        let mut skill = decode_retained_skill(&bytes)
-            .map(|(skill, _)| skill)
-            .map_err(|e| {
-                config_error(format!(
-                    "failed to parse managed skill record '{}': {e}",
-                    path.display()
-                ))
-            })?;
-        skill.normalize_timestamps();
-        validate_managed_skill(&skill)?;
-        skills.push(skill);
+        match decode_managed_skill_record(&path, &bytes) {
+            Ok(skill) => skills.push(skill),
+            Err(refusal) if refusal.reset_required_context().is_some() => {
+                reset_refused_skill_dir(&root, &entry.path(), &refusal)?;
+            }
+            Err(error) => return Err(error),
+        }
     }
     skills.sort_by(|a, b| a.metadata.id.cmp(&b.metadata.id));
     Ok(skills)
+}
+
+/// The complete-store scan owns a refused record: its skill directory is
+/// deleted (nothing kept) so one released record cannot fail every listing.
+fn reset_refused_skill_dir(root: &Path, dir: &Path, refusal: &TraceDecayError) -> Result<()> {
+    std::fs::remove_dir_all(dir).map_err(|error| {
+        config_error(format!(
+            "failed to reset refused managed skill '{}': {error}",
+            dir.display()
+        ))
+    })?;
+    sync_directory(root)?;
+    tracing::warn!(
+        managed_skill = %dir.display(),
+        refusal = %refusal,
+        "reset refused managed skill record"
+    );
+    Ok(())
 }
 
 pub async fn set_managed_skill_state(

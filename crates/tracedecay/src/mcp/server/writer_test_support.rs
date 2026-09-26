@@ -4,10 +4,10 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tracedecay_runtime_core::path_safety::{plain_git_args, plain_host_path};
 
-use crate::config::PinnedUserDataDir;
 use crate::mcp::server::McpServerConstructionContext;
-use crate::project::TraceDecay;
-use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_project::config::PinnedUserDataDir;
+use tracedecay_project::project::TraceDecay;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 
 pub(super) fn git(root: &Path, args: &[&str]) {
     let output = std::process::Command::new(
@@ -35,7 +35,7 @@ impl WriterTestFixtureAuthority {
         self.runtime
             .open_project_graph_for_test(
                 project_root,
-                crate::project::TraceDecayOpenOptions {
+                tracedecay_project::project::TraceDecayOpenOptions {
                     profile_root: Some(self.runtime.profile_root_for_test().to_path_buf()),
                     global_db_path: None,
                 },
@@ -44,8 +44,8 @@ impl WriterTestFixtureAuthority {
             .expect("reopen registered project graph")
     }
 
-    /// Releases the retained runtime — the profile's only session-relation
-    /// writer — while keeping the profile pin alive, so a test can reopen the
+    /// Releases the retained runtime, the profile's only session-relation
+    /// writer, while keeping the profile pin alive, so a test can reopen the
     /// profile the way a fresh process would.
     pub(super) fn release_runtime_for_reopen(self) -> PinnedUserDataDir {
         self._pin
@@ -56,7 +56,7 @@ impl WriterTestFixtureAuthority {
 /// session-relation graph has exactly one writer, so tests must share this
 /// runtime instead of constructing a second one on the same profile. This is
 /// the registry authority the daemon holds in production, so a server built
-/// from it resolves path selectors — including hook workspace routes —
+/// from it resolves path selectors, including hook workspace routes,
 /// instead of reporting the project unregistered.
 pub(super) fn registered_runtime(
     authority: &WriterTestFixtureAuthority,

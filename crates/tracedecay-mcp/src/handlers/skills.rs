@@ -5,7 +5,6 @@ use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use tracedecay_automation_runtime::ports::session_store::AutomationSessionStore;
 
 use crate::ToolResult;
 use tracedecay_automation_runtime::automation::hermes_skill_bridge::{
@@ -123,7 +122,7 @@ pub async fn handle_skill_list(
     let usage_summaries = summarize_skill_usage(&profile_root, &skills).await?;
     let recommendations = stale_skill_recommendations(
         &usage_summaries,
-        tracedecay_project::project::current_timestamp(),
+        tracedecay_runtime_core::tracedecay::current_timestamp(),
         STALE_SKILL_AFTER_SECS,
     );
     let improvement_recommendations = skill_improvement_recommendations(&usage_summaries);
@@ -161,7 +160,7 @@ pub async fn handle_skill_list(
             .collect::<Vec<_>>(),
     });
     Ok(tool_json_with_md(
-        Some(cg.project_root()),
+        Some(&cg.store_layout().response_handle_root),
         &args,
         &payload,
         || renderers::skill_list_md(&payload),
@@ -219,7 +218,7 @@ pub async fn handle_skill_view(
     let usage_summary = summarize_skill_usage_for(&profile_root, &skill).await?;
     let stale_recommendation = stale_skill_recommendations(
         std::slice::from_ref(&usage_summary),
-        tracedecay_project::project::current_timestamp(),
+        tracedecay_runtime_core::tracedecay::current_timestamp(),
         STALE_SKILL_AFTER_SECS,
     )
     .into_iter()
@@ -243,7 +242,7 @@ pub async fn handle_skill_view(
         "support_file_summaries": support_file_summaries,
     });
     Ok(tool_json_with_md(
-        Some(cg.project_root()),
+        Some(&cg.store_layout().response_handle_root),
         &args,
         &payload,
         || renderers::skill_view_md(&payload),
@@ -285,7 +284,7 @@ pub async fn handle_automation_run_artifact_view(
         "payload": payload,
     });
     Ok(tool_json_with_md(
-        Some(cg.project_root()),
+        Some(&cg.store_layout().response_handle_root),
         &args,
         &payload,
         || renderers::automation_artifact_md(&payload),
@@ -300,7 +299,7 @@ async fn sync_project_skill_analytics(
     ingest_project_analytics_events(
         profile_root,
         cg.project_root(),
-        analytics_db.map(|database| database as &dyn AutomationSessionStore),
+        analytics_db,
         SKILL_ANALYTICS_IMPORT_LIMIT,
     )
     .await
@@ -317,5 +316,9 @@ pub fn handle_hermes_skill_bridge(cg: &TraceDecay, args: &Value) -> Result<ToolR
         "status": "ok",
         "bridge": snapshot,
     });
-    Ok(tool_json(Some(cg.project_root()), args, &payload))
+    Ok(tool_json(
+        Some(&cg.store_layout().response_handle_root),
+        args,
+        &payload,
+    ))
 }

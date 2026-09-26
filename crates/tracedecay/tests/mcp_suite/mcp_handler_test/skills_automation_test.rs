@@ -7,8 +7,6 @@ use tempfile::TempDir;
 #[cfg(feature = "test-transport")]
 use tracedecay::mcp::McpServer;
 #[cfg(feature = "test-transport")]
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
-#[cfg(feature = "test-transport")]
 use tracedecay_automation_runtime::automation::managed_skills::{
     ManagedSkillDraft, ManagedSkillProvenance, ManagedSkillSource, ManagedSupportFile,
     create_managed_skill,
@@ -21,7 +19,8 @@ use tracedecay_automation_runtime::automation::run_ledger::{
 use tracedecay_automation_runtime::automation::skill_usage::{
     SkillUsageAction, load_skill_usage_record, record_skill_usage,
 };
-
+use tracedecay_global_db::RegisteredGlobalDb;
+#[cfg(feature = "test-transport")]
 #[tokio::test]
 async fn automation_run_artifact_mcp_tool_reads_verified_payload() {
     let dir = TempDir::new().unwrap();
@@ -77,6 +76,7 @@ async fn automation_run_artifact_mcp_tool_reads_verified_payload() {
             backend_attempt_count: 0,
             backend_attempts: Vec::new(),
             fallback_status: None,
+            session_evidence_budget_stage: None,
             report_ref: None,
             artifacts: vec![artifact],
             started_at: "1782283199".to_string(),
@@ -143,18 +143,18 @@ async fn automation_run_artifact_mcp_tool_reads_verified_payload() {
 #[cfg(feature = "test-transport")]
 #[tokio::test]
 async fn managed_skill_mcp_tools_list_and_view_profile_store() {
-    let env_lock = GLOBAL_DB_ENV_LOCK.lock().await;
+    let env_lock = lock_process_env().await;
     let dir = TempDir::new().unwrap();
     let project = dir.path().join("repo");
     fs::create_dir_all(project.join("src")).unwrap();
     fs::write(project.join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
     let home = dir.path().join("home");
-    let _home_guard = HomeEnvGuard::set(&home);
+    let _home_guard = HomeEnvGuard::set(&env_lock, &home);
     let _global_db_guard = GlobalDbEnvGuard::set(&home.join(".tracedecay/global.db"));
     let cg = TestTraceDecay::new(fixture::init_project_from_template(&project).await.unwrap());
     let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
     let runtime = open_active_project_scoped_runtime(&cg).await;
-    let project_id = HostAdmissionTestRuntimeV1::canonical_project_key(cg.project_root());
+    let project_id = RegisteredGlobalDb::canonical_project_key(cg.project_root());
 
     let active_skill = create_managed_skill(
         &profile_root,
@@ -178,7 +178,7 @@ async fn managed_skill_mcp_tools_list_and_view_profile_store() {
             provider: "mcp".to_string(),
             project_id: project_id.clone(),
             session_id: Some("mcp-skill-session".to_string()),
-            timestamp: tracedecay::project::current_timestamp(),
+            timestamp: tracedecay_runtime_core::tracedecay::current_timestamp(),
             event_kind: "mcp_tool_call".to_string(),
             hook_name: None,
             tool_name: Some("tracedecay_skill_view".to_string()),
@@ -331,7 +331,7 @@ async fn managed_skill_mcp_tools_list_and_view_profile_store() {
             provider: "mcp".to_string(),
             project_id,
             session_id: Some("mcp-skill-session".to_string()),
-            timestamp: tracedecay::project::current_timestamp(),
+            timestamp: tracedecay_runtime_core::tracedecay::current_timestamp(),
             event_kind: "mcp_tool_call".to_string(),
             hook_name: None,
             tool_name: Some("tracedecay_skill_view".to_string()),

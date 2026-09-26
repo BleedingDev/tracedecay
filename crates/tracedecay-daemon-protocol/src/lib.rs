@@ -61,7 +61,12 @@ pub mod transport;
 pub use application_surface::{
     ApplicationSurfaceAdapterError, ApplicationSurfaceInvocationResult, ApplicationSurfaceRequest,
     ApplicationToolRequest, FeedbackSurfaceRequest, adapt_application_tool_request,
-    parse_application_surface_request, separate_application_tool_request,
+    application_delivery_route, application_outcome_value, application_response,
+    application_surface_cancellation_policy, application_surface_feedback_is_observable,
+    application_surface_feedback_operation, decode_retained_request, invoke_application_surface,
+    is_source_edit_operation, parse_application_surface_invocation_payload,
+    parse_application_surface_request, parse_source_edit_arguments,
+    separate_application_tool_request,
 };
 pub use client::{
     AdapterInvocation, BindingResolution, BindingResolver, BoundInvocation, CanonicalInvocation,
@@ -69,9 +74,8 @@ pub use client::{
     DaemonInvocationError, DaemonInvocationExecutor, DaemonInvocationExecutorFuture,
     DaemonInvocationResult, DaemonLspSessionClient, DispatchError, DispatchInput,
     DispatchedInvocation, InvocationCancellationPolicy, InvocationControls, ResolvedBinding,
-    ScopeSelector, application_delivery_route, application_response, deadline_remaining,
-    handshake_refusal_error, invocation_now_micros, map_invocation_error, resolve_dispatch,
-    wait_for_cancellation,
+    ScopeSelector, deadline_remaining, handshake_refusal_error, map_invocation_error,
+    resolve_dispatch, wait_for_cancellation,
 };
 pub use client_identity::DaemonClientIdentity;
 pub use connection::{
@@ -81,7 +85,8 @@ pub use connection::{
     DaemonLivenessProbe, MAX_TOOL_REQUEST_DEADLINE, TOOL_REQUEST_DEADLINE_ENV,
     connect_to_daemon_connection, daemon_connect_failure, daemon_response_stalled,
     daemon_response_stalled_during, daemon_tool_response_bound, next_daemon_response_line,
-    tool_request_deadline, write_daemon_preamble,
+    poll_daemon_response_line, tool_request_deadline, write_daemon_handshake_preamble,
+    write_daemon_preamble,
 };
 pub use contract::{
     DAEMON_INVOCATION_PROTOCOL, DAEMON_INVOCATION_REVISION, DAEMON_SHUTDOWN_METHOD,
@@ -99,6 +104,7 @@ pub use contract::{
 pub use handshake::{
     DAEMON_HANDSHAKE_REFUSAL_PROTOCOL, DaemonHandshake, DaemonHandshakeRefusal,
     DaemonHandshakeRefusalReason, MovedStoreAdoption, client_version_skew, version_skew_action,
+    versions_name_same_build,
 };
 pub use lsp_wire::{
     ConnectionLocalRequestSequence, FramePoll, FrameSend, LspFrame, LspSessionAccess,

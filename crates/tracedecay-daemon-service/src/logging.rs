@@ -37,9 +37,9 @@ pub struct WatcherEvent {
 /// understands a documented subset of the `RUST_LOG` grammar rather than the
 /// full directive language: a bare `level` sets the level for every target,
 /// and `target=level` sets the level for targets that start with `target`.
-/// Anything else — span selectors, field predicates, a target with no level —
-/// is recorded as unparsed and reported once, never reinterpreted as
-/// something the operator did not write.
+/// Anything else is recorded as unparsed and reported once, never
+/// reinterpreted as something the operator did not write. That includes span
+/// selectors, field predicates, and a target with no level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StderrTracingFilter {
     /// Level for targets that no directive names.
@@ -107,7 +107,7 @@ impl StderrTracingFilter {
     }
 
     /// The most verbose level any directive can enable. Only a max-level hint
-    /// for the subscriber — [`Self::level_for_target`] still decides each
+    /// for the subscriber, [`Self::level_for_target`] still decides each
     /// event, so a target directive never globalizes.
     pub fn max_level(&self) -> LevelFilter {
         self.targets
@@ -168,7 +168,7 @@ impl StderrTracingDefault {
 
 /// Installs the process-wide stderr `tracing` subscriber, honoring `RUST_LOG`
 /// over `default`. Additive to the bespoke `[tracedecay] event=` stderr lines
-/// above — both channels share stderr, and tools that parse `event=` lines are
+/// above, both channels share stderr, and tools that parse `event=` lines are
 /// unaffected because tracing output never carries that marker.
 ///
 /// An explicit `RUST_LOG` is operator intent and outranks `default`, including
@@ -316,7 +316,7 @@ pub fn recent_watcher_events(max_lines: usize) -> HashMap<String, WatcherEvent> 
 #[hotpath::measure(label = "daemon.engine.logging.read_tail")]
 fn read_daemon_log_tail(max_lines: usize) -> String {
     // macOS launchd: a plain err-log file next to the data dir.
-    if let Some(data_dir) = tracedecay_project::config::user_data_dir() {
+    if let Some(data_dir) = tracedecay_runtime_core::config::user_data_dir() {
         let err_log = data_dir.join("daemon.err.log");
         if let Ok(contents) = std::fs::read_to_string(&err_log) {
             let lines: Vec<&str> = contents.lines().collect();
@@ -343,12 +343,14 @@ fn read_daemon_log_tail(max_lines: usize) -> String {
 
 pub fn unavailable_error(socket_path: &Path) -> TraceDecayError {
     let advice = tracedecay_daemon_control::unavailable_daemon_socket_advice(socket_path, None);
-    TraceDecayError::Config {
-        message: format!(
+    TraceDecayError::project_route(
+        tracedecay_daemon_protocol::DAEMON_CONNECT_DOWN,
+        true,
+        format!(
             "TraceDecay daemon socket '{}' is not available. {advice}",
             socket_path.display()
         ),
-    }
+    )
 }
 
 #[cfg(test)]

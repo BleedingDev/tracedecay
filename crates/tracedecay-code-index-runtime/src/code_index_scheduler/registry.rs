@@ -13,7 +13,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, RwLock, Weak,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -27,7 +27,8 @@ use tracedecay_contracts::code_index_freshness::{
     CodeGraphServingReadinessV1, CodeIndexBuildBlockedReasonV1, CodeIndexConvergenceParkedV1,
 };
 use tracedecay_domain::{
-    CodeGenerationId, ManifestDigest, ProjectId, RepositoryId, WorktreeId, host_cpu_target,
+    CodeGenerationId, ManifestDigest, ProjectId, RepositoryId, SanitizedCodeFileV1, WorktreeId,
+    host_cpu_target,
 };
 use tracedecay_lsp::LspRuntimeFailure;
 
@@ -42,6 +43,7 @@ use super::{
     LatestCompleteCodeIndexV1, PendingHintsV1, SharedCodeIndexBytePoolV1,
     newly_eligible_percentile, now_micros,
 };
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 #[cfg(test)]
 mod cold_read_wake_tests;
@@ -51,11 +53,14 @@ pub(super) mod graph_cursor_retention;
 mod ignored_dependencies;
 mod lsp_projection;
 mod mount;
+mod owner_signals;
 mod query_authority;
 #[cfg(test)]
 mod reconcile_failure_isolation_tests;
 mod scope_identity;
 mod semantic_runtime;
+#[cfg(test)]
+mod seat_swap_tests;
 #[cfg(test)]
 mod serving_readiness_tests;
 mod serving_reads;
@@ -144,11 +149,12 @@ const TEXT_PROJECTION_MAXIMUM_ACTIVATION_ADVANCES_V1: usize = 10_000;
 /// generation, so a complete sealed generation sat on disk with zero seat
 /// attempts and no log line, because a missing prepare is not a refusal. The
 /// gate is now the text owner, not the tree: a publication prepares on its own
-/// pass once its lightweight text owner has finished, and an unchanged pass
-/// prepares as soon as a retained owner exists to recover a verified head.
-/// Fresh graph publication and any retained full replay follow text projection
-/// because both are corpus-sized consumers of the sealed source and process
-/// memory. Every skip names itself.
+/// pass alongside its lightweight text owner's projection, and an unchanged
+/// pass prepares as soon as a retained owner exists to recover a verified head.
+/// Both are corpus-sized consumers of the sealed source and process memory, so
+/// fresh graph publication starts only once that projection holds its build
+/// reservation, and any retained full replay follows text projection. Every
+/// skip names itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GraphSeatGateV1 {
     /// Prepare, decode, activate, and swap this generation into serving.
@@ -175,15 +181,21 @@ enum PublishedTextProjectionOutcomeV1 {
     /// contract violation (parked on the owner), a failure, or an abnormal
     /// task exit. The owner carries the typed state; the pass seats nothing.
     Unfinished,
+    /// The resident-memory authority refused the build. Unfinished, but a
+    /// continuation would only repeat the refusal: the worker retries when
+    /// the resident owners report memory given back.
+    WaitingForMemory,
     /// Shutdown retired the text control mid-slice.
     Shutdown,
 }
 
 impl GraphSeatGateV1 {
     /// `text_owner_admitted_for_graph` means a publication's replacement
-    /// owner is ready, or an unchanged pass has a retained owner from which it
-    /// can first try to recover an already-verified graph head. A retained full
-    /// replay is gated separately on text readiness after that recovery attempt.
+    /// owner is ready or its projection runs in this pass (the serving swap
+    /// joins it before seating), or an unchanged pass has a retained owner
+    /// from which it can first try to recover an already-verified graph head.
+    /// A retained full replay is gated separately on text readiness after that
+    /// recovery attempt.
     #[hotpath::skip]
     pub const fn decide(
         activation_enabled: bool,
@@ -242,7 +254,7 @@ impl GraphSeatGateV1 {
 ///
 /// Preparation binds the complete generation and hands it to the serving
 /// swap; activation installs its native graph. The two used to share one
-/// gate, so refusing a redundant activation also refused the seat — a restart
+/// gate, so refusing a redundant activation also refused the seat, a restart
 /// that restored an owner whose graph was already Ready therefore left the
 /// serving slot empty forever while status read the same owner and reported
 /// Ready. Every arm here refuses activation only; the seat always happens.
@@ -337,7 +349,7 @@ impl ServingSwapOutcomeV1 {
                 // generation must not move the slot backwards.
                 return Self::Superseded;
             }
-            // Nothing active holds the slot — it is empty, or its incumbent
+            // Nothing active holds the slot, it is empty, or its incumbent
             // was superseded too. Either way this generation is no worse than
             // what is there, and refusing left the route wedged on a
             // generation the store no longer publishes.
@@ -351,6 +363,12 @@ impl ServingSwapOutcomeV1 {
     pub const fn installs(self) -> bool {
         matches!(self, Self::Seated | Self::SeatedStale)
     }
+}
+
+/// An unfinished text projection withholds the serving seat only when its
+/// query owners are still missing.
+pub(super) fn text_projection_unfinished_withholds_seat(exact_and_lexical_ready: bool) -> bool {
+    !exact_and_lexical_ready
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
@@ -420,6 +438,7 @@ mod resident_memory;
 #[cfg(test)]
 mod test_gates;
 pub mod watch_ingress;
+pub use owner_signals::{CodeIndexOwnerSignalsClosedV1, CodeIndexOwnerSignalsV1};
 
 /// At most two distinct worktrees may reconcile concurrently. Each reconcile
 /// already saturates the shared indexing pool during extraction; the second
@@ -464,7 +483,7 @@ struct ColdMountOpenTestControlV1 {
     release: Condvar,
     events: Mutex<Vec<ColdMountOpenEventV1>>,
     changed: tokio::sync::watch::Sender<usize>,
-    followers: AtomicUsize,
+    followers: std::sync::atomic::AtomicUsize,
 }
 
 #[cfg(test)]
@@ -477,7 +496,7 @@ impl ColdMountOpenTestControlV1 {
             release: Condvar::new(),
             events: Mutex::new(Vec::new()),
             changed,
-            followers: AtomicUsize::new(0),
+            followers: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -590,6 +609,10 @@ pub struct CodeIndexMountedScopeV1 {
     pub shutting_down: Arc<AtomicBool>,
 }
 
+/// One worktree's graph-bearing serving seat. Every read path takes it, so it
+/// is Hotpath instrumented; each writer bumps the worktree's serving epoch.
+pub type ServingGenerationSlot = hotpath::rw_locks::RwLock<Option<LatestCompleteCodeIndexV1>>;
+
 /// Outcome of retiring the retained generation from a failed branch
 /// publication. A no-match preserves a newer generation that won the race.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,12 +697,13 @@ pub struct MountedCodeIndexWorktreeV1 {
     /// work so competing builds wait without occupying a blocking-pool thread.
     pub(super) build_publication_lock: Arc<tokio::sync::Mutex<()>>,
     pub historical_generation_owner: super::HistoricalCodeIndexGenerationOwnerV1,
-    pub serving_generation: Arc<RwLock<Option<LatestCompleteCodeIndexV1>>>,
+    pub serving_generation: Arc<ServingGenerationSlot>,
     /// Complete-generation callers need the decoded serving owner; restored
     /// text and persistent graph reads do not. Only their explicit demand
     /// admits this optional decode after verified-head recovery.
     complete_generation_requested: Arc<AtomicBool>,
     complete_generation_requested_changed: tokio::sync::watch::Sender<bool>,
+    memory_retry: Arc<MemoryRefusalRetryV1>,
     /// Source-freshness state is independent from scheduler build state so
     /// readiness probes remain available throughout a long publication.
     source_freshness: super::SourceFreshnessFenceV1,
@@ -703,8 +727,8 @@ pub struct MountedCodeIndexWorktreeV1 {
     /// passes or when a generation extracted this pass seats as the active
     /// publication; cleared when the probe fails or the slot is rewritten
     /// with an unproven generation. A background reconcile owns the scheduler
-    /// mutex for its whole pass — sealing a production-scale corpus holds it
-    /// for minutes — and verified graph reads re-prove the witness against
+    /// mutex for its whole pass, sealing a production-scale corpus holds it
+    /// for minutes, and verified graph reads re-prove the witness against
     /// the live checkout through that window instead of refusing.
     serving_source_witness: Arc<RwLock<Option<super::ServingSourceWitnessV1>>>,
     /// Immutable progress snapshot independently readable while the scheduler
@@ -714,11 +738,15 @@ pub struct MountedCodeIndexWorktreeV1 {
     /// branch-publication token even if a future worker re-seats an equal id.
     serving_generation_epoch: Arc<AtomicU64>,
     /// A wake signal only: readers resolve identity and availability from the serving slot.
-    serving_generation_changed: tokio::sync::watch::Sender<()>,
+    serving_generation_changed: Arc<tokio::sync::watch::Sender<()>>,
     /// One in-flight branch publication may own a serving-slot installation.
     /// It is paired with `serving_generation_epoch` under the slot CAS.
     serving_generation_installation: Arc<Mutex<Option<ServingGenerationInstallationClaimV1>>>,
     graph_activation: CodeGraphActivationAuthorityV1,
+    /// Lease over this worktree's decoded generations; complete-generation
+    /// reads renew it.
+    residency: Arc<super::residency::WorktreeResidencyV1>,
+    _residency_registration: super::residency::WorktreeResidencyRegistrationV1,
     /// Superseded graph generations still pinned by an unexpired graph
     /// cursor. Holding the owner keeps its replay retained across pages.
     graph_cursor_retention: Arc<graph_cursor_retention::GraphCursorRetentionV1>,
@@ -742,9 +770,12 @@ pub struct MountedCodeIndexWorktreeV1 {
     /// canonical index or retrieval observations (never a fabricated zero).
     index_observability: Arc<OnceLock<super::observability::CodeIndexObservabilityV1>>,
     shutting_down: Arc<AtomicBool>,
-    /// Count of in-flight owner passes; nonzero means activation or reconcile
-    /// work is running for this worktree.
-    reconcile_in_progress: Arc<AtomicUsize>,
+    /// In-flight owner passes; running means activation or reconcile work is
+    /// in progress for this worktree.
+    reconcile_in_progress: Arc<super::ReconcilePassesV1>,
+    /// Where the background worker is between wakes; see
+    /// [`CodeIndexWorkerPhaseV1`].
+    worker_phase: Arc<tokio::sync::watch::Sender<CodeIndexWorkerPhaseV1>>,
     /// Live handle to the publication's encoded-byte counter; observed only by
     /// test memory accounting today.
     _active_generation_encoded_bytes: Arc<AtomicU64>,
@@ -813,9 +844,41 @@ const CONVERGENCE_PARK_TASK_FAILURE_REMEDIATION_V1: &str = "inspect the daemon l
      abnormal text-projection failure; indexing retries when a new generation seals over \
      changed input";
 
-const CONVERGENCE_PARK_PUBLICATION_CORRUPTION_REMEDIATION_V1: &str = "the durable code-index \
-     publication store is corrupt; retire this project route, replace or rebuild that store, \
-     then remount — `tracedecay sync` and ordinary wakes cannot clear it";
+/// Remediation when a background reconcile fails the same way over unchanged
+/// source. Passes stay held until the input changes, so the operator either
+/// changes what the named failure points at or installs a build that no
+/// longer refuses it; both retry through an ordinary path.
+const CONVERGENCE_PARK_RECONCILE_FAILURE_REMEDIATION_V1: &str = "indexing this worktree fails \
+     the same way on every pass over unchanged source; fix what the named failure points at, \
+     then run `tracedecay sync` to retry; if it names an internal indexing contract, run \
+     `tracedecay upgrade` (a restarted daemon retries automatically) and report the failure if \
+     it persists";
+
+/// Remediation when the native graph publication stopped at the measured-RSS
+/// watermark. The refused generation keeps serving exact and lexical reads and
+/// does not re-attempt its graph in this daemon; a restart or a new generation
+/// does.
+const CONVERGENCE_PARK_GRAPH_RESIDENT_MEMORY_REMEDIATION_V1: &str = "the native code graph \
+     was refused because daemon memory reached its admission watermark; exact and lexical \
+     search keep serving, and the graph retries on its own once retained memory is given \
+     back or RSS falls (a source change that seals a new generation also retries it)";
+
+/// Remediation when the derived publication was already deleted and rebuilt
+/// once in this mount and is corrupt again. The daemon deletes and rebuilds a
+/// corrupt derived store automatically; a repeat is bounded to one attempt per
+/// mount so a defect that corrupts every fresh seal cannot cycle re-indexes.
+const CONVERGENCE_PARK_PUBLICATION_CORRUPTION_REMEDIATION_V1: &str = "the derived code-index \
+     publication was deleted and rebuilt once in this daemon and is corrupt again; run \
+     `tracedecay daemon restart` for one more automatic rebuild, and report the daemon log's \
+     code_index_publication_authority_* events if it recurs";
+
+/// Remediation when the derived publication could not be deleted (the store
+/// directory refused the unlink). Nothing in that directory is authoritative,
+/// so the operator fixes the named filesystem fault and restarts.
+const CONVERGENCE_PARK_PUBLICATION_RESET_FAILED_REMEDIATION_V1: &str = "the derived code-index \
+     publication is corrupt and could not be deleted; fix the named filesystem fault on the \
+     project's code-index-v1 scope store, then run `tracedecay daemon restart` to rebuild it \
+     from source";
 
 fn is_terminal_publication_authority_park(parked: &CodeIndexConvergenceParkedV1) -> bool {
     parked.blocked_reason == Some(CodeIndexBuildBlockedReasonV1::PublicationAuthorityCorrupt)
@@ -912,18 +975,32 @@ fn convergence_park_retries_on_wake(slot: &RwLock<Option<CodeIndexConvergencePar
 /// violation is no longer the current convergence obstacle.
 ///
 /// Terminal publication-authority corruption is preserved until the worktree
-/// is retired and remounted over a repaired store.
+/// is retired and remounted over a repaired store. A resident-memory graph
+/// refusal is preserved too: text progress does not activate the refused
+/// graph, so only [`clear_graph_resident_memory_park`] retires it.
 fn clear_convergence_park(slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>) {
     let mut slot = slot
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if slot
-        .as_ref()
-        .is_some_and(is_terminal_publication_authority_park)
-    {
+    if slot.as_ref().is_some_and(|parked| {
+        is_terminal_publication_authority_park(parked)
+            || parked.blocked_reason == Some(CodeIndexBuildBlockedReasonV1::ResidentMemory)
+    }) {
         return;
     }
     *slot = None;
+}
+
+/// Retire a resident-memory graph refusal once a native graph activated.
+fn clear_graph_resident_memory_park(slot: &RwLock<Option<CodeIndexConvergenceParkedV1>>) {
+    let mut slot = slot
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.as_ref().is_some_and(|parked| {
+        parked.blocked_reason == Some(CodeIndexBuildBlockedReasonV1::ResidentMemory)
+    }) {
+        *slot = None;
+    }
 }
 
 #[cfg(test)]
@@ -1070,8 +1147,8 @@ mod terminal_publication_park_tests {
 
 /// The sealed-generation identity half of a freshness reading. Every other
 /// field is left at its default so callers can fill in the observation half
-/// with struct-update syntax, which keeps these seven — six of them
-/// `Option<String>` — matched by name rather than by position.
+/// with struct-update syntax, which keeps these seven, six of them
+/// `Option<String>`, matched by name rather than by position.
 fn dashboard_freshness_identity(
     latest: Option<&LatestCompleteCodeIndexV1>,
 ) -> tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
@@ -1123,11 +1200,13 @@ pub(super) fn dashboard_code_graph_serving(
     ))
 }
 
-/// Whether status may report this worktree as terminal (`fresh` / `current`).
+/// Whether the lane owners alone would let status report this worktree as
+/// terminal (`fresh` / `current`).
 ///
 /// Refused graph activation remains terminal for text serving, preserving the
 /// existing status behavior; strict dogfood can distinguish it from Ready via
-/// the separate typed projection.
+/// the separate typed projection. [`dashboard_terminal_status`] is what
+/// freshness reads use.
 fn dashboard_generation_is_ready(
     latest: Option<&LatestCompleteCodeIndexV1>,
     text_ready: bool,
@@ -1139,6 +1218,49 @@ fn dashboard_generation_is_ready(
     } else {
         latest.is_some() || text_ready
     }
+}
+
+/// Whether the generation status advertises is the one search will serve.
+///
+/// Status identity is taken from the text owner, but a publication installs
+/// the replacement text owner before the serving swap (`registry/mount.rs`),
+/// and a graph-on search answers from the decoded seat. Until the seat catches
+/// up, search serves the predecessor and the split is not terminal. A graph-off
+/// mount serves the text owner directly and deliberately never seats the
+/// decoded generation, so there is no seat to compare.
+pub(super) fn serving_seat_matches_advertised_generation(
+    graph_activation_enabled: bool,
+    serving_generation_id: Option<&str>,
+    advertised_text_generation_id: Option<&str>,
+) -> bool {
+    match advertised_text_generation_id {
+        Some(advertised) if graph_activation_enabled => serving_generation_id == Some(advertised),
+        _ => true,
+    }
+}
+
+/// Terminal freshness: lane owners are ready and search serves the generation
+/// status advertises.
+pub(super) fn dashboard_terminal_status(
+    latest: Option<&LatestCompleteCodeIndexV1>,
+    released_seat: Option<&str>,
+    text: Option<&LatestCodeTextGenerationV1>,
+    text_ready: bool,
+    graph_activation_enabled: bool,
+    code_graph_serving: &Option<CodeGraphServingReadinessV1>,
+) -> bool {
+    dashboard_generation_is_ready(
+        latest,
+        text_ready,
+        graph_activation_enabled,
+        code_graph_serving,
+    ) && serving_seat_matches_advertised_generation(
+        graph_activation_enabled,
+        latest
+            .map(|latest| latest.generation().manifest().generation_id.as_str())
+            .or(released_seat),
+        text.map(|text| text.metadata().manifest().generation_id.as_str()),
+    )
 }
 
 fn dashboard_text_freshness_identity(
@@ -1231,11 +1353,81 @@ enum ColdMountAdmissionV1 {
 
 /// One exact worktree's pending worker wake. `micros == 0` means no pending
 /// arrival, and every nonzero arrival is held by one nonzero owner token.
+///
+/// `attributable` is false for a worker-owned continuation: the slot stays
+/// nonzero so freshness still sees the follow-up, but the instant is not an
+/// external wake. Publishing it as [`CodeIndexArrivalV1::Observed`] fabricated
+/// an event-to-ready receipt for a pass nobody requested.
 struct PendingWakeStateV1 {
     micros: u64,
     trigger: u64,
     owner: u64,
     next_owner: u64,
+    attributable: bool,
+}
+
+/// Delayed retry for a text build the resident-memory authority refused.
+///
+/// Memory given back through the resident owners wakes the worktree at once.
+/// RSS can also fall with no owner released (a build elsewhere finished), so
+/// a refusal also retries after a delay that doubles up to a ceiling instead
+/// of waiting for an unrelated wake.
+#[derive(Default)]
+struct MemoryRefusalRetryV1 {
+    delay_secs: AtomicU64,
+    /// Work is parked on resident memory. A reader's wake cannot help until
+    /// memory is given back or the delay elapses, so readers do not wake the
+    /// worker meanwhile.
+    waiting: AtomicBool,
+}
+
+impl MemoryRefusalRetryV1 {
+    const FIRST_DELAY_SECS: u64 = 5;
+    const MAX_DELAY_SECS: u64 = 300;
+
+    fn schedule(&self, pending_wake: &Arc<PendingWakeV1>, wake: &Arc<tokio::sync::Notify>) {
+        let previous = self
+            .delay_secs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |delay| {
+                Some(match delay {
+                    0 => Self::FIRST_DELAY_SECS.saturating_mul(2),
+                    delay => delay.saturating_mul(2).min(Self::MAX_DELAY_SECS),
+                })
+            })
+            .unwrap_or_else(|delay| delay);
+        let delay = Duration::from_secs(match previous {
+            0 => Self::FIRST_DELAY_SECS,
+            delay => delay,
+        });
+        self.waiting.store(true, Ordering::Release);
+        let pending_wake = Arc::downgrade(pending_wake);
+        let wake = Arc::downgrade(wake);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let (Some(pending_wake), Some(wake)) = (pending_wake.upgrade(), wake.upgrade()) {
+                CodeIndexSchedulerRegistryV1::note_wake_if_idle(
+                    &pending_wake,
+                    &wake,
+                    CodeIndexCadenceTriggerV1::MemoryRetry,
+                );
+            }
+        });
+    }
+
+    fn reset(&self) {
+        self.delay_secs.store(0, Ordering::Release);
+        self.waiting.store(false, Ordering::Release);
+    }
+
+    /// A memory pass is re-checking; readers may wake the worker again once
+    /// it lands.
+    fn retrying(&self) {
+        self.waiting.store(false, Ordering::Release);
+    }
+
+    fn waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire)
+    }
 }
 
 /// The single synchronization authority for one worktree's coalesced wake.
@@ -1243,7 +1435,11 @@ struct PendingWakeStateV1 {
 /// linearizable transition: no producer can arrive between a claim's owner
 /// release and its marker release.
 struct PendingWakeV1 {
-    state: Mutex<PendingWakeStateV1>,
+    slot: Mutex<PendingWakeStateV1>,
+    /// Whether the slot holds a wake. Every writer publishes it through
+    /// [`PendingWakeGuardV1`] before releasing `slot`, so subscribers observe
+    /// occupancy changes in lock order.
+    occupied: tokio::sync::watch::Sender<bool>,
     #[cfg(test)]
     drop_gate: Mutex<Option<Arc<PendingWakeDropGateTestV1>>>,
 }
@@ -1251,20 +1447,141 @@ struct PendingWakeV1 {
 impl Default for PendingWakeV1 {
     fn default() -> Self {
         Self {
-            state: Mutex::new(PendingWakeStateV1::default()),
+            slot: Mutex::new(PendingWakeStateV1::default()),
+            occupied: tokio::sync::watch::Sender::new(false),
             #[cfg(test)]
             drop_gate: Mutex::new(None),
         }
     }
 }
 
+/// Where one worktree's background worker is between wakes.
+///
+/// The pass counter deliberately drops between graph-tail steps (an O(store)
+/// decode is not a rebuild in flight), so "no pass running" is not "the worker
+/// finished its pass". The worker is done only once it is back at one of the
+/// waits below.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CodeIndexWorkerPhaseV1 {
+    /// Not yet started, or running a pass or its tail.
+    #[default]
+    Working,
+    /// Waiting for a wake.
+    Parked,
+    /// Woken and waiting for a background reconcile permit.
+    AwaitingAdmission,
+    /// Holding a permit and waiting for the worktree's build/publication gate.
+    AwaitingPublicationGate,
+}
+
+impl CodeIndexWorkerPhaseV1 {
+    pub(super) fn enter(phase: &tokio::sync::watch::Sender<Self>, next: Self) {
+        phase.send_if_modified(|current| std::mem::replace(current, next) != next);
+    }
+}
+
+/// One mounted worktree's owner activity: its owner passes, whether a wake
+/// is queued for it (together the freshness ladder's `refresh_in_flight`),
+/// and where its background worker is.
+pub struct CodeIndexOwnerActivityV1 {
+    passes: tokio::sync::watch::Receiver<super::CodeIndexOwnerPassesV1>,
+    pending_wake: tokio::sync::watch::Receiver<bool>,
+    worker_phase: tokio::sync::watch::Receiver<CodeIndexWorkerPhaseV1>,
+}
+
+impl CodeIndexOwnerActivityV1 {
+    pub fn worker_phase(&self) -> CodeIndexWorkerPhaseV1 {
+        *self.worker_phase.borrow()
+    }
+
+    /// No owner pass holds the worktree and the worker is back at a wait, so
+    /// the last pass and its tail have finished.
+    pub fn pass_finished(&self) -> bool {
+        !self.passes().running() && self.worker_phase() != CodeIndexWorkerPhaseV1::Working
+    }
+
+    pub fn passes(&self) -> super::CodeIndexOwnerPassesV1 {
+        *self.passes.borrow()
+    }
+
+    pub fn wake_pending(&self) -> bool {
+        *self.pending_wake.borrow()
+    }
+
+    pub fn refresh_in_flight(&self) -> bool {
+        self.passes().running() || self.wake_pending()
+    }
+
+    /// Resolves on the next pass, pending-wake, or worker-phase transition, or with
+    /// [`tokio::sync::watch::error::RecvError`] once the worktree's owner is
+    /// gone.
+    ///
+    /// Every transition published before it resolves is consumed with it, so
+    /// a burst of intra-pass updates wakes a subscriber once.
+    pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
+        let changed = tokio::select! {
+            changed = self.passes.changed() => changed,
+            changed = self.pending_wake.changed() => changed,
+            changed = self.worker_phase.changed() => changed,
+        };
+        self.passes.borrow_and_update();
+        self.pending_wake.borrow_and_update();
+        self.worker_phase.borrow_and_update();
+        changed
+    }
+
+    /// Whether a transition was published since the last [`Self::changed`].
+    pub fn has_changed(&self) -> bool {
+        [
+            self.passes.has_changed(),
+            self.pending_wake.has_changed(),
+            self.worker_phase.has_changed(),
+        ]
+        .into_iter()
+        .any(|changed| changed.unwrap_or(true))
+    }
+}
+
+struct PendingWakeGuardV1<'a> {
+    state: std::sync::MutexGuard<'a, PendingWakeStateV1>,
+    occupied: &'a tokio::sync::watch::Sender<bool>,
+}
+
+impl std::ops::Deref for PendingWakeGuardV1<'_> {
+    type Target = PendingWakeStateV1;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for PendingWakeGuardV1<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for PendingWakeGuardV1<'_> {
+    fn drop(&mut self) {
+        let occupied = self.state.micros != 0;
+        self.occupied
+            .send_if_modified(|published| std::mem::replace(published, occupied) != occupied);
+    }
+}
+
 impl PendingWakeV1 {
+    fn lock(&self) -> PendingWakeGuardV1<'_> {
+        PendingWakeGuardV1 {
+            state: self
+                .slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            occupied: &self.occupied,
+        }
+    }
+
     fn has_pending_arrival(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .micros
-            != 0
+        self.lock().micros != 0
     }
 
     #[cfg(test)]
@@ -1313,6 +1630,7 @@ impl Default for PendingWakeStateV1 {
             trigger: 0,
             owner: 0,
             next_owner: 1,
+            attributable: false,
         }
     }
 }
@@ -1340,16 +1658,14 @@ struct PendingWakeClaimV1 {
 
 impl PendingWakeClaimV1 {
     fn claim(pending_wake: Arc<PendingWakeV1>) -> Option<Self> {
-        let mut state = pending_wake
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = pending_wake.lock();
         if state.micros != 0 {
             return None;
         }
         let claimed_micros = u64::try_from(now_micros().0).unwrap_or(u64::MAX);
         let owner = state.next_owner();
         state.micros = claimed_micros;
+        state.attributable = true;
         state.owner = owner;
         drop(state);
         Some(Self {
@@ -1365,11 +1681,7 @@ impl PendingWakeClaimV1 {
     }
 
     fn still_owns(&self) -> bool {
-        let state = self
-            .pending_wake
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self.pending_wake.lock();
         state.owner == self.owner && state.micros == self.claimed_micros
     }
 }
@@ -1382,15 +1694,12 @@ impl Drop for PendingWakeClaimV1 {
             // the production lock.
             #[cfg(test)]
             self.pending_wake.pause_claim_drop_for_test();
-            let mut state = self
-                .pending_wake
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.pending_wake.lock();
             if state.owner == self.owner && state.micros == self.claimed_micros {
                 state.micros = 0;
                 state.trigger = 0;
                 state.owner = 0;
+                state.attributable = false;
             }
         }
     }
@@ -1400,17 +1709,17 @@ impl Drop for PendingWakeClaimV1 {
 type ReadyProbeServingPartsV1 = (
     super::SourceFreshnessFenceV1,
     super::HistoricalCodeIndexGenerationOwnerV1,
-    Arc<RwLock<Option<LatestCompleteCodeIndexV1>>>,
+    Arc<ServingGenerationSlot>,
     Arc<RwLock<Option<super::ServingSourceWitnessV1>>>,
     Arc<AtomicBool>,
     Arc<tokio::sync::Notify>,
     Arc<PendingWakeV1>,
-    Arc<AtomicUsize>,
+    Arc<super::ReconcilePassesV1>,
 );
 
 /// Typed verdict from a demand-driven reconcile wake (hooks, overflow, query
-/// admission). Callers must match this — especially
-/// [`Self::PublicationAuthorityCorrupt`] — instead of swallowing a bool and
+/// admission). Callers must match this, especially
+/// [`Self::PublicationAuthorityCorrupt`], instead of swallowing a bool and
 /// driving inline work against a terminal park.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CodeIndexReconcileAdmissionV1 {
@@ -1430,6 +1739,9 @@ pub struct CodeIndexSchedulerRegistryV1 {
     /// cannot reuse a progress ordering key.
     pub next_progress_producer_incarnation: Arc<AtomicU64>,
     pub resident_memory: Arc<resident_memory::ProcessResidentMemoryV1>,
+    /// Inventory that frees each mounted worktree's retained decodes on idle
+    /// and under pressure.
+    resident_owners: Arc<tracedecay_runtime_core::resident_memory::ResidentOwnersV1>,
     pub byte_pool: Arc<SharedCodeIndexBytePoolV1>,
     pub mounted: Arc<tokio::sync::Mutex<BTreeMap<PathBuf, MountedCodeIndexWorktreeV1>>>,
     /// Owners whose project was retired (remote deletion, replacement) but whose
@@ -1453,21 +1765,27 @@ pub struct CodeIndexSchedulerRegistryV1 {
     /// activation observe this so they can re-subscribe instead of parking on
     /// a forever-pending per-worktree arm.
     root_mounted: Arc<tokio::sync::watch::Sender<u64>>,
-    cadence_telemetry: Arc<Mutex<CodeIndexCadenceTelemetryV1>>,
-    pub(super) relation_symbol_hydrations: Arc<AtomicU64>,
+    cadence_telemetry: Arc<tokio::sync::watch::Sender<CodeIndexCadenceTelemetryV1>>,
     activations: Arc<Mutex<BTreeMap<ManifestDigest, Weak<super::CodeIndexActivationV1>>>>,
-    test_attribution_authorities: Arc<
-        RwLock<
-            BTreeMap<
-                PathBuf,
-                (
-                    CodeGenerationId,
-                    crate::code_index::production::PublishedGenerationTestAttributionAuthorityV1,
-                ),
-            >,
-        >,
-    >,
+    /// The serving generation each root last proved current, held weakly so a
+    /// retired generation is not pinned here. Its test attribution is
+    /// materialized only on an attribution read, never on query admission.
+    test_attribution_authorities: Arc<RwLock<AttributionSeatsV1>>,
+    /// Early-shutdown handles of every mounted worker. `mounted` is an async
+    /// map held across awaits, so the synchronous `cancel` signals workers
+    /// through these instead and never waits for that map.
+    worker_shutdown_signals: Arc<Mutex<Vec<WorkerShutdownSignalV1>>>,
 }
+
+/// One worker's early-shutdown handles, registered when it is mounted.
+struct WorkerShutdownSignalV1 {
+    shutting_down: Weak<AtomicBool>,
+    wake: Weak<tokio::sync::Notify>,
+    serving_generation_changed: Weak<tokio::sync::watch::Sender<()>>,
+}
+
+type AttributionSeatsV1 =
+    BTreeMap<PathBuf, (CodeGenerationId, Weak<CodeIndexPublishedGenerationV1>)>;
 
 impl CodeIndexSchedulerRegistryV1 {
     fn incomplete_text_slice_may_continue(pending_wake: &PendingWakeV1) -> bool {
@@ -1835,14 +2153,11 @@ impl CodeIndexSchedulerRegistryV1 {
             if worktree.repository_id == scope.repository_id
                 && worktree.worktree_id == scope.worktree_id
             {
-                let mut pending_wake = worktree
-                    .pending_wake
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut pending_wake = worktree.pending_wake.lock();
                 pending_wake.micros = 0;
                 pending_wake.owner = 0;
                 pending_wake.trigger = 0;
+                pending_wake.attributable = false;
             }
         }
     }
@@ -1856,7 +2171,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         expected: &Arc<CodeIndexPublishedGenerationV1>,
     ) -> ServingGenerationInstallationOutcomeV1 {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return ServingGenerationInstallationOutcomeV1::NoMatch;
         };
         let (serving_generation, serving_epoch, installation_slot) = {
@@ -1929,7 +2244,7 @@ impl CodeIndexSchedulerRegistryV1 {
         installation: &ServingGenerationInstallationClaimV1,
         retire: bool,
     ) -> ServingGenerationRollbackOutcomeV1 {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return ServingGenerationRollbackOutcomeV1::NoMatch;
         };
         let (
@@ -2003,6 +2318,8 @@ impl CodeIndexSchedulerRegistryV1 {
             CodeIndexCadenceTriggerV1::QueryAdmission => 4,
             CodeIndexCadenceTriggerV1::BusyFollowUp => 5,
             CodeIndexCadenceTriggerV1::GitWatcher => 6,
+            CodeIndexCadenceTriggerV1::MemoryHeadroom => 7,
+            CodeIndexCadenceTriggerV1::MemoryRetry => 8,
         }
     }
 
@@ -2013,6 +2330,8 @@ impl CodeIndexSchedulerRegistryV1 {
             4 => CodeIndexCadenceTriggerV1::QueryAdmission,
             5 => CodeIndexCadenceTriggerV1::BusyFollowUp,
             6 => CodeIndexCadenceTriggerV1::GitWatcher,
+            7 => CodeIndexCadenceTriggerV1::MemoryHeadroom,
+            8 => CodeIndexCadenceTriggerV1::MemoryRetry,
             _ => CodeIndexCadenceTriggerV1::Mount,
         }
     }
@@ -2025,14 +2344,15 @@ impl CodeIndexSchedulerRegistryV1 {
         let wake_micros = u64::try_from(now_micros().0).unwrap_or(u64::MAX);
         #[cfg(test)]
         pending_wake.note_foreign_wake_attempt_for_test();
-        let mut state = pending_wake
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = pending_wake.lock();
         state.owner = state.next_owner();
-        if state.micros == 0 {
+        // A worker continuation occupies the slot without an external instant.
+        // This wake is the arrival; keep an already-observed one so a later
+        // stamp cannot shorten the wait that wake already took.
+        if state.micros == 0 || !state.attributable {
             state.micros = wake_micros;
         }
+        state.attributable = true;
         state.trigger = Self::pack_trigger(trigger);
         drop(state);
         wake.notify_one();
@@ -2046,59 +2366,90 @@ impl CodeIndexSchedulerRegistryV1 {
         trigger: CodeIndexCadenceTriggerV1,
     ) -> bool {
         let wake_micros = u64::try_from(now_micros().0).unwrap_or(u64::MAX);
-        let mut state = pending_wake
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.micros != 0 {
+        let mut state = pending_wake.lock();
+        // An unattributable continuation is not an arrival. Upgrade it: the
+        // caller that just proved work is the event the receipt must name.
+        if state.micros != 0 && state.attributable {
             return false;
         }
         state.owner = state.next_owner();
         state.micros = wake_micros;
+        state.attributable = true;
         state.trigger = Self::pack_trigger(trigger);
         drop(state);
         wake.notify_one();
         true
     }
 
-    /// Queue worker-owned continuation work through the same pending-arrival
-    /// authority as external wakes. This keeps readiness truthful while the
-    /// continuation waits for shared admission; a bare `Notify` permit is not
-    /// observable by freshness readers.
+    /// Queue worker-owned continuation work so freshness still sees it.
+    ///
+    /// A bare `Notify` permit is not observable by freshness readers, so the
+    /// slot is stamped like an arrival. It is not one. The worker decided to
+    /// continue work an earlier wake already claimed. `attributable = false`
+    /// keeps that stamp out of the event-to-ready receipt, which otherwise
+    /// charged a suppressed freshness probe that raced it.
     fn note_worker_continuation(pending_wake: &PendingWakeV1, wake: &tokio::sync::Notify) {
-        if !Self::note_wake_if_idle(pending_wake, wake, CodeIndexCadenceTriggerV1::BusyFollowUp) {
-            // This pass may have consumed the permit for an arrival it has not
-            // claimed yet. Keep that observable arrival and replenish its
-            // coalesced permit so the continuation cannot sleep behind it.
+        let mut state = pending_wake.lock();
+        if state.micros != 0 {
+            // An arrival is already queued, or a continuation already occupies
+            // the slot. Replenish the coalesced permit so the worker cannot
+            // sleep behind work it has not claimed.
+            drop(state);
             wake.notify_one();
+            return;
         }
+        state.owner = state.next_owner();
+        state.micros = u64::try_from(now_micros().0).unwrap_or(u64::MAX);
+        state.attributable = false;
+        state.trigger = Self::pack_trigger(CodeIndexCadenceTriggerV1::BusyFollowUp);
+        drop(state);
+        wake.notify_one();
+    }
+
+    /// Stamp a continuation while `reconcile_in_progress` still reports this pass.
+    ///
+    /// Callers that already released the worker's pass guard use this so a
+    /// reader waiting for the counter to hit zero cannot observe an empty
+    /// slot and then lose to `BusyFollowUp`. The stamp is the idle boundary;
+    /// the guard lives only for the note.
+    fn note_visible_worker_continuation(
+        passes: &Arc<super::ReconcilePassesV1>,
+        pending_wake: &PendingWakeV1,
+        wake: &tokio::sync::Notify,
+    ) {
+        let _visible = super::ReconcilePassGuard::enter(passes);
+        Self::note_worker_continuation(pending_wake, wake);
     }
 
     /// Claim the pending wake as one reconcile's arrival, at the instant the
     /// scheduler dequeues it.
     ///
-    /// A reconcile with no pending wake — a follow-up pass draining work an
-    /// earlier wake already claimed — has no attributable arrival. Reporting the
+    /// A reconcile with no pending wake, a follow-up pass draining work an
+    /// earlier wake already claimed, has no attributable arrival. Reporting the
     /// dequeue or terminal instant instead would publish a fabricated zero queue
     /// delay, so the absence stays typed.
     fn take_pending_arrival(
         pending_wake: &PendingWakeV1,
         default_trigger: CodeIndexCadenceTriggerV1,
     ) -> (CodeIndexArrivalV1, CodeIndexCadenceTriggerV1) {
-        let (wake_micros, packed_trigger) = {
-            let mut state = pending_wake
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (wake_micros, packed_trigger, attributable) = {
+            let mut state = pending_wake.lock();
             let wake_micros = state.micros;
             let packed_trigger = state.trigger;
+            let attributable = state.attributable;
             state.micros = 0;
             state.trigger = 0;
             state.owner = 0;
-            (wake_micros, packed_trigger)
+            state.attributable = false;
+            (wake_micros, packed_trigger, attributable)
         };
-        if wake_micros == 0 {
-            return (CodeIndexArrivalV1::Unavailable, default_trigger);
+        if wake_micros == 0 || !attributable {
+            let trigger = if wake_micros == 0 {
+                default_trigger
+            } else {
+                Self::unpack_trigger(packed_trigger)
+            };
+            return (CodeIndexArrivalV1::Unavailable, trigger);
         }
         let trigger = Self::unpack_trigger(packed_trigger);
         match i64::try_from(wake_micros) {
@@ -2123,17 +2474,16 @@ impl CodeIndexSchedulerRegistryV1 {
         let Ok(wake_micros) = u64::try_from(wake_micros) else {
             return;
         };
-        let mut state = pending_wake
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = pending_wake.lock();
         // A wake that arrived while this pass ran is newer, so the restored
-        // arrival remains the earliest and stays authoritative.
-        if state.micros != 0 && state.micros <= wake_micros {
+        // arrival remains the earliest and stays authoritative. A continuation
+        // occupying the slot is not an arrival and must not hide this one.
+        if state.attributable && state.micros != 0 && state.micros <= wake_micros {
             return;
         }
         state.owner = state.next_owner();
         state.micros = wake_micros;
+        state.attributable = true;
         state.trigger = Self::pack_trigger(trigger);
     }
 
@@ -2177,7 +2527,7 @@ impl CodeIndexSchedulerRegistryV1 {
     fn lock_scheduler_for_graph_step<'a>(
         scheduler: &'a Mutex<CodeIndexWorktreeSchedulerV1>,
         shutting_down: &AtomicBool,
-        passes: &Arc<AtomicUsize>,
+        passes: &Arc<super::ReconcilePassesV1>,
     ) -> Result<
         (
             super::ReconcilePassGuard,
@@ -2190,14 +2540,17 @@ impl CodeIndexSchedulerRegistryV1 {
             .map(|scheduler| (pass, scheduler))
     }
 
-    /// Drive one pass's text owner — a publication's replacement owner or the
-    /// restored retained owner — through its bounded projection, one blocking
+    /// Drive one pass's text owner, a publication's replacement owner or the
+    /// restored retained owner, through its bounded projection, one blocking
     /// advance at a time, until exact and lexical serving are ready or the
     /// projection stops typed.
     ///
-    /// The caller chooses ordering. Fresh publications await this before graph
-    /// work because text and graph compete for the same sealed source and
-    /// resident-memory headroom. Retained owners may still run on their own
+    /// The caller chooses ordering. Text and graph compete for the same sealed
+    /// source and resident-memory headroom, so a fresh publication starts
+    /// graph work only once `opened` fires: the first advance succeeded and
+    /// the build holds its reservation. A projection that stops before that
+    /// (parked, failed, or already ready) drops the sender instead, and graph
+    /// then waits for ready owners. Retained owners may still run on their own
     /// task while the scheduler recovers an already-verified graph head. The
     /// advance itself is single-flight on the owner's projection slot, so
     /// scheduler wakes that race it wait, never double drive.
@@ -2220,6 +2573,7 @@ impl CodeIndexSchedulerRegistryV1 {
         shutting_down: Arc<AtomicBool>,
         convergence_park: Arc<RwLock<Option<CodeIndexConvergenceParkedV1>>>,
         installed: Option<Arc<RwLock<Option<LatestCodeTextGenerationV1>>>>,
+        mut opened: Option<tokio::sync::oneshot::Sender<()>>,
         #[cfg(test)] project_root: PathBuf,
     ) -> PublishedTextProjectionOutcomeV1 {
         #[cfg(test)]
@@ -2232,11 +2586,6 @@ impl CodeIndexSchedulerRegistryV1 {
                 return PublishedTextProjectionOutcomeV1::Shutdown;
             }
             // A publication's pass waits only for the owners the seat needs.
-            // Once the admission artifact serves exact and lexical, the slot
-            // may still hold the clone-fingerprint successor: that backfill
-            // re-decodes the whole sealed source into a second artifact and
-            // is not a seat precondition, so it continues on the retained
-            // driver of a later pass instead of holding graph activation.
             if installed.is_none() && text.query_owners_are_ready() {
                 break;
             }
@@ -2251,14 +2600,19 @@ impl CodeIndexSchedulerRegistryV1 {
                 break;
             }
             let advancing = text.clone();
-            match hotpath::future!(
+            let advance = hotpath::future!(
                 tokio::task::spawn_blocking(
                     move || advancing.advance_text_serving(TEXT_PROJECTION_DOCUMENTS_PER_PASS_V1)
                 ),
                 label = "daemon.code_index.text_projection"
             )
-            .await
+            .await;
+            if matches!(advance, Ok(Ok(_)))
+                && let Some(opened) = opened.take()
             {
+                let _ = opened.send(());
+            }
+            match advance {
                 Ok(Ok(true)) => {
                     clear_convergence_park(&convergence_park);
                     break;
@@ -2311,6 +2665,16 @@ impl CodeIndexSchedulerRegistryV1 {
                             "published text projection stopped before graph seating"
                         );
                         return PublishedTextProjectionOutcomeV1::Shutdown;
+                    } else if let tracedecay_query::retrieval::RetrievalPortError::ResidentMemoryRefused(
+                        detail,
+                    ) = &error
+                    {
+                        tracing::info!(
+                            event = "code_index_text_projection_waiting_for_memory",
+                            detail = %detail,
+                            "published text projection waits for resident memory to be given back"
+                        );
+                        return PublishedTextProjectionOutcomeV1::WaitingForMemory;
                     } else {
                         tracing::warn!(
                             event = "code_index_text_projection_failed",
@@ -2366,10 +2730,7 @@ impl CodeIndexSchedulerRegistryV1 {
         // The pending slot coalesces at most one waiting wake, so the queue
         // behind this pass is empty or singular.
         let queue_depth_bucket = {
-            let state = pending_wake
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = pending_wake.lock();
             if state.micros == 0 {
                 tracedecay_domain::QueueDepthBucketV1::Zero
             } else {
@@ -2380,7 +2741,7 @@ impl CodeIndexSchedulerRegistryV1 {
     }
 
     fn record_reconcile_receipt(
-        telemetry: &Mutex<CodeIndexCadenceTelemetryV1>,
+        telemetry: &tokio::sync::watch::Sender<CodeIndexCadenceTelemetryV1>,
         project_root: PathBuf,
         arrival: CodeIndexArrivalV1,
         trigger: CodeIndexCadenceTriggerV1,
@@ -2434,7 +2795,7 @@ impl CodeIndexSchedulerRegistryV1 {
         // A successful publication is the terminal outcome operators need to see
         // to know a rebuild window actually closed, so it is `info`, not `debug`:
         // the cadence receipt below is debug-level and was invisible in the
-        // journal during the live search outage. Identifiers and counters only —
+        // journal during the live search outage. Identifiers and counters only,
         // no project path.
         if let CodeIndexReconcileOutcomeV1::Published(evidence) = outcome {
             tracing::info!(
@@ -2462,10 +2823,14 @@ impl CodeIndexSchedulerRegistryV1 {
         // `service_micros` is clamped non-negative by construction, so the
         // widening cast is exact.
         let service_micros = receipt.service_micros().max(0) as u64;
-        let mut telemetry = telemetry
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        telemetry.record(receipt);
+        telemetry.send_modify(|telemetry| {
+            telemetry.record(receipt);
+            Self::log_newly_eligible_cadence_percentile(telemetry);
+        });
+        service_micros
+    }
+
+    fn log_newly_eligible_cadence_percentile(telemetry: &CodeIndexCadenceTelemetryV1) {
         // Emit the aggregate exactly when a percentile first becomes eligible,
         // so aggregate lines stay bounded to a few per ring cycle.
         if let Some(percentile) = newly_eligible_percentile(telemetry.latency_sample_count()) {
@@ -2488,13 +2853,21 @@ impl CodeIndexSchedulerRegistryV1 {
                 "code-index cadence percentile became eligible"
             );
         }
-        service_micros
     }
 
     pub fn subscribe_generation_publications(
         &self,
     ) -> tokio::sync::broadcast::Receiver<CodeIndexGenerationPublishedV1> {
         self.generation_publications.subscribe()
+    }
+
+    /// Changes whenever an event-to-ready cadence receipt is recorded, so a
+    /// reader of the cadence read model can wait for the receipt a wake owes
+    /// instead of sampling the ring.
+    pub fn subscribe_cadence_receipts(
+        &self,
+    ) -> tokio::sync::watch::Receiver<CodeIndexCadenceTelemetryV1> {
+        self.cadence_telemetry.subscribe()
     }
 
     /// Push one synthetic publication for scheduler integration tests.
@@ -2517,23 +2890,40 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
     ) -> Option<tokio::sync::watch::Receiver<()>> {
-        let project_root = project_root.canonicalize().ok()?;
+        let project_root = canonical_existing_identity(project_root).ok()?;
         let mounted = self.mounted.lock().await;
         let worktree = mounted.get(&project_root)?;
         Some(worktree.serving_generation_changed.subscribe())
+    }
+
+    /// Watch one mounted worktree's owner passes and pending wake, the inputs
+    /// the freshness ladder reports as `refresh_in_flight`.
+    pub async fn subscribe_owner_activity(
+        &self,
+        project_root: &Path,
+    ) -> Option<CodeIndexOwnerActivityV1> {
+        let project_root = canonical_existing_identity(project_root).ok()?;
+        let mounted = self.mounted.lock().await;
+        let worktree = mounted.get(&project_root)?;
+        Some(CodeIndexOwnerActivityV1 {
+            passes: worktree.reconcile_in_progress.subscribe(),
+            pending_wake: worktree.pending_wake.occupied.subscribe(),
+            worker_phase: worktree.worker_phase.subscribe(),
+        })
     }
 
     /// Stamp complete-generation demand for a mounted worktree. The first flip
     /// notes a [`CodeIndexCadenceTriggerV1::QueryAdmission`] wake so the worker
     /// yields text-only work and seats a complete generation.
     pub async fn request_complete_generation(&self, project_root: &Path) -> bool {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return false;
         };
         let mounted = self.mounted.lock().await;
         let Some(worktree) = mounted.get(&project_root) else {
             return false;
         };
+        worktree.residency.touch();
         if !worktree
             .complete_generation_requested
             .swap(true, Ordering::AcqRel)
@@ -2577,7 +2967,7 @@ impl CodeIndexSchedulerRegistryV1 {
     /// only when its sealed-digest proof describes this snapshot, so a seat
     /// the checkout has moved past is never armed here.
     pub(super) fn bind_unproven_seat_to_verified_source(
-        serving_generation: &RwLock<Option<LatestCompleteCodeIndexV1>>,
+        serving_generation: &ServingGenerationSlot,
         serving_source_witness: &RwLock<Option<super::ServingSourceWitnessV1>>,
         source_freshness: &super::SourceFreshnessFenceV1,
         verified_snapshot_content_identity: &tracedecay_domain::ContentDigest,
@@ -2655,7 +3045,7 @@ impl CodeIndexSchedulerRegistryV1 {
             reconciling_worktrees: u64::try_from(
                 mounted
                     .values()
-                    .filter(|worktree| worktree.reconcile_in_progress.load(Ordering::Acquire) != 0)
+                    .filter(|worktree| worktree.reconcile_in_progress.running())
                     .count(),
             )
             .unwrap_or(u64::MAX),
@@ -2675,7 +3065,7 @@ impl CodeIndexSchedulerRegistryV1 {
     /// `false` when the path cannot be canonicalized (a path Doctor could never
     /// have mounted under).
     pub async fn is_worktree_mounted(&self, project_root: &Path) -> bool {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return false;
         };
         self.mounted.lock().await.contains_key(&project_root)
@@ -2699,7 +3089,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         path: PathBuf,
     ) -> CodeIndexDemandAdmissionV1 {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return CodeIndexDemandAdmissionV1::Unavailable(
                 CodeIndexDemandUnavailableV1::SchedulerUnmounted,
             );
@@ -2740,7 +3130,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         rel_paths: &[String],
     ) -> CodeIndexDemandAdmissionV1 {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return CodeIndexDemandAdmissionV1::Unavailable(
                 CodeIndexDemandUnavailableV1::SchedulerUnmounted,
             );
@@ -2786,7 +3176,7 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
     ) -> Option<CodeIndexConvergenceParkedV1> {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return None;
         };
         let mounted = self.mounted.lock().await;
@@ -2804,7 +3194,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         reason: &str,
     ) -> bool {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return false;
         };
         let mounted = self.mounted.lock().await;
@@ -2832,7 +3222,7 @@ impl CodeIndexSchedulerRegistryV1 {
     /// bounded exact-path capacity. Overflow requests one authoritative scan for
     /// this exact mounted worktree; it never aliases a sibling worktree.
     pub async fn notify_hook_overflow(&self, project_root: &Path) -> CodeIndexDemandAdmissionV1 {
-        let Ok(project_root) = project_root.canonicalize() else {
+        let Ok(project_root) = canonical_existing_identity(project_root) else {
             return CodeIndexDemandAdmissionV1::Unavailable(
                 CodeIndexDemandUnavailableV1::SchedulerUnmounted,
             );
@@ -2915,7 +3305,7 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
     ) -> CodeIndexDemandAdmissionV1 {
-        let Ok(canonical) = project_root.canonicalize() else {
+        let Ok(canonical) = canonical_existing_identity(project_root) else {
             return CodeIndexDemandAdmissionV1::Unavailable(
                 CodeIndexDemandUnavailableV1::SchedulerUnmounted,
             );
@@ -2951,7 +3341,7 @@ impl CodeIndexSchedulerRegistryV1 {
         &self,
         project_root: &Path,
     ) -> Option<Arc<Mutex<CodeIndexWorktreeSchedulerV1>>> {
-        let project_root = project_root.canonicalize().ok()?;
+        let project_root = canonical_existing_identity(project_root).ok()?;
         let mounted = self.mounted.lock().await;
         mounted
             .get(&project_root)
@@ -3158,13 +3548,42 @@ impl CodeIndexSchedulerRegistryV1 {
     pub fn cancel(&self) {
         self.background_reconcile_admission.close();
         self.cancel_cold_mount_reservations();
-        if let Ok(mounted) = self.mounted.try_lock() {
-            for worktree in mounted.values() {
-                worktree.shutting_down.store(true, Ordering::Release);
-                worktree.serving_generation_changed.send_replace(());
-                worktree.wake.notify_one();
+        let signals = self
+            .worker_shutdown_signals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for signal in signals.iter() {
+            let Some(shutting_down) = signal.shutting_down.upgrade() else {
+                continue;
+            };
+            shutting_down.store(true, Ordering::Release);
+            if let Some(serving_generation_changed) = signal.serving_generation_changed.upgrade() {
+                serving_generation_changed.send_replace(());
+            }
+            if let Some(wake) = signal.wake.upgrade() {
+                wake.notify_one();
             }
         }
+    }
+
+    /// Registers a newly mounted worker for early shutdown, pruning workers
+    /// that have fully exited.
+    fn register_worker_shutdown_signal(
+        &self,
+        shutting_down: &Arc<AtomicBool>,
+        wake: &Arc<tokio::sync::Notify>,
+        serving_generation_changed: &Arc<tokio::sync::watch::Sender<()>>,
+    ) {
+        let mut signals = self
+            .worker_shutdown_signals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        signals.retain(|signal| signal.shutting_down.strong_count() > 0);
+        signals.push(WorkerShutdownSignalV1 {
+            shutting_down: Arc::downgrade(shutting_down),
+            wake: Arc::downgrade(wake),
+            serving_generation_changed: Arc::downgrade(serving_generation_changed),
+        });
     }
 }
 
@@ -3181,7 +3600,7 @@ impl CodeIndexSchedulerRegistryV1 {
         project_root: &Path,
         scope: &tracedecay_contracts::ResolvedScope,
     ) -> Option<LatestCodeTextGenerationV1> {
-        let project_root = project_root.canonicalize().ok()?;
+        let project_root = canonical_existing_identity(project_root).ok()?;
         let mounted_root = {
             let mounted = self.mounted.lock().await;
             let (mounted_root, _) = unique_mounted_for_scope(&mounted, scope).unique()?;
@@ -3213,7 +3632,7 @@ impl ScopedFeedbackDocumentIdentityV1 {
     ) -> Option<Self> {
         Some(Self {
             registry,
-            project_root: project_root.canonicalize().ok()?,
+            project_root: canonical_existing_identity(project_root).ok()?,
             scope,
         })
     }
@@ -3230,8 +3649,7 @@ impl tracedecay_application::feedback::cycle_production::ProductionFeedbackDocum
     {
         let owner = self.clone();
         Box::pin(async move {
-            let requested_root = project_root
-                .canonicalize()
+            let requested_root = canonical_existing_identity(&project_root)
                 .map_err(|_| LspRuntimeFailure::new("feedback-code-index-root-unavailable"))?;
             if requested_root != owner.project_root {
                 return Err(LspRuntimeFailure::new("feedback-code-index-root-mismatch"));
@@ -3270,19 +3688,51 @@ pub fn feedback_document_identity_from_generation(
                 .find(|file| file.logical_path == logical_path)
                 .ok_or_else(|| LspRuntimeFailure::new("feedback-code-index-document-unavailable"))?
         }
+        // The seed only carries generation identity into provider identities
+        // that are re-keyed per saved document, so any indexed language serves.
         None => snapshot
             .files
             .iter()
-            .find(|file| {
-                Path::new(&file.logical_path)
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    == Some("rs")
-            })
+            .find(|file| file.language.is_some())
             .ok_or_else(|| {
-                LspRuntimeFailure::new("feedback-code-index-rust-document-unavailable")
+                LspRuntimeFailure::new("feedback-code-index-generation-has-no-documents")
             })?,
     };
+    feedback_document_identity_for_file(&generation, file)
+}
+
+/// The first indexed document of `language` in an already-selected
+/// generation; `Ok(None)` when the generation indexes none.
+pub fn feedback_language_document_identity_from_generation(
+    generation: &LatestCodeTextGenerationV1,
+    language: &str,
+) -> Result<
+    Option<
+        tracedecay_application::feedback::cycle_production::ProductionFeedbackDocumentIdentityV1,
+    >,
+    LspRuntimeFailure,
+> {
+    generation
+        .metadata()
+        .snapshot()
+        .files
+        .iter()
+        .find(|file| {
+            file.language
+                .as_ref()
+                .is_some_and(|id| id.as_str() == language)
+        })
+        .map(|file| feedback_document_identity_for_file(generation, file))
+        .transpose()
+}
+
+fn feedback_document_identity_for_file(
+    generation: &LatestCodeTextGenerationV1,
+    file: &SanitizedCodeFileV1,
+) -> Result<
+    tracedecay_application::feedback::cycle_production::ProductionFeedbackDocumentIdentityV1,
+    LspRuntimeFailure,
+> {
     let manifest = generation.metadata().manifest();
     let generation_digest = ManifestDigest::new(manifest.snapshot_digest.as_str().to_owned())
         .map_err(|_| LspRuntimeFailure::new("feedback-code-index-generation-invalid"))?;
@@ -3316,7 +3766,7 @@ impl CodeIndexSchedulerRegistryV1 {
         scope: Option<tracedecay_contracts::ResolvedScope>,
     ) -> Option<tracedecay_application::diagnostics_publication::CodeIndexPublicationIdentityV1>
     {
-        let root = project_root.canonicalize().ok()?;
+        let root = canonical_existing_identity(&project_root).ok()?;
         let root_generation = self.latest_text_serving_for_root(&root).await?;
         let scope = match scope {
             Some(scope) => scope,
@@ -3397,34 +3847,40 @@ impl crate::code_index::provider::GenerationTestAttributionJoinReadPort
     fn read_test_attribution(
         &self,
         generation: &CodeGenerationId,
-    ) -> crate::code_index::provider::GenerationProviderReadV1<
-        crate::code_index::test_attribution::GenerationTestJoinV1,
+    ) -> Arc<
+        crate::code_index::provider::GenerationProviderReadV1<
+            crate::code_index::test_attribution::GenerationTestJoinV1,
+        >,
     > {
-        let authorities = self
-            .test_attribution_authorities
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut matching = authorities
-            .values()
-            .filter(|(candidate, _)| candidate == generation);
-        let Some((_, authority)) = matching.next() else {
-            return crate::code_index::provider::GenerationProviderReadV1::new(
-                tracedecay_domain::ProviderEvaluationStateV1::Unavailable,
-                crate::code_index::provider::GenerationProviderCoverageV1::Unavailable,
-                None,
+        let unavailable = || {
+            Arc::new(
+                crate::code_index::provider::GenerationProviderReadV1::new(
+                    tracedecay_domain::ProviderEvaluationStateV1::Unavailable,
+                    crate::code_index::provider::GenerationProviderCoverageV1::Unavailable,
+                    None,
+                )
+                .unwrap_or_else(|_| panic!("static unavailable attribution read")),
             )
-            .unwrap_or_else(|_| panic!("static unavailable attribution read"));
         };
-        if matching.next().is_some() {
-            return crate::code_index::provider::GenerationProviderReadV1::new(
-                tracedecay_domain::ProviderEvaluationStateV1::Unavailable,
-                crate::code_index::provider::GenerationProviderCoverageV1::Unavailable,
-                None,
-            )
-            .unwrap_or_else(|_| panic!("static ambiguous attribution read"));
-        }
+        let seated = {
+            let authorities = self
+                .test_attribution_authorities
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut matching = authorities
+                .values()
+                .filter(|(candidate, _)| candidate == generation);
+            // Two roots claiming one generation is ambiguous, not a choice.
+            match (matching.next(), matching.next()) {
+                (Some((_, seated)), None) => seated.upgrade(),
+                _ => None,
+            }
+        };
+        let Some(Ok(authority)) = seated.map(|seated| seated.test_attribution_authority()) else {
+            return unavailable();
+        };
         crate::code_index::provider::GenerationTestAttributionJoinReadPort::read_test_attribution(
-            authority, generation,
+            &authority, generation,
         )
     }
 }
@@ -3461,8 +3917,8 @@ fn feedback_document_logical_path(
 ///
 /// The caller canonicalizes the mounted root; the client addresses a document
 /// by whatever path it opened. Those two spellings differ whenever any prefix
-/// of the root is a symlink — on macOS every `/var/folders/...` root the
-/// daemon holds as `/private/var/folders/...` — and a raw prefix strip
+/// of the root is a symlink, on macOS every `/var/folders/...` root the
+/// daemon holds as `/private/var/folders/...`, and a raw prefix strip
 /// refused every document under such a root as outside it.
 ///
 /// The document need not exist yet (an unsaved buffer), so the deepest
@@ -3477,7 +3933,7 @@ fn canonical_relative_document_path(project_root: &Path, path: &Path) -> Option<
     let mut unresolved: Vec<&std::ffi::OsStr> = Vec::new();
     let mut candidate = path;
     loop {
-        if let Ok(canonical) = candidate.canonicalize() {
+        if let Ok(canonical) = canonical_existing_identity(candidate) {
             let mut relative = canonical.strip_prefix(project_root).ok()?.to_path_buf();
             for component in unresolved.iter().rev() {
                 relative.push(component);
@@ -3492,6 +3948,7 @@ fn canonical_relative_document_path(project_root: &Path, path: &Path) -> Option<
 #[cfg(all(test, unix))]
 mod feedback_document_path_tests {
     use super::feedback_document_logical_path;
+    use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
     /// A symlinked root reproduces on Linux exactly what every macOS
     /// `/var/folders/...` temporary root does in production: the daemon holds
@@ -3506,7 +3963,7 @@ mod feedback_document_path_tests {
         let alias = base.path().join("alias");
         std::os::unix::fs::symlink(&real, &alias).expect("root alias");
 
-        let canonical_root = real.canonicalize().expect("canonical root");
+        let canonical_root = canonical_existing_identity(&real).expect("canonical root");
         let canonical_uri = url::Url::from_file_path(canonical_root.join("src/lib.rs"))
             .expect("canonical document uri");
         let alias_uri =
@@ -3533,7 +3990,7 @@ mod feedback_document_path_tests {
         std::fs::create_dir_all(real.join("src")).expect("real tree");
         let alias = base.path().join("alias");
         std::os::unix::fs::symlink(&real, &alias).expect("root alias");
-        let canonical_root = real.canonicalize().expect("canonical root");
+        let canonical_root = canonical_existing_identity(&real).expect("canonical root");
 
         let uri = url::Url::from_file_path(alias.join("src/unsaved.rs")).expect("document uri");
         assert_eq!(
@@ -3554,7 +4011,7 @@ mod feedback_document_path_tests {
         std::fs::create_dir_all(&outside).expect("outside tree");
         std::fs::write(outside.join("secret.rs"), b"pub fn secret() {}\n").expect("outside file");
         std::os::unix::fs::symlink(&outside, real.join("escape")).expect("escaping alias");
-        let canonical_root = real.canonicalize().expect("canonical root");
+        let canonical_root = canonical_existing_identity(&real).expect("canonical root");
 
         let escaping = url::Url::from_file_path(canonical_root.join("escape/secret.rs"))
             .expect("escaping document uri");
@@ -3574,7 +4031,9 @@ mod feedback_document_path_tests {
 
 #[cfg(test)]
 mod text_slice_fairness_tests {
-    use super::{CodeIndexCadenceTriggerV1, CodeIndexSchedulerRegistryV1, PendingWakeV1};
+    use super::{
+        CodeIndexArrivalV1, CodeIndexCadenceTriggerV1, CodeIndexSchedulerRegistryV1, PendingWakeV1,
+    };
 
     #[test]
     fn pending_reconcile_is_serviced_between_bounded_text_slices() {
@@ -3603,6 +4062,58 @@ mod text_slice_fairness_tests {
             CodeIndexSchedulerRegistryV1::incomplete_text_slice_may_continue(&pending),
             "text continuation resumes only after reconcile claims the pending arrival"
         );
+    }
+
+    #[test]
+    fn worker_continuation_stays_pending_without_an_observed_arrival() {
+        let pending = PendingWakeV1::default();
+        let wake = tokio::sync::Notify::new();
+        CodeIndexSchedulerRegistryV1::note_worker_continuation(&pending, &wake);
+        assert!(
+            pending.has_pending_arrival(),
+            "freshness must still see the continuation while it waits"
+        );
+
+        let (arrival, trigger) = CodeIndexSchedulerRegistryV1::take_pending_arrival(
+            &pending,
+            CodeIndexCadenceTriggerV1::Mount,
+        );
+        assert_eq!(
+            arrival,
+            CodeIndexArrivalV1::Unavailable,
+            "a worker continuation is not an external wake and must not publish \
+             an event-to-ready sample"
+        );
+        assert_eq!(trigger, CodeIndexCadenceTriggerV1::BusyFollowUp);
+        assert!(
+            !pending.has_pending_arrival(),
+            "claiming the continuation clears the slot"
+        );
+    }
+
+    #[test]
+    fn an_external_wake_replaces_an_unattributable_continuation() {
+        let pending = PendingWakeV1::default();
+        let wake = tokio::sync::Notify::new();
+        CodeIndexSchedulerRegistryV1::note_worker_continuation(&pending, &wake);
+        assert!(
+            CodeIndexSchedulerRegistryV1::note_wake_if_idle(
+                &pending,
+                &wake,
+                CodeIndexCadenceTriggerV1::QueryAdmission,
+            ),
+            "a real wake must replace the continuation placeholder"
+        );
+
+        let (arrival, trigger) = CodeIndexSchedulerRegistryV1::take_pending_arrival(
+            &pending,
+            CodeIndexCadenceTriggerV1::Mount,
+        );
+        assert!(
+            matches!(arrival, CodeIndexArrivalV1::Observed { wake_micros } if wake_micros > 1),
+            "the receipt names the external wake, not the continuation slot: {arrival:?}"
+        );
+        assert_eq!(trigger, CodeIndexCadenceTriggerV1::QueryAdmission);
     }
 }
 

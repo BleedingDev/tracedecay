@@ -10,8 +10,8 @@
 //! - [`telemetry`] (§7): per-store size, per-table growth, free-page ratio, soft
 //!   budgets, and the [`telemetry::StoreSizeTelemetryPort`] seam over
 //!   `dbstat`/pragma sources.
-//! - [`debris`] (§5): incident-artifact classification, the quarantine-location
-//!   contract, and debris scan read models.
+//! - [`debris`] (§5): incident-artifact classification and debris scan read
+//!   models.
 //! - [`compaction`] (§6): the free-page-ratio compaction trigger policy, off the
 //!   hot path by construction.
 //! - [`inventory`]: orphan / retention-backlog read models.
@@ -35,8 +35,8 @@ pub use convergence::{
     SchemaConvergenceStateV1,
 };
 pub use debris::{
-    IncidentDebrisArtifactV1, IncidentDebrisKindV1, IncidentDebrisScanV1, QuarantineContractV1,
-    QuarantinedArtifactV1,
+    IncidentDebrisArtifactV1, IncidentDebrisKindV1, IncidentDebrisScanV1,
+    RETIRED_BRANCH_STORE_DIRECTORY, is_retired_branch_store_path,
 };
 pub use findings::{
     code_generation_retention_finding, incident_debris_finding, orphan_store_finding,
@@ -44,8 +44,7 @@ pub use findings::{
     table_growth_finding,
 };
 pub use identity::{
-    FreePageRatioV1, QuarantineLocationV1, RelativeArtifactPathV1, StorageByteSizeV1, StoreKeyV1,
-    TableNameV1,
+    FreePageRatioV1, RelativeArtifactPathV1, StorageByteSizeV1, StoreKeyV1, TableNameV1,
 };
 pub use inventory::{
     CodeGenerationRetentionRecordV1, OrphanStoreRecordV1, RetentionBacklogRecordV1,

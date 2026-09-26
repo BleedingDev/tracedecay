@@ -9,19 +9,19 @@
 //!
 //! The corpus is seeded into a real per-test global store and every query runs
 //! the production `search_session_messages` path (bm25 over
-//! `session_messages_fts`), not a reimplementation. Where current master ranks
+//! `lcm_raw_messages_fts`), not a reimplementation. Where current master ranks
 //! a case worse than the ranking we ultimately want, the case is marked
 //! `expected_current_failure: true`: the test asserts the DOCUMENTED current
 //! outcome (keeping the suite green today) while printing the aspirational one,
 //! forming a known-gap ledger that a later ranking fix must consciously flip.
 //!
 //! Set `TD_MSG_EVAL_RECORD=1` to print the live ranking of every query and
-//! skip assertions — the calibration path used to author/refresh the fixture.
+//! skip assertions, the calibration path used to author/refresh the fixture.
 
 use serde_json::Value;
 use tempfile::TempDir;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_domain::ProjectId;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::SessionMessageSearchResult;
 

@@ -36,7 +36,7 @@ generation truthfully is not permission to leave it stale indefinitely.
 
 (Update 2026-08-07: both assignments in that paragraph have code repairs at
 tip. The hint/reconcile cadence diagnosis produced a three-tier freshness
-ladder run at query admission rather than trusting a hint to arrive —
+ladder run at query admission rather than trusting a hint to arrive,
 `fix(daemon): close code-index freshness cadence` (cbac4ae64e); tier-1 is the
 cheap `.git`-metadata fingerprint
 (`crates/tracedecay-code-index-runtime/src/code_index_scheduler/identity.rs`)
@@ -47,9 +47,9 @@ HEAD-moved paths at
 (`threshold_expiry_reconciles_out_of_band_write_without_watcher`,
 `identity_move_reconciles_and_never_mixes_identity`). The event-to-ready
 measurements are implemented as receipts in
-`crates/tracedecay-code-index-runtime/src/code_index_scheduler/cadence.rs` —
+`crates/tracedecay-code-index-runtime/src/code_index_scheduler/cadence.rs`,
 `feat(code-index): measure event-to-ready arrival, wait, and service`
-(325ea665e4) — which records arrival, dequeue, and terminal instants
+(325ea665e4), which records arrival, dequeue, and terminal instants
 separately so queue wait and service time are distinct, and withholds latency
 as `CodeIndexArrivalV1::Unavailable` rather than emitting a false zero sample.
 What is NOT closed: the 237-minute observation was an operational measurement
@@ -61,12 +61,12 @@ the staleness defect does not reproduce. Method: the live daemon (installed
 release 0.0.73, running since 08:56 UTC) journals `git_watch_synced` per
 metadata-watcher sync; joining today's 164 commits made inside that daemon's
 window against the journal's sync timestamps gives commit-to-next-sync delays
-of p50 = 8 s, p95 = 252 s, p99 = 1,043 s, max = 1,176 s (19.6 min) — minutes,
+of p50 = 8 s, p95 = 252 s, p99 = 1,043 s, max = 1,176 s (19.6 min), minutes,
 not the 237–285 min measured before the watcher/backstop repairs. The worst
 inter-sync gap today (67 min) contained zero commits, i.e. idle time, not
 staleness. Caveat kept honest: the installed 0.0.73 binary predates the
 event-to-ready receipts (325ea665e4) and the query-admission ladder close
-(cbac4ae64e), so its journal contains no `code_index_event_to_ready` records —
+(cbac4ae64e), so its journal contains no `code_index_event_to_ready` records,
 this closes the *operational* defect with data, while the receipts-based
 percentile proof still requires the next operator install and rides the
 existing operator-journey item (H1). Reopen only if that re-observation
@@ -232,8 +232,10 @@ generation.
   source, unsupported normalization, exhausted budget, or stale generation is
   not a complete empty result.
 - Update clone payloads, occurrences, and postings at changed-symbol
-  granularity. A no-op generation reuses them. Clone backfill never blocks
-  exact, lexical, graph, Git, diagnostic, or test retrieval.
+  granularity. A no-op generation reuses them. Clone postings seal with the
+  lexical artifact in its one build, so clone lookups serve as soon as lexical
+  search does; clone work never blocks graph, Git, diagnostic, or test
+  retrieval.
 - Repository, revision-pair, branch-diff, PR change-set, and
   authorized-project-set families select a frozen generation per included
   snapshot or project. Comparisons never collapse those selections into a
@@ -421,14 +423,14 @@ pub struct ProjectionBatchReceiptV1 {
   overflow signals trigger one bounded reconciliation before generation
   planning.
 
-  **Dated amendment (2026-08-07, recorded decision — supersedes the
+  **Dated amendment (2026-08-07, recorded decision, supersedes the
   opt-in-fallback text above).** The recursive `notify` working-tree watcher
   (the "#80 working-tree watcher") was removed rather than shipped
   off-by-default; no opt-in config key exists to enable a working-tree
   watcher (only `user.watcher_debounce_ms.v1` tunes the replacement below).
   The v6.x `notify-debouncer-full` watcher recursively watched the working
   tree and drowned on monorepo `node_modules`/`target` churn. Its
-  replacement — landed and unconditional — is an always-on unix-only
+  replacement, landed and unconditional, is an always-on unix-only
   git-metadata watcher (`src/daemon/git_watch.rs`, designs D3/D5) that
   watches only `HEAD`, `packed-refs`, `refs/`, and `worktrees/` under
   `<git_common_dir>` (~5-20 inotify watches per repository) and "never fires
@@ -455,10 +457,15 @@ pub struct ProjectionBatchReceiptV1 {
   inputs match; recompute relation and attribution rows only for dependency
   closures invalidated by versioned evidence.
 - Keep generation identity exact per repository/worktree/ref/snapshot.
-  Content-addressed parse and chunk artifacts may be physically reused across
-  worktrees only when source content, language descriptor, extractor,
-  sanitizer, privacy domain, and key epoch match. Reuse never merges worktree,
-  occurrence, authorization, generation, or lineage identity.
+  Occurrence identity names repository content (repository, logical path,
+  content, and sanitization receipt), not the worktree holding it. Linked
+  worktrees sealing unchanged content share its occurrence identity and every
+  artifact derived from it (parse/chunk artifacts, sealed segments, read-bundle
+  artifacts) when source content, language descriptor, extractor, sanitizer,
+  privacy domain, and key epoch match. Sharing never merges worktree,
+  snapshot, authorization, generation, or lineage identity: each worktree's
+  manifest and generation bind its snapshot authority, and reads route by
+  exact worktree first and never fall back to another worktree's graph.
 - Coalesce superseded batches by exact worktree and content frontier. Bound
   queue depth/bytes and parser/publication concurrency, preserve fair progress
   across active worktrees, and cancel a build whose fenced snapshot can no
@@ -472,9 +479,10 @@ pub struct ProjectionBatchReceiptV1 {
 
 ### Identity and lineage
 
-- Generation-local occurrence identity is exact. Logical identity remains
-  stable only while its declared repository, language, qualified-structure,
-  and source-evidence tuple is unchanged.
+- Occurrence identity is exact for its repository content; a worktree or
+  generation binds it only through the manifest that names it. Logical
+  identity remains stable only while its declared repository, language,
+  qualified-structure, and source-evidence tuple is unchanged.
 - Record rename, move, split, merge, and structural-continuity candidates with
   method, evidence, confidence kind, alternatives, and abstention.
   Tree-sitter object reuse, path, line, qualified-name similarity, or shared
@@ -679,10 +687,11 @@ normal CI.
   manifest as one clean reconciliation. Rename pairs are stitched when the
   platform supplies stable file identity, and watcher overflow falls back to
   bounded `gix` reconciliation rather than a full rebuild or guessed deletion.
-- Two linked worktrees sharing unchanged blobs may reuse physical parse/chunk
-  artifacts, but publish different snapshot/generation/occurrence identities.
-  An edit in one worktree invalidates no generation or cache entry in the
-  other.
+- Two linked worktrees sharing unchanged blobs share their physical
+  artifacts and the unchanged files' occurrence identities, but publish
+  different snapshot and generation identities. A read routed to one
+  worktree's generation never returns content only its sibling holds, and an
+  edit in one worktree invalidates no generation or cache entry in the other.
 - Rename, move, split, merge, ambiguous-lineage, parse-error, deletion, and unsupported-language fixtures remain truthful.
 - Fixtures prove Tree-sitter reuse never becomes lineage, parse/extraction caps
   remain partial, every graph path preserves its weakest edge authority and

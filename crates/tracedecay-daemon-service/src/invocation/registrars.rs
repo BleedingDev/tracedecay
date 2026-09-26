@@ -521,6 +521,7 @@ impl DaemonFeedbackRuntimeRegistrar {
         &self,
         database: Database,
         project_root: PathBuf,
+        response_handle_root: PathBuf,
         scope: ResolvedScope,
         access: ProjectSourceAccessSnapshot,
         authorization: Arc<dyn CallableCodeAuthorizationSourcePort>,
@@ -537,8 +538,14 @@ impl DaemonFeedbackRuntimeRegistrar {
                 #[cfg(any(test, feature = "test-helpers"))]
                 producer_constructions.fetch_add(1, Ordering::SeqCst);
                 let runtime = Arc::new(
-                    open_feedback_runtime(database, runtime_root.clone(), scope.clone(), access)
-                        .await?,
+                    open_feedback_runtime(
+                        database,
+                        runtime_root.clone(),
+                        response_handle_root,
+                        scope.clone(),
+                        access,
+                    )
+                    .await?,
                 );
                 let publications = runtime.publication_store();
                 let unavailable_cycle = Arc::new(UnavailableFeedbackCycleRuntimeV1::new(
@@ -842,7 +849,7 @@ impl DaemonConfigurationRuntimeRegistrar {
             selection,
         )
         .map_err(tracedecay_configuration::map_profile_worker_configuration_error)?;
-        let observed_at = current_micros();
+        let observed_at = now_micros();
         let authority = registered
             .grants
             .issue_direct(
@@ -931,7 +938,7 @@ impl DaemonConfigurationRuntimeRegistrar {
             }
         })?;
         runtime
-            .record_runtime_activation(Some(current.revision_id().clone()), None, current_micros())
+            .record_runtime_activation(Some(current.revision_id().clone()), None, now_micros())
             .await
             .map_err(|error| TraceDecayError::Config {
                 message: format!("configuration runtime activation could not be recorded: {error}"),
@@ -1073,8 +1080,8 @@ impl DaemonWorkRuntimeRegistrar {
                     // Store authority only. The evidence-retrieval adapter is
                     // built fresh by every route that mounts it, so comparing
                     // its object identity refused the second route of one
-                    // project — a linked worktree, or a reopen of a route
-                    // whose server was replaced — and left it permanently
+                    // project, a linked worktree, or a reopen of a route
+                    // whose server was replaced, and left it permanently
                     // degraded. Its own project scope is already proven by
                     // `grant.scope` and the authority digest.
                     if registered.actor == actor
@@ -1211,14 +1218,14 @@ impl DaemonRetainedRuntimeRegistrar {
 
     /// Registers this project's one retained runtime, or joins the incumbent.
     ///
-    /// Identity is the registered store authority — the authenticated profile,
-    /// exact authorized scope, and actor whose grant issued it — never the
-    /// identity of the ports object. Every route builds its own
-    /// `RetainedSurfacePortsV1`, so
-    /// comparing that object (or the grant digest it folds the current
-    /// configuration into) refused the second same-identity worktree route and
-    /// every reopen of a route whose ports had been rebuilt: project open then
-    /// degraded, for the life of the daemon. A matching same-profile route
+    /// Identity is the registered store authority, the authenticated profile,
+    /// the exact authorized scope and the actor whose grant issued it, never
+    /// the identity of the ports object. Every route builds its own
+    /// `RetainedSurfacePortsV1`, so comparing that object (or the grant digest
+    /// it folds the current configuration into) refused the second
+    /// same-identity worktree route and every reopen of a route whose ports
+    /// had been rebuilt: project open then degraded, for the life of the
+    /// daemon. A matching same-profile route
     /// aliases the incumbent and stamps its own grant on it. Later publication
     /// may add missing families (session/LCM after the memory core), but never
     /// replaces an incumbent family. A foreign profile, scope, or actor is

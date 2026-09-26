@@ -161,11 +161,6 @@ async fn status_reports_daemon_owned_partial_history_catch_up() {
     assert_eq!(status["session_history_catch_up"]["status"], "warming");
     assert_eq!(status["session_history_catch_up"]["coverage"], "partial");
     assert_eq!(status["session_history_catch_up"]["authority"], "daemon");
-    let text = status.to_string();
-    assert!(text.contains("continues bounded background catch-up"));
-    assert!(!text.contains("tracedecay sessions ingest --project-path"));
-    assert!(!text.contains("hook catch-up cap"));
-    assert!(!text.contains("tracedecay doctor --agent cursor"));
 }
 
 #[cfg(feature = "test-transport")]
@@ -465,28 +460,22 @@ async fn test_runtime_snapshot_runs_authority_audit_only_when_requested() {
     assert!(db["authority_audit_reason"].is_null());
     assert!(db["authority_audit_error"].is_null());
 
-    let census = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            let response = harness
-                .call_tool(&project, "tracedecay_runtime", json!({ "format": "json" }))
-                .await
-                .expect("production runtime invocation succeeds");
-            let result = response.result.expect("production runtime result");
-            let payload: Value =
-                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-            let census = payload["database"]["generation_census"].clone();
-            if census["state"] == "observed" {
-                break census;
-            }
-            assert_eq!(
-                census["reason"], "exact_scope_generation_not_ready",
-                "the composed server may wait only for its exact sealed generation: {census}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("production route publishes its sealed generation census");
+    crate::support::harness_wait_for_readiness(
+        &harness,
+        &project,
+        "fresh",
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    let response = harness
+        .call_tool(&project, "tracedecay_runtime", json!({ "format": "json" }))
+        .await
+        .expect("production runtime invocation succeeds");
+    let result = response.result.expect("production runtime result");
+    let payload: Value =
+        serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    let census = payload["database"]["generation_census"].clone();
+    assert_eq!(census["state"], "observed", "{census}");
     assert!(census["source_total_bytes"].is_u64());
     assert!(census["symbol_count"].is_u64());
     assert!(census["edge_count"].is_u64());

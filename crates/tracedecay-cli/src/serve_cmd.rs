@@ -3,14 +3,14 @@
 use std::io::Write;
 use std::path::Path;
 
-use tracedecay::project::TraceDecay;
 use tracedecay_domain::errors::Result;
+use tracedecay_project::project::TraceDecay;
 
 /// Returns the first plausible unexpanded `${...}` template variable in a
 /// `--path` argument (e.g. `${workspaceFolder}`), or `None` when the value
 /// contains no template syntax. The brace contents must look like a variable
-/// name — a leading ASCII letter followed by word/`.`/`-` characters,
-/// optionally with a `:`-introduced modifier such as a default value — so
+/// name, a leading ASCII letter followed by word/`.`/`-` characters,
+/// optionally with a `:`-introduced modifier such as a default value, so
 /// degenerate forms (`${}`, `${ }`, `${a/b}`) and directories that merely
 /// contain `$` are not misclassified. A matching value is overwhelmingly more
 /// likely to be an unexpanded host template than a real directory name, so
@@ -99,11 +99,10 @@ fn proxy_serve_handshake(
     };
 
     let ambient_discovery =
-        !explicit_path && tracedecay::config::is_ambient_project_root(&resolved_path);
+        !explicit_path && tracedecay_runtime_core::config::is_ambient_project_root(&resolved_path);
     let initialized = !ambient_discovery && TraceDecay::is_initialized(&resolved_path);
     // `serve` is a database-free proxy. It may consult only an already-pinned
-    // in-memory snapshot; missing authority disables implicit auto-init rather
-    // than reading legacy `config.json` from the client process.
+    // in-memory snapshot.
     // A never-opened project has no pinned snapshot, so `cached_sync_config`
     // fails. Follow the schema default (auto-init enabled) in that case rather
     // than failing closed: otherwise a discovery-mode client sitting in an
@@ -112,13 +111,13 @@ fn proxy_serve_handshake(
     // mirrors the same default fallback in `resolve_daemon_initialize_route`.
     let auto_init_root = (!ambient_discovery
         && !initialized
-        && tracedecay::config::cached_sync_config(&resolved_path).map_or_else(
+        && tracedecay_project::config::cached_sync_config(&resolved_path).map_or_else(
             |_| tracedecay_configuration::SyncConfig::default().auto_init,
             |config| config.auto_init,
         ))
     .then(|| tracedecay_runtime_core::worktree::git_worktree_root(&resolved_path))
     .flatten()
-    .filter(|root| !tracedecay::config::is_ambient_project_root(root));
+    .filter(|root| !tracedecay_runtime_core::config::is_ambient_project_root(root));
     if let Some(root) = auto_init_root.as_ref() {
         resolved_path.clone_from(root);
     }
@@ -129,7 +128,7 @@ fn proxy_serve_handshake(
         .and_then(|project_path| serve_scope_prefix(original_cwd, project_path));
     let telemetry_timings = timings
         || project_path.as_deref().is_some_and(|path| {
-            tracedecay::config::cached_telemetry_config(path)
+            tracedecay_project::config::cached_telemetry_config(path)
                 .is_ok_and(|telemetry| telemetry.timings)
         });
     let mut handshake = tracedecay::daemon::handshake_for_current_client(
@@ -186,7 +185,7 @@ mod tests {
 
     #[test]
     fn dollar_signs_without_brace_syntax_are_not_templates() {
-        // Real directories can contain `$` — only `${...}` is template syntax.
+        // Real directories can contain `$`, only `${...}` is template syntax.
         assert_eq!(unexpanded_template_variable("/tmp/pri$ce/data"), None);
         assert_eq!(unexpanded_template_variable("$workspaceFolder"), None);
         assert_eq!(unexpanded_template_variable("/tmp/{braces}/x"), None);

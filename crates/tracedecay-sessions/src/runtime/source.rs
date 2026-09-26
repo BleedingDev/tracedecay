@@ -1,6 +1,6 @@
 //! Provider-neutral transcript ingestion framework.
 //!
-//! Every agent transcript — Cursor, Claude Code, Codex, Vibe, … — converges to
+//! Every agent transcript, Cursor, Claude Code, Codex, Vibe, …, converges to
 //! the same provider-neutral [`SessionMessageRecord`] rows in a per-project
 //! `sessions.db`. This module factors the *incremental, fail-open* machinery
 //! out of the original Cursor-specific implementation so any adapter can plug
@@ -9,20 +9,20 @@
 //! ## Incremental cursors
 //!
 //! Sources differ in how they store transcripts, so three cursor kinds are
-//! supported, all persisted through the authoritative [`TranscriptStore`]
+//! supported, all persisted through the authoritative `TranscriptStore`
 //! implementation and its existing `parse_offsets` table keyed by file path.
 //! The stored [`StoredCursor`] is `(position, mtime)` where `position`
 //! means:
 //!
-//! * [`stream_new_jsonl`] — **`ByteOffset`**: append-only JSONL (Cursor, Claude,
+//! * [`stream_new_jsonl`], **`ByteOffset`**: append-only JSONL (Cursor, Claude,
 //!   Codex, …). `position` is the byte offset of the next unread line; we seek
 //!   there and stream only new lines.
-//! * [`read_changed_file`] — **`ContentHash`**: full-file-rewrite JSON (Cline,
+//! * [`read_changed_file`], **`ContentHash`**: full-file-rewrite JSON (Cline,
 //!   Roo Code, Kilo, …). `position` is a stable 64-bit prefix of the content
 //!   hash; combined with `mtime` it detects rewrites. On change the whole
-//!   document is re-parsed and re-upserted — idempotent `ON CONFLICT` upserts
+//!   document is re-parsed and re-upserted, idempotent `ON CONFLICT` upserts
 //!   make re-adding unchanged messages a no-op.
-//! * [`read_new_rows`](crate::runtime::shared::read_new_rows) — **`RowCursor`**: SQLite-backed stores (Zed, Copilot CLI
+//! * [`read_new_rows`](crate::runtime::shared::read_new_rows), **`RowCursor`**: SQLite-backed stores (Zed, Copilot CLI
 //!   `session-store.db`). `position` is the last-seen `rowid`; we select rows
 //!   with a greater `rowid`.
 //!
@@ -107,7 +107,7 @@ pub(super) async fn read_host_provider_coverage(
 pub(super) async fn read_codex_history_frontier(
     admission: &dyn HostAdmission,
     scope: &ObservationScopeV1,
-) -> TranscriptIngestResult<crate::runtime::codex::CodexDiscoveryFrontier> {
+) -> TranscriptIngestResult<crate::runtime::hosts::codex::CodexDiscoveryFrontier> {
     let stored_frontier = admission
         .get_parse_offset(scope, CODEX_HISTORY_FRONTIER_KEY)
         .await
@@ -122,14 +122,17 @@ pub(super) async fn read_codex_history_frontier(
             crate::runtime::snapshot_observation::host_admission_error("codex", outcome)
         })?
         .unwrap_or_default();
-    crate::runtime::codex::CodexDiscoveryFrontier::from_parse_offsets(stored_frontier, stored_epoch)
+    crate::runtime::hosts::codex::CodexDiscoveryFrontier::from_parse_offsets(
+        stored_frontier,
+        stored_epoch,
+    )
 }
 
 pub(super) async fn persist_codex_history_frontier(
     admission: &dyn HostAdmission,
     scope: &ObservationScopeV1,
-    expected: crate::runtime::codex::CodexDiscoveryFrontier,
-    frontier: crate::runtime::codex::CodexDiscoveryFrontier,
+    expected: crate::runtime::hosts::codex::CodexDiscoveryFrontier,
+    frontier: crate::runtime::hosts::codex::CodexDiscoveryFrontier,
 ) -> TranscriptIngestResult<()> {
     let (frontier_offset, epoch_offset) = frontier.into_parse_offsets();
     let (expected_frontier, expected_epoch) = expected.into_parse_offsets();
@@ -790,7 +793,7 @@ pub async fn persist_parsed_transcript<S: TranscriptIngestStore>(
     // ingest funnels through, so it is where "an agent said something in this
     // project" becomes observable. Published only after the durable batch
     // commits, so the dashboard never lights work that did not land. The project
-    // id is left for the dashboard to resolve from the registry — ingest holds a
+    // id is left for the dashboard to resolve from the registry, ingest holds a
     // project root, not a registered identity, and must not pay a lookup here.
     store
         .record_session_ingest_activity(project_root, messages_upserted, provider)

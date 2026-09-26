@@ -4,7 +4,7 @@ use tracedecay_contracts::{
     ApplicationProblem, ApplicationProblemEnvelope, OpaqueCursor, PageRequest, RequestId,
     ResultContractRef, SafeDiagnostic,
 };
-use tracedecay_daemon_service::application_surface::retained::decode_request as decode_retained_request;
+use tracedecay_daemon_protocol::decode_retained_request;
 use tracedecay_daemon_service::application_surface::{
     parse_http_application_surface_request, resolve_application_surface_dispatch_with_controls,
     resolve_catalog_tool_binding,
@@ -23,97 +23,12 @@ fn def(name: &str) -> ToolDefinition {
 }
 
 #[test]
-fn fact_store_tool_lookup_rejects_broad_and_accepts_exact_routes() {
-    let definitions = defs();
-    assert!(
-        definitions
-            .iter()
-            .all(|definition| definition.name != "tracedecay_fact_store")
-    );
-    for name in [
-        "fact_store_add",
-        "fact_store_search",
-        "fact_store_probe",
-        "fact_store_related",
-        "fact_store_reason",
-        "fact_store_contradict",
-        "fact_store_get",
-        "fact_store_update",
-        "fact_store_remove",
-        "fact_store_supersede",
-        "fact_store_list",
-    ] {
-        let canonical = canonical_tool_name(name);
-        assert!(
-            definitions
-                .iter()
-                .any(|definition| definition.name == canonical),
-            "{canonical} must resolve through the CLI catalog"
-        );
-    }
-}
-
-#[test]
-fn canonicalizes_alias_and_strip_prefix() {
-    assert_eq!(canonical_tool_name("query"), "tracedecay_search");
+fn canonicalizes_prefix_and_dashes() {
     assert_eq!(
         canonical_tool_name("tracedecay_search"),
         "tracedecay_search"
     );
     assert_eq!(canonical_tool_name("dead-code"), "tracedecay_dead_code");
-}
-
-#[test]
-fn application_operations_resolve_by_identity_and_by_cli_spelling() {
-    for operation in ApplicationSurfaceOperation::ALL {
-        assert_eq!(
-            cli_application_operation(&canonical_tool_name(operation.as_str())),
-            Some(operation),
-            "{} must resolve by its canonical identity",
-            operation.as_str()
-        );
-        assert_eq!(
-            cli_application_operation(&canonical_tool_name(operation.mcp_operation_name())),
-            Some(operation),
-            "{} must resolve by its CLI binding spelling",
-            operation.as_str()
-        );
-    }
-    for spelling in ["diagnostics_read", "diagnostics", "tracedecay_diagnostics"] {
-        assert_eq!(
-            cli_application_operation(&canonical_tool_name(spelling)),
-            Some(ApplicationSurfaceOperation::DiagnosticsRead),
-            "{spelling}"
-        );
-    }
-    assert_eq!(
-        cli_application_operation(&canonical_tool_name("totally-fake-tool")),
-        None
-    );
-}
-
-#[test]
-fn retryable_surface_refusals_stop_at_the_attempt_and_deadline_bounds() {
-    let delay = Duration::from_millis(10);
-    let roomy_deadline = Instant::now() + Duration::from_secs(1);
-    assert_eq!(
-        bounded_surface_retry_delay(Some(delay), 1, roomy_deadline),
-        Some(delay)
-    );
-    assert_eq!(
-        bounded_surface_retry_delay(Some(delay), 2, roomy_deadline),
-        Some(delay)
-    );
-    assert_eq!(
-        bounded_surface_retry_delay(Some(delay), 3, roomy_deadline),
-        None,
-        "the third typed refusal is surfaced instead of retried"
-    );
-    assert_eq!(
-        bounded_surface_retry_delay(Some(delay), 1, Instant::now() + delay),
-        None,
-        "a retry that cannot complete inside the request deadline is refused"
-    );
 }
 
 #[test]
@@ -241,12 +156,11 @@ fn rejects_non_numeric_flag() {
 #[test]
 fn args_escape_hatch_reads_at_file() {
     let d = def("search");
-    let dir = std::env::temp_dir().join(format!("ts-args-at-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     // Payload comfortably above Linux's 128 KiB MAX_ARG_STRLEN to prove
     // the @file path carries what a literal argv string cannot.
     let big = "x".repeat(200 * 1024);
-    let path = dir.join("payload.json");
+    let path = dir.path().join("payload.json");
     std::fs::write(&path, format!(r#"{{"query":"{big}","limit":7}}"#)).unwrap();
     let parsed =
         parse_invocation(&d, &["--args".to_string(), format!("@{}", path.display())]).unwrap();
@@ -255,7 +169,6 @@ fn args_escape_hatch_reads_at_file() {
         parsed.tool_args["query"].as_str().map(str::len),
         Some(big.len())
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -273,13 +186,11 @@ fn args_escape_hatch_reads_bare_path() {
     // `--args` is a whole-payload arg, so a bare file path works without the
     // `@` sigil used by per-key file values.
     let d = def("search");
-    let dir = std::env::temp_dir().join(format!("ts-args-bare-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("payload.json");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("payload.json");
     std::fs::write(&path, r#"{"query":"bare","limit":4}"#).unwrap();
     let parsed = parse_invocation(&d, &["--args".to_string(), path.display().to_string()]).unwrap();
     assert_eq!(parsed.tool_args, json!({ "query": "bare", "limit": 4 }));
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -405,10 +316,12 @@ const REGISTRY_READ_TOOLS: [&str; 3] = [
     "tracedecay_project_context",
 ];
 
+/// An initialised root is one whose repository carries the `.git/`-side
+/// identity marker (or a path-local profile store); the repo-local
+/// `.tracedecay/tracedecay.db` layout no longer exists.
 fn mark_initialised_project(root: &Path) {
-    let store = root.join(".tracedecay");
-    std::fs::create_dir_all(&store).expect("create project store dir");
-    std::fs::write(store.join("tracedecay.db"), b"").expect("write project marker");
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(root, "proj_dispatch")
+        .expect("pin fixture repository identity");
 }
 
 #[test]
@@ -515,10 +428,10 @@ fn registry_read_dispatch_honours_an_explicit_ambient_root_verbatim() {
     // process-wide profile discovery variables, and HOME is restored below.
     unsafe { std::env::set_var("HOME", home.path()) };
     assert!(
-        tracedecay::config::is_ambient_project_root(home.path()),
+        tracedecay_runtime_core::config::is_ambient_project_root(home.path()),
         "fixture HOME must be an ambient root"
     );
-    let discovered = tracedecay::config::discover_project_root(home.path());
+    let discovered = tracedecay_runtime_core::config::discover_project_root(home.path());
     let explicit =
         DaemonToolDispatch::for_tool(Some(home_arg), "tracedecay_project_list", &mut json!({}));
     match previous_home {
@@ -795,38 +708,17 @@ fn semantic_structural_identity_remains_schema_validated() {
 }
 
 #[test]
-fn removed_storage_routing_keys_fail_validation() {
-    let d = def("fact_store_list");
-    for removed in ["storage_scope", "hermes_home"] {
-        let payload = format!(r#"{{"{removed}":"removed"}}"#);
-        let error = parse_invocation(&d, &["--args".to_string(), payload]).unwrap_err();
-        let flag = format!("--{}", removed.replace('_', "-"));
-        assert!(
-            error.to_string().contains("unknown parameter") && error.to_string().contains(&flag),
-            "removed argument should fail clearly: {error}"
-        );
-    }
-}
+fn lcm_storage_scope_flag_lands_in_tool_args_and_rejects_unknown_scopes() {
+    let d = def("lcm_status");
+    let parsed = parse_invocation(&d, &["--storage-scope".to_string(), "user".to_string()])
+        .expect("storage scope flag should parse");
+    assert_eq!(parsed.tool_args["storage_scope"], json!("user"));
 
-#[test]
-fn lcm_cli_help_exposes_scope_without_hermes_profile_routing() {
-    for tool_name in [
-        "lcm_status",
-        "lcm_load_session",
-        "lcm_grep",
-        "lcm_describe",
-        "lcm_expand",
-        "lcm_expand_query",
-        "lcm_doctor",
-        "hermes_skill_bridge",
-    ] {
-        let help = render_tool_cli_help(&def(tool_name));
-        if tool_name.starts_with("lcm_") {
-            assert!(help.contains("--storage-scope"), "{tool_name}: {help}");
-        }
-        assert!(!help.contains("--hermes-home"), "{tool_name}: {help}");
-        assert!(!help.contains("hermes_profile"), "{tool_name}: {help}");
-    }
+    let err =
+        parse_invocation(&d, &["--storage-scope".to_string(), "shared".to_string()]).unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("`shared` is not one of:"), "got: {msg}");
+    assert!(msg.contains("project"), "got: {msg}");
 }
 
 #[test]
@@ -1029,25 +921,29 @@ fn join_content_text_joins_warning_and_payload() {
 }
 
 #[test]
-fn join_content_text_routes_the_daemon_metrics_footer_to_stderr() {
+fn join_content_text_routes_the_trailer_and_footer_to_stderr() {
     // `--format json` payloads are parsed from stdout as one document; the
-    // daemon appends its token accounting as a separate block, which must not
-    // trail the payload (run 34296614024: "Extra data: line 4 column 1").
+    // stale-graph trailer and the token accounting are separate blocks that
+    // must not trail the payload (run 34296614024: "Extra data: line 4
+    // column 1").
     let value = json!({
         "content": [
             { "type": "text", "text": r#"{"code":[],"coverage":{"exact":"complete"}}"# },
+            { "type": "text", "text": "\ncode_graph_freshness: stale, serving the last complete generation g.7" },
             { "type": "text", "text": "\ntracedecay_metrics: before=151600 after=3721" }
         ]
     });
+    let stdout = join_content_text(&value);
+    assert_eq!(stdout, r#"{"code":[],"coverage":{"exact":"complete"}}"#);
+    assert!(serde_json::from_str::<Value>(&stdout).is_ok());
     assert_eq!(
-        join_content_text(&value),
-        r#"{"code":[],"coverage":{"exact":"complete"}}"#
+        beside_result_blocks(&value),
+        vec![
+            "code_graph_freshness: stale, serving the last complete generation g.7".to_owned(),
+            "tracedecay_metrics: before=151600 after=3721".to_owned(),
+        ]
     );
-    assert_eq!(
-        token_accounting_footers(&value),
-        vec!["tracedecay_metrics: before=151600 after=3721".to_owned()]
-    );
-    assert!(token_accounting_footers(&json!({ "content": [] })).is_empty());
+    assert!(beside_result_blocks(&json!({ "content": [] })).is_empty());
 }
 
 #[test]
@@ -1180,14 +1076,14 @@ fn application_error_tool_result_exits_nonzero() {
 
 /// A truthful *degraded* answer is not a failure. Retrieval lanes that report
 /// themselves `unavailable` inside an otherwise successful payload, partial
-/// coverage, and warming generations all keep exit 0 — only an outcome the
+/// coverage, and warming generations all keep exit 0, only an outcome the
 /// daemon itself marked `isError` changes the status.
 #[test]
 fn typed_unavailable_coverage_inside_a_successful_result_stays_exit_zero() {
     let markdown = json!({
         "content": [{
             "type": "text",
-            "text": "### Coverage\nPartial recall — some retrieval lanes did not answer:\n\
+            "text": "### Coverage\nPartial recall. Some retrieval lanes did not answer:\n\
                      - exact: unavailable (generation_rebuilding)\n\
                      - graph: unavailable (generation_rebuilding)"
         }]
@@ -1279,7 +1175,7 @@ fn application_problem_makes_the_tool_command_fail() {
         requested_format: RequestedOutputFormat::Json,
     };
 
-    let error = print_cli_application_surface(result, true)
+    let error = print_cli_application_surface(None, result, true)
         .expect_err("a canonical application problem must fail the CLI process");
     assert!(
         error
@@ -1664,7 +1560,7 @@ fn application_surface_rejects_invalid_output_formats() {
         .expect_err("format outside the schema must fail");
         assert!(matches!(
             error,
-            ApplicationSurfaceAdapterError::InvalidSurfaceRequest
+            ApplicationSurfaceAdapterError::InvalidSurfaceRequest { .. }
         ));
     }
 }

@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_runtime_core::cancellation::{CancellationToken, MonotonicDeadline};
 
+use super::collection::{RegularFileSnapshot, read_regular_file};
 use super::fence::{
     StoreContentFence, StoreDirectoryFence, capture_store_content_fence,
     capture_store_content_fence_controlled, capture_store_directory_fence,
 };
-use super::quarantine::{RegularFileSnapshot, read_regular_file};
 use super::unregistered_page::{
     DEFAULT_UNREGISTERED_STORE_PAGE_LIMIT, UnregisteredStoreSweepReport,
     UnregisteredStoreSweepRequestV1, UnregisteredSweepCompletionV1, sweep_unregistered_store_page,
@@ -20,8 +20,8 @@ use super::{
 };
 #[cfg(test)]
 use super::{
-    CollectionFailure, classify_stores, execute_registered_collection, plan_collection,
-    quarantine::store_finding_is_profile_contained,
+    CollectionFailure, classify_stores, collection::store_finding_is_profile_contained,
+    execute_registered_collection, plan_collection,
 };
 
 pub(super) struct StoreWalkStats {
@@ -507,8 +507,8 @@ pub(crate) async fn sweep_orphan_stores(
 //
 // `build_store_census` walks *from* the registry: for every registered
 // project, for every one of its registered store instances. A store dir with
-// no registry trace at all — no `code_projects` row for its identity, ever —
-// is invisible to that walk no matter how large it grows. This is a distinct
+// no registry trace at all, meaning no `code_projects` row for its identity
+// ever, is invisible to that walk no matter how large it grows. This is a distinct
 // failure mode from [`StoreDisposition::Orphaned`] (whose registry row still
 // exists; only its root vanished): here the row itself is gone, e.g. because
 // registry GC removed the stale identity row without also removing
@@ -522,7 +522,7 @@ pub(crate) async fn sweep_orphan_stores(
 /// One store directory found on disk with no registry identity at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnregisteredStoreFinding {
-    /// The `projects/` leaf directory name — the project id this store would
+    /// The `projects/` leaf directory name, the project id this store would
     /// have if it were registered.
     pub project_dir_name: String,
     pub data_root: PathBuf,
@@ -577,22 +577,13 @@ pub async fn census_unregistered_project_dirs(
 }
 
 /// The partitioned collection decision over a set of unregistered-store
-/// findings. There is no `Live`/`Relinkable` disposition here — an
-/// unregistered directory has no registry identity to resolve at all — so
+/// findings. There is no `Live`/`Relinkable` disposition here, an
+/// unregistered directory has no registry identity to resolve at all, so
 /// every finding is either past the retention window or not.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UnregisteredCollectionPlan {
     pub collect: Vec<UnregisteredStoreFinding>,
     pub retained_immature: Vec<UnregisteredStoreFinding>,
-}
-
-impl UnregisteredCollectionPlan {
-    /// Total bytes that collecting [`Self::collect`] would reclaim.
-    pub fn collectable_bytes(&self) -> u64 {
-        self.collect
-            .iter()
-            .fold(0u64, |acc, f| acc.saturating_add(f.size_bytes))
-    }
 }
 
 /// Partition findings under a retention window. Pure.
@@ -632,11 +623,10 @@ pub(crate) fn manifest_names_abandoned_root(data_root: &Path, profile_root: &Pat
         )
 }
 
-/// Deletes unregistered directories through the same two-phase boundary:
-/// content/durable inspection and quarantine first, then a short final
-/// still-unregistered confirmation before the irreversible phase.
+/// Deletes unregistered directories after content/durable inspection and a
+/// short final still-unregistered confirmation.
 ///
-/// Compatibility convenience for one bounded read/apply page. The daemon uses
+/// Convenience for one bounded read/apply page. The daemon uses
 /// [`sweep_unregistered_store_page`] directly so it can persist the returned
 /// cursor across maintenance cadences; Doctor deliberately receives one
 /// bounded preview rather than a hidden full-profile traversal.

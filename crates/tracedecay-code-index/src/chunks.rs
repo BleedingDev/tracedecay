@@ -9,13 +9,16 @@
 //! and mutable line numbers cannot affect `CodeSearchChunkId`.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracedecay_code_extraction::{ExtractedCloneBodyV1, ExtractionArtifactV1};
+use tracedecay_code_extraction::{
+    ExtractedCloneBodyV1, ExtractedImportEvidenceV1, ExtractionArtifactV1, ImportNamespaceV1,
+    is_test_framework_call_signature,
+};
 use tracedecay_domain::{
     BoundedSanitizedText, CanonicalRelationEdgeV1, ChunkLogicalIdentityV1, ChunkerRevision,
     CodeGenerationId, CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId,
@@ -58,12 +61,9 @@ pub enum CodeSearchEligibilityV1 {
     Partial {
         reason: String,
     },
-    Unsupported {
-        reason: String,
-    },
 }
 
-/// One generation-bound file manifest — the scheduling/checkpoint unit.
+/// One generation-bound file manifest, the scheduling/checkpoint unit.
 /// Chunks are the projection and receipt unit.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -92,21 +92,6 @@ pub enum ChunkingFailureV1 {
     /// unit is named instead of aborting the sweep.
     #[error("chunk worker unit {index} panicked: {message}")]
     WorkerPanic { index: usize, message: String },
-}
-
-/// The deterministic chunker contract (Plan 25: `src/code_index/chunks.rs`
-/// builds chunks and their parent/child hierarchy).
-pub trait CodeChunker {
-    /// Build every chunk for one receipt-bound file plus its extraction batch,
-    /// covering every eligible sanitized byte with a declared chunk or an
-    /// explicit unsupported/excluded range.
-    fn chunk_file(
-        &self,
-        file: &ReceiptBoundCodeFileV1,
-        batch: &ExtractionBatchV1,
-        descriptor: &LanguageDescriptorV1,
-        cancellation: &dyn ExtractionCancellation,
-    ) -> Result<CodeFileChunksV1, ChunkingFailureV1>;
 }
 
 /// The chunks produced for one file: the generation-bound document manifest
@@ -149,8 +134,8 @@ pub struct ExactExtractionAuthorityV1 {
 /// still this allocation carries the minted bytes and allocation identity
 /// alone admits it.
 ///
-/// The digest is therefore what a row the authority did *not* mint — a fresh
-/// allocation, a row minted elsewhere, a forgery — is compared against, and
+/// The digest is therefore what a row the authority did *not* mint, a fresh
+/// allocation, a row minted elsewhere, a forgery, is compared against, and
 /// only such a row makes the mint pay for one. Minting it up front cost a
 /// corpus-scale digest sweep per generation for a comparison most rows never
 /// reach. The minted row is held, not weakly referenced, so the digest stays
@@ -523,12 +508,10 @@ pub const EXACT_EXTRACTION_AUTHORITY_SEPARATOR: &str = "tracedecay.exact-extract
 
 /// The deterministic five-grain chunker.
 ///
-/// The compatibility `CodeChunker` port accepts only extraction evidence and
-/// therefore re-parses. Production indexing uses
-/// [`Self::index_file_with_authority_from_extraction`] to consume the exact
-/// sanitized parser rows that produced that evidence, avoiding a second parse.
-/// Both paths validate batch, descriptor, and file identity before structural
-/// work and share the same canonical materialization.
+/// [`Self::index_file_with_authority_from_extraction`] consumes the exact
+/// sanitized parser rows that produced the extraction evidence, so chunking
+/// never re-parses. Batch, descriptor, and file identity are validated before
+/// structural work.
 ///
 /// Construct one chunker per generation: generation identity, repository
 /// identity, sanitizer revision, policy revision, and chunker revision are
@@ -538,89 +521,31 @@ pub struct DeterministicCodeChunker {
     repository: RepositoryId,
     sanitizer_revision: SanitizerRevision,
     policy_revision: PolicyRevisionId,
-    sensitivity_level: SensitivityLevelV1,
     chunker_revision: ChunkerRevision,
-    extractors: Arc<tracedecay_code_extraction::LanguageRegistry>,
 }
 
 impl DeterministicCodeChunker {
-    /// Create a chunker bound to one generation. Chunks default to
-    /// `SensitivityLevelV1::Public` under `policy_revision`; application
-    /// policy output refines this via `with_sensitivity_level`.
+    /// Create a chunker bound to one generation. Each indexing call supplies
+    /// the sensitivity level its chunks carry under `policy_revision`.
     pub fn new(
         generation_id: CodeGenerationId,
         repository: RepositoryId,
         sanitizer_revision: SanitizerRevision,
         policy_revision: PolicyRevisionId,
         chunker_revision: ChunkerRevision,
-        extractors: tracedecay_code_extraction::LanguageRegistry,
-    ) -> Self {
-        Self::from_shared_registry(
-            generation_id,
-            repository,
-            sanitizer_revision,
-            policy_revision,
-            chunker_revision,
-            Arc::new(extractors),
-        )
-    }
-
-    /// Create a generation-bound chunker over a shared parser registry.
-    pub fn from_shared_registry(
-        generation_id: CodeGenerationId,
-        repository: RepositoryId,
-        sanitizer_revision: SanitizerRevision,
-        policy_revision: PolicyRevisionId,
-        chunker_revision: ChunkerRevision,
-        extractors: Arc<tracedecay_code_extraction::LanguageRegistry>,
     ) -> Self {
         Self {
             generation_id,
             repository,
             sanitizer_revision,
             policy_revision,
-            sensitivity_level: SensitivityLevelV1::Public,
             chunker_revision,
-            extractors,
         }
-    }
-
-    /// Pin the sensitivity level recorded on every chunk of this generation.
-    #[must_use]
-    pub fn with_sensitivity_level(mut self, level: SensitivityLevelV1) -> Self {
-        self.sensitivity_level = level;
-        self
     }
 
     /// The generation this chunker is bound to.
     pub fn generation_id(&self) -> &CodeGenerationId {
         &self.generation_id
-    }
-
-    /// Index one receipt-bound file and retain its symbols, canonical graph
-    /// edges, and typed edge abstentions alongside its chunks.
-    pub fn index_file(
-        &self,
-        file: &ReceiptBoundCodeFileV1,
-        batch: &ExtractionBatchV1,
-        descriptor: &LanguageDescriptorV1,
-        cancellation: &dyn ExtractionCancellation,
-    ) -> Result<CodeFileIndexArtifactsV1, ChunkingFailureV1> {
-        self.build_file_artifacts(file, batch, descriptor, cancellation)
-    }
-
-    /// Index one receipt-bound file and return the opaque capability required
-    /// to re-admit its exact extraction evidence into lexical projection.
-    pub fn index_file_with_authority(
-        &self,
-        file: &ReceiptBoundCodeFileV1,
-        batch: &ExtractionBatchV1,
-        descriptor: &LanguageDescriptorV1,
-        cancellation: &dyn ExtractionCancellation,
-    ) -> Result<(CodeFileIndexArtifactsV1, ExactExtractionAuthorityV1), ChunkingFailureV1> {
-        let result = self.index_file(file, batch, descriptor, cancellation)?;
-        let authority = ExactExtractionAuthorityV1::mint(&result.chunks.chunks);
-        Ok((result, authority))
     }
 
     /// Index one file from the parser rows that produced its extraction batch.
@@ -667,7 +592,7 @@ impl DeterministicCodeChunker {
             file,
             extraction.batch(),
             descriptor,
-            Some(extraction.parse_artifact()),
+            extraction.parse_artifact(),
             sensitivity_level,
             cancellation,
             &mut clone_build,
@@ -677,20 +602,6 @@ impl DeterministicCodeChunker {
             ExactExtractionAuthorityV1::mint(&result.chunks.chunks)
         );
         Ok((result, authority, clone_build.stats()))
-    }
-
-    /// Chunk one receipt-bound file and return the opaque capability required
-    /// to re-admit its exact extraction evidence into lexical projection.
-    pub fn chunk_file_with_authority(
-        &self,
-        file: &ReceiptBoundCodeFileV1,
-        batch: &ExtractionBatchV1,
-        descriptor: &LanguageDescriptorV1,
-        cancellation: &dyn ExtractionCancellation,
-    ) -> Result<(CodeFileChunksV1, ExactExtractionAuthorityV1), ChunkingFailureV1> {
-        let (result, authority) =
-            self.index_file_with_authority(file, batch, descriptor, cancellation)?;
-        Ok((result.chunks, authority))
     }
 
     fn file_identity(&self, logical_path: &str) -> Result<FileIdentityDigest, ChunkingFailureV1> {
@@ -704,21 +615,29 @@ impl DeterministicCodeChunker {
         grain: CodeSearchChunkGrainV1,
         split_path: Vec<u32>,
     ) -> Result<CodeSearchChunkId, ChunkingFailureV1> {
-        let identity = ChunkLogicalIdentityV1 {
+        code_chunk_id(ChunkLogicalIdentityV1 {
             repository: self.repository.clone(),
             file_identity: file_identity.clone(),
             symbol_identity: symbol_identity.cloned(),
             grain,
             split_path,
             chunker_revision: self.chunker_revision.clone(),
-        };
-        let digest = canonical_digest(CHUNK_IDENTITY_SEPARATOR, &identity)?;
-        CodeSearchChunkId::new(format!("chunk.v1.{digest}")).map_err(|error| {
-            ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
-                error,
-            ))
         })
     }
+}
+
+/// The one authority for the logical chunk identity → chunk id binding.
+/// Chunk planning mints ids through it, and sealed segments recompute the
+/// ids they omit here so the recipe cannot fork.
+pub(crate) fn code_chunk_id(
+    identity: ChunkLogicalIdentityV1,
+) -> Result<CodeSearchChunkId, ChunkingFailureV1> {
+    let digest = canonical_digest(CHUNK_IDENTITY_SEPARATOR, &identity)?;
+    CodeSearchChunkId::new(format!("chunk.v1.{digest}")).map_err(|error| {
+        ChunkingFailureV1::NonCanonicalIdentity(crate::noncanonical::noncanonical_from_domain(
+            error,
+        ))
+    })
 }
 
 /// The one authority for the `(repository, logical path)` → file identity
@@ -1118,50 +1037,14 @@ struct PendingChunk {
     parent: Option<(usize, Vec<u32>)>,
 }
 
-impl CodeChunker for DeterministicCodeChunker {
-    #[hotpath::measure(label = "code_index.chunk.file")]
-    fn chunk_file(
-        &self,
-        file: &ReceiptBoundCodeFileV1,
-        batch: &ExtractionBatchV1,
-        descriptor: &LanguageDescriptorV1,
-        cancellation: &dyn ExtractionCancellation,
-    ) -> Result<CodeFileChunksV1, ChunkingFailureV1> {
-        self.index_file(file, batch, descriptor, cancellation)
-            .map(|artifacts| artifacts.chunks)
-    }
-}
-
 impl DeterministicCodeChunker {
-    /// Build all parser-backed file artifacts. The legacy chunk-only port
-    /// delegates here so chunk, lineage, and graph evidence are always
-    /// derived from the same bounded parser result.
-    fn build_file_artifacts(
-        &self,
-        file: &ReceiptBoundCodeFileV1,
-        batch: &ExtractionBatchV1,
-        descriptor: &LanguageDescriptorV1,
-        cancellation: &dyn ExtractionCancellation,
-    ) -> Result<CodeFileIndexArtifactsV1, ChunkingFailureV1> {
-        let mut clone_build = ClonePayloadBuildContextV1::new(None);
-        self.build_file_artifacts_with_parse(
-            file,
-            batch,
-            descriptor,
-            None,
-            self.sensitivity_level,
-            cancellation,
-            &mut clone_build,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn build_file_artifacts_with_parse(
         &self,
         file: &ReceiptBoundCodeFileV1,
         batch: &ExtractionBatchV1,
         descriptor: &LanguageDescriptorV1,
-        parse_artifact: Option<&ExtractionArtifactV1>,
+        parse_artifact: &ExtractionArtifactV1,
         sensitivity_level: SensitivityLevelV1,
         cancellation: &dyn ExtractionCancellation,
         clone_build: &mut ClonePayloadBuildContextV1<'_>,
@@ -1186,50 +1069,10 @@ impl DeterministicCodeChunker {
             return Err(ChunkingFailureV1::GenerationMismatch);
         }
 
-        // A failed, timed-out, or cancelled extraction attests no structure:
-        // the document is explicitly unsupported and every byte is covered by
-        // the batch's error/unsupported evidence, not by invented chunks.
-        let parse_reason = match &batch.parse_outcome {
-            ParseOutcomeV1::Complete => None,
-            ParseOutcomeV1::Partial { reason } => {
-                return self.build_partial_artifacts(
-                    file,
-                    authority,
-                    batch,
-                    descriptor,
-                    parse_artifact,
-                    sensitivity_level,
-                    cancellation,
-                    reason.clone(),
-                    clone_build,
-                );
-            }
-            ParseOutcomeV1::TimedOut => {
-                Some("Tree-sitter parsing exceeded the bounded per-file parse budget".to_owned())
-            }
-            ParseOutcomeV1::Cancelled => {
-                Some("extraction was cancelled before parsing completed".to_owned())
-            }
-            ParseOutcomeV1::Failed { reason } => {
-                Some(format!("Tree-sitter parsing failed: {reason}"))
-            }
+        let partial_reason = match &batch.parse_outcome {
+            ParseOutcomeV1::Complete => String::new(),
+            ParseOutcomeV1::Partial { reason } => reason.clone(),
         };
-        if let Some(reason) = parse_reason {
-            let document = CodeSearchDocumentV1 {
-                generation_id: self.generation_id.clone(),
-                file_occurrence_id: file.file.file_occurrence_id.clone(),
-                content_digest: file.file.content_digest.clone(),
-                eligibility: CodeSearchEligibilityV1::Unsupported { reason },
-                chunk_ids: Vec::new(),
-            };
-            return CodeFileIndexArtifactsV1::without_parser_rows(
-                CodeFileChunksV1 {
-                    document,
-                    chunks: Vec::new(),
-                },
-                batch,
-            );
-        }
         self.build_partial_artifacts(
             file,
             authority,
@@ -1238,7 +1081,7 @@ impl DeterministicCodeChunker {
             parse_artifact,
             sensitivity_level,
             cancellation,
-            String::new(),
+            partial_reason,
             clone_build,
         )
     }
@@ -1252,7 +1095,7 @@ impl DeterministicCodeChunker {
         authority: &crate::intake::ReceiptBoundCodeFileAuthorityV1,
         batch: &ExtractionBatchV1,
         descriptor: &LanguageDescriptorV1,
-        parse_artifact: Option<&ExtractionArtifactV1>,
+        artifact: &ExtractionArtifactV1,
         sensitivity_level: SensitivityLevelV1,
         cancellation: &dyn ExtractionCancellation,
         partial_reason: String,
@@ -1301,28 +1144,6 @@ impl DeterministicCodeChunker {
             ));
         }
         let source = &full_source[..parsed_prefix_end];
-        let mut reparsed;
-        let artifact = if let Some(parse_artifact) = parse_artifact {
-            parse_artifact
-        } else {
-            let extractor = self
-                .extractors
-                .extractor_for_file(&file.file.logical_path)
-                .or_else(|| {
-                    descriptor.extensions.iter().find_map(|extension| {
-                        self.extractors
-                            .extractor_for_file(&format!("probe.{extension}"))
-                    })
-                })
-                .ok_or(ChunkingFailureV1::DescriptorMismatch)?;
-            if cancellation.is_cancelled() {
-                return Err(ChunkingFailureV1::Cancelled);
-            }
-            reparsed = extractor.extract_artifact(&file.file.logical_path, source);
-            reparsed.result.sanitize();
-            reparsed.result.canonicalize_order();
-            &reparsed
-        };
         let result = &artifact.result;
         if cancellation.is_cancelled() {
             return Err(ChunkingFailureV1::Cancelled);
@@ -1370,8 +1191,14 @@ impl DeterministicCodeChunker {
             clone_build,
         )?;
         let (mut edges, edge_abstentions) = canonical_relation_edges(&result.edges, &symbol_rows);
-        let (same_file_edges, unresolved_references) =
-            resolve_file_references(source, &offsets, &result.unresolved_refs, &symbol_rows);
+        let (same_file_edges, unresolved_references) = resolve_file_references(
+            batch.language.as_str(),
+            source,
+            &offsets,
+            &result.unresolved_refs,
+            &symbol_rows,
+            &artifact.imports,
+        );
         edges.extend(same_file_edges);
         edges.sort_by(|left, right| canonical_edge_key(left).cmp(&canonical_edge_key(right)));
 
@@ -1728,7 +1555,16 @@ impl DeterministicCodeChunker {
                     pieces.push((Vec::new(), symbol.span));
                 }
                 let line_end = offsets_line_end(source, symbol.span.start_byte);
-                let signature_end = line_end.min(symbol.span.end_byte);
+                // A minified declaration puts its whole body on the signature
+                // line. The signature chunk keeps the bounded prefix so one
+                // such file cannot fail the generation's chunk contract.
+                let signature_end = snap_down(
+                    source,
+                    line_end
+                        .min(symbol.span.end_byte)
+                        .min(symbol.span.start_byte + MAX_CHUNK_TEXT_BYTES as u64)
+                        as usize,
+                ) as u64;
                 let signature = (signature_end > symbol.span.start_byte).then_some(SourceSpan {
                     start_byte: symbol.span.start_byte,
                     end_byte: signature_end,
@@ -2102,8 +1938,14 @@ pub(crate) fn cross_file_reference_name_is_blocklisted(reference_name: &str) -> 
 /// `Builder::default`). Keeps the intentional `<Type as Trait>` definition
 /// name while restoring same-file / seal recall for those calls. `None` when
 /// `path` is not a well-formed UFCS trait-impl method.
+///
+/// A trait impl inside an inline module carries that module path
+/// (`inner::<Rows as Wide>::wide`); the alias keeps it, because same-file
+/// resolution keys definitions by their whole file-relative name.
 pub(crate) fn rust_type_path_alias_for_trait_impl_method(path: &str) -> Option<String> {
-    if !path.starts_with('<') {
+    let open = path.find('<')?;
+    let (module_prefix, path) = path.split_at(open);
+    if !(module_prefix.is_empty() || module_prefix.ends_with("::")) {
         return None;
     }
     let mut depth = 0_i32;
@@ -2139,7 +1981,7 @@ pub(crate) fn rust_type_path_alias_for_trait_impl_method(path: &str) -> Option<S
     {
         return None;
     }
-    Some(format!("{type_name}::{method}"))
+    Some(format!("{module_prefix}{type_name}::{method}"))
 }
 
 /// Whether `qualified_name`'s file-relative path is a UFCS trait-impl method
@@ -2170,6 +2012,25 @@ fn reference_evidence_span(
     let line_start = offsets.get(reference.line as usize).copied()?;
     let site_start = usize::try_from(line_start.checked_add(u64::from(reference.column))?).ok()?;
     let source_at_site = source.get(site_start..)?;
+    // Typed receiver references name `Type::method`, while the source spells
+    // `receiver.method`. Both forms must identify the parser-observed method
+    // token so a sealed edge can discharge the same site's limitation.
+    let rust_call =
+        reference.reference_kind == EdgeKind::Calls && reference.file_path.ends_with(".rs");
+    let reference_name = if rust_call
+        && (reference.reference_name.contains('.')
+            || !source_at_site.starts_with(&reference.reference_name))
+    {
+        reference.reference_name.rsplit(['.', ':']).next()?
+    } else {
+        &reference.reference_name
+    };
+    if rust_call && source_at_site.starts_with(reference_name) {
+        return Some(SourceSpan {
+            start_byte: u64::try_from(site_start).ok()?,
+            end_byte: u64::try_from(site_start.checked_add(reference_name.len())?).ok()?,
+        });
+    }
     references_by_site
         .get(&(
             reference.from_node_id.as_str(),
@@ -2197,14 +2058,36 @@ fn reference_evidence_span(
 }
 
 fn resolve_file_references(
+    language: &str,
     source: &str,
     offsets: &[u64],
     unresolved: &[UnresolvedRef],
     symbols: &[SymbolRow],
+    imports: &[ExtractedImportEvidenceV1],
 ) -> (
     Vec<CanonicalRelationEdgeV1>,
     Vec<CodeIndexUnresolvedReferenceV1>,
 ) {
+    // A TypeScript import binds one exact module and name, so a ubiquitous
+    // name (`format`, `parse`, `get`) imported explicitly is still a real
+    // cross-file candidate; only name-only binding needs the blocklist.
+    let imported_locals = imports
+        .iter()
+        .filter(|binding| !binding.is_public)
+        .filter_map(|binding| binding.local_name.as_deref())
+        .collect::<HashSet<&str>>();
+    let typescript = is_typescript_family(language);
+    let mut typescript_imports: HashMap<&str, Vec<ImportNamespaceV1>> = HashMap::new();
+    if typescript {
+        for binding in imports.iter().filter(|binding| !binding.is_public) {
+            if let Some(local) = binding.local_name.as_deref() {
+                typescript_imports
+                    .entry(local)
+                    .or_default()
+                    .push(binding.namespace);
+            }
+        }
+    }
     let mut by_name: BTreeMap<&str, Vec<&SymbolRow>> = BTreeMap::new();
     let mut by_file_relative_name: BTreeMap<String, Vec<&SymbolRow>> = BTreeMap::new();
     let mut type_path_aliases: Vec<(String, &SymbolRow)> = Vec::new();
@@ -2276,12 +2159,11 @@ fn resolve_file_references(
             .and_modify(|entry| *entry = None)
             .or_insert(Some(symbol));
     }
-    // Extractors emit a bare method-name duplicate alongside every dotted
-    // receiver call (`self.rows.push(row)` → `self.rows.push` + `push`) so an
-    // in-file method definition can still match. Index those duplicates by
-    // their call site: a duplicate that binds back to its own enclosing symbol
-    // is a receiver whose type is unknown (usually a container or another
-    // struct's method sharing the name), not evidence of recursion.
+    // A dotted call used to also emit its method's simple name
+    // (`self.rows.push(row)` → `self.rows.push` + `push`) so an in-file method
+    // could match. That duplicate binds the enclosing symbol when the names
+    // coincide, which is a receiver call, not recursion. Rust extraction no
+    // longer emits it; keep the skip so a duplicate cannot invent one.
     let dotted_duplicate_sites = unresolved
         .iter()
         .filter(|reference| reference.reference_name.contains('.'))
@@ -2303,6 +2185,27 @@ fn resolve_file_references(
         } else {
             by_name.get(reference.reference_name.as_str())
         };
+        // A TypeScript import is the module-scope binding of its name; a
+        // same-named module-scope declaration would be a redeclaration error,
+        // so only a declaration nested in a function scope that encloses the
+        // reference (a helper inside a `describe` callback) shadows it.
+        let shadows_import = typescript
+            && !reference.reference_name.contains("::")
+            && typescript_imports
+                .get(reference.reference_name.as_str())
+                .is_some_and(|namespaces| {
+                    namespaces
+                        .iter()
+                        .any(|namespace| match reference.reference_kind {
+                            EdgeKind::Calls => *namespace == ImportNamespaceV1::Value,
+                            _ => *namespace != ImportNamespaceV1::SideEffect,
+                        })
+                });
+        let from_span = by_node_id
+            .get(reference.from_node_id.as_str())
+            .copied()
+            .flatten()
+            .map(|from| from.span);
         let compatible = candidates
             .map(|candidates| {
                 candidates
@@ -2310,6 +2213,16 @@ fn resolve_file_references(
                     .copied()
                     .filter(|target| {
                         reference_target_kind_is_compatible(reference.reference_kind, &target.kind)
+                            && !(typescript
+                                && target.kind == NodeKind::Function.as_str()
+                                && target
+                                    .signature
+                                    .as_deref()
+                                    .is_some_and(is_test_framework_call_signature))
+                            && (!shadows_import
+                                || from_span.is_some_and(|from| {
+                                    encloses_in_function_scope(symbols, target, from)
+                                }))
                     })
                     .collect::<Vec<_>>()
             })
@@ -2353,6 +2266,7 @@ fn resolve_file_references(
                     &references_by_site,
                     reference,
                     &by_node_id,
+                    &imported_locals,
                 ) {
                     retained.push(candidate);
                 }
@@ -2362,23 +2276,53 @@ fn resolve_file_references(
             _ => {}
         }
     }
+    // The parser may describe one invocation both as a receiver expression
+    // and as a type-qualified call. A proved edge covers that exact call site;
+    // keeping the receiver form would falsely report a missing caller there.
+    let resolved_sites = resolved
+        .iter()
+        .map(|edge| (edge.from_occurrence.clone(), edge.kind, edge.evidence_span))
+        .collect::<BTreeSet<_>>();
+    retained.retain(|reference| {
+        !resolved_sites.contains(&(
+            reference.from_occurrence.clone(),
+            reference.kind,
+            reference.evidence_span,
+        ))
+    });
     (resolved, retained)
 }
 
 /// The retained cross-file form of one reference the file could not bind, or
-/// `None` when the reference can never bind cross-file: receiver-dotted
-/// paths (unknown receiver type), blocklisted ubiquitous names, relation
-/// kinds outside the canonical graph contract, and references whose
-/// enclosing symbol is not uniquely identified.
+/// `None` when the reference can never bind cross-file: blocklisted names,
+/// relation kinds outside the canonical graph contract, and references whose
+/// enclosing symbol is not uniquely identified. Rust receiver calls remain as
+/// limitation evidence; a dotted name never grants edge authority.
 fn cross_file_reference_candidate(
     source: &str,
     offsets: &[u64],
     references_by_site: &HashMap<(&str, EdgeKind, u32, u32), Vec<&UnresolvedRef>>,
     reference: &UnresolvedRef,
     by_node_id: &BTreeMap<&str, Option<&SymbolRow>>,
+    imported_locals: &HashSet<&str>,
 ) -> Option<CodeIndexUnresolvedReferenceV1> {
-    if reference.reference_name.contains('.')
-        || cross_file_reference_name_is_blocklisted(&reference.reference_name)
+    let receiver_call = reference.reference_kind == EdgeKind::Calls
+        && reference.file_path.ends_with(".rs")
+        && reference.reference_name.contains('.');
+    let typescript = typescript_family_path(&reference.file_path);
+    let explicitly_imported =
+        typescript && imported_locals.contains(reference.reference_name.as_str());
+    // `ns.f()` through an imported module namespace binds at sealing, where
+    // the namespace's module is known.
+    let imported_member_call = typescript
+        && reference.reference_kind == EdgeKind::Calls
+        && typescript_member_call_path(&reference.reference_name)
+            .is_some_and(|(head, _)| imported_locals.contains(head));
+    if !receiver_call
+        && !imported_member_call
+        && (reference.reference_name.contains('.')
+            || (!explicitly_imported
+                && cross_file_reference_name_is_blocklisted(&reference.reference_name)))
     {
         return None;
     }
@@ -2390,6 +2334,29 @@ fn cross_file_reference_candidate(
         kind,
         evidence_span: reference_evidence_span(source, offsets, references_by_site, reference)
             .unwrap_or(from.span),
+    })
+}
+
+/// `(local name, member path)` of a TypeScript member call `a.b.c`, whose
+/// segments are all plain identifiers; `None` for a bare name or any other
+/// callee expression (calls, indexing, optional chaining).
+pub(crate) fn typescript_member_call_path(reference_name: &str) -> Option<(&str, &str)> {
+    let (head, members) = reference_name.split_once('.')?;
+    let identifier = |segment: &str| {
+        !segment.is_empty()
+            && !segment.starts_with(|c: char| c.is_ascii_digit())
+            && segment
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+    };
+    (identifier(head) && members.split('.').all(identifier)).then_some((head, members))
+}
+
+/// Whether a path is a TypeScript-family source the TypeScript extractor
+/// produced import bindings for.
+pub(crate) fn typescript_family_path(path: &str) -> bool {
+    path.rsplit('.').next().is_some_and(|extension| {
+        matches!(extension, "ts" | "tsx" | "js" | "jsx" | "astro" | "svelte")
     })
 }
 
@@ -2408,6 +2375,34 @@ fn reference_target_kind_is_compatible(reference_kind: EdgeKind, target_kind: &s
         // abstention names a plausible endpoint rather than a name collision.
         None => relation_target_kind_is_compatible(RelationEdgeKindV1::Implements, target_kind),
     }
+}
+
+/// Languages whose files import through TypeScript/JavaScript module syntax.
+pub(crate) fn is_typescript_family(language: &str) -> bool {
+    matches!(
+        language,
+        "typescript" | "tsx" | "javascript" | "astro" | "svelte"
+    )
+}
+
+/// Whether `target` is declared directly in a function-like scope whose span
+/// contains the referencing symbol's span.
+fn encloses_in_function_scope(symbols: &[SymbolRow], target: &SymbolRow, from: SourceSpan) -> bool {
+    target
+        .parent
+        .and_then(|parent| symbols.get(parent))
+        .is_some_and(|scope| {
+            matches!(
+                NodeKind::from_str(&scope.kind),
+                Some(
+                    NodeKind::Function
+                        | NodeKind::Method
+                        | NodeKind::Constructor
+                        | NodeKind::ArrowFunction
+                )
+            ) && scope.span.start_byte <= from.start_byte
+                && from.end_byte <= scope.span.end_byte
+        })
 }
 
 /// [`reference_target_kind_is_compatible`] over the canonical relation kinds,
@@ -2550,7 +2545,7 @@ fn edge_abstention(
     CodeIndexEdgeAbstentionV1 {
         source_node_id: edge.source.clone(),
         target_node_id: edge.target.clone(),
-        legacy_kind: edge.kind.as_str().to_owned(),
+        kind: edge.kind,
         reason,
     }
 }
@@ -2728,11 +2723,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::extract::ExtractionCoverageV1;
     use tracedecay_domain::{
         BoundedSanitizedText, ChunkerRevision, CodeGenerationId, CodeIndexWorkerSelectionV1,
         CodeSearchChunkAnchorV1, CodeSearchChunkGrainV1, CodeSearchChunkId, ContentDigest,
-        FileOccurrenceId, GrammarRevision, LanguageDescriptorRevision, LanguageId, ManifestDigest,
+        FileOccurrenceId, GrammarRevision, LanguageDescriptorRevision, LanguageId,
         PolicyRevisionId, ProjectId, SanitizationReceiptId, SanitizedCodeFileV1,
         SanitizedCodeSnapshotV1, SanitizerRevision, SensitivityDecision, SensitivityLevelV1,
         SnapshotFileDispositionV1, SourceSpan, SymbolOccurrenceId, UtcMicros, ValidatedCodeFileV1,
@@ -2754,17 +2748,9 @@ mod tests {
         }
     }
 
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        T::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("valid fixture identity")
-    }
+    use tracedecay_domain::test_fixtures::id;
 
-    fn digest(byte: char) -> String {
-        format!("sha256:{}", byte.to_string().repeat(64))
-    }
+    use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
     fn fixture_function_row(
         source: &str,
@@ -3029,7 +3015,6 @@ mod tests {
             id("sanitizer.v1"),
             id("policy.v1"),
             id("chunker.v1"),
-            tracedecay_code_extraction::LanguageRegistry::new(),
         )
     }
 
@@ -3073,47 +3058,22 @@ mod tests {
             .expect("receipt-bound file")
     }
 
-    fn batch_for(file: &ReceiptBoundCodeFileV1, outcome: ParseOutcomeV1) -> ExtractionBatchV1 {
-        let descriptor = rust_descriptor();
-        // The parser import digest is the extractor's to state, never the
-        // fixture's: chunking re-derives the rows and refuses a batch that
-        // declares different ones. An outcome that attests no structure
-        // carries no rows at all, which is what the unsupported-document path
-        // builds its artifacts from.
-        let parser_import_rows_digest = match &outcome {
-            ParseOutcomeV1::Complete | ParseOutcomeV1::Partial { .. } => TreeSitterExtractor::new()
-                .extract(file, &descriptor, &NeverCancelled)
-                .expect("fixture extraction")
-                .batch()
-                .parser_import_rows_digest
-                .clone(),
-            ParseOutcomeV1::Failed { .. }
-            | ParseOutcomeV1::TimedOut
-            | ParseOutcomeV1::Cancelled => crate::extract::parser_import_rows_digest(&[])
-                .expect("empty parser import rows digest"),
-        };
-        ExtractionBatchV1 {
-            generation_id: file.generation_id.clone(),
-            file_occurrence_id: file.file.file_occurrence_id.clone(),
-            language: descriptor.language.clone(),
-            descriptor_revision: descriptor.descriptor_revision.clone(),
-            grammar_revision: descriptor.grammar_revision.clone(),
-            extractor_revision: descriptor.extractor_revision.clone(),
-            content_digest: file.file.content_digest.clone(),
-            parse_outcome: outcome,
-            parsed_ranges: vec![SourceSpan {
-                start_byte: 0,
-                end_byte: file.sanitized_bytes.len() as u64,
-            }],
-            error_ranges: Vec::new(),
-            unsupported_ranges: Vec::new(),
-            coverage: ExtractionCoverageV1 {
-                parsed_bytes: file.sanitized_bytes.len() as u64,
-                ..ExtractionCoverageV1::default()
-            },
-            parser_import_rows_digest,
-            rows_digest: id::<ManifestDigest>(&digest('d')),
-        }
+    fn extract_rust(file: &ReceiptBoundCodeFileV1) -> ExtractedCodeFileV1 {
+        TreeSitterExtractor::new()
+            .extract(file, &rust_descriptor(), &NeverCancelled)
+            .expect("fixture extraction")
+    }
+
+    fn index_rust(
+        file: &ReceiptBoundCodeFileV1,
+    ) -> Result<(CodeFileIndexArtifactsV1, ExactExtractionAuthorityV1), ChunkingFailureV1> {
+        chunker().index_file_with_authority_from_extraction(
+            file,
+            &extract_rust(file),
+            &rust_descriptor(),
+            SensitivityLevelV1::Public,
+            &NeverCancelled,
+        )
     }
 
     fn rust_descriptor() -> tracedecay_domain::LanguageDescriptorV1 {
@@ -3125,13 +3085,7 @@ mod tests {
 
     fn chunk_source(source: &str) -> CodeFileChunksV1 {
         let file = validated_file("src/lib.rs", source.as_bytes());
-        let descriptor = rust_descriptor();
-        let extracted = TreeSitterExtractor::new()
-            .extract(&file, &descriptor, &NeverCancelled)
-            .expect("extract source");
-        chunker()
-            .chunk_file(&file, extracted.batch(), &descriptor, &NeverCancelled)
-            .expect("chunking succeeds")
+        index_rust(&file).expect("chunking succeeds").0.chunks
     }
 
     /// A generation-sized chunk set, built from real extraction rather than
@@ -3705,6 +3659,37 @@ mod tests {
     }
 
     #[test]
+    fn minified_single_line_symbol_keeps_its_signature_chunk_within_the_bound() {
+        let mut source = String::from("pub fn minified() -> u32 { let mut total = 0;");
+        while source.len() <= MAX_CHUNK_TEXT_BYTES + 4096 {
+            source.push_str(" total += 1;");
+        }
+        source.push_str(" total }\n");
+        let chunks = chunk_source(&source);
+        let signature = chunks
+            .chunks
+            .iter()
+            .find(|chunk| chunk.anchor.grain == CodeSearchChunkGrainV1::SymbolSignature)
+            .expect("a one-line symbol still emits a signature chunk");
+        assert_eq!(
+            signature.sanitized_text.as_str().len(),
+            MAX_CHUNK_TEXT_BYTES
+        );
+        assert!(
+            signature
+                .sanitized_text
+                .as_str()
+                .starts_with("pub fn minified() -> u32 {")
+        );
+        assert!(
+            chunks
+                .chunks
+                .iter()
+                .all(|chunk| { chunk.sanitized_text.as_str().len() <= MAX_CHUNK_TEXT_BYTES })
+        );
+    }
+
+    #[test]
     fn symbol_member_chunks_include_leading_attributes() {
         let result = chunk_source(
             "pub enum DomainError {\n    #[error(\"time interval start must not be after its end\")]\n    InvalidTimeInterval,\n}\n",
@@ -3815,85 +3800,57 @@ mod tests {
     #[test]
     fn descriptor_and_generation_mismatch_are_typed_failures() {
         let file = validated_file("src/lib.rs", RUST_SOURCE.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
+        let extraction = extract_rust(&file);
+        let failure = |chunker: DeterministicCodeChunker,
+                       file: &ReceiptBoundCodeFileV1,
+                       descriptor: &LanguageDescriptorV1,
+                       cancellation: &dyn ExtractionCancellation| {
+            chunker
+                .index_file_with_authority_from_extraction(
+                    file,
+                    &extraction,
+                    descriptor,
+                    SensitivityLevelV1::Public,
+                    cancellation,
+                )
+                .err()
+        };
 
-        // Descriptor mismatch: python descriptor against a rust batch.
+        // Descriptor mismatch: python descriptor against a rust extraction.
         let python = StaticLanguageRegistry::new()
             .descriptor(&id::<LanguageId>("python"))
             .expect("python descriptor")
             .clone();
         assert_eq!(
-            chunker().chunk_file(&file, &batch, &python, &NeverCancelled),
-            Err(ChunkingFailureV1::DescriptorMismatch)
+            failure(chunker(), &file, &python, &NeverCancelled),
+            Some(ChunkingFailureV1::DescriptorMismatch)
         );
 
-        // Generation mismatch: batch attests a different content digest.
-        let mut stale_batch = batch.clone();
-        stale_batch.content_digest = id::<ContentDigest>(&digest('f'));
+        // Generation mismatch: extraction attests a different content digest.
+        let edited = validated_file("src/lib.rs", b"pub fn edited() {}\n");
         assert_eq!(
-            chunker().chunk_file(&file, &stale_batch, &rust_descriptor(), &NeverCancelled),
-            Err(ChunkingFailureV1::GenerationMismatch)
+            failure(chunker(), &edited, &rust_descriptor(), &NeverCancelled),
+            Some(ChunkingFailureV1::GenerationMismatch)
         );
 
-        // Generation mismatch: batch belongs to another generation.
-        let mut other_generation = batch.clone();
-        other_generation.generation_id = id("generation.other");
+        // Generation mismatch: extraction belongs to another generation.
+        let other_generation = DeterministicCodeChunker::new(
+            id("generation.other"),
+            id("repo.fixture"),
+            id("sanitizer.v1"),
+            id("policy.v1"),
+            id("chunker.v1"),
+        );
         assert_eq!(
-            chunker().chunk_file(
-                &file,
-                &other_generation,
-                &rust_descriptor(),
-                &NeverCancelled
-            ),
-            Err(ChunkingFailureV1::GenerationMismatch)
+            failure(other_generation, &file, &rust_descriptor(), &NeverCancelled),
+            Some(ChunkingFailureV1::GenerationMismatch)
         );
 
         // Cancellation is a typed failure.
         assert_eq!(
-            chunker().chunk_file(&file, &batch, &rust_descriptor(), &AlwaysCancelled),
-            Err(ChunkingFailureV1::Cancelled)
+            failure(chunker(), &file, &rust_descriptor(), &AlwaysCancelled),
+            Some(ChunkingFailureV1::Cancelled)
         );
-    }
-
-    #[test]
-    fn failed_parse_yields_an_explicit_unsupported_document() {
-        let file = validated_file("src/lib.rs", RUST_SOURCE.as_bytes());
-        let batch = batch_for(
-            &file,
-            ParseOutcomeV1::Failed {
-                reason: "grammar crashed".to_owned(),
-            },
-        );
-        let result = chunker()
-            .chunk_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("failed parse is evidence, not an error");
-        assert!(result.chunks.is_empty());
-        assert!(matches!(
-            result.document.eligibility,
-            CodeSearchEligibilityV1::Unsupported { .. }
-        ));
-        result.validate().expect("unsupported document validates");
-    }
-
-    #[test]
-    fn partial_parse_is_declared_on_the_document() {
-        let file = validated_file("src/lib.rs", RUST_SOURCE.as_bytes());
-        let batch = batch_for(
-            &file,
-            ParseOutcomeV1::Partial {
-                reason: "bounded traversal cap reached".to_owned(),
-            },
-        );
-        let result = chunker()
-            .chunk_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("partial parse still chunks");
-        assert_eq!(
-            result.document.eligibility,
-            CodeSearchEligibilityV1::Partial {
-                reason: "bounded traversal cap reached".to_owned()
-            }
-        );
-        assert!(!result.chunks.is_empty());
     }
 
     #[test]
@@ -4152,10 +4109,10 @@ pub fn real_symbol() {}
             &missing_endpoint.reason,
             CodeIndexEdgeAbstentionReasonV1::MissingSymbolEndpoint
         ));
-        assert_eq!(missing_endpoint.legacy_kind, EdgeKind::Calls.as_str());
+        assert_eq!(missing_endpoint.kind, EdgeKind::Calls);
         let unsupported_kind = abstentions
             .iter()
-            .find(|abstention| abstention.legacy_kind == EdgeKind::DerivesMacro.as_str())
+            .find(|abstention| abstention.kind == EdgeKind::DerivesMacro)
             .expect("unsupported kind abstention");
         assert!(matches!(
             &unsupported_kind.reason,
@@ -4173,10 +4130,7 @@ pub fn real_symbol() {}
 
         let index = |source: &str| {
             let file = validated_file("src/lib.rs", source.as_bytes());
-            let batch = batch_for(&file, ParseOutcomeV1::Complete);
-            chunker()
-                .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-                .expect("indexing succeeds")
+            index_rust(&file).expect("indexing succeeds").0
         };
         let relations = |artifacts: &CodeFileIndexArtifactsV1| {
             let name_of = |occurrence: &SymbolOccurrenceId| {
@@ -4273,21 +4227,78 @@ pub fn real_symbol() {}
         assert_eq!(identities(&reformatted), identities(&artifacts));
     }
 
+    /// The graph-rebuild refresh batch is one no-call function per file.
+    /// File-rooted `Contains` edges abstain because the file node is not a
+    /// symbol row, and primitive `u32` refs have no import or glob, so the
+    /// sealed relation census is empty. A same-file call still binds, so an
+    /// empty edge list is that fixture's shape rather than a dead emitter.
+    #[test]
+    fn no_call_refresh_probe_seals_zero_relation_edges() {
+        let index = |source: &str| {
+            let file = validated_file("src/refresh_batch/file_0000.rs", source.as_bytes());
+            index_rust(&file).expect("indexing succeeds").0
+        };
+
+        let probe = "pub fn refresh_probe_0000_000(input: u32) -> u32 { input + 0 }\n";
+        let artifacts = index(probe);
+        assert_eq!(artifacts.symbols.len(), 1, "{:?}", artifacts.symbols);
+        assert!(
+            artifacts.edges.is_empty(),
+            "no-call probe must not seal relation edges: {:?}",
+            artifacts.edges
+        );
+        assert!(
+            artifacts.edge_abstentions.iter().all(|abstention| {
+                abstention.reason == CodeIndexEdgeAbstentionReasonV1::MissingSymbolEndpoint
+                    && abstention.kind == EdgeKind::Contains
+                    && abstention.source_node_id.starts_with("file:")
+            }),
+            "file Contains must abstain, not vanish: {:?}",
+            artifacts.edge_abstentions
+        );
+        assert!(
+            !artifacts.edge_abstentions.is_empty(),
+            "the file node still emits a Contains edge that the census drops"
+        );
+        assert!(
+            artifacts
+                .unresolved_references
+                .iter()
+                .all(|reference| reference.reference_name == "u32"
+                    && matches!(
+                        reference.kind,
+                        RelationEdgeKindV1::TypeOf | RelationEdgeKindV1::Returns
+                    )),
+            "primitive type refs stay unresolved, not edges: {:?}",
+            artifacts.unresolved_references
+        );
+
+        let calling = "pub fn caller() -> u32 { refresh_probe_0000_000(1) }\n\
+                       pub fn refresh_probe_0000_000(input: u32) -> u32 { input + 0 }\n";
+        let calling = index(calling);
+        assert!(
+            calling
+                .edges
+                .iter()
+                .any(|edge| edge.kind == RelationEdgeKindV1::Calls),
+            "a same-file call must still seal, so the empty probe is not a dead path: {:?}",
+            calling.edges
+        );
+    }
+
     /// A body larger than the extractor's traversal budget reaches this path
     /// as an incomplete analysis: the lineage record carries the state and
     /// offers no exact counters, while ordinary bodies stay exact.
     #[test]
     fn incomplete_complexity_walk_reaches_lineage_records_as_unavailable_counters() {
         let mut source = String::from("pub fn huge(mut x: u64) -> u64 {\n");
+        // Dense statements keep the file under the extraction byte cap.
         for _ in 0..tracedecay_code_extraction::complexity::TRAVERSAL_BUDGET / 4 {
-            source.push_str("    x += 1;\n");
+            source.push_str("x+=1;");
         }
         source.push_str("    if x > 3 { return x; }\n    x\n}\n\npub fn small(x: u64) -> u64 {\n    if x > 3 { return x; }\n    x\n}\n");
         let file = validated_file("src/lib.rs", source.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
-        let artifacts = chunker()
-            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("indexing succeeds");
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
         let record = |name: &str| {
             artifacts
                 .symbols
@@ -4329,10 +4340,7 @@ pub fn real_symbol() {}
     fn resolved_calls_keep_each_parser_observed_invocation_span() {
         let source = "pub fn target() {}\npub fn caller() {\n    let _label = \"λ\"; target();\n    target();\n}\n";
         let file = validated_file("src/lib.rs", source.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
-        let artifacts = chunker()
-            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("indexing succeeds");
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
         let occurrence = |name: &str| {
             artifacts
                 .symbols
@@ -4366,6 +4374,261 @@ pub fn real_symbol() {}
             ["target", "target"]
         );
         assert_ne!(calls[0].evidence_span, calls[1].evidence_span);
+    }
+
+    #[test]
+    fn bare_receiver_method_call_does_not_invent_a_same_file_caller() {
+        let source = concat!(
+            "fn prepare(value: i32) {}\n",
+            "fn push(value: i32) {}\n",
+            "\n",
+            "struct Rows;\n",
+            "impl Rows {\n",
+            "    fn len(&self) -> usize { 0 }\n",
+            "    fn measure(&self) -> usize { self.len() }\n",
+            "}\n",
+            "trait Span {}\n",
+            "impl Span for Rows {\n",
+            "    fn wide(&self) -> usize { self.len() }\n",
+            "}\n",
+            "\n",
+            "fn caller(items: Vec<i32>, rows: Rows) {\n",
+            "    let foreign = make();\n",
+            "    foreign.prepare(1);\n",
+            "    items.push(1);\n",
+            "    prepare(1);\n",
+            "    push(1);\n",
+            "    rows.len();\n",
+            "}\n",
+            "fn make() -> Vec<i32> { Vec::new() }\n",
+        );
+        let file = validated_file("src/lib.rs", source.as_bytes());
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
+        let qualified = |occurrence: &SymbolOccurrenceId| {
+            artifacts
+                .symbols
+                .iter()
+                .find(|symbol| &symbol.occurrence == occurrence)
+                .map(|symbol| symbol.qualified_name.as_str())
+                .unwrap_or("<missing>")
+        };
+        let mut calls = artifacts
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == RelationEdgeKindV1::Calls)
+            .map(|edge| {
+                (
+                    qualified(&edge.from_occurrence).to_owned(),
+                    qualified(&edge.to_occurrence).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort();
+
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "src/lib.rs::<Rows as Span>::wide".to_owned(),
+                    "src/lib.rs::Rows::len".to_owned(),
+                ),
+                (
+                    "src/lib.rs::Rows::measure".to_owned(),
+                    "src/lib.rs::Rows::len".to_owned(),
+                ),
+                (
+                    "src/lib.rs::caller".to_owned(),
+                    "src/lib.rs::Rows::len".to_owned(),
+                ),
+                (
+                    "src/lib.rs::caller".to_owned(),
+                    "src/lib.rs::make".to_owned(),
+                ),
+                (
+                    "src/lib.rs::caller".to_owned(),
+                    "src/lib.rs::prepare".to_owned(),
+                ),
+                (
+                    "src/lib.rs::caller".to_owned(),
+                    "src/lib.rs::push".to_owned()
+                ),
+            ],
+            "a bare receiver must not add a same-file caller; self and typed \
+             bindings still bind: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn dotted_chain_references_keep_distinct_method_token_spans() {
+        let source = "fn nested(builder: &WalkBuilder) { builder.repeat().repeat(); }\n";
+        let file = validated_file("src/lib.rs", source.as_bytes());
+        let artifacts = index_rust(&file).expect("real Rust extraction").0;
+        let receiver_sites = artifacts
+            .unresolved_references
+            .iter()
+            .filter(|reference| reference.reference_name.contains('.'))
+            .map(|reference| reference.evidence_span)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            receiver_sites.len(),
+            2,
+            "inner and outer calls are distinct sites"
+        );
+        for span in receiver_sites {
+            assert_eq!(
+                &source[span.start_byte as usize..span.end_byte as usize],
+                "repeat"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_receiver_member_identity_survives_trivia() {
+        for source in [
+            "fn caller(args: &Args) { args.walk_builder()?.\n build(); }\n",
+            "fn caller(args: &Args) { args.walk_builder()?. /* comment */ build(); }\n",
+            "fn caller(args: &Args) { args.walk_builder()?. /* decoy.unused */ build::<u8>(); }\n",
+        ] {
+            let file = validated_file("src/lib.rs", source.as_bytes());
+            let artifacts = index_rust(&file).expect("real Rust extraction").0;
+            let member = artifacts
+                .unresolved_references
+                .iter()
+                .find(|reference| reference.reference_name.ends_with(".build"))
+                .expect("parser-observed member identity");
+            assert_eq!(
+                &source[member.evidence_span.start_byte as usize
+                    ..member.evidence_span.end_byte as usize],
+                "build"
+            );
+        }
+    }
+
+    #[test]
+    fn trait_bound_method_call_binds_the_trait_callee() {
+        let source = concat!(
+            "pub trait Processor {\n",
+            "    fn process(&self, input: u32) -> u32;\n",
+            "    fn via_self(&self, input: u32) -> u32 { self.process(input) }\n",
+            "}\n",
+            "pub trait Other { fn process(&self, input: u32) -> u32; }\n",
+            "pub struct Doubler;\n",
+            "impl Doubler { fn kick(&self, input: u32) -> u32 { self.process(input) } }\n",
+            "impl Processor for Doubler { fn process(&self, input: u32) -> u32 { input * 2 } }\n",
+            "pub fn via_dyn(processor: &dyn Processor, input: u32) -> u32 { processor.process(input) }\n",
+            "pub fn via_impl(processor: impl Processor + 'static, input: u32) -> u32 { processor.process(input) }\n",
+            "pub fn via_bound<T: Processor>(processor: &T, input: u32) -> u32 { processor.process(input) }\n",
+            "pub fn via_where<T>(processor: &T, input: u32) -> u32 where T: Processor { processor.process(input) }\n",
+            "pub fn ambiguous<T: Processor + Other>(processor: &T, input: u32) -> u32 { processor.process(input) }\n",
+        );
+        let file = validated_file("src/lib.rs", source.as_bytes());
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
+        let qualified = |occurrence: &SymbolOccurrenceId| {
+            artifacts
+                .symbols
+                .iter()
+                .find(|symbol| &symbol.occurrence == occurrence)
+                .map(|symbol| symbol.qualified_name.as_str())
+                .unwrap_or("<missing>")
+        };
+        let mut calls = artifacts
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == RelationEdgeKindV1::Calls)
+            .map(|edge| {
+                (
+                    qualified(&edge.from_occurrence).to_owned(),
+                    qualified(&edge.to_occurrence).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort();
+
+        let trait_method = "src/lib.rs::Processor::process";
+        let impl_method = "src/lib.rs::<Doubler as Processor>::process";
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "src/lib.rs::Doubler::kick".to_owned(),
+                    impl_method.to_owned()
+                ),
+                (
+                    "src/lib.rs::Processor::via_self".to_owned(),
+                    trait_method.to_owned()
+                ),
+                ("src/lib.rs::via_bound".to_owned(), trait_method.to_owned()),
+                ("src/lib.rs::via_dyn".to_owned(), trait_method.to_owned()),
+                ("src/lib.rs::via_impl".to_owned(), trait_method.to_owned()),
+                ("src/lib.rs::via_where".to_owned(), trait_method.to_owned()),
+            ],
+            "a unique trait bound is the callee; two bounds and a bare method name are not: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn self_call_inside_an_inline_module_binds_the_module_scoped_method() {
+        let source = concat!(
+            "mod inner {\n",
+            "    pub struct Rows;\n",
+            "    trait Wide { fn wide(&self) -> usize; }\n",
+            "    impl Wide for Rows {\n",
+            "        fn wide(&self) -> usize { 1 }\n",
+            "    }\n",
+            "    impl Rows {\n",
+            "        fn len(&self) -> usize { 0 }\n",
+            "        fn measure(&self) -> usize { self.len() + self.wide() }\n",
+            "    }\n",
+            "}\n",
+        );
+        let file = validated_file("src/lib.rs", source.as_bytes());
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
+        let qualified = |occurrence: &SymbolOccurrenceId| {
+            artifacts
+                .symbols
+                .iter()
+                .find(|symbol| &symbol.occurrence == occurrence)
+                .map(|symbol| symbol.qualified_name.as_str())
+                .unwrap_or("<missing>")
+        };
+        let mut calls = artifacts
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == RelationEdgeKindV1::Calls)
+            .map(|edge| {
+                (
+                    qualified(&edge.from_occurrence).to_owned(),
+                    qualified(&edge.to_occurrence).to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        calls.sort();
+
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    "src/lib.rs::inner::Rows::measure".to_owned(),
+                    "src/lib.rs::inner::<Rows as Wide>::wide".to_owned(),
+                ),
+                (
+                    "src/lib.rs::inner::Rows::measure".to_owned(),
+                    "src/lib.rs::inner::Rows::len".to_owned(),
+                ),
+            ],
+            "`self` must name the module-scoped receiver type so same-file \
+             resolution still binds: {calls:?}"
+        );
+        let retained_calls = artifacts
+            .unresolved_references
+            .iter()
+            .filter(|reference| reference.kind == RelationEdgeKindV1::Calls)
+            .collect::<Vec<_>>();
+        assert!(
+            retained_calls.is_empty(),
+            "a same-file self call must not be retained as cross-file: \
+             {retained_calls:?}"
+        );
     }
 
     #[test]
@@ -4405,10 +4668,7 @@ pub fn real_symbol() {}
             "}\n",
         );
         let file = validated_file("src/walk.rs", source.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
-        let artifacts = chunker()
-            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("indexing succeeds");
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
         let from_method = artifacts
             .symbols
             .iter()
@@ -4455,10 +4715,7 @@ pub fn real_symbol() {}
             "}\n",
         );
         let file = validated_file("src/lib.rs", source.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
-        let artifacts = chunker()
-            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("indexing succeeds");
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
         let inherent = artifacts
             .symbols
             .iter()
@@ -4503,10 +4760,7 @@ pub fn real_symbol() {}
             "pub struct Holder { pub processor: Doubler }\n",
         );
         let file = validated_file("src/lib.rs", source.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
-        let artifacts = chunker()
-            .index_file(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("indexing succeeds");
+        let artifacts = index_rust(&file).expect("indexing succeeds").0;
         let holder_field = artifacts
             .symbols
             .iter()
@@ -4577,10 +4831,12 @@ pub fn real_symbol() {}
         ];
 
         let (resolved, retained) = resolve_file_references(
+            "rust",
             source,
             &line_offsets(source.as_bytes()),
             &references,
             &[caller],
+            &[],
         );
 
         assert!(resolved.is_empty());
@@ -4646,10 +4902,12 @@ pub fn real_symbol() {}
         let trait_occurrence = trait_target.occurrence.clone();
 
         let (resolved, retained) = resolve_file_references(
+            "rust",
             source,
             &line_offsets(source.as_bytes()),
             &[reference],
             &[implementor, enum_variant, trait_target],
+            &[],
         );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].kind, RelationEdgeKindV1::Implements);
@@ -4706,10 +4964,12 @@ pub fn real_symbol() {}
             .expect("the fixture defines a local Result");
 
         let (resolved, retained) = resolve_file_references(
+            "rust",
             source,
             &offsets,
             &artifact.result.unresolved_refs,
             &symbol_rows,
+            &[],
         );
 
         assert!(
@@ -4777,10 +5037,12 @@ pub fn real_symbol() {}
         let right_occurrence = right.occurrence.clone();
         let symbols = [child, left, right];
         let (resolved, retained) = resolve_file_references(
+            "rust",
             source,
             &line_offsets(source.as_bytes()),
             std::slice::from_ref(&reference),
             &symbols,
+            &[],
         );
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].to_occurrence, right_occurrence);
@@ -4791,10 +5053,12 @@ pub fn real_symbol() {}
             ..reference.clone()
         };
         let (resolved, _) = resolve_file_references(
+            "rust",
             source,
             &line_offsets(source.as_bytes()),
             &[missing_namespace],
             &symbols[..2],
+            &[],
         );
         assert!(
             resolved.is_empty(),
@@ -4806,10 +5070,12 @@ pub fn real_symbol() {}
             ..reference
         };
         let (resolved, retained) = resolve_file_references(
+            "rust",
             source,
             &line_offsets(source.as_bytes()),
             &[ambiguous],
             &symbols,
+            &[],
         );
         assert!(resolved.is_empty());
         assert!(retained.is_empty());
@@ -4819,11 +5085,9 @@ pub fn real_symbol() {}
     fn extraction_authority_rejects_matching_occurrence_forgery() {
         let source = "pub fn real_symbol() {\n    // comment_fake\n}\n";
         let file = validated_file("src/lib.rs", source.as_bytes());
-        let batch = batch_for(&file, ParseOutcomeV1::Complete);
-        let (result, authority) = chunker()
-            .chunk_file_with_authority(&file, &batch, &rust_descriptor(), &NeverCancelled)
-            .expect("parser-backed chunks");
+        let (result, authority) = index_rust(&file).expect("parser-backed chunks");
         let mut chunk = result
+            .chunks
             .chunks
             .into_iter()
             .find(|chunk| {
@@ -4879,11 +5143,19 @@ pub fn real_symbol() {}
     #[test]
     fn grammar_revision_in_descriptor_must_match_the_batch() {
         let file = validated_file("src/lib.rs", RUST_SOURCE.as_bytes());
-        let mut batch = batch_for(&file, ParseOutcomeV1::Complete);
-        batch.grammar_revision = GrammarRevision::new("grammar.other.v1").expect("valid id");
+        let mut descriptor = rust_descriptor();
+        descriptor.grammar_revision = GrammarRevision::new("grammar.other.v1").expect("valid id");
         assert_eq!(
-            chunker().chunk_file(&file, &batch, &rust_descriptor(), &NeverCancelled),
-            Err(ChunkingFailureV1::DescriptorMismatch)
+            chunker()
+                .index_file_with_authority_from_extraction(
+                    &file,
+                    &extract_rust(&file),
+                    &descriptor,
+                    SensitivityLevelV1::Public,
+                    &NeverCancelled,
+                )
+                .err(),
+            Some(ChunkingFailureV1::DescriptorMismatch)
         );
     }
 }

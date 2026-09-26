@@ -7,9 +7,8 @@ tests, and normal CI remain active delivery work. The repository is not green.
 This file is the sole authority for V2 precedence, rejected mechanisms,
 delivery order, and acceptance. Numbered plans own semantic product behavior,
 failure semantics, fresh-store cutover, and direct acceptance; they are not independent
-queues and do not require one delivery branch per document. `NEXT.md` tracks
-current outcomes and blockers only. Historical gap ledgers and contract-spine
-artifacts are records, not parallel authorities.
+queues and do not require one delivery branch per document. Historical gap
+ledgers and contract-spine artifacts are records, not parallel authorities.
 
 The `TraceDecay V2` roadmap name is independent of contract/schema versioning.
 Only an actually independently released public wire/API protocol may retain an
@@ -26,8 +25,9 @@ applies to incompatible, unrecognized shapes, not the released relational
 stores proven by tagged DDL or live dogfood evidence. Admit and converge those
 stores without resetting project memory, diagnostics, or receipts. Exact
 released dense-staging objects may remain as preserved historical data; no
-dense runtime, query surface, or new dense writes return. Fresh stores omit
-those objects. A modified or incomplete staging inventory remains refused.
+dense runtime, query surface, or new dense writes return to those objects (the
+opt-in dense semantic lane in rejected decision 11 is a separate authority and
+never reads them). Fresh stores omit those objects. A modified or incomplete staging inventory remains refused.
 This exception takes precedence over the fresh-store-reset wording below.
 
 The root package and every workspace crate, including `tracedecay-sdk`, are
@@ -100,7 +100,7 @@ invariants and do not by themselves keep a journey open.
   conflict. Plan 09 owns Doctor composition and Plan 27 owns
   host lifecycle/ownership recovery. The host capability/lifecycle reachability
   fixes do not close this Cursor Core ownership conflict, which remains open.
-  (Update 2026-08-07: code repairs landed for both — the doctor composed
+  (Update 2026-08-07: code repairs landed for both, the doctor composed
   report now consults the real read-only authority-audit pass, and Cursor
   Core content drift is reported as `Drifted` distinct from
   `OwnershipConflict`, with the component-set transaction the sole writer of
@@ -224,10 +224,7 @@ records the rejected mechanism, the reason, and the retained replacement:
 6. **The Cargo shim and `cargo-slot` are rejected.** The earlier local build
    shim was removed by explicit direction and is not product, contributor, CI,
    or release architecture. Stock Cargo behavior and portable repository
-   configuration supersede it. Machine-local cargo-conductor brokers `cargo`
-   invocations; `kache` remains the `rustc-wrapper` compile cache, not a
-   cargo prefix. Neither is a revived cargo-slot, and neither is product or
-   CI architecture.
+   configuration supersede it. Run ordinary `cargo` commands.
 7. **Delivery choreography is not product authority.** Capability plans,
    production callers, direct behavior, and ordinary CI define completion;
    branch, worktree, or pull-request layouts do not.
@@ -459,7 +456,7 @@ delivery phases:
 | Provider capture (complete) | Supported hosts/sources, daemon host-admission for non-replayable events, identities, dedupe, partial input, backpressure, and canonical event relations. |
 | Project memory and facts (active) | Project/profile ownership, evidence, corrections, trust, curation, deletion lineage, and generation-bound repository provenance anchors. |
 | Session and LCM retrieval (active) | Occurrences, copies, authentic summaries, supersession, current/as-of/evolution retrieval, stable context assembly, and daemon-owned refresh. |
-| Code intelligence and lexical retrieval (active) | Deterministic extraction with typed edge authority and coverage, exact occurrence identity plus evidenced/abstaining lineage, generation-bound managed diagnostics/tests, a non-demotable exact/phrase/BM25 tier, typed quantifier inputs, legacy-behavior parity, and typed read-only Git status/diff/history/blame/hunk intelligence enriched by graph impact. Worktree-aware incremental indexing reuses content-addressed parse/chunk artifacts while retaining exact worktree and generation identity. |
+| Code intelligence and lexical retrieval (active) | Deterministic extraction with typed edge authority and coverage, exact occurrence identity plus evidenced/abstaining lineage, generation-bound managed diagnostics/tests, a non-demotable exact/phrase/BM25 tier, typed quantifier inputs, legacy-behavior parity, and typed read-only Git status/diff/history/blame/hunk intelligence enriched by graph impact. Worktree-aware incremental indexing shares content-addressed artifacts and occurrence identity for unchanged content across linked worktrees, while each worktree's manifest and generation keep exact snapshot authority and reads route by exact worktree first. |
 | Source-bound shared-code detection (active; complements dense semantic retrieval) | Conservative and rename-normalized body tokens computed during the existing parse for functions, methods, and stably identified closures; content-addressed clone payloads, occurrence bindings, and exact digest postings sealed in the code generation with its publication, privacy domain, budgets, integrity digest, and pagination; token-verified exact and renamed copies through `tracedecay_similar`; repository, revision-pair, branch-diff, PR change-set, and authorized-project-set clone families and review candidates through `tracedecay_redundancy`; then positional winnowed fingerprint postings (`k = 7`, `w = 8`, positions retained) with rare-first posting reads, bounded candidate admission, anchor-chained bounded token diff, separate left/right coverage, explicit differences, and non-transitive verified pairs. Clone facts update at changed-symbol granularity, never gate lexical, graph, or dense-semantic readiness, and report exhausted posting or verification budgets as partial coverage, never as "no similar implementations". |
 | Policy, application, catalog, and configuration (active) | Typed use cases, grants, routing, replay, operations, capabilities, analyzer policy/settings, one runtime configuration authority, daemon-serialized Git index transactions with compare-and-swap and receipts, and typed branch-aware feedback-cycle orchestration. |
 | CLI, MCP, HTTP, LSP, and SDK delivery (active) | One revisioned schema authority, dispatcher, binding taxonomy, semantic problem model, capability intersection, executable lifecycle/stream/cancellation contract, stable errors/cursors, canonical output, managed diagnostics, semantic parity, Git preview/apply bindings, and negotiated context and handoff operations. |
@@ -559,9 +556,9 @@ send authorized configuration commands through their named daemon operation.
 
 **Implementation and deletion.**
 
-- Ship exactly the original twelve dashboard workspaces — Brain, Explorer,
+- Ship exactly the original twelve dashboard workspaces. Brain, Explorer,
   Loom, Sessions, Agents, Code, Knowledge, Delivery, Automations, Observatory,
-  Costs, and Settings — plus Work as the thirteenth workspace, with
+  Costs, and Settings, plus Work as the thirteenth workspace, with
   renderer-neutral semantics, a permissive default
   renderer, keyboard/accessibility parity, typed SLOs, and denominator-safe
   measurements with provenance, coverage, cohort, temporal delta, uncertainty,
@@ -580,7 +577,7 @@ send authorized configuration commands through their named daemon operation.
 
 **Implementation architecture.** Finalized 2026-07-23 in
 [Plan 11](11-dashboard-frontend.md) §"Finalized implementation architecture"
-(fresh single-app rebuild on Rsbuild — decided, no ADR; React Router, TanStack
+(fresh single-app rebuild on Rsbuild, decided, no ADR; React Router, TanStack
 Query, bounded Zustand, Zod over one generated contracts module, Radix +
 Tailwind v4 semantic tokens, TanStack Virtual, `d3-force` default graph
 adapter, ECharts as the single charting library, SSE monotone reducer). The
@@ -802,8 +799,8 @@ never silently choose a model, mutate the graph, or execute an unadmitted step.
 ## Supported external development
 
 **User outcome.** Rust and TypeScript users can perform every
-supported public TraceDecay operation—including graph,
-task-intelligence, and workflow additions—through first-party SDKs with the
+supported public TraceDecay operation, including graph,
+task-intelligence, and workflow additions, through first-party SDKs with the
 same behavior and lifecycle as built-in surfaces.
 
 **End-to-end production path.** Revisioned published names, schemas, and
@@ -947,10 +944,10 @@ Unmeasured speculative optimizations and placeholder benchmarks do not ship.
   [Plans 05](05-query-crate.md),
   [15](15-search-quality-evaluation-and-retrieval-research.md),
   [23](23-session-lcm-temporal-retrieval-and-evaluation.md), and
-  [25](25-code-intelligence-indexing-crate.md), with the active V2 code
-  retrieval replacement plan owning the dense lane contract. [Plan 31]
-  (31-native-fastembed-semantic-code-search.md) is an archival historical
-  design superseded by the contract above; it is not an implementation
+  [25](25-code-intelligence-indexing-crate.md), with the dense semantic
+  code-search contract above owning the dense lane.
+  [Plan 31](31-native-fastembed-semantic-code-search.md) is an archival
+  historical design superseded by that contract; it is not an implementation
   authority.
   Indexing runtime is `tracedecay-code-index-runtime`; generation retention is
   `tracedecay-code-index-retention`.

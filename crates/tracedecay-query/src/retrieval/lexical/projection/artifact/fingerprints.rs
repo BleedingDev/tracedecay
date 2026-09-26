@@ -11,12 +11,9 @@ use tracedecay_code_index::clones::{
 use tracedecay_code_index::production::CodeIndexExecutionControlV1;
 use tracedecay_domain::{ManifestDigest, RetrieverCoverage, SymbolOccurrenceId, canonical_sha256};
 
-use super::format::VerifiedCodeLexicalArtifactV1;
-use super::reader::{
-    AuthenticatedCloneArtifactPageV1, CloneArtifactCursorPositionV1, CloneArtifactCursorV1,
-    CloneArtifactPageV1, CloneFingerprintDiscoveryPositionV2,
-};
-use super::schema::LexicalArtifactLayoutV1;
+use super::clone_codec::{CloneOccurrenceRouteV1, routed_clone_body_row};
+use super::format::{VerifiedCodeLexicalArtifactV1, contract_number, decode_fingerprint_postings};
+use super::reader::{CloneArtifactCursorPositionV1, CloneArtifactCursorV1, CloneArtifactPageV1};
 use super::{CodeLexicalArtifactErrorV1, sqlite_error};
 
 pub const CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1: u64 = 16_384;
@@ -99,18 +96,6 @@ pub struct CloneFingerprintArtifactReadV1 {
     pub accounting: CloneFingerprintReadAccountingV1,
 }
 
-/// Whole-body near evidence with an authenticated wire continuation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthenticatedCloneFingerprintArtifactReadV1 {
-    pub page: AuthenticatedCloneArtifactPageV1<CloneNearMatchArtifactV1>,
-    pub stream: Option<CloneFingerprintStreamDescriptorV1>,
-    pub source_eligibility: CloneBodyEligibilityV1,
-    pub minimum_directional_coverage_millionths: u32,
-    pub coverage: RetrieverCoverage,
-    pub partial_reasons: Vec<CloneFingerprintPartialReasonV1>,
-    pub accounting: CloneFingerprintReadAccountingV1,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CloneSelectedBlockContainmentClassV1 {
     Equal,
@@ -135,16 +120,6 @@ pub struct CloneSelectedBlockArtifactReadV1 {
     pub accounting: CloneFingerprintReadAccountingV1,
 }
 
-/// Selected-token near evidence with an authenticated wire continuation.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthenticatedCloneSelectedBlockArtifactReadV1 {
-    pub page: AuthenticatedCloneArtifactPageV1<CloneSelectedBlockArtifactCandidateV1>,
-    pub stream: CloneFingerprintStreamDescriptorV1,
-    pub coverage: RetrieverCoverage,
-    pub partial_reasons: Vec<CloneFingerprintPartialReasonV1>,
-    pub accounting: CloneFingerprintReadAccountingV1,
-}
-
 struct CandidateAccumulatorV1 {
     payload: CloneBodyPayloadV1,
     occurrences: BTreeMap<SymbolOccurrenceId, CloneBodyOccurrenceV1>,
@@ -153,18 +128,15 @@ struct CandidateAccumulatorV1 {
 }
 
 pub(super) struct CloneFingerprintReadRequestV1<'a> {
-    pub(super) layout: LexicalArtifactLayoutV1,
     pub(super) receipt: &'a VerifiedCodeLexicalArtifactV1,
+    /// The opener's route, which also names the generation cursors bind.
+    pub(super) route: &'a CloneOccurrenceRouteV1,
     pub(super) authority_digest: &'a ManifestDigest,
     pub(super) authority: &'a CloneBodyOccurrenceV1,
     pub(super) source: &'a CloneBodyPayloadV1,
     pub(super) selected_block: Option<&'a CloneSelectedBlockV1>,
     pub(super) cursor: Option<&'a CloneArtifactCursorV1>,
     pub(super) limit: usize,
-    /// Legacy direct readers page candidate bodies. Authenticated serving
-    /// additionally supplies an occurrence cap so a grouped body can be
-    /// continued without dropping its tail at the wire result limit.
-    pub(super) occurrence_limit: Option<usize>,
     pub(super) control: &'a dyn CodeIndexExecutionControlV1,
 }
 
@@ -174,32 +146,19 @@ pub(super) fn read_clone_fingerprint_page(
 ) -> Result<CloneFingerprintArtifactReadV1, CodeLexicalArtifactErrorV1> {
     let started = Instant::now();
     let CloneFingerprintReadRequestV1 {
-        layout,
         receipt,
+        route,
         authority_digest,
         authority,
         source,
         selected_block,
         cursor,
         limit,
-        occurrence_limit,
         control,
     } = request;
-    if !layout.has_clone_fingerprints() {
-        return Err(CodeLexicalArtifactErrorV1::Incompatible(
-            "clone fingerprint lookup requires lexical artifact revision 16".to_owned(),
-        ));
-    }
     if limit == 0 || limit > MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1 {
         return Err(CodeLexicalArtifactErrorV1::Contract(format!(
             "clone fingerprint page limit must be within 1..={MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1}"
-        )));
-    }
-    if occurrence_limit.is_some_and(|occurrences| {
-        occurrences == 0 || occurrences > MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1
-    }) {
-        return Err(CodeLexicalArtifactErrorV1::Contract(format!(
-            "clone fingerprint occurrence limit must be within 1..={MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1}"
         )));
     }
     if authority.payload_digest != source.payload_digest
@@ -213,7 +172,7 @@ pub(super) fn read_clone_fingerprint_page(
             "clone fingerprint source payload does not match its occurrence".to_owned(),
         ));
     }
-    let (descriptor, source_tokens) = match selected_block {
+    let (descriptor, source_tokens, source_positions) = match selected_block {
         Some(block) => (
             CloneFingerprintStreamDescriptorV1 {
                 language: block.language().to_owned(),
@@ -222,6 +181,9 @@ pub(super) fn read_clone_fingerprint_page(
                 rename_tier_unavailable: block.rename_tier_unavailable(),
             },
             block.tokens(),
+            block
+                .fingerprint_positions()
+                .map_err(CodeLexicalArtifactErrorV1::Contract)?,
         ),
         None => {
             let Some(stream) = source.fingerprint_stream(authority.eligibility) else {
@@ -255,6 +217,9 @@ pub(super) fn read_clone_fingerprint_page(
                     rename_tier_unavailable: stream.rename_tier_unavailable,
                 },
                 stream.tokens,
+                source
+                    .fingerprint_positions(authority.eligibility)
+                    .map_err(CodeLexicalArtifactErrorV1::Contract)?,
             )
         }
     };
@@ -267,74 +232,21 @@ pub(super) fn read_clone_fingerprint_page(
         &descriptor.language,
         descriptor.class,
         descriptor.normalization_revision,
-        selected_block.map(|block| {
-            (
-                block.source_token_start(),
-                block.source_token_end(),
-                block.tokens(),
-            )
-        }),
+        selected_block.map(CloneSelectedBlockV1::tokens),
     ))
     .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-    let (
-        after,
-        after_occurrence,
-        discovery_after,
-        discovery_complete_resume,
-        mut pending_comparison,
-    ) = match cursor {
+    let after = match cursor {
         Some(cursor)
             if cursor.artifact_digest == *receipt.artifact_digest()
-                && cursor.generation == *receipt.generation()
+                && cursor.generation == route.source_generation
                 && cursor.request_digest == request_digest =>
         {
             match &cursor.after {
                 CloneArtifactCursorPositionV1::Fingerprint {
                     body_digest,
                     payload_digest,
-                    occurrence_id,
-                } => (
-                    Some((body_digest.clone(), payload_digest.clone())),
-                    occurrence_id.clone(),
-                    None,
-                    false,
-                    None,
-                ),
-                CloneArtifactCursorPositionV1::FingerprintDiscovery {
-                    discovery,
-                    comparison_body_digest,
-                    comparison_payload_digest,
-                } => {
-                    if comparison_body_digest.is_some() != comparison_payload_digest.is_some() {
-                        return Err(CodeLexicalArtifactErrorV1::Contract(
-                            "clone fingerprint discovery cursor has an incomplete comparison position"
-                                .to_owned(),
-                        ));
-                    }
-                    if discovery.pending_comparison_body_digest.is_some()
-                        != discovery.pending_comparison_payload_digest.is_some()
-                    {
-                        return Err(CodeLexicalArtifactErrorV1::Contract(
-                            "clone fingerprint discovery cursor has an incomplete pending comparison position"
-                                .to_owned(),
-                        ));
-                    }
-                    (
-                        comparison_body_digest
-                            .clone()
-                            .zip(comparison_payload_digest.clone()),
-                        None,
-                        (!discovery.complete).then(|| discovery.clone()),
-                        discovery.complete,
-                        discovery
-                            .pending_comparison_body_digest
-                            .clone()
-                            .zip(discovery.pending_comparison_payload_digest.clone()),
-                    )
-                }
-                CloneArtifactCursorPositionV1::Exact(_)
-                | CloneArtifactCursorPositionV1::ExactStart(_)
-                | CloneArtifactCursorPositionV1::NearStart => {
+                } => Some((body_digest.clone(), payload_digest.clone())),
+                CloneArtifactCursorPositionV1::Exact(_) => {
                     return Err(CodeLexicalArtifactErrorV1::Contract(
                         "clone cursor position does not match a fingerprint read".to_owned(),
                     ));
@@ -347,31 +259,9 @@ pub(super) fn read_clone_fingerprint_page(
                     .to_owned(),
             ));
         }
-        None => (None, None, None, false, None),
+        None => None,
     };
 
-    if let (Some(after), Some(pending)) = (&after, &pending_comparison)
-        && pending <= after
-    {
-        return Err(CodeLexicalArtifactErrorV1::Contract(
-            "clone fingerprint pending comparison does not advance past its completed comparison"
-                .to_owned(),
-        ));
-    }
-
-    // The source stream is charged before any posting is authenticated. There
-    // is no valid row frontier to resume from when this bound is exceeded, so
-    // return a terminal contract error instead of issuing a cursor that would
-    // retry the same first posting forever.
-    let source_token_work = source_token_work_within_budget(source_tokens.len())?;
-    let source_positions = match selected_block {
-        Some(block) => block
-            .fingerprint_positions()
-            .map_err(CodeLexicalArtifactErrorV1::Contract)?,
-        None => source
-            .fingerprint_positions(authority.eligibility)
-            .map_err(CodeLexicalArtifactErrorV1::Contract)?,
-    };
     if source_positions.is_empty() {
         return Err(CodeLexicalArtifactErrorV1::Contract(
             "clone fingerprint source has no winnowed fingerprints".to_owned(),
@@ -385,14 +275,28 @@ pub(super) fn read_clone_fingerprint_page(
             .push(position.token_position);
     }
     let mut accounting = CloneFingerprintReadAccountingV1 {
-        token_work: source_token_work,
+        token_work: u64::try_from(source_tokens.len()).map_err(contract_number)?,
         ..CloneFingerprintReadAccountingV1::default()
     };
     let mut partial_reasons = BTreeSet::new();
     let mut ordered_lists = Vec::with_capacity(positions_by_fingerprint.len());
+    let mut list_statement = connection
+        .prepare_cached(
+            "SELECT postings FROM clone_fingerprint_postings WHERE language = ?1 AND class = ?2 AND normalization_revision = ?3 AND fingerprint = ?4",
+        )
+        .map_err(sqlite_error)?;
+    let mut occurrence_statement = connection
+        .prepare_cached(
+            "SELECT occurrence.symbol_key, payload.payload_digest, occurrence.path,
+             occurrence.body_start, occurrence.body_end, occurrence.eligibility, payload.payload
+             FROM clone_occurrences AS occurrence
+             LEFT JOIN clone_body_payloads AS payload ON payload.ordinal = occurrence.payload_ordinal
+             WHERE occurrence.ordinal = ?1",
+        )
+        .map_err(sqlite_error)?;
     let mut count_statement = connection
         .prepare_cached(
-            "SELECT posting_count FROM clone_fingerprint_counts WHERE language = ?1 AND class = ?2 AND normalization_revision = ?3 AND fingerprint = ?4",
+            "SELECT posting_count FROM clone_fingerprint_postings WHERE language = ?1 AND class = ?2 AND normalization_revision = ?3 AND fingerprint = ?4",
         )
         .map_err(sqlite_error)?;
     for fingerprint in positions_by_fingerprint.keys().copied() {
@@ -434,24 +338,10 @@ pub(super) fn read_clone_fingerprint_page(
 
     let mut candidates =
         BTreeMap::<(ManifestDigest, ManifestDigest), CandidateAccumulatorV1>::new();
-    let mut last_discovered: Option<CloneFingerprintDiscoveryPositionV2> = None;
     let mut stop = accounting.cancellation_point.is_some();
     for (posting_count, fingerprint) in ordered_lists {
         if stop {
             break;
-        }
-        let discovery_checkpoint = discovery_after.as_ref().filter(|position| {
-            position.posting_count == posting_count && position.fingerprint == fingerprint
-        });
-        if let Some(checkpoint) = &discovery_after {
-            if (posting_count, fingerprint) < (checkpoint.posting_count, checkpoint.fingerprint) {
-                continue;
-            }
-            if (posting_count, fingerprint) == (checkpoint.posting_count, checkpoint.fingerprint)
-                && checkpoint.symbol_occurrence_id.is_none()
-            {
-                continue;
-            }
         }
         if posting_count > CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1 {
             accounting.hot_postings_skipped = accounting.hot_postings_skipped.saturating_add(1);
@@ -461,75 +351,33 @@ pub(super) fn read_clone_fingerprint_page(
             partial_reasons.insert(CloneFingerprintPartialReasonV1::HotPostings);
             continue;
         }
-        let remaining = if discovery_complete_resume {
-            posting_count
-        } else {
-            CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1.saturating_sub(accounting.posting_rows_examined)
-        };
+        let remaining = CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1 - accounting.posting_rows_examined;
         if remaining == 0 {
             partial_reasons.insert(CloneFingerprintPartialReasonV1::PostingRowBudget);
             break;
         }
-        let mut statement = if discovery_checkpoint.is_some() {
-            connection
-                .prepare_cached(
-                    "SELECT posting.symbol_occurrence_id, posting.token_position, posting.payload_digest, posting.body_digest, occurrence.occurrence, payload.payload
-                     FROM clone_fingerprint_postings AS posting
-                     LEFT JOIN clone_occurrences AS occurrence ON occurrence.symbol_occurrence_id = posting.symbol_occurrence_id
-                     LEFT JOIN clone_body_payloads AS payload ON payload.payload_digest = posting.payload_digest
-                     WHERE posting.language = ?1 AND posting.class = ?2 AND posting.normalization_revision = ?3 AND posting.fingerprint = ?4
-                       AND (posting.symbol_occurrence_id > ?5 OR (posting.symbol_occurrence_id = ?5 AND posting.token_position > ?6))
-                     ORDER BY posting.symbol_occurrence_id, posting.token_position
-                     LIMIT ?7",
-                )
-                .map_err(sqlite_error)?
-        } else {
-            connection
-                .prepare_cached(
-                    "SELECT posting.symbol_occurrence_id, posting.token_position, posting.payload_digest, posting.body_digest, occurrence.occurrence, payload.payload
-                     FROM clone_fingerprint_postings AS posting
-                     LEFT JOIN clone_occurrences AS occurrence ON occurrence.symbol_occurrence_id = posting.symbol_occurrence_id
-                     LEFT JOIN clone_body_payloads AS payload ON payload.payload_digest = posting.payload_digest
-                     WHERE posting.language = ?1 AND posting.class = ?2 AND posting.normalization_revision = ?3 AND posting.fingerprint = ?4
-                     ORDER BY posting.symbol_occurrence_id, posting.token_position
-                     LIMIT ?5",
-                )
-                .map_err(sqlite_error)?
-        };
         let read_limit = remaining.min(posting_count);
-        let mut rows_read_for_list = 0_u64;
-        let mut rows = if let Some(checkpoint) = discovery_checkpoint {
-            let occurrence = checkpoint
-                .symbol_occurrence_id
-                .as_ref()
-                .expect("discovery checkpoint with a row has an occurrence");
-            let token_position = checkpoint
-                .token_position
-                .expect("discovery checkpoint with a row has a token position");
-            statement
-                .query(rusqlite::params![
+        let list: Vec<u8> = list_statement
+            .query_row(
+                rusqlite::params![
                     descriptor.language,
                     i64::from(descriptor.class as u8),
                     i64::from(descriptor.normalization_revision),
                     i64::try_from(fingerprint).map_err(contract_number)?,
-                    occurrence.as_str(),
-                    i64::from(token_position),
-                    i64::try_from(read_limit).map_err(contract_number)?,
-                ])
-                .map_err(sqlite_error)?
-        } else {
-            statement
-                .query(rusqlite::params![
-                    descriptor.language,
-                    i64::from(descriptor.class as u8),
-                    i64::from(descriptor.normalization_revision),
-                    i64::try_from(fingerprint).map_err(contract_number)?,
-                    i64::try_from(read_limit).map_err(contract_number)?,
-                ])
-                .map_err(sqlite_error)?
-        };
-        while let Some(row) = rows.next().map_err(sqlite_error)? {
-            rows_read_for_list = rows_read_for_list.saturating_add(1);
+                ],
+                |row| row.get(0),
+            )
+            .map_err(sqlite_error)?;
+        let postings = decode_fingerprint_postings(&list)?;
+        if u64::try_from(postings.len()).ok() != Some(posting_count) {
+            return Err(CodeLexicalArtifactErrorV1::Corrupt(
+                "clone fingerprint posting list disagrees with its stored count".to_owned(),
+            ));
+        }
+        for (occurrence_ordinal, candidate_position) in postings
+            .into_iter()
+            .take(usize::try_from(read_limit).map_err(contract_number)?)
+        {
             accounting.posting_rows_examined = accounting.posting_rows_examined.saturating_add(1);
             if interrupt(
                 control,
@@ -540,61 +388,16 @@ pub(super) fn read_clone_fingerprint_page(
                 stop = true;
                 break;
             }
-            let posting_occurrence: String = row.get(0).map_err(sqlite_error)?;
-            let candidate_position = u32::try_from(row.get::<_, i64>(1).map_err(sqlite_error)?)
-                .map_err(|_| {
+            let stored = occurrence_statement
+                .query_row([occurrence_ordinal], routed_clone_body_row)
+                .optional()
+                .map_err(sqlite_error)?
+                .ok_or_else(|| {
                     CodeLexicalArtifactErrorV1::Corrupt(
-                        "clone fingerprint token position is outside u32".to_owned(),
+                        "clone fingerprint posting is missing its occurrence".to_owned(),
                     )
                 })?;
-            let posting_payload: String = row.get(2).map_err(sqlite_error)?;
-            let posting_body: String = row.get(3).map_err(sqlite_error)?;
-            let occurrence_bytes: Option<Vec<u8>> = row.get(4).map_err(sqlite_error)?;
-            let payload_bytes: Option<Vec<u8>> = row.get(5).map_err(sqlite_error)?;
-            let (Some(occurrence_bytes), Some(payload_bytes)) = (occurrence_bytes, payload_bytes)
-            else {
-                return Err(CodeLexicalArtifactErrorV1::Corrupt(
-                    "clone fingerprint posting is missing its occurrence or payload".to_owned(),
-                ));
-            };
-            let occurrence: CloneBodyOccurrenceV1 = serde_json::from_slice(&occurrence_bytes)
-                .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?;
-            let payload: CloneBodyPayloadV1 = serde_json::from_slice(&payload_bytes)
-                .map_err(|error| CodeLexicalArtifactErrorV1::Corrupt(error.to_string()))?;
-            if occurrence.symbol_occurrence_id.as_str() != posting_occurrence
-                || occurrence.project_id != authority.project_id
-                || occurrence.repository_id != authority.repository_id
-                || occurrence.worktree_id != authority.worktree_id
-                || occurrence.source_generation != *receipt.generation()
-                || occurrence.payload_digest.as_str() != posting_payload
-                || occurrence.payload_digest != payload.payload_digest
-                || payload.body_digest.as_str() != posting_body
-                || payload.validate().is_err()
-            {
-                return Err(CodeLexicalArtifactErrorV1::Corrupt(
-                    "clone fingerprint posting does not match its payload and occurrence"
-                        .to_owned(),
-                ));
-            }
-            let previous_discovered = last_discovered.clone();
-            // Advance the discovery frontier for every validated posting,
-            // even rows rejected by source or symbol filters. This keeps a
-            // bounded page resumable when no candidate comparison completed.
-            last_discovered = Some(CloneFingerprintDiscoveryPositionV2 {
-                posting_count,
-                fingerprint,
-                symbol_occurrence_id: Some(
-                    SymbolOccurrenceId::new(posting_occurrence.clone()).map_err(|error| {
-                        CodeLexicalArtifactErrorV1::Corrupt(format!(
-                            "clone fingerprint posting occurrence id is invalid: {error}"
-                        ))
-                    })?,
-                ),
-                token_position: Some(candidate_position),
-                pending_comparison_body_digest: None,
-                pending_comparison_payload_digest: None,
-                complete: false,
-            });
+            let (occurrence, payload) = route.occurrence_and_payload(stored)?;
             if occurrence.symbol_occurrence_id == authority.symbol_occurrence_id
                 || payload.language != source.language
                 || (selected_block.is_none()
@@ -615,24 +418,18 @@ pub(super) fn read_clone_fingerprint_page(
             }
             let key = (payload.body_digest.clone(), payload.payload_digest.clone());
             if !candidates.contains_key(&key) {
+                if candidates.len() == CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1 {
+                    partial_reasons.insert(CloneFingerprintPartialReasonV1::CandidateBodyBudget);
+                    stop = true;
+                    break;
+                }
                 let selected_positions = payload
                     .fingerprint_positions(occurrence.eligibility)
                     .map_err(CodeLexicalArtifactErrorV1::Contract)?
                     .into_iter()
                     .map(|position| (position.fingerprint, position.token_position))
                     .collect();
-                if accounting.candidates_admitted
-                    < CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1 as u64
-                {
-                    accounting.candidates_admitted =
-                        accounting.candidates_admitted.saturating_add(1);
-                } else {
-                    // The accumulator retains the complete discovered key set
-                    // so the later B-tree comparison order is stable. The
-                    // body budget caps expensive comparisons, rather than
-                    // dropping an unresolved candidate from the continuation.
-                    partial_reasons.insert(CloneFingerprintPartialReasonV1::CandidateBodyBudget);
-                }
+                accounting.candidates_admitted = accounting.candidates_admitted.saturating_add(1);
                 candidates.insert(
                     key.clone(),
                     CandidateAccumulatorV1 {
@@ -662,10 +459,6 @@ pub(super) fn read_clone_fingerprint_page(
                 &mut accounting,
                 &mut partial_reasons,
             ) {
-                // The current posting has not yet been authenticated as an
-                // anchor. Leave it behind the cursor so a retry can verify
-                // the occurrence instead of silently losing it.
-                last_discovered = previous_discovered;
                 stop = true;
                 break;
             }
@@ -691,10 +484,6 @@ pub(super) fn read_clone_fingerprint_page(
                     > CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1
                 {
                     partial_reasons.insert(CloneFingerprintPartialReasonV1::VerificationWorkBudget);
-                    // The current posting consumed no complete verification
-                    // unit. Retain it for the next authenticated discovery
-                    // page rather than advancing past its occurrence.
-                    last_discovered = previous_discovered;
                     stop = true;
                     break;
                 }
@@ -725,60 +514,27 @@ pub(super) fn read_clone_fingerprint_page(
                     .insert(occurrence.symbol_occurrence_id.clone(), occurrence);
             }
         }
-        if !discovery_complete_resume
-            && read_limit < posting_count
-            && rows_read_for_list == read_limit
-        {
+        if read_limit < posting_count {
             partial_reasons.insert(CloneFingerprintPartialReasonV1::PostingRowBudget);
             break;
         }
     }
 
-    // A bounded discovery page never emits comparisons. Its candidate map is
-    // only a local probe and cannot represent postings already consumed on an
-    // earlier page. Defer the comparison pass until a completed-discovery
-    // cursor asks us to replay the immutable stream from its beginning.
-    let posting_discovery_partial = partial_reasons
-        .iter()
-        .any(|reason| matches!(reason, CloneFingerprintPartialReasonV1::PostingRowBudget));
-    let resumed_discovery = discovery_after.is_some();
-    let completed_discovery_replay = resumed_discovery && !stop && !posting_discovery_partial;
-    let discovery_partial = stop || posting_discovery_partial || resumed_discovery;
-    let candidates = if discovery_partial {
-        Vec::new()
-    } else {
-        candidates
-            .into_iter()
-            .filter(|(_, candidate)| !candidate.anchors.is_empty())
-            .filter(|(key, _)| match &after {
-                None => true,
-                Some(after) if key > after => true,
-                // A cursor that stopped inside a grouped occurrence set must
-                // replay that body so its remaining occurrences can be
-                // emitted before advancing to the next candidate key.
-                Some(after) if key == after => after_occurrence.is_some(),
-                Some(_) => false,
-            })
-            .collect::<Vec<_>>()
-    };
+    let source_views = source_tokens.iter().collect::<Vec<_>>();
+    let selected_views = selected_block.map(|block| block.tokens().iter().collect::<Vec<_>>());
+    let candidates = candidates
+        .into_iter()
+        .filter(|(_, candidate)| !candidate.anchors.is_empty())
+        .filter(|(key, _)| after.as_ref().is_none_or(|after| key > after))
+        .collect::<Vec<_>>();
     let candidate_count = candidates.len();
     let mut members = Vec::new();
-    let mut last_compared = after.clone();
-    let mut occurrence_continuation: Option<(
-        (ManifestDigest, ManifestDigest),
-        SymbolOccurrenceId,
-    )> = None;
-    let mut remaining_occurrences = occurrence_limit;
+    let mut last_compared = after;
     let mut has_more = false;
     for (ordinal, (key, candidate)) in candidates.into_iter().enumerate() {
         if accounting.candidate_bodies_compared == CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1 {
             partial_reasons.insert(CloneFingerprintPartialReasonV1::VerificationBodyBudget);
             has_more = true;
-            if let (Some(after), Some(occurrence_id)) = (&after, &after_occurrence)
-                && after == &key
-            {
-                occurrence_continuation = Some((after.clone(), occurrence_id.clone()));
-            }
             break;
         }
         accounting.candidate_bodies_compared =
@@ -803,40 +559,20 @@ pub(super) fn read_clone_fingerprint_page(
                 )
             })?
             .tokens;
-        let selected_block_containment =
-            selected_block.and_then(|block| containment_class(block.tokens(), candidate_tokens));
-        let retry_pending = pending_comparison
-            .as_ref()
-            .is_some_and(|pending| pending == &key);
+        let candidate_tokens = candidate_tokens.iter().collect::<Vec<_>>();
+        let selected_block_containment = selected_views
+            .as_deref()
+            .and_then(|selected| containment_class(selected, &candidate_tokens));
         if selected_block.is_some() && selected_block_containment.is_none() {
-            // A containment rejection is a completed comparison for paging
-            // purposes. Advancing before the next budget check prevents the
-            // same rejected candidate from being replayed forever when the
-            // comparison cap is reached.
-            last_compared = Some(key);
-            if retry_pending {
-                pending_comparison = None;
-            }
             continue;
         }
         let remaining_work =
             CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1.saturating_sub(accounting.token_work);
-        // A candidate that stopped at the page budget has already paid the
-        // discovery and anchor-verification costs. Give its first retry a
-        // fresh alignment allowance so a large but finite comparison can
-        // complete instead of producing the same cursor forever. If that
-        // retry still cannot finish, the failure is made terminal below and
-        // the ordered candidate frontier advances.
-        let alignment_work_budget = if retry_pending {
-            CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1
-        } else {
-            remaining_work
-        };
         let alignment = align_clone_tokens(
-            source_tokens,
-            candidate_tokens,
+            &source_views,
+            &candidate_tokens,
             &candidate.anchors.iter().copied().collect::<Vec<_>>(),
-            alignment_work_budget,
+            remaining_work,
             || control.is_cancelled() || control.is_deadline_exceeded(),
         );
         let alignment = match alignment {
@@ -860,29 +596,11 @@ pub(super) fn read_clone_fingerprint_page(
                         );
                     }
                 }
-                if matches!(
-                    stopped.reason,
-                    CloneAlignmentStopReasonV1::WorkBudgetExhausted
-                ) {
-                    if retry_pending {
-                        // The candidate has had one fresh full-budget retry.
-                        // Retaining it again would make an authenticated
-                        // continuation repeat forever when its alignment is
-                        // intrinsically larger than the bounded allowance.
-                        last_compared = Some(key.clone());
-                        pending_comparison = None;
-                    } else {
-                        pending_comparison = Some(key.clone());
-                    }
-                }
                 has_more = true;
                 break;
             }
         };
         last_compared = Some(key.clone());
-        if retry_pending {
-            pending_comparison = None;
-        }
         if selected_block_containment.is_some()
             || (alignment.left_coverage_millionths
                 >= CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1
@@ -897,38 +615,10 @@ pub(super) fn read_clone_fingerprint_page(
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect();
-            let mut occurrences = candidate
-                .occurrences
-                .into_values()
-                .filter(|occurrence| {
-                    after_occurrence.as_ref().is_none_or(|after_occurrence| {
-                        after.as_ref() != Some(&key)
-                            || occurrence.symbol_occurrence_id > *after_occurrence
-                    })
-                })
-                .collect::<Vec<_>>();
-            let occurrence_tail = if let Some(remaining) = remaining_occurrences.as_mut() {
-                if occurrences.len() > *remaining {
-                    occurrences.truncate(*remaining);
-                    *remaining = 0;
-                    occurrences
-                        .last()
-                        .map(|occurrence| occurrence.symbol_occurrence_id.clone())
-                } else {
-                    *remaining = remaining.saturating_sub(occurrences.len());
-                    None
-                }
-            } else {
-                None
-            };
-            if occurrences.is_empty() {
-                last_compared = Some(key.clone());
-                continue;
-            }
             members.push(CloneNearMatchArtifactV1 {
                 source: authority.clone(),
                 payload: candidate.payload,
-                occurrences,
+                occurrences: candidate.occurrences.into_values().collect(),
                 class: descriptor.class,
                 extent: CloneNearMatchExtentV1::WholeBody,
                 shared_fingerprints,
@@ -939,119 +629,25 @@ pub(super) fn read_clone_fingerprint_page(
                 differences: alignment.differences,
                 selected_block_containment,
             });
-            last_compared = Some(key.clone());
-            if let Some(occurrence_id) = occurrence_tail {
-                occurrence_continuation = Some((key.clone(), occurrence_id));
-                has_more = true;
-                break;
-            }
-        }
-        if remaining_occurrences == Some(0) {
-            has_more = ordinal.saturating_add(1) < candidate_count;
-            if has_more {
-                break;
-            }
         }
         if members.len() == limit {
             has_more = ordinal.saturating_add(1) < candidate_count;
             break;
         }
     }
-    // A verification budget can fire before the first candidate comparison.
-    // In that case `last_compared` is still the incoming comparison position,
-    // so retain the discovery frontier as the resumable source of progress.
-    let discovery_frontier = last_discovered.or_else(|| discovery_after.clone());
-    let pending_alignment = pending_comparison.is_some();
-    let next_cursor =
-        if let Some(((body_digest, payload_digest), occurrence_id)) = occurrence_continuation {
-            Some(CloneArtifactCursorV1 {
-                artifact_digest: receipt.artifact_digest().clone(),
-                generation: receipt.generation().clone(),
-                request_digest: request_digest.clone(),
-                after: CloneArtifactCursorPositionV1::Fingerprint {
-                    body_digest,
-                    payload_digest,
-                    occurrence_id: Some(occurrence_id),
-                },
-            })
-        } else if discovery_partial && !completed_discovery_replay {
-            discovery_frontier.map(|mut discovery| {
-                discovery.complete = false;
-                discovery.pending_comparison_body_digest = pending_comparison
-                    .as_ref()
-                    .map(|(body_digest, _)| body_digest.clone());
-                discovery.pending_comparison_payload_digest = pending_comparison
-                    .as_ref()
-                    .map(|(_, payload_digest)| payload_digest.clone());
-                CloneArtifactCursorV1 {
-                    artifact_digest: receipt.artifact_digest().clone(),
-                    generation: receipt.generation().clone(),
-                    request_digest: request_digest.clone(),
-                    after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
-                        discovery,
-                        comparison_body_digest: last_compared
-                            .as_ref()
-                            .map(|(body_digest, _)| body_digest.clone()),
-                        comparison_payload_digest: last_compared
-                            .as_ref()
-                            .map(|(_, payload_digest)| payload_digest.clone()),
-                    },
-                }
-            })
-        } else if (pending_alignment
-            || completed_discovery_replay
-            || (has_more && last_compared.is_none()))
-            && discovery_frontier.is_some()
-        {
-            discovery_frontier.map(|mut discovery| {
-                // A completed discovery boundary no longer points at a
-                // posting row. Clear both halves of the paired row position
-                // before signing it; otherwise the authenticated cursor is
-                // rejected by `CloneFingerprintDiscoveryPositionV2::validate`
-                // and the partial page cannot transition to the comparison
-                // pass.
-                discovery.symbol_occurrence_id = None;
-                discovery.token_position = None;
-                discovery.complete = true;
-                discovery.pending_comparison_body_digest = pending_comparison
-                    .as_ref()
-                    .map(|(body_digest, _)| body_digest.clone());
-                discovery.pending_comparison_payload_digest = pending_comparison
-                    .as_ref()
-                    .map(|(_, payload_digest)| payload_digest.clone());
-                CloneArtifactCursorV1 {
-                    artifact_digest: receipt.artifact_digest().clone(),
-                    generation: receipt.generation().clone(),
-                    request_digest: request_digest.clone(),
-                    after: CloneArtifactCursorPositionV1::FingerprintDiscovery {
-                        discovery,
-                        comparison_body_digest: last_compared
-                            .as_ref()
-                            .map(|(body_digest, _)| body_digest.clone()),
-                        comparison_payload_digest: last_compared
-                            .as_ref()
-                            .map(|(_, payload_digest)| payload_digest.clone()),
-                    },
-                }
-            })
-        } else if has_more {
-            last_compared.map(|(body_digest, payload_digest)| CloneArtifactCursorV1 {
-                artifact_digest: receipt.artifact_digest().clone(),
-                generation: receipt.generation().clone(),
-                request_digest: request_digest.clone(),
-                after: CloneArtifactCursorPositionV1::Fingerprint {
-                    body_digest,
-                    payload_digest,
-                    occurrence_id: None,
-                },
-            })
-        } else {
-            None
-        };
-    // A bounded read must never return the exact cursor it consumed. A hot
-    // posting or candidate-body cap can leave no usable successor; retaining
-    // an identical cursor would make every retry repeat the same partial page.
-    let next_cursor = next_cursor.filter(|next| cursor.is_none_or(|previous| next != previous));
+    let next_cursor = if has_more {
+        last_compared.map(|(body_digest, payload_digest)| CloneArtifactCursorV1 {
+            artifact_digest: receipt.artifact_digest().clone(),
+            generation: route.source_generation.clone(),
+            request_digest,
+            after: CloneArtifactCursorPositionV1::Fingerprint {
+                body_digest,
+                payload_digest,
+            },
+        })
+    } else {
+        None
+    };
     let interrupted = accounting.cancellation_point.is_some();
     let coverage = RetrieverCoverage {
         examined: 1,
@@ -1082,8 +678,8 @@ fn candidate_size_ratio_admitted(left: u32, right: u32) -> bool {
 }
 
 fn containment_class(
-    selected: &[ConservativeCloneTokenV1],
-    candidate: &[ConservativeCloneTokenV1],
+    selected: &[ConservativeCloneTokenV1<'_>],
+    candidate: &[ConservativeCloneTokenV1<'_>],
 ) -> Option<CloneSelectedBlockContainmentClassV1> {
     if selected == candidate {
         Some(CloneSelectedBlockContainmentClassV1::Equal)
@@ -1124,44 +720,14 @@ fn interrupt(
     }
 }
 
-fn contract_number(error: impl std::fmt::Display) -> CodeLexicalArtifactErrorV1 {
-    CodeLexicalArtifactErrorV1::Contract(error.to_string())
-}
-
-fn source_token_work_within_budget(token_count: usize) -> Result<u64, CodeLexicalArtifactErrorV1> {
-    let token_work = u64::try_from(token_count).map_err(contract_number)?;
-    if token_work > CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1 {
-        return Err(CodeLexicalArtifactErrorV1::Contract(format!(
-            "clone fingerprint source token stream exceeds its verification work budget: {token_work} > {CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1}"
-        )));
-    }
-    Ok(token_work)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1, candidate_size_ratio_admitted,
-        source_token_work_within_budget,
-    };
+    use super::candidate_size_ratio_admitted;
 
     #[test]
     fn whole_body_size_ratio_has_an_exact_seventy_percent_boundary() {
         assert!(candidate_size_ratio_admitted(70, 100));
         assert!(candidate_size_ratio_admitted(100, 70));
         assert!(!candidate_size_ratio_admitted(69, 100));
-    }
-
-    #[test]
-    fn oversized_source_stream_fails_without_a_resumable_frontier() {
-        let error = source_token_work_within_budget(
-            usize::try_from(CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1)
-                .expect("test budget fits usize")
-                .saturating_add(1),
-        )
-        .expect_err("an oversized source stream must fail terminally");
-        assert!(
-            matches!(error, super::CodeLexicalArtifactErrorV1::Contract(detail) if detail.contains("source token stream exceeds"))
-        );
     }
 }

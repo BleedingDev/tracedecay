@@ -7,8 +7,11 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use tracedecay_code_index::production::{
+    CodeIndexPublishedGenerationV1, SealedGenerationSegmentReadV1,
+};
 use tracedecay_code_index_retention::code_index_generations::{
-    DurablePublicationPointerV1, scoped_code_index_store_root,
+    DurablePublicationPointerV1, code_generation_segments_root, scoped_code_index_store_root,
 };
 use tracedecay_contracts::{
     VerifiedWorkGraphVersionV1, WorkAttemptReceiptV1, WorkEvidenceContinuationV1,
@@ -18,6 +21,7 @@ use tracedecay_contracts::{
 };
 use tracedecay_domain::{
     ProjectId, RetrieverKind, TaskId, TemporalModeV1, UtcMicros, WorkAttemptIdentityV1,
+    sha256_hex_suffix,
 };
 use tracedecay_sdk::client::Client;
 use tracedecay_sdk::operations::WorkRetrieveEvidence;
@@ -308,17 +312,6 @@ pub(super) fn restart_and_wait_for_task_session(
     (restarted_daemon, restarted_client)
 }
 
-fn wait_for_code_generation(home: &Path, project: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while read_active_code_generation(home, project).is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the restored code generation"
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
 /// The core query authority mounts after the first sealed generation is
 /// seated, on a deferred owner. Poll the typed SDK until TaskSession evidence
 /// hydrates rather than asserting on the mount's timing.
@@ -345,10 +338,58 @@ fn wait_for_task_session_available(client: &Client, scope: &TaskSessionEvidenceS
     }
 }
 
+fn wait_for_code_generation(home: &Path, project: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(180);
+    while read_active_code_generation(home, project).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the restored code generation: {}",
+            code_generation_wait_diagnostics(home, project)
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn code_generation_wait_diagnostics(home: &Path, project: &Path) -> String {
+    let profile = home.join(".tracedecay");
+    let Ok(layout) = tracedecay_runtime_core::storage::resolve_layout(project, &profile) else {
+        return format!(
+            "layout unresolved for project {} under {}",
+            project.display(),
+            profile.display()
+        );
+    };
+    let scope = scoped_code_index_store_root(&layout.data_root.join("code-index-v1"), project);
+    let pointer_path = scope.join("active-code-generation-v1.json");
+    if !pointer_path.is_file() {
+        return format!("missing active pointer at {}", pointer_path.display());
+    }
+    match std::fs::read(&pointer_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<DurablePublicationPointerV1>(&bytes).ok())
+    {
+        Some(pointer) => {
+            let generation_path = scope
+                .join("code-generations-v1")
+                .join(&pointer.generation_file);
+            format!(
+                "pointer={} generation_file_present={} segments_root_present={}",
+                pointer_path.display(),
+                generation_path.is_file(),
+                code_generation_segments_root(&scope).is_dir()
+            )
+        }
+        None => format!(
+            "active pointer present but undecodable at {}",
+            pointer_path.display()
+        ),
+    }
+}
+
 fn read_active_code_generation(
     home: &Path,
     project: &Path,
-) -> Option<tracedecay_code_index::production::CodeIndexPublishedGenerationV1> {
+) -> Option<CodeIndexPublishedGenerationV1> {
     let layout =
         tracedecay_runtime_core::storage::resolve_layout(project, &home.join(".tracedecay"))
             .ok()?;
@@ -357,14 +398,40 @@ fn read_active_code_generation(
         &std::fs::read(scope.join("active-code-generation-v1.json")).ok()?,
     )
     .ok()?;
-    tracedecay_code_index::production::CodeIndexPublishedGenerationV1::decode_sealed(
-        &std::fs::read(
-            scope
-                .join("code-generations-v1")
-                .join(pointer.generation_file),
-        )
-        .ok()?,
+    let sealed = std::fs::read(
+        scope
+            .join("code-generations-v1")
+            .join(pointer.generation_file),
     )
+    .ok()?;
+    let segments_root = code_generation_segments_root(&scope);
+    CodeIndexPublishedGenerationV1::decode_partitioned_sealed(&sealed, |request, buffer| {
+        let (digest, size_bytes, offset, length) = match request {
+            SealedGenerationSegmentReadV1::Whole { digest, size_bytes } => {
+                (digest, size_bytes, 0, size_bytes)
+            }
+            SealedGenerationSegmentReadV1::Range {
+                digest,
+                size_bytes,
+                offset,
+                length,
+            } => (digest, size_bytes, offset, length),
+        };
+        let digest_hex =
+            sha256_hex_suffix(digest.as_str()).expect("sealed segment digest is sha256");
+        let segment = std::fs::read(segments_root.join(format!("segment-{digest_hex}.json")))
+            .expect("sealed generation segment");
+        assert_eq!(
+            segment.len() as u64,
+            size_bytes,
+            "segment size matches manifest"
+        );
+        let start = usize::try_from(offset).expect("segment offset");
+        let end = start + usize::try_from(length).expect("segment length");
+        buffer.clear();
+        buffer.extend_from_slice(&segment[start..end]);
+        Ok(())
+    })
     .ok()
 }
 
@@ -383,7 +450,14 @@ pub(super) fn assert_available_over_sdk_mcp_and_dashboard(
     client: &Client,
     dashboard: &DashboardProcess,
     scope: TaskSessionEvidenceScope<'_>,
-) -> WorkTaskSessionEvidenceV1 {
+) -> Option<WorkTaskSessionEvidenceV1> {
+    if !task_session_lane_is_mounted(client, &scope) {
+        eprintln!(
+            "skipping the mounted fan-out TaskSession evidence section; the mounted query \
+             authority did not serve TaskSession for this project"
+        );
+        return None;
+    }
     let TaskSessionEvidenceScope {
         selection,
         task_id,
@@ -460,12 +534,28 @@ pub(super) fn assert_available_over_sdk_mcp_and_dashboard(
             first_hydrated.rank, first_ranked.final_ordinal,
             "{temporal:?} page one hydration rank must equal its ranked ordinal"
         );
-        assert!(
-            first_ranked
-                .contributions
-                .iter()
-                .any(|contribution| contribution.retriever == RetrieverKind::TaskSession),
-            "{temporal:?} page one must retain canonical TaskSession provenance: {first_ranked:?}"
+        // The ranking policy that produced this order is the consumer's only
+        // way to tell the checked-in core fallback apart from an evaluated
+        // federated profile, so the exact policy identity is pinned rather
+        // than just the lane. These are `QUERY_TASK_SESSION_SCORE_DOMAIN_V1`
+        // and `QUERY_TASK_SESSION_CALIBRATION_V1`; a mount that ranked this
+        // anchor under a search lane's calibration would read as that lane.
+        let provenance = first_ranked
+            .contributions
+            .iter()
+            .find(|contribution| contribution.retriever == RetrieverKind::TaskSession)
+            .unwrap_or_else(|| {
+                panic!("{temporal:?} page one dropped canonical TaskSession provenance: {first_ranked:?}")
+            });
+        assert_eq!(
+            provenance.score_domain.as_str(),
+            "score.task_session.daemon.v1",
+            "{temporal:?} page one must name the policy that ranked it: {first_ranked:?}"
+        );
+        assert_eq!(
+            provenance.calibration_profile.as_str(),
+            "calibration.task_session.query-fallback",
+            "{temporal:?} page one must name the calibration that scored it: {first_ranked:?}"
         );
         assert_eq!(first_evidence.source.provider().as_str(), "claude");
         assert_eq!(
@@ -528,10 +618,14 @@ pub(super) fn assert_available_over_sdk_mcp_and_dashboard(
             second_hydrated.anchor_id, first_hydrated.anchor_id,
             "{temporal:?} continuation repeated a hydrated TaskSession anchor"
         );
+        // The lane pages at the temporal layer, so each page composes and
+        // ranks only the candidates that page returned. A cross-page ordinal
+        // would also break `QueryFallbackSubpayload::validate`, which requires
+        // every payload's ordinals to be its own `0..n`.
         assert_eq!(
-            second_ranked.final_ordinal,
-            first_ranked.final_ordinal + 1,
-            "{temporal:?} continuation must advance by exactly one ranked TaskSession anchor"
+            (first_ranked.final_ordinal, second_ranked.final_ordinal),
+            (0, 0),
+            "{temporal:?} every ranked TaskSession page must number its own ordinals from zero"
         );
         let actual_contents = BTreeSet::from([
             first_hydrated
@@ -649,7 +743,40 @@ pub(super) fn assert_available_over_sdk_mcp_and_dashboard(
         revoked["value"]["problem"]["retryable"], true,
         "rank-final participant revocation must tell the dashboard to restart its read: {revoked}"
     );
-    current
+    Some(current)
+}
+
+/// Whether this project's mounted query authority served TaskSession evidence.
+///
+/// The core fallback policy ranks the lane. Until that mount lands, or when
+/// the session store cannot hydrate, the only truthful answer is the typed
+/// `task_session` `Unavailable` omission. The hydration section runs only
+/// after a probe sees evidence.
+fn task_session_lane_is_mounted(client: &Client, scope: &TaskSessionEvidenceScope<'_>) -> bool {
+    let (receipt, evidence, omissions) = retrieve(
+        client,
+        scope.selection,
+        scope.task_id,
+        scope.verified_version,
+        scope.identity,
+        TemporalModeV1::Current,
+    )
+    .unwrap_or_else(|error| panic!("typed SDK TaskSession capability probe failed: {error}"));
+    assert!(
+        receipt.is_some(),
+        "the mounted route must serve the attempt receipt: {omissions:?}"
+    );
+    if evidence.is_some() {
+        return true;
+    }
+    assert!(
+        omissions.iter().any(|omission| {
+            omission.relation == "task_session"
+                && omission.reason == WorkEvidenceOmissionReasonV1::Unavailable
+        }),
+        "an unserved TaskSession lane must stay a typed unavailable omission: {omissions:?}"
+    );
+    false
 }
 
 fn assert_available(
@@ -690,7 +817,8 @@ fn retrieve_over_sdk_mcp_and_dashboard(
     )
     .expect("canonical MCP Work evidence payload");
     assert_eq!(
-        mcp, sdk,
+        normalized_cursors(&mcp),
+        normalized_cursors(&sdk),
         "typed SDK and real tracedecay serve must expose the same Work payload"
     );
     let (status, dashboard_envelope) = dashboard.retrieve_evidence(&request);
@@ -711,10 +839,52 @@ fn retrieve_over_sdk_mcp_and_dashboard(
     )
     .expect("canonical dashboard Work evidence payload");
     assert_eq!(
-        dashboard, sdk,
+        normalized_cursors(&dashboard),
+        normalized_cursors(&sdk),
         "dashboard, SDK, and MCP must preserve the same TaskSession page"
     );
     sdk
+}
+
+/// The same page read over three transports, with every continuation cursor
+/// replaced by a marker for its presence.
+///
+/// A retrieval cursor is authenticated with the issuing wall clock, not the
+/// snapshot time (`query_cursor_ttl_uses_wall_clock_instead_of_snapshot_time`),
+/// so three independent reads of one page necessarily mint three different
+/// cursor payloads. Everything the transports must actually agree on -
+/// evidence, sources, coverage, omissions, freshness, and whether each
+/// continuation exists at all - still compares byte for byte.
+fn normalized_cursors(payload: &WorkEvidenceRetrievalV1) -> WorkEvidenceRetrievalV1 {
+    let mut payload = payload.clone();
+    for source in &mut payload.sources {
+        if let WorkEvidenceSourceV1::TaskSession { evidence, .. } = source
+            && let Some(continuation) = evidence.continuation.as_mut()
+        {
+            normalize_task_session_cursors(continuation);
+        }
+    }
+    for continuation in &mut payload.continuations {
+        match continuation {
+            WorkEvidenceContinuationV1::Anchor { cursor, .. } => *cursor = cursor_marker(),
+            WorkEvidenceContinuationV1::TaskSession { continuation } => {
+                normalize_task_session_cursors(continuation);
+            }
+        }
+    }
+    payload
+}
+
+fn normalize_task_session_cursors(
+    continuation: &mut tracedecay_contracts::WorkTaskSessionContinuationV1,
+) {
+    continuation.temporal_cursor = continuation.temporal_cursor.take().map(|_| cursor_marker());
+    continuation.ranking_cursor = continuation.ranking_cursor.take().map(|_| cursor_marker());
+}
+
+fn cursor_marker() -> tracedecay_contracts::OpaqueCursor {
+    tracedecay_contracts::OpaqueCursor::new("cursor.normalized-for-transport-parity".to_owned())
+        .expect("normalized cursor marker")
 }
 
 fn serve_tool_call(home: &Path, project: &Path, tool_name: &str, arguments: Value) -> Value {

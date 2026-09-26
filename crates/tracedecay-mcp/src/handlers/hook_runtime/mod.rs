@@ -8,6 +8,7 @@ use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::SharedHostAdmissionBroker;
 use tracedecay_project::project::TraceDecay;
 use tracedecay_sessions::admission::HostAdmissionOutcome;
+use tracedecay_sessions::serving::SessionRefreshWorkerPort;
 use tracedecay_store_runtime::DaemonSessionRuntimeRegistryV1;
 
 use crate::handlers::SessionAuthorities;
@@ -119,7 +120,11 @@ pub async fn handle_hook_runtime(
             )));
         }
     };
-    Ok(tool_json(Some(cg.project_root()), &args, &output))
+    Ok(tool_json(
+        Some(&cg.store_layout().response_handle_root),
+        &args,
+        &output,
+    ))
 }
 
 #[hotpath::measure(future = true, label = "mcp.hook_runtime.lsp")]
@@ -158,6 +163,7 @@ pub async fn handle_projectless_hook_runtime(
     global_db: &RegisteredGlobalDb,
     session_authorities: SessionAuthorities<'_>,
     host_admission_broker: std::result::Result<&SharedHostAdmissionBroker, HostAdmissionOutcome>,
+    user_refresh: Arc<dyn SessionRefreshWorkerPort>,
 ) -> Result<ToolResult> {
     let action = required_str(&args, "action")?;
     if !projectless_action_allowed(action, &args) {
@@ -186,6 +192,7 @@ pub async fn handle_projectless_hook_runtime(
             profile_root,
             &session_runtime_registry,
             &session_authorities,
+            Arc::clone(&user_refresh),
         )?,
         "hermes_receipt" => {
             let host_admission_broker =

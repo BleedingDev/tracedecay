@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[cfg(test)]
 use tracedecay_runtime_core::db::engine::{Connection, TransactionBehavior};
@@ -129,8 +128,6 @@ pub struct LcmGcReport {
     pub totals: LcmGcTotals,
     pub last_gc_at: Option<i64>,
     pub last_error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub backup: Option<Value>,
 }
 
 impl LcmGcReport {
@@ -162,7 +159,6 @@ impl LcmGcReport {
             totals: LcmGcTotals::default(),
             last_gc_at: None,
             last_error: None,
-            backup: None,
         }
     }
 
@@ -546,12 +542,6 @@ pub async fn run_payload_gc_in_transaction(
     let dir = payload::existing_payload_dir_opt(storage_root)?;
     let all_metadata_refs = maintenance::all_payload_metadata_refs(conn).await?;
 
-    if apply && cfg.backup_before_reap && (dir.is_some() || !all_metadata_refs.is_empty()) {
-        report.backup = Some(
-            maintenance::backup_database(&gc_database_path(storage_root), storage_root).await?,
-        );
-    }
-
     let scoped_metadata_refs = payload_metadata_refs_for_scope(conn, provider, session_id).await?;
     let referenced = referenced_payload_refs(conn, provider, session_id).await?;
     let metadata_bytes = payload_metadata_bytes(conn).await?;
@@ -625,7 +615,8 @@ pub async fn run_payload_gc_in_transaction(
 
     report.ended_at = now;
     if apply {
-        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let duration_ms =
+            tracedecay_runtime_core::tracedecay::saturating_duration_millis(started.elapsed());
         let status = if report.errors.is_empty() {
             "ok"
         } else {
@@ -1066,20 +1057,19 @@ async fn tombstone_dangling_refs_in_transaction(
             continue;
         }
         let store_id = row.store_id;
-        let (content, snippet_text, index_text, metadata_json, changed) =
+        let (content, placeholder_text, metadata_json, changed) =
             tombstone_row_for_refs(row, dangling);
         if changed == 0 {
             continue;
         }
         conn.execute(
             "UPDATE lcm_raw_messages
-             SET content = ?2, snippet_text = ?3, index_text = ?4, metadata_json = ?5
+             SET content = ?2, placeholder_text = ?3, metadata_json = ?4
              WHERE store_id = ?1",
             params![
                 store_id,
                 content.as_deref(),
-                snippet_text,
-                index_text,
+                placeholder_text.as_deref(),
                 metadata_json.as_deref()
             ],
         )
@@ -1092,23 +1082,28 @@ async fn tombstone_dangling_refs_in_transaction(
 fn tombstone_row_for_refs(
     row: PlaceholderTextRow,
     payload_refs: &BTreeSet<String>,
-) -> (Option<String>, String, String, Option<String>, usize) {
+) -> (Option<String>, Option<String>, Option<String>, usize) {
     let mut changed = 0usize;
     let content = row.content.map(|text| {
         let (tombstoned, field_changes) = tombstone_text_for_refs(&text, payload_refs);
         changed += field_changes;
         tombstoned
     });
-    let (snippet_text, snippet_changes) = tombstone_text_for_refs(&row.snippet_text, payload_refs);
+    // The snippet and index columns derive from the tombstoned body; they are
+    // counted because they are retrieval text a reader sees change.
+    let (_, snippet_changes) = tombstone_text_for_refs(&row.snippet_text, payload_refs);
     changed += snippet_changes;
-    let (index_text, index_changes) = tombstone_text_for_refs(&row.index_text, payload_refs);
+    let (_, index_changes) = tombstone_text_for_refs(&row.index_text, payload_refs);
     changed += index_changes;
+    let placeholder_text = row
+        .placeholder_text
+        .map(|text| tombstone_text_for_refs(&text, payload_refs).0);
     let metadata_json = row.metadata_json.map(|text| {
         let (tombstoned, field_changes) = tombstone_text_for_refs(&text, payload_refs);
         changed += field_changes;
         tombstoned
     });
-    (content, snippet_text, index_text, metadata_json, changed)
+    (content, placeholder_text, metadata_json, changed)
 }
 
 fn tombstone_text_for_refs(text: &str, payload_refs: &BTreeSet<String>) -> (String, usize) {
@@ -1255,18 +1250,6 @@ async fn upsert_gc_marks(
         conn.execute(&sql, values).await?;
     }
     Ok(())
-}
-
-fn gc_database_path(storage_root: &Path) -> PathBuf {
-    let sessions = storage_root.join("sessions.db");
-    if sessions.is_file() {
-        return sessions;
-    }
-    let global = storage_root.join("global.db");
-    if global.is_file() {
-        return global;
-    }
-    sessions
 }
 
 #[cfg(test)]

@@ -153,7 +153,7 @@ impl McpServer {
             }
             HookEventPlan::AddBranch(branch) => {
                 // Project-root plans must revalidate live root + current branch
-                // immediately before effect — same strictness as AddBranchAt.
+                // immediately before effect, same strictness as AddBranchAt.
                 self.apply_branch_effect(root, root, branch).await
             }
             HookEventPlan::AddBranchAt {
@@ -163,7 +163,7 @@ impl McpServer {
             } => {
                 // Durable effect roots stay concrete (not hashed) and must be
                 // freshly normalized, canonicalized, and reauthorized before
-                // any write — admit-time membership/branch are never reused.
+                // any write, admit-time membership/branch are never reused.
                 self.apply_branch_effect(&effect_root, root, branch).await
             }
             HookEventPlan::SyncCurrentBranch { branch, agent: _ } => {
@@ -230,7 +230,7 @@ impl McpServer {
     pub(crate) async fn run_hook_incremental_sync(
         &self,
         cg: Arc<TraceDecay>,
-        agent: HookAgent,
+        agent: HostIntegrationIdV1,
     ) -> HostAdmissionOutcome {
         match self.accept_debounced_code_index_reconcile(&cg, agent).await {
             Ok(changed) => HostAdmissionOutcome::replay_completed(changed, !changed),
@@ -242,10 +242,10 @@ impl McpServer {
     async fn accept_debounced_code_index_reconcile(
         &self,
         cg: &TraceDecay,
-        agent: HookAgent,
+        agent: HostIntegrationIdV1,
     ) -> std::result::Result<bool, HostAdmissionOutcome> {
         let marker = hook_events::sync_marker_path(&cg.store_layout().data_root, agent);
-        let now = crate::project::current_timestamp();
+        let now = tracedecay_runtime_core::tracedecay::current_timestamp();
         if !hook_events::should_run_sync(&marker, now, 3) {
             return Ok(false);
         }

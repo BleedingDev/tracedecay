@@ -31,7 +31,6 @@ pub async fn expand(
                 summary_sources: Vec::new(),
                 payload_ref: None,
                 from_current_session: Some(true),
-                externalized_note: None,
                 source_pagination: None,
             })
         }
@@ -64,7 +63,6 @@ pub async fn expand(
                 summary_sources: Vec::new(),
                 payload_ref,
                 from_current_session: Some(from_current_session),
-                externalized_note: None,
                 source_pagination: None,
             })
         }
@@ -92,7 +90,6 @@ pub async fn expand(
                 summary_sources,
                 payload_ref: None,
                 from_current_session: None,
-                externalized_note: None,
                 source_pagination: Some(source_pagination),
             })
         }
@@ -131,7 +128,6 @@ pub async fn expand(
                 summary_sources: Vec::new(),
                 payload_ref: Some(expansion.payload_ref),
                 from_current_session: None,
-                externalized_note: None,
                 source_pagination: None,
             })
         }
@@ -176,8 +172,8 @@ fn token_is_signature_blob(token: &str, min_chars: usize) -> bool {
         has_digit |= c.is_ascii_digit();
     }
     // Require real base64 entropy (mixed case and digits). A monotonous run of
-    // one repeated character — long padding, ASCII art, a giant single-case
-    // word — is not a signature blob and must not be dropped as noise.
+    // one repeated character, long padding, ASCII art, a giant single-case
+    // word, is not a signature blob and must not be dropped as noise.
     has_lower && has_upper && has_digit
 }
 

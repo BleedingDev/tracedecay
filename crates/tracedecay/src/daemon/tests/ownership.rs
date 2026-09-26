@@ -102,8 +102,8 @@ async fn assert_fresh_project_open_owners(label: &str, git_state: ProjectGitStat
         "fresh project open must retain its LSP owner"
     );
     // Project open publishes the route as soon as its owners are registered and
-    // lets the cold code-index mount finish behind it, so the feedback cycle —
-    // which is minted against a sealed generation — arrives with that
+    // lets the cold code-index mount finish behind it, so the feedback cycle,
+    // which is minted against a sealed generation, arrives with that
     // generation rather than inside the open. Sampling the instant the open
     // returns therefore measures mount latency, not ownership. Wait for the
     // deferred mount for the one Git state that must reach it; an unborn HEAD
@@ -770,7 +770,7 @@ fn database_owner_registry_rekeys_and_evicts_stale_routes() {
 
 /// A failed rekey is terminal for the route: its replacement key could not be
 /// taken, so this registration can never serve again. Clearing the fence alone
-/// is not enough — the code-index activation mount and the query-authority
+/// is not enough, the code-index activation mount and the query-authority
 /// waiter no longer poll that flag, they hang off the route's own cancellation
 /// child. The revocation must cancel it, and must leave the project-open token
 /// it descends from alone: that one belongs to the caller, not the route.
@@ -784,9 +784,9 @@ async fn failed_rekey_cancels_the_route_waiters_but_not_project_open() {
     let client_identity = test_client_identity_for(profile_root.clone());
     initialize_test_project(&project, &client_identity).await;
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             &project,
-            crate::project::TraceDecayOpenOptions {
+            tracedecay_project::project::TraceDecayOpenOptions {
                 profile_root: Some(profile_root.clone()),
                 global_db_path: Some(client_identity.global_db_path.clone()),
             },

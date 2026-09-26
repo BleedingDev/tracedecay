@@ -1,5 +1,9 @@
 //! Closed result authority for retained memory and temporal operations.
 
+use serde_json::from_value;
+
+use crate::retained_surfaces::RetainedSurfaceOperation;
+
 mod automation;
 mod lcm;
 mod memory;
@@ -36,7 +40,8 @@ pub use lcm::{
     LcmPayloadGcStatusV1, LcmPayloadStatusV1, LcmRawMessageMetadataV1, LcmRawMessageOverviewV1,
     LcmRawMessageV1, LcmRedactionStatusV1, LcmRetrievalOutcomeV1, LcmSourcePaginationV1,
     LcmSourceRefV1, LcmStatusResultV1, LcmStatusV1, LcmStorageKindV1, LcmStoreStatusV1,
-    LcmStoreTokenCoverageV1, LcmSummaryNodeOverviewV1, LcmSummaryNodeV1, LcmTemporalFieldsV1,
+    LcmStoreTokenCoverageV1, LcmSummaryConvergenceReasonV1, LcmSummaryConvergenceStateV1,
+    LcmSummaryConvergenceStatusV1, LcmSummaryNodeOverviewV1, LcmSummaryNodeV1, LcmTemporalFieldsV1,
 };
 pub use memory::{
     FactCommitDispositionV1, FactCommitOwnerV1, FactCommitReceiptV1, FactContradictionV1,
@@ -52,9 +57,8 @@ pub use memory::{
 };
 pub use session::{
     ClosedUtcIntervalV1, CorrelationIndexCountModeV1, CorrelationIndexV1, GitScopeV1,
-    HydrationStateResultV1, MessageSearchFreshnessV1, MessageSearchHitV1, MessageSearchResultV1,
-    MessageSearchRootV1, MessageSearchSkipV1, RetainedNextActionV1, RetrievalWorkerStatusV1,
-    SessionCorrelationHitV1, SessionCoverageIntervalV1, SessionCoverageModeV1,
+    HydrationStateResultV1, MessageSearchHitV1, MessageSearchResultV1, RetainedNextActionV1,
+    RetrievalWorkerStatusV1, SessionCorrelationHitV1, SessionCoverageIntervalV1,
     SessionCoverageReasonV1, SessionCoverageRequestV1, SessionCoverageStateV1, SessionMessageV1,
     SessionRecordV1, SessionRefreshBeginResultV1, SessionRefreshCancelResultV1,
     SessionRefreshFrontierResultV1, SessionRefreshProgressV1, SessionRefreshReceiptV1,
@@ -144,18 +148,104 @@ pub enum RetainedSurfaceResultV1 {
     LcmDoctor(LcmDoctorResultV1),
     LcmLoadSession(LcmLoadSessionResultV1),
     LcmGrep(LcmGrepResultV1),
-    LcmDescribe(LcmDescribeResultV1),
+    LcmDescribe(Box<LcmDescribeResultV1>),
     LcmExpand(Box<LcmExpandResultV1>),
     LcmExpandQuery(LcmExpandQueryResultV1),
+}
+
+impl RetainedSurfaceResultV1 {
+    /// Decodes `operation`'s result body. The enum is untagged on the wire, so
+    /// a decode that does not know the operation selects the first variant
+    /// with a matching shape, which may be a sibling operation's.
+    pub fn from_operation_value(
+        operation: RetainedSurfaceOperation,
+        value: serde_json::Value,
+    ) -> serde_json::Result<Self> {
+        type Operation = RetainedSurfaceOperation;
+        Ok(match operation {
+            Operation::FactStoreCurate => Self::FactStoreCurate(from_value(value)?),
+            Operation::FactStoreAdd => Self::FactStoreAdd(from_value(value)?),
+            Operation::FactStoreSearch => Self::FactStoreSearch(from_value(value)?),
+            Operation::FactStoreProbe => Self::FactStoreProbe(from_value(value)?),
+            Operation::FactStoreRelated => Self::FactStoreRelated(from_value(value)?),
+            Operation::FactStoreReason => Self::FactStoreReason(from_value(value)?),
+            Operation::FactStoreContradict => Self::FactStoreContradict(from_value(value)?),
+            Operation::FactStoreGet => Self::FactStoreGet(from_value(value)?),
+            Operation::FactStoreUpdate => Self::FactStoreUpdate(from_value(value)?),
+            Operation::FactStoreRemove => Self::FactStoreRemove(from_value(value)?),
+            Operation::FactStoreSupersede => Self::FactStoreSupersede(from_value(value)?),
+            Operation::FactStoreList => Self::FactStoreList(from_value(value)?),
+            Operation::FactFeedback => Self::FactFeedback(from_value(value)?),
+            Operation::MemoryStatus => Self::MemoryStatus(from_value(value)?),
+            Operation::SessionRefreshStatus => Self::SessionRefreshStatus(from_value(value)?),
+            Operation::SessionRefreshCancel => Self::SessionRefreshCancel(from_value(value)?),
+            Operation::SessionRefreshBegin => Self::SessionRefreshBegin(from_value(value)?),
+            Operation::MessageSearch => Self::MessageSearch(from_value(value)?),
+            Operation::SessionsFor => Self::SessionsFor(from_value(value)?),
+            Operation::Workflows => Self::Workflows(from_value(value)?),
+            Operation::LcmStatus => Self::LcmStatus(from_value(value)?),
+            Operation::LcmDoctor => Self::LcmDoctor(from_value(value)?),
+            Operation::LcmLoadSession => Self::LcmLoadSession(from_value(value)?),
+            Operation::LcmGrep => Self::LcmGrep(from_value(value)?),
+            Operation::LcmDescribe => Self::LcmDescribe(Box::new(from_value(value)?)),
+            Operation::LcmExpand => Self::LcmExpand(Box::new(from_value(value)?)),
+            Operation::LcmExpandQuery => Self::LcmExpandQuery(from_value(value)?),
+        })
+    }
+
+    /// The same result under the variant `operation` names.
+    pub fn for_operation(self, operation: RetainedSurfaceOperation) -> serde_json::Result<Self> {
+        Self::from_operation_value(operation, serde_json::to_value(self)?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::RetainedSurfaceResultV1;
     use super::automation::tests::{automation_request, with_request_digest};
+    use super::{RetainedSurfaceOperation, RetainedSurfaceResultV1};
     use crate::retained_surfaces::AutomationTaskV1;
+
+    #[test]
+    fn operation_decode_selects_the_named_variant_of_a_shared_shape() {
+        let page = json!({
+            "owner": {"kind": "profile"},
+            "hits": [],
+            "next_after": null,
+            "graph_coverage": {"kind": "not_mounted"}
+        });
+        let untagged = serde_json::from_value::<RetainedSurfaceResultV1>(page.clone())
+            .expect("untagged fact-page result");
+        assert!(
+            matches!(untagged, RetainedSurfaceResultV1::FactStoreProbe(_)),
+            "an untagged decode picks the first sibling with the shape: {untagged:?}"
+        );
+
+        let related = untagged
+            .clone()
+            .for_operation(RetainedSurfaceOperation::FactStoreRelated)
+            .expect("related page");
+        assert!(
+            matches!(related, RetainedSurfaceResultV1::FactStoreRelated(_)),
+            "{related:?}"
+        );
+        let reason = untagged
+            .for_operation(RetainedSurfaceOperation::FactStoreReason)
+            .expect("reason page");
+        assert!(
+            matches!(reason, RetainedSurfaceResultV1::FactStoreReason(_)),
+            "{reason:?}"
+        );
+        assert!(
+            RetainedSurfaceResultV1::from_operation_value(
+                RetainedSurfaceOperation::FactStoreSearch,
+                page
+            )
+            .is_err(),
+            "a body decodes only as the named operation's result"
+        );
+    }
 
     #[test]
     fn automation_terminal_selects_only_its_exact_result_variant() {

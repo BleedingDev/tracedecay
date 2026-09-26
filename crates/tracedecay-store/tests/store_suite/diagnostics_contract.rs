@@ -6,17 +6,9 @@ use tracedecay_domain::{
 };
 use tracedecay_store::{DiagnosticStoreError, SanitizedCleanDiagnosticSnapshotV1};
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    <T as TryFrom<String>>::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).expect("valid fixture identity")
-}
+use tracedecay_domain::test_fixtures::id;
 
-fn digest(byte: char) -> String {
-    format!("sha256:{}", byte.to_string().repeat(64))
-}
+use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
 fn fixture_record(generation: &str, anchor: &str) -> GenerationDiagnosticV1 {
     let mut record = GenerationDiagnosticV1 {
@@ -91,7 +83,7 @@ fn clean_snapshot_rejects_cross_snapshot_or_stale_records() {
     ));
 
     let stale = fixture_record(generation.as_str(), "anchor.diagnostic.stale")
-        .supersede(id("generation.clean.2"))
+        .clear(id("generation.clean.2"))
         .unwrap();
     assert!(matches!(
         SanitizedCleanDiagnosticSnapshotV1::new(generation.clone(), vec![stale]),

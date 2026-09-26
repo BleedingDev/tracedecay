@@ -243,16 +243,12 @@ impl InProcessDaemonInvocationExecutor {
 
     #[hotpath::skip]
     async fn invoke_once(&self, request: DaemonInvocationRequest) -> DaemonInvocationResponse {
-        if let Some(project_admission) = self.project_admission.as_ref() {
-            let profile_id = match self.store_administration.profile_identity() {
-                Ok(identity) => identity.profile_id().clone(),
-                Err(_) => {
-                    return DaemonInvocationResponse::problem(
-                        request.request_id,
-                        DaemonInvocationProblem::Unavailable,
-                    );
-                }
-            };
+        if let Some(project_admission) = self.project_admission.as_ref()
+            && !matches!(
+                request.payload,
+                tracedecay_daemon_service::DaemonInvocationPayload::ProfileRetainedApplication { .. }
+            )
+        {
             let git_service = if invocation_is_git_operation(request.operation()) {
                 git_service_for_project_path(&self.store_administration, Some(&self.project_path))
                     .await
@@ -271,9 +267,8 @@ impl InProcessDaemonInvocationExecutor {
                 };
             self.invocation
                 .service
-                .invoke_with_project_admission_for_profile(
+                .invoke_with_project_admission(
                     &self.invocation.lsp_session_registry,
-                    &profile_id,
                     &self.project_path,
                     git_service,
                     native_integration_service,
@@ -312,114 +307,19 @@ impl tracedecay_contracts::ApplicationInvocationExecutor for InProcessDaemonInvo
     > {
         Box::pin(async move {
             let (context, request) = invocation.into_parts();
-            let (request_id, target, deadline, cancellation) = context.into_parts();
-            if target.resolved().is_some_and(|scope| scope != &self.scope) {
+            if context
+                .target()
+                .resolved()
+                .is_some_and(|scope| scope != &self.scope)
+            {
                 return Err(tracedecay_contracts::InvocationError::Denied);
             }
-            let target = match target {
-                tracedecay_contracts::InvocationTarget::CurrentProject => {
-                    tracedecay_contracts::InvocationTarget::Resolved(self.scope.clone())
-                }
-                target @ tracedecay_contracts::InvocationTarget::Resolved(_) => target,
-            };
             match request {
                 tracedecay_contracts::ApplicationRequest::Surface { binding, payload } => {
-                    let (_binding_id, surface, operation, result_contract, _page) =
-                        binding.into_parts();
-                    let operation =
-                        ApplicationSurfaceOperation::from_surface_name(surface, operation.as_str())
-                            .ok_or(tracedecay_contracts::InvocationError::InvalidRequest)?;
-                    let observed_at = tracedecay_daemon_protocol::invocation_now_micros();
-                    let cancellation_context = cancellation.context();
-                    let scope = match target {
-                        tracedecay_contracts::InvocationTarget::CurrentProject => None,
-                        tracedecay_contracts::InvocationTarget::Resolved(scope) => Some(scope),
-                    };
-                    let policy = if matches!(
-                        operation,
-                        ApplicationSurfaceOperation::ConfigurationSet
-                            | ApplicationSurfaceOperation::ConfigurationUnset
-                            | ApplicationSurfaceOperation::ConfigurationBatch
-                    ) {
-                        tracedecay_daemon_protocol::InvocationCancellationPolicy::AuthoritativeEffect
-                    } else {
-                        tracedecay_daemon_protocol::InvocationCancellationPolicy::ReadOnly
-                    };
-                    let request = match operation {
-                        ApplicationSurfaceOperation::ConfigurationGet
-                        | ApplicationSurfaceOperation::ConfigurationSet
-                        | ApplicationSurfaceOperation::ConfigurationUnset
-                        | ApplicationSurfaceOperation::ConfigurationBatch => {
-                            let request = tracedecay_contracts::configuration_wire_request_from_invocation_payload(
-                                operation.as_str(),
-                                payload,
-                            )
-                            .map_err(|_| {
-                                tracedecay_contracts::InvocationError::InvalidRequest
-                            })?;
-                            DaemonInvocationRequest::configuration(
-                                request_id.as_str(),
-                                operation,
-                                request,
-                                observed_at,
-                                deadline.clone(),
-                                cancellation_context,
-                            )
-                            .with_resolved_scope(scope)
-                            .map_err(|_| {
-                                tracedecay_contracts::InvocationError::InvalidRequest
-                            })?
-                        }
-                        ApplicationSurfaceOperation::FeedbackGet => {
-                            let typed = tracedecay_daemon_protocol::parse_application_surface_request(
-                                operation, payload,
-                            )
-                            .map_err(|_| {
-                                tracedecay_contracts::InvocationError::InvalidRequest
-                            })?;
-                            let tracedecay_daemon_protocol::ApplicationSurfaceRequest::Feedback(
-                                request,
-                            ) = typed
-                            else {
-                                return Err(
-                                    tracedecay_contracts::InvocationError::InvalidRequest,
-                                );
-                            };
-                            DaemonInvocationRequest::feedback(
-                                request_id.as_str(),
-                                operation,
-                                request.request_handle,
-                                observed_at,
-                                deadline.clone(),
-                                cancellation_context,
-                            )
-                            .with_resolved_scope(scope)
-                            .map_err(|_| {
-                                tracedecay_contracts::InvocationError::InvalidRequest
-                            })?
-                        }
-                        _ => {
-                            return Err(
-                                tracedecay_contracts::InvocationError::InvalidRequest,
-                            );
-                        }
-                    }
-                    .with_delivery_route(tracedecay_daemon_protocol::application_delivery_route(surface));
-                    let response =
-                        <Self as tracedecay_daemon_protocol::DaemonInvocationExecutor>::invoke_controlled(
-                            self,
-                            request,
-                            deadline,
-                            cancellation,
-                            policy,
-                        )
-                        .await
-                        .map_err(tracedecay_daemon_protocol::map_invocation_error)?;
-                    tracedecay_daemon_protocol::application_response(
-                        request_id,
-                        result_contract,
-                        response.outcome,
+                    tracedecay_daemon_protocol::invoke_application_surface(
+                        self, context, binding, payload,
                     )
+                    .await
                 }
                 tracedecay_contracts::ApplicationRequest::FeedbackObservation {
                     configuration_digest,
@@ -430,7 +330,7 @@ impl tracedecay_contracts::ApplicationInvocationExecutor for InProcessDaemonInvo
                         .map_err(|_| tracedecay_contracts::InvocationError::InvalidRequest)?;
                     let response = self
                         .invoke_once(DaemonInvocationRequest::feedback_observation(
-                            request_id.as_str(),
+                            context.request_id().as_str(),
                             configuration_digest,
                             observed_at,
                             event,
@@ -450,11 +350,14 @@ impl tracedecay_contracts::ApplicationInvocationExecutor for InProcessDaemonInvo
                     max_events,
                     after_sequence,
                 } => {
+                    let (request_id, _, deadline, cancellation) = context.into_parts();
+                    let target =
+                        tracedecay_contracts::InvocationTarget::Resolved(self.scope.clone());
                     let operation_id =
                         tracedecay_application::operation_stream::OperationId::from_request(
                             operation_id.clone(),
                         );
-                    let observed_at = tracedecay_daemon_protocol::invocation_now_micros();
+                    let observed_at = tracedecay_contracts::now_micros();
                     let authority = self.invocation.service.operation_events();
                     let admitted = authority
                         .resolve_invocation_context(
@@ -538,11 +441,14 @@ impl tracedecay_contracts::ApplicationInvocationExecutor for InProcessDaemonInvo
                     ))
                 }
                 tracedecay_contracts::ApplicationRequest::OperationCancel { operation_id } => {
+                    let (request_id, _, deadline, cancellation) = context.into_parts();
+                    let target =
+                        tracedecay_contracts::InvocationTarget::Resolved(self.scope.clone());
                     let operation_id =
                         tracedecay_application::operation_stream::OperationId::from_request(
                             operation_id.clone(),
                         );
-                    let observed_at = tracedecay_daemon_protocol::invocation_now_micros();
+                    let observed_at = tracedecay_contracts::now_micros();
                     let authority = self.invocation.service.operation_events();
                     let admitted = authority
                         .resolve_invocation_context(
@@ -643,7 +549,7 @@ async fn settle_in_process_invocation(
             // An authoritative effect settles itself: its own budget bounds it,
             // and when that budget expires after the commit point it reports
             // `PartialEffect` with a committed receipt. Waiting only
-            // `DAEMON_TASK_ABORT_DEADLINE` — two seconds, a *shutdown* bound —
+            // `DAEMON_TASK_ABORT_DEADLINE`, two seconds, a *shutdown* bound,
             // replaced that answer with `ResetRequired` whenever settlement
             // took a moment longer than the deadline, which tells the operator
             // their store is corrupt and must be reset when in truth one

@@ -1,12 +1,13 @@
 //! Daemon-side implementation of the dashboard git-correlation read port.
 //!
-//! [`DashboardGitCorrelationReadAdapter`] recovers the verified
-//! session-git-evidence graph projection through the registered
-//! project-sessions authority's mounted graph runtime — the same store the
-//! `sessions_for` and correlation-health reads consult — and hands Loom's
-//! routes complete typed span and commit rows. A projection that has never
-//! published a verified head is the typed empty start, never an error, and a
-//! store without its graph runtime mount stays a typed failed read.
+//! [`DashboardGitCorrelationReadAdapter`] reads the Git evidence rows of the
+//! registered project-sessions authority, the same store the `sessions_for`
+//! and correlation-health reads consult, and hands Loom's routes complete
+//! typed span and commit rows for the requested sessions. A store that never
+//! recorded Git evidence is the typed empty start, never an error.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use tracedecay_dashboard_api::{
     DashboardGitCorrelationReadErrorV1, DashboardGitCorrelationReadFutureV1,
@@ -16,42 +17,39 @@ use tracedecay_global_db::GlobalDbGitCorrelationStore;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 
 pub struct DashboardGitCorrelationReadAdapter {
-    store: GlobalDbGitCorrelationStore<RegisteredGlobalDbLeaseV1>,
+    store: Arc<GlobalDbGitCorrelationStore<RegisteredGlobalDbLeaseV1>>,
 }
 
 impl DashboardGitCorrelationReadAdapter {
     pub fn new(project_database: RegisteredGlobalDbLeaseV1) -> Self {
         Self {
-            store: GlobalDbGitCorrelationStore::new(project_database),
+            store: Arc::new(GlobalDbGitCorrelationStore::new(project_database)),
         }
-    }
-
-    #[hotpath::measure(label = "mcp.dashboard.git_correlation.read")]
-    fn read_inner(
-        &self,
-    ) -> Result<DashboardGitCorrelationReadV1, DashboardGitCorrelationReadErrorV1> {
-        let Some(projection) = self.store.git_evidence_projection().map_err(|error| {
-            DashboardGitCorrelationReadErrorV1 {
-                detail: error.to_string(),
-            }
-        })?
-        else {
-            return Ok(DashboardGitCorrelationReadV1::Unpublished);
-        };
-        Ok(DashboardGitCorrelationReadV1::Published {
-            generation: projection
-                .verified_snapshot()
-                .generation()
-                .as_str()
-                .to_owned(),
-            spans: projection.projection().spans().to_vec(),
-            commits: projection.projection().commit_sessions().to_vec(),
-        })
     }
 }
 
+#[hotpath::measure(label = "mcp.dashboard.git_correlation.read", future = true)]
+async fn read_sessions(
+    store: &GlobalDbGitCorrelationStore<RegisteredGlobalDbLeaseV1>,
+    session_ids: &BTreeSet<String>,
+) -> Result<DashboardGitCorrelationReadV1, DashboardGitCorrelationReadErrorV1> {
+    let read_error = |detail: String| DashboardGitCorrelationReadErrorV1 { detail };
+    let Some(evidence) = store
+        .git_evidence_for_sessions(session_ids)
+        .await
+        .map_err(|error| read_error(error.to_string()))?
+    else {
+        return Ok(DashboardGitCorrelationReadV1::Unpublished);
+    };
+    Ok(DashboardGitCorrelationReadV1::Published {
+        generation: evidence.generation,
+        spans: evidence.spans,
+        commits: evidence.commits,
+    })
+}
+
 impl DashboardGitCorrelationReadPortV1 for DashboardGitCorrelationReadAdapter {
-    fn read(&self) -> DashboardGitCorrelationReadFutureV1<'_> {
-        Box::pin(std::future::ready(self.read_inner()))
+    fn read(&self, session_ids: BTreeSet<String>) -> DashboardGitCorrelationReadFutureV1<'_> {
+        Box::pin(async move { read_sessions(&self.store, &session_ids).await })
     }
 }

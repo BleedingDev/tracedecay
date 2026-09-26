@@ -1,29 +1,24 @@
-//! MCP adapter for the canonical Workflow application owner.
+//! Tool adapter for the canonical Workflow application owner.
 //!
-//! Workflow owns a typed HTTP envelope already. MCP builds that exact request
-//! and returns the owner's envelope as JSON content, so request decoding,
-//! binding lookup, cancellation policy, result contracts, and failure taxonomy
-//! cannot drift between the two transports. This is the Work adapter's mirror;
-//! the composition root supplies the daemon-owned invoke.
+//! Workflow owns a typed HTTP envelope already. MCP and `tracedecay tool`
+//! build that exact request and return the owner's envelope as JSON content, so
+//! request decoding, binding lookup, cancellation policy, result contracts, and
+//! failure taxonomy cannot drift between transports. This is the Work adapter's
+//! mirror; the composition root supplies the daemon-owned invoke.
 
 use std::future::Future;
 
 use serde_json::Value;
 use tracedecay_api::{HttpApplicationControls, WorkflowHttpRequest, WorkflowOperation};
+use tracedecay_contracts::now_micros;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_contracts::{CancellationSignal, Deadline, RequestId};
-use tracedecay_daemon_protocol::invocation_now_micros;
 use tracedecay_domain::UtcMicros;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_tool_catalog::OperationId;
 
 use crate::ToolResult;
-use crate::handlers::support::unknown_tool_error;
-use crate::text_tool_result;
-
-fn json_result(value: &Value) -> ToolResult {
-    text_tool_result(&value.to_string(), Vec::new())
-}
+use crate::handlers::support::{json_result, unknown_tool_error};
 
 #[hotpath::measure(future = true, label = "mcp.workflow.total")]
 pub async fn handle_workflow<Invoke, InvokeFuture>(
@@ -134,7 +129,7 @@ fn workflow_controls(
             "The canonical Workflow deadline exceeds the domain clock",
         )
     })?;
-    let maximum_deadline = UtcMicros(invocation_now_micros().0.saturating_add(maximum_micros));
+    let maximum_deadline = UtcMicros(now_micros().0.saturating_add(maximum_micros));
     let deadline = protocol_deadline
         .filter(|deadline| deadline.expires_at <= maximum_deadline)
         .map_or_else(|| Deadline::new(maximum_deadline), Ok)

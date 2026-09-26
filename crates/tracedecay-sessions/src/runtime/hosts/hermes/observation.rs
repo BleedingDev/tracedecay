@@ -47,7 +47,6 @@ pub(super) fn project_projection_metadata(
     location_provenance: &'static str,
 ) -> HermesProjectionMetadata {
     let presentation_path = match location_provenance {
-        "profile_pin" => source.legacy_project_pin.as_deref(),
         "session_cwd" => row.session_cwd.as_deref().map(Path::new),
         _ => None,
     }
@@ -345,13 +344,8 @@ pub fn normalize_native_observation(
 fn canonical_message_role(
     role: &str,
 ) -> Result<CanonicalMessageRoleV1, ObservationRecordParseErrorV1> {
-    match role {
-        "user" => Ok(CanonicalMessageRoleV1::User),
-        "assistant" => Ok(CanonicalMessageRoleV1::Assistant),
-        "system" => Ok(CanonicalMessageRoleV1::System),
-        "tool" => Ok(CanonicalMessageRoleV1::Tool),
-        _ => Err(ObservationRecordParseErrorV1::InvalidCanonicalEnvelope),
-    }
+    CanonicalMessageRoleV1::from_known_label(role)
+        .ok_or(ObservationRecordParseErrorV1::InvalidCanonicalEnvelope)
 }
 
 fn append_tool_invocations(

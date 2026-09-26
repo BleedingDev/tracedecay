@@ -1,53 +1,16 @@
 #[cfg(feature = "lang-clojure")]
 use tracedecay_code_extraction::ClojureExtractor;
-#[cfg(feature = "lang-pascal")]
-use tracedecay_code_extraction::PascalExtractor;
 #[cfg(feature = "lang-perl")]
 use tracedecay_code_extraction::PerlExtractor;
 use tracedecay_code_extraction::{
     CloneBodyEligibilityV1, CloneBodyTokenizationIssueV1, CloneBodyTokenizationStatusV1,
-    ConservativeCloneTokenV1, CppExtractor, ExtractedCloneBodyV1, ExtractionArtifactV1,
-    GoExtractor, JavaExtractor, KotlinExtractor, LanguageExtractor, PythonExtractor, RustExtractor,
-    TypeScriptExtractor,
+    CloneTokenStreamV1, ConservativeCloneTokenV1, LanguageExtractor,
+    MAX_AUTOMATIC_CLONE_BODY_BYTES_V1, MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1, PythonExtractor,
+    RustExtractor, TypeScriptExtractor,
 };
 use tracedecay_domain::NodeKind;
 
-fn body_for_kind<'a>(
-    artifact: &'a ExtractionArtifactV1,
-    kind: &NodeKind,
-) -> &'a ExtractedCloneBodyV1 {
-    artifact
-        .clone_bodies
-        .iter()
-        .find(|body| &body.symbol_kind == kind)
-        .unwrap_or_else(|| {
-            panic!(
-                "missing clone body for {kind:?}; nodes: {:?}",
-                artifact.result.nodes
-            )
-        })
-}
-
-fn assert_complete_body(body: &ExtractedCloneBodyV1, label: &str) {
-    assert_eq!(
-        body.tokenization_status,
-        CloneBodyTokenizationStatusV1::Complete,
-        "{label}: {:?}",
-        body.tokenization_issues
-    );
-    assert!(
-        body.tokenization_issues.is_empty(),
-        "{label}: {:?}",
-        body.tokenization_issues
-    );
-    assert!(!body.body_span.is_empty(), "{label}: empty body span");
-}
-
-fn tokens(
-    extractor: &dyn LanguageExtractor,
-    path: &str,
-    source: &str,
-) -> Vec<ConservativeCloneTokenV1> {
+fn tokens(extractor: &dyn LanguageExtractor, path: &str, source: &str) -> CloneTokenStreamV1 {
     let artifact = extractor.extract_artifact(path, source);
     assert!(
         artifact.result.errors.is_empty(),
@@ -128,7 +91,7 @@ fn syntax_tokens_keep_comment_markers_inside_literals_and_javascript_asi_boundar
     let literal_text = literal
         .iter()
         .filter_map(|token| match token {
-            ConservativeCloneTokenV1::Syntax { text, .. } => Some(text.as_str()),
+            ConservativeCloneTokenV1::Syntax { text, .. } => Some(text),
             ConservativeCloneTokenV1::StructureStart { .. }
             | ConservativeCloneTokenV1::StructureEnd { .. } => None,
         })
@@ -257,9 +220,77 @@ fn automatic_discovery_minimum_is_thirty_non_trivia_tokens() {
     }
 }
 
+/// A body above the token maximum is a typed exclusion carrying no token
+/// stream, not a record the text-artifact page later refuses. One such body
+/// parked a whole project's text projection before graph seating; the bound
+/// exists so extraction never emits a record a 4 MiB page cannot hold.
+#[test]
+fn bodies_above_the_token_maximum_are_excluded_without_streams() {
+    let artifact = |statements: usize| {
+        RustExtractor.extract_artifact(
+            "src/lib.rs",
+            &format!("fn body() {{ {} }}", "foo(); ".repeat(statements)),
+        )
+    };
+    // `foo();` is four non-trivia tokens.
+    let over = artifact(usize::try_from(MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1).unwrap() / 4 + 1);
+    let body = &over.clone_bodies[0];
+    assert!(body.non_trivia_token_count > MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1);
+    assert_eq!(
+        body.eligibility,
+        CloneBodyEligibilityV1::ExcludedTooLarge {
+            maximum_tokens: MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1,
+            maximum_bytes: MAX_AUTOMATIC_CLONE_BODY_BYTES_V1,
+        }
+    );
+    assert!(body.conservative_tokens.is_empty());
+    assert_eq!(
+        body.tokenization_status,
+        CloneBodyTokenizationStatusV1::Complete
+    );
+    assert!(body.rename_tokens.is_none());
+    assert!(body.complete_rename_tokens().is_none());
+
+    let under = artifact(usize::try_from(MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1).unwrap() / 4 - 8);
+    let body = &under.clone_bodies[0];
+    assert!(body.non_trivia_token_count <= MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1);
+    assert_eq!(body.eligibility, CloneBodyEligibilityV1::Eligible);
+    assert_eq!(body.conservative_tokens.len(), 10164);
+}
+
+#[test]
+fn body_bytes_are_bounded_before_a_large_literal_is_tokenized() {
+    let literal = "x".repeat(usize::try_from(MAX_AUTOMATIC_CLONE_BODY_BYTES_V1).unwrap());
+    let artifact = RustExtractor.extract_artifact(
+        "src/lib.rs",
+        &format!("fn body() {{ let value = \"{literal}\"; }}"),
+    );
+    let body = &artifact.clone_bodies[0];
+
+    assert_eq!(
+        body.eligibility,
+        CloneBodyEligibilityV1::ExcludedTooLarge {
+            maximum_tokens: MAX_AUTOMATIC_CLONE_BODY_TOKENS_V1,
+            maximum_bytes: MAX_AUTOMATIC_CLONE_BODY_BYTES_V1,
+        }
+    );
+    assert_eq!(body.non_trivia_token_count, 0);
+    assert!(body.conservative_tokens.is_empty());
+    assert_eq!(
+        body.tokenization_issues,
+        vec![CloneBodyTokenizationIssueV1::BodyExceedsSizeBound]
+    );
+    assert_eq!(
+        body.tokenization_status,
+        CloneBodyTokenizationStatusV1::Partial
+    );
+    assert!(body.rename_tokens.is_none());
+}
+
 #[test]
 fn clone_bodies_bind_to_method_and_stable_arrow_occurrences() {
-    for (artifact, expected_kind, expected_language) in [
+    // Both bodies are the `{ load(); }` block.
+    for (artifact, expected_kind, expected_language, expected_span) in [
         (
             RustExtractor.extract_artifact(
                 "src/store.rs",
@@ -267,11 +298,13 @@ fn clone_bodies_bind_to_method_and_stable_arrow_occurrences() {
             ),
             NodeKind::Method,
             "rust",
+            (42, 53),
         ),
         (
             TypeScriptExtractor.extract_artifact("src/store.ts", "const read = () => { load(); };"),
             NodeKind::ArrowFunction,
             "typescript",
+            (19, 30),
         ),
     ] {
         let body = artifact.clone_bodies.first().expect("clone body");
@@ -284,230 +317,47 @@ fn clone_bodies_bind_to_method_and_stable_arrow_occurrences() {
         assert_eq!(body.symbol_occurrence_id, callable.id);
         assert_eq!(body.symbol_kind, expected_kind);
         assert_eq!(body.language, expected_language);
-        assert!(!body.body_span.is_empty());
-    }
-}
-
-#[test]
-fn clone_admission_covers_language_specific_callable_kinds() {
-    for (extractor, path, source, kind) in [
-        (
-            &CppExtractor as &dyn LanguageExtractor,
-            "src/box.cpp",
-            r#"
-class Box {
-public:
-    Box(int value) : value(value) { initialize(); }
-private:
-    int value;
-    void initialize() { value += 1; }
-};
-"#,
-            NodeKind::Constructor,
-        ),
-        (
-            &GoExtractor,
-            "src/box.go",
-            r#"
-package model
-
-type Box struct { value int }
-
-func (b *Box) Reset() {
-    b.value = 0
-    notify()
-}
-"#,
-            NodeKind::StructMethod,
-        ),
-        (
-            &JavaExtractor,
-            "src/Box.java",
-            r#"
-class Box {
-    private int value;
-
-    Box(int value) {
-        this.value = value;
-        validate(value);
-    }
-}
-"#,
-            NodeKind::Constructor,
-        ),
-        (
-            &KotlinExtractor,
-            "src/Box.kt",
-            r#"
-class Box(val value: Int) {
-    constructor(value: Int, extra: Int) : this(value) {
-        val total = value + extra
-        println(total)
-    }
-}
-"#,
-            NodeKind::Constructor,
-        ),
-        (
-            &TypeScriptExtractor,
-            "src/box.ts",
-            r#"
-class Box {
-    constructor(value: number) {
-        initialize(value);
-        record(value);
-    }
-}
-"#,
-            NodeKind::Constructor,
-        ),
-    ] {
-        let artifact = extractor.extract_artifact(path, source);
-        assert!(
-            artifact.result.errors.is_empty(),
-            "{path}: {:?}",
-            artifact.result.errors
-        );
-        let body = body_for_kind(&artifact, &kind);
-        let node = artifact
-            .result
-            .nodes
-            .iter()
-            .find(|node| node.kind == kind)
-            .expect("callable node");
-        assert_eq!(body.symbol_occurrence_id, node.id, "{path}");
-        assert_complete_body(body, path);
-    }
-
-    let artifact = KotlinExtractor.extract_artifact(
-        "src/box.kt",
-        r#"
-class Box {
-    fun reset(value: Int): Int {
-        val next = value + 1
-        println(next)
-        return next
-    }
-}
-"#,
-    );
-    assert!(
-        artifact.result.errors.is_empty(),
-        "{:?}",
-        artifact.result.errors
-    );
-    assert_complete_body(body_for_kind(&artifact, &NodeKind::Method), "kotlin method");
-}
-
-#[test]
-fn abstract_methods_are_retained_as_conservative_partial_evidence() {
-    for (extractor, path, source) in [
-        (
-            &CppExtractor as &dyn LanguageExtractor,
-            "src/shape.cpp",
-            r#"
-class Shape {
-public:
-    virtual double area() = 0;
-};
-"#,
-        ),
-        (
-            &JavaExtractor,
-            "src/Shape.java",
-            r#"
-public abstract class Shape {
-    public abstract double area();
-}
-"#,
-        ),
-        (
-            &KotlinExtractor,
-            "src/Shape.kt",
-            r#"
-interface Shape {
-    fun area(): Double
-}
-"#,
-        ),
-    ] {
-        let artifact = extractor.extract_artifact(path, source);
-        assert!(
-            artifact.result.errors.is_empty(),
-            "{path}: {:?}",
-            artifact.result.errors
-        );
-        let body = body_for_kind(&artifact, &NodeKind::AbstractMethod);
         assert_eq!(
-            body.tokenization_status,
-            CloneBodyTokenizationStatusV1::Partial,
-            "{path}"
-        );
-        assert!(
-            body.tokenization_issues
-                .contains(&CloneBodyTokenizationIssueV1::BodyBoundaryUnavailable),
-            "{path}: {:?}",
-            body.tokenization_issues
-        );
-        assert_eq!(
-            body.eligibility,
-            CloneBodyEligibilityV1::ExcludedIncompleteTokenization,
-            "{path}"
+            (body.body_span.start_byte, body.body_span.end_byte),
+            expected_span
         );
     }
 }
 
-#[cfg(feature = "lang-pascal")]
 #[test]
-fn pascal_procedures_receive_bounded_clone_bodies() {
-    let source = r#"
-program CloneBody;
-
-procedure Emit(value: Integer);
-begin
-    WriteLn(value);
-end;
-
-begin
-end.
-"#;
-    let artifact = PascalExtractor.extract_artifact("src/clone_body.pas", source);
-    assert!(
-        artifact.result.errors.is_empty(),
-        "{:?}",
-        artifact.result.errors
-    );
-    let body = body_for_kind(&artifact, &NodeKind::Procedure);
-    let node = artifact
-        .result
-        .nodes
+fn extracted_streams_hold_grammar_kinds_by_number_without_changing_the_wire_shape() {
+    let source = "pub fn publish(input: &str) -> bool {\n    let trimmed = input.trim();\n    let ready = !trimmed.is_empty();\n    let flagged = trimmed.starts_with('!');\n    let long = trimmed.len() > 4;\n    ready && long && !flagged\n}\n";
+    let emitted = tokens(&RustExtractor, "borrowed.rs", source);
+    assert_eq!(emitted.len(), 92);
+    let texts: Vec<&str> = emitted
         .iter()
-        .find(|node| node.kind == NodeKind::Procedure)
-        .expect("procedure node");
-    assert_eq!(body.symbol_occurrence_id, node.id);
-    assert_complete_body(body, "pascal procedure");
-}
-
-#[test]
-fn test_framework_closures_use_only_their_bounded_callback_body() {
-    let source = r#"
-describe("suite", () => {
-    setup();
-    verify();
-});
-"#;
-    let artifact = TypeScriptExtractor.extract_artifact("src/suite.ts", source);
-    assert!(
-        artifact.result.errors.is_empty(),
-        "{:?}",
-        artifact.result.errors
+        .filter_map(ConservativeCloneTokenV1::text)
+        .collect();
+    assert_eq!(
+        texts.join(" "),
+        "{ let trimmed = input . trim ( ) ; let ready = ! trimmed . is_empty ( ) ; \
+         let flagged = trimmed . starts_with ( '!' ) ; let long = trimmed . len ( ) > 4 ; \
+         ready && long && ! flagged }"
     );
-    let body = body_for_kind(&artifact, &NodeKind::Function);
-    assert_complete_body(body, "typescript test callback");
-    let start = usize::try_from(body.body_span.start_byte).expect("body start");
-    let end = usize::try_from(body.body_span.end_byte).expect("body end");
-    let body_source = &source[start..end];
-    assert!(body_source.contains("setup"));
-    assert!(body_source.contains("verify"));
-    assert!(!body_source.contains("describe"));
+    // 92 token codes plus one text code for each of the 17 identifiers and
+    // literals, those 17 texts (95 bytes) and their 17 ends, and the 56-byte
+    // stream header. Owning a 48-byte enum per token was 4,416 bytes before
+    // any text.
+    assert_eq!(
+        emitted.token_retained_bytes(),
+        56 + (92 + 17) * 4 + 95 + 17 * 4
+    );
+
+    let encoded = serde_json::to_string(&emitted).expect("stream encodes");
+    assert!(
+        encoded.starts_with(r#"[{"kind":"structure_start","syntax_kind":"block"},"#),
+        "the persisted clone-token shape changed: {encoded}"
+    );
+    let decoded: CloneTokenStreamV1 = serde_json::from_str(&encoded).expect("stream decodes");
+    assert_eq!(decoded, emitted);
+    assert_eq!(
+        decoded.token_retained_bytes(),
+        emitted.token_retained_bytes(),
+        "a stream read back from disk resolves its kinds to the same grammar numbers"
+    );
 }

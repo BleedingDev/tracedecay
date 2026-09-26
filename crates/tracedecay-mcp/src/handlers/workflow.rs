@@ -14,6 +14,11 @@ use serde_json::{Value, json};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_code_index::intake::content_digest;
 use tracedecay_contracts::clock::now_micros;
+use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
+use tracedecay_contracts::retrieval::{
+    DiagnoseItemV1, DiagnosePublicationV1, DiagnoseResultV1, DiagnoseSeverityFilterV1,
+    DiagnoseSeverityV1, DiagnoseSurfaceRequestV1, DiagnoseSymbolV1,
+};
 use tracedecay_contracts::{
     CancellationObservation, CancellationSignal, CancellationStage, Deadline, OperationBudgetUsage,
     OperationReceipt, OperationTermination,
@@ -28,13 +33,15 @@ use tracedecay_application::diagnostics_store::DiagnosticsStore;
 use tracedecay_application::operation_stream::{
     OperationEmitter, OperationEventError, operation_event_authority,
 };
+use tracedecay_code_index::is_test_file;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_domain::errors::{Result, TraceDecayError};
-use tracedecay_project::project::{TraceDecay, is_test_file};
+use tracedecay_project::project::TraceDecay;
 
 use crate::ToolResult;
-use crate::handlers::{generic_tool_result, rendered_tool_result, unique_file_paths};
-use crate::tools::render;
+use crate::handlers::graph::graph_tool_completion;
+use crate::handlers::support::decode_primitive_request;
+use crate::handlers::{generic_tool_result, unique_file_paths};
 
 mod affected_test_failure;
 
@@ -116,55 +123,40 @@ fn test_target_key(node: &GraphTestSymbol) -> String {
     }
 }
 
-/// Handles `tracedecay_diagnose`.
+/// Computes `tracedecay_diagnose`: parses compiler output, maps each
+/// diagnostic to its graph symbol, and publishes the parse.
 #[hotpath::measure(future = true, label = "mcp.workflow.diagnose.total")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Diagnose handling is one workflow match onto the live diagnostic readers."
-)]
-pub async fn handle_diagnose(
+pub async fn compute_diagnose(
     cg: &TraceDecay,
     graph: &tracedecay_graph_query::VerifiedGraphQuery,
     args: Value,
     code_index_identity: Option<&dyn CodeIndexPublicationIdentityPortV1>,
-) -> Result<ToolResult> {
-    let cargo_output =
-        args.get("cargo_output")
-            .and_then(|v| v.as_str())
-            .ok_or(TraceDecayError::Config {
-                message: "missing required parameter: cargo_output".to_string(),
-            })?;
+) -> Result<GraphToolCompletionV1> {
+    let request: DiagnoseSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_diagnose")?;
     // The upstream text carries no trustworthy capture timestamp. Record the
     // one temporal fact this server owns, once, before parse and enrichment.
     let diagnostic_observed_at = now_micros();
 
-    let severity_filter = args
-        .get("severity")
-        .and_then(|v| v.as_str())
-        .unwrap_or("all");
-    let include_callers = args
-        .get("include_callers")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let max_diagnostics = args
-        .get("max_diagnostics")
-        .and_then(serde_json::Value::as_u64)
+    let severity_filter = request.severity.unwrap_or_default();
+    let include_callers = request.include_callers.unwrap_or(true);
+    let max_diagnostics = request
+        .max_diagnostics
         .map_or(50_usize, |v| v.min(500) as usize);
 
     let mut diagnostics: Vec<_> = hotpath::measure_block!("mcp.workflow.diagnose.parse", {
-        parse_cargo_output(cargo_output)
+        parse_cargo_output(&request.cargo_output)
             .into_iter()
             .filter(|d| match severity_filter {
-                "error" => d.severity == Severity::Error,
-                "warning" => d.severity == Severity::Warning,
-                _ => true,
+                DiagnoseSeverityFilterV1::Error => d.severity == Severity::Error,
+                DiagnoseSeverityFilterV1::Warning => d.severity == Severity::Warning,
+                DiagnoseSeverityFilterV1::All => true,
             })
             .collect()
     });
     let total = diagnostics.len();
     diagnostics.truncate(max_diagnostics);
 
-    let mut items: Vec<Value> = Vec::with_capacity(diagnostics.len());
+    let mut items: Vec<DiagnoseItemV1> = Vec::with_capacity(diagnostics.len());
     let mut touched: HashSet<String> = HashSet::new();
     for d in &diagnostics {
         // Preserve the compiler spelling in the result; the graph uses
@@ -172,7 +164,7 @@ pub async fn handle_diagnose(
         let path = normalized_diagnostic_path(cg.project_root(), &d.file);
         touched.insert(path.clone());
         let node = diagnostic_symbol_at_location(graph, &path, d.line)?;
-        let callers_json = if include_callers {
+        let callers = if include_callers {
             match &node {
                 Some(n) => {
                     let callers = graph.callers(
@@ -180,43 +172,41 @@ pub async fn handle_diagnose(
                         &[RelationEdgeKindV1::Calls],
                         5,
                     )?;
-                    let trimmed: Vec<Value> = callers
+                    let trimmed = callers
                         .into_iter()
                         .next()
                         .into_iter()
                         .flatten()
                         .take(5)
                         .map(|edge| {
-                            diagnostic_symbol_json(&edge.neighbor).inspect(|caller| {
-                                if let Some(file) = caller.get("file").and_then(Value::as_str) {
-                                    touched.insert(file.to_owned());
-                                }
+                            diagnostic_symbol(&edge.neighbor).inspect(|caller| {
+                                touched.insert(caller.file.clone());
                             })
                         })
                         .collect::<Result<Vec<_>>>()?;
-                    Value::Array(trimmed)
+                    Some(trimmed)
                 }
-                None => Value::Array(vec![]),
+                None => Some(Vec::new()),
             }
         } else {
-            Value::Null
+            None
         };
 
-        items.push(json!({
-            "severity": severity_string(d.severity),
-            "code": d.code,
-            "message": d.message,
-            "file": d.file,
-            "line": d.line,
-            "column": d.column,
-            "node": node.as_ref().map(diagnostic_symbol_json).transpose()?,
-            "callers": callers_json,
-        }));
+        items.push(DiagnoseItemV1 {
+            severity: severity_wire(d.severity),
+            code: d.code.clone(),
+            message: d.message.clone(),
+            file: d.file.clone(),
+            line: d.line,
+            column: d.column,
+            node: node.as_ref().map(diagnostic_symbol).transpose()?,
+            callers,
+        });
     }
 
     // Populate the durable managed-diagnostics store so the LSP Problems
     // projection and every diagnostic read surface see these findings.
-    let publication = publish_parsed_compiler_diagnostics(
+    let published = publish_parsed_compiler_diagnostics(
         cg,
         code_index_identity,
         &diagnostics,
@@ -224,25 +214,19 @@ pub async fn handle_diagnose(
     )
     .await;
 
-    let mapped = items.iter().filter(|i| !i["node"].is_null()).count();
-    let body = hotpath::measure_block!(
-        "mcp.workflow.diagnose.assemble",
-        json!({
-            "diagnostics_parsed": total,
-            "diagnostics_returned": items.len(),
-            "mapped_to_node": mapped,
-            "unmapped": items.len() - mapped,
-            "truncated": total > items.len(),
-            "published": publication,
-            "diagnostics": items,
-        })
-    );
-    Ok(rendered_tool_result(
-        Some(cg.project_root()),
-        &args,
-        &body,
+    let mapped = items.iter().filter(|item| item.node.is_some()).count();
+    let result = DiagnoseResultV1 {
+        diagnostics_parsed: total as u64,
+        diagnostics_returned: items.len() as u64,
+        mapped_to_node: mapped as u64,
+        unmapped: (items.len() - mapped) as u64,
+        truncated: total > items.len(),
+        published,
+        diagnostics: items,
+    };
+    Ok(graph_tool_completion(
+        GraphToolResultV1::Diagnose(result),
         touched.into_iter().collect(),
-        || render::diagnostics_md(&body),
     ))
 }
 
@@ -309,7 +293,7 @@ fn diagnostic_symbol_at_location(
     Ok(matched.into_iter().next())
 }
 
-fn diagnostic_symbol_json(symbol: &CodeGraphSymbolSummaryV1) -> Result<Value> {
+fn diagnostic_symbol(symbol: &CodeGraphSymbolSummaryV1) -> Result<DiagnoseSymbolV1> {
     let metadata = symbol.metadata.as_ref().ok_or_else(|| {
         diagnostic_graph_problem("verified diagnostic symbol is missing extraction metadata")
     })?;
@@ -332,16 +316,16 @@ fn diagnostic_symbol_json(symbol: &CodeGraphSymbolSummaryV1) -> Result<Value> {
         .start_line
         .checked_add(1)
         .ok_or_else(|| diagnostic_graph_problem("verified diagnostic display line overflowed"))?;
-    Ok(json!({
-        "node_id": symbol.occurrence.as_str(),
-        "name": metadata.simple_name,
-        "kind": metadata.kind,
-        "qualified_name": metadata.qualified_name,
-        "file": file,
-        "line": line,
-        "start_line": metadata.start_line,
-        "end_line": end_line,
-    }))
+    Ok(DiagnoseSymbolV1 {
+        node_id: symbol.occurrence.as_str().to_owned(),
+        name: metadata.simple_name.clone(),
+        kind: metadata.kind.clone(),
+        qualified_name: metadata.qualified_name.clone(),
+        file: file.to_owned(),
+        line,
+        start_line: metadata.start_line,
+        end_line,
+    })
 }
 
 fn diagnostic_graph_problem(detail: &str) -> TraceDecayError {
@@ -352,8 +336,8 @@ fn diagnostic_graph_problem(detail: &str) -> TraceDecayError {
 /// store as one clean-generation snapshot.
 ///
 /// This is the production write path for the compiler pillar. Failure to
-/// publish never fails the diagnose call — the caller still receives its
-/// mapped diagnostics — but the outcome is reported in the response so a
+/// publish never fails the diagnose call. The caller still receives its
+/// mapped diagnostics, but the outcome is reported in the response so a
 /// silent no-op is observable.
 ///
 /// Identity is resolved from the code-index generation authority, never minted
@@ -361,7 +345,7 @@ fn diagnostic_graph_problem(detail: &str) -> TraceDecayError {
 /// the projection compares a record's `file_occurrence_id` against the
 /// saved-edit cycle's impact target and its `generation_id` against the cycle's
 /// code-index generation, and both sides now come from the same mint. Without a
-/// resolver — a direct, non-daemon server — the honest outcome is to publish
+/// resolver, a direct, non-daemon server, the honest outcome is to publish
 /// nothing under a named reason rather than to guess a repository-relative
 /// path, which the projection could only refuse.
 #[hotpath::measure(future = true, label = "mcp.workflow.diagnose.publish")]
@@ -370,17 +354,17 @@ async fn publish_parsed_compiler_diagnostics(
     code_index_identity: Option<&dyn CodeIndexPublicationIdentityPortV1>,
     parsed: &[tracedecay_application::diagnose::Diagnostic],
     observed_at: UtcMicros,
-) -> Value {
+) -> DiagnosePublicationV1 {
     use tracedecay_application::diagnostics_publication::{
         compiler_diagnostic_analyzer_revision_v1, compiler_diagnostic_configuration_revision_v1,
     };
 
     let root = cg.project_root().to_path_buf();
     let Some(analyzer_revision) = compiler_diagnostic_analyzer_revision_v1().ok() else {
-        return json!({ "status": "skipped", "reason": "analyzer-identity-unavailable" });
+        return publication_skipped("analyzer-identity-unavailable", None);
     };
     let Some(configuration_revision) = compiler_diagnostic_configuration_revision_v1().ok() else {
-        return json!({ "status": "skipped", "reason": "configuration-identity-unavailable" });
+        return publication_skipped("configuration-identity-unavailable", None);
     };
     let database = cg.dashboard_database_guard();
     let store = DiagnosticsStore::new(database.as_ref().clone());
@@ -398,11 +382,18 @@ async fn publish_parsed_compiler_diagnostics(
     compiler_publication_report(&outcome)
 }
 
-/// Renders the typed publication outcome for the diagnose response. Every
-/// refusal keeps its name so an empty Problems list is explainable.
+fn publication_skipped(reason: &str, unresolved: Option<Vec<String>>) -> DiagnosePublicationV1 {
+    DiagnosePublicationV1::Skipped {
+        reason: reason.to_owned(),
+        unresolved,
+    }
+}
+
+/// The typed publication outcome for the diagnose response. Every refusal
+/// keeps its name so an empty Problems list is explainable.
 fn compiler_publication_report(
     outcome: &tracedecay_application::diagnostics_publication::CompilerDiagnosticPublicationOutcomeV1,
-) -> Value {
+) -> DiagnosePublicationV1 {
     use tracedecay_application::diagnostics_publication::CompilerDiagnosticPublicationOutcomeV1 as Outcome;
 
     let names = |skips: &[tracedecay_application::diagnostics_publication::CompilerDiagnosticResolutionSkipV1]| {
@@ -410,43 +401,38 @@ fn compiler_publication_report(
     };
     match outcome {
         Outcome::CodeIndexIdentityUnavailable => {
-            json!({ "status": "skipped", "reason": "code-index-identity-unavailable" })
+            publication_skipped("code-index-identity-unavailable", None)
         }
         Outcome::CodeIndexGenerationUnavailable => {
-            json!({ "status": "skipped", "reason": "code-index-generation-unavailable" })
+            publication_skipped("code-index-generation-unavailable", None)
         }
-        Outcome::NoResolvableDiagnostics { unresolved } => json!({
-            "status": "skipped",
-            "reason": "no-resolvable-diagnostics",
-            "unresolved": names(unresolved),
-        }),
+        Outcome::NoResolvableDiagnostics { unresolved } => {
+            publication_skipped("no-resolvable-diagnostics", Some(names(unresolved)))
+        }
         Outcome::Published {
             generation,
             report,
             unresolved,
-        } => json!({
-            "status": "published",
-            "generation": generation.as_str(),
-            "publication_revision": report.publication_revision,
-            "inserted": report.inserted,
-            "cleared": report.cleared,
-            "unresolved": names(unresolved),
-            "rejected": report
-                .rejected
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-        }),
-        Outcome::Failed { reason } => json!({ "status": "failed", "reason": reason }),
+        } => DiagnosePublicationV1::Published {
+            generation: generation.as_str().to_owned(),
+            publication_revision: report.publication_revision,
+            inserted: report.inserted,
+            cleared: report.cleared,
+            unresolved: names(unresolved),
+            rejected: report.rejected.iter().map(ToString::to_string).collect(),
+        },
+        Outcome::Failed { reason } => DiagnosePublicationV1::Failed {
+            reason: reason.clone(),
+        },
     }
 }
 
-fn severity_string(s: Severity) -> &'static str {
+fn severity_wire(s: Severity) -> DiagnoseSeverityV1 {
     match s {
-        Severity::Error => "error",
-        Severity::Warning => "warning",
-        Severity::Note => "note",
-        Severity::Help => "help",
+        Severity::Error => DiagnoseSeverityV1::Error,
+        Severity::Warning => DiagnoseSeverityV1::Warning,
+        Severity::Note => DiagnoseSeverityV1::Note,
+        Severity::Help => DiagnoseSeverityV1::Help,
     }
 }
 
@@ -464,9 +450,12 @@ where
 }
 
 #[hotpath::measure(future = true, label = "mcp.workflow.affected_tests.total")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Affected-test run is one select-and-execute through the injected runner."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Affected-test run is one select-and-execute through the injected runner."
+    )
 )]
 async fn handle_run_affected_tests_with_runner<F, Runner, RunFuture>(
     cg: &TraceDecay,
@@ -482,7 +471,7 @@ where
 {
     let run_args = match RunAffectedArgs::parse(&args) {
         Ok(run_args) => run_args,
-        Err(result) => return Ok(result),
+        Err(result) => return Ok(*result),
     };
     let project_root = cg.project_root().to_path_buf();
 
@@ -492,7 +481,7 @@ where
     // of whether the graph projection is mounted.
     let changed_paths = match resolve_changed_paths(&args, run_args.explicit_paths) {
         Ok(paths) => paths,
-        Err(result) => return Ok(result),
+        Err(result) => return Ok(*result),
     };
     if changed_paths.is_empty() {
         return Ok(empty_result(&args, "no changed files detected"));
@@ -641,7 +630,7 @@ where
     );
 
     Ok(generic_tool_result(
-        Some(cg.project_root()),
+        Some(&cg.store_layout().response_handle_root),
         &args,
         &body,
         touched_files,
@@ -654,8 +643,8 @@ async fn wait_for_test_run_cancellation(
 ) {
     // CancellationSignal is still a polled atomic (no event wait API on this
     // type without changing application crate callers we do not own). When no
-    // signal is attached, wait only on the emitter. Otherwise poll at 50ms —
-    // same cancel semantics, ~10x fewer timers than the prior 5ms wakeups.
+    // signal is attached, wait only on the emitter. Otherwise poll at 50ms.
+    // Same cancel semantics, ~10x fewer timers than the prior 5ms wakeups.
     let Some(cancellation) = cancellation else {
         emitter.cancelled().await;
         return;
@@ -766,7 +755,7 @@ async fn managed_test_document_content_digests(
 }
 
 fn current_head_commit_id(root: &Path) -> Option<CommitId> {
-    let repository = gix::open(root).ok()?;
+    let repository = tracedecay_runtime_core::git_open::open(root).ok()?;
     let commit = repository.head_commit().ok()?;
     CommitId::new(commit.id().to_hex().to_string()).ok()
 }
@@ -842,15 +831,15 @@ fn test_run_contract_error(error: impl std::fmt::Display) -> TraceDecayError {
 fn resolve_changed_paths(
     args: &Value,
     explicit_paths: Option<Vec<String>>,
-) -> std::result::Result<Vec<String>, ToolResult> {
+) -> std::result::Result<Vec<String>, Box<ToolResult>> {
     match explicit_paths {
         Some(paths) => Ok(paths),
-        None => Err(error_result(
+        None => Err(Box::new(error_result(
             args,
             "invalid_request",
             "changed_paths",
             "`changed_paths` is required and must explicitly scope the affected-test run",
-        )),
+        ))),
     }
 }
 
@@ -1028,8 +1017,8 @@ fn test_annotations_in_file<'a>(
                 MAX_ANNOTATION_RELATIONS,
             )?
             .into_iter()
-            .filter(|edge| markers.contains(&edge.edge.from_occurrence))
-            .map(|edge| edge.edge.to_occurrence.as_str().to_owned())
+            .filter(|edge| markers.contains(&edge.from_occurrence))
+            .map(|edge| edge.to_occurrence.as_str().to_owned())
             .collect();
         cache.insert(path.to_owned(), annotated);
     }

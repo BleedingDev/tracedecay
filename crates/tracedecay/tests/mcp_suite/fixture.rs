@@ -25,21 +25,48 @@ use std::path::{Path, PathBuf};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::sync::OnceCell;
-use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_domain::errors::Result as TdResult;
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_runtime_core::storage::{
     PrivateStoreIo, default_profile_project_id, default_profile_root,
 };
 
 use crate::common::GLOBAL_DB_ENV;
 
+/// Store schema versions admitted by recorded version rather than by the
+/// graph-DB final shape. Init refuses a store recorded at any other version,
+/// so each one must invalidate the template when it changes.
+#[derive(Clone, Copy)]
+struct StoreSchemaVersions {
+    lcm: i64,
+    session_temporal: i64,
+    git_correlation: i64,
+}
+
+impl StoreSchemaVersions {
+    const CURRENT: Self = Self {
+        lcm: tracedecay_lcm::schema::LCM_SCHEMA_VERSION,
+        session_temporal: tracedecay_session_temporal_store::SESSION_TEMPORAL_SCHEMA_VERSION,
+        git_correlation:
+            tracedecay_sessions::runtime::git_correlation::GIT_CORRELATION_SCHEMA_VERSION,
+    };
+}
+
 /// Shared on-disk template identity. Keyed on the admitted final-shape
 /// fingerprint, not `SCHEMA_VERSION` or a hand-maintained revision: a required
 /// table can land in the final shape without a version bump, and a warm
-/// target must not reuse the previous template.
-fn template_dir_name() -> Option<String> {
+/// target must not reuse the previous template. The tables admitted by a
+/// recorded version alone are keyed on [`StoreSchemaVersions`].
+fn template_dir_name(versions: StoreSchemaVersions) -> Option<String> {
+    let StoreSchemaVersions {
+        lcm,
+        session_temporal,
+        git_correlation,
+    } = versions;
     match tracedecay_runtime_core::db::migrations::expected_final_schema_fingerprint() {
-        Ok(fingerprint) => Some(format!("mcp-suite-store-template-{fingerprint}")),
+        Ok(fingerprint) => Some(format!(
+            "mcp-suite-store-template-{fingerprint}-lcm{lcm}-temporal{session_temporal}-git{git_correlation}"
+        )),
         Err(error) => {
             eprintln!("[mcp_suite::fixture] schema fingerprint unavailable: {error}");
             None
@@ -122,8 +149,15 @@ pub async fn init_project_from_template_with_options(
     project_root: &Path,
     options: TraceDecayOpenOptions,
 ) -> TdResult<TraceDecay> {
-    if let (Some(template), Some(targets)) =
-        (template_root().await, SeedTargets::from_options(&options))
+    init_project_from_template_root(template_root().await, project_root, options).await
+}
+
+async fn init_project_from_template_root(
+    template: Option<&Path>,
+    project_root: &Path,
+    options: TraceDecayOpenOptions,
+) -> TdResult<TraceDecay> {
+    if let (Some(template), Some(targets)) = (template, SeedTargets::from_options(&options))
         && seed_store(&template.join(EMPTY_FLAVOR), project_root, &targets).is_ok()
         && let Ok(cg) = Box::pin(TraceDecay::open_with_options(project_root, options.clone())).await
     {
@@ -205,7 +239,13 @@ fn seed_store(flavor: &Path, project_root: &Path, targets: &SeedTargets) -> io::
 
 async fn template_root() -> Option<&'static Path> {
     TEMPLATE_ROOT
-        .get_or_init(|| async { ensure_template().await })
+        .get_or_init(|| async {
+            ensure_template(
+                Path::new(env!("CARGO_TARGET_TMPDIR")),
+                StoreSchemaVersions::CURRENT,
+            )
+            .await
+        })
         .await
         .as_deref()
 }
@@ -214,9 +254,8 @@ async fn template_root() -> Option<&'static Path> {
 /// process to need it. nextest runs one process per test, so an exclusive
 /// file lock serializes the build machine-wide: exactly one process builds,
 /// every concurrent process blocks briefly and then finds READY.
-async fn ensure_template() -> Option<PathBuf> {
-    let tmp_root = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let template_dir_name = template_dir_name()?;
+async fn ensure_template(tmp_root: &Path, versions: StoreSchemaVersions) -> Option<PathBuf> {
+    let template_dir_name = template_dir_name(versions)?;
     let shared = tmp_root.join(&template_dir_name);
     if shared.join("READY").is_file() {
         return Some(shared);
@@ -230,7 +269,7 @@ async fn ensure_template() -> Option<PathBuf> {
             .truncate(false)
             .write(true)
             .open(&lock_path)?;
-        fs2::FileExt::lock_exclusive(&file)?;
+        file.lock()?;
         Ok(file)
     })
     .await
@@ -239,7 +278,7 @@ async fn ensure_template() -> Option<PathBuf> {
 
     // Another process may have finished the build while we waited.
     if shared.join("READY").is_file() {
-        let _ = fs2::FileExt::unlock(&lock_file);
+        let _ = lock_file.unlock();
         return Some(shared);
     }
 
@@ -265,7 +304,7 @@ async fn ensure_template() -> Option<PathBuf> {
             None
         }
     };
-    let _ = fs2::FileExt::unlock(&lock_file);
+    let _ = lock_file.unlock();
     result
 }
 
@@ -494,4 +533,58 @@ fn sqlite_master_shape_fingerprint(database_path: &Path) -> io::Result<String> {
                 .map(|(name, sql)| (name.as_str(), sql.as_str())),
         ),
     )
+}
+
+#[tokio::test]
+async fn template_recorded_at_an_older_git_correlation_version_is_rebuilt() {
+    let scratch = tempfile::TempDir::new().unwrap();
+    let tmp_root = scratch.path().canonicalize().unwrap();
+    let current = StoreSchemaVersions::CURRENT;
+    let older = StoreSchemaVersions {
+        git_correlation: current.git_correlation - 1,
+        ..current
+    };
+
+    // What a build before the Git correlation bump left in a warm target.
+    let stale = ensure_template(&tmp_root, older).await.unwrap();
+    let stale_sessions = sole_subdir(&stale.join(EMPTY_FLAVOR).join("home/.tracedecay/projects"))
+        .unwrap()
+        .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
+    let downgraded = Connection::open(&stale_sessions)
+        .unwrap()
+        .execute(
+            "UPDATE session_schema_migrations SET version = ?1 WHERE name = 'git_correlation'",
+            [older.git_correlation],
+        )
+        .unwrap();
+    assert_eq!(
+        downgraded, 1,
+        "stale template must record the older version"
+    );
+
+    let template = ensure_template(&tmp_root, current).await.unwrap();
+    let profile_root = tmp_root.join("home/.tracedecay");
+    let cg = match init_project_from_template_root(
+        Some(&template),
+        &tmp_root.join("project"),
+        TraceDecayOpenOptions {
+            profile_root: Some(profile_root.clone()),
+            global_db_path: Some(profile_root.join("global.db")),
+        },
+    )
+    .await
+    {
+        Ok(cg) => cg,
+        Err(error) => panic!("project must initialize from the template: {error:?}"),
+    };
+    let recorded: i64 = Connection::open(&cg.store_layout().sessions_db_path)
+        .unwrap()
+        .query_row(
+            "SELECT version FROM session_schema_migrations WHERE name = 'git_correlation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(recorded, 6);
+    cg.close();
 }

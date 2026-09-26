@@ -1,11 +1,14 @@
 use serde::Serialize;
 use serde_json::{Value, json};
+use tracedecay_contracts::retained_surfaces::AutomationSkipReasonV1;
+use tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1;
 use tracedecay_domain::TemporalCoverageCountsV1;
 
-use crate::ports::session_evidence::{LcmGrepHit, LcmGrepSort, LcmScope};
+use tracedecay_lcm::{LcmGrepHit, LcmGrepSort, LcmScope};
 
 use crate::automation::artifacts::sha256_json;
 use crate::automation::managed_skills::list_managed_skills;
+use crate::automation::normalized_non_empty;
 use crate::automation::skill_usage::{
     DEFAULT_SKILL_OVERLAP_LIMIT, ingest_project_analytics_events, skill_overlap_candidates,
     stale_skill_recommendations, summarize_skill_usage,
@@ -13,16 +16,16 @@ use crate::automation::skill_usage::{
 use crate::automation::skill_writer::{
     skill_improvement_recommendations, support_file_evidence as skill_writer_support_file_evidence,
 };
-use crate::ports::session_store::AutomationSessionStore;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use tracedecay_automation::analytics::{ToolUsageObservation, underused_tool_family_signals};
 use tracedecay_automation::text::truncate_chars_for_prompt;
 use tracedecay_domain::errors::Result;
+use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_runtime_core::tracedecay::current_timestamp;
 
 use super::retrieval::{
-    AutomationSessionRetrieval, AutomationTemporalRetrieval, automation_structural_refusal_reason,
+    AutomationSessionRetrieval, AutomationTemporalRetrieval, automation_structural_refusal_skip,
     retrieve_automation_session_evidence,
 };
 use super::session_reflector::{
@@ -139,6 +142,7 @@ pub(super) enum SkillWriterEvidenceOutcome {
     Ready(SkillWriterEvidenceBundle),
     Skipped {
         reason: &'static str,
+        budget_stage: Option<SessionRetrievalBudgetStageV1>,
         evidence_hash: Option<String>,
     },
 }
@@ -152,6 +156,7 @@ pub(super) enum SessionReflectorEvidenceOutcome {
     Ready(SessionReflectorEvidenceBundle),
     Skipped {
         reason: &'static str,
+        budget_stage: Option<SessionRetrievalBudgetStageV1>,
         evidence_hash: Option<String>,
     },
 }
@@ -278,15 +283,6 @@ fn session_reflector_replay_allowed(
     }
 
     matches!(scope, LcmScope::All) || session_id.is_some()
-}
-
-fn normalized_non_empty(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
 }
 
 fn compare_evidence_items(
@@ -645,6 +641,7 @@ pub(super) async fn build_session_reflector_evidence(
     {
         return Ok(SessionReflectorEvidenceOutcome::Skipped {
             reason: "session_evidence_filter_unavailable",
+            budget_stage: None,
             evidence_hash: None,
         });
     }
@@ -678,6 +675,7 @@ pub(super) async fn build_session_reflector_evidence(
                 Err(reason) => {
                     return Ok(SessionReflectorEvidenceOutcome::Skipped {
                         reason,
+                        budget_stage: None,
                         evidence_hash: None,
                     });
                 }
@@ -693,12 +691,15 @@ pub(super) async fn build_session_reflector_evidence(
         AutomationTemporalRetrieval::Rejected(reason) => {
             return Ok(SessionReflectorEvidenceOutcome::Skipped {
                 reason,
+                budget_stage: None,
                 evidence_hash: None,
             });
         }
         AutomationTemporalRetrieval::StructuralRefusal(refusal) => {
+            let (reason, budget_stage) = automation_structural_refusal_skip(refusal);
             return Ok(SessionReflectorEvidenceOutcome::Skipped {
-                reason: automation_structural_refusal_reason(refusal),
+                reason,
+                budget_stage,
                 evidence_hash: None,
             });
         }
@@ -738,6 +739,7 @@ pub(super) async fn build_session_reflector_evidence(
     if !has_grep_hits && !has_replay_sessions {
         return Ok(SessionReflectorEvidenceOutcome::Skipped {
             reason: "no_session_evidence",
+            budget_stage: None,
             evidence_hash,
         });
     }
@@ -753,7 +755,7 @@ pub(super) async fn build_session_reflector_evidence(
 pub(super) async fn build_skill_writer_evidence(
     retrieval: &dyn AutomationSessionRetrieval,
     analytics_project_root: Option<&std::path::Path>,
-    analytics_db: Option<&dyn AutomationSessionStore>,
+    analytics_db: Option<&RegisteredGlobalDb>,
     options: SkillWriterAutomationOptions,
 ) -> Result<SkillWriterEvidenceOutcome> {
     let profile_root = match options.profile_root {
@@ -786,6 +788,7 @@ pub(super) async fn build_skill_writer_evidence(
                 Err(reason) => {
                     return Ok(SkillWriterEvidenceOutcome::Skipped {
                         reason,
+                        budget_stage: None,
                         evidence_hash: None,
                     });
                 }
@@ -801,12 +804,15 @@ pub(super) async fn build_skill_writer_evidence(
         AutomationTemporalRetrieval::Rejected(reason) => {
             return Ok(SkillWriterEvidenceOutcome::Skipped {
                 reason,
+                budget_stage: None,
                 evidence_hash: None,
             });
         }
         AutomationTemporalRetrieval::StructuralRefusal(refusal) => {
+            let (reason, budget_stage) = automation_structural_refusal_skip(refusal);
             return Ok(SkillWriterEvidenceOutcome::Skipped {
-                reason: automation_structural_refusal_reason(refusal),
+                reason,
+                budget_stage,
                 evidence_hash: None,
             });
         }
@@ -827,7 +833,8 @@ pub(super) async fn build_skill_writer_evidence(
             .is_none_or(std::vec::Vec::is_empty)
     {
         return Ok(SkillWriterEvidenceOutcome::Skipped {
-            reason: "no_skill_writer_evidence",
+            reason: AutomationSkipReasonV1::NoSessionEvidence.as_str(),
+            budget_stage: None,
             evidence_hash: Some(canonical_evidence_hash(&json!({
                 "evidence_mode": evidence_mode_label(recent_session_slices.is_some()),
                 "temporal_mode": "forensic",
@@ -839,7 +846,6 @@ pub(super) async fn build_skill_writer_evidence(
             }))?),
         });
     }
-    crate::automation::managed_skills::migrate_managed_skill_routing(&profile_root).await?;
     let existing_skills = list_managed_skills(&profile_root).await?;
     if let (Some(project_root), Some(analytics_db)) = (analytics_project_root, analytics_db) {
         ingest_project_analytics_events(
@@ -919,7 +925,8 @@ pub(super) async fn build_skill_writer_evidence(
         .is_some_and(|sessions| !sessions.is_empty());
     if !has_grep_hits && !has_replay_sessions {
         return Ok(SkillWriterEvidenceOutcome::Skipped {
-            reason: "no_skill_writer_evidence",
+            reason: AutomationSkipReasonV1::NoSessionEvidence.as_str(),
+            budget_stage: None,
             evidence_hash,
         });
     }

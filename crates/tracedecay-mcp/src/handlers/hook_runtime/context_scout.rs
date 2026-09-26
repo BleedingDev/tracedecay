@@ -1,6 +1,9 @@
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::sync::{Mutex as StdMutex, OnceLock};
+use tracedecay_agent_hosts::agents::context_scout::address_registry::{
+    AdmittedContextScoutHookV1, ContextScoutLifecycleAddressV1,
+};
 use tracedecay_agent_hosts::agents::context_scout::{
     ContextScoutControlV1, ContextScoutDurableStoreOutcomeV1, ContextScoutErrorV1,
 };
@@ -36,7 +39,7 @@ use super::required_value;
 async fn hook_v2_context_scout_lifecycle(
     args: &Value,
     envelope: &tracedecay_hooks::HookEventEnvelopeV2,
-) -> Option<tracedecay_agent_hosts::agents::context_scout::ports::ContextScoutLifecycleAddressV1> {
+) -> Option<ContextScoutLifecycleAddressV1> {
     hook_v2_context_scout_lifecycle_for_session(envelope, hook_v2_native_session_id(args, envelope))
         .await
 }
@@ -44,7 +47,7 @@ async fn hook_v2_context_scout_lifecycle(
 pub(super) async fn hook_v2_context_scout_lifecycle_for_session(
     envelope: &tracedecay_hooks::HookEventEnvelopeV2,
     session_id: Option<SessionId>,
-) -> Option<tracedecay_agent_hosts::agents::context_scout::ports::ContextScoutLifecycleAddressV1> {
+) -> Option<ContextScoutLifecycleAddressV1> {
     let session_id = session_id?;
     tracedecay_daemon_service::context_scout_lifecycle::lookup_registered_context_scout_lifecycle(
         envelope.project_id,
@@ -64,9 +67,12 @@ pub(super) fn hook_v2_native_context_scout_lifecycle(
 }
 
 #[hotpath::measure(future = true, label = "mcp.hook_runtime.scout_lifecycle")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Context-scout admission is one native lifecycle bind for the scout claim."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Context-scout admission is one native lifecycle bind for the scout claim."
+    )
 )]
 pub(super) async fn admit_native_context_scout_lifecycle(
     sessions: &RegisteredGlobalDb,
@@ -130,7 +136,7 @@ pub(super) async fn admit_native_context_scout_lifecycle(
             Err(_) => return false,
         };
     let binding = sessions.binding();
-    let authorities = HostAdmissionAuthorities::registered_for_project(
+    let authorities = HostAdmissionAuthorities::for_project(
         binding.shard_id.brain_id.clone(),
         binding.shard_id.profile_id.clone(),
         project_id,
@@ -478,12 +484,7 @@ pub(super) async fn hook_v2_scout_read(
     let Some(lifecycle) = hook_v2_context_scout_lifecycle(args, &envelope).await else {
         return Ok(json!({ "action": action, "status": "unavailable" }));
     };
-    let Some(hook) =
-        tracedecay_agent_hosts::agents::context_scout::ports::AdmittedContextScoutHookV1::new(
-            envelope,
-            &snapshot.binding,
-        )
-    else {
+    let Some(hook) = AdmittedContextScoutHookV1::new(envelope, &snapshot.binding) else {
         return Ok(json!({ "action": action, "status": "unavailable" }));
     };
     let Some((address, _)) = cg

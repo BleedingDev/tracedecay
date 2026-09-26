@@ -24,19 +24,6 @@ pub enum ReconcileOutcome {
     Failed,
 }
 
-/// Removes the retired generation's sealed read bundle files from the
-/// durable generations root. Idempotent; an absent bundle is a success.
-fn retire_generation_read_bundle(store_root: &Path, generation_file: &str) -> Result<(), String> {
-    let digest = generation_file
-        .strip_prefix("generation-")
-        .and_then(|value| value.strip_suffix(".json"))
-        .ok_or_else(|| "sealed generation filename is invalid".to_owned())?;
-    let sealed = tracedecay_graph_db::SealedGraphStateDigest::try_from(format!("sha256:{digest}"))
-        .map_err(|error| error.to_string())?;
-    tracedecay_graph_db::retire_sealed_read_bundle(&store_root.join("code-generations-v1"), &sealed)
-        .map_err(|error| error.to_string())
-}
-
 /// Every code-generation degradation is a genuine anomaly: it keeps the tick
 /// summary loud and logs on every attempt.
 pub fn log_code_generation_retention_degraded(
@@ -87,7 +74,7 @@ fn log_code_generation_retention_degraded_with_error(
 }
 
 /// Whether a release failure names a graph runtime that cannot serve right
-/// now — the class worth backing off from — as opposed to evidence or store
+/// now, the class worth backing off from, as opposed to evidence or store
 /// defects (conflict, corruption, invalid identity) that must stay loud on
 /// every attempt until someone fixes them.
 fn release_failure_is_runtime_unhealthy(error: &tracedecay_graph_db::GraphDbError) -> bool {
@@ -102,9 +89,9 @@ fn release_failure_is_runtime_unhealthy(error: &tracedecay_graph_db::GraphDbErro
 /// Non-blocking replay-pool probe. The retention pass used to discover a held
 /// pool lock the expensive way: the release reconcile polled it at
 /// five-millisecond intervals for the full 30s graph-operation deadline and
-/// then failed with `DeadlineExceeded` — every tick, for as long as the
+/// then failed with `DeadlineExceeded`, every tick, for as long as the
 /// holder (typically a publisher hashing a multi-GiB seal under the lock)
-/// stayed wedged — and the collection executor behind it would park on the
+/// stayed wedged, and the collection executor behind it would park on the
 /// same lock's *deadline-free* blocking flock. One `try_lock` answers the
 /// same question for the cost of a syscall, before any full-digest planning
 /// is paid. The probe lock is dropped immediately; later acquisitions re-take
@@ -133,7 +120,7 @@ pub async fn reconcile_graph_replay_releases(
     lease: &ProjectStoreMaintenanceLeaseV1,
     store_root: &Path,
     observations: &crate::telemetry::StoreTelemetrySamplingRegistry,
-    cancellation: &tracedecay_session_memory::context::CancellationToken,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
 ) -> ReconcileOutcome {
     let Some(project_id) = lease.store_layout().identity.project_id.as_ref() else {
         log_code_generation_retention_degraded(
@@ -155,7 +142,7 @@ pub async fn reconcile_graph_replay_releases(
     let project_root = lease.project_root();
     // A runtime that answered its last attempts with deadline or
     // unavailability failures is skipped for the bounded backoff window
-    // instead of being polled — and timed out against — on every tick. The
+    // instead of being polled, and timed out against, on every tick. The
     // arming failure was already reported; skips stay quiet on the log and
     // visible on the gauge.
     if !observations.graph_replay_release_attempt_admitted(project_root) {
@@ -222,24 +209,6 @@ pub async fn reconcile_graph_replay_releases(
             .await
         {
             Ok(true) => {
-                // The generation's graph replay is retired; its sealed
-                // read bundle (derived read artifacts) retires with it.
-                // Runs before the release checkpoint so a crash here
-                // retries the idempotent sweep on the next pass.
-                if let Err(error) =
-                    retire_generation_read_bundle(store_root, &release.generation.generation_file)
-                {
-                    observations.mark_loud_retention_log();
-                    log_daemon_event(
-                        "retention_degraded",
-                        &[
-                            ("pass", "code_generations".to_string()),
-                            ("failure", "graph_read_bundle_retire_failed".to_string()),
-                            ("error", error),
-                        ],
-                    );
-                    return ReconcileOutcome::Failed;
-                }
                 if complete_code_generation_graph_replay_release(store_root, &release).is_err() {
                     log_code_generation_retention_degraded(
                         observations,

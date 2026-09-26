@@ -3,10 +3,7 @@ use std::path::PathBuf;
 use tracedecay_domain::FactId;
 
 pub(crate) async fn setup_target_project(fixture: &DashboardFixture) -> (PathBuf, Arc<TraceDecay>) {
-    let target_root = fixture
-        ._tmp
-        .path()
-        .canonicalize()
+    let target_root = canonical_existing_identity(fixture._tmp.path())
         .expect("fixture root should canonicalize")
         .join("target-project");
     write_file(
@@ -21,7 +18,9 @@ pub(crate) async fn setup_target_project(fixture: &DashboardFixture) -> (PathBuf
         .await
         .expect("initialize retained target project");
     let target_cg = Arc::new(target_cg);
-    fixture.project_graphs.register(target_cg.clone());
+    fixture
+        .project_graphs
+        .register(Arc::new(dashboard::dashboard_project_context(&target_cg)));
     (target_root, target_cg)
 }
 
@@ -210,7 +209,7 @@ fn project_scoped_plugin_routes_read_selected_project_store() {
         let (active_status, active_payload) = get_json(
             &agent,
             &format!(
-                "{}/api/plugins/holographic/?q=selector&limit=10",
+                "{}/api/plugins/holographic?q=selector&limit=10",
                 fixture.base_url
             ),
         );
@@ -226,7 +225,7 @@ fn project_scoped_plugin_routes_read_selected_project_store() {
         let (selected_status, selected_payload) = get_json(
             &agent,
             &format!(
-                "{}/api/projects/{}/plugins/holographic/?q=selector&limit=10",
+                "{}/api/projects/{}/plugins/holographic?q=selector&limit=10",
                 fixture.base_url, target_project_id
             ),
         );
@@ -350,7 +349,7 @@ fn project_scoped_gateway_reports_registry_read_failures_as_unavailable() {
         let (gateway_status, gateway) = get_json(
             &agent,
             &format!(
-                "{}/api/projects/{target_project_id}/plugins/holographic/",
+                "{}/api/projects/{target_project_id}/plugins/holographic",
                 fixture.base_url
             ),
         );

@@ -5,31 +5,23 @@ use serde_json::{Value, json};
 use tracedecay_contracts::multi_root::MultiRootApplicationOperation;
 use tracedecay_contracts::{
     ApplicationEnvelope, ApplicationOutcome, ApplicationProblem, ApplicationProblemEnvelope,
-    CancellationSignal, Deadline, LegalAction, MultiRootExecuteRequestV1,
-    MultiRootScopeSetCasRequestV1, MultiRootScopeSetReadRequestV1, ProblemOwningLayer, RequestId,
-    ResultContractRef, RetryDirective, SafeDiagnostic,
+    CancellationSignal, Deadline, MultiRootExecuteRequestV1, MultiRootScopeSetCasRequestV1,
+    MultiRootScopeSetReadRequestV1, ProblemOwningLayer, RequestId, ResultContractRef,
+    RetryDirective, SafeDiagnostic,
 };
 use tracedecay_domain::UtcMicros;
 use tracedecay_tool_catalog::{BindingId, SchemaId};
 
 use crate::ToolResult;
-use crate::handlers::support::unknown_tool_error;
+use crate::handlers::support::{json_result, unknown_tool_error};
+use tracedecay_contracts::now_micros;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
-use tracedecay_daemon_protocol::{
-    DaemonInvocationExecutor, InvocationCancellationPolicy, invocation_now_micros,
-};
+use tracedecay_daemon_protocol::{DaemonInvocationExecutor, InvocationCancellationPolicy};
 use tracedecay_daemon_protocol::{
     DaemonInvocationOutcome, DaemonInvocationProblem, DaemonInvocationRequest,
     DaemonInvocationResponse,
 };
 use tracedecay_domain::errors::{Result, TraceDecayError};
-
-fn json_result(value: &Value) -> ToolResult {
-    ToolResult::new(
-        json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
-        Vec::new(),
-    )
-}
 
 const DEFAULT_DEADLINE_MICROS: i64 = 30_000_000;
 
@@ -52,7 +44,7 @@ pub async fn handle_multi_root(
             }
         })?,
     };
-    let observed_at = invocation_now_micros();
+    let observed_at = now_micros();
     let deadline = match protocol_deadline {
         Some(deadline) => deadline,
         None => Deadline::new(UtcMicros(
@@ -221,6 +213,10 @@ where
         request_id,
         scope,
         outcome,
+        touched_files: Vec::new(),
+        code_graph: None,
+        analytics: None,
+        cost: None,
     };
     let payload = json!({
         "binding_id": binding_id(operation)?,
@@ -236,14 +232,10 @@ fn invalid_request(
     problem_result(
         operation,
         request_id,
-        ApplicationProblem::InvalidRequest {
-            diagnostic: SafeDiagnostic {
-                code: "multi_root.invalid_request".to_owned(),
-                message: "The multi-root application request is invalid".to_owned(),
-            },
-            retry: RetryDirective::Never,
-            legal_actions: vec![LegalAction::CorrectRequest],
-        },
+        ApplicationProblem::invalid_request(
+            "multi_root.invalid_request",
+            "The multi-root application request is invalid",
+        ),
     )
 }
 
@@ -271,14 +263,10 @@ fn problem_result(
 fn daemon_problem(problem: DaemonInvocationProblem) -> ApplicationProblem {
     match problem {
         DaemonInvocationProblem::InvalidRequest | DaemonInvocationProblem::UnsupportedRevision => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic {
-                    code: "multi_root.invalid_request".to_owned(),
-                    message: "The multi-root application request is invalid".to_owned(),
-                },
-                retry: RetryDirective::Never,
-                legal_actions: vec![LegalAction::CorrectRequest],
-            }
+            ApplicationProblem::invalid_request(
+                "multi_root.invalid_request",
+                "The multi-root application request is invalid",
+            )
         }
         DaemonInvocationProblem::NotFoundOrNotAuthorized => {
             ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never)

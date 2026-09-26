@@ -1,7 +1,7 @@
 /**
  * The CORTEX layout model, against a wire-true `StrataMeasurementV1`.
  *
- * What this suite protects is not the picture — it is the four claims that make
+ * What this suite protects is not the picture, it is the four claims that make
  * the picture admissible: a region is placed at a depth one of its own files
  * actually has, area carries the file count, a contour is a real interval of a
  * real quantity, and nothing the drawing cap folds out disappears from the
@@ -65,13 +65,10 @@ function measurement(
     ideal_depth: 3,
     max_depth: overrides.max_depth ?? 4,
     scan: {
-      budget_ms: 4000,
       cache_scope: 'graph_generation',
       cache_state: 'hit',
       dependency_edges_examined: 900,
       files_examined: 120,
-      max_dependency_edges: 40_000,
-      max_files: 20_000,
     },
     ...overrides,
   };
@@ -134,7 +131,7 @@ describe('elevation', () => {
       ),
     );
     const region = model.regions[0]!;
-    // The mean of 0,2,2,6 is 2.5 — a depth no file in this region is at. The
+    // The mean of 0,2,2,6 is 2.5, a depth no file in this region is at. The
     // lower median is 2, which is a depth two of them are at.
     expect(region.depth).toBe(2);
     expect(region.depthMin).toBe(0);
@@ -535,22 +532,5 @@ describe('the aggregation cap', () => {
     expect(model.drawnRegions.map((region) => region.order)).toEqual(
       Array.from({ length: MAX_DRAWN_REGIONS }, (_, index) => index),
     );
-  });
-
-  it('reports the scan budget as a cap on the terrain, not as a depth', () => {
-    const model = buildCortexModel(
-      measurement([cluster('a', { order: 0 })], [file('a/x.rs', 1)], {
-        scan: {
-          budget_ms: 4000,
-          cache_scope: 'graph_generation',
-          cache_state: 'miss',
-          dependency_edges_examined: 40_000,
-          files_examined: 20_000,
-          max_dependency_edges: 40_000,
-          max_files: 20_000,
-        },
-      }),
-    );
-    expect(model.capped).toBe(true);
   });
 });

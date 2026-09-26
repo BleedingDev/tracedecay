@@ -14,8 +14,8 @@ use crate::canonical_text::validated_string_newtype;
 /// Reject values that are not an algorithm-tagged, lowercase-hex integrity
 /// digest: `sha256:`/`blake3:` over 64 hex characters, `sha512:` over 128.
 ///
-/// Every digest newtype in the domain — research, code-intelligence, and
-/// retrieval alike — accepts and rejects exactly this set.
+/// Every digest newtype in the domain, research, code-intelligence, and
+/// retrieval alike, accepts and rejects exactly this set.
 pub(crate) fn validate_integrity_digest(
     value: &str,
     field: &'static str,
@@ -182,10 +182,6 @@ validated_string_newtype!(
     FactEvidenceId,
     FactEventId,
     RetrievalAnchorId,
-    CanonicalSourceOccurrenceSetIdV1,
-    RetrieverContributionIdV1,
-    EvidenceSpanProjectionReceiptIdV1,
-    EvidenceAssemblyPublicationReceiptIdV1,
     PrivacyDomainId,
     ShardId,
     ActorId,

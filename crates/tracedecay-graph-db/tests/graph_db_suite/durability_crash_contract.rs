@@ -9,7 +9,7 @@
 //!    verified generation.
 //! 2. Convergence interrupted before the relational compare-and-swap must leave
 //!    the prior verified snapshot serving and must replay to the identical
-//!    generation once the authority recovers — never half-visible.
+//!    generation once the authority recovers, never half-visible.
 //! 3. A foreign, non-final store shape must be typed `ResetRequired` on open,
 //!    and a fresh recreation must republish from the canonical manifest and
 //!    serve the new verified head.
@@ -302,13 +302,17 @@ impl GraphPublicationStoreV1 for RelationalAuthority {
         self.cas_attempts += 1;
         if self.fail_next_cas {
             self.fail_next_cas = false;
-            return Err(GraphPublicationStoreErrorV1::Infrastructure);
+            return Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "injected compare-and-swap failure".to_owned(),
+            ));
         }
         let record = self
             .records
             .get(&request.publication_key)
             .cloned()
-            .ok_or(GraphPublicationStoreErrorV1::Infrastructure)?;
+            .ok_or_else(|| {
+                GraphPublicationStoreErrorV1::Infrastructure("unstaged test publication".to_owned())
+            })?;
         if self.heads.get(&request.publication_key.projection)
             != request.expected_prior_head.as_ref()
         {
@@ -506,7 +510,7 @@ fn marker_of(snapshot: &VerifiedGraphSnapshot, identity: &GraphProjectionIdentit
 }
 
 /// Writes a Grafeo store carrying a TraceDecay format marker whose schema is
-/// not the final native scalar schema — the foreign/non-final shape the open
+/// not the final native scalar schema, the foreign/non-final shape the open
 /// path must reject as `ResetRequired`.
 fn write_non_final_shape(path: &std::path::Path) {
     let raw = grafeo_engine::GrafeoDB::with_config(
@@ -533,39 +537,29 @@ fn write_non_final_shape(path: &std::path::Path) {
     raw.close().unwrap();
 }
 
-/// Locates the timestamped quarantine directory the corrupt-mount recovery
-/// created beside the container, or `None` before any quarantine ran.
-fn quarantine_directory(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut directories: Vec<_> = std::fs::read_dir(root)
+/// Corrupt-mount recovery deletes the container family outright; no
+/// `.corrupt-` copy may ever appear beside the store.
+fn assert_no_corrupt_copy(root: &std::path::Path) {
+    let copies: Vec<_> = std::fs::read_dir(root)
         .unwrap()
-        .map(|entry| entry.unwrap())
-        .filter(|entry| {
-            entry.file_type().unwrap().is_dir()
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("graph.grafeo.corrupt-"))
-        })
-        .map(|entry| entry.path())
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".corrupt-"))
         .collect();
-    directories.sort();
-    directories.pop()
-}
-
-fn quarantine_receipt(quarantine: &std::path::Path) -> serde_json::Value {
-    serde_json::from_slice(&std::fs::read(quarantine.join("store-quarantined.json")).unwrap())
-        .unwrap()
+    assert!(
+        copies.is_empty(),
+        "corrupt store copies were kept: {copies:?}"
+    );
 }
 
 /// GitHub issue #763: a deterministic corruption verdict on the durable
-/// container was retried identically forever — every mount refaulted, every
+/// container was retried identically forever, every mount refaulted, every
 /// activation refused, and only manual surgery (move the store and WAL aside,
 /// restart) recovered the project. This pins the automatic form of exactly
-/// that recovery: the second identical verdict quarantines the container for
-/// forensics, the mount reopens fresh, and the relational replay journal
-/// re-projects the verified generation without ever advancing the head.
+/// that recovery: the second identical verdict deletes the container, the
+/// mount reopens fresh, and the relational replay journal re-projects the
+/// verified generation without ever advancing the head.
 #[test]
-fn torn_durable_store_is_quarantined_and_rebuilt_from_the_replay_journal() {
+fn torn_durable_store_is_deleted_and_rebuilt_from_the_replay_journal() {
     let temp = TempDir::new().unwrap();
     let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
     let (control, probe) = control_and_probe();
@@ -607,7 +601,7 @@ fn torn_durable_store_is_quarantined_and_rebuilt_from_the_replay_journal() {
 
     // A foreign or corrupt WAL sidecar left beside a checkpointed store is not
     // durable evidence: the reopen serves the last verified generation from the
-    // single file, the relational head is untouched, and nothing quarantines.
+    // single file, the relational head is untouched, and nothing is deleted.
     std::fs::create_dir_all(&sidecar).unwrap();
     std::fs::write(sidecar.join("000001.wal"), vec![0xAB_u8; 4096]).unwrap();
     registered.mount().unwrap();
@@ -627,7 +621,8 @@ fn torn_durable_store_is_quarantined_and_rebuilt_from_the_replay_journal() {
     assert_eq!(marker_of(&after_foreign_sidecar, &identity), "g1");
     drop(after_foreign_sidecar);
     assert_eq!(authority.head(&projection_key), Some(&verified_head));
-    assert!(quarantine_directory(temp.path()).is_none());
+    assert_no_corrupt_copy(temp.path());
+    assert!(sidecar.join("000001.wal").is_file());
     assert!(registered.close().unwrap());
 
     // A torn write in the single durable file is the real crash surface.
@@ -639,37 +634,19 @@ fn torn_durable_store_is_quarantined_and_rebuilt_from_the_replay_journal() {
     let torn = bytes[..bytes.len() / 3].to_vec();
     std::fs::write(&path, &torn).unwrap();
 
-    // The mount re-proves the fault itself and quarantines instead of
-    // faulting: retry #2 with the identical verdict is the terminal state
+    // The mount re-proves the fault itself and deletes the container instead
+    // of faulting: retry #2 with the identical verdict is the terminal state
     // for these bytes, never retry #25.
     registered.mount().unwrap();
-    let quarantine = quarantine_directory(temp.path())
-        .expect("a deterministically corrupt container must be quarantined");
-    assert_eq!(
-        std::fs::read(quarantine.join("graph.grafeo")).unwrap(),
-        torn,
-        "the forensic bytes must move into quarantine unmodified"
-    );
-    let receipt = quarantine_receipt(&quarantine);
-    assert_eq!(
-        receipt["version"].as_str().unwrap(),
-        "tracedecay.graph-store-quarantine.v1"
-    );
-    assert_eq!(receipt["verification_attempts"].as_u64().unwrap(), 2);
-    assert!(
-        receipt["fault"].as_str().unwrap().contains("corrupt")
-            || !receipt["fault"].as_str().unwrap().is_empty(),
-        "the receipt journals the exact fault"
-    );
-    assert!(
-        receipt["fault_fingerprint"]
-            .as_str()
-            .unwrap()
-            .starts_with("sha256:")
+    assert_no_corrupt_copy(temp.path());
+    assert_ne!(
+        std::fs::read(&path).ok().as_deref(),
+        Some(torn.as_slice()),
+        "the torn container must be gone, not served or kept"
     );
 
     // The fresh store refuses the recovered head with a typed mismatch until
-    // the replay journal re-projects it — never a silent empty success.
+    // the replay journal re-projects it, never a silent empty success.
     let pending = registered
         .registry
         .recover_verified_snapshot(
@@ -732,11 +709,11 @@ fn torn_durable_store_is_quarantined_and_rebuilt_from_the_replay_journal() {
 /// the durable WAL phase and exits without closing the store. The abandoned
 /// image is a current-version container plus a live WAL sidecar. After the
 /// parent copies that image, this test corrupts a serialized block so the
-/// CRC fault is deterministic; quarantine must adopt the container *and*
-/// the WAL sidecar so the forensic pair stays together, and the fresh store
-/// must rebuild from the replay journal.
+/// CRC fault is deterministic; recovery must delete the container *and* its
+/// WAL sidecar so no stale journal replays into the fresh store, and the
+/// fresh store must rebuild from the replay journal.
 #[test]
-fn crc_faulted_store_is_quarantined_with_its_wal_sidecar_and_rebuilt() {
+fn crc_faulted_store_is_deleted_with_its_wal_sidecar_and_rebuilt() {
     if let Some(root) = crash_child_root() {
         let registered = write_published_g1_leaving_wal(&root, "crash", "crc");
         mark_durable_phase(&root);
@@ -754,7 +731,7 @@ fn crc_faulted_store_is_quarantined_with_its_wal_sidecar_and_rebuilt() {
 
     // Child publishes g1, reaches the durable WAL phase, and exits without
     // a clean close. That is unclean process exit, not host power-loss. The
-    // abandoned image is copied only after the child is reaped — never while
+    // abandoned image is copied only after the child is reaped, never while
     // a live Windows handle still owns the store (issue #933).
     let crash = TempDir::new().unwrap();
     capture_unclean_crash_image(crash.path());
@@ -781,7 +758,7 @@ fn crc_faulted_store_is_quarantined_with_its_wal_sidecar_and_rebuilt() {
 
     // Flip authoritative leading bytes while keeping the length: the store
     // is still current-sized but its serialized sections no longer match
-    // their checksums. The physical midpoint is not a valid target — the
+    // their checksums. The physical midpoint is not a valid target, the
     // format may leave aligned padding there, outside every section
     // checksum (see verified_generation_contract/verify_once.rs).
     let mut bytes = std::fs::read(&crashed_container).unwrap();
@@ -795,38 +772,21 @@ fn crc_faulted_store_is_quarantined_with_its_wal_sidecar_and_rebuilt() {
     let crashed = RegisteredGraph::new(crash.path()).unwrap();
     crashed.mount().unwrap();
 
-    let quarantine =
-        quarantine_directory(crash.path()).expect("a CRC-faulted container must be quarantined");
-    assert_eq!(
-        std::fs::read(quarantine.join("graph.grafeo")).unwrap(),
-        corrupted,
-        "the corrupted container bytes are forensic evidence and move unmodified"
+    assert_no_corrupt_copy(crash.path());
+    assert_ne!(
+        std::fs::read(&crashed_container).ok().as_deref(),
+        Some(corrupted.as_slice()),
+        "the corrupted container must be deleted"
     );
-    let quarantined_sidecar = quarantine.join("graph.grafeo.wal");
+    // The fresh WalSync store legitimately creates its own new sidecar at the
+    // live path, and its format-header segment is byte-identical to the old
+    // one; the old journal as a whole must be gone.
     assert!(
-        quarantined_sidecar.is_dir(),
-        "the WAL sidecar must move with its container"
+        wal_segments.iter().any(|(segment, old_bytes)| {
+            std::fs::read(crashed_sidecar.join(segment)).ok().as_ref() != Some(old_bytes)
+        }),
+        "the old WAL journal must be deleted with its container"
     );
-    // The quarantined segments are the exact pre-mount forensic bytes. The
-    // fresh WalSync store legitimately creates its own new sidecar at the
-    // live path; the old journal is provably not beside it because every
-    // old segment now lives in quarantine with unmodified content.
-    for (segment, expected_bytes) in &wal_segments {
-        assert_eq!(
-            &std::fs::read(quarantined_sidecar.join(segment)).unwrap(),
-            expected_bytes,
-            "WAL segment {segment} must be retained in quarantine unmodified"
-        );
-    }
-    let receipt = quarantine_receipt(&quarantine);
-    let members: Vec<&str> = receipt["members"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|member| member.as_str().unwrap())
-        .collect();
-    assert!(members.contains(&"graph.grafeo"));
-    assert!(members.contains(&"graph.grafeo.wal"));
 
     // The journal rebuild serves the exact verified generation again.
     let rebuilt = crashed
@@ -849,15 +809,13 @@ fn crc_faulted_store_is_quarantined_with_its_wal_sidecar_and_rebuilt() {
     assert_eq!(authority.head(&projection_key), Some(&verified_head));
 }
 
-/// The compare-and-swap discipline for the quarantine decision itself: an
+/// The compare-and-swap discipline for the corruption decision itself: an
 /// authority that does not hold the decision lock must neither re-verify nor
-/// sweep the store — another incarnation may be mid-recovery. The refusal is
+/// sweep the store, another incarnation may be mid-recovery. The refusal is
 /// a retryable typed unavailable, not a retained terminal fault, so the next
 /// mount attempt (after the holder releases) completes the recovery.
 #[test]
-fn held_quarantine_decision_defers_the_mount_and_the_next_attempt_recovers() {
-    use fs2::FileExt;
-
+fn held_corruption_decision_defers_the_mount_and_the_next_attempt_recovers() {
     let temp = TempDir::new().unwrap();
     let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
     let (control, probe) = control_and_probe();
@@ -893,8 +851,8 @@ fn held_quarantine_decision_defers_the_mount_and_the_next_attempt_recovers() {
     let torn = bytes[..bytes.len() / 3].to_vec();
     std::fs::write(&path, &torn).unwrap();
 
-    // A foreign incarnation holds the quarantine decision.
-    let lock_path = temp.path().join("graph.grafeo.quarantine-lock");
+    // A foreign incarnation holds the corruption decision.
+    let lock_path = temp.path().join("graph.grafeo.corruption-lock");
     let foreign_holder = std::fs::OpenOptions::new()
         .create(true)
         .read(true)
@@ -902,7 +860,10 @@ fn held_quarantine_decision_defers_the_mount_and_the_next_attempt_recovers() {
         .truncate(false)
         .open(&lock_path)
         .unwrap();
-    foreign_holder.try_lock_exclusive().unwrap();
+    foreign_holder
+        .try_lock()
+        .map_err(std::io::Error::from)
+        .unwrap();
 
     let deferred = registered.mount().unwrap_err();
     assert!(
@@ -913,19 +874,18 @@ fn held_quarantine_decision_defers_the_mount_and_the_next_attempt_recovers() {
     assert_eq!(
         std::fs::read(&path).unwrap(),
         torn,
-        "a non-holder must not move or modify the store"
+        "a non-holder must not delete or modify the store"
     );
-    assert!(quarantine_directory(temp.path()).is_none());
 
     // Once the holder releases, the same mount request completes the
-    // quarantine and rebuild instead of remaining faulted.
-    FileExt::unlock(&foreign_holder).unwrap();
+    // deletion and rebuild instead of remaining faulted.
+    foreign_holder.unlock().unwrap();
     registered.mount().unwrap();
-    let quarantine = quarantine_directory(temp.path())
-        .expect("the released decision lock lets the next mount quarantine");
-    assert_eq!(
-        std::fs::read(quarantine.join("graph.grafeo")).unwrap(),
-        torn
+    assert_no_corrupt_copy(temp.path());
+    assert_ne!(
+        std::fs::read(&path).ok().as_deref(),
+        Some(torn.as_slice()),
+        "the released decision lock lets the next mount delete the torn store"
     );
 }
 
@@ -1126,7 +1086,7 @@ fn reset_required_shape_is_recreated_fresh_and_republished_from_the_manifest() {
     assert_eq!(marker_of(&snapshot, &identity), "g1");
 }
 
-/// Highest sequence among non-empty `wal_<sequence>.log` segments — the same
+/// Highest sequence among non-empty `wal_<sequence>.log` segments, the same
 /// replay-debt signal the open-time collapse gates on.
 fn newest_wal_segment(sidecar: &std::path::Path) -> Option<u64> {
     let entries = std::fs::read_dir(sidecar).ok()?;

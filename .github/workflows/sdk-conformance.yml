@@ -1,7 +1,8 @@
 name: SDK conformance
 
 on:
-  pull_request:
+  push:
+    branches: [master]
     paths:
       - ".github/workflows/**"
       - ".github/release-targets.json"
@@ -11,8 +12,11 @@ on:
       - "crates/tracedecay-domain/**"
       - "crates/tracedecay-sdk/**"
       - "crates/tracedecay-tool-catalog/**"
+      - "dashboard/codegen/**"
+      - "dashboard/package.json"
       - "sdks/**"
-      - "scripts/check-sdk-codegen.sh"
+      - "pnpm-lock.yaml"
+      - "pnpm-workspace.yaml"
       - "scripts/check-sdk-publish-workflow.py"
       - "scripts/test-check-sdk-publish-workflow.py"
       - "scripts/check-github-hosted-runners.py"
@@ -22,8 +26,7 @@ on:
       - "scripts/plan-release-recovery.py"
       - "scripts/test-plan-release-recovery.py"
       - "tests/release_safety_test.sh"
-  push:
-    branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -75,16 +78,17 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: sdks/typescript/package-lock.json
-      - run: cargo test --manifest-path sdks/codegen/Cargo.toml
-      - run: scripts/check-sdk-codegen.sh
+      - uses: ./.github/actions/setup-pnpm
+      # Cargo reads .cargo/config.toml from the working directory, and the
+      # codegen workspace has its own pnpm-vendored sources and lockfile.
+      - run: cargo test
+        working-directory: sdks/codegen
+      - run: pnpm run contracts:check
+        working-directory: dashboard
       - run: cargo test --manifest-path crates/tracedecay-sdk/Cargo.toml
-      - run: npm ci
+      - run: pnpm run typecheck
         working-directory: sdks/typescript
-      - run: npm run typecheck
-        working-directory: sdks/typescript
-      - run: npm test
+      - run: pnpm test
         working-directory: sdks/typescript
 
   production-router:
@@ -97,23 +101,18 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            dashboard/package-lock.json
-            sdks/typescript/package-lock.json
-      - run: npm ci
-        working-directory: dashboard
-      - run: npm run build
+      - uses: ./.github/actions/setup-pnpm
+      - run: pnpm run build
         working-directory: dashboard
       - run: cargo build -p tracedecay-cli --bin tracedecay
+      # This job owns every sdk_suite test that needs the production daemon.
+      # It is the only job that builds one, so an unfiltered run is what keeps
+      # a daemon-backed test from silently never executing anywhere.
       - run: >-
           cargo nextest run
           --manifest-path crates/tracedecay-sdk/Cargo.toml
           --test sdk_suite
-          -E 'test(/^production_daemon::/)'
           --run-ignored all
           --no-tests=fail
-      - run: npm ci
-        working-directory: sdks/typescript
-      - run: npm run test:installed
+      - run: pnpm run test:installed
         working-directory: sdks/typescript

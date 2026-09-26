@@ -61,7 +61,8 @@ impl NativeContextScoutLifecycleV1 {
     pub fn matches_envelope(&self, envelope: &HookEventEnvelopeV2) -> bool {
         matches!(
             envelope.producer,
-            crate::HookHostV1::KimiCode | crate::HookHostV1::OpenCode
+            tracedecay_domain::NativeHostIdentityV1::KimiCode
+                | tracedecay_domain::NativeHostIdentityV1::OpenCode
         ) && <[u8; 32]>::from(Sha256::digest(self.session_id.as_str().as_bytes()))
             == envelope.protected_session_id
             && self.event_id == envelope.event_id
@@ -237,6 +238,8 @@ pub fn decode_native_hook_event(
         NativeHostIdentityV1::Kiro => decode_kiro(&raw)?,
         NativeHostIdentityV1::KimiCode => decode_kimi(&raw)?,
         NativeHostIdentityV1::OpenCode => decode_opencode_event(&raw)?,
+        NativeHostIdentityV1::Pi => decode_pi(&raw)?,
+        NativeHostIdentityV1::FactoryDroid => decode_droid(&raw)?,
         NativeHostIdentityV1::Cline
         | NativeHostIdentityV1::RooCode
         | NativeHostIdentityV1::Kilo => {
@@ -567,6 +570,30 @@ struct KimiStopEvent {
     _stop_hook_active: IgnoredAny,
 }
 
+/// The lifecycle payload the TraceDecay Pi extension writes for Pi's
+/// in-process `session_start` and `agent_end` events.
+#[derive(Deserialize)]
+struct PiLifecycleEvent {
+    id: String,
+    session_id: String,
+    #[serde(rename = "cwd")]
+    _cwd: IgnoredAny,
+}
+
+/// The lifecycle payload Factory Droid writes for its `SessionStart` and
+/// `Stop` hooks (`~/.factory/hooks.json` commands receive one JSON object on
+/// stdin; see fixtures/host_events/droid.json for the captured shape).
+#[derive(Deserialize)]
+struct DroidLifecycleEvent {
+    session_id: String,
+    #[serde(rename = "transcript_path")]
+    _transcript_path: IgnoredAny,
+    #[serde(rename = "cwd")]
+    _cwd: IgnoredAny,
+    #[serde(rename = "permission_mode")]
+    _permission_mode: IgnoredAny,
+}
+
 #[derive(Deserialize)]
 struct OpenCodeEventProperties {
     file: Option<String>,
@@ -780,6 +807,32 @@ fn decode_kimi(raw: &Value) -> Result<NativeHookSignalV1, NativeHookDecodeError>
         }
         _ => Err(NativeHookDecodeError::UnsupportedNativeEvent),
     }
+}
+
+fn decode_pi(raw: &Value) -> Result<NativeHookSignalV1, NativeHookDecodeError> {
+    let boundary = match event_name(raw, "hook_event_name")? {
+        "session_start" => HookBoundaryV1::Start,
+        "agent_end" => HookBoundaryV1::TurnComplete,
+        _ => return Err(NativeHookDecodeError::UnsupportedNativeEvent),
+    };
+    let event = decode_shape::<PiLifecycleEvent>(raw)?;
+    if event.id.is_empty() || event.session_id.is_empty() {
+        return Err(NativeHookDecodeError::MissingTypedIdentity);
+    }
+    Ok(NativeHookSignalV1::SessionBoundary(boundary))
+}
+
+fn decode_droid(raw: &Value) -> Result<NativeHookSignalV1, NativeHookDecodeError> {
+    let boundary = match event_name(raw, "hook_event_name")? {
+        "SessionStart" => HookBoundaryV1::Start,
+        "Stop" => HookBoundaryV1::TurnComplete,
+        _ => return Err(NativeHookDecodeError::UnsupportedNativeEvent),
+    };
+    let event = decode_shape::<DroidLifecycleEvent>(raw)?;
+    if event.session_id.is_empty() {
+        return Err(NativeHookDecodeError::MissingTypedIdentity);
+    }
+    Ok(NativeHookSignalV1::SessionBoundary(boundary))
 }
 
 fn decode_opencode_event(raw: &Value) -> Result<NativeHookSignalV1, NativeHookDecodeError> {
@@ -1007,6 +1060,16 @@ mod tests {
                 include_bytes!("../fixtures/host_events/kimi/stop.json"),
                 NativeHookSignalV1::SessionBoundary(HookBoundaryV1::TurnComplete),
             ),
+            (
+                NativeHostIdentityV1::Pi,
+                include_bytes!("../fixtures/host_events/pi/session-start.json"),
+                NativeHookSignalV1::SessionBoundary(HookBoundaryV1::Start),
+            ),
+            (
+                NativeHostIdentityV1::Pi,
+                include_bytes!("../fixtures/host_events/pi/agent-end.json"),
+                NativeHookSignalV1::SessionBoundary(HookBoundaryV1::TurnComplete),
+            ),
         ];
 
         for (host, payload, signal) in captures {
@@ -1052,6 +1115,96 @@ mod tests {
                 .unwrap()
                 .ordering,
             HookOrderingV1::Unknown
+        );
+    }
+
+    #[test]
+    fn pi_evidence_catalog_requests_are_the_checked_in_captures() {
+        let catalog = include_str!("../fixtures/host_events/pi.json");
+        for (identity, capture, signal) in [
+            (
+                "session_start",
+                &include_bytes!("../fixtures/host_events/pi/session-start.json")[..],
+                NativeHookSignalV1::SessionBoundary(HookBoundaryV1::Start),
+            ),
+            (
+                "stop",
+                &include_bytes!("../fixtures/host_events/pi/agent-end.json")[..],
+                NativeHookSignalV1::SessionBoundary(HookBoundaryV1::TurnComplete),
+            ),
+        ] {
+            let request = fixture_request(catalog, identity);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request).unwrap(),
+                serde_json::from_slice::<Value>(capture).unwrap(),
+                "{identity} catalog request drifted from its capture"
+            );
+            assert_eq!(
+                decode_native_hook_event(NativeHostIdentityV1::Pi, &request)
+                    .unwrap()
+                    .signal,
+                signal
+            );
+        }
+    }
+
+    #[test]
+    fn pi_lifecycle_requires_its_own_event_and_session_identity() {
+        let agent_end = include_bytes!("../fixtures/host_events/pi/agent-end.json");
+        let mut payload = serde_json::from_slice::<Value>(agent_end).unwrap();
+        payload["session_id"] = Value::String(String::new());
+        assert_eq!(
+            decode_native_hook_event(
+                NativeHostIdentityV1::Pi,
+                &serde_json::to_vec(&payload).unwrap()
+            ),
+            Err(NativeHookDecodeError::MissingTypedIdentity)
+        );
+        payload["hook_event_name"] = Value::String("tool_result".to_owned());
+        assert_eq!(
+            decode_native_hook_event(
+                NativeHostIdentityV1::Pi,
+                &serde_json::to_vec(&payload).unwrap()
+            ),
+            Err(NativeHookDecodeError::UnsupportedNativeEvent)
+        );
+        // Another host's event shape never decodes as a Pi boundary.
+        assert_eq!(
+            decode_native_hook_event(
+                NativeHostIdentityV1::Pi,
+                include_bytes!("../fixtures/host_events/codex/stop.json")
+            ),
+            Err(NativeHookDecodeError::UnsupportedNativeEvent)
+        );
+    }
+
+    #[test]
+    fn droid_lifecycle_requires_its_own_event_and_session_identity() {
+        let stop = include_bytes!("../fixtures/host_events/droid/stop.json");
+        let mut payload = serde_json::from_slice::<Value>(stop).unwrap();
+        payload["session_id"] = Value::String(String::new());
+        assert_eq!(
+            decode_native_hook_event(
+                NativeHostIdentityV1::FactoryDroid,
+                &serde_json::to_vec(&payload).unwrap()
+            ),
+            Err(NativeHookDecodeError::MissingTypedIdentity)
+        );
+        payload["hook_event_name"] = Value::String("PreToolUse".to_owned());
+        assert_eq!(
+            decode_native_hook_event(
+                NativeHostIdentityV1::FactoryDroid,
+                &serde_json::to_vec(&payload).unwrap()
+            ),
+            Err(NativeHookDecodeError::UnsupportedNativeEvent)
+        );
+        // Another host's event shape never decodes as a Droid boundary.
+        assert_eq!(
+            decode_native_hook_event(
+                NativeHostIdentityV1::FactoryDroid,
+                include_bytes!("../fixtures/host_events/pi/agent-end.json")
+            ),
+            Err(NativeHookDecodeError::UnsupportedNativeEvent)
         );
     }
 

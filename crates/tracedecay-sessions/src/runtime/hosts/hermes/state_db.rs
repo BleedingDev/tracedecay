@@ -50,7 +50,7 @@ impl HermesReadSql {
     }
 }
 
-/// Column names of the `messages` table — `active` (v12 rewind soft-delete)
+/// Column names of the `messages` table, `active` (v12 rewind soft-delete)
 /// and `reasoning` arrived in later Hermes schema revisions, so the sweep
 /// probes before selecting to stay readable on legacy stores.
 pub async fn message_columns(
@@ -512,7 +512,7 @@ pub(super) async fn try_ingest_state_db_bounded_with_admission(
         resume_fingerprint,
         budget,
         |bounded| {
-            let locations = turn_project_locations(bounded, project_root, source);
+            let locations = turn_project_locations(bounded, project_root);
             move |row: &HermesRow| {
                 locations.get(&row.id).copied().map(|provenance| {
                     project_projection_metadata(row, source, project_root, provenance)
@@ -574,7 +574,6 @@ pub(super) async fn try_ingest_state_db_for_projects(
                 turn_project_locations_for_destinations(
                     bounded,
                     &destination_matchers,
-                    source,
                     &mut destination_routes,
                 )
             })
@@ -656,10 +655,7 @@ pub(super) async fn try_ingest_user_state_db_bounded_with_admission(
         |bounded| {
             let locations = user_turn_locations(bounded, source);
             let profile = source.profile.clone();
-            let fallback_provenance = source
-                .legacy_project_pin
-                .as_ref()
-                .map_or("session_cwd", |_| "profile_pin");
+            let fallback_provenance = "session_cwd";
             move |row: &HermesRow| {
                 locations
                     .contains(&row.id)

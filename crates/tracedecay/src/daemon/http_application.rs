@@ -30,10 +30,10 @@ use tracedecay_contracts::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
 use tracedecay_contracts::remote::status::RemoteOperationalStatusReadV1;
 use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, SdkRequestIdControlV1};
 use tracedecay_contracts::{
-    APPLICATION_REQUEST_ID_HEADER, ApplicationProblem, LegalAction, RequestId, RetryDirective,
-    SafeDiagnostic,
+    APPLICATION_REQUEST_ID_HEADER, ApplicationProblem, RequestId, RetryDirective, SafeDiagnostic,
 };
 use tracedecay_daemon_control::RemoteBrainTlsConfig;
+use tracedecay_daemon_service::logging::unavailable_error;
 use tracedecay_daemon_service::remote_http_transport::RemoteBrainTlsListener;
 #[cfg(test)]
 use tracedecay_daemon_service::remote_http_transport::{
@@ -532,7 +532,10 @@ async fn provision_remote_node(
     .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(_) => StatusCode::CONFLICT.into_response(),
+        Err(error) => {
+            tracing::error!(%error, "remote node provision failed");
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
     }
 }
 
@@ -568,9 +571,7 @@ pub fn live_remote_operational_status() -> Result<RemoteOperationalStatusReadV1>
             message: "TraceDecay daemon HTTP application endpoint is not published. Start or restart the daemon.".to_owned(),
         });
     };
-    let Some(auth_token) = connection.auth_token.as_deref() else {
-        return Err(missing_daemon_authority());
-    };
+    let auth_token = connection.auth_token();
     let origin = format!("http://{endpoint}");
     let url = format!("http://{endpoint}/remote-status");
     let agent = ureq::Agent::config_builder()
@@ -607,17 +608,9 @@ pub fn live_remote_operational_status() -> Result<RemoteOperationalStatusReadV1>
     })
 }
 
-fn missing_daemon_authority() -> TraceDecayError {
-    TraceDecayError::Config {
-        message:
-            "TraceDecay daemon authority record is not available. Start or restart the daemon."
-                .to_owned(),
-    }
-}
-
 fn remote_status_daemon_unavailable() -> TraceDecayError {
     match tracedecay_daemon_control::default_socket_path() {
-        Ok(socket_path) => super::unavailable_error(&socket_path),
+        Ok(socket_path) => unavailable_error(&socket_path),
         Err(error) => error,
     }
 }
@@ -720,11 +713,7 @@ fn project_router_problem_response(
             ) else {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             };
-            ApplicationProblem::Saturated {
-                diagnostic,
-                retry: RetryDirective::AfterDelay,
-                legal_actions: vec![LegalAction::Retry],
-            }
+            ApplicationProblem::saturated(diagnostic.code, diagnostic.message)
         }
         ProjectRouterProblem::TimedOut => ApplicationProblem::timed_out_before_admission(),
         ProjectRouterProblem::Unavailable => {

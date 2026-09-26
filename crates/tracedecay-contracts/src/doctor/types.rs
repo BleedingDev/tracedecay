@@ -27,7 +27,7 @@ use crate::identity::application_identifier;
 #[serde(rename_all = "snake_case")]
 pub enum DoctorFindingFamilyV1 {
     /// advisory/scout findings (GitHub review, CI localization,
-    /// proximity, context scout) — `crate::advisory` / domain feedback.
+    /// proximity, context scout): `crate::advisory` / domain feedback.
     Advisory,
     /// Desired-versus-effective configuration and compatibility drift from
     /// `ProjectConfigurationRuntime` / `ConfigurationControlPlane`.
@@ -37,8 +37,8 @@ pub enum DoctorFindingFamilyV1 {
     StorageRuntime,
     /// Storage retention, size, and efficiency over canonical observability
     /// read models. Distinct from [`Self::StorageRuntime`] health: this
-    /// family surfaces over-budget stores, identity-drift orphans, quarantined
-    /// incident debris, and retention backlog. The typed
+    /// family surfaces over-budget stores, identity-drift orphans, incident
+    /// debris, and retention backlog. The typed
     /// subclass vocabulary is [`DoctorStorageFindingKindV1`].
     Storage,
     /// Language-server / analyzer engine status from the LSP gateway's
@@ -50,6 +50,10 @@ pub enum DoctorFindingFamilyV1 {
     /// Denominator-safe measurement and telemetry health from analytics,
     /// accounting read models, and session ingest.
     Observability,
+    /// Retained daemon memory as the resident-memory inventory reports it:
+    /// RSS against the admission limit and pressure line, and each retained
+    /// owner's bytes.
+    Memory,
 }
 
 /// Typed subclasses of the [`DoctorFindingFamilyV1::Storage`] finding family.
@@ -68,8 +72,8 @@ pub enum DoctorStorageFindingKindV1 {
     /// A store whose project identity no longer resolves to a live repository
     /// root (identity-drift orphan), reported with age and size.
     OrphanStore,
-    /// Quarantined recovery/corruption artifacts are present and awaiting
-    /// collection.
+    /// Recovery/corruption artifacts are present beside a store and awaiting
+    /// deletion.
     IncidentDebrisPresent,
     /// Retention-eligible rows or stores are past their window and awaiting
     /// offload/collection.
@@ -269,7 +273,7 @@ impl DoctorFindingV1 {
     /// 1. Every finding cites at least one typed evidence reference.
     /// 2. Evidence references are unique (no duplicates).
     /// 3. A [`DoctorEvidenceStateV1::HealthyCompleteCoverage`] finding requires
-    ///    [`DoctorCoverageCompletenessV1::Complete`] coverage — partial or
+    ///    [`DoctorCoverageCompletenessV1::Complete`] coverage. Partial or
     ///    unknown coverage never collapses into a healthy claim.
     pub fn new(
         family: DoctorFindingFamilyV1,

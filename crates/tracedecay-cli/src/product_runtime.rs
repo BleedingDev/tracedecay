@@ -3,7 +3,7 @@
 //! embeds.
 //!
 //! `build.rs` resolves source provenance (verified git worktree, release env,
-//! or `cargo package` VCS journal — a build with none fails) and validates the
+//! or `cargo package` VCS journal, a build with none fails) and validates the
 //! dashboard bundle into `$OUT_DIR/product_runtime_generated.rs`; this module
 //! is that file's only mount point and assembles the provider `main` registers
 //! into the composition library at process start.
@@ -30,17 +30,18 @@ pub(crate) use generated::PRODUCT_FULL_SHA;
 /// fixture may call this unconditionally.
 #[cfg(test)]
 pub(crate) fn register_for_tests() {
-    match tracedecay::register_product_runtime(provider()) {
-        Ok(()) | Err(tracedecay::ProductRuntimeError::ConflictingProvider) => {}
+    match tracedecay_project::product_runtime::register_product_runtime(provider()) {
+        Ok(())
+        | Err(tracedecay_project::product_runtime::ProductRuntimeError::ConflictingProvider) => {}
         Err(error) => panic!("register the CLI product runtime for tests: {error}"),
     }
     crate::cloud::admit_sync_probes();
 }
 
-pub(crate) fn provider() -> tracedecay::ProductRuntimeProvider {
-    tracedecay::ProductRuntimeProvider {
+pub(crate) fn provider() -> tracedecay_project::product_runtime::ProductRuntimeProvider {
+    tracedecay_project::product_runtime::ProductRuntimeProvider {
         release_version: env!("CARGO_PKG_VERSION"),
-        source: tracedecay::ProductSourceProvenance {
+        source: tracedecay_project::product_runtime::ProductSourceProvenance {
             full_sha: generated::PRODUCT_FULL_SHA,
             dirty: generated::PRODUCT_SOURCE_DIRTY,
         },

@@ -35,10 +35,10 @@ use tracedecay_store::{
     AnchoredObservationWrite, ObservationPersistOutcome, ObservationProjectionStore,
     ObservationStore, ObservationWrite, SessionRefreshBeginOrJoinRequestV1,
     SessionRefreshFrontierV1, SessionRefreshStore, build_observation_resolution_authorization_v1,
-    build_observation_retrieval_anchor_v2,
+    build_observation_retrieval_anchor,
 };
 
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::serving::{
     SessionProjectionServingState, SessionProjectionServingStatusPort, SessionProjectionStaleReason,
@@ -364,7 +364,7 @@ fn healthy_provider_observation(provider: &str, session: &str) -> AnchoredObserv
     let authorization =
         build_observation_resolution_authorization_v1(write.observation(), "history-scheduler")
             .expect("fixture resolution authorization");
-    let anchor = build_observation_retrieval_anchor_v2(
+    let anchor = build_observation_retrieval_anchor(
         write.observation(),
         generation.clone(),
         UtcMicros(1),
@@ -620,8 +620,8 @@ async fn shutdown_cancels_and_joins_in_flight_history_pass() {
 }
 
 /// A saturated daemon-wide historical-ingest admission defers the pass as
-/// typed retryable state — the ingestor never runs, the worker keeps cycling
-/// (serving stays available) — and the deferred pass runs once a permit
+/// typed retryable state, the ingestor never runs, the worker keeps cycling
+/// (serving stays available), and the deferred pass runs once a permit
 /// frees, so a huge backlog on other stores cannot wedge this one.
 #[tokio::test]
 async fn saturated_history_admission_defers_the_pass_and_resumes() {

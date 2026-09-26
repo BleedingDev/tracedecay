@@ -2,6 +2,7 @@ pub(crate) use std::fs;
 pub(crate) use std::path::{Path, PathBuf};
 pub(crate) use std::process::Command;
 pub(crate) use std::sync::Arc;
+pub(crate) use std::sync::atomic::{AtomicBool, Ordering};
 pub(crate) use std::thread;
 
 pub(crate) use crate::common::{
@@ -12,13 +13,14 @@ pub(crate) use crate::common::{
 pub(crate) use crate::runtime::DashboardTestRuntimeV1;
 pub(crate) use serde_json::Value;
 pub(crate) use tempfile::TempDir;
-pub(crate) use tracedecay::config::USER_DATA_DIR_ENV;
 pub(crate) use tracedecay::dashboard;
-pub(crate) use tracedecay::project::TraceDecay;
 pub(crate) use tracedecay_domain::{
     ActorId, Confidence, FactCategoryV1, FactEventId, FactId, ProjectId,
 };
 pub(crate) use tracedecay_lcm::{LcmSourceRef, LcmSummaryNodeDraft};
+pub(crate) use tracedecay_project::project::TraceDecay;
+pub(crate) use tracedecay_runtime_core::config::USER_DATA_DIR_ENV;
+pub(crate) use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 pub(crate) use tracedecay_sessions::admission::HostAdmissionScope;
 pub(crate) use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
@@ -81,7 +83,7 @@ pub(crate) struct DashboardFixture {
     pub(crate) base_url: String,
     pub(crate) project_root: std::path::PathBuf,
     pub(crate) host_runtime: Arc<DashboardTestRuntimeV1>,
-    pub(crate) project_graphs: dashboard::DashboardTestProjectGraphsV1,
+    pub(crate) project_graphs: tracedecay_dashboard_api::DashboardTestProjectGraphsV1,
     pub(crate) server: DashboardServer,
 }
 
@@ -116,19 +118,35 @@ impl Drop for DashboardServer {
 pub(crate) fn spawn_dashboard_server_with_host_runtime(
     cg: TraceDecay,
     host_runtime: Arc<DashboardTestRuntimeV1>,
-    project_graphs: dashboard::DashboardTestProjectGraphsV1,
+    project_graphs: tracedecay_dashboard_api::DashboardTestProjectGraphsV1,
     port: u16,
 ) -> DashboardServer {
-    spawn_dashboard_server_with_runner(cg, Some((host_runtime, project_graphs)), false, None, port)
+    spawn_dashboard_server_with_runner(
+        cg,
+        Some((host_runtime, project_graphs)),
+        false,
+        None,
+        None,
+        None,
+        port,
+    )
 }
 
 pub(crate) fn spawn_dashboard_server_with_configuration_runtime(
     cg: TraceDecay,
     host_runtime: Arc<DashboardTestRuntimeV1>,
-    project_graphs: dashboard::DashboardTestProjectGraphsV1,
+    project_graphs: tracedecay_dashboard_api::DashboardTestProjectGraphsV1,
     port: u16,
 ) -> DashboardServer {
-    spawn_dashboard_server_with_runner(cg, Some((host_runtime, project_graphs)), true, None, port)
+    spawn_dashboard_server_with_runner(
+        cg,
+        Some((host_runtime, project_graphs)),
+        true,
+        None,
+        None,
+        None,
+        port,
+    )
 }
 
 /// Test-only mount point for a fake `DashboardDeliveryReadPortV1` and a fake
@@ -145,10 +163,14 @@ fn spawn_dashboard_server_with_runner(
     cg: TraceDecay,
     host_authority: Option<(
         Arc<DashboardTestRuntimeV1>,
-        dashboard::DashboardTestProjectGraphsV1,
+        tracedecay_dashboard_api::DashboardTestProjectGraphsV1,
     )>,
     mount_configuration_runtime: bool,
     delivery_authority: Option<FakeDeliveryAuthority>,
+    git_correlation_authority: Option<
+        Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>,
+    >,
+    project_open: Option<Arc<AtomicBool>>,
     port: u16,
 ) -> DashboardServer {
     let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -160,7 +182,7 @@ fn spawn_dashboard_server_with_runner(
                 Some(authority) => authority,
                 None => (
                     open_dashboard_host_runtime(&cg).await,
-                    dashboard::DashboardTestProjectGraphsV1::default(),
+                    tracedecay_dashboard_api::DashboardTestProjectGraphsV1::default(),
                 ),
             };
             let authority = if mount_configuration_runtime {
@@ -182,16 +204,41 @@ fn spawn_dashboard_server_with_runner(
                     .with_code_index_freshness_reader(code_index_freshness_reader),
                 None => authority,
             };
+            let authority = match git_correlation_authority {
+                Some(git_correlation) => {
+                    authority.with_git_correlation_read_authority(git_correlation)
+                }
+                None => authority,
+            };
+            let authority = match project_open {
+                Some(project_open) => {
+                    let admitted = authority.project_session_authorities();
+                    authority.with_opening_project_sessions(Arc::new(move || {
+                        let resolution = if project_open.load(Ordering::SeqCst) {
+                            tracedecay_dashboard_api::DashboardSessionResolutionV1::Ready(
+                                admitted.clone(),
+                            )
+                        } else {
+                            tracedecay_dashboard_api::DashboardSessionResolutionV1::Opening
+                        };
+                        Box::pin(async move { resolution })
+                    }))
+                }
+                None => authority,
+            };
             let result = dashboard::run_until_shutdown_for_tests_with_host_admission(
                 cg.clone(),
                 authority,
                 project_graphs,
-                dashboard::DashboardTestEndpointV1 {
+                tracedecay_dashboard_api::DashboardTestEndpointV1 {
                     host: "127.0.0.1",
                     port,
                 },
-                tracedecay::product_runtime::register_fixture_product_runtime().build_version(),
-                dashboard::spa_router(tracedecay::product_runtime::FIXTURE_DASHBOARD_ASSETS),
+                tracedecay_project::product_runtime::register_fixture_product_runtime()
+                    .build_version(),
+                tracedecay_api::static_dashboard_router(std::sync::Arc::new(
+                    tracedecay_project::product_runtime::FIXTURE_DASHBOARD_ASSETS,
+                )),
                 async move {
                     let _ = shutdown_rx.await;
                 },
@@ -240,7 +287,7 @@ pub(crate) async fn setup_project(
             });
     let profile_root = tracedecay_runtime_core::storage::default_profile_root()
         .unwrap_or_else(|error| panic!("resolve dashboard fixture profile root: {error}"));
-    let open_options = tracedecay::project::TraceDecayOpenOptions {
+    let open_options = tracedecay_project::project::TraceDecayOpenOptions {
         profile_root: Some(profile_root.clone()),
         global_db_path: None,
     };
@@ -552,7 +599,7 @@ pub(crate) fn fixture_fact_id(
 ) -> FactId {
     let (status, overview) = get_json(
         agent,
-        &format!("{}/api/plugins/holographic/?limit=100", fixture.base_url),
+        &format!("{}/api/plugins/holographic?limit=100", fixture.base_url),
     );
     assert_eq!(status, 200, "dashboard fixture overview must succeed");
     overview["payload"]["holographic"]["facts"]
@@ -647,20 +694,11 @@ pub(crate) async fn seed_lcm_fixture(runtime: &DashboardTestRuntimeV1, project_p
 
     for message in messages {
         // Production ingest persists every message as a canonical durable
-        // observation (which projects the session_messages row itself) plus
-        // the raw LCM payload row; the session-temporal refresh discovers
-        // sessions ONLY from the observation effects, so the fixture walks
-        // the same two writes instead of raw session_messages upserts the
-        // temporal projection would never see.
-        runtime
-            .lcm_ingest_raw_message_for_test(HostAdmissionScope::Project, &message)
-            .await
-            .unwrap_or_else(|error| {
-                panic!(
-                    "failed to ingest raw LCM fixture message {}: {error}",
-                    message.message_id
-                )
-            });
+        // observation whose projection is the sole writer of its
+        // `lcm_raw_messages` row. A second raw write of the same message would
+        // make that projection an output collision with no temporal output,
+        // and the session-temporal refresh discovers sessions only from
+        // output-producing observation effects.
         runtime
             .seed_session_message_observation_for_test(
                 tracedecay::dashboard::observation_seed::DashboardSessionMessageSeedV1 {
@@ -756,6 +794,51 @@ pub(crate) fn post_json_body(agent: &ureq::Agent, url: &str, body: &Value) -> (u
         agent.post(url).send_json(body)
     });
     response_to_json(response)
+}
+
+/// Binds `codex_bin` as the project's configured `codex` summarizer through
+/// the dashboard's application configuration routes: the automation backend
+/// spawns only the executable `lcm.summarizer_executables.v1` names.
+pub(crate) fn configure_codex_summarizer(
+    agent: &ureq::Agent,
+    base_url: &str,
+    project_id: &str,
+    codex_bin: &Path,
+) {
+    let key = tracedecay_domain::configuration::LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY;
+    let configuration_url = format!("{base_url}/api/application/configuration");
+    let (status, current) = post_json_body(
+        agent,
+        &format!("{configuration_url}/configuration_get"),
+        &serde_json::json!({ "key": key }),
+    );
+    assert_eq!(status, 200, "configuration read failed: {current}");
+    let expected_revision = current
+        .pointer("/value/outcome/value/payload/revision_id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("configuration revision: {current}"))
+        .to_owned();
+    let (status, receipt) = post_json_body(
+        agent,
+        &format!("{configuration_url}/configuration_set"),
+        &serde_json::json!({
+            "layer": {"kind": "project", "project_id": project_id},
+            "key": key,
+            "value": {
+                "kind": "lcm_summarizer_executables",
+                "value": {
+                    "codex": {"state": "configured", "canonical_path": codex_bin},
+                },
+            },
+            "expected_revision": expected_revision,
+            "idempotency_key": "configuration.idempotency.dashboard-codex-summarizer",
+        }),
+    );
+    assert_eq!(status, 200, "codex summarizer binding failed: {receipt}");
+    assert_eq!(
+        receipt["value"]["outcome"]["outcome"], "effect",
+        "codex summarizer binding must commit: {receipt}"
+    );
 }
 
 pub(crate) fn patch_json_body(agent: &ureq::Agent, url: &str, body: &Value) -> (u16, Value) {
@@ -865,8 +948,48 @@ pub(crate) async fn start_dashboard_retained_memory_fixture() -> DashboardFixtur
 pub(crate) async fn start_dashboard_fixture_with_delivery_authority(
     delivery_authority: FakeDeliveryAuthority,
 ) -> DashboardFixture {
-    start_dashboard_fixture_with_options_and_delivery(false, false, false, Some(delivery_authority))
-        .await
+    start_dashboard_fixture_with_options_and_delivery(
+        false,
+        false,
+        false,
+        Some(delivery_authority),
+        None,
+        None,
+    )
+    .await
+}
+
+/// Starts a session-read fixture over seeded sessions, composed the way the
+/// daemon composes a dashboard whose project is still opening: its session
+/// authorities mount once `project_open` is set.
+pub(crate) async fn start_dashboard_fixture_while_opening(
+    project_open: Arc<AtomicBool>,
+) -> DashboardFixture {
+    start_dashboard_fixture_with_options_and_delivery(
+        true,
+        false,
+        false,
+        None,
+        None,
+        Some(project_open),
+    )
+    .await
+}
+
+/// Starts a session-read fixture whose Loom git-correlation read goes through
+/// `git_correlation_authority` instead of the registered graph adapter.
+pub(crate) async fn start_dashboard_fixture_with_git_correlation_authority(
+    git_correlation_authority: Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>,
+) -> DashboardFixture {
+    start_dashboard_fixture_with_options_and_delivery(
+        false,
+        false,
+        false,
+        None,
+        Some(git_correlation_authority),
+        None,
+    )
+    .await
 }
 
 async fn start_dashboard_fixture_with_options(
@@ -879,6 +1002,8 @@ async fn start_dashboard_fixture_with_options(
         seed_memory,
         mount_configuration_runtime,
         None,
+        None,
+        None,
     )
     .await
 }
@@ -888,11 +1013,13 @@ async fn start_dashboard_fixture_with_options_and_delivery(
     seed_memory: bool,
     mount_configuration_runtime: bool,
     delivery_authority: Option<FakeDeliveryAuthority>,
+    git_correlation_authority: Option<
+        Arc<dyn tracedecay_dashboard_api::DashboardGitCorrelationReadPortV1>,
+    >,
+    project_open: Option<Arc<AtomicBool>>,
 ) -> DashboardFixture {
     let tmp = tempdir_or_panic();
-    let tmp_root = tmp
-        .path()
-        .canonicalize()
+    let tmp_root = canonical_existing_identity(tmp.path())
         .unwrap_or_else(|err| panic!("failed to canonicalize temp root: {err}"));
     let project_root = tmp_root.join("project");
     let profile_root = tmp_root.join("profile").join(".tracedecay");
@@ -927,7 +1054,7 @@ async fn start_dashboard_fixture_with_options_and_delivery(
         seed_memory_fixture(&cg).await;
     }
 
-    let project_graphs = dashboard::DashboardTestProjectGraphsV1::default();
+    let project_graphs = tracedecay_dashboard_api::DashboardTestProjectGraphsV1::default();
     if seed_lcm {
         seed_lcm_fixture(&host_runtime, &project_root).await;
     }
@@ -938,6 +1065,8 @@ async fn start_dashboard_fixture_with_options_and_delivery(
         Some((Arc::clone(&host_runtime), project_graphs.clone())),
         mount_configuration_runtime,
         delivery_authority,
+        git_correlation_authority,
+        project_open,
         port,
     );
 

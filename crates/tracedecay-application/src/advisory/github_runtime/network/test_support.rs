@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-pub(super) fn read_http_request_with_headers(
+pub(in crate::advisory::github_runtime) fn read_http_request_with_headers(
     stream: &mut TcpStream,
 ) -> (String, serde_json::Value) {
     // macOS `accept` inherits `O_NONBLOCK` from a non-blocking listener, so
@@ -49,7 +49,10 @@ pub(super) fn read_http_request(stream: &mut TcpStream) -> serde_json::Value {
     read_http_request_with_headers(stream).1
 }
 
-pub(super) fn write_http_json(stream: &mut TcpStream, value: &serde_json::Value) {
+pub(in crate::advisory::github_runtime) fn write_http_json(
+    stream: &mut TcpStream,
+    value: &serde_json::Value,
+) {
     let body = serde_json::to_vec(value).unwrap();
     write!(
         stream,
@@ -57,5 +60,26 @@ pub(super) fn write_http_json(stream: &mut TcpStream, value: &serde_json::Value)
         body.len()
     )
     .unwrap();
+    stream.write_all(&body).unwrap();
+}
+
+/// Writes one response with an exact status line and extra headers, as a
+/// captured provider refusal carries them.
+pub(in crate::advisory::github_runtime) fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    headers: &[(&str, &str)],
+    value: &serde_json::Value,
+) {
+    let body = serde_json::to_vec(value).unwrap();
+    let mut head = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    ));
+    stream.write_all(head.as_bytes()).unwrap();
     stream.write_all(&body).unwrap();
 }

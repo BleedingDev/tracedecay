@@ -4,14 +4,15 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use serde_json::{Value, json};
-use tracedecay::project::{TraceDecay, TraceDecayOpenOptions, current_timestamp};
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_automation_runtime::automation::automatic_facts::record_session_automatic_facts;
 use tracedecay_automation_runtime::automation::run_ledger::{
     AutomationRunLedgerRecord, read_run_artifact_payload,
 };
 use tracedecay_domain::FactOwnerV1;
 use tracedecay_global_db::ParseOffset;
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_runtime_core::tracedecay::current_timestamp;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
@@ -31,7 +32,7 @@ use super::{project_memory_owner, test_automation_run_control};
 /// lifecycle lease. The hermetic escape hatch
 /// (`TraceDecay::standalone_test_open_options`) is `cfg(test)`/`test-transport`
 /// gated, so it is inactive for this integration binary and cannot be relied
-/// on — the fixture must pin the profile itself, the same shape
+/// on, the fixture must pin the profile itself, the same shape
 /// `memory_eval_test::initialize_fixture_project` already uses.
 ///
 /// The shard lives under the project's own `.tracedecay/` marker directory so

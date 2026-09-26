@@ -21,16 +21,22 @@ use super::{
     ExactLaneRequest, ExactLaneRetriever, ExactLiteralV1,
 };
 use crate::retrieval::ports::{
-    CodeCandidateBindingV1, CodeOccurrenceRefV1, ExactTermPostingReadPort, RetrievalPortError,
+    CodeCandidateBindingV1, CodeOccurrenceRefV1, ExactTermPostingReadPort,
+    RetrievalExecutionControl, RetrievalPortError,
 };
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    <T as TryFrom<String>>::Error: fmt::Debug,
-{
-    T::try_from(value.to_owned()).expect("valid fixture identity")
+struct ActiveControl;
+
+impl RetrievalExecutionControl for ActiveControl {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+    fn elapsed_micros(&self) -> u64 {
+        0
+    }
 }
+
+use tracedecay_domain::test_fixtures::id;
 
 fn digest_id<T>(byte: char) -> T
 where
@@ -179,6 +185,7 @@ fn exact_request(
         .expect("query sanitizes"),
     ));
     ExactLaneRequest {
+        control: &ActiveControl,
         literals: authority.parse_literals(query_view, &base),
         base,
         query_view,

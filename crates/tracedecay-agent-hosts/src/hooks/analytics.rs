@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -14,8 +14,9 @@ use tracedecay_sessions::admission::{
     HostAdmissionTelemetryDisposition as HookDispositionTelemetry,
 };
 
-use super::tool_hints::{HintAgent, ToolHint};
+use super::tool_hints::ToolHint;
 use super::{HookWorkspaceStatus, claude, prompt_like_text};
+use tracedecay_domain::HostIntegrationIdV1;
 
 pub(crate) const HOOK_ANALYTICS_FILENAME: &str = "hook_analytics.jsonl";
 
@@ -111,7 +112,7 @@ impl HookTimingSpan {
     fn new(
         runtime: &HookRuntimeV1,
         root: Option<&Path>,
-        agent: HintAgent,
+        agent: HostIntegrationIdV1,
         hook_name: &str,
         prompt_category: Option<&'static str>,
         payload_bytes: Option<u64>,
@@ -138,9 +139,9 @@ impl HookTimingSpan {
         // parse legacy configuration, so a daemon-published snapshot is the
         // only authority consulted here. A hook subprocess starts with an
         // empty snapshot cache, so treating "no authority" as "off" silenced
-        // every `hook_completed` row in production while `hook_invoked` — the
+        // every `hook_completed` row in production while `hook_invoked`, the
         // other half of the same span, written by the same unconditional
-        // recorder — kept flowing. That renders every real hook as invoked but
+        // recorder, kept flowing. That renders every real hook as invoked but
         // never finished. Only an authority that explicitly says timings are
         // off suppresses the completion row.
         let enabled = root
@@ -440,11 +441,11 @@ pub(crate) fn measure_json_payload_bytes<T: Serialize + ?Sized>(value: &T) -> Op
 }
 
 pub(crate) fn elapsed_us(started: Instant) -> u64 {
-    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+    tracedecay_runtime_core::tracedecay::saturating_duration_micros(started.elapsed())
 }
 
 fn duration_as_millis_u64(budget: Duration) -> u64 {
-    u64::try_from(budget.as_millis()).unwrap_or(u64::MAX)
+    tracedecay_runtime_core::tracedecay::saturating_duration_millis(budget)
 }
 
 fn bounded_identifier(value: &str) -> String {
@@ -484,7 +485,7 @@ fn disposition_from_daemon_error(error: &TraceDecayError) -> HookDispositionTele
 
 /// Shared implementation for [`record_hook_invoked`] and
 /// [`record_other_hook_invoked`], which differ only in how the analytics
-/// `agent` key is derived (a typed [`HintAgent`] vs. the literal `"other"`).
+/// `agent` key is derived (a typed [`HostIntegrationIdV1`] vs. the literal `"other"`).
 fn record_hook_invoked_named(
     runtime: &HookRuntimeV1,
     root: Option<&Path>,
@@ -493,7 +494,7 @@ fn record_hook_invoked_named(
     event_json: &str,
     parsed: &Value,
 ) -> HookTimingSpan {
-    // Length only — never persist event content, prompts, tools, credentials, or paths here.
+    // Length only, never persist event content, prompts, tools, credentials, or paths here.
     let payload_bytes = measure_host_event_payload_bytes(event_json);
     let prompt_category = inferred_prompt_category(parsed);
     record_hook_analytics(
@@ -522,7 +523,7 @@ fn record_hook_invoked_named(
 pub(crate) fn record_hook_invoked(
     runtime: &HookRuntimeV1,
     root: Option<&Path>,
-    agent: HintAgent,
+    agent: HostIntegrationIdV1,
     hook_name: &str,
     event_json: &str,
 ) -> HookTimingSpan {
@@ -543,7 +544,7 @@ pub(crate) fn record_hook_invoked(
 pub(crate) fn record_hook_invoked_parsed(
     runtime: &HookRuntimeV1,
     root: Option<&Path>,
-    agent: HintAgent,
+    agent: HostIntegrationIdV1,
     hook_name: &str,
     event_json: &str,
     parsed: &Value,
@@ -575,7 +576,7 @@ pub(super) fn mint_hint_id() -> String {
 pub(super) fn record_hint_analytics(
     root: Option<&Path>,
     event: &str,
-    agent: HintAgent,
+    agent: HostIntegrationIdV1,
     session_id: Option<&str>,
     hint_id: &str,
     hint: &ToolHint,
@@ -601,7 +602,7 @@ pub(super) fn record_workspace_status_analytics(
         root,
         "workspace_status",
         serde_json::json!({
-            "agent": HintAgent::Codex.as_key(),
+            "agent": HostIntegrationIdV1::Codex.as_key(),
             "session_id": session_id,
             "workspace_status": status.as_key(),
         }),
@@ -610,7 +611,7 @@ pub(super) fn record_workspace_status_analytics(
 
 pub(super) fn record_hint_emitted(
     root: Option<&Path>,
-    agent: HintAgent,
+    agent: HostIntegrationIdV1,
     session_id: Option<&str>,
     hint_id: &str,
     hint: &ToolHint,
@@ -673,7 +674,7 @@ pub(super) fn record_hook_analytics(
 /// A hook fires in whatever directory the agent happens to be in, so it must
 /// not be the thing that decides a directory is a project. When no authority
 /// already names this checkout, analytics go to the profile-wide file rather
-/// than to a store shard minted from the path — writing here used to create
+/// than to a store shard minted from the path, writing here used to create
 /// `projects/proj_<path hash>/` for directories that never became projects, and
 /// those shards then outnumbered the real stores.
 ///
@@ -698,10 +699,7 @@ fn append_private_jsonl(path: &Path, line: &str) {
 }
 
 fn now_unix_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or_default()
+    tracedecay_runtime_core::tracedecay::unix_millis()
 }
 
 mod readiness;

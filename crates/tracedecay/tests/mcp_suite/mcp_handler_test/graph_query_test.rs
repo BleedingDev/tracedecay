@@ -1,5 +1,10 @@
 #![cfg(feature = "test-transport")]
 
+mod callers_coverage;
+mod relation_page_cost;
+mod typed_evidence_trailers;
+mod typescript_module_resolution;
+
 use crate::support::*;
 use serde_json::{Value, json};
 use std::fs;
@@ -20,66 +25,36 @@ impl GraphQueryFixture {
     }
 }
 
-struct GraphQueryProjectRoot(std::path::PathBuf);
-
-impl GraphQueryProjectRoot {
-    fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
 async fn graph_query_fixture_with_sources(
     write_sources: impl FnOnce(&std::path::Path),
-) -> (GraphQueryFixture, GraphQueryProjectRoot) {
+) -> GraphQueryFixture {
     let production = production_composition_fixture_with_sources(write_sources).await;
     let server = production
         .harness
         .server(&production.project_root)
         .expect("production graph-query server");
     warm_code_index_search(&server, "helper").await;
-    let project_root = GraphQueryProjectRoot(production.project_root.clone());
-    (GraphQueryFixture { production }, project_root)
+    GraphQueryFixture { production }
 }
 
-async fn production_graph_query_fixture() -> (GraphQueryFixture, GraphQueryProjectRoot) {
+async fn production_graph_query_fixture() -> GraphQueryFixture {
     let production = production_composition_fixture().await;
     let server = production
         .harness
         .server(&production.project_root)
         .expect("production graph-query server");
     warm_code_index_search(&server, "helper").await;
-    let project_root = GraphQueryProjectRoot(production.project_root.clone());
-    (GraphQueryFixture { production }, project_root)
+    GraphQueryFixture { production }
 }
 
-async fn production_empty_graph_query_fixture() -> (GraphQueryFixture, (), GraphQueryProjectRoot) {
-    let (fixture, root) = graph_query_fixture_with_sources(|project| {
-        fs::write(project.join("README.md"), "# Empty graph fixture\n").unwrap();
-    })
-    .await;
-    (fixture, (), root)
-}
-
-async fn production_function_vs_field_fixture() -> (GraphQueryFixture, GraphQueryProjectRoot) {
+async fn production_empty_graph_query_fixture() -> GraphQueryFixture {
     graph_query_fixture_with_sources(|project| {
-        fs::create_dir_all(project.join("src")).unwrap();
-        fs::write(
-            project.join("src/lib.rs"),
-            r#"pub struct Solvers {
-    pub gmres: u32,
-}
-
-pub fn gmres(x: u32) -> u32 {
-    x + 1
-}
-"#,
-        )
-        .unwrap();
+        fs::write(project.join("README.md"), "# Empty graph fixture\n").unwrap();
     })
     .await
 }
 
-async fn production_signature_metadata_fixture() -> (GraphQueryFixture, GraphQueryProjectRoot) {
+async fn production_signature_metadata_fixture() -> GraphQueryFixture {
     graph_query_fixture_with_sources(|project| {
         fs::create_dir_all(project.join("src")).unwrap();
         fs::write(
@@ -102,6 +77,10 @@ pub struct PlainValue;
         .unwrap();
     })
     .await
+}
+
+fn clone_family_lane_still_publishing(error: &str) -> bool {
+    error.contains("generation_unverified")
 }
 
 async fn shutdown_graph_fixture(fixture: GraphQueryFixture) {
@@ -167,7 +146,7 @@ async fn graph_node_id(fixture: &GraphQueryFixture, name: &str) -> String {
 
 #[tokio::test]
 async fn rust_wrapper_callees_follow_declared_sibling_module_imports() {
-    let (fixture, _root) = graph_query_fixture_with_sources(|project| {
+    let fixture = graph_query_fixture_with_sources(|project| {
         fs::create_dir_all(project.join("src")).unwrap();
         fs::write(
             project.join("src/lib.rs"),
@@ -198,20 +177,11 @@ async fn rust_wrapper_callees_follow_declared_sibling_module_imports() {
     let wrapper = graph_node_id(&fixture, "execute_source_edit").await;
     let result = call_production_tool(
         &fixture,
-        "tracedecay_code_callees",
+        "tracedecay_callees",
         json!({
             "node_id": wrapper,
             "maximum_depth": 1,
             "resolve_trait_dispatch": false,
-            "scope": {
-                "generation": tracedecay_contracts::UNPINNED_LATEST_GENERATION_SENTINEL,
-                "path_prefix": Value::Null,
-            },
-            "meta": {
-                "projection": "evidence",
-                "order": "source_position",
-                "cursor": Value::Null,
-            },
             "format": "json",
         }),
         None,
@@ -261,7 +231,7 @@ async fn search_limit_above_retrieval_budget_serves_full_candidate_set() {
     // Cold activation of the code-index query authority is deferred to
     // bounded background work, so a freshly opened project may serve the
     // typed `authority_unavailable` transition state. Poll through only that
-    // state — any other failure (notably `search_failed`) must surface
+    // state, any other failure (notably `search_failed`) must surface
     // immediately.
     let mut payload = Value::Null;
     for _ in 0..60 {
@@ -322,7 +292,7 @@ async fn search_limit_above_retrieval_budget_serves_full_candidate_set() {
 
 #[tokio::test]
 async fn test_grep_literal_hit_is_enriched_with_symbol() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     // `format!("Hello, {}!", name)` lives inside `format_greeting` in utils.rs.
     let result = call_production_tool(
         &cg,
@@ -342,11 +312,11 @@ async fn test_grep_literal_hit_is_enriched_with_symbol() {
         .unwrap_or_else(|| panic!("expected a hit in src/utils.rs: {payload}"));
     assert!(hit["text"].as_str().unwrap().contains("Hello, {}!"));
     // Graph enrichment: the hit resolves to its enclosing symbol + node id so
-    // the natural next call is `tracedecay_body`.
+    // the natural next call is `tracedecay_source_body`.
     assert_eq!(hit["symbol"].as_str(), Some("format_greeting"));
     assert!(
         hit["node_id"].as_str().is_some_and(|id| !id.is_empty()),
-        "hit should carry a node_id for tracedecay_body: {payload}"
+        "hit should carry a node_id for tracedecay_source_body: {payload}"
     );
     assert!(
         result.value["content"]
@@ -361,7 +331,7 @@ async fn test_grep_literal_hit_is_enriched_with_symbol() {
 
 #[tokio::test]
 async fn test_grep_regex_hit() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     // Regex: a `pub fn` declaration returning `String`.
     let result = call_production_tool(
         &cg,
@@ -384,7 +354,7 @@ async fn test_grep_regex_hit() {
 
 #[tokio::test]
 async fn test_grep_no_match_reports_empty() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let result = call_production_tool(
         &cg,
         "tracedecay_grep",
@@ -402,7 +372,7 @@ async fn test_grep_no_match_reports_empty() {
 
 #[tokio::test]
 async fn test_grep_respects_gitignore() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     fs::write(root.join(".gitignore"), "ignored_dir/\n").unwrap();
     fs::create_dir_all(root.join("ignored_dir")).unwrap();
@@ -441,7 +411,7 @@ async fn test_grep_respects_gitignore() {
 
 #[tokio::test]
 async fn test_grep_skips_binary_files() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     // A NUL byte makes this file "binary"; the matching text must not surface.
     fs::write(root.join("blob.bin"), b"BINARY_MARKER\0BINARY_MARKER").unwrap();
@@ -472,7 +442,7 @@ async fn test_grep_skips_binary_files() {
 
 #[tokio::test]
 async fn test_grep_prunes_generated_trees_unless_path_glob_selects_one() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     fs::create_dir_all(root.join("dist")).unwrap();
     fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
@@ -531,7 +501,7 @@ async fn test_grep_prunes_generated_trees_unless_path_glob_selects_one() {
 
 #[tokio::test]
 async fn test_grep_basename_glob_reaches_nested_generated_file() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     fs::create_dir_all(root.join("dist/nested")).unwrap();
     fs::write(
@@ -563,7 +533,7 @@ async fn test_grep_basename_glob_reaches_nested_generated_file() {
 
 #[tokio::test]
 async fn test_ast_grep_search_respects_public_path_glob() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     fs::write(
         root.join("src/outside_scope.rs"),
@@ -602,7 +572,7 @@ async fn test_ast_grep_search_respects_public_path_glob() {
 
 #[tokio::test]
 async fn test_grep_enforces_max_results_cap() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     let mut body = String::new();
     for _ in 0..10 {
@@ -633,7 +603,7 @@ async fn test_grep_enforces_max_results_cap() {
 
 #[tokio::test]
 async fn test_grep_case_sensitivity() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     fs::write(root.join("case.txt"), "MixedCaseToken here\n").unwrap();
 
@@ -676,7 +646,7 @@ async fn test_grep_case_sensitivity() {
 
 #[tokio::test]
 async fn test_grep_context_lines() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let root = cg.project_root().to_path_buf();
     fs::write(
         root.join("ctx.txt"),
@@ -706,7 +676,7 @@ async fn test_grep_context_lines() {
 
 #[tokio::test]
 async fn test_grep_missing_pattern_errors() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let err = call_production_tool(&cg, "tracedecay_grep", json!({}), None, None)
         .await
         .unwrap_err();
@@ -718,7 +688,7 @@ async fn test_grep_missing_pattern_errors() {
 
 #[tokio::test]
 async fn test_node_existing() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let node_id = graph_node_id(&cg, "helper").await;
     let result = call_production_tool(
         &cg,
@@ -750,7 +720,7 @@ async fn test_node_existing() {
 
 #[tokio::test]
 async fn signature_search_and_derives_use_extracted_metadata() {
-    let (fixture, _root) = production_signature_metadata_fixture().await;
+    let fixture = production_signature_metadata_fixture().await;
     let async_node = graph_node_id(&fixture, "fetch_value").await;
     let sync_node = graph_node_id(&fixture, "cached_value").await;
 
@@ -797,7 +767,7 @@ async fn signature_search_and_derives_use_extracted_metadata() {
         let result = call_production_tool(
             &fixture,
             "tracedecay_signature_search",
-            json!({"async": want_async, "format": "json"}),
+            json!({"is_async": want_async, "format": "json"}),
             None,
             None,
         )
@@ -805,7 +775,10 @@ async fn signature_search_and_derives_use_extracted_metadata() {
         .expect("signature search");
         let payload: Value = serde_json::from_str(extract_text(&result.value))
             .expect("signature-search response JSON");
-        let matches = payload["matches"].as_array().expect("signature matches");
+        let matches = payload
+            .pointer("/outcome/value/payload/items")
+            .and_then(Value::as_array)
+            .expect("signature matches");
         assert_eq!(matches.len(), 1, "unexpected matches: {payload}");
         assert_eq!(matches[0]["name"], expected_name);
         assert_eq!(matches[0]["is_async"], want_async);
@@ -846,7 +819,7 @@ async fn signature_search_and_derives_use_extracted_metadata() {
 
 #[tokio::test]
 async fn test_node_not_found() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
+    let cg = production_empty_graph_query_fixture().await;
     let result = call_production_tool(
         &cg,
         "tracedecay_node",
@@ -865,45 +838,8 @@ async fn test_node_not_found() {
 }
 
 #[tokio::test]
-async fn test_files_no_filter() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let result = call_production_tool(&cg, "tracedecay_files", json!({}), None, None)
-        .await
-        .unwrap();
-    let text = extract_text(&result.value);
-    assert!(!text.is_empty(), "files listing should not be empty");
-    assert!(text.starts_with("## Files"), "should have Files header");
-    assert!(
-        text.contains("**indexed files:**"),
-        "should include indexed files field"
-    );
-    assert!(
-        text.contains("```text"),
-        "should render compact tree/list block"
-    );
-    assert!(!text.contains("|"), "files markdown should not use tables");
-}
-
-#[tokio::test]
-async fn test_files_flat_format() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_files",
-        json!({"layout": "flat"}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    assert!(!text.is_empty());
-    assert!(text.contains("bytes"), "flat format should show byte sizes");
-}
-
-#[tokio::test]
 async fn test_files_json_format_with_grouped_layout() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let json_result = call_production_tool(
         &cg,
         "tracedecay_files",
@@ -919,26 +855,6 @@ async fn test_files_json_format_with_grouped_layout() {
         file["path"].as_str() == Some("src/main.rs")
             && file["symbols"].as_i64().unwrap_or_default() >= 1
     }));
-}
-
-#[tokio::test]
-async fn test_affected() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_affected",
-        json!({"files": ["src/utils.rs"]}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    assert!(
-        text.contains("affected_tests"),
-        "should have affected_tests key"
-    );
-    assert!(text.contains("count"), "should have count key");
 }
 
 #[cfg(feature = "test-transport")]
@@ -1069,6 +985,37 @@ async fn affected_central_daemon_fixture_preserves_set_and_ranks_near_tests_over
         payload["ranking_metadata"]["strategy"],
         "dependency_distance_then_path"
     );
+
+    // A changed-file list is a git diff, so it routinely names paths this
+    // generation never published: a new file, a deleted one, a rename's old
+    // path, a manifest. Such a path has no symbols, so the traversal reaches
+    // adjacency with an empty seed list, and adjacency refuses that by
+    // contract. The refusal used to surface as a non-retryable
+    // `code-graph-invalid-request` that failed the whole call, so one
+    // unindexed entry cost the caller every other file's answer.
+    let unpublished = harness
+        .call_tool(
+            &project,
+            "tracedecay_affected",
+            json!({"files": ["src/never_published.rs"], "depth": 5, "format": "json"}),
+        )
+        .await
+        .expect("production invocation succeeds")
+        .result
+        .expect("an unpublished path is answerable, not an invalid request");
+    let unpublished: Value = serde_json::from_str(
+        unpublished["content"][0]["text"]
+            .as_str()
+            .expect("affected JSON text"),
+    )
+    .expect("affected JSON payload");
+    assert_eq!(
+        unpublished["affected_tests"],
+        json!([]),
+        "a path this generation never published has no dependents, not an error"
+    );
+    assert_eq!(unpublished["ranked_tests"], json!([]));
+    assert_eq!(unpublished["recommended_tests"], json!([]));
 }
 
 #[cfg(feature = "test-transport")]
@@ -1202,7 +1149,7 @@ async fn test_module_api() {
 
 #[tokio::test]
 async fn name_first_lexical_search_discloses_preferred_symbol_route() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let search = call_production_tool(
         &cg,
         "tracedecay_search",
@@ -1231,807 +1178,6 @@ async fn name_first_lexical_search_discloses_preferred_symbol_route() {
 }
 
 #[tokio::test]
-async fn similar_serves_verified_exact_and_rename_normalized_families() {
-    let body = "
-        let one = parse(input);
-        let two = transform(one);
-        let three = validate(two);
-        let four = persist(three);
-        finish(four, input, one, two, three);
-    ";
-    let (fixture, _root) = graph_query_fixture_with_sources(|project| {
-        fs::create_dir_all(project.join("src")).unwrap();
-        fs::write(
-            project.join("src/source.rs"),
-            format!("pub fn source_copy(input: Input) {{ {body} }}\n"),
-        )
-        .unwrap();
-        fs::write(
-            project.join("src/exact.rs"),
-            format!("pub fn source_copy(input: Input) {{ {body} }}\n"),
-        )
-        .unwrap();
-        fs::write(
-            project.join("src/formatted.rs"),
-            format!("pub fn formatted_copy(input: Input) {{\n{body}\n}}\n"),
-        )
-        .unwrap();
-        fs::write(
-            project.join("src/commented.rs"),
-            format!("pub fn commented_copy(input: Input) {{ /* same body */ {body} }}\n"),
-        )
-        .unwrap();
-        fs::write(
-            project.join("src/renamed.rs"),
-            "
-                pub fn renamed_copy(value: Input) {
-                    let first = parse(value);
-                    let second = transform(first);
-                    let third = validate(second);
-                    let fourth = persist(third);
-                    finish(fourth, value, first, second, third);
-                }
-            ",
-        )
-        .unwrap();
-        fs::write(
-            project.join("src/near.rs"),
-            format!("pub fn near_copy(input: Input) {{ {body} changed_tail(input); }}\n"),
-        )
-        .unwrap();
-    })
-    .await;
-    let source = graph_node_id(&fixture, "source_copy").await;
-    let project_id = fixture
-        .production
-        .harness
-        .project_id(fixture.project_root())
-        .await
-        .expect("fixture project identity");
-    let repository_id =
-        tracedecay_code_index_runtime::code_index_scheduler::identity::repository_id_for(
-            fixture.project_root(),
-        )
-        .expect("fixture repository identity");
-
-    let result = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 100,
-            "work_limit": 100,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("production similar invocation");
-    let payload: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
-
-    assert_eq!(
-        payload["source"]["symbol_occurrence_id"], source,
-        "{payload}"
-    );
-    assert!(
-        payload["families"].as_array().is_some_and(|families| {
-            families
-                .iter()
-                .any(|family| family["match_class"] == "conservative_exact")
-                && families
-                    .iter()
-                    .any(|family| family["match_class"] == "rename_normalized_exact")
-        }),
-        "exact families must disclose their verification class: {payload}"
-    );
-    let conservative = payload["families"]
-        .as_array()
-        .and_then(|families| {
-            families
-                .iter()
-                .find(|family| family["match_class"] == "conservative_exact")
-        })
-        .expect("conservative family");
-    assert!(
-        conservative["member_count"]
-            .as_u64()
-            .is_some_and(|count| count >= 3),
-        "formatting-only and comments-only copies must remain exact: {payload}"
-    );
-
-    // With the dashboard-sized page limit, work_limit == 2 leaves only the
-    // source lookup and one exact lookahead unit. The first request must hand
-    // back an authenticated boundary for the first exact key, while replaying
-    // that boundary must terminate without minting the identical cursor.
-    let minimal_work = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 2,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("minimal-work similar page");
-    let minimal_work: Value =
-        serde_json::from_str(extract_text(&minimal_work.value)).expect("minimal-work similar JSON");
-    let minimal_cursor = minimal_work["families"]
-        .as_array()
-        .expect("minimal-work exact families")
-        .iter()
-        .find_map(|family| family["next_cursor"].as_str())
-        .expect("minimal-work page must expose the first exact boundary")
-        .to_owned();
-    assert!(
-        minimal_work["near"]["matches"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "minimal work must leave no near budget: {minimal_work}"
-    );
-    let minimal_replay = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 2,
-            "cursor": minimal_cursor,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("minimal-work boundary replay");
-    let minimal_replay: Value = serde_json::from_str(extract_text(&minimal_replay.value))
-        .expect("minimal-work replay JSON");
-    let replay_cursors = minimal_replay["families"]
-        .as_array()
-        .expect("minimal-work replay exact families")
-        .iter()
-        .filter_map(|family| family["next_cursor"].as_str())
-        .collect::<Vec<_>>();
-    assert!(
-        replay_cursors
-            .iter()
-            .all(|cursor| *cursor != minimal_cursor.as_str()),
-        "minimal-work replay must not mint the same exact boundary forever: {minimal_work} -> {minimal_replay}"
-    );
-    assert!(
-        minimal_replay["families"]
-            .as_array()
-            .is_some_and(|families| families
-                .iter()
-                .all(|family| family["next_cursor"].is_null())),
-        "minimal-work replay must terminate without an identical cursor: {minimal_replay}"
-    );
-
-    // Let the exact families establish their immutable result count, then
-    // issue a page whose exact lane fills that count. The authenticated
-    // NearStart phase boundary must make the first near candidate reachable
-    // on the following request.
-    let exact_result_limit = payload["families"]
-        .as_array()
-        .expect("exact family array")
-        .iter()
-        .filter_map(|family| family["member_count"].as_u64())
-        .sum::<u64>();
-    assert!(
-        exact_result_limit > 0,
-        "fixture must produce exact families"
-    );
-    let phase_request = |cursor: Option<&str>| {
-        let mut arguments = json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": exact_result_limit,
-            "work_limit": exact_result_limit + 8,
-        });
-        if let Some(cursor) = cursor {
-            arguments["cursor"] = json!(cursor);
-        }
-        arguments
-    };
-    let exact_filled = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        phase_request(None),
-        None,
-        None,
-    )
-    .await
-    .expect("exact-filled similar page");
-    let exact_filled: Value = serde_json::from_str(extract_text(&exact_filled.value)).unwrap();
-    assert_eq!(
-        exact_filled["families"]
-            .as_array()
-            .expect("exact-filled families")
-            .iter()
-            .filter_map(|family| family["member_count"].as_u64())
-            .sum::<u64>(),
-        exact_result_limit,
-        "the first page must spend its full result budget in exact families: {exact_filled}"
-    );
-    assert!(
-        exact_filled["near"]["matches"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "the exact-filled page must leave the near lane empty until its phase continuation: {exact_filled}"
-    );
-    let near_phase_cursor = exact_filled["near"]["next_cursor"]
-        .as_str()
-        .expect("exact-filled page must expose the authenticated near phase cursor");
-    assert!(
-        near_phase_cursor.starts_with("ccclone2."),
-        "near phase cursor must use the authenticated clone cursor domain: {exact_filled}"
-    );
-    let near_phase_envelope: Value = serde_json::from_slice(
-        &hex::decode(
-            near_phase_cursor
-                .strip_prefix("ccclone2.")
-                .expect("authenticated clone cursor prefix"),
-        )
-        .expect("authenticated clone cursor payload is hex"),
-    )
-    .expect("authenticated clone cursor payload is JSON");
-    assert_eq!(
-        near_phase_envelope["payload"]["after"],
-        json!("NearStart"),
-        "exact-filled cursor must decode to the near phase boundary: {exact_filled}"
-    );
-    let mut removed_class_request = phase_request(Some(near_phase_cursor));
-    removed_class_request["match_classes"] = json!(["conservative_exact"]);
-    call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        removed_class_request,
-        None,
-        None,
-    )
-    .await
-    .expect_err("removing a requested class must stale the authenticated cursor");
-    let mut changed_extent_request = phase_request(Some(near_phase_cursor));
-    changed_extent_request["source_extent"] = json!({
-        "kind": "selected_token_range",
-        "start": 0,
-        "end": 8,
-    });
-    call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        changed_extent_request,
-        None,
-        None,
-    )
-    .await
-    .expect_err("changing the source extent must stale the authenticated cursor");
-    let added_class_first = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact"],
-            "result_limit": 1,
-            "work_limit": 20,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("single-class exact page");
-    let added_class_first: Value = serde_json::from_str(extract_text(&added_class_first.value))
-        .expect("single-class exact page JSON");
-    let added_class_cursor = added_class_first["families"][0]["next_cursor"]
-        .as_str()
-        .expect("single-class page must expose an exact continuation");
-    call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 20,
-            "cursor": added_class_cursor,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect_err("adding a requested class must stale the authenticated cursor");
-    let near_phase = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        phase_request(Some(near_phase_cursor)),
-        None,
-        None,
-    )
-    .await
-    .expect("near phase continuation");
-    let near_phase: Value = serde_json::from_str(extract_text(&near_phase.value)).unwrap();
-    assert!(
-        near_phase["families"]
-            .as_array()
-            .is_some_and(|families| families.is_empty()),
-        "near phase continuation must skip the completed exact lane: {near_phase}"
-    );
-    assert!(
-        near_phase["near"]["matches"]
-            .as_array()
-            .is_some_and(|matches| matches
-                .iter()
-                .any(|item| { item["candidate"]["path"] == json!("src/near.rs") })),
-        "near phase continuation must reach the first near result: {near_phase}"
-    );
-    assert!(
-        near_phase["near"]["next_cursor"].is_null(),
-        "the near phase fixture must complete without re-minting a cursor: {near_phase}"
-    );
-
-    // A continuation owned by the second exact key must never replay the
-    // earlier key. This exercises the real multi-key cursor path and checks
-    // the returned occurrence ids for duplication.
-    let multi_key_first = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 4,
-            "work_limit": 20,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("multi-key exact first page");
-    let multi_key_first: Value =
-        serde_json::from_str(extract_text(&multi_key_first.value)).unwrap();
-    let multi_key_families = multi_key_first["families"]
-        .as_array()
-        .expect("multi-key exact families");
-    let cursor_family_index = multi_key_families
-        .iter()
-        .position(|family| family["next_cursor"].is_string())
-        .expect("second exact key must expose a continuation");
-    assert!(
-        cursor_family_index > 0,
-        "the cursor must belong to a later exact key: {multi_key_first}"
-    );
-    let cursor_family_ids = multi_key_families[cursor_family_index]["members"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|member| member["symbol_occurrence_id"].as_str())
-        .collect::<Vec<_>>();
-    let earlier_family_class = multi_key_families[0]["match_class"].clone();
-    let exact_cursor = multi_key_families[cursor_family_index]["next_cursor"]
-        .as_str()
-        .expect("multi-key exact cursor")
-        .to_owned();
-    let multi_key_second = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 4,
-            "work_limit": 20,
-            "cursor": exact_cursor,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("multi-key exact continuation");
-    let multi_key_second: Value =
-        serde_json::from_str(extract_text(&multi_key_second.value)).unwrap();
-    let resumed_ids = multi_key_second["families"]
-        .as_array()
-        .expect("resumed exact families")
-        .iter()
-        .flat_map(|family| family["members"].as_array().into_iter().flatten())
-        .filter_map(|member| member["symbol_occurrence_id"].as_str())
-        .collect::<Vec<_>>();
-    assert!(
-        cursor_family_ids.iter().all(|id| !resumed_ids.contains(id)),
-        "exact continuation replayed a member before its cursor: {multi_key_first} -> {multi_key_second}"
-    );
-    assert!(
-        multi_key_second["families"]
-            .as_array()
-            .is_some_and(|families| families
-                .iter()
-                .all(|family| { family["match_class"] != earlier_family_class })),
-        "exact continuation must skip the earlier family: {multi_key_second}"
-    );
-
-    // The first exact key consumes three posting rows. The exact lane then
-    // reserves one lookahead unit before opening the next key, so the near
-    // lane must stay empty under the hard request-wide work limit.
-    let tight_work = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 10,
-            "work_limit": 5,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("tight multi-key work-budget page");
-    let tight_work: Value = serde_json::from_str(extract_text(&tight_work.value)).unwrap();
-    assert!(
-        tight_work["near"]["matches"]
-            .as_array()
-            .is_some_and(Vec::is_empty),
-        "exact lookahead must consume the shared work budget before near starts: {tight_work}"
-    );
-    assert!(
-        tight_work["families"]
-            .as_array()
-            .is_some_and(|families| families
-                .iter()
-                .any(|family| { family["next_cursor"].is_string() })),
-        "the tight page must leave the active exact key resumable: {tight_work}"
-    );
-    let tight_cursor = tight_work["families"]
-        .as_array()
-        .expect("tight exact families")
-        .iter()
-        .find_map(|family| family["next_cursor"].as_str())
-        .expect("tight exact continuation");
-    let tight_continuation = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact", "rename_normalized_exact"],
-            "result_limit": 10,
-            "work_limit": 5,
-            "cursor": tight_cursor,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("tight exact continuation");
-    let tight_continuation: Value = serde_json::from_str(extract_text(&tight_continuation.value))
-        .expect("tight exact continuation JSON");
-    assert!(
-        tight_continuation["families"]
-            .as_array()
-            .is_some_and(|families| {
-                families.iter().all(|family| {
-                    family["match_class"] != json!("conservative_exact")
-                        && family["member_count"]
-                            .as_u64()
-                            .is_some_and(|count| count > 0)
-                })
-            }),
-        "an ExactStart continuation must begin at the first unvisited key: {tight_continuation}"
-    );
-
-    let paged = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "source_range",
-                "path": payload["source"]["path"],
-                "span": payload["source"]["body_span"],
-            },
-            "match_classes": ["rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 20,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("source-range similar invocation");
-    let paged: Value = serde_json::from_str(extract_text(&paged.value)).unwrap();
-    let cursor = paged["families"][0]["next_cursor"]
-        .as_str()
-        .expect("partial family cursor");
-    let continuation = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 20,
-            "cursor": cursor,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect("similar family continuation");
-    let continuation: Value = serde_json::from_str(extract_text(&continuation.value)).unwrap();
-    assert_eq!(
-        continuation["families"][0]["member_count"], 1,
-        "{continuation}"
-    );
-
-    let unauthorized = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        json!({
-            "project_id": project_id,
-            "repository_id": "repository.unauthorized",
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["conservative_exact"],
-            "result_limit": 10,
-            "work_limit": 20,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect_err("foreign repository scope must be denied");
-    assert!(
-        unauthorized
-            .to_string()
-            .contains("outside the authorized repository scope"),
-        "{unauthorized}"
-    );
-    shutdown_graph_fixture(fixture).await;
-}
-
-#[tokio::test]
-async fn similar_near_pages_resume_each_occurrence_and_refuse_a_tampered_cursor() {
-    let source_body = "
-        let one = parse(input);
-        let two = transform(one);
-        let three = validate(two);
-        let four = persist(three);
-        let five = audit(four);
-        let six = publish(five);
-        let seven = archive(six);
-        finish(seven, input, one, two, three, four, five, six);
-        1
-    ";
-    let repeated_near_body = "
-        let one = parse(input);
-        let two = transform(one);
-        let three = validate(two);
-        let four = persist(three);
-        let five = audit(four);
-        let six = publish(five);
-        let seven = archive(six);
-        finish(seven, input, one, two, three, four, five, six);
-        2
-    ";
-    let (fixture, _root) = graph_query_fixture_with_sources(|project| {
-        fs::create_dir_all(project.join("src")).unwrap();
-        fs::write(
-            project.join("src/source.rs"),
-            format!("pub fn source_copy(input: Input) -> u32 {{ {source_body} }}\n"),
-        )
-        .unwrap();
-        // Keep the declaration text byte-identical so the artifact groups all
-        // four occurrences under one candidate body. The wire result limit
-        // must then resume inside that grouped occurrence set.
-        for path in [
-            "src/near_a.rs",
-            "src/near_b.rs",
-            "src/near_c.rs",
-            "src/near_d.rs",
-        ] {
-            fs::write(
-                project.join(path),
-                format!("pub fn near_copy(input: Input) -> u32 {{ {repeated_near_body} }}\n"),
-            )
-            .unwrap();
-        }
-    })
-    .await;
-    let source = graph_node_id(&fixture, "source_copy").await;
-    let project_id = fixture
-        .production
-        .harness
-        .project_id(fixture.project_root())
-        .await
-        .expect("fixture project identity");
-    let repository_id =
-        tracedecay_code_index_runtime::code_index_scheduler::identity::repository_id_for(
-            fixture.project_root(),
-        )
-        .expect("fixture repository identity");
-
-    let request = |cursor: Option<String>| {
-        let mut arguments = json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "target": {
-                "kind": "symbol_occurrence",
-                "symbol_occurrence_id": source,
-            },
-            "match_classes": ["rename_normalized_exact"],
-            "result_limit": 1,
-            "work_limit": 20,
-        });
-        if let Some(cursor) = cursor {
-            arguments["cursor"] = json!(cursor);
-        }
-        arguments
-    };
-
-    let first = call_production_tool(&fixture, "tracedecay_similar", request(None), None, None)
-        .await
-        .expect("first near page");
-    let first: Value = serde_json::from_str(extract_text(&first.value)).unwrap();
-    let first_match = first["near"]["matches"]
-        .as_array()
-        .expect("first near matches");
-    assert_eq!(
-        first_match.len(),
-        1,
-        "wire page must contain one occurrence"
-    );
-    let first_cursor = first["near"]["next_cursor"]
-        .as_str()
-        .expect("truncated candidate must expose a continuation")
-        .to_owned();
-    let first_candidate = first_match[0]["candidate"]["symbol_occurrence_id"]
-        .as_str()
-        .expect("first candidate occurrence id")
-        .to_owned();
-    let first_path = first_match[0]["candidate"]["path"]
-        .as_str()
-        .expect("first candidate path")
-        .to_owned();
-
-    let mut seen_ids = vec![first_candidate];
-    let mut seen_paths = vec![first_path];
-    let mut cursor = Some(first_cursor.clone());
-    while let Some(cursor_value) = cursor.take() {
-        let page = call_production_tool(
-            &fixture,
-            "tracedecay_similar",
-            request(Some(cursor_value)),
-            None,
-            None,
-        )
-        .await
-        .expect("near continuation page");
-        let page: Value = serde_json::from_str(extract_text(&page.value)).unwrap();
-        let matches = page["near"]["matches"]
-            .as_array()
-            .expect("near continuation matches");
-        assert_eq!(matches.len(), 1, "each near page must honor result_limit");
-        let candidate = &matches[0]["candidate"];
-        let id = candidate["symbol_occurrence_id"]
-            .as_str()
-            .expect("near continuation occurrence id")
-            .to_owned();
-        let path = candidate["path"]
-            .as_str()
-            .expect("near continuation path")
-            .to_owned();
-        assert!(!seen_ids.contains(&id), "near pagination duplicated {id}");
-        seen_ids.push(id);
-        seen_paths.push(path);
-        cursor = page["near"]["next_cursor"].as_str().map(str::to_owned);
-        assert!(seen_ids.len() <= 8, "near pagination did not terminate");
-    }
-    assert_eq!(
-        seen_paths.len(),
-        4,
-        "all repeated candidate occurrences remain"
-    );
-    assert!(
-        seen_paths.iter().all(|path| path.starts_with("src/near_")),
-        "near pagination must not return the source occurrence: {seen_paths:?}"
-    );
-
-    let mut changed_near_classes = request(Some(first_cursor.clone()));
-    changed_near_classes["match_classes"] =
-        json!(["conservative_exact", "rename_normalized_exact"]);
-    call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        changed_near_classes,
-        None,
-        None,
-    )
-    .await
-    .expect_err("adding a class must stale a near cursor as well");
-
-    let mut tampered_cursor = first_cursor.into_bytes();
-    let last = tampered_cursor
-        .last_mut()
-        .expect("authenticated cursor has bytes");
-    *last = if *last == b'0' { b'1' } else { b'0' };
-    let tampered_cursor = String::from_utf8(tampered_cursor).expect("cursor remains UTF-8");
-    let tampered = call_production_tool(
-        &fixture,
-        "tracedecay_similar",
-        request(Some(tampered_cursor)),
-        None,
-        None,
-    )
-    .await
-    .expect_err("tampered near cursor must be rejected");
-    assert!(
-        tampered.to_string().contains("invalid_request"),
-        "tampered near cursor must remain a typed invalid request: {tampered}"
-    );
-
-    shutdown_graph_fixture(fixture).await;
-}
-
-#[tokio::test]
 async fn redundancy_reports_ranked_repository_exact_families_with_bounded_pages() {
     let large_body = "
         let one = parse(input);
@@ -2049,7 +1195,7 @@ async fn redundancy_reports_ranked_repository_exact_families_with_bounded_pages(
         let four = persist(three);
         finish(four, input, one, two, three);
     ";
-    let (fixture, _root) = graph_query_fixture_with_sources(|project| {
+    let fixture = graph_query_fixture_with_sources(|project| {
         fs::create_dir_all(project.join("src")).unwrap();
         for (path, name) in [
             ("src/large_a.rs", "large_a"),
@@ -2207,7 +1353,7 @@ async fn redundancy_pull_request_scope_shares_one_budget_and_resumes_changed_fam
         let four = persist(three);
         finish(four, input, one, two, three);
     ";
-    let (fixture, _root) = graph_query_fixture_with_sources(|project| {
+    let fixture = graph_query_fixture_with_sources(|project| {
         fs::create_dir_all(project.join("src")).unwrap();
         for (path, name, body) in [
             ("src/changed.rs", "changed", large_body),
@@ -2378,28 +1524,57 @@ async fn redundancy_pull_request_scope_shares_one_budget_and_resumes_changed_fam
         .server(fixture.project_root())
         .expect("production graph-query server");
     warm_code_index_search(&server, "generation_bump").await;
-    let stale = call_production_tool(
-        &fixture,
-        "tracedecay_redundancy",
-        json!({
-            "project_id": project_id,
-            "repository_id": repository_id,
-            "match_classes": ["conservative_exact"],
-            "scope": scope,
-            "include_generated_paths": true,
-            "family_limit": 10,
-            "member_limit": 10,
-            "work_limit": 4,
-            "cursor": stale_cursor,
-        }),
-        None,
-        None,
-    )
-    .await
-    .expect_err("a prior-generation pull-request cursor must be stale");
+    let stale_args = json!({
+        "project_id": project_id,
+        "repository_id": repository_id,
+        "match_classes": ["conservative_exact"],
+        "scope": scope,
+        "include_generated_paths": true,
+        "family_limit": 10,
+        "member_limit": 10,
+        "work_limit": 4,
+        "cursor": stale_cursor,
+    });
+    // Search lane coverage can seal while clone-family publication is still
+    // retiring the previous generation. That window answers `search_failed`
+    // or `generation_unverified`; the stale cursor's terminal is
+    // `generation_unavailable` once the successor artifact can be read.
+    let mut last = String::new();
+    for _ in 0..40 {
+        match call_production_tool(
+            &fixture,
+            "tracedecay_redundancy",
+            stale_args.clone(),
+            None,
+            None,
+        )
+        .await
+        {
+            Err(error) => {
+                let rendered = error.to_string();
+                if rendered.contains("generation_unavailable") {
+                    last = rendered;
+                    break;
+                }
+                if clone_family_lane_still_publishing(&rendered) {
+                    last = rendered;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+                panic!("stale pull-request cursor failed closed: {rendered}");
+            }
+            Ok(value) => {
+                last = format!(
+                    "successor still served the prior cursor: {}",
+                    extract_text(&value.value)
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
     assert!(
-        stale.to_string().contains("generation_unavailable"),
-        "{stale}"
+        last.contains("generation_unavailable"),
+        "prior-generation pull-request cursor must be stale, last={last}"
     );
 
     shutdown_graph_fixture(fixture).await;
@@ -2407,7 +1582,7 @@ async fn redundancy_pull_request_scope_shares_one_budget_and_resumes_changed_fam
 
 #[tokio::test]
 async fn analytics_tools_return_their_canonical_envelope_keys() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let cases: &[(&str, Value, &[&str])] = &[
         (
             "tracedecay_rank",
@@ -2457,7 +1632,7 @@ async fn analytics_tools_return_their_canonical_envelope_keys() {
 
 #[tokio::test]
 async fn test_rank_invalid_direction() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
+    let cg = production_empty_graph_query_fixture().await;
     let result = call_production_tool(
         &cg,
         "tracedecay_rank",
@@ -2470,8 +1645,10 @@ async fn test_rank_invalid_direction() {
         Err(err) => {
             let err_msg = format!("{}", err);
             assert!(
-                err_msg.contains("invalid direction"),
-                "error should mention 'invalid direction', got: {}",
+                err_msg.contains(
+                    "invalid arguments for tracedecay_rank: unknown variant `sideways`, expected `incoming` or `outgoing`"
+                ),
+                "error should refuse the direction, got: {}",
                 err_msg,
             );
         }
@@ -2481,7 +1658,7 @@ async fn test_rank_invalid_direction() {
 
 #[tokio::test]
 async fn test_unknown_tool() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
+    let cg = production_empty_graph_query_fixture().await;
     let result = call_production_tool(&cg, "tracedecay_unknown", json!({}), None, None).await;
     match result {
         Err(err) => {
@@ -2498,7 +1675,7 @@ async fn test_unknown_tool() {
 
 #[tokio::test]
 async fn test_distribution_with_path_filter() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let result = call_production_tool(
         &cg,
         "tracedecay_distribution",
@@ -2518,36 +1695,8 @@ async fn test_distribution_with_path_filter() {
 }
 
 #[tokio::test]
-async fn test_files_grouped_format() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_files",
-        json!({"layout": "grouped"}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    assert!(!text.is_empty());
-    assert!(
-        text.contains("indexed files"),
-        "grouped format should have 'indexed files' header"
-    );
-    assert!(
-        text.contains("**layout:** grouped"),
-        "grouped format should report grouped layout"
-    );
-    assert!(
-        text.contains("```text") && text.contains("src/"),
-        "grouped format should show compact tree/list block"
-    );
-}
-
-#[tokio::test]
 async fn test_complexity_response_fields() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let result = call_production_tool(&cg, "tracedecay_complexity", json!({}), None, None)
         .await
         .unwrap();
@@ -2583,7 +1732,7 @@ async fn test_complexity_response_fields() {
 
 #[tokio::test]
 async fn doc_coverage_distinguishes_documented_and_undocumented_enum_variants() {
-    let (cg, _dir) = graph_query_fixture_with_sources(|project| {
+    let cg = graph_query_fixture_with_sources(|project| {
         fs::create_dir_all(project.join("src")).unwrap();
         fs::write(
             project.join("src/lib.rs"),
@@ -2639,9 +1788,196 @@ async fn doc_coverage_distinguishes_documented_and_undocumented_enum_variants() 
     );
 }
 
+fn census_without_ids(payload: &Value) -> Value {
+    let mut payload = payload.clone();
+    let Some(files) = payload.get_mut("files").and_then(Value::as_array_mut) else {
+        return payload;
+    };
+    for file in files {
+        let Some(symbols) = file.get_mut("symbols").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for symbol in symbols {
+            if let Some(object) = symbol.as_object_mut() {
+                let id = object.get("id").and_then(Value::as_str).unwrap_or("");
+                assert!(
+                    !id.is_empty(),
+                    "doc coverage symbol is missing its id: {symbol}"
+                );
+                object.remove("id");
+            }
+        }
+    }
+    payload
+}
+
+async fn doc_coverage_census(fixture: &GraphQueryFixture, args: Value) -> Value {
+    let result = call_production_tool(fixture, "tracedecay_doc_coverage", args, None, None)
+        .await
+        .unwrap_or_else(|error| panic!("tracedecay_doc_coverage failed: {error}"));
+    let text = extract_text(&result.value);
+    serde_json::from_str(text).unwrap_or_else(|error| {
+        panic!("tracedecay_doc_coverage payload was not JSON: {error}\n{text}")
+    })
+}
+
+#[tokio::test]
+async fn doc_coverage_lists_undocumented_public_symbols_and_honors_path_and_limit() {
+    let fixture = graph_query_fixture_with_sources(|project| {
+        fs::create_dir_all(project.join("src")).unwrap();
+        // Item lines are the declaration line, not the doc comment above it.
+        fs::write(
+            project.join("src/lib.rs"),
+            "/// Ready for callers.\n\
+             pub fn ready() -> u32 {\n\
+                 1\n\
+             }\n\
+             \n\
+             pub fn missing() -> u32 {\n\
+                 2\n\
+             }\n\
+             \n\
+             fn hidden() -> u32 {\n\
+                 3\n\
+             }\n\
+             \n\
+             pub(crate) fn crate_local() -> u32 {\n\
+                 4\n\
+             }\n\
+             \n\
+             ///   \n\
+             pub fn blank_doc() -> u32 {\n\
+                 5\n\
+             }\n\
+             \n\
+             /// Counted.\n\
+             pub const COUNTED: u32 = 1;\n\
+             \n\
+             pub const UNCOUNTED: u32 = 2;\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("src/other.rs"),
+            "pub fn elsewhere() -> u32 {\n    9\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            project.join("src/done.rs"),
+            "/// Finished.\npub fn finished() -> u32 {\n    7\n}\n",
+        )
+        .unwrap();
+    })
+    .await;
+
+    let lib = doc_coverage_census(&fixture, json!({"path": "src/lib.rs", "limit": 50})).await;
+    assert_eq!(
+        census_without_ids(&lib),
+        json!({
+            "path_filter": "src/lib.rs",
+            "total_undocumented": 3,
+            "returned_count": 3,
+            "omitted_count": 0,
+            "complete": true,
+            "limit": 50,
+            "file_count": 1,
+            "files": [{
+                "file": "src/lib.rs",
+                "count": 3,
+                "symbols": [
+                    {
+                        "name": "missing",
+                        "kind": "function",
+                        "line": 6,
+                        "signature": "pub fn missing() -> u32"
+                    },
+                    {
+                        "name": "blank_doc",
+                        "kind": "function",
+                        "line": 19,
+                        "signature": "pub fn blank_doc() -> u32"
+                    },
+                    {
+                        "name": "UNCOUNTED",
+                        "kind": "const",
+                        "line": 26,
+                        "signature": "pub const UNCOUNTED: u32 = 2;"
+                    }
+                ]
+            }]
+        }),
+        "documented, private, and pub(crate) symbols must stay out: {lib}"
+    );
+
+    let other = doc_coverage_census(&fixture, json!({"path": "src/other.rs", "limit": 50})).await;
+    assert_eq!(
+        census_without_ids(&other),
+        json!({
+            "path_filter": "src/other.rs",
+            "total_undocumented": 1,
+            "returned_count": 1,
+            "omitted_count": 0,
+            "complete": true,
+            "limit": 50,
+            "file_count": 1,
+            "files": [{
+                "file": "src/other.rs",
+                "count": 1,
+                "symbols": [{
+                    "name": "elsewhere",
+                    "kind": "function",
+                    "line": 1,
+                    "signature": "pub fn elsewhere() -> u32"
+                }]
+            }]
+        }),
+        "a file path must not leak symbols from other files: {other}"
+    );
+
+    let done = doc_coverage_census(&fixture, json!({"path": "src/done.rs", "limit": 50})).await;
+    assert_eq!(
+        done,
+        json!({
+            "path_filter": "src/done.rs",
+            "total_undocumented": 0,
+            "returned_count": 0,
+            "omitted_count": 0,
+            "complete": true,
+            "limit": 50,
+            "file_count": 0,
+            "files": []
+        }),
+        "a file whose public symbols are documented reports an empty census: {done}"
+    );
+
+    let limited = doc_coverage_census(&fixture, json!({"path": "src", "limit": 1})).await;
+    assert_eq!(
+        census_without_ids(&limited),
+        json!({
+            "path_filter": "src",
+            "total_undocumented": 4,
+            "returned_count": 1,
+            "omitted_count": 3,
+            "complete": false,
+            "limit": 1,
+            "file_count": 1,
+            "files": [{
+                "file": "src/lib.rs",
+                "count": 1,
+                "symbols": [{
+                    "name": "missing",
+                    "kind": "function",
+                    "line": 6,
+                    "signature": "pub fn missing() -> u32"
+                }]
+            }]
+        }),
+        "limit keeps path-then-line order and reports the omitted tail: {limited}"
+    );
+}
+
 #[tokio::test]
 async fn test_files_public_path_filters() {
-    let (cg, _dir) = production_graph_query_fixture().await;
+    let cg = production_graph_query_fixture().await;
     let result = call_production_tool(&cg, "tracedecay_files", json!({"path": "src"}), None, None)
         .await
         .unwrap();
@@ -2653,22 +1989,40 @@ async fn test_files_public_path_filters() {
     assert!(text.contains("main.rs"), "should include src/main.rs");
 }
 
+/// Name-to-body is an exact symbol lookup followed by `tracedecay_source_body`
+/// on the returned node ID.
+#[cfg(feature = "test-transport")]
 #[tokio::test]
-async fn test_body_returns_full_function_source() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_body",
-        json!({"symbol": "format_greeting"}),
-        None,
-        None,
+async fn source_body_returns_full_function_source_for_exact_lookup() {
+    let fixture = production_composition_fixture().await;
+    let server = fixture
+        .harness
+        .server(&fixture.project_root)
+        .expect("production project server");
+    wait_for_current_graph(&server).await;
+    let lookup = handle_real_server_tool_call(
+        &server,
+        "tracedecay_find_exact_symbol",
+        json!({"name": "format_greeting"}),
     )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    let output: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(output["match_count"].as_u64().unwrap(), 1);
-    let m = &output["matches"][0];
+    .await;
+    let lookup: Value = serde_json::from_str(extract_real_server_text(&lookup)).unwrap();
+    let node_id = lookup["matches"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("exact lookup must return a node id: {lookup}"));
+    let result = handle_real_server_tool_call(
+        &server,
+        "tracedecay_source_body",
+        json!({"node_id": node_id}),
+    )
+    .await;
+    let payload: Value = serde_json::from_str(extract_real_server_text(&result)).unwrap();
+    assert_eq!(
+        payload["outcome"]["outcome"],
+        json!("evidence"),
+        "{payload}"
+    );
+    let m = &payload["outcome"]["value"]["payload"];
     let body = m["body"].as_str().unwrap();
     assert!(
         body.contains("fn format_greeting"),
@@ -2694,7 +2048,7 @@ async fn test_body_returns_full_function_source() {
         "end_line should not precede start_line"
     );
     let file_rel = m["file"].as_str().unwrap();
-    let file_abs = _dir.path().join(file_rel);
+    let file_abs = fixture.project_root.join(file_rel);
     let source = std::fs::read_to_string(&file_abs).unwrap();
     let lines: Vec<&str> = source.lines().collect();
     let end_line_text = lines
@@ -2705,219 +2059,164 @@ async fn test_body_returns_full_function_source() {
         end_line_text.trim_end().ends_with('}'),
         "end_line ({end_line}) should point at the closing brace; line text: {end_line_text:?}"
     );
+    fixture.harness.shutdown().await;
 }
 
-#[tokio::test]
-async fn test_body_unknown_symbol() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_body",
-        json!({"symbol": "no_such_symbol_anywhere"}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    assert!(
-        text.contains("No symbol named"),
-        "should report no match, got: {text}"
-    );
+/// Occurrence ids hash the fixture's temporary git directory, so they change
+/// every run. Drop them before comparing the location an agent actually opens.
+fn stable_symbol_locations(mut items: Vec<Value>) -> Vec<Value> {
+    for item in &mut items {
+        item.as_object_mut()
+            .expect("qualified-name row")
+            .remove("node_id");
+    }
+    items.sort_by(|left, right| {
+        left["file"]
+            .as_str()
+            .cmp(&right["file"].as_str())
+            .then(
+                left["start_line"]
+                    .as_u64()
+                    .cmp(&right["start_line"].as_u64()),
+            )
+            .then(left["name"].as_str().cmp(&right["name"].as_str()))
+    });
+    items
 }
 
-#[tokio::test]
-async fn test_callers_for_returns_caller_set_per_id() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-
-    // Look up two distinct targets in one call.
-    let helper_id = graph_node_id(&cg, "helper").await;
-    let format_id = graph_node_id(&cg, "format_greeting").await;
-
+async fn qualified_name_rows(fixture: &GraphQueryFixture, qualified_name: &str) -> Vec<Value> {
     let result = call_production_tool(
-        &cg,
-        "tracedecay_callers_for",
-        json!({"node_ids": [helper_id.clone(), format_id.clone()]}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    let output: Value = serde_json::from_str(text).unwrap();
-
-    // Response shape: { callers: { id: [...], id2: [...] }, truncated: bool, max_per_item: N }
-    assert_eq!(output["truncated"], json!(false));
-    assert!(output["max_per_item"].as_u64().unwrap() > 0);
-
-    let callers = &output["callers"];
-    let helper_callers = callers[&helper_id].as_array().unwrap();
-    let format_callers = callers[&format_id].as_array().unwrap();
-
-    // helper is called from main; format_greeting is called from helper.
-    assert!(
-        !helper_callers.is_empty(),
-        "expected helper to have at least one caller"
-    );
-    assert!(
-        !format_callers.is_empty(),
-        "expected format_greeting to have at least one caller"
-    );
-}
-
-#[tokio::test]
-async fn test_callers_for_includes_unmatched_ids_as_empty() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let helper_id = graph_node_id(&cg, "helper").await;
-    let bogus_id = "function:0000000000000000000000000000ffff".to_string();
-
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_callers_for",
-        json!({"node_ids": [helper_id.clone(), bogus_id.clone()]}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
-    let callers = &output["callers"];
-    assert!(callers[&bogus_id].as_array().unwrap().is_empty());
-    assert!(!callers[&helper_id].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_callers_for_respects_max_per_item() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let helper_id = graph_node_id(&cg, "helper").await;
-    // Cap at 0 — every caller should be marked truncated.
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_callers_for",
-        json!({"node_ids": [helper_id.clone()], "max_per_item": 0}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let output: Value = serde_json::from_str(extract_text(&result.value)).unwrap();
-    assert_eq!(output["truncated"], json!(true));
-    assert!(output["callers"][&helper_id].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_callers_for_rejects_empty_input() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_callers_for",
-        json!({"node_ids": []}),
-        None,
-        None,
-    )
-    .await;
-    let Err(err) = result else {
-        panic!("expected error for empty node_ids");
-    };
-    assert!(format!("{err}").contains("non-empty"));
-}
-
-#[tokio::test]
-async fn test_callers_for_rejects_unknown_kind() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_callers_for",
-        json!({"node_ids": ["function:0000000000000000000000000000ffff"], "kind": "not_a_real_kind"}),
-        None,
-        None,
-    )
-    .await;
-    let Err(err) = result else {
-        panic!("expected error for unknown edge kind");
-    };
-    assert!(format!("{err}").contains("unknown edge kind"));
-    shutdown_graph_fixture(cg).await;
-}
-
-#[tokio::test]
-async fn test_by_qualified_name_finds_indexed_node() {
-    let (cg, _dir) = production_graph_query_fixture().await;
-    let exact = call_production_tool(
-        &cg,
-        "tracedecay_find_exact_symbol",
-        json!({"name": "helper", "limit": 5, "format": "json"}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let exact: Value = serde_json::from_str(extract_text(&exact.value)).unwrap();
-    let qualified_name = exact["matches"]
-        .as_array()
-        .and_then(|matches| matches.first())
-        .and_then(|item| item["qualified_name"].as_str())
-        .expect("exact-symbol response must expose helper's qualified name");
-
-    let result = call_production_tool(
-        &cg,
+        fixture,
         "tracedecay_by_qualified_name",
-        json!({"qualified_name": qualified_name}),
+        json!({"qualified_name": qualified_name, "format": "json"}),
         None,
         None,
     )
     .await
-    .unwrap();
-    let items: Vec<Value> = serde_json::from_str(extract_text(&result.value)).unwrap();
-    assert!(
-        !items.is_empty(),
-        "expected at least one match for helper qname"
-    );
-    assert!(items.iter().any(|i| i["name"] == "helper"));
-    assert!(items[0]["start_line"].as_u64().is_some());
-    assert_eq!(items[0]["unavailable_fields"], json!(["attrs_start_line"]));
+    .unwrap_or_else(|error| {
+        panic!("tracedecay_by_qualified_name({qualified_name}) failed: {error}")
+    });
+    serde_json::from_value(extract_json(&result.value)).unwrap_or_else(|error| {
+        panic!(
+            "tracedecay_by_qualified_name({qualified_name}) was not a JSON array: {error}; {}",
+            result.value
+        )
+    })
 }
 
 #[tokio::test]
-async fn test_by_qualified_name_returns_empty_for_unknown() {
-    let (cg, _env, _dir) = production_empty_graph_query_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_by_qualified_name",
-        json!({"qualified_name": "crate::does::not::exist"}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let items: Vec<Value> = serde_json::from_str(extract_text(&result.value)).unwrap();
-    assert!(items.is_empty());
-}
+async fn tracedecay_by_qualified_name_returns_the_symbol_at_that_exact_name() {
+    let fixture = production_graph_query_fixture().await;
 
-#[tokio::test]
-async fn body_prefers_function_over_field_with_same_name() {
-    let (cg, _dir) = production_function_vs_field_fixture().await;
-    let result = call_production_tool(
-        &cg,
-        "tracedecay_body",
-        json!({"symbol": "gmres"}),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
-    let text = extract_text(&result.value);
-    let output: Value = serde_json::from_str(text).unwrap();
-    let matches = output["matches"].as_array().unwrap();
-    let first = &matches[0];
+    let helper = qualified_name_rows(&fixture, "src/utils.rs::helper").await;
+    let greeting = qualified_name_rows(&fixture, "src/utils.rs::format_greeting").await;
+    let entry = qualified_name_rows(&fixture, "src/main.rs::main").await;
+    let bare_name = qualified_name_rows(&fixture, "helper").await;
+    let suffix = qualified_name_rows(&fixture, "utils.rs::helper").await;
+    let unknown = qualified_name_rows(&fixture, "src/utils.rs::does_not_exist").await;
+
     assert_eq!(
-        first["kind"].as_str(),
-        Some("function"),
-        "first match should be the function definition, got {first}"
+        stable_symbol_locations(helper),
+        vec![json!({
+            "name": "helper",
+            "qualified_name": "src/utils.rs::helper",
+            "kind": "function",
+            "file": "src/utils.rs",
+            "start_line": 3,
+            "end_line": 5,
+            "unavailable_fields": ["attrs_start_line"]
+        })]
     );
-    let body = first["body"].as_str().unwrap();
-    assert!(
-        body.contains("pub fn gmres"),
-        "body should be the function source, got: {body}"
+    assert_eq!(
+        stable_symbol_locations(greeting),
+        vec![json!({
+            "name": "format_greeting",
+            "qualified_name": "src/utils.rs::format_greeting",
+            "kind": "function",
+            "file": "src/utils.rs",
+            "start_line": 7,
+            "end_line": 9,
+            "unavailable_fields": ["attrs_start_line"]
+        })]
     );
+    assert_eq!(
+        stable_symbol_locations(entry),
+        vec![json!({
+            "name": "main",
+            "qualified_name": "src/main.rs::main",
+            "kind": "function",
+            "file": "src/main.rs",
+            "start_line": 5,
+            "end_line": 8,
+            "unavailable_fields": ["attrs_start_line"]
+        })]
+    );
+    assert_eq!(bare_name, Vec::<Value>::new());
+    assert_eq!(suffix, Vec::<Value>::new());
+    assert_eq!(unknown, Vec::<Value>::new());
+
+    let server = fixture
+        .production
+        .harness
+        .server(fixture.project_root())
+        .expect("production graph-query server");
+    for arguments in [json!({}), json!({"qualified_name": 4})] {
+        let response =
+            handle_real_server_tool_call_raw(&server, "tracedecay_by_qualified_name", arguments)
+                .await;
+        assert_eq!(
+            response["error"],
+            json!({
+                "code": -32602,
+                "message": "missing required parameter: qualified_name",
+                "data": {
+                    "detail": "missing required parameter: qualified_name",
+                    "reason_code": "missing_required_parameter",
+                    "retryable": false,
+                    "tool": "tracedecay_by_qualified_name"
+                }
+            }),
+            "rejection: {response}"
+        );
+    }
+    shutdown_graph_fixture(fixture).await;
+}
+
+#[tokio::test]
+async fn tracedecay_by_qualified_name_returns_every_symbol_sharing_that_name() {
+    let fixture = graph_query_fixture_with_sources(|project| {
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(
+            project.join("src/lib.rs"),
+            "fn overloaded() {}\nfn overloaded() {}\n",
+        )
+        .unwrap();
+    })
+    .await;
+
+    let rows = qualified_name_rows(&fixture, "src/lib.rs::overloaded").await;
+    assert_eq!(
+        stable_symbol_locations(rows),
+        vec![
+            json!({
+                "name": "overloaded",
+                "qualified_name": "src/lib.rs::overloaded",
+                "kind": "function",
+                "file": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 1,
+                "unavailable_fields": ["attrs_start_line"]
+            }),
+            json!({
+                "name": "overloaded",
+                "qualified_name": "src/lib.rs::overloaded",
+                "kind": "function",
+                "file": "src/lib.rs",
+                "start_line": 2,
+                "end_line": 2,
+                "unavailable_fields": ["attrs_start_line"]
+            }),
+        ]
+    );
+    shutdown_graph_fixture(fixture).await;
 }

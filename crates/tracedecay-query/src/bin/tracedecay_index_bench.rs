@@ -19,7 +19,7 @@
 //!    generated function changes, recording clone payload recomputation and
 //!    reuse;
 //! 5. drain the sealed generation through
-//!    [`VerifiedSealedLexicalPageSourceV1::next_page_batch_if`], which is
+//!    `VerifiedSealedLexicalPageSourceV1::next_page_batch_if`, which is
 //!    `code_index.lexical_source.batch_stage`;
 //! 6. ingest those pages into an isolated SQLite lexical artifact in bounded
 //!    batches and finalize it, which is `query.artifact.append_pages` and
@@ -49,36 +49,33 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+#[path = "../bench_support.rs"]
+mod artifact_bench;
+
+use artifact_bench::{
+    ActiveControl, AdmittedFile, ApplyingProjectionSink, MemoryPublicationStore, SealedDrainBounds,
+    default_corpus_root, drain_pages, identity, load_corpus, millis, peak_rss_bytes, percentile,
+    replicate, seal_partitioned,
+};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
-use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracedecay_code_index::chunks::content_digest;
 use tracedecay_code_index::clones::{CloneBodyEligibilityV1, CloneNormalizationClassV1};
-use tracedecay_code_index::languages::{LanguageRegistry, StaticLanguageRegistry};
 use tracedecay_code_index::production::{
-    CodeIndexAtomicPublicationPort, CodeIndexBuildRequestV1, CodeIndexCapturedFileV1,
-    CodeIndexExecutionControlV1, CodeIndexGenerationScopeV1, CodeIndexProductionConfigV1,
-    CodeIndexProductionOwnerV1, CodeIndexPublicationStoreErrorV1, CodeIndexPublishedGenerationV1,
+    CodeIndexBuildRequestV1, CodeIndexCapturedFileV1, CodeIndexExecutionControlV1,
+    CodeIndexProductionConfigV1, CodeIndexProductionOwnerV1, CodeIndexPublishedGenerationV1,
     CodeIndexRepositoryParseIdentityV1, PhysicalCodeArtifactPoolStatsV1,
-    VerifiedSealedLexicalPageBatchBoundsV1, VerifiedSealedLexicalPageBatchReadV1,
-    VerifiedSealedLexicalPageSourceV1, VerifiedSealedLexicalPageV1,
-    VerifiedSealedLexicalSourceReceiptV1,
-};
-use tracedecay_code_index::projection::{
-    ChunkProjectionDecisionV1, CodeChunkProjectionSink, ProjectionReceiptBuilderV1,
-    ProjectionSinkErrorV1, ProjectionSinkReceiptV1,
+    VerifiedSealedLexicalPageV1, VerifiedSealedLexicalSourceReceiptV1,
 };
 use tracedecay_domain::{
-    ChunkerRevision, CodeGenerationId, ComponentRevision, ContentDigest, FileOccurrenceId,
-    FreshnessCompatibilityV1, LanguageId, ManifestDigest, PolicyRevisionId, PrivacyDomainId,
-    ProjectId, ProjectionBatchRequestV1, ProjectionKeyV1, ProjectionKindV1, ProjectionOperationV1,
-    ProjectionOutcomeV1, RepositoryDirtyStateV1, RepositoryId, SanitizationReceiptId,
+    ChunkerRevision, ComponentRevision, ContentDigest, FileOccurrenceId, FreshnessCompatibilityV1,
+    ManifestDigest, PolicyRevisionId, PrivacyDomainId, ProjectId, ProjectionKeyV1,
+    ProjectionKindV1, RepositoryDirtyStateV1, RepositoryId, SanitizationReceiptId,
     SanitizedCodeFileV1, SanitizedCodeSnapshotV1, SanitizerRevision, ScoreDomainId,
     SensitivityLevelV1, SnapshotFileDispositionV1, SourceFreshness, SourceInstanceKey,
     SourceNamespace, SymbolOccurrenceId, TreeId, UtcMicros,
@@ -89,15 +86,14 @@ use tracedecay_query::retrieval::lexical::{
     CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
     CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CloneExactArtifactMemberV1,
     CodeLexicalArtifactBuilderV1, CodeLexicalArtifactFinalizationStepV1,
-    CodeLexicalArtifactReaderV1, CodeLexicalArtifactWriterRevisionV1,
-    CodeLexicalProjectionMetadataV1, MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
-    MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1, VerifiedCodeLexicalArtifactV1,
+    CodeLexicalArtifactReaderV1, CodeLexicalCloneRouteV1, CodeLexicalProjectionMetadataV1,
+    MAX_CLONE_EXACT_PAGE_MEMBERS_V1, MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1,
+    VerifiedCodeLexicalArtifactV1,
 };
 
 /// Bumped whenever the workload shape changes, so a profile comparison
 /// across a shape change is visibly not comparable.
 const WORKLOAD_REVISION: &str = "index-bench.v1";
-const DEFAULT_CORPUS_RELATIVE: &str = "benchmark_data/index-bench/corpus";
 const CORPUS_ENV: &str = "TRACEDECAY_INDEX_BENCH_CORPUS";
 const REPLICAS_ENV: &str = "TRACEDECAY_INDEX_BENCH_REPLICAS";
 
@@ -201,14 +197,13 @@ const HOTPATH_OUTPUT_PATH_ENV: &str = "HOTPATH_OUTPUT_PATH";
 const HOTPATH_OUTPUT_FORMAT_ENV: &str = "HOTPATH_OUTPUT_FORMAT";
 
 const USAGE: &str = "\
-usage: tracedecay-index-bench [--corpus DIR] [--replicas N] [--format-revision 14|15|16] [--clone-envelope]
+usage: tracedecay-index-bench [--corpus DIR] [--replicas N] [--clone-envelope]
 
   --corpus DIR   committed fixture corpus to index
                  (default: $TRACEDECAY_INDEX_BENCH_CORPUS, else
                  benchmark_data/index-bench/corpus beside this workspace)
   --replicas N   index the corpus N times under distinct logical path
                  prefixes (default: $TRACEDECAY_INDEX_BENCH_REPLICAS, else 1)
-  --format-revision  lexical artifact revision (default: 16)
   --clone-envelope  measure one-body refresh and clone query behavior
   -h, --help     print this message
 
@@ -219,8 +214,6 @@ report is written.";
 struct Options {
     corpus_root: PathBuf,
     replicas: usize,
-    writer_revision: CodeLexicalArtifactWriterRevisionV1,
-    format_revision: u32,
     clone_envelope: bool,
 }
 
@@ -228,8 +221,6 @@ impl Options {
     fn parse(arguments: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut corpus_root: Option<PathBuf> = None;
         let mut replicas: Option<usize> = None;
-        let mut writer_revision = CodeLexicalArtifactWriterRevisionV1::default();
-        let mut format_revision = 16;
         let mut clone_envelope = false;
         let mut arguments = arguments.peekable();
         while let Some(argument) = arguments.next() {
@@ -246,20 +237,6 @@ impl Options {
                         .next()
                         .ok_or_else(|| "--replicas needs a count".to_owned())?;
                     replicas = Some(parse_replicas(&value)?);
-                }
-                "--format-revision" => {
-                    let value = arguments
-                        .next()
-                        .ok_or_else(|| "--format-revision needs 14, 15, or 16".to_owned())?;
-                    writer_revision = match value.as_str() {
-                        "14" => CodeLexicalArtifactWriterRevisionV1::V14,
-                        "15" => CodeLexicalArtifactWriterRevisionV1::V15,
-                        "16" => CodeLexicalArtifactWriterRevisionV1::V16,
-                        _ => return Err("--format-revision needs 14, 15, or 16".to_owned()),
-                    };
-                    format_revision = value
-                        .parse()
-                        .map_err(|error| format!("invalid artifact revision: {error}"))?;
                 }
                 "--clone-envelope" => clone_envelope = true,
                 other => return Err(format!("unrecognized argument {other:?}")),
@@ -278,8 +255,6 @@ impl Options {
         Ok(Some(Self {
             corpus_root,
             replicas,
-            writer_revision,
-            format_revision,
             clone_envelope,
         }))
     }
@@ -293,119 +268,6 @@ fn parse_replicas(value: &str) -> Result<usize, String> {
         return Err("replica count must be at least 1".to_owned());
     }
     Ok(replicas)
-}
-
-/// The corpus lives beside the workspace this binary was compiled from, so
-/// the default resolves from `CARGO_MANIFEST_DIR` rather than the process
-/// working directory: the profiling job invokes the binary by path, not
-/// from the crate root.
-fn default_corpus_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join(DEFAULT_CORPUS_RELATIVE)
-}
-
-// ---------------------------------------------------------------------------
-// Corpus admission
-// ---------------------------------------------------------------------------
-
-struct CorpusFile {
-    relative_path: String,
-    language: LanguageId,
-    bytes: Vec<u8>,
-}
-
-/// Ordered, `.gitignore`-blind directory walk. `ignore`-crate walking would
-/// consult repository and global ignore files, which makes the admitted file
-/// set depend on the machine - unacceptable for a head-vs-base comparison.
-fn load_corpus(root: &Path) -> Result<Vec<CorpusFile>, String> {
-    let registry = StaticLanguageRegistry::new();
-    let mut files = Vec::new();
-    collect_corpus(root, root, &registry, &mut files)?;
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    if files.is_empty() {
-        return Err(format!(
-            "corpus {} admitted no files with a known language extension",
-            root.display()
-        ));
-    }
-    Ok(files)
-}
-
-fn collect_corpus(
-    root: &Path,
-    directory: &Path,
-    registry: &StaticLanguageRegistry,
-    files: &mut Vec<CorpusFile>,
-) -> Result<(), String> {
-    let mut entries = std::fs::read_dir(directory)
-        .map_err(|error| format!("read {}: {error}", directory.display()))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read {}: {error}", directory.display()))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        let file_type = entry
-            .file_type()
-            .map_err(|error| format!("stat {}: {error}", path.display()))?;
-        if file_type.is_dir() {
-            collect_corpus(root, &path, registry, files)?;
-            continue;
-        }
-        if !file_type.is_file() {
-            continue;
-        }
-        let Some(extension) = path.extension().and_then(std::ffi::OsStr::to_str) else {
-            continue;
-        };
-        let Some(descriptor) = registry.descriptor_for_extension(&extension.to_lowercase()) else {
-            continue;
-        };
-        if !descriptor.capabilities.extraction {
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|error| format!("relativize {}: {error}", path.display()))?;
-        let Some(relative_path) = relative.to_str() else {
-            return Err(format!("corpus path {} is not Unicode", relative.display()));
-        };
-        let bytes =
-            std::fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
-        files.push(CorpusFile {
-            relative_path: relative_path.replace('\\', "/"),
-            language: descriptor.language.clone(),
-            bytes,
-        });
-    }
-    Ok(())
-}
-
-/// One admitted source file, already replicated and identified.
-struct AdmittedFile {
-    logical_path: String,
-    language: LanguageId,
-    bytes: Arc<[u8]>,
-}
-
-fn replicate(corpus: &[CorpusFile], replicas: usize) -> Vec<AdmittedFile> {
-    let mut admitted = Vec::with_capacity(corpus.len().saturating_mul(replicas));
-    for replica in 0..replicas {
-        for file in corpus {
-            let logical_path = if replica == 0 {
-                file.relative_path.clone()
-            } else {
-                format!("replica{replica:02}/{}", file.relative_path)
-            };
-            admitted.push(AdmittedFile {
-                logical_path,
-                language: file.language.clone(),
-                bytes: Arc::from(file.bytes.clone()),
-            });
-        }
-    }
-    admitted.sort_by(|left, right| left.logical_path.cmp(&right.logical_path));
-    admitted
 }
 
 /// Deterministic incremental edit: append a distinguishing trailing comment
@@ -523,22 +385,6 @@ fn build_body_refresh(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// In-memory production authorities
-// ---------------------------------------------------------------------------
-
-struct ActiveControl;
-
-impl CodeIndexExecutionControlV1 for ActiveControl {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-
-    fn is_deadline_exceeded(&self) -> bool {
-        false
-    }
-}
-
 struct CancelledControl;
 
 impl CodeIndexExecutionControlV1 for CancelledControl {
@@ -550,99 +396,6 @@ impl CodeIndexExecutionControlV1 for CancelledControl {
         false
     }
 }
-
-/// In-memory compare-and-swap publication authority. The real daemon store
-/// is a database; the benchmark deliberately measures indexing rather than
-/// storage, so publication is a map behind a mutex.
-#[derive(Default)]
-struct MemoryPublicationStore {
-    active: Arc<Mutex<BTreeMap<CodeIndexGenerationScopeV1, Arc<CodeIndexPublishedGenerationV1>>>>,
-}
-
-impl CodeIndexAtomicPublicationPort for MemoryPublicationStore {
-    fn load_active(
-        &self,
-        scope: &CodeIndexGenerationScopeV1,
-    ) -> Result<Option<Arc<CodeIndexPublishedGenerationV1>>, CodeIndexPublicationStoreErrorV1> {
-        Ok(self
-            .active
-            .lock()
-            .map_err(|_| CodeIndexPublicationStoreErrorV1::CompareAndSwap)?
-            .get(scope)
-            .map(Arc::clone))
-    }
-
-    fn publish_atomically(
-        &mut self,
-        scope: &CodeIndexGenerationScopeV1,
-        expected_active_generation: Option<&CodeGenerationId>,
-        generation: Arc<CodeIndexPublishedGenerationV1>,
-    ) -> Result<(), CodeIndexPublicationStoreErrorV1> {
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| CodeIndexPublicationStoreErrorV1::CompareAndSwap)?;
-        if active
-            .get(scope)
-            .map(|current| current.manifest().generation_id.clone())
-            .as_ref()
-            != expected_active_generation
-        {
-            return Err(CodeIndexPublicationStoreErrorV1::CompareAndSwap);
-        }
-        active.insert(scope.clone(), generation);
-        Ok(())
-    }
-}
-
-/// Applies every decision without a downstream model or store, so the
-/// profile attributes time to extraction and sealing rather than to a
-/// projection backend this workload does not mount.
-struct ApplyingProjectionSink;
-
-impl CodeChunkProjectionSink for ApplyingProjectionSink {
-    fn project_changed_chunks(
-        &mut self,
-        request: &ProjectionBatchRequestV1,
-        receipt_builder: ProjectionReceiptBuilderV1<'_>,
-    ) -> Result<ProjectionSinkReceiptV1, ProjectionSinkErrorV1> {
-        let mut decisions = Vec::with_capacity(
-            request.changes.added_or_changed.len() + request.changes.deleted.len(),
-        );
-        decisions.extend(request.changes.added_or_changed.iter().map(|change| {
-            ChunkProjectionDecisionV1 {
-                chunk_id: change.chunk_id.clone(),
-                prior_chunk_digest: change.prior_digest.clone(),
-                current_chunk_digest: change.current_digest.clone(),
-                operation: if change.prior_digest.is_some() {
-                    ProjectionOperationV1::Updated
-                } else {
-                    ProjectionOperationV1::Added
-                },
-                outcome: ProjectionOutcomeV1::Applied,
-                output_digest: change.current_digest.clone(),
-            }
-        }));
-        decisions.extend(
-            request
-                .changes
-                .deleted
-                .iter()
-                .map(|change| ChunkProjectionDecisionV1 {
-                    chunk_id: change.chunk_id.clone(),
-                    prior_chunk_digest: change.prior_digest.clone(),
-                    current_chunk_digest: None,
-                    operation: ProjectionOperationV1::Deleted,
-                    outcome: ProjectionOutcomeV1::Applied,
-                    output_digest: None,
-                }),
-        );
-        receipt_builder
-            .build(&decisions)
-            .map_err(|error| ProjectionSinkErrorV1::Rejected(error.to_string()))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Workload
 // ---------------------------------------------------------------------------
@@ -782,17 +535,23 @@ fn run(options: &Options) -> Result<String, String> {
         .map_err(|error| format!("read generation statistics: {error}"))?;
 
     let seal_started = Instant::now();
-    let sealed = generations
-        .generation
-        .encode_sealed()
-        .map_err(|error| format!("encode sealed generation: {error}"))?;
+    let sealed = seal_partitioned(&generations.generation)?;
     let seal_wall = seal_started.elapsed();
-    let sealed_len = sealed.len() as u64;
-    let state_digest = sealed_state_digest(&sealed)?;
+    let sealed_len = sealed.byte_len();
+    let state_digest = sealed.state_digest.clone();
 
     // Pass 3 - drain the sealed generation as bounded page batches.
     let drain_started = Instant::now();
-    let (pages, source_receipt) = drain_pages(&sealed, sealed_len, &state_digest, &control)?;
+    let (pages, source_receipt) = drain_pages(
+        &sealed,
+        &control,
+        SealedDrainBounds {
+            batch_pages: BATCH_MAX_PAGES,
+            batch_retained_bytes: BATCH_MAX_RETAINED_BYTES,
+            page_chunks: MAX_PAGE_CHUNKS,
+            page_bytes: MAX_PAGE_BYTES,
+        },
+    )?;
     let drain_wall = drain_started.elapsed();
 
     // Pass 4 - ingest the pages into an isolated on-disk lexical artifact.
@@ -802,10 +561,9 @@ fn run(options: &Options) -> Result<String, String> {
     let artifact_path = scratch.path().join("lexical.sqlite");
     let artifact = ingest_artifact(
         &artifact_path,
-        metadata,
+        metadata.clone(),
         &pages,
         &source_receipt,
-        options.writer_revision,
         &control,
     )?;
     let ingest_wall = ingest_started.elapsed();
@@ -813,7 +571,7 @@ fn run(options: &Options) -> Result<String, String> {
         measure_clone_queries(
             &artifact_path,
             &artifact.receipt,
-            options.format_revision,
+            &metadata,
             &pages,
             generations.body_refresh.changed_path.as_deref(),
             &control,
@@ -851,7 +609,7 @@ fn run(options: &Options) -> Result<String, String> {
         committed_pages: artifact.committed_pages,
         committed_chunks: artifact.committed_chunks,
         artifact: &artifact.receipt,
-        artifact_format_revision: options.format_revision,
+        artifact_format_revision: artifact.receipt.format_revision(),
         clone_queries,
         corpus_wall,
         clean_wall: generations.clean_wall,
@@ -933,64 +691,6 @@ fn benchmark_file_occurrence_id(file: &AdmittedFile, digest: &ContentDigest) -> 
         occurrence.as_str().trim_start_matches("sha256:")
     ))
 }
-
-fn sealed_state_digest(sealed: &[u8]) -> Result<ManifestDigest, String> {
-    let envelope: serde_json::Value = serde_json::from_slice(sealed)
-        .map_err(|error| format!("decode sealed generation envelope: {error}"))?;
-    let digest = envelope
-        .get("state_digest")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| "sealed generation envelope has no state digest".to_owned())?;
-    ManifestDigest::try_from(digest.to_owned())
-        .map_err(|error| format!("sealed generation state digest: {error:?}"))
-}
-
-/// Drain the sealed generation through the bounded batch path, which is the
-/// shape the daemon's artifact ingestion uses. The single-page path is
-/// asserted to agree on the source receipt so a regression that desynchronizes
-/// the two cursors fails here instead of skewing the comparison.
-fn drain_pages(
-    sealed: &[u8],
-    sealed_len: u64,
-    state_digest: &ManifestDigest,
-    control: &ActiveControl,
-) -> Result<
-    (
-        Vec<VerifiedSealedLexicalPageV1>,
-        VerifiedSealedLexicalSourceReceiptV1,
-    ),
-    String,
-> {
-    let bounds =
-        VerifiedSealedLexicalPageBatchBoundsV1::new(BATCH_MAX_PAGES, BATCH_MAX_RETAINED_BYTES)
-            .map_err(|error| format!("sealed lexical batch bounds: {error}"))?;
-    let mut source = VerifiedSealedLexicalPageSourceV1::open(
-        Cursor::new(sealed.to_vec()),
-        sealed_len,
-        state_digest.clone(),
-        MAX_PAGE_CHUNKS,
-        MAX_PAGE_BYTES,
-        control,
-    )
-    .map_err(|error| format!("open sealed lexical page source: {error}"))?;
-    let mut pages = Vec::new();
-    loop {
-        let read = source
-            .next_page_batch_if(control, bounds, |staged| {
-                NonZeroUsize::new(staged.len())
-                    .ok_or_else(|| "sealed lexical batch staged no pages".to_owned())
-            })
-            .map_err(|error| format!("stage sealed lexical page batch: {error}"))?
-            .map_err(|error| format!("admit sealed lexical page batch: {error}"))?;
-        match read {
-            VerifiedSealedLexicalPageBatchReadV1::Pages(batch) => pages.extend(batch),
-            VerifiedSealedLexicalPageBatchReadV1::Complete(receipt) => {
-                return Ok((pages, receipt));
-            }
-        }
-    }
-}
-
 fn projection_metadata(
     generation: &CodeIndexPublishedGenerationV1,
     repository: &RepositoryId,
@@ -1020,6 +720,11 @@ fn projection_metadata(
             "retriever.lexical.index-bench.v1",
         ),
         exact_score_domain: identity::<ScoreDomainId>("score.exact.index-bench.v1"),
+        clone_route: Some(CodeLexicalCloneRouteV1 {
+            project_id: generation.manifest().project_id.clone(),
+            worktree_id: generation.snapshot().worktree.clone(),
+            snapshot_digest: generation.manifest().snapshot_digest.clone(),
+        }),
     }
 }
 
@@ -1034,15 +739,10 @@ fn ingest_artifact(
     metadata: CodeLexicalProjectionMetadataV1,
     pages: &[VerifiedSealedLexicalPageV1],
     source_receipt: &VerifiedSealedLexicalSourceReceiptV1,
-    writer_revision: CodeLexicalArtifactWriterRevisionV1,
     control: &ActiveControl,
 ) -> Result<ArtifactIngestResult, String> {
-    let mut builder = CodeLexicalArtifactBuilderV1::create_with_format_revision(
-        artifact_path,
-        metadata,
-        writer_revision,
-    )
-    .map_err(|error| format!("create lexical artifact: {error}"))?;
+    let mut builder = CodeLexicalArtifactBuilderV1::create(artifact_path, metadata)
+        .map_err(|error| format!("create lexical artifact: {error}"))?;
     let mut progress = builder
         .progress()
         .map_err(|error| format!("read artifact progress: {error}"))?;
@@ -1112,34 +812,23 @@ fn clone_census(pages: &[VerifiedSealedLexicalPageV1]) -> serde_json::Value {
 fn measure_clone_queries(
     artifact_path: &Path,
     receipt: &VerifiedCodeLexicalArtifactV1,
-    format_revision: u32,
+    metadata: &CodeLexicalProjectionMetadataV1,
     pages: &[VerifiedSealedLexicalPageV1],
     excluded_path: Option<&str>,
     control: &ActiveControl,
 ) -> Result<serde_json::Value, String> {
     let elapsed_micros =
         |duration: Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
-    // Always open the reader under --clone-envelope so peak RSS compares like
-    // with like across format revisions. Format 14 has no clone index, but it
-    // still mmaps the sealed artifact; skipping the open made v16−v14 look like
-    // a multi-GiB clone regression when most of the delta was "mmap vs no mmap".
     let open_started = Instant::now();
     let reader = CodeLexicalArtifactReaderV1::open_with_control(
         artifact_path,
         receipt,
+        metadata,
         CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
         control,
     )
     .map_err(|error| format!("open clone artifact reader: {error}"))?;
     let first_reader_open_micros = elapsed_micros(open_started.elapsed());
-    if format_revision < 15 {
-        drop(reader);
-        return Ok(serde_json::json!({
-            "state": "unavailable",
-            "reason": "artifact_has_no_clone_index",
-            "first_reader_open_micros": first_reader_open_micros,
-        }));
-    }
     let Some(source) = pages
         .iter()
         .flat_map(VerifiedSealedLexicalPageV1::clone_bodies)
@@ -1198,7 +887,7 @@ fn measure_clone_queries(
             )
         })?;
 
-    let fingerprint = if reader.has_clone_fingerprints() {
+    let fingerprint = {
         let read = reader
             .clone_fingerprint_page(
                 &artifact_source.occurrence,
@@ -1255,11 +944,6 @@ fn measure_clone_queries(
                 "point": cancelled.accounting.cancellation_point.map(|point| format!("{point:?}")),
             },
         })
-    } else {
-        serde_json::json!({
-            "state": "unavailable",
-            "reason": "artifact_has_no_clone_fingerprints",
-        })
     };
 
     drop(reader);
@@ -1267,6 +951,7 @@ fn measure_clone_queries(
     let restarted = CodeLexicalArtifactReaderV1::open_with_control(
         artifact_path,
         receipt,
+        metadata,
         CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
         control,
     )
@@ -1379,22 +1064,6 @@ impl Scratch {
             .map_err(|error| format!("remove scratch {}: {error}", self.path.display()))
     }
 }
-
-/// Peak resident set size in bytes, or `None` off Linux. The profiling job
-/// budgets 4 GB; reporting the high-water mark makes a breach visible in the
-/// run log instead of only as an OOM kill.
-fn peak_rss_bytes() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    for line in status.lines() {
-        let Some(value) = line.strip_prefix("VmHWM:") else {
-            continue;
-        };
-        let kilobytes = value.split_whitespace().next()?.parse::<u64>().ok()?;
-        return kilobytes.checked_mul(1024);
-    }
-    None
-}
-
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
@@ -1492,19 +1161,6 @@ fn summary(fields: SummaryFields<'_>) -> String {
     });
     serde_json::to_string_pretty(&report).unwrap_or_else(|_| report.to_string())
 }
-
-fn millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn percentile(sorted: &[u64], percent: usize) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let rank = (sorted.len() * percent).div_ceil(100);
-    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
-}
-
 fn host_facts() -> serde_json::Value {
     let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
         .ok()
@@ -1533,17 +1189,6 @@ fn host_facts() -> serde_json::Value {
         "memory_bytes": memory_bytes,
     })
 }
-
-fn identity<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    <T as TryFrom<String>>::Error: fmt::Debug,
-{
-    T::try_from(value.to_owned()).unwrap_or_else(|error| {
-        panic!("deterministic benchmark identity {value:?} must be valid: {error:?}")
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

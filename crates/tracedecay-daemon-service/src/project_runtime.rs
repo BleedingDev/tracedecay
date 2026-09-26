@@ -9,6 +9,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 use tracedecay_runtime_core::path_safety::plain_host_path;
 
@@ -114,9 +115,9 @@ impl<const SLOT: u8> Drop for RecordingComponent<SLOT> {
 /// `RegisteredWorkRuntime` mounts.
 ///
 /// It carries a real
-/// [`tracedecay_runtime_core::cancellation::CancellationToken`] — the same
+/// [`tracedecay_runtime_core::cancellation::CancellationToken`], the same
 /// handle the production
-/// recovery owners cancel through — so a test can observe the synchronous
+/// recovery owners cancel through, so a test can observe the synchronous
 /// shutdown sweep without assembling a whole Work runtime (a registered
 /// database lease, grant, topology policy, and routing authority) around it.
 #[cfg(test)]
@@ -185,6 +186,7 @@ pub struct ProjectRuntime {
     retained: Option<RegisteredRetainedRuntime>,
     lsp_owner: Option<DaemonLspInvocationOwner>,
     source_edit: Option<Arc<crate::project_owner_registration::ProjectSourceEditOwnerV1>>,
+    graph_tool: Option<crate::invocation::RegisteredGraphToolOwnerV1>,
     #[cfg(any(test, feature = "test-helpers"))]
     test_marker: Option<Arc<dyn Any + Send + Sync>>,
     observability: Option<RegisteredObservabilityProducerV1>,
@@ -234,6 +236,7 @@ impl ProjectRuntime {
             || self.retained.is_some()
             || self.lsp_owner.is_some()
             || self.source_edit.is_some()
+            || self.graph_tool.is_some()
             || self.observability.is_some()
             || {
                 #[cfg(any(test, feature = "test-helpers"))]
@@ -313,6 +316,7 @@ project_runtime_components!(
     RegisteredRetainedRuntime => retained,
     DaemonLspInvocationOwner => lsp_owner,
     Arc<crate::project_owner_registration::ProjectSourceEditOwnerV1> => source_edit,
+    crate::invocation::RegisteredGraphToolOwnerV1 => graph_tool,
     RegisteredObservabilityProducerV1 => observability,
 );
 
@@ -638,6 +642,9 @@ pub struct ProjectRuntimeRegistryV1 {
     root_fences: Arc<ProfiledMutex<ProjectRuntimeRootFencesV1>>,
     reservation_changed: watch::Sender<u64>,
     reservation_blocking_changed: Arc<(StdMutex<u64>, Condvar)>,
+    /// Bumped whenever a published owner or a project's publication state
+    /// changes, so a request waiting on an owner re-reads the runtime.
+    published_changed: watch::Sender<u64>,
     /// The blocking drain is retained independently of whichever async
     /// shutdown caller first requested it. A retry can therefore join the
     /// same work after that caller is cancelled.
@@ -654,6 +661,7 @@ pub struct ProjectRuntimeRegistryV1 {
 impl Default for ProjectRuntimeRegistryV1 {
     fn default() -> Self {
         let (reservation_changed, _) = watch::channel(0);
+        let (published_changed, _) = watch::channel(0);
         let (shutdown_complete, _) = watch::channel(ShutdownState::Pending);
         Self {
             runtimes: Arc::new(hotpath::mutex!(
@@ -666,6 +674,7 @@ impl Default for ProjectRuntimeRegistryV1 {
             )),
             reservation_changed,
             reservation_blocking_changed: Arc::new((StdMutex::new(0), Condvar::new())),
+            published_changed,
             shutdown_task: Arc::new(AsyncMutex::new(None)),
             closed: Arc::new(AtomicBool::new(false)),
             shutdown_started: Arc::new(AtomicBool::new(false)),
@@ -1092,6 +1101,8 @@ impl ProjectRuntimeRegistryV1 {
                 let runtime = runtimes.entry(project_root.clone()).or_default();
                 if !runtime.reservations.contains(&TypeId::of::<C>()) {
                     *C::slot(runtime) = Some(component);
+                    drop(runtimes);
+                    self.signal_published_changed();
                     return Ok(());
                 }
             }
@@ -1239,6 +1250,9 @@ impl ProjectRuntimeRegistryV1 {
                         .map_err(|_| FeedbackCyclePublicationError::RouterUnavailable)?;
                     runtime.advisory = Some(advisory);
                     runtime.advisory_cycle = Some(advisory_cycle);
+                    drop(runtimes);
+                    drop(root_fences);
+                    self.signal_published_changed();
                     return Ok(());
                 }
             }
@@ -1293,7 +1307,7 @@ impl ProjectRuntimeRegistryV1 {
         C: ProjectRuntimeComponent,
         F: FnOnce(&C) -> T,
     {
-        let canonical = project_root.canonicalize().ok();
+        let canonical = canonical_existing_identity(project_root).ok();
         let runtimes = self.lock_runtimes();
         runtime_for_lookup(&runtimes, project_root, canonical.as_deref())
             .and_then(C::peek)
@@ -1305,7 +1319,7 @@ impl ProjectRuntimeRegistryV1 {
         &self,
         project_root: &Path,
     ) -> Option<ProjectRuntimePublicationStateV1> {
-        let canonical = project_root.canonicalize().ok();
+        let canonical = canonical_existing_identity(project_root).ok();
         let runtimes = self.lock_runtimes();
         runtime_for_lookup(&runtimes, project_root, canonical.as_deref())
             .map(|runtime| runtime.publication)
@@ -1345,7 +1359,35 @@ impl ProjectRuntimeRegistryV1 {
         }
         runtime.publication = state;
         runtime.publication_attempt = None;
+        drop(runtimes);
+        self.signal_published_changed();
         true
+    }
+
+    fn signal_published_changed(&self) {
+        self.published_changed
+            .send_modify(|version| *version = version.wrapping_add(1));
+    }
+
+    /// The advisory-cycle owner and publication state held for
+    /// `project_root`, with a receiver subscribed before the read so no later
+    /// publication is missed.
+    pub(crate) fn advisory_cycle_view(
+        &self,
+        project_root: &Path,
+    ) -> (
+        Option<DaemonAdvisoryCycleInvocationOwner>,
+        Option<ProjectRuntimePublicationStateV1>,
+        watch::Receiver<u64>,
+    ) {
+        let changed = self.published_changed.subscribe();
+        let runtimes = self.lock_runtimes();
+        let runtime = runtimes.get(project_root);
+        (
+            runtime.and_then(|runtime| runtime.advisory_cycle.clone()),
+            runtime.map(|runtime| runtime.publication),
+            changed,
+        )
     }
 
     /// Record terminal owner failure only for the attempt that is still current.
@@ -1381,8 +1423,8 @@ impl ProjectRuntimeRegistryV1 {
     /// Register a component, or accept an incumbent the caller recognizes as
     /// the same authority.
     ///
-    /// `reconcile` sees the incumbent and either accepts it — returning `Ok`,
-    /// having refreshed whatever the caller renews — or refuses. An empty slot
+    /// `reconcile` sees the incumbent and either accepts it, returning `Ok`,
+    /// having refreshed whatever the caller renews, or refuses. An empty slot
     /// is reserved under the registry locks, then `build` runs after both
     /// locks are released. Registrations for the same typed slot join that
     /// reservation and receive its exact terminal outcome.

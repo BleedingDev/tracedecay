@@ -128,7 +128,7 @@ pub(super) async fn execute_observatory_read(
             );
         }
     };
-    let finished_at = current_micros();
+    let finished_at = now_micros();
     let authority = match authorization
         .recheck_publication(&context, &operation, &admission, finished_at)
         .await
@@ -157,7 +157,7 @@ fn observatory_evidence(
 ) -> Result<DaemonFeedbackResult, ApplicationProblem> {
     let execution = OperationReceipt::completed(
         observed_at,
-        current_micros(),
+        now_micros(),
         deadline,
         OperationBudgetUsage::default(),
     )
@@ -188,14 +188,10 @@ fn observatory_evidence(
 }
 
 fn invalid_observatory_request() -> ApplicationProblem {
-    ApplicationProblem::InvalidRequest {
-        diagnostic: SafeDiagnostic {
-            code: "application.observatory.invalid-request".to_owned(),
-            message: "The Observatory read request is invalid".to_owned(),
-        },
-        retry: RetryDirective::Never,
-        legal_actions: Vec::new(),
-    }
+    ApplicationProblem::invalid_request_without_action(
+        "application.observatory.invalid-request",
+        "The Observatory read request is invalid",
+    )
 }
 
 fn observatory_unavailable(request_id: String, code: &str) -> DaemonInvocationResponse {

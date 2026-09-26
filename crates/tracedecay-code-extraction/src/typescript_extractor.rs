@@ -18,6 +18,8 @@ use crate::types::{
 mod imports;
 mod test_calls;
 
+pub use test_calls::is_test_framework_call_signature;
+
 /// Extracts code graph nodes and edges from TypeScript/JavaScript source files
 /// using tree-sitter.
 pub struct TypeScriptExtractor;
@@ -30,8 +32,8 @@ struct ShadowedCallNames {
 /// Internal state used during AST traversal.
 ///
 /// Borrows the caller's source for the lifetime of the walk: copying the
-/// whole file here made every `extract_parsed` pass — including incremental
-/// walks of one tiny item — pay a full-file memcpy before visiting a node.
+/// whole file here made every `extract_parsed` pass, including incremental
+/// walks of one tiny item, pay a full-file memcpy before visiting a node.
 struct ExtractionState<'s> {
     nodes: Vec<Node>,
     edges: Vec<Edge>,
@@ -68,8 +70,7 @@ impl<'s> ExtractionState<'s> {
     ///
     /// The file root is pushed onto `node_stack` as the first frame when
     /// extraction begins, so iterating the stack already yields the file
-    /// path as the leading segment — prepending `self.file_path` here was
-    /// a leftover that duplicated the prefix (`<file>::<file>::Type::method`).
+    /// path as the leading segment.
     fn qualified_prefix(&self) -> String {
         self.node_stack
             .iter()
@@ -250,7 +251,7 @@ impl TypeScriptExtractor {
                 }
             }
             _ => {
-                // For other node types, skip — children are visited explicitly
+                // For other node types, skip. Children are visited explicitly
                 // by the specific visit_* methods when needed.
             }
         }
@@ -263,6 +264,8 @@ impl TypeScriptExtractor {
         state.in_export = true;
 
         let start_line = node.start_position().row as u32;
+        imports::visit_reexport(state, node);
+        imports::visit_default_export(state, node);
 
         let mut cursor = node.walk();
         if cursor.goto_first_child() {

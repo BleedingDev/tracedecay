@@ -149,9 +149,7 @@ pub(super) fn prepare_execution_snapshot(
             tracedecay_contracts::WorkProductApplicationErrorV1::SelectionCoverageIncomplete,
         ));
     }
-    let tracedecay_contracts::WorkGraphReadV1::Current { snapshot, .. } = read else {
-        return Err(work_product_authority_unavailable());
-    };
+    let snapshot = read.into_current_snapshot().map_err(work_product_problem)?;
     let tracedecay_contracts::WorkProductExpectedAuthorityV1::Verified { verified_version } =
         &request.mutation.expected_authority
     else {
@@ -254,10 +252,12 @@ pub(super) fn current_work_product_snapshot(
         CapabilityId::new(capability).map_err(|_| work_product_authority_unavailable())?;
     let binding = tracedecay_contracts::WorkProductBindingV1::new(capability, use_case.clone());
     let selection = tracedecay_contracts::WorkProductSelectionScopeV1::relations(
-        std::collections::BTreeSet::from([tracedecay_contracts::WorkRelationScopeV1::Repository {
-            project_id: context.scope().project_id.clone(),
-            repository_id: context.scope().repository_id.clone(),
-        }]),
+        std::collections::BTreeSet::from([
+            tracedecay_contracts::WorkProductAuthorizedRelationScopeV1::Repository {
+                project_id: context.scope().project_id.clone(),
+                repository_id: context.scope().repository_id.clone(),
+            },
+        ]),
     )
     .map_err(|_| work_product_authority_unavailable())?;
     let read =
@@ -273,14 +273,7 @@ pub(super) fn current_work_product_snapshot(
         tracedecay_contracts::WorkGraphReadRequestV1::current(selection, observed_at),
     )
     .map_err(work_product_problem)?;
-    match read {
-        tracedecay_contracts::WorkGraphReadV1::Current { snapshot, .. } => Ok(snapshot),
-        tracedecay_contracts::WorkGraphReadV1::AsOf { .. }
-        | tracedecay_contracts::WorkGraphReadV1::Evolution { .. }
-        | tracedecay_contracts::WorkGraphReadV1::Forensic { .. } => {
-            Err(work_product_authority_unavailable())
-        }
-    }
+    read.into_current_snapshot().map_err(work_product_problem)
 }
 
 pub(super) fn decide_product_proposal(

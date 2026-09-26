@@ -7,11 +7,11 @@
 //! commands. TraceDecay stages the source; Claude Code owns registration,
 //! enabled state, cache, and trust through its native plugin commands.
 //!
-//! 1. Deploy the embedded bundle to a stable marketplace dir
-//!    (`~/.claude/plugins/marketplaces/tracedecay/`), stamping the plugin
-//!    version and substituting the resolved tracedecay binary path.
-//! 2. The operator runs Claude Code's native `claude plugin` command against
-//!    that source and then retries TraceDecay so the receipt can be tracked.
+//! 1. The receipt-backed component transaction deploys the rendered bundle to
+//!    a stable marketplace dir (`~/.claude/plugins/marketplaces/tracedecay/`),
+//!    stamping the plugin version and substituting the resolved binary path.
+//! 2. Its activation step then drives Claude Code's native `claude plugin`
+//!    commands against that source, inside the same rollback boundary.
 
 use std::path::{Path, PathBuf};
 
@@ -21,11 +21,8 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 
 pub(super) use super::plugin_bundle::TRACEDECAY_BIN_PLACEHOLDER;
 use super::{
-    AgentIntegration, DeferredUserAction, DoctorCounters, HealthcheckContext, InstallContext,
-    JsonConfigDialect, JsonConfigMutation, NonInteractiveInstallOutcome, UpdatePluginOutcome,
-    collect_regular_files, expected_tool_perms, is_auto_discovered_entrypoint, load_json_file,
-    safe_remove_host_file, safe_write_text_file, skill_contents_have_tracedecay_marker,
-    update_json_config_transactionally,
+    AgentIntegration, DoctorCounters, HealthcheckContext, InstallContext, JsonConfigDialect,
+    JsonConfigMutation, load_json_file, update_json_config_transactionally,
 };
 
 pub struct ClaudeIntegration;
@@ -41,21 +38,6 @@ impl AgentIntegration for ClaudeIntegration {
 
     fn supports_local_install(&self) -> bool {
         true
-    }
-
-    fn preflight_non_interactive_install(
-        &self,
-        ctx: &InstallContext,
-    ) -> Result<NonInteractiveInstallOutcome> {
-        claude_non_interactive_install_state(&ctx.home, &ctx.tracedecay_bin, Vec::new())
-    }
-
-    fn prepare_non_interactive_install(
-        &self,
-        ctx: &InstallContext,
-    ) -> Result<NonInteractiveInstallOutcome> {
-        let deploy_dir = deploy_plugin_bundle(&ctx.home, &ctx.tracedecay_bin)?;
-        claude_non_interactive_install_state(&ctx.home, &ctx.tracedecay_bin, vec![deploy_dir])
     }
 
     // Claude Code exposes a first-party plugin lifecycle CLI, so TraceDecay
@@ -94,12 +76,11 @@ impl AgentIntegration for ClaudeIntegration {
     fn deactivate_project_host_component_registration(
         &self,
         _components: &[super::host_bundle::HostComponentV1],
-        ctx: &InstallContext,
+        _ctx: &InstallContext,
         project_path: &Path,
     ) -> Result<()> {
         let claude_md_path = project_path.join(".claude/CLAUDE.md");
         super::remove_managed_skill_prompt_index(
-            &ctx.home,
             &claude_md_path,
             tracedecay_automation_runtime::automation::skill_targets::SkillInstallTarget::Claude,
         )?;
@@ -107,69 +88,42 @@ impl AgentIntegration for ClaudeIntegration {
     }
 
     fn activate_deployed_host_registration(&self, ctx: &InstallContext) -> Result<()> {
+        // Claude copies the marketplace tree into its versioned cache. A
+        // receiptless older plugin keeps entrypoints the current catalog no
+        // longer ships; those survive artifact replacement and make the
+        // loaded cache fail discovery after `plugin install` exits 0.
+        remove_non_catalog_claude_marketplace_files(&ctx.home)?;
         if !claude_plugin_is_natively_active(&ctx.home, Some(&ctx.tracedecay_bin))? {
             let claude = require_claude_cli()?;
             claude_plugin_activate_with(&claude, &ctx.home)?;
         }
+        // Sibling version directories are not part of the registration
+        // snapshot. Claude leaves them in place across install and update.
+        remove_stale_claude_plugin_cache(&ctx.home)?;
         ensure_claude_plugin_permission(&ctx.home)
     }
 
     fn deactivate_deployed_host_registration(&self, ctx: &InstallContext) -> Result<()> {
-        let deploy_dir = plugin_deploy_dir(&ctx.home);
-        let source_owned = deploy_dir_is_tracedecay(&deploy_dir);
-        // A component-set uninstall removes receipt-owned source files before
-        // this registration boundary runs. If a legacy receiptless install is
-        // still present, however, its manifest is the only ownership proof we
-        // have before cleaning that source. A foreign manifest must stop the
-        // lifecycle before Claude's native removal command is invoked.
-        if deploy_dir_has_manifest(&deploy_dir) && !source_owned {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "refusing to remove non-tracedecay plugin directory {}",
-                    deploy_dir.display()
-                ),
-            });
-        }
         if !claude_plugin_registration_is_active(&ctx.home)? {
-            return source_owned
-                .then(|| remove_deployed_bundle(&ctx.home))
-                .unwrap_or(Ok(()));
+            return Ok(());
         }
         let claude = require_claude_cli()?;
-        claude_plugin_deactivate_with(&claude, &ctx.home)?;
-        if source_owned {
-            remove_deployed_bundle(&ctx.home)?;
-        }
-        Ok(())
-    }
-
-    fn update_plugin(&self, ctx: &InstallContext) -> Result<UpdatePluginOutcome> {
-        // The source directory is a mutable path under the user's Claude
-        // profile. Presence alone is not evidence that TraceDecay owns it:
-        // reject a foreign or malformed marketplace before staging an update.
-        if !ensure_owned_deploy_dir(&plugin_deploy_dir(&ctx.home))? {
-            return Ok(UpdatePluginOutcome::NotInstalled);
-        }
-
-        // The marketplace source is TraceDecay-owned, but Claude Code activates
-        // a versioned cache through its own CLI. Refreshing only this source
-        // cannot honestly report an activated plugin, so stage it and defer
-        // the host-native cache update to the operator.
-        let deploy_dir = deploy_plugin_bundle(&ctx.home, &ctx.tracedecay_bin)?;
-        Ok(UpdatePluginOutcome::DeferredUserAction(
-            super::DeferredUserAction {
-                remediation: format!(
-                    "Claude Code plugin source is staged. Run `claude plugin update {PLUGIN_IDENTIFIER}`, then restart Claude Code."
-                ),
-                staged_paths: vec![deploy_dir],
-            },
-        ))
+        claude_plugin_deactivate_with(&claude, &ctx.home)
     }
 
     fn healthcheck(&self, dc: &mut DoctorCounters, ctx: &HealthcheckContext) {
         eprintln!("\n\x1b[1mClaude Code integration\x1b[0m");
         doctor_check_plugin(dc, &ctx.home);
         doctor_check_permissions_json(dc, &ctx.home);
+        super::doctor_check_managed_skill_prompt_indexes(
+            dc,
+            &ctx.home,
+            &[
+                ctx.home.join(".claude").join("CLAUDE.md"),
+                ctx.project_path.join(".claude/CLAUDE.md"),
+            ],
+            tracedecay_automation_runtime::automation::skill_targets::SkillInstallTarget::Claude,
+        );
         doctor_check_local_config(dc, &ctx.project_path);
     }
 
@@ -190,15 +144,7 @@ impl AgentIntegration for ClaudeIntegration {
             Ok(None) => json!({}),
             Err(()) => return State::Corrupt,
         };
-        let deploy_dir = plugin_deploy_dir(&ctx.home);
-        // The source itself is a receiptless-install signal. It also gives
-        // uninstall a chance to clean a prior native-plugin install after the
-        // host registration was manually removed.
-        if deploy_dir_is_present(&deploy_dir) && !deploy_dir_is_tracedecay(&deploy_dir) {
-            return State::Corrupt;
-        }
-        let marketplace_residue =
-            marketplace.get("tracedecay").is_some() || deploy_dir_is_tracedecay(&deploy_dir);
+        let marketplace_residue = marketplace.get("tracedecay").is_some();
         let settings_residue = settings
             .pointer("/enabledPlugins/tracedecay@tracedecay")
             .is_some()
@@ -308,31 +254,8 @@ impl AgentIntegration for ClaudeIntegration {
     }
 
     fn has_tracedecay(&self, home: &Path) -> bool {
-        deploy_dir_is_tracedecay(&plugin_deploy_dir(home))
+        plugin_marketplace_manifest_path(home).exists()
     }
-}
-
-fn claude_non_interactive_install_state(
-    home: &Path,
-    tracedecay_bin: &str,
-    staged_paths: Vec<PathBuf>,
-) -> Result<NonInteractiveInstallOutcome> {
-    if !claude_plugin_registration_is_active(home)? {
-        return Ok(NonInteractiveInstallOutcome::DeferredUserAction(
-            claude_native_install_action(staged_paths.first().map(PathBuf::as_path)),
-        ));
-    }
-    if claude_loaded_cache_matches_expected_bundle(home, tracedecay_bin)? {
-        return Ok(NonInteractiveInstallOutcome::Ready);
-    }
-    Ok(NonInteractiveInstallOutcome::DeferredUserAction(
-        DeferredUserAction {
-            remediation: format!(
-                "Claude Code's loaded TraceDecay cache is stale. Run `claude plugin update {PLUGIN_IDENTIFIER}`, restart Claude Code, then retry the TraceDecay lifecycle."
-            ),
-            staged_paths,
-        },
-    ))
 }
 
 fn claude_plugin_is_natively_active(home: &Path, tracedecay_bin: Option<&str>) -> Result<bool> {
@@ -391,29 +314,6 @@ fn claude_current_cached_plugin_root(home: &Path) -> PathBuf {
         .join(crate::PRODUCT_VERSION)
 }
 
-/// Check Claude's host-owned loaded cache without consulting the deployed
-/// marketplace source. Source drift is repaired by the receipt-backed component
-/// transaction, which must observe and back up the pre-transaction bytes first.
-fn claude_loaded_cache_matches_expected_bundle(home: &Path, tracedecay_bin: &str) -> Result<bool> {
-    let cache_root = claude_current_cached_plugin_root(home);
-    let rendered = rendered_plugin_files(tracedecay_bin)?;
-    let (expected, relatives) = super::rendered_bundle_content_digest(&rendered)?;
-    let Some(cache) = super::observed_bundle_content_digest(&cache_root, &relatives)? else {
-        return Ok(false);
-    };
-    if cache != expected {
-        return Ok(false);
-    }
-    // A self-comparison reuses the discovery validator to reject unexpected
-    // auto-discovered entrypoints without making readiness depend on source.
-    super::observed_bundle_discovery_matches(
-        &cache_root,
-        &cache_root,
-        &relatives,
-        &[".claude-plugin", "agents", "commands", "hooks", "skills"],
-    )
-}
-
 fn claude_loaded_cache_matches_rendered_bundle(
     home: &Path,
     tracedecay_bin: Option<&str>,
@@ -451,17 +351,202 @@ fn claude_loaded_cache_matches_rendered_bundle(
     )
 }
 
-fn claude_native_install_action(staged_dir: Option<&Path>) -> DeferredUserAction {
-    let register = staged_dir.map_or_else(
-        || "Claude Code's native marketplace command".to_string(),
-        |path| format!("`claude plugin marketplace add {}`", path.display()),
-    );
-    DeferredUserAction {
-        remediation: format!(
-            "Claude Code owns marketplace registration, cache, and enabled state. Run {register}, then `claude plugin install {PLUGIN_IDENTIFIER}` and re-run TraceDecay to record the staged source."
+fn claude_plugin_needs_reinstall(home: &Path) -> Result<bool> {
+    let recorded = claude_plugin_registration_is_active(home)?
+        || claude_installed_plugins_records_plugin(home)?;
+    Ok(recorded && !claude_loaded_cache_matches_rendered_bundle(home, None)?)
+}
+
+fn claude_installed_plugins_path(home: &Path) -> PathBuf {
+    home.join(".claude/plugins/installed_plugins.json")
+}
+
+/// Stock Claude records an installed plugin at
+/// `/plugins/<plugin>@<marketplace>` as either a non-empty array of scope
+/// entries or one object. A missing file means the plugin is not recorded.
+/// Unreadable or invalid JSON is a typed failure, not "not installed".
+fn claude_installed_plugins_records_plugin(home: &Path) -> Result<bool> {
+    let path = claude_installed_plugins_path(home);
+    let document = read_optional_json(&path).map_err(|()| TraceDecayError::Config {
+        message: format!(
+            "could not read Claude installed plugin state at {}",
+            path.display()
         ),
-        staged_paths: staged_dir.into_iter().map(Path::to_path_buf).collect(),
+    })?;
+    let Some(document) = document else {
+        return Ok(false);
+    };
+    let pointer = format!("/plugins/{PLUGIN_IDENTIFIER}");
+    Ok(claude_plugin_record_is_present(document.pointer(&pointer)))
+}
+
+fn claude_plugin_record_is_present(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Array(entries)) => !entries.is_empty(),
+        Some(serde_json::Value::Object(entry)) => !entry.is_empty(),
+        Some(serde_json::Value::Null) | None => false,
+        Some(_) => true,
     }
+}
+
+fn remove_non_catalog_claude_marketplace_files(home: &Path) -> Result<()> {
+    let deploy = plugin_deploy_dir(home);
+    match std::fs::symlink_metadata(&deploy) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "refusing to clean a symlinked Claude marketplace at {}",
+                    deploy.display()
+                ),
+            });
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "Claude marketplace at {} is not a directory",
+                    deploy.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "could not inspect Claude marketplace at {}: {error}",
+                    deploy.display()
+                ),
+            });
+        }
+    }
+    let catalog = claude_embedded_plugin_files();
+    let files = super::collect_regular_files(&deploy).map_err(|error| TraceDecayError::Config {
+        message: format!(
+            "failed to list Claude marketplace {}: {error}",
+            deploy.display()
+        ),
+    })?;
+    for file in files {
+        let relative = marketplace_relative(&deploy, &file)?;
+        if catalog.iter().any(|(path, _)| *path == relative) {
+            continue;
+        }
+        super::safe_remove_host_file(&file).map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to remove non-catalog Claude marketplace file {}: {error}",
+                file.display()
+            ),
+        })?;
+        prune_empty_dirs_up_to(&file, &deploy)?;
+    }
+    Ok(())
+}
+
+fn marketplace_relative(deploy: &Path, file: &Path) -> Result<String> {
+    let relative = file
+        .strip_prefix(deploy)
+        .map_err(|_| TraceDecayError::Config {
+            message: format!(
+                "Claude marketplace file {} is outside {}",
+                file.display(),
+                deploy.display()
+            ),
+        })?;
+    let text = relative.to_str().ok_or_else(|| TraceDecayError::Config {
+        message: format!("Claude marketplace path is not UTF-8: {}", file.display()),
+    })?;
+    Ok(text.replace(std::path::MAIN_SEPARATOR, "/"))
+}
+
+fn prune_empty_dirs_up_to(file: &Path, root: &Path) -> Result<()> {
+    for dir in file.ancestors().skip(1).take_while(|dir| *dir != root) {
+        match std::fs::remove_dir(dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(TraceDecayError::Config {
+                    message: format!("failed to prune {}: {error}", dir.display()),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delete every cache child that is not the version this binary ships.
+/// The current version directory is the registration snapshot; older
+/// siblings are not, and renaming them would leave a recoverable copy.
+fn remove_stale_claude_plugin_cache(home: &Path) -> Result<()> {
+    let versions = home.join(".claude/plugins/cache/tracedecay/tracedecay");
+    match std::fs::symlink_metadata(&versions) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "refusing to clean a symlinked Claude plugin cache at {}",
+                    versions.display()
+                ),
+            });
+        }
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "Claude plugin cache at {} is not a directory",
+                    versions.display()
+                ),
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "could not inspect Claude plugin cache at {}: {error}",
+                    versions.display()
+                ),
+            });
+        }
+    }
+    for entry in std::fs::read_dir(&versions).map_err(|error| TraceDecayError::Config {
+        message: format!(
+            "failed to list Claude plugin cache {}: {error}",
+            versions.display()
+        ),
+    })? {
+        let entry = entry.map_err(|error| TraceDecayError::Config {
+            message: format!(
+                "failed to read a Claude plugin cache entry under {}: {error}",
+                versions.display()
+            ),
+        })?;
+        if entry.file_name() == crate::PRODUCT_VERSION {
+            continue;
+        }
+        let path = entry.path();
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|error| TraceDecayError::Config {
+                message: format!(
+                    "could not inspect stale Claude plugin cache {}: {error}",
+                    path.display()
+                ),
+            })?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            std::fs::remove_dir_all(&path).map_err(|error| TraceDecayError::Config {
+                message: format!(
+                    "failed to remove stale Claude plugin cache {}: {error}",
+                    path.display()
+                ),
+            })?;
+        } else {
+            super::safe_remove_host_file(&path).map_err(|error| TraceDecayError::Config {
+                message: format!(
+                    "failed to remove stale Claude plugin cache {}: {error}",
+                    path.display()
+                ),
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Name of Claude Code's lifecycle binary.
@@ -493,10 +578,25 @@ fn require_claude_cli() -> Result<PathBuf> {
 /// Drive Claude Code's own commands to register the staged marketplace and
 /// enable the plugin.
 ///
+/// Claude keys its plugin cache by manifest version, and `plugin install` and
+/// `plugin update` both leave an installed version's cache untouched. A
+/// rebuilt bundle that keeps the version (every build between releases) is
+/// therefore only loaded after Claude's own uninstall drops the stale cache.
+/// Stock `plugin install` also exits 0 without copying when
+/// `installed_plugins.json` already records the plugin, which is how an
+/// unrecorded older install survives a receiptless adoption.
+///
 /// Split from the trait method so tests can supply a launcher and an isolated
 /// `HOME` without mutating the process environment.
 #[hotpath::measure(label = "hosts.agent.claude.plugin_activate")]
 fn claude_plugin_activate_with(claude: &Path, home: &Path) -> Result<()> {
+    if claude_plugin_needs_reinstall(home)? {
+        run_claude_plugin_step(
+            claude,
+            &["plugin", "uninstall", PLUGIN_SELECTION_NAME],
+            home,
+        )?;
+    }
     let deploy_dir = plugin_deploy_dir(home);
     let deploy_arg = deploy_dir.to_string_lossy().into_owned();
     run_claude_plugin_step(
@@ -566,7 +666,7 @@ fn plugin_deploy_dir(home: &Path) -> PathBuf {
     home.join(".claude/plugins/marketplaces/tracedecay")
 }
 
-/// The deployed marketplace manifest — presence signals a plugin install.
+/// The deployed marketplace manifest, presence signals a plugin install.
 fn plugin_marketplace_manifest_path(home: &Path) -> PathBuf {
     plugin_deploy_dir(home).join(".claude-plugin/marketplace.json")
 }
@@ -576,37 +676,9 @@ fn known_marketplaces_path(home: &Path) -> PathBuf {
     home.join(".claude/plugins/known_marketplaces.json")
 }
 
-/// Deploy every embedded bundle file into the stable marketplace dir,
-/// stamping the plugin version and substituting the binary path.
-#[hotpath::measure(label = "hosts.agent.claude.plugin_deploy")]
-fn deploy_plugin_bundle(home: &Path, tracedecay_bin: &str) -> Result<PathBuf> {
-    if std::fs::symlink_metadata(home.join(".claude"))
-        .is_ok_and(|metadata| metadata.file_type().is_symlink())
-    {
-        return Err(TraceDecayError::Config {
-            message: super::host_bundle::HostBundleError::UnsafeClaudeHomeSymlink.to_string(),
-        });
-    }
-    let deploy_dir = plugin_deploy_dir(home);
-    write_rendered_plugin_bundle(&deploy_dir, tracedecay_bin)?;
-    eprintln!(
-        "\x1b[32m✔\x1b[0m Deployed tracedecay plugin bundle to {}",
-        deploy_dir.display()
-    );
-    Ok(deploy_dir)
-}
-
-fn write_rendered_plugin_bundle(deploy_dir: &Path, tracedecay_bin: &str) -> Result<()> {
-    clean_replace_owned_deploy_dir(deploy_dir)?;
-    for (relative, rendered) in rendered_plugin_files(tracedecay_bin)? {
-        safe_write_text_file(&deploy_dir.join(relative), &rendered, None)?;
-    }
-    Ok(())
-}
-
-/// Canonical rendered Claude plugin inventory shared by native-activation
-/// staging and the receipt-backed first-party catalog. One renderer keeps the
-/// staged source byte-identical to the later component transaction.
+/// Canonical rendered Claude plugin inventory: the receipt-backed first-party
+/// catalog deploys exactly these bytes as the marketplace source, and the
+/// native-activation probe compares Claude's loaded cache against them.
 pub(crate) fn rendered_plugin_files(tracedecay_bin: &str) -> Result<Vec<(&'static str, String)>> {
     claude_embedded_plugin_files()
         .into_iter()
@@ -615,273 +687,6 @@ pub(crate) fn rendered_plugin_files(tracedecay_bin: &str) -> Result<Vec<(&'stati
                 .map(|rendered| (relative, rendered))
         })
         .collect()
-}
-
-/// Return whether the path itself exists, including a broken symlink or another
-/// unreadable entry. A failed metadata lookup is treated as present so callers
-/// that classify read-only host state fail closed as `Corrupt`.
-fn deploy_dir_is_present(deploy_dir: &Path) -> bool {
-    match std::fs::symlink_metadata(deploy_dir) {
-        Ok(_) => true,
-        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-    }
-}
-
-/// Return whether either durable manifest is present at the deploy root.
-/// Manifest presence is used only to distinguish a post-transaction foreign
-/// file tree from an old receiptless install during native deactivation.
-fn deploy_dir_has_manifest(deploy_dir: &Path) -> bool {
-    [
-        ".claude-plugin/plugin.json",
-        ".claude-plugin/marketplace.json",
-    ]
-    .iter()
-    .any(|relative| std::fs::symlink_metadata(deploy_dir.join(relative)).is_ok())
-}
-
-/// True when a deployed marketplace dir is tracedecay-owned: its plugin or
-/// marketplace manifest names the tracedecay plugin. Ownership requires a real
-/// directory and a regular, non-symlink manifest, so a foreign path cannot
-/// redirect lifecycle writes through an apparently valid manifest.
-fn deploy_dir_is_tracedecay(deploy_dir: &Path) -> bool {
-    let Ok(metadata) = std::fs::symlink_metadata(deploy_dir) else {
-        return false;
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return false;
-    }
-    let names_tracedecay = |manifest: &Path| {
-        let Ok(metadata) = std::fs::symlink_metadata(manifest) else {
-            return false;
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return false;
-        }
-        load_json_file(manifest)
-            .get("name")
-            .and_then(|v| v.as_str())
-            == Some("tracedecay")
-    };
-    names_tracedecay(&deploy_dir.join(".claude-plugin/plugin.json"))
-        || names_tracedecay(&deploy_dir.join(".claude-plugin/marketplace.json"))
-}
-
-/// Validate an existing deploy path before a lifecycle operation. A missing
-/// path is a normal first install; every other existing path must be a real
-/// directory carrying TraceDecay's manifest ownership proof.
-fn ensure_owned_deploy_dir(deploy_dir: &Path) -> Result<bool> {
-    let metadata = match std::fs::symlink_metadata(deploy_dir) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "failed to inspect Claude plugin directory {}: {error}",
-                    deploy_dir.display()
-                ),
-            });
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "refusing to replace non-tracedecay plugin directory {}",
-                deploy_dir.display()
-            ),
-        });
-    }
-    if !deploy_dir_is_tracedecay(deploy_dir) {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "refusing to replace non-tracedecay plugin directory {}",
-                deploy_dir.display()
-            ),
-        });
-    }
-    Ok(true)
-}
-
-/// Remove every managed file from an owned deploy root while preserving
-/// user-created files, directories, and symlinks. Retired auto-discovered
-/// entrypoints are removed only when their own contents carry a TraceDecay
-/// marker; a same-name user workflow therefore stays intact.
-fn remove_deployed_bundle(home: &Path) -> Result<()> {
-    let deploy_dir = plugin_deploy_dir(home);
-    if !ensure_owned_deploy_dir(&deploy_dir)? {
-        return Ok(());
-    }
-    remove_managed_deploy_files(&deploy_dir)
-}
-
-fn remove_managed_deploy_files(deploy_dir: &Path) -> Result<()> {
-    let managed = claude_embedded_plugin_files()
-        .into_iter()
-        .map(|(relative, _)| deploy_dir.join(relative))
-        .collect::<std::collections::BTreeSet<_>>();
-    for path in &managed {
-        remove_managed_deploy_file(path)?;
-    }
-    sweep_retired_deploy_files(deploy_dir, &managed)?;
-    prune_empty_deploy_dirs(deploy_dir)
-}
-
-fn remove_managed_deploy_file(path: &Path) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "failed to inspect Claude plugin file {}: {error}",
-                    path.display()
-                ),
-            });
-        }
-    };
-    if metadata.file_type().is_symlink() || metadata.is_dir() || !metadata.is_file() {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "refusing to remove unsafe Claude plugin file {}",
-                path.display()
-            ),
-        });
-    }
-    match safe_remove_host_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(TraceDecayError::Config {
-            message: format!(
-                "failed to remove Claude plugin file {}: {error}",
-                path.display()
-            ),
-        }),
-    }
-}
-
-fn sweep_retired_deploy_files(
-    deploy_dir: &Path,
-    managed: &std::collections::BTreeSet<PathBuf>,
-) -> Result<()> {
-    for relative_root in ["agents", "commands", "skills"] {
-        let root = deploy_dir.join(relative_root);
-        let metadata = match std::fs::symlink_metadata(&root) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(TraceDecayError::Config {
-                    message: format!(
-                        "failed to inspect retired Claude plugin files under {}: {error}",
-                        root.display()
-                    ),
-                });
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            continue;
-        }
-        let mut files = collect_regular_files(&root).map_err(|error| TraceDecayError::Config {
-            message: format!(
-                "failed to inventory retired Claude plugin files under {}: {error}",
-                root.display()
-            ),
-        })?;
-        files.sort();
-        for file in files {
-            if managed.contains(&file) {
-                continue;
-            }
-            let Some(relative) = file
-                .strip_prefix(deploy_dir)
-                .ok()
-                .and_then(Path::to_str)
-                .map(|relative| relative.replace(std::path::MAIN_SEPARATOR, "/"))
-            else {
-                continue;
-            };
-            if !is_auto_discovered_entrypoint(&relative) {
-                continue;
-            }
-            let contents =
-                std::fs::read_to_string(&file).map_err(|error| TraceDecayError::Config {
-                    message: format!(
-                        "failed to read retired Claude plugin file {}: {error}",
-                        file.display()
-                    ),
-                })?;
-            if !skill_contents_have_tracedecay_marker(&contents) {
-                continue;
-            }
-            remove_managed_deploy_file(&file)?;
-        }
-        prune_empty_deploy_dirs(&root)?;
-    }
-    Ok(())
-}
-
-fn prune_empty_deploy_dirs(root: &Path) -> Result<()> {
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "failed to inspect Claude plugin directory {}: {error}",
-                    root.display()
-                ),
-            });
-        }
-    };
-    for entry in entries {
-        let entry = entry.map_err(|error| TraceDecayError::Config {
-            message: format!(
-                "failed to inspect Claude plugin directory {}: {error}",
-                root.display()
-            ),
-        })?;
-        let metadata = entry.file_type().map_err(|error| TraceDecayError::Config {
-            message: format!(
-                "failed to inspect Claude plugin path {}: {error}",
-                entry.path().display()
-            ),
-        })?;
-        if metadata.is_dir() && !metadata.is_symlink() {
-            prune_empty_deploy_dirs(&entry.path())?;
-        }
-    }
-    let empty = std::fs::read_dir(root)
-        .map_err(|error| TraceDecayError::Config {
-            message: format!(
-                "failed to inspect Claude plugin directory {}: {error}",
-                root.display()
-            ),
-        })?
-        .next()
-        .is_none();
-    if empty {
-        match std::fs::remove_dir(root) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(TraceDecayError::Config {
-                    message: format!(
-                        "failed to remove empty Claude plugin directory {}: {error}",
-                        root.display()
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Remove the managed files from an owned deploy dir so the next write is a
-/// clean replacement of TraceDecay's bundle. Foreign files remain available
-/// to the marketplace owner and are never removed by this lifecycle.
-fn clean_replace_owned_deploy_dir(deploy_dir: &Path) -> Result<()> {
-    if !ensure_owned_deploy_dir(deploy_dir)? {
-        return Ok(());
-    }
-    remove_managed_deploy_files(deploy_dir)
 }
 
 /// Apply per-file deploy-time substitutions:
@@ -969,13 +774,9 @@ fn ensure_claude_dir(claude_dir: &Path) -> Result<()> {
     })
 }
 
-/// Permission-allowlist prefixes, shared with usage classification so the
-/// installer and the analytics reader agree on which namespaces are ours. The
-/// legacy and prior-plugin prefixes are read only to detect and mirror existing
-/// entries onto the current plugin namespace; they are never removed.
-use crate::tool_name::{
-    LEGACY_TOOL_PREFIX as LEGACY_TOOL_PERM_PREFIX, PLUGIN_TOOL_PREFIX as PLUGIN_TOOL_PERM_PREFIX,
-};
+/// Permission-allowlist prefix, shared with usage classification so the
+/// installer and the analytics reader agree on which namespace is ours.
+use crate::tool_name::PLUGIN_TOOL_PREFIX as PLUGIN_TOOL_PERM_PREFIX;
 
 /// Every managed tracedecay tool's plugin-namespace permission entry.
 fn plugin_tool_perms() -> tracedecay_domain::errors::Result<Vec<String>> {
@@ -996,8 +797,7 @@ fn plugin_wildcard_perm() -> String {
 
 /// Add the one documented plugin-namespace allow rule without replacing any
 /// other Claude setting. The receipt-backed lifecycle snapshots settings.json
-/// before this registration effect, while the config transaction also leaves
-/// the normal recoverable `.bak` used by every shared-config edit.
+/// before this registration effect.
 fn ensure_claude_plugin_permission(home: &Path) -> Result<()> {
     let settings_path = home.join(".claude/settings.json");
     ensure_claude_dir(
@@ -1069,7 +869,7 @@ fn plugin_perms_satisfied(installed: &[&str]) -> tracedecay_domain::errors::Resu
 }
 
 /// Coverage check against a concrete expected-tool list. An empty expected
-/// list must not read as vacuously satisfied — only the wildcard rule can
+/// list must not read as vacuously satisfied, only the wildcard rule can
 /// cover it.
 fn plugin_perms_covered(installed: &[&str], per_tool: &[String]) -> bool {
     installed.contains(&plugin_wildcard_perm().as_str())
@@ -1087,23 +887,6 @@ const CLAUDE_MD_SENTINELS: super::prompt_rules::OwnedBlockSentinels =
         start: "<!-- tracedecay:claude:start -->",
         end: "<!-- tracedecay:claude:end -->",
     };
-/// Heading markers shipped releases (through v0.1.0-beta.37) used as the
-/// block's identity: the steady heading, its display-case product-name
-/// variant, and the Codegraph-era fragment (matched as a substring because
-/// historical heading prefixes varied). Update and uninstall must recognize
-/// them so an existing install converges instead of stranding a stale block.
-const CLAUDE_MD_HISTORICAL_MARKERS: [&str; 3] = [
-    "## MANDATORY: No Explore Agents When Tracedecay Is Available",
-    "## MANDATORY: No Explore Agents When TraceDecay Is Available",
-    "No Explore Agents When Codegraph Is Available",
-];
-/// The one `## ` sub-heading historical blocks owned. A historical block range
-/// extends across exactly this heading — never any arbitrary line containing
-/// "tracedecay", which would wrongly absorb a user's own `## …tracedecay…`
-/// heading on uninstall.
-const CLAUDE_MD_HISTORICAL_OWNED_SUBHEADING: &str =
-    "## When you spawn an Explore agent in a tracedecay-enabled project";
-
 /// True when a `CLAUDE.md` is a tracedecay-managed Claude config (references
 /// tracedecay), so a lifecycle skill export may refresh it. An unrelated
 /// project `CLAUDE.md` must not become an export destination.
@@ -1111,55 +894,11 @@ fn claude_md_references_tracedecay(claude_md_path: &Path) -> bool {
     std::fs::read_to_string(claude_md_path).is_ok_and(|contents| contents.contains("tracedecay"))
 }
 
-/// Every tracedecay-owned CLAUDE.md range in document order: current
-/// sentinel-delimited blocks plus historical heading-marked ones.
+/// Every tracedecay-owned CLAUDE.md block in document order.
 fn owned_claude_md_ranges(contents: &str) -> Vec<std::ops::Range<usize>> {
-    super::prompt_rules::owned_block_ranges(contents, first_owned_claude_md_range)
-}
-
-/// Earliest owned block at or after `from`.
-fn first_owned_claude_md_range(contents: &str, from: usize) -> Option<std::ops::Range<usize>> {
-    let current = CLAUDE_MD_SENTINELS.block_range(contents, from);
-    let historical = historical_claude_md_range(contents, from);
-    match (current, historical) {
-        (Some(current), Some(historical)) if historical.start < current.start => Some(historical),
-        (Some(current), _) => Some(current),
-        (None, historical) => historical,
-    }
-}
-
-/// Byte range of the earliest historical heading-marked block at or after
-/// `from`: from the start of the marker's line across its owned sub-heading to
-/// the next foreign `## ` heading, the managed skill index, a current start
-/// sentinel, or EOF.
-fn historical_claude_md_range(contents: &str, from: usize) -> Option<std::ops::Range<usize>> {
-    let (start, mut search_from) = CLAUDE_MD_HISTORICAL_MARKERS
-        .iter()
-        .filter_map(|marker| {
-            contents[from..].find(marker).map(|at| {
-                let pos = from + at;
-                let line_start = contents[..pos].rfind('\n').map_or(0, |nl| nl + 1);
-                (line_start, pos + marker.len())
-            })
-        })
-        .min_by_key(|(start, _)| *start)?;
-    loop {
-        let boundary = super::prompt_rules::historical_heading_block_end(
-            contents,
-            search_from,
-            CLAUDE_MD_SENTINELS,
-        );
-        // Only extend across the block's own known sub-heading; any other
-        // boundary closes the block.
-        let heading_line = contents[boundary..]
-            .strip_prefix('\n')
-            .and_then(|rest| rest.lines().next());
-        if heading_line.map(str::trim_end) == Some(CLAUDE_MD_HISTORICAL_OWNED_SUBHEADING) {
-            search_from = boundary + 1 + CLAUDE_MD_HISTORICAL_OWNED_SUBHEADING.len();
-            continue;
-        }
-        return Some(start..boundary);
-    }
+    super::prompt_rules::owned_block_ranges(contents, |contents, from| {
+        CLAUDE_MD_SENTINELS.block_range(contents, from)
+    })
 }
 
 /// The full tracedecay-managed CLAUDE.md block.
@@ -1200,9 +939,9 @@ fn claude_md_guidance_text() -> String {
     )
 }
 
-/// Install or refresh the CLAUDE.md block: every owned range, current or
-/// historical, converges onto exactly one copy of the current block in place
-/// while operator text around it is preserved.
+/// Install or refresh the CLAUDE.md block: every owned range converges onto
+/// exactly one copy of the current block in place while operator text around
+/// it is preserved.
 fn install_claude_md_rules(claude_md_path: &Path) -> Result<()> {
     let block = claude_md_rules_text();
     super::prompt_rules::reconcile_prompt_rules_with(claude_md_path, |existing| {
@@ -1213,7 +952,7 @@ fn install_claude_md_rules(claude_md_path: &Path) -> Result<()> {
     })
 }
 
-/// Remove every tracedecay-owned CLAUDE.md block, current or historical.
+/// Remove every tracedecay-owned CLAUDE.md block.
 fn uninstall_claude_md_rules(claude_md_path: &Path) -> Result<()> {
     super::prompt_rules::remove_prompt_rules_with(claude_md_path, |contents| {
         let ranges = owned_claude_md_ranges(contents);
@@ -1231,7 +970,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
     let manifest_path = plugin_marketplace_manifest_path(home);
     if !manifest_path.exists() {
         dc.warn(&format!(
-            "{} not found — run `tracedecay install` if you use Claude Code",
+            "{} not found, run `tracedecay install` if you use Claude Code",
             manifest_path.display()
         ));
         return;
@@ -1251,7 +990,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
     match plugin_manifest.get("version").and_then(|v| v.as_str()) {
         Some(crate::PRODUCT_VERSION) => dc.pass("Deployed plugin version matches tracedecay"),
         Some(version) => dc.warn(&format!(
-            "Deployed plugin version {version} does not match tracedecay {} — run `tracedecay update-plugin`",
+            "Deployed plugin version {version} does not match tracedecay {}, run `tracedecay update-plugin`",
             crate::PRODUCT_VERSION
         )),
         None => dc.warn("Deployed plugin.json does not contain a version"),
@@ -1266,7 +1005,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
             dc.pass(&format!("Plugin {label} present"));
         } else {
             dc.fail(&format!(
-                "Plugin {label} missing in {} — run `tracedecay install`",
+                "Plugin {label} missing in {}, run `tracedecay install`",
                 deploy_dir.display()
             ));
         }
@@ -1280,7 +1019,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
             dc.pass(&format!("Plugin {label} present"));
         } else {
             dc.fail(&format!(
-                "Plugin {label} missing in {} — run `tracedecay install`",
+                "Plugin {label} missing in {}, run `tracedecay install`",
                 deploy_dir.display()
             ));
         }
@@ -1302,7 +1041,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
     });
     if registered && !schema_complete {
         dc.fail(&format!(
-            "Marketplace entry in {} is missing installLocation/lastUpdated — repair it with Claude Code's native plugin command",
+            "Marketplace entry in {} is missing installLocation/lastUpdated, repair it with Claude Code's native plugin command",
             known_marketplaces_path(home).display()
         ));
     } else if registered {
@@ -1312,7 +1051,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
         ));
     } else {
         dc.warn(&format!(
-            "Marketplace not registered in {} — run the native Claude plugin marketplace command",
+            "Marketplace not registered in {}, run the native Claude plugin marketplace command",
             known_marketplaces_path(home).display()
         ));
     }
@@ -1330,7 +1069,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
         ));
     } else {
         dc.warn(&format!(
-            "Plugin {PLUGIN_IDENTIFIER} not enabled in settings.json — enable it with Claude Code's native plugin command"
+            "Plugin {PLUGIN_IDENTIFIER} not enabled in settings.json, enable it with Claude Code's native plugin command"
         ));
     }
 }
@@ -1339,7 +1078,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path) {
 fn doctor_check_permissions_json(dc: &mut DoctorCounters, home: &Path) {
     let settings_path = home.join(".claude").join("settings.json");
     if !settings_path.exists() {
-        dc.warn("~/.claude/settings.json not found — configure plugin permissions in Claude Code");
+        dc.warn("~/.claude/settings.json not found, configure plugin permissions in Claude Code");
         return;
     }
     let Some(settings) = std::fs::read_to_string(&settings_path)
@@ -1358,7 +1097,7 @@ fn doctor_check_permissions_json(dc: &mut DoctorCounters, home: &Path) {
 
     // The plugin-namespace entries are the ones the plugin MCP server actually
     // matches against; without coverage every call to a tool prompts
-    // interactively and hard-fails headless/in subagents. Check these first —
+    // interactively and hard-fails headless/in subagents. Check these first,
     // this is the real adoption gate. Install/update add the one managed
     // wildcard while preserving the rest of Claude's host-owned settings.
     let wildcard = plugin_wildcard_perm();
@@ -1366,7 +1105,7 @@ fn doctor_check_permissions_json(dc: &mut DoctorCounters, home: &Path) {
         Ok(per_tool) => per_tool,
         Err(error) => {
             // An unreadable catalog is a composition failure, never "this host
-            // advertises no tools" — say so instead of reporting coverage of
+            // advertises no tools", say so instead of reporting coverage of
             // an empty set.
             dc.fail(&format!(
                 "Could not read the advertised tool catalog, so tool permissions cannot be \
@@ -1381,53 +1120,16 @@ fn doctor_check_permissions_json(dc: &mut DoctorCounters, home: &Path) {
         ));
     } else if plugin_perms_covered(&installed, &per_tool) {
         dc.pass(&format!(
-            "All {} plugin tool permissions granted individually — the single allow rule \
+            "All {} plugin tool permissions granted individually, the single allow rule \
              \"{wildcard}\" would replace them",
             per_tool.len()
         ));
     } else {
         dc.fail(&format!(
-            "Plugin tool calls will prompt interactively — add the single allow rule \
+            "Plugin tool calls will prompt interactively, add the single allow rule \
              \"{wildcard}\" to `permissions.allow` in {} (or run `/permissions` in Claude Code \
              and allow that rule); it covers every tracedecay plugin tool",
             settings_path.display()
-        ));
-    }
-
-    let expected = match expected_tool_perms() {
-        Ok(expected) => expected,
-        Err(error) => {
-            dc.fail(&format!(
-                "Could not read the advertised tool catalog: {error}"
-            ));
-            return;
-        }
-    };
-    let missing: Vec<&String> = expected
-        .iter()
-        .filter(|p| !installed.contains(&p.as_str()))
-        .collect();
-
-    if missing.is_empty() {
-        dc.pass(&format!(
-            "All {} legacy tool permissions granted",
-            expected.len()
-        ));
-    } else {
-        dc.info(&format!(
-            "{} legacy tool permission(s) not present (harmless — plugin namespace is authoritative)",
-            missing.len()
-        ));
-    }
-
-    let stale: Vec<&&str> = installed
-        .iter()
-        .filter(|p| p.starts_with(LEGACY_TOOL_PERM_PREFIX) && !expected.contains(&p.to_string()))
-        .collect();
-    if !stale.is_empty() {
-        dc.warn(&format!(
-            "{} stale permission(s) from older version (harmless)",
-            stale.len()
         ));
     }
 }
@@ -1449,7 +1151,7 @@ fn doctor_check_local_config(dc: &mut DoctorCounters, project_path: &Path) {
         dc.pass("No tracedecay in local config");
     } else {
         dc.warn(&format!(
-            "TraceDecay entries remain in local config ({}) — leave them or remove them manually; TraceDecay does not rewrite Claude config",
+            "TraceDecay entries remain in local config ({}), leave them or remove them manually; TraceDecay does not rewrite Claude config",
             tracedecay_paths.join(", ")
         ));
     }
@@ -1480,11 +1182,10 @@ fn warn_missing_permissions(settings: &serde_json::Value) {
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
-    // Check the plugin namespace — the entries the plugin MCP server matches.
-    // A machine mid-upgrade may carry legacy `mcp__tracedecay__*` entries but
-    // lack coverage of the `mcp__plugin_tracedecay_graph__*` namespace, which
-    // is exactly what causes per-call prompts, so that is the gap worth
-    // warning about — with the one-rule remedy, not a tool census.
+    // Check the plugin namespace, the entries the plugin MCP server matches.
+    // Missing coverage of `mcp__plugin_tracedecay_graph__*` is exactly what
+    // causes per-call prompts, so that is the gap worth warning about, with
+    // the one-rule remedy.
     match plugin_perms_satisfied(&installed) {
         Ok(true) => {}
         Ok(false) => eprintln!(

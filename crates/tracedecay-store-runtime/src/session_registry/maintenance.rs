@@ -78,21 +78,18 @@ enum SchemaConvergenceTarget {
         database: RegisteredGlobalDbLeaseV1,
         convergence: RegisteredSchemaConvergence,
     },
-    RuntimeLedger(Database),
 }
 
 impl SchemaConvergenceTarget {
     fn binding(&self) -> &StoreRuntimeBindingV1 {
         match self {
             Self::Registered { database, .. } => database.binding(),
-            Self::RuntimeLedger(database) => database.registered_binding(),
         }
     }
 
     fn db_path(&self) -> &Path {
         match self {
             Self::Registered { database, .. } => database.db_path(),
-            Self::RuntimeLedger(database) => database.canonical_database_path(),
         }
     }
 
@@ -102,16 +99,12 @@ impl SchemaConvergenceTarget {
                 database,
                 convergence,
             } => database.converge_schema(*convergence).await,
-            Self::RuntimeLedger(database) => {
-                tracedecay_global_db::schema_stages::converge_runtime_writer_ledger(database).await
-            }
         }
     }
 
     async fn release_connection_memory(&self) -> Result<()> {
         match self {
             Self::Registered { database, .. } => database.release_connection_memory().await,
-            Self::RuntimeLedger(database) => database.release_connection_memory().await,
         }
     }
 }
@@ -279,20 +272,9 @@ impl RegisteredSchemaConvergenceMaintenance {
         });
     }
 
-    pub(super) fn schedule_runtime_ledger(&self, database: Database) {
-        self.schedule_target(SchemaConvergenceTarget::RuntimeLedger(database));
-    }
-
     fn schedule_target(&self, target: SchemaConvergenceTarget) {
         let shard_id = target.binding().shard_id.clone();
-        let stage = match &target {
-            SchemaConvergenceTarget::Registered { .. } => {
-                SchemaConvergenceStageV1::RegisteredSchema
-            }
-            SchemaConvergenceTarget::RuntimeLedger(_) => {
-                SchemaConvergenceStageV1::RuntimeWriterLedger
-            }
-        };
+        let stage = SchemaConvergenceStageV1::RegisteredSchema;
         let mut tasks = self
             .tasks
             .lock()
@@ -575,23 +557,15 @@ impl DaemonSessionRuntimeRegistryV1 {
             let database =
                 Database::publish_runtime(runtime, DatabaseAccessMode::ReadWrite).await?;
             let long_lived = self.long_lived_session_maintenance;
-            // Every registry mode shares terminal graph-operation ownership; only
-            // long-lived daemons defer schema convergence to resumable maintenance.
+            // Only long-lived daemons defer schema convergence to resumable
+            // maintenance.
             let (database, convergence) = if long_lived {
                 let (database, convergence) =
-                    RegisteredGlobalDbOwnerV1::admit_and_attach_for_daemon(
-                        database,
-                        Arc::clone(&self.operation_task_owner),
-                    )
-                    .await?;
+                    RegisteredGlobalDbOwnerV1::admit_and_attach_for_daemon(database).await?;
                 (database, Some(convergence))
             } else {
                 (
-                    RegisteredGlobalDbOwnerV1::admit_and_attach_with_operation_task_owner(
-                        database,
-                        Arc::clone(&self.operation_task_owner),
-                    )
-                    .await?,
+                    RegisteredGlobalDbOwnerV1::admit_and_attach(database).await?,
                     None,
                 )
             };
@@ -664,7 +638,14 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    // The held destructor below parks one worker thread for the whole test, and
+    // `begin_shutdown` injects both aborts at once. A worker drains
+    // `inject.len() / worker_threads + 1` notifications in one batch, so with two
+    // workers the one that blocks can also capture the second shard's abort into
+    // its local queue, where the surviving worker never gets notified to steal it
+    // and the second retirement hangs instead of running slowly. Four workers keep
+    // that batch at one task each and leave spare capacity for the blocked one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_shutdown_retains_incomplete_future_drop_and_independent_retirement() {
         struct HeldDrop {
             started: Arc<Notify>,

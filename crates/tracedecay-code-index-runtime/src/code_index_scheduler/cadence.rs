@@ -31,6 +31,10 @@ pub enum CodeIndexCadenceTriggerV1 {
     QueryAdmission,
     /// Follow-up wake after a busy serve-prior-generation admission.
     BusyFollowUp,
+    /// The process gave memory back, so work refused for memory retries.
+    MemoryHeadroom,
+    /// A build refused for memory retries after its delay elapsed.
+    MemoryRetry,
 }
 
 impl CodeIndexCadenceTriggerV1 {
@@ -43,15 +47,17 @@ impl CodeIndexCadenceTriggerV1 {
             Self::GitWatcher => "git_watcher",
             Self::QueryAdmission => "query_admission",
             Self::BusyFollowUp => "busy_follow_up",
+            Self::MemoryHeadroom => "memory_headroom",
+            Self::MemoryRetry => "memory_retry",
         }
     }
 }
 
 /// When the wake that produced one reconcile was accepted.
 ///
-/// A reconcile that runs without an attributable pending wake — a follow-up pass
+/// A reconcile that runs without an attributable pending wake, a follow-up pass
 /// draining work an earlier wake already claimed, or an out-of-range clock
-/// reading — has no arrival instant. That is a typed absence, not an instant
+/// reading, has no arrival instant. That is a typed absence, not an instant
 /// equal to the terminal time, because substituting the terminal time would
 /// publish a zero queue delay and a zero event-to-ready latency for a sample
 /// whose arrival was never observed.
@@ -254,7 +260,7 @@ pub struct CodeIndexCadenceReadModelV1 {
 
 /// Bounded ring of recent event-to-ready receipts.
 ///
-/// Capacity is at least [`P99_MINIMUM_SAMPLES`] so a retained population can
+/// Capacity is at least `P99_MINIMUM_SAMPLES` so a retained population can
 /// actually reach p99 eligibility; a shorter ring would make p99 permanently
 /// unavailable by construction.
 #[derive(Debug, Default)]
@@ -420,6 +426,12 @@ fn observe_receipt(receipt: &CodeIndexEventToReadyReceiptV1) {
         CodeIndexCadenceTriggerV1::BusyFollowUp => {
             hotpath::gauge!("daemon.code_index.cadence.wake.busy_follow_up_total").inc(1_u64);
         }
+        CodeIndexCadenceTriggerV1::MemoryHeadroom => {
+            hotpath::gauge!("daemon.code_index.cadence.wake.memory_headroom_total").inc(1_u64);
+        }
+        CodeIndexCadenceTriggerV1::MemoryRetry => {
+            hotpath::gauge!("daemon.code_index.cadence.wake.memory_retry_total").inc(1_u64);
+        }
     }
     if receipt.is_noop() {
         hotpath::gauge!("daemon.code_index.cadence.reconcile.noop_total").inc(1_u64);
@@ -499,7 +511,7 @@ mod tests {
         assert_eq!(read_model.arrival_unavailable_count, 4);
         assert_eq!(read_model.latency_sample_count, 1);
         assert_eq!(read_model.event_to_ready_micros.sample_count, 1);
-        // One sample is below every floor, so no percentile may be published —
+        // One sample is below every floor, so no percentile may be published,
         // and none of the four withheld receipts contributed a zero.
         assert_eq!(read_model.event_to_ready_micros.p50.value, None);
         assert_eq!(read_model.queue_delay_micros.p50.value, None);

@@ -1,7 +1,7 @@
 //! Writing, advancing, and reading one observation.
 //!
 //! The executor owns the transaction shape; the siblings own the pieces it
-//! composes — [`authority`] the anchor/provenance/receipt rows a write persists
+//! composes, [`authority`] the anchor/provenance/receipt rows a write persists
 //! and a replay verifies, and [`rows`] the single projection every read decodes
 //! through.
 
@@ -14,7 +14,8 @@ use tracedecay_store::{
     AnchoredObservationWrite, CursorAdvanceLedgerDisagreementV1, CursorAdvanceLedgerIdentityV1,
     ObservationCoverageReason, ObservationCursorAdvance, ObservationReadOperationV1,
     ObservationReadResultV1, ObservationRecentWindowRequest, ObservationRecentWindowV1,
-    ProjectionRebuildProgressV1, ProjectionRebuildStateV1, SESSION_MESSAGE_PROJECTOR_VERSION,
+    PROJECTION_TERMINAL_RETRY_MICROS, ProjectionRebuildProgressV1, ProjectionRebuildStateV1,
+    SESSION_MESSAGE_PROJECTOR_VERSION,
 };
 
 use crate::operation::StorageOperationError;
@@ -32,7 +33,8 @@ use authority::{
     persist_sanitization_receipt, read_cursor, verify_observation_authority,
 };
 use cursor_authority::{
-    COMMIT_SOURCE_CURSOR_SQL, READ_CURSOR_ADVANCE_SQL, RECORD_CURSOR_ADVANCE_SQL,
+    COMMIT_SOURCE_CURSOR_SQL, PRUNE_SUPERSEDED_CURSOR_ADVANCES_SQL, READ_CURSOR_ADVANCE_SQL,
+    RECORD_CURSOR_ADVANCE_SQL,
 };
 use rows::{
     decode_nonnegative, decode_observation_row, encoded_observation_row, observation_row_projection,
@@ -162,6 +164,10 @@ impl ObservationExecutor {
             params![source_json, scope_json, committed_cursor_json],
         )?;
         savepoint.execute(
+            PRUNE_SUPERSEDED_CURSOR_ADVANCES_SQL,
+            params![source_json, scope_json],
+        )?;
+        savepoint.execute(
             "INSERT INTO projection_queue (observation_id, observation_sequence)
              VALUES (?1, ?2)",
             params![observation.observation_id().as_str(), sequence],
@@ -177,16 +183,16 @@ impl ObservationExecutor {
         let source_json = encode(advance.next_cursor().source())?;
         let scope_json = encode(advance.next_cursor().scope())?;
         let actual_cursor = read_cursor(savepoint, &source_json, &scope_json)?;
-        if actual_cursor.as_ref() == Some(advance.next_cursor()) {
-            if let Some(disagreement) =
-                cursor_advance_ledger_disagreement(savepoint, &source_json, &scope_json, advance)?
-            {
-                return Err(disagreement);
-            }
-            if cursor_advance_receipt_matches(savepoint, &source_json, &scope_json, advance)? {
-                return Ok(());
-            }
-            return Err(StorageOperationError::ObservationCursorAdvanceCollision);
+        // The durable cursor owns the range. Live ingest and catch-up both
+        // advance the same bytes with legitimately different reasons; once
+        // the frontier is reached the first ledger row stays and the later
+        // owner is a no-op. A disagreement is still a failure below, when
+        // this advance would be the write that moves the cursor.
+        if actual_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.reached(advance.next_cursor()))
+        {
+            return Ok(());
         }
         if actual_cursor.as_ref() != advance.expected_cursor() {
             return Err(observation_source_cursor_conflict(
@@ -221,6 +227,10 @@ impl ObservationExecutor {
         savepoint.execute(
             COMMIT_SOURCE_CURSOR_SQL,
             params![source_json, scope_json, encode(advance.next_cursor())?],
+        )?;
+        savepoint.execute(
+            PRUNE_SUPERSEDED_CURSOR_ADVANCES_SQL,
+            params![source_json, scope_json],
         )?;
         Ok(())
     }
@@ -326,13 +336,18 @@ impl ObservationExecutor {
                          WHERE next_retry_at_micros <= ?2
                            AND observation_sequence = (
                              SELECT MIN(observation_sequence) FROM projection_queue
+                             WHERE next_retry_at_micros < ?3
                            )
                            AND NOT EXISTS (
                            SELECT 1 FROM observation_projection_rebuilds
                            WHERE projector_version = ?1
                          )
                          LIMIT 1",
-                        (SESSION_MESSAGE_PROJECTOR_VERSION, now_micros),
+                        (
+                            SESSION_MESSAGE_PROJECTOR_VERSION,
+                            now_micros,
+                            PROJECTION_TERMINAL_RETRY_MICROS,
+                        ),
                         |row| row.get::<_, String>(0),
                     )
                     .optional()?

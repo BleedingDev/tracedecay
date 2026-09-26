@@ -6,15 +6,17 @@ use super::evidence::{
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
-use std::path::Path;
 #[cfg(test)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracedecay_contracts::retrieval::SessionRetrievalStructuralRefusalV1;
+use tracedecay_contracts::retained_surfaces::AutomationSkipReasonV1;
+use tracedecay_contracts::retrieval::{
+    SessionRetrievalBudgetStageV1, SessionRetrievalStructuralRefusalV1,
+};
 use tracedecay_contracts::{
     CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
     ProfileIdentityReadPort, RequestContext, RequestId,
@@ -26,26 +28,26 @@ use tracedecay_domain::{
 use tracedecay_store::{StoreShardIdV1, StoreShardScopeV1};
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
-use crate::ports::session_evidence::LcmScope;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
+use tracedecay_lcm::LcmScope;
+use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_session_memory::context::{
-    BranchId, CancellationToken, CapabilityDigest, ConfigurationDigest, PolicyDigest, ProfileId,
-    RequestBudgets, ResolvedGitRoute, ResolvedSessionIdentity, SessionRootId, SessionStoreId,
+    BranchId, CapabilityDigest, ConfigurationDigest, PolicyDigest, ProfileId, RequestBudgets,
+    ResolvedGitRoute, ResolvedSessionIdentity, SessionRootId, SessionStoreId,
     application_observed_at, session_application_grant_digest,
 };
 use tracedecay_session_memory::session::{
     AuthorizationGrantId, SessionAccess, SessionAuthorizationError, SessionAuthorizationGrant,
     SessionFreshnessPolicy, SessionRequestBinding, SessionRetrievalConfiguration,
     SessionRetrievalOutcome, SessionRetrievalScope, SessionRetrievalService,
-    SessionScopeAuthorizationRequest, SessionScopeAuthorizer, SessionTemporalExecutionPort,
-    SessionTemporalQuery,
+    SessionScopeAuthorizationRequest, SessionScopeAuthorizer, SessionTemporalQuery,
 };
 use tracedecay_session_temporal_store::RegisteredGlobalDbSessionTemporalExecution;
 use tracedecay_temporal_query::TemporalKernelResult;
 use tracedecay_temporal_query::context::{ContextBudget, TokenPolicy, VersionedTokenEstimator};
-use tracedecay_temporal_query::ports::ExecutionLimits;
+use tracedecay_temporal_query::execution::ExecutionLimits;
 use tracedecay_temporal_query::ranking::{DiversityLimits, RankedCandidate};
 
 pub(super) const AUTOMATION_SESSION_MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -92,51 +94,6 @@ pub trait AutomationSessionRetrieval: Send + Sync {
     fn anchor_session_id(&self) -> &SessionId;
 
     fn retrieve(&self, query: SessionTemporalQuery) -> AutomationSessionRetrievalFuture<'_>;
-}
-
-impl<'a, A, P, E> AuthorizedAutomationSessionRetrieval<'a, A, P, E> {
-    pub fn new(
-        service: &'a SessionRetrievalService<A, P, E>,
-        context: &'a RequestContext,
-        binding: &'a SessionRequestBinding,
-        anchor_session_id: SessionId,
-    ) -> Self {
-        Self {
-            service,
-            context,
-            binding,
-            anchor_session_id,
-        }
-    }
-}
-
-impl<A, P, E> AutomationSessionRetrieval for AuthorizedAutomationSessionRetrieval<'_, A, P, E>
-where
-    A: SessionScopeAuthorizer + Send + Sync,
-    P: SessionTemporalExecutionPort + Send + Sync,
-    E: VersionedTokenEstimator + Send + Sync,
-{
-    fn anchor_session_id(&self) -> &SessionId {
-        &self.anchor_session_id
-    }
-
-    fn retrieve(&self, query: SessionTemporalQuery) -> AutomationSessionRetrievalFuture<'_> {
-        Box::pin(async move {
-            accept_automation_temporal_outcome(
-                self.service
-                    .retrieve(self.context, self.binding, query)
-                    .await,
-            )
-        })
-    }
-}
-
-/// Adapter for an already-authorized application retrieval service.
-pub struct AuthorizedAutomationSessionRetrieval<'a, A, P, E> {
-    service: &'a SessionRetrievalService<A, P, E>,
-    context: &'a RequestContext,
-    binding: &'a SessionRequestBinding,
-    anchor_session_id: SessionId,
 }
 
 struct ProductionAutomationSessionRetrieval {
@@ -567,81 +524,18 @@ pub(super) fn ranked_evidence_owner(ranked: &RankedCandidate) -> Option<(&str, &
     ))
 }
 
-pub(super) const fn automation_structural_refusal_reason(
+pub(super) const fn automation_structural_refusal_skip(
     refusal: SessionRetrievalStructuralRefusalV1,
-) -> &'static str {
+) -> (&'static str, Option<SessionRetrievalBudgetStageV1>) {
     match refusal {
-        SessionRetrievalStructuralRefusalV1::CursorManifestLimitExceeded {
-            kind: tracedecay_domain::CursorManifestLimitKindV1::Participants,
-            ..
-        } => "session_cursor_manifest_participants_limit_exceeded",
-        SessionRetrievalStructuralRefusalV1::CursorManifestLimitExceeded {
-            kind: tracedecay_domain::CursorManifestLimitKindV1::CanonicalBytes,
-            ..
-        } => "session_cursor_manifest_canonical_bytes_limit_exceeded",
-        SessionRetrievalStructuralRefusalV1::BudgetExhausted { stage, .. } => {
-            automation_budget_refusal_reason(stage)
-        }
-    }
-}
-
-const fn automation_budget_refusal_reason(
-    stage: tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1,
-) -> &'static str {
-    use tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1;
-
-    match stage {
-        SessionRetrievalBudgetStageV1::RequestResultLimit => {
-            "session_evidence_budget_exhausted_request_result_limit"
-        }
-        SessionRetrievalBudgetStageV1::RequestHydrationLimit => {
-            "session_evidence_budget_exhausted_request_hydration_limit"
-        }
-        SessionRetrievalBudgetStageV1::RequestContextBytes => {
-            "session_evidence_budget_exhausted_request_context_bytes"
-        }
-        SessionRetrievalBudgetStageV1::RequestCandidateBytes => {
-            "session_evidence_budget_exhausted_request_candidate_bytes"
-        }
-        SessionRetrievalBudgetStageV1::RequestRecordBytes => {
-            "session_evidence_budget_exhausted_request_record_bytes"
-        }
-        SessionRetrievalBudgetStageV1::RequestHydrationBytes => {
-            "session_evidence_budget_exhausted_request_hydration_bytes"
-        }
-        SessionRetrievalBudgetStageV1::EstimatorVersionMismatch => {
-            "session_evidence_budget_exhausted_estimator_version_mismatch"
-        }
-        SessionRetrievalBudgetStageV1::ExecutionWorkExhausted => {
-            "session_evidence_budget_exhausted_execution_work_exhausted"
-        }
-        SessionRetrievalBudgetStageV1::CandidateReadExhausted => {
-            "session_evidence_budget_exhausted_candidate_read_exhausted"
-        }
-        SessionRetrievalBudgetStageV1::RecordReadExhausted => {
-            "session_evidence_budget_exhausted_record_read_exhausted"
-        }
-        SessionRetrievalBudgetStageV1::KernelResultLimit => {
-            "session_evidence_budget_exhausted_kernel_result_limit"
-        }
-        SessionRetrievalBudgetStageV1::CursorManifestLimit => {
-            "session_evidence_budget_exhausted_cursor_manifest_limit"
-        }
-        SessionRetrievalBudgetStageV1::ParticipantManifestParticipants => {
-            "session_evidence_budget_exhausted_participant_manifest_participants"
-        }
-        SessionRetrievalBudgetStageV1::ParticipantManifestCanonicalBytes => {
-            "session_evidence_budget_exhausted_participant_manifest_canonical_bytes"
-        }
-        SessionRetrievalBudgetStageV1::HydrationBytes => {
-            "session_evidence_budget_exhausted_hydration_bytes"
-        }
-        SessionRetrievalBudgetStageV1::ContextBytes => {
-            "session_evidence_budget_exhausted_context_bytes"
-        }
-        SessionRetrievalBudgetStageV1::ContextTokens => {
-            "session_evidence_budget_exhausted_context_tokens"
-        }
+        SessionRetrievalStructuralRefusalV1::CursorManifestLimitExceeded { .. } => (
+            AutomationSkipReasonV1::SessionCursorManifestLimitExceeded.as_str(),
+            None,
+        ),
+        SessionRetrievalStructuralRefusalV1::BudgetExhausted { stage, .. } => (
+            AutomationSkipReasonV1::SessionEvidenceBudgetExhausted.as_str(),
+            Some(stage),
+        ),
     }
 }
 
@@ -788,17 +682,12 @@ pub(super) fn unavailable_automation_retrieval(
     })
 }
 
-pub(super) async fn production_user_automation_retrieval(
-    _profile_root: &Path,
-) -> Box<dyn AutomationSessionRetrieval> {
-    unavailable_automation_retrieval("session_evidence_retrieval_unavailable")
-}
-
 #[cfg(test)]
 mod authority_tests {
     use tempfile::tempdir;
     use tracedecay_domain::{BrainId, ProjectId, UserProfileId};
     use tracedecay_global_db::tests::harness::RegisteredGlobalDbTestRuntime;
+    use tracedecay_lcm::LcmGrepSort;
     use tracedecay_store::StoreShardIdV1;
 
     use super::*;
@@ -884,46 +773,6 @@ mod authority_tests {
     }
 
     #[tokio::test]
-    async fn convenience_retrieval_does_not_create_a_profile_session_database() {
-        let directory = tempdir().expect("temporary profile");
-        let database_path = directory.path().join("user-sessions.db");
-        assert!(!database_path.exists());
-
-        let retrieval = production_user_automation_retrieval(directory.path()).await;
-
-        assert!(!database_path.exists());
-        assert!(matches!(
-            retrieval
-                .retrieve(
-                    SessionTemporalQuery::new(
-                        SessionId::new("session.automation.test").expect("session id"),
-                        None,
-                        "test",
-                        None,
-                        TemporalModeV1::Forensic,
-                        RetrievalGrainV1::LogicalMessage,
-                        1,
-                        DiversityLimits {
-                            per_logical_message: 1,
-                            per_turn: 1,
-                            per_session: 1,
-                            per_source: 1,
-                            per_evidence_role: 1,
-                        },
-                        ContextBudget {
-                            max_bytes: 1024,
-                            max_tokens: 256,
-                            estimator_version: AUTOMATION_SESSION_ESTIMATOR_VERSION.to_string(),
-                        },
-                    )
-                    .expect("bounded query"),
-                )
-                .await,
-            AutomationTemporalRetrieval::Rejected("session_evidence_retrieval_unavailable")
-        ));
-    }
-
-    #[tokio::test]
     async fn project_retrieval_rejects_non_project_scope_without_fallback() {
         let directory = tempdir().expect("temporary profile");
         let runtime = RegisteredGlobalDbTestRuntime::profile(directory.path())
@@ -987,6 +836,99 @@ mod authority_tests {
         }
     }
 
+    fn outcome_label(outcome: &AutomationTemporalRetrieval) -> String {
+        match outcome {
+            AutomationTemporalRetrieval::Complete(_) => "complete".to_owned(),
+            AutomationTemporalRetrieval::CompleteZero => "complete_zero".to_owned(),
+            AutomationTemporalRetrieval::Rejected(reason) => (*reason).to_owned(),
+            AutomationTemporalRetrieval::StructuralRefusal(refusal) => format!("{refusal:?}"),
+        }
+    }
+
+    /// The production authorizer admits the forensic request the runner builds,
+    /// so a bounded request reaches the registered store, while a candidate
+    /// workspace past the ranker ceiling is refused before execution.
+    #[tokio::test]
+    async fn production_retrieval_admits_bounded_requests_and_refuses_oversized_workspaces() {
+        let directory = tempdir().expect("temporary profile");
+        let project_id = ProjectId::new("project.automation.bounded").expect("project id");
+        let runtime = RegisteredGlobalDbTestRuntime::project(
+            directory.path().join("profile"),
+            directory.path().join("project"),
+            project_id.clone(),
+        )
+        .await
+        .expect("registered test runtime");
+        let database = runtime.project_database_arc().expect("project database");
+        let shard = database.binding().shard_id.clone();
+        let profile_identity = FixtureProfileIdentity::new(
+            directory.path().join("profile"),
+            shard.brain_id.clone(),
+            shard.profile_id.clone(),
+        );
+        let retrieval = ProductionAutomationSessionRetrieval {
+            database,
+            identity: project_automation_identity(&shard, &profile_identity, &project_id)
+                .expect("project identity"),
+            anchor_session_id: SessionId::new("session.automation.bounded").expect("session id"),
+        };
+
+        let bounded = retrieve_automation_session_evidence(
+            &retrieval,
+            "bounded automation evidence",
+            LcmScope::All,
+            AutomationEvidenceFilters {
+                provider: "cursor",
+                session_id: None,
+                include_summaries: true,
+                evidence_limit: 5,
+                include_recent_sessions: false,
+                recent_sessions_limit: 1,
+                role: None,
+                start_time: None,
+                end_time: None,
+                sort: LcmGrepSort::Relevance,
+            },
+        )
+        .await
+        .expect("bounded request");
+
+        let oversized = SessionTemporalQuery::new(
+            SessionId::new("session.automation.bounded").expect("session id"),
+            Some("cursor".to_owned()),
+            "oversized automation evidence",
+            None,
+            TemporalModeV1::Forensic,
+            RetrievalGrainV1::LogicalMessage,
+            1,
+            DiversityLimits {
+                per_logical_message: 1,
+                per_turn: 1,
+                per_session: 1,
+                per_source: 1,
+                per_evidence_role: 1,
+            },
+            ContextBudget {
+                max_bytes: AUTOMATION_SESSION_MAX_BYTES,
+                max_tokens: AUTOMATION_SESSION_MAX_BYTES / 4,
+                estimator_version: AUTOMATION_SESSION_ESTIMATOR_VERSION.to_string(),
+            },
+        )
+        .expect("oversized query")
+        .with_execution_limits(ExecutionLimits {
+            candidate_total_bytes: ExecutionLimits::default().candidate_total_bytes + 1,
+            ..ExecutionLimits::default()
+        });
+        let refused = retrieval.retrieve(oversized).await;
+        assert_eq!(
+            (outcome_label(&bounded), outcome_label(&refused)),
+            (
+                "complete_zero".to_owned(),
+                "BudgetExhausted { stage: RequestCandidateBytes, accounting: None }".to_owned(),
+            )
+        );
+    }
+
     #[tokio::test]
     async fn registered_identities_keep_typed_unavailable_without_active_anchor() {
         let directory = tempdir().expect("temporary profile");
@@ -1021,20 +963,6 @@ mod authority_tests {
         assert_eq!(
             typed_reject_reason(project_retrieval.as_ref()).await,
             "session_evidence_retrieval_unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn path_only_user_convenience_never_fabricates_empty_hits() {
-        let directory = tempdir().expect("temporary profile");
-        let retrieval = production_user_automation_retrieval(directory.path()).await;
-        assert_eq!(
-            typed_reject_reason(retrieval.as_ref()).await,
-            "session_evidence_retrieval_unavailable"
-        );
-        assert!(
-            !directory.path().join("user-sessions.db").exists(),
-            "path-only convenience must not invent a session database"
         );
     }
 }

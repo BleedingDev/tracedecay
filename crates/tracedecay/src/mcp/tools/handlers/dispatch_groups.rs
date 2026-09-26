@@ -1,25 +1,24 @@
 use serde_json::Value;
-use tracedecay_contracts::{
-    ApplicationOperation, ApplicationProblem, ResultContractRef, RetainedSurfaceOperation,
-};
+use tracedecay_contracts::{ApplicationOperation, RetainedSurfaceOperation};
 use tracedecay_graph_query::VerifiedGraphQueryRequest;
 use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
 
-use crate::project::TraceDecay;
-use tracedecay_daemon_protocol::InvocationCancellationPolicy;
-use tracedecay_daemon_service::application_surface::resolve_catalog_tool_binding;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
+use tracedecay_project::project::TraceDecay;
 
-use tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader;
+use tracedecay_contracts::code_index_freshness::{
+    CodeIndexFreshnessReader, CodeIndexReadinessWaitOutcomeV1, CodeIndexReadinessWaitV1,
+};
 use tracedecay_dashboard_api::AdmittedDoctorReportV1;
-use tracedecay_mcp::handlers::analysis as portable_analysis;
 use tracedecay_mcp::handlers::git;
 use tracedecay_mcp::handlers::graph as portable_graph;
 use tracedecay_mcp::handlers::info as portable_info;
 use tracedecay_mcp::handlers::{
     VerifiedGraphOpenFuture, unknown_tool_error, verified_read_operation,
 };
+use tracedecay_mcp::tools::binding::tool_dispatches_registered_project_reader;
+use tracedecay_mcp::tools::dispatch_ceiling::{tool_dispatch_budget, tool_dispatch_deadline_error};
 use tracedecay_mcp::{
     AdmittedCodeIndex, McpAdmittedProjectV1, McpDoctorReportV1, McpProjectIdentityV1,
     McpRequestAuthoritiesV1, McpToolBinding, McpToolContext, RequestControls, ToolResult,
@@ -35,9 +34,6 @@ use tracedecay_mcp::handlers::{
 
 mod health_dispatch;
 pub(super) use health_dispatch::dispatch_health_tools;
-use tracedecay_mcp::{
-    retained_problem_envelope, retained_safe_diagnostic, validated_retained_response,
-};
 
 fn graph_read_unavailable(detail: &str) -> TraceDecayError {
     TraceDecayError::ProjectRoute {
@@ -57,7 +53,7 @@ async fn admitted_graph_query(
 /// Lends the root's verified-graph admission funnel to a portable dispatch
 /// table for one tool call. The borrow of `options` is the whole lifetime of
 /// the table's dispatch, so every lazy open it issues reports back through
-/// the same `served_stale_graph_generation` slot.
+/// the same `served_code_graph` slot.
 fn verified_graph_open<'o>(
     options: &'o ToolCallRegistryOptions<'_>,
 ) -> impl Fn(ApplicationOperation) -> VerifiedGraphOpenFuture<'o> + Sync + 'o {
@@ -88,7 +84,7 @@ async fn admitted_graph_query_for_operation(
         .as_ref()
         .ok_or_else(|| graph_read_unavailable("the caller cancellation signal is unavailable"))?;
     // Admission wait is measured apart from handler execution: every
-    // graph-backed tool in the graph/info/analysis/git/health groups funnels
+    // graph-backed tool in the graph/info/git groups and the graph-tool owner funnels
     // through this one open, so a slow span here is admission contention or a
     // stale generation, never handler work.
     let query = hotpath::future!(
@@ -101,22 +97,15 @@ async fn admitted_graph_query_for_operation(
         label = "mcp.dispatch.graph_query_admission"
     )
     .await?;
-    if let tracedecay_graph_query::CodeGraphReadFreshnessV1::LastCompleteStale {
-        sealed_at,
-        rebuild_in_flight,
-    } = query.freshness()
-    {
-        // Every graph-backed tool funnels through this open, so this is the
-        // single point that reports serve-old-while-rebuilding back to the
-        // dispatch boundary for the typed response trailer.
-        let _ = options
-            .served_stale_graph_generation
-            .set(super::ServedStaleCodeGraphReadV1 {
-                generation: query.generation().as_str().to_owned(),
-                sealed_at,
-                rebuild_in_flight,
-            });
-    }
+    // Every graph-backed tool funnels through this open, so this is the
+    // single point that reports the served generation, and a
+    // serve-old-while-rebuilding seat, back to the dispatch boundary.
+    options.served_code_graph.record(
+        tracedecay_contracts::retrieval::ServedCodeGraphGenerationV1 {
+            generation: query.generation().as_str().to_owned(),
+            freshness: query.freshness(),
+        },
+    );
     Ok(query)
 }
 
@@ -168,7 +157,7 @@ fn dispatch_graph_tools_inner<'a>(
 }
 
 /// Dispatch project-info, registry, and file-inspection tools
-/// (`tracedecay_status`, `tracedecay_project_list`, `tracedecay_read`, ...).
+/// (`tracedecay_status`, `tracedecay_project_list`, `tracedecay_files`, ...).
 #[allow(clippy::too_many_arguments)]
 #[hotpath::measure(future = true, label = "mcp.dispatch.info")]
 pub(super) async fn dispatch_info_tools(
@@ -214,15 +203,23 @@ fn dispatch_info_tools_inner<'a>(
         // dispatch through the portable table.
         match tool_name {
             "tracedecay_remote_status" => portable_info::handle_remote_status(
-                cg.project_root(),
+                &cg.store_layout().response_handle_root,
                 &args,
                 options.remote_operational_status.as_ref(),
             ),
             "tracedecay_status" => {
+                // Wait before admitting snapshots, so the payload describes
+                // the worktree the wait ended on.
+                let wait = match portable_info::status_readiness_wait(&args)? {
+                    Some(request) => {
+                        Some(status_readiness_wait(&options, cg.project_root(), request).await?)
+                    }
+                    None => None,
+                };
                 let project = admitted_project_authorities(cg, &options)?;
                 let snapshots = admitted_status_snapshots(&options).await;
                 let ctx = admitted_tool_context_for(&options, &project, &snapshots)?;
-                portable_info::handle_status(&ctx, args, server_stats, scope_prefix).await
+                portable_info::handle_status(&ctx, args, server_stats, scope_prefix, wait).await
             }
             "tracedecay_active_project" => {
                 let project = admitted_project_authorities(cg, &options)?;
@@ -249,17 +246,19 @@ fn dispatch_info_tools_inner<'a>(
             "tracedecay_project_context" => {
                 portable_info::handle_project_context(
                     Some(cg.project_root()),
+                    Some(&cg.store_layout().response_handle_root),
                     args,
                     options.project_registry_reads,
                 )
                 .await
             }
             "tracedecay_admin_sync" => {
-                info::handle_admin_sync(cg, args, options.code_index_reconcile_sink.as_ref()).await
+                info::handle_admin_sync(cg, options.code_index_reconcile_sink.as_ref()).await
             }
             _ => {
                 portable_info::dispatch_tool(
                     cg.project_root(),
+                    &cg.store_layout().response_handle_root,
                     &verified_graph_open(&options),
                     tool_name,
                     args,
@@ -359,7 +358,7 @@ pub(super) async fn dispatch_application_surface_tools(
 fn dispatch_application_surface_tools_inner<'a>(
     tool_name: &'a str,
     cg: &'a TraceDecay,
-    args: Value,
+    mut args: Value,
     options: ToolCallRegistryOptions<'a>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
     // Erase the deeply nested application-surface future before it reaches
@@ -368,6 +367,72 @@ fn dispatch_application_surface_tools_inner<'a>(
         let Some(operation) = ApplicationSurfaceOperation::from_tool_name(tool_name) else {
             return Err(unknown_tool_error(tool_name));
         };
+        let retained = RetainedSurfaceOperation::from_application(operation).is_some();
+        let source_edit = tracedecay_daemon_protocol::is_source_edit_operation(operation);
+        let graph_tool = operation.is_graph_tool();
+        // An already-elapsed carried deadline is refused before these tools
+        // dispatch, exactly as their retained handlers always refused it.
+        if (retained || source_edit || graph_tool)
+            && tool_dispatch_budget(tool_name, options.application_deadline.as_ref()).is_none()
+        {
+            return Err(tool_dispatch_deadline_error(
+                tool_name,
+                std::time::Duration::ZERO,
+            ));
+        }
+        if retained {
+            return application_surface::run_retained_surface_tool(
+                Some(&cg.store_layout().response_handle_root),
+                BindingSurface::Mcp,
+                operation,
+                args,
+                options.application_invocation_executor,
+                options.application_request_id.clone(),
+                options.application_deadline.clone(),
+                options.application_cancellation.clone(),
+            )
+            .await;
+        }
+        if graph_tool {
+            let execution = application_surface::execute_graph_tool_surface(
+                BindingSurface::Mcp,
+                operation,
+                args.clone(),
+                options.application_invocation_executor,
+                options.application_request_id.clone(),
+                options.application_deadline.clone(),
+                options.application_cancellation.clone(),
+            )
+            .await?;
+            return tracedecay_mcp::handlers::graph_tool::render_graph_tool(
+                Some(&cg.store_layout().response_handle_root),
+                &args,
+                execution,
+            );
+        }
+        if source_edit {
+            return edit::source_edit_tool(
+                Some(&cg.store_layout().response_handle_root),
+                BindingSurface::Mcp,
+                operation,
+                args,
+                edit::SourceEditInvocationContext {
+                    executor: options.application_invocation_executor,
+                    target: options.application_invocation_target,
+                    request_id: options.application_request_id.clone(),
+                    deadline: options.application_deadline.clone(),
+                    cancellation: options.application_cancellation.clone(),
+                },
+            )
+            .await;
+        }
+        // Routing resolved the registered-project selector into the invocation
+        // target before dispatch; the canonical request schema does not carry it.
+        if tool_dispatches_registered_project_reader(tool_name)
+            && let Some(arguments) = args.as_object_mut()
+        {
+            arguments.remove("project_selector");
+        }
         let normalized_args =
             match tracedecay_daemon_protocol::adapt_application_tool_request(tool_name, args) {
                 Ok(args) => args,
@@ -393,37 +458,63 @@ fn dispatch_application_surface_tools_inner<'a>(
     })
 }
 
-/// Dispatch static-analysis report tools such as `tracedecay_dead_code` and
-/// `tracedecay_complexity`.
-#[hotpath::measure(future = true, label = "mcp.dispatch.analysis")]
-pub(super) async fn dispatch_analysis_tools(
-    tool_name: &str,
-    cg: &TraceDecay,
-    args: Value,
-    scope_prefix: Option<&str>,
-    options: ToolCallRegistryOptions<'_>,
-) -> Result<ToolResult> {
-    dispatch_analysis_tools_inner(tool_name, cg, args, scope_prefix, options).await
-}
-
-fn dispatch_analysis_tools_inner<'a>(
-    tool_name: &'a str,
+/// Computes one graph-tool operation for the project's graph-tool owner,
+/// under the same admitted authorities and dispatch ceiling as every other
+/// graph read.
+pub(crate) fn compute_graph_tool_for_owner<'a>(
     cg: &'a TraceDecay,
+    operation: ApplicationSurfaceOperation,
     args: Value,
     scope_prefix: Option<&'a str>,
     options: ToolCallRegistryOptions<'a>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-    // Erase the portable dispatch future before it reaches the measured
-    // wrapper so every profiling feature can compute its layout.
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<tracedecay_contracts::graph_tool::GraphToolCompletionV1>,
+            > + Send
+            + 'a,
+    >,
+> {
     Box::pin(async move {
-        portable_analysis::dispatch_tool(
-            cg.project_root(),
-            &verified_graph_open(&options),
-            tool_name,
-            args,
-            scope_prefix,
-        )
-        .await
+        let tool_name = operation.mcp_tool_name();
+        let Some(budget) = tool_dispatch_budget(tool_name, options.application_deadline.as_ref())
+        else {
+            return Err(tool_dispatch_deadline_error(
+                tool_name,
+                std::time::Duration::ZERO,
+            ));
+        };
+        let project = admitted_project_authorities(cg, &options)?;
+        let snapshots = AdmittedRequestSnapshotsV1::default();
+        let freshness = graph_freshness_reader(tool_name, &options);
+        let ctx = admitted_tool_context(&options, &project, &snapshots, freshness)?;
+        let open = verified_graph_open(&options);
+        let computed = async {
+            if operation == ApplicationSurfaceOperation::Diagnose {
+                let graph = admitted_graph_query(&options, "diagnostics_read").await?;
+                return workflow::compute_diagnose(
+                    cg,
+                    &graph,
+                    args,
+                    options.code_index_publication_identity.as_deref(),
+                )
+                .await;
+            }
+            tracedecay_mcp::handlers::graph_tool::compute_graph_tool(
+                &ctx,
+                &open,
+                operation,
+                args,
+                scope_prefix,
+            )
+            .await
+        };
+        let mut completion = match tokio::time::timeout(budget, computed).await {
+            Ok(result) => result?,
+            Err(_elapsed) => return Err(tool_dispatch_deadline_error(tool_name, budget)),
+        };
+        completion.code_graph = options.served_code_graph.served();
+        Ok(completion)
     })
 }
 
@@ -461,7 +552,7 @@ fn dispatch_git_tools_inner<'a>(
 ///
 /// Every served route publishes a checkout at project-open. Absence is a
 /// typed root failure, not a second binding shape. The session store is the
-/// canonical `registered_project_session_db` lease only — never a silent
+/// canonical `registered_project_session_db` lease only, never a silent
 /// fallback to `session_authorities.project`. Attached means admitted;
 /// absent is the typed unavailable/denied state.
 fn admitted_project_authorities(
@@ -564,6 +655,54 @@ async fn admitted_runtime_snapshots(
     }
 }
 
+/// Hold a status read until the project reaches the requested readiness,
+/// for at most the caller's `timeout_ms`.
+///
+/// The budget is the caller's; a budget this call cannot live out is refused
+/// rather than shortened. Cancellation ends the wait with a typed outcome and
+/// dropping it leaves no state behind.
+async fn status_readiness_wait(
+    options: &ToolCallRegistryOptions<'_>,
+    project_root: &std::path::Path,
+    request: CodeIndexReadinessWaitV1,
+) -> Result<CodeIndexReadinessWaitOutcomeV1> {
+    let budget = std::time::Duration::from_millis(request.timeout_ms);
+    let dispatch_budget =
+        tool_dispatch_budget("tracedecay_status", options.application_deadline.as_ref())
+            .unwrap_or_default();
+    if budget > dispatch_budget {
+        return Err(TraceDecayError::Config {
+            message: format!(
+                "tracedecay_status wait_for.timeout_ms {} exceeds this call's {} ms dispatch budget",
+                request.timeout_ms,
+                dispatch_budget.as_millis()
+            ),
+        });
+    }
+    let Some(waiter) = options.code_index_readiness_waiter.as_ref() else {
+        return Ok(CodeIndexReadinessWaitOutcomeV1::Unavailable {
+            reason: "code_index_scheduler_authority_not_attached".to_owned(),
+        });
+    };
+    let wait = waiter(project_root.to_path_buf(), request.state, budget);
+    let cancelled = async {
+        match options.application_cancellation.as_ref() {
+            Some(cancellation) => cancellation.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    Ok(tokio::select! {
+        biased;
+        () = cancelled => CodeIndexReadinessWaitOutcomeV1::Unavailable { reason: "request_cancelled".to_owned() },
+        read = wait => match read {
+            Ok(read) => portable_info::readiness_wait_outcome(read),
+            Err(_) => CodeIndexReadinessWaitOutcomeV1::Unavailable {
+                reason: "code_index_freshness_read_failed".to_owned(),
+            },
+        },
+    })
+}
+
 fn graph_freshness_reader<'a>(
     tool_name: &str,
     options: &'a ToolCallRegistryOptions<'a>,
@@ -575,10 +714,10 @@ fn graph_freshness_reader<'a>(
 
 /// Binds the admitted authorities a moved handler family reads.
 ///
-/// Everything the family may touch — the resolved project scope, the caller's
+/// Everything the family may touch, the resolved project scope, the caller's
 /// deadline and cancellation, the registered project session store that
 /// authenticates PR-context cursors, and the daemon-owned code-index executors
-/// with the authorization proved for them — crosses into `tracedecay-mcp` as
+/// with the authorization proved for them, crosses into `tracedecay-mcp` as
 /// one validated binding, under the single checkout the serving route was
 /// admitted for. An authority the daemon did not admit stays absent and the
 /// handler reports its own typed unavailable state; an authority that
@@ -649,225 +788,6 @@ fn admitted_tool_context<'a>(
     Ok(McpToolContext::bind(McpToolBinding { project, request })?)
 }
 
-/// Dispatch source-editing tools (`tracedecay_str_replace`,
-/// `tracedecay_move_symbol`, ...).
-#[hotpath::measure(future = true, label = "mcp.dispatch.edit")]
-pub(super) async fn dispatch_edit_tools(
-    tool_name: &str,
-    cg: &TraceDecay,
-    args: Value,
-    options: ToolCallRegistryOptions<'_>,
-) -> Result<ToolResult> {
-    dispatch_edit_tools_inner(tool_name, cg, args, options).await
-}
-
-fn dispatch_edit_tools_inner<'a>(
-    tool_name: &'a str,
-    cg: &'a TraceDecay,
-    args: Value,
-    options: ToolCallRegistryOptions<'a>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-    // Erase the deeply nested match-arm futures before they reach the
-    // measured wrapper so every profiling feature can compute its layout.
-    Box::pin(async move {
-        let invocation = edit::SourceEditInvocationContext {
-            executor: options.application_invocation_executor,
-            request_id: options.application_request_id.clone(),
-            deadline: options.application_deadline.clone(),
-            cancellation: options.application_cancellation.clone(),
-        };
-        match tool_name {
-            "tracedecay_str_replace" => {
-                edit::handle_str_replace(cg, args, invocation.clone()).await
-            }
-            "tracedecay_multi_str_replace" => {
-                edit::handle_multi_str_replace(cg, args, invocation.clone()).await
-            }
-            "tracedecay_insert_at" => edit::handle_insert_at(cg, args, invocation.clone()).await,
-            "tracedecay_ast_grep_rewrite" => {
-                edit::handle_ast_grep_rewrite(cg, args, invocation.clone()).await
-            }
-            "tracedecay_replace_symbol" => {
-                edit::handle_replace_symbol(cg, args, invocation.clone()).await
-            }
-            "tracedecay_insert_at_symbol" => {
-                edit::handle_insert_at_symbol(cg, args, invocation.clone()).await
-            }
-            "tracedecay_move_symbol" => {
-                edit::handle_move_symbol(cg, args, invocation.clone()).await
-            }
-            "tracedecay_rename_symbol" => {
-                edit::handle_rename_symbol(cg, args, invocation.clone()).await
-            }
-            "tracedecay_source_edit_rollback" => {
-                edit::handle_source_edit_rollback(cg, args, invocation.clone()).await
-            }
-            "tracedecay_source_edit_reconcile" => {
-                edit::handle_source_edit_reconcile(cg, args, invocation).await
-            }
-            _ => Err(unknown_tool_error(tool_name)),
-        }
-    })
-}
-
-/// Dispatch retained memory, session, and workflow operations only after the
-/// application-owned catalog has resolved their stable operation identity.
-#[hotpath::measure(future = true, label = "mcp.dispatch.retained_application")]
-pub(super) async fn dispatch_retained_application_tools(
-    tool_name: &str,
-    cg: &TraceDecay,
-    args: Value,
-    _scope_prefix: Option<&str>,
-    _active_project_session_db: Option<&RegisteredGlobalDbLeaseV1>,
-    options: ToolCallRegistryOptions<'_>,
-) -> Result<ToolResult> {
-    dispatch_retained_application_tools_inner(
-        tool_name,
-        cg,
-        args,
-        _scope_prefix,
-        _active_project_session_db,
-        options,
-    )
-    .await
-}
-
-#[expect(
-    clippy::too_many_lines,
-    reason = "Retained-application dispatch is one name match onto the application surface."
-)]
-fn dispatch_retained_application_tools_inner<'a>(
-    tool_name: &'a str,
-    cg: &'a TraceDecay,
-    args: Value,
-    _scope_prefix: Option<&'a str>,
-    _active_project_session_db: Option<&'a RegisteredGlobalDbLeaseV1>,
-    options: ToolCallRegistryOptions<'a>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ToolResult>> + Send + 'a>> {
-    // Erase the deeply nested retained-application future before it reaches
-    // the measured wrapper so every profiling feature can compute its layout.
-    Box::pin(async move {
-        let retained_operation = RetainedSurfaceOperation::from_tool_name(tool_name)
-            .ok_or_else(|| unknown_tool_error(tool_name))?;
-        let binding = resolve_catalog_tool_binding(BindingSurface::Mcp, tool_name)
-            .map_err(|error| TraceDecayError::Config {
-                message: error.to_string(),
-            })?
-            .ok_or_else(|| unknown_tool_error(tool_name))?;
-        let normalized = tracedecay_daemon_protocol::separate_application_tool_request(args)
-            .map_err(|error| TraceDecayError::Config {
-                message: error.to_string(),
-            })?;
-        let requested_format = normalized.requested_format;
-        let request = hotpath::measure_block!(
-            "mcp.retained.decode",
-            tracedecay_daemon_service::application_surface::retained::decode_request(
-                retained_operation,
-                normalized.request,
-            )
-        )
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("invalid retained application request for {tool_name}: {error}"),
-        })?;
-        if request.operation() != retained_operation {
-            return Err(TraceDecayError::Config {
-                message: format!("retained application request does not match {tool_name}"),
-            });
-        }
-        let request_id = match options.application_request_id {
-            Some(request_id) => request_id,
-            None => application_surface::request_id()?,
-        };
-        let result_contract = ResultContractRef::from_schema(&binding.result_schema);
-        let result = match options.application_invocation_executor {
-            Some(executor) => {
-                let (deadline, cancellation) =
-                    application_surface::complete_retained_protocol_controls(
-                        retained_operation,
-                        &request_id,
-                        options.application_deadline,
-                        options.application_cancellation,
-                    )?
-                    .ok_or_else(|| {
-                        TraceDecayError::project_route(
-                            "retained_application_controls_unavailable",
-                            true,
-                            "retained application protocol controls are unavailable",
-                        )
-                    })?;
-                let invocation =
-                    tracedecay_daemon_protocol::DaemonInvocationRequest::retained_application(
-                        request_id.as_str(),
-                        request,
-                        tracedecay_contracts::now_micros(),
-                        deadline.clone(),
-                        cancellation.context(),
-                    );
-                let policy =
-                    if tracedecay_contracts::retained_surfaces::retained_surface_operation_is_effect(
-                        retained_operation,
-                    ) {
-                        InvocationCancellationPolicy::AuthoritativeEffect
-                    } else {
-                        InvocationCancellationPolicy::ReadOnly
-                    };
-                match hotpath::future!(
-                    executor.invoke_controlled(invocation, deadline, cancellation, policy),
-                    label = "mcp.retained.invoke"
-                )
-                .await
-                {
-                    Ok(response)
-                        if response.protocol
-                            == tracedecay_daemon_protocol::DAEMON_INVOCATION_PROTOCOL
-                            && response.revision
-                                == tracedecay_daemon_protocol::DAEMON_INVOCATION_REVISION
-                            && response.request_id == request_id.as_str() =>
-                    {
-                        validated_retained_response(
-                            response.outcome,
-                            retained_operation,
-                            &request_id,
-                            &result_contract,
-                        )?
-                    }
-                    Ok(_) => Err(retained_problem_envelope(
-                        result_contract.clone(),
-                        request_id.clone(),
-                        ApplicationProblem::unavailable(retained_safe_diagnostic(
-                            "application.surface.invalid_response",
-                            "The daemon returned an invalid retained application envelope",
-                        )?),
-                    )?),
-                    Err(error) => Err(retained_problem_envelope(
-                        result_contract.clone(),
-                        request_id.clone(),
-                        error.into_application_problem(),
-                    )?),
-                }
-            }
-            None => Err(retained_problem_envelope(
-                result_contract,
-                request_id,
-                ApplicationProblem::unavailable(retained_safe_diagnostic(
-                    "application.transport.unavailable",
-                    "The daemon retained application transport is unavailable",
-                )?),
-            )?),
-        };
-        hotpath::measure_block!(
-            "mcp.retained.render",
-            application_surface::render_retained_result(
-                Some(cg.project_root()),
-                retained_operation,
-                &binding.binding_id,
-                result,
-                requested_format,
-            )
-        )
-    })
-}
-
 /// Dispatch memory, skill, and analytics tools (`tracedecay_fact_store_add`,
 /// `tracedecay_skill_list`, `tracedecay_analytics`, ...).
 #[hotpath::measure(future = true, label = "mcp.dispatch.memory")]
@@ -932,16 +852,6 @@ fn dispatch_session_workflow_tools_inner<'a>(
     // measured wrapper so every profiling feature can compute its layout.
     Box::pin(async move {
         match tool_name {
-            "tracedecay_diagnose" => {
-                let graph = admitted_graph_query(&options, "diagnostics_read").await?;
-                workflow::handle_diagnose(
-                    cg,
-                    &graph,
-                    args,
-                    options.code_index_publication_identity.as_deref(),
-                )
-                .await
-            }
             "tracedecay_run_affected_tests" => {
                 workflow::handle_run_affected_tests(
                     cg,

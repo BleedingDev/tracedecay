@@ -17,8 +17,8 @@ use tracedecay_contracts::feedback::{
     feedback_surface_operation,
 };
 use tracedecay_contracts::{
-    ApplicationOperation, CancellationContext, CapabilityGrantId, CapabilityGrantSnapshot,
-    Deadline, DiagnosticProviderDescriptor, DiagnosticProviderIdentity,
+    ApplicationOperation, ApplicationOutcome, CancellationContext, CapabilityGrantId,
+    CapabilityGrantSnapshot, Deadline, DiagnosticProviderDescriptor, DiagnosticProviderIdentity,
     DiagnosticProviderIdentityParts, DiagnosticProviderResult, DiagnosticProviderState,
     DisclosureClass, PolicyDecisionRef, ProviderCoverage, ProviderDocumentIdentity,
     ProviderFreshness, ProviderOrigin, ProviderProvenance, ProviderSourceIdentity, RequestContext,
@@ -38,8 +38,8 @@ use tracedecay_domain::feedback::{
 };
 use tracedecay_domain::{
     ActorId, CodeGenerationId, CommitId, ComponentVersion, ContentDigest, FileOccurrenceId,
-    LanguageDescriptorRevision, LanguageId, LocatorDigest, ManifestDigest, ProjectId, ProviderId,
-    RefId, RepositoryId, RetrievalAnchorId, SourceSpan, UtcMicros, WorktreeId,
+    LanguageDescriptorRevision, LanguageId, LocatorDigest, ProjectId, ProviderId, RefId,
+    RepositoryId, RetrievalAnchorId, SourceSpan, SymbolOccurrenceId, UtcMicros, WorktreeId,
 };
 use tracedecay_hooks::{HookFeedbackDeliveryOutcomeV1, HookFeedbackRollbackSwitchV1};
 use tracedecay_lsp::{
@@ -63,9 +63,7 @@ use crate::feedback::concrete::{FeedbackRuntime, open_feedback_runtime};
 use crate::lsp_runtime::DaemonLspSessionFactory;
 use crate::source_authorization::ProjectSourceAccessSnapshot;
 
-fn digest(fill: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", fill.to_string().repeat(64))).expect("digest")
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn resolved_scope() -> ResolvedScope {
     ResolvedScope::new(
@@ -332,19 +330,6 @@ impl FeedbackImpactPort for FixedImpact {
     }
 }
 
-#[derive(Clone)]
-struct Observations(Arc<dyn tracedecay_contracts::feedback::FeedbackObservationPort + Send + Sync>);
-
-impl tracedecay_contracts::feedback::FeedbackObservationPort for Observations {
-    fn observe(
-        &self,
-        input: &tracedecay_domain::feedback::FeedbackEvaluationInputV1,
-        observation: tracedecay_domain::feedback::FeedbackCycleObservationV1,
-    ) {
-        self.0.observe(input, observation);
-    }
-}
-
 struct NoopFeedbackCycle;
 
 impl FeedbackCycleRuntimePort for NoopFeedbackCycle {
@@ -447,6 +432,7 @@ async fn consume_fixture() -> ConsumeFixture {
         open_feedback_runtime(
             database,
             root.path(),
+            root.path().join("response-handles"),
             scope.clone(),
             source_access(&scope, &operation, observed_at),
         )
@@ -485,7 +471,9 @@ async fn consume_fixture() -> ConsumeFixture {
         target: request.input.target.clone(),
         affected_files: vec![request.input.target.file.clone()],
         affected_callers: Vec::new(),
-        affected_tests: Vec::new(),
+        affected_tests: vec![
+            SymbolOccurrenceId::new("symbol.feedback-entry-test").expect("affected test symbol"),
+        ],
         evidence_anchors: Vec::new(),
         state: FeedbackImpactStateV1::Complete,
         affected_tests_state: FeedbackImpactStateV1::Complete,
@@ -505,7 +493,7 @@ async fn consume_fixture() -> ConsumeFixture {
         },
         FixedImpact(impact),
         runtime.publication_store(),
-        Observations(runtime.observation_port()),
+        runtime.observation_port(),
         runtime.route_authorization(),
         operation,
     );
@@ -620,10 +608,21 @@ async fn completed_publication_is_consumed_into_exactly_one_hook_notice() {
         )
         .await
         .expect("project published affected tests");
-    assert!(matches!(
-        affected_tests,
-        crate::feedback::owner::FeedbackReadInvocationResultV1::AffectedTests(Ok(_))
-    ));
+    let crate::feedback::owner::FeedbackReadInvocationResultV1::AffectedTests(Ok(envelope)) =
+        affected_tests
+    else {
+        panic!("published affected-tests read must return the projection");
+    };
+    let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
+        panic!("affected-tests projection must be evidence, not a problem or effect");
+    };
+    let payload = evidence.payload.expect("affected-tests payload");
+    assert_eq!(
+        payload.affected_tests,
+        vec![SymbolOccurrenceId::new("symbol.feedback-entry-test").expect("affected test symbol")]
+    );
+    assert_eq!(payload.state, Some(FeedbackImpactStateV1::Complete));
+    assert!(payload.evidence_anchors.is_empty());
     let listed = fixture
         .registration
         .feedback_owner

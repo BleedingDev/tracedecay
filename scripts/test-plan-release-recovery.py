@@ -283,6 +283,20 @@ def main() -> None:
         assert completed.returncode != 0
         assert "model-acquisition-manifest.json" in completed.stderr
 
+        beta_assets = (
+            beta_linux,
+            beta_linux_mcpb,
+            "tracedecay-beta-v1.2.3-windows.zip",
+            "tracedecay-beta-v1.2.3-windows.mcpb",
+            "SHA256SUMS",
+            "install.sh",
+        )
+        matrix, retained = run(root, beta_assets, profile="beta")
+        assert matrix == {"include": []}
+        assert len(retained) == 4
+
+        run(root, (beta_linux, "install.sh"), profile="beta", success=False)
+
     print("release recovery planner tests passed")
 
 

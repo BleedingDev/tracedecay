@@ -7,7 +7,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tracedecay_contracts::context_scout::{ContextScoutAddressV1, ContextScoutDeliveryReceiptV1};
@@ -23,7 +23,6 @@ use crate::agents::context_scout::ContextScoutDeliveryReceiptHookV1;
 use crate::ports::hook_runtime::HookRuntimeV1;
 
 use super::analytics::HookTimingSpan;
-use super::dispatch::NativeSessionStartLocatorV1;
 use tracedecay_hooks::NativeContextScoutLifecycleV1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,11 +33,9 @@ pub(crate) struct DaemonAdmissionPort<'a> {
     project_root: &'a Path,
     session_id: Option<&'a str>,
     lifecycle: Option<&'a NativeContextScoutLifecycleV1>,
-    start_locator: Option<&'a NativeSessionStartLocatorV1>,
     context_scout_address: Mutex<Option<ContextScoutAddressV1>>,
     feedback_notice: Mutex<Option<tracedecay_application::advisory::AdvisoryHookLookupNoticeV1>>,
     github_stack_signal_available: Mutex<bool>,
-    binding_changed: Mutex<bool>,
     /// The caller's hook span, so the admission round trip is attributed like
     /// every other hook/daemon call. Passing `None` here reported hosts that
     /// route through the native dispatcher as having done no daemon IPC at all.
@@ -51,7 +48,6 @@ impl<'a> DaemonAdmissionPort<'a> {
         project_root: &'a Path,
         session_id: Option<&'a str>,
         lifecycle: Option<&'a NativeContextScoutLifecycleV1>,
-        start_locator: Option<&'a NativeSessionStartLocatorV1>,
         telemetry: Option<&'a HookTimingSpan>,
     ) -> Self {
         Self {
@@ -59,11 +55,9 @@ impl<'a> DaemonAdmissionPort<'a> {
             project_root,
             session_id,
             lifecycle,
-            start_locator,
             context_scout_address: Mutex::new(None),
             feedback_notice: Mutex::new(None),
             github_stack_signal_available: Mutex::new(false),
-            binding_changed: Mutex::new(false),
             telemetry,
         }
     }
@@ -93,12 +87,6 @@ impl<'a> DaemonAdmissionPort<'a> {
             .lock()
             .is_ok_and(|mut available| std::mem::take(&mut *available))
     }
-
-    pub(crate) fn take_binding_changed(&self) -> bool {
-        self.binding_changed
-            .lock()
-            .is_ok_and(|mut changed| std::mem::take(&mut *changed))
-    }
 }
 
 pub(crate) struct DaemonAdmissionResponseV1 {
@@ -107,7 +95,6 @@ pub(crate) struct DaemonAdmissionResponseV1 {
     pub(crate) feedback_notice:
         Option<tracedecay_application::advisory::AdvisoryHookLookupNoticeV1>,
     pub(crate) github_stack_signal_available: bool,
-    binding_changed: bool,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -136,12 +123,11 @@ struct DaemonAdmissionResponseWireV1 {
 }
 
 pub(crate) fn now_utc() -> UtcMicros {
-    let micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(1, |duration| {
-            duration.as_micros().min(i64::MAX as u128) as i64
-        });
-    UtcMicros(micros.max(1))
+    UtcMicros(
+        tracedecay_runtime_core::tracedecay::saturating_utc_now()
+            .0
+            .max(1),
+    )
 }
 
 #[hotpath::measure(label = "agent_hosts.hook_ports.admission_decode")]
@@ -151,7 +137,6 @@ pub(crate) fn daemon_admission_response(response: &serde_json::Value) -> DaemonA
         context_scout_address: None,
         feedback_notice: None,
         github_stack_signal_available: false,
-        binding_changed: false,
     };
     let Ok(wire) = DaemonAdmissionResponseWireV1::deserialize(response) else {
         return unavailable();
@@ -159,7 +144,7 @@ pub(crate) fn daemon_admission_response(response: &serde_json::Value) -> DaemonA
     if wire.action != "hook_v2_admit" {
         return unavailable();
     }
-    let _ = &wire.orchestration;
+    let _ = (&wire.orchestration, &wire.reason);
     match (wire.status, wire.disposition) {
         (DaemonAdmissionStatusV1::Rejected, Some(HookTransportDispositionV1::CatchupRequired)) => {
             DaemonAdmissionResponseV1 {
@@ -167,7 +152,6 @@ pub(crate) fn daemon_admission_response(response: &serde_json::Value) -> DaemonA
                 context_scout_address: None,
                 feedback_notice: None,
                 github_stack_signal_available: false,
-                binding_changed: wire.reason.as_deref() == Some("binding_changed"),
             }
         }
         (
@@ -191,7 +175,6 @@ pub(crate) fn daemon_admission_response(response: &serde_json::Value) -> DaemonA
                 context_scout_address: wire.context_scout_address,
                 feedback_notice: wire.feedback_notice,
                 github_stack_signal_available: wire.github_stack_signal_available.unwrap_or(false),
-                binding_changed: false,
             }
         }
         (DaemonAdmissionStatusV1::Backpressured, None) => DaemonAdmissionResponseV1 {
@@ -199,39 +182,24 @@ pub(crate) fn daemon_admission_response(response: &serde_json::Value) -> DaemonA
             context_scout_address: None,
             feedback_notice: None,
             github_stack_signal_available: false,
-            binding_changed: false,
         },
         (DaemonAdmissionStatusV1::Unavailable, None) => unavailable(),
         _ => unavailable(),
     }
 }
 
-impl DaemonAdmissionPort<'_> {
-    /// The bound native lifecycle lane owns an absolute hook-start deadline;
-    /// optional guidance continues to use the stock synchronous deadline.
-    pub(crate) fn try_admit_lifecycle<'a>(
+impl AsyncHookAdmissionPortV1 for DaemonAdmissionPort<'_> {
+    fn try_admit_async<'a>(
         &'a self,
         envelope: &'a HookEventEnvelopeV2,
-        deadline: Instant,
-    ) -> HookAdmissionFutureV1<'a> {
-        self.try_admit_until(envelope, deadline)
-    }
-
-    fn try_admit_until<'a>(
-        &'a self,
-        envelope: &'a HookEventEnvelopeV2,
-        deadline: Instant,
+        deadline: HookSynchronousDeadlineV1,
     ) -> HookAdmissionFutureV1<'a> {
         Box::pin(async move {
-            self.take_binding_changed();
-            if Instant::now() >= deadline {
-                return HookImmediateAdmissionV1::TimedOut;
-            }
             let Ok(envelope) = serde_json::to_value(envelope) else {
                 return HookImmediateAdmissionV1::Unavailable;
             };
-            let response = tokio::time::timeout_at(
-                deadline.into(),
+            let response = tokio::time::timeout(
+                Duration::from_micros(deadline.remaining_micros()),
                 super::daemon_hook_action(
                     self.runtime,
                     Some(self.project_root),
@@ -240,7 +208,6 @@ impl DaemonAdmissionPort<'_> {
                         "envelope": envelope,
                         "native_session_id": self.session_id,
                         "native_lifecycle": self.lifecycle,
-                        "native_start_locator": self.start_locator,
                     }),
                     self.telemetry,
                 ),
@@ -250,9 +217,6 @@ impl DaemonAdmissionPort<'_> {
                 return HookImmediateAdmissionV1::Unavailable;
             };
             let response = daemon_admission_response(&response);
-            if let Ok(mut changed) = self.binding_changed.lock() {
-                *changed = response.binding_changed;
-            }
             if let Some(address) = response.context_scout_address {
                 let Ok(mut retained) = self.context_scout_address.lock() else {
                     return HookImmediateAdmissionV1::Unavailable;
@@ -271,19 +235,6 @@ impl DaemonAdmissionPort<'_> {
             }
             response.immediate
         })
-    }
-}
-
-impl AsyncHookAdmissionPortV1 for DaemonAdmissionPort<'_> {
-    fn try_admit_async<'a>(
-        &'a self,
-        envelope: &'a HookEventEnvelopeV2,
-        deadline: HookSynchronousDeadlineV1,
-    ) -> HookAdmissionFutureV1<'a> {
-        self.try_admit_until(
-            envelope,
-            Instant::now() + Duration::from_micros(deadline.remaining_micros()),
-        )
     }
 }
 
@@ -452,100 +403,6 @@ impl<'a> DaemonOpenCodeLspUpdatePort<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn binding_refresh_requires_the_exact_rejected_catchup_reason() {
-        let response = serde_json::json!({
-            "action": "hook_v2_admit", "status": "rejected",
-            "disposition": "catchup_required", "reason": "binding_changed",
-        });
-        let changed = daemon_admission_response(&response);
-        assert!(changed.binding_changed);
-        assert!(matches!(
-            changed.immediate,
-            HookImmediateAdmissionV1::CatchupRequired
-        ));
-        for (field, value) in [
-            ("reason", serde_json::json!("admission_identity_conflict")),
-            ("reason", serde_json::Value::Null),
-            ("reason", serde_json::json!("binding_changed ")),
-            ("status", serde_json::json!("accepted")),
-            ("disposition", serde_json::json!("accepted")),
-            ("action", serde_json::json!("hook_v2_profile_admit")),
-            ("unexpected", serde_json::json!(true)),
-        ] {
-            let mut rejected = response.clone();
-            rejected[field] = value;
-            assert!(
-                !daemon_admission_response(&rejected).binding_changed,
-                "{field}"
-            );
-        }
-        let accepted = serde_json::json!({
-            "action": "hook_v2_admit", "status": "accepted",
-            "disposition": "accepted", "reason": "binding_changed",
-        });
-        assert!(!daemon_admission_response(&accepted).binding_changed);
-    }
-
-    #[tokio::test]
-    async fn binding_refresh_signal_is_consumed_once_and_cleared_on_a_later_attempt() {
-        let runtime = crate::ports::hook_runtime::crate_test_runtime();
-        let project = tempfile::tempdir().unwrap();
-        let response = serde_json::json!({
-            "action": "hook_v2_admit", "status": "rejected",
-            "disposition": "catchup_required", "reason": "binding_changed",
-        });
-        let _guard = super::super::TestDaemonHookActionGuard::install([response.clone(), response]);
-        let port = DaemonAdmissionPort::new(&runtime, project.path(), None, None, None, None);
-        let binding = tracedecay_hooks::HookScopeBindingV1 {
-            host: tracedecay_hooks::HookHostV1::ClaudeCode,
-            project_id: [1; 16],
-            repository_id: [2; 16],
-            worktree_id: [3; 16],
-            worktree_epoch: 1,
-            binding_token: [4; 32],
-            capabilities: vec![tracedecay_hooks::HookCapabilityV1 {
-                family: tracedecay_hooks::HookEventFamily::SessionBoundary,
-                support: tracedecay_hooks::HookEventSupportV1::Native,
-            }],
-        };
-        let decoded = tracedecay_hooks::decode_native_hook_event(
-            binding.host,
-            br#"{"hook_event_name":"SessionStart"}"#,
-        )
-        .unwrap();
-        let envelope = decoded
-            .into_envelope(
-                &binding,
-                tracedecay_hooks::NativeEnvelopeMaterialV1 {
-                    event_id: [5; 16],
-                    protected_session_id: [6; 32],
-                    observed_at: now_utc(),
-                    tool_id: None,
-                    effect_receipt_id: None,
-                    file_id: None,
-                    changed_range_count: 0,
-                },
-            )
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        assert!(matches!(
-            port.try_admit_lifecycle(&envelope, deadline).await,
-            HookImmediateAdmissionV1::CatchupRequired
-        ));
-        assert!(port.take_binding_changed());
-        assert!(!port.take_binding_changed());
-        assert!(matches!(
-            port.try_admit_lifecycle(&envelope, deadline).await,
-            HookImmediateAdmissionV1::CatchupRequired
-        ));
-        assert!(matches!(
-            port.try_admit_lifecycle(&envelope, Instant::now()).await,
-            HookImmediateAdmissionV1::TimedOut
-        ));
-        assert!(!port.take_binding_changed());
-    }
 
     #[test]
     fn delivery_outcome_maps_superseded_as_duplicate() {

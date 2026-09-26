@@ -27,6 +27,9 @@ pub mod hint_outcomes;
 mod hook_boundary_failure_matrix;
 mod kiro;
 pub mod memory_inject;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod pi_tests;
 mod post_tool_use;
 mod steering;
 mod store_layout;
@@ -87,8 +90,8 @@ pub fn aggregate_hook_completed_readiness(rows: &[Value]) -> HookCompletedReadin
 /// capture path did not, so each capture-only callback fired silently: the
 /// project's `hook_analytics.jsonl` gained no row, `tracedecay analytics`
 /// reported the host as never having invoked a hook, and that is exactly the
-/// signal a broken install gives. Attribution follows the host's own event name
-/// — read the way the Hermes terminal-receipt handler reads it — so a capture
+/// signal a broken install gives. Attribution follows the host's own event name,
+/// read the way the Hermes terminal-receipt handler reads it, so a capture
 /// row is indistinguishable from the response row the same event produces.
 ///
 /// `hook_name` overrides that read for the one surface whose payload carries no
@@ -97,7 +100,7 @@ pub fn aggregate_hook_completed_readiness(rows: &[Value]) -> HookCompletedReadin
 pub fn record_native_capture_invoked(
     runtime: &HookRuntimeV1,
     project_root: Option<&Path>,
-    host: tracedecay_hooks::HookHostV1,
+    host: NativeHostIdentityV1,
     hook_name: Option<&str>,
     event_json: &str,
 ) {
@@ -128,27 +131,30 @@ pub fn record_native_capture_invoked(
     }
 }
 
-/// Analytics agent key for a native host. Hosts outside the five typed
+/// Analytics agent key for a native host. Hosts outside the typed
 /// integrations record under the shared `other` key, matching the OpenCode and
-/// Kimi dispatchers above.
-const fn native_capture_agent(host: tracedecay_hooks::HookHostV1) -> Option<HintAgent> {
-    use tracedecay_hooks::HookHostV1;
-
+/// Kimi dispatchers below.
+const fn native_capture_agent(host: NativeHostIdentityV1) -> Option<HostIntegrationIdV1> {
     match host {
-        HookHostV1::ClaudeCode => Some(HintAgent::Claude),
-        HookHostV1::Codex => Some(HintAgent::Codex),
-        HookHostV1::CursorDesktop | HookHostV1::CursorCloud => Some(HintAgent::Cursor),
-        HookHostV1::Hermes => Some(HintAgent::Hermes),
-        HookHostV1::Kiro => Some(HintAgent::Kiro),
-        HookHostV1::Cline
-        | HookHostV1::RooCode
-        | HookHostV1::Kilo
-        | HookHostV1::KimiCode
-        | HookHostV1::OpenCode => None,
+        NativeHostIdentityV1::ClaudeCode => Some(HostIntegrationIdV1::Claude),
+        NativeHostIdentityV1::Codex => Some(HostIntegrationIdV1::Codex),
+        NativeHostIdentityV1::CursorDesktop | NativeHostIdentityV1::CursorCloud => {
+            Some(HostIntegrationIdV1::Cursor)
+        }
+        NativeHostIdentityV1::Hermes => Some(HostIntegrationIdV1::Hermes),
+        NativeHostIdentityV1::Kiro => Some(HostIntegrationIdV1::Kiro),
+        NativeHostIdentityV1::Pi => Some(HostIntegrationIdV1::Pi),
+        NativeHostIdentityV1::Cline
+        | NativeHostIdentityV1::RooCode
+        | NativeHostIdentityV1::Kilo
+        | NativeHostIdentityV1::KimiCode
+        | NativeHostIdentityV1::OpenCode
+        | NativeHostIdentityV1::FactoryDroid => None,
     }
 }
 
-use tool_hints::{HintAgent, ToolHint};
+use tool_hints::ToolHint;
+use tracedecay_domain::{HostIntegrationIdV1, NativeHostIdentityV1};
 use tracedecay_policy::hint_delivery::HintDeliveryDecisionV1;
 
 #[hotpath::measure(future = true, label = "agent_hosts.hooks.dispatch_kimi_event")]
@@ -162,7 +168,81 @@ pub async fn dispatch_kimi_event(
         record_other_hook_invoked(runtime, Some(project_root), "kimi_event", event_json);
     dispatch::dispatch(
         runtime,
-        tracedecay_hooks::HookHostV1::KimiCode,
+        NativeHostIdentityV1::KimiCode,
+        event_json,
+        project_root,
+        Some(&telemetry),
+        started,
+    )
+    .await
+    .into_recorded_guidance(&telemetry)
+    .flatten()
+}
+
+const PI_HOT_INGEST_MAX_BYTES: u64 = 256 * 1024;
+const PI_HOT_INGEST_BUDGET: Duration = Duration::from_millis(1_500);
+
+/// Pi lifecycle events record under the Pi host with Pi's own event name, and
+/// each session boundary lands that session's transcript through the
+/// canonical Pi source so recall reflects the session the event names.
+#[hotpath::measure(future = true, label = "agent_hosts.hooks.dispatch_pi_event")]
+pub async fn dispatch_pi_event(
+    runtime: &HookRuntimeV1,
+    event_json: &str,
+    project_root: &Path,
+    started: Instant,
+) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(event_json).unwrap_or(Value::Null);
+    let hook_name = parsed
+        .get("hook_event_name")
+        .and_then(Value::as_str)
+        .unwrap_or("nativeCallback");
+    let telemetry = record_hook_invoked_parsed(
+        runtime,
+        Some(project_root),
+        HostIntegrationIdV1::Pi,
+        hook_name,
+        event_json,
+        &parsed,
+    );
+    let guidance = dispatch::dispatch(
+        runtime,
+        NativeHostIdentityV1::Pi,
+        event_json,
+        project_root,
+        Some(&telemetry),
+        started,
+    )
+    .await
+    .into_recorded_guidance(&telemetry)
+    .flatten();
+    if matches!(hook_name, "session_start" | "agent_end") {
+        ingest_transcript_for_event(
+            runtime,
+            "pi",
+            event_json,
+            Some(project_root),
+            Some(PI_HOT_INGEST_MAX_BYTES),
+            PI_HOT_INGEST_BUDGET,
+            Some(&telemetry),
+        )
+        .await;
+    }
+    guidance
+}
+
+#[hotpath::measure(future = true, label = "agent_hosts.hooks.dispatch_droid_event")]
+pub async fn dispatch_droid_event(
+    runtime: &HookRuntimeV1,
+    event_json: &str,
+    project_root: &Path,
+    started: Instant,
+) -> Option<String> {
+    let telemetry =
+        record_other_hook_invoked(runtime, Some(project_root), "droid_event", event_json);
+    dispatch::dispatch(
+        runtime,
+        NativeHostIdentityV1::FactoryDroid,
         event_json,
         project_root,
         Some(&telemetry),
@@ -188,7 +268,7 @@ pub async fn dispatch_opencode_event(
     } else {
         dispatch::dispatch(
             runtime,
-            tracedecay_hooks::HookHostV1::OpenCode,
+            NativeHostIdentityV1::OpenCode,
             event_json,
             project_root,
             Some(&telemetry),
@@ -239,7 +319,7 @@ pub async fn dispatch_opencode_tool_after(
 #[hotpath::measure(future = true, label = "hosts.hooks.write_output")]
 pub(crate) async fn write_hook_output(
     project_root: Option<&Path>,
-    host: tracedecay_hooks::HookHostV1,
+    host: NativeHostIdentityV1,
     event_json: &str,
     output: &str,
 ) -> bool {
@@ -349,7 +429,7 @@ pub(crate) async fn write_hook_output(
 }
 
 fn hook_output_owner_event_id(
-    host: tracedecay_hooks::HookHostV1,
+    host: NativeHostIdentityV1,
     event_json: &str,
     output: &str,
 ) -> Option<String> {
@@ -380,7 +460,7 @@ pub(crate) use read_hook_event;
 /// project root, dispatch, and deliver any guidance for `host`.
 async fn hook_native_event(
     runtime: &HookRuntimeV1,
-    host: tracedecay_hooks::HookHostV1,
+    host: NativeHostIdentityV1,
     dispatch: impl AsyncFnOnce(&HookRuntimeV1, &str, &Path, Instant) -> Option<String>,
 ) -> i32 {
     let started = Instant::now();
@@ -398,10 +478,20 @@ async fn hook_native_event(
 
 #[hotpath::measure(future = true, label = "hosts.hooks.kimi_event")]
 pub async fn hook_kimi_event(runtime: &HookRuntimeV1) -> i32 {
+    hook_native_event(runtime, NativeHostIdentityV1::KimiCode, dispatch_kimi_event).await
+}
+
+#[hotpath::measure(future = true, label = "hosts.hooks.pi_event")]
+pub async fn hook_pi_event(runtime: &HookRuntimeV1) -> i32 {
+    hook_native_event(runtime, NativeHostIdentityV1::Pi, dispatch_pi_event).await
+}
+
+#[hotpath::measure(future = true, label = "hosts.hooks.droid_event")]
+pub async fn hook_droid_event(runtime: &HookRuntimeV1) -> i32 {
     hook_native_event(
         runtime,
-        tracedecay_hooks::HookHostV1::KimiCode,
-        dispatch_kimi_event,
+        NativeHostIdentityV1::FactoryDroid,
+        dispatch_droid_event,
     )
     .await
 }
@@ -410,7 +500,7 @@ pub async fn hook_kimi_event(runtime: &HookRuntimeV1) -> i32 {
 pub async fn hook_opencode_event(runtime: &HookRuntimeV1) -> i32 {
     hook_native_event(
         runtime,
-        tracedecay_hooks::HookHostV1::OpenCode,
+        NativeHostIdentityV1::OpenCode,
         dispatch_opencode_event,
     )
     .await
@@ -420,7 +510,7 @@ pub async fn hook_opencode_event(runtime: &HookRuntimeV1) -> i32 {
 pub async fn hook_opencode_tool_after(runtime: &HookRuntimeV1) -> i32 {
     hook_native_event(
         runtime,
-        tracedecay_hooks::HookHostV1::OpenCode,
+        NativeHostIdentityV1::OpenCode,
         dispatch_opencode_tool_after,
     )
     .await
@@ -734,13 +824,13 @@ pub async fn hook_hermes_terminal_receipt(runtime: &HookRuntimeV1) -> i32 {
     let hook_telemetry = record_hook_invoked(
         runtime,
         project_root.as_deref(),
-        HintAgent::Hermes,
+        HostIntegrationIdV1::Hermes,
         hook_name,
         &event_json,
     );
     let guidance = dispatch::dispatch_for_scope(
         runtime,
-        tracedecay_hooks::HookHostV1::Hermes,
+        NativeHostIdentityV1::Hermes,
         &event_json,
         project_root.as_deref(),
         Some(&hook_telemetry),
@@ -777,7 +867,7 @@ pub async fn hook_hermes_terminal_receipt(runtime: &HookRuntimeV1) -> i32 {
     );
     if !write_hook_output(
         project_root.as_deref(),
-        tracedecay_hooks::HookHostV1::Hermes,
+        NativeHostIdentityV1::Hermes,
         &event_json,
         &output,
     )
@@ -1005,7 +1095,7 @@ fn hook_route_session_id(parsed: &Value) -> Option<String> {
 
 fn deduped_project_hint_with_id(
     root: Option<&Path>,
-    agent: HintAgent,
+    agent: HostIntegrationIdV1,
     session_id: Option<String>,
     hint_id: &str,
     hint: ToolHint,
@@ -1033,7 +1123,7 @@ fn deduped_project_hint_with_id(
     };
     let mut dedupe = tool_hints::ToolHintDedupe::load_or_default(&path);
     let decision = dedupe.decide(&session_id, hint.category);
-    // Every decision — including the suppressed ones — advances the persisted
+    // Every decision, including the suppressed ones, advances the persisted
     // budget, so the save is unconditional.
     let _ = dedupe.save(&path);
 

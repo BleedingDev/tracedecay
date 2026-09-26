@@ -3,7 +3,7 @@
 use tracedecay_runtime_core::db::Database;
 
 use tracedecay_domain::RunId;
-use tracedecay_domain::{FactLineageEventV1, FactOwnerV1, ProvenanceId, RetrievalAnchorRecordV2};
+use tracedecay_domain::{FactLineageEventV1, FactOwnerV1, ProvenanceId, RetrievalAnchorRecord};
 use tracedecay_store::ProjectMemoryAutomationRunReceiptsV1;
 use tracedecay_store::{
     CurrentFactsQuery, FactAsOfQuery, FactAsOfResponseV1, FactCommitOutcome, FactCurrentQuery,
@@ -313,7 +313,7 @@ impl FactStore for DatabaseFactStore<'_> {
     async fn get_retrieval_anchor(
         &self,
         query: RetrievalAnchorQuery,
-    ) -> FactStoreResult<Option<RetrievalAnchorRecordV2>> {
+    ) -> FactStoreResult<Option<RetrievalAnchorRecord>> {
         let snapshot = self
             .db
             .begin_memory_read_transaction(QUERY_OPERATION)
@@ -503,8 +503,10 @@ impl ProjectMemoryFactStore for DatabaseFactStore<'_> {
         request: ProjectMemoryFactAddCommandV1,
         write_control: &FactWriteControl,
     ) -> FactStoreResult<ProjectMemoryFactAddOutcomeV1> {
-        self.project_memory_write(
+        let barrier_content = Some(request.content().to_owned());
+        self.project_memory_write_with_barrier_content(
             write_control,
+            barrier_content,
             |outcome: &ProjectMemoryFactAddOutcomeV1| {
                 outcome.commit_receipt().is_some() && !outcome.commit_replayed()
             },
@@ -870,8 +872,8 @@ impl ProjectMemoryGraphStore for DatabaseFactStore<'_> {
 }
 
 /// The single owned-or-borrowed handle shape for the shared project-memory
-/// database. Every project-memory route — the root crate's `tracedecay::facts`
-/// fact-store accessors and the MCP memory handlers alike — resolves
+/// database. Every project-memory route, the root crate's `tracedecay::facts`
+/// fact-store accessors and the MCP memory handlers alike, resolves
 /// through this one type and its `db_path() == graph_db_path` routing
 /// predicate, instead of each maintaining its own near-duplicate enum kept in
 /// sync only by hand.
@@ -966,7 +968,7 @@ impl FactStore for ProjectFactStore<'_> {
         ) -> FactStoreResult<FactLineageResponseV1>;
         fn get_retrieval_anchor(
             query: RetrievalAnchorQuery,
-        ) -> FactStoreResult<Option<RetrievalAnchorRecordV2>>;
+        ) -> FactStoreResult<Option<RetrievalAnchorRecord>>;
     }
 }
 

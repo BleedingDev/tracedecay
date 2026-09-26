@@ -47,14 +47,10 @@ impl DaemonAdvisoryCycleInvocationPort for MountedAdvisoryCycle {
         _request: DaemonAdvisoryCycleInvocationRequest,
     ) -> DaemonAdvisoryCycleInvocationFuture<'_> {
         Box::pin(async {
-            Err(ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic {
-                    code: "feedback.test-mounted-advisory-owner".to_owned(),
-                    message: "The mounted advisory owner received the request".to_owned(),
-                },
-                retry: RetryDirective::Never,
-                legal_actions: Vec::new(),
-            })
+            Err(ApplicationProblem::invalid_request_without_action(
+                "feedback.test-mounted-advisory-owner",
+                "The mounted advisory owner received the request",
+            ))
         })
     }
 
@@ -63,21 +59,17 @@ impl DaemonAdvisoryCycleInvocationPort for MountedAdvisoryCycle {
         _request: DaemonFeedbackProximityInvocationRequest,
     ) -> DaemonFeedbackProximityInvocationFuture<'_> {
         Box::pin(async {
-            Err(ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic {
-                    code: "feedback.test-mounted-proximity-owner".to_owned(),
-                    message: "The mounted proximity owner received the request".to_owned(),
-                },
-                retry: RetryDirective::Never,
-                legal_actions: Vec::new(),
-            })
+            Err(ApplicationProblem::invalid_request_without_action(
+                "feedback.test-mounted-proximity-owner",
+                "The mounted proximity owner received the request",
+            ))
         })
     }
 }
 
 #[tokio::test]
 async fn advisory_cycle_dispatches_to_the_mounted_project_owner() {
-    let observed_at = current_micros();
+    let observed_at = now_micros();
     let project_id = ProjectId::new("project.feedback-cycle-mounted").expect("project id");
     let owner = DaemonAdvisoryCycleInvocationOwner::new(project_id, Arc::new(MountedAdvisoryCycle));
     let response = execute_feedback_advisory_cycle(
@@ -120,7 +112,7 @@ fn proximity_wire_request_has_one_typed_body() {
 
 #[tokio::test]
 async fn proximity_dispatches_to_the_mounted_project_owner() {
-    let observed_at = current_micros();
+    let observed_at = now_micros();
     let project_id = ProjectId::new("project.feedback-proximity-mounted").expect("project id");
     let owner = DaemonAdvisoryCycleInvocationOwner::new(project_id, Arc::new(MountedAdvisoryCycle));
     let response = execute_feedback_proximity(

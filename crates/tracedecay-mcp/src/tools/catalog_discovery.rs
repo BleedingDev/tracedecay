@@ -306,24 +306,6 @@ pub fn catalog_discovery_tools_list_payload(
     Ok(payload)
 }
 
-pub fn get_catalog_filtered_tool_definitions_with_warming_budget(
-    budget: u8,
-    profile_id: &ProfileId,
-    authorized_capabilities: &BTreeSet<CapabilityId>,
-    available_scope: &BTreeSet<ScopeDimension>,
-    registry_mode: ToolRegistryMode,
-) -> Result<Vec<ToolDefinition>, McpDispatchMetadataError> {
-    let entry = discovery_cache_get_or_insert(
-        profile_id,
-        authorized_capabilities,
-        available_scope,
-        registry_mode,
-    )?;
-    let mut definitions = (*entry.tools).clone();
-    apply_context_description(&mut definitions, &context_warming_description(budget));
-    Ok(definitions)
-}
-
 pub fn default_catalog_discovery_authority()
 -> Result<BTreeSet<CapabilityId>, tracedecay_daemon_protocol::ApplicationSurfaceAdapterError> {
     Ok(
@@ -412,7 +394,6 @@ mod tests {
                     definition.annotations.as_ref().unwrap()["readOnlyHint"],
                     dispatch["read_only"]
                 );
-                assert!(dispatch["deadline"]["maximum_millis"].as_u64().unwrap() > 0);
                 dispatch["fingerprint"].as_str().unwrap()
             })
             .collect::<BTreeSet<_>>();
@@ -439,8 +420,19 @@ mod tests {
         let dispatch = &doctor.meta.as_ref().unwrap()["tracedecay/dispatch"];
         assert_eq!(dispatch["effect"], "read");
         assert_eq!(dispatch["availability"]["state"], "available");
+        assert_eq!(dispatch["deadline"]["maximum_millis"], 30_000);
         assert!(dispatch.get("receipt").is_none());
         assert!(dispatch.get("reconciliation").is_none());
+
+        let affected_tests = definitions
+            .iter()
+            .find(|definition| definition.name == "tracedecay_run_affected_tests")
+            .unwrap();
+        assert_eq!(
+            affected_tests.meta.as_ref().unwrap()["tracedecay/dispatch"]["deadline"]["maximum_millis"],
+            600_000,
+            "a long-running tool gets the ten-minute ceiling"
+        );
 
         for retired in [
             "tracedecay_lcm_preflight",

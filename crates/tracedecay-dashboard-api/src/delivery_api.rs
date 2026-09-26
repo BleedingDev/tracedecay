@@ -40,7 +40,7 @@ use tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1;
 use tracedecay_contracts::git::GitReadRequestV1;
 use tracedecay_domain::feedback::{
     CiFailureKindV1, GitHubReviewAuthorClassV1, GitHubReviewCoverageV1,
-    GitHubReviewIngressProviderOutcomeV1, GitHubReviewLifecycleV1,
+    GitHubReviewIngressProviderOutcomeV1, GitHubReviewLifecycleV1, GitHubReviewQuarantineReasonV1,
     GitHubReviewRateLimitCheckpointV1, GitHubReviewReadOperationV1, GitHubReviewStateV1,
 };
 use tracedecay_domain::git::{GitHeadStateV1, GitHistoryV1, GitOperationStateV1};
@@ -53,6 +53,7 @@ use crate::application::git_reads::{
 };
 use crate::git_query::{GitQueryBounds, GitStatusSummaryV1};
 
+use super::delivery_agent_usage::{DeliveryAgentUsageV1, agent_usage_projection};
 use super::read_model::{
     DashboardCoverageV1, DashboardDomainStateV1, DashboardEnvelopeV1, DashboardFreshnessV1,
     DashboardLegalActionKindV1, DashboardLegalActionRefV1, DashboardVersionV1,
@@ -60,7 +61,7 @@ use super::read_model::{
 };
 use super::{DashboardHttpRequestControlV1, DashboardState, RequestControl};
 
-const DELIVERY_SOURCE_COUNT: u64 = 8;
+const DELIVERY_SOURCE_COUNT: u64 = 9;
 const MAX_DELIVERY_INBOX_PROJECTS_V1: usize = 64;
 const MAX_DELIVERY_INBOX_PULL_REQUESTS_V1: usize = 64;
 const DELIVERY_AUTHORITY: &str = "daemon-owned ProjectDeliveryReadPortV1 authority";
@@ -109,7 +110,7 @@ impl<T> DeliveryProjectionV1<T> {
         Self::Ready { value }
     }
 
-    fn unavailable(authority: impl Into<String>, reason: impl Into<String>) -> Self {
+    pub(super) fn unavailable(authority: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::Unavailable {
             required_authority: authority.into(),
             reason: reason.into(),
@@ -318,7 +319,22 @@ pub struct DeliveryGitHubOperationSnapshotV1 {
     pub merge_base_commit_id: String,
     pub outcome: DeliveryGitHubOutcomeV1,
     pub coverage: DeliveryGitHubCoverageV1,
+    /// Comments the read observed but withheld from ingest, each with why.
+    pub quarantined: Vec<DeliveryGitHubQuarantinedCommentV1>,
     pub fetched_at_micros: i64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct DeliveryGitHubQuarantinedCommentV1 {
+    pub comment_id: String,
+    pub reason: DeliveryGitHubQuarantineReasonV1,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryGitHubQuarantineReasonV1 {
+    PrivacySanitizer,
+    BodyOutOfBounds,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -591,6 +607,7 @@ pub struct DeliveryOverviewV1 {
     pub failure_localization: DeliveryProjectionV1<DeliveryFailureLocalizationTimelineV1>,
     pub releases: DeliveryProjectionV1<DeliveryReleaseTimelineV1>,
     pub generation_freshness: DeliveryProjectionV1<DeliveryGenerationFreshnessV1>,
+    pub agent_usage: DeliveryProjectionV1<DeliveryAgentUsageV1>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
@@ -896,6 +913,7 @@ pub async fn overview(
     };
     let delivery_denied = matches!(&delivery, ProjectDeliveryReadOutcomeV1::Denied);
     let projections = delivery_projections(delivery);
+    let agent_usage = agent_usage_projection(&state, &changes).await;
     let payload = DeliveryOverviewV1 {
         changes,
         commits,
@@ -905,6 +923,7 @@ pub async fn overview(
         failure_localization: projections.failure_localization,
         releases: projections.releases,
         generation_freshness,
+        agent_usage,
     };
 
     let scope = scope_from_state(&state);
@@ -920,6 +939,7 @@ pub async fn overview(
             ("failure localization", &payload.failure_localization),
             ("releases", &payload.releases),
             ("generation freshness", &payload.generation_freshness),
+            ("agent usage", &payload.agent_usage),
         ];
         let (coverage, domain_state, freshness) = delivery_envelope_axes(&sources);
         DashboardEnvelopeV1::new(scope, domain_state, coverage, freshness, payload)
@@ -1292,7 +1312,7 @@ fn map_provider_state(state: ProjectDeliveryProviderStateV1) -> DeliveryProvider
 /// Next steps, not completed Code readings.
 ///
 /// `RequiresSelection` means this row does not name a symbol or a base
-/// revision. Shared Code must link to `/code`, where selection starts — not
+/// revision. Shared Code must link to `/code`, where selection starts, not
 /// `/code?view=shared-code`, which blocks with no symbol. Compare carries the
 /// indexed head so the operator only names the base.
 fn code_navigation_refs(
@@ -1604,15 +1624,12 @@ fn delivery_projections(outcome: ProjectDeliveryReadOutcomeV1) -> DeliverySource
     }
 }
 
-/// The exact project-open gate, rendered so a reader can tell "configure a
-/// token" apart from "broken".
+/// The exact project-open gate, rendered so a reader can tell an
+/// unmountable provider apart from a broken one.
 fn provider_mount_gate_reason(gate: ProjectDeliveryProviderMountGateV1) -> &'static str {
     match gate {
         ProjectDeliveryProviderMountGateV1::NoGitRemote => {
             "the admitted checkout has no recognizable GitHub remote, so no provider read can be mounted"
-        }
-        ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured => {
-            "no GitHub read-only credential is configured for this profile and repository — configure a token (or register the repository as public) to mount provider reads"
         }
         ProjectDeliveryProviderMountGateV1::GitHubAccessRefused => {
             "the configured GitHub credential was refused for this repository (missing, rejected, or write-capable), so provider reads stay unmounted"
@@ -1817,7 +1834,7 @@ fn map_pull_request(item: ProjectDeliveryPullRequestV1) -> DeliveryPullRequestV1
     DeliveryPullRequestV1 {
         id: format!("{provider}:{pull_request_id}"),
         label: match item.identity.as_ref() {
-            Some(identity) => format!("Pull request #{pull_request_id} — {}", identity.title),
+            Some(identity) => format!("Pull request #{pull_request_id}, {}", identity.title),
             None => format!("Pull request #{pull_request_id}"),
         },
         provider,
@@ -1867,6 +1884,21 @@ fn map_github_snapshot(
         merge_base_commit_id: snapshot.merge_base_commit_id.as_str().to_owned(),
         outcome: map_github_outcome(snapshot.outcome),
         coverage: map_github_coverage(snapshot.coverage),
+        quarantined: snapshot
+            .quarantined
+            .into_iter()
+            .map(|item| DeliveryGitHubQuarantinedCommentV1 {
+                comment_id: item.comment_id.as_str().to_owned(),
+                reason: match item.reason {
+                    GitHubReviewQuarantineReasonV1::PrivacySanitizer => {
+                        DeliveryGitHubQuarantineReasonV1::PrivacySanitizer
+                    }
+                    GitHubReviewQuarantineReasonV1::BodyOutOfBounds => {
+                        DeliveryGitHubQuarantineReasonV1::BodyOutOfBounds
+                    }
+                },
+            })
+            .collect(),
         fetched_at_micros: snapshot.fetched_at.0,
     }
 }
@@ -2449,7 +2481,8 @@ mod tests {
             ("five", &ready),
             ("six", &ready),
             ("seven", &ready),
-            ("eight", &stale),
+            ("eight", &ready),
+            ("nine", &stale),
         ];
 
         let (coverage, domain_state, freshness) = delivery_envelope_axes(&sources);
@@ -2468,14 +2501,14 @@ mod tests {
     #[test]
     fn provider_mount_gate_serves_an_actionable_reason_distinct_from_broken() {
         let gated = delivery_projections(ProjectDeliveryReadOutcomeV1::NotMounted {
-            gate: ProjectDeliveryProviderMountGateV1::GitHubCredentialNotConfigured,
+            gate: ProjectDeliveryProviderMountGateV1::NoGitRemote,
         });
         let DeliveryProjectionV1::Unavailable { reason, .. } = gated.pull_requests else {
             panic!("a gated mount must project as typed unavailable");
         };
         assert!(
-            reason.contains("configure a token"),
-            "the credential gate must tell the reader what to do: {reason}"
+            reason.contains("no recognizable GitHub remote"),
+            "the gate must name why no provider read mounted: {reason}"
         );
 
         let generic = delivery_projections(ProjectDeliveryReadOutcomeV1::Unavailable);
@@ -2488,7 +2521,7 @@ mod tests {
         };
         assert_ne!(
             reason, generic_reason,
-            "a missing credential must be distinguishable from a broken authority"
+            "a missing remote must be distinguishable from a broken authority"
         );
 
         let refused = delivery_projections(ProjectDeliveryReadOutcomeV1::NotMounted {

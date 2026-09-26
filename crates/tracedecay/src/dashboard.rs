@@ -1,36 +1,30 @@
-//! Root-side dashboard composition: the SPA-router seam plus the
+//! Root-side dashboard composition: the graph-to-context mapping plus the
 //! daemon-coupled integration fixtures.
 //!
-//! The dashboard API — routes, read models, services and their tests — lives
+//! The dashboard API, routes, read models, services and their tests, lives
 //! in `crates/tracedecay-dashboard-api`; callers import it directly.
 //!
 //! The embedded asset bundle is not generated here: the shipping binary crate
 //! embeds it and hands it to this library through the registered product
-//! runtime ([`crate::product_runtime`]). The canonical API crate owns the
+//! runtime ([`mod@tracedecay_project::product_runtime`]). The canonical API crate owns the
 //! resulting HTTP router and transport policy.
 
 use tracedecay_dashboard_api::DashboardProjectContext;
+#[cfg(feature = "test-transport")]
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 #[cfg(feature = "test-transport")]
 use tracedecay_daemon_service::DaemonInvocationService;
 #[cfg(feature = "test-transport")]
 use tracedecay_dashboard_api::{
     DashboardApplicationRuntime, DashboardAutomationAuthorityV1, DashboardAutomationWriter,
-    DashboardGitCorrelationReadPortV1, DashboardLcmReadPortV1,
-    DashboardProfileCodeIndexWorkerSettingsPort, standalone_dashboard_automation_writer,
+    DashboardGitCorrelationReadPortV1, DashboardHostAdmissionTestAuthorityV1,
+    DashboardLcmReadPortV1, DashboardProfileCodeIndexWorkerSettingsPort, DashboardTestEndpointV1,
+    DashboardTestProjectGraphsV1, standalone_dashboard_automation_writer,
 };
 #[cfg(feature = "test-transport")]
 use tracedecay_session_runtime::session_retrieval::{
     DaemonSessionRetrievalRoot, DaemonSessionRetrievalService, SessionRetrievalServingIdentityV1,
-};
-
-#[cfg(feature = "test-transport")]
-#[doc(hidden)]
-pub use tracedecay_dashboard_api::contract_schema;
-#[cfg(feature = "test-transport")]
-#[doc(hidden)]
-pub use tracedecay_dashboard_api::{
-    DashboardHostAdmissionTestAuthorityV1, DashboardTestEndpointV1,
 };
 
 /// Canonical observation-capture seeding for dashboard integration fixtures.
@@ -44,16 +38,6 @@ pub mod observation_seed;
 #[path = "dashboard_graph_test_runtime.rs"]
 pub mod dashboard_graph_test_runtime;
 
-/// Embedded single-page-app routes shared by production and integration
-/// servers. The caller supplies the registered product runtime's bundle;
-/// `tracedecay-api` owns route matching, cache policy, and the API fallback
-/// boundary.
-#[doc(hidden)]
-#[hotpath::measure(label = "dashboard.spa")]
-pub fn spa_router(assets: tracedecay_api::StaticDashboardAssets) -> axum::Router {
-    tracedecay_api::static_dashboard_router(std::sync::Arc::new(assets))
-}
-
 /// Installs the canonical root-owned registered schema port before dashboard
 /// integration fixtures open any database authority.
 #[cfg(feature = "test-transport")]
@@ -63,8 +47,9 @@ pub fn register_test_schema_installer() {
     REGISTER.call_once(tracedecay_global_db::register_registered_schema_installer);
 }
 
-pub(crate) fn dashboard_project_context(
-    graph: &crate::project::TraceDecay,
+#[doc(hidden)]
+pub fn dashboard_project_context(
+    graph: &tracedecay_project::project::TraceDecay,
 ) -> DashboardProjectContext {
     DashboardProjectContext {
         store_layout: graph.store_layout().clone(),
@@ -78,24 +63,9 @@ pub(crate) fn dashboard_project_context(
 
 #[cfg(feature = "test-transport")]
 #[doc(hidden)]
-#[derive(Clone, Default)]
-pub struct DashboardTestProjectGraphsV1 {
-    contexts: tracedecay_dashboard_api::DashboardTestProjectGraphsV1,
-}
-
-#[cfg(feature = "test-transport")]
-impl DashboardTestProjectGraphsV1 {
-    pub fn register(&self, graph: std::sync::Arc<crate::project::TraceDecay>) {
-        self.contexts
-            .register(std::sync::Arc::new(dashboard_project_context(&graph)));
-    }
-}
-
-#[cfg(feature = "test-transport")]
-#[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_until_shutdown_for_tests_with_host_admission<F>(
-    graph: std::sync::Arc<crate::project::TraceDecay>,
+    graph: std::sync::Arc<tracedecay_project::project::TraceDecay>,
     authority: DashboardHostAdmissionTestAuthorityV1,
     project_graphs: DashboardTestProjectGraphsV1,
     endpoint: DashboardTestEndpointV1<'_>,
@@ -109,7 +79,7 @@ where
     tracedecay_dashboard_api::run_until_shutdown_for_tests_with_host_admission(
         std::sync::Arc::new(dashboard_project_context(&graph)),
         authority,
-        project_graphs.contexts,
+        project_graphs,
         endpoint,
         build_version,
         spa_routes,
@@ -129,12 +99,12 @@ where
 #[cfg(feature = "test-transport")]
 #[doc(hidden)]
 pub async fn dashboard_automation_authority_for_test(
-    cg: std::sync::Arc<crate::project::TraceDecay>,
+    cg: std::sync::Arc<tracedecay_project::project::TraceDecay>,
     profile_root: impl AsRef<std::path::Path>,
 ) -> tracedecay_domain::errors::Result<(DashboardAutomationAuthorityV1, DashboardAutomationWriter)>
 {
-    let profile_root = profile_root.as_ref().canonicalize()?;
-    let project_root = cg.project_root().canonicalize()?;
+    let profile_root = canonical_existing_identity(profile_root.as_ref())?;
+    let project_root = canonical_existing_identity(cg.project_root())?;
     let configuration = hotpath::future!(
         cg.configuration_runtime().client().current(),
         label = "dashboard.automation.configuration"
@@ -143,7 +113,8 @@ pub async fn dashboard_automation_authority_for_test(
     .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
         message: format!("dashboard automation fixture configuration is unavailable: {error}"),
     })?;
-    let configured_project_root = configuration.target().project_root.canonicalize()?;
+    let configured_project_root =
+        canonical_existing_identity(&configuration.target().project_root)?;
     if configured_project_root != project_root {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "dashboard automation fixture configuration resolved a different project root"
@@ -219,7 +190,7 @@ pub async fn dashboard_automation_authority_for_test(
 #[cfg(feature = "test-transport")]
 #[doc(hidden)]
 pub async fn dashboard_configuration_authorities_for_test(
-    cg: std::sync::Arc<crate::project::TraceDecay>,
+    cg: std::sync::Arc<tracedecay_project::project::TraceDecay>,
     profile_database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
 ) -> tracedecay_domain::errors::Result<(
     std::sync::Arc<dyn DashboardApplicationRuntime>,
@@ -229,14 +200,14 @@ pub async fn dashboard_configuration_authorities_for_test(
 }
 
 /// Composes the daemon-owned LCM read authority over the fixture's
-/// registered project-sessions store — the same `DashboardLcmReadAdapter`
+/// registered project-sessions store, the same `DashboardLcmReadAdapter`
 /// over the daemon session retrieval service that the MCP dashboard
 /// composition mounts in production. Without it every `hermes-lcm` and
 /// explorer session read answers `lcm_daemon_authority_unavailable`.
 #[cfg(feature = "test-transport")]
 #[doc(hidden)]
 pub async fn dashboard_lcm_read_authority_for_test(
-    cg: &crate::project::TraceDecay,
+    cg: &tracedecay_project::project::TraceDecay,
     registry: &tracedecay_global_db::RegisteredGlobalDb,
     project_database: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
 ) -> Option<std::sync::Arc<dyn DashboardLcmReadPortV1>> {
@@ -267,7 +238,7 @@ pub async fn dashboard_lcm_read_authority_for_test(
 }
 
 /// Composes the daemon-owned git-correlation read authority over the
-/// fixture's registered project-sessions store — the same
+/// fixture's registered project-sessions store, the same
 /// `DashboardGitCorrelationReadAdapter` the MCP dashboard composition mounts
 /// in production. Without it Loom's session↔commit and branch/worktree
 /// sources answer their typed unavailable states.
@@ -319,15 +290,17 @@ mod spa_router_tests {
 
     #[tokio::test]
     async fn unknown_api_paths_never_receive_the_single_page_app() {
-        let response = super::spa_router(crate::product_runtime::FIXTURE_DASHBOARD_ASSETS)
-            .oneshot(
-                Request::builder()
-                    .uri("/api/not-a-real-route")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("SPA router response");
+        let response = tracedecay_api::static_dashboard_router(std::sync::Arc::new(
+            tracedecay_project::product_runtime::FIXTURE_DASHBOARD_ASSETS,
+        ))
+        .oneshot(
+            Request::builder()
+                .uri("/api/not-a-real-route")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("SPA router response");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }

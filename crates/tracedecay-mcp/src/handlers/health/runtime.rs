@@ -1,10 +1,11 @@
-//! `tracedecay_runtime` — daemon, store, and session-observation health, including the optional doctor report.
+//! `tracedecay_runtime`, daemon, store, and session-observation health, including the optional doctor report.
 
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_session_temporal_store::SessionTemporalAccess;
 
 use crate::{McpDoctorReportV1, McpToolContext, ToolResult, generic_tool_result};
 
@@ -18,7 +19,7 @@ async fn session_temporal_health_value(
     match project_session_db {
         Some(db) => match tokio::time::timeout(
             SESSION_TEMPORAL_HEALTH_BUDGET,
-            db.session_temporal_doctor_health(),
+            SessionTemporalAccess::new(db).session_temporal_doctor_health(),
         )
         .await
         {
@@ -129,16 +130,19 @@ fn attach_doctor_report(value: &mut Value, report: McpDoctorReportV1<'_>) {
             "report": admitted.report,
             "table_growth_evidence": admitted.table_growth_evidence,
             "schema_convergences": admitted.schema_convergences,
+            "language_servers": admitted.language_servers,
         }),
         McpDoctorReportV1::ReadFailed => json!({
             "kind": "unknown",
             "table_growth_evidence": [],
             "schema_convergences": [],
+            "language_servers": tracedecay_contracts::doctor::LanguageServerReadV1::Unknown,
         }),
         McpDoctorReportV1::NotAttached => json!({
             "kind": "unsupported",
             "table_growth_evidence": [],
             "schema_convergences": [],
+            "language_servers": tracedecay_contracts::doctor::LanguageServerReadV1::Unsupported,
         }),
     };
 }
@@ -344,7 +348,7 @@ pub async fn handle_runtime(
         attach_doctor_report(&mut value, ctx.doctor_report());
     }
     Ok(generic_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         &args,
         &value,
         vec![],
@@ -367,6 +371,7 @@ mod tests {
                 "kind": "unsupported",
                 "table_growth_evidence": [],
                 "schema_convergences": [],
+                "language_servers": { "kind": "unsupported" },
             })
         );
     }

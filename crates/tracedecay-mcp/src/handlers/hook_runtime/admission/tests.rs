@@ -39,9 +39,12 @@ fn daemon_admission_is_idempotent_per_identity_and_conflicts_on_different_bytes(
     );
     assert_eq!(second.order, first.order + 1);
     assert!(
-        hook_v2_admission_ledger_root(data_root.path(), tracedecay_hooks::HookHostV1::ClaudeCode)
-            .join("admissions.v1.bin")
-            .is_file()
+        hook_v2_admission_ledger_root(
+            data_root.path(),
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode
+        )
+        .join("admissions.v1.bin")
+        .is_file()
     );
 }
 
@@ -60,15 +63,20 @@ fn completion_persists_before_pending_ack_failure_and_cleanup_retries() {
     assert_eq!(
         hook_v2_pending_work_envelopes(
             data_root.path(),
-            tracedecay_hooks::HookHostV1::ClaudeCode,
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
             now,
         ),
         std::slice::from_ref(&envelope)
     );
     let pending_sequence = {
         let (mut spool, _) = tracedecay_hooks::HookSpoolV1::open(
-            hook_v2_pending_work_root(data_root.path(), tracedecay_hooks::HookHostV1::ClaudeCode),
-            tracedecay_hooks::HookSpoolConfigV1::stock(tracedecay_hooks::HookHostV1::ClaudeCode),
+            hook_v2_pending_work_root(
+                data_root.path(),
+                tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+            ),
+            tracedecay_hooks::HookSpoolConfigV1::stock(
+                tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+            ),
             now,
         )
         .unwrap();
@@ -95,7 +103,7 @@ fn completion_persists_before_pending_ack_failure_and_cleanup_retries() {
     assert_eq!(
         hook_v2_pending_work_envelopes(
             data_root.path(),
-            tracedecay_hooks::HookHostV1::ClaudeCode,
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
             now,
         ),
         std::slice::from_ref(&envelope)
@@ -110,7 +118,7 @@ fn completion_persists_before_pending_ack_failure_and_cleanup_retries() {
     assert!(
         hook_v2_pending_work_envelopes(
             data_root.path(),
-            tracedecay_hooks::HookHostV1::ClaudeCode,
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
             now,
         )
         .is_empty()
@@ -122,7 +130,7 @@ fn completion_persists_before_pending_ack_failure_and_cleanup_retries() {
     );
     forget_hook_v2_admission_ledger_for_test(
         data_root.path(),
-        tracedecay_hooks::HookHostV1::ClaudeCode,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
     );
     assert!(
         record_hook_v2_admission(data_root.path(), &envelope, now)
@@ -143,9 +151,9 @@ fn completed_restart_duplicate_cleans_pending_without_work_redrive() {
         retain_hook_v2_pending_work(data_root.path(), &envelope, &envelope, &binding, now)
             .expect("durable pending work");
     {
-        let key = (
-            data_root.path().to_path_buf(),
-            tracedecay_hooks::HookHostV1::ClaudeCode.hook_key(),
+        let key = hook_v2_admission_ledger_root(
+            data_root.path(),
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
         );
         let mut ledgers = hook_v2_admission_ledgers().lock().unwrap();
         assert!(
@@ -159,7 +167,7 @@ fn completed_restart_duplicate_cleans_pending_without_work_redrive() {
     drop(completion);
     forget_hook_v2_admission_ledger_for_test(
         data_root.path(),
-        tracedecay_hooks::HookHostV1::ClaudeCode,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
     );
 
     let duplicate = record_hook_v2_admission(data_root.path(), &envelope, now).unwrap();
@@ -176,7 +184,7 @@ fn completed_restart_duplicate_cleans_pending_without_work_redrive() {
     assert!(
         hook_v2_pending_work_envelopes(
             data_root.path(),
-            tracedecay_hooks::HookHostV1::ClaudeCode,
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
             now,
         )
         .is_empty(),
@@ -234,16 +242,16 @@ fn hook_v2_missing_configuration_remains_transiently_unavailable() {
 fn github_stack_wakeup_is_cursor_desktop_only_and_first_admission_only() {
     assert!(cursor_stack_wakeup_allowed(
         true,
-        tracedecay_hooks::HookHostV1::CursorDesktop,
+        tracedecay_domain::NativeHostIdentityV1::CursorDesktop,
     ));
     assert!(!cursor_stack_wakeup_allowed(
         false,
-        tracedecay_hooks::HookHostV1::CursorDesktop,
+        tracedecay_domain::NativeHostIdentityV1::CursorDesktop,
     ));
     for host in [
-        tracedecay_hooks::HookHostV1::Codex,
-        tracedecay_hooks::HookHostV1::ClaudeCode,
-        tracedecay_hooks::HookHostV1::CursorCloud,
+        tracedecay_domain::NativeHostIdentityV1::Codex,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+        tracedecay_domain::NativeHostIdentityV1::CursorCloud,
     ] {
         assert!(!cursor_stack_wakeup_allowed(true, host), "{host:?}");
     }
@@ -267,7 +275,7 @@ fn profile_scoped_native_admission_is_idempotent_in_the_authenticated_profile() 
     let identity =
         tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
     let decoded = tracedecay_hooks::decode_native_hook_event(
-        tracedecay_hooks::HookHostV1::ClaudeCode,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
         br#"{"hook_event_name":"SessionStart"}"#,
     )
     .unwrap();
@@ -300,5 +308,72 @@ fn profile_scoped_native_admission_is_idempotent_in_the_authenticated_profile() 
             .join("claude")
             .join("admissions.v1.bin")
             .is_file()
+    );
+}
+
+/// Profile-scoped admissions arrive on concurrent daemon requests. Each must
+/// be admitted exactly once through the daemon-owned ledger; none may be
+/// answered `unavailable` because a sibling request held the writer lock.
+#[test]
+fn concurrent_profile_scoped_admissions_are_all_recorded() {
+    const WRITERS: u8 = 16;
+    let _profile = tracedecay_project::config::PinnedUserDataDir::new();
+    let profile_root = tracedecay_runtime_core::storage::default_profile_root().unwrap();
+    let identity =
+        tracedecay_daemon_identity::profile_identity::load_or_create(&profile_root).unwrap();
+    let admission = |event: u8| {
+        serde_json::json!({
+            "admission": tracedecay_hooks::ProfileScopedNativeHookAdmissionV1 {
+                decoded: tracedecay_hooks::decode_native_hook_event(
+                    tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+                    br#"{"hook_event_name":"SessionStart"}"#,
+                )
+                .unwrap(),
+                material: tracedecay_hooks::NativeEnvelopeMaterialV1 {
+                    event_id: [event; 16],
+                    protected_session_id: [8; 32],
+                    observed_at: UtcMicros(1_000),
+                    tool_id: None,
+                    effect_receipt_id: None,
+                    file_id: None,
+                    changed_range_count: 0,
+                },
+            },
+        })
+    };
+    let admit_all = || {
+        let barrier = std::sync::Barrier::new(usize::from(WRITERS));
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (1..=WRITERS)
+                .map(|event| {
+                    let (barrier, identity, profile_root) = (&barrier, &identity, &profile_root);
+                    let args = admission(event);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        hook_v2_profile_admit(
+                            &args,
+                            "hook_v2_profile_admit",
+                            profile_root,
+                            identity,
+                        )
+                        .unwrap()["status"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>()
+        })
+    };
+
+    assert_eq!(admit_all(), vec!["accepted"; usize::from(WRITERS)]);
+    assert_eq!(
+        admit_all(),
+        vec!["exact_duplicate"; usize::from(WRITERS)],
+        "every concurrent admission was durably recorded exactly once"
     );
 }

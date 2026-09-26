@@ -3,7 +3,6 @@ use std::process::Command;
 
 use serde_json::json;
 use tempfile::TempDir;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_capture::codex::{
     CodexObservationLocation, codex_native_record_id, normalize_codex_observation_with_location,
 };
@@ -15,13 +14,14 @@ use tracedecay_domain::{
 use tracedecay_global_db::GlobalDbGitCorrelationStore;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
 use tracedecay_privacy::parse_normalized_observation_record_v1;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::observation::{
     CaptureObservationOutcome, CaptureObservationRequest, ObservationCancellation,
 };
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
 use tracedecay_sessions::runtime::git_correlation::{
-    CommitRelationFilter, GitRefFilter, SessionsForQuery, pending_git_evidence_publication_count,
+    CommitRelationFilter, GitRefFilter, SessionsForQuery, normalize_worktree,
 };
 
 fn run_git(project: &Path, args: &[&str]) -> String {
@@ -162,39 +162,15 @@ async fn canonical_codex_capture_publishes_admitted_git_evidence_for_sessions_fo
     assert!(sanitized.contains("capture-branch"));
     assert!(sanitized.contains(&commit_sha));
 
+    // The capture recorded the evidence rows in its own transaction; the
+    // projection drain that follows neither needs nor changes them.
     let store = GlobalDbGitCorrelationStore::new(database);
-    assert_eq!(
-        pending_git_evidence_publication_count(database)
-            .await
-            .unwrap(),
-        1
-    );
-    assert!(
-        store
-            .sessions_for_with_relation(
-                &SessionsForQuery {
-                    git_ref: GitRefFilter::Branch("capture-branch".to_owned()),
-                    since: None,
-                    until: None,
-                    limit: 10,
-                },
-                CommitRelationFilter::All,
-            )
-            .await
-            .unwrap()
-            .is_empty(),
-        "capture stages evidence without publishing the Git graph inline"
-    );
+    let captured = store.correlation_index_health().await.unwrap();
+    assert_eq!((captured.span_count, captured.commit_count), (1, 1));
     facade
         .drain_projection_queue("codex", &scope, &ObservationCancellation::default(), 1)
         .await
         .unwrap();
-    assert_eq!(
-        pending_git_evidence_publication_count(database)
-            .await
-            .unwrap(),
-        0
-    );
     let branch_hits = store
         .sessions_for_with_relation(
             &SessionsForQuery {
@@ -209,7 +185,11 @@ async fn canonical_codex_capture_publishes_admitted_git_evidence_for_sessions_fo
         .unwrap();
     assert_eq!(branch_hits.len(), 1);
     assert_eq!(branch_hits[0].session_id, session_id.as_str());
-    assert_eq!(branch_hits[0].worktree.as_deref(), project.to_str());
+    // Worktrees are keyed in their portable `/`-separated spelling.
+    assert_eq!(
+        branch_hits[0].worktree,
+        Some(normalize_worktree(&project.to_string_lossy()))
+    );
 
     let commit_hits = store
         .sessions_for_with_relation(

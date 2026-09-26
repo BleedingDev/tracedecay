@@ -2,25 +2,40 @@ name: CI
 
 on:
   push:
-    branches: [master, feature/holographic-memory, codex/tracedecay-total-redesign-plan-reopened]
-  pull_request:
-    branches: ['**']
+    branches: [master, feature/holographic-memory]
+  workflow_dispatch:
+    inputs:
+      run_os:
+        description: "Also run macOS and Windows matrices"
+        type: boolean
+        default: false
+      run_hosts:
+        description: "Also run stock host integrations"
+        type: boolean
+        default: false
+      run_perf:
+        description: "Also run hotpath parity"
+        type: boolean
+        default: false
+      run_full_nextest:
+        description: "Also run the full Linux search and transport selections"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
-# One run per pull request (or per pushed ref). A newer push to a pull
-# request supersedes the run in flight: its verdict is for a head nobody can
-# merge any more, and letting it finish only holds runners the current head is
-# waiting for. Keeping master-bound runs to completion did not buy a verdict
-# per tip either: GitHub holds one pending run per group, so while a 100-min
-# run finished, every intermediate push was queued and then cancelled by the
-# next (runs 34311300344, 34312118984, 34313237349 never scheduled a job) and
-# only the head at the moment the old run ended got a verdict, ~100 min late.
-# `push` runs are never cancelled.
+# One run per ref, and a newer push cancels the run in flight, master
+# included. The newest master commit contains every merge before it, so its
+# run is the verdict on what ships; a superseded run proves nothing the newer
+# one does not. One master push spends 16 of the account's 20 hosted jobs, and
+# keeping superseded master runs (keyed per SHA) serialized a merge burst at
+# ~27 min per merge and left release-please waiting 80-93 min for a runner.
+# To attribute a break inside a burst, bisect or dispatch this workflow on a
+# branch at the suspect commit.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -30,95 +45,80 @@ env:
   AST_GREP_VERSION: "0.44.0"
 
 jobs:
-  # Single source of truth for the fork/base-branch guard: heavy jobs run on
-  # pushes, on PRs from this repository, and on fork PRs that target an
-  # integration branch. Guarded jobs `needs:`-check this job's output instead
-  # of each repeating the expression, so the branch list lives in one place.
+  # Manual dispatch is the only PR-head entry point. GitHub queues a
+  # pull_request workflow before evaluating job conditions, and automation
+  # applied every opt-in label to 173 PRs; only removing the trigger prevents
+  # that volume from occupying the account FIFO. A dispatch runs the Linux
+  # lane and may add OS, host, perf, or full-workspace work through explicit
+  # inputs. A master push runs the Linux lane only so release jobs retain
+  # runner slots.
   scope-gate:
     name: Scope gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       run-heavy: ${{ steps.decide.outputs.run-heavy }}
+      run-os: ${{ steps.decide.outputs.run-os }}
+      run-hosts: ${{ steps.decide.outputs.run-hosts }}
+      run-perf: ${{ steps.decide.outputs.run-perf }}
       linux-partitions: ${{ steps.linux-partitions.outputs.matrix }}
+      windows-partitions: ${{ steps.windows-partitions.outputs.matrix }}
       macos-groups: ${{ steps.macos-groups.outputs.matrix }}
     steps:
-      - name: Decide whether guarded jobs run
+      - name: Decide what this run may spend
         id: decide
-        run: echo "run-heavy=${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository || contains(fromJSON('["master","feature/holographic-memory"]'), github.event.pull_request.base.ref) }}" >> "$GITHUB_OUTPUT"
+        env:
+          EVENT: ${{ github.event_name }}
+          RUN_OS: ${{ inputs.run_os || false }}
+          RUN_HOSTS: ${{ inputs.run_hosts || false }}
+          RUN_PERF: ${{ inputs.run_perf || false }}
+        run: |
+          heavy=true
+          os=false
+          hosts=false
+          perf=false
+          if [[ $EVENT == workflow_dispatch ]]; then
+            [[ $RUN_OS == true ]] && os=true
+            [[ $RUN_HOSTS == true ]] && hosts=true
+            [[ $RUN_PERF == true ]] && perf=true
+          fi
+          {
+            echo "run-heavy=$heavy"
+            echo "run-os=$os"
+            echo "run-hosts=$hosts"
+            echo "run-perf=$perf"
+          } >>"$GITHUB_OUTPUT"
+          echo "run-heavy=$heavy run-os=$os run-hosts=$hosts run-perf=$perf (event=$EVENT)"
 
-      # The Linux and macOS test matrices come from the same manifest the
-      # partition jobs select their targets from, so a partition cannot exist
-      # without a job or a job without a partition. This needs the checkout
-      # and nothing else.
+      # The Linux, Windows and macOS test matrices come from the same manifest
+      # the partition jobs select their targets from, so a partition cannot
+      # exist without a job or a job without a partition.
       - uses: actions/checkout@v7
         with:
           sparse-checkout: |
             .github/linux-test-partitions.json
-            scripts/linux-test-partitions.py
+            scripts
           sparse-checkout-cone-mode: false
 
       - name: Derive the Linux test matrix
         id: linux-partitions
         run: echo "matrix=$(python3 scripts/linux-test-partitions.py matrix)" >> "$GITHUB_OUTPUT"
 
+      - name: Derive the Windows test matrix
+        id: windows-partitions
+        run: echo "matrix=$(python3 scripts/linux-test-partitions.py windows-matrix)" >> "$GITHUB_OUTPUT"
+
       - name: Derive the macOS test matrix
         id: macos-groups
         run: echo "matrix=$(python3 scripts/linux-test-partitions.py macos-matrix)" >> "$GITHUB_OUTPUT"
 
-  # Exercises the checked-out PR head through the CLI against an isolated
-  # daemon (scripts/ci-pr-dogfood-smoke.sh). The binary is the one `debug-cli`
-  # builds from the merge ref: the smoke only needs an executable `tracedecay`,
-  # and building a second one from the head cost a cold
-  # `cargo build -p tracedecay-cli` that never fit this job's budget (runs
-  # 34217290139 and 34231734416: the build was cancelled after 29 minutes
-  # while `debug-cli` finished the same build in 30-31 minutes and published
-  # it).
-  pr-dogfood:
-    name: PR checkout dogfood
-    needs: [scope-gate, debug-cli]
-    if: ${{ github.event_name == 'pull_request' && needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha }}
-
-      - name: Fetch the debug CLI built once for this run
-        uses: actions/download-artifact@v4
-        with:
-          name: debug-tracedecay-cli
-          path: target/debug
-      - name: Restore the executable bit the artifact store drops
-        run: chmod +x target/debug/tracedecay
-
-      - name: Test dogfood harnesses
-        run: |
-          python3 scripts/test-check-pr-dogfood-output.py
-          python3 scripts/test-efficiency-scorecard.py
-          python3 scripts/test-pr-dogfood-portability.py
-
-      - name: Initialize checkout and exercise CLI tools
-        run: scripts/ci-pr-dogfood-smoke.sh
-        env:
-          TRACEDECAY_BIN: target/debug/tracedecay
-          TRACEDECAY_DOGFOOD_BASE_REF: ${{ github.event.pull_request.base.sha }}
-          TRACEDECAY_DOGFOOD_HEAD_REF: ${{ github.event.pull_request.head.sha }}
-          TRACEDECAY_DOGFOOD_BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
-          TRACEDECAY_DOGFOOD_HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-
-  # One dev-profile `tracedecay` binary for every job that only exercises the
-  # built CLI (`pr-dogfood`, Hermes, Claude Code, OpenCode). Each of those
-  # jobs used to compile the whole workspace itself behind its own cache key,
-  # so a cold cache cost the run several 30-minute builds instead of one and
-  # tripped their timeouts.
+  # One dev-profile `tracedecay` binary for the explicitly requested stock
+  # host integrations. Ordinary Linux validation needs no CLI artifact, so
+  # this build is absent unless `run_hosts=true`.
   debug-cli:
     name: Build debug CLI
     needs: scope-gate
-    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
+    if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -127,6 +127,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: ./.github/actions/setup-linux-mold
+
+      - uses: ./.github/actions/setup-pnpm
 
       # This is the workflow's only dev-profile build, so `ci-dev-*` has one
       # writer. rust-cache stores dependency artifacts only. The repository
@@ -154,10 +156,27 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  commit-messages:
-    name: Commit Messages
+  benchmark-harness:
+    name: Benchmark harness self-tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # The runtime benchmark harness produces the evidence PRs cite; its own
+      # unit tests only count if something runs them.
+      - name: Test the runtime benchmark harness
+        working-directory: benchmark_data/runtime
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+
+  # The cheap repository gates in one job: commit lint, cache lineage, the
+  # release guards, and rustfmt. Each used to hold its own ubuntu-latest
+  # runner for a couple of minutes of work; on 20 free slots that is three
+  # queue entries per push doing what one does.
+  gates:
+    name: Repository gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -166,10 +185,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
 
-      - name: Install commit message lint dependencies
-        run: npm ci
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Reject tracked ignored files
         run: scripts/check-release-pr-integrity.sh HEAD HEAD
@@ -177,119 +194,84 @@ jobs:
       - name: Test bounded commit range linting
         run: python3 scripts/test-lint-commit-range.py
 
+      - name: Test worktree GC classification and build reclamation
+        run: python3 scripts/test-worktree-gc.py
+
+      - name: Check Rust cache key lineage and the superseded-entry selection
+        run: |
+          python3 scripts/test-prune-superseded-actions-caches.py
+          python3 scripts/test-rust-cache-lineage.py
+          python3 scripts/check-rust-cache-lineage.py
+
+      # Packager unit tests. They do not need a release binary, so they run
+      # once here instead of once per release matrix target.
+      - name: Test release packagers
+        run: |
+          python3 scripts/test-check-packaged-lsp-bridge.py
+          python3 scripts/test-build-mcpb.py
+          python3 scripts/test-resolve-installed-binary.py
+          python3 scripts/test-check-packaged-mcp-stdio.py
+          python3 scripts/test-check-distribution-feature-wiring.py
+          python3 scripts/test-resolve-release-source-profile.py
+          python3 scripts/test-package-release-archive.py
+          python3 scripts/test-plan-release-recovery.py
+          python3 scripts/test-check-release-artifacts.py
+          bash scripts/test-check-distribution-clean-source.sh
+          bash scripts/test-check-distribution-snapshot.sh
+          bash scripts/test-check-distribution-reuse.sh
+          bash tests/macos_stable_codesign_test.sh
+
+      # Release guards: drift, safety, installer, PR integrity, bundle check.
+      # Pull requests only; the release PR itself is exempt because it is
+      # the one change allowed to move the version authorities.
+      - name: Check the release guards
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          bash tests/release_drift_check_test.sh
+          bash tests/release_safety_test.sh
+          bash tests/install_script_test.sh
+          bash tests/release_pr_integrity_test.sh
+          bash tests/dashboard_bundle_check_test.sh
+
+      # Judge formatting with the toolchain `rust-toolchain.toml` pins, not
+      # whatever `stable` is on the runner: rustfmt's output changes between
+      # releases (1.98.1 breaks a chain 1.97.1 keeps inline), and
+      # `dtolnay/rust-toolchain@stable` exports `RUSTUP_TOOLCHAIN`, which
+      # overrides the file. Installing through rustup with no override keeps
+      # the pin in one place.
+      - name: Install the repository's pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Test and check dev skill host copies
         run: |
           python3 scripts/test-check-dev-skill-mirrors.py
           python3 scripts/check-dev-skill-mirrors.py check
 
-      - name: Validate PR commit messages
-        if: github.event_name == 'pull_request'
+      # Dispatch admits an integration branch. Judge the commits a merge onto
+      # the default branch would introduce, with the same linter a push uses.
+      # A push still uses the before SHA, so published history is not rejudged.
+      - name: Validate commit messages
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: node scripts/lint-commit-range.mjs --repository "$PWD" "$BASE_SHA" "$HEAD_SHA"
-
-      - name: Validate pushed commit messages
-        if: github.event_name == 'push'
-        env:
+          EVENT_NAME: ${{ github.event_name }}
           BEFORE_SHA: ${{ github.event.before }}
           HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          if [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            if git rev-parse "${HEAD_SHA}^" >/dev/null 2>&1; then
-              base_sha="${HEAD_SHA}^"
-            else
-              git show --no-patch --format=%B "$HEAD_SHA" | npm run lint:commit --
-              exit 0
-            fi
-          else
-            base_sha="$BEFORE_SHA"
-          fi
-          node scripts/lint-commit-range.mjs --repository "$PWD" "$base_sha" "$HEAD_SHA"
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: scripts/lint-ci-commits.sh
 
-  release-version-drift:
-    name: Release Version Drift
-    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Test release version drift guard
-        run: bash tests/release_drift_check_test.sh
-
-      # The workflow-contract pin scripts were replaced by the safety-guard
-      # assertions (f3b065545) and the dogfood surface was retired (b73a8a396);
-      # this job keeps the guards that protect the shipped release flow.
-      - name: Check release safety guards
-        run: bash tests/release_safety_test.sh
-
-      - name: Test GitHub release installer
-        run: bash tests/install_script_test.sh
-
-      # These two sat unwired: they are the tests for
-      # `scripts/check-release-pr-integrity.sh` and
-      # `scripts/check-dashboard-bundle.py`, both of which CI does run. So the
-      # guards were enforced while the tests proving the guards work were not,
-      # which is the shape that let a `test-transport` target rot until it
-      # stopped compiling. Three of the five `tests/*_test.sh` gates were wired;
-      # these are the other two.
-      - name: Test release PR integrity guard
-        run: bash tests/release_pr_integrity_test.sh
-
-      - name: Test dashboard bundle check
-        run: bash tests/dashboard_bundle_check_test.sh
-
-      - name: Check release version drift
-        run: scripts/check-release-drift.sh
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-
-  # macOS compiles and runs the suite as groups of the Linux partitions
-  # (`macos_groups` in .github/linux-test-partitions.json), one hosted 3-vCPU
-  # `macos-14` job per group, so the lane's wall time is the slowest group
-  # instead of the whole workspace. The single job this replaces built
-  # `--workspace --bins --tests` in 80.2 min and ran the suite in 19.9 min
-  # (run 34303181887; run 34309279328 built for 74.9 min and was cancelled in
-  # its tests at 85 min), about 80 min after every other lane had reported,
-  # so it was the critical path of every pull request run. rust-cache carries
-  # the dependency graph only; the workspace crates compile fresh every run,
-  # and on three cores with ld64 that build is the whole cost.
-  #
-  # A group runs each of its partitions in turn against one target directory
-  # with the selection `linux-test-partition` resolves for it, so
-  # `root-sessions` and `root-journeys`, which select the same packages with
-  # the same feature, compile the chain beneath the root crate once and the
-  # second adds only its own suites. The grouping balances the warm Linux
-  # measurements (run 34309279328, compile + tests in minutes): root-lib
-  # 14.7 + 7.5 alone, since its root chain, library test target and 1675
-  # tests are the floor no split lowers; root-sessions 15.3 + 3.1 with
-  # root-journeys, which adds 2.7 + 2.7 on the shared resolution; runtime
-  # 15.6 + 2.4 with core-storage 10.4 + 1.9; core-contracts 13.9 + 0.6 with
-  # root-dashboard-api 12.7 + 0.8. Every pairing that puts a second partition
-  # beside a root group is heavier than the heaviest of these, and no two of
-  # the other four share a feature resolution, so grouping them differently
-  # saves no compile. At the 3-vCPU floor (compile × 4/3, tests as measured)
-  # the groups come to 28, 31, 40 and 38 min; at the 2× the one macOS
-  # measurement showed (the chain beneath the root crate compiled in 19.0
-  # min against 9.3 on Arm in the runs above) to 38, 43, 57 and 56. The
-  # budgets in the manifest take the 2×, plus the cold-dependency allowance
-  # and headroom the Linux budgets carry, until a hosted run measures the
-  # groups. The account admits five concurrent macOS jobs; a run takes at
-  # most four (`MACOS_GROUP_CAP`) so another run's macOS jobs can start.
   macos-test-partition:
     name: Test macOS ${{ matrix.group }}
     needs: scope-gate
-    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
+    if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
     runs-on: macos-14
     # Each group's budget is set in the manifest beside the group, with the
     # measurement it rests on.
     timeout-minutes: ${{ matrix.timeout }}
+    # Re-signs the product after release strip (see .cargo/config.toml).
+    env:
+      CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/scripts/macos-rustc-wrapper.sh
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope-gate.outputs.macos-groups) }}
@@ -310,7 +292,7 @@ jobs:
       # standard methods the client declared, and the upstream `initialize`
       # response is the only authority for those. Without the component the
       # runner still has rustup's `rust-analyzer` proxy on PATH, so the daemon
-      # routes the language and only the spawn fails — the test would then
+      # routes the language and only the spawn fails. The test would then
       # measure a missing component instead of the negotiation contract. This
       # action exports `RUSTUP_TOOLCHAIN`, so the component has to be installed
       # here rather than through `rust-toolchain.toml`, which it overrides.
@@ -321,6 +303,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - uses: ./.github/actions/setup-pnpm
 
       - uses: actions/setup-python@v6
         with:
@@ -339,12 +323,19 @@ jobs:
       # compiler store: the perf-profile test graph wrote 15.7 GB of outputs
       # per build on macOS, which no store inside the repository's 10 GB
       # cache budget can hold. One writer keeps the lane at one entry:
-      # `root-suites` resolves the widest graph (the root crate with its
-      # dev-dependencies, the CLI and the evaluator), so its save covers
-      # `root-lib` exactly; the other groups unify dependency features
-      # differently and recompile a few small dependency units against it
-      # every run, as the lower Linux partitions do. Restored before the first
-      # `cargo metadata` below so the registry index comes from the cache too.
+      # `root-suites` resolves the widest root graph (the root crate with
+      # its dev-dependencies, the CLI and the evaluator), so its save covers
+      # `root-lib` and the `root-transport` group exactly (test-transport
+      # re-resolves 31 workspace crates but no dependency unit). The lower
+      # partitions unify the dependencies differently and recompile ~100-200
+      # units against it, which costs nothing measurable here: `runtime`
+      # compiled in 28.5-29.6 min with every one of its 604 dependency units
+      # built from source and in 29.5 with a full-match cache of its own
+      # (runs 36087768140 and 36095356282), because on three cores the
+      # serial workspace chain plus the test targets are the whole path and
+      # the dependency units fill the slots beside it. A lineage for them
+      # was tried and removed on that evidence. Crate sources come from the
+      # pnpm store that setup-pnpm restores, not from this cache.
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
         with:
@@ -365,9 +356,17 @@ jobs:
       # (`build-args`; nothing for a partition whose tests spawn nothing),
       # then nextest under the `ci` policy and the perf cargo profile with
       # `--no-tests=fail`. One target directory for the group, so a later
-      # partition's shared units are fingerprint hits. Every partition runs
-      # even after an earlier one fails — as nextest's `ci` policy runs every
-      # test — and the step fails if any did. Every nextest run rewrites the
+      # partition's shared units are fingerprint hits; the manifest pairs
+      # partitions of one resolution where they exist (run 36051245663 had
+      # `root-transport` re-resolve 31 workspace crates behind
+      # `root-journeys`, 18 min on three cores, and `root-dashboard-api` as
+      # a lone `-p tracedecay` selection recompile 48 workspace crates and
+      # 108 dependency units, 24 min, because the CLI's clap graph changes
+      # `mio`'s features and so tokio's and every crate above it) and
+      # otherwise balances the sums of the measured partition costs, since
+      # a group's wall time is that sum. Every partition runs
+      # even after an earlier one fails, as nextest's `ci` policy runs every
+      # test, and the step fails if any did. Every nextest run rewrites the
       # `ci` profile's junit.xml, so each partition's report is moved under
       # its own name before the next runs. The per-partition wall times this
       # prints are the measurements the manifest's macOS budgets wait for.
@@ -421,7 +420,7 @@ jobs:
   # per group holding a junit.xml per partition.
   macos-test:
     name: Test macOS
-    if: ${{ !cancelled() && needs.scope-gate.outputs.run-heavy == 'true' }}
+    if: ${{ !cancelled() && needs.scope-gate.outputs.run-os == 'true' }}
     needs: [macos-test-partition, scope-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -463,9 +462,9 @@ jobs:
   # shape) keeps the whole 55 min compile plus an archive round trip on the
   # path and then the dashboard rebuild and parity on the same job: ~88 min,
   # or ~70 with both moved elsewhere. The partitions pay for the shorter path
-  # with duplicated compile — each root partition rebuilds the library chain
+  # with duplicated compile. Each root partition rebuilds the library chain
   # beneath the root crate, about 200 core-minutes per run across the seven
-  # jobs — which is free on hosted runners where only wall time and the
+  # jobs, which is free on hosted runners where only wall time and the
   # 20-job concurrency cap count. A cold dependency cache adds ~6 min to every
   # job alike (the dependencies compile at opt-level 0 in ~17 core-minutes).
   # The floor no partitioning reaches is the root chain itself: library
@@ -475,10 +474,13 @@ jobs:
   # `--lib` / `--test <name>` / `--bins` decide what compiles, and a filterset
   # would compile everything and skip at run time. The three root partitions
   # share one package selection (`tracedecay`, `tracedecay-cli`,
-  # `tracedecay-search-eval`) with the root fixture feature, so they resolve
-  # one identical dependency graph and every cargo invocation inside a job
-  # (the test build, the executables the suites spawn) is a cache hit against
-  # it. `scripts/linux-test-partitions.py check` proves, from `cargo
+  # `tracedecay-search-eval`) with the root fixture feature. Journeys also
+  # enable `tracedecay/search-eval`, the only link from the root crate to the
+  # evaluator library. It stays off every other partition: an unconditional
+  # dependency links the evaluator into every test target of the package.
+  # Every cargo invocation inside a job (the test build,
+  # the executables the suites spawn) is a cache hit against that job's
+  # resolution. `scripts/linux-test-partitions.py check` proves, from `cargo
   # metadata`, that every test target in the workspace is selected by exactly
   # one partition or listed under `not_run` with a reason, so a new crate or
   # suite cannot fall out of the lane silently; `scope-gate` derives the
@@ -511,7 +513,7 @@ jobs:
       # standard methods the client declared, and the upstream `initialize`
       # response is the only authority for those. Without the component the
       # runner still has rustup's `rust-analyzer` proxy on PATH, so the daemon
-      # routes the language and only the spawn fails — the test would then
+      # routes the language and only the spawn fails. The test would then
       # measure a missing component instead of the negotiation contract. This
       # action exports `RUSTUP_TOOLCHAIN`, so the component has to be installed
       # here rather than through `rust-toolchain.toml`, which it overrides.
@@ -524,6 +526,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      - uses: ./.github/actions/setup-pnpm
 
       - uses: actions/setup-python@v6
         with:
@@ -543,12 +547,17 @@ jobs:
       # lane at one entry in the repository's 10 GB cache: `root-journeys`
       # resolves the widest graph (the root crate with its dev-dependencies,
       # the CLI and the evaluator), so its save covers the other root
-      # partitions exactly. The three lower partitions unify dependency
-      # features differently and each recompile ~30 small dependency units
-      # (syn, serde_json, futures, chrono, ...) against it every run — a few
-      # minutes inside jobs that are far from the critical path, cheaper than
-      # three more cache entries. Restored before the first `cargo metadata`
-      # below so the registry index comes from the cache too.
+      # partitions exactly (`root-dashboard-api` selects the CLI package for
+      # that reason: alone, `-p tracedecay` resolves `mio` without the
+      # features the CLI's clap graph adds, so tokio and every workspace
+      # crate above it hash differently). The three lower partitions unify
+      # dependency features differently and each recompile ~150 dependency
+      # units (syn, serde_json, tokio, gix-*, grafeo-*, ...) against it every
+      # run, measured in run 36051245663: 4-6 min beside chains that end
+      # 4-12 min before `root-transport` does, cheaper than three more cache
+      # entries in the 10 GB budget (macOS, where the same recompile is 2.5x
+      # longer and on the lane's critical path, carries one). Crate sources
+      # come from the pnpm store that setup-pnpm restores, not from this cache.
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
         with:
@@ -616,8 +625,8 @@ jobs:
   # hotpath/, and the `#[ignore]`d test in the crate's library test target
   # (`controlled_workloads::tests::hotpath_off_vs_on_durable_results_are_
   # identical`) spawns them from there; `--run-ignored only` with
-  # `--no-tests=fail` is the only way it runs, and nothing else — no
-  # partition, artifact upload or junit merge — consumes the executables.
+  # `--no-tests=fail` is the only way it runs, and nothing else. No
+  # partition, artifact upload or junit merge consumes the executables.
   #
   # Its own job rather than a tail on the `root-lib` partition, where it ran
   # after the root library's tests: the feature-on build recompiles every
@@ -625,12 +634,12 @@ jobs:
   # the feature flip changes each one's metadata hash) plus the example,
   # ~10 min on top of the ~26 min root chain, which made that job the lane's
   # critical path. Here the graph beneath the evaluator compiles from the
-  # checkout in both modes — a serial chain domain → contracts →
+  # checkout in both modes. A serial chain domain → contracts →
   # rusqlite-runtime → runtime-core → code-index → sessions → query →
   # search-eval → example of ~9 min per mode with four compile slots (cargo
   # `--timings`, -j4 on EPYC 7742 cores; the same pair of builds took 19.5
   # min on a hosted runner in run 34138693824, when the single-job lane
-  # still built them as their own resolution) — then the library test target
+  # still built them as their own resolution). Then the library test target
   # (24 s against the feature-off graph) and the test itself (under 1 s).
   # With setup, ~24 min hosted: beside the partitions and no longer than the
   # slowest of them (25.9 and 27.4 min in run 34296614024), so the `Test
@@ -659,7 +668,7 @@ jobs:
   hotpath-parity:
     name: Hotpath parity
     needs: scope-gate
-    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
+    if: ${{ needs.scope-gate.outputs.run-perf == 'true' }}
     runs-on: ubuntu-24.04-arm
     # 19.5 min for the two builds (hosted, above) + ~1.5 cold registry the
     # chain does not hide + ~1.5 setup + 0.5 test target + 0.5 run ≈ 24 min,
@@ -671,6 +680,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: ./.github/actions/setup-linux-mold
+
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -721,36 +732,147 @@ jobs:
             echo "Linux partition result: ${{ needs.linux-test-partition.result }}"
             exit 1
           fi
-          if [ "${{ needs.hotpath-parity.result }}" != "success" ]; then
+          if [ "${{ needs.hotpath-parity.result }}" != "success" ] && [ "${{ needs.hotpath-parity.result }}" != "skipped" ]; then
             echo "Hotpath parity result: ${{ needs.hotpath-parity.result }}"
             exit 1
           fi
           echo "All Linux partitions and the hotpath parity gate passed."
 
-  windows-build:
-    name: Build Windows tests
-    needs: scope-gate
-    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: windows-latest
-    # Build every Windows test once, then shard execution from the archive.
-    # Keep a bounded guard around the hosted build; Cargo timings are retained
-    # below so a slow or failed archive can be attributed instead of treating
-    # the timeout itself as the defect. Measured 2026-09-05 (run 33954670866,
-    # no parity rebuild): portability compile 31 min, archive still compiling
-    # the root crate's test targets at the 75-minute bound, so the archive
-    # never completed and the compiler caches never seeded. The bound is
-    # widened so one archive can finish and seed them; shrink it back once a
-    # warm run's timings show the real cost.
-    timeout-minutes: 120
+  # Optional cross-test isolation proof. The partition lane cannot expose
+  # authorities leaked between targets that it runs in separate jobs. Keep
+  # the evaluator and transport resolutions separate: the transport surface
+  # includes a generation-scale cancellation journey whose bounded receipts
+  # assume it is not competing with the entire workspace. Each compatible
+  # selection still shares one nextest process across all of its targets.
+  # Keep this off ordinary pushes and run it after the normal Linux verdict so
+  # its extra compilation and eight concurrent tests do not crowd that lane.
+  linux-full-nextest:
+    name: Test Linux full selection isolation
+    needs: linux-test
+    if: ${{ !cancelled() && needs.linux-test.result != 'skipped' && github.event_name == 'workflow_dispatch' && inputs.run_full_nextest }}
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
-      - name: Tune Windows runner for build I/O
+      - name: Verify pinned Rust toolchain and analyzer
+        run: |
+          rustup show active-toolchain
+          rustup which rust-analyzer
+          rust-analyzer --version
+
+      - uses: ./.github/actions/setup-linux-mold
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: ./.github/actions/setup-pnpm
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install ast-grep
+        uses: ./.github/actions/install-ast-grep
+        with:
+          version: ${{ env.AST_GREP_VERSION }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Build the evaluator selection and the executables its journeys spawn
+      # with the same feature set and perf resolution nextest uses below.
+      - name: Build full evaluator selection and support executables
+        run: cargo build --workspace --bins --tests --example tracedecay-host-cli-fixture --locked --profile perf --features tracedecay/test-helpers,tracedecay/search-eval
+
+      - name: Run full evaluator selection
+        run: |
+          set +e
+          cargo test-ci --locked --no-tests=fail
+          status=$?
+          set -e
+          if [ -f target/nextest/ci/junit.xml ]; then
+            mv target/nextest/ci/junit.xml target/nextest/ci/full-evaluator.xml
+          fi
+          exit "$status"
+
+      # Transport-only modules live inside otherwise ordinary root targets, so
+      # run every root library, binary, and integration target in one process.
+      # The evaluator selection above already covers the remaining workspace
+      # crates without implicitly linking evaluator code into this resolution.
+      - name: Build full transport selection and support executables
+        id: transport_build
+        if: ${{ always() && !cancelled() }}
+        run: cargo build -p tracedecay -p tracedecay-cli --bins --tests --example tracedecay-host-cli-fixture --locked --profile perf --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay-cli/test-transport
+
+      - name: Run full transport selection
+        if: ${{ always() && !cancelled() && steps.transport_build.outcome == 'success' }}
+        run: |
+          set +e
+          cargo nextest run -p tracedecay -p tracedecay-cli --bins --tests --profile ci --cargo-profile perf --locked --features tracedecay/test-helpers,tracedecay/test-transport,tracedecay-cli/test-transport --no-tests=fail
+          status=$?
+          set -e
+          if [ -f target/nextest/ci/junit.xml ]; then
+            mv target/nextest/ci/junit.xml target/nextest/ci/full-transport.xml
+          fi
+          exit "$status"
+
+      - name: Upload full-selection nextest reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextest-junit-Linux-full-selections
+          path: target/nextest/ci/full-*.xml
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Windows compiles and runs the suite as the same partitions as Linux, one
+  # hosted 4-vCPU `windows-latest` job each. The lane that preceded it built
+  # every test of the workspace in one job and sharded only the execution
+  # from a nextest archive: in run 36051245663 (warm dependency cache, full
+  # match) that build spent 27 min compiling the library chain beneath the
+  # root crate and then 67 min on the root crate's library and its ~40 test
+  # targets alone, 94 min of `cargo build` plus 5 of archive in a job that
+  # nothing could shorten, then the five shards ran 10-14 min each: 116 min
+  # for the lane's verdict, against 27 for Linux. As partitions each job pays
+  # the chain and its own selection's test targets, as `linux-test-partition`
+  # does, so the lane's wall time is the slowest partition: 66.5 min in run
+  # 36077289779 (`runtime`: 25 min of library chain with its dependency
+  # units beside it, 23 min of 31 test targets, 15 min of tests; the root
+  # partitions compile 35-38 min each). The manifest's
+  # `windows_timeout_minutes` are the budgets; the executables the suites
+  # spawn are built into the same resolution first, as on Linux.
+  windows-test-partition:
+    name: Test Windows ${{ matrix.partition }}
+    needs: scope-gate
+    if: ${{ needs.scope-gate.outputs.run-os == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scope-gate.outputs.windows-partitions) }}
+    steps:
+      # Full history for the same reason as the Linux and macOS partition
+      # jobs: the pinned search-quality fixture commit must be resolvable here.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Tune Windows runner for build and test I/O
         uses: ./.github/actions/tune-windows-runner
+        with:
+          redirect-temp: "true"
 
-      # Install only the toolchain pinned by rust-toolchain.toml. Installing
-      # `stable` as well makes Swatinem/rust-cache include an unused compiler
-      # in its environment key, fragmenting the cache whenever stable moves.
+      # Install only the toolchain pinned by rust-toolchain.toml, with the
+      # components it lists (`rust-analyzer` is a test dependency of the LSP
+      # negotiation acceptance). Installing `stable` as well makes
+      # Swatinem/rust-cache include an unused compiler in its environment
+      # key, fragmenting the cache whenever stable moves. The architecture
+      # tests exec `cargo metadata` at runtime under nextest, so the install
+      # has to be serial and up front: concurrent rustup shims racing to
+      # self-install corrupt each other's partial downloads.
       - name: Install pinned toolchain
         shell: pwsh
         run: |
@@ -764,114 +886,13 @@ jobs:
           lld-link.exe --version
           "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=lld-link.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      # Node is only needed so build.rs can produce the embedded dashboard
-      # dist assets (npm ci + npm run build) once, instead of once per shard.
+      # Node so build.rs can produce the embedded dashboard dist assets for
+      # the partitions that compile the CLI.
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: dashboard/package-lock.json
 
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Cache Windows Rust build outputs
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ci-test-full-windows-msvc-lld
-          cache-on-failure: true
-
-      # Acceptance tests execute the ordinary evaluator binaries. Match the
-      # archive's features and perf profile to reuse dependency artifacts;
-      # nextest's archive.include carries the executables to every shard.
-      # `--tests` keeps the binaries in the dev-dependency graph the archive
-      # is built from; a `--bins`-only build resolves 60 dependencies with
-      # different features and compiles them a second time (see the Linux
-      # lane).
-      - name: Build workspace binaries and tests for the Windows test lane
-        shell: pwsh
-        run: cargo build --workspace --bins --tests --locked --profile perf --features tracedecay/test-helpers
-
-      # `--workspace`, not `-p tracedecay-cli`: the package selection decides
-      # feature unification, and the narrower one recompiles the code-index
-      # and extraction crates in a second configuration (see the Linux lane).
-      - name: Build Windows host-CLI test fixture
-        shell: pwsh
-        run: cargo build --workspace --example tracedecay-host-cli-fixture --locked --profile perf --features tracedecay/test-helpers
-
-      # The controlled-workload Hotpath parity helpers are provisioned and
-      # verified by the `hotpath-parity` job. Building them here would put a
-      # second, feature-on resolution of the search-eval dependency graph
-      # inside this job's bound (18 of its 62 minutes before it was cancelled),
-      # and the parity property does not depend on the platform.
-      # Same selection as `cargo test-ci` (.cargo/config.toml); nextest has no
-      # archive alias, so the arguments are spelled out here once.
-      - name: Build nextest archive
-        shell: pwsh
-        run: cargo nextest archive --workspace --profile ci --locked --features tracedecay/test-helpers --cargo-profile perf --timings --archive-file "$env:RUNNER_TEMP/nextest-archive.tar.zst"
-
-      - name: Upload Windows archive build timings
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-nextest-build-timings
-          path: target/cargo-timings/cargo-timing.html
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Upload nextest archive
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-nextest-archive
-          path: ${{ runner.temp }}/nextest-archive.tar.zst
-          retention-days: 1
-          compression-level: 0
-
-      # The archive already carries these (`archive.include` in
-      # .config/nextest.toml), but nothing lands on a shard until the run
-      # step extracts, so a missing evaluator can only surface as product
-      # test failures. Publishing them separately lets each shard restore and
-      # prove them *before* the suite starts. Same executables, from the
-      # workspace/test-helpers build above: an evaluator built under a
-      # narrower `-p tracedecay-search-eval` selection resolves
-      # tracedecay-code-index without its default language tiers and cannot
-      # parse Rust.
-      - name: Upload Windows evaluator executables
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-search-eval-bins
-          path: |
-            target/perf/tracedecay-search-eval.exe
-            target/perf/tracedecay-search-eval-direct.exe
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-
-  windows-test-shard:
-    name: Test Windows shard ${{ matrix.partition }}/5
-    needs: windows-build
-    runs-on: windows-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3, 4, 5]
-    steps:
-      # Full history for the same reason as the Linux and macOS partition
-      # jobs: the shards run the workspace suite remapped onto this checkout,
-      # so the pinned search-quality fixture commit must be resolvable here too.
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Tune Windows runner for test I/O
-        uses: ./.github/actions/tune-windows-runner
-        with:
-          redirect-temp: "true"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
+      - uses: ./.github/actions/setup-pnpm
 
       - uses: actions/setup-python@v6
         with:
@@ -882,85 +903,52 @@ jobs:
         with:
           version: ${{ env.AST_GREP_VERSION }}
 
-      # The architecture tests exec `cargo metadata` at runtime, and they run
-      # concurrently under nextest: without the pinned toolchain installed,
-      # each test process's rustup shim races to self-install it and the
-      # concurrent downloads corrupt each other's partial files. Install the
-      # rust-toolchain.toml pin serially up front.
-      - name: Install pinned toolchain
-        shell: pwsh
-        run: |
-          rustup toolchain install
-          rustup show active-toolchain
-
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
 
-      - name: Download nextest archive
-        uses: actions/download-artifact@v4
+      # One dependency cache for the lane, as on Linux: `root-journeys`
+      # resolves the widest graph, so its save covers the other root
+      # partitions; the lower partitions recompile the dependency units they
+      # unify differently, beside their shorter chains.
+      - name: Cache Windows Rust build outputs
+        uses: Swatinem/rust-cache@v2
         with:
-          name: windows-nextest-archive
-          path: ${{ runner.temp }}
+          shared-key: ci-test-full-windows-msvc-lld
+          save-if: ${{ matrix.partition == 'root-journeys' }}
+          cache-on-failure: true
 
-      - name: Download Windows evaluator executables
-        uses: actions/download-artifact@v4
-        with:
-          name: windows-search-eval-bins
-          path: ${{ runner.temp }}/search-eval-bin
-
-      # Preflight: the evaluator subprocesses the acceptance and packaged
-      # suites launch must exist, execute, and report their bundled workload
-      # before any test runs, so a provisioning gap fails here instead of as
-      # five product-test failures elsewhere in the shard matrix. `validate`
-      # against an empty directory is the packaged-identity probe: it reads
-      # only the workload compiled into the binary, so a build missing it
-      # cannot pass. The exports are the overrides both resolvers declare
-      # (`search_eval_bin` in crates/tracedecay/tests/common/mod.rs and
-      # `search_eval_direct_bin` in the default-feature packaged suite), which
-      # bind every test to the executables proven here rather than to whatever
-      # the archive happens to extract beside the test binaries.
-      - name: Preflight the restored evaluator executables
-        shell: pwsh
+      # Every partition job re-proves the cover before it compiles anything,
+      # as on Linux.
+      - name: Check the partitions cover every test target
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          $binDir = Join-Path $env:RUNNER_TEMP "search-eval-bin"
-          $probe = Join-Path $env:RUNNER_TEMP "search-eval-preflight"
-          New-Item -ItemType Directory -Force -Path $probe | Out-Null
-          foreach ($name in @("tracedecay-search-eval", "tracedecay-search-eval-direct")) {
-            $path = Join-Path $binDir "$name.exe"
-            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-              throw "restored evaluator '$name.exe' is missing at $path"
-            }
-            # stdout only: the typed report is the whole of it, and merging
-            # stderr in would make any log line unparseable JSON.
-            $stdout = & $path validate --repo-root $probe | Out-String
-            if ($LASTEXITCODE -ne 0) {
-              throw "$name validate exited with $LASTEXITCODE`n$stdout"
-            }
-            $report = $stdout | ConvertFrom-Json
-            if ($report.command -ne "validate" -or $report.status -ne "pass") {
-              throw "$name reported command=$($report.command) status=$($report.status)`n$stdout"
-            }
-            if ([int]$report.query_count -le 0 -or [int]$report.profile_count -le 0) {
-              throw "$name has no bundled workload: query_count=$($report.query_count) profile_count=$($report.profile_count)"
-            }
-            Write-Host "$name.exe ok: $($report.query_count) queries, $($report.profile_count) profiles"
-          }
-          "TRACEDECAY_SEARCH_EVAL_TEST_BIN=$binDir\tracedecay-search-eval.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "TRACEDECAY_SEARCH_EVAL_DIRECT_TEST_BIN=$binDir\tracedecay-search-eval-direct.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python scripts/test-linux-test-partitions.py
+          python scripts/linux-test-partitions.py check
 
-      - name: Run Windows tests
-        shell: pwsh
-        # --extract-to must be the workspace so target/ lands at the same
-        # absolute path as on the build job: integration tests bake
-        # env!("CARGO_BIN_EXE_tracedecay") into the binaries at compile time.
-        run: >-
-          cargo-nextest nextest run --profile ci
-          --archive-file "$env:RUNNER_TEMP/nextest-archive.tar.zst"
-          --extract-to "$env:GITHUB_WORKSPACE"
-          --workspace-remap "$env:GITHUB_WORKSPACE"
-          --partition slice:${{ matrix.partition }}/5
-          --test-threads num-cpus --status-level slow
+      - name: Resolve this partition's cargo selection
+        id: selection
+        shell: bash
+        run: |
+          {
+            echo "test=$(python scripts/linux-test-partitions.py cargo-args '${{ matrix.partition }}')"
+            echo "build=$(python scripts/linux-test-partitions.py build-args '${{ matrix.partition }}')"
+          } >> "$GITHUB_OUTPUT"
+
+      # The CLI and evaluator executables the suites spawn, in the same
+      # resolution as the test build below (see `linux-test-partition`); the
+      # test resolvers find them beside the test executables under
+      # target/perf, so no override or preflight is needed.
+      - name: Build the executables the suites spawn
+        if: ${{ steps.selection.outputs.build != '' }}
+        shell: bash
+        run: cargo build --locked --profile perf ${{ steps.selection.outputs.build }}
+
+      # nextest `ci` policy and the perf cargo profile, as on Linux;
+      # `--test-threads num-cpus` as the Windows shards ran, since the
+      # Windows test groups in .config/nextest.toml are sized for it.
+      - name: Run tests
+        shell: bash
+        run: cargo nextest run --profile ci --cargo-profile perf --locked ${{ steps.selection.outputs.test }} --no-tests=fail --test-threads num-cpus --status-level slow
 
       - name: Clean abandoned Windows test children
         if: always()
@@ -992,29 +980,43 @@ jobs:
             Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Upload Windows nextest report
+      # `windows-test` folds the partition reports back into one report.
+      - name: Upload Windows partition nextest report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: windows-nextest-junit-${{ matrix.partition }}
+          name: nextest-junit-Windows-${{ matrix.partition }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 1
 
+  # The one `Test Windows` verdict: every partition must pass. It also folds
+  # the partition reports into the `nextest-junit-Windows` artifact, one
+  # directory per partition, as `linux-test` does.
   windows-test:
     name: Test Windows
-    if: ${{ !cancelled() && needs.scope-gate.outputs.run-heavy == 'true' }}
-    needs: [windows-test-shard, scope-gate]
+    if: ${{ !cancelled() && needs.scope-gate.outputs.run-os == 'true' }}
+    needs: [windows-test-partition, scope-gate]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Check Windows shards
+      - name: Merge the partition reports into the Windows nextest report
+        if: ${{ needs.windows-test-partition.result != 'skipped' }}
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: nextest-junit-Windows
+          pattern: nextest-junit-Windows-*
+          separate-directories: true
+          retention-days: 7
+
+      - name: Check Windows partitions
+        if: ${{ !cancelled() }}
         run: |
-          if [ "${{ needs.windows-test-shard.result }}" != "success" ]; then
-            echo "Windows shard result: ${{ needs.windows-test-shard.result }}"
+          if [ "${{ needs.windows-test-partition.result }}" != "success" ]; then
+            echo "Windows partition result: ${{ needs.windows-test-partition.result }}"
             exit 1
           fi
-          echo "All Windows shards passed."
+          echo "All Windows partitions passed."
 
   clippy:
     name: Clippy
@@ -1034,6 +1036,8 @@ jobs:
           components: clippy
 
       - uses: ./.github/actions/setup-linux-mold
+
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
@@ -1058,7 +1062,7 @@ jobs:
   # builds, a graph the perf-profile test lanes share nothing with, so there
   # is no compiled tree to reuse and nothing to gain from waiting for one.
   # As the last steps of the Linux test job they ran only after a green
-  # suite — never once on this branch — and would have held the Linux shards
+  # suite, never once on this branch, and would have held the Linux shards
   # back by their own duration. Here the verdict lands independently at
   # about clippy's cost: the cold `cargo clippy --workspace --all-targets`
   # took 13.7 min (run 34231734416), the second check re-resolves only the
@@ -1080,31 +1084,112 @@ jobs:
 
       - uses: ./.github/actions/setup-linux-mold
 
+      - uses: ./.github/actions/setup-pnpm
+
       - name: Check feature-gated surfaces compile
         run: |
           cargo check --workspace --all-targets --features test-transport --locked
           cargo check --workspace --all-targets --features hotpath,hotpath-mcp --locked
+          # Lights the hotpath backend without any crate's own hotpath feature.
+          # The two lines above keep them in sync, which hides a type that
+          # forks on the local feature while hotpath::io! expands on the backend.
+          # It also carries tracedecay-hotpath-guard's live MCP proof, whose
+          # required-features name these two dependency features. That guard is
+          # a leaf and holds no backend feature of its own (see its manifest).
+          cargo check --workspace --all-targets --features hotpath/hotpath,hotpath/hotpath-mcp --locked
 
-  fmt:
-    name: Format
+      # One graph walk per push. The release resolver repeats it on the tag it
+      # builds, since a release is dispatched without waiting on this run.
+      - name: Check the production feature graph
+        run: python3 scripts/check-production-feature-profile.py
+
+  # The configuration users actually receive. `scripts/resolve-release-source-profile.py`
+  # resolves the release build to `--no-default-features --features production`
+  # on the release profile, and nothing on a push compiled it: `debug-cli` is a
+  # dev-profile binary built only for the stock host integrations, and every
+  # other lane runs the default feature graph. A break confined to the
+  # `production` graph (the mimalloc allocator, the embedded dashboard, the
+  # release profile itself) therefore first appeared while a release was being
+  # cut, which is the most expensive place to find it.
+  #
+  # Compile plus a smoke run, on one target. The packaging battery that sits on
+  # top of this binary (`cargo package`, the extracted-crate rebuild, MCPB, the
+  # MCP stdio checks) stays in distribution-acceptance.yml, which is
+  # dispatch-only and explicitly not a ship gate. This job does not repeat any
+  # of it, and that workflow keeps its own cache lineage.
+  shipped-cli:
+    name: Shipped CLI build (x86_64-linux)
     needs: scope-gate
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 45
+    env:
+      TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v7
-      # Judge formatting with the toolchain `rust-toolchain.toml` pins, not
-      # whatever `stable` is on the runner. rustfmt's output changes between
-      # releases — 1.98.1 breaks a `.unwrap_or_else(|err| { ... })` chain that
-      # 1.97.1 keeps inline — so a `stable` rustfmt rejects a tree the pinned
-      # rustfmt developers run formats exactly, and every contributor sees a
-      # red lane they cannot reproduce. `dtolnay/rust-toolchain@stable` also
-      # exports `RUSTUP_TOOLCHAIN`, which overrides the toolchain file rather
-      # than deferring to it. Installing through rustup with no override keeps
-      # the pin in one place: the toolchain file, components included.
-      - name: Install the repository's pinned toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - run: cargo fmt --all -- --check
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - uses: ./.github/actions/setup-pnpm
+
+      # `production` embeds the dashboard, so the bundle has to exist before
+      # cargo runs. Handing build.rs the digest of this bundle keeps the build
+      # script from building the frontend a second time.
+      - name: Build the embedded dashboard bundle
+        working-directory: dashboard
+        run: pnpm run build
+
+      - name: Pin the embedded bundle for the skip-mode build
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="$(python3 scripts/check-dashboard-bundle.py dashboard/app-dist --print-digest)"
+          echo "TRACEDECAY_SKIP_DASHBOARD_BUILD=1" >> "$GITHUB_ENV"
+          echo "TRACEDECAY_DASHBOARD_BUNDLE_SHA256=${digest}" >> "$GITHUB_ENV"
+
+      # rust-toolchain.toml, not floating stable: the release workflows build
+      # this configuration with the pinned compiler, so a push gate on a
+      # different one is not evidence about the same artifact.
+      - name: Resolve pinned toolchain
+        id: pin
+        shell: bash
+        run: |
+          python3 -c 'import pathlib, tomllib; print("toolchain=" + tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]["channel"])' >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # 1.97.1 pin
+        with:
+          toolchain: ${{ steps.pin.outputs.toolchain }}
+          targets: ${{ env.TARGET }}
+
+      - uses: ./.github/actions/setup-linux-mold
+
+      # Dependencies only. The workspace crates are what a push changes, so
+      # caching their release artifacts would re-save the tree every run for a
+      # restore that hits nothing, against the repository's 10 GB budget that
+      # the test lanes' caches are already evicted from.
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-shipped-cli-${{ env.TARGET }}
+          cache-workspace-crates: "false"
+          cache-on-failure: true
+
+      - name: Build the shipped binary
+        shell: bash
+        run: |
+          cargo build --package tracedecay-cli --bin tracedecay --release \
+            --target "$TARGET" --no-default-features --features production --locked
+
+      - name: Smoke-run the shipped binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${TARGET}/release/tracedecay"
+          test -x "$binary"
+          "$binary" --version
+          "$binary" --help >/dev/null
 
   dashboard:
     name: Dashboard
@@ -1118,20 +1203,16 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: dashboard/package-lock.json
 
-      - name: Install dashboard dependencies
-        working-directory: dashboard
-        run: npm ci
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Build dashboard assets
         working-directory: dashboard
-        run: npm run build
+        run: pnpm run build
 
       - name: Run dashboard unit tests
         working-directory: dashboard
-        run: npm test
+        run: pnpm test
 
       # The dashboard is one rsbuild app emitting `app-dist/` (the legacy
       # shell/holographic/lcm/graph/savings bundle split no longer exists), so
@@ -1143,17 +1224,17 @@ jobs:
           set -euo pipefail
           python3 ../scripts/check-dashboard-bundle.py app-dist
           (cd app-dist && find . -type f | sort | xargs sha256sum) > /tmp/dashboard-dist.sha
-          npm run build
+          pnpm run build
           (cd app-dist && find . -type f | sort | xargs sha256sum) | diff /tmp/dashboard-dist.sha -
 
   hermes-integration:
     name: Hermes integration (stock)
     needs: [scope-gate, debug-cli]
-    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
+    if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
-      # Stock (upstream) Hermes pin — the generated plugin must keep working
+      # Stock (upstream) Hermes pin. The generated plugin must keep working
       # against this exact upstream commit. Bump deliberately after rerunning
       # scripts/hermes_stock_integration.sh against the new ref locally.
       HERMES_UPSTREAM_REPO: https://github.com/NousResearch/hermes-agent.git
@@ -1203,11 +1284,11 @@ jobs:
   host-stock-integration:
     name: Claude Code + OpenCode integration (stock)
     needs: [scope-gate, debug-cli]
-    if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
+    if: ${{ needs.scope-gate.outputs.run-hosts == 'true' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     env:
-      # Stock host pins — the installed bundle must keep working against these
+      # Stock host pins. The installed bundle must keep working against these
       # exact host releases. Bump deliberately after rerunning
       # scripts/claude_stock_integration.sh and
       # scripts/opencode_stock_integration.sh against the new versions locally.
@@ -1229,6 +1310,11 @@ jobs:
           npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" "opencode-ai@${OPENCODE_VERSION}"
           claude --version
           opencode --version
+
+      - name: Run MCP conformance smoke
+        env:
+          TRACEDECAY_BIN: ${{ github.workspace }}/target/debug/tracedecay
+        run: scripts/mcp-conformance-smoke.sh
 
       - name: Run stock Claude Code integration checks
         env:

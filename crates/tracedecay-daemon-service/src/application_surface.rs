@@ -36,7 +36,8 @@ use tracedecay_daemon_protocol::{
 };
 use tracedecay_domain::{ProjectId, ScopeOutcome, ScopePartialReasonV1, ScopeUnavailableReasonV1};
 use tracedecay_tool_catalog::{
-    ApplicationSurfaceOperation, BindingSurface, CapabilityId, CatalogSnapshotV1, UseCaseId,
+    ApplicationSurfaceOperation, BindingSurface, CapabilityId, CatalogSnapshotV1,
+    ExecutableBindingRegistryV1, OperationId, RouteExposureV1, UseCaseId,
 };
 
 mod catalog;
@@ -76,6 +77,26 @@ pub(crate) use registered_http::registered_executor_unavailable;
 use request_control::application_http_context;
 pub use workflow::invoke_workflow_operation;
 use workflow::router_with_executor as workflow_application_router_with_executor;
+
+pub(super) fn require_public_catalog_route(
+    registry: &ExecutableBindingRegistryV1,
+    operation_id: &OperationId,
+    expected_route: &str,
+) -> Result<(), ApplicationSurfaceAdapterError> {
+    let Some(binding) = registry
+        .get(operation_id)
+        .and_then(|availability| availability.binding())
+    else {
+        return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
+    };
+    let RouteExposureV1::Public { route_path, .. } = binding.exposure() else {
+        return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
+    };
+    if route_path != expected_route {
+        return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
+    }
+    Ok(())
+}
 
 const DEFAULT_DEADLINE_MICROS: i64 = 30_000_000;
 const APPLICATION_PROTOCOL_REVISION: u32 = 1;
@@ -313,7 +334,6 @@ pub fn assemble_http_application_router(
     let workflow_router = workflow_application_router_with_executor(Arc::clone(&executor))?;
     let handoff_router = handoff_application_router_with_executor(Arc::clone(&executor))?;
     let multi_root_router = multi_root_application_router_with_executor(Arc::clone(&executor))?;
-    let retained_router = retained::router_with_executor(Arc::clone(&executor))?;
     Ok(
         tracedecay_api::application_router(application_invoker_for_surface(
             executor,
@@ -324,7 +344,6 @@ pub fn assemble_http_application_router(
         .merge(workflow_router)
         .merge(handoff_router)
         .merge(multi_root_router)
-        .merge(retained_router)
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&cancellations),
             application_http_context,

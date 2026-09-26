@@ -4,8 +4,9 @@
 //! alone must not create a report without a process-boundary guard.
 
 use tracedecay_domain::{FactCategoryV1, FactOwnerV1, ProjectId};
+use tracedecay_runtime_core::cancellation::CancellationToken;
 use tracedecay_session_memory::context::{
-    CancellationToken, CapabilityDigest, ConfigurationDigest, PolicyDigest, RequestBudgets,
+    CapabilityDigest, ConfigurationDigest, PolicyDigest, RequestBudgets,
     session_application_grant_digest,
 };
 use tracedecay_session_memory::memory::{ProjectMemoryFactAddRequest, automatic_fact_add_command};
@@ -64,7 +65,7 @@ mod unguarded {
     fn workload_is_a_no_op_for_profiling() {
         let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join("session-memory-hotpath-off.json");
         let _ = std::fs::remove_file(&report);
-        // SAFETY: single-threaded with respect to readers — the feature-off
+        // SAFETY: single-threaded with respect to readers, the feature-off
         // build contains no hotpath runtime and nothing else in this test
         // binary reads these variables.
         unsafe {

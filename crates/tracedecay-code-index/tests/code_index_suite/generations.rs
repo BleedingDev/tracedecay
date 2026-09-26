@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fmt::Debug;
 
 use tracedecay_code_index::capabilities::expected_seal_digest;
 use tracedecay_code_index::generations::{
@@ -9,19 +8,12 @@ use tracedecay_code_index::intake::INTAKE_DIGEST_SEPARATOR;
 use tracedecay_code_index::intake::ValidatedCodeSnapshotV1;
 use tracedecay_code_index::languages::StaticLanguageRegistry;
 use tracedecay_domain::{
-    ChunkerRevision, CodeGenerationManifestV1, ContentDigest, DomainError, FileOccurrenceId,
-    LanguageId, ManifestDigest, PrivacyDomainId, RepositoryId, SanitizationReceiptId,
-    SanitizedCodeFileV1, SanitizedCodeSnapshotV1, SanitizerRevision, SnapshotFileDispositionV1,
-    UtcMicros, canonical_sha256,
+    ChunkerRevision, ContentDigest, DomainError, FileOccurrenceId, LanguageId, PrivacyDomainId,
+    RepositoryId, SanitizationReceiptId, SanitizedCodeFileV1, SanitizedCodeSnapshotV1,
+    SanitizerRevision, SnapshotFileDispositionV1, UtcMicros, canonical_sha256,
 };
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    <T as TryFrom<String>>::Error: Debug,
-{
-    T::try_from(value.to_owned()).expect("valid fixture identity")
-}
+use tracedecay_domain::test_fixtures::id;
 
 fn content_digest(byte: char) -> ContentDigest {
     id(&format!("sha256:{}", byte.to_string().repeat(64)))
@@ -243,66 +235,5 @@ fn resealing_cannot_hide_a_generation_fingerprint_mismatch() {
         Err(GenerationPlanningErrorV1::Contract(
             "manifest digest does not match its canonical domain-separated payload".to_owned(),
         ))
-    );
-}
-
-#[test]
-fn legacy_v1_manifest_deserialization_migrates_and_remains_a_valid_parent() {
-    let planner = planner();
-    let snapshot = validated(snapshot(vec![file("file.a", "src/a.rs", 'a')]));
-    let current = planner
-        .plan_generation(&snapshot, None, UtcMicros(3_000))
-        .expect("current manifest");
-    let mut legacy_identity = current
-        .generation_id
-        .as_str()
-        .split('.')
-        .take(4)
-        .collect::<Vec<_>>()
-        .join(".");
-    assert_eq!(legacy_identity.matches('.').count(), 3);
-
-    let mut wire = serde_json::to_value(&current).expect("manifest wire");
-    let object = wire.as_object_mut().expect("manifest object");
-    object.insert(
-        "generation_id".to_owned(),
-        serde_json::Value::String(std::mem::take(&mut legacy_identity)),
-    );
-    object.remove("invalidation_digest");
-    object
-        .get_mut("seal")
-        .and_then(serde_json::Value::as_object_mut)
-        .expect("seal object")
-        .insert(
-            "expected_digest".to_owned(),
-            serde_json::Value::String(format!("sha256:{}", "0".repeat(64))),
-        );
-
-    let mut migrated: CodeGenerationManifestV1 =
-        serde_json::from_value(wire).expect("legacy wire migrates");
-    migrated.seal.expected_digest = expected_seal_digest(&migrated).expect("legacy seal digest");
-    let mut legacy_wire = serde_json::to_value(&migrated).expect("migrated wire");
-    legacy_wire
-        .as_object_mut()
-        .expect("manifest object")
-        .remove("invalidation_digest");
-    let legacy_parent: CodeGenerationManifestV1 =
-        serde_json::from_value(legacy_wire).expect("legacy fixture deserializes");
-
-    legacy_parent.validate().expect("legacy parent validates");
-    assert_eq!(
-        legacy_parent.invalidation_digest,
-        migrated.invalidation_digest
-    );
-    assert_ne!(
-        legacy_parent.invalidation_digest,
-        id::<ManifestDigest>(&format!("sha256:{}", "0".repeat(64)))
-    );
-    let child = planner
-        .plan_generation(&snapshot, Some(&legacy_parent), UtcMicros(4_000))
-        .expect("legacy parent accepted");
-    assert_eq!(
-        child.parent_generation.as_ref(),
-        Some(&legacy_parent.generation_id)
     );
 }

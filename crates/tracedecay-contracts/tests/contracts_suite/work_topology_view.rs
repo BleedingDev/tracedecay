@@ -16,33 +16,25 @@ use tracedecay_contracts::{
     WorkAttemptService, WorkAttemptTopologyBindingV1, WorkAttemptTopologyStateV1,
     WorkIntelligenceServiceV1, WorkPlacementReadingV1, WorkPlacementService,
     WorkPlacementStorageError, WorkPlacementStoragePort, WorkProductAttemptServiceV1,
-    WorkProductSelectionScopeV1, WorkRelationScopeV1, WorkRoutingSnapshotErrorV1,
+    WorkProductAuthorizedRelationScopeV1, WorkProductSelectionScopeV1, WorkRoutingSnapshotErrorV1,
     WorkRoutingSnapshotPortV1, WorkRoutingSnapshotV1, WorkTopologyViewRequestV1,
     execution_topology_view,
 };
 use tracedecay_domain::configuration::safe_work_topology_policy_v1;
 use tracedecay_domain::{
-    ActorId, CommitId, ConfigurationRevisionId, ConfigurationSnapshotId, ManifestDigest, ProjectId,
-    ProviderId, RefId, RepositoryId, TaskId, UtcMicros, WorkApprovalPolicy, WorkAuthority,
-    WorkEffectStateV1, WorkEgressPolicy, WorkExecutableReference, WorkExecutionLimits,
-    WorkExecutionSnapshot, WorkExecutionSnapshotInput, WorkFallbackTopology, WorkFilesystemPolicy,
+    ActorId, CommitId, ConfigurationRevisionId, ConfigurationSnapshotId, ProjectId, ProviderId,
+    RefId, RepositoryId, TaskId, UtcMicros, WorkApprovalPolicy, WorkAuthority, WorkEffectStateV1,
+    WorkEgressPolicy, WorkExecutableReference, WorkExecutionLimits, WorkExecutionSnapshot,
+    WorkExecutionSnapshotInput, WorkFallbackTopology, WorkFilesystemPolicy,
     WorkPlacementIdentityV1, WorkPlacementKindV1, WorkPlacementObservationV1, WorkPlacementStateV1,
     WorkPlacementTargetV1, WorkPlacementV1, WorkProviderBackendV1, WorkProviderProtocol,
     WorkProviderRouteId, WorkProviderRouteV1, WorkSandboxPolicy, WorkflowOperationRef, WorktreeId,
 };
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).unwrap()
-}
+use tracedecay_domain::test_fixtures::id;
 
-fn digest(byte: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).unwrap()
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn context(project: &str) -> RequestContext {
     let scope = ResolvedScope::new(
@@ -186,10 +178,12 @@ fn execution_snapshot(topology: tracedecay_domain::WorkTopologyPolicyV1) -> Work
 }
 
 fn selected_product_scope(context: &RequestContext) -> WorkProductSelectionScopeV1 {
-    WorkProductSelectionScopeV1::relations(BTreeSet::from([WorkRelationScopeV1::Repository {
-        project_id: context.scope().project_id.clone(),
-        repository_id: context.scope().repository_id.clone(),
-    }]))
+    WorkProductSelectionScopeV1::relations(BTreeSet::from([
+        WorkProductAuthorizedRelationScopeV1::Repository {
+            project_id: context.scope().project_id.clone(),
+            repository_id: context.scope().repository_id.clone(),
+        },
+    ]))
     .unwrap()
 }
 

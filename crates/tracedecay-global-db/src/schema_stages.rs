@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use super::schema_contract::{
     authority_invariant_triggers_intact, ensure_authority_audit_checkpoint_schema,
     ensure_authority_invariant_schema, ensure_authority_invariants,
@@ -22,12 +20,9 @@ use tracedecay_runtime_core::{
         RegisteredSchemaInstallationTransactionV1, RegisteredSchemaInstallationV1,
     },
 };
+use tracedecay_rusqlite_runtime::handoff::HANDOFF_OPEN_SCHEMA_V1;
 use tracedecay_rusqlite_runtime::repository::AUTHORIZED_SCOPE_SET_SCHEMA_V1;
-use tracedecay_rusqlite_runtime::runtime_ledger::{
-    COPY_RETIRED_IDEMPOTENCY_LEDGER_PAGE_SQL, DELETE_CONVERGED_IDEMPOTENCY_LEDGER_PAGE_SQL,
-    DROP_RETIRED_IDEMPOTENCY_LEDGER_SQL, RETIRED_IDEMPOTENCY_LEDGER_PRESENT_SQL,
-    RUNTIME_LEDGER_SCHEMA,
-};
+use tracedecay_rusqlite_runtime::runtime_ledger::RUNTIME_LEDGER_SCHEMA;
 use tracedecay_rusqlite_runtime::work::{
     RETIRE_WORK_EVENT_JOURNAL_V1, WORK_PRODUCT_SCHEMA_V1 as WORK_PRODUCT_GRAPH_JOURNAL_SCHEMA_V1,
     WORK_SCHEMA_V1,
@@ -36,8 +31,9 @@ use tracedecay_rusqlite_runtime::workflow::{
     WORKFLOW_SCHEMA_DEFINITION_DIGEST_V1, WORKFLOW_SCHEMA_IDENTITY_V1, WORKFLOW_SCHEMA_VERSION_V1,
     WORKFLOW_TABLE_CONTRACTS_V1,
 };
-
-mod support;
+use tracedecay_sessions::runtime::git_correlation::{
+    GIT_CORRELATION_SCHEMA_VERSION, recorded_git_correlation_schema_version,
+};
 
 const REGISTRY_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS projects (
@@ -106,7 +102,7 @@ const REGISTRY_SCHEMA: &str = "
 ";
 
 const REMOTE_DELETION_SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS remote_deletion_tombstones (
+    CREATE TABLE remote_deletion_tombstones (
         profile_id TEXT NOT NULL,
         target_kind TEXT NOT NULL,
         project_id TEXT NOT NULL,
@@ -232,87 +228,12 @@ const TRANSCRIPT_SCHEMA: &str = "
     CREATE INDEX IF NOT EXISTS idx_sessions_active_project_path
         ON sessions(project_path, provider, session_id)
         WHERE ended_at IS NULL;
-    CREATE TABLE IF NOT EXISTS session_messages (
-        provider TEXT NOT NULL,
-        message_id TEXT NOT NULL,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        timestamp INTEGER,
-        ordinal INTEGER NOT NULL,
-        text TEXT NOT NULL,
-        kind TEXT,
-        model TEXT,
-        tool_names TEXT,
-        source_path TEXT,
-        source_offset INTEGER,
-        metadata_json TEXT,
-        PRIMARY KEY(provider, message_id),
-        FOREIGN KEY(provider, session_id)
-            REFERENCES sessions(provider, session_id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS idx_session_messages_session
-        ON session_messages(provider, session_id, ordinal);
-    CREATE INDEX IF NOT EXISTS idx_session_messages_timestamp
-        ON session_messages(timestamp);
-    CREATE INDEX IF NOT EXISTS idx_session_messages_source
-        ON session_messages(source_path);
     CREATE TABLE IF NOT EXISTS session_backfill_meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL,
         updated_at INTEGER NOT NULL DEFAULT (unixepoch())
     );
-    CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
-        text, role, kind, model, tool_names,
-        content='session_messages', content_rowid='rowid'
-    );
-    CREATE TRIGGER IF NOT EXISTS session_messages_fts_insert
-        AFTER INSERT ON session_messages BEGIN
-            INSERT INTO session_messages_fts(rowid, text, role, kind, model, tool_names)
-            VALUES (NEW.rowid, NEW.text, NEW.role, NEW.kind, NEW.model, NEW.tool_names);
-        END;
-    CREATE TRIGGER IF NOT EXISTS session_messages_fts_delete
-        AFTER DELETE ON session_messages BEGIN
-            INSERT INTO session_messages_fts(
-                session_messages_fts, rowid, text, role, kind, model, tool_names
-            )
-            VALUES (
-                'delete', OLD.rowid, OLD.text, OLD.role, OLD.kind, OLD.model, OLD.tool_names
-            );
-        END;
-    CREATE TRIGGER IF NOT EXISTS session_messages_fts_update
-        AFTER UPDATE ON session_messages BEGIN
-            INSERT INTO session_messages_fts(
-                session_messages_fts, rowid, text, role, kind, model, tool_names
-            )
-            VALUES (
-                'delete', OLD.rowid, OLD.text, OLD.role, OLD.kind, OLD.model, OLD.tool_names
-            );
-            INSERT INTO session_messages_fts(rowid, text, role, kind, model, tool_names)
-            VALUES (NEW.rowid, NEW.text, NEW.role, NEW.kind, NEW.model, NEW.tool_names);
-        END;
 ";
-
-/// The activity read fetches a bounded LIMIT of rows per session, so a
-/// covering index buys little there, and copying `metadata_json` (kilobytes
-/// per message) into it doubled the table's footprint: on one store the index
-/// alone was 0.77 GB against 0.66 GB of table. The replacement covers the
-/// ordering columns and lets the scan fetch the blob from the table.
-///
-/// Both statements are store-sized — on a store with 184k messages the build
-/// measured 33 s and dropping the blob-covering predecessor 1 m 54 s — so
-/// neither belongs in the leased schema transaction, where each one outran
-/// the per-statement execution limit and failed every open. They run as
-/// separate independently durable batches on the long-lease migration writer:
-/// the replacement is durable before the predecessor is dropped, an
-/// interrupted migration never redoes a completed statement, and the activity
-/// read uses whichever of the two is present, so no reader waits for this.
-const SESSION_ACTIVITY_INDEX_MIGRATION_SQL: &[&str] = &[
-    "CREATE INDEX IF NOT EXISTS idx_session_messages_session_activity_v2
-        ON session_messages(
-            provider, session_id, timestamp, ordinal, message_id, kind, tool_names
-        );",
-    "DROP INDEX IF EXISTS idx_session_messages_session_activity;",
-];
 
 const DELIVERY_SETTLEMENT_SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS delivery_fanout_events (
@@ -432,18 +353,7 @@ pub async fn ensure_registered_schema(
             "new registered schema installation was not classified fresh",
         ));
     }
-    ensure_fresh_authority_invariants(installation).await?;
-    // A fresh store's session table is empty, so the statements that cost a
-    // migration on a populated store cost nothing here: run them and the
-    // store is installed already converged, with the activity index present
-    // for its first read. Nothing can be carrying the retired external-source
-    // tables a fresh install never creates.
-    for sql in SESSION_ACTIVITY_INDEX_MIGRATION_SQL {
-        installation.execute_batch(sql).await.map_err(|error| {
-            global_db_operation_error("install the session activity index", error)
-        })?;
-    }
-    Ok(())
+    ensure_fresh_authority_invariants(installation).await
 }
 
 #[derive(Clone, Copy)]
@@ -488,17 +398,13 @@ struct RegisteredSchemaAdmissionClassification {
 #[hotpath::measure(future = true, label = "global_db.schema.query.classify")]
 async fn classify_registered_schema_admission(
     connection: &impl QueryExecutor,
-    binding: &tracedecay_store::StoreRuntimeBindingV1,
 ) -> tracedecay_domain::errors::Result<RegisteredSchemaAdmissionClassification> {
-    Box::pin(classify_registered_schema_authorities(connection, binding)).await
+    Box::pin(classify_registered_schema_authorities(connection)).await
 }
 
 async fn classify_registered_schema_authorities(
     connection: &impl QueryExecutor,
-    binding: &tracedecay_store::StoreRuntimeBindingV1,
 ) -> tracedecay_domain::errors::Result<RegisteredSchemaAdmissionClassification> {
-    crate::registered_legacy_relations::reject_legacy_session_relation_shape(connection, binding)
-        .await?;
     // The LCM authority classifies profile content first: a legacy or
     // version-skewed session store must surface its own ProfileResetRequired
     // state instead of being masked by the coarser workflow/configuration
@@ -533,32 +439,7 @@ async fn classify_registered_schema_authorities(
     )
     .await?;
     let workflow_admission = inspect_workflow_schema_for_admission(connection).await?;
-    // The legacy workflow-run index is installed in the same registered
-    // database as the source-journal tables above. Its own admission is
-    // read-only, so a malformed index table is rejected before configuration
-    // admission or the shared schema transaction can write.
-    tracedecay_sessions::runtime::workflow_index::require_admissible_workflow_index_schema(
-        connection,
-    )
-    .await
-    .map_err(|error| match error {
-        tracedecay_sessions::runtime::workflow_index::WorkflowIndexError::ResetRequired {
-            found_version,
-            required_version,
-        } => workflow_schema_reset_required(&format!(
-            "workflow index schema {found_version:?} is incompatible with required schema {required_version}"
-        )),
-        error => global_db_operation_error("inspect workflow index schema admission", error),
-    })?;
-    // The only additive registry migration is the released 8-column
-    // `code_projects` shape. Validate that shape before configuration
-    // admission or any schema transaction can write, so an unknown column,
-    // type, key, or hidden column cannot be partially repaired on refusal.
-    // It runs after the session-temporal and workflow classifiers so a store
-    // whose own authority schema is foreign reports that authority instead of
-    // the registry table it never received.
-    support::require_admissible_code_projects_shape(connection, configuration_fresh.is_some())
-        .await?;
+    require_admissible_git_correlation_schema(connection).await?;
     configuration::admit_configuration_schema(connection, configuration_fresh.as_ref())
         .await
         .map_err(|error| match error {
@@ -573,48 +454,69 @@ async fn classify_registered_schema_authorities(
     // contract cannot be trusted to gate replay or admission, so admission fails
     // closed with the tip's typed reset authority rather than silently
     // continuing on a shape that no longer proves deletion state.
-    if configuration_fresh.is_none() {
-        let mut rows = connection
-            .query(
-                "SELECT 1 FROM sqlite_master
-                 WHERE type = 'table' AND name = 'remote_deletion_tombstones'",
-                (),
-            )
-            .await
-            .map_err(|error| {
-                global_db_operation_error("inspect remote deletion catalog admission", error)
-            })?;
-        let remote_deletion_exists = rows
-            .next()
-            .await
-            .map_err(|error| {
-                global_db_operation_error("read remote deletion catalog admission", error)
-            })?
-            .is_some();
-        // v0.0.66 stores predate the remote-deletion catalog. They are
-        // admissible only when the newer workflow source namespace is absent;
-        // a current source store with a missing catalog is still a typed reset.
-        if remote_deletion_exists {
-            validate_remote_deletion_schema_contract(connection)
-                .await
-                .map_err(|error| {
-                    tracedecay_domain::errors::TraceDecayError::reset_required(
-                        "remote deletion tombstones",
-                        error.to_string(),
-                    )
-                })?;
-        } else if workflow_admission != WorkflowSchemaAdmission::Create {
-            return Err(tracedecay_domain::errors::TraceDecayError::reset_required(
-                "remote deletion tombstones",
-                "remote_deletion_tombstones is missing from an existing current store",
-            ));
-        }
+    if configuration_fresh.is_none()
+        && let Err(error) = validate_remote_deletion_schema_contract(connection).await
+    {
+        return Err(tracedecay_domain::errors::TraceDecayError::reset_required(
+            "remote deletion tombstones",
+            error.to_string(),
+        ));
     }
     Ok(RegisteredSchemaAdmissionClassification {
         configuration_fresh,
         temporal_admission,
         workflow_admission,
     })
+}
+
+/// Git evidence is stored as per-session rows since schema version 6. A store
+/// recorded at any other version holds a shape nothing converts, so it keeps
+/// its data untouched behind the typed reset.
+async fn require_admissible_git_correlation_schema(
+    connection: &impl QueryExecutor,
+) -> tracedecay_domain::errors::Result<()> {
+    let recorded = recorded_git_correlation_schema_version(connection)
+        .await
+        .map_err(|error| global_db_operation_error("inspect git correlation schema", error))?;
+    match recorded {
+        Some(found) if found != GIT_CORRELATION_SCHEMA_VERSION => {
+            Err(tracedecay_domain::errors::TraceDecayError::reset_required(
+                "git correlation",
+                format!(
+                    "the store records Git correlation schema version {found}; this build \
+                     stores Git evidence as per-session rows at version \
+                     {GIT_CORRELATION_SCHEMA_VERSION}"
+                ),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Authority named by the typed reset an existing store receives when the
+/// composed authority schema (observation, projection, and anchor tables with
+/// their invariant triggers) drifted from the contract. No such shape migrates
+/// in place: the store stays untouched for the operator's reset decision. A
+/// fresh install failing the same check is a programming error and keeps its
+/// storage classification.
+const AUTHORITY_SCHEMA_AUTHORITY: &str = "authority schema";
+
+async fn validate_admitted_authority_schema(
+    conn: &impl QueryExecutor,
+    is_fresh: bool,
+) -> tracedecay_domain::errors::Result<()> {
+    validate_authority_schema_contract(conn)
+        .await
+        .map_err(|error| {
+            if is_fresh {
+                error
+            } else {
+                tracedecay_domain::errors::TraceDecayError::reset_required(
+                    AUTHORITY_SCHEMA_AUTHORITY,
+                    error.to_string(),
+                )
+            }
+        })
 }
 
 /// Installs the minimum schema and write guards required before a registered
@@ -629,7 +531,7 @@ pub async fn ensure_registered_schema_for_admission(
         configuration_fresh,
         temporal_admission,
         workflow_admission,
-    } = classify_registered_schema_admission(installation, installation.binding()).await?;
+    } = classify_registered_schema_admission(installation).await?;
     let is_fresh = configuration_fresh.is_some();
     let force_exhaustive = !authority_invariant_triggers_intact(installation).await?;
     let transaction = installation
@@ -665,7 +567,7 @@ pub async fn ensure_registered_schema_for_admission(
                 global_db_operation_error("initialize LCM status performance indexes", error)
             })?;
     }
-    validate_authority_schema_contract(installation).await?;
+    validate_admitted_authority_schema(installation, is_fresh).await?;
     Ok(RegisteredSchemaConvergence {
         force_exhaustive,
         is_fresh,
@@ -803,7 +705,7 @@ async fn install_registered_schema_stage_sequence(
         .map_err(|error| {
             global_db_operation_error("initialize project registry performance indexes", error)
         })?;
-    if is_fresh || workflow_admission == WorkflowSchemaAdmission::Create {
+    if is_fresh {
         transaction
             .execute_batch(REMOTE_DELETION_SCHEMA)
             .await
@@ -880,6 +782,12 @@ async fn install_registered_schema_stage_sequence(
         .map_err(|error| {
             global_db_operation_error("initialize authorized scope-set schema", error)
         })?;
+    // The daemon's handoff runtime attaches its grant store to the same
+    // registered database as the Work runtime.
+    transaction
+        .execute_batch(HANDOFF_OPEN_SCHEMA_V1)
+        .await
+        .map_err(|error| global_db_operation_error("initialize handoff-open schema", error))?;
     ensure_session_parent_columns(transaction)
         .await
         .map_err(|error| global_db_operation_error("ensure session parent columns", error))?;
@@ -907,6 +815,22 @@ async fn install_registered_schema_stage_sequence(
         .execute_batch(RUNTIME_LEDGER_SCHEMA)
         .await
         .map_err(|error| global_db_operation_error("initialize runtime writer ledger", error))?;
+    // Projection raw-twin triggers sit on `lcm_raw_messages`. The table has to
+    // exist before those triggers are created, including on a fresh store
+    // whose authority triggers are installed in this same transaction.
+    tracedecay_lcm::schema::ensure_lcm_schema_in_transaction(transaction)
+        .await
+        .map_err(|error| match error {
+            tracedecay_lcm::LcmError::ProfileResetRequired {
+                found_version,
+                required_version,
+            } => tracedecay_domain::errors::TraceDecayError::ProfileResetRequired {
+                component: "LCM",
+                found_version,
+                required_version,
+            },
+            error => global_db_operation_error("initialize LCM schema", error),
+        })?;
     // `force_exhaustive` means admission observed damaged or missing guard
     // triggers (for example a dropped guarded table takes its triggers with
     // it). Reinstall them here so the post-commit contract validation sees a
@@ -924,50 +848,14 @@ async fn install_registered_schema_stage_sequence(
             ));
         }
     }
-
-    tracedecay_lcm::schema::ensure_lcm_schema_in_transaction(transaction)
-        .await
-        .map_err(|error| match error {
-            tracedecay_lcm::LcmError::ProfileResetRequired {
-                found_version,
-                required_version,
-            } => tracedecay_domain::errors::TraceDecayError::ProfileResetRequired {
-                component: "LCM",
-                found_version,
-                required_version,
-            },
-            error => global_db_operation_error("initialize LCM schema", error),
-        })?;
     tracedecay_sessions::runtime::git_correlation::ensure_git_correlation_receipt_schema_in_transaction(
             transaction,
         )
         .await
-        .map_err(|error| match error {
-            tracedecay_sessions::runtime::git_correlation::GitCorrelationError::ResetRequired {
-                found_version,
-                required_version,
-            } => tracedecay_domain::errors::TraceDecayError::reset_required(
-                "git correlation",
-                format!(
-                    "Git correlation receipt schema {found_version:?} is incompatible with required schema {required_version}; reset the store"
-                ),
-            ),
-            error => global_db_operation_error("initialize git correlation schema", error),
-        })?;
+        .map_err(|error| global_db_operation_error("initialize git correlation schema", error))?;
     tracedecay_sessions::runtime::workflow_index::ensure_workflow_index_schema(transaction)
         .await
-        .map_err(|error| match error {
-            tracedecay_sessions::runtime::workflow_index::WorkflowIndexError::ResetRequired {
-                found_version,
-                required_version,
-            } => tracedecay_domain::errors::TraceDecayError::reset_required(
-                "workflow",
-                format!(
-                    "workflow index schema {found_version:?} is incompatible with required schema {required_version}"
-                ),
-            ),
-            error => global_db_operation_error("initialize workflow index schema", error),
-        })?;
+        .map_err(|error| global_db_operation_error("initialize workflow index schema", error))?;
     Ok(())
 }
 
@@ -1029,126 +917,15 @@ async fn converge_registered_schema_on(
     database: &Database,
     convergence: RegisteredSchemaConvergence,
 ) -> tracedecay_domain::errors::Result<()> {
-    converge_store_sized_migrations(database).await?;
-    ensure_authority_invariants(database, convergence.force_exhaustive, convergence.is_fresh).await
-}
-
-/// Copies the released WITHOUT ROWID ledger in bounded transactions after
-/// admission. Each committed page releases the canonical writer, and runtime
-/// submissions continue to consult V1 until the final exact-schema retirement.
-#[hotpath::measure(
-    future = true,
-    label = "global_db.schema.persist.converge_runtime_ledger"
-)]
-pub async fn converge_runtime_writer_ledger(
-    database: &Database,
-) -> tracedecay_domain::errors::Result<()> {
-    let installation = database
-        .begin_write_transaction("install current runtime writer ledger")
-        .await?;
-    installation
-        .execute_batch(RUNTIME_LEDGER_SCHEMA)
-        .await
-        .map_err(|error| {
-            global_db_operation_error("install current runtime writer ledger", error)
-        })?;
-    installation.commit().await?;
-
-    loop {
-        let transaction = database
-            .begin_write_transaction("converge runtime writer ledger page")
-            .await?;
-        let mut presence = transaction
-            .query(RETIRED_IDEMPOTENCY_LEDGER_PRESENT_SQL, ())
-            .await
-            .map_err(|error| {
-                global_db_operation_error("inspect retired runtime writer ledger", error)
-            })?;
-        let present = presence
-            .next()
-            .await
-            .map_err(|error| {
-                global_db_operation_error("read retired runtime writer ledger state", error)
-            })?
-            .is_some();
-        drop(presence);
-        if !present {
-            transaction.commit().await?;
-            return Ok(());
-        }
-
-        let copied = transaction
-            .execute(COPY_RETIRED_IDEMPOTENCY_LEDGER_PAGE_SQL, ())
-            .await
-            .map_err(|error| {
-                global_db_operation_error("copy retired runtime writer ledger page", error)
-            })?;
-        let retired = transaction
-            .execute(DELETE_CONVERGED_IDEMPOTENCY_LEDGER_PAGE_SQL, ())
-            .await
-            .map_err(|error| {
-                global_db_operation_error("retire converged runtime writer ledger page", error)
-            })?;
-        let mut remaining = transaction
-            .query("SELECT 1 FROM td_runtime_writer_idempotency_v1 LIMIT 1", ())
-            .await
-            .map_err(|error| {
-                global_db_operation_error("inspect runtime writer ledger convergence", error)
-            })?;
-        let has_remaining = remaining
-            .next()
-            .await
-            .map_err(|error| {
-                global_db_operation_error("read runtime writer ledger convergence", error)
-            })?
-            .is_some();
-        drop(remaining);
-        transaction.commit().await?;
-
-        if !has_remaining {
-            // Current binaries never append V1. Once the last bounded page is
-            // committed, no producer can repopulate the retired table before
-            // this separately authorized exact-schema statement removes it.
-            database
-                .execute_authority_revalidated_batch(
-                    "retire converged runtime writer ledger",
-                    DROP_RETIRED_IDEMPOTENCY_LEDGER_SQL,
-                )
-                .await?;
-            return Ok(());
-        }
-        if copied == 0 && retired == 0 {
-            return Err(global_db_operation_message(
-                "converge runtime writer ledger",
-                "retired and current idempotency authorities disagree",
-            ));
-        }
-    }
-}
-
-/// Runs the migrations whose cost scales with the store rather than with the
-/// schema.
-///
-/// Installation is cheap idempotent `CREATE ... IF NOT EXISTS` and belongs in
-/// the leased admission transaction. Rebuilding an index or rewriting rows
-/// does not: each of these measured tens of seconds to minutes on a real
-/// store, so inside that transaction they tripped the per-statement execution
-/// limit and made every open of a large store fail. They run here instead —
-/// after the fail-closed admission checks, on the long-lease migration
-/// writer, releasing the writer between units — so admission, retrieval, and
-/// ordinary writes never wait for them.
-#[hotpath::measure(future = true, label = "global_db.schema.persist.converge_migrations")]
-async fn converge_store_sized_migrations(
-    database: &Database,
-) -> tracedecay_domain::errors::Result<()> {
-    converge_migration_batches(
+    observation_projection::rearm_queued_projection_retries(
         database,
-        "migrate the session activity index",
-        SESSION_ACTIVITY_INDEX_MIGRATION_SQL,
+        observation_projection::REARM_PROJECTION_RETRY_BATCH_ROWS,
     )
-    .await?;
-    tracedecay_runtime_core::db::migrate_retired_mutation_copy_tables(database).await?;
-    converge_runtime_writer_ledger(database).await
+    .await
+    .map_err(|error| {
+        global_db_operation_message("rearm queued projection retries", error.durable_detail())
+    })?;
+    ensure_authority_invariants(database, convergence.force_exhaustive, convergence.is_fresh).await
 }
 
 /// Synchronously converges an attached existing store's historical schema.
@@ -1193,8 +970,8 @@ pub async fn converge_attached_registered_schema(
 /// temporal / workflow / configuration / remote-deletion resets) while a
 /// refused store stays untouched for the operator's explicit reset decision.
 /// An admissible store then re-ensures every admission-critical idempotent
-/// schema stage. An admissibly-fresh store — an existing database file with no
-/// schema objects — receives the same admission-critical install as
+/// schema stage. An admissibly-fresh store, an existing database file with no
+/// schema objects, receives the same admission-critical install as
 /// initialization. The returned convergence plan carries the LCM status-index
 /// work for lifecycle-owned daemon maintenance; short-lived callers run that
 /// same work synchronously through [`converge_attached_registered_schema`].
@@ -1207,8 +984,7 @@ pub async fn ensure_attached_registered_schema(
         configuration_fresh,
         temporal_admission,
         workflow_admission,
-    } = classify_registered_schema_admission(&read_connection, database.registered_binding())
-        .await?;
+    } = classify_registered_schema_admission(&read_connection).await?;
     let force_exhaustive = !authority_invariant_triggers_intact(&read_connection).await?;
     let transaction = database
         .begin_bulk_write_transaction("install attached registered global database schema")
@@ -1235,7 +1011,7 @@ pub async fn ensure_attached_registered_schema(
         })?;
         transaction.commit().await?;
     }
-    validate_authority_schema_contract(&read_connection).await?;
+    validate_admitted_authority_schema(&read_connection, configuration_fresh.is_some()).await?;
     Ok(RegisteredSchemaConvergence {
         force_exhaustive,
         is_fresh: configuration_fresh.is_some(),
@@ -1254,7 +1030,7 @@ async fn inspect_workflow_schema_for_admission(
 ) -> tracedecay_domain::errors::Result<WorkflowSchemaAdmission> {
     let mut rows = conn
         .query(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master
+            "SELECT type, name, sql FROM sqlite_master
              WHERE name NOT LIKE 'sqlite_%'
              ORDER BY type, name",
             (),
@@ -1274,10 +1050,7 @@ async fn inspect_workflow_schema_for_admission(
             row.get::<String>(1).map_err(|error| {
                 global_db_operation_error("decode workflow schema object name", error)
             })?,
-            row.get::<String>(2).map_err(|error| {
-                global_db_operation_error("decode workflow schema object table", error)
-            })?,
-            row.get::<Option<String>>(3).map_err(|error| {
+            row.get::<Option<String>>(2).map_err(|error| {
                 global_db_operation_error("decode workflow schema object SQL", error)
             })?,
         ));
@@ -1288,75 +1061,22 @@ async fn inspect_workflow_schema_for_admission(
 
     let actual_workflow_tables = tables
         .iter()
-        .filter(|(object_type, name, _, _)| {
+        .filter(|(object_type, name, _)| {
             object_type == "table"
                 && WORKFLOW_TABLE_CONTRACTS_V1
                     .iter()
                     .any(|contract| contract.name == name.as_str())
         })
-        .map(|(_, name, _, sql)| (name.as_str(), sql.as_deref()))
+        .map(|(_, name, sql)| (name.as_str(), sql.as_deref()))
         .collect::<Vec<_>>();
     let expected_workflow_tables = WORKFLOW_TABLE_CONTRACTS_V1
         .iter()
         .map(|contract| (contract.name, Some(contract.sql)))
         .collect::<Vec<_>>();
-    // A v0.0.66 store has only the legacy workflow-run index. It must be
-    // admitted as a create path for the newer source-journal namespace, while
-    // a partial/newer namespace still fails closed. A view is special here:
-    // SQLite records the view's own name in `tbl_name`, so its dependency on a
-    // workflow table must be found in the view SQL before this early return.
-    let current_workflow_namespace_present =
-        tables.iter().any(|(object_type, name, table, sql)| {
-            is_workflow_schema_object(object_type, table, sql)
-                && !is_legacy_workflow_schema_object(name, table)
-        });
-    let workflow_view_drift_present = tables.iter().any(|(object_type, _, _, sql)| {
-        object_type.eq_ignore_ascii_case("view")
-            && sql
-                .as_deref()
-                .is_some_and(sql_mentions_workflow_table_identifier)
-    });
-    if actual_workflow_tables.is_empty()
-        && !current_workflow_namespace_present
-        && !workflow_view_drift_present
-    {
-        return Ok(WorkflowSchemaAdmission::Create);
-    }
     if actual_workflow_tables != expected_workflow_tables {
         return Err(workflow_schema_reset_required(
             "workflow tables are absent, incomplete, or not exact",
         ));
-    }
-
-    // Workflow has two durable namespaces in this database: the final
-    // source-journal tables and the legacy workflow-run index. Every object
-    // attached to either namespace is admission-owned. SQLite records the
-    // owning table in `tbl_name` for tables, indexes, and triggers, so that
-    // field keeps similarly named objects owned by another authority out of
-    // this inventory. Views require the SQL dependency check below because
-    // their `tbl_name` is the view name. SQLite autoindexes remain excluded by
-    // the sqlite_master query above.
-    let expected_workflow_objects = expected_workflow_schema_objects();
-    let actual_workflow_objects = tables
-        .iter()
-        .filter(|(object_type, _, table, sql)| is_workflow_schema_object(object_type, table, sql))
-        .map(|(object_type, name, table, _)| {
-            (
-                object_type.to_ascii_lowercase(),
-                name.to_ascii_lowercase(),
-                table.to_ascii_lowercase(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    let unexpected_workflow_objects = actual_workflow_objects
-        .difference(&expected_workflow_objects)
-        .map(|(object_type, name, table)| format!("{object_type} {name} on {table}"))
-        .collect::<Vec<_>>();
-    if !unexpected_workflow_objects.is_empty() {
-        return Err(workflow_schema_reset_required(&format!(
-            "workflow schema contains unexpected objects: {}",
-            unexpected_workflow_objects.join(", ")
-        )));
     }
 
     let mut schema = conn
@@ -1450,94 +1170,6 @@ fn workflow_schema_reset_required(reason: &str) -> tracedecay_domain::errors::Tr
     tracedecay_domain::errors::TraceDecayError::reset_required("workflow", reason)
 }
 
-fn is_workflow_schema_object(object_type: &str, table: &str, sql: &Option<String>) -> bool {
-    let table = table.to_ascii_lowercase();
-    table.starts_with("workflow_")
-        || table.starts_with("idx_workflow_")
-        || (object_type.eq_ignore_ascii_case("view")
-            && sql
-                .as_deref()
-                .is_some_and(sql_mentions_workflow_table_identifier))
-}
-
-fn is_legacy_workflow_schema_object(name: &str, table: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    let table = table.to_ascii_lowercase();
-    matches!(
-        name.as_str(),
-        "workflow_runs"
-            | "workflow_agents"
-            | "workflow_index_meta"
-            | "idx_workflow_runs_parent"
-            | "idx_workflow_agents_run"
-    ) || matches!(
-        table.as_str(),
-        "workflow_runs" | "workflow_agents" | "workflow_index_meta"
-    )
-}
-
-fn sql_mentions_workflow_table_identifier(sql: &str) -> bool {
-    WORKFLOW_TABLE_CONTRACTS_V1
-        .iter()
-        .any(|contract| sql_mentions_identifier(sql, contract.name))
-        || ["workflow_runs", "workflow_agents", "workflow_index_meta"]
-            .iter()
-            .any(|table| sql_mentions_identifier(sql, table))
-}
-
-fn sql_mentions_identifier(sql: &str, identifier: &str) -> bool {
-    let identifier = identifier.to_ascii_lowercase();
-    sql.to_ascii_lowercase()
-        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
-        .any(|token| token == identifier)
-}
-
-fn expected_workflow_schema_objects() -> BTreeSet<(String, String, String)> {
-    let mut expected = WORKFLOW_TABLE_CONTRACTS_V1
-        .iter()
-        .map(|contract| {
-            (
-                "table".to_owned(),
-                contract.name.to_owned(),
-                contract.name.to_owned(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    expected.extend([
-        (
-            "table".to_owned(),
-            "workflow_schema".to_owned(),
-            "workflow_schema".to_owned(),
-        ),
-        (
-            "table".to_owned(),
-            "workflow_runs".to_owned(),
-            "workflow_runs".to_owned(),
-        ),
-        (
-            "table".to_owned(),
-            "workflow_agents".to_owned(),
-            "workflow_agents".to_owned(),
-        ),
-        (
-            "table".to_owned(),
-            "workflow_index_meta".to_owned(),
-            "workflow_index_meta".to_owned(),
-        ),
-        (
-            "index".to_owned(),
-            "idx_workflow_runs_parent".to_owned(),
-            "workflow_runs".to_owned(),
-        ),
-        (
-            "index".to_owned(),
-            "idx_workflow_agents_run".to_owned(),
-            "workflow_agents".to_owned(),
-        ),
-    ]);
-    expected
-}
-
 pub async fn validate_observation_authority_connection(
     conn: &impl QueryExecutor,
 ) -> tracedecay_domain::errors::Result<()> {
@@ -1547,15 +1179,8 @@ pub async fn validate_observation_authority_connection(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use tempfile::TempDir;
 
-    use super::support::{
-        RELEASED_FIXTURE_GIT_OID, RELEASED_FIXTURE_PROJECT_ID, RELEASED_FIXTURE_SESSION_ID,
-        RELEASED_FIXTURE_WORKFLOW_RUN_ID, install_released_v066_registry_and_workflow_fixture,
-        seed_released_legacy_profile_fixture, seed_released_profile_fixture,
-    };
     use crate::tests::harness::open_registered_test_database_fixture;
     use tracedecay_runtime_core::db::TestDatabaseRuntimeScope;
     use tracedecay_runtime_core::db::engine::{QueryExecutor, TestConnection, params};
@@ -1583,60 +1208,6 @@ mod tests {
             Ok(_) => panic!("incompatible registered schema must not be admitted"),
             Err(error) => error,
         }
-    }
-
-    async fn fixture_row_counts(connection: &TestConnection) -> Vec<i64> {
-        let mut rows = connection
-            .query(
-                "SELECT
-                    (SELECT COUNT(*) FROM projects),
-                    (SELECT COUNT(*) FROM code_projects),
-                    (SELECT COUNT(*) FROM remote_deletion_tombstones),
-                    (SELECT COUNT(*) FROM project_aliases),
-                    (SELECT COUNT(*) FROM store_instances),
-                    (SELECT COUNT(*) FROM graph_scopes),
-                    (SELECT COUNT(*) FROM store_artifacts),
-                    (SELECT COUNT(*) FROM sessions),
-                    (SELECT COUNT(*) FROM session_messages),
-                    (SELECT COUNT(*) FROM parse_offsets),
-                    (SELECT COUNT(*) FROM savings_ledger),
-                    (SELECT COUNT(*) FROM analytics_events),
-                    (SELECT COUNT(*) FROM observability_emission_outbox),
-                    (SELECT COUNT(*) FROM delivery_fanout_events),
-                    (SELECT COUNT(*) FROM delivery_settlements),
-                    (SELECT COUNT(*) FROM delivery_source_receipts),
-                    (SELECT COUNT(*) FROM authorized_scope_sets_v1),
-                    (SELECT COUNT(*) FROM sanitization_receipts),
-                    (SELECT COUNT(*) FROM observations),
-                    (SELECT COUNT(*) FROM source_cursors),
-                    (SELECT COUNT(*) FROM workflow_artifact_payloads),
-                    (SELECT COUNT(*) FROM workflow_run_journal),
-                    (SELECT COUNT(*) FROM workflow_fan_out_census_journal),
-                    (SELECT COUNT(*) FROM workflow_definition_source_journal),
-                    (SELECT COUNT(*) FROM workflow_definition_disposition),
-                    (SELECT COUNT(*) FROM workflow_definition_transition_journal),
-                    (SELECT COUNT(*) FROM workflow_effect_journal),
-                    (SELECT COUNT(*) FROM workflow_handoffs),
-                    (SELECT COUNT(*) FROM workflow_runs),
-                    (SELECT COUNT(*) FROM workflow_agents),
-                    (SELECT COUNT(*) FROM workflow_index_meta),
-                    (SELECT COUNT(*) FROM git_correlation_meta),
-                    (SELECT COUNT(*) FROM git_evidence_publication_outbox),
-                    (SELECT COUNT(*) FROM git_history_index_progress),
-                    (SELECT COUNT(*) FROM git_history_index_segments),
-                    (SELECT COUNT(*) FROM git_history_index_pending),
-                    (SELECT COUNT(*) FROM git_history_index_seen),
-                    (SELECT COUNT(*) FROM git_history_index_staged_spans),
-                    (SELECT COUNT(*) FROM git_history_index_staged_commits),
-                    (SELECT COUNT(*) FROM git_history_index_failures)",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        (0..40)
-            .map(|index| row.get::<i64>(index).unwrap())
-            .collect()
     }
 
     #[tokio::test]
@@ -1777,58 +1348,30 @@ mod tests {
     }
 
     /// The 8-column `code_projects` shape shipped in released binaries
-    /// (through 0.0.66), so admission must migrate it additively in place —
-    /// columns added, existing rows preserved — instead of demanding a reset.
+    /// (through 0.0.66), so admission must migrate it additively in place,
+    /// columns added, existing rows preserved, instead of demanding a reset.
     #[tokio::test]
     async fn released_registry_without_primary_root_columns_migrates_in_place() {
         let directory = TempDir::new().unwrap();
         let database_path = directory.path().join("sessions.db");
         install_registered_schema(&database_path).await;
-        let expected_observation;
-        let expected_receipt;
-        let expected_payload_digest;
         {
             let connection = rusqlite::Connection::open(&database_path).unwrap();
-            install_released_v066_registry_and_workflow_fixture(&connection);
-            let fixture = seed_released_legacy_profile_fixture(&connection);
-            expected_observation = fixture.observation_id;
-            expected_receipt = fixture.receipt_id;
-            expected_payload_digest = fixture.payload_digest;
-            let mut rows = connection
-                .prepare(
-                    "SELECT COUNT(*) FROM sqlite_schema
-                     WHERE type = 'table'
-                       AND (name = 'remote_deletion_tombstones'
-                            OR name IN ('workflow_artifact_payloads',
-                                        'workflow_run_journal',
-                                        'workflow_fan_out_census_journal',
-                                        'workflow_definition_source_journal',
-                                        'workflow_definition_disposition',
-                                        'workflow_definition_transition_journal',
-                                        'workflow_effect_journal',
-                                        'workflow_handoffs',
-                                        'workflow_schema'))",
+            connection
+                .execute_batch(
+                    "ALTER TABLE code_projects DROP COLUMN primary_root_platform;
+                     ALTER TABLE code_projects DROP COLUMN primary_root_bytes;
+                     ALTER TABLE code_projects DROP COLUMN primary_root_last_seen_at;
+                     INSERT INTO code_projects
+                        (project_id, canonical_root, display_root, created_at, last_seen_at)
+                     VALUES ('released-project', '/released/root', '/released/root', 100, 100);",
                 )
-                .unwrap();
-            assert_eq!(rows.query_row([], |row| row.get::<_, i64>(0)).unwrap(), 0);
+                .expect("shape the registry like the released 8-column registry");
         }
 
         install_registered_schema(&database_path).await;
 
         let connection = TestConnection::open(&database_path);
-        let mut rows = connection
-            .query(
-                "SELECT path, tokens_saved FROM projects
-                 WHERE path = '/released/profile/root'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "/released/profile/root");
-        assert_eq!(row.get::<i64>(1).unwrap(), 77);
-        drop(rows);
-
         for column in [
             "primary_root_platform",
             "primary_root_bytes",
@@ -1848,11 +1391,9 @@ mod tests {
         }
         let mut rows = connection
             .query(
-                "SELECT project_id, canonical_root, display_root, git_common_dir,
-                        git_remote_url, default_branch, created_at, last_seen_at,
-                        primary_root_platform, primary_root_bytes, primary_root_last_seen_at
-                 FROM code_projects WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
+                "SELECT canonical_root, primary_root_platform FROM code_projects
+                 WHERE project_id = 'released-project'",
+                (),
             )
             .await
             .unwrap();
@@ -1861,852 +1402,11 @@ mod tests {
             .await
             .unwrap()
             .expect("released project row must survive the in-place migration");
-        assert_eq!(row.get::<String>(0).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(1).unwrap(), "/released/profile/root");
-        assert_eq!(row.get::<String>(2).unwrap(), "/released/profile/display");
-        assert_eq!(row.get::<String>(3).unwrap(), "/released/profile/.git");
-        assert_eq!(
-            row.get::<String>(4).unwrap(),
-            "https://example.invalid/released.git"
-        );
-        assert_eq!(row.get::<String>(5).unwrap(), "released-main");
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_000);
-        assert_eq!(row.get::<i64>(7).unwrap(), 2_000);
+        assert_eq!(row.get::<String>(0).unwrap(), "/released/root");
         assert!(
-            row.get::<Option<String>>(8).unwrap().is_none(),
+            row.get::<Option<String>>(1).unwrap().is_none(),
             "migrated columns must stay NULL until the next registration backfills them"
         );
-        assert!(row.get::<Option<Vec<u8>>>(9).unwrap().is_none());
-        assert!(row.get::<Option<i64>>(10).unwrap().is_none());
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT alias_path, project_id, last_seen_at
-                 FROM project_aliases WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "/released/profile/alias");
-        assert_eq!(row.get::<String>(1).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<i64>(2).unwrap(), 2_001);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT store_id, project_id, store_kind, storage_mode, store_relpath,
-                        manifest_relpath, created_at, last_verified_at, last_write_at
-                 FROM store_instances WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-profile-store");
-        assert_eq!(row.get::<String>(1).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(2).unwrap(), "graph");
-        assert_eq!(row.get::<String>(3).unwrap(), "private");
-        assert_eq!(row.get::<String>(4).unwrap(), "store/graph");
-        assert_eq!(row.get::<String>(5).unwrap(), "store/graph/manifest.json");
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_010);
-        assert_eq!(row.get::<i64>(7).unwrap(), 1_020);
-        assert_eq!(row.get::<i64>(8).unwrap(), 1_030);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT graph_scope_id, project_id, store_id, branch_name, db_relpath,
-                        parent_scope_id, last_synced_at, writable
-                 FROM graph_scopes WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-profile-scope");
-        assert_eq!(row.get::<String>(1).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(2).unwrap(), "released-profile-store");
-        assert_eq!(row.get::<String>(3).unwrap(), "released-main");
-        assert_eq!(row.get::<String>(4).unwrap(), "scopes/released.db");
-        assert!(row.get::<Option<String>>(5).unwrap().is_none());
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_040);
-        assert_eq!(row.get::<i64>(7).unwrap(), 1);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT store_id, artifact_kind, relpath, size_bytes, schema_version, updated_at
-                 FROM store_artifacts WHERE store_id = 'released-profile-store'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-profile-store");
-        assert_eq!(row.get::<String>(1).unwrap(), "manifest");
-        assert_eq!(row.get::<String>(2).unwrap(), "manifest.json");
-        assert_eq!(row.get::<i64>(3).unwrap(), 123);
-        assert_eq!(row.get::<String>(4).unwrap(), "released-v1");
-        assert_eq!(row.get::<i64>(5).unwrap(), 1_050);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT COUNT(*) FROM remote_deletion_tombstones
-                 WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-            0
-        );
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT provider, session_id, project_key, project_path, title, started_at, ended_at,
-                        transcript_path, metadata_json, parent_session_id, is_subagent,
-                        agent_id, parent_tool_use_id
-                 FROM sessions WHERE session_id = ?1 AND provider = 'codex'",
-                params![RELEASED_FIXTURE_SESSION_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "codex");
-        assert_eq!(row.get::<String>(1).unwrap(), RELEASED_FIXTURE_SESSION_ID);
-        assert_eq!(row.get::<String>(2).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(3).unwrap(), "/released/profile/display");
-        assert_eq!(row.get::<String>(4).unwrap(), "released transcript");
-        assert_eq!(row.get::<i64>(5).unwrap(), 1_100);
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_200);
-        assert_eq!(
-            row.get::<String>(7).unwrap(),
-            "/released/profile/transcript.jsonl"
-        );
-        assert_eq!(row.get::<String>(8).unwrap(), "{\"fixture\":true}");
-        assert_eq!(row.get::<String>(9).unwrap(), "released-parent-session");
-        assert_eq!(row.get::<i64>(10).unwrap(), 0);
-        assert_eq!(row.get::<String>(11).unwrap(), "released-agent");
-        assert_eq!(row.get::<String>(12).unwrap(), "released-tool-use");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT message_id, role, timestamp, ordinal, text, kind, model,
-                        tool_names, source_path, source_offset, metadata_json
-                 FROM session_messages WHERE session_id = ?1 AND provider = 'codex'",
-                params![RELEASED_FIXTURE_SESSION_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-profile-message");
-        assert_eq!(row.get::<String>(1).unwrap(), "assistant");
-        assert_eq!(row.get::<i64>(2).unwrap(), 1_150);
-        assert_eq!(row.get::<i64>(3).unwrap(), 1);
-        assert_eq!(row.get::<String>(4).unwrap(), "released transcript message");
-        assert_eq!(row.get::<String>(5).unwrap(), "assistant");
-        assert_eq!(row.get::<String>(6).unwrap(), "gpt-5.6-codex");
-        assert_eq!(row.get::<String>(7).unwrap(), "terminal");
-        assert_eq!(
-            row.get::<String>(8).unwrap(),
-            "/released/profile/transcript.jsonl"
-        );
-        assert_eq!(row.get::<i64>(9).unwrap(), 42);
-        assert_eq!(row.get::<String>(10).unwrap(), "{\"fixture\":true}");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT byte_offset, mtime, file_id FROM parse_offsets
-                 WHERE file_path = '/released/profile/transcript.jsonl'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 42);
-        assert_eq!(row.get::<i64>(1).unwrap(), 1_250);
-        assert_eq!(row.get::<i64>(2).unwrap(), 99);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT ts, project_path, tool_name, before_tokens, after_tokens
-                 FROM savings_ledger WHERE project_path = ?1",
-                params!["/released/profile/display"],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1_260);
-        assert_eq!(row.get::<String>(1).unwrap(), "/released/profile/display");
-        assert_eq!(row.get::<String>(2).unwrap(), "released-tool");
-        assert_eq!(row.get::<i64>(3).unwrap(), 100);
-        assert_eq!(row.get::<i64>(4).unwrap(), 70);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT provider, project_id, session_id, timestamp, event_kind,
-                        hook_name, tool_name, tool_category, skill_name,
-                        hint_category, hint_id, outcome, metadata_json
-                 FROM analytics_events WHERE event_kind = 'released_event'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "codex");
-        assert_eq!(row.get::<String>(1).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(2).unwrap(), RELEASED_FIXTURE_SESSION_ID);
-        assert_eq!(row.get::<i64>(3).unwrap(), 1_270);
-        assert_eq!(row.get::<String>(4).unwrap(), "released_event");
-        assert_eq!(row.get::<String>(5).unwrap(), "released_hook");
-        assert_eq!(row.get::<String>(6).unwrap(), "released-tool");
-        assert_eq!(row.get::<String>(7).unwrap(), "terminal");
-        assert_eq!(row.get::<String>(8).unwrap(), "released-skill");
-        assert_eq!(row.get::<String>(9).unwrap(), "released-hint");
-        assert!(row.get::<Option<String>>(10).unwrap().is_none());
-        assert_eq!(row.get::<String>(11).unwrap(), "ok");
-        assert_eq!(row.get::<String>(12).unwrap(), "{\"fixture\":true}");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT project_id, owner_event_id, owner_fact_json,
-                        delivery_envelope_json, state, analytics_event_id
-                 FROM observability_emission_outbox WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(
-            row.get::<String>(1).unwrap(),
-            "released-profile-observability"
-        );
-        assert_eq!(row.get::<String>(2).unwrap(), "{}");
-        assert_eq!(row.get::<String>(3).unwrap(), "{}");
-        assert_eq!(row.get::<String>(4).unwrap(), "pending");
-        assert!(row.get::<Option<i64>>(5).unwrap().is_none());
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT project_id, owner_event_id, surface, event_class, eligible,
-                        valid_at_micros, work_attempt_json, work_attempt_digest
-                 FROM delivery_fanout_events WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(1).unwrap(), "released-profile-delivery");
-        assert_eq!(row.get::<String>(2).unwrap(), "hook");
-        assert_eq!(row.get::<String>(3).unwrap(), "operation_terminal");
-        assert_eq!(row.get::<i64>(4).unwrap(), 1);
-        assert_eq!(row.get::<i64>(5).unwrap(), 1_300);
-        assert_eq!(row.get::<String>(6).unwrap(), "{}");
-        assert_eq!(
-            row.get::<String>(7).unwrap(),
-            "released-work-attempt-digest"
-        );
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT project_id, owner_event_id, surface, channel_ref,
-                        attempted_at_micros, outcome, settled_at_micros,
-                        drop_reason, census_json
-                 FROM delivery_settlements WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(1).unwrap(), "released-profile-delivery");
-        assert_eq!(row.get::<String>(2).unwrap(), "hook");
-        assert_eq!(row.get::<String>(3).unwrap(), "released-channel");
-        assert_eq!(row.get::<i64>(4).unwrap(), 1_301);
-        assert_eq!(row.get::<String>(5).unwrap(), "delivered");
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_302);
-        assert!(row.get::<Option<String>>(7).unwrap().is_none());
-        assert_eq!(row.get::<String>(8).unwrap(), "{}");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT project_id, receipt_ref, owner_event_id, surface, channel_ref
-                 FROM delivery_source_receipts WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(
-            row.get::<String>(1).unwrap(),
-            "released-profile-delivery-receipt"
-        );
-        assert_eq!(row.get::<String>(2).unwrap(), "released-profile-delivery");
-        assert_eq!(row.get::<String>(3).unwrap(), "hook");
-        assert_eq!(row.get::<String>(4).unwrap(), "released-channel");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT sequence, observation_id, payload_digest, receipt_id,
-                        observation_json, committed_cursor_json
-                 FROM observations WHERE observation_id = ?1",
-                params![expected_observation.as_str()],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        let observation_sequence = row.get::<i64>(0).unwrap();
-        assert_eq!(observation_sequence, 1);
-        assert_eq!(row.get::<String>(1).unwrap(), expected_observation);
-        let observation_payload_digest = row.get::<String>(2).unwrap();
-        let observation_receipt_id = row.get::<String>(3).unwrap();
-        assert_eq!(observation_receipt_id, expected_receipt);
-        assert_eq!(observation_payload_digest, expected_payload_digest);
-        assert!(row.get::<String>(4).unwrap().contains("released-row"));
-        assert!(row.get::<String>(5).unwrap().contains("released-row"));
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT receipt_id, sanitizer_version, payload_digest, receipt_json
-                 FROM sanitization_receipts
-                 WHERE receipt_id = ?1",
-                params![observation_receipt_id.as_str()],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), observation_receipt_id);
-        assert_eq!(row.get::<String>(1).unwrap(), "sanitizer.invariant.v1");
-        assert_eq!(row.get::<String>(2).unwrap(), observation_payload_digest);
-        assert!(row.get::<String>(3).unwrap().contains("released-row"));
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_json, scope_json, cursor_json FROM source_cursors",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert!(row.get::<String>(0).unwrap().contains("codex"));
-        assert!(row.get::<String>(1).unwrap().contains("profile"));
-        assert!(row.get::<String>(2).unwrap().contains("released-row"));
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT scope_set_id, revision, digest, canonical_payload
-                 FROM authorized_scope_sets_v1 WHERE scope_set_id = 'released-profile-scope-set'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-profile-scope-set");
-        assert_eq!(row.get::<i64>(1).unwrap(), 1);
-        assert_eq!(row.get::<String>(2).unwrap(), "released-scope-digest");
-        assert_eq!(row.get::<Vec<u8>>(3).unwrap(), vec![0x7b, 0x7d]);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT singleton, schema_version, definition_digest
-                 FROM workflow_schema",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 1);
-        assert_eq!(
-            row.get::<String>(2).unwrap(),
-            super::WORKFLOW_SCHEMA_DEFINITION_DIGEST_V1
-        );
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT run_id, parent_session_id, name, description, phase_json,
-                        status, started_ts, ended_ts, result_summary, agent_count,
-                        created_at, updated_at
-                 FROM workflow_runs WHERE run_id = ?1",
-                params![RELEASED_FIXTURE_WORKFLOW_RUN_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(
-            row.get::<String>(0).unwrap(),
-            RELEASED_FIXTURE_WORKFLOW_RUN_ID
-        );
-        assert_eq!(row.get::<String>(1).unwrap(), RELEASED_FIXTURE_SESSION_ID);
-        assert_eq!(row.get::<String>(2).unwrap(), "released workflow");
-        assert_eq!(row.get::<String>(3).unwrap(), "released workflow fixture");
-        assert_eq!(row.get::<String>(4).unwrap(), "[]");
-        assert_eq!(row.get::<String>(5).unwrap(), "completed");
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_410);
-        assert_eq!(row.get::<i64>(7).unwrap(), 1_420);
-        assert_eq!(row.get::<String>(8).unwrap(), "released result");
-        assert_eq!(row.get::<i64>(9).unwrap(), 1);
-        assert_eq!(row.get::<i64>(10).unwrap(), 1_410);
-        assert_eq!(row.get::<i64>(11).unwrap(), 1_420);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT key, value, updated_at FROM workflow_index_meta
-                 WHERE key = 'released-watermark'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-watermark");
-        assert_eq!(row.get::<i64>(1).unwrap(), 1_420);
-        assert_eq!(row.get::<i64>(2).unwrap(), 1_421);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT key, value, updated_at FROM git_correlation_meta
-                 WHERE key = 'released-git-watermark'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-git-watermark");
-        assert_eq!(row.get::<i64>(1).unwrap(), 1_430);
-        assert_eq!(row.get::<i64>(2).unwrap(), 1_431);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT receipt_id, publication_prefix, evidence_json, created_at
-                 FROM git_evidence_publication_outbox
-                 WHERE receipt_id = 'released-git-receipt'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-git-receipt");
-        assert_eq!(row.get::<String>(1).unwrap(), "released-prefix");
-        assert_eq!(row.get::<String>(2).unwrap(), "{}");
-        assert_eq!(row.get::<i64>(3).unwrap(), 1_432);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT activity_timestamp, source_rowid, provider, session_id,
-                        project_path, window_start, window_end, worktree,
-                        worktree_identity, git_dir, git_dir_identity, common_dir,
-                        common_dir_identity, generation, scan_mode, reflog_path,
-                        reflog_byte_offset, reflog_byte_length, source_generation,
-                        reflog_digest, capture_target_offset, verify_byte_offset,
-                        verify_digest, source_head_referent, source_head_oid,
-                        cursor_head_state, cursor_head_branch, cursor_oid, segment_end,
-                        segment_tip_oid, segment_cursor, emitted_count,
-                        consulted_ref_seal_json
-                 FROM git_history_index_progress WHERE source_rowid = 1",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1_433);
-        assert_eq!(row.get::<i64>(1).unwrap(), 1);
-        assert_eq!(row.get::<String>(2).unwrap(), "codex");
-        assert_eq!(row.get::<String>(3).unwrap(), RELEASED_FIXTURE_SESSION_ID);
-        assert_eq!(row.get::<String>(4).unwrap(), "/released/profile/display");
-        assert_eq!(row.get::<i64>(5).unwrap(), 1_430);
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_431);
-        assert_eq!(row.get::<Vec<u8>>(7).unwrap(), b"worktree".to_vec());
-        assert_eq!(row.get::<Vec<u8>>(8).unwrap(), b"worktree-id".to_vec());
-        assert_eq!(row.get::<Vec<u8>>(9).unwrap(), b"git-dir".to_vec());
-        assert_eq!(row.get::<Vec<u8>>(10).unwrap(), b"git-dir-id".to_vec());
-        assert_eq!(row.get::<Vec<u8>>(11).unwrap(), b"common-dir".to_vec());
-        assert_eq!(row.get::<Vec<u8>>(12).unwrap(), b"common-dir-id".to_vec());
-        assert_eq!(row.get::<i64>(13).unwrap(), 0);
-        assert_eq!(row.get::<String>(14).unwrap(), "reflog_capture");
-        assert_eq!(row.get::<Vec<u8>>(15).unwrap(), b"reflog-path".to_vec());
-        assert_eq!(row.get::<i64>(16).unwrap(), 0);
-        assert_eq!(row.get::<i64>(17).unwrap(), 0);
-        assert_eq!(row.get::<String>(18).unwrap(), "released-source-generation");
-        assert_eq!(row.get::<String>(19).unwrap(), "released-reflog-digest");
-        assert!(row.get::<Option<i64>>(20).unwrap().is_none());
-        assert_eq!(row.get::<i64>(21).unwrap(), 0);
-        assert_eq!(
-            row.get::<String>(22).unwrap(),
-            "sha256:ada855f318c248e40b2bb191bbe42fad3ec6300cc470ecca8d2e2322a6d82ae3"
-        );
-        assert!(row.get::<Option<Vec<u8>>>(23).unwrap().is_none());
-        assert_eq!(row.get::<String>(24).unwrap(), "released-head-oid");
-        assert_eq!(row.get::<String>(25).unwrap(), "local_branch");
-        assert_eq!(
-            row.get::<Option<String>>(26).unwrap().as_deref(),
-            Some("released-main")
-        );
-        assert_eq!(row.get::<String>(27).unwrap(), "released-cursor-oid");
-        assert_eq!(row.get::<i64>(28).unwrap(), 1_430);
-        assert_eq!(row.get::<String>(29).unwrap(), "released-segment-tip");
-        assert_eq!(row.get::<i64>(30).unwrap(), 0);
-        assert_eq!(row.get::<i64>(31).unwrap(), 0);
-        assert_eq!(row.get::<String>(32).unwrap(), "{}");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_rowid, ordinal, branch, start_ts, end_ts,
-                        tip_oid, applied, completed
-                 FROM git_history_index_segments WHERE source_rowid = 1",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 0);
-        assert_eq!(row.get::<String>(2).unwrap(), "released-main");
-        assert_eq!(row.get::<i64>(3).unwrap(), 1_430);
-        assert_eq!(row.get::<i64>(4).unwrap(), 1_431);
-        assert_eq!(row.get::<String>(5).unwrap(), "released-segment-tip");
-        assert_eq!(row.get::<i64>(6).unwrap(), 0);
-        assert_eq!(row.get::<i64>(7).unwrap(), 0);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_rowid, segment_ordinal, oid
-                 FROM git_history_index_pending WHERE oid = ?1",
-                params![RELEASED_FIXTURE_GIT_OID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 0);
-        assert_eq!(row.get::<String>(2).unwrap(), RELEASED_FIXTURE_GIT_OID);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_rowid, segment_ordinal, oid
-                 FROM git_history_index_seen WHERE oid = 'released-seen-oid'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 0);
-        assert_eq!(row.get::<String>(2).unwrap(), "released-seen-oid");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_rowid, segment_ordinal, boundary, branch, timestamp
-                 FROM git_history_index_staged_spans WHERE source_rowid = 1",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 0);
-        assert_eq!(row.get::<i64>(2).unwrap(), 0);
-        assert_eq!(row.get::<String>(3).unwrap(), "released-main");
-        assert_eq!(row.get::<i64>(4).unwrap(), 1_434);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_rowid, segment_ordinal, oid, branch, committed_at
-                 FROM git_history_index_staged_commits WHERE source_rowid = 1",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 1);
-        assert_eq!(row.get::<i64>(1).unwrap(), 0);
-        assert_eq!(row.get::<String>(2).unwrap(), "released-staged-oid");
-        assert_eq!(row.get::<String>(3).unwrap(), "released-main");
-        assert_eq!(row.get::<i64>(4).unwrap(), 1_435);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT source_rowid, activity_timestamp, provider, session_id,
-                        project_path, window_start, window_end, reason,
-                        source_generation, reflog_digest
-                 FROM git_history_index_failures WHERE source_rowid = 2",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<i64>(0).unwrap(), 2);
-        assert_eq!(row.get::<i64>(1).unwrap(), 1_436);
-        assert_eq!(row.get::<String>(2).unwrap(), "codex");
-        assert_eq!(row.get::<String>(3).unwrap(), RELEASED_FIXTURE_SESSION_ID);
-        assert_eq!(row.get::<String>(4).unwrap(), "/released/profile/display");
-        assert_eq!(row.get::<i64>(5).unwrap(), 1_430);
-        assert_eq!(row.get::<i64>(6).unwrap(), 1_431);
-        assert_eq!(row.get::<String>(7).unwrap(), "unsupported_source_framing");
-        assert!(row.get::<Option<String>>(8).unwrap().is_none());
-        assert!(row.get::<Option<String>>(9).unwrap().is_none());
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT run_id, agent_label, agent_id, phase, transcript_path,
-                        agent_session_id, status, model, tokens, started_ts,
-                        ended_ts, created_at, updated_at
-                 FROM workflow_agents
-                 WHERE run_id = ?1 AND agent_id = 'released-agent-id'",
-                params![RELEASED_FIXTURE_WORKFLOW_RUN_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(
-            row.get::<String>(0).unwrap(),
-            RELEASED_FIXTURE_WORKFLOW_RUN_ID
-        );
-        assert_eq!(row.get::<String>(1).unwrap(), "released-agent");
-        assert_eq!(row.get::<String>(2).unwrap(), "released-agent-id");
-        assert_eq!(row.get::<String>(3).unwrap(), "run");
-        assert_eq!(
-            row.get::<String>(4).unwrap(),
-            "/released/profile/workflow.jsonl"
-        );
-        assert_eq!(row.get::<String>(5).unwrap(), RELEASED_FIXTURE_SESSION_ID);
-        assert_eq!(row.get::<String>(6).unwrap(), "completed");
-        assert_eq!(row.get::<String>(7).unwrap(), "gpt-5.6-codex");
-        assert_eq!(row.get::<i64>(8).unwrap(), 321);
-        assert_eq!(row.get::<i64>(9).unwrap(), 1_411);
-        assert_eq!(row.get::<i64>(10).unwrap(), 1_419);
-        assert_eq!(row.get::<i64>(11).unwrap(), 1_411);
-        assert_eq!(row.get::<i64>(12).unwrap(), 1_419);
-        drop(rows);
-
-        let before_counts = fixture_row_counts(&connection).await;
-        assert_eq!(
-            before_counts[2], 0,
-            "released fixture must gain an empty deletion catalog"
-        );
-        assert_eq!(
-            &before_counts[20..28],
-            &[0, 0, 0, 0, 0, 0, 0, 0],
-            "legacy-only release must gain empty source-journal tables"
-        );
-        drop(connection);
-
-        // Re-admission must be idempotent for a populated released fixture;
-        // in particular, schema stages must not duplicate receipt, workflow,
-        // or Git rows while they re-ensure their indexes and columns.
-        install_registered_schema(&database_path).await;
-        let connection = TestConnection::open(&database_path);
-        assert_eq!(fixture_row_counts(&connection).await, before_counts);
-    }
-
-    #[tokio::test]
-    async fn current_rowful_profile_fixture_is_preserved_and_idempotent() {
-        let directory = TempDir::new().unwrap();
-        let database_path = directory.path().join("sessions.db");
-        install_registered_schema(&database_path).await;
-        {
-            let connection = rusqlite::Connection::open(&database_path).unwrap();
-            seed_released_profile_fixture(&connection);
-        }
-        let before_counts = {
-            let connection = TestConnection::open(&database_path);
-            fixture_row_counts(&connection).await
-        };
-
-        install_registered_schema(&database_path).await;
-
-        let connection = TestConnection::open(&database_path);
-        assert_eq!(fixture_row_counts(&connection).await, before_counts);
-        let mut rows = connection
-            .query(
-                "SELECT project_id, canonical_root, display_root,
-                        primary_root_platform, primary_root_bytes,
-                        primary_root_last_seen_at, git_common_dir,
-                        git_remote_url, default_branch, created_at, last_seen_at
-                 FROM code_projects WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(1).unwrap(), "/released/profile/root");
-        assert_eq!(row.get::<String>(2).unwrap(), "/released/profile/display");
-        assert_eq!(row.get::<String>(3).unwrap(), "unix");
-        assert_eq!(row.get::<Vec<u8>>(4).unwrap(), b"root".to_vec());
-        assert_eq!(row.get::<i64>(5).unwrap(), 1_701);
-        assert_eq!(row.get::<String>(6).unwrap(), "/released/profile/.git");
-        assert_eq!(
-            row.get::<String>(7).unwrap(),
-            "https://example.invalid/released.git"
-        );
-        assert_eq!(row.get::<String>(8).unwrap(), "released-main");
-        assert_eq!(row.get::<i64>(9).unwrap(), 1_000);
-        assert_eq!(row.get::<i64>(10).unwrap(), 2_000);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT profile_id, target_kind, project_id, tombstone_id,
-                        recorded_at_micros, cleanup_status, failure_code,
-                        failure_phase, retryable
-                 FROM remote_deletion_tombstones WHERE project_id = ?1",
-                params![RELEASED_FIXTURE_PROJECT_ID],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-profile");
-        assert_eq!(row.get::<String>(1).unwrap(), "project");
-        assert_eq!(row.get::<String>(2).unwrap(), RELEASED_FIXTURE_PROJECT_ID);
-        assert_eq!(row.get::<String>(3).unwrap(), "released-profile-tombstone");
-        assert_eq!(row.get::<i64>(4).unwrap(), 1_060);
-        assert_eq!(row.get::<String>(5).unwrap(), "pending");
-        assert!(row.get::<Option<String>>(6).unwrap().is_none());
-        assert!(row.get::<Option<String>>(7).unwrap().is_none());
-        assert!(row.get::<Option<i64>>(8).unwrap().is_none());
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT payload_digest, byte_length, payload
-                 FROM workflow_artifact_payloads
-                 WHERE payload_digest = 'released-workflow-payload'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-workflow-payload");
-        assert_eq!(row.get::<i64>(1).unwrap(), 4);
-        assert_eq!(row.get::<Vec<u8>>(2).unwrap(), b"row!".to_vec());
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT run_id, sequence, command_id, event_payload, event_digest
-                 FROM workflow_run_journal WHERE run_id = 'released-source-workflow'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-source-workflow");
-        assert_eq!(row.get::<i64>(1).unwrap(), 1);
-        assert_eq!(row.get::<String>(2).unwrap(), "released-command");
-        assert_eq!(row.get::<String>(3).unwrap(), "{}");
-        assert_eq!(row.get::<String>(4).unwrap(), "released-event");
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT run_id, workflow_sequence, observed_at, census_payload,
-                        census_digest, observability_settled
-                 FROM workflow_fan_out_census_journal
-                 WHERE run_id = 'released-source-workflow'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-source-workflow");
-        assert_eq!(row.get::<i64>(1).unwrap(), 1);
-        assert_eq!(row.get::<i64>(2).unwrap(), 1_400);
-        assert_eq!(row.get::<String>(3).unwrap(), "{}");
-        assert_eq!(row.get::<String>(4).unwrap(), "released-census");
-        assert_eq!(row.get::<i64>(5).unwrap(), 1);
-        drop(rows);
-
-        let mut rows = connection
-            .query(
-                "SELECT definition_id, definition_version, payload, payload_digest
-                 FROM workflow_definition_source_journal
-                 WHERE definition_id = 'released-definition'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-definition");
-        assert_eq!(row.get::<i64>(1).unwrap(), 1);
-        assert_eq!(row.get::<String>(2).unwrap(), "{}");
-        assert_eq!(row.get::<String>(3).unwrap(), "released-definition-source");
-        drop(rows);
-
-        for (table, column, expected, predicate) in [
-            (
-                "workflow_definition_disposition",
-                "state",
-                "active",
-                "definition_id = 'released-definition'",
-            ),
-            (
-                "workflow_definition_transition_journal",
-                "operation",
-                "activate",
-                "definition_id = 'released-definition'",
-            ),
-            (
-                "workflow_effect_journal",
-                "state",
-                "committed",
-                "idempotency_key = 'released-effect'",
-            ),
-        ] {
-            let sql = format!("SELECT {column} FROM {table} WHERE {predicate}");
-            let mut rows = connection.query(&sql, ()).await.unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            assert_eq!(row.get::<String>(0).unwrap(), expected);
-        }
-        let mut rows = connection
-            .query(
-                "SELECT token_digest, scope_payload, issued_at, expires_at,
-                        consumed, frontier_payload, frontier_digest
-                 FROM workflow_handoffs WHERE token_digest = 'released-handoff'",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        assert_eq!(row.get::<String>(0).unwrap(), "released-handoff");
-        assert_eq!(row.get::<String>(1).unwrap(), "{}");
-        assert_eq!(row.get::<i64>(2).unwrap(), 1_405);
-        assert_eq!(row.get::<i64>(3).unwrap(), 1_406);
-        assert_eq!(row.get::<i64>(4).unwrap(), 0);
-        assert_eq!(row.get::<String>(5).unwrap(), "{}");
-        assert_eq!(row.get::<String>(6).unwrap(), "released-frontier");
     }
 
     /// Only the known released shape migrates; a registry whose
@@ -2719,19 +1419,12 @@ mod tests {
         install_registered_schema(&database_path).await;
         {
             let connection = rusqlite::Connection::open(&database_path).unwrap();
-            seed_released_profile_fixture(&connection);
             connection
                 .execute_batch("ALTER TABLE code_projects ADD COLUMN unknown_shape TEXT")
                 .expect("make the code-project catalog drift beyond the released shape");
         }
 
-        let before_bytes = fs::read(&database_path).unwrap();
         let error = registered_admission_error(&database_path).await;
-        assert_eq!(
-            fs::read(&database_path).unwrap(),
-            before_bytes,
-            "registry shape refusal must happen before any schema mutation"
-        );
         let connection = TestConnection::open(&database_path);
         let Some((authority, reason)) = error.reset_required_context() else {
             panic!("unknown code-project shape returned the wrong typed problem: {error}");
@@ -2755,221 +1448,6 @@ mod tests {
         assert!(
             rows.next().await.unwrap().is_some(),
             "rejected code-project schema must not be silently converged"
-        );
-    }
-
-    async fn assert_code_projects_drift_requires_reset_without_mutation(
-        mutation: &str,
-        reason_fragment: &str,
-    ) {
-        let directory = TempDir::new().unwrap();
-        let database_path = directory.path().join("sessions.db");
-        install_registered_schema(&database_path).await;
-        {
-            let connection = rusqlite::Connection::open(&database_path).unwrap();
-            connection.execute_batch(mutation).unwrap();
-        }
-
-        let before_bytes = fs::read(&database_path).unwrap();
-        let error = registered_admission_error(&database_path).await;
-        assert_eq!(
-            fs::read(&database_path).unwrap(),
-            before_bytes,
-            "code-project admission refusal must happen before any schema mutation"
-        );
-        let Some((authority, reason)) = error.reset_required_context() else {
-            panic!("code-project drift returned the wrong typed problem: {error}");
-        };
-        assert_eq!(
-            authority,
-            super::project_registry::PROJECT_REGISTRY_AUTHORITY
-        );
-        assert!(
-            reason.contains(reason_fragment),
-            "reset problem must identify code-project drift ({reason_fragment}): {reason}"
-        );
-    }
-
-    #[tokio::test]
-    async fn code_project_table_check_drift_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "PRAGMA foreign_keys = OFF;
-             DROP TABLE code_projects;
-             CREATE TABLE code_projects (
-                 project_id TEXT PRIMARY KEY,
-                 canonical_root TEXT NOT NULL,
-                 display_root TEXT NOT NULL,
-                 primary_root_platform TEXT,
-                 primary_root_bytes BLOB,
-                 primary_root_last_seen_at INTEGER,
-                 git_common_dir TEXT,
-                 git_remote_url TEXT,
-                 default_branch TEXT,
-                 created_at INTEGER NOT NULL,
-                 last_seen_at INTEGER NOT NULL,
-                 CHECK(length(project_id) > 0)
-             );
-             PRAGMA foreign_keys = ON;",
-            "table SQL contract",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn missing_code_project_table_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "PRAGMA foreign_keys = OFF;
-             DROP TABLE code_projects;
-             PRAGMA foreign_keys = ON;",
-            "code_projects table is missing",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn code_project_object_type_drift_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "PRAGMA foreign_keys = OFF;
-             DROP TABLE code_projects;
-             CREATE VIEW code_projects AS SELECT 'wrong-object-type' AS project_id;
-             PRAGMA foreign_keys = ON;",
-            "incompatible object type",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn code_project_attached_trigger_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "CREATE TRIGGER arbitrary_code_project_trigger
-             AFTER INSERT ON code_projects
-             BEGIN
-                 SELECT 1;
-             END;",
-            "unexpected attached index, trigger, or view",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn code_project_attached_index_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "CREATE INDEX arbitrary_code_project_index ON code_projects(project_id);",
-            "unexpected attached index, trigger, or view",
-        )
-        .await;
-    }
-
-    /// A final-shape registry that lost its read indexes is not the exact
-    /// final inventory; admission refuses it instead of reinstalling them.
-    #[tokio::test]
-    async fn code_project_missing_read_indexes_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "DROP INDEX idx_code_projects_last_seen_project;
-             DROP INDEX idx_code_projects_git_common_dir;
-             DROP INDEX idx_code_projects_canonical_root_project;",
-            "unexpected attached index, trigger, or view",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn code_project_attached_view_reference_requires_reset_without_mutation() {
-        assert_code_projects_drift_requires_reset_without_mutation(
-            "CREATE VIEW arbitrary_code_project_view AS
-             SELECT project_id FROM code_projects;",
-            "unexpected attached index, trigger, or view",
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn released_registry_migration_rolls_back_on_registry_shape_error() {
-        let directory = TempDir::new().unwrap();
-        let database_path = directory.path().join("sessions.db");
-        install_registered_schema(&database_path).await;
-        {
-            let connection = rusqlite::Connection::open(&database_path).unwrap();
-            install_released_v066_registry_and_workflow_fixture(&connection);
-            seed_released_legacy_profile_fixture(&connection);
-            connection
-                .execute_batch(
-                    "ALTER TABLE project_aliases ADD COLUMN incompatible_alias_shape TEXT;",
-                )
-                .expect("shape the released registry and a later registry contract failure");
-        }
-
-        let before_bytes = fs::read(&database_path).unwrap();
-        let error = registered_admission_error(&database_path).await;
-        assert_eq!(
-            fs::read(&database_path).unwrap(),
-            before_bytes,
-            "failed released migration must roll back every schema mutation"
-        );
-        let Some((authority, reason)) = error.reset_required_context() else {
-            panic!("later registry shape failure returned the wrong typed problem: {error}");
-        };
-        assert_eq!(
-            authority,
-            super::project_registry::PROJECT_REGISTRY_AUTHORITY
-        );
-        assert!(
-            reason.contains("project_aliases"),
-            "reset problem must identify the later registry contract failure: {reason}"
-        );
-
-        let connection = TestConnection::open(&database_path);
-        for column in [
-            "primary_root_platform",
-            "primary_root_bytes",
-            "primary_root_last_seen_at",
-        ] {
-            let mut rows = connection
-                .query(
-                    "SELECT 1 FROM pragma_table_xinfo('code_projects') WHERE name = ?1",
-                    params![column],
-                )
-                .await
-                .unwrap();
-            assert!(
-                rows.next().await.unwrap().is_none(),
-                "failed released migration must roll back added column {column}"
-            );
-        }
-        let mut rows = connection
-            .query(
-                "SELECT 1 FROM pragma_table_xinfo('project_aliases')
-                 WHERE name = 'incompatible_alias_shape'",
-                (),
-            )
-            .await
-            .unwrap();
-        assert!(
-            rows.next().await.unwrap().is_some(),
-            "rollback must preserve the pre-existing incompatible registry shape"
-        );
-        let mut rows = connection
-            .query(
-                "SELECT COUNT(*) FROM sqlite_schema
-                 WHERE type = 'table'
-                   AND (name = 'remote_deletion_tombstones'
-                        OR name IN ('workflow_artifact_payloads',
-                                    'workflow_run_journal',
-                                    'workflow_fan_out_census_journal',
-                                    'workflow_definition_source_journal',
-                                    'workflow_definition_disposition',
-                                    'workflow_definition_transition_journal',
-                                    'workflow_effect_journal',
-                                    'workflow_handoffs',
-                                    'workflow_schema'))",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-            0,
-            "failed legacy migration must roll back newly created catalogs"
         );
     }
 

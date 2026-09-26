@@ -7,7 +7,7 @@ use tracedecay_contracts::{ApplicationEnvelope, ApplicationOutcome, ApplicationP
 /// boundary so a slow CLI invocation can attribute time to client identity
 /// resolution separately from the daemon round-trip itself.
 #[hotpath::measure(label = "cli.daemon.handshake")]
-fn client_handshake(
+pub(crate) fn client_handshake(
     project_path: Option<&std::path::Path>,
 ) -> tracedecay_domain::errors::Result<tracedecay_daemon_protocol::DaemonHandshake> {
     tracedecay::daemon::handshake_for_current_client(
@@ -36,7 +36,9 @@ pub(crate) fn retained_tool_payload<T: DeserializeOwned>(
 ) -> tracedecay_domain::errors::Result<T> {
     let payload = match retained_tool_outcome(tool_name, reply)? {
         ApplicationOutcome::Evidence(packet) => packet.payload,
-        ApplicationOutcome::Preview(_) | ApplicationOutcome::Effect(_) => {
+        ApplicationOutcome::Preview(_)
+        | ApplicationOutcome::Effect(_)
+        | ApplicationOutcome::Result(_) => {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("daemon tool {tool_name} returned a non-evidence outcome"),
             });
@@ -55,7 +57,9 @@ pub(crate) fn retained_effect_payload<T: DeserializeOwned>(
 ) -> tracedecay_domain::errors::Result<T> {
     let payload = match retained_tool_outcome(tool_name, reply)? {
         ApplicationOutcome::Effect(effect) => effect.payload,
-        ApplicationOutcome::Evidence(_) | ApplicationOutcome::Preview(_) => {
+        ApplicationOutcome::Evidence(_)
+        | ApplicationOutcome::Preview(_)
+        | ApplicationOutcome::Result(_) => {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
                 message: format!("daemon tool {tool_name} returned a non-effect outcome"),
             });
@@ -326,7 +330,7 @@ mod tests {
         ResolvedScope, ResultContractRef, RetrievalEvidence, RetryDirective, TemporalState,
     };
     use tracedecay_domain::{
-        ActorId, ComponentVersion, ManifestDigest, ProjectId, RepositoryId, UtcMicros, WorktreeId,
+        ActorId, ComponentVersion, ProjectId, RepositoryId, UtcMicros, WorktreeId,
     };
     use tracedecay_tool_catalog::{CapabilityId, SchemaId, SortContractId, UseCaseId};
 
@@ -346,9 +350,7 @@ mod tests {
         .unwrap()
     }
 
-    fn digest(seed: char) -> ManifestDigest {
-        ManifestDigest::new(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
-    }
+    use tracedecay_domain::test_fixtures::digest;
 
     fn context() -> RequestContext {
         let capability = CapabilityId::new("capability.cli.fixture").unwrap();
@@ -418,6 +420,7 @@ mod tests {
             finished_at: UtcMicros(3),
             budget: Default::default(),
             cancellation: None,
+            cost: None,
         };
         let packet = EvidencePacket::from_retrieval(evidence, authority, receipt).unwrap();
         serde_json::to_value(tracedecay_contracts::ApplicationEnvelope::evidence(

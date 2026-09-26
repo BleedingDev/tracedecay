@@ -2,11 +2,12 @@ use std::hash::BuildHasher;
 use std::io::Write;
 
 use tempfile::TempDir;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 #[cfg(unix)]
 use tracedecay_agent_hosts::hooks::cursor_pre_compact_via_daemon;
+use tracedecay_global_db::observation::ObservationRefusalCensusV1;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
-use tracedecay_sessions::runtime::cursor::{
+use tracedecay_sessions::runtime::hosts::cursor::{
     CursorSweepSource, CursorTranscriptIngestStats, cursor_project_slug,
     ingest_cursor_transcript_event as ingest_cursor_transcript_event_for_project,
     ingest_cursor_transcript_event_capped as ingest_cursor_transcript_event_capped_for_project,
@@ -14,7 +15,7 @@ use tracedecay_sessions::runtime::cursor::{
     ingest_cursor_user_transcript_event_capped_with_registered_roots,
     try_ingest_cursor_project_sweep_capped as try_ingest_cursor_project_sweep_capped_for_project,
 };
-use tracedecay_sessions::runtime::source::TranscriptIngestResult;
+use tracedecay_sessions::runtime::source::{TranscriptIngestResult, TranscriptSource};
 
 use crate::common::{EnvVarGuard, GLOBAL_DB_ENV, GLOBAL_DB_ENV_LOCK};
 #[cfg(unix)]
@@ -432,8 +433,6 @@ async fn cursor_transcript_ingest_populates_searchable_messages() {
     ];
     let project = tmp.path().join("project");
     std::fs::create_dir_all(&project).unwrap();
-    std::fs::create_dir(project.join(".tracedecay")).unwrap();
-    std::fs::write(project.join(".tracedecay/tracedecay.db"), "").unwrap();
     init_git_repo(&project);
     let project_id = mark_test_project(&project);
 
@@ -741,8 +740,8 @@ async fn cursor_transcript_ingest_retries_after_mid_batch_db_failure() {
         "transcript_path": transcript,
         "workspace_roots": [project]
     });
-    // Keep the registered authority alive, then deliberately break its fixture
-    // table so ingest exercises the exact retained runtime against the damage.
+    // Keep the registered authority alive, then deliberately fail its message
+    // writes so ingest exercises the exact retained runtime against the damage.
     let broken_db = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id.clone())
         .await
         .unwrap();
@@ -752,9 +751,11 @@ async fn cursor_transcript_ingest_retries_after_mid_batch_db_failure() {
         .to_path_buf();
     let broken_conn = rusqlite::Connection::open(&db_path).unwrap();
     broken_conn
-        .execute("DROP TABLE session_messages", [])
+        .execute_batch(
+            "CREATE TRIGGER fail_cursor_message_write BEFORE INSERT ON lcm_raw_messages
+             BEGIN SELECT RAISE(ABORT, 'injected message write failure'); END;",
+        )
         .unwrap();
-    drop(broken_conn);
 
     let first = ingest_cursor_transcript_event_for_project(
         &event.to_string(),
@@ -765,9 +766,13 @@ async fn cursor_transcript_ingest_retries_after_mid_batch_db_failure() {
     assert_eq!(first.sessions_upserted, 0);
     assert_eq!(first.messages_upserted, 0);
     drop(broken_db);
+    broken_conn
+        .execute_batch("DROP TRIGGER fail_cursor_message_write;")
+        .unwrap();
+    drop(broken_conn);
 
-    // Re-opening with schema ensure repairs the dropped table; retry should
-    // ingest the same line because the failed pass did not advance the cursor.
+    // Once the failure clears, the retry ingests the same line because the
+    // failed pass did not advance the cursor.
     let repaired_db = HostAdmissionTestRuntimeV1::project(&profile, &project, project_id.clone())
         .await
         .unwrap();
@@ -1325,6 +1330,117 @@ async fn cursor_sweep_prefers_subagent_copy_over_toplevel_duplicate() {
         .search_session_messages("cursor", None, "Drifted preamble", 10)
         .await;
     assert!(drifted.is_empty());
+}
+
+#[tokio::test]
+async fn cursor_sweep_skips_toplevel_duplicate_whose_subagent_copy_is_past_the_walk_cap() {
+    let tmp = TempDir::new().unwrap();
+    let project = init_project(&tmp);
+    let home = tmp.path().join("home");
+    let transcripts_dir = home
+        .join(".cursor")
+        .join("projects")
+        .join(cursor_project_slug(&project).unwrap())
+        .join("agent-transcripts");
+    // More sessions than one sweep page holds, so the first page must stop
+    // before the last session in id order.
+    for index in 0..4100 {
+        let session = format!("filler-{index:04}");
+        let dir = transcripts_dir.join(&session);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{session}.jsonl")), b"").unwrap();
+    }
+    let mut session_order: Vec<String> = std::fs::read_dir(&transcripts_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    session_order.sort();
+    let worker = session_order.first().unwrap().clone();
+    let parent = session_order.last().unwrap().clone();
+
+    // The subagent copy repeats one byte-identical line (a repeated tool
+    // call), so its second occurrence takes the positional identity. The
+    // drifted top-level copy shares those offsets; admitting it under the
+    // same native session collides on that positional identity.
+    let repeated = r#"{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"git status"}}]}}"#;
+    let between = r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Worker found orchard truncation evidence."}]}}"#;
+    let drifted = r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Drifted truncation tail line."}]}}"#;
+    let subagent_copy = format!("{repeated}\n{between}\n{repeated}\n");
+    let parent_dir = transcripts_dir.join(&parent);
+    std::fs::write(
+        parent_dir.join(format!("{parent}.jsonl")),
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"Parent dispatches orchard truncation worker."}]}}
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(parent_dir.join("subagents")).unwrap();
+    std::fs::write(
+        parent_dir.join("subagents").join(format!("{worker}.jsonl")),
+        &subagent_copy,
+    )
+    .unwrap();
+    std::fs::write(
+        transcripts_dir
+            .join(&worker)
+            .join(format!("{worker}.jsonl")),
+        format!("{subagent_copy}{drifted}\n"),
+    )
+    .unwrap();
+
+    let db = open_project_session_db(&project).await.unwrap();
+    let event = serde_json::json!({
+        "session_id": parent,
+        "transcript_path": parent_dir.join(format!("{parent}.jsonl")),
+        "workspace_roots": [project],
+        "cwd": project,
+    });
+    let hook = ingest_cursor_transcript_event(&event.to_string(), &db).await;
+    assert_eq!(hook.messages_upserted, 4);
+
+    let sweep = CursorSweepSource::with_home(&home);
+    let paths = sweep.transcript_paths(&project);
+    assert!(
+        paths.len() < session_order.len(),
+        "the fixture must span more than one sweep page"
+    );
+    assert!(
+        !paths.iter().any(|path| path.starts_with(&parent_dir)),
+        "the parent directory must fall past the first sweep page"
+    );
+    try_ingest_source(&db, &sweep, &project, None)
+        .await
+        .unwrap();
+
+    let census = db
+        .runtime()
+        .registered_database(HostAdmissionScope::Project)
+        .unwrap()
+        .observation_refusal_census()
+        .await;
+    assert_eq!(
+        census,
+        ObservationRefusalCensusV1::Observed {
+            refusals: Vec::new()
+        }
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|path| path.file_stem().and_then(std::ffi::OsStr::to_str) == Some(&worker)),
+        "the top-level copy of a subagent session is a duplicate even when its \
+         subagent copy is on a later sweep page"
+    );
+    let child = db
+        .get_session("cursor", &worker)
+        .await
+        .expect("subagent session should be stored");
+    assert!(child.is_subagent);
+    assert_eq!(child.parent_session_id.as_deref(), Some(parent.as_str()));
+    assert!(
+        db.search_session_messages("cursor", None, "Drifted", 10)
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]

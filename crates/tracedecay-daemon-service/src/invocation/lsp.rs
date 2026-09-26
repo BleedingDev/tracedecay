@@ -3,6 +3,7 @@
 use super::*;
 use tracedecay_lsp::LspRuntimeFailure;
 use tracedecay_runtime_core::cancellation::CancellationToken;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 mod project_lifecycle;
 mod workspace_admission;
@@ -28,7 +29,7 @@ pub(super) fn admit_lsp_control(
             ApplicationProblem::cancelled_before_admission(),
         )));
     }
-    if deadline.is_elapsed_at(current_micros()) {
+    if deadline.is_elapsed_at(now_micros()) {
         return Err(Box::new(DaemonInvocationResponse::application_problem(
             request_id,
             ApplicationProblem::timed_out_before_admission(),
@@ -63,7 +64,7 @@ impl DaemonInvocationService {
     /// that does not need an await to close.
     ///
     /// Kept separate so the daemon shutdown coordinator can run it during
-    /// `prepare_shutdown_owner_phases` — before *any* owner join is polled —
+    /// `prepare_shutdown_owner_phases`, before *any* owner join is polled,
     /// instead of only when the invocation owner's own phase is reached.
     /// Every call here is idempotent.
     pub fn cancel_admissions(&self) {
@@ -98,7 +99,7 @@ impl DaemonInvocationService {
         {
             return Some(owner);
         }
-        let canonical_root = project_root.canonicalize().ok()?;
+        let canonical_root = canonical_existing_identity(project_root).ok()?;
         self.project_runtimes.get(&canonical_root).await
     }
 
@@ -234,7 +235,7 @@ impl DaemonInvocationService {
         )
         .ok()?;
         if request_cancellation.is_some_and(CancellationToken::is_cancelled)
-            || deadline.is_elapsed_at(current_micros())
+            || deadline.is_elapsed_at(now_micros())
         {
             return None;
         }
@@ -308,7 +309,7 @@ impl DaemonInvocationService {
         let authority = AuthorityReceipt::from_context(&context, policy, observed_at).ok()?;
         let execution = OperationReceipt::completed(
             observed_at,
-            current_micros(),
+            now_micros(),
             deadline,
             OperationBudgetUsage::default(),
         )
@@ -386,8 +387,10 @@ impl DaemonInvocationService {
         let project_runtimes_clean = self.project_runtimes.shut_down_all_until(deadline).await;
         step("project_runtimes_shut_down");
         self.session_holder_databases.lock().await.clear();
-        self.operation_events.expire_all().await;
-        step("operation_events_expired");
+        // The operation-event authority is process-global, not owned by this
+        // composition: only frontiers without a live producer expire here.
+        self.operation_events.expire_idle().await;
+        step("idle_operation_events_expired");
         let lease_shutdown_clean = lease_shutdown.is_ok();
         if let Err(problem) = lease_shutdown {
             tracing::error!(
@@ -685,7 +688,7 @@ impl DaemonInvocationService {
                 &mut session.next_delivery_sequence,
                 frame,
                 access.session_id(),
-                current_micros(),
+                now_micros(),
             );
         }
         let frame = outbound.and_then(|frame| String::from_utf8(frame).ok());
@@ -775,7 +778,7 @@ impl DaemonInvocationService {
         // Detach is idempotent over every state that already satisfies it.
         // `LspSessionControl::detach` is a transition, so it refuses
         // `Detached -> Detached`, and `Exited`/`Expired` are already past it.
-        // Only a still-attached actor needs the transition — and needs it for
+        // Only a still-attached actor needs the transition, and needs it for
         // the in-flight reset it carries. Reporting the other three as a
         // failed detach is what made a session the daemon's own connection
         // teardown (`disconnect_lsp_session`) had already detached come back

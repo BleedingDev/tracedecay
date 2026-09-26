@@ -6,7 +6,7 @@ use super::*;
 
 const READINESS_AGGREGATION_SCHEMA_VERSION: u32 = 1;
 pub(super) const MAX_READINESS_INPUT_ROWS: usize = 10_000;
-pub(super) const READINESS_HOST_BUCKETS: usize = 6;
+pub(super) const READINESS_HOST_BUCKETS: usize = 7;
 const READINESS_DISPOSITION_CLASSES: usize = 5;
 const READINESS_DISPOSITION_STATUSES: usize = 8;
 const READINESS_RETRYABLE_STATES: usize = 3;
@@ -56,6 +56,7 @@ pub(crate) enum ReadinessHost {
     Cursor,
     Hermes,
     Kiro,
+    Pi,
     Other,
 }
 
@@ -67,6 +68,7 @@ impl ReadinessHost {
             Some(tracedecay_domain::HostIntegrationIdV1::Cursor) => Self::Cursor,
             Some(tracedecay_domain::HostIntegrationIdV1::Hermes) => Self::Hermes,
             Some(tracedecay_domain::HostIntegrationIdV1::Kiro) => Self::Kiro,
+            Some(tracedecay_domain::HostIntegrationIdV1::Pi) => Self::Pi,
             Some(_) | None => Self::Other,
         }
     }
@@ -118,7 +120,7 @@ pub(crate) struct TimeoutOutcomesByHost {
     pub(crate) host: ReadinessHost,
     pub(crate) timed_out_true: u64,
     pub(crate) timed_out_false: u64,
-    /// `timeout.timed_out` null/missing — distinct from measured false.
+    /// `timeout.timed_out` null/missing, distinct from measured false.
     pub(crate) timed_out_unavailable: u64,
     pub(crate) budget_ms_present: u64,
     pub(crate) budget_ms_absent: u64,
@@ -304,7 +306,7 @@ type MutableDispositionCounts = BTreeMap<DispositionSeriesKey, DispositionSeries
 /// Aggregate real `hook_completed` telemetry into bounded readiness distributions.
 ///
 /// Null/missing numeric fields increment `absent_count` and never enter buckets as zero.
-/// Missing or invalid dispositions fold into closed typed `unknown` values — never
+/// Missing or invalid dispositions fold into closed typed `unknown` values, never
 /// default-success. Hook names and reason codes are not emitted. Daemon processing
 /// duration is reported unavailable (upstream blocker).
 pub fn aggregate_hook_completed_readiness(rows: &[Value]) -> HookCompletedReadinessDistributions {
@@ -340,7 +342,7 @@ pub fn aggregate_hook_completed_readiness(rows: &[Value]) -> HookCompletedReadin
             rows_folded_to_other_host = rows_folded_to_other_host.saturating_add(1);
         }
 
-        // TRUE host IPC RTT. Null means unavailable — never treat as 0 RTT.
+        // TRUE host IPC RTT. Null means unavailable, never treat as 0 RTT.
         let latency = latency_by_host.entry(host).or_default();
         latency
             .wall_time_us

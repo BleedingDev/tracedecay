@@ -2,7 +2,7 @@
 // environment variables in-process.
 //! Hotpath coverage contract for `tracedecay-capture`.
 //!
-//! Feature-off (default build): every hotpath macro must be a no-op — no
+//! Feature-off (default build): every hotpath macro must be a no-op, no
 //! report file even when the report environment is set.
 //!
 //! Feature-on (`--features hotpath`): a process-boundary guard must capture
@@ -10,8 +10,8 @@
 //! the instrumentation is real rather than dead configuration.
 
 use serde_json::json;
-use tracedecay_capture::parse_claude_record_v1;
-use tracedecay_domain::ObservationSourceRangeV1;
+use tracedecay_capture::parse_observation_record_v1;
+use tracedecay_domain::{ObservationOrderingDomainV1, ObservationSourceRangeV1};
 
 /// Deterministic, daemon-free workload that reaches this crate's measured
 /// parse path (`capture.parse.record` and `capture.parse.record_digest`).
@@ -23,7 +23,9 @@ fn run_capture_parse_workload() -> usize {
     .expect("serialize claude record fixture");
     let range =
         ObservationSourceRangeV1::new(0, record.len() as u64).expect("valid fixture byte range");
-    let parsed = parse_claude_record_v1(&record, range).expect("parse claude record fixture");
+    let parsed =
+        parse_observation_record_v1(&record, range, ObservationOrderingDomainV1::FileBytes)
+            .expect("parse claude record fixture");
     assert_eq!(parsed.encoded_len(), record.len());
     assert_eq!(
         parsed.value()["message"]["content"],
@@ -42,7 +44,7 @@ mod feature_off {
     fn workload_is_a_no_op_for_profiling() {
         let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join("capture-hotpath-off.json");
         let _ = std::fs::remove_file(&report);
-        // SAFETY: single-threaded with respect to readers — the feature-off
+        // SAFETY: single-threaded with respect to readers, the feature-off
         // build contains no hotpath runtime and nothing else in this test
         // binary reads these variables.
         unsafe {

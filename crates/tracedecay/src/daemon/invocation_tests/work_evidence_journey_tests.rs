@@ -8,8 +8,8 @@ use tracedecay_contracts::{
     DisclosureClass, PrepareWorkProductMutationRequestV1, StartWorkAttemptCommand,
     WorkAttemptEvidenceRecordV1, WorkAttemptProviderOutcomeV1, WorkAttemptStoragePort,
     WorkEvidenceExpansionSelectorV1, WorkEvidenceRetrieveRequestV1, WorkEvidenceSourceV1,
-    WorkGraphReadRequestV1, WorkProductChangeDraftV1, WorkProductMutationRequestV1,
-    WorkProductSelectionScopeV1, WorkRelationScopeV1,
+    WorkGraphReadRequestV1, WorkProductAuthorizedRelationScopeV1, WorkProductChangeDraftV1,
+    WorkProductMutationRequestV1, WorkProductSelectionScopeV1, now_micros,
 };
 use tracedecay_daemon_service::{DaemonInvocationService, *};
 use tracedecay_domain::{
@@ -30,18 +30,9 @@ use tracedecay_lsp::LspSessionRegistry;
 use tracedecay_session_memory::context::{BranchId, ProfileId, SessionRootId, SessionStoreId};
 use tracedecay_tool_catalog::{CapabilityId, UseCaseId};
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).expect("Work evidence journey identity")
-}
+use tracedecay_domain::test_fixtures::id;
 
-fn digest(byte: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64)))
-        .expect("Work evidence journey digest")
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn product_task(task_id: TaskId) -> (WorkInitiativeV1, WorkPlanV1, WorkMilestoneV1, WorkItemV1) {
     let created_at = UtcMicros(10);
@@ -168,10 +159,10 @@ pub(super) fn configured_work_proposal_routing(
         .expect("configuration revision");
     let key = SettingKey::new(WORK_EXECUTABLE_BINDINGS_SETTING_KEY)
         .expect("work executable bindings key");
-    let snapshot = crate::config::resolver::resolve_configuration(
-        &crate::config::registry::ConfigurationRegistry::core()
+    let snapshot = tracedecay_project::config::resolver::resolve_configuration(
+        &tracedecay_project::config::registry::ConfigurationRegistry::core()
             .expect("configuration registry defaults"),
-        &[crate::config::resolver::ConfigurationLayerV1 {
+        &[tracedecay_project::config::resolver::ConfigurationLayerV1 {
             layer: ConfigurationLayerIdV1::Project {
                 project_id: scope.project_id.clone(),
             },
@@ -210,7 +201,7 @@ fn seal_attempt(
     admitted: WorkAttemptV1,
     provider_session: ObservationSourceIdentityV1,
 ) {
-    let observed_at = current_micros();
+    let observed_at = now_micros();
     let running = admitted
         .transition(
             WorkAttemptStateV1::Running,
@@ -278,7 +269,7 @@ async fn invoke_work(
     request_id: &str,
     request: WorkApplicationInvocationV1,
 ) -> DaemonInvocationOutcome {
-    let observed_at = current_micros();
+    let observed_at = now_micros();
     service
         .invoke(
             registry,
@@ -305,7 +296,7 @@ async fn invoke_work_without_attempt_spawn(
     request_id: &str,
     request: WorkApplicationInvocationV1,
 ) -> DaemonInvocationOutcome {
-    let observed_at = current_micros();
+    let observed_at = now_micros();
     let canonical_root = project_root.canonicalize().expect("canonical project root");
     let runtimes = service
         .project_runtimes
@@ -336,13 +327,14 @@ async fn registered_work_evidence_hydrates_the_provider_qualified_task_session()
     let project_id = id::<ProjectId>("project.work.evidence-journey");
     let repository_id = id::<RepositoryId>("repository.work.evidence-journey");
     let worktree_id = id::<WorktreeId>("worktree.work.evidence-journey");
-    let host = crate::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
-        profile.path(),
-        &project,
-        project_id.clone(),
-    )
-    .await
-    .expect("registered project runtime");
+    let host =
+        tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+            profile.path(),
+            &project,
+            project_id.clone(),
+        )
+        .await
+        .expect("registered project runtime");
     let database = host
         .registered_database_arc(tracedecay_sessions::admission::HostAdmissionScope::Project)
         .expect("registered project database");
@@ -423,7 +415,7 @@ async fn registered_work_evidence_hydrates_the_provider_qualified_task_session()
 
     let actor = id::<ActorId>("actor.work.evidence-journey");
     let grant_digest = digest('d');
-    let journey_now = current_micros();
+    let journey_now = now_micros();
     let grant = CapabilityGrantSnapshot::new(
         id::<CapabilityGrantId>("grant.work.evidence-journey"),
         1,
@@ -478,12 +470,13 @@ async fn registered_work_evidence_hydrates_the_provider_qualified_task_session()
         .await
         .expect("registered Work runtime");
     let registry = Arc::new(Mutex::new(LspSessionRegistry::default()));
-    let selection =
-        WorkProductSelectionScopeV1::relations(BTreeSet::from([WorkRelationScopeV1::Repository {
+    let selection = WorkProductSelectionScopeV1::relations(BTreeSet::from([
+        WorkProductAuthorizedRelationScopeV1::Repository {
             project_id: scope.project_id.clone(),
             repository_id: scope.repository_id.clone(),
-        }]))
-        .expect("repository Work selection");
+        },
+    ]))
+    .expect("repository Work selection");
     let (initiative, plan, milestone, item) = product_task(task_id.clone());
     let prepared = invoke_work(
         &service,
@@ -660,7 +653,7 @@ async fn registered_work_evidence_hydrates_the_provider_qualified_task_session()
             commit: id::<CommitId>("0123456789abcdef0123456789abcdef01234567"),
             instructions: "Hydrate the exact provider session.".to_owned(),
             effect_state: WorkEffectStateV1::Observational,
-            occurred_at: current_micros(),
+            occurred_at: now_micros(),
         }),
     )
     .await;
@@ -686,7 +679,7 @@ async fn registered_work_evidence_hydrates_the_provider_qualified_task_session()
         "request.work.evidence-graph",
         WorkApplicationInvocationV1::Views(WorkGraphReadRequestV1::current(
             selection.clone(),
-            current_micros(),
+            now_micros(),
         )),
     )
     .await;
@@ -720,7 +713,7 @@ async fn registered_work_evidence_hydrates_the_provider_qualified_task_session()
                 attempt: attempt.clone(),
             }),
             continuation: None,
-            observed_at: current_micros(),
+            observed_at: now_micros(),
         }),
     )
     .await;

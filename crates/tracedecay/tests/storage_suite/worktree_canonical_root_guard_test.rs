@@ -6,7 +6,7 @@
 //! `tracedecay_runtime_core::worktree::primary_checkout_root`, opening a session
 //! from *any* linked worktree would re-register the shared project with
 //! `canonical_root`/`display_root` pinned to that worktree's own (often
-//! transient) path — the last worktree to touch the project would win.
+//! transient) path, the last worktree to touch the project would win.
 //!
 //! These tests drive the real registration/touch call site
 //! (`TraceDecay::init_with_options` / `TraceDecay::open_with_options`)
@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_runtime_core::path_safety::canonical_root_identity as canonical_temp_path;
 
-use crate::common::canonical_existing_path as canonical_temp_path;
 use crate::home_env_lock::HOME_ENV_LOCK;
 
 fn git_cli_path(path: &Path) -> PathBuf {
@@ -208,7 +209,7 @@ async fn opening_from_linked_worktree_keeps_canonical_root_on_primary() {
         .expect("project should be registered");
     assert_eq!(
         record.canonical_root,
-        HostAdmissionTestRuntimeV1::canonical_project_key(&fx.main),
+        RegisteredGlobalDb::canonical_project_key(&fx.main),
         "canonical_root must stay pinned to the primary checkout, not the worktree that just touched it"
     );
     assert_eq!(
@@ -228,7 +229,7 @@ async fn opening_from_linked_worktree_keeps_canonical_root_on_primary() {
         .expect("linked worktree must expose a git common dir");
     let expected_alias = format!(
         "git-common-dir:{}",
-        HostAdmissionTestRuntimeV1::canonical_project_key(&git_common_dir)
+        RegisteredGlobalDb::canonical_project_key(&git_common_dir)
     );
     assert!(
         context
@@ -275,7 +276,7 @@ async fn stale_worktree_canonical_root_heals_on_next_touch() {
             .expect("stale row should exist");
         assert_eq!(
             stale.canonical_root,
-            HostAdmissionTestRuntimeV1::canonical_project_key(&fx.worktree),
+            RegisteredGlobalDb::canonical_project_key(&fx.worktree),
             "fixture setup should have produced the stale (bug) state"
         );
         drop(db);
@@ -294,7 +295,7 @@ async fn stale_worktree_canonical_root_heals_on_next_touch() {
     let artifact_bytes = std::fs::read(&artifact).expect("read store artifact");
     std::fs::write(&artifact, artifact_bytes).expect("bump store artifact mtime");
 
-    // Any subsequent touch — even one opened from the same worktree — must
+    // Any subsequent touch, even one opened from the same worktree, must
     // self-heal canonical_root/display_root back to the primary checkout.
     let reopened = TraceDecay::open_with_options(&fx.worktree, fx.open_options.clone())
         .await
@@ -311,7 +312,7 @@ async fn stale_worktree_canonical_root_heals_on_next_touch() {
         .expect("project should still be registered");
     assert_eq!(
         healed.canonical_root,
-        HostAdmissionTestRuntimeV1::canonical_project_key(&fx.main),
+        RegisteredGlobalDb::canonical_project_key(&fx.main),
         "a stale worktree-pinned canonical_root must heal back to the primary checkout on touch"
     );
     assert_eq!(healed.display_root, fx.main.to_string_lossy());
@@ -322,5 +323,5 @@ async fn stale_worktree_canonical_root_heals_on_next_touch() {
 // A real git worktree cannot produce that state end-to-end: a linked
 // worktree resolves `git_common_dir` by reading files inside the primary's
 // `.git` directory, so deleting the primary also deletes the very metadata
-// the worktree needs to resolve a common dir at all — the unit test exposes
+// the worktree needs to resolve a common dir at all, the unit test exposes
 // the guard function directly to exercise that branch precisely instead.

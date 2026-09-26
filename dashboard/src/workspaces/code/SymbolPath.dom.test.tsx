@@ -121,7 +121,7 @@ function node(id: string, name: string) {
 }
 
 /** The envelope header the daemon actually stamps, taken from the fixture the
- * contract gate parses rather than hand-built here — a second hand-written
+ * contract gate parses rather than hand-built here, a second hand-written
  * envelope is exactly how a test starts passing against a shape the daemon does
  * not send. */
 function envelope(payload: unknown) {
@@ -142,6 +142,7 @@ function stub(path: unknown) {
             limit: 6,
             offset: 0,
             total: 2,
+            has_more: false,
             count: 2,
             results: [node('n-a', 'alpha'), node('n-c', 'gamma')],
           });

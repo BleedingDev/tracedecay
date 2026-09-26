@@ -8,7 +8,7 @@
 //! facade composed without it rejects every frame before preparation and
 //! stops ingesting host observations silently.
 //!
-//! In production the daemon is the sole owner — profile worker-plan admission
+//! In production the daemon is the sole owner, profile worker-plan admission
 //! during daemon bootstrap (`install_profile_worker_plan` ->
 //! `tracedecay_code_index::parallelism::install_worker_plan`) constructs it at
 //! the effective indexing width and hands it to every ingest composition, and
@@ -30,7 +30,7 @@ use tracedecay_domain::{
 };
 use tracedecay_global_db::tests::harness::HostAdmissionTestRuntimeV1;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
-use tracedecay_privacy::{ClaudeRecordParseErrorV1, parse_normalized_observation_record_v1};
+use tracedecay_privacy::{ObservationRecordParseErrorV1, parse_normalized_observation_record_v1};
 use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
 use tracedecay_sessions::admission::{HostAdmissionScope, HostAdmissionStatus};
 use tracedecay_sessions::observation::{
@@ -78,7 +78,7 @@ fn capture_requests(session_id: &SessionId, count: usize) -> Vec<CaptureObservat
                     }],
                     CanonicalObservationEvidenceV1::new(ordering_domain, range),
                 )
-                .map_err(|_| ClaudeRecordParseErrorV1::NormalizationFailed)
+                .map_err(|_| ObservationRecordParseErrorV1::NormalizationFailed)
             },
         )
         .expect("record normalizes");

@@ -609,14 +609,31 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
     let state = Arc::new(crate::daemon::invocation_state::DaemonInvocationState::default());
     let endpoint_guard = state.lsp_session_registry.lock().await;
     let shutdown_state = Arc::clone(&state);
-    let mut shutdown = Box::pin(async move {
+    let shutdown = tokio::spawn(async move {
         shutdown_state.shutdown().await;
     });
-    // Deterministic: begin_shutdown closes LSP admission before the endpoint
-    // expiry sweep that this test's registry guard is blocking, so once the
-    // gate reads closed the open spawned below is queued strictly between them.
-    assert!(futures_util::poll!(&mut shutdown).is_pending());
-    assert!(!*state.service.lsp_admission_open.lock().await);
+    // The fence the open below must be queued behind is the closed admission
+    // gate, so observe it directly: `begin_shutdown` closes the gate and then
+    // parks on the endpoint registry this test holds. Yielding a fixed number
+    // of times is not an ordering, on a two-worker runtime under load the
+    // shutdown task can still be unscheduled after eight yields, and an open
+    // that wins the gate first is a pre-shutdown admission the sweep retires,
+    // not a queued one the fence refuses.
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if state
+                .service
+                .lsp_admission_open
+                .try_lock()
+                .is_ok_and(|open| !*open)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must close the LSP admission gate while the endpoint registry is held");
 
     let open_state = Arc::clone(&state);
     let (open_started, started) = tokio::sync::oneshot::channel();
@@ -646,13 +663,20 @@ async fn state_shutdown_fences_a_queued_open_before_the_endpoint_expiry_sweep() 
             .await
     });
     started.await.expect("racing open started");
-    let response = tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        open.await.expect("racing LSP open")
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if open.is_finished() || state.service.lsp_admission_open.try_lock().is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
     })
     .await
-    .expect("the fenced open must settle before the endpoint expiry sweep");
+    .expect("shutdown or open must acquire the LSP admission gate");
     drop(endpoint_guard);
-    shutdown.await;
+
+    let response = open.await.expect("racing LSP open");
+    shutdown.await.expect("daemon invocation state shutdown");
 
     assert!(matches!(
         response.outcome,

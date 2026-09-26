@@ -30,7 +30,7 @@ use tracedecay_contracts::feedback::{
     FeedbackListRequestV1, FeedbackListResultV1, FeedbackObservationPort, FeedbackPortFuture,
     FeedbackPublicationReadPort, FeedbackPublicationRecordState, FeedbackPublicationV1,
     FeedbackReadPort, FeedbackReadPortContext, FeedbackReadPortFuture, FeedbackReadService,
-    FeedbackRouteAdmission, FeedbackRouteAuthorizationPort, feedback_surface_operation,
+    FeedbackRouteAuthorizationPort, feedback_surface_operation,
 };
 use tracedecay_contracts::{
     ApplicationContractError, ApplicationOperation, ApplicationProblem, AuthorityReceipt,
@@ -39,6 +39,7 @@ use tracedecay_contracts::{
     RequestId, ResolvedScope, ResultProjection, RetrievalOrder, RetrievalRequestMeta,
     RetryDirective, now_micros,
 };
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_domain::feedback::{
     FeedbackCycleTerminationV1, FeedbackDedupeKeyV1, FeedbackFindingId, FeedbackFindingV1,
 };
@@ -99,6 +100,8 @@ pub enum FeedbackRuntimeError {
     Store,
     #[error("feedback runtime handle operation failed")]
     Handle,
+    #[error("feedback runtime handle store failed")]
+    HandleStore(#[source] TraceDecayError),
     #[error("feedback runtime record is corrupt")]
     Corrupt,
     #[error("feedback observation worker failed")]
@@ -108,13 +111,14 @@ pub enum FeedbackRuntimeError {
 #[derive(Clone)]
 pub struct ProjectFeedbackStore {
     database: Database,
-    project_root: PathBuf,
+    response_handle_root: PathBuf,
     source_observations: Option<Arc<dyn FeedbackObservationEmitterV1 + Send + Sync>>,
 }
 
 #[derive(Clone)]
 pub struct ProjectFeedbackRequestAuthority {
     project_root: PathBuf,
+    response_handle_root: PathBuf,
     scope: ResolvedScope,
     requester: ActorId,
     maximum_expiry: UtcMicros,
@@ -370,7 +374,7 @@ impl ProjectFeedbackObservationSinkV1 {
         // refused) are the waste being diagnosed; count them even though the
         // durable drop tally also travels inside later envelopes.
         hotpath::gauge!("usecases.feedback.observations_dropped").inc(1.0);
-        saturating_increment(&self.dropped_count);
+        saturating_add(&self.dropped_count, 1);
     }
 
     fn restore_drops(&self, dropped: u64) {
@@ -462,10 +466,11 @@ struct StoredFeedbackRequestV1 {
 pub async fn open_feedback_runtime(
     database: Database,
     project_root: impl Into<PathBuf>,
+    response_handle_root: impl Into<PathBuf>,
     scope: ResolvedScope,
     access: ProjectSourceAccessSnapshot,
 ) -> Result<FeedbackRuntime, FeedbackRuntimeError> {
-    FeedbackRuntime::open(database, project_root, scope, access).await
+    FeedbackRuntime::open(database, project_root, response_handle_root, scope, access).await
 }
 
 impl FeedbackRuntime {
@@ -473,6 +478,7 @@ impl FeedbackRuntime {
     pub async fn open(
         database: Database,
         project_root: impl Into<PathBuf>,
+        response_handle_root: impl Into<PathBuf>,
         scope: ResolvedScope,
         access: ProjectSourceAccessSnapshot,
     ) -> Result<Self, FeedbackRuntimeError> {
@@ -481,17 +487,19 @@ impl FeedbackRuntime {
             return Err(FeedbackRuntimeError::AccessDenied);
         }
         let project_root = project_root.into();
+        let response_handle_root = response_handle_root.into();
         let requester = access.requester.clone();
         let maximum_expiry = access.grant_expires_at;
         let requests = ProjectFeedbackRequestAuthority {
-            project_root: project_root.clone(),
+            project_root,
+            response_handle_root: response_handle_root.clone(),
             scope,
             requester,
             maximum_expiry,
         };
         let mut publications = ProjectFeedbackStore {
             database,
-            project_root,
+            response_handle_root,
             source_observations: None,
         };
         let route_authorization = ProjectFeedbackRouteAuthorization {
@@ -551,6 +559,10 @@ impl FeedbackRuntime {
 
     pub fn project_root(&self) -> &Path {
         &self.requests.project_root
+    }
+
+    pub fn response_handle_root(&self) -> &Path {
+        &self.requests.response_handle_root
     }
 
     pub fn scope(&self) -> &ResolvedScope {
@@ -655,7 +667,7 @@ impl ProjectFeedbackRequestAuthority {
         RequestId::new(request_id.clone())?;
         let expires_at = self.expiry_at(observed_at)?;
         store_request_handle(
-            &self.project_root,
+            &self.response_handle_root,
             StoredFeedbackRequestV1 {
                 schema_version: REQUEST_HANDLE_SCHEMA_VERSION,
                 operation: request.operation(),
@@ -677,7 +689,7 @@ impl ProjectFeedbackRequestAuthority {
         observed_at: UtcMicros,
     ) -> Result<AuthorizedFeedbackReadRequestV1, FeedbackReadRequestResolutionV1> {
         let mut record = load_handle_content::<StoredFeedbackRequestV1>(
-            &self.project_root,
+            &self.response_handle_root,
             handle,
             observed_at,
         )?;
@@ -782,7 +794,7 @@ impl FeedbackRouteAuthorizationPort for ProjectFeedbackRouteAuthorization {
         context: &RequestContext,
         operation: &ApplicationOperation,
         observed_at: UtcMicros,
-    ) -> Result<FeedbackRouteAdmission, ApplicationProblem> {
+    ) -> Result<AuthorityReceipt, ApplicationProblem> {
         match context.admission_at(observed_at) {
             RequestAdmission::Cancelled => {
                 return Err(ApplicationProblem::cancelled_before_admission());
@@ -810,7 +822,6 @@ impl FeedbackRouteAuthorizationPort for ProjectFeedbackRouteAuthorization {
             .map_err(|_| ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never))?,
             observed_at,
         )
-        .map(FeedbackRouteAdmission::Routed)
         .map_err(|_| ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never))
     }
 
@@ -818,20 +829,10 @@ impl FeedbackRouteAuthorizationPort for ProjectFeedbackRouteAuthorization {
         &self,
         context: &RequestContext,
         operation: &ApplicationOperation,
-        admission: &FeedbackRouteAdmission,
+        admission: &AuthorityReceipt,
         observed_at: UtcMicros,
     ) -> Result<AuthorityReceipt, ApplicationProblem> {
         let current = self.admit(context, operation, observed_at)?;
-        let FeedbackRouteAdmission::Routed(admission) = admission else {
-            return Err(ApplicationProblem::not_found_or_not_authorized(
-                RetryDirective::Never,
-            ));
-        };
-        let FeedbackRouteAdmission::Routed(current) = current else {
-            return Err(ApplicationProblem::not_found_or_not_authorized(
-                RetryDirective::Never,
-            ));
-        };
         if admission.grant_id != current.grant_id
             || admission.grant_revision != current.grant_revision
             || admission.grant_digest != current.grant_digest
@@ -1448,7 +1449,7 @@ impl ProjectFeedbackStore {
         observed_at: UtcMicros,
     ) -> Result<FeedbackFindingReadV1, FeedbackRuntimeError> {
         let get_handle = store_request_handle(
-            &self.project_root,
+            &self.response_handle_root,
             request_record(
                 context,
                 FeedbackReadRequestV1::Get(FeedbackGetRequestV1 {
@@ -1463,7 +1464,7 @@ impl ProjectFeedbackStore {
             .map(|anchor| {
                 let page = PageRequest::first(DEFAULT_EXPANSION_PAGE_SIZE)?;
                 store_request_handle(
-                    &self.project_root,
+                    &self.response_handle_root,
                     request_record(
                         context,
                         FeedbackReadRequestV1::Expand(FeedbackExpandRequestV1 {
@@ -1503,7 +1504,7 @@ impl ProjectFeedbackStore {
             return Ok(0);
         };
         let stored = load_handle_content::<StoredFeedbackRequestV1>(
-            &self.project_root,
+            &self.response_handle_root,
             cursor.as_str(),
             observed_at,
         )
@@ -1542,7 +1543,8 @@ impl ProjectFeedbackStore {
             }),
         );
         next_request.after_finding_id = Some(after_finding_id.clone());
-        let next_handle = store_request_handle(&self.project_root, next_request, observed_at)?;
+        let next_handle =
+            store_request_handle(&self.response_handle_root, next_request, observed_at)?;
         Ok((OpaqueCursor::new(next_handle)?, expires_at))
     }
 }
@@ -1621,18 +1623,22 @@ fn request_record(
 }
 
 fn store_request_handle(
-    project_root: &Path,
+    response_handle_root: &Path,
     record: StoredFeedbackRequestV1,
     observed_at: UtcMicros,
 ) -> Result<String, FeedbackRuntimeError> {
     let content = serde_json::to_string(&record).map_err(|_| FeedbackRuntimeError::Corrupt)?;
-    let stored = store_response_handle(project_root, &content, micros_to_seconds(observed_at))
-        .map_err(|_| FeedbackRuntimeError::Handle)?;
+    let stored = store_response_handle(
+        response_handle_root,
+        &content,
+        micros_to_seconds(observed_at),
+    )
+    .map_err(FeedbackRuntimeError::HandleStore)?;
     Ok(stored.handle)
 }
 
 fn load_handle_content<T>(
-    project_root: &Path,
+    response_handle_root: &Path,
     handle: &str,
     observed_at: UtcMicros,
 ) -> Result<T, FeedbackReadRequestResolutionV1>
@@ -1643,7 +1649,7 @@ where
         log_handle_refusal("invalid_handle", None);
         return Err(FeedbackReadRequestResolutionV1::NotFoundOrNotAuthorized);
     }
-    match retrieve_response_handle(project_root, handle, micros_to_seconds(observed_at))
+    match retrieve_response_handle(response_handle_root, handle, micros_to_seconds(observed_at))
         .map_err(|_| FeedbackReadRequestResolutionV1::Unavailable)?
     {
         ResponseHandleLookup::Found(record) => {
@@ -1924,10 +1930,6 @@ fn retain_removed_boot_accounting(ledger: &mut StoredFeedbackObservationLedgerV1
     }
 }
 
-fn saturating_increment(counter: &AtomicU64) {
-    saturating_add(counter, 1);
-}
-
 fn saturating_add(counter: &AtomicU64, increment: u64) {
     let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
         Some(count.saturating_add(increment))
@@ -2028,12 +2030,7 @@ mod tests {
     };
     use tracedecay_runtime_core::db::{DatabaseAuthority, TestDatabaseRuntimeMode};
 
-    fn id<T: TryFrom<String>>(value: &str) -> T
-    where
-        T::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).unwrap()
-    }
+    use tracedecay_domain::test_fixtures::id;
 
     fn scope() -> ResolvedScope {
         ResolvedScope::new(
@@ -2101,6 +2098,65 @@ mod tests {
             .unwrap(),
             effective_capabilities: [operation.capability_id().clone()].into_iter().collect(),
             grant_expires_at: UtcMicros(100),
+        }
+    }
+
+    #[test]
+    fn concurrent_request_authorities_keep_handles_in_their_own_store() {
+        let stores = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        let authorities = stores
+            .each_ref()
+            .map(|store| ProjectFeedbackRequestAuthority {
+                project_root: store.path().to_path_buf(),
+                response_handle_root: store.path().join("response-handles"),
+                scope: scope(),
+                requester: id("actor.feedback-reader.requester"),
+                maximum_expiry: UtcMicros(i64::MAX),
+            });
+        let barrier = std::sync::Barrier::new(authorities.len());
+        let handles = std::thread::scope(|threads| {
+            let workers = authorities.each_ref().map(|authority| {
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let request = FeedbackReadRequestV1::List(FeedbackListRequestV1 {
+                        head_commit_id: None,
+                        page: PageRequest::first(10).unwrap(),
+                    });
+                    let request_id = format!(
+                        "request.feedback-reader.{}",
+                        authority
+                            .project_root
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                    );
+                    barrier.wait();
+                    authority.mint(request_id, request, UtcMicros(10)).unwrap()
+                })
+            });
+            workers.map(|worker| worker.join().unwrap())
+        });
+        assert_ne!(handles[0], handles[1]);
+
+        for (owner, other) in [(0, 1), (1, 0)] {
+            assert!(
+                authorities[owner]
+                    .resolve_record(
+                        FeedbackReadOperationV1::List,
+                        &handles[owner],
+                        UtcMicros(11)
+                    )
+                    .is_ok(),
+                "owner {owner} resolves its own handle"
+            );
+            assert!(matches!(
+                authorities[other].resolve_record(
+                    FeedbackReadOperationV1::List,
+                    &handles[owner],
+                    UtcMicros(11)
+                ),
+                Err(FeedbackReadRequestResolutionV1::NotFoundOrNotAuthorized)
+            ));
         }
     }
 

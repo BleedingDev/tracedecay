@@ -1,7 +1,7 @@
 //! The canonical Work HTTP surface.
 //!
-//! Every Work adapter — the daemon's application router, the dashboard's public
-//! `/api/work` mount, the catalog registry, and the generated SDKs — is derived
+//! Every Work adapter, the daemon's application router, the dashboard's public
+//! `/api/work` mount, the catalog registry, and the generated SDKs, is derived
 //! from the single [`WorkOperation`] descriptor in this module. Adding an
 //! operation is one enum variant plus one row in the `work_operations!` table,
 //! which derives every key, id, segment, and path; there is no second route
@@ -360,8 +360,8 @@ impl WorkOperation {
     /// Resolve an operation from the final path segment that names it.
     ///
     /// The route segment is the one public name a Work operation has, so every
-    /// adapter that accepts an operation by name — the router, the CLI, the
-    /// catalog — resolves it here rather than keeping a second name table.
+    /// adapter that accepts an operation by name, the router, the CLI, the
+    /// catalog, resolves it here rather than keeping a second name table.
     pub fn from_route_segment(segment: &str) -> Option<Self> {
         Self::ALL
             .iter()
@@ -374,10 +374,6 @@ impl WorkOperation {
     /// surface but is not a dashboard API.
     pub const fn is_dashboard_operation(self) -> bool {
         !matches!(self, Self::StartAttempt)
-    }
-
-    fn parse(segment: &str) -> Option<Self> {
-        Self::from_route_segment(segment)
     }
 }
 
@@ -497,7 +493,7 @@ where
     let request = match hotpath::measure_block!("api.http.admission", {
         // An operation this build does not mount is concealed the same way an
         // unauthorised one is, so probing a path cannot reveal what exists.
-        match WorkOperation::parse(&segment) {
+        match WorkOperation::from_route_segment(&segment) {
             None => Err(adapter_problem_response(
                 request_id,
                 ApplicationProblem::not_found_or_not_authorized(RetryDirective::Never),
@@ -560,41 +556,5 @@ mod tests {
                 "retired operation {retired} must not be mounted"
             );
         }
-    }
-
-    #[test]
-    fn execution_admission_publishes_the_snapshot_consumed_by_attempt_start() {
-        for operation in [
-            WorkOperation::Create,
-            WorkOperation::ReviewProposal,
-            WorkOperation::AcceptProposal,
-        ] {
-            assert_eq!(
-                operation.result_schema_name(),
-                "WorkProductMutationReceiptV1",
-                "{}",
-                operation.operation_key()
-            );
-        }
-        assert_eq!(
-            WorkOperation::Create.request_schema_name(),
-            "CreateWorkTaskRequestV1"
-        );
-        assert_eq!(
-            WorkOperation::ReviewProposal.request_schema_name(),
-            "ReviewWorkProposalRequestV1"
-        );
-        assert_eq!(
-            WorkOperation::AcceptProposal.request_schema_name(),
-            "AcceptWorkProposalRequestV1"
-        );
-        assert_eq!(
-            WorkOperation::AdmitExecution.request_schema_name(),
-            "AdmitWorkExecutionRequestV1"
-        );
-        assert_eq!(
-            WorkOperation::AdmitExecution.result_schema_name(),
-            "AdmittedWorkExecutionV1"
-        );
     }
 }

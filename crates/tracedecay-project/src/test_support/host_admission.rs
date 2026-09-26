@@ -19,7 +19,7 @@ use tracedecay_host_admission::{
 use tracedecay_sessions::admission::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus,
 };
-use tracedecay_sessions::runtime::codex::CodexDiscoveryHub;
+use tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub;
 
 use crate::project::{TraceDecay, TraceDecayOpenOptions};
 use tracedecay_domain::errors::{Result, TraceDecayError};
@@ -96,10 +96,10 @@ static SESSION_CAPTURE_TEST_RESIDENT_MEMORY: LazyLock<Arc<ProcessResidentMemoryV
 /// authority for injection. Production installs it during daemon worker-plan
 /// admission, which these fixtures never run; without it every observation
 /// capture is refused with `background_cpu_unavailable`. Going through
-/// `install_worker_plan` — the same authority production and the scheduler's
-/// test fallback use — keeps the background CPU width consistent with any
+/// `install_worker_plan` keeps the background CPU width consistent with any
 /// later worker-plan install in the same test process instead of poisoning
-/// it with an ad-hoc width.
+/// it with an ad-hoc width. Production and the scheduler's test fallback use
+/// the same authority.
 pub fn ensure_process_background_cpu_authority() -> Result<Arc<ProcessBackgroundCpuV1>> {
     let memory = SESSION_CAPTURE_TEST_RESIDENT_MEMORY.snapshot();
     let installed = install_worker_plan(
@@ -179,7 +179,7 @@ impl HostAdmissionTestRuntimeV1 {
     /// session registry, mirroring production multi-project composition: one
     /// daemon registry holds the single-writer profile authorities and many
     /// project mounts. A second independent runtime on the same profile
-    /// cannot exist — the profile session-relation graph has exactly one
+    /// cannot exist, the profile session-relation graph has exactly one
     /// writer.
     #[doc(hidden)]
     #[hotpath::skip]
@@ -353,11 +353,6 @@ impl HostAdmissionTestRuntimeV1 {
             background_cpu,
             _database_scope: database_scope,
         })
-    }
-
-    #[doc(hidden)]
-    pub fn canonical_project_key(project_path: &Path) -> String {
-        RegisteredGlobalDb::canonical_project_key(project_path)
     }
 
     #[doc(hidden)]
@@ -669,7 +664,7 @@ impl HostAdmissionTestRuntimeV1 {
         provider: &str,
         session_id: &str,
         transcript_path: &Path,
-    ) -> Result<(i64, i64, i64, i64, i64, i64, i64)> {
+    ) -> Result<(i64, i64, i64, i64, i64, i64)> {
         let snapshot = self
             .session_database_for_test(scope)?
             .read_snapshot()
@@ -679,8 +674,6 @@ impl HostAdmissionTestRuntimeV1 {
                 "SELECT
                     (SELECT COUNT(*) FROM sessions
                      WHERE provider = ?1 AND session_id = ?2),
-                    (SELECT COUNT(*) FROM session_messages
-                     WHERE provider = ?1 AND session_id = ?2),
                     (SELECT COUNT(*) FROM lcm_raw_messages
                      WHERE provider = ?1 AND session_id = ?2),
                     (SELECT COUNT(*) FROM lcm_raw_messages_fts
@@ -688,14 +681,16 @@ impl HostAdmissionTestRuntimeV1 {
                        ON raw.store_id = lcm_raw_messages_fts.rowid
                      WHERE raw.provider = ?1 AND raw.session_id = ?2),
                     (SELECT COUNT(*) FROM lcm_raw_messages_fts),
-                    (SELECT COUNT(*) FROM lcm_summary_nodes
+                    (SELECT COUNT(*) FROM session_summary_nodes
                      WHERE provider = ?1 AND session_id = ?2),
                     (SELECT COUNT(*) FROM parse_offsets
                      WHERE file_path = ?3)",
                 tracedecay_runtime_core::db::engine::params![
                     provider,
                     session_id,
-                    transcript_path.to_string_lossy().as_ref()
+                    tracedecay_sessions::runtime::shared::path_identity_key(
+                        transcript_path.to_string_lossy().as_ref()
+                    )
                 ],
             )
             .await?;
@@ -713,7 +708,6 @@ impl HostAdmissionTestRuntimeV1 {
             row.get(3)?,
             row.get(4)?,
             row.get(5)?,
-            row.get(6)?,
         ))
     }
 
@@ -880,7 +874,7 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         project_root: &Path,
         layout: &tracedecay_runtime_core::storage::StoreLayout,
-    ) -> Result<crate::config::DaemonRuntimeConfiguration> {
+    ) -> Result<tracedecay_configuration::config::PinnedRuntimeConfiguration> {
         crate::config::ensure_runtime_configuration_for_registered_database(
             project_root,
             layout,
@@ -894,7 +888,7 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         project_root: &Path,
         layout: &tracedecay_runtime_core::storage::StoreLayout,
-    ) -> Result<crate::config::DaemonRuntimeConfiguration> {
+    ) -> Result<tracedecay_configuration::config::PinnedRuntimeConfiguration> {
         crate::config::resolve_runtime_configuration_for_registered_database(
             project_root,
             layout,
@@ -908,7 +902,7 @@ impl HostAdmissionTestRuntimeV1 {
         &self,
         project_root: &Path,
         layout: &tracedecay_runtime_core::storage::StoreLayout,
-    ) -> Result<crate::config::DaemonRuntimeConfiguration> {
+    ) -> Result<tracedecay_configuration::config::PinnedRuntimeConfiguration> {
         crate::config::open_runtime_configuration_for_registered_database_read_only(
             project_root,
             layout,
@@ -952,15 +946,13 @@ impl HostAdmissionTestRuntimeV1 {
 
     pub fn facade(&self) -> HostAdmissionFacade<'_> {
         let authorities = match (self.project_id.as_ref(), self.project_registered.as_ref()) {
-            (Some(project_id), Some(project_registered)) => {
-                HostAdmissionAuthorities::registered_for_project(
-                    self.brain_id.clone(),
-                    self.profile_id.clone(),
-                    project_id.clone(),
-                    project_registered,
-                )
-                .with_profile_registered(self.profile_id.clone(), self.profile_registered.as_ref())
-            }
+            (Some(project_id), Some(project_registered)) => HostAdmissionAuthorities::for_project(
+                self.brain_id.clone(),
+                self.profile_id.clone(),
+                project_id.clone(),
+                project_registered,
+            )
+            .with_profile_registered(self.profile_id.clone(), self.profile_registered.as_ref()),
             _ => HostAdmissionAuthorities::for_profile(
                 self.brain_id.clone(),
                 self.profile_id.clone(),
@@ -1145,7 +1137,7 @@ const fn registered_authority_unavailable_outcome() -> HostAdmissionOutcome {
         retryable: true,
         reason_code: Some("registered_authority_unavailable"),
         recovery: None,
-        storage_cause: None,
+        cause: None,
     }
 }
 

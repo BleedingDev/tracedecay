@@ -12,14 +12,13 @@ use super::writer_test_support::{
 };
 use super::{CodeIndexReconcileSink, McpServer, McpServerConstructionContext};
 use crate::mcp::project_route::HookProjectRouteCache;
-use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay_hooks::core_events::{
-    DaemonHookEvent, HookAgent, HookRouteMetadata, HookTerminalReceipt,
-};
+use tracedecay_domain::HostIntegrationIdV1;
+use tracedecay_hooks::core_events::{DaemonHookEvent, HookRouteMetadata, HookTerminalReceipt};
 use tracedecay_host_admission::{
     HostAdmissionBroker, HostAdmissionRuntime, SharedHostAdmissionBroker, SpoolBounds,
 };
 use tracedecay_mcp::JsonRpcRequest;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus,
 };
@@ -29,7 +28,11 @@ use tracedecay_sessions::runtime::git_correlation::{
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
 fn session_start(root: PathBuf) -> Value {
-    serde_json::to_value(DaemonHookEvent::session_start(HookAgent::Codex, root)).unwrap()
+    serde_json::to_value(DaemonHookEvent::session_start(
+        HostIntegrationIdV1::Codex,
+        root,
+    ))
+    .unwrap()
 }
 
 /// Builds the terminal-receipt wire event the Hermes plugin sends. Production
@@ -40,7 +43,7 @@ fn hermes_terminal_receipt_event(
     receipt: HookTerminalReceipt,
 ) -> DaemonHookEvent {
     DaemonHookEvent {
-        agent: HookAgent::Hermes.as_wire().to_string(),
+        agent: HostIntegrationIdV1::Hermes.as_wire().to_string(),
         event: "terminalReceipt".to_string(),
         rel_paths: Vec::new(),
         command: None,
@@ -72,7 +75,7 @@ fn terminal_receipt(root: PathBuf) -> Value {
 }
 
 async fn server_with_broker(
-    cg: crate::project::TraceDecay,
+    cg: tracedecay_project::project::TraceDecay,
     authority: &WriterTestFixtureAuthority,
     broker: SharedHostAdmissionBroker,
     reconcile_sink: CodeIndexReconcileSink,
@@ -84,7 +87,7 @@ async fn server_with_broker(
 }
 
 async fn server_with_owned_project_replay_worker(
-    cg: crate::project::TraceDecay,
+    cg: tracedecay_project::project::TraceDecay,
     authority: &WriterTestFixtureAuthority,
     broker: SharedHostAdmissionBroker,
     reconcile_sink: CodeIndexReconcileSink,
@@ -121,7 +124,7 @@ fn sync_current_branch_payload(branch: &str) -> Vec<u8> {
     tracedecay_mcp::hook_events::encode_durable_hook_event_plan(
         &tracedecay_mcp::hook_events::HookEventPlan::SyncCurrentBranch {
             branch: branch.to_string(),
-            agent: HookAgent::Codex,
+            agent: HostIntegrationIdV1::Codex,
         },
     )
     .expect("sync_current_branch plan should encode")
@@ -149,7 +152,7 @@ async fn hook_watch_policy_refusal_is_not_scheduler_unavailable() {
         tracedecay_mcp::hook_events::HookEventPlan::SyncFiles(vec!["src/a.rs".to_owned()]),
         tracedecay_mcp::hook_events::HookEventPlan::SyncCurrentBranch {
             branch: cg.active_branch().unwrap().to_owned(),
-            agent: HookAgent::Codex,
+            agent: HostIntegrationIdV1::Codex,
         },
     ] {
         let outcome = server
@@ -611,7 +614,7 @@ fn add_branch_at_payload(root: PathBuf, branch: &str) -> Vec<u8> {
         &tracedecay_mcp::hook_events::HookEventPlan::AddBranchAt {
             root,
             branch: branch.to_string(),
-            agent: HookAgent::Codex,
+            agent: HostIntegrationIdV1::Codex,
         },
     )
     .expect("add_branch_at plan should encode")
@@ -620,7 +623,7 @@ fn add_branch_at_payload(root: PathBuf, branch: &str) -> Vec<u8> {
 fn linked_worktree_on(project: &std::path::Path) -> PathBuf {
     use super::writer_test_support::git;
 
-    // Sibling of the unique TempDir root — never a shared /tmp fixed name.
+    // Sibling of the unique TempDir root, never a shared /tmp fixed name.
     let worktree = project.with_file_name(format!(
         "{}-admission-wt",
         project
@@ -1069,7 +1072,7 @@ async fn add_branch_at_restart_replay_rejects_symlink_swap() {
 
 fn session_start_with_route(root: PathBuf) -> Value {
     serde_json::to_value(
-        DaemonHookEvent::session_start(HookAgent::Codex, root.clone()).with_route(Some(
+        DaemonHookEvent::session_start(HostIntegrationIdV1::Codex, root.clone()).with_route(Some(
             HookRouteMetadata {
                 session_id: Some("session-admission-test".to_string()),
                 thread_id: Some("thread-admission-test".to_string()),
@@ -1083,7 +1086,7 @@ fn session_start_with_route(root: PathBuf) -> Value {
 }
 
 async fn server_with_broker_and_runtime(
-    cg: crate::project::TraceDecay,
+    cg: tracedecay_project::project::TraceDecay,
     broker: SharedHostAdmissionBroker,
     reconcile_sink: CodeIndexReconcileSink,
     runtime: Arc<HostAdmissionTestRuntimeV1>,
@@ -1182,7 +1185,7 @@ async fn hook_request_acknowledges_only_after_processing_and_publishes_route() {
 async fn admitted_hook_v2_session_start_publishes_explicit_session_route() {
     let (cg, _project, authority) = init_indexed_repo().await;
     let binding = {
-        let host = tracedecay_hooks::HookHostV1::ClaudeCode;
+        let host = tracedecay_domain::NativeHostIdentityV1::ClaudeCode;
         let binding = tracedecay_hooks::HookScopeBindingV1 {
             host,
             project_id: [1; 16],
@@ -1453,15 +1456,14 @@ async fn durable_route_survives_unavailable_effect_for_same_connection_retry() {
         server_with_broker_and_runtime(cg, Arc::clone(&broker), reconcile_sink, test_runtime).await;
     let raw_session = ["AKIA", "SYNTHETIC", "CANARY", "3"].concat();
     let event = serde_json::to_value(
-        DaemonHookEvent::session_start(HookAgent::Codex, project.path().to_path_buf()).with_route(
-            Some(HookRouteMetadata {
+        DaemonHookEvent::session_start(HostIntegrationIdV1::Codex, project.path().to_path_buf())
+            .with_route(Some(HookRouteMetadata {
                 session_id: Some(raw_session.clone()),
                 thread_id: None,
                 cwd: Some(project.path().to_path_buf()),
                 worktree: Some(project.path().to_path_buf()),
                 branch: Some("main".to_string()),
-            }),
-        ),
+            })),
     )
     .unwrap();
     let mut routes = HookProjectRouteCache::default();
@@ -1619,7 +1621,8 @@ async fn committed_admissions_emit_post_commit_private_route_analytics() {
 async fn credential_canary_receipt_analytics_and_git_span_survive_database_reopen() {
     let (cg, project, authority) = init_indexed_repo().await;
     let dashboard_root = cg.store_layout().dashboard_root.clone();
-    let profile_root = crate::config::user_data_dir().expect("isolated profile root");
+    let profile_root =
+        tracedecay_runtime_core::config::user_data_dir().expect("isolated profile root");
     let project_id = tracedecay_domain::ProjectId::new(
         cg.store_layout()
             .identity

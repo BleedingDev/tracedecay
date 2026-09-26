@@ -14,10 +14,7 @@ use serde_json::Value;
 
 use super::skill_targets::SkillInstallSummary;
 use tracedecay_domain::errors::Result;
-
-/// The unslugged managed-skill start marker. Same literal the agent-hosts
-/// prompt-rules block-splicer stops at.
-pub const SKILL_INDEX_START: &str = "<!-- TRACEDECAY MANAGED SKILLS START -->";
+use tracedecay_runtime_core::path_safety::same_canonical_path;
 
 /// Per-agent outcome of a managed-skill export refresh.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,8 +34,8 @@ pub struct PluginFile {
 
 pub type ExportToAgents = fn(&Path, &Path) -> Vec<ManagedSkillExportReport>;
 pub type ExportToAgentHosts = fn(&Path, &Path, &Path) -> Vec<ManagedSkillExportReport>;
-pub type WriteText = fn(&Path, &str, Option<&Path>) -> Result<()>;
-pub type WriteJson = fn(&Path, &Value, Option<&Path>) -> Result<()>;
+pub type WriteText = fn(&Path, &str) -> Result<()>;
+pub type WriteJson = fn(&Path, &Value) -> Result<()>;
 pub type RemoveHostFile = fn(&Path) -> std::io::Result<()>;
 pub type CodexAgentFiles = fn() -> &'static [PluginFile];
 
@@ -81,22 +78,12 @@ impl HostIo {
         (self.export_to_agent_hosts)(home, project_root, profile_root)
     }
 
-    pub fn safe_write_text_file(
-        &self,
-        path: &Path,
-        contents: &str,
-        backup: Option<&Path>,
-    ) -> Result<()> {
-        (self.write_text)(path, contents, backup)
+    pub fn safe_write_text_file(&self, path: &Path, contents: &str) -> Result<()> {
+        (self.write_text)(path, contents)
     }
 
-    pub fn safe_write_json_file(
-        &self,
-        path: &Path,
-        value: &Value,
-        backup: Option<&Path>,
-    ) -> Result<()> {
-        (self.write_json)(path, value, backup)
+    pub fn safe_write_json_file(&self, path: &Path, value: &Value) -> Result<()> {
+        (self.write_json)(path, value)
     }
 
     pub fn safe_remove_host_file(&self, path: &Path) -> std::io::Result<()> {
@@ -119,44 +106,5 @@ pub fn home_dir() -> Option<PathBuf> {
 
 #[must_use]
 pub fn uses_default_user_profile(home: &Path, profile_root: &Path) -> bool {
-    profile_root == home.join(".tracedecay")
-}
-
-/// A bundle whose file writes land on disk plainly and whose export sweeps
-/// touch no agent host, for tests that exercise automation without a host
-/// installer.
-#[cfg(test)]
-pub(crate) fn plain_file_host_io() -> HostIo {
-    fn export_to_agents(_: &Path, _: &Path) -> Vec<ManagedSkillExportReport> {
-        Vec::new()
-    }
-
-    fn export_to_agent_hosts(_: &Path, _: &Path, _: &Path) -> Vec<ManagedSkillExportReport> {
-        Vec::new()
-    }
-
-    fn write_text(path: &Path, contents: &str, _: Option<&Path>) -> Result<()> {
-        Ok(std::fs::write(path, contents)?)
-    }
-
-    fn write_json(path: &Path, value: &Value, _: Option<&Path>) -> Result<()> {
-        Ok(std::fs::write(path, serde_json::to_vec_pretty(value)?)?)
-    }
-
-    fn remove_host_file(path: &Path) -> std::io::Result<()> {
-        std::fs::remove_file(path)
-    }
-
-    fn codex_agent_files() -> &'static [PluginFile] {
-        &[]
-    }
-
-    HostIo {
-        export_to_agents,
-        export_to_agent_hosts,
-        write_text,
-        write_json,
-        remove_host_file,
-        codex_agent_files,
-    }
+    same_canonical_path(profile_root, &home.join(".tracedecay"))
 }

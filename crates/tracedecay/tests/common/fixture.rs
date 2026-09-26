@@ -1,9 +1,9 @@
 //! The shared fixture authority: one isolated environment, one profile, and
 //! project identities resolved and registered through the production paths.
 //!
-//! Test setup used to reimplement identity resolution — synthesizing a profile
+//! Test setup used to reimplement identity resolution, synthesizing a profile
 //! root, re-deriving a store layout, writing an enrollment marker by hand,
-//! running a fresh `git init` per fixture — and each reimplementation got some
+//! running a fresh `git init` per fixture, and each reimplementation got some
 //! part of it subtly wrong in a different way. The pieces here compose instead,
 //! and every one of them delegates to the authority production uses:
 //!
@@ -44,9 +44,10 @@ use std::process::{Command, Output};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
-use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_domain::ProjectId;
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 use tracedecay_runtime_core::storage::{self, StoreLayout};
 
 use super::IsolatedEnv;
@@ -134,7 +135,7 @@ impl TestProfile {
                 path.display()
             )
         });
-        path.canonicalize().unwrap_or_else(|err| {
+        canonical_existing_identity(&path).unwrap_or_else(|err| {
             panic!(
                 "failed to canonicalize fixture directory '{}': {err}",
                 path.display()
@@ -160,7 +161,7 @@ impl TestProfile {
     }
 
     async fn enroll_inner(&self, project_root: &Path) -> RegisteredProject {
-        let project_root = project_root.canonicalize().unwrap_or_else(|err| {
+        let project_root = canonical_existing_identity(project_root).unwrap_or_else(|err| {
             panic!(
                 "fixture project root '{}' must exist to be enrolled: {err}",
                 project_root.display()
@@ -262,12 +263,7 @@ impl TestProfile {
     pub fn unenrolled(&self, name: impl AsRef<Path>) -> UnenrolledProject {
         let root = self.path(name);
         assert!(
-            !storage::has_repository_identity_marker(&root)
-                && storage::read_legacy_enrollment_marker(&root)
-                    .unwrap_or_else(|err| {
-                        panic!("failed to read fixture enrollment marker: {err}")
-                    })
-                    .is_none(),
+            !storage::has_repository_identity_marker(&root),
             "an unenrolled fixture root must not carry an identity marker: {}",
             root.display()
         );
@@ -487,10 +483,10 @@ impl RegisteredProject {
     /// and project-session seams require.
     pub fn project_scoped_runtime(
         &self,
-    ) -> tracedecay::test_support::host_admission::ProjectScopedTestRuntimeV1 {
-        tracedecay::test_support::host_admission::ProjectScopedTestRuntimeV1::new(Arc::clone(
-            &self.registry,
-        ))
+    ) -> tracedecay_project::test_support::host_admission::ProjectScopedTestRuntimeV1 {
+        tracedecay_project::test_support::host_admission::ProjectScopedTestRuntimeV1::new(
+            Arc::clone(&self.registry),
+        )
         .unwrap_or_else(|err| panic!("fixture project runtime must be project-scoped: {err}"))
     }
 
@@ -601,7 +597,7 @@ impl GitFixture {
     /// built once per target directory.
     ///
     /// The template carries the `git init`, the branch rename, and the initial
-    /// commit — including a `.gitignore` for `.tracedecay/`, so a fixture that
+    /// commit, including a `.gitignore` for `.tracedecay/`, so a fixture that
     /// stages its working tree can never commit enrollment state. Falls back to
     /// building in place when the template is unavailable, so a template
     /// failure can never change what a test exercises.
@@ -676,7 +672,7 @@ impl GitFixture {
         if !seeded {
             self.run(&["init", "--bare", &origin.to_string_lossy()]);
         }
-        let origin = origin.canonicalize().unwrap_or_else(|err| {
+        let origin = canonical_existing_identity(&origin).unwrap_or_else(|err| {
             panic!(
                 "failed to canonicalize fixture origin '{}': {err}",
                 origin.display()
@@ -705,16 +701,13 @@ impl GitFixture {
     }
 
     fn assert_collapses_onto_primary(&self, path: &Path) -> PathBuf {
-        let path = path.canonicalize().unwrap_or_else(|err| {
+        let path = canonical_existing_identity(path).unwrap_or_else(|err| {
             panic!(
                 "failed to canonicalize fixture worktree '{}': {err}",
                 path.display()
             )
         });
-        let primary = self
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| self.root.clone());
+        let primary = canonical_existing_identity(&self.root).unwrap_or_else(|_| self.root.clone());
         assert_eq!(
             tracedecay_runtime_core::worktree::repository_identity_root(&path),
             Some(primary.clone()),
@@ -762,11 +755,11 @@ fn ensure_git_template() -> Option<PathBuf> {
         .write(true)
         .open(&lock_path)
         .ok()?;
-    fs2::FileExt::lock_exclusive(&lock_file).ok()?;
+    lock_file.lock().ok()?;
 
     // Another process may have finished the build while we waited.
     if shared.join("READY").is_file() {
-        let _ = fs2::FileExt::unlock(&lock_file);
+        let _ = lock_file.unlock();
         return Some(shared);
     }
 
@@ -791,7 +784,7 @@ fn ensure_git_template() -> Option<PathBuf> {
             None
         }
     };
-    let _ = fs2::FileExt::unlock(&lock_file);
+    let _ = lock_file.unlock();
     result
 }
 
@@ -856,4 +849,162 @@ fn copy_tree_contents(src: &Path, dest: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The one report the TypeScript fixture's compiler prints, byte-for-byte the
+/// `tsc --noEmit --pretty false` shape for a real `TS4023` on `src/index.ts`
+/// line 3 column 14, where `value` is declared.
+pub const TYPESCRIPT_FIXTURE_TSC_REPORT: &str = "src/index.ts(3,14): error TS4023: Exported variable 'value' has or is using name 'Hidden' from external module \"./src/dep\" but cannot be named.\n";
+
+/// Where the fixture compiler records each invocation: one line per run with
+/// the working directory and the arguments it received.
+pub const TYPESCRIPT_FIXTURE_TSC_INVOCATIONS: &str = "node_modules/tsc-invocations.log";
+
+/// Whether the TypeScript fixture project carries its own compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeScriptFixtureCompiler {
+    /// `node_modules/.bin/tsc` exists and reports [`TYPESCRIPT_FIXTURE_TSC_REPORT`].
+    Present,
+    /// No `node_modules` at all: a checkout before `npm install`.
+    Missing,
+}
+
+/// A small TypeScript project whose sources genuinely produce `TS4023` under
+/// `declaration: true`: `index.ts` exports a value typed by an interface
+/// `dep.ts` does not export. With [`TypeScriptFixtureCompiler::Present`] the
+/// project's own `node_modules/.bin/tsc` reports that finding, so the daemon's
+/// producer must run exactly that binary from the project root.
+#[cfg(unix)]
+pub fn write_typescript_diagnostics_fixture(project: &Path, compiler: TypeScriptFixtureCompiler) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(project.join("src")).unwrap();
+    fs::write(
+        project.join("package.json"),
+        "{\n  \"name\": \"diagnostics-fixture\",\n  \"private\": true\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("tsconfig.json"),
+        "{\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"declaration\": true,\n    \"module\": \"es2022\",\n    \"target\": \"es2022\"\n  },\n  \"include\": [\"src\"]\n}\n",
+    )
+    .unwrap();
+    fs::write(project.join(".gitignore"), "node_modules/\n").unwrap();
+    fs::write(
+        project.join("src/dep.ts"),
+        "interface Hidden {\n  a: number;\n}\n\nexport function make(): Hidden {\n  return { a: 1 };\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("src/index.ts"),
+        "import { make } from \"./dep\";\n\nexport const value = make();\n",
+    )
+    .unwrap();
+    if compiler == TypeScriptFixtureCompiler::Missing {
+        return;
+    }
+    let bin = project.join("node_modules/.bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tsc = bin.join("tsc");
+    fs::write(
+        &tsc,
+        format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$(pwd)\" \"$*\" >> \"{}\"\ncat <<'TSC_REPORT'\n{}TSC_REPORT\nexit 2\n",
+            project.join(TYPESCRIPT_FIXTURE_TSC_INVOCATIONS).display(),
+            TYPESCRIPT_FIXTURE_TSC_REPORT
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The package file the monorepo fixture's `TS4023` is reported on.
+pub const TYPESCRIPT_MONOREPO_APP_FILE: &str = "packages/app/src/index.ts";
+
+/// A TypeScript file in the monorepo fixture that no tsconfig owns.
+pub const TYPESCRIPT_MONOREPO_UNOWNED_FILE: &str = "scripts/release.ts";
+
+/// The issue #2025 layout: a pnpm workspace whose packages each carry a
+/// `tsconfig.json` extending a root `tsconfig.base.json`, with no root
+/// `tsconfig.json`. `packages/app` has the same genuine `TS4023` sources as
+/// [`write_typescript_diagnostics_fixture`]; `packages/lib` is clean.
+///
+/// With [`TypeScriptFixtureCompiler::Present`] the workspace root's
+/// `node_modules/.bin/tsc` (pnpm hoists the binary of a root dev dependency)
+/// logs every invocation to [`TYPESCRIPT_FIXTURE_TSC_INVOCATIONS`] and reports
+/// the finding only when pointed at `packages/app/tsconfig.json`, so a record
+/// on [`TYPESCRIPT_MONOREPO_APP_FILE`] proves the producer checked that
+/// package's own tsconfig.
+#[cfg(unix)]
+pub fn write_typescript_monorepo_diagnostics_fixture(
+    project: &Path,
+    compiler: TypeScriptFixtureCompiler,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let files = [
+        (
+            "package.json",
+            "{\n  \"name\": \"monorepo-fixture\",\n  \"private\": true,\n  \"devDependencies\": { \"typescript\": \"5.6.3\" }\n}\n",
+        ),
+        ("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n"),
+        ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+        (".gitignore", "node_modules/\n"),
+        (
+            "tsconfig.base.json",
+            "{\n  // shared by every package\n  \"compilerOptions\": {\n    \"strict\": true,\n    \"declaration\": true,\n    \"module\": \"es2022\",\n    \"target\": \"es2022\",\n  },\n}\n",
+        ),
+        (
+            "packages/app/package.json",
+            "{ \"name\": \"@fixture/app\", \"private\": true }\n",
+        ),
+        (
+            "packages/app/tsconfig.json",
+            "{ \"extends\": \"../../tsconfig.base.json\", \"include\": [\"src\"] }\n",
+        ),
+        (
+            "packages/app/src/dep.ts",
+            "interface Hidden {\n  a: number;\n}\n\nexport function make(): Hidden {\n  return { a: 1 };\n}\n",
+        ),
+        (
+            TYPESCRIPT_MONOREPO_APP_FILE,
+            "import { make } from \"./dep\";\n\nexport const value = make();\n",
+        ),
+        (
+            "packages/lib/package.json",
+            "{ \"name\": \"@fixture/lib\", \"private\": true }\n",
+        ),
+        (
+            "packages/lib/tsconfig.json",
+            "{ \"extends\": \"../../tsconfig.base.json\", \"include\": [\"src\"] }\n",
+        ),
+        (
+            "packages/lib/src/lib.ts",
+            "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+        ),
+        (
+            TYPESCRIPT_MONOREPO_UNOWNED_FILE,
+            "export const release = \"v1\";\n",
+        ),
+    ];
+    for (path, contents) in files {
+        let path = project.join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+    }
+    if compiler == TypeScriptFixtureCompiler::Missing {
+        return;
+    }
+    let bin = project.join("node_modules/.bin");
+    fs::create_dir_all(&bin).unwrap();
+    let tsc = bin.join("tsc");
+    fs::write(
+        &tsc,
+        format!(
+            "#!/bin/sh\nprintf '%s %s\\n' \"$(pwd)\" \"$*\" >> \"{}\"\ncase \"$2\" in\n  */packages/app/tsconfig.json)\n    echo \"{TYPESCRIPT_MONOREPO_APP_FILE}(3,14): error TS4023: Exported variable 'value' has or is using name 'Hidden' from external module \\\"./dep\\\" but cannot be named.\"\n    exit 2 ;;\nesac\nexit 0\n",
+            project.join(TYPESCRIPT_FIXTURE_TSC_INVOCATIONS).display(),
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&tsc, fs::Permissions::from_mode(0o755)).unwrap();
 }

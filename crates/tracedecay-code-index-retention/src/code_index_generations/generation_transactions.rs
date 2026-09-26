@@ -2,26 +2,24 @@
 //!
 //! Quarantined generations are journaled, then hard-linked into the replay pool before the receipt is durable.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::Read;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
 use tracedecay_domain::CodeGenerationId;
 use tracedecay_domain::canonical_text::{encode_lowercase_hex, is_lowercase_hex};
 
+use super::file_quarantine::{FileQuarantine, open_optional_dir};
 use super::graph_replay_release;
-use super::journal::{
-    BoundedJournalSpec, clear_journal, journal_path, load_journal, persist_journal,
-};
+use super::journal::{BoundedJournalSpec, journal_path};
 use super::locking::{CodeGenerationStoreLockV1, try_acquire_code_generation_store_lock};
-use super::receipt_store;
 use super::receipt_store::ReceiptStoreSpec;
 use super::{
     CodeGenerationRetentionErrorV1, CodeGenerationRetentionGenerationV1,
@@ -32,14 +30,17 @@ use super::{
     sync_directory, total_bytes, validate_generation_file, write_active_pointer,
 };
 
-const GENERATION_TRANSACTION_JOURNAL: BoundedJournalSpec<CodeGenerationRetentionTransactionV1> =
-    BoundedJournalSpec {
-        file_name: TRANSACTION_FILE,
-        max_bytes: MAX_TRANSACTION_BYTES,
-        label: "retention transaction",
-        write_context: "code-generation-retention-transaction",
-        validate: validate_transaction,
-    };
+pub(super) const GENERATION_TRANSACTION_JOURNAL: BoundedJournalSpec<
+    CodeGenerationRetentionTransactionV1,
+> = BoundedJournalSpec {
+    file_name: TRANSACTION_FILE,
+    max_bytes: MAX_TRANSACTION_BYTES,
+    label: "retention transaction",
+    write_context: "code-generation-retention-transaction",
+    validate: validate_transaction,
+};
+
+const GENERATION_QUARANTINE_LABEL: &str = "collectable generation";
 
 pub(super) const GENERATION_RECEIPT_STORE: ReceiptStoreSpec = ReceiptStoreSpec {
     directory: RECEIPTS_DIRECTORY,
@@ -56,19 +57,6 @@ pub(super) fn transaction_stage_root(
     store_root
         .join(QUARANTINE_DIRECTORY)
         .join(&receipt.receipt_digest)
-}
-
-pub(super) fn persist_transaction(
-    store_root: &Path,
-    transaction: &CodeGenerationRetentionTransactionV1,
-) -> Result<(), CodeGenerationRetentionErrorV1> {
-    persist_journal(store_root, &GENERATION_TRANSACTION_JOURNAL, transaction)
-}
-
-pub(super) fn load_transaction(
-    store_root: &Path,
-) -> Result<Option<CodeGenerationRetentionTransactionV1>, CodeGenerationRetentionErrorV1> {
-    load_journal(store_root, &GENERATION_TRANSACTION_JOURNAL)
 }
 
 pub(super) fn validate_transaction(
@@ -140,80 +128,27 @@ pub(super) fn validate_transaction(
     Ok(())
 }
 
-pub(super) fn receipt_is_durable(
-    store_root: &Path,
-    receipt: &CodeGenerationRetentionReceiptV1,
-) -> Result<bool, CodeGenerationRetentionErrorV1> {
-    receipt_store::receipt_is_durable(
-        store_root,
-        &GENERATION_RECEIPT_STORE,
-        &receipt.receipt_digest,
-        receipt,
-    )
-}
-
-pub(super) fn write_receipt(
-    store_root: &Path,
-    receipt: &CodeGenerationRetentionReceiptV1,
-) -> Result<(), CodeGenerationRetentionErrorV1> {
-    receipt_store::write_receipt(
-        store_root,
-        &GENERATION_RECEIPT_STORE,
-        &receipt.receipt_digest,
-        receipt,
-    )
-}
-
 #[hotpath::measure(label = "usecases.retention.stage")]
 pub(super) fn stage_collectable_generations(
     store_root: &Path,
     transaction: &CodeGenerationRetentionTransactionV1,
 ) -> Result<(), CodeGenerationRetentionErrorV1> {
-    let generations_root = store_root.join(GENERATIONS_DIRECTORY);
-    let stage_root = transaction_stage_root(store_root, &transaction.receipt);
-    std::fs::create_dir_all(&stage_root).map_err(storage)?;
-    sync_directory(stage_root.parent().ok_or_else(|| {
-        CodeGenerationRetentionErrorV1::UnsafeState("retention quarantine has no parent".to_owned())
-    })?)?;
-
+    let generations = open_optional_dir(&store_root.join(GENERATIONS_DIRECTORY))?;
+    let quarantine = FileQuarantine::prepare(
+        GENERATION_QUARANTINE_LABEL,
+        &store_root.join(QUARANTINE_DIRECTORY),
+        &transaction.receipt.receipt_digest,
+    )?;
     for generation in &transaction.receipt.deleted_generations {
-        let source = generations_root.join(&generation.generation_file);
-        let staged = stage_root.join(&generation.generation_file);
-        match (regular_file_exists(&source)?, regular_file_exists(&staged)?) {
-            (true, false) => {
-                // No-follow: `regular_file_exists` already proved the path is
-                // a regular file, and sizing through a racing symlink would
-                // measure foreign bytes.
-                let metadata = std::fs::symlink_metadata(&source).map_err(storage)?;
-                if metadata.len() != generation.size_bytes {
-                    return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                        "collectable generation '{}' changed after the mark phase",
-                        generation.generation_file
-                    )));
-                }
-                std::fs::rename(&source, &staged).map_err(storage)?;
-                sync_directory(&generations_root)?;
-                sync_directory(&stage_root)?;
-            }
-            (false, false) => {
+        quarantine.stage(generations.as_ref(), &generation.generation_file, |file| {
+            if file.metadata().map_err(storage)?.len() != generation.size_bytes {
                 return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                    "collectable generation '{}' is missing before quarantine",
+                    "collectable generation '{}' changed after the mark phase",
                     generation.generation_file
                 )));
             }
-            (false, true) => {
-                return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                    "collectable generation '{}' was already quarantined",
-                    generation.generation_file
-                )));
-            }
-            (true, true) => {
-                return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                    "collectable generation '{}' exists in both source and quarantine",
-                    generation.generation_file
-                )));
-            }
-        }
+            Ok(())
+        })?;
     }
     crate::hotpath_observe::retention_quarantined(
         transaction
@@ -264,23 +199,30 @@ pub(super) fn acquire_graph_replay_pool_lock_checked(
     GraphReplayPoolLockV1::acquire_exclusive(pool_root, deadline, is_cancelled)
 }
 
+// Per-thread, not process-wide: an acquire runs on its caller's thread, and
+// the test harness runs the other acquire tests in parallel on their own
+// threads. Shared statics let any concurrent acquire land between a test's
+// reset and its read, which is what turned the exact `(1, 0)` proof into an
+// occasional `(5, 3)`.
 #[cfg(test)]
-static GRAPH_REPLAY_POOL_ACQUIRE_TRIES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static GRAPH_REPLAY_POOL_ACQUIRE_WAITS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static GRAPH_REPLAY_POOL_ACQUIRE_TRIES: Cell<usize> = const { Cell::new(0) };
+    static GRAPH_REPLAY_POOL_ACQUIRE_WAITS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(super) fn reset_graph_replay_pool_acquire_observation() {
-    GRAPH_REPLAY_POOL_ACQUIRE_TRIES.store(0, Ordering::SeqCst);
-    GRAPH_REPLAY_POOL_ACQUIRE_WAITS.store(0, Ordering::SeqCst);
+    GRAPH_REPLAY_POOL_ACQUIRE_TRIES.with(|tries| tries.set(0));
+    GRAPH_REPLAY_POOL_ACQUIRE_WAITS.with(|waits| waits.set(0));
 }
 
-/// `(non_blocking_tries, wait_for_exclusive_calls)` since the last reset.
+/// `(non_blocking_tries, wait_for_exclusive_calls)` on this thread since the
+/// last reset.
 #[cfg(test)]
 pub(super) fn graph_replay_pool_acquire_observation() -> (usize, usize) {
     (
-        GRAPH_REPLAY_POOL_ACQUIRE_TRIES.load(Ordering::SeqCst),
-        GRAPH_REPLAY_POOL_ACQUIRE_WAITS.load(Ordering::SeqCst),
+        GRAPH_REPLAY_POOL_ACQUIRE_TRIES.with(Cell::get),
+        GRAPH_REPLAY_POOL_ACQUIRE_WAITS.with(Cell::get),
     )
 }
 
@@ -307,7 +249,7 @@ impl GraphReplayPoolLockV1 {
             // the budget is gone. Windows lock-conflict is `Ok(None)` via
             // `is_lock_contended`, not Storage.
             #[cfg(test)]
-            GRAPH_REPLAY_POOL_ACQUIRE_TRIES.fetch_add(1, Ordering::SeqCst);
+            GRAPH_REPLAY_POOL_ACQUIRE_TRIES.with(|tries| tries.set(tries.get() + 1));
             match try_acquire_code_generation_store_lock(pool_root)? {
                 Some(guard) => {
                     crate::hotpath_observe::retention_replay_pool_acquired();
@@ -327,7 +269,7 @@ impl GraphReplayPoolLockV1 {
 
     fn wait_for_exclusive(deadline: Instant) {
         #[cfg(test)]
-        GRAPH_REPLAY_POOL_ACQUIRE_WAITS.fetch_add(1, Ordering::SeqCst);
+        GRAPH_REPLAY_POOL_ACQUIRE_WAITS.with(|waits| waits.set(waits.get() + 1));
         crate::hotpath_observe::retention_replay_pool_acquire_wait();
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -364,7 +306,7 @@ impl GraphReplayPoolLockV1 {
 /// directory. The pool root sits directly beside the graph database
 /// (`database_path().with_extension("graph-replay")`), so its parent always
 /// exists and no ancestors are ever manufactured the way `create_dir_all`
-/// would — under a permissive umask that would hard-link already-private
+/// would, under a permissive umask that would hard-link already-private
 /// sealed generations into a world-readable pool.
 pub(super) fn ensure_private_graph_replay_pool_root(
     pool_root: &Path,
@@ -713,7 +655,7 @@ pub(super) fn read_full(
 /// Withdraw a rolled-back transaction's pool exposure. The canonical files
 /// are restored by the rollback rename before this runs, so the graph replay
 /// path resolves them from the generation directory again. Only entries that
-/// are provably that generation's sealed bytes are removed — normally the
+/// are provably that generation's sealed bytes are removed, normally the
 /// very inode the rollback just renamed back, or a same-digest copy left by
 /// the eager staging path. A foreign same-name entry (non-regular or with
 /// different bytes) was never linked by this transaction and is left in
@@ -765,31 +707,14 @@ pub(super) fn rollback_staged_transaction(
     transaction: &CodeGenerationRetentionTransactionV1,
     graph_replay_pool_root: Option<&Path>,
 ) -> Result<(), CodeGenerationRetentionErrorV1> {
-    let generations_root = store_root.join(GENERATIONS_DIRECTORY);
-    let stage_root = transaction_stage_root(store_root, &transaction.receipt);
+    let generations = open_optional_dir(&store_root.join(GENERATIONS_DIRECTORY))?;
+    let quarantine = FileQuarantine::recover(
+        GENERATION_QUARANTINE_LABEL,
+        &store_root.join(QUARANTINE_DIRECTORY),
+        &transaction.receipt.receipt_digest,
+    )?;
     for generation in &transaction.receipt.deleted_generations {
-        let source = generations_root.join(&generation.generation_file);
-        let staged = stage_root.join(&generation.generation_file);
-        match (regular_file_exists(&source)?, regular_file_exists(&staged)?) {
-            (true, false) => {}
-            (false, true) => {
-                std::fs::rename(&staged, &source).map_err(storage)?;
-                sync_directory(&generations_root)?;
-                sync_directory(&stage_root)?;
-            }
-            (false, false) => {
-                return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                    "retention rollback cannot find '{}'",
-                    generation.generation_file
-                )));
-            }
-            (true, true) => {
-                return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                    "retention rollback found duplicate '{}'",
-                    generation.generation_file
-                )));
-            }
-        }
+        quarantine.restore(generations.as_ref(), &generation.generation_file)?;
     }
     if let Some(pool_root) = graph_replay_pool_root {
         withdraw_generations_from_graph_replay_pool(store_root, transaction, pool_root)?;
@@ -801,7 +726,7 @@ pub(super) fn rollback_staged_transaction(
     // reverse order is safe at every intermediate crash point because a
     // rewritten pointer names a strict subset of what is on disk.
     restore_pointer_for_rollback(store_root, transaction)?;
-    remove_empty_stage_root(&stage_root)
+    quarantine.remove_empty_stage()
 }
 
 /// Put the pre-collection `generation_index` back after a rolled-back unit.
@@ -885,23 +810,16 @@ pub(super) fn cleanup_committed_transaction_under_graph_replay_pool_lock(
     if let Some(pool_lock) = graph_replay_pool_lock {
         verify_committed_graph_replay_pool_state(store_root, transaction, pool_lock)?;
     }
-    let generations_root = store_root.join(GENERATIONS_DIRECTORY);
-    let stage_root = transaction_stage_root(store_root, &transaction.receipt);
+    let generations = open_optional_dir(&store_root.join(GENERATIONS_DIRECTORY))?;
+    let quarantine = FileQuarantine::recover(
+        GENERATION_QUARANTINE_LABEL,
+        &store_root.join(QUARANTINE_DIRECTORY),
+        &transaction.receipt.receipt_digest,
+    )?;
     for generation in &transaction.receipt.deleted_generations {
-        let source = generations_root.join(&generation.generation_file);
-        if regular_file_exists(&source)? {
-            return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-                "retention receipt is durable but '{}' returned to the generation directory",
-                generation.generation_file
-            )));
-        }
-        let staged = stage_root.join(&generation.generation_file);
-        if regular_file_exists(&staged)? {
-            std::fs::remove_file(&staged).map_err(storage)?;
-            sync_directory(&stage_root)?;
-        }
+        quarantine.remove_committed(generations.as_ref(), &generation.generation_file)?;
     }
-    remove_empty_stage_root(&stage_root)
+    quarantine.remove_empty_stage()
 }
 
 pub(super) fn ensure_transaction_liveness(
@@ -946,30 +864,6 @@ pub(super) fn ensure_transaction_liveness(
         ));
     }
     Ok(())
-}
-
-pub(super) fn clear_transaction(store_root: &Path) -> Result<(), CodeGenerationRetentionErrorV1> {
-    clear_journal(store_root, &GENERATION_TRANSACTION_JOURNAL)
-}
-
-pub(super) fn remove_empty_stage_root(
-    stage_root: &Path,
-) -> Result<(), CodeGenerationRetentionErrorV1> {
-    let mut entries = match std::fs::read_dir(stage_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(storage(error)),
-    };
-    if entries.next().is_some() {
-        return Err(CodeGenerationRetentionErrorV1::UnsafeState(format!(
-            "retention quarantine '{}' contains unexpected files",
-            stage_root.display()
-        )));
-    }
-    std::fs::remove_dir(stage_root).map_err(storage)?;
-    sync_directory(stage_root.parent().ok_or_else(|| {
-        CodeGenerationRetentionErrorV1::UnsafeState("retention quarantine has no parent".to_owned())
-    })?)
 }
 
 pub(super) fn regular_file_exists(path: &Path) -> Result<bool, CodeGenerationRetentionErrorV1> {

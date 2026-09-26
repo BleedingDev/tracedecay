@@ -9,7 +9,7 @@ use tracedecay_tool_catalog::{EffectClass, SortContractId};
 
 use crate::retained_surfaces::{
     RetainedSurfaceEvidenceFactsV1, RetainedSurfaceEvidenceTerminalV1, RetainedSurfaceOperation,
-    RetainedSurfaceResultV1, RetainedSurfaceTemporalRequestV1, SessionCoverageModeV1,
+    RetainedSurfaceResultV1, RetainedSurfaceTemporalRequestV1,
 };
 use crate::{
     ApplicationOutcome, AuthorityReceipt, CancellationStage, CoverageDomainState, Deadline,
@@ -600,14 +600,7 @@ fn temporal_request_mode(
             "the temporal coverage requests disagreed on their mode",
         ));
     }
-    Ok(match first.mode {
-        SessionCoverageModeV1::Current => TemporalModeV1::Current,
-        SessionCoverageModeV1::AsOf { cutoff } => TemporalModeV1::AsOf {
-            cutoff: tracedecay_domain::UtcMicros(cutoff),
-        },
-        SessionCoverageModeV1::Evolution => TemporalModeV1::Evolution,
-        SessionCoverageModeV1::Forensic => TemporalModeV1::Forensic,
-    })
+    Ok(first.mode)
 }
 
 struct CountingSink {
@@ -688,7 +681,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use tracedecay_domain::{
-        ActorId, ManifestDigest, ProjectId, RepositoryId, UtcMicros, WorktreeId, canonical_sha256,
+        ActorId, ProjectId, RepositoryId, UtcMicros, WorktreeId, canonical_sha256,
     };
 
     use crate::retained_surfaces::{
@@ -704,10 +697,7 @@ mod tests {
 
     use super::session_refresh_effect_outcome;
 
-    fn digest(byte: char) -> ManifestDigest {
-        ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64)))
-            .expect("valid digest")
-    }
+    use tracedecay_domain::test_fixtures::digest;
 
     fn refresh_effect_settlement(
         reconciliation_required: bool,

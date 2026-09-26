@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
-use fs2::FileExt;
+use tracedecay_private_fs::FileLease;
 use tracedecay_private_fs::framed_log::{DirectorySyncPolicy, set_owner_private_file_mode};
 
 use crate::config;
@@ -12,10 +12,10 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 #[cfg(windows)]
 use super::DURABLE_REMOVAL_TOMBSTONE_PREFIX;
 use super::{
-    ActiveProjectContext, BRANCH_META_FILENAME, DurableAtomicWritePhase, EnrollmentMarker,
-    GraphScopeId, PrivateStoreIo, ProjectIdentity, ProjectPath, QueryTarget,
-    RESPONSE_HANDLES_DIRECTORY, SESSIONS_DB_FILENAME, STORE_MANIFEST_SCHEMA_VERSION, StorageMode,
-    StoreArtifactPath, StoreKind, StoreLayout, StoreManifest, inject_durable_atomic_write_fault,
+    ActiveProjectContext, BRANCH_META_FILENAME, DurableAtomicWritePhase, GraphScopeId,
+    PrivateStoreIo, ProjectIdentity, ProjectPath, QueryTarget, RESPONSE_HANDLES_DIRECTORY,
+    SESSIONS_DB_FILENAME, STORE_MANIFEST_SCHEMA_VERSION, StorageMode, StoreArtifactPath, StoreKind,
+    StoreLayout, StoreManifest, inject_durable_atomic_write_fault,
     inject_durable_namespace_sync_fault,
 };
 
@@ -98,7 +98,7 @@ impl ProjectPath {
     }
 
     pub fn relative_path_string(&self) -> String {
-        self.relative_path.to_string_lossy().replace('\\', "/")
+        tracedecay_domain::forward_slash_path(&self.relative_path)
     }
 }
 
@@ -768,7 +768,7 @@ pub fn append_lock_path(path: &Path) -> PathBuf {
 // should reuse one rather than hand-rolling a third:
 //
 //   1. Sidecar advisory lock (this utility). Open a dedicated `<file>.lock`
-//      handle for read+write and hold an `fs2` `flock` on it while mutating the
+//      handle for read+write and hold a `File::lock` on it while mutating the
 //      real file. Use it to serialize writers to an append-only log or an
 //      mmap/config file where readers must never see a torn write and a crashed
 //      holder must not leave a stale marker (the OS drops the lock on process
@@ -789,6 +789,8 @@ pub fn append_lock_path(path: &Path) -> PathBuf {
 // (os error 5). Locking the r/w sidecar sidesteps that and avoids locking the
 // data region being written. This rationale lives here once; call sites point
 // back to it rather than restating it.
+
+const SIDECAR_LEASE_LABEL: &str = "storage.sidecar";
 
 pub(super) fn open_lock_file(lock_path: &Path, private: bool) -> io::Result<fs::File> {
     if let Some(parent) = lock_path.parent() {
@@ -817,10 +819,10 @@ pub(super) fn open_lock_file(lock_path: &Path, private: bool) -> io::Result<fs::
 /// success, or `None` when another process/thread already holds it (the caller
 /// then skips its critical section). See the sidecar-lock module note above for
 /// the read+write-handle rationale.
-pub fn try_acquire_sidecar_lock(lock_path: &Path) -> io::Result<Option<fs::File>> {
+pub fn try_acquire_sidecar_lock(lock_path: &Path) -> io::Result<Option<FileLease>> {
     let file = open_lock_file(lock_path, false)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => Ok(Some(file)),
+    match file.try_lock().map_err(std::io::Error::from) {
+        Ok(()) => Ok(Some(FileLease::held(file, SIDECAR_LEASE_LABEL))),
         // `is_lock_contended` covers Windows, where contention surfaces as
         // ERROR_LOCK_VIOLATION rather than a `WouldBlock` error kind.
         Err(err) if crate::db::is_lock_contended(&err) => Ok(None),
@@ -831,14 +833,14 @@ pub fn try_acquire_sidecar_lock(lock_path: &Path) -> io::Result<Option<fs::File>
 /// Blocking sidecar lock acquisition. Returns the held lock file once the
 /// exclusive lock is granted. See the sidecar-lock module note above for the
 /// read+write-handle rationale.
-pub fn acquire_sidecar_lock_blocking(lock_path: &Path) -> io::Result<fs::File> {
+pub fn acquire_sidecar_lock_blocking(lock_path: &Path) -> io::Result<FileLease> {
     acquire_lock_file_blocking(lock_path, false)
 }
 
-fn acquire_lock_file_blocking(lock_path: &Path, private: bool) -> io::Result<fs::File> {
+fn acquire_lock_file_blocking(lock_path: &Path, private: bool) -> io::Result<FileLease> {
     let file = open_lock_file(lock_path, private)?;
-    file.lock_exclusive()?;
-    Ok(file)
+    file.lock()?;
+    Ok(FileLease::held(file, SIDECAR_LEASE_LABEL))
 }
 
 fn check_directory_creation_interrupt(
@@ -889,7 +891,7 @@ pub(crate) fn append_line_locked(path: &Path, line: &str, private: bool) -> io::
     } else {
         append_line_plain(path, line)
     };
-    let unlock_result = lock_file.unlock();
+    let unlock_result = lock_file.release();
     write_result?;
     unlock_result?;
     if private {
@@ -967,15 +969,13 @@ impl StoreLayout {
         data_root: PathBuf,
         manifest_filename: Option<&str>,
     ) -> Self {
-        let graph_db_path = data_root.join(config::db_filename(&data_root));
-        let config_path = data_root.join("config.json");
+        let graph_db_path = data_root.join(config::DB_FILENAME);
         let branch_meta_path = data_root.join(BRANCH_META_FILENAME);
         let sessions_db_path = data_root.join(SESSIONS_DB_FILENAME);
         let response_handle_root = data_root.join(RESPONSE_HANDLES_DIRECTORY);
         let lcm_payload_root = data_root.join("lcm-payloads");
         let dashboard_root = data_root.join("dashboard");
         let manifest_path = manifest_filename.map(|filename| data_root.join(filename));
-        let dirty_path = data_root.join("dirty");
         let sync_lock_path = data_root.join("sync.lock");
         let branch_add_lock_path = data_root.join(".branch-add.lock");
         Self {
@@ -985,24 +985,16 @@ impl StoreLayout {
             project_root,
             data_root,
             graph_db_path,
-            config_path,
             branch_meta_path,
             sessions_db_path,
             response_handle_root,
             lcm_payload_root,
             dashboard_root,
             manifest_path,
-            dirty_path,
             sync_lock_path,
             branch_add_lock_path,
         }
     }
-}
-
-pub(super) fn validate_enrollment_marker(marker: &EnrollmentMarker, path: &Path) -> Result<()> {
-    validate_project_id(&marker.project_id).map_err(|message| TraceDecayError::Config {
-        message: format!("invalid enrollment marker '{}': {message}", path.display()),
-    })
 }
 
 pub fn validate_project_id(project_id: &str) -> std::result::Result<(), &'static str> {
@@ -1075,10 +1067,11 @@ pub fn set_private_dir_permissions(path: &Path) -> std::io::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
-#[cfg(not(unix))]
-#[allow(clippy::unnecessary_wraps)] // Keep platform implementations signature-compatible.
-pub fn set_private_dir_permissions(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+/// A new directory inherits its parent's ACEs, which private-directory
+/// readers reject.
+#[cfg(windows)]
+pub fn set_private_dir_permissions(path: &Path) -> std::io::Result<()> {
+    tracedecay_private_fs::make_private_directory(path)
 }
 
 #[cfg(unix)]

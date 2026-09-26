@@ -106,10 +106,16 @@ pub enum SessionRefreshServiceOutcome {
     Denied,
     WrongScope,
     Stale,
+    StaleFrontier {
+        active_projection_frontier: u64,
+    },
     NotFound,
     Aborted,
     DeadlineExceeded,
-    Unavailable,
+    /// `reason` is the refresh authority's typed cause, rendered.
+    Unavailable {
+        reason: String,
+    },
 }
 
 pub fn utc_micros_value(value: UtcMicros) -> i64 {

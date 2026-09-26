@@ -3,10 +3,11 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tracedecay_domain::NativeHostIdentityV1;
 use tracedecay_domain::UtcMicros;
 use tracedecay_hooks::delivery_spool::HookDeliverySpoolError;
 use tracedecay_hooks::{
-    HookDeliveryReceiptSpoolV1, HookHostV1, NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1,
+    HookDeliveryReceiptSpoolV1, NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1,
 };
 
 use crate::cli::Commands;
@@ -14,111 +15,119 @@ use crate::cli::Commands;
 const NATIVE_CAPTURE_COMMANDS: &[(&str, NativeHookCaptureSourceV1)] = &[
     (
         "hook-prompt-submit",
-        NativeHookCaptureSourceV1::Host(HookHostV1::ClaudeCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::ClaudeCode),
     ),
     (
         "hook-stop",
-        NativeHookCaptureSourceV1::Host(HookHostV1::ClaudeCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::ClaudeCode),
     ),
     (
         "hook-claude-session-start",
-        NativeHookCaptureSourceV1::Host(HookHostV1::ClaudeCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::ClaudeCode),
     ),
     (
         "hook-claude-post-tool-use",
-        NativeHookCaptureSourceV1::Host(HookHostV1::ClaudeCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::ClaudeCode),
     ),
     (
         "hook-claude-subagent-start",
-        NativeHookCaptureSourceV1::Host(HookHostV1::ClaudeCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::ClaudeCode),
     ),
     (
         "hook-kiro-pre-tool-use",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Kiro),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Kiro),
     ),
     (
         "hook-kiro-prompt-submit",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Kiro),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Kiro),
     ),
     (
         "hook-kiro-post-tool-use",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Kiro),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Kiro),
     ),
     (
         "hook-cursor-subagent-start",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-post-tool-use",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-before-submit-prompt",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-pre-compact",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-after-file-edit",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-session-start",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-session-end",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-after-shell",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-workspace-open",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-cursor-stop",
-        NativeHookCaptureSourceV1::Host(HookHostV1::CursorDesktop),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::CursorDesktop),
     ),
     (
         "hook-codex-session-start",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Codex),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Codex),
     ),
     (
         "hook-codex-user-prompt-submit",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Codex),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Codex),
     ),
     (
         "hook-codex-subagent-start",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Codex),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Codex),
     ),
     (
         "hook-codex-post-tool-use",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Codex),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Codex),
     ),
     (
         "hook-codex-stop",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Codex),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Codex),
     ),
     (
         "hook-hermes-terminal-receipt",
-        NativeHookCaptureSourceV1::Host(HookHostV1::Hermes),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Hermes),
     ),
     (
         "hook-kimi-event",
-        NativeHookCaptureSourceV1::Host(HookHostV1::KimiCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::KimiCode),
     ),
     (
         "hook-opencode-event",
-        NativeHookCaptureSourceV1::Host(HookHostV1::OpenCode),
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::OpenCode),
     ),
     (
         "hook-opencode-tool-after",
         NativeHookCaptureSourceV1::OpenCodeToolExecuteAfter,
+    ),
+    (
+        "hook-pi-event",
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::Pi),
+    ),
+    (
+        "hook-droid-event",
+        NativeHookCaptureSourceV1::Host(NativeHostIdentityV1::FactoryDroid),
     ),
 ];
 
@@ -139,7 +148,7 @@ pub(crate) fn try_run(args: &[OsString]) -> Option<i32> {
         tracedecay_agent_hosts::hooks::record_native_capture_invoked(
             &tracedecay::hook_runtime(),
             std::env::current_dir().ok().as_deref(),
-            HookHostV1::ClaudeCode,
+            NativeHostIdentityV1::ClaudeCode,
             Some("preToolUse"),
             &std::env::var("TOOL_INPUT").unwrap_or_default(),
         );
@@ -192,12 +201,13 @@ fn native_response_command_from_name(command: &str) -> bool {
             | "hook-codex-session-start"
             | "hook-codex-user-prompt-submit"
             | "hook-codex-post-tool-use"
-            | "hook-codex-stop"
             | "hook-hermes-terminal-receipt"
             | "hook-kiro-prompt-submit"
             | "hook-kimi-event"
             | "hook-opencode-event"
             | "hook-opencode-tool-after"
+            | "hook-pi-event"
+            | "hook-droid-event"
     )
 }
 
@@ -230,6 +240,8 @@ fn capture_command_name(command: &Commands) -> Option<&'static str> {
         Commands::HookKimiEvent => Some("hook-kimi-event"),
         Commands::HookOpenCodeEvent => Some("hook-opencode-event"),
         Commands::HookOpenCodeToolAfter => Some("hook-opencode-tool-after"),
+        Commands::HookPiEvent => Some("hook-pi-event"),
+        Commands::HookDroidEvent => Some("hook-droid-event"),
         _ => None,
     }
 }
@@ -241,7 +253,7 @@ fn capture_command_name(command: &Commands) -> Option<&'static str> {
 /// be refused for. The response hooks' output write waits the same way.
 fn open_delivery_receipt_spool(
     data_root: &Path,
-    host: HookHostV1,
+    host: NativeHostIdentityV1,
 ) -> Result<HookDeliveryReceiptSpoolV1, HookDeliverySpoolError> {
     HookDeliveryReceiptSpoolV1::open_within(
         tracedecay_hooks::hook_delivery_receipt_spool_root(data_root, host),
@@ -249,15 +261,91 @@ fn open_delivery_receipt_spool(
     )
 }
 
+struct PreparedNativeCapture {
+    outcome: NativeHookCaptureOutcomeV1,
+    delivery_writer: Option<HookDeliveryReceiptSpoolV1>,
+    delivery_open_error: Option<HookDeliverySpoolError>,
+    delivery_material: Option<tracedecay_hooks::NativeEnvelopeMaterialV1>,
+    rejection: Option<String>,
+}
+
+impl PreparedNativeCapture {
+    fn plain(outcome: NativeHookCaptureOutcomeV1) -> Self {
+        Self {
+            outcome,
+            delivery_writer: None,
+            delivery_open_error: None,
+            delivery_material: None,
+            rejection: None,
+        }
+    }
+}
+
+fn prepare_native_capture(
+    source: NativeHookCaptureSourceV1,
+    payload: &[u8],
+    working_directory: &std::io::Result<std::path::PathBuf>,
+) -> PreparedNativeCapture {
+    let Ok(project_root) = working_directory.as_ref() else {
+        return PreparedNativeCapture::plain(NativeHookCaptureOutcomeV1::Unavailable);
+    };
+    let layout = match tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(
+        project_root,
+    ) {
+        Ok(Some(layout)) => layout,
+        Ok(None) => return PreparedNativeCapture::plain(NativeHookCaptureOutcomeV1::Unbound),
+        Err(_) => return PreparedNativeCapture::plain(NativeHookCaptureOutcomeV1::Unavailable),
+    };
+    let worktree_id = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
+        &tracedecay::hook_runtime(),
+        &layout,
+    );
+    let (Some(now), Ok(worktree_id)) = (current_time(), worktree_id) else {
+        return PreparedNativeCapture::plain(NativeHookCaptureOutcomeV1::Unavailable);
+    };
+    match tracedecay_agent_hosts::hooks::native_capture_material(source, payload, now) {
+        Ok(material) => {
+            let outcome = tracedecay_hooks::capture_native_event_for_replay(
+                &layout.data_root,
+                worktree_id,
+                source,
+                payload,
+                material,
+                now,
+                tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
+            );
+            if outcome != NativeHookCaptureOutcomeV1::Captured {
+                return PreparedNativeCapture::plain(outcome);
+            }
+            let (delivery_writer, delivery_open_error) =
+                match open_delivery_receipt_spool(&layout.data_root, source.host()) {
+                    Ok(writer) => (Some(writer), None),
+                    Err(error) => (None, Some(error)),
+                };
+            PreparedNativeCapture {
+                outcome,
+                delivery_writer,
+                delivery_open_error,
+                delivery_material: Some(material),
+                rejection: None,
+            }
+        }
+        Err(
+            tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeEvent
+            | tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeFamily,
+        ) => PreparedNativeCapture::plain(NativeHookCaptureOutcomeV1::Unsupported),
+        Err(error) => PreparedNativeCapture {
+            rejection: Some(error.to_string()),
+            ..PreparedNativeCapture::plain(NativeHookCaptureOutcomeV1::Rejected)
+        },
+    }
+}
+
 pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
     let payload = match read_bounded_stdin() {
         Ok(payload) => payload,
         Err(()) => return refused("stdin was unreadable or exceeded the payload bound"),
     };
-    let mut delivery_writer = None;
-    let mut delivery_open_error = None;
-    let mut delivery_material = None;
-    let mut rejection = None;
     let working_directory = std::env::current_dir();
     // The invocation is analytics-visible whatever the capture outcome: an
     // unbound, unsupported, or rejected callback still proves the host fired
@@ -269,62 +357,8 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         None,
         &String::from_utf8_lossy(&payload),
     );
-    let outcome = match working_directory {
-        Ok(project_root) => {
-            match tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(
-                &project_root,
-            ) {
-                Ok(Some(layout)) => {
-                    let worktree_id = tracedecay_agent_hosts::hooks::hook_worktree_id_for_layout(
-                        &tracedecay::hook_runtime(),
-                        &layout,
-                    );
-                    match (current_time(), worktree_id) {
-                        (Some(now), Ok(worktree_id)) => {
-                            match tracedecay_agent_hosts::hooks::native_capture_material(
-                                source, &payload, now,
-                            ) {
-                                Ok(material) => {
-                                    let outcome = tracedecay_hooks::capture::capture_native_event_for_replay(
-                                        &layout.data_root,
-                                        worktree_id,
-                                        source,
-                                        &payload,
-                                        material,
-                                        now,
-                                        tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET,
-                                    );
-                                    if outcome == NativeHookCaptureOutcomeV1::Captured {
-                                        match open_delivery_receipt_spool(
-                                            &layout.data_root,
-                                            source.host(),
-                                        ) {
-                                            Ok(writer) => delivery_writer = Some(writer),
-                                            Err(error) => delivery_open_error = Some(error),
-                                        }
-                                        delivery_material = Some(material);
-                                    }
-                                    outcome
-                                }
-                                Err(
-                                    tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeEvent
-                                    | tracedecay_hooks::NativeHookDecodeError::UnsupportedNativeFamily,
-                                ) => NativeHookCaptureOutcomeV1::Unsupported,
-                                Err(error) => {
-                                    rejection = Some(error.to_string());
-                                    NativeHookCaptureOutcomeV1::Rejected
-                                }
-                            }
-                        }
-                        _ => NativeHookCaptureOutcomeV1::Unavailable,
-                    }
-                }
-                Ok(None) => NativeHookCaptureOutcomeV1::Unbound,
-                Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
-            }
-        }
-        Err(_) => NativeHookCaptureOutcomeV1::Unavailable,
-    };
+    let prepared = prepare_native_capture(source, &payload, &working_directory);
+    let outcome = prepared.outcome;
 
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
@@ -337,13 +371,14 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
     }
     drop(stdout);
     if outcome == NativeHookCaptureOutcomeV1::Captured {
-        let Some(writer) = delivery_writer else {
-            return refused(match delivery_open_error {
+        let Some(writer) = prepared.delivery_writer else {
+            return refused(match prepared.delivery_open_error {
                 Some(error) => format!("native delivery receipt spool unavailable: {error}"),
                 None => "native delivery receipt writer unavailable".to_string(),
             });
         };
-        let (Some(material), Some(delivered_at)) = (delivery_material, current_time()) else {
+        let (Some(material), Some(delivered_at)) = (prepared.delivery_material, current_time())
+        else {
             return refused("native delivery receipt material unavailable");
         };
         let Some(settlement) = native_hook_delivery_settlement(source, material, delivered_at)
@@ -367,11 +402,21 @@ pub(crate) fn run_native_capture(source: NativeHookCaptureSourceV1) -> i32 {
         | NativeHookCaptureOutcomeV1::Full
         | NativeHookCaptureOutcomeV1::ResetRequired
         | NativeHookCaptureOutcomeV1::Unavailable
-        | NativeHookCaptureOutcomeV1::AdmissionTimedOut => refused(match rejection {
+        | NativeHookCaptureOutcomeV1::AdmissionTimedOut => refused(match prepared.rejection {
             Some(reason) => format!("native capture did not land: {outcome:?} ({reason})"),
             None => format!("native capture did not land: {outcome:?}"),
         }),
     }
+}
+
+/// The one exit-1 site of the capture fast path. A successful hook is silent
+/// on stderr (the host shows every byte to the user), but a refused one must
+/// name its reason there: this path runs before the tracing subscriber is
+/// installed, so a `tracing::warn!` here was dropped and every refusal
+/// surfaced as a bare exit 1 with `{}` and empty stderr.
+fn refused(reason: impl std::fmt::Display) -> i32 {
+    eprintln!("tracedecay hook: {reason}");
+    1
 }
 
 fn native_hook_delivery_settlement(
@@ -419,16 +464,6 @@ fn native_hook_delivery_settlement(
     })
 }
 
-/// The one exit-1 site of the capture fast path. A successful hook is silent
-/// on stderr (the host shows every byte to the user), but a refused one must
-/// name its reason there: this path runs before the tracing subscriber is
-/// installed, so a `tracing::warn!` here was dropped and every refusal
-/// surfaced as a bare exit 1 with `{}` and empty stderr.
-fn refused(reason: impl std::fmt::Display) -> i32 {
-    eprintln!("tracedecay hook: {reason}");
-    1
-}
-
 fn read_bounded_stdin() -> Result<Vec<u8>, ()> {
     let bound = tracedecay_hooks::MAX_HOOK_PAYLOAD_BYTES;
     let mut payload = Vec::with_capacity(bound);
@@ -444,21 +479,4 @@ fn current_time() -> Option<UtcMicros> {
     let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
     let micros = i64::try_from(elapsed.as_micros()).ok()?;
     Some(UtcMicros(micros))
-}
-
-#[cfg(test)]
-#[test]
-fn codex_stop_selects_native_response_instead_of_capture_only() {
-    assert!(native_response_command_from_name("hook-codex-stop"));
-    assert_eq!(
-        capture_command_name(&Commands::HookCodexStop),
-        Some("hook-codex-stop")
-    );
-    assert_eq!(
-        try_run(&[
-            OsString::from("tracedecay"),
-            OsString::from("hook-codex-stop")
-        ]),
-        None
-    );
 }

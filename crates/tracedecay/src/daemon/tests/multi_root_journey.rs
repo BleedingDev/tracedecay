@@ -1,7 +1,6 @@
 #![cfg(unix)]
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,24 +26,14 @@ use tracedecay_daemon_service::{
     DaemonInvocationRequest, parse_daemon_invocation_request,
 };
 
-fn git(root: &Path, args: &[&str]) {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .status()
-        .expect("run Git fixture command");
-    assert!(status.success(), "git {args:?}");
-}
-
 fn repository() -> TempDir {
     let repository = TempDir::new().expect("repository");
-    git(repository.path(), &["init", "--quiet"]);
-    git(
+    super::git(repository.path(), &["init", "--quiet"]);
+    super::git(
         repository.path(),
         &["config", "user.name", "TraceDecay Test"],
     );
-    git(
+    super::git(
         repository.path(),
         &["config", "user.email", "tracedecay@example.com"],
     );
@@ -53,8 +42,8 @@ fn repository() -> TempDir {
         "pub fn value() -> u8 { 1 }\n",
     )
     .expect("source");
-    git(repository.path(), &["add", "."]);
-    git(repository.path(), &["commit", "--quiet", "-m", "base"]);
+    super::git(repository.path(), &["add", "."]);
+    super::git(repository.path(), &["commit", "--quiet", "-m", "base"]);
     repository
 }
 
@@ -67,8 +56,8 @@ fn paginated_repository(prefix: &str) -> TempDir {
         .collect::<Vec<_>>()
         .concat();
     std::fs::write(repository.path().join("lib.rs"), source).expect("paged source");
-    git(repository.path(), &["add", "."]);
-    git(
+    super::git(repository.path(), &["add", "."]);
+    super::git(
         repository.path(),
         &["commit", "--quiet", "-m", "paged source"],
     );
@@ -242,6 +231,13 @@ async fn run_scope_set_cas_with_registered_cold_root() {
         "registry discovery must not pretend the cold project runtime is mounted"
     );
 
+    let capacity_gate = super::super::project_open_capacity_gate(&engine.project_open_gates).await;
+    let capacity_guard = capacity_gate.lock_owned().await;
+    let release_capacity = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        drop(capacity_guard);
+    });
+
     let scope_set_id = ScopeSetId::new("scope-set.cold-roots").expect("scope set id");
     let roots = vec![
         RegisteredRootSelectorV1::new(
@@ -270,6 +266,9 @@ async fn run_scope_set_cas_with_registered_cold_root() {
         ),
     )
     .await;
+    release_capacity
+        .await
+        .expect("release cold-root capacity gate");
     let DaemonInvocationOutcome::MultiRootScopeSetCompareAndSwap { outcome, .. } = cas.outcome
     else {
         panic!("cold-root CAS must reach storage: {:?}", cas.outcome);
@@ -623,7 +622,7 @@ async fn run_authenticated_multi_root_journey() {
             problem: DaemonInvocationProblem::InvalidRequest
         }
     ));
-    let portable_invalid = execute_portable_daemon_invocation(
+    let portable_invalid = Box::pin(execute_portable_daemon_invocation(
         engine.lifecycle.clone(),
         engine.store_administration.clone(),
         Arc::clone(&engine.project_open_gates),
@@ -632,7 +631,7 @@ async fn run_authenticated_multi_root_journey() {
         engine.http_application_registry.clone(),
         wire_round_trip(&invalid_read),
         Some(Arc::clone(&engine.project_open_attempts)),
-    )
+    ))
     .await;
     assert!(matches!(
         portable_invalid.outcome,
@@ -1170,7 +1169,7 @@ async fn run_authenticated_multi_root_journey() {
     // resolves or mounts any selected root, then reach the same executor.
     let observed_at = now();
     let (deadline, cancellation) = controls("portable-execute", observed_at);
-    let portable_execute = execute_portable_daemon_invocation(
+    let portable_execute = Box::pin(execute_portable_daemon_invocation(
         engine.lifecycle.clone(),
         engine.store_administration.clone(),
         Arc::clone(&engine.project_open_gates),
@@ -1193,7 +1192,7 @@ async fn run_authenticated_multi_root_journey() {
             cancellation,
         ),
         Some(Arc::clone(&engine.project_open_attempts)),
-    )
+    ))
     .await;
     assert!(
         matches!(

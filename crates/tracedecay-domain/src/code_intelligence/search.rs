@@ -185,6 +185,18 @@ pub enum CodeSearchChunkGrainV1 {
     FileWindow,
 }
 
+impl CodeSearchChunkGrainV1 {
+    /// Row-codec grain ordinal. Append new grains; reordering changes sealed
+    /// artifact bytes. Capability emission sorts a filtered copy of this list.
+    pub const ORDER: [Self; 5] = [
+        Self::SymbolSignature,
+        Self::SymbolBody,
+        Self::SymbolMember,
+        Self::FilePreamble,
+        Self::FileWindow,
+    ];
+}
+
 /// Where one chunk lives inside one generation.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -249,6 +261,26 @@ pub enum ExactTechnicalTermKindV1 {
     ToolName,
     ConfigurationKey,
     CommitIdentifier,
+}
+
+impl ExactTechnicalTermKindV1 {
+    /// Lexical row-codec ordinal and the capability manifest's kind set.
+    ///
+    /// The codec stores the index in this array. Append new kinds; reordering
+    /// changes sealed artifact bytes.
+    pub const ORDER: [Self; 11] = [
+        Self::WholeSymbol,
+        Self::QualifiedName,
+        Self::Path,
+        Self::CompilerErrorCode,
+        Self::CompilerErrorText,
+        Self::RuntimeErrorCode,
+        Self::RuntimeErrorText,
+        Self::CliFlag,
+        Self::ToolName,
+        Self::ConfigurationKey,
+        Self::CommitIdentifier,
+    ];
 }
 
 /// One whole exact technical term extracted as evidence. Extraction
@@ -1056,15 +1088,6 @@ impl ChangedCodeChunkSetV1 {
         Ok((reused.len() as u64, reused_digest))
     }
 
-    /// Like [`Self::seal_reused_partition_refs`], but skips per-row identity
-    /// validation. Callers must pass already-validated manifest rows.
-    pub fn seal_reused_partition_refs_trusted(
-        reused: &[(&CodeSearchChunkId, &ContentDigest)],
-    ) -> Result<(u64, ManifestDigest), DomainError> {
-        let reused_digest = code_reused_partition_digest_refs_trusted(reused)?;
-        Ok((reused.len() as u64, reused_digest))
-    }
-
     /// Seal Arc-shared reuse from the parent full-replay commitment.
     ///
     /// Use at Arc-share publish only. Pair-list sealing stays on the mixed /
@@ -1094,9 +1117,26 @@ impl ChangedCodeChunkSetV1 {
 
     /// Structural request checks only. `reused_count` / `reused_digest` are
     /// sealed into `manifest_digest`, but this does not reconstruct the
-    /// complement — call [`Self::validate_reused_complement`] at the
+    /// complement, call [`Self::validate_reused_complement`] at the
     /// publication or restore boundary that holds the current corpus.
     pub fn validate(&self) -> Result<(), DomainError> {
+        self.validate_partitions()?;
+        self.manifest_digest.validate()?;
+        if self.compute_digest()? != self.manifest_digest {
+            return Err(DomainError::DigestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Write `manifest_digest` over a set that passes [`Self::validate`],
+    /// without hashing the set a second time to compare against it.
+    pub fn seal(&mut self) -> Result<(), DomainError> {
+        self.validate_partitions()?;
+        self.manifest_digest = self.compute_digest()?;
+        Ok(())
+    }
+
+    fn validate_partitions(&self) -> Result<(), DomainError> {
         self.to_generation.validate()?;
         if let Some(from_generation) = &self.from_generation {
             from_generation.validate()?;
@@ -1127,10 +1167,6 @@ impl ChangedCodeChunkSetV1 {
                     field: "changed chunk partitions",
                 });
             }
-        }
-        self.manifest_digest.validate()?;
-        if self.compute_digest()? != self.manifest_digest {
-            return Err(DomainError::DigestMismatch);
         }
         Ok(())
     }
@@ -2093,7 +2129,7 @@ pub struct CodeIndexCapabilityManifestV1 {
 /// a checkout that reseals the same commit must not be refused as
 /// capability-incompatible. The manifest still carries its `generation_id`,
 /// and `CodeIndexPublishedGenerationV1` still refuses a capability manifest
-/// naming a different generation than its own, so the pairing stays bound —
+/// naming a different generation than its own, so the pairing stays bound,
 /// by that invariant rather than by this digest.
 #[derive(Serialize)]
 struct CodeIndexCapabilityManifestDigestInput<'a> {
@@ -2194,17 +2230,9 @@ mod tests {
     use crate::code_intelligence::language::EdgeAuthorityV1;
     use crate::research::id::{PrivacyDomainId, SanitizationReceiptId};
 
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        <T as TryFrom<String>>::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("valid fixture identity")
-    }
+    use crate::test_fixtures::id;
 
-    fn digest(byte: char) -> String {
-        format!("sha256:{}", byte.to_string().repeat(64))
-    }
+    use crate::test_fixtures::repeated_sha256_text as digest;
 
     #[test]
     fn ephemeral_query_view_is_bounded_and_redacts_its_text() {
@@ -2820,7 +2848,7 @@ mod tests {
     #[test]
     fn capability_identity_survives_a_new_generation_but_not_a_new_capability() {
         let sealed = capability_manifest();
-        // The same source resealed under a new generation id — a checkout, a
+        // The same source resealed under a new generation id, a checkout, a
         // detached HEAD, a rollback that mints a fresh generation.
         let mut resealed = sealed.clone();
         resealed.generation_id = id("generation.v1.0cbc773a.00000002.resealed");

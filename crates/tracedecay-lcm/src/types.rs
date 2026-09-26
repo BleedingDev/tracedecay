@@ -3,7 +3,7 @@
 //! The DB-free retrieval and rendering contracts live in
 //! [`crate::contracts`] and are re-exported here so this module remains the
 //! single import surface for the session engine.
-//! Only infrastructure-facing conversions — notably the SQL error mapping —
+//! Only infrastructure-facing conversions, notably the SQL error mapping,
 //! stay in this module.
 
 pub use crate::contracts::{
@@ -103,8 +103,6 @@ pub struct LcmLoadSessionMessage {
     pub content_hash: String,
     pub storage_kind: LcmStorageKind,
     pub payload_ref: Option<String>,
-    pub legacy_source: bool,
-    pub legacy_truncated: bool,
     pub metadata_json: Option<String>,
 }
 
@@ -364,6 +362,17 @@ pub struct LcmSummaryConvergenceStatus {
     pub current_session_count: i64,
     pub unavailable_session_count: i64,
     pub permanent_session_count: i64,
+    /// Parked and failed sessions grouped by the reason their queue state
+    /// records, ordered by state then reason.
+    #[serde(default)]
+    pub reasons: Vec<LcmSummaryConvergenceReasonCount>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LcmSummaryConvergenceReasonCount {
+    pub state: crate::summary_convergence::LcmSummaryConvergenceQueueState,
+    pub reason: String,
+    pub session_count: i64,
 }
 
 /// Default fresh-tail size applied when the host omits `fresh_tail_count`.
@@ -481,12 +490,6 @@ pub struct LcmGcConfig {
     pub reap_missing_enabled: bool,
     #[serde(default = "default_lcm_gc_max_batch_size")]
     pub max_batch_size: usize,
-    #[serde(default = "default_lcm_gc_backup_before_reap")]
-    pub backup_before_reap: bool,
-    #[serde(default = "default_lcm_gc_interval_seconds")]
-    pub interval_seconds: u64,
-    #[serde(default = "default_lcm_gc_enabled")]
-    pub gc_enabled: bool,
 }
 
 impl LcmGcConfig {
@@ -510,9 +513,6 @@ impl Default for LcmGcConfig {
             reap_missing_after: default_lcm_gc_reap_missing_after(),
             reap_missing_enabled: default_lcm_gc_reap_missing_enabled(),
             max_batch_size: default_lcm_gc_max_batch_size(),
-            backup_before_reap: default_lcm_gc_backup_before_reap(),
-            interval_seconds: default_lcm_gc_interval_seconds(),
-            gc_enabled: default_lcm_gc_enabled(),
         }
         .normalized()
     }
@@ -532,18 +532,6 @@ fn default_lcm_gc_reap_missing_enabled() -> bool {
 
 fn default_lcm_gc_max_batch_size() -> usize {
     500
-}
-
-fn default_lcm_gc_backup_before_reap() -> bool {
-    true
-}
-
-fn default_lcm_gc_interval_seconds() -> u64 {
-    21_600
-}
-
-fn default_lcm_gc_enabled() -> bool {
-    true
 }
 
 fn deserialize_lcm_gc_grace_seconds<'de, D>(deserializer: D) -> Result<u64, D::Error>
@@ -621,7 +609,6 @@ pub struct LcmLifecycleStatus {
 pub struct LcmRedactionStatus {
     pub enabled: bool,
     pub lossy_records: i64,
-    pub legacy_truncated_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -797,7 +784,6 @@ pub struct LcmCompressionResponse {
     pub replay_token_estimate: i64,
     pub replay_over_budget: bool,
     pub compression_attempts: usize,
-    pub fallback_used: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_recovery_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -815,14 +801,12 @@ mod tests {
 
     #[test]
     fn gc_config_clamps_grace_floor_from_serde() {
-        let config: LcmGcConfig = serde_json::from_str(
-            r#"{"grace_seconds":10,"reap_missing_after":0,"gc_enabled":false}"#,
-        )
-        .expect("gc config should deserialize");
+        let config: LcmGcConfig =
+            serde_json::from_str(r#"{"grace_seconds":10,"reap_missing_after":0}"#)
+                .expect("gc config should deserialize");
 
         assert_eq!(config.grace_seconds, 300);
         assert_eq!(config.reap_missing_after, 0);
-        assert!(!config.gc_enabled);
     }
 
     #[test]

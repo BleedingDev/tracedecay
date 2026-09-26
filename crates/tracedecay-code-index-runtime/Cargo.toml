@@ -16,10 +16,9 @@ doctest = false
 # feature exists only for the `cfg(feature = "hotpath")` sites in this crate
 # that change compiled behaviour under profiling. It also forwards the
 # semantic runtime's opt-in observation feature.
-# Type-coupled: `git_index_transactions::ProfiledFile` names the on-mode
-# `hotpath::io::InstrumentedIo` (hotpath 0.24 has no mode-agnostic `wrap`
-# alias for I/O), so any build that selects the backend with this crate in
-# its graph must select this feature too.
+# No type in this crate names hotpath's on-mode `InstrumentedIo`: `io!` results
+# stay in local `let` bindings whose type is inferred, so selecting the backend
+# without this feature still compiles.
 hotpath = ["hotpath/hotpath", "tracedecay-semantic/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 lite = ["tracedecay-code-extraction/lite", "tracedecay-code-index/lite"]
@@ -41,7 +40,7 @@ test-helpers = [
 
 [dependencies]
 futures-util = "0.3.33"
-gix = { version = "=0.86.0", default-features = false, features = [
+gix = { version = "=0.87.1", default-features = false, features = [
     "revision",
     "blob-diff",
     "parallel",
@@ -64,26 +63,26 @@ tracing = "0.1"
 url = "2"
 walkdir = "2"
 
-tracedecay-contracts = { path = "../tracedecay-contracts", version = "0.1.0" }
-tracedecay-code-extraction = { path = "../tracedecay-code-extraction", version = "0.1.0", default-features = false }
-tracedecay-code-index = { path = "../tracedecay-code-index", version = "0.1.0", default-features = false }
-tracedecay-code-index-retention = { path = "../tracedecay-code-index-retention", version = "0.1.0" }
-tracedecay-domain = { path = "../tracedecay-domain", version = "0.1.0" }
-tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0" }
-tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0" }
-tracedecay-graph-query = { path = "../tracedecay-graph-query", version = "0.1.0" }
-tracedecay-lsp = { path = "../tracedecay-lsp", version = "0.1.0" }
-tracedecay-policy = { path = "../tracedecay-policy", version = "0.1.0" }
-tracedecay-privacy = { path = "../tracedecay-privacy", version = "0.1.0" }
-tracedecay-private-fs = { path = "../tracedecay-private-fs", version = "0.1.0" }
-tracedecay-query = { path = "../tracedecay-query", version = "0.1.0" }
-tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0" }
-tracedecay-semantic = { path = "../tracedecay-semantic", version = "0.1.0" }
+tracedecay-contracts = { path = "../tracedecay-contracts" }
+tracedecay-code-extraction = { path = "../tracedecay-code-extraction", default-features = false }
+tracedecay-code-index = { path = "../tracedecay-code-index", default-features = false }
+tracedecay-code-index-retention = { path = "../tracedecay-code-index-retention" }
+tracedecay-domain = { path = "../tracedecay-domain" }
+tracedecay-global-db = { path = "../tracedecay-global-db" }
+tracedecay-graph-db = { path = "../tracedecay-graph-db" }
+tracedecay-graph-query = { path = "../tracedecay-graph-query" }
+tracedecay-lsp = { path = "../tracedecay-lsp" }
+tracedecay-policy = { path = "../tracedecay-policy" }
+tracedecay-privacy = { path = "../tracedecay-privacy" }
+tracedecay-private-fs = { path = "../tracedecay-private-fs" }
+tracedecay-query = { path = "../tracedecay-query" }
+tracedecay-runtime-core = { path = "../tracedecay-runtime-core" }
+tracedecay-semantic = { path = "../tracedecay-semantic" }
 tracedecay-semantic-contracts.workspace = true
-tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store", version = "0.1.0" }
-tracedecay-store = { path = "../tracedecay-store", version = "0.1.0" }
-tracedecay-tool-catalog = { path = "../tracedecay-tool-catalog", version = "0.1.0" }
-tracedecay-application = { path = "../tracedecay-application", version = "0.1.0" }
+tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store" }
+tracedecay-store = { path = "../tracedecay-store" }
+tracedecay-tool-catalog = { path = "../tracedecay-tool-catalog" }
+tracedecay-application = { path = "../tracedecay-application" }
 
 [target.'cfg(unix)'.dependencies]
 notify = "6"
@@ -91,23 +90,22 @@ notify = "6"
 [dev-dependencies]
 filetime = "0.2"
 rusqlite = { version = "0.40.1", default-features = false, features = ["backup"] }
-tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
-tracedecay-code-index = { path = "../tracedecay-code-index", version = "0.1.0", default-features = false, features = [
+tracedecay-code-index = { path = "../tracedecay-code-index", default-features = false, features = [
     "test-helpers",
     "lite",
 ] }
-tracedecay-configuration = { path = "../tracedecay-configuration", version = "0.1.0" }
-tracedecay-global-db = { path = "../tracedecay-global-db", version = "0.1.0", features = [
+tracedecay-configuration = { path = "../tracedecay-configuration" }
+tracedecay-global-db = { path = "../tracedecay-global-db", features = [
     "test-helpers",
 ] }
-tracedecay-graph-db = { path = "../tracedecay-graph-db", version = "0.1.0", features = [
+tracedecay-graph-db = { path = "../tracedecay-graph-db", features = [
     "test-helpers",
 ] }
-tracedecay-runtime-core = { path = "../tracedecay-runtime-core", version = "0.1.0", features = [
+tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = [
     "test-helpers",
 ] }
-tracedecay-application = { path = "../tracedecay-application", version = "0.1.0", features = [
+tracedecay-application = { path = "../tracedecay-application", features = [
     "test-helpers",
 ] }

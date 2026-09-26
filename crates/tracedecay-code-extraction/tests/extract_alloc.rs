@@ -5,7 +5,7 @@
 //! keep a small signature prefix. Each fixture here pairs a tiny item header
 //! with a huge body (hundreds of KB of repeated statements), proves the
 //! emitted signature strings byte-for-byte, and caps the bytes allocated
-//! during the walk below the fixture size — a whole-file or whole-item copy
+//! during the walk below the fixture size. A whole-file or whole-item copy
 //! busts the budget immediately.
 //!
 //! This suite is its own test binary (not a `main.rs` module) because the
@@ -80,7 +80,7 @@ fn measure_allocation<T>(work: impl FnOnce() -> T) -> (T, usize) {
 
 /// Statement lines per hot body. Each line carries `PAD_WIDTH` bytes of
 /// trailing comment so the body is huge in *bytes* while staying small in
-/// node count — the memcpy waste under test scales with bytes, while the
+/// node count. The memcpy waste under test scales with bytes, while the
 /// legitimate walk cost (complexity traversal stack) scales with nodes.
 const BODY_LINES: usize = 640;
 const PAD_WIDTH: usize = 960;
@@ -294,7 +294,7 @@ fn extract_both_and_compare(
     source: &str,
     grammar_key: &str,
 ) -> (ParsedExtraction, usize) {
-    let full = extractor.extract(file_path, source);
+    let full = extractor.extract_artifact(file_path, source).result;
     assert!(full.errors.is_empty(), "extract errors: {:?}", full.errors);
 
     let tree = parse_with_grammar(grammar_key, source);
@@ -653,7 +653,10 @@ fn representative_language_walks_allocate_by_changed_region() {
             case.file_path,
             case.source.len()
         );
-        let cold = case.extractor.extract(case.file_path, &case.source);
+        let cold = case
+            .extractor
+            .extract_artifact(case.file_path, &case.source)
+            .result;
         assert!(
             cold.errors.is_empty(),
             "{} cold errors: {:?}",
@@ -741,7 +744,7 @@ fn representative_language_walks_allocate_by_changed_region() {
 #[test]
 fn bash_changed_region_reset_walk_does_not_copy_source() {
     let source = regional_fixture("kept() { echo kept; }\nkept\ntiny() { echo tiny; }\n");
-    let cold = BashExtractor.extract("region.sh", &source);
+    let cold = BashExtractor.extract_artifact("region.sh", &source).result;
     let tree = parse_with_grammar("bash", &source);
     let region = trailing_region(&source, "tiny()");
     let (incremental, walk_bytes) = measure_allocation(|| {
@@ -1196,7 +1199,10 @@ fn every_migrated_language_walk_allocates_by_changed_region() {
             case.file_path,
             source.len()
         );
-        let cold = case.extractor.extract(case.file_path, &source);
+        let cold = case
+            .extractor
+            .extract_artifact(case.file_path, &source)
+            .result;
         let tree = parse_with_grammar(case.grammar_key, &source);
         let region = trailing_region(&source, case.needle);
         let regions = [region];

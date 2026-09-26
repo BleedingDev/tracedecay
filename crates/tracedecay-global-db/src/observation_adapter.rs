@@ -10,7 +10,7 @@ use tracedecay_domain::{
     GenerationBoundRepositoryProvenanceV1, ManifestDigest, ObservationCollisionOutcomeV1,
     ObservationIdentityMaterialV1, ObservationScopeV1, ObservationSourceCursorV1,
     ObservationSourceIdentityV1, PayloadDigestV1, PayloadReferenceV1, ProjectionGenerationId,
-    RetrievalAnchorId, RetrievalAnchorRecordV2, SanitizationReceiptV1, canonical_json_bytes,
+    RetrievalAnchorId, RetrievalAnchorRecord, SanitizationReceiptV1, canonical_json_bytes,
     canonical_json_bytes_and_sha256, canonical_sha256, classify_observation_collision,
     cline_native_source_successor_id, cline_task_native_observation_id,
     is_canonical_payload_revision_replay, prove_cline_native_source_transition, sha256_hex_suffix,
@@ -24,10 +24,10 @@ use tracedecay_store::{
     BACKGROUND_BATCH_MAX_BYTES, BACKGROUND_BATCH_MAX_OPERATIONS, CommandDigestV1,
     ConsistencyModeV1, CursorAdvanceLedgerDisagreementV1, CursorAdvanceLedgerIdentityV1,
     DurabilityClassV1, FOREGROUND_BATCH_MAX_BYTES, IdempotencyIdentityV1,
-    ObservationBatchFallbackCause, ObservationBatchPersistOutcome, ObservationCommitReceipt,
-    ObservationPersistOutcome, ObservationProjectionStatus, ObservationProjectionStore,
-    ObservationReadOperationV1, ObservationReadResultV1, ObservationRecentWindowRequest,
-    ObservationRecentWindowV1, ObservationReplayRequest, ObservationStore, ObservationStoreError,
+    ObservationBatchPersistOutcome, ObservationCommitReceipt, ObservationPersistOutcome,
+    ObservationProjectionStatus, ObservationProjectionStore, ObservationReadOperationV1,
+    ObservationReadResultV1, ObservationRecentWindowRequest, ObservationRecentWindowV1,
+    ObservationReplayRequest, ObservationStore, ObservationStoreError,
     ObservationStoreResult, OperationPriorityV1, ProjectReadOperationV1, ProjectReadResultV1,
     ProjectionCheckpoint, ProjectionPersistOutcome, ProjectionPredecessorConvergence,
     ProjectionRebuildOutcome, ProjectionStoreResult, RepositoryOperationEnvelopeV1,
@@ -44,8 +44,8 @@ use tracedecay_store::{
 use tracedecay_runtime_core::db::{Database, DatabaseEngineReadSnapshot, DatabaseRuntimeClientV1};
 use tracedecay_runtime_core::shard_runtime::registry::StoreRuntimeRegistryFailure;
 use tracedecay_rusqlite_runtime::repository::observation_cursor_authority::{
-    COMMIT_SOURCE_CURSOR_SQL, READ_CURSOR_ADVANCE_SQL, READ_SOURCE_CURSOR_SQL,
-    RECORD_CURSOR_ADVANCE_SQL, cursor_advance_ledger_row_matches,
+    COMMIT_SOURCE_CURSOR_SQL, PRUNE_SUPERSEDED_CURSOR_ADVANCES_SQL, READ_CURSOR_ADVANCE_SQL,
+    READ_SOURCE_CURSOR_SQL, RECORD_CURSOR_ADVANCE_SQL, cursor_advance_ledger_row_matches,
 };
 use tracedecay_rusqlite_runtime::repository::{
     REPOSITORY_PROVENANCE_CAPTURE_JOIN, REPOSITORY_PROVENANCE_HYDRATED_COLUMNS,
@@ -53,9 +53,9 @@ use tracedecay_rusqlite_runtime::repository::{
 
 /// Observation-store adapter over the already-registered authoritative
 /// runtime. The struct is concrete: the collision tests prove the
-/// terminal-refusal fast path never accesses the retained observation row —
+/// terminal-refusal fast path never accesses the retained observation row,
 /// they corrupt and hide that row after the marker exists, so any later read
-/// fails loudly — not through an adapter seam or test-only port.
+/// fails loudly, not through an adapter seam or test-only port.
 #[derive(Clone)]
 pub struct GlobalDbObservationStore {
     database: Database,
@@ -68,9 +68,9 @@ impl GlobalDbObservationStore {
         Self { database, runtime }
     }
 
-    /// Records a terminal refusal — the marker in
+    /// Records a terminal refusal, the marker in
     /// `observation_admission_refusals` AND the typed
-    /// `observation_identity_collision` coverage advance — in ONE atomic
+    /// `observation_identity_collision` coverage advance, in ONE atomic
     /// authority transaction, but only when
     /// the candidate stands at the sequential scan frontier; any other shape
     /// (covered replay, stale expected cursor, gap, generation jump) leaves
@@ -82,7 +82,7 @@ impl GlobalDbObservationStore {
     /// frontier is re-verified INSIDE the transaction (exact compare-and-set
     /// against the durable cursor), the advance-ledger row must carry the
     /// `observation_identity_collision` reason with no receipt, and the cursor moves to
-    /// the advance's next position — executed through the one canonical
+    /// the advance's next position, executed through the one canonical
     /// cursor-advance statement set
     /// (`tracedecay_rusqlite_runtime::repository::observation_cursor_authority`)
     /// that the runtime write path also executes. No record content is
@@ -225,7 +225,7 @@ impl GlobalDbObservationStore {
         drop(ledger_rows);
         // A coverage row that names any other reason or a receipt is a real
         // cursor-advance failure: roll the WHOLE transaction back so the
-        // marker is not visible either — no orphan, by construction.
+        // marker is not visible either, no orphan, by construction.
         if !cursor_advance_ledger_row_matches(
             ledger.as_ref(),
             ObservationCoverageReason::ObservationIdentityCollision.as_str(),
@@ -300,10 +300,149 @@ impl GlobalDbObservationStore {
             .await
             .map_err(|error| runtime_storage_error(OPERATION, error))?;
         transaction
+            .execute(
+                PRUNE_SUPERSEDED_CURSOR_ADVANCES_SQL,
+                tracedecay_runtime_core::db::engine::params![
+                    source_json.as_str(),
+                    scope_json.as_str()
+                ],
+            )
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        transaction
             .commit()
             .await
             .map_err(|error| runtime_storage_error(OPERATION, error))?;
         Ok(RefusalCoverageOutcome::Recorded)
+    }
+
+    /// The runtime key for this coverage is already committed, so the writer
+    /// will not run the command again. If that commit left the cursor behind
+    /// the admitted range, put it back; a missing or different ledger row stays
+    /// a collision.
+    async fn restore_admitted_cursor_coverage(
+        &self,
+        advance: &ObservationCursorAdvance,
+    ) -> ObservationStoreResult<CursorAdvanceOutcome> {
+        const OPERATION: &str = "restore admitted observation source cursor";
+        let source_json = serde_json::to_string(advance.next_cursor().source())
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let scope_json = serde_json::to_string(advance.next_cursor().scope())
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let coverage_json = serde_json::to_string(&advance.coverage())
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let next_cursor_json = serde_json::to_string(advance.next_cursor())
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let transaction = self
+            .database
+            .begin_write_transaction(OPERATION)
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let mut cursor_rows = transaction
+            .query(
+                READ_SOURCE_CURSOR_SQL,
+                tracedecay_runtime_core::db::engine::params![
+                    source_json.as_str(),
+                    scope_json.as_str()
+                ],
+            )
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let durable_cursor = cursor_rows
+            .next()
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?
+            .map(|row| {
+                let encoded = row
+                    .get::<String>(0)
+                    .map_err(|error| runtime_storage_error(OPERATION, error))?;
+                serde_json::from_str::<ObservationSourceCursorV1>(&encoded)
+                    .map_err(|error| runtime_storage_error(OPERATION, error))
+            })
+            .transpose()?;
+        drop(cursor_rows);
+        if durable_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.reached(advance.next_cursor()))
+        {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| runtime_storage_error(OPERATION, error))?;
+            return Ok(CursorAdvanceOutcome::ExactDuplicate);
+        }
+        if durable_cursor.as_ref() != advance.expected_cursor() {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| runtime_storage_error(OPERATION, error))?;
+            return Err(ObservationStoreError::CursorAdvanceCollision);
+        }
+        let mut ledger_rows = transaction
+            .query(
+                READ_CURSOR_ADVANCE_SQL,
+                tracedecay_runtime_core::db::engine::params![
+                    source_json.as_str(),
+                    scope_json.as_str(),
+                    coverage_json.as_str()
+                ],
+            )
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        let ledger = ledger_rows
+            .next()
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?
+            .map(|row| {
+                Ok::<_, ObservationStoreError>((
+                    row.get::<String>(0)
+                        .map_err(|error| runtime_storage_error(OPERATION, error))?,
+                    row.get::<Option<String>>(1)
+                        .map_err(|error| runtime_storage_error(OPERATION, error))?,
+                ))
+            })
+            .transpose()?;
+        drop(ledger_rows);
+        let receipt_id = advance
+            .sanitization_receipt()
+            .map(|receipt| receipt.receipt().receipt_id().as_str());
+        if !cursor_advance_ledger_row_matches(
+            ledger.as_ref(),
+            advance.reason().as_str(),
+            receipt_id,
+        ) {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| runtime_storage_error(OPERATION, error))?;
+            return Err(ObservationStoreError::CursorAdvanceCollision);
+        }
+        transaction
+            .execute(
+                COMMIT_SOURCE_CURSOR_SQL,
+                tracedecay_runtime_core::db::engine::params![
+                    source_json.as_str(),
+                    scope_json.as_str(),
+                    next_cursor_json.as_str()
+                ],
+            )
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        transaction
+            .execute(
+                PRUNE_SUPERSEDED_CURSOR_ADVANCES_SQL,
+                tracedecay_runtime_core::db::engine::params![
+                    source_json.as_str(),
+                    scope_json.as_str()
+                ],
+            )
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| runtime_storage_error(OPERATION, error))?;
+        Ok(CursorAdvanceOutcome::Committed)
     }
 
     #[hotpath::skip]
@@ -389,9 +528,9 @@ impl GlobalDbObservationStore {
             && !canonical_payload_revision
         {
             if pending.is_some() {
-                return Err(ObservationStoreError::BatchRequiresScalarFallback {
-                    cause: ObservationBatchFallbackCause::IntraBatchIdentityCollision,
-                });
+                return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                    Box::new(write),
+                ));
             }
             let retained_digest = pending
                 .as_ref()
@@ -429,8 +568,10 @@ impl GlobalDbObservationStore {
                         observation.payload_reference().digest().clone(),
                     ));
                 }
-                if let Some(fallback) = durable_frontier_owned_by_batch(&known_cursor) {
-                    return Err(fallback);
+                if known_cursor.is_some() {
+                    return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                        Box::new(write),
+                    ));
                 }
                 if let RefusalCoverageOutcome::NotAtFrontier { actual } = self
                     .record_refusal_with_coverage(&write, retained_digest, cursor.as_ref())
@@ -479,8 +620,10 @@ impl GlobalDbObservationStore {
                     existing,
                 ));
             }
-            if let Some(fallback) = durable_frontier_owned_by_batch(&known_cursor) {
-                return Err(fallback);
+            if known_cursor.is_some() {
+                return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                    Box::new(write),
+                ));
             }
             let mut advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
                 identity.source().clone(),
@@ -539,9 +682,9 @@ impl GlobalDbObservationStore {
                 }))
         {
             if pending.is_some() {
-                return Err(ObservationStoreError::BatchRequiresScalarFallback {
-                    cause: ObservationBatchFallbackCause::IntraBatchSanitizationReceiptCollision,
-                });
+                return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                    Box::new(write),
+                ));
             }
             return Err(ObservationStoreError::SanitizationReceiptCollision);
         }
@@ -549,9 +692,9 @@ impl GlobalDbObservationStore {
             .pending_receipt(observation.receipt())
             .is_some_and(|retained| retained != observation.receipt())
         {
-            return Err(ObservationStoreError::BatchRequiresScalarFallback {
-                cause: ObservationBatchFallbackCause::IntraBatchSanitizationReceiptCollision,
-            });
+            return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                Box::new(write),
+            ));
         }
         for alias in write.retrieval_anchor().aliases() {
             if let Some(existing) =
@@ -559,10 +702,9 @@ impl GlobalDbObservationStore {
                 && existing.anchor_id != *write.retrieval_anchor_id()
             {
                 if existing.pending {
-                    return Err(ObservationStoreError::BatchRequiresScalarFallback {
-                        cause:
-                            ObservationBatchFallbackCause::IntraBatchRetrievalAnchorAliasCollision,
-                    });
+                    return Ok(PreparedObservationPersist::AwaitsDurablePredecessor(
+                        Box::new(write),
+                    ));
                 }
                 if !preflight.accepts_pending_cline_alias(&write, &existing.anchor_id)? {
                     return Err(ObservationStoreError::RetrievalAnchorAliasCollision {
@@ -626,6 +768,95 @@ impl GlobalDbObservationStore {
             batch_state.register_pending(&write)?;
         }
         Ok(PreparedObservationPersist::Submit(Box::new(write)))
+    }
+
+    /// Persists the longest prefix of `writes` that settles in one runtime
+    /// batch, returning its outcomes in input order and the writes that must
+    /// be prepared again once that prefix is durable.
+    #[hotpath::skip]
+    async fn persist_observation_segment(
+        &self,
+        writes: Vec<AnchoredObservationWrite>,
+    ) -> ObservationStoreResult<(
+        Vec<ObservationBatchPersistOutcome>,
+        Vec<AnchoredObservationWrite>,
+    )> {
+        crate::hotpath_observe::record_transaction_rows(1);
+        let preflight = load_observation_preflight(&self.database, &writes).await?;
+        let mut batch_state = ObservationBatchState::from_preflight(&preflight);
+        let mut published_cursors = HashMap::<
+            (ObservationSourceIdentityV1, ObservationScopeV1),
+            ObservationSourceCursorV1,
+        >::new();
+        let mut outcomes: Vec<Option<ObservationBatchPersistOutcome>> =
+            Vec::with_capacity(writes.len());
+        let mut submits = Vec::new();
+        let mut deferred_exact_duplicates = Vec::new();
+        let mut awaiting = Vec::new();
+        let mut writes = writes.into_iter();
+        while let Some(write) = writes.next() {
+            let key = (
+                write.observation().source().clone(),
+                write.observation().scope().clone(),
+            );
+            let known_cursor = published_cursors.get(&key).cloned().map(Some);
+            let next_cursor = write.next_cursor().clone();
+            match self
+                .prepare_observation_persist(write, &preflight, &mut batch_state, known_cursor)
+                .await?
+            {
+                PreparedObservationPersist::Ready(outcome) => outcomes.push(Some(*outcome)),
+                PreparedObservationPersist::Submit(write) => {
+                    submits.push((outcomes.len(), *write));
+                    outcomes.push(None);
+                }
+                PreparedObservationPersist::DeferredExactDuplicate(write) => {
+                    deferred_exact_duplicates.push((outcomes.len(), *write));
+                    outcomes.push(None);
+                }
+                PreparedObservationPersist::AwaitsDurablePredecessor(write) => {
+                    if outcomes.is_empty() {
+                        return Err(runtime_storage_error(
+                            "persist_observations",
+                            "the first write of a batch segment has no batch predecessor",
+                        ));
+                    }
+                    awaiting.push(*write);
+                    awaiting.extend(writes);
+                    break;
+                }
+            }
+            published_cursors.insert(key, next_cursor);
+        }
+        if !submits.is_empty() {
+            let submitted = submit_observation_writes(
+                &self.database,
+                &self.runtime,
+                submits,
+                deferred_exact_duplicates,
+            )
+            .await?;
+            for (slot, outcome) in submitted {
+                outcomes[slot] = Some(outcome);
+            }
+        } else if !deferred_exact_duplicates.is_empty() {
+            return Err(runtime_storage_error(
+                "persist_observations",
+                "deferred duplicate has no preceding batch submission",
+            ));
+        }
+        let outcomes = outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    runtime_storage_error(
+                        "persist_observations",
+                        "batch slot was not settled by writer authority",
+                    )
+                })
+            })
+            .collect::<ObservationStoreResult<Vec<_>>>()?;
+        Ok((outcomes, awaiting))
     }
 }
 
@@ -791,7 +1022,7 @@ impl ObservationBatchState {
     fn retrieval_anchor_by_alias(
         &self,
         scope: &ObservationScopeV1,
-        alias: &tracedecay_domain::NativeAliasV2,
+        alias: &tracedecay_domain::NativeAlias,
     ) -> ObservationStoreResult<Option<BatchAliasAuthority>> {
         let key = retrieval_alias_key(scope, alias)?;
         Ok(self.retrieval_aliases.get(&key).cloned())
@@ -951,7 +1182,7 @@ async fn read_cline_supersessions_from_snapshot(
             .validate()
             .map_err(|error| runtime_storage_error(operation, error))?;
         if let Some(owner) = anchors.get(record.anchor_id())
-            && record.owner().v2() == Some(&tracedecay_domain::FactOwnerV1::from(owner.clone()))
+            && *record.owner() == tracedecay_domain::FactOwnerV1::from(owner.clone())
             && record.state() == AnchorDispositionStateV1::Superseded
             && record.reason_class() == AnchorDispositionReasonClassV1::Correction
             && let Some(successor) = record.superseded_by()
@@ -1099,7 +1330,7 @@ async fn read_source_cursors_from_snapshot(
 
 fn retrieval_alias_key(
     scope: &ObservationScopeV1,
-    alias: &tracedecay_domain::NativeAliasV2,
+    alias: &tracedecay_domain::NativeAlias,
 ) -> ObservationStoreResult<(String, String, String)> {
     Ok((
         serde_json::to_string(scope)
@@ -1267,7 +1498,7 @@ async fn read_stored_observations_from_snapshot(
                 "observation committed cursor binding mismatch",
             ));
         }
-        let retrieval_anchor: RetrievalAnchorRecordV2 = decode_json(
+        let retrieval_anchor: RetrievalAnchorRecord = decode_json(
             row.get::<Option<String>>(4)
                 .map_err(|error| runtime_storage_error(operation, error))?
                 .ok_or_else(|| {
@@ -1316,7 +1547,7 @@ async fn read_stored_observations_from_snapshot(
             .map_err(|error| runtime_storage_error(operation, error))?;
         let expected_repository_owner = repository_anchor
             .as_ref()
-            .map(|anchor: &RetrievalAnchorRecordV2| serde_json::to_string(anchor.owner()))
+            .map(RetrievalAnchorRecord::owner_column_json)
             .transpose()
             .map_err(|error| runtime_storage_error(operation, error))?;
         if repository_owner != expected_repository_owner {
@@ -1370,6 +1601,11 @@ enum PreparedObservationPersist {
     Ready(Box<ObservationBatchPersistOutcome>),
     Submit(Box<AnchoredObservationWrite>),
     DeferredExactDuplicate(Box<AnchoredObservationWrite>),
+    /// The write collides with, or must compare-and-set a source cursor
+    /// published by, an earlier member of this batch that is not durable yet.
+    /// The batch commits its prefix first and re-prepares this write against
+    /// the durable result, so it settles exactly as it would alone.
+    AwaitsDurablePredecessor(Box<AnchoredObservationWrite>),
 }
 
 impl PreparedObservationPersist {
@@ -1417,72 +1653,14 @@ impl ObservationStore for GlobalDbObservationStore {
             writes = writes.len()
         );
         async move {
-            crate::hotpath_observe::record_transaction_rows(1);
-            let preflight = load_observation_preflight(&self.database, &writes).await?;
-            let mut batch_state = ObservationBatchState::from_preflight(&preflight);
-            let mut published_cursors = HashMap::<
-                (ObservationSourceIdentityV1, ObservationScopeV1),
-                ObservationSourceCursorV1,
-            >::new();
-            let mut prepared = Vec::with_capacity(writes.len());
-            for write in writes {
-                let key = (
-                    write.observation().source().clone(),
-                    write.observation().scope().clone(),
-                );
-                let known_cursor = published_cursors.get(&key).cloned().map(Some);
-                let next_cursor = write.next_cursor().clone();
-                let item = self
-                    .prepare_observation_persist(write, &preflight, &mut batch_state, known_cursor)
-                    .await?;
-                published_cursors.insert(key, next_cursor);
-                prepared.push(item);
+            let mut settled = Vec::with_capacity(writes.len());
+            let mut remaining = writes;
+            while !remaining.is_empty() {
+                let (outcomes, awaiting) = self.persist_observation_segment(remaining).await?;
+                settled.extend(outcomes);
+                remaining = awaiting;
             }
-            let mut outcomes: Vec<Option<ObservationBatchPersistOutcome>> =
-                Vec::with_capacity(prepared.len());
-            let mut submits = Vec::new();
-            let mut deferred_exact_duplicates = Vec::new();
-            for item in prepared {
-                match item {
-                    PreparedObservationPersist::Ready(outcome) => outcomes.push(Some(*outcome)),
-                    PreparedObservationPersist::Submit(write) => {
-                        submits.push((outcomes.len(), *write));
-                        outcomes.push(None);
-                    }
-                    PreparedObservationPersist::DeferredExactDuplicate(write) => {
-                        deferred_exact_duplicates.push((outcomes.len(), *write));
-                        outcomes.push(None);
-                    }
-                }
-            }
-            if !submits.is_empty() {
-                let submitted = submit_observation_writes(
-                    &self.database,
-                    &self.runtime,
-                    submits,
-                    deferred_exact_duplicates,
-                )
-                .await?;
-                for (slot, outcome) in submitted {
-                    outcomes[slot] = Some(outcome);
-                }
-            } else if !deferred_exact_duplicates.is_empty() {
-                return Err(runtime_storage_error(
-                    "persist_observations",
-                    "deferred duplicate has no preceding batch submission",
-                ));
-            }
-            outcomes
-                .into_iter()
-                .map(|outcome| {
-                    outcome.ok_or_else(|| {
-                        runtime_storage_error(
-                            "persist_observations",
-                            "batch slot was not settled by writer authority",
-                        )
-                    })
-                })
-                .collect()
+            Ok(settled)
         }
         .instrument(span)
         .await
@@ -1508,8 +1686,15 @@ impl ObservationStore for GlobalDbObservationStore {
             advance.next_cursor().source(),
             advance.next_cursor().scope(),
         )?;
-        let existed_at_next = actual_cursor.as_ref() == Some(advance.next_cursor());
-        if !existed_at_next && actual_cursor.as_ref() != advance.expected_cursor() {
+        // One owner per frontier. A cursor that already reached `next` has
+        // recorded the range; a second reason must not become a permanent
+        // collision that both ingest owners then warn on forever. The
+        // command still goes to the writer so the current authority epoch
+        // receipts the replay; only its outcome is reported as a duplicate.
+        let reached_frontier = actual_cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.reached(advance.next_cursor()));
+        if !reached_frontier && actual_cursor.as_ref() != advance.expected_cursor() {
             return Err(ObservationStoreError::CursorConflict {
                 expected: Box::new(advance.expected_cursor().cloned()),
                 actual: Box::new(actual_cursor),
@@ -1521,6 +1706,7 @@ impl ObservationStore for GlobalDbObservationStore {
             "coverage": advance.coverage(),
         });
         let key = format!("cursor.{}", canonical_runtime_digest(&identity)?);
+        let replay = advance.clone();
         let payload = RepositoryWritePayloadV1::ObservationCursorAdvance(Box::new(advance));
         let (command_bytes, command_digest) = canonical_json_bytes_and_sha256(
             &runtime_command_value(&payload)?,
@@ -1540,7 +1726,7 @@ impl ObservationStore for GlobalDbObservationStore {
         match outcome? {
             RuntimeSubmitOutcomeV1::Committed { .. }
             | RuntimeSubmitOutcomeV1::CommittedAfterCancellation { .. }
-                if existed_at_next =>
+                if reached_frontier =>
             {
                 Ok(CursorAdvanceOutcome::ExactDuplicate)
             }
@@ -1549,8 +1735,18 @@ impl ObservationStore for GlobalDbObservationStore {
                 Ok(CursorAdvanceOutcome::Committed)
             }
             RuntimeSubmitOutcomeV1::ExactReplay { .. } => Ok(CursorAdvanceOutcome::ExactDuplicate),
+            // The idempotency key covers the advanced coverage, not the whole
+            // command, so a re-scan of already-admitted history reuses the key
+            // with different bytes (a fresh `expected_cursor` or resume
+            // checkpoint) and the writer reports a conflict against the earlier
+            // committed receipt. The other owner may also have committed this
+            // key between the pre-check and the writer lookup. Re-read the
+            // durable cursor under one write transaction: an owner that already
+            // reached `next_cursor` holds the range, a matching ledger row whose
+            // commit left the cursor behind gets that cursor restored, and a
+            // missing or different ledger row stays a collision.
             RuntimeSubmitOutcomeV1::IdempotencyConflict { .. } => {
-                Err(ObservationStoreError::CursorAdvanceCollision)
+                self.restore_admitted_cursor_coverage(&replay).await
             }
             other => Err(runtime_storage_error(
                 "advance observation source cursor",
@@ -1802,14 +1998,14 @@ fn read_runtime_source_cursor(
 /// the caller's expected cursor matches the durable one. Generation values
 /// are opaque source identities, not ordered counters.
 ///
-/// `NotAtFrontier` is the not-at-frontier verdict — a covered replay or a stale
-/// expected view — and leaves every ledger untouched. Gaps and generation
+/// `NotAtFrontier` is the not-at-frontier verdict, a covered replay or a stale
+/// expected view, and leaves every ledger untouched. Gaps and generation
 /// jumps never reach the advance constructor here: `ObservationWrite::new`
 /// already validated that this write's expected→next cursor transition
 /// covers the candidate range, which is exactly the transition the advance
 /// re-derives from the same identity, expected cursor, and range. A
 /// construction failure is therefore a contract violation, and it surfaces
-/// as the typed store error — silently answering "not at the scan frontier"
+/// as the typed store error, silently answering "not at the scan frontier"
 /// would record no coverage and leave the refused record re-read forever.
 enum RefusedScanFrontier {
     AtFrontier(Box<ObservationCursorAdvance>),
@@ -1821,23 +2017,6 @@ enum RefusalCoverageOutcome {
     NotAtFrontier {
         actual: Option<ObservationSourceCursorV1>,
     },
-}
-
-/// Whether an earlier member of this batch already published the source cursor
-/// this write would compare-and-set against.
-///
-/// The collision paths below read the *durable* frontier, but a published
-/// batch cursor only becomes durable when the batch submits. Replaying the
-/// batch as scalar writes lets each earlier write land first, instead of
-/// refusing the whole window as a cursor conflict and wedging the frontier.
-fn durable_frontier_owned_by_batch(
-    known_cursor: &Option<Option<ObservationSourceCursorV1>>,
-) -> Option<ObservationStoreError> {
-    known_cursor
-        .is_some()
-        .then_some(ObservationStoreError::BatchRequiresScalarFallback {
-            cause: ObservationBatchFallbackCause::IntraBatchDurableFrontier,
-        })
 }
 
 fn refused_scan_frontier(

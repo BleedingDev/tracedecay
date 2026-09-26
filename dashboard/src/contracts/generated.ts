@@ -93,6 +93,30 @@ export type AdmitWorkSynthesisCommand = z.infer<typeof AdmitWorkSynthesisCommand
 export const AgentInstanceIdSchema = z.string();
 export type AgentInstanceId = z.infer<typeof AgentInstanceIdSchema>;
 
+export const AgentTaskFailureClassSchema = z.enum(["denied", "disconnected", "malformed_output", "permanent", "retryable", "timeout", "unavailable"]);
+export type AgentTaskFailureClass = z.infer<typeof AgentTaskFailureClassSchema>;
+
+export const AgentTaskKindSchema = z.enum(["combined_review", "memory_curator", "session_reflector", "skill_writer", "user_job"]);
+export type AgentTaskKind = z.infer<typeof AgentTaskKindSchema>;
+
+export const AgentTaskRetryAttemptSchema = z.object({
+  attempt: z.number().int().min(0),
+  backoff_millis: z.number().int().safe().min(0),
+  failure_classification: z.union([z.lazy(() => AgentTaskFailureClassSchema), z.null()]).optional(),
+  succeeded: z.boolean(),
+});
+export type AgentTaskRetryAttempt = z.infer<typeof AgentTaskRetryAttemptSchema>;
+
+export const AggregatedProviderUsageCountersV1Schema = z.object({
+  cache_read_tokens: z.number().int().safe().min(0).nullable(),
+  cache_write_tokens: z.number().int().safe().min(0).nullable(),
+  input_tokens: z.number().int().safe().min(0).nullable(),
+  output_tokens: z.number().int().safe().min(0).nullable(),
+  reasoning_tokens: z.number().int().safe().min(0).nullable(),
+  total_tokens: z.number().int().safe().min(0).nullable(),
+});
+export type AggregatedProviderUsageCountersV1 = z.infer<typeof AggregatedProviderUsageCountersV1Schema>;
+
 export const AnalyticsAgentsPayloadV1Schema = z.object({
   available: z.boolean(),
   by_agent: z.array(z.lazy(() => AnalyticsAgentUsageV1Schema)),
@@ -243,6 +267,7 @@ export const AnalyticsPromptCategoryCountV1Schema = z.object({
 export type AnalyticsPromptCategoryCountV1 = z.infer<typeof AnalyticsPromptCategoryCountV1Schema>;
 
 export const AnalyticsRecentEventV1Schema = z.object({
+  cost: z.union([z.lazy(() => RequestCostReceiptV1Schema), z.null()]).optional(),
   event_kind: z.string(),
   hook_name: z.string(),
   outcome: z.string(),
@@ -285,13 +310,14 @@ export const AnalyticsSubagentNodeV1Schema = z.object({
   session_id: z.string(),
   started_at: z.number().int().safe().nullable(),
   title: z.string().nullable(),
+  usage: z.union([z.lazy(() => ProviderUsageSessionTotalsV1Schema), z.null()]).optional(),
 });
 export type AnalyticsSubagentNodeV1 = z.infer<typeof AnalyticsSubagentNodeV1Schema>;
 
 /** The subagent tree: parent/child session edges, not a per-agent rollup.
 
-`nodes` is a pre-order flattening — every node appears after its own parent
-and before that parent's later siblings — so a reader can draw the tree from
+`nodes` is a pre-order flattening, every node appears after its own parent
+and before that parent's later siblings, so a reader can draw the tree from
 `depth` alone without reassembling edges client-side. */
 export const AnalyticsSubagentTreePayloadV1Schema = z.object({
   available: z.boolean(),
@@ -305,6 +331,7 @@ export const AnalyticsSubagentTreePayloadV1Schema = z.object({
   sessions_read: z.number().int().safe(),
   source: z.string(),
   truncated: z.boolean(),
+  usage_coverage: z.union([z.lazy(() => ProviderUsageCoverageV1Schema), z.null()]).optional(),
 });
 export type AnalyticsSubagentTreePayloadV1 = z.infer<typeof AnalyticsSubagentTreePayloadV1Schema>;
 
@@ -423,7 +450,8 @@ export type AuthorizedRoot = z.infer<typeof AuthorizedRootSchema>;
 
 /** Immutable canonical set of exact roots admitted by their existing request
 contexts. A registered locator participates only as frozen reopening
-evidence; its paired [`ResolvedScope`] remains the root identity authority. */
+evidence; its paired [`ResolvedScope`](crate::context::ResolvedScope) remains
+the root identity authority. */
 export const AuthorizedScopeSetSchema = z.object({
   actor_id: z.lazy(() => ActorIdSchema),
   digest: z.lazy(() => ManifestDigestSchema),
@@ -441,6 +469,32 @@ export const AuthorizedWorkProductScopeV1Schema = z.object({
   selection: z.lazy(() => WorkProductSelectionScopeV1Schema),
 }).strict();
 export type AuthorizedWorkProductScopeV1 = z.infer<typeof AuthorizedWorkProductScopeV1Schema>;
+
+export const AutomaticFactReceiptSchema = z.object({
+  add_fact_request: z.lazy(() => ProjectMemoryFactAddRequestSchema),
+  applied_fact_id: z.string().nullable().optional(),
+  apply_id: z.string(),
+  evidence_hash: z.string().nullable().optional(),
+  item: z.unknown().optional(),
+  quarantine_reason: z.string().nullable().optional(),
+  recorded_at_micros: z.number().int().safe(),
+  run_id: z.string(),
+  schema_version: z.number().int().min(0),
+  state: z.lazy(() => AutomaticFactStateSchema),
+  validation: z.unknown().optional(),
+}).strict();
+export type AutomaticFactReceipt = z.infer<typeof AutomaticFactReceiptSchema>;
+
+/** `GET /api/automation/automatic-fact-receipts`, newest first under `limit`. */
+export const AutomaticFactReceiptsPayloadV1Schema = z.object({
+  count: z.number().int().safe().min(0),
+  limit: z.number().int().safe().min(0),
+  receipts: z.array(z.lazy(() => AutomaticFactReceiptSchema)),
+});
+export type AutomaticFactReceiptsPayloadV1 = z.infer<typeof AutomaticFactReceiptsPayloadV1Schema>;
+
+export const AutomaticFactStateSchema = z.enum(["applied", "quarantined"]);
+export type AutomaticFactState = z.infer<typeof AutomaticFactStateSchema>;
 
 export const AutomaticWorktreeGcV1Schema = z.discriminatedUnion("kind", [z.object({
   kind: z.literal("disabled"),
@@ -474,6 +528,137 @@ export const AutomationExternalEffectReceiptV1Schema = z.object({
 }).strict();
 export type AutomationExternalEffectReceiptV1 = z.infer<typeof AutomationExternalEffectReceiptV1Schema>;
 
+export const AutomationJobSchema = z.object({
+  cooldown_secs: z.number().int().safe().min(0).nullable().optional(),
+  created_at: z.number().int().safe(),
+  delivery: z.lazy(() => JobDeliverySchema),
+  enabled: z.boolean(),
+  id: z.string(),
+  interval_secs: z.number().int().safe().min(0).nullable().optional(),
+  name: z.string(),
+  pre_run_command: z.string().nullable().optional(),
+  prompt: z.string(),
+  schedule: z.string().nullable().optional(),
+  skill_ids: z.array(z.string()).optional(),
+  updated_at: z.number().int().safe(),
+});
+export type AutomationJob = z.infer<typeof AutomationJobSchema>;
+
+/** `GET /api/automation/jobs`. */
+export const AutomationJobsPayloadV1Schema = z.object({
+  count: z.number().int().safe().min(0),
+  jobs: z.array(z.lazy(() => AutomationJobSchema)),
+});
+export type AutomationJobsPayloadV1 = z.infer<typeof AutomationJobsPayloadV1Schema>;
+
+/** `GET /api/automation/outcomes`. */
+export const AutomationOutcomesPayloadV1Schema = z.object({
+  error: z.string(),
+  facts: z.array(z.lazy(() => FactOutcomeRecordSchema)),
+  generated_at: z.number().int().safe(),
+  skills: z.array(z.lazy(() => SkillOutcomeRecordSchema)),
+  snapshot: z.lazy(() => AutomationOutcomesSnapshotStatusV1Schema),
+});
+export type AutomationOutcomesPayloadV1 = z.infer<typeof AutomationOutcomesPayloadV1Schema>;
+
+/** Refresh watermarks of the persisted outcomes snapshot. `available` is
+false when the snapshot could not be read, which differs from a snapshot
+that was never refreshed. */
+export const AutomationOutcomesSnapshotStatusV1Schema = z.object({
+  available: z.boolean(),
+  facts_refreshed_at: z.number().int().safe().nullable(),
+  skills_refreshed_at: z.number().int().safe().nullable(),
+});
+export type AutomationOutcomesSnapshotStatusV1 = z.infer<typeof AutomationOutcomesSnapshotStatusV1Schema>;
+
+export const AutomationRunArtifactSchema = z.object({
+  created_at: z.string(),
+  kind: z.string(),
+  path: z.string(),
+  schema_version: z.number().int().min(0),
+  sha256: z.string(),
+  summary: z.string().nullable().optional(),
+});
+export type AutomationRunArtifact = z.infer<typeof AutomationRunArtifactSchema>;
+
+export const AutomationRunArtifactChainV1Schema = z.object({
+  complete: z.boolean(),
+  expected_kinds: z.array(z.lazy(() => AutomationRunArtifactKindSchema)),
+  integrity_status: z.lazy(() => AutomationRunArtifactIntegrityV1Schema),
+  metadata_complete: z.boolean(),
+  present_kinds: z.array(z.string()),
+});
+export type AutomationRunArtifactChainV1 = z.infer<typeof AutomationRunArtifactChainV1Schema>;
+
+/** Whether the ledger's artifact list matches the published artifact chain. */
+export const AutomationRunArtifactIntegrityV1Schema = z.enum(["ledger_publication_mismatch", "publication_unavailable", "verification_failed", "verified"]);
+export type AutomationRunArtifactIntegrityV1 = z.infer<typeof AutomationRunArtifactIntegrityV1Schema>;
+
+export const AutomationRunArtifactKindSchema = z.enum(["codex_handoff", "feedback", "generated_evals", "optimizer_diagnosis", "traces", "validation_gate"]);
+export type AutomationRunArtifactKind = z.infer<typeof AutomationRunArtifactKindSchema>;
+
+/** `GET /api/automation/runs/{id}/artifacts/{kind}`. The artifact kind owns its
+payload shape, so it is served as opaque JSON. */
+export const AutomationRunArtifactPayloadV1Schema = z.object({
+  artifact: z.lazy(() => AutomationRunArtifactSchema),
+  payload: z.unknown(),
+  run_id: z.string(),
+});
+export type AutomationRunArtifactPayloadV1 = z.infer<typeof AutomationRunArtifactPayloadV1Schema>;
+
+/** `GET /api/automation/runs/{id}/artifacts`. */
+export const AutomationRunArtifactsPayloadV1Schema = z.object({
+  artifact_chain: z.lazy(() => AutomationRunArtifactChainV1Schema),
+  artifacts: z.array(z.lazy(() => AutomationRunArtifactSchema)),
+  count: z.number().int().safe().min(0),
+  run_id: z.string(),
+});
+export type AutomationRunArtifactsPayloadV1 = z.infer<typeof AutomationRunArtifactsPayloadV1Schema>;
+
+/** `known` only when the ledger page holds every row and none was malformed. */
+export const AutomationRunLedgerCompletenessV1Schema = z.enum(["known", "partial"]);
+export type AutomationRunLedgerCompletenessV1 = z.infer<typeof AutomationRunLedgerCompletenessV1Schema>;
+
+export const AutomationRunLedgerRecordSchema = z.object({
+  accepted_count: z.number().int().safe().min(0),
+  applied_ops: z.unknown().optional(),
+  artifacts: z.array(z.lazy(() => AutomationRunArtifactSchema)).optional(),
+  backend: z.string(),
+  backend_attempt_count: z.number().int().safe().min(0),
+  backend_attempts: z.array(z.lazy(() => AgentTaskRetryAttemptSchema)).optional(),
+  backend_identity: z.string().nullable().optional(),
+  completed_at: z.string(),
+  completed_at_micros: z.number().int().safe().nullable().optional(),
+  error: z.string().nullable().optional(),
+  error_classification: z.union([z.lazy(() => AgentTaskFailureClassSchema), z.null()]).optional(),
+  error_retryable: z.boolean().nullable().optional(),
+  evidence_hash: z.string().nullable().optional(),
+  fallback_status: z.string().nullable().optional(),
+  host_mode: z.string().nullable().optional(),
+  input_hash: z.string().nullable().optional(),
+  model: z.string().nullable().optional(),
+  output_hash: z.string().nullable().optional(),
+  prompt_version: z.string().nullable().optional(),
+  proposed_ops: z.unknown().optional(),
+  rejected_count: z.number().int().safe().min(0),
+  rejected_ops: z.unknown().optional(),
+  report_ref: z.unknown().optional(),
+  response_schema: z.unknown().optional(),
+  reviewed_count: z.number().int().safe().min(0),
+  run_id: z.string(),
+  schema_version: z.number().int().min(0),
+  session_evidence_budget_stage: z.union([z.lazy(() => SessionRetrievalBudgetStageV1Schema), z.null()]).optional(),
+  skipped_count: z.number().int().safe().min(0),
+  started_at: z.string(),
+  status: z.lazy(() => AutomationRunStatusSchema),
+  strict_json: z.boolean().nullable().optional(),
+  task: z.lazy(() => AgentTaskKindSchema),
+  task_key: z.string().nullable().optional(),
+  trigger: z.lazy(() => AutomationTriggerSchema),
+  validation_report: z.unknown().optional(),
+});
+export type AutomationRunLedgerRecord = z.infer<typeof AutomationRunLedgerRecordSchema>;
+
 /** Canonical admitted problem for one automation run.
 
 The generic application receipt binds the outer operation. The ordered
@@ -503,6 +688,45 @@ export const AutomationRunResultV1Schema = z.object({
   terminal: z.lazy(() => AutomationRunTerminalV1Schema),
 }).strict();
 export type AutomationRunResultV1 = z.infer<typeof AutomationRunResultV1Schema>;
+
+/** One ledger record as the run-history row. `task_key` is the exact per-job
+identity (`user_job:<id>`); rows written before it existed carry `null` and
+cannot be joined to a job. */
+export const AutomationRunRowV1Schema = z.object({
+  accepted_count: z.number().int().safe().min(0),
+  artifact_kinds: z.array(z.string()),
+  backend: z.string(),
+  backend_attempt_count: z.number().int().safe().min(0),
+  completed_at: z.string(),
+  error: z.string().nullable(),
+  error_classification: z.union([z.lazy(() => AgentTaskFailureClassSchema), z.null()]),
+  error_retryable: z.boolean().nullable(),
+  model: z.string().nullable(),
+  rejected_count: z.number().int().safe().min(0),
+  reviewed_count: z.number().int().safe().min(0),
+  run_id: z.string(),
+  skipped_count: z.number().int().safe().min(0),
+  started_at: z.string(),
+  status: z.lazy(() => AutomationRunStatusSchema),
+  task: z.lazy(() => AgentTaskKindSchema),
+  task_key: z.string().nullable(),
+  trigger: z.lazy(() => AutomationTriggerSchema),
+});
+export type AutomationRunRowV1 = z.infer<typeof AutomationRunRowV1Schema>;
+
+/** `GET /api/automation/runs`, newest first under `limit`. */
+export const AutomationRunsPayloadV1Schema = z.object({
+  completeness: z.lazy(() => AutomationRunLedgerCompletenessV1Schema),
+  count: z.number().int().safe().min(0),
+  has_more: z.boolean(),
+  limit: z.number().int().safe().min(0),
+  malformed_row_count: z.number().int().safe().min(0),
+  runs: z.array(z.lazy(() => AutomationRunRowV1Schema)),
+});
+export type AutomationRunsPayloadV1 = z.infer<typeof AutomationRunsPayloadV1Schema>;
+
+export const AutomationRunStatusSchema = z.enum(["failed", "queued", "running", "skipped", "succeeded"]);
+export type AutomationRunStatus = z.infer<typeof AutomationRunStatusSchema>;
 
 export const AutomationRunSummaryV1Schema = z.object({
   accepted_count: z.number().int().safe().min(0),
@@ -557,12 +781,19 @@ export const AutomationSettingsPayloadV1Schema = z.object({
 });
 export type AutomationSettingsPayloadV1 = z.infer<typeof AutomationSettingsPayloadV1Schema>;
 
-export const AutomationSkipReasonV1Schema = z.enum(["automation_disabled", "backend_disabled", "backend_identity_suppressed", "combined_review_disabled", "delegated_host_mode", "job_commands_disabled", "job_lock_active", "memory_curator_disabled", "no_new_session_activity", "no_session_evidence", "nothing_to_review", "partial_coverage_no_candidates", "scheduler_cooldown_active", "scheduler_cron_not_due", "scheduler_history_invalid", "scheduler_idle_window_active", "scheduler_interval_not_elapsed", "scheduler_lock_active", "scheduler_non_retryable_failure", "scheduler_paused", "scheduler_schedule_invalid", "scheduler_schedule_manual", "session_cursor_manifest_limit_exceeded", "session_evidence_budget_exhausted", "session_evidence_budget_suppressed", "session_evidence_cancelled", "session_evidence_denied", "session_evidence_filter_unavailable", "session_evidence_locked", "session_evidence_partial", "session_evidence_reset_required", "session_evidence_retrieval_unavailable", "session_evidence_stale", "session_evidence_timed_out", "session_evidence_unavailable", "session_reflector_disabled", "shipped_fact_proposal_history_retired", "similarity_authority_unavailable", "skill_writer_disabled", "task_not_schedulable", "user_job_disabled"]);
+/** `GET /api/automation/skills`. */
+export const AutomationSkillsPayloadV1Schema = z.object({
+  count: z.number().int().safe().min(0),
+  skills: z.array(z.lazy(() => ManagedSkillSchema)),
+});
+export type AutomationSkillsPayloadV1 = z.infer<typeof AutomationSkillsPayloadV1Schema>;
+
+export const AutomationSkipReasonV1Schema = z.enum(["automation_disabled", "backend_disabled", "backend_identity_suppressed", "combined_review_disabled", "delegated_host_mode", "job_commands_disabled", "job_lock_active", "memory_curator_disabled", "no_new_session_activity", "no_session_evidence", "nothing_to_review", "partial_coverage_no_candidates", "scheduler_cooldown_active", "scheduler_cron_not_due", "scheduler_history_invalid", "scheduler_idle_window_active", "scheduler_interval_not_elapsed", "scheduler_lock_active", "scheduler_non_retryable_failure", "scheduler_paused", "scheduler_schedule_invalid", "scheduler_schedule_manual", "session_cursor_manifest_limit_exceeded", "session_evidence_budget_exhausted", "session_evidence_budget_suppressed", "session_evidence_cancelled", "session_evidence_denied", "session_evidence_filter_unavailable", "session_evidence_locked", "session_evidence_partial", "session_evidence_reset_required", "session_evidence_retrieval_unavailable", "session_evidence_stale", "session_evidence_timed_out", "session_evidence_unavailable", "session_reflector_disabled", "similarity_authority_unavailable", "skill_writer_disabled", "task_not_schedulable", "user_job_disabled"]);
 export type AutomationSkipReasonV1 = z.infer<typeof AutomationSkipReasonV1Schema>;
 
 export const AutomationTaskStatusV1Schema = z.object({
   due: z.boolean(),
-  last_scheduler_run: z.unknown(),
+  last_scheduler_run: z.union([z.lazy(() => AutomationRunLedgerRecordSchema), z.null()]),
   skip_reason: z.union([z.lazy(() => AutomationSkipReasonV1Schema), z.null()]),
   task: z.string(),
 });
@@ -571,6 +802,9 @@ export type AutomationTaskStatusV1 = z.infer<typeof AutomationTaskStatusV1Schema
 /** Automation capability selected after one registered application admission. */
 export const AutomationTaskV1Schema = z.enum(["combined_review", "memory_curator", "session_reflector", "skill_writer", "user_job"]);
 export type AutomationTaskV1 = z.infer<typeof AutomationTaskV1Schema>;
+
+export const AutomationTriggerSchema = z.enum(["application", "dashboard", "host_receipt", "manual_cli", "manual_mcp", "scheduler"]);
+export type AutomationTrigger = z.infer<typeof AutomationTriggerSchema>;
 
 /** Strongly typed canonical identity: `BrainId`. */
 export const BrainIdSchema = z.string();
@@ -685,11 +919,11 @@ Counts are `None` until the clone artifact has observed the corresponding
 denominator. A complete empty repository reports `Some(0)`, which keeps a
 designed zero distinct from unavailable coverage. */
 export const CodeCloneIndexCoverageV1Schema = z.object({
-  completed_source_pages: z.number().int().safe().min(0),
   conservative_normalized_bodies: z.number().int().safe().min(0).nullable(),
   eligible_source_bodies: z.number().int().safe().min(0).nullable(),
   exact_postings: z.number().int().safe().min(0).nullable(),
   excluded_incomplete_tokenization_bodies: z.number().int().safe().min(0).nullable(),
+  excluded_too_large_bodies: z.number().int().safe().min(0).nullable(),
   excluded_too_small_bodies: z.number().int().safe().min(0).nullable(),
   hot_posting_rows_skipped: z.number().int().safe().min(0).nullable(),
   hot_postings_skipped: z.number().int().safe().min(0).nullable(),
@@ -700,7 +934,6 @@ export const CodeCloneIndexCoverageV1Schema = z.object({
   rename_partial_bodies: z.number().int().safe().min(0).nullable(),
   rename_unsupported_bodies: z.number().int().safe().min(0).nullable(),
   source_bodies: z.number().int().safe().min(0).nullable(),
-  total_source_pages: z.number().int().safe().min(0),
   unique_payloads: z.number().int().safe().min(0).nullable(),
 });
 export type CodeCloneIndexCoverageV1 = z.infer<typeof CodeCloneIndexCoverageV1Schema>;
@@ -729,9 +962,6 @@ export type CodeCloneIndexResourcesV1 = z.infer<typeof CodeCloneIndexResourcesV1
 
 /** Clone readiness, independent from lexical and graph serving. */
 export const CodeCloneIndexStatusV1Schema = z.discriminatedUnion("state", [z.object({
-  observation: z.lazy(() => CodeCloneIndexObservationV1Schema),
-  state: z.literal("backfilling"),
-}), z.object({
   observation: z.lazy(() => CodeCloneIndexObservationV1Schema),
   omission_reasons: z.array(z.string()),
   state: z.literal("partial"),
@@ -859,7 +1089,7 @@ export type CodeIndexGenerationRecoveryV1 = z.infer<typeof CodeIndexGenerationRe
 /** Closed staleness ladder for one mounted worktree.
 
 The scheduler publishes one of these tokens. MCP, the dashboard, and the
-CLI must match the variant — not a hand-copied string — so a new ladder
+CLI must match the variant, not a hand-copied string, so a new ladder
 state cannot appear at one caller and be missed at the others. */
 export const CodeIndexStalenessStateV1Schema = z.enum(["fresh", "indexing", "parked", "refreshing", "stale", "verifying"]);
 export type CodeIndexStalenessStateV1 = z.infer<typeof CodeIndexStalenessStateV1Schema>;
@@ -1046,7 +1276,7 @@ export const DashboardCoverageCompletenessV1Schema = z.enum(["complete", "partia
 export type DashboardCoverageCompletenessV1 = z.infer<typeof DashboardCoverageCompletenessV1Schema>;
 
 /** Coverage statement. Counts are optional; an unknown denominator is `None`,
-never a fabricated `0`/`100%`. The completeness axis is authoritative — the
+never a fabricated `0`/`100%`. The completeness axis is authoritative, the
 frontend never derives `complete` from a `matched == eligible` coincidence. */
 export const DashboardCoverageV1Schema = z.object({
   completeness: z.lazy(() => DashboardCoverageCompletenessV1Schema),
@@ -1067,8 +1297,8 @@ export type DashboardCoverageV1 = z.infer<typeof DashboardCoverageV1Schema>;
 The first sixteen variants are the plan's exact `DashboardDomainState`
 discriminated union. [`Self::Unsupported`] is the backend-gap binding
 state: the read model's HTTP surface exists, but its live producer/source is
-not yet wired server-side. It is never healthy or empty — the frontend
-renders a distinct "not yet available" state — and it is deliberately
+not yet wired server-side. It is never healthy or empty, the frontend
+renders a distinct "not yet available" state, and it is deliberately
 separate from [`Self::UnsupportedSchema`] (an undecodable schema/variant). */
 export const DashboardDomainStateV1Schema = z.union([z.enum(["cancelled", "complete_zero_findings", "conflicting", "denied", "error", "loading", "locked", "offline", "partial", "ready", "redacted", "stale", "timed_out", "unauthorized", "unknown", "unsupported_schema"]), z.literal("unsupported")]).catch("unsupported_schema");
 export type DashboardDomainStateV1 = z.infer<typeof DashboardDomainStateV1Schema>;
@@ -1188,6 +1418,27 @@ export const DecideWorkRelationReplanRequestV1Schema = z.object({
   selection: z.lazy(() => WorkProductSelectionScopeV1Schema),
 }).strict();
 export type DecideWorkRelationReplanRequestV1 = z.infer<typeof DecideWorkRelationReplanRequestV1Schema>;
+
+export const DeliveryAgentUsageRowV1Schema = z.object({
+  agent: z.string().nullable(),
+  counters: z.lazy(() => AggregatedProviderUsageCountersV1Schema),
+  provider: z.string(),
+  sessions: z.number().int().safe().min(0),
+  sessions_with_usage: z.number().int().safe().min(0),
+  tool_calls: z.number().int().safe().min(0),
+  usage_complete: z.boolean(),
+});
+export type DeliveryAgentUsageRowV1 = z.infer<typeof DeliveryAgentUsageRowV1Schema>;
+
+/** The agents whose sessions the correlation index places on `branch`. */
+export const DeliveryAgentUsageV1Schema = z.object({
+  agents: z.array(z.lazy(() => DeliveryAgentUsageRowV1Schema)),
+  branch: z.string(),
+  sessions: z.number().int().safe().min(0),
+  truncated: z.boolean(),
+  usage_coverage: z.lazy(() => ProviderUsageCoverageV1Schema),
+});
+export type DeliveryAgentUsageV1 = z.infer<typeof DeliveryAgentUsageV1Schema>;
 
 export const DeliveryAttentionEvidenceV1Schema = z.discriminatedUnion("kind", [z.object({
   failure_anchor: z.string(),
@@ -1350,11 +1601,21 @@ export const DeliveryGitHubOperationSnapshotV1Schema = z.object({
   outcome: z.lazy(() => DeliveryGitHubOutcomeV1Schema),
   provider_base_commit_id: z.string(),
   provider_head_commit_id: z.string(),
+  quarantined: z.array(z.lazy(() => DeliveryGitHubQuarantinedCommentV1Schema)),
 });
 export type DeliveryGitHubOperationSnapshotV1 = z.infer<typeof DeliveryGitHubOperationSnapshotV1Schema>;
 
 export const DeliveryGitHubOutcomeV1Schema = z.enum(["complete", "denied", "failed", "partial", "rate_limited", "stale", "unavailable"]);
 export type DeliveryGitHubOutcomeV1 = z.infer<typeof DeliveryGitHubOutcomeV1Schema>;
+
+export const DeliveryGitHubQuarantinedCommentV1Schema = z.object({
+  comment_id: z.string(),
+  reason: z.lazy(() => DeliveryGitHubQuarantineReasonV1Schema),
+});
+export type DeliveryGitHubQuarantinedCommentV1 = z.infer<typeof DeliveryGitHubQuarantinedCommentV1Schema>;
+
+export const DeliveryGitHubQuarantineReasonV1Schema = z.enum(["body_out_of_bounds", "privacy_sanitizer"]);
+export type DeliveryGitHubQuarantineReasonV1 = z.infer<typeof DeliveryGitHubQuarantineReasonV1Schema>;
 
 export const DeliveryGitHubReadOperationV1Schema = z.enum(["pull_request", "review_comments", "review_threads", "reviews"]);
 export type DeliveryGitHubReadOperationV1 = z.infer<typeof DeliveryGitHubReadOperationV1Schema>;
@@ -1447,6 +1708,7 @@ export const DeliveryMembershipEdgeV1Schema = z.object({
 export type DeliveryMembershipEdgeV1 = z.infer<typeof DeliveryMembershipEdgeV1Schema>;
 
 export const DeliveryOverviewV1Schema = z.object({
+  agent_usage: z.lazy(() => DeliveryProjectionV19Schema),
   changes: z.lazy(() => DeliveryProjectionV1Schema),
   ci_checks: z.lazy(() => DeliveryProjectionV15Schema),
   commits: z.lazy(() => DeliveryProjectionV12Schema),
@@ -1738,6 +2000,41 @@ export const DeliveryProjectionV18Schema = z.discriminatedUnion("state", [z.obje
 })]);
 export type DeliveryProjectionV18 = z.infer<typeof DeliveryProjectionV18Schema>;
 
+export const DeliveryProjectionV19Schema = z.discriminatedUnion("state", [z.object({
+  state: z.literal("denied"),
+  value: z.union([z.lazy(() => DeliveryAgentUsageV1Schema), z.null()]),
+}), z.object({
+  state: z.literal("empty_measured"),
+  value: z.lazy(() => DeliveryAgentUsageV1Schema),
+}), z.object({
+  state: z.literal("failed"),
+  value: z.lazy(() => DeliveryAgentUsageV1Schema),
+}), z.object({
+  reason: z.string(),
+  required_authority: z.string(),
+  state: z.literal("not_published"),
+}), z.object({
+  state: z.literal("partial"),
+  value: z.lazy(() => DeliveryAgentUsageV1Schema),
+}), z.object({
+  checkpoint: z.union([z.lazy(() => DeliveryRateLimitCheckpointV1Schema), z.null()]),
+  retry_at_micros: z.number().int().safe().nullable(),
+  state: z.literal("rate_limited"),
+  value: z.union([z.lazy(() => DeliveryAgentUsageV1Schema), z.null()]),
+}), z.object({
+  state: z.literal("ready"),
+  value: z.lazy(() => DeliveryAgentUsageV1Schema),
+}), z.object({
+  state: z.literal("stale"),
+  value: z.lazy(() => DeliveryAgentUsageV1Schema),
+}), z.object({
+  reason: z.string(),
+  required_authority: z.string(),
+  state: z.literal("unavailable"),
+  value: z.union([z.lazy(() => DeliveryAgentUsageV1Schema), z.null()]),
+})]);
+export type DeliveryProjectionV19 = z.infer<typeof DeliveryProjectionV19Schema>;
+
 export const DeliveryProviderStateV1Schema = z.enum(["denied", "failed", "not_configured", "not_published", "partial", "rate_limited", "ready", "stale", "unavailable"]);
 export type DeliveryProviderStateV1 = z.infer<typeof DeliveryProviderStateV1Schema>;
 
@@ -1967,7 +2264,7 @@ configuration compatibility drift, code-index mount state, session ingest).
 Each family maps to one audited typed input surface. The set is kept small
 and honest; new families are added through a future versioned enum rather
 than by widening the meaning of an existing variant. */
-export const DoctorFindingFamilyV1Schema = z.union([z.literal("advisory"), z.literal("configuration"), z.literal("storage_runtime"), z.literal("storage"), z.literal("language_server"), z.literal("code_index"), z.literal("observability")]);
+export const DoctorFindingFamilyV1Schema = z.union([z.literal("advisory"), z.literal("configuration"), z.literal("storage_runtime"), z.literal("storage"), z.literal("language_server"), z.literal("code_index"), z.literal("observability"), z.literal("memory")]);
 export type DoctorFindingFamilyV1 = z.infer<typeof DoctorFindingFamilyV1Schema>;
 
 /** The canonical Doctor report projection for the read-only dashboard. */
@@ -1978,6 +2275,7 @@ export const DoctorFindingsPayloadV1Schema = z.object({
   note: z.string(),
   report_coverage: z.union([z.lazy(() => DoctorReportCoverageV1Schema), z.null()]),
   schema_convergences: z.array(z.lazy(() => SchemaConvergenceFindingV1Schema)),
+  storage_kind_statuses: z.array(z.lazy(() => StorageFindingKindStatusV1Schema)),
 });
 export type DoctorFindingsPayloadV1 = z.infer<typeof DoctorFindingsPayloadV1Schema>;
 
@@ -2057,7 +2355,7 @@ export const EffectReceiptSchema = z.object({
 export type EffectReceipt = z.infer<typeof EffectReceiptSchema>;
 
 /** Durable effect receipt terminal state. */
-export const EffectTerminationSchema = z.enum(["cancelled", "completed", "effect_unknown", "failed", "no_change", "partial", "timed_out"]);
+export const EffectTerminationSchema = z.enum(["cancelled", "completed", "effect_unknown", "failed", "partial", "timed_out"]);
 export type EffectTermination = z.infer<typeof EffectTerminationSchema>;
 
 export const EnvironmentSettingsPayloadV1Schema = z.object({
@@ -2385,7 +2683,6 @@ export const ExplorerReadContextV1Schema = z.object({
   messages: z.array(z.lazy(() => LcmMessageV1Schema)),
   offset: z.number().int().safe(),
   order: z.string(),
-  provider: z.string(),
   session_id: z.string(),
   storage_scope: z.string(),
   summary_nodes: z.array(z.lazy(() => LcmSummaryNodeV1Schema)),
@@ -2416,7 +2713,6 @@ export type ExplorerSessionCountsV1 = z.infer<typeof ExplorerSessionCountsV1Sche
 
 export const ExplorerSessionSizeV1Schema = z.object({
   counts: z.lazy(() => ExplorerSessionCountsV1Schema),
-  provider: z.string(),
   session_id: z.string(),
   storage_scope: z.string(),
 });
@@ -2520,6 +2816,26 @@ export const FactMatchesMeasurementV1Schema = z.object({
   same_name_collision_possible: z.boolean(),
 });
 export type FactMatchesMeasurementV1 = z.infer<typeof FactMatchesMeasurementV1Schema>;
+
+export const FactOutcomeRecordSchema = z.object({
+  access_count: z.number().int().safe().min(0).nullable().optional(),
+  apply_id: z.string(),
+  canonical_fact_id: z.string().nullable().optional(),
+  days_since_recorded: z.number().int().safe(),
+  helpful_count: z.number().int().safe().min(0).nullable().optional(),
+  last_recalled_at: z.number().int().safe().nullable().optional(),
+  recorded_at: z.number().int().safe(),
+  retrieval_count: z.number().int().safe().min(0).nullable().optional(),
+  run_id: z.string().nullable().optional(),
+  state: z.lazy(() => ProjectMemoryAutomaticFactStateV1Schema),
+  still_exists: z.boolean(),
+  unhelpful_count: z.number().int().safe().min(0).nullable().optional(),
+  verdict: z.lazy(() => FactOutcomeVerdictSchema),
+});
+export type FactOutcomeRecord = z.infer<typeof FactOutcomeRecordSchema>;
+
+export const FactOutcomeVerdictSchema = z.enum(["deleted", "never_recalled", "quarantined", "recalled", "recalled_and_helpful", "unavailable"]);
+export type FactOutcomeVerdict = z.infer<typeof FactOutcomeVerdictSchema>;
 
 export const FactSearchGraphCoverageV1Schema = z.discriminatedUnion("kind", [z.object({
   expanded_fact_count: z.number().int().safe().min(0),
@@ -2878,7 +3194,6 @@ export const GraphNodeV1Schema = z.object({
 export type GraphNodeV1 = z.infer<typeof GraphNodeV1Schema>;
 
 export const GraphOverviewPayloadV1Schema = z.object({
-  edges_by_kind: z.array(z.lazy(() => GraphKindCountV1Schema)),
   files_by_language: z.array(z.lazy(() => GraphLanguageCountV1Schema)),
   largest_files: z.array(z.lazy(() => GraphLargestFileV1Schema)),
   nodes_by_kind: z.array(z.lazy(() => GraphKindCountV1Schema)),
@@ -2901,11 +3216,12 @@ export type GraphPathPayloadV1 = z.infer<typeof GraphPathPayloadV1Schema>;
 
 export const GraphSearchPayloadV1Schema = z.object({
   count: z.number().int().safe().min(0),
+  has_more: z.boolean(),
   limit: z.number().int().safe(),
   offset: z.number().int().safe(),
   query: z.string(),
   results: z.array(z.lazy(() => GraphNodeV1Schema)),
-  total: z.number().int().safe(),
+  total: z.number().int().safe().min(0).nullable(),
 });
 export type GraphSearchPayloadV1 = z.infer<typeof GraphSearchPayloadV1Schema>;
 
@@ -2961,6 +3277,15 @@ export const IncomingCallEdgeV1Schema = z.object({
 });
 export type IncomingCallEdgeV1 = z.infer<typeof IncomingCallEdgeV1Schema>;
 
+export const JobDeliverySchema = z.discriminatedUnion("mode", [z.object({
+  mode: z.literal("file"),
+  path: z.string().nullable().optional(),
+}), z.object({
+  mode: z.literal("webhook"),
+  url: z.string(),
+})]);
+export type JobDelivery = z.infer<typeof JobDeliverySchema>;
+
 /** p50/p95/p99 for one provider operation latency stage. */
 export const LatencyDistributionReadModelV1Schema = z.object({
   p50: z.lazy(() => MetricValueV1Schema),
@@ -2987,7 +3312,6 @@ export const LcmLatestSessionV1Schema = z.object({
   last_store_id: z.number().int().safe().nullable(),
   last_timestamp: z.number().int().safe().nullable(),
   message_count: z.number().int().safe(),
-  provider: z.string(),
   session_id: z.string(),
 });
 export type LcmLatestSessionV1 = z.infer<typeof LcmLatestSessionV1Schema>;
@@ -3004,7 +3328,6 @@ export const LcmMessageV1Schema = z.object({
   metadata_json: z.string().nullable(),
   ordinal: z.number().int().safe().nullable(),
   pinned: z.number().int().safe().nullable(),
-  provider: z.string(),
   role: z.string().nullable(),
   session_id: z.string(),
   snippet: z.string().nullable(),
@@ -3016,6 +3339,7 @@ export const LcmMessageV1Schema = z.object({
   token_count: z.number().int().safe().nullable(),
   token_count_provenance: z.union([z.lazy(() => LcmTokenCountProvenanceV1Schema), z.null()]),
   tool_name: z.string().nullable(),
+  tool_use_id: z.string().nullable().optional(),
 });
 export type LcmMessageV1 = z.infer<typeof LcmMessageV1Schema>;
 
@@ -3025,10 +3349,8 @@ export const LcmOverviewPayloadV1Schema = z.object({
   latest_summary_nodes: z.array(z.lazy(() => LcmSummaryNodeV1Schema)),
   limit: z.number().int().safe(),
   matches: z.lazy(() => LcmMatchesV1Schema),
-  next_cursor: z.string().nullable(),
   overview: z.lazy(() => LcmOverviewStatsV1Schema),
   path: z.string(),
-  provider: z.string().nullable(),
   query: z.string(),
   storage_scope: z.string(),
 });
@@ -3060,7 +3382,6 @@ export const LcmSearchEngineDetailV1Schema = z.object({
 export type LcmSearchEngineDetailV1 = z.infer<typeof LcmSearchEngineDetailV1Schema>;
 
 export const LcmSearchFiltersV1Schema = z.object({
-  provider: z.string().nullable(),
   role: z.string().nullable(),
   session_id: z.string().nullable(),
   since: z.number().nullable(),
@@ -3108,7 +3429,6 @@ export const LcmSessionPayloadV1Schema = z.object({
   messages: z.array(z.lazy(() => LcmMessageV1Schema)),
   next_cursor: z.string().nullable(),
   path: z.string(),
-  provider: z.string(),
   session_id: z.string(),
   storage_scope: z.string(),
   summary_nodes: z.array(z.lazy(() => LcmSummaryNodeV1Schema)),
@@ -3117,7 +3437,6 @@ export type LcmSessionPayloadV1 = z.infer<typeof LcmSessionPayloadV1Schema>;
 
 export const LcmSourceCountV1Schema = z.object({
   count: z.number().int().safe(),
-  provider: z.string(),
   source: z.string(),
 });
 export type LcmSourceCountV1 = z.infer<typeof LcmSourceCountV1Schema>;
@@ -3129,7 +3448,6 @@ export const LcmSummaryNodeV1Schema = z.object({
   expand_hint: z.string(),
   latest_at: z.number().int().safe().nullable(),
   node_id: z.string(),
-  provider: z.string(),
   recency: z.number().int().safe().nullable(),
   session_id: z.string(),
   snippet: z.string().nullable(),
@@ -3171,10 +3489,8 @@ export const LcmTimelinePayloadV1Schema = z.object({
   buckets: z.array(z.lazy(() => LcmTimelineBucketV1Schema)),
   coverage: z.union([z.lazy(() => LcmTimelineCoverageV1Schema), z.null()]),
   exists: z.boolean(),
-  next_cursor: z.string().nullable(),
   node_buckets: z.array(z.lazy(() => LcmTimelineNodeBucketV1Schema)),
   path: z.string(),
-  provider: z.string().nullable(),
   session_id: z.string().nullable(),
   storage_scope: z.string(),
   undated: z.lazy(() => LcmTimelineUndatedV1Schema),
@@ -3213,7 +3529,7 @@ export type LinkAcceptedWorkAttemptRequestV1 = z.infer<typeof LinkAcceptedWorkAt
 
 Mirrors [`IssueTaskHandoffResultV1`]'s doctrine: the complete binding stays
 inside the daemon authority, and only these identifiers cross the wire. No
-bearer secret exists to leak here — the authority never stored one — and the
+bearer secret exists to leak here. The authority never stored one, and the
 issuer's grant identity and policy digests stay concealed. */
 export const ListedTaskHandoffV1Schema = z.object({
   consumed_at: z.union([z.lazy(() => UtcMicrosSchema), z.null()]),
@@ -3282,6 +3598,7 @@ export type LoomCommitV1 = z.infer<typeof LoomCommitV1Schema>;
 
 export const LoomEditedFileV1Schema = z.object({
   change_type: z.string().nullable(),
+  edited_at_micros: z.number().int().safe().nullable().optional(),
   hunks: z.number().int().safe().nullable(),
   path: z.string(),
   provider: z.string(),
@@ -3311,6 +3628,8 @@ export const LoomSessionRowV1Schema = z.object({
   last_message_at: z.number().int().safe().nullable(),
   messages: z.number().int().safe(),
   models: z.array(z.lazy(() => LoomSessionModelV1Schema)),
+  parent_session_id: z.string().nullable().optional(),
+  parent_tool_use_id: z.string().nullable().optional(),
   provider: z.string(),
   session_id: z.string(),
   started_at: z.number().int().safe().nullable(),
@@ -3362,6 +3681,55 @@ export const LoomTemporalRefreshV1Schema = z.object({
   state: z.lazy(() => DashboardDomainStateV1Schema),
 });
 export type LoomTemporalRefreshV1 = z.infer<typeof LoomTemporalRefreshV1Schema>;
+
+export const ManagedSkillSchema = z.object({
+  body_markdown: z.string(),
+  metadata: z.lazy(() => ManagedSkillMetadataSchema),
+  support_files: z.array(z.lazy(() => ManagedSupportFileSchema)),
+});
+export type ManagedSkill = z.infer<typeof ManagedSkillSchema>;
+
+export const ManagedSkillMaterializationScopeSchema = z.enum(["global", "project"]);
+export type ManagedSkillMaterializationScope = z.infer<typeof ManagedSkillMaterializationScopeSchema>;
+
+export const ManagedSkillMetadataSchema = z.object({
+  absorbed_into: z.string().nullable().optional(),
+  activated_at: z.number().int().safe().nullable().optional(),
+  archived_reason: z.string().nullable().optional(),
+  category: z.string(),
+  checksum: z.string(),
+  created_at: z.number().int().safe(),
+  id: z.string(),
+  materialization_scope: z.lazy(() => ManagedSkillMaterializationScopeSchema).optional(),
+  pinned: z.boolean(),
+  provenance: z.lazy(() => ManagedSkillProvenanceSchema),
+  routing_description: z.string(),
+  state: z.lazy(() => ManagedSkillStateSchema),
+  summary: z.string(),
+  targets: z.array(z.lazy(() => SkillInstallTargetSchema)),
+  title: z.string(),
+  updated_at: z.number().int().safe(),
+});
+export type ManagedSkillMetadata = z.infer<typeof ManagedSkillMetadataSchema>;
+
+export const ManagedSkillProvenanceSchema = z.object({
+  actor: z.string(),
+  run_id: z.string().nullable(),
+  source: z.lazy(() => ManagedSkillSourceSchema),
+});
+export type ManagedSkillProvenance = z.infer<typeof ManagedSkillProvenanceSchema>;
+
+export const ManagedSkillSourceSchema = z.enum(["automation_run", "import", "user"]);
+export type ManagedSkillSource = z.infer<typeof ManagedSkillSourceSchema>;
+
+export const ManagedSkillStateSchema = z.enum(["active", "archived", "disabled"]);
+export type ManagedSkillState = z.infer<typeof ManagedSkillStateSchema>;
+
+export const ManagedSupportFileSchema = z.object({
+  bytes: z.array(z.number().int().min(0).max(255)),
+  path: z.string(),
+});
+export type ManagedSupportFile = z.infer<typeof ManagedSupportFileSchema>;
 
 /** Strongly typed algorithm-tagged integrity digest: `ManifestDigest`. */
 export const ManifestDigestSchema = z.string();
@@ -3599,6 +3967,14 @@ export const MemoryCategoryCountV1Schema = z.object({
 }).strict();
 export type MemoryCategoryCountV1 = z.infer<typeof MemoryCategoryCountV1Schema>;
 
+/** Cache provenance of one derived (projection or similarity) read. */
+export const MemoryDerivedScanV1Schema = z.object({
+  cache_scope: z.string(),
+  cache_state: z.string(),
+  vector_rows_read: z.number().int().safe().min(0),
+});
+export type MemoryDerivedScanV1 = z.infer<typeof MemoryDerivedScanV1Schema>;
+
 export const MemoryEntityRowV1Schema = z.object({
   entity_id: z.string(),
   fact_count: z.number().int().safe().min(0),
@@ -3644,6 +4020,14 @@ export const MemoryFactsCoverageV1Schema = z.object({
   limit: z.number().int().safe().min(1).max(100),
 }).strict();
 export type MemoryFactsCoverageV1 = z.infer<typeof MemoryFactsCoverageV1Schema>;
+
+export const MemoryFeedbackActionV1Schema = z.enum(["helpful", "unhelpful"]);
+export type MemoryFeedbackActionV1 = z.infer<typeof MemoryFeedbackActionV1Schema>;
+
+/** How much of a feedback event this store can still account for. Redacted
+detail was withheld; unknown detail was never recorded. */
+export const MemoryFeedbackDetailsAvailabilityV1Schema = z.enum(["available", "redacted", "unknown"]);
+export type MemoryFeedbackDetailsAvailabilityV1 = z.infer<typeof MemoryFeedbackDetailsAvailabilityV1Schema>;
 
 export const MemoryFeedbackFunnelV1Schema = z.object({
   access_count_total: z.number().int().safe().min(0),
@@ -3726,6 +4110,27 @@ export const MemoryHolographicPayloadV1Schema = z.object({
 }).strict();
 export type MemoryHolographicPayloadV1 = z.infer<typeof MemoryHolographicPayloadV1Schema>;
 
+/** One canonical lineage operation. Operations without a fact target carry no
+`fact_id`; the route does not expose mutation detail. */
+export const MemoryOplogEventV1Schema = z.object({
+  fact_id: z.string().nullable(),
+  id: z.number().int().safe(),
+  op: z.string(),
+  ts: z.number().int().safe(),
+});
+export type MemoryOplogEventV1 = z.infer<typeof MemoryOplogEventV1Schema>;
+
+/** `GET /api/plugins/holographic/oplog`, newest first. */
+export const MemoryOplogPayloadV1Schema = z.object({
+  code: z.string().nullable().optional(),
+  count: z.number().int().safe().min(0),
+  error: z.string(),
+  events: z.array(z.lazy(() => MemoryOplogEventV1Schema)),
+  limit: z.number().int().safe(),
+  state: z.union([z.lazy(() => DashboardDomainStateV1Schema), z.null()]).optional(),
+});
+export type MemoryOplogPayloadV1 = z.infer<typeof MemoryOplogPayloadV1Schema>;
+
 export const MemoryOverviewPayloadV1Schema = z.object({
   holographic: z.lazy(() => MemoryHolographicPayloadV1Schema),
   limit: z.number().int().safe(),
@@ -3743,12 +4148,121 @@ export const MemoryOverviewSummaryV1Schema = z.object({
 }).strict();
 export type MemoryOverviewSummaryV1 = z.infer<typeof MemoryOverviewSummaryV1Schema>;
 
+export const MemoryProjectionCompletenessV1Schema = z.enum(["bounded", "complete", "unknown"]);
+export type MemoryProjectionCompletenessV1 = z.infer<typeof MemoryProjectionCompletenessV1Schema>;
+
+export const MemoryProjectionCoverageV1Schema = z.object({
+  completeness: z.lazy(() => MemoryProjectionCompletenessV1Schema),
+  examined: z.number().int().safe().min(0),
+  limit: z.number().int().safe(),
+  omission_reasons: z.array(z.string()),
+});
+export type MemoryProjectionCoverageV1 = z.infer<typeof MemoryProjectionCoverageV1Schema>;
+
+/** `pca` only when the decomposition succeeded over at least two equal-length
+vectors; every other outcome is `none` and is not a semantic map. */
+export const MemoryProjectionMethodV1Schema = z.enum(["none", "pca"]);
+export type MemoryProjectionMethodV1 = z.infer<typeof MemoryProjectionMethodV1Schema>;
+
+/** `GET /api/plugins/holographic/projection`. */
+export const MemoryProjectionPayloadV1Schema = z.object({
+  code: z.string().nullable().optional(),
+  coverage: z.lazy(() => MemoryProjectionCoverageV1Schema),
+  dim: z.number().int().safe().min(0),
+  error: z.string(),
+  exists: z.boolean(),
+  limit: z.number().int().safe(),
+  method: z.lazy(() => MemoryProjectionMethodV1Schema),
+  points: z.array(z.lazy(() => MemoryProjectionPointV1Schema)),
+  scan: z.union([z.lazy(() => MemoryDerivedScanV1Schema), z.null()]).optional(),
+  state: z.union([z.lazy(() => DashboardDomainStateV1Schema), z.null()]).optional(),
+});
+export type MemoryProjectionPayloadV1 = z.infer<typeof MemoryProjectionPayloadV1Schema>;
+
+/** One projected fact placed in the 2D phase projection. */
+export const MemoryProjectionPointV1Schema = z.object({
+  access_count: z.number().int().safe().min(0),
+  category: z.string(),
+  content: z.string(),
+  created_at: z.number().int().safe(),
+  entities: z.array(z.string()),
+  entity_count: z.number().int().safe().min(0),
+  fact_id: z.lazy(() => FactIdSchema),
+  helpful_count: z.number().int().safe().min(0),
+  last_recalled_at: z.number().int().safe().nullable(),
+  metadata: z.unknown(),
+  payload_access: z.lazy(() => PayloadAccessStateSchema),
+  projected_as_of: z.number().int().safe(),
+  retrieval_count: z.number().int().safe().min(0),
+  source_label: z.string().nullable().optional(),
+  tags: z.array(z.string()),
+  trust_score: z.number(),
+  unhelpful_count: z.number().int().safe().min(0),
+  updated_at: z.number().int().safe(),
+  x: z.number(),
+  y: z.number(),
+});
+export type MemoryProjectionPointV1 = z.infer<typeof MemoryProjectionPointV1Schema>;
+
 export const MemoryReadStatusV1Schema = z.object({
   code: z.string().nullable().optional(),
   error: z.string().nullable().optional(),
   state: z.lazy(() => DashboardDomainStateV1Schema),
 }).strict();
 export type MemoryReadStatusV1 = z.infer<typeof MemoryReadStatusV1Schema>;
+
+/** One fixed-width similarity histogram bin. */
+export const MemoryScoreBinV1Schema = z.object({
+  count: z.number().int().safe().min(0),
+  end: z.number(),
+  start: z.number(),
+});
+export type MemoryScoreBinV1 = z.infer<typeof MemoryScoreBinV1Schema>;
+
+/** Similarity score distribution over every finite scored pair. Every
+statistic is `None` when no finite pair was scored, never zero. */
+export const MemoryScoreDistributionV1Schema = z.object({
+  average_score: z.number().nullable(),
+  bin_count: z.number().int().safe().min(0),
+  bins: z.array(z.lazy(() => MemoryScoreBinV1Schema)),
+  max_score: z.number().nullable(),
+  min_score: z.number().nullable(),
+  total_pairs: z.number().int().safe().min(0),
+});
+export type MemoryScoreDistributionV1 = z.infer<typeof MemoryScoreDistributionV1Schema>;
+
+/** One scored fact pair above the requested similarity floor. */
+export const MemorySimilarityPairV1Schema = z.object({
+  a_category: z.string(),
+  a_content: z.string(),
+  a_id: z.string(),
+  b_category: z.string(),
+  b_content: z.string(),
+  b_id: z.string(),
+  classification: z.string(),
+  similarity: z.number(),
+});
+export type MemorySimilarityPairV1 = z.infer<typeof MemorySimilarityPairV1Schema>;
+
+/** `GET /api/plugins/holographic/similarity`.
+
+`count` is the number of vectored facts scored, `total_pairs` the finite
+pairs scored before the floor and cap, and `pairs` what survived both. */
+export const MemorySimilarityPayloadV1Schema = z.object({
+  code: z.string().nullable().optional(),
+  count: z.number().int().safe().min(0),
+  dim: z.number().int().safe().min(0),
+  error: z.string(),
+  exists: z.boolean(),
+  limit: z.number().int().safe().min(0),
+  min_similarity: z.number(),
+  pairs: z.array(z.lazy(() => MemorySimilarityPairV1Schema)),
+  scan: z.union([z.lazy(() => MemoryDerivedScanV1Schema), z.null()]).optional(),
+  score_distribution: z.lazy(() => MemoryScoreDistributionV1Schema),
+  state: z.union([z.lazy(() => DashboardDomainStateV1Schema), z.null()]).optional(),
+  total_pairs: z.number().int().safe(),
+});
+export type MemorySimilarityPayloadV1 = z.infer<typeof MemorySimilarityPayloadV1Schema>;
 
 export const MemoryStatusPayloadV1Schema = z.object({
   error: z.string(),
@@ -3779,6 +4293,42 @@ export const MemoryTrustBucketV1Schema = z.object({
   label: z.string(),
 }).strict();
 export type MemoryTrustBucketV1 = z.infer<typeof MemoryTrustBucketV1Schema>;
+
+export const MemoryTrustHistoryCompletenessV1Schema = z.enum(["complete", "partial"]);
+export type MemoryTrustHistoryCompletenessV1 = z.infer<typeof MemoryTrustHistoryCompletenessV1Schema>;
+
+export const MemoryTrustHistoryCursorV1Schema = z.object({
+  event_id: z.string(),
+  occurred_at: z.number().int().safe(),
+}).strict();
+export type MemoryTrustHistoryCursorV1 = z.infer<typeof MemoryTrustHistoryCursorV1Schema>;
+
+/** One append-only feedback event. `source` and `note` are absent when the
+event carried none, which differs from an unknown value. */
+export const MemoryTrustHistoryEventV1Schema = z.object({
+  action: z.lazy(() => MemoryFeedbackActionV1Schema),
+  delta: z.number(),
+  details_availability: z.lazy(() => MemoryFeedbackDetailsAvailabilityV1Schema),
+  event_id: z.string(),
+  new_trust: z.number(),
+  note: z.string().nullable().optional(),
+  old_trust: z.number(),
+  source: z.string().nullable().optional(),
+  timestamp: z.number().int().safe(),
+});
+export type MemoryTrustHistoryEventV1 = z.infer<typeof MemoryTrustHistoryEventV1Schema>;
+
+/** `GET /api/plugins/holographic/fact/{fact_id}/trust-history`. `partial`
+exactly when `next_after` names the continuation. */
+export const MemoryTrustHistoryPayloadV1Schema = z.object({
+  completeness: z.lazy(() => MemoryTrustHistoryCompletenessV1Schema),
+  error: z.string(),
+  fact_id: z.string(),
+  limit: z.number().int().safe().min(0),
+  next_after: z.union([z.lazy(() => MemoryTrustHistoryCursorV1Schema), z.null()]),
+  trust_history: z.array(z.lazy(() => MemoryTrustHistoryEventV1Schema)),
+});
+export type MemoryTrustHistoryPayloadV1 = z.infer<typeof MemoryTrustHistoryPayloadV1Schema>;
 
 export const MetricCalibrationV1Schema = z.object({
   calibration_revision: z.string(),
@@ -4126,6 +4676,28 @@ export type ProjectId = z.infer<typeof ProjectIdSchema>;
 export const ProjectionGenerationIdSchema = z.string();
 export type ProjectionGenerationId = z.infer<typeof ProjectionGenerationIdSchema>;
 
+/** The only durable outcomes of an automatic fact apply. Candidate discovery
+and in-flight work are owned by the automation run receipt, never this
+terminal audit record. */
+export const ProjectMemoryAutomaticFactStateV1Schema = z.enum(["applied", "quarantined"]);
+export type ProjectMemoryAutomaticFactStateV1 = z.infer<typeof ProjectMemoryAutomaticFactStateV1Schema>;
+
+/** Transport-neutral input accepted before privacy sanitization.
+
+Transport adapters own their wire DTOs. This single use-case request owns
+the boundary between unsanitized user intent and the canonical store
+command, so callers cannot accidentally bypass payload sanitization. */
+export const ProjectMemoryFactAddRequestSchema = z.object({
+  category: z.lazy(() => FactCategoryV1Schema),
+  content: z.string(),
+  entities: z.array(z.string()),
+  metadata: z.unknown(),
+  source_label: z.string().nullable(),
+  tags: z.array(z.string()),
+  trust: z.number().nullable(),
+}).strict();
+export type ProjectMemoryFactAddRequest = z.infer<typeof ProjectMemoryFactAddRequestSchema>;
+
 /** The finite relationship vocabulary exposed by the verified project-memory graph. */
 export const ProjectMemoryGraphRelationKindV1Schema = z.enum(["active_assertion", "contradicts", "derived_from", "evidence_anchor", "mentions", "supersedes", "supports"]);
 export type ProjectMemoryGraphRelationKindV1 = z.infer<typeof ProjectMemoryGraphRelationKindV1Schema>;
@@ -4136,6 +4708,7 @@ export const ProjectRegistryEntrySchema = z.object({
   branches: z.array(z.string()),
   canonical_root: z.string(),
   default_branch: z.string().nullable(),
+  head_branch: z.string().nullable(),
   is_active: z.boolean().nullable().optional(),
   kind: z.string(),
   label: z.string(),
@@ -4180,13 +4753,9 @@ export type ProjectSettingsPatch = z.infer<typeof ProjectSettingsPatchSchema>;
 
 export const ProjectSettingsPayloadV1Schema = z.object({
   config: z.lazy(() => ProjectEditableSettingsV1Schema),
-  config_path: z.string(),
   configuration_revision_id: z.string(),
   configuration_snapshot_id: z.string(),
-  legacy_config_path: z.string(),
-  legacy_config_read_only: z.boolean(),
   pr_autotrack: z.lazy(() => PrAutoTrackPayloadV1Schema),
-  tracedecay_dir_gitignored: z.boolean(),
 });
 export type ProjectSettingsPayloadV1 = z.infer<typeof ProjectSettingsPayloadV1Schema>;
 
@@ -4255,6 +4824,18 @@ export const ProviderLatencyReadModelV1Schema = z.object({
 });
 export type ProviderLatencyReadModelV1 = z.infer<typeof ProviderLatencyReadModelV1Schema>;
 
+export const ProviderUsageCoverageV1Schema = z.enum(["complete", "partial", "unavailable"]);
+export type ProviderUsageCoverageV1 = z.infer<typeof ProviderUsageCoverageV1Schema>;
+
+/** Provider-reported usage attributed to one `(provider, session_id)`, summed
+from the reduced deltas of one aggregate. */
+export const ProviderUsageSessionTotalsV1Schema = z.object({
+  complete: z.boolean(),
+  counters: z.lazy(() => AggregatedProviderUsageCountersV1Schema),
+  usage_events: z.number().int().safe().min(0),
+});
+export type ProviderUsageSessionTotalsV1 = z.infer<typeof ProviderUsageSessionTotalsV1Schema>;
+
 export const ProviderUsageSummaryV1Schema = z.object({
   available: z.boolean(),
   cost_basis: z.string().nullable(),
@@ -4288,6 +4869,7 @@ export const PublicCodeProjectSchema = z.object({
   default_branch: z.string().nullable(),
   display_root: z.string(),
   git_common_dir: z.string().nullable(),
+  head_branch: z.string().nullable(),
   is_active: z.boolean().nullable().optional(),
   label: z.string(),
   last_seen_at: z.number().int().safe(),
@@ -4411,7 +4993,6 @@ export type RemoteListenerKindV1 = z.infer<typeof RemoteListenerKindV1Schema>;
 export const RemoteOperationalStatusPayloadV1Schema = z.discriminatedUnion("kind", [z.object({
   authority: z.lazy(() => RemoteAuthoritySummaryV1Schema),
   coverage: z.lazy(() => DoctorCoverageCompletenessV1Schema),
-  current_backup_verified: z.boolean(),
   enrollment_configured: z.boolean(),
   failover_in_progress: z.boolean(),
   kind: z.literal("observed"),
@@ -4450,6 +5031,17 @@ export const RepositoryPlacementScopeV1Schema = z.discriminatedUnion("kind", [z.
   repositories: z.array(z.lazy(() => RepositoryIdSchema)),
 })]);
 export type RepositoryPlacementScopeV1 = z.infer<typeof RepositoryPlacementScopeV1Schema>;
+
+/** What one request cost the stores that answered it, counted on its read
+lease, so an operator can see why a call was slow. */
+export const RequestCostReceiptV1Schema = z.object({
+  adjacency_queries: z.number().int().safe().min(0),
+  adjacency_rows: z.number().int().safe().min(0),
+  bytes_hydrated: z.number().int().safe().min(0),
+  point_reads: z.lazy(() => StorePointReadsV1Schema),
+  wall_micros: z.number().int().safe().min(0),
+}).strict();
+export type RequestCostReceiptV1 = z.infer<typeof RequestCostReceiptV1Schema>;
 
 export const RequiredCheckExpectationV1Schema = z.literal("successful_terminal");
 export type RequiredCheckExpectationV1 = z.infer<typeof RequiredCheckExpectationV1Schema>;
@@ -4702,7 +5294,6 @@ export const SavingsAccountingSummaryV1Schema = z.object({
   db: z.string(),
   error: z.string().nullable(),
   ledger: z.union([z.lazy(() => SavingsLedgerSummaryV1Schema), z.null()]),
-  lifetime_counters: z.union([z.lazy(() => SavingsLifetimeCountersV1Schema), z.null()]),
   recording: z.unknown(),
 });
 export type SavingsAccountingSummaryV1 = z.infer<typeof SavingsAccountingSummaryV1Schema>;
@@ -4714,21 +5305,6 @@ export const SavingsLedgerSummaryV1Schema = z.object({
   today: z.lazy(() => SavingsSumV1Schema),
 });
 export type SavingsLedgerSummaryV1 = z.infer<typeof SavingsLedgerSummaryV1Schema>;
-
-export const SavingsLifetimeCountersV1Schema = z.object({
-  project_total: z.number().int().safe(),
-  projects: z.array(z.lazy(() => SavingsLifetimeProjectV1Schema)),
-  projects_limit: z.number().int().safe(),
-  projects_truncated: z.boolean(),
-  total_tokens_saved: z.number().int().safe(),
-});
-export type SavingsLifetimeCountersV1 = z.infer<typeof SavingsLifetimeCountersV1Schema>;
-
-export const SavingsLifetimeProjectV1Schema = z.object({
-  path: z.string().nullable(),
-  tokens_saved: z.number().int().safe().nullable(),
-});
-export type SavingsLifetimeProjectV1 = z.infer<typeof SavingsLifetimeProjectV1Schema>;
 
 /** One UTC-day bucket of the per-model content aggregate. */
 export const SavingsModelDayRowV1Schema = z.object({
@@ -4875,47 +5451,6 @@ export const SavingsProviderUsageAttributionV1Schema = z.object({
 });
 export type SavingsProviderUsageAttributionV1 = z.infer<typeof SavingsProviderUsageAttributionV1Schema>;
 
-export const SavingsSessionModelV1Schema = z.object({
-  cost_basis: z.string(),
-  estimated: z.lazy(() => TokenPairV1Schema),
-  estimated_messages: z.number().int().safe(),
-  messages: z.number().int().safe(),
-  model: z.string().nullable(),
-  provider_actual: z.union([z.lazy(() => TokenActualV1Schema), z.null()]),
-  provider_usage_events: z.number().int().safe(),
-  tokenized: z.lazy(() => TokenPairV1Schema),
-  tokenized_messages: z.number().int().safe(),
-  tokenizer: z.unknown(),
-});
-export type SavingsSessionModelV1 = z.infer<typeof SavingsSessionModelV1Schema>;
-
-export const SavingsSessionRowV1Schema = z.object({
-  cost_basis: z.string(),
-  estimated_messages: z.number().int().safe(),
-  is_subagent: z.boolean(),
-  last_message_at: z.number().int().safe().nullable(),
-  messages: z.number().int().safe(),
-  models: z.array(z.lazy(() => SavingsSessionModelV1Schema)),
-  provider: z.string(),
-  provider_usage_events: z.number().int().safe(),
-  session_id: z.string(),
-  started_at: z.number().int().safe().nullable(),
-  title: z.string().nullable(),
-  tokenized_messages: z.number().int().safe(),
-});
-export type SavingsSessionRowV1 = z.infer<typeof SavingsSessionRowV1Schema>;
-
-export const SavingsSessionsPayloadV1Schema = z.object({
-  available: z.boolean(),
-  db: z.string(),
-  range: z.string(),
-  scope: z.string().nullable(),
-  sessions: z.array(z.lazy(() => SavingsSessionRowV1Schema)),
-  since: z.number().int().safe().nullable(),
-  total: z.number().int().safe(),
-});
-export type SavingsSessionsPayloadV1 = z.infer<typeof SavingsSessionsPayloadV1Schema>;
-
 export const SavingsSessionSummaryV1Schema = z.object({
   available: z.boolean(),
   cost_basis: z.string().nullable(),
@@ -4964,7 +5499,7 @@ export const SchemaConvergenceProgressV1Schema = z.discriminatedUnion("unit", [z
 }).strict()]);
 export type SchemaConvergenceProgressV1 = z.infer<typeof SchemaConvergenceProgressV1Schema>;
 
-export const SchemaConvergenceStageV1Schema = z.enum(["registered_schema", "runtime_writer_ledger"]);
+export const SchemaConvergenceStageV1Schema = z.literal("registered_schema");
 export type SchemaConvergenceStageV1 = z.infer<typeof SchemaConvergenceStageV1Schema>;
 
 export const SchemaConvergenceStateV1Schema = z.enum(["completed", "degraded", "pending_schema_migration", "released_shape_convergence_in_progress"]);
@@ -5079,8 +5614,8 @@ export type SessionId = z.infer<typeof SessionIdSchema>;
 
 `stage` names which budget refused; this is what tells an oversized request
 apart from a read whose cost was mis-sized for it. The ceiling value also
-distinguishes the resources inside one stage — a record read that stopped at
-1024 hit the item count, one that stopped at 16 MiB hit the byte total — so
+distinguishes the resources inside one stage: a record read that stopped at
+1024 hit the item count, one that stopped at 16 MiB hit the byte total, so
 the kernel's resource spelling stays in the kernel instead of becoming a
 second wire vocabulary to keep in step. */
 export const SessionRetrievalBudgetAccountingV1Schema = z.object({
@@ -5093,7 +5628,7 @@ export type SessionRetrievalBudgetAccountingV1 = z.infer<typeof SessionRetrieval
 
 Both variants are exact. A bounded read never counts the rows it declined to
 read, so an exhausted read reports what it consumed and that storage held
-more — never a total it would have to run the refused scan to learn. */
+more, never a total it would have to run the refused scan to learn. */
 export const SessionRetrievalBudgetObservationV1Schema = z.discriminatedUnion("observation", [z.object({
   observation: z.literal("consumed_with_more_available"),
   units: z.number().int().safe().min(0),
@@ -5162,34 +5697,14 @@ export const SignificantTableGrowthSampleV1Schema = z.object({
 });
 export type SignificantTableGrowthSampleV1 = z.infer<typeof SignificantTableGrowthSampleV1Schema>;
 
-export const SimilarAlignedDifferenceV1Schema = z.object({
-  candidate_span: z.lazy(() => SimilarTokenSpanV1Schema),
-  candidate_token_count: z.number().int().min(0),
-  source_span: z.lazy(() => SimilarTokenSpanV1Schema),
-  source_token_count: z.number().int().min(0),
-}).strict();
-export type SimilarAlignedDifferenceV1 = z.infer<typeof SimilarAlignedDifferenceV1Schema>;
-
-export const SimilarAlignmentAnchorV1Schema = z.object({
-  candidate_token_position: z.number().int().min(0),
-  fingerprint: z.number().int().safe().min(0),
-  source_token_position: z.number().int().min(0),
-}).strict();
-export type SimilarAlignmentAnchorV1 = z.infer<typeof SimilarAlignmentAnchorV1Schema>;
-
-export const SimilarAlignmentV1Schema = z.object({
-  anchors: z.array(z.lazy(() => SimilarAlignmentAnchorV1Schema)),
-  shared_token_count: z.number().int().min(0),
-}).strict();
-export type SimilarAlignmentV1 = z.infer<typeof SimilarAlignmentV1Schema>;
-
-export const SimilarContainmentV1Schema = z.enum(["candidate_contains_selected_range", "equal", "selected_range_contains_candidate"]);
-export type SimilarContainmentV1 = z.infer<typeof SimilarContainmentV1Schema>;
-
 export const SimilarCoverageV1Schema = z.discriminatedUnion("status", [z.object({
   status: z.literal("complete"),
 }).strict(), z.object({
   status: z.literal("excluded_incomplete_tokenization"),
+}).strict(), z.object({
+  maximum_bytes: z.number().int().safe().min(0),
+  maximum_tokens: z.number().int().min(0),
+  status: z.literal("excluded_too_large"),
 }).strict(), z.object({
   minimum_tokens: z.number().int().min(0),
   status: z.literal("excluded_too_small"),
@@ -5213,51 +5728,6 @@ export type SimilarFamilyV1 = z.infer<typeof SimilarFamilyV1Schema>;
 export const SimilarMatchClassV1Schema = z.enum(["conservative_exact", "rename_normalized_exact"]);
 export type SimilarMatchClassV1 = z.infer<typeof SimilarMatchClassV1Schema>;
 
-export const SimilarNearCoverageV1Schema = z.discriminatedUnion("status", [z.object({
-  status: z.literal("complete"),
-}).strict(), z.object({
-  status: z.literal("excluded_incomplete_tokenization"),
-}).strict(), z.object({
-  minimum_tokens: z.number().int().min(0),
-  status: z.literal("excluded_too_small"),
-}).strict(), z.object({
-  reasons: z.array(z.lazy(() => SimilarNearPartialReasonV1Schema)),
-  status: z.literal("partial"),
-}).strict(), z.object({
-  reason: z.lazy(() => SimilarNearUnavailableReasonV1Schema),
-  status: z.literal("unavailable"),
-}).strict()]);
-export type SimilarNearCoverageV1 = z.infer<typeof SimilarNearCoverageV1Schema>;
-
-/** One candidate supported by verified fingerprint anchors. Directional
-coverage is reported separately for source and candidate; no scalar score
-is meaningful for a directional code comparison and none is emitted. */
-export const SimilarNearMatchV1Schema = z.object({
-  alignment: z.lazy(() => SimilarAlignmentV1Schema),
-  candidate: z.lazy(() => SimilarOccurrenceV1Schema),
-  candidate_coverage_millionths: z.number().int().min(0),
-  containment: z.union([z.lazy(() => SimilarContainmentV1Schema), z.null()]).optional(),
-  differences: z.array(z.lazy(() => SimilarAlignedDifferenceV1Schema)),
-  extent: z.lazy(() => SimilarSourceExtentV1Schema),
-  match_class: z.lazy(() => SimilarMatchClassV1Schema),
-  source_coverage_millionths: z.number().int().min(0),
-}).strict();
-export type SimilarNearMatchV1 = z.infer<typeof SimilarNearMatchV1Schema>;
-
-export const SimilarNearPartialReasonV1Schema = z.enum(["cancelled", "candidate_body_budget", "deadline_exceeded", "hot_postings", "posting_row_budget", "verification_body_budget", "verification_work_budget"]);
-export type SimilarNearPartialReasonV1 = z.infer<typeof SimilarNearPartialReasonV1Schema>;
-
-export const SimilarNearResultV1Schema = z.object({
-  coverage: z.lazy(() => SimilarNearCoverageV1Schema),
-  extent: z.lazy(() => SimilarSourceExtentV1Schema),
-  matches: z.array(z.lazy(() => SimilarNearMatchV1Schema)),
-  next_cursor: z.string().nullable(),
-}).strict();
-export type SimilarNearResultV1 = z.infer<typeof SimilarNearResultV1Schema>;
-
-export const SimilarNearUnavailableReasonV1Schema = z.enum(["authority_unavailable", "cancelled", "capability_unavailable", "capacity_unavailable", "corruption_reset_required", "generation_unavailable", "generation_unverified", "internal", "invalid_request", "linked_worktree_disabled", "timed_out"]);
-export type SimilarNearUnavailableReasonV1 = z.infer<typeof SimilarNearUnavailableReasonV1Schema>;
-
 export const SimilarOccurrenceV1Schema = z.object({
   body_span: z.lazy(() => SourceSpanSchema),
   path: z.string(),
@@ -5273,32 +5743,27 @@ export type SimilarOccurrenceV1 = z.infer<typeof SimilarOccurrenceV1Schema>;
 export const SimilarResultV1Schema = z.object({
   coverage: z.lazy(() => SimilarCoverageV1Schema),
   families: z.array(z.lazy(() => SimilarFamilyV1Schema)),
-  near: z.union([z.lazy(() => SimilarNearResultV1Schema), z.null()]).optional(),
   source: z.lazy(() => SimilarOccurrenceV1Schema),
   source_generation: z.lazy(() => CodeGenerationIdSchema),
 }).strict();
 export type SimilarResultV1 = z.infer<typeof SimilarResultV1Schema>;
 
-/** The source extent compared by the verified shared-code lane.
+export const SkillInstallTargetSchema = z.enum(["agents", "claude", "codex", "cursor", "hermes", "kimi", "kiro", "opencode"]);
+export type SkillInstallTarget = z.infer<typeof SkillInstallTargetSchema>;
 
-The field on [`SimilarSurfaceRequestV1`] is optional for wire
-compatibility; an omitted value means [`Self::WholeBody`]. A selected
-extent is measured in the canonical normalized token stream, so mutable
-source line numbers never become part of the comparison request. */
-export const SimilarSourceExtentV1Schema = z.discriminatedUnion("kind", [z.object({
-  end: z.number().int().min(0),
-  kind: z.literal("selected_token_range"),
-  start: z.number().int().min(0),
-}).strict(), z.object({
-  kind: z.literal("whole_body"),
-}).strict()]);
-export type SimilarSourceExtentV1 = z.infer<typeof SimilarSourceExtentV1Schema>;
+export const SkillOutcomeRecordSchema = z.object({
+  activated_at: z.number().int().safe(),
+  days_since_activation: z.number().int().safe(),
+  skill_id: z.string(),
+  title: z.string().nullable().optional(),
+  uses_since_activation: z.number().int().safe().min(0),
+  verdict: z.lazy(() => SkillOutcomeVerdictSchema),
+  views_since_activation: z.number().int().safe().min(0),
+});
+export type SkillOutcomeRecord = z.infer<typeof SkillOutcomeRecordSchema>;
 
-export const SimilarTokenSpanV1Schema = z.object({
-  end: z.number().int().min(0),
-  start: z.number().int().min(0),
-}).strict();
-export type SimilarTokenSpanV1 = z.infer<typeof SimilarTokenSpanV1Schema>;
+export const SkillOutcomeVerdictSchema = z.enum(["adopted", "ignored", "too_early"]);
+export type SkillOutcomeVerdict = z.infer<typeof SkillOutcomeVerdictSchema>;
 
 /** Byte range inside one sanitized source file. Mutable line numbers are
 never part of identity. */
@@ -5350,22 +5815,6 @@ a real result. This is source coverage, not a health grade: `Real` can
 describe a clean observation or a problem finding. */
 export const StorageFindingSourceStateV1Schema = z.enum(["partial", "real", "unsupported"]);
 export type StorageFindingSourceStateV1 = z.infer<typeof StorageFindingSourceStateV1Schema>;
-
-/** Route-specific payload for `/api/storage/findings`.
-
-Storage producer coverage is required here rather than an optional field on
-the general Doctor payload, so generated consumers cannot mistake one route
-for the other. */
-export const StorageFindingsPayloadV1Schema = z.object({
-  entries: z.array(z.lazy(() => DoctorReportEntryV1Schema)),
-  family_filter: z.union([z.lazy(() => DoctorFindingFamilyV1Schema), z.null()]),
-  kind_statuses: z.array(z.lazy(() => StorageFindingKindStatusV1Schema)),
-  known_families: z.array(z.lazy(() => DoctorFindingFamilyV1Schema)),
-  note: z.string(),
-  report_coverage: z.union([z.lazy(() => DoctorReportCoverageV1Schema), z.null()]),
-  schema_convergences: z.array(z.lazy(() => SchemaConvergenceFindingV1Schema)),
-});
-export type StorageFindingsPayloadV1 = z.infer<typeof StorageFindingsPayloadV1Schema>;
 
 export const StorageSettingsPayloadV1Schema = z.object({
   dashboard_root: z.string(),
@@ -5456,9 +5905,16 @@ export const StoreGrowthDimensionV1Schema = z.discriminatedUnion("state", [z.obj
 export type StoreGrowthDimensionV1 = z.infer<typeof StoreGrowthDimensionV1Schema>;
 
 /** Logical name of one owner-profile store (for example `sessions.db`,
-`graph.db`, or `branches/feature-x`). Never an absolute on-disk path. */
+`graph.db`, or `projects/proj_x`). Never an absolute on-disk path. */
 export const StoreKeyV1Schema = z.string();
 export type StoreKeyV1 = z.infer<typeof StoreKeyV1Schema>;
+
+/** Point reads per graph store kind. */
+export const StorePointReadsV1Schema = z.object({
+  graph_sealed: z.number().int().safe().min(0),
+  graph_staging: z.number().int().safe().min(0),
+}).strict();
+export type StorePointReadsV1 = z.infer<typeof StorePointReadsV1Schema>;
 
 /** One cheap size sample for a single store, derived from page-count pragmas.
 
@@ -5525,13 +5981,10 @@ export const StrataMeasurementV1Schema = z.object({
 export type StrataMeasurementV1 = z.infer<typeof StrataMeasurementV1Schema>;
 
 export const StrataScanV1Schema = z.object({
-  budget_ms: z.number().int().safe().min(0),
   cache_scope: z.string(),
   cache_state: z.string(),
   dependency_edges_examined: z.number().int().safe().min(0),
   files_examined: z.number().int().safe().min(0),
-  max_dependency_edges: z.number().int().safe().min(0),
-  max_files: z.number().int().safe().min(0),
 });
 export type StrataScanV1 = z.infer<typeof StrataScanV1Schema>;
 
@@ -5802,8 +6255,6 @@ export const UserSettingsPayloadV1Schema = z.object({
   configuration_snapshot_id: z.string(),
   extraction_timeout_secs: z.number().int().safe().min(0),
   installed_agents: z.array(z.string()),
-  legacy_config_path: z.string(),
-  legacy_config_read_only: z.boolean(),
   upload_enabled: z.boolean(),
   watcher_debounce: z.string(),
 });
@@ -6633,7 +7084,7 @@ export type WorkflowDefinitionId = z.infer<typeof WorkflowDefinitionIdSchema>;
 Plan 32 ("Typed workflow definitions"): "Lifecycle retains candidate,
 validate, activate, retire, reject, list, get, diff, and history operations
 through the same application surfaces." The definition payload itself stays
-immutable — "Editing creates a new version; admitted runs remain pinned" —
+immutable, "Editing creates a new version; admitted runs remain pinned",
 so the disposition is a separate revisioned aggregate keyed by the same
 definition identity. */
 export const WorkflowDefinitionLifecycleStateSchema = z.enum(["active", "candidate", "rejected", "retired", "validated"]);
@@ -6956,6 +7407,10 @@ export type WorkGraphReadRequestV1 = z.infer<typeof WorkGraphReadRequestV1Schema
 
 export const WorkGraphReadV1Schema = z.discriminatedUnion("mode", [z.object({
   authorized_scope: z.lazy(() => AuthorizedWorkProductScopeV1Schema),
+  mode: z.literal("absent"),
+  selection_coverage: z.lazy(() => WorkGraphSelectionCoverageV1Schema),
+}), z.object({
+  authorized_scope: z.lazy(() => AuthorizedWorkProductScopeV1Schema),
   mode: z.literal("as_of"),
   selection_coverage: z.lazy(() => WorkGraphSelectionCoverageV1Schema),
   snapshot: z.lazy(() => WorkGraphVersionEntryV1Schema),
@@ -6983,7 +7438,7 @@ A selection names a slice of the owner's work, not the whole journal: an
 event records the relation scopes it was admitted under, and a selection
 that does not name them puts that event *outside* the slice. The events
 outside a selection do not poison the ones inside it, but they must never be
-concealed either — a caller who is shown the covered slice with no way to
+concealed either, a caller who is shown the covered slice with no way to
 learn that more exists is reading a silently incomplete graph.
 
 So the read answers over the covered slice and says so, in the same
@@ -7664,7 +8119,7 @@ export const WorkProviderRouteV1Schema = z.object({
 }).strict();
 export type WorkProviderRouteV1 = z.infer<typeof WorkProviderRouteV1Schema>;
 
-/** Ranked route. Dimensions stay SEPARATE — no scalar score field is permitted here. */
+/** Ranked route. Dimensions stay SEPARATE. No scalar score field is permitted here. */
 export const WorkRankedRouteV1Schema = z.object({
   autonomy: z.lazy(() => WorkOrdinalBandV1Schema),
   correctness: z.lazy(() => WorkOrdinalBandV1Schema),
@@ -8014,7 +8469,7 @@ export const WorkTaskSessionEvidenceV1Schema = z.object({
 }).strict();
 export type WorkTaskSessionEvidenceV1 = z.infer<typeof WorkTaskSessionEvidenceV1Schema>;
 
-export const WorkTaskSessionHydrationStateV1Schema = z.enum(["available", "deleted", "locked", "redacted", "retained_but_unavailable", "retention_expired", "unauthorized", "unverifiable_legacy"]);
+export const WorkTaskSessionHydrationStateV1Schema = z.enum(["available", "deleted", "locked", "redacted", "retained_but_unavailable", "retention_expired", "unauthorized", "unverifiable"]);
 export type WorkTaskSessionHydrationStateV1 = z.infer<typeof WorkTaskSessionHydrationStateV1Schema>;
 
 export const WorkTaskSessionHydrationV1Schema = z.object({

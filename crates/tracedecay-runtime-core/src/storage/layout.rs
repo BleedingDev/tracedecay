@@ -7,13 +7,13 @@ use tracedecay_domain::ProjectId;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::{
-    EnrollmentMarker, ProjectIdentity, RESPONSE_HANDLES_DIRECTORY, STORE_MANIFEST_FILENAME,
-    StorageMode, StoreKind, StoreLayout, read_repository_identity_marker, validate_project_id,
+    ProjectIdentity, STORE_MANIFEST_FILENAME, StorageMode, StoreKind, StoreLayout,
+    read_repository_identity_marker, validate_project_id,
 };
 
 /// Typed project identity recorded on a registered store layout.
 ///
-/// Absence or an invalid id is a configuration fault — registered code
+/// Absence or an invalid id is a configuration fault, registered code
 /// runtimes never invent a project id from the filesystem path.
 pub fn registered_project_id(store_layout: &StoreLayout) -> Result<ProjectId> {
     let project_id =
@@ -36,8 +36,8 @@ pub fn registered_project_id(store_layout: &StoreLayout) -> Result<ProjectId> {
 /// identity equal to it.
 ///
 /// This never creates or repairs a marker, so a caller that must not mount
-/// a store the profile has not enrolled — a cross-project memory reader,
-/// for one — can tell "not enrolled here" apart from "enrolled".
+/// a store the profile has not enrolled, a cross-project memory reader,
+/// for one, can tell "not enrolled here" apart from "enrolled".
 pub fn enrolled_project_roots(
     candidates: impl IntoIterator<Item = PathBuf>,
     project_id: &ProjectId,
@@ -81,8 +81,8 @@ fn project_id_for_identity_root(identity_root: &Path) -> String {
 /// repository it belongs to.
 ///
 /// Only discovery wants this. Discovery asks a narrower question than identity
-/// resolution — not "which repository owns this checkout" but "was a store
-/// ever minted for this exact directory" — and answering it with the
+/// resolution, not "which repository owns this checkout" but "was a store
+/// ever minted for this exact directory", and answering it with the
 /// repository id would report every linked worktree of an initialized
 /// repository as independently initialized.
 pub fn path_local_profile_project_id(project_root: &Path) -> String {
@@ -117,44 +117,35 @@ pub(crate) fn has_path_local_profile_store(project_root: &Path) -> bool {
     };
     let data_root =
         profile_sharded_data_root(&profile_root, &path_local_profile_project_id(project_root));
-    data_root.join(config::db_filename(&data_root)).exists()
+    data_root.join(config::DB_FILENAME).exists()
 }
 
 pub fn default_profile_sharded_layout(
     project_root: &Path,
     profile_root: &Path,
 ) -> Result<StoreLayout> {
-    let marker = EnrollmentMarker {
-        project_id: default_profile_project_id(project_root),
-        storage_mode: StorageMode::ProfileSharded,
-    };
-    profile_sharded_layout(project_root, profile_root, &marker)
+    profile_sharded_layout(
+        project_root,
+        profile_root,
+        &default_profile_project_id(project_root),
+    )
 }
 
 pub fn profile_sharded_layout(
     project_root: &Path,
     profile_root: &Path,
-    marker: &EnrollmentMarker,
+    project_id: &str,
 ) -> Result<StoreLayout> {
-    if marker.storage_mode != StorageMode::ProfileSharded {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "enrollment marker for '{}' uses storage_mode={:?}, not profile_sharded",
-                project_root.display(),
-                marker.storage_mode
-            ),
-        });
-    }
-    validate_project_id(&marker.project_id).map_err(|message| TraceDecayError::Config {
+    validate_project_id(project_id).map_err(|message| TraceDecayError::Config {
         message: format!(
-            "invalid enrollment marker for '{}': {message}",
+            "invalid project identity for '{}': {message}",
             project_root.display()
         ),
     })?;
-    let data_root = profile_sharded_data_root(profile_root, &marker.project_id);
+    let data_root = profile_sharded_data_root(profile_root, project_id);
     Ok(StoreLayout::new(
         ProjectIdentity {
-            project_id: Some(marker.project_id.clone()),
+            project_id: Some(project_id.to_owned()),
             display_root: project_root.to_path_buf(),
             primary_alias: project_root.to_path_buf(),
         },
@@ -182,15 +173,7 @@ pub fn resolve_persisted_layout(
     // any path-derived guess, or one repository can acquire two project
     // stores and two mutable writer lanes.
     if let Some(marker) = read_repository_identity_marker(project_root)? {
-        return profile_sharded_layout(
-            project_root,
-            profile_root,
-            &EnrollmentMarker {
-                project_id: marker.project_id,
-                storage_mode: StorageMode::ProfileSharded,
-            },
-        )
-        .map(Some);
+        return profile_sharded_layout(project_root, profile_root, &marker.project_id).map(Some);
     }
 
     // Without a repository-side marker (a non-git project, or a repository
@@ -199,18 +182,10 @@ pub fn resolve_persisted_layout(
     // Nothing in the working tree carries identity.
     let project_id = default_profile_project_id(project_root);
     let data_root = profile_sharded_data_root(profile_root, &project_id);
-    let store_exists = data_root.join(config::db_filename(&data_root)).exists()
+    let store_exists = data_root.join(config::DB_FILENAME).exists()
         || data_root.join(STORE_MANIFEST_FILENAME).is_file();
     if store_exists {
-        return profile_sharded_layout(
-            project_root,
-            profile_root,
-            &EnrollmentMarker {
-                project_id,
-                storage_mode: StorageMode::ProfileSharded,
-            },
-        )
-        .map(Some);
+        return profile_sharded_layout(project_root, profile_root, &project_id).map(Some);
     }
     Ok(None)
 }
@@ -225,11 +200,9 @@ pub fn default_profile_root() -> Result<PathBuf> {
 /// hooks, MCP response handles, config resolution, the agent command, Doctor,
 /// and diagnostics.
 ///
-/// This used to read only the enrollment marker and otherwise derive a project
-/// id from the checkout path, so it disagreed with the async registry resolver
-/// about the same directory and split one repository across shards. It now
-/// consults every authority available without awaiting — the same enrollment
-/// marker and repository identity marker via [`resolve_persisted_layout`].
+/// It consults every authority available without awaiting, the repository
+/// identity marker and the profile shard via [`resolve_persisted_layout`], so
+/// it agrees with the async registry resolver about the same directory.
 pub fn resolve_layout_for_current_profile(project_root: &Path) -> Result<StoreLayout> {
     let profile_root = default_profile_root()?;
     match resolve_enrolled_layout(project_root, &profile_root)? {
@@ -241,8 +214,8 @@ pub fn resolve_layout_for_current_profile(project_root: &Path) -> Result<StoreLa
 /// Resolves this checkout's store only when an authority already names it, and
 /// reports `Ok(None)` when the answer would be a path-derived guess.
 ///
-/// Callers that merely want somewhere to put a file — hook analytics is the
-/// motivating one — must not enroll a directory as a side effect. Every
+/// Callers that merely want somewhere to put a file, hook analytics is the
+/// motivating one, must not enroll a directory as a side effect. Every
 /// directory this resolver declines is a store shard that never gets minted for
 /// a path that was never a project.
 pub fn resolve_enrolled_layout_for_current_profile(
@@ -261,24 +234,6 @@ fn resolve_enrolled_layout(
 
 pub fn resolve_project_session_db_path(project_root: &Path) -> Result<PathBuf> {
     Ok(resolve_layout_for_current_profile(project_root)?.sessions_db_path)
-}
-
-/// Where a checkout's truncated tool responses live.
-///
-/// An enrolled project keeps them in its own store shard. Any other directory
-/// an MCP server happens to run in gets the profile-wide root: a response
-/// handle is transient output, not evidence that the directory is a project,
-/// and resolving through the path-derived default layout used to mint a
-/// `projects/proj_<hash>/response-handles/` shard for every such directory —
-/// 286 of them on one profile, outnumbering the real stores.
-pub fn resolve_response_handle_root(project_root: &Path) -> Result<PathBuf> {
-    let profile_root = default_profile_root()?;
-    Ok(
-        match resolve_enrolled_layout(project_root, &profile_root)? {
-            Some(layout) => layout.response_handle_root,
-            None => profile_root.join(RESPONSE_HANDLES_DIRECTORY),
-        },
-    )
 }
 
 pub fn resolve_lcm_payload_root(project_root: &Path) -> Result<PathBuf> {

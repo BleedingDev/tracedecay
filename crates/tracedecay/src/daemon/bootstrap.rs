@@ -15,6 +15,11 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
 
 use super::*;
+#[cfg(unix)]
+use tracedecay_daemon_service::bounded_stderr_log::BoundedStderrLog;
+use tracedecay_daemon_service::shutdown::DAEMON_CLIENT_DRAIN_DEADLINE;
+#[cfg(not(unix))]
+use tracedecay_daemon_service::shutdown::{DaemonLifecycle, ShutdownStatus};
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 /// Slice of the shutdown budget reserved for writing the terminal shutdown
@@ -69,8 +74,10 @@ async fn run_foreground_loopback(
     remote_tls: Option<RemoteBrainTlsConfig>,
 ) -> Result<()> {
     let bootstrap_started = Instant::now();
-    let profile_root = crate::config::user_data_dir().ok_or_else(|| TraceDecayError::Config {
-        message: "could not determine TraceDecay user data directory".to_string(),
+    let profile_root = tracedecay_runtime_core::config::user_data_dir().ok_or_else(|| {
+        TraceDecayError::Config {
+            message: "could not determine TraceDecay user data directory".to_string(),
+        }
     })?;
     let catalog_prewarm = tokio::task::spawn_blocking(prewarm_static_daemon_bootstrap_catalog);
     let requested = default_loopback_endpoint();
@@ -93,10 +100,7 @@ async fn run_foreground_loopback(
     let invocation =
         DaemonInvocationState::with_progress_producer_incarnation(authority.record().epoch);
     invocation.configure_github_read_only_credentials(authority.profile_identity());
-    store_administration.install_remote_recovery_project_lifecycle(
-        invocation.clone(),
-        Arc::clone(&project_open_gates),
-    )?;
+    store_administration.install_remote_recovery_project_lifecycle()?;
     let deletion_owners = remote_deletion::RemoteDeletionRuntimeOwners {
         administration: store_administration.clone(),
         invocation: invocation.clone(),
@@ -163,7 +167,7 @@ async fn run_foreground_loopback(
         );
     }
     let lifecycle = DaemonLifecycle::default();
-    let sync_config = tracedecay_configuration::SyncConfig::default().with_env_overrides();
+    let sync_config = tracedecay_configuration::SyncConfig::default();
     let profile_database = store_administration.registered_profile_database().await?;
     let maintenance = maintenance::MaintenanceCoordinator::spawn(
         profile_root.clone(),
@@ -173,7 +177,6 @@ async fn run_foreground_loopback(
         sync_config.retention.clone(),
         maintenance::BranchStoreGcCadenceV1 {
             branch_gc_days: sync_config.branch_gc_days,
-            orphan_db_gc_days: sync_config.orphan_db_gc_days,
         },
     )
     .await;
@@ -504,8 +507,10 @@ async fn run_foreground_unix(
     remote_tls: Option<RemoteBrainTlsConfig>,
 ) -> Result<()> {
     let bootstrap_started = Instant::now();
-    let profile_root = crate::config::user_data_dir().ok_or_else(|| TraceDecayError::Config {
-        message: "could not determine TraceDecay user data directory".to_string(),
+    let profile_root = tracedecay_runtime_core::config::user_data_dir().ok_or_else(|| {
+        TraceDecayError::Config {
+            message: "could not determine TraceDecay user data directory".to_string(),
+        }
     })?;
     let catalog_prewarm = tokio::task::spawn_blocking(prewarm_static_daemon_bootstrap_catalog);
     let endpoint = DaemonEndpoint::Unix(socket_path);
@@ -529,10 +534,7 @@ async fn run_foreground_unix(
         .with_http_application_registry(http_application_registry.clone());
     engine
         .store_administration
-        .install_remote_recovery_project_lifecycle(
-            engine.invocation.clone(),
-            Arc::clone(&engine.project_open_gates),
-        )?;
+        .install_remote_recovery_project_lifecycle()?;
     let deletion_owners = remote_deletion::RemoteDeletionRuntimeOwners {
         administration: engine.store_administration.clone(),
         invocation: engine.invocation.clone(),
@@ -633,20 +635,19 @@ async fn run_foreground_unix(
             &[("endpoint", format!("https://{endpoint}/remote/"))],
         );
     }
-    let sync_config = tracedecay_configuration::SyncConfig::default().with_env_overrides();
+    let sync_config = tracedecay_configuration::SyncConfig::default();
     let profile_database = engine
         .store_administration
         .registered_profile_database()
         .await?;
     let maintenance = maintenance::MaintenanceCoordinator::spawn(
         profile_root.clone(),
-        profile_database.clone(),
+        profile_database,
         engine.store_administration.clone(),
         engine.invocation.code_index_schedulers.clone(),
         sync_config.retention.clone(),
         maintenance::BranchStoreGcCadenceV1 {
             branch_gc_days: sync_config.branch_gc_days,
-            orphan_db_gc_days: sync_config.orphan_db_gc_days,
         },
     )
     .await;
@@ -684,6 +685,21 @@ async fn run_foreground_unix(
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let admission = DaemonClientAdmission::new(MAX_CONCURRENT_DAEMON_CLIENTS);
     let mut client_tasks: JoinSet<Result<()>> = JoinSet::new();
+    // launchd appends this daemon's stderr to a plain file with no rotation
+    // of its own; the journal (systemd) or a terminal is not a regular file
+    // and is left alone. Detection is truthful about what fd 2 is, so a
+    // failure to inspect it is reported, not treated as "not a file".
+    let stderr_log_rotation = match BoundedStderrLog::detect() {
+        Ok(Some(log)) => Some(log.spawn_rotation()),
+        Ok(None) => None,
+        Err(error) => {
+            log_daemon_event(
+                "daemon_stderr_log_unbounded",
+                &[("error", error.to_string())],
+            );
+            None
+        }
+    };
     log_daemon_event(
         "daemon_ready",
         &[(
@@ -735,6 +751,9 @@ async fn run_foreground_unix(
     }
     engine.lifecycle.begin_draining();
     tracedecay_daemon_service::shutdown::arm_shutdown_exit_bound();
+    if let Some(rotation) = stderr_log_rotation {
+        rotation.abort();
+    }
     // Stop accepting and unlink the socket before draining so clients that
     // connect during shutdown get NotFound/ConnectionRefused (which they retry
     // via `connect_with_restart_grace`) instead of a queued connection that
@@ -751,7 +770,7 @@ async fn run_foreground_unix(
     // each of them; awaiting its receipt keeps this fence active until those
     // owners have either joined or reported a typed timeout.
     let _codex_shutdown =
-        tracedecay_sessions::runtime::codex_app_server::begin_codex_app_server_shutdown();
+        tracedecay_sessions::runtime::hosts::codex_app_server::begin_codex_app_server_shutdown();
     log_daemon_event(
         "daemon_shutdown",
         &[("socket", socket_path.display().to_string())],
@@ -828,9 +847,9 @@ async fn install_profile_worker_plan(
 const DAEMON_ACCEPT_ERROR_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_millis(250);
 
 /// One failed accept must never end the daemon. `accept(2)` legitimately
-/// fails for per-connection reasons — a client that resets before accept
+/// fails for per-connection reasons, a client that resets before accept
 /// surfaces `ECONNABORTED` on macOS/BSD, and reachability probes connect and
-/// drop immediately — and for transient resource pressure (`EMFILE`).
+/// drop immediately, and for transient resource pressure (`EMFILE`).
 /// Returning the error exited the whole daemon, which a service supervisor
 /// then restarts: one aborted connection became a daemon flap.
 async fn log_accept_error_and_backoff(error: &TraceDecayError) {

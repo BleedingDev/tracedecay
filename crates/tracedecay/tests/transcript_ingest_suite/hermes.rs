@@ -8,21 +8,24 @@ use std::path::{Path, PathBuf};
 
 use serde_json::json;
 use tempfile::TempDir;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_domain::{
     MAX_OBSERVATION_RECORD_BYTES, ProjectId, ProviderUsageCounterSemanticsV1,
     ProviderUsageCountersV1, ProviderUsageModelV1, ProviderUsageScopeV1,
 };
 use tracedecay_lcm::{LcmCompressionRequest, LcmSummarizerMode};
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
-use tracedecay_sessions::runtime::hermes::{
+use tracedecay_sessions::runtime::hosts::hermes::{
     ProjectIngestDestination, ingest_for_project as ingest_for_project_with_id,
     ingest_homes as ingest_homes_with_id, ingest_homes_for_projects, ingest_user_homes,
 };
 use tracedecay_sessions::runtime::source::TranscriptIngestStats;
 use tracedecay_sessions::runtime::{SessionProvider, SessionRecord};
 
-use crate::common::{EnvVarGuard, GLOBAL_DB_ENV_LOCK};
+use crate::common::{
+    EnvVarGuard, GLOBAL_DB_ENV_LOCK, canonical_existing_path, spawn_tracedecay_daemon,
+    tracedecay_command_with_home,
+};
 use crate::restart_atomicity::{
     ProjectSessionTestRuntime, assert_secret_absent_from_observation_sinks, durable_table_count,
     mark_test_project, observation_source_cursor, open_project_session_db,
@@ -108,33 +111,21 @@ fn setup(tmp: &TempDir) -> (PathBuf, PathBuf) {
     (home.join(".hermes"), project)
 }
 
-/// Writes a Hermes profile dir: a `config.yaml` optionally pinning
-/// `pinned_project` (the real `plugins.tracedecay.project_root` shape) and a
-/// `state.db` with the real Hermes schema. Unpinned profiles (the default
-/// since the installer stopped writing storage-home pins) carry only the
-/// plugin-enable block.
+/// Writes a Hermes profile dir: a `config.yaml` with the plugin-enable block
+/// and a `state.db` with the real Hermes schema whose session optionally runs
+/// in `session_cwd`, the evidence that associates it with a project.
 async fn write_hermes_profile(
     hermes_home: &Path,
     profile: &str,
-    pinned_project: Option<&Path>,
+    session_cwd: Option<&Path>,
 ) -> PathBuf {
     let profile_dir = hermes_home.join("profiles").join(profile);
     std::fs::create_dir_all(&profile_dir).unwrap();
-    let config = match pinned_project {
-        Some(pinned_project) => {
-            // The pin is JSON-encoded exactly as `tracedecay install --agent
-            // hermes` writes it, so Windows backslashes survive the
-            // double-quoted YAML scalar.
-            let pin = serde_json::to_string(pinned_project.to_string_lossy().as_ref()).unwrap();
-            format!(
-                "memory:\n  provider: tracedecay\nplugins:\n  enabled:\n    - tracedecay\n  tracedecay:\n    project_root: {pin}\n",
-            )
-        }
-        None => {
-            "memory:\n  provider: tracedecay\nplugins:\n  enabled:\n    - tracedecay\n".to_string()
-        }
-    };
-    std::fs::write(profile_dir.join("config.yaml"), config).unwrap();
+    std::fs::write(
+        profile_dir.join("config.yaml"),
+        "memory:\n  provider: tracedecay\nplugins:\n  enabled:\n    - tracedecay\n",
+    )
+    .unwrap();
 
     let state_db = profile_dir.join("state.db");
     let conn = open_state_db(&state_db);
@@ -187,10 +178,13 @@ async fn write_hermes_profile(
     conn.execute(
         "INSERT INTO sessions (id, source, model, started_at, ended_at, title,
                                input_tokens, output_tokens, cache_read_tokens,
-                               cache_write_tokens, reasoning_tokens)
+                               cache_write_tokens, reasoning_tokens, cwd)
          VALUES (?1, 'tui', 'gpt-5.5', 1780629300.0, 1780629340.0,
-                 'Billing pipeline fix', 96443, 3804, 1064960, 0, 2061)",
-        rusqlite::params![SESSION_ID],
+                 'Billing pipeline fix', 96443, 3804, 1064960, 0, 2061, ?2)",
+        rusqlite::params![
+            SESSION_ID,
+            session_cwd.map(|cwd| cwd.to_string_lossy().into_owned())
+        ],
     )
     .unwrap();
 
@@ -262,7 +256,7 @@ fn open_state_db(path: &Path) -> rusqlite::Connection {
 }
 
 #[tokio::test]
-async fn hermes_state_db_populates_projection_for_pinned_project() {
+async fn hermes_state_db_populates_projection_for_session_cwd_project() {
     let tmp = TempDir::new().unwrap();
     let (hermes_home, project) = setup(&tmp);
     let linked_worktree = tmp.path().join("linked-worktree");
@@ -291,7 +285,7 @@ async fn hermes_state_db_populates_projection_for_pinned_project() {
         .await;
     assert!(
         results.iter().any(|hit| hit.message.role == "user"),
-        "expected pinned-project user hit; projected session path: {:?}",
+        "expected project user hit; projected session path: {:?}",
         session.project_path
     );
     assert!(results.iter().any(|hit| hit.message.role == "assistant"));
@@ -322,7 +316,7 @@ async fn hermes_state_db_populates_projection_for_pinned_project() {
     assert_metadata_path_eq(&metadata["hermes_session_worktree"], &linked_worktree);
     assert_eq!(
         metadata["hermes_session_location_provenance"].as_str(),
-        Some("profile_pin")
+        Some("session_cwd")
     );
     // Session-cumulative token counters from the Hermes sessions table land
     // in the immutable provider-usage observation family (captured at the
@@ -376,17 +370,23 @@ async fn hermes_state_db_populates_projection_for_pinned_project() {
     assert_metadata_path_eq(&tool_metadata["hermes_session_worktree"], &linked_worktree);
     assert_eq!(
         tool_metadata["hermes_session_location_provenance"].as_str(),
-        Some("profile_pin")
+        Some("session_cwd")
     );
 
-    // Projection-only: Hermes raw messages are owned by the runtime LCM
-    // ingest, so the transcript sweep must never write lcm_raw_messages.
+    // The sweep's message rows are the one stored copy, so the LCM raw
+    // authority hydrates the same rows session search serves.
     for ordinal in 2..=5 {
-        assert!(
-            db.lcm_load_raw_message("hermes", &format!("{SESSION_ID}:{ordinal}"))
-                .await
-                .is_none()
-        );
+        let message_id = format!("{SESSION_ID}:{ordinal}");
+        let raw = db
+            .lcm_load_raw_message("hermes", &message_id)
+            .await
+            .expect("the projected Hermes row must hydrate through the raw authority");
+        let stored = db
+            .get_session_message("hermes", &message_id)
+            .await
+            .expect("projected Hermes row");
+        assert_eq!(raw.session_id, stored.session_id);
+        assert!(raw.content.starts_with(stored.text.as_str()));
     }
 }
 
@@ -523,11 +523,12 @@ async fn hermes_projection_sweep_does_not_mutate_runtime_owned_raw_messages() {
         .await
         .expect("runtime-owned raw message should exist before the sweep");
     assert_eq!(raw_before.content, runtime_owned_raw);
-    assert!(
+    assert_eq!(
         db.get_session_message("hermes", &raw_message_id)
             .await
-            .is_none(),
-        "LCM active-message ingest should not create a session-message projection"
+            .expect("the runtime-owned turn is the session message row")
+            .text,
+        runtime_owned_raw
     );
 
     let stats = ingest_homes(&db, std::slice::from_ref(&hermes_home), &project).await;
@@ -543,13 +544,15 @@ async fn hermes_projection_sweep_does_not_mutate_runtime_owned_raw_messages() {
     assert_eq!(raw_after.content, runtime_owned_raw);
     assert_eq!(raw_after.content_hash, raw_before.content_hash);
 
+    // The sweep contributes the row's session columns; the body stays the
+    // runtime-owned turn, the row's one stored copy.
     let projection = db
         .get_session_message("hermes", &raw_message_id)
         .await
         .expect("projection row should still be searchable");
     assert_eq!(projection.role, "assistant");
     assert_eq!(projection.kind.as_deref(), Some("tool_invocation"));
-    assert!(projection.text.contains("cargo test billing"));
+    assert_eq!(projection.text, runtime_owned_raw);
     assert_eq!(projection.tool_names.as_deref(), Some("terminal"));
 }
 
@@ -796,7 +799,7 @@ async fn hermes_shared_sweep_routes_one_source_to_multiple_project_stores() {
 }
 
 #[tokio::test]
-async fn hermes_profile_pinned_elsewhere_is_not_ingested() {
+async fn hermes_session_elsewhere_is_not_ingested() {
     let tmp = TempDir::new().unwrap();
     let (hermes_home, project) = setup(&tmp);
     let other_project = tmp.path().join("other-project");
@@ -1514,5 +1517,118 @@ async fn hermes_zeroblob_content_is_covered_without_payload_leak() {
             .await
             .len(),
         1
+    );
+}
+
+/// Hermes' plugin syncs every turn into the profile conversation store with no
+/// project: `tracedecay tool` runs from outside any project, so the daemon
+/// serves it on the projectless route. The turn must land in the profile LCM
+/// store that user-scope LCM reads answer from, and temporal retrieval must
+/// find it once the ingest call has joined the profile refresh.
+#[cfg(unix)]
+#[test]
+fn projectless_hermes_turn_sync_is_described_and_searchable_in_the_user_scope_store() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let outside = tmp.path().join("general-chat");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let home = canonical_existing_path(&home);
+    let _daemon = spawn_tracedecay_daemon(&home);
+    let run_tool = |name: &str, arguments: serde_json::Value| -> serde_json::Value {
+        let output = tracedecay_command_with_home(&home)
+            .current_dir(&outside)
+            .args(["tool", name, "--json", "--args"])
+            .arg(arguments.to_string())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("run `tracedecay tool {name}`: {error}"));
+        assert!(
+            output.status.success(),
+            "`tracedecay tool {name}` failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|error| panic!("`tracedecay tool {name}` JSON: {error}"));
+        let text = result["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`tracedecay tool {name}` text: {result}"));
+        serde_json::from_str(text)
+            .unwrap_or_else(|error| panic!("`tracedecay tool {name}` payload: {error}; {text}"))
+    };
+
+    let ingest = run_tool(
+        "tracedecay_hook_runtime",
+        json!({
+            "action": "ingest_transcript",
+            "provider": "hermes",
+            "session_id": "hermes-profile-turn",
+            "user_scope": true,
+            "messages": [{
+                "id": "hermes-profile-turn:1",
+                "role": "user",
+                "content": "Remember the quartz lighthouse rota for Tuesday",
+            }],
+            "format": "json",
+        }),
+    );
+    assert_eq!(ingest["status"], "committed", "{ingest}");
+    assert_eq!(ingest["messages_upserted"], 1, "{ingest}");
+
+    let described = run_tool(
+        "tracedecay_lcm_describe",
+        json!({
+            "provider": "hermes",
+            "session_id": "hermes-profile-turn",
+            "storage_scope": "user",
+            "format": "json",
+        }),
+    );
+    let description = &described["outcome"]["value"]["payload"]["description"];
+    let raw_messages = description["raw_messages"]
+        .as_array()
+        .unwrap_or_else(|| panic!("described raw messages: {described}"))
+        .iter()
+        .map(|message| {
+            (
+                message["message_id"].as_str().unwrap_or_default(),
+                message["role"].as_str().unwrap_or_default(),
+                message["content_preview"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        raw_messages,
+        [(
+            "hermes-profile-turn:1",
+            "user",
+            "Remember the quartz lighthouse rota for Tuesday"
+        )],
+        "{described}"
+    );
+
+    let searched = run_tool(
+        "tracedecay_message_search",
+        json!({
+            "query": "quartz lighthouse rota",
+            "provider": "hermes",
+            "storage_scope": "user",
+            "format": "json",
+        }),
+    );
+    let search = searched
+        .pointer("/outcome/value/payload")
+        .unwrap_or(&searched);
+    let texts = search["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("message search results: {searched}"))
+        .iter()
+        .map(|result| result["message"]["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        texts,
+        ["Remember the quartz lighthouse rota for Tuesday"],
+        "{searched}"
     );
 }

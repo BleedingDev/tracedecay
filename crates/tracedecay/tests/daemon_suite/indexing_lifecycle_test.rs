@@ -17,7 +17,7 @@ use tracedecay_code_index::production::{
     CodeIndexPublishedGenerationV1, SealedGenerationSegmentReadV1,
 };
 use tracedecay_code_index_retention::code_index_generations::{
-    DurablePublicationPointerV1, scoped_code_index_store_root,
+    DurablePublicationPointerV1, code_generation_segments_root, scoped_code_index_store_root,
 };
 use tracedecay_daemon_protocol::DaemonHandshake;
 use tracedecay_domain::sha256_hex_suffix;
@@ -29,9 +29,10 @@ use crate::code_index_journey::{
     ExactIndexIdentity, RECEIPT_TIMEOUT, assert_exact_identity, assert_project_identity,
     commit_all, daemon_log_for_failure, deliver_save, exact_identity, exact_symbol, git,
     initialize_tracedecay, result_paths, search, status, stop_daemon_gracefully, tool,
-    wait_for_terminal_generation,
+    wait_for_readiness, wait_for_terminal_generation,
 };
 use crate::common::{EnvVarGuard, IsolatedEnv, daemon_socket_path, spawn_tracedecay_daemon_with};
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 fn initialize_repository(project: &Path) -> (String, String) {
     fs::create_dir_all(project.join("src")).expect("fixture source directory");
@@ -94,7 +95,7 @@ async fn inject_overflow(socket: &Path, handshake: &DaemonHandshake) {
         socket,
         handshake,
         "tracedecay_admin_sync",
-        json!({ "force": true, "format": "json" }),
+        json!({ "format": "json" }),
     )
     .await;
     assert_eq!(receipt["status"], "queued", "overflow receipt: {receipt}");
@@ -197,7 +198,7 @@ fn read_active_generation(home: &Path, project: &Path) -> CodeIndexPublishedGene
     .expect("sealed active code generation");
     // The daemon publishes partitioned manifests whose file segments live
     // beside the generations directory; decode those the way the store does.
-    let segments_root = scope.join("code-generation-segments-v1");
+    let segments_root = code_generation_segments_root(&scope);
     CodeIndexPublishedGenerationV1::decode_partitioned_sealed(&sealed, |request, buffer| {
         let (digest, size_bytes, offset, length) = match request {
             SealedGenerationSegmentReadV1::Whole { digest, size_bytes } => {
@@ -226,7 +227,6 @@ fn read_active_generation(home: &Path, project: &Path) -> CodeIndexPublishedGene
         Ok(())
     })
     .expect("active generation must be sealed and compatible")
-    .expect("active generation must be a partitioned manifest")
 }
 
 fn assert_sealed_generation_identity(
@@ -306,13 +306,13 @@ fn assert_exact_ignored_dependency_roster(generation: &CodeIndexPublishedGenerat
 #[tokio::test]
 async fn ignored_dependency_admission_survives_physical_daemon_restart_without_widening() {
     let (environment, project) = IsolatedEnv::acquire().await;
-    let project = project.canonicalize().expect("canonical fixture project");
+    let project = canonical_existing_identity(&project).expect("canonical fixture project");
     let revision = initialize_ignored_dependency_repository(&project);
     let socket = daemon_socket_path(environment.home());
     let mut daemon = spawn_tracedecay_daemon_with(environment.home(), |_| {});
     let project_id = initialize_tracedecay(environment.home(), &project);
     let identity = exact_identity(&project, project_id);
-    tracedecay::product_runtime::register_fixture_product_runtime();
+    tracedecay_project::product_runtime::register_fixture_product_runtime();
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("production daemon handshake");
@@ -422,7 +422,7 @@ async fn ignored_dependency_admission_survives_physical_daemon_restart_without_w
 #[tokio::test]
 async fn one_line_append_publishes_fresh_generation_with_carried_clone_bodies() {
     let (environment, project) = IsolatedEnv::acquire().await;
-    let project = project.canonicalize().expect("canonical fixture project");
+    let project = canonical_existing_identity(&project).expect("canonical fixture project");
     fs::create_dir_all(project.join("src")).expect("fixture source directory");
     fs::write(
         project.join("Cargo.toml"),
@@ -457,7 +457,7 @@ async fn one_line_append_publishes_fresh_generation_with_carried_clone_bodies() 
     });
     let project_id = initialize_tracedecay(environment.home(), &project);
     let identity = exact_identity(&project, project_id);
-    tracedecay::product_runtime::register_fixture_product_runtime();
+    tracedecay_project::product_runtime::register_fixture_product_runtime();
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("production daemon handshake");
@@ -505,10 +505,71 @@ async fn one_line_append_publishes_fresh_generation_with_carried_clone_bodies() 
     stop_daemon_gracefully(&mut daemon);
 }
 
+/// `tracedecay_status` `wait_for` holds the read across a saved edit's
+/// reconcile and returns `reached` with the edit's generation already in the
+/// same payload.
+#[tokio::test]
+async fn status_wait_for_returns_reached_with_the_saved_edit_generation() {
+    let (environment, project) = IsolatedEnv::acquire().await;
+    let project = canonical_existing_identity(&project).expect("canonical fixture project");
+    fs::create_dir_all(project.join("src")).expect("fixture source directory");
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"status-wait\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+    )
+    .expect("fixture manifest");
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn before_wait() -> usize { 1 }\n",
+    )
+    .expect("fixture source");
+    git(&project, &["init", "--quiet", "--initial-branch=main"]);
+    commit_all(&project, "status wait fixture");
+    let socket = daemon_socket_path(environment.home());
+    let log_path = environment.scratch().join("status-wait.log");
+    let _daemon_log = EnvVarGuard::set("TRACEDECAY_TEST_DAEMON_LOG", &log_path);
+    let mut daemon = spawn_tracedecay_daemon_with(environment.home(), |_| {});
+    initialize_tracedecay(environment.home(), &project);
+    tracedecay_project::product_runtime::register_fixture_product_runtime();
+    let handshake =
+        tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
+            .expect("production daemon handshake");
+
+    let initial = wait_for_readiness(&socket, &handshake, "fresh", RECEIPT_TIMEOUT).await;
+    let initial_generation = initial["code_index_freshness"]["worktree"]["latest_generation_id"]
+        .as_str()
+        .expect("initial generation")
+        .to_owned();
+
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub fn before_wait() -> usize { 1 }\npub fn after_wait() -> usize { 2 }\n",
+    )
+    .expect("edit source");
+    deliver_save(&project, &["src/lib.rs"]).await;
+    let waited = wait_for_readiness(&socket, &handshake, "fresh", RECEIPT_TIMEOUT).await;
+    assert_eq!(
+        waited["code_index_freshness"]["status"], "current",
+        "{waited}"
+    );
+    let waited_generation = waited["code_index_freshness"]["worktree"]["latest_generation_id"]
+        .as_str()
+        .expect("waited generation");
+    assert_ne!(waited_generation, initial_generation, "{waited}");
+    let found = search(&socket, &handshake, "after_wait").await;
+    assert_eq!(
+        found["code_generation"].as_str(),
+        Some(waited_generation),
+        "{found}"
+    );
+    assert_eq!(result_paths(&found), vec!["src/lib.rs"], "{found}");
+    stop_daemon_gracefully(&mut daemon);
+}
+
 #[tokio::test]
 async fn mounted_incremental_lifecycle_preserves_only_complete_compatible_generations() {
     let (environment, project) = IsolatedEnv::acquire().await;
-    let project = project.canonicalize().expect("canonical fixture project");
+    let project = canonical_existing_identity(&project).expect("canonical fixture project");
     let (main_revision, feature_revision) = initialize_repository(&project);
     let socket = daemon_socket_path(environment.home());
     let log_path = environment
@@ -523,7 +584,7 @@ async fn mounted_incremental_lifecycle_preserves_only_complete_compatible_genera
     });
     let project_id = initialize_tracedecay(environment.home(), &project);
     let identity = exact_identity(&project, project_id);
-    tracedecay::product_runtime::register_fixture_product_runtime();
+    tracedecay_project::product_runtime::register_fixture_product_runtime();
     let handshake =
         tracedecay::daemon::handshake_for_current_client(Some(project.clone()), None, false, false)
             .expect("production daemon handshake");
@@ -548,7 +609,7 @@ async fn mounted_incremental_lifecycle_preserves_only_complete_compatible_genera
     .expect("save source file");
     deliver_save(&project, &["src/saved.rs"]).await;
     // Dirty worktree generations keep ref/worktree identity but must not claim
-    // HEAD as source_revision — that field is exact-commit evidence only.
+    // HEAD as source_revision, that field is exact-commit evidence only.
     let saved = wait_for_terminal_generation(
         &socket,
         &handshake,

@@ -18,8 +18,8 @@ Outputs (under --output, default target/efficiency-scorecard):
 
 What is measured
 ----------------
-Every run builds a fresh SANDBOX under the OS temp dir — isolated HOME/XDG,
-isolated TRACEDECAY_DATA_DIR/GLOBAL_DB, private daemon socket — and drives
+Every run builds a fresh SANDBOX under the OS temp dir, isolated HOME/XDG,
+isolated TRACEDECAY_DATA_DIR/GLOBAL_DB, private daemon socket, and drives
 the pinned fixture repo through the production journeys with the real
 binary. The operator's daemon, profile, and stores are never touched.
 
@@ -98,6 +98,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from lib.portable_process import dies_with_this_process
 
 SCHEMA = "tracedecay.efficiency-scorecard/v1"
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -435,7 +437,6 @@ class Sandbox:
 
     binary: Path
     fixture: Path
-    keep: bool
     root: Path = field(init=False)
     project: Path = field(init=False)
     profile: Path = field(init=False)
@@ -527,6 +528,7 @@ class Sandbox:
                 stdout=log,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                preexec_fn=dies_with_this_process(),
             )
         if callable(self.on_spawn):
             self.on_spawn(self.daemon.pid)
@@ -616,10 +618,7 @@ class Sandbox:
 
     def cleanup(self) -> None:
         self.stop_daemon()
-        if self.keep:
-            print(f"scorecard: sandbox kept at {self.root}", file=sys.stderr)
-        else:
-            shutil.rmtree(self.root, ignore_errors=True)
+        shutil.rmtree(self.root, ignore_errors=True)
 
 
 def freshness(payload: dict) -> dict:
@@ -703,7 +702,7 @@ def store_measurements(sandbox: Sandbox) -> dict:
 
     - `generation_payload_bytes`: files under `**/code-generations-v*/`
       grouped by the 64-hex generation digest embedded in the file name
-      (generation-<digest>.json) — the manifest-size-per-generation signal.
+      (generation-<digest>.json), the manifest-size-per-generation signal.
     - `generation_segment_bytes`: physical bytes in the shared
       `code-generation-segments-v*/` content-addressed pool.
     - `code_index_children_bytes`: one-level size breakdown under each
@@ -876,9 +875,9 @@ def restart_current_generation(
 
 
 def run_scenario(
-    binary: Path, fixture: Path, tool_samples: int, keep_sandbox: bool, sampler: RssSampler
+    binary: Path, fixture: Path, tool_samples: int, sampler: RssSampler
 ) -> dict:
-    sandbox = Sandbox(binary=binary, fixture=fixture, keep=keep_sandbox)
+    sandbox = Sandbox(binary=binary, fixture=fixture)
     sandbox.on_spawn = sampler.set_pid
     run: dict = {"sandbox": str(sandbox.root), "fixture_commit": sandbox.head_commit()}
     try:
@@ -1085,7 +1084,7 @@ def human_summary(scorecard: dict) -> str:
     runs = scorecard["runs"]
     ok = sum(1 for run in runs if run.get("status") == "ok")
     lines = [
-        f"## TraceDecay efficiency scorecard — {scorecard.get('label') or 'unlabeled'}",
+        f"## TraceDecay efficiency scorecard, {scorecard.get('label') or 'unlabeled'}",
         "",
         f"binary `{scorecard['binary']['version']}` · fixture "
         f"`{scorecard['fixture']['tree_sha256'][:12]}` ({scorecard['fixture']['files']} files) · "
@@ -1159,7 +1158,7 @@ def human_summary(scorecard: dict) -> str:
         "incremental_sync",
         "daemon_restart",
     ):
-        row(f"peak daemon RSS — {phase}", f"rss.peak_bytes.{phase}", "B")
+        row(f"peak daemon RSS, {phase}", f"rss.peak_bytes.{phase}", "B")
     lines.append("")
     return "\n".join(lines)
 
@@ -1258,7 +1257,6 @@ def main() -> int:
         "--fixture", default=str(DEFAULT_FIXTURE), help="pinned fixture corpus directory"
     )
     parser.add_argument("--label", default="", help="free-form label recorded in the scorecard")
-    parser.add_argument("--keep-sandbox", action="store_true", help="do not delete sandboxes")
     parser.add_argument(
         "--quick", action="store_true", help="smoke settings: --runs 1 --tool-samples 8"
     )
@@ -1321,7 +1319,7 @@ def main() -> int:
     for index in range(args.runs):
         print(f"scorecard: run {index + 1}/{args.runs}", file=sys.stderr)
         sampler = RssSampler()
-        run = run_scenario(binary, fixture, args.tool_samples, args.keep_sandbox, sampler)
+        run = run_scenario(binary, fixture, args.tool_samples, sampler)
         peaks, hwm = sampler.finish()
         run["rss"] = {"peak_bytes": peaks, "vmhwm_bytes_at_phase_end": hwm}
         flatten_store_bytes(run)

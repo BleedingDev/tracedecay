@@ -7,7 +7,9 @@ use thiserror::Error;
 use tracedecay_domain::{HydrationStateV1, RetrievalAnchorId};
 use zeroize::Zeroizing;
 
-use super::ports::{TemporalExecutionSnapshot, TemporalPortError, await_controlled};
+use super::execution::await_controlled;
+use super::snapshot::TemporalExecutionSnapshot;
+use crate::execution::TemporalPortError;
 
 /// Fallible pre-allocation ceiling for a single authorized payload buffer.
 const MAX_HYDRATION_PREALLOC_BYTES: usize = 1024 * 1024;
@@ -254,7 +256,7 @@ pub async fn hydrate_selected(
     // resulting payloads are also appended to `batch` in anchor order. Running
     // anchors concurrently would have to grant each read a budget computed
     // before its predecessors finished, changing truncation, the first
-    // over-budget anchor, and batch ordering — i.e. changing the output.
+    // over-budget anchor, and batch ordering, i.e. changing the output.
     // Bounded concurrency cannot preserve this running-budget semantics, so the
     // sequential walk is the correct implementation.
     for anchor_id in anchors {
@@ -316,20 +318,18 @@ mod tests {
     use tracedecay_domain::{RetrievalAnchorId, RetrievalGrainV1, SessionId, TemporalModeV1};
 
     use super::*;
-    use crate::ports::{
-        BindingDigest, ExecutionControl, ExecutionLimits, KernelVersions,
-        TemporalExecutionSnapshot, TemporalPortError, TemporalSnapshotRequest, TemporalWatermarks,
-    };
+    use crate::execution::TemporalPortError;
+    use crate::execution::{BindingDigest, ExecutionControl, ExecutionLimits};
     use crate::resolution::types::ValidatedAuthorization;
+    use crate::snapshot::TemporalSnapshotRequest;
+    use crate::snapshot::{KernelVersions, TemporalExecutionSnapshot, TemporalWatermarks};
     use crate::test_support::block_on;
 
     fn anchor(value: &str) -> RetrievalAnchorId {
         serde_json::from_str(&format!("\"{value}\"")).expect("valid anchor")
     }
 
-    fn digest(byte: char) -> String {
-        format!("sha256:{}", byte.to_string().repeat(64))
-    }
+    use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
     fn snapshot() -> TemporalExecutionSnapshot {
         snapshot_with_limits(ExecutionLimits::default())

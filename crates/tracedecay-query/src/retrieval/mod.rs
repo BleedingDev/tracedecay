@@ -9,8 +9,8 @@
 //! hydration.
 //!
 //! Foreground retrieval is explicitly single-root. The exact lane is
-//! independent of the fielded lexical/BM25 lane. Semantic is an optional,
-//! independently admitted augmentation.
+//! independent of the fielded lexical/BM25 lane; the graph lane expands from
+//! their seeds. Semantic is an optional, independently admitted augmentation.
 
 pub mod dedupe;
 pub mod diversity;
@@ -85,6 +85,23 @@ pub const QUERY_SEMANTIC_EVALUATION_SCORE_DOMAIN_V1: &str = "score.semantic-dist
 pub const QUERY_SEMANTIC_SCORE_DOMAIN_V1: &str = QUERY_SEMANTIC_EVALUATION_SCORE_DOMAIN_V1;
 pub const QUERY_SEMANTIC_EVALUATION_SCORE_RAW_MIN_MICROS_V1: u64 = i64::MAX as u64 - 1_000_000_000;
 pub const QUERY_SEMANTIC_EVALUATION_SCORE_RAW_MAX_MICROS_V1: u64 = i64::MAX as u64;
+/// Raw lexical score (BM25 micros) that calibrates to the full lexical
+/// feature. Fusion counts one lexical contribution per candidate, so this
+/// range is the only lexical strength utility carries: at a 1.0 ceiling every
+/// hit saturated and the graph lane alone decided between lexical candidates.
+/// Hits above it still order by raw score.
+///
+/// ponytail: one static ceiling for every corpus (about the evaluator
+/// corpus's 25th-percentile top hit); BM25 grows with corpus idf, so
+/// per-query normalization is the upgrade path if larger repositories
+/// saturate.
+pub const QUERY_LEXICAL_CALIBRATION_CEILING_MICROS_V1: u64 = 32_000_000;
+/// Score domain used when the mounted core fallback policy ranks TaskSession.
+///
+/// It is not part of the exact/lexical/graph fusion profile, so search cursor
+/// identity stays the checked-in fallback policy.
+pub const QUERY_TASK_SESSION_SCORE_DOMAIN_V1: &str = "score.task_session.daemon.v1";
+pub const QUERY_TASK_SESSION_CALIBRATION_V1: &str = "calibration.task_session.query-fallback";
 
 #[cfg(test)]
 mod tests;

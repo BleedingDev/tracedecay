@@ -43,7 +43,7 @@ struct IngestTestRuntime {
     _profile: Option<tempfile::TempDir>,
     /// Project runs only: a project sessions store carries its verified graph
     /// runtime once its project-memory owner is mounted, and Git evidence
-    /// convergence — which every project catch-up pass finalizes through —
+    /// convergence, which every project catch-up pass finalizes through,
     /// refuses to publish without one. Holding the memory database keeps that
     /// owner mounted for the whole pass, the way the daemon does.
     _memory: Option<std::sync::Arc<tracedecay_runtime_core::db::Database>>,
@@ -63,7 +63,7 @@ impl IngestTestRuntime {
         &self,
     ) -> GlobalDbSessionIngestAuthority<RegisteredGlobalDbLeaseV1> {
         let background_cpu =
-            tracedecay::test_support::host_admission::ensure_process_background_cpu_authority()
+            tracedecay_project::test_support::host_admission::ensure_process_background_cpu_authority()
                 .expect("install fixture worker plan authority");
         GlobalDbSessionIngestAuthority::new(self.database.clone())
             .with_background_cpu(background_cpu)
@@ -441,7 +441,7 @@ async fn cancelled_user_pass_reports_partial_coverage() {
     assert_eq!(outcome.units_admitted, 0);
     assert_eq!(
         outcome.coverage,
-        IngestPassCoverage::Partial { deferred_units: 11 }
+        IngestPassCoverage::Partial { deferred_units: 12 }
     );
     assert!(
         outcome
@@ -507,8 +507,8 @@ async fn registered_project_roots_include_modern_registry_aliases() {
     let worktree = temp.path().join("repo-worktree");
     std::fs::create_dir_all(&canonical).unwrap();
     std::fs::create_dir_all(&worktree).unwrap();
-    let canonical = std::fs::canonicalize(canonical).unwrap();
-    let worktree = std::fs::canonicalize(worktree).unwrap();
+    let canonical = tracedecay_runtime_core::path_safety::canonical_root_identity(&canonical);
+    let worktree = tracedecay_runtime_core::path_safety::canonical_root_identity(&worktree);
     let runtime = profile_test_runtime().await;
     runtime
         .database

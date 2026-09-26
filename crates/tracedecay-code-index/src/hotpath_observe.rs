@@ -4,7 +4,7 @@
 //! per-node work is never measured. Tight loops are sampled (1 in 32) so a
 //! generation of thousands of files does not flood the profiler. Every helper
 //! is `#[inline(always)]` and compiles to a no-op when the `hotpath` feature
-//! is off — atomics, clocks, and census walks must not run on the default path.
+//! is off, atomics, clocks, and census walks must not run on the default path.
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -295,18 +295,6 @@ pub(crate) fn record_pages(count: u64) {
     #[cfg(not(feature = "hotpath"))]
     {
         let _ = count;
-    }
-}
-
-#[inline(always)]
-pub(crate) fn record_seal_bytes(bytes: u64) {
-    #[cfg(feature = "hotpath")]
-    {
-        hotpath::gauge!("code_index_seal_bytes").set(bytes);
-    }
-    #[cfg(not(feature = "hotpath"))]
-    {
-        let _ = bytes;
     }
 }
 

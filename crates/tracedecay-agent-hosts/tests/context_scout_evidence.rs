@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use tracedecay_agent_hosts::agents::context_scout::ports::context_scout_candidates_from_publication;
+use tracedecay_agent_hosts::agents::context_scout::address_registry::context_scout_candidates_from_publication;
 use tracedecay_agent_hosts::agents::context_scout::{
     ContextScoutControlV1, ContextScoutDecisionV1, ContextScoutEvidenceEnvelopeExt,
     ContextScoutLimitsV1, ContextScoutRuntimeModeV1, ContextScoutSelectionInputV1,
@@ -28,21 +28,13 @@ use tracedecay_domain::feedback::{
     ProviderEvaluationStateV1,
 };
 use tracedecay_domain::{
-    CodeGenerationId, CommitId, ComponentVersion, ManifestDigest, ProjectId, RefId, RepositoryId,
+    CodeGenerationId, CommitId, ComponentVersion, ProjectId, RefId, RepositoryId,
     RetrievalAnchorId, SourceSpan, TemporalModeV1, UtcMicros, WorktreeId,
 };
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).unwrap()
-}
+use tracedecay_domain::test_fixtures::id;
 
-fn digest(character: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn resolved_scope() -> ResolvedScope {
     ResolvedScope::new(

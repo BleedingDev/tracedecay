@@ -58,8 +58,7 @@ use tracedecay_domain::configuration::{
     AuthorityRef, ConfigurationRevisionId, ScopeSourceBinding, SourceBindingId, SourceKindV1,
 };
 use tracedecay_domain::{
-    ActorId, CommitId, LocatorDigest, ManifestDigest, ProjectId, RefId, RepositoryId, UtcMicros,
-    WorktreeId,
+    ActorId, CommitId, LocatorDigest, ProjectId, RefId, RepositoryId, UtcMicros, WorktreeId,
 };
 #[cfg(all(unix, feature = "test-transport"))]
 use tracedecay_domain::{
@@ -92,6 +91,13 @@ impl RuntimeFixture {
         self._environment.home()
     }
 
+    fn response_handle_root(&self) -> PathBuf {
+        tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(&self.project)
+            .expect("resolve admitted project store")
+            .expect("admitted project is enrolled")
+            .response_handle_root
+    }
+
     /// The path an LSP client addresses the admitted project through.
     ///
     /// Daemon admission canonicalizes the root, while a client spells it the
@@ -99,7 +105,7 @@ impl RuntimeFixture {
     /// that canonicalizes to `/private/var/...`, and a linked worktree is
     /// reached through its symlink. On Unix the fixture therefore addresses
     /// the project through a real filesystem alias, so every request in the
-    /// journey — initialize, document routing, feedback reads — has to
+    /// journey, initialize, document routing, feedback reads, has to
     /// preserve the admitted identity across the spelling difference rather
     /// than only on hosts whose temp directory happens to be an alias.
     fn client_project_path(&self) -> PathBuf {
@@ -224,7 +230,7 @@ async fn lsp_runtime_fixture() -> RuntimeFixture {
 /// (`crates/tracedecay/src/daemon/project_open_owners.rs`, reason
 /// `warming_without_sealed_generation`), and the deferred owner
 /// (`.../advisory_runtime/deferred.rs`) upgrades it after the first generation
-/// seals — measured here at one to two seconds *after* `status` already reports
+/// seals, measured here at one to two seconds *after* `status` already reports
 /// `code_graph_serving: ready`. Waiting on the index alone therefore still
 /// negotiates against the warming owner.
 ///
@@ -366,7 +372,7 @@ async fn poll_lsp_response(session: &mut DaemonLspSessionClient, response_id: u6
     // flight the gateway writes no frame at all, so silence means "not yet"
     // rather than "never" and a client has to keep reading. The old bound of
     // 200 polls gave up after roughly two seconds, which a real analyzer's
-    // cold start — sysroot load and crate graph build — cannot beat.
+    // cold start, sysroot load and crate graph build, cannot beat.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
     while std::time::Instant::now() < deadline {
         let (operation_deadline, cancellation) = lsp_control();
@@ -504,9 +510,9 @@ fn initialize_project(home: &Path, project: &Path) {
     // The V2 code index is Git-authority-based end to end: candidate paths come
     // from the gix worktree classification, generations are minted from Git tree
     // captures, and `worktree_stat_signature_for` opens the repository to prove
-    // freshness. A plain directory therefore never seats a serving generation —
+    // freshness. A plain directory therefore never seats a serving generation,
     // `mount_worktree_inner` documents that missing Git authority leaves it
-    // empty — so every code-graph-backed route reads `failed` here. Enrol the
+    // empty, so every code-graph-backed route reads `failed` here. Enrol the
     // fixture as a repository before `tracedecay init`, exactly as this file's
     // `lsp_runtime_fixture` and `git_runtime_fixture` already do; initializing
     // Git afterwards would re-key the project onto a different worktree
@@ -576,43 +582,35 @@ fn run_storage_status(home: &Path, project: &Path, json_output: bool) -> Output 
 /// therefore races the daemon: graph primitives answer `termination: failed`
 /// and `initialize` negotiates none of the routed analyzer's methods.
 ///
-/// The wait polls the product's own readiness evidence rather than sleeping —
-/// the same `code_index_freshness` boundary `mcp_suite::support::\
-/// wait_for_current_graph` observes.
+/// One status read held by `wait_for` until the index serves its native
+/// graph: the `ready` boundary `mcp_suite::support::wait_for_current_graph`
+/// also waits on.
 fn await_published_code_index(home: &Path, project: &Path) {
     let project_arg = project.to_string_lossy().into_owned();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    let mut last = String::new();
-    while std::time::Instant::now() < deadline {
-        let output = common::tracedecay_command_with_home(home)
-            .current_dir(project)
-            .args([
-                "tool",
-                "--project",
-                project_arg.as_str(),
-                "status",
-                "--args",
-                r#"{"format":"json"}"#,
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .expect("run status");
-        if output.status.success()
-            && let Ok(status) = serde_json::from_slice::<Value>(&output.stdout)
-        {
-            let freshness = &status["code_index_freshness"];
-            if freshness["status"] == "current"
-                && freshness["worktree"]["code_graph_serving"]["state"] == "ready"
-            {
-                return;
-            }
-            last = freshness.to_string();
-        } else {
-            last = String::from_utf8_lossy(&output.stderr).into_owned();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    panic!("daemon never published a serving code-index generation; last status: {last}");
+    let output = common::tracedecay_command_with_home(home)
+        .current_dir(project)
+        .args([
+            "tool",
+            "--project",
+            project_arg.as_str(),
+            "status",
+            "--args",
+            r#"{"format":"json","wait_for":{"state":"ready","timeout_ms":110000}}"#,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run status");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(
+        status["wait"],
+        serde_json::json!({ "outcome": "reached" }),
+        "daemon never published a serving code-index generation: {status}"
+    );
 }
 
 fn run_feedback_diagnostics(home: &Path, project: &Path, request_handle: &str) -> Output {
@@ -969,12 +967,6 @@ async fn dashboard_project_settings_commit_through_the_daemon_control_plane() {
         .as_str()
         .unwrap_or_else(|| panic!("settings must expose a revision: {settings}"))
         .to_owned();
-    let legacy_config_path = PathBuf::from(
-        settings["project"]["legacy_config_path"]
-            .as_str()
-            .unwrap_or_else(|| panic!("settings must expose the legacy path: {settings}")),
-    );
-    let legacy_config_before = std::fs::read(&legacy_config_path).ok();
     let original_max_file_size = settings["project"]["config"]["max_file_size"].clone();
 
     // The mirror of the in-process assertion: with the control plane mounted,
@@ -1026,11 +1018,6 @@ async fn dashboard_project_settings_commit_through_the_daemon_control_plane() {
     assert_ne!(
         applied_payload["project"]["config"]["max_file_size"], original_max_file_size,
         "the committed value must differ from the pre-change reading"
-    );
-    assert_eq!(
-        std::fs::read(&legacy_config_path).ok(),
-        legacy_config_before,
-        "a typed mutation must not fall back to config.json"
     );
 
     // Re-read: the commit is durable and the pinned runtime configuration the
@@ -1096,11 +1083,8 @@ async fn dashboard_user_settings_replay_through_application_restart() {
         initial_revision.as_str(),
         "project and profile settings must share the control-plane revision"
     );
-    let legacy_user_config = PathBuf::from(
-        initial["user"]["legacy_config_path"]
-            .as_str()
-            .unwrap_or_else(|| panic!("profile settings must expose the legacy path: {initial}")),
-    );
+    let legacy_user_config = tracedecay_session_memory::user_config::config_path()
+        .expect("pinned profile user config path");
     let legacy_user_config_before = std::fs::read(&legacy_user_config).ok();
     let legal_actions = envelope["legal_actions"]
         .as_array()
@@ -1437,6 +1421,53 @@ fn patch_dashboard_json(agent: &ureq::Agent, url: &str, body: &Value) -> (u16, V
     common::response_to_json(response)
 }
 
+/// The Agents page Tokens card asks the daemon-hosted dashboard for one
+/// session's handoff-token frontier; the daemon answers it from the grant
+/// store of the project's registered session database.
+#[tokio::test(flavor = "multi_thread")]
+async fn dashboard_handoff_token_frontier_reads_the_registered_grant_store() {
+    let _dashboard_lock = DASHBOARD_CONFIGURATION_TEST_LOCK.lock().await;
+    let fixture = runtime_fixture().await;
+    let base_url = start_daemon_hosted_dashboard(&fixture).await;
+    let agent = common::http_agent();
+    let url = format!("{base_url}/api/application/handoff/list-task");
+
+    let response = common::http_call_with_retry(&format!("POST {url}"), || {
+        agent
+            .post(&url)
+            .send_json(serde_json::json!({ "session_id": "session.agents-tokens-card" }))
+    });
+    let (status, body) = common::response_to_json(response);
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["kind"], "success", "{body}");
+    assert_eq!(body["value"]["outcome"]["outcome"], "evidence", "{body}");
+    let mut frontier = body["value"]["outcome"]["value"]["payload"].clone();
+    assert!(
+        frontier["observed_at"].as_i64().is_some_and(|at| at > 0),
+        "the frontier names the instant its states were decided at: {frontier}"
+    );
+    frontier["observed_at"] = Value::Null;
+    assert_eq!(
+        frontier,
+        serde_json::json!({
+            "observed_at": null,
+            "handoffs": [],
+            "open_count": 0,
+            "consumed_count": 0,
+            "expired_count": 0,
+            "truncated": false,
+        })
+    );
+
+    let _ = call_default_tool(
+        &fixture.handshake,
+        "tracedecay_dashboard",
+        serde_json::json!({ "action": "stop", "format": "json" }),
+    )
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn project_open_application_boundary() {
     let fixture = runtime_fixture().await;
@@ -1488,53 +1519,30 @@ async fn project_open_application_boundary() {
 #[tokio::test(flavor = "multi_thread")]
 async fn production_primitive_code_routes_have_cli_mcp_http_parity() {
     let fixture = lsp_runtime_fixture().await;
-    let generation = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        loop {
-            let result = call_default_tool(
-                &fixture.handshake,
-                "tracedecay_status",
-                serde_json::json!({
-                    "format": "json", "include_branch_diagnostics": false,
-                    "include_storage_health": false, "include_session_ingest": false,
-                    "include_staleness": false,
-                }),
-            )
-            .await
-            .expect("read exact project graph readiness");
-            let status = tracedecay::daemon::tool_json_payload(&result, "tracedecay_status")
-                .expect("canonical project status");
-            let freshness = &status["code_index_freshness"];
-            let serving = &freshness["worktree"]["code_graph_serving"];
-            match (
-                freshness["status"].as_str(),
-                serving["state"].as_str(),
-                serving["reason"].as_str(),
-            ) {
-                (Some("current"), Some("ready"), _) => {
-                    break freshness["worktree"]["latest_generation_id"]
-                        .as_str()
-                        .expect("current code-index generation")
-                        .to_owned();
-                }
-                (_, Some("refused"), _) | (_, _, Some("activation_disabled")) => {
-                    panic!("graph readiness refused: {status}")
-                }
-                (Some("warming"), _, _)
-                | (_, Some("pending"), _)
-                | (_, Some("unavailable"), Some("generation_unavailable")) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-                actual => panic!("unexpected graph readiness {actual:?}: {status}"),
-            }
-        }
-    })
+    let result = call_default_tool(
+        &fixture.handshake,
+        "tracedecay_status",
+        serde_json::json!({
+            "format": "json", "include_branch_diagnostics": false,
+            "include_storage_health": false, "include_session_ingest": false,
+            "include_staleness": false,
+            "wait_for": { "state": "ready", "timeout_ms": 20_000 },
+        }),
+    )
     .await
-    .unwrap_or_else(|_| {
-        panic!(
-            "graph did not become current within publication budget\n{}",
-            fixture.daemon_log_tail()
-        )
-    });
+    .expect("read exact project graph readiness");
+    let status = tracedecay::daemon::tool_json_payload(&result, "tracedecay_status")
+        .expect("canonical project status");
+    assert_eq!(
+        status["wait"],
+        serde_json::json!({ "outcome": "reached" }),
+        "graph did not become current within publication budget: {status}\n{}",
+        fixture.daemon_log_tail()
+    );
+    let generation = status["code_index_freshness"]["worktree"]["latest_generation_id"]
+        .as_str()
+        .expect("current code-index generation")
+        .to_owned();
     let page = serde_json::json!({ "page_size": 10, "cursor": null });
     let authenticate = assert_application_transport_parity(
         &fixture,
@@ -2243,8 +2251,9 @@ async fn stdio_bridge_exits_successfully_after_client_shutdown_and_exit() {
 
     assert!(
         output.status.success(),
-        "graceful LSP exit must not fail explicit bridge detach: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "graceful LSP exit must not fail explicit bridge detach: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        fixture.daemon_log_tail()
     );
 }
 
@@ -2270,7 +2279,12 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
         cancellation,
     )
     .await
-    .expect("open production daemon LSP session");
+    .unwrap_or_else(|error| {
+        panic!(
+            "open production daemon LSP session: {error:?}\n{}",
+            fixture.daemon_log_tail()
+        )
+    });
 
     let projections = [
         "diagnostics",
@@ -2385,15 +2399,15 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
     // The gateway compares roots by parsed path rather than by raw string,
     // because a directory URI legitimately arrives with or without a trailing
     // slash, so the projection is checked the same way it is admitted. The
-    // projection names the root the daemon admitted — the canonical directory
-    // — not the alias the client spelled it through.
+    // projection names the root the daemon admitted, the canonical directory,
+    // not the alias the client spelled it through.
     let projected_root = projection["result"]["rootUri"]
         .as_str()
         .expect("projected root URI");
     // The expectation is the root's identity, not `canonicalize`: a file URL
     // never carries the `\\?\` verbatim prefix Windows canonicalization
     // returns, so comparing against that spelling would refuse the very root
-    // the daemon published. The alias the client spelled is still refused —
+    // the daemon published. The alias the client spelled is still refused,
     // it is a different name for this directory, not this name.
     let projected_path = url::Url::parse(projected_root)
         .ok()
@@ -2574,7 +2588,7 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
             // producer or publication exists for the scope yet) and `failed`
             // (a read that ran and failed) are separately carried terminal
             // states and are never collapsed into one another, so both are
-            // legal here — see the diagnostics projection above, which makes
+            // legal here, see the diagnostics projection above, which makes
             // the same distinction for the same first-run condition. What is
             // never legal is claiming completeness, or carrying items that no
             // handle can expand.
@@ -2708,7 +2722,7 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
             "cycle-backed related projections must expose retrieval handles"
         );
         let handle_record = match retrieve_response_handle(
-            &fixture.project,
+            &fixture.response_handle_root(),
             lsp_handle,
             wall_clock_micros().0.div_euclid(1_000_000),
         )
@@ -2750,7 +2764,7 @@ async fn production_lsp_negotiates_and_projects_canonical_context() {
 
         for lsp_handle in related_lsp_handles {
             let record = match retrieve_response_handle(
-                &fixture.project,
+                &fixture.response_handle_root(),
                 &lsp_handle,
                 wall_clock_micros().0.div_euclid(1_000_000),
             )
@@ -3086,9 +3100,15 @@ async fn feedback_handle_bootstrap_reads() {
     let scope = resolved_scope("feedback");
     let observed_at = wall_clock_micros();
     let access = feedback_access(&scope, observed_at);
-    let runtime = open_feedback_runtime(database, project.path(), scope, access)
-        .await
-        .expect("feedback runtime");
+    let runtime = open_feedback_runtime(
+        database,
+        project.path(),
+        project.path().join("response-handles"),
+        scope,
+        access,
+    )
+    .await
+    .expect("feedback runtime");
     let owner = runtime.owner();
 
     let list_handle = runtime
@@ -3641,6 +3661,4 @@ fn cancelled_receipt(context: &RequestContext) -> OperationReceipt {
     receipt
 }
 
-fn digest(byte: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", byte.to_string().repeat(64))).expect("manifest digest")
-}
+use tracedecay_domain::test_fixtures::digest;

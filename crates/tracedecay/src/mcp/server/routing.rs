@@ -2,9 +2,15 @@
 //! connection-scoped route state threaded through request dispatch.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tracedecay_mcp::server::{McpConnectionState, McpResponseLease};
+use tracedecay_runtime_core::cancellation::{CancellationToken, MonotonicDeadline};
+use tracedecay_runtime_core::git_discovery::{
+    GitDiscoveryUnknown, GitRepositoryIdentityOutcome, discover_repository_identity,
+};
+use tracedecay_runtime_core::path_safety::{canonical_root_identity, plain_host_path};
 
 use crate::mcp::project_route::{
     HookProjectRouteCache, ProjectRouteFailure, ProjectRouteFailureKind, WorkspaceProjectRoute,
@@ -16,7 +22,7 @@ use tracedecay_global_db::RegisteredGlobalDb;
 /// wire contract or a second routing identity.
 pub(crate) struct SelectedProjectResponseLease {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
-    revoked: tracedecay_session_memory::context::CancellationToken,
+    revoked: tracedecay_runtime_core::cancellation::CancellationToken,
     _active: ResponseLeaseGaugeGuard,
 }
 
@@ -38,7 +44,7 @@ impl Drop for ResponseLeaseGaugeGuard {
 impl SelectedProjectResponseLease {
     pub(crate) fn new(
         guard: tokio::sync::OwnedRwLockReadGuard<()>,
-        revoked: tracedecay_session_memory::context::CancellationToken,
+        revoked: tracedecay_runtime_core::cancellation::CancellationToken,
     ) -> Self {
         Self {
             _guard: guard,
@@ -47,20 +53,20 @@ impl SelectedProjectResponseLease {
         }
     }
 
-    pub(crate) fn revoked(&self) -> &tracedecay_session_memory::context::CancellationToken {
+    pub(crate) fn revoked(&self) -> &tracedecay_runtime_core::cancellation::CancellationToken {
         &self.revoked
     }
 }
 
 impl McpResponseLease for SelectedProjectResponseLease {
-    fn revoked(&self) -> &tracedecay_session_memory::context::CancellationToken {
+    fn revoked(&self) -> &tracedecay_runtime_core::cancellation::CancellationToken {
         &self.revoked
     }
 }
 
 /// Per-connection routing and identity context, constructed once per client
 /// connection (or per initialize-replay dispatch) and threaded through
-/// [`McpServer::handle_request_for_connection`]. Bundling these values keeps
+/// [`McpServer::dispatch_envelope`]. Bundling these values keeps
 /// persisted application request correlation and cancellation scoped to the
 /// exact client connection.
 pub(crate) struct ConnectionRouteState {
@@ -73,7 +79,6 @@ pub(crate) struct ConnectionRouteState {
     pub(crate) route_cache: HookProjectRouteCache,
     selected_response_lease: Option<SelectedProjectResponseLease>,
     selected_request_server: Option<std::sync::Arc<super::McpServer>>,
-    connection_owns_dispatch: bool,
 }
 
 impl ConnectionRouteState {
@@ -84,7 +89,6 @@ impl ConnectionRouteState {
             route_cache,
             selected_response_lease: None,
             selected_request_server: None,
-            connection_owns_dispatch: false,
         }
     }
 
@@ -120,18 +124,7 @@ impl ConnectionRouteState {
             route_cache: self.route_cache.clone(),
             selected_response_lease: None,
             selected_request_server: None,
-            connection_owns_dispatch: false,
         }
-    }
-
-    pub(crate) fn fork_for_connection_owned_read(&self) -> Self {
-        let mut fork = self.fork_for_independent_read();
-        fork.connection_owns_dispatch = true;
-        fork
-    }
-
-    pub(crate) fn connection_owns_dispatch(&self) -> bool {
-        self.connection_owns_dispatch
     }
 
     pub(crate) fn install_selected_response_lease(&mut self, lease: SelectedProjectResponseLease) {
@@ -175,12 +168,24 @@ impl McpConnectionState for ConnectionRouteState {
         ConnectionRouteState::fork_for_independent_read(self)
     }
 
-    fn fork_for_connection_owned_read(&self) -> Self {
-        ConnectionRouteState::fork_for_connection_owned_read(self)
-    }
-
     fn take_selected_response_lease(&mut self) -> Option<Self::ResponseLease> {
         ConnectionRouteState::take_selected_response_lease(self)
+    }
+}
+
+/// One discovery budget for a whole initialize request. Per-root budgets would
+/// stack into N times this duration.
+const MCP_REPOSITORY_DISCOVERY_DEADLINE: Duration = Duration::from_secs(2);
+
+struct RepositoryDiscovery {
+    deadline: MonotonicDeadline,
+    cancellation: CancellationToken,
+}
+
+fn repository_discovery() -> RepositoryDiscovery {
+    RepositoryDiscovery {
+        deadline: MonotonicDeadline::at(Instant::now() + MCP_REPOSITORY_DISCOVERY_DEADLINE),
+        cancellation: CancellationToken::new(),
     }
 }
 
@@ -194,8 +199,11 @@ async fn resolve_initialize_roots_project_route(
     if roots.is_empty() {
         return None;
     }
+    let discovery = repository_discovery();
     for root in roots {
-        let route = resolve_private_project_route(&root, registry_db, resolver.clone()).await;
+        let route =
+            resolve_private_project_route_within(&root, registry_db, resolver.clone(), &discovery)
+                .await;
         if !matches!(
             &route,
             WorkspaceProjectRoute::Failed(ProjectRouteFailure {
@@ -218,6 +226,53 @@ pub(crate) async fn resolve_private_project_route(
     registry_db: Option<&RegisteredGlobalDb>,
     resolver: Option<super::RetainedProjectServerResolver>,
 ) -> WorkspaceProjectRoute {
+    resolve_private_project_route_within(
+        requested_path,
+        registry_db,
+        resolver,
+        &repository_discovery(),
+    )
+    .await
+}
+
+async fn resolve_private_selected_path(
+    requested_path: &Path,
+    registry_db: &RegisteredGlobalDb,
+    discovery: &RepositoryDiscovery,
+) -> Result<PathBuf, ProjectRouteFailure> {
+    match resolve_initialize_root_project_path(requested_path, registry_db, discovery).await {
+        Ok(Some(path)) => Ok(path),
+        Ok(None) => Err(ProjectRouteFailure {
+            kind: ProjectRouteFailureKind::NotFound,
+            detail: format!(
+                "workspace {} did not resolve to a registered project",
+                requested_path.display()
+            ),
+        }),
+        Err(InitializeRootResolutionError::AmbiguousIdentity) => Err(ProjectRouteFailure {
+            kind: ProjectRouteFailureKind::Ambiguous,
+            detail: format!(
+                "workspace {} matches multiple registered projects",
+                requested_path.display()
+            ),
+        }),
+        Err(InitializeRootResolutionError::AuthorityUnavailable) => Err(ProjectRouteFailure {
+            kind: ProjectRouteFailureKind::Unavailable,
+            detail: "private project route authority is unavailable".to_owned(),
+        }),
+        Err(InitializeRootResolutionError::Discovery(reason)) => Err(ProjectRouteFailure {
+            kind: ProjectRouteFailureKind::Unavailable,
+            detail: format!("repository discovery {reason}"),
+        }),
+    }
+}
+
+async fn resolve_private_project_route_within(
+    requested_path: &Path,
+    registry_db: Option<&RegisteredGlobalDb>,
+    resolver: Option<super::RetainedProjectServerResolver>,
+    discovery: &RepositoryDiscovery,
+) -> WorkspaceProjectRoute {
     let Some(registry_db) = registry_db else {
         return WorkspaceProjectRoute::Failed(ProjectRouteFailure {
             kind: ProjectRouteFailureKind::NotAuthorized,
@@ -225,32 +280,9 @@ pub(crate) async fn resolve_private_project_route(
         });
     };
     let selected_path =
-        match resolve_initialize_root_project_path(requested_path, registry_db).await {
-            Ok(Some(path)) => path,
-            Ok(None) => {
-                return WorkspaceProjectRoute::Failed(ProjectRouteFailure {
-                    kind: ProjectRouteFailureKind::NotFound,
-                    detail: format!(
-                        "workspace {} did not resolve to a registered project",
-                        requested_path.display()
-                    ),
-                });
-            }
-            Err(InitializeRootResolutionError::AmbiguousIdentity) => {
-                return WorkspaceProjectRoute::Failed(ProjectRouteFailure {
-                    kind: ProjectRouteFailureKind::Ambiguous,
-                    detail: format!(
-                        "workspace {} matches multiple registered projects",
-                        requested_path.display()
-                    ),
-                });
-            }
-            Err(InitializeRootResolutionError::AuthorityUnavailable) => {
-                return WorkspaceProjectRoute::Failed(ProjectRouteFailure {
-                    kind: ProjectRouteFailureKind::Unavailable,
-                    detail: "private project route authority is unavailable".to_owned(),
-                });
-            }
+        match resolve_private_selected_path(requested_path, registry_db, discovery).await {
+            Ok(path) => path,
+            Err(failure) => return WorkspaceProjectRoute::Failed(failure),
         };
     let context = match registry_db
         .project_registry_context_by_alias(&selected_path)
@@ -258,7 +290,22 @@ pub(crate) async fn resolve_private_project_route(
     {
         Ok(Some(context)) => Some(context),
         Ok(None) => {
-            let git_common_dir = tracedecay_runtime_core::worktree::git_common_dir(&selected_path);
+            let git_common_dir = match discover_repository_identity(
+                &selected_path,
+                discovery.deadline,
+                &discovery.cancellation,
+            )
+            .await
+            {
+                GitRepositoryIdentityOutcome::Resolved(identity) => Some(identity.common_dir),
+                GitRepositoryIdentityOutcome::NotRepository => None,
+                GitRepositoryIdentityOutcome::Unknown(reason) => {
+                    return WorkspaceProjectRoute::Failed(ProjectRouteFailure {
+                        kind: ProjectRouteFailureKind::Unavailable,
+                        detail: format!("repository discovery {reason}"),
+                    });
+                }
+            };
             match registry_db
                 .project_registry_context_by_identity(&selected_path, git_common_dir.as_deref())
                 .await
@@ -312,7 +359,9 @@ async fn resolve_initialize_roots_project_path(
     }
     let registry_db = registry_db?;
     for root in roots {
-        match resolve_initialize_root_project_path(&root, registry_db).await {
+        match resolve_initialize_root_project_path(&root, registry_db, &repository_discovery())
+            .await
+        {
             Ok(Some(project_path)) => return Some(project_path),
             Ok(None) => {}
             Err(_) => return None,
@@ -324,8 +373,9 @@ async fn resolve_initialize_roots_project_path(
 async fn resolve_initialize_root_project_path(
     root: &Path,
     registry_db: &RegisteredGlobalDb,
+    discovery: &RepositoryDiscovery,
 ) -> Result<Option<PathBuf>, InitializeRootResolutionError> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = canonical_root_identity(root);
     let mut candidates = Vec::with_capacity(2);
 
     for candidate in root.ancestors() {
@@ -342,15 +392,28 @@ async fn resolve_initialize_root_project_path(
         }
     }
 
-    if let Some(git_root) = tracedecay_runtime_core::worktree::git_worktree_root(&root) {
-        let git_common_dir = tracedecay_runtime_core::worktree::git_common_dir(&git_root);
-        match registry_db
-            .project_registry_context_by_identity(&git_root, git_common_dir.as_deref())
-            .await
-        {
-            Ok(Some(context)) => candidates.push((git_root, context.project.project_id)),
-            Ok(None) => {}
-            Err(_) => return Err(InitializeRootResolutionError::AuthorityUnavailable),
+    match discover_repository_identity(&root, discovery.deadline, &discovery.cancellation).await {
+        GitRepositoryIdentityOutcome::Resolved(identity) => {
+            match registry_db
+                .project_registry_context_by_identity(
+                    &identity.worktree_root,
+                    Some(&identity.common_dir),
+                )
+                .await
+            {
+                Ok(Some(context)) => {
+                    candidates.push((
+                        plain_host_path(&identity.worktree_root),
+                        context.project.project_id,
+                    ));
+                }
+                Ok(None) => {}
+                Err(_) => return Err(InitializeRootResolutionError::AuthorityUnavailable),
+            }
+        }
+        GitRepositoryIdentityOutcome::NotRepository => {}
+        GitRepositoryIdentityOutcome::Unknown(reason) => {
+            return Err(InitializeRootResolutionError::Discovery(reason));
         }
     }
 
@@ -397,6 +460,7 @@ fn select_initialize_project_path(
 enum InitializeRootResolutionError {
     AuthorityUnavailable,
     AmbiguousIdentity,
+    Discovery(GitDiscoveryUnknown),
 }
 
 #[cfg(test)]
@@ -410,8 +474,13 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::{resolve_initialize_roots_project_path, select_initialize_project_path};
-    use crate::test_support::host_admission::HostAdmissionTestRuntimeV1;
+    use super::{
+        InitializeRootResolutionError, RepositoryDiscovery, resolve_initialize_root_project_path,
+        resolve_initialize_roots_project_path, resolve_initialize_roots_project_route,
+        select_initialize_project_path,
+    };
+    use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+    use tracedecay_runtime_core::path_safety::canonical_existing_identity;
     use tracedecay_sessions::admission::HostAdmissionScope;
 
     fn run_git(root: &Path, args: &[&str]) {
@@ -550,7 +619,7 @@ mod tests {
 
         assert_eq!(
             resolved,
-            Some(linked_root.canonicalize().expect("canonical linked root"))
+            Some(canonical_existing_identity(&linked_root).expect("canonical linked root"))
         );
     }
 
@@ -583,7 +652,85 @@ mod tests {
 
         assert_eq!(
             resolved,
-            Some(nested_root.canonicalize().expect("canonical nested root"))
+            Some(canonical_existing_identity(&nested_root).expect("canonical nested root"))
+        );
+    }
+
+    #[tokio::test]
+    async fn many_slow_initialize_roots_share_one_discovery_budget() {
+        let profile = TempDir::new().expect("profile");
+        let projects = TempDir::new().expect("projects");
+        let runtime = HostAdmissionTestRuntimeV1::profile(profile.path())
+            .await
+            .expect("open registered profile runtime");
+        let registry = runtime
+            .registered_database(HostAdmissionScope::Profile)
+            .expect("registered profile database");
+        let mut params_roots = Vec::new();
+        let probe = std::time::Duration::from_millis(1_500);
+        for index in 0..3 {
+            let root = projects.path().join(format!("slow-{index}"));
+            fs::create_dir_all(&root).expect("create slow root");
+            run_git(&root, &["init", "--quiet"]);
+            tracedecay_runtime_core::git_repository::delay_repository_discovery_for_test(
+                &root, probe,
+            );
+            let uri = url::Url::from_file_path(&root).expect("file uri");
+            params_roots.push(json!({"uri": uri.as_str(), "name": format!("slow-{index}")}));
+        }
+        let params = json!({"roots": params_roots});
+        let started = std::time::Instant::now();
+        let route =
+            resolve_initialize_roots_project_route(Some(&params), Some(registry), None).await;
+        let elapsed = started.elapsed();
+        for index in 0..3 {
+            tracedecay_runtime_core::git_repository::reset_repository_discovery_for_test(
+                &projects.path().join(format!("slow-{index}")),
+            );
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "three {probe:?} probes must not stack past one 2s budget, took {elapsed:?}"
+        );
+        let Some(crate::mcp::project_route::WorkspaceProjectRoute::Failed(failure)) = route else {
+            panic!("shared budget must defer before every slow root resolves");
+        };
+        assert!(
+            failure.detail.contains("deadline exceeded"),
+            "expected a deadline miss, got {failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_repository_discovery_is_unavailable_not_absent() {
+        let profile = TempDir::new().expect("profile");
+        let projects = TempDir::new().expect("projects");
+        let root = projects.path().join("repo");
+        fs::create_dir_all(&root).expect("create repo");
+        run_git(&root, &["init", "--quiet"]);
+
+        let runtime = HostAdmissionTestRuntimeV1::profile(profile.path())
+            .await
+            .expect("open registered profile runtime");
+        let registry = runtime
+            .registered_database(HostAdmissionScope::Profile)
+            .expect("registered profile database");
+        let discovery = RepositoryDiscovery {
+            deadline: tracedecay_runtime_core::cancellation::MonotonicDeadline::at(
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            ),
+            cancellation: tracedecay_runtime_core::cancellation::CancellationToken::new(),
+        };
+        discovery.cancellation.cancel();
+
+        let error = resolve_initialize_root_project_path(&root, registry, &discovery)
+            .await
+            .expect_err("cancelled discovery must not resolve a project");
+        assert_eq!(
+            error,
+            InitializeRootResolutionError::Discovery(
+                tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown::Cancelled
+            )
         );
     }
 

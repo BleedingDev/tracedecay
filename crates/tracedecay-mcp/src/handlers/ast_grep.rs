@@ -3,7 +3,7 @@
 //! Runs an ast-grep structural pattern over the project working tree *in
 //! process* (via [`tracedecay_code_index::ast_grep_search`], which wires the
 //! repo's bundled tree-sitter grammars into the `ast-grep-core` pattern
-//! engine — no external `ast-grep` binary required).
+//! engine, no external `ast-grep` binary required).
 
 use std::path::Path;
 
@@ -26,6 +26,7 @@ const DEFAULT_MAX_RESULTS: usize = 50;
 #[hotpath::measure(future = true, label = "mcp.search.ast_grep.total")]
 pub async fn handle_ast_grep_search(
     project_root: &Path,
+    response_handle_root: &Path,
     args: Value,
     scope_prefix: Option<&str>,
     deadline: Option<tracedecay_contracts::Deadline>,
@@ -90,7 +91,7 @@ pub async fn handle_ast_grep_search(
     let touched_files = unique_file_paths(hits.iter().map(|hit| hit.file.as_ref()));
     let output_value = build_output_value(&hits, search.truncated, search.files_scanned);
 
-    let text = render::finalize(Some(project_root), &args, &output_value, || {
+    let text = render::finalize(Some(response_handle_root), &args, &output_value, || {
         render_md(&hits, search.truncated, search.files_scanned)
     });
     Ok(ToolResult::new(
@@ -140,7 +141,7 @@ fn render_md(hits: &[AstGrepSearchMatch], truncated: bool, files_scanned: usize)
     md.blank();
     let mut summary = format!("_{} matches across {files_scanned} files._", hits.len());
     if truncated {
-        summary.push_str(" Results capped — narrow with `path_glob` or `max_results`.");
+        summary.push_str(" Results capped. Narrow with `path_glob` or `max_results`.");
     }
     md.line(&summary);
     md.render()
@@ -168,6 +169,7 @@ mod tests {
 
         let result = handle_ast_grep_search(
             temp.path(),
+            &temp.path().join("response-handles"),
             json!({"pattern": "target($A)", "lang": "rust", "max_results": 10}),
             None,
             None,

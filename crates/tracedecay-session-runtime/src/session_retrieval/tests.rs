@@ -23,18 +23,18 @@ use tracedecay_domain::{
     SessionId, TemporalModeV1, UtcMicros, derive_exact_observation_anchor_id,
 };
 use tracedecay_lcm::contracts::{LcmDataFreshness, LcmRetrievalOutcome};
+use tracedecay_session_temporal_store::SessionTemporalAccess;
 use tracedecay_store::{
     AnchoredObservationWrite, ObservationProjectionStore, ObservationStore, ObservationWrite,
     SessionRecord, SessionTemporalSnapshotRequestV1, build_observation_resolution_authorization_v1,
-    build_observation_retrieval_anchor_v2,
+    build_observation_retrieval_anchor,
 };
 use tracedecay_temporal_query::context::{CompactContext, ContextBudget};
-use tracedecay_temporal_query::ports::{
-    BindingDigest, KernelVersions, TemporalAuthorizedRoot, TemporalSnapshotRequest,
-    TemporalWatermarks,
-};
+use tracedecay_temporal_query::execution::BindingDigest;
 use tracedecay_temporal_query::ranking::{DiversityLimits, RankedCandidate, RetrieverContribution};
 use tracedecay_temporal_query::resolution::ValidatedAuthorization;
+use tracedecay_temporal_query::snapshot::{KernelVersions, TemporalWatermarks};
+use tracedecay_temporal_query::snapshot::{TemporalAuthorizedRoot, TemporalSnapshotRequest};
 use tracedecay_temporal_query::{TemporalHydratedResult, TemporalKernelResult};
 use tracedecay_tool_catalog::{CapabilityId, SchemaId, UseCaseId};
 
@@ -269,7 +269,7 @@ async fn seed_real_page_fixture_in_session(
         tracedecay_store::OBSERVATION_CAPTURE_AUTHORITY_V1,
     )
     .expect("resolution authorization");
-    let anchor = build_observation_retrieval_anchor_v2(
+    let anchor = build_observation_retrieval_anchor(
         write.observation(),
         projection_generation.clone(),
         UtcMicros(1),
@@ -298,7 +298,7 @@ async fn seed_real_page_fixture_in_session(
             )
             .await
             .expect("materialize canonical temporal occurrence");
-        database
+        SessionTemporalAccess::new(database)
             .freeze_session_temporal_snapshot_result(SessionTemporalSnapshotRequestV1::new(
                 SessionId::new(session_id.clone()).expect("frozen session"),
             ))
@@ -1171,6 +1171,53 @@ async fn require_fresh_without_a_refresh_worker_is_refused_as_worker_missing() {
     }
 }
 
+/// A core mount has no refresh worker. Zero LCM rows are absence, not a
+/// historical catch-up, so describe must not answer `RefreshWorkerMissing`.
+#[tokio::test]
+async fn describe_without_a_refresh_worker_does_not_pretend_history_is_converging() {
+    let harness = tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness::open(
+        "session-describe-refresh-worker-missing",
+    )
+    .await;
+    let root = registered_profile_retrieval_root(&harness.registered);
+    let scope = root
+        .identity()
+        .session_request_scope()
+        .expect("profile session scope");
+    let service =
+        DaemonSessionRetrievalService::new_without_refresh_worker(harness.registered.clone(), root)
+            .expect("registered retrieval service");
+    let context = admitted_lookup_context(scope);
+    let cancellation =
+        tracedecay_contracts::CancellationSignal::active("cancellation.session-lookup")
+            .expect("cancellation");
+    let command = LcmDescribeServiceCommand::new(
+        "codex",
+        SessionId::new("session.describe.worker-missing").expect("session identity"),
+        tracedecay_lcm::contracts::LcmDescribeTarget::Session,
+        tracedecay_domain::RetrievalGrainV1::Occurrence,
+        SessionRetrievalStoreScope::Profile,
+    );
+    let outcome = SessionApplicationRetrievalPortV1::describe_lcm_admitted(
+        &service,
+        &context,
+        &cancellation,
+        command,
+    )
+    .await;
+    match outcome {
+        LcmDescribeServiceOutcome::Unavailable(unavailable) => assert_ne!(
+            unavailable.reason,
+            SessionRetrievalUnavailableReason::RefreshWorkerMissing,
+            "a missing worker must not rewrite absence as catch-up: {unavailable:?}"
+        ),
+        LcmDescribeServiceOutcome::Complete { .. }
+        | LcmDescribeServiceOutcome::Partial { .. }
+        | LcmDescribeServiceOutcome::Deleted => {}
+        other => panic!("describe without a worker returned {other:?}"),
+    }
+}
+
 struct CurrentRefreshServing;
 
 impl tracedecay_sessions::serving::SessionProjectionServingStatusPort for CurrentRefreshServing {
@@ -1550,18 +1597,11 @@ async fn project_retrieval_mounts_each_branch_of_a_shared_graph_store() {
     let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
         &project,
         &profile,
-        &tracedecay_runtime_core::storage::EnrollmentMarker {
-            project_id: project_id.to_string(),
-            storage_mode: tracedecay_runtime_core::storage::StorageMode::ProfileSharded,
-        },
+        project_id.as_str(),
     )
     .unwrap();
     let mut branches = tracedecay_runtime_core::branch_meta::BranchMeta::new("master");
-    branches.add_branch(
-        "refs/heads/feature",
-        tracedecay_runtime_core::config::DB_FILENAME,
-        "master",
-    );
+    branches.add_branch("refs/heads/feature", "master");
     tracedecay_runtime_core::branch_meta::save_branch_meta(&layout.data_root, &branches).unwrap();
     let registry = runtime.profile_database();
     tracedecay_global_db::register_project_store(registry, &project, &layout)

@@ -1,9 +1,9 @@
 use std::io::Write;
 
 use tempfile::TempDir;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
-use tracedecay_sessions::runtime::codex::CodexSource;
+use tracedecay_sessions::runtime::hosts::codex::CodexSource;
 
 use crate::restart_atomicity::{open_project_session_db, try_ingest_source};
 
@@ -355,7 +355,7 @@ pub(crate) fn write_codex_rollout_with_goal_context(
 /// A rollout carrying the full spread of structured Codex telemetry: a turn
 /// boundary pair, a joined `exec_command` tool call, a plan update, a patch
 /// application, an MCP tool call, a web search, sub-agent activity, and an
-/// encrypted inter-agent routing edge — plus a `turn_context` and a
+/// encrypted inter-agent routing edge, plus a `turn_context` and a
 /// `token_count` with rate limits feeding the session summary.
 pub(crate) fn write_codex_rollout_with_structured_events(
     home: &std::path::Path,

@@ -4,14 +4,14 @@ use tracedecay_contracts::retained_surfaces::{
     RetainedOutcomeStatusV1, RetainedSurfaceRequestV1, RetainedSurfaceResultV1,
     SessionRefreshActionRequestV1, SessionRefreshActionV1, SessionRefreshFrontierV1,
     SessionRefreshGrainV1, SessionRefreshRequestV1, SessionRefreshScopeV1, SessionRefreshSessionV1,
-    SessionRefreshSourceV1, SessionRefreshTargetV1, SessionRefreshTemporalModeV1,
+    SessionRefreshSourceV1, SessionRefreshTargetV1,
 };
 use tracedecay_contracts::{
-    ApplicationOutcome, ApplicationProblemKind, ApplicationResult, CancellationSignal, Deadline,
+    ApplicationOutcome, ApplicationProblem, ApplicationProblemKind, CancellationSignal, Deadline,
     RequestId, now_micros,
 };
 use tracedecay_daemon_identity::profile_identity;
-use tracedecay_domain::UtcMicros;
+use tracedecay_domain::{TemporalModeV1, UtcMicros};
 use tracedecay_session_memory::context::ResolvedSessionIdentity;
 use tracedecay_session_runtime::retained::{
     ProfileRetainedAuthoritiesV1, ProfileRetainedConnectionAuthorityV1,
@@ -53,7 +53,7 @@ fn refresh_request(
                 scope: "codex".to_owned(),
             },
             target: SessionRefreshTargetV1 {
-                temporal_mode: SessionRefreshTemporalModeV1::Current,
+                temporal_mode: TemporalModeV1::Current,
                 grain: SessionRefreshGrainV1::LogicalMessage,
                 frontier: SessionRefreshFrontierV1 {
                     observed_through: 0,
@@ -61,7 +61,6 @@ fn refresh_request(
                 },
             },
             handle,
-            format: None,
         },
     ))
 }
@@ -77,7 +76,7 @@ async fn execute_refresh(
     refresh: Option<&dyn RetainedSessionRefreshPortV1>,
     request: RetainedSurfaceRequestV1,
     label: &str,
-) -> ApplicationResult<RetainedSurfaceResultV1> {
+) -> Result<ApplicationOutcome<RetainedSurfaceResultV1>, ApplicationProblem> {
     execute_profile_retained_application(
         ProfileRetainedAuthoritiesV1 {
             profile_sessions: Some(Arc::new(move || {
@@ -100,11 +99,12 @@ async fn execute_refresh(
     )
     .await
     .expect("profile refresh transport")
+    .outcome
 }
 
 /// The profile session authority owns profile-scoped refreshes end to end:
 /// begin issues an opaque handle bound to the profile store, status reads
-/// it back, and cancel settles a receipt — all through one canonical
+/// it back, and cancel settles a receipt, all through one canonical
 /// request shape and without any project.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn profile_retained_session_refresh_begins_reads_and_cancels_in_the_profile_store() {
@@ -148,7 +148,7 @@ async fn profile_retained_session_refresh_begins_reads_and_cancels_in_the_profil
     )
     .await
     .expect("profile refresh begin must be mounted");
-    let ApplicationOutcome::Effect(effect) = begun.outcome else {
+    let ApplicationOutcome::Effect(effect) = begun else {
         panic!("begin must be an effect")
     };
     let Some(RetainedSurfaceResultV1::SessionRefreshBegin(begin)) = effect.payload else {
@@ -179,7 +179,7 @@ async fn profile_retained_session_refresh_begins_reads_and_cancels_in_the_profil
     )
     .await
     .expect("profile refresh status must be mounted");
-    let ApplicationOutcome::Evidence(packet) = status.outcome else {
+    let ApplicationOutcome::Evidence(packet) = status else {
         panic!("status must be evidence")
     };
     let Some(RetainedSurfaceResultV1::SessionRefreshStatus(status)) = packet.payload else {
@@ -209,7 +209,7 @@ async fn profile_retained_session_refresh_begins_reads_and_cancels_in_the_profil
     )
     .await
     .expect("profile refresh cancel must be mounted");
-    let ApplicationOutcome::Effect(effect) = cancelled.outcome else {
+    let ApplicationOutcome::Effect(effect) = cancelled else {
         panic!("cancel must be an effect")
     };
     let Some(RetainedSurfaceResultV1::SessionRefreshCancel(cancel)) = effect.payload else {
@@ -278,7 +278,7 @@ async fn profile_retained_session_refresh_refuses_foreign_owners_and_unmounted_s
     .await
     .expect_err("a project-scoped refresh must not reach the profile store");
     assert_eq!(
-        project_scoped.problem.kind,
+        project_scoped.kind(),
         ApplicationProblemKind::NotFoundOrNotAuthorized
     );
 
@@ -292,14 +292,15 @@ async fn profile_retained_session_refresh_refuses_foreign_owners_and_unmounted_s
     )
     .await
     .expect_err("an unmounted refresh service is a typed unavailable terminal");
-    assert_eq!(unmounted.problem.kind, ApplicationProblemKind::Unavailable);
+    let ApplicationProblem::Unavailable { diagnostic, .. } = unmounted else {
+        panic!("an unmounted refresh service must be unavailable: {unmounted:?}")
+    };
     assert!(
-        unmounted
-            .problem
+        diagnostic
             .message
             .contains("profile session refresh authority is not mounted"),
         "{}",
-        unmounted.problem.message
+        diagnostic.message
     );
     schedulers.shutdown().await;
 }

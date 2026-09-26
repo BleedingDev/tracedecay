@@ -2,82 +2,28 @@
 //!
 //! Claude and Codex share the common hook JSON shape.
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::Instant;
 
 use serde_json::Value;
-use tracedecay_hooks::{DaemonHookEvent, HookAgent};
 
 use crate::ports::hook_runtime::HookRuntimeV1;
 
 use super::post_tool_use::is_post_tool_use_failure_event;
-use super::tool_hints::{HintAgent, ToolHintInput, decide_hint};
+use super::tool_hints::{ToolHintInput, decide_hint};
 use super::{
     additional_context_json, compact_daemon_args, event_project_root_with_identity,
     event_session_id, prompt_like_text, read_hook_event, record_hook_invoked_parsed,
     research_block_reason,
 };
-
-/// Largest Claude transcript tail one lifecycle catch-up hook will read.
-/// A larger backlog stays queued for the next hook or the daemon's own
-/// session-sync sweep instead of holding the host's lifecycle event open.
-const CLAUDE_CATCH_UP_INGEST_MAX_BYTES: u64 =
-    tracedecay_sessions::runtime::SESSION_TRANSCRIPT_STALLED_INGEST_WARNING_BYTES;
-
-/// Budget for the `SessionStart` catch-up ingest. Orientation is on the
-/// critical path of the agent's first turn, so this is deliberately short: the
-/// tail that does not fit is picked up by `Stop` or by the daemon's own sweep.
-const CLAUDE_SESSION_START_INGEST_BUDGET: Duration = Duration::from_secs(5);
-
-/// Budget for the `Stop` catch-up ingest, the primary Claude ingest point.
-/// `Stop` runs at a turn boundary under Claude's default 60s hook guard, so a
-/// 25s budget leaves ample headroom for the rest of the handler.
-const CLAUDE_STOP_INGEST_BUDGET: Duration = Duration::from_secs(25);
-
-/// Runs one bounded project-scoped Claude transcript catch-up for a lifecycle
-/// event, reporting -- never discarding -- a route that did not complete.
-///
-/// This is the production moment a Claude session running *inside* a
-/// registered project becomes canonical project observations. The
-/// profile-scoped route these handlers already used covers only sessions that
-/// belong to no registered project, so without this call a project session's
-/// evidence waits for the daemon's next session-sync sweep.
-///
-/// Fail-open by construction: the hook's own answer (orientation guidance, the
-/// turn boundary) is produced regardless, and an unreachable or slow daemon
-/// costs the host nothing but a diagnostic line.
-async fn ingest_claude_project_transcript(
-    runtime: &HookRuntimeV1,
-    hook_event_name: &str,
-    event: &str,
-    root: &Path,
-    budget: Duration,
-    telemetry: &super::analytics::HookTimingSpan,
-) {
-    let outcome = super::ingest_transcript_for_event(
-        runtime,
-        "claude",
-        event,
-        Some(root),
-        Some(CLAUDE_CATCH_UP_INGEST_MAX_BYTES),
-        budget,
-        Some(telemetry),
-    )
-    .await;
-    if let Some(reason) = outcome.failure_reason() {
-        eprintln!(
-            "[tracedecay] Claude {hook_event_name} transcript ingest failed open: \
-             stage=project_ingest outcome={reason}"
-        );
-    }
-}
+use tracedecay_domain::HostIntegrationIdV1;
 
 /// Pure decision logic for the `PreToolUse` hook.
 pub fn evaluate_hook_decision(tool_input: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(tool_input).unwrap_or_else(|_| serde_json::json!({}));
     let hint = decide_hint(&ToolHintInput {
-        agent: HintAgent::Claude,
+        agent: HostIntegrationIdV1::Claude,
         session_id: event_session_id(&parsed),
         tool_name: Some("Agent".to_string()),
         command: None,
@@ -142,82 +88,7 @@ pub(super) fn is_code_research_prompt(prompt: &str) -> bool {
 /// Claude Code `SessionStart` hook handler.
 #[hotpath::measure(future = true, label = "hosts.hooks.claude.session_start")]
 pub async fn hook_claude_session_start(runtime: &HookRuntimeV1) -> i32 {
-    let started = Instant::now();
-    let event = read_hook_event!();
-    let (root, output) = claude_session_start_response(runtime, &event, started).await;
-    if !super::write_hook_output(
-        root.as_deref(),
-        tracedecay_hooks::HookHostV1::ClaudeCode,
-        &event,
-        &output,
-    )
-    .await
-    {
-        return 1;
-    }
-    0
-}
-
-fn claude_session_start_route_event(parsed: &Value, project_root: &Path) -> DaemonHookEvent {
-    DaemonHookEvent::session_start(HookAgent::Claude, project_root.to_path_buf()).with_route(Some(
-        super::hook_route_metadata_from_parsed(parsed, project_root),
-    ))
-}
-
-/// Returns the identity-resolved root alongside the response so the handler
-/// does not repeat the registry-probing resolution for output delivery.
-async fn claude_session_start_response(
-    runtime: &HookRuntimeV1,
-    event: &str,
-    started: Instant,
-) -> (Option<PathBuf>, String) {
-    let parsed = serde_json::from_str::<Value>(event).unwrap_or(Value::Null);
-    // Resolve the project root the same identity-aware way the printed context
-    // does, including global-only stores and fresh harness-created worktrees.
-    let root = event_project_root_with_identity(runtime, &parsed).await;
-    let hook_telemetry = record_hook_invoked_parsed(
-        runtime,
-        root.as_deref(),
-        HintAgent::Claude,
-        "SessionStart",
-        event,
-        &parsed,
-    );
-    // Record the live frontier before catch-up can admit the appended rows.
-    let output = super::dispatch::dispatch_for_scope(
-        runtime,
-        tracedecay_hooks::HookHostV1::ClaudeCode,
-        event,
-        root.as_deref(),
-        Some(&hook_telemetry),
-        started,
-    )
-    .await
-    .into_recorded_guidance(&hook_telemetry)
-    .flatten()
-    .map_or_else(
-        || serde_json::json!({}).to_string(),
-        |guidance| additional_context_json("SessionStart", &guidance),
-    );
-    if let Some(project_root) = root.as_deref() {
-        super::notify_hook_event_with_telemetry(
-            runtime,
-            project_root,
-            claude_session_start_route_event(&parsed, project_root),
-            &hook_telemetry,
-        )
-        .await;
-        ingest_claude_project_transcript(
-            runtime,
-            "SessionStart",
-            event,
-            project_root,
-            CLAUDE_SESSION_START_INGEST_BUDGET,
-            &hook_telemetry,
-        )
-        .await;
-    }
-    (root, output)
+    claude_guidance_hook(runtime, "SessionStart").await
 }
 
 /// Claude Code `PostCompact` hook handler.
@@ -234,7 +105,7 @@ pub async fn hook_claude_post_compact(runtime: &HookRuntimeV1) -> i32 {
     let hook_telemetry = record_hook_invoked_parsed(
         runtime,
         root.as_deref(),
-        HintAgent::Claude,
+        HostIntegrationIdV1::Claude,
         "PostCompact",
         &event,
         &parsed,
@@ -247,7 +118,7 @@ pub async fn hook_claude_post_compact(runtime: &HookRuntimeV1) -> i32 {
     }
     if !super::write_hook_output(
         root.as_deref(),
-        tracedecay_hooks::HookHostV1::ClaudeCode,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
         &event,
         &serde_json::json!({}).to_string(),
     )
@@ -267,7 +138,7 @@ pub async fn hook_claude_post_tool_use(runtime: &HookRuntimeV1) -> i32 {
     if let Some(response) = response
         && !super::write_hook_output(
             root.as_deref(),
-            tracedecay_hooks::HookHostV1::ClaudeCode,
+            tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
             &event,
             &response,
         )
@@ -295,14 +166,14 @@ async fn claude_post_tool_use_response(
     let hook_telemetry = record_hook_invoked_parsed(
         runtime,
         root.as_deref(),
-        HintAgent::Claude,
+        HostIntegrationIdV1::Claude,
         hook_event_name,
         event,
         &parsed,
     );
     let response = super::dispatch::dispatch_for_scope(
         runtime,
-        tracedecay_hooks::HookHostV1::ClaudeCode,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
         event,
         root.as_deref(),
         Some(&hook_telemetry),
@@ -318,44 +189,28 @@ async fn claude_post_tool_use_response(
 /// `Stop` hook handler: submits the native turn boundary to the daemon.
 #[hotpath::measure(future = true, label = "hosts.hooks.claude.stop")]
 pub async fn hook_stop(runtime: &HookRuntimeV1) -> i32 {
-    let started = Instant::now();
-    let event = read_hook_event!();
-    let (root, output) = claude_stop_response_for_event(runtime, &event, started).await;
-    if !super::write_hook_output(
-        root.as_deref(),
-        tracedecay_hooks::HookHostV1::ClaudeCode,
-        &event,
-        &output,
-    )
-    .await
-    {
-        return 1;
-    }
-    0
+    claude_guidance_hook(runtime, "Stop").await
 }
 
-/// Returns the identity-resolved root alongside the response so the handler
-/// does not repeat the registry-probing resolution for output delivery.
-async fn claude_stop_response_for_event(
-    runtime: &HookRuntimeV1,
-    event: &str,
-    started: Instant,
-) -> (Option<PathBuf>, String) {
-    let parsed = serde_json::from_str::<Value>(event).unwrap_or(Value::Null);
+/// SessionStart and Stop share one guidance envelope. The project root is
+/// resolved once and reused for both dispatch and stdout delivery.
+async fn claude_guidance_hook(runtime: &HookRuntimeV1, hook_name: &'static str) -> i32 {
+    let started = Instant::now();
+    let event = read_hook_event!();
+    let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
     let root = event_project_root_with_identity(runtime, &parsed).await;
     let hook_telemetry = record_hook_invoked_parsed(
         runtime,
         root.as_deref(),
-        HintAgent::Claude,
-        "Stop",
-        event,
+        HostIntegrationIdV1::Claude,
+        hook_name,
+        &event,
         &parsed,
     );
-    // Record the live frontier before catch-up can admit the appended rows.
     let output = super::dispatch::dispatch_for_scope(
         runtime,
-        tracedecay_hooks::HookHostV1::ClaudeCode,
-        event,
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+        &event,
         root.as_deref(),
         Some(&hook_telemetry),
         started,
@@ -365,39 +220,17 @@ async fn claude_stop_response_for_event(
     .flatten()
     .map_or_else(
         || serde_json::json!({}).to_string(),
-        |guidance| additional_context_json("Stop", &guidance),
+        |guidance| additional_context_json(hook_name, &guidance),
     );
-    if let Some(project_root) = root.as_deref() {
-        ingest_claude_project_transcript(
-            runtime,
-            "Stop",
-            event,
-            project_root,
-            CLAUDE_STOP_INGEST_BUDGET,
-            &hook_telemetry,
-        )
-        .await;
+    if !super::write_hook_output(
+        root.as_deref(),
+        tracedecay_domain::NativeHostIdentityV1::ClaudeCode,
+        &event,
+        &output,
+    )
+    .await
+    {
+        return 1;
     }
-    (root, output)
-}
-
-#[cfg(test)]
-#[test]
-fn session_start_publishes_private_route_identity() {
-    let root = Path::new("/workspace/claude-session");
-    let event = claude_session_start_route_event(
-        &serde_json::json!({
-            "session_id": "session.claude.route",
-            "cwd": root,
-        }),
-        root,
-    );
-
-    assert_eq!(event.agent, HookAgent::Claude.as_wire());
-    assert_eq!(event.event, "sessionStart");
-    assert_eq!(event.cwd.as_deref(), Some(root));
-    let route = event.route.expect("session route metadata");
-    assert_eq!(route.session_id.as_deref(), Some("session.claude.route"));
-    assert_eq!(route.cwd.as_deref(), Some(root));
-    assert_eq!(route.worktree.as_deref(), Some(root));
+    0
 }

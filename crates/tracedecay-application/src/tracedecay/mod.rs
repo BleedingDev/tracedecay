@@ -10,7 +10,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{FactOwnerV1, ProjectId};
 use tracedecay_runtime_core::branch;
 use tracedecay_runtime_core::branch_meta;
-use tracedecay_runtime_core::config::db_filename;
+use tracedecay_runtime_core::config::DB_FILENAME;
 
 mod store_meta;
 
@@ -91,7 +91,7 @@ pub fn resolve_db_for_branch(
     tracedecay_dir: &Path,
     branch_name: Option<&str>,
 ) -> (PathBuf, Option<String>, Option<String>) {
-    let default_db = tracedecay_dir.join(db_filename(tracedecay_dir));
+    let default_db = tracedecay_dir.join(DB_FILENAME);
 
     let Some(meta) = branch_meta::load_branch_meta(tracedecay_dir) else {
         return (default_db, None, None);
@@ -101,7 +101,7 @@ pub fn resolve_db_for_branch(
         return (
             default_db,
             Some(meta.default_branch.clone()),
-            Some("detached HEAD — using default branch index".to_string()),
+            Some("detached HEAD, using default branch index".to_string()),
         );
     };
 
@@ -115,7 +115,7 @@ pub fn resolve_db_for_branch(
             default_db,
             Some(ancestor.clone()),
             Some(format!(
-                "branch '{branch_name}' is not tracked — serving from '{ancestor}'. \
+                "branch '{branch_name}' is not tracked, serving from '{ancestor}'. \
                          Run `tracedecay branch add {branch_name}` to track it."
             )),
         );
@@ -126,7 +126,7 @@ pub fn resolve_db_for_branch(
         default_db,
         Some(serving),
         Some(format!(
-            "branch '{branch_name}' is not tracked — serving from '{}'. \
+            "branch '{branch_name}' is not tracked, serving from '{}'. \
              Run `tracedecay branch add {branch_name}` to track it.",
             meta.default_branch
         )),
@@ -142,6 +142,56 @@ pub struct ServingGraphSource<'a> {
     pub is_current: bool,
 }
 
+/// The tracked branch the served graph was built for: the one whose published
+/// source matches it, else the live branch when the served source is current.
+fn observed_serving_branch(
+    meta: Option<&branch_meta::BranchMeta>,
+    current_branch: Option<&str>,
+    serving_source: Option<ServingGraphSource<'_>>,
+) -> Option<String> {
+    let source = serving_source?;
+    let published = source.revision.and_then(|revision| {
+        let meta = meta?;
+        meta.branches.iter().find_map(|(name, entry)| {
+            entry
+                .graph_source
+                .as_ref()
+                .filter(|graph_source| {
+                    graph_source.reference == source.reference
+                        && graph_source.source_oid == revision
+                        && meta.is_query_eligible(name)
+                })
+                .map(|_| name.clone())
+        })
+    });
+    published.or_else(|| {
+        source
+            .is_current
+            .then(|| source.reference.strip_prefix("refs/heads/"))
+            .flatten()
+            .filter(|name| current_branch == Some(*name))
+            .map(str::to_owned)
+    })
+}
+
+/// The `(open_active_branch, serving_branch)` pair [`build_branch_diagnostics`]
+/// reports, without its drift, database, and tracked-ancestor probes. Compact
+/// status answers from this on every poll.
+pub fn serving_branch_identity(
+    project_root: &Path,
+    data_root: &Path,
+    open_active_branch: Option<String>,
+    serving_branch: Option<String>,
+    serving_source: Option<ServingGraphSource<'_>>,
+) -> (Option<String>, Option<String>) {
+    let meta = branch_meta::load_branch_meta(data_root);
+    let current_branch = branch::current_branch(project_root);
+    match observed_serving_branch(meta.as_ref(), current_branch.as_deref(), serving_source) {
+        Some(branch) => (Some(branch.clone()), Some(branch)),
+        None => (open_active_branch, serving_branch),
+    }
+}
+
 pub fn build_branch_diagnostics(
     project_root: &Path,
     data_root: &Path,
@@ -153,30 +203,8 @@ pub fn build_branch_diagnostics(
 ) -> BranchDiagnostics {
     let meta = branch_meta::load_branch_meta(data_root);
     let current_branch = branch::current_branch(project_root);
-    let published_serving_branch = serving_source.and_then(|source| {
-        let (reference, revision) = (source.reference, source.revision);
-        revision.and_then(|revision| {
-            meta.as_ref().and_then(|meta| {
-                meta.branches.iter().find_map(|(name, entry)| {
-                    entry
-                        .graph_source
-                        .as_ref()
-                        .filter(|source| {
-                            source.reference == reference
-                                && source.source_oid == revision
-                                && meta.is_query_eligible(name)
-                        })
-                        .map(|_| name.clone())
-                })
-            })
-        })
-    });
-    let current_source_branch = serving_source
-        .filter(|source| source.is_current)
-        .and_then(|source| source.reference.strip_prefix("refs/heads/"))
-        .filter(|name| current_branch.as_deref() == Some(*name))
-        .map(str::to_owned);
-    let observed_serving_branch = published_serving_branch.or(current_source_branch);
+    let observed_serving_branch =
+        observed_serving_branch(meta.as_ref(), current_branch.as_deref(), serving_source);
     let observed_current_branch_is_ready = observed_serving_branch == current_branch;
     let (open_active_branch, serving_branch, fallback_warning) =
         if let Some(branch) = observed_serving_branch {

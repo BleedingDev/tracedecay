@@ -27,6 +27,7 @@ use tracedecay_contracts::{
     EvidenceDomain, EvidencePacket, OperationBudgetUsage, OperationReceipt, PageState,
     RetrievalEvidence, TemporalState,
 };
+use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{CurrentRemoteAuthorityStateV1, UtcMicros};
 use tracedecay_rusqlite_runtime::remote::{RemoteQueryAuthoritySnapshotV1, RemoteSqliteStorageV1};
 use tracedecay_store::{
@@ -279,6 +280,7 @@ impl RemoteExactObservationQueryReadPortV1 for DaemonRemoteExactObservationQuery
             finished_at: ended_at,
             budget,
             cancellation: None,
+            cost: None,
         };
         let execution = OperationReceipt::completed(
             command.observed_at,
@@ -355,11 +357,14 @@ fn current_frontier(
 fn runtime_control(
     command: &RemoteExactObservationQueryCommandV1,
 ) -> Result<RuntimeRequestControlV1, RemoteExactObservationQueryErrorV1> {
-    let suffix = hex::encode(Sha256::digest(format!(
-        "{}:{}",
-        command.request_id.as_str(),
-        command.observation_id.as_str()
-    )));
+    let suffix = sha256_hex(
+        format!(
+            "{}:{}",
+            command.request_id.as_str(),
+            command.observation_id.as_str()
+        )
+        .as_bytes(),
+    );
     Ok(RuntimeRequestControlV1 {
         requested_at: command.observed_at,
         deadline: RuntimeDeadlineV1 {

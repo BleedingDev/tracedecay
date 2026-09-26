@@ -139,7 +139,7 @@ async fn handle_sessions_search(args: SessionsSearchArgs) -> tracedecay_domain::
 }
 
 /// One line per hit, or an explicit empty/refusal report. A search that
-/// matched nothing must say so — and say what was searched — rather than
+/// matched nothing must say so, and say what was searched, rather than
 /// printing nothing, and a typed error travels with whatever partial results
 /// accompanied it.
 struct SessionsSearchReport;
@@ -173,7 +173,7 @@ impl SessionsSearchReport {
             if let Some(next_action) = &result.next_action {
                 let _ = writeln!(
                     report,
-                    "next: {} {} — {}",
+                    "next: {} {}, {}",
                     next_action.tool, next_action.action, next_action.reason
                 );
             }
@@ -251,10 +251,7 @@ mod search_report_tests {
 
     fn base_result() -> serde_json::Value {
         json!({
-            "catch_up": false,
-            "catch_up_failures": [],
-            "catch_up_performed": false,
-            "catch_up_provider": "all",
+            "require_fresh": false,
             "goals": false,
             "include_subagents": false,
             "message_type": "any",

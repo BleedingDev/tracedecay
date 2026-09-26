@@ -3,11 +3,11 @@
 //! The observation store keeps three append-only, forever-growing evidence
 //! tables that dominated one observed `sessions.db`:
 //!
-//! * `observations` — the durable observation payload (`observation_json`,
+//! * `observations`, the durable observation payload (`observation_json`,
 //!   1.8 GB measured).
-//! * `retrieval_anchors` — the immutable retrieval-anchor payload
+//! * `retrieval_anchors`, the immutable retrieval-anchor payload
 //!   (`anchor_json`, 1.6 GB measured).
-//! * `observation_repository_provenance` — the repository-provenance payload
+//! * `observation_repository_provenance`, the repository-provenance payload
 //!   (`availability_json` + `capture_json`, 1.4 GB measured).
 //!
 //! Superseded and deleted dispositions release their storage. This module
@@ -22,11 +22,11 @@
 //! is the highest-`sequence` row for its `(anchor_id, owner_json)`. The four
 //! states carry different retention meaning:
 //!
-//! * `active` — live, referenced evidence. **Never** released.
-//! * `unavailable` — the source is gone, but the evidence record is retained
+//! * `active`, live, referenced evidence. **Never** released.
+//! * `unavailable`, the source is gone, but the evidence record is retained
 //!   as the durable account of what was seen. **Never** released.
-//! * `superseded` — a newer generation's anchor replaced this one.
-//! * `deleted` — the evidence was retired (user request, retention, redaction,
+//! * `superseded`, a newer generation's anchor replaced this one.
+//! * `deleted`, the evidence was retired (user request, retention, redaction,
 //!   …).
 //!
 //! Only `superseded` and `deleted` current states release storage. Live and
@@ -37,9 +37,9 @@
 //!
 //! The ledger, its reverse-lineage, its derivative tombstones, and the anchor
 //! *aliases* are all compact and are the audit trail of what happened to each
-//! anchor. They are **never** mutated — their `BEFORE UPDATE/DELETE
+//! anchor. They are **never** mutated. Their `BEFORE UPDATE/DELETE
 //! RAISE(ABORT)` immutability triggers stay in force and this module respects
-//! them. Additionally, the ledger's `FOREIGN KEY(anchor_id, owner_json)
+//! them. The ledger's `FOREIGN KEY(anchor_id, owner_json)
 //! REFERENCES retrieval_anchors(...)` means the anchor *skeleton row* (its
 //! identity columns) must survive for the ledger to remain valid.
 //!
@@ -57,7 +57,7 @@
 //! `observation_repository_provenance` carry `BEFORE UPDATE` immutability
 //! triggers. Each releasing transaction drops only its relevant update trigger,
 //! rewrites the payload column, and recreates the identical canonical trigger
-//! — all inside one `Immediate` transaction, so immutability is never
+//!, all inside one `Immediate` transaction, so immutability is never
 //! observably relaxed and a crash mid-batch rolls back to the fully-triggered
 //! schema.
 //!
@@ -106,7 +106,7 @@ pub(super) const PROVENANCE_RELEASED_MARKER: &str = "{\"__retention_released\":\
 /// when the anchor's *current* disposition (highest `sequence`) is `superseded`
 /// or `deleted` and took effect before the cutoff. `active` and `unavailable`
 /// current states never satisfy it, so live and source-unavailable evidence is
-/// never released — the plan's non-goal encoded in SQL.
+/// never released, the plan's non-goal encoded in SQL.
 const RELEASED_DISPOSITION: &str = "EXISTS (
         SELECT 1 FROM retrieval_anchor_dispositions d
         WHERE d.anchor_id = a.anchor_id AND d.owner_json = a.owner_json
@@ -136,13 +136,6 @@ const CREATE_PROVENANCE_UPDATE_TRIGGER: &str = "CREATE TRIGGER IF NOT EXISTS \
      observation_repository_provenance_immutable_update BEFORE UPDATE ON \
      observation_repository_provenance BEGIN SELECT RAISE(ABORT, \
      'observation repository provenance is immutable'); END";
-
-const DROP_CURSOR_ADVANCE_DELETE_TRIGGER: &str =
-    "DROP TRIGGER IF EXISTS source_cursor_advances_immutable_delete_v1";
-const CREATE_CURSOR_ADVANCE_DELETE_TRIGGER: &str = "CREATE TRIGGER \
-     source_cursor_advances_immutable_delete_v1 BEFORE DELETE ON \
-     source_cursor_advances BEGIN SELECT RAISE(ABORT, \
-     'source cursor advances are immutable'); END";
 
 mod restore;
 pub use restore::replay_current_release_state_for_restore;
@@ -362,7 +355,7 @@ async fn live_payload_count(
 }
 
 // The release passes write the marker consts verbatim (and the restore scan
-// matches them exactly), so a direct string comparison is the released test —
+// matches them exactly), so a direct string comparison is the released test,
 // no JSON parse of every multi-KB live payload.
 fn anchor_payload_count_sql() -> String {
     format!(
@@ -577,7 +570,7 @@ async fn run_anchor_pass(
     }
 
     // Drop the update trigger, rewrite the fat column to the compact marker,
-    // then recreate the identical trigger — atomically, so immutability is
+    // then recreate the identical trigger, atomically, so immutability is
     // never observably relaxed and a crash rolls back to the triggered schema.
     let txn = require_apply_transaction(
         transaction,
@@ -996,7 +989,6 @@ async fn run_cursor_advance_pass(
         transaction,
         "apply mode requires an open cursor advance retention transaction",
     )?;
-    execute_required(&txn, DROP_CURSOR_ADVANCE_DELETE_TRIGGER).await?;
     for chunk in targets.chunks(RETENTION_DML_CHUNK) {
         let placeholders = vec!["?"; chunk.len()].join(",");
         let sql = format!("DELETE FROM source_cursor_advances WHERE rowid IN ({placeholders})");
@@ -1025,7 +1017,6 @@ async fn run_cursor_advance_pass(
             )),
         }
     }
-    execute_required(&txn, CREATE_CURSOR_ADVANCE_DELETE_TRIGGER).await?;
     commit_transaction(txn).await?;
     Ok(report)
 }

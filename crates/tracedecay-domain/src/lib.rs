@@ -26,6 +26,8 @@ pub mod retrieval;
 pub mod session;
 pub mod session_derived;
 pub mod source_path_policy;
+pub mod test_fixtures;
+pub mod text;
 pub mod work;
 pub mod work_duplicate_adjudication;
 pub mod work_execution_snapshot;
@@ -42,7 +44,7 @@ pub mod workflow_receipt;
 pub mod workflow_run;
 
 pub use automation::{SESSION_EVIDENCE_BUDGET_EXHAUSTED, SESSION_EVIDENCE_BUDGET_SUPPRESSED};
-pub use canonical_text::{encode_lowercase_hex, sha256_hex_suffix};
+pub use canonical_text::{encode_lowercase_hex, nonnegative_sha256_prefix, sha256_hex_suffix};
 pub use code_intelligence::{
     AdaptiveRecallDepthPolicyV1, AdaptiveRecallStepV1, AdaptiveRecallStopV1,
     AdmittedEmbeddingProjectionKeyV1, BoundedSanitizedText, CanonicalRelationEdgeV1,
@@ -74,7 +76,7 @@ pub use code_intelligence::{
     generate_node_id, generate_node_id_at, is_cli_flag_token, is_commit_hash,
     is_commit_identifier_token, is_compiler_error_code_token, is_configuration_key_token,
     is_identifier_token, is_path_shape, is_path_token, is_qualified_name_token,
-    is_runtime_error_code_token, is_technical_token_char, is_tool_name_token,
+    is_runtime_error_code_token, is_technical_token_char, is_tool_name_token, path_matches_scope,
     projection_batch_publication_digest, repository_path_matches_scope,
     semantic_vector_output_digest, split_subtokens, technical_tokens, validate_code_logical_path,
 };
@@ -104,6 +106,7 @@ pub use configuration::{
     INDEX_EXCLUDE_SETTING_KEY, INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY, INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_INCLUDE_SETTING_KEY, INDEX_MAX_FILE_SIZE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY, INDEX_TRACK_CALL_SITES_SETTING_KEY,
+    LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY, LcmSummarizerExecutableV1, LcmSummarizerExecutablesV1,
     MAX_WORK_EXPERTISE_CONSENT_LIFETIME_MICROS_V1, PROJECT_WORK_EXPERTISE_CONSENT_SETTING_KEY,
     ProtectedApplyRequest, ProtectedChange, ProtectedChangePlan, ProtectedChangeSnapshotError,
     ProtectedRefDispositionV1, ProtectedRefRuleV1, ProtectedRefSelectorV1, QueryCollectionId,
@@ -114,23 +117,23 @@ pub use configuration::{
     SYNC_AUTO_TRACK_PR_BRANCHES_SETTING_KEY, SYNC_AUTO_TRACK_PR_POLL_SECS_SETTING_KEY,
     SYNC_AUTO_WATCH_SETTING_KEY, SYNC_BACKSTOP_INTERVAL_MINS_SETTING_KEY,
     SYNC_BRANCH_GC_DAYS_SETTING_KEY, SYNC_FULL_SYNC_ESCALATION_FILES_SETTING_KEY,
-    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_ORPHAN_DB_GC_DAYS_SETTING_KEY,
-    SYNC_READ_COOLDOWN_SECS_SETTING_KEY, SYNC_READ_REFRESH_SETTING_KEY,
-    SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY, SYNC_SESSION_START_SYNC_SETTING_KEY,
-    SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY, SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
-    SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY, SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, ScopeAccessRule,
-    ScopeAccessSubjectV1, ScopeControlOperationV1, ScopeSourceBinding,
-    SensitiveFilesystemLocatorV1, SettingDefinitionV1, SettingKey, SettingScopeV1,
-    SettingSensitivityV1, SourceBindingId, SourceKindV1, TELEMETRY_TIMINGS_SETTING_KEY,
-    TopologyConcurrencyPolicyV1, TopologyEscalationPolicyV1, TopologyGatePolicyV1,
-    TopologyNotificationLevelV1, TopologyPolicyDigestV1, USER_CODE_INDEX_WORKERS_SETTING_KEY,
-    USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY, USER_UPLOAD_ENABLED_SETTING_KEY,
-    USER_WATCHER_DEBOUNCE_MS_SETTING_KEY, USER_WORK_EXPERTISE_CONSENT_SETTING_KEY, UserProfileId,
-    WORK_EXECUTABLE_BINDINGS_SETTING_KEY, WORK_TOPOLOGY_POLICY_SETTING_KEY,
-    WorkExecutableBindingV1, WorkExecutableCapabilityV1, WorkExpertiseCategoryV1,
-    WorkExpertiseConsentV1, WorkTopologyPolicyV1, WorktreeCleanlinessRequirementV1,
-    WorktreePlacementModeV1, WorktreePlacementRootId, WorktreeRetentionPolicyV1,
-    WorktreeRootPolicyV1, resolve_restrictive_capabilities, safe_work_topology_policy_v1,
+    SYNC_MAX_CONCURRENT_SYNCS_SETTING_KEY, SYNC_READ_COOLDOWN_SECS_SETTING_KEY,
+    SYNC_READ_REFRESH_SETTING_KEY, SYNC_SESSION_START_STALE_THRESHOLD_SECS_SETTING_KEY,
+    SYNC_SESSION_START_SYNC_SETTING_KEY, SYNC_WATCH_DEBOUNCE_MS_SETTING_KEY,
+    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, SYNC_WATCH_MAX_DELAY_MS_SETTING_KEY,
+    SYNC_WATCH_MAX_PROJECTS_SETTING_KEY, ScopeAccessRule, ScopeAccessSubjectV1,
+    ScopeControlOperationV1, ScopeSourceBinding, SensitiveFilesystemLocatorV1, SettingDefinitionV1,
+    SettingKey, SettingScopeV1, SettingSensitivityV1, SourceBindingId, SourceKindV1,
+    TELEMETRY_TIMINGS_SETTING_KEY, TopologyConcurrencyPolicyV1, TopologyEscalationPolicyV1,
+    TopologyGatePolicyV1, TopologyNotificationLevelV1, TopologyPolicyDigestV1,
+    USER_CODE_INDEX_WORKERS_SETTING_KEY, USER_EXTRACTION_TIMEOUT_SECS_SETTING_KEY,
+    USER_UPLOAD_ENABLED_SETTING_KEY, USER_WATCHER_DEBOUNCE_MS_SETTING_KEY,
+    USER_WORK_EXPERTISE_CONSENT_SETTING_KEY, UserProfileId, WORK_EXECUTABLE_BINDINGS_SETTING_KEY,
+    WORK_TOPOLOGY_POLICY_SETTING_KEY, WorkExecutableBindingV1, WorkExecutableCapabilityV1,
+    WorkExpertiseCategoryV1, WorkExpertiseConsentV1, WorkTopologyPolicyV1,
+    WorktreeCleanlinessRequirementV1, WorktreePlacementModeV1, WorktreePlacementRootId,
+    WorktreeRetentionPolicyV1, WorktreeRootPolicyV1, resolve_restrictive_capabilities,
+    safe_work_topology_policy_v1,
 };
 pub use diagnostics::{
     DiagnosticEvidenceClassV1, DiagnosticProducerKindV1, DiagnosticProvenanceV1,
@@ -180,7 +183,7 @@ pub use feedback::{
     ProximityContributionIdV1, ProximityContributionV1, ProximityCoverageV1, ProximityInclusionV1,
     ProximityObservationIdV1, ProximityRelationPathKindV1, ProximityRelationPathV1,
     ProximityRelationStrengthV1, ProximityRiskInputsV1, ProximityTierV1, ProximityWarningClassV1,
-    ProximityWarningIdV1, derive_feedback_finding_id, derive_overlay_feedback_finding_id,
+    derive_feedback_finding_id, derive_overlay_feedback_finding_id,
 };
 pub use framed_log::{CHECKSUM_BYTES, checksum, partial_tail_matches_prefix};
 pub use git::{
@@ -267,12 +270,12 @@ pub use observation::{
     CanonicalObservationFactV1, CanonicalObservationIdV1, CanonicalObservationRelationsV1,
     CanonicalReasoningVisibilityV1, CanonicalUnknownStateV1, CanonicalWorkflowEvidenceKindV1,
     CanonicalWorkflowSemanticKindV1, ClineNativeSourceTransition, ClineTranscriptStream,
-    DurableClaudeObservationV1, DurableObservationV1, MAX_CANONICAL_OBSERVATION_FACTS_V1,
-    MAX_OBSERVATION_RECORD_BYTES, MAX_OBSERVATION_STRUCTURE_DEPTH,
-    MAX_OBSERVATION_STRUCTURE_VALUES, ObservationCollisionOutcomeV1, ObservationContractError,
-    ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationPositionalOccurrenceV1,
-    ObservationScopeV1, ObservationSourceCursorV1, ObservationSourceGenerationV1,
-    ObservationSourceIdentityV1, ObservationSourceRangeV1, PayloadDigestV1, PayloadReferenceV1,
+    DurableObservationV1, MAX_CANONICAL_OBSERVATION_FACTS_V1, MAX_OBSERVATION_RECORD_BYTES,
+    MAX_OBSERVATION_STRUCTURE_DEPTH, MAX_OBSERVATION_STRUCTURE_VALUES,
+    ObservationCollisionOutcomeV1, ObservationContractError, ObservationIdentityMaterialV1,
+    ObservationOrderingDomainV1, ObservationPositionalOccurrenceV1, ObservationScopeV1,
+    ObservationSourceCursorV1, ObservationSourceGenerationV1, ObservationSourceIdentityV1,
+    ObservationSourceRangeV1, PayloadDigestV1, PayloadReferenceV1,
     ProviderUsageContractDimensionV1, ProviderUsageCounterSemanticsV1, ProviderUsageCountersV1,
     ProviderUsageCursorV1, ProviderUsageModelV1, ProviderUsageObservationV1, ProviderUsageReadV1,
     ProviderUsageScopeV1, SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
@@ -293,28 +296,26 @@ pub use repository::{
     RepositoryEvidenceV1, RepositoryProvenanceV1, RepositoryRemoteIdentityV1,
 };
 pub use research::{
-    AccessPolicyDigest, ActorId, AgentInstanceId, AnchorDurabilityClass, AnchorLineageRefV2,
-    AnchorLineageRefV3, AnchorOwnerBindingV1, AnchorProvenanceRelationV2, AnchorResolutionStateV2,
-    AnchorSourceGenerationV2, AnchorSourceGenerationV3, ApplyReceiptAnchorRefV1, AttemptId,
-    AuthorityEpoch, AuthorizedAnchorResolution, BlobId, BoundedVec, BrainId, BrainNodeId,
-    BrainNodeRoleV1, BranchStackEdgeV1, BranchStackId, BranchStackNodeV1, BranchStackRevisionId,
-    BranchStackRevisionV1, BranchStackSourceV1, CanonicalSourceOccurrenceSetIdV1, CapabilityId,
-    CatalogGenerationId, CatalogSnapshotRefV1, CheckSnapshotAnchorRefV1, CommitId,
-    ComponentVersion, Confidence, ConflictEvidenceAnchorRefV1, CoverageReportV1,
-    CoverageUniverseKnowledgeV1, DataVersionDigest, DomainError, EntityId, EntityKind, EntityRef,
-    EntityVersionId, EvidenceAssemblyPublicationReceiptIdV1, EvidenceClass,
-    EvidenceRetentionWatermark, EvidenceSpanProjectionReceiptIdV1, FactAssertionId, FactEventId,
-    FactEvidenceId, FactId, FrozenBranchStackSnapshotV1, FrozenIndependentBranchSelectionV1,
-    FrozenWatermarkResolutionV1, GitHubStackCapabilitySnapshotV1, GitHubStackCapabilityStateV1,
-    GitHubStackLayerSnapshotV1, GitHubStackSnapshotV1, GitTopologyAnchorTargetV1,
-    GitTopologyGenerationRefV1, GitTopologySourceRoleV1, HostInstanceId,
-    IntegrationReceiptAnchorRefV1, LocatorDigest, LogSafeText, ManifestDigest,
-    ManifestDigestHasher, MechanicalIntegrationModeV1, MessageId, NativeAliasKindV2, NativeAliasV2,
-    NativeGitObjectAnchorRefV1, NativeGitObjectKindV1, NativeIntegrationAnalysisAnchorV1,
-    NativeIntegrationAnalysisCoverageV1, NativeIntegrationAnalysisGapV1,
-    NativeIntegrationAnalysisLaneV1, NativeIntegrationAnalysisReportV1,
-    NativeIntegrationApprovalId, NativeIntegrationApprovalV1, NativeIntegrationDirectionV1,
-    NativeIntegrationGenerationBindingV1, NativeIntegrationPhaseV1,
+    AccessPolicyDigest, ActorId, AgentInstanceId, AnchorDurabilityClass, AnchorLineageRef,
+    AnchorOwnerBindingV1, AnchorProvenanceRelation, AnchorResolutionStateV2,
+    AnchorSourceGeneration, ApplyReceiptAnchorRefV1, AttemptId, AuthorityEpoch,
+    AuthorizedAnchorResolution, BlobId, BoundedVec, BrainId, BrainNodeId, BrainNodeRoleV1,
+    BranchStackEdgeV1, BranchStackId, BranchStackNodeV1, BranchStackRevisionId,
+    BranchStackRevisionV1, BranchStackSourceV1, CapabilityId, CatalogGenerationId,
+    CatalogSnapshotRefV1, CheckSnapshotAnchorRefV1, CommitId, ComponentVersion, Confidence,
+    ConflictEvidenceAnchorRefV1, CoverageReportV1, CoverageUniverseKnowledgeV1, DataVersionDigest,
+    DomainError, EntityId, EntityKind, EntityRef, EntityVersionId, EvidenceClass,
+    EvidenceRetentionWatermark, FactAssertionId, FactEventId, FactEvidenceId, FactId,
+    FrozenBranchStackSnapshotV1, FrozenIndependentBranchSelectionV1, FrozenWatermarkResolutionV1,
+    GitHubStackCapabilitySnapshotV1, GitHubStackCapabilityStateV1, GitHubStackLayerSnapshotV1,
+    GitHubStackSnapshotV1, GitTopologyAnchorTargetV1, GitTopologyGenerationRefV1,
+    GitTopologySourceRoleV1, HostInstanceId, IntegrationReceiptAnchorRefV1, LocatorDigest,
+    LogSafeText, ManifestDigest, ManifestDigestHasher, MechanicalIntegrationModeV1, MessageId,
+    NativeAlias, NativeAliasKind, NativeGitObjectAnchorRefV1, NativeGitObjectKindV1,
+    NativeIntegrationAnalysisAnchorV1, NativeIntegrationAnalysisCoverageV1,
+    NativeIntegrationAnalysisGapV1, NativeIntegrationAnalysisLaneV1,
+    NativeIntegrationAnalysisReportV1, NativeIntegrationApprovalId, NativeIntegrationApprovalV1,
+    NativeIntegrationDirectionV1, NativeIntegrationGenerationBindingV1, NativeIntegrationPhaseV1,
     NativeIntegrationPreviewDispositionV1, NativeIntegrationPreviewId, NativeIntegrationPreviewV1,
     NativeIntegrationReceiptV1, NativeIntegrationRepositorySnapshotV1,
     NativeIntegrationSelectionV1, NativeIntegrationSemanticConflictKindV1,
@@ -329,21 +330,20 @@ pub use research::{
     RefSnapshotAnchorRefV1, RefSnapshotKindV1, RegistryManifestDigest, RemoteCoverageV1,
     RemoteShardCoverageV1, RepositoryCaptureAnchorRefV1, RepositoryCaptureId, RepositoryId,
     ResolutionAuthorizationV1, RetentionClass, RetrievalAnchorId, RetrievalAnchorRecord,
-    RetrievalAnchorRecordV2, RetrievalAnchorRecordV2Parts, RetrievalAnchorRecordV3,
-    RetrievalAnchorRecordV3Parts, RetrievalAnchorTargetV2, RetrievalAnchorTargetV3,
-    RetrieverContributionIdV1, ReviewSnapshotAnchorRefV1, RunId, SanitizationProofV1,
-    SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptResolverV1,
-    SanitizedTextRefV1, SanitizedTextV1, ScopeResolutionId, SessionId, ShardDispositionV1, ShardId,
-    ShardWatermark, SourceInstanceId, SourcePosition, SourceStoreId, StackDeliveryWatermarkId,
-    StackNodeId, StackSignalId, StoreAuthorityId, TaskId, ThreadId, TimeInterval, ToolInvocationId,
-    TreeId, TurnId, UseCaseId, UtcMicros, VectorWatermark, VerifiedCacheGrantSnapshotV1,
-    WatermarkDriftV1, WorkArtifactId, WorkCancellationRequestId, WorkCommandId, WorkLeaseId,
-    WorkProviderRouteId, WorkTopologyGenerationRefV1, WorkflowDefinitionId, WorkflowOperationRef,
-    WorkflowOutputName, WorkflowStepId, WorktreeCaptureAnchorRefV1, WorktreeId,
-    WorktreeInventoryEpoch, WorktreeInventorySnapshotId, canonical_json_bytes,
+    RetrievalAnchorRecordParts, RetrievalAnchorTarget, ReviewSnapshotAnchorRefV1, RunId,
+    SanitizationProofV1, SanitizationReceiptId, SanitizationReceiptRefV1,
+    SanitizationReceiptResolverV1, SanitizedTextRefV1, SanitizedTextV1, ScopeResolutionId,
+    SessionId, ShardDispositionV1, ShardId, ShardWatermark, SourceInstanceId, SourcePosition,
+    SourceStoreId, StackDeliveryWatermarkId, StackNodeId, StackSignalId, StoreAuthorityId, TaskId,
+    ThreadId, TimeInterval, ToolInvocationId, TreeId, TurnId, UseCaseId, UtcMicros,
+    VectorWatermark, VerifiedCacheGrantSnapshotV1, WatermarkDriftV1, WorkArtifactId,
+    WorkCancellationRequestId, WorkCommandId, WorkLeaseId, WorkProviderRouteId,
+    WorkTopologyGenerationRefV1, WorkflowDefinitionId, WorkflowOperationRef, WorkflowOutputName,
+    WorkflowStepId, WorktreeCaptureAnchorRefV1, WorktreeId, WorktreeInventoryEpoch,
+    WorktreeInventorySnapshotId, authority_access_policy_digest, canonical_json_bytes,
     canonical_json_bytes_and_sha256, canonical_json_value, canonical_sha256,
-    derive_exact_observation_anchor_id, derive_exact_source_occurrence_anchor_id,
-    derive_git_topology_anchor_id, validate_anchor_lineage_v3, zero_digest,
+    decode_with_canonical_digest, derive_exact_observation_anchor_id,
+    derive_git_topology_anchor_id,
 };
 pub use resource_policy::host_cpu_target;
 pub use retrieval::{
@@ -392,6 +392,10 @@ pub use session_derived::{
     SessionDerivedEvidenceRecordV1, derive_session_evidence_from_occurrences,
 };
 pub use source_path_policy::{GENERATED_DIR_SEGMENTS, is_generated_dir_segment};
+pub use text::{
+    blank_json_comments, collapse_whitespace, fold_control_characters, forward_slash_path,
+    forward_slash_text, utf8_prefix_at_or_before,
+};
 pub use work::{RuntimeEvidenceRef, WorkAuthority, WorkContractError, WorkVersion};
 pub use work_duplicate_adjudication::{
     MAX_WORK_DUPLICATE_REASON_BYTES_V1, WorkDuplicateAdjudicationCommandV1,

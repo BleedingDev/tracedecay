@@ -1,10 +1,4 @@
 //! Kernel-owned configuration primitives.
-//!
-//! These items used to live in the root crate's `config` module, but the
-//! storage layout, database, branch-metadata, and store layers all need them
-//! and those layers moved into this crate. The root `config` module re-exports
-//! every item declared here, so `crate::config::<item>` keeps resolving on
-//! both sides of the split.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -17,11 +11,6 @@ pub const USER_DATA_DIR_ENV: &str = "TRACEDECAY_DATA_DIR";
 
 /// Environment variable that pins the user-level global database path.
 pub const GLOBAL_DB_PATH_ENV: &str = "TRACEDECAY_GLOBAL_DB";
-
-/// Reads the `TRACEDECAY_<suffix>` environment variable.
-pub fn brand_env(suffix: &str) -> Option<String> {
-    std::env::var(format!("TRACEDECAY_{suffix}")).ok()
-}
 
 /// Project graph database filename inside a `.tracedecay/` data dir.
 pub const DB_FILENAME: &str = "tracedecay.db";
@@ -44,34 +33,11 @@ pub fn holds_cargo_profile_dir(target_dir: &Path) -> bool {
         .any(|profile| target_dir.join(profile).is_dir())
 }
 
-/// New runtime storage lives in the user-level profile shard. The project root
-/// only carries lightweight marker/config files under `.tracedecay/`.
+/// A root's `.tracedecay/` directory. Runtime storage lives in the profile
+/// shard; a checkout's copy only holds the retired layout that
+/// [`crate::storage::refuse_retired_checkout_layout`] refuses.
 pub fn get_tracedecay_dir(project_root: &Path) -> PathBuf {
     project_root.join(TRACEDECAY_DIR)
-}
-
-pub fn active_data_dir_name(project_root: &Path) -> &'static str {
-    let _ = project_root;
-    TRACEDECAY_DIR
-}
-
-pub fn db_filename(data_dir: &Path) -> &'static str {
-    let _ = data_dir;
-    DB_FILENAME
-}
-
-/// Full path to the repo-local graph database marker path.
-///
-/// Normal runtime graph storage resolves through [`crate::storage::StoreLayout`]
-/// into the user profile shard; this helper is only for explicit marker checks
-/// and migration cleanup.
-pub fn get_project_db_path(project_root: &Path) -> PathBuf {
-    get_tracedecay_dir(project_root).join(DB_FILENAME)
-}
-
-/// Returns true when the old repo-local `TraceDecay` graph DB exists at this root.
-pub fn has_project_database(project_root: &Path) -> bool {
-    project_root.join(TRACEDECAY_DIR).join(DB_FILENAME).exists()
 }
 
 /// User-level data directory. Runtime storage is always rooted at
@@ -179,7 +145,7 @@ fn canonicalize_data_dir(path: PathBuf) -> PathBuf {
 /// # Canonical local project-root resolution order
 ///
 /// This walk-up is the heart of project-root resolution. Every entry point
-/// that needs a project root should resolve it in this order — new code must
+/// that needs a project root should resolve it in this order. New code must
 /// converge on this chain instead of inventing its own:
 ///
 /// 0. **Template pre-filter** (`serve` only, `sanitize_serve_path_arg`): an
@@ -188,10 +154,10 @@ fn canonicalize_data_dir(path: PathBuf) -> PathBuf {
 ///    it) is discarded with a warning and resolution continues as if no path
 ///    was given.
 /// 1. **Explicit path** (`--path`/`-p`, tool `path` argument): used verbatim,
-///    no discovery, and failure to open is fatal — never silently fall back.
+///    no discovery, and failure to open is fatal, never silently fall back.
 /// 2. **CWD walk-up** (this function via `resolve_path_with_discovery`):
-///    nearest ancestor of the working directory containing an initialised
-///    project database (see [`get_project_db_path`]).
+///    nearest ancestor of the working directory hosting a path-local profile
+///    store or, at a worktree root, a repository identity marker.
 ///
 /// `serve` forwards this routing metadata to the managed daemon. MCP
 /// `initialize` roots and registry aliases are resolved there; the proxy never
@@ -227,8 +193,7 @@ pub fn is_initialized_project_root(dir: &Path) -> bool {
 }
 
 fn directory_hosts_initialized_project(dir: &Path, at_worktree_root: bool) -> bool {
-    has_project_database(dir)
-        || crate::storage::has_path_local_profile_store(dir)
+    crate::storage::has_path_local_profile_store(dir)
         || (at_worktree_root && crate::storage::has_repository_identity_marker(dir))
 }
 
@@ -257,7 +222,7 @@ pub use tracedecay_domain::source_path_policy::{GENERATED_DIR_SEGMENTS, is_gener
 
 // Deliberately unconditional (not gated behind `cfg(test)` /
 // `feature = "test-helpers"`): some call sites reach it from a non-test build
-// — e.g. the root crate's `session_temporal_benchmark`, which backs
+// e.g. the root crate's `session_temporal_benchmark`, which backs
 // `cargo bench` and compiles as an optimized bench profile, not under
 // `cfg(test)`. The mutex and accessor are trivial and side-effect free, so
 // keeping them unconditional costs nothing while guaranteeing every consumer,

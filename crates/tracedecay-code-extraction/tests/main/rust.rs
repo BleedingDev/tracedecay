@@ -4,6 +4,8 @@ use tracedecay_code_extraction::{
 use tracedecay_domain::*;
 use tree_sitter::Parser;
 
+include!("support/edges.rs");
+
 #[test]
 fn test_rust_cfg_attribute_in_struct_pattern_field() {
     let source = r#"
@@ -39,7 +41,7 @@ fn destructure(context: Context) {
 fn test_rust_file_node_is_root() {
     let source = r#"fn main() {}"#;
     let extractor = RustExtractor;
-    let result = extractor.extract("test.rs", source);
+    let result = extractor.extract_artifact("test.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let files: Vec<_> = result
         .nodes
@@ -61,7 +63,7 @@ pub fn add(a: i32, b: i32) -> i32 {
 fn helper() {}
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("math.rs", source);
+    let result = extractor.extract_artifact("math.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let fns: Vec<_> = result
         .nodes
@@ -100,7 +102,7 @@ pub enum Mode {
     Fast,
 }
 "#;
-    let result = RustExtractor.extract("mode.rs", source);
+    let result = RustExtractor.extract_artifact("mode.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let safe = result
         .nodes
@@ -124,7 +126,7 @@ pub async fn fetch_data() -> String {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("async.rs", source);
+    let result = extractor.extract_artifact("async.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let fns: Vec<_> = result
         .nodes
@@ -145,7 +147,7 @@ pub struct Point {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("types.rs", source);
+    let result = extractor.extract_artifact("types.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let structs: Vec<_> = result
         .nodes
@@ -189,7 +191,7 @@ pub enum Color {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("color.rs", source);
+    let result = extractor.extract_artifact("color.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let enums: Vec<_> = result
         .nodes
@@ -222,7 +224,7 @@ pub trait Drawable {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("draw.rs", source);
+    let result = extractor.extract_artifact("draw.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let traits: Vec<_> = result
         .nodes
@@ -261,7 +263,7 @@ impl Rect {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("rect.rs", source);
+    let result = extractor.extract_artifact("rect.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let impls: Vec<_> = result
         .nodes
@@ -390,7 +392,7 @@ pub const MAX_SIZE: usize = 1024;
 static COUNTER: u32 = 0;
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("consts.rs", source);
+    let result = extractor.extract_artifact("consts.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let consts: Vec<_> = result
         .nodes
@@ -414,7 +416,7 @@ fn test_rust_type_alias() {
 pub type Result<T> = std::result::Result<T, Error>;
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("types.rs", source);
+    let result = extractor.extract_artifact("types.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let aliases: Vec<_> = result
         .nodes
@@ -433,7 +435,7 @@ pub mod inner {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("lib.rs", source);
+    let result = extractor.extract_artifact("lib.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let modules: Vec<_> = result
         .nodes
@@ -467,7 +469,7 @@ mod tests {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("src/lib.rs", source);
+    let result = extractor.extract_artifact("src/lib.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
 
     let modules: Vec<_> = result
@@ -483,10 +485,7 @@ mod tests {
         .iter()
         .filter(|e| e.kind == EdgeKind::Annotates && e.target == modules[0].id)
         .collect();
-    assert!(
-        !cfg_annotations.is_empty(),
-        "expected #[cfg(test)] to annotate the 'tests' module"
-    );
+    assert_eq!(cfg_annotations.len(), 1);
     let cfg_source = result
         .nodes
         .iter()
@@ -514,10 +513,7 @@ mod tests {
         .iter()
         .filter(|e| e.kind == EdgeKind::Annotates && e.target == test_fn.id)
         .collect();
-    assert!(
-        !test_annotations.is_empty(),
-        "expected #[test] to annotate the test function"
-    );
+    assert_eq!(test_annotations.len(), 1);
     let test_annot = result
         .nodes
         .iter()
@@ -542,7 +538,7 @@ fn complex(x: i32) -> i32 {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("complex.rs", source);
+    let result = extractor.extract_artifact("complex.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let fns: Vec<_> = result
         .nodes
@@ -576,7 +572,7 @@ fn risky(v: Option<i32>) -> i32 {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("risky.rs", source);
+    let result = extractor.extract_artifact("risky.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let fns: Vec<_> = result
         .nodes
@@ -607,7 +603,7 @@ fn caller() {
 fn helper() {}
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("calls.rs", source);
+    let result = extractor.extract_artifact("calls.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     assert!(
         result
@@ -657,7 +653,7 @@ fn assemble(args: &HiArgs, raw: Vec<u8>) -> Widget {
     types.clone().matched();
 }
 "#;
-    let result = RustExtractor.extract("typed.rs", source);
+    let result = RustExtractor.extract_artifact("typed.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let names = call_names(&result, "assemble");
     // `Vec::len` is stated too: which owners never bind cross-file is the
@@ -706,7 +702,7 @@ fn assemble() {
     r.run();
 }
 "#;
-    let result = RustExtractor.extract("factory.rs", source);
+    let result = RustExtractor.extract_artifact("factory.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let names = call_names(&result, "assemble");
     assert!(
@@ -744,7 +740,9 @@ fn assemble() -> Questioned {
     Questioned {}
 }
 "#;
-    let result = RustExtractor.extract("initializers.rs", source);
+    let result = RustExtractor
+        .extract_artifact("initializers.rs", source)
+        .result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let names = call_names(&result, "assemble");
     assert!(
@@ -778,7 +776,7 @@ fn rebound(builders: Vec<Builder>, pair: (Builder, Builder), maybe: Option<Build
     let typed = |arg: Builder| arg.build();
 }
 "#;
-    let result = RustExtractor.extract("rebound.rs", source);
+    let result = RustExtractor.extract_artifact("rebound.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let names = call_names(&result, "rebound");
     assert_eq!(
@@ -809,7 +807,7 @@ impl Greet for Bot {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("greet.rs", source);
+    let result = extractor.extract_artifact("greet.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let impls: Vec<_> = result
         .nodes
@@ -832,7 +830,7 @@ impl Greet for Bot {
 #[test]
 fn test_rust_empty_source() {
     let extractor = RustExtractor;
-    let result = extractor.extract("empty.rs", "");
+    let result = extractor.extract_artifact("empty.rs", "").result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let files: Vec<_> = result
         .nodes
@@ -862,7 +860,7 @@ pub struct Config {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("attrs.rs", source);
+    let result = extractor.extract_artifact("attrs.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
 
     let annots: Vec<_> = result
@@ -904,7 +902,7 @@ pub struct Config {
         annot_names
     );
 
-    // derive should NOT be in AnnotationUsage — it's handled separately by DerivesMacro
+    // derive should NOT be in AnnotationUsage. It's handled separately by DerivesMacro
     assert!(
         !annot_names.contains(&"derive"),
         "derive should not appear as AnnotationUsage, got: {:?}",
@@ -916,9 +914,15 @@ pub struct Config {
         .iter()
         .filter(|e| e.kind == EdgeKind::Annotates)
         .collect();
-    assert!(
-        !annotates_edges.is_empty(),
-        "expected Annotates edges, found none"
+    assert_eq!(
+        edge_pairs(&result, EdgeKind::Annotates),
+        [
+            ("test", "my_test"),
+            ("cfg", "guarded_fn"),
+            ("allow", "guarded_fn"),
+            ("inline", "fast_add"),
+            ("serde", "Config")
+        ]
     );
     assert_eq!(
         annotates_edges.len(),
@@ -953,7 +957,7 @@ pub fn no_attrs(y: i32) -> i32 {
     y
 }
 "#;
-    let result = RustExtractor.extract("doc.rs", source);
+    let result = RustExtractor.extract_artifact("doc.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let double = result
         .nodes
@@ -981,7 +985,7 @@ pub fn no_attrs(y: i32) -> i32 {
         "expected attrs_start_line to walk back over 2 doc + 2 attribute lines"
     );
 
-    // `no_attrs` has nothing leading it that should count — its blank gap means
+    // `no_attrs` has nothing leading it that should count. Its blank gap means
     // the walk stops, so attrs_start_line == start_line.
     assert_eq!(no_attrs.attrs_start_line, no_attrs.start_line);
 }
@@ -995,7 +999,7 @@ pub struct Container {
     count: usize,
 }
 "#;
-    let result = RustExtractor.extract("c.rs", source);
+    let result = RustExtractor.extract_artifact("c.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let type_of_refs: Vec<_> = result
         .unresolved_refs
@@ -1024,7 +1028,7 @@ pub fn make(name: String, count: usize) -> Result<MyType, MyError> {
     todo!()
 }
 "#;
-    let result = RustExtractor.extract("f.rs", source);
+    let result = RustExtractor.extract_artifact("f.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     let type_of: Vec<_> = result
         .unresolved_refs
@@ -1068,7 +1072,7 @@ fn test_check() {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("src/lib.rs", source);
+    let result = extractor.extract_artifact("src/lib.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
 
     let test_fn = result
@@ -1107,7 +1111,7 @@ fn use_foo() {
 }
 "#;
     let extractor = RustExtractor;
-    let result = extractor.extract("src/lib.rs", source);
+    let result = extractor.extract_artifact("src/lib.rs", source).result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
 
     let use_fn = result
@@ -1126,24 +1130,272 @@ fn use_foo() {
         .map(|r| r.reference_name.as_str())
         .collect();
 
-    // Foo::new() produces "Foo::new" — should resolve via qualified match.
+    // Foo::new() produces "Foo::new". Should resolve via qualified match.
     assert!(
         ref_names.contains(&"Foo::new"),
         "expected Foo::new call, got: {ref_names:?}"
     );
-    // f.bar() should also produce "bar" (method-name hint).
     assert!(
-        ref_names.contains(&"bar"),
-        "expected 'bar' method-name ref from f.bar(), got: {ref_names:?}"
+        ref_names.contains(&"f.bar"),
+        "the receiver-dotted form remains: {ref_names:?}"
+    );
+    // `Foo::new()` does not state that `f` is Foo, and `bar` is the method of
+    // an impl in this file. Emitting the simple name would invent that caller.
+    assert!(
+        !ref_names.contains(&"bar"),
+        "untyped f.bar() must not emit a bare method name: {ref_names:?}"
+    );
+    assert!(
+        !ref_names.contains(&"Foo::bar"),
+        "constructor-like Foo::new() must not fabricate a Foo receiver: {ref_names:?}"
+    );
+}
+
+#[test]
+fn bare_receiver_calls_name_self_without_the_method_simple_name() {
+    let source = r#"
+fn prepare(value: i32) {}
+fn push(value: i32) {}
+
+struct Rows;
+impl Rows {
+    fn len(&self) -> usize { 0 }
+    fn measure(&self) -> usize { self.len() }
+    fn via_explicit(self: &Self) -> usize { self.len() }
+}
+trait Span {}
+impl Span for Rows {
+    fn wide(&self) -> usize { self.len() }
+}
+
+fn caller(items: Vec<i32>, rows: Rows) {
+    let foreign = make();
+    foreign.prepare(1);
+    items.push(1);
+    prepare(1);
+    push(1);
+    rows.len();
+}
+fn make() -> Vec<i32> { Vec::new() }
+"#;
+    let result = RustExtractor.extract_artifact("src/lib.rs", source).result;
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+    let from = |name: &str| {
+        let function = result
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::Function | NodeKind::Method) && node.name == name
+            })
+            .unwrap_or_else(|| panic!("{name} is extracted"));
+        result
+            .unresolved_refs
+            .iter()
+            .filter(|reference| {
+                reference.reference_kind == EdgeKind::Calls && reference.from_node_id == function.id
+            })
+            .map(|reference| reference.reference_name.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    let measure = from("measure");
+    assert!(
+        measure.contains(&"self.len") && measure.contains(&"Rows::len"),
+        "{measure:?}"
+    );
+    assert!(
+        !measure.contains(&"len"),
+        "self.len() must not emit the bare method name: {measure:?}"
+    );
+
+    let via_explicit = from("via_explicit");
+    assert!(
+        via_explicit.contains(&"Rows::len"),
+        "self: &Self still names the enclosing type: {via_explicit:?}"
+    );
+
+    let wide = from("wide");
+    assert!(
+        wide.contains(&"Rows::len"),
+        "self inside `impl Span for Rows` names Rows, not Span: {wide:?}"
+    );
+    assert!(!wide.contains(&"Span::len"), "{wide:?}");
+
+    let caller = from("caller");
+    assert!(caller.contains(&"prepare"), "{caller:?}");
+    assert!(caller.contains(&"push"), "{caller:?}");
+    assert!(caller.contains(&"Rows::len"), "{caller:?}");
+    assert!(caller.contains(&"Vec::push"), "{caller:?}");
+    assert!(caller.contains(&"foreign.prepare"), "{caller:?}");
+    assert!(caller.contains(&"items.push"), "{caller:?}");
+    assert_eq!(
+        caller.iter().filter(|name| **name == "prepare").count(),
+        1,
+        "foreign.prepare() invented a second prepare call: {caller:?}"
+    );
+    assert_eq!(
+        caller.iter().filter(|name| **name == "push").count(),
+        1,
+        "items.push() invented a second push call: {caller:?}"
+    );
+}
+
+#[test]
+fn trait_bound_calls_name_the_trait_without_a_bare_method() {
+    let source = r#"
+trait Processor {
+    fn process(&self, input: u32) -> u32;
+    fn via_self(&self, input: u32) -> u32 {
+        self.process(input)
+    }
+}
+trait Other {
+    fn process(&self, input: u32) -> u32;
+}
+struct Doubler;
+impl Doubler {
+    fn kick(&self, input: u32) -> u32 {
+        self.process(input)
+    }
+}
+impl Processor for Doubler {
+    fn process(&self, input: u32) -> u32 {
+        input * 2
+    }
+}
+fn via_dyn(processor: &dyn Processor, input: u32) -> u32 {
+    processor.process(input)
+}
+fn via_impl(processor: impl Processor + 'static, input: u32) -> u32 {
+    processor.process(input)
+}
+fn via_bound<T: Processor>(processor: &T, input: u32) -> u32 {
+    processor.process(input)
+}
+fn via_where<T>(processor: &T, input: u32) -> u32
+where
+    T: Processor,
+{
+    processor.process(input)
+}
+fn ambiguous<T: Processor + Other>(processor: &T, input: u32) -> u32 {
+    processor.process(input)
+}
+"#;
+    let result = RustExtractor.extract_artifact("src/lib.rs", source).result;
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let from = |name: &str| {
+        let function = result
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::Function | NodeKind::Method) && node.name == name
+            })
+            .unwrap_or_else(|| panic!("{name} is extracted"));
+        result
+            .unresolved_refs
+            .iter()
+            .filter(|reference| {
+                reference.reference_kind == EdgeKind::Calls && reference.from_node_id == function.id
+            })
+            .map(|reference| reference.reference_name.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    for owner in ["via_self", "via_dyn", "via_impl", "via_bound", "via_where"] {
+        let names = from(owner);
+        assert!(
+            names.contains(&"Processor::process"),
+            "{owner} must name the trait callee: {names:?}"
+        );
+        assert!(
+            !names.contains(&"process"),
+            "{owner} must not reintroduce the bare method name: {names:?}"
+        );
+    }
+    let kick = from("kick");
+    assert!(
+        kick.contains(&"Doubler::process") && !kick.contains(&"Processor::process"),
+        "self in an inherent impl stays the type, not the trait: {kick:?}"
+    );
+    assert!(!kick.contains(&"process"), "{kick:?}");
+    let ambiguous = from("ambiguous");
+    assert!(
+        !ambiguous.iter().any(|name| name.contains("::process")),
+        "two trait bounds must not pick a callee: {ambiguous:?}"
+    );
+    assert!(!ambiguous.contains(&"process"), "{ambiguous:?}");
+}
+
+#[test]
+fn self_receiver_names_carry_module_scope_and_the_outer_as_delimiter() {
+    let source = r#"
+mod inner {
+    pub struct Rows;
+    impl Rows {
+        fn len(&self) -> usize { 0 }
+        fn measure(&self) -> usize { self.len() }
+    }
+    trait Wide { fn wide(&self) -> usize; }
+    impl Wide for Rows {
+        fn wide(&self) -> usize { self.len() }
+    }
+}
+struct Foo;
+trait Assoc { type Item; }
+trait Local { fn span(&self) -> usize; }
+impl Local for <Foo as Assoc>::Item {
+    fn span(&self) -> usize { self.len() }
+}
+"#;
+    let result = RustExtractor.extract_artifact("src/lib.rs", source).result;
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+    let from = |qualified: &str| {
+        let function = result
+            .nodes
+            .iter()
+            .find(|node| {
+                matches!(node.kind, NodeKind::Function | NodeKind::Method)
+                    && node.qualified_name == qualified
+            })
+            .unwrap_or_else(|| panic!("{qualified} is extracted"));
+        result
+            .unresolved_refs
+            .iter()
+            .filter(|reference| {
+                reference.reference_kind == EdgeKind::Calls && reference.from_node_id == function.id
+            })
+            .map(|reference| reference.reference_name.as_str())
+            .collect::<Vec<_>>()
+    };
+
+    let measure = from("src/lib.rs::inner::Rows::measure");
+    assert!(
+        measure.contains(&"inner::Rows::len"),
+        "self inside `mod inner` names the module-scoped type: {measure:?}"
+    );
+    let wide = from("src/lib.rs::inner::<Rows as Wide>::wide");
+    assert!(
+        wide.contains(&"inner::Rows::len"),
+        "a trait impl in a module keeps the module path: {wide:?}"
+    );
+    let span = from("src/lib.rs::<<Foo as Assoc>::Item as Local>::span");
+    assert!(
+        span.contains(&"<Foo as Assoc>::Item::len"),
+        "a projected self type splits at the outer `as`: {span:?}"
     );
 }
 
 #[test]
 fn wildcard_imports_retain_unresolved_dependencies_alongside_named_bindings() {
-    let result = RustExtractor.extract(
-        "src/lib.rs",
-        "use crate::one::*;\nuse crate::two::{Item, *};",
-    );
+    let result = RustExtractor
+        .extract_artifact(
+            "src/lib.rs",
+            "use crate::one::*;\nuse crate::two::{Item, *};",
+        )
+        .result;
     assert!(result.errors.is_empty(), "{:?}", result.errors);
     let uses: Vec<_> = result
         .unresolved_refs

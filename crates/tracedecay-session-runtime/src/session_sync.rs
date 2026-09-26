@@ -20,6 +20,7 @@ use tracedecay_domain::{BrainId, ProjectId, SessionId, UserProfileId, UtcMicros}
 use tracedecay_global_db::GlobalDbGitCorrelationStore;
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
+use tracedecay_session_temporal_store::SessionTemporalAccess;
 use tracedecay_sessions::admission::{SESSION_INGEST_DISABLED_REASON_V1, session_ingest_disabled};
 use tracedecay_sessions::serving::{
     SessionProjectionServingState, SessionProjectionServingStatusPort,
@@ -643,7 +644,6 @@ impl DaemonSessionSyncService {
     async fn await_import_history(
         &self,
         context: &SessionSyncProjectContext,
-        project_sessions: &RegisteredGlobalDbLeaseV1,
         request: &SessionSyncRequestV1,
     ) -> Result<
         crate::session_temporal_refresh_scheduler::history::SessionHistoricalIngestProgress,
@@ -678,22 +678,14 @@ impl DaemonSessionSyncService {
                 return Err(Some(interruption));
             }
         };
-        if let (Some(project), Some(user)) = settled
-            && matches!(
-                context.project_refresh.serving_status().state,
-                SessionProjectionServingState::Current
-            )
-            && matches!(
-                context.user_refresh.serving_status().state,
-                SessionProjectionServingState::Current
-            )
-            && self
-                .projection_store_is_current(project_sessions, request)
-                .await?
-            && self
-                .projection_store_is_current(&context.user_sessions, request)
-                .await?
-        {
+        // Only the historical frontier is decided here. Projection currency is
+        // `await_import_projection`'s gate, which waits for the projection
+        // workers and then re-checks these same serving states and stores. This
+        // gate does not wait for them, so asserting them here reports
+        // `session_history_not_current` for a history that is current and whose
+        // projection has simply not drained yet, and skips the stage that would
+        // have waited for it.
+        if let (Some(project), Some(user)) = settled {
             Ok(
                 crate::session_temporal_refresh_scheduler::history::SessionHistoricalIngestProgress {
                     stats: project.stats.merge(user.stats),
@@ -775,10 +767,11 @@ impl DaemonSessionSyncService {
                 .max_begin_requests_per_pass;
         let active_scan_slots = page_limit / 2;
 
+        let temporal = SessionTemporalAccess::new(&**database);
         let mut active_after: Option<SessionId> = None;
         loop {
             let page = {
-                let discovery = database.pending_session_temporal_refresh_page_result(
+                let discovery = temporal.pending_session_temporal_refresh_page_result(
                     page_limit,
                     active_scan_slots,
                     active_after.as_ref(),

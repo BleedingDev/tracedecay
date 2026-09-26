@@ -168,7 +168,7 @@ fn prepare_discovered_run(
 
     // Scope to this project by the owning session's recorded cwd. A run whose
     // parent thread began in another project is skipped without touching the
-    // DB — the same per-session cwd filter ClaudeSource uses. This filter also
+    // DB, the same per-session cwd filter ClaudeSource uses. This filter also
     // gates the watermark: discovery walks every project on the machine, but
     // the watermark is persisted per-store, so only in-scope runs may advance
     // it. Letting an out-of-project run raise this store's watermark could push
@@ -329,13 +329,13 @@ fn run_cwd(run: &DiscoveredRun) -> Option<PathBuf> {
     });
     if let Some(cwd) = parent_transcript
         .as_deref()
-        .and_then(crate::runtime::claude::transcript_cwd)
+        .and_then(crate::runtime::hosts::claude::transcript_cwd)
     {
         return Some(cwd);
     }
     // Fall back to the first agent transcript that records a cwd.
     for path in agent_transcripts(&run.agents_dir) {
-        if let Some(cwd) = crate::runtime::claude::transcript_cwd(&path) {
+        if let Some(cwd) = crate::runtime::hosts::claude::transcript_cwd(&path) {
             return Some(cwd);
         }
     }
@@ -381,7 +381,7 @@ async fn persist_prepared_run<S: WorkflowIngestSink>(
 }
 
 /// Read and JSON-parse a `workflows/<run_id>.json` file, or `None` when it is
-/// missing or malformed (fail-open — the run is then treated as dir-only).
+/// missing or malformed (fail-open, the run is then treated as dir-only).
 #[hotpath::measure(label = "sessions.workflow_ingest.read_meta")]
 fn read_run_meta(path: &Path) -> Option<Value> {
     let text = read_snapshot_text_bounded("claude-workflow", path, MAX_SNAPSHOT_METADATA_BYTES)

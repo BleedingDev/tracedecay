@@ -17,10 +17,11 @@ pub mod lcm;
 pub mod profile;
 pub mod session;
 pub mod session_refresh;
+mod wire;
 
 pub use lcm::DirectRetainedLcmPortV1;
 pub use profile::{
-    ProfileRetainedAuthoritiesV1, ProfileRetainedConnectionAuthorityV1,
+    ProfileRetainedAuthoritiesV1, ProfileRetainedConnectionAuthorityV1, ProfileRetainedTerminalV1,
     execute_profile_retained_application, profile_retained_connection_authority,
     profile_session_retrieval_serving_identity,
 };

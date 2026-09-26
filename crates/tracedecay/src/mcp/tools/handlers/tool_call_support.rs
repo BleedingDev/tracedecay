@@ -2,13 +2,13 @@ use std::path::Path;
 
 use serde_json::{Value, json};
 
-use crate::project::TraceDecay;
-use crate::project::current_timestamp;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_mcp::response_handles::{
     ResponseHandleLookup, public_retrieve_error, retrieve_response_handle,
 };
+use tracedecay_project::project::TraceDecay;
+use tracedecay_runtime_core::tracedecay::current_timestamp;
 
 use super::support::{registered_project_context, validate_registered_project_selector_aliases};
 use tracedecay_mcp::ToolResult;
@@ -45,19 +45,13 @@ pub(crate) async fn resolve_registered_project_route_for_tool(
     global_db: Option<&RegisteredGlobalDb>,
     resolver: Option<crate::mcp::server::RetainedProjectServerResolver>,
 ) -> Result<Option<crate::mcp::project_route::ResolvedProjectRoute>> {
-    let semantic_top_level_fields =
-        crate::mcp::project_route::semantic_route_argument_fields(&tool_name);
     if tool_accepts_registered_project_selector(&tool_name) {
-        validate_registered_project_selector_aliases(&args, semantic_top_level_fields)?;
+        validate_registered_project_selector_aliases(&args)?;
     }
     if !tool_dispatches_registered_project_reader(&tool_name) {
         return Ok(None);
     }
-    let context = boxed_send(registered_project_context(
-        &args,
-        semantic_top_level_fields,
-        global_db,
-    ));
+    let context = boxed_send(registered_project_context(&args, global_db));
     let Some(context) = context.await? else {
         return Ok(None);
     };
@@ -81,9 +75,12 @@ pub(crate) async fn resolve_registered_project_route_for_tool(
 }
 
 #[hotpath::measure(future = true, label = "mcp.retrieve.handle.total")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Retrieve handling is one exact-or-semantic resolution through the mounted graph."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Retrieve handling is one exact-or-semantic resolution through the mounted graph."
+    )
 )]
 pub(super) async fn handle_retrieve(cg: &TraceDecay, args: &Value) -> Result<ToolResult> {
     let object = args.as_object().ok_or_else(|| TraceDecayError::Config {
@@ -123,11 +120,11 @@ pub(super) async fn handle_retrieve(cg: &TraceDecay, args: &Value) -> Result<Too
     // loading it back is real disk I/O that must not run inline on the async
     // dispatch worker.
     let lookup = {
-        let project_root = cg.project_root().to_path_buf();
+        let response_handle_root = cg.store_layout().response_handle_root.clone();
         let handle = handle.to_string();
         hotpath::future!(
             tokio::task::spawn_blocking(move || {
-                retrieve_response_handle(&project_root, &handle, current_timestamp())
+                retrieve_response_handle(&response_handle_root, &handle, current_timestamp())
             }),
             label = "mcp.retrieve.handle.load"
         )
@@ -224,7 +221,11 @@ pub(super) async fn handle_retrieve(cg: &TraceDecay, args: &Value) -> Result<Too
             "expires_at": expires_at,
         }),
     };
-    Ok(tool_json(Some(cg.project_root()), args, &payload))
+    Ok(tool_json(
+        Some(&cg.store_layout().response_handle_root),
+        args,
+        &payload,
+    ))
 }
 
 fn optional_usize_argument(args: &Value, field: &str) -> Result<Option<usize>> {

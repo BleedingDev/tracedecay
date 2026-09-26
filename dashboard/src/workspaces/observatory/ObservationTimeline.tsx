@@ -85,7 +85,7 @@ function useRailWidth(): [RefObject<HTMLDivElement | null>, number] {
  * labelled as such; a source that published no observation time is listed
  * beside the rail as a typed absence rather than placed at zero. No production
  * route accepts a time window, so the rail selects and previews but does not
- * filter — and says so. Reads that land within one touch target of each other
+ * filter, and says so. Reads that land within one touch target of each other
  * fold into a cluster that states its count and opens into its members.
  */
 export function ObservationTimeline({
@@ -288,7 +288,7 @@ export function ObservationTimeline({
                   aria-pressed={isSelected}
                   aria-controls={EVIDENCE_INSPECTOR_ID}
                   className={cn(
-                    'td-hit flex w-full items-center gap-2 border px-2 text-left text-2xs',
+                    'td-hit flex w-full items-center gap-2 border px-2 text-left text-body',
                     isSelected
                       ? 'border-edge-strong bg-surface-3'
                       : 'border-transparent hover:border-edge-subtle hover:bg-surface-2',
@@ -312,7 +312,7 @@ export function ObservationTimeline({
         </ul>
       ) : null}
 
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-3xs text-text-muted">
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-text-muted">
         <span data-timeline-newest>
           {extent
             ? `newest read ${formatMicrosUtc(extent.newestMicros)} · oldest ${formatMicrosUtc(extent.oldestMicros)}`

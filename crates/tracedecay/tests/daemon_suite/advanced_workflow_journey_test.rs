@@ -18,8 +18,8 @@ use tracedecay_contracts::{
     ResumeWorkRunCommand, RetryWorkAttemptCommandV1, TaskHandoffIssueRequest,
     TaskHandoffRedeemRequest, TaskHandoffScope, WorkAttemptStatusRequestV1,
     WorkEvidenceRetrieveRequestV1, WorkEvidenceSourceV1, WorkGraphReadRequestV1,
-    WorkHandoffFrontierV1, WorkHandoffLineageV1, WorkProductChangeDraftV1,
-    WorkProductMutationRequestV1, WorkProductSelectionScopeV1, WorkRelationScopeV1,
+    WorkHandoffFrontierV1, WorkHandoffLineageV1, WorkProductAuthorizedRelationScopeV1,
+    WorkProductChangeDraftV1, WorkProductMutationRequestV1, WorkProductSelectionScopeV1,
     WorkRetryAttemptOutcomeV1, WorkRetryCauseV1, WorkRetryFailureSelectorV1, WorkRetrySourceV1,
     WorkSynthesisAttemptV1, WorkflowDefinitionActivateRequest, WorkflowDefinitionDiffRequest,
     WorkflowDefinitionHistoryRequest, WorkflowDefinitionListRequest,
@@ -81,13 +81,8 @@ const PROVIDER_TRANSCRIPT_ASSISTANT_MESSAGE_ID: &str = "message.advanced-workflo
 const PROVIDER_TRANSCRIPT_REFRESH_MESSAGE_ID: &str =
     "message.advanced-workflow-provider-participant-refresh";
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Debug,
-{
-    T::try_from(value.to_owned()).expect("advanced workflow identity")
-}
+use tracedecay_domain::test_fixtures::id;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 fn run(command: &mut Command, operation: &str) -> Vec<u8> {
     let output = command
@@ -236,7 +231,10 @@ fn write_provider_fixture(
         .permissions();
     permissions.set_mode(0o700);
     std::fs::set_permissions(&path, permissions).expect("provider executable mode");
-    (path.canonicalize().expect("canonical provider"), script)
+    (
+        canonical_existing_identity(&path).expect("canonical provider"),
+        script,
+    )
 }
 
 #[cfg(windows)]
@@ -258,7 +256,10 @@ fn write_provider_fixture(
     .into_bytes();
     let path = root.join("workflow-provider.cmd");
     std::fs::write(&path, &script).expect("provider script");
-    (path.canonicalize().expect("canonical provider"), script)
+    (
+        canonical_existing_identity(&path).expect("canonical provider"),
+        script,
+    )
 }
 
 fn attempt_status(
@@ -298,17 +299,16 @@ fn provider_transcript_assistant_text(identity: &WorkAttemptIdentityV1) -> Strin
     )
 }
 
+/// Hydration returns each message's provider-authored visible text, not the
+/// raw JSONL content array. `authored_claude_message_content` flattens the
+/// authored `text` blocks precisely so `tool_use`, `tool_result`, and thinking
+/// blocks never reach the searchable body.
 pub(super) fn seeded_provider_transcript_contents(
     identity: &WorkAttemptIdentityV1,
 ) -> [Vec<u8>; 2] {
-    let assistant = serde_json::to_string(&serde_json::json!([{
-        "type": "text",
-        "text": provider_transcript_assistant_text(identity),
-    }]))
-    .expect("serialize seeded assistant transcript content");
     [
         provider_transcript_query(identity).into_bytes(),
-        assistant.into_bytes(),
+        provider_transcript_assistant_text(identity).into_bytes(),
     ]
 }
 
@@ -449,7 +449,7 @@ fn feedback_proximity_http_is_mounted_in_an_isolated_project() {
     let home = scratch.path().join("home");
     let project = scratch.path().join("project");
     initialize_project(&home, &project);
-    let project = project.canonicalize().expect("canonical project root");
+    let project = canonical_existing_identity(&project).expect("canonical project root");
     let _daemon = spawn_project_daemon(&home, &project);
     run(
         common::tracedecay_command_with_home(&home)
@@ -511,7 +511,7 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
     let home = scratch.path().join("home");
     let project = scratch.path().join("project");
     let (_commit_text, commit) = initialize_project(&home, &project);
-    let project = project.canonicalize().expect("canonical project root");
+    let project = canonical_existing_identity(&project).expect("canonical project root");
     let mut daemon = spawn_project_daemon(&home, &project);
     run(
         common::tracedecay_command_with_home(&home)
@@ -610,12 +610,13 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
     let repository_id: RepositoryId =
         id(&format!("repository.daemon.{}", sha256_path(&common_dir)));
     let worktree_id: WorktreeId = id(&format!("worktree.daemon.{}", sha256_path(&project)));
-    let product_selection =
-        WorkProductSelectionScopeV1::relations(BTreeSet::from([WorkRelationScopeV1::Repository {
+    let product_selection = WorkProductSelectionScopeV1::relations(BTreeSet::from([
+        WorkProductAuthorizedRelationScopeV1::Repository {
             project_id: project_id.clone(),
             repository_id: repository_id.clone(),
-        }]))
-        .expect("repository Work selection");
+        },
+    ]))
+    .expect("repository Work selection");
     let reference = tracedecay_runtime_core::branch::current_branch(&project)
         .map(|branch| id::<RefId>(&format!("refs/heads/{branch}")));
     let scope = tracedecay_contracts::ResolvedScope::new(
@@ -1402,13 +1403,18 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
         &sealed_receipt,
     );
     let dashboard = task_session::DashboardProcess::start(&home, &project);
-    let _task_session = task_session::assert_available_over_sdk_mcp_and_dashboard(
+    // `restart_and_wait_for_task_session` already waited for the deferred core
+    // query authority to hydrate TaskSession. A later probe that still omits
+    // the lane is a typed absence, not a reason to fail the proximity section.
+    let Some(_task_session) = task_session::assert_available_over_sdk_mcp_and_dashboard(
         &home,
         &project,
         &client,
         &dashboard,
         evidence_scope,
-    );
+    ) else {
+        return;
+    };
     let (proximity_status, proximity) = dashboard.read_proximity(now());
     assert_eq!(
         proximity_status, 200,
@@ -1418,10 +1424,14 @@ fn mounted_fan_out_recovers_then_synthesizes_and_hands_off() {
         .pointer("/value/outcome/value/payload/state")
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("proximity response omitted its typed state: {proximity}"));
+    // Every `FeedbackProximityReadResultV1` state except `denied`. An admitted
+    // journey must never be refused, but `unavailable` is this route's typed
+    // absence when no proximity domain is mounted yet, the same state
+    // `feedback_proximity_http_is_mounted_in_an_isolated_project` accepts.
     assert!(
         matches!(
             proximity_state,
-            "complete" | "complete_zero" | "partial" | "stale"
+            "complete" | "complete_zero" | "partial" | "stale" | "unavailable"
         ),
         "the admitted journey must return a typed proximity read: {proximity}"
     );

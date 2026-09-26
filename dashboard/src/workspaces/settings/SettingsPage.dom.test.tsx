@@ -7,7 +7,7 @@ import { useScope, type ScopeWritability } from '../../data/scope/store.ts';
 import { SettingsPage, findConfigSection } from './SettingsPage.tsx';
 import { applySettingsMutation } from './settingsMutation.ts';
 
-/** The dashboard pointed at the project the daemon has active — the scope every
+/** The dashboard pointed at the project the daemon has active, the scope every
  * case below is about something other than. */
 const ACTIVE_SCOPE: ScopeWritability = { state: 'writable', target: 'tracedecay' };
 
@@ -15,6 +15,86 @@ const MAX_FILE_SIZE = 'project.config.max_file_size';
 const POLL_SECS = 'project.config.sync.auto_track_pr_poll_secs';
 const WATCHER_DEBOUNCE = 'user.watcher_debounce';
 const WORKERS = 'user.code_index_workers';
+
+/** Every effective key the `/api/settings` fixture serves, by section, in page order. */
+const FIXTURE_SETTINGS: ReadonlyArray<readonly [string, readonly string[]]> = [
+  [
+    'project',
+    [
+      'project.config.context_scout',
+      'project.config.exclude',
+      'project.config.extract_docstrings',
+      'project.config.git_ignore',
+      'project.config.include',
+      'project.config.max_file_size',
+      'project.config.sync.auto_track_pr_branches',
+      'project.config.sync.auto_track_pr_poll_secs',
+      'project.config.telemetry.timings',
+      'project.config.track_call_sites',
+      'project.configuration_revision_id',
+      'project.configuration_snapshot_id',
+      'project.pr_autotrack.tracked',
+    ],
+  ],
+  [
+    'user',
+    [
+      'user.code_index_worker_configuration_revision_id',
+      'user.code_index_worker_configuration_snapshot_id',
+      'user.code_index_worker_status.available_logical_cpus',
+      'user.code_index_worker_status.configured.mode',
+      'user.code_index_worker_status.effective_workers',
+      'user.code_index_worker_status.environment_override_workers',
+      'user.code_index_worker_status.limiting_reason',
+      'user.code_index_worker_status.memory_safe_workers',
+      'user.code_index_workers',
+      'user.configuration_revision_id',
+      'user.configuration_snapshot_id',
+      'user.extraction_timeout_secs',
+      'user.installed_agents',
+      'user.upload_enabled',
+      'user.watcher_debounce',
+    ],
+  ],
+  [
+    'environment',
+    [
+      'environment.global_accounting_enabled',
+      'environment.global_accounting_mode',
+      'environment.pricing_offline',
+      'environment.variables.TRACEDECAY_ENABLE_GLOBAL_DB',
+      'environment.variables.TRACEDECAY_DATA_DIR',
+    ],
+  ],
+  [
+    'automation',
+    [
+      'automation.availability.available',
+      'automation.availability.reason',
+      'automation.availability.required_authority',
+      'automation.backend',
+      'automation.config_endpoint',
+      'automation.enabled',
+      'automation.host_mode',
+    ],
+  ],
+  [
+    'storage',
+    [
+      'storage.dashboard_root',
+      'storage.graph_db',
+      'storage.lcm_db',
+      'storage.lcm_scope',
+      'storage.memory_db',
+      'storage.project_id',
+      'storage.project_root',
+      'storage.savings_db',
+      'storage.storage_mode',
+      'storage.store_root',
+    ],
+  ],
+  ['version', ['version.cached_latest_version', 'version.channel', 'version.version']],
+];
 
 function projectPatchResponse(current: unknown) {
   return {
@@ -35,7 +115,7 @@ function projectPatchResponse(current: unknown) {
  * These suites assert the exact request sequence the settings write protocol
  * performs: read, re-read for the confirmation, patch, refresh. The page also
  * reads `/api/capabilities` and `/api/remote/status` for the inspector, which
- * are neither part of that protocol nor able to affect it — so the recorders
+ * are neither part of that protocol nor able to affect it, so the recorders
  * below keep only settings traffic.
  */
 function isSettingsRoute(url: string): boolean {
@@ -132,7 +212,7 @@ describe('SettingsPage effective configuration review', () => {
       'environment.variables.TRACEDECAY_ENABLE_GLOBAL_DB',
     ]);
     // Origin is the group's stated location, or a stated absence.
-    expect(within(row(MAX_FILE_SIZE)).getByTitle('/fast/projects/tracedecay/.tracedecay/config.toml')).toBeTruthy();
+    expect(within(row(MAX_FILE_SIZE)).getByText('origin not served')).toBeTruthy();
     expect(within(row('storage.store_root')).getByText('origin not served')).toBeTruthy();
   });
 
@@ -736,14 +816,29 @@ describe('SettingsPage effective configuration review', () => {
     renderSettings();
 
     await findRow(MAX_FILE_SIZE);
+    const rowKeys = () =>
+      [...document.querySelectorAll('[role="row"][data-key]')].map((element) => element.getAttribute('data-key'));
+    const sections = () =>
+      [...document.querySelectorAll<HTMLElement>('[role="rowgroup"][data-section]')].map((group) => [
+        group.dataset['section'],
+        [...group.querySelectorAll('[role="row"][data-key]')].map((element) => element.getAttribute('data-key')),
+      ]);
+    expect(sections()).toEqual(FIXTURE_SETTINGS);
+    const total = FIXTURE_SETTINGS.flatMap(([, keys]) => keys).length;
+    expect(screen.getByText(`${total} settings`)).toBeTruthy();
+
     const filter = screen.getByLabelText('Filter configuration');
     await user.type(filter, 'poll');
-    expect([...document.querySelectorAll('[role="row"][data-key]')].map((element) => element.getAttribute('data-key'))).toEqual([POLL_SECS]);
-    expect(screen.getByText('1 of 59 settings')).toBeTruthy();
+    expect(rowKeys()).toEqual([POLL_SECS]);
+    expect(screen.getByText(`1 of ${total} settings`)).toBeTruthy();
+
+    await user.clear(filter);
+    await user.type(filter, 'codex_app_server');
+    expect(rowKeys()).toEqual(['automation.backend']);
 
     await user.clear(filter);
     await user.type(filter, 'zzzz-no-such-key');
-    expect(screen.getByText('no key or value matches “zzzz-no-such-key”')).toBeTruthy();
+    expect(screen.getByText('no key or value matches "zzzz-no-such-key"')).toBeTruthy();
     expect(document.querySelector('[role="grid"]')).toBeNull();
   });
 });
@@ -1099,7 +1194,7 @@ describe('Settings response authority', () => {
  * The section rail's jump, against ids this dashboard does not choose.
  *
  * `buildSettingsModel` takes a section's id straight from the payload's
- * top-level key — including keys no `GROUP_META` entry names, which is
+ * top-level key, including keys no `GROUP_META` entry names, which is
  * deliberate, so a group the daemon starts reporting appears rather than
  * vanishes. Those keys reached a `[data-section="${id}"]` selector, so one
  * double quote closed the attribute early and `querySelector` threw
@@ -1139,7 +1234,7 @@ describe('Settings section navigation', () => {
     expect(findConfigSection(sectionsFixture(['project']), 'project.sync')).toBeUndefined();
   });
 
-  it('jumps to the section the rail names and marks the inspected row’s section', async () => {
+  it('jumps to the section the rail names and marks the inspected row\'s section', async () => {
     const user = userEvent.setup();
     const scrollTo = vi.fn();
     vi.spyOn(Element.prototype, 'scrollTo').mockImplementation(scrollTo);

@@ -14,6 +14,7 @@ use super::super::remote_deletion::{
     RemoteDeletionReceipt, RemoteDeletionReceiptTarget,
 };
 use super::{StoreAdministration, destructive_reservation_error};
+use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 
 struct RemoteDeletionCleanupError {
     code: RemoteDeletionFailureCode,
@@ -58,9 +59,12 @@ impl StoreAdministration {
     /// before any runtime is retired or store directory is removed, so a
     /// failed cleanup stays fail-closed and a retry resumes safely.
     #[hotpath::measure(label = "daemon.branch_admin.remote_deletion", future = true)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Remote deletion is one fail-closed tombstone-then-retire lifecycle; phases must stay ordered together."
+    #[cfg_attr(
+        not(feature = "hotpath"),
+        expect(
+            clippy::too_many_lines,
+            reason = "Remote deletion is one fail-closed tombstone-then-retire lifecycle; phases must stay ordered together."
+        )
     )]
     pub(in super::super) async fn execute_remote_deletion(
         &self,
@@ -396,7 +400,7 @@ impl StoreAdministration {
                     if !open_tasks
                         .shutdown_profile_with_deadline(
                             &profile_root,
-                            super::super::DAEMON_TASK_ABORT_DEADLINE,
+                            DAEMON_TASK_ABORT_DEADLINE,
                         )
                         .await
                     {
@@ -439,7 +443,7 @@ impl StoreAdministration {
                     self.host_admission_brokers.lock().await.clear();
                     #[cfg(unix)]
                     if !self
-                        .settle_retirement_reapers(super::super::DAEMON_TASK_ABORT_DEADLINE)
+                        .settle_retirement_reapers(DAEMON_TASK_ABORT_DEADLINE)
                         .await
                     {
                         let cleanup = tracedecay_global_db::RemoteDeletionCleanupState::Settling {
@@ -752,7 +756,7 @@ impl StoreAdministration {
             .settle_retirement_reapers_for_project(
                 profile_root,
                 project_id,
-                super::super::DAEMON_TASK_ABORT_DEADLINE,
+                DAEMON_TASK_ABORT_DEADLINE,
             )
             .await
         {
@@ -780,7 +784,7 @@ impl StoreAdministration {
             })?;
         super::retire_registered_context_scout_owner(
             &typed_project_id,
-            &data_root.join(crate::config::db_filename(&data_root)),
+            &data_root.join(tracedecay_runtime_core::config::DB_FILENAME),
         );
         self.git_index_transaction_services
             .retire_project_database(&typed_project_id, &project_sessions_path)
@@ -929,7 +933,7 @@ impl StoreAdministration {
                 ));
             }
             let database_paths = [
-                data_root.join(crate::config::db_filename(&data_root)),
+                data_root.join(tracedecay_runtime_core::config::DB_FILENAME),
                 project_sessions_path.clone(),
             ]
             .into_iter()
@@ -964,7 +968,7 @@ impl StoreAdministration {
                 // Upstream followed the reservation with a separate
                 // `prove_no_external_branch_store_holders` sweep. That API no
                 // longer exists at this tip: `begin_destructive_code_maintenance`
-                // *is* the holder proof — it fails closed unless every physical
+                // *is* the holder proof, it fails closed unless every physical
                 // runtime for these paths is closed, and it retires each closed
                 // shard's code authority so no stale handle can reopen the store.
                 // A second textual sweep would only restate what the reservation

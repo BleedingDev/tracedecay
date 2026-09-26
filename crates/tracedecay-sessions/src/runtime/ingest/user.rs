@@ -6,7 +6,9 @@ use crate::admission::HostAdmission;
 use crate::observation::ObservationCancellation;
 use crate::runtime::shared::TranscriptIngestStats;
 use crate::runtime::source::{self, TranscriptDiscoveryBounds};
-use crate::runtime::{SessionProvider, claude_observation, codex, cursor, cursor_composer};
+use crate::runtime::{
+    SessionProvider, hosts::claude_observation, hosts::codex, hosts::cursor, hosts::cursor_composer,
+};
 use tracedecay_domain::{BrainId, ObservationScopeV1, UserProfileId};
 use tracedecay_store::StoreShardScopeV1;
 
@@ -762,8 +764,10 @@ async fn ingest_user_global_sources_for_provider_with_roots_bounded_inner<
 mod cursor_tests {
     use std::collections::BTreeSet;
 
-    use crate::runtime::cursor::{CursorSweepIngestOutcome, CursorTranscriptIngestStats};
-    use crate::runtime::cursor_composer::CursorComposerSweepOutcome;
+    use crate::runtime::hosts::cursor::{
+        CursorSweepCoverage, CursorSweepIngestOutcome, CursorTranscriptIngestStats,
+    };
+    use crate::runtime::hosts::cursor_composer::CursorComposerSweepOutcome;
 
     use super::merge_user_cursor_sweep;
 
@@ -779,8 +783,11 @@ mod cursor_tests {
                 messages_upserted: 3,
                 bytes_consumed: 4,
                 source_deferred: true,
+                observations_committed: 0,
+                exact_duplicate: false,
             },
             session_ids: BTreeSet::from(["shared-session".to_string()]),
+            coverage: CursorSweepCoverage::Complete,
         };
 
         let outcome = merge_user_cursor_sweep(

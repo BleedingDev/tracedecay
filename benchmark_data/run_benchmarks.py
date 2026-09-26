@@ -1,4 +1,4 @@
-"""TraceDecay vs Token-Savior — side-by-side benchmark on Python repos.
+"""TraceDecay vs Token-Savior, side-by-side benchmark on Python repos.
 
 Adapted from token-savior's benchmarks/run_benchmarks.py
 (https://github.com/Mibayy/token-savior). Runs both tools against the same
@@ -188,7 +188,7 @@ class TraceDecayMcp:
 
     Spawns a long-lived server so per-call latency reflects actual query work
     instead of process startup + DB open. Newline-delimited JSON, no Content-
-    Length framing — see src/mcp/transport.rs.
+    Length framing, see src/mcp/transport.rs.
     """
 
     def __init__(self, root: Path, env: dict[str, str] | None = None):
@@ -342,14 +342,20 @@ def benchmark_tracedecay(name: str, root: Path, sample_symbols: list[str]) -> di
             ]
             out["find_symbol_avg_ms"] = avg_ms(find_us)
 
-            body_us = [
-                d
-                for q in queries
-                if (
-                    d := handler_us(mcp.call_tool("tracedecay_body", {"symbol": q, "limit": 1}))
+            # Name-to-source is an exact lookup followed by `tracedecay_source_body`.
+            body_us: list[int] = []
+            for q in queries:
+                fresp = mcp.call_tool(
+                    "tracedecay_find_exact_symbol", {"name": q, "limit": 1, "format": "json"}
                 )
-                is not None
-            ]
+                try:
+                    matches = json.loads(fresp["result"]["content"][0]["text"])["matches"]
+                    node_id = matches[0]["id"]
+                except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+                    continue
+                bus = handler_us(mcp.call_tool("tracedecay_source_body", {"node_id": node_id}))
+                if bus is not None:
+                    body_us.append((handler_us(fresp) or 0) + bus)
             out["get_function_source_avg_ms"] = avg_ms(body_us)
 
             impact_us: list[int] = []
@@ -428,11 +434,11 @@ def generate_report(results: list[dict], naive_sizes: dict[str, int]) -> str:
         "**Memory notes.** token-savior's peak memory is measured with `tracemalloc`",
         "(Python heap only). tracedecay runs as a subprocess, so its peak is the",
         "`ru_maxrss` delta from `getrusage(RUSAGE_CHILDREN)` (resident set size).",
-        "These are *not* identical units — treat them as order-of-magnitude.",
+        "These are *not* identical units, treat them as order-of-magnitude.",
         "",
         "**Query timing.** token-savior is called in-process (pure Python dict",
         "lookups). tracedecay is driven over MCP via `tracedecay serve --timings`",
-        "and the per-query column reports the handler's `_meta.duration_us` —",
+        "and the per-query column reports the handler's `_meta.duration_us`,",
         "i.e. the time spent inside the Rust handler, with JSON-RPC / stdio /",
         "Python-parse overhead stripped out. A warm-up call is issued before",
         "each timed loop. `get_change_impact` for tracedecay sums the handler",

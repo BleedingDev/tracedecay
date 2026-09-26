@@ -66,9 +66,14 @@ fn git_error_result(
             "message": message,
         }
     });
-    generic_tool_result(Some(ctx.project_root()), args, &output, vec![])
-        .with_semantic_error(true)
-        .with_failure_message(message)
+    generic_tool_result(
+        Some(&ctx.store_layout().response_handle_root),
+        args,
+        &output,
+        vec![],
+    )
+    .with_semantic_error(true)
+    .with_failure_message(message)
 }
 
 /// Typed result returned when a git-dispatched tool exhausts the dispatch
@@ -77,7 +82,7 @@ fn git_error_result(
 /// Git tree walks, revwalks, diffs, and the branch-add index build are
 /// unbounded on pathological or diverged inputs. When the carried deadline
 /// elapses the caller must receive the same shaped, semantic error every other
-/// git failure surfaces — never a bare hang or a panic.
+/// git failure surfaces, never a bare hang or a panic.
 pub fn git_dispatch_deadline_result(ctx: &McpToolContext<'_>, tool_name: &str) -> ToolResult {
     let message =
         format!("git tool '{tool_name}' exceeded its dispatch deadline and was cancelled");
@@ -175,7 +180,9 @@ mod tests {
     /// failure every other git error uses, so a caller never sees a bare hang.
     #[test]
     fn an_elapsed_dispatch_deadline_is_a_typed_semantic_failure() {
-        let project = fixture_project(std::path::Path::new("/unread"));
+        // Never read, but admission requires a host-absolute root, which a
+        // driveless `/unread` is not on Windows.
+        let project = fixture_project(&std::env::temp_dir().join("unread"));
         let result =
             git_dispatch_deadline_result(&fixture_context(&project), "tracedecay_pr_context");
 

@@ -4,9 +4,9 @@ use serde_json::Value;
 use tracedecay_domain::{
     CanonicalBoundaryKindV1, CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1,
     CanonicalObservationEvidenceV1, CanonicalObservationFactV1, CanonicalObservationRelationsV1,
-    CanonicalReasoningVisibilityV1, ObservationId, ObservationOrderingDomainV1,
-    ObservationSourceRangeV1, PayloadReferenceV1, ProviderId, ProviderUsageContractDimensionV1,
-    SessionId,
+    CanonicalReasoningVisibilityV1, CanonicalWorkflowEvidenceKindV1, ObservationId,
+    ObservationOrderingDomainV1, ObservationSourceRangeV1, PayloadReferenceV1, ProviderId,
+    ProviderUsageContractDimensionV1, SessionId,
 };
 
 use crate::timestamp::timestamp_secs as shared_timestamp_secs;
@@ -53,10 +53,15 @@ fn normalize_opencode_record(
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    let created_at = timestamp_secs(
+        message
+            .pointer("/time/created")
+            .or_else(|| message.get("time_created")),
+    );
     let mut facts = Vec::new();
     if let Some(content) = message_content(parts) {
         facts.push(CanonicalObservationFactV1::Message {
-            role: canonical_role(role),
+            role: CanonicalMessageRoleV1::from_wire_label(role),
             content,
             model: message
                 .pointer("/model/modelID")
@@ -64,11 +69,7 @@ fn normalize_opencode_record(
                 .or_else(|| message.get("modelID"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            timestamp: timestamp_secs(
-                message
-                    .pointer("/time/created")
-                    .or_else(|| message.get("time_created")),
-            ),
+            timestamp: created_at,
         });
     }
     if role == "user"
@@ -81,11 +82,7 @@ fn normalize_opencode_record(
             role: CanonicalMessageRoleV1::System,
             content: Value::String(system.to_owned()),
             model: None,
-            timestamp: timestamp_secs(
-                message
-                    .pointer("/time/created")
-                    .or_else(|| message.get("time_created")),
-            ),
+            timestamp: created_at,
         });
     }
     append_usage(
@@ -99,22 +96,30 @@ fn normalize_opencode_record(
         return Err(ObservationRecordParseErrorV1::Empty);
     }
 
-    let timestamp = timestamp_secs(
-        message
-            .pointer("/time/created")
-            .or_else(|| message.get("time_created")),
-    );
+    let timestamp = created_at;
     let mut evidence =
         CanonicalObservationEvidenceV1::new(ObservationOrderingDomainV1::SnapshotOrder, range);
     if let Some(timestamp) = timestamp {
         evidence = evidence.with_native_timestamp(timestamp);
     }
+    let mut relations =
+        CanonicalObservationRelationsV1::new(SessionId::new(session_id).map_err(|_| invalid())?)
+            .with_message_id(message_id);
+    // The owning `session.parent_id` row names the session whose `task` call
+    // spawned this one; the call id itself is recorded only on that parent.
+    if let Some(parent) = native
+        .pointer("/session/parentID")
+        .and_then(Value::as_str)
+        .filter(|parent| !parent.is_empty() && *parent != session_id)
+        .and_then(|parent| SessionId::new(parent).ok())
+    {
+        relations = relations.with_parent_session_id(parent);
+    }
     CanonicalObservationEnvelopeV1::new(
         ProviderId::new(PROVIDER).map_err(|_| invalid())?,
         "message",
         stable_record_id.clone(),
-        CanonicalObservationRelationsV1::new(SessionId::new(session_id).map_err(|_| invalid())?)
-            .with_message_id(message_id),
+        relations,
         facts,
         evidence,
     )
@@ -255,6 +260,29 @@ fn append_tool_fact(
                 }),
         });
     }
+    // A `task` part records the child session it spawned in
+    // `state.metadata.sessionId`; with the host's `callID` that is the spawn
+    // edge the child's own transcript never carries.
+    if let (Some(child), Some(call_id)) = (
+        state
+            .pointer("/metadata/sessionId")
+            .and_then(Value::as_str)
+            .filter(|child| !child.is_empty()),
+        part.get("callID")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty()),
+    ) {
+        let mut content = serde_json::Map::new();
+        content.insert("tool_use_id".to_owned(), Value::String(call_id.to_owned()));
+        if let Some(description) = state.pointer("/input/description").and_then(Value::as_str) {
+            content.insert("text".to_owned(), Value::String(description.to_owned()));
+        }
+        facts.push(CanonicalObservationFactV1::Workflow {
+            evidence_kind: CanonicalWorkflowEvidenceKindV1::Subagent,
+            reference: Some(child.to_owned()),
+            content: Some(Value::Object(content)),
+        });
+    }
     Ok(())
 }
 
@@ -288,16 +316,6 @@ fn message_content(parts: &[Value]) -> Option<Value> {
         .cloned()
         .collect::<Vec<_>>();
     (!content.is_empty()).then_some(Value::Array(content))
-}
-
-fn canonical_role(role: &str) -> CanonicalMessageRoleV1 {
-    match role {
-        "user" => CanonicalMessageRoleV1::User,
-        "assistant" => CanonicalMessageRoleV1::Assistant,
-        "system" => CanonicalMessageRoleV1::System,
-        "tool" => CanonicalMessageRoleV1::Tool,
-        _ => CanonicalMessageRoleV1::Unknown,
-    }
 }
 
 /// OpenCode's `time.created` is strictly numeric; string forms stay
@@ -450,5 +468,81 @@ mod tests {
                     ProviderUsageContractDimensionV1::CounterSemantics,
                 ])
         )));
+    }
+
+    #[test]
+    fn task_part_records_the_spawned_session_and_its_call() {
+        let task = json!({
+            "message": {"id": "msg_parent", "role": "assistant", "time": {"created": 1_700_000_000_000_i64}},
+            "parts": [{
+                "id": "prt_task", "type": "tool", "tool": "task", "callID": "call_649e87f9",
+                "state": {
+                    "status": "completed",
+                    "input": {"description": "Survey the loom", "subagent_type": "general"},
+                    "metadata": {"parentSessionId": "ses_parent", "sessionId": "ses_child"},
+                    "output": "done"
+                }
+            }]
+        });
+        let envelope = normalize_observation(
+            &task,
+            "ses_parent",
+            ObservationId::new("msg_parent").unwrap(),
+            ObservationSourceRangeV1::new(0, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            envelope
+                .facts()
+                .contains(&CanonicalObservationFactV1::Workflow {
+                    evidence_kind: tracedecay_domain::CanonicalWorkflowEvidenceKindV1::Subagent,
+                    reference: Some("ses_child".to_owned()),
+                    content: Some(
+                        json!({"tool_use_id": "call_649e87f9", "text": "Survey the loom"})
+                    ),
+                }),
+            "{:?}",
+            envelope.facts()
+        );
+        assert!(envelope.relations().parent_session_id().is_none());
+
+        let mut pending = task.clone();
+        pending["parts"][0]["state"] = json!({"status": "pending", "input": {}});
+        let envelope = normalize_observation(
+            &pending,
+            "ses_parent",
+            ObservationId::new("msg_parent.pending").unwrap(),
+            ObservationSourceRangeV1::new(0, 1).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            envelope
+                .facts()
+                .iter()
+                .all(|fact| !matches!(fact, CanonicalObservationFactV1::Workflow { .. })),
+            "a task that has not created its session names no spawn"
+        );
+    }
+
+    #[test]
+    fn child_session_records_its_parent_session() {
+        let envelope = normalize_observation(
+            &json!({
+                "message": {"id": "msg_child", "role": "user", "time": {"created": 1_700_000_001_000_i64}},
+                "parts": [{"id": "prt_1", "type": "text", "text": "Survey the loom"}],
+                "session": {"parentID": "ses_parent"}
+            }),
+            "ses_child",
+            ObservationId::new("msg_child").unwrap(),
+            ObservationSourceRangeV1::new(0, 1).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            envelope
+                .relations()
+                .parent_session_id()
+                .map(|session| session.as_str()),
+            Some("ses_parent")
+        );
     }
 }

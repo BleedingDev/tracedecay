@@ -78,7 +78,7 @@ pub(crate) async fn handle_projects_action(
 ///
 /// The destructive path runs offline inside the bounded profile-offline
 /// window, so it completes even when the project's runtime is wedged in a
-/// terminal activation loop — the managed daemon service is stopped (the
+/// terminal activation loop, the managed daemon service is stopped (the
 /// supervisor bounds the stop) and restored afterward. The preview runs
 /// through the daemon like every other read-only `projects` subcommand and
 /// never stops the service.
@@ -269,6 +269,9 @@ fn render_project_context_payload(payload: &Value) -> String {
     if let Some(branch) = project["default_branch"].as_str() {
         let _ = writeln!(out, "default branch: {branch}");
     }
+    if let Some(branch) = project["head_branch"].as_str() {
+        let _ = writeln!(out, "head branch: {branch}");
+    }
     if let Some(git_common_dir) = project["git_common_dir"].as_str() {
         let _ = writeln!(out, "git common dir: {git_common_dir}");
     }
@@ -333,7 +336,7 @@ fn render_project_context_payload(payload: &Value) -> String {
 #[hotpath::measure(label = "cli.projects.request", future = true)]
 async fn call_registry_admin(arguments: Value) -> Result<Value> {
     let cwd = std::env::current_dir()?;
-    let project_root = tracedecay::config::discover_project_root(&cwd);
+    let project_root = tracedecay_runtime_core::config::discover_project_root(&cwd);
     let arguments = registry_admin_arguments(project_root, arguments);
     daemon_tool_json(None, "tracedecay_admin_cli", arguments).await
 }
@@ -350,7 +353,7 @@ fn registry_admin_arguments(project_root: Option<PathBuf>, mut arguments: Value)
 }
 
 /// Renders the plain-text `projects context` view. Deliberately omits
-/// `project.git_remote_url` — a git remote URL can embed credentials
+/// `project.git_remote_url`, a git remote URL can embed credentials
 /// (`https://user:token@host/...`), so it must never be printed here or
 /// serialized into the JSON view (see `PublicCodeProject`).
 #[cfg(test)]
@@ -545,5 +548,25 @@ mod tests {
         assert!(text.contains("scope store:test:branch:main branch=main"));
         assert!(text.contains("artifact graph_db path=projects/proj_test/branches/main.db"));
         assert!(!text.contains("sekret-token"));
+    }
+
+    #[test]
+    fn daemon_context_payload_names_default_and_head_branches_apart() {
+        let payload = serde_json::json!({
+            "project": {
+                "project_id": "proj_test",
+                "display_root": "/repo",
+                "default_branch": "main",
+                "head_branch": "served-head",
+                "last_seen_at": 200,
+            },
+        });
+
+        let text = render_project_context_payload(&payload);
+
+        assert!(
+            text.contains("default branch: main\nhead branch: served-head\n"),
+            "{text}"
+        );
     }
 }

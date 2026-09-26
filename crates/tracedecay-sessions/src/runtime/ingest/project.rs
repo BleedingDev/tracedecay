@@ -6,7 +6,7 @@ use super::authority::{IngestAdmissionBinding, SessionIngestAuthority};
 use crate::observation::ObservationCancellation;
 use crate::repository_provenance::RepositoryProvenanceAdmissionContext;
 use crate::runtime::shared::TranscriptIngestStats;
-use crate::runtime::{SessionProvider, claude_observation};
+use crate::runtime::{SessionProvider, hosts::claude_observation};
 use tracedecay_domain::{BrainId, ObservationScopeV1, ProjectId, UserProfileId};
 use tracedecay_store::StoreShardScopeV1;
 
@@ -110,7 +110,7 @@ pub async fn ingest_project_sources_for_provider_with_cancellation_and_codex_sta
     provider: Option<SessionProvider>,
     include_hermes: bool,
     cancellation: &ObservationCancellation,
-    codex_discovery: &crate::runtime::codex::CodexDiscoveryHub,
+    codex_discovery: &crate::runtime::hosts::codex::CodexDiscoveryHub,
     codex_consumer: &str,
 ) -> TranscriptIngestOutcome {
     ingest_project_sources_for_provider_inner(
@@ -190,7 +190,7 @@ async fn ingest_project_sources_for_provider_inner<A: SessionIngestAuthority>(
     provider: Option<SessionProvider>,
     include_hermes: bool,
     cancellation: &ObservationCancellation,
-    codex_discovery: Option<(&crate::runtime::codex::CodexDiscoveryHub, &str)>,
+    codex_discovery: Option<(&crate::runtime::hosts::codex::CodexDiscoveryHub, &str)>,
 ) -> TranscriptIngestOutcome {
     ingest_project_sources_for_provider_bounded_inner(
         registered,
@@ -208,8 +208,8 @@ async fn ingest_project_sources_for_provider_inner<A: SessionIngestAuthority>(
 /// Plans which providers one bounded pass may attempt.
 ///
 /// The full catch-up sweep (`provider == None`) rotates through the provider
-/// ring from the durable frontier so consecutive passes — including passes
-/// separated by a daemon restart — cover every provider without restarting at
+/// ring from the durable frontier so consecutive passes, including passes
+/// separated by a daemon restart, cover every provider without restarting at
 /// the first one. Single-provider calls are hook-driven and run directly.
 #[hotpath::measure(label = "sessions.ingest.project.rotation_plan", future = true)]
 async fn plan_project_provider_rotation<S: crate::runtime::store_port::TranscriptIngestStore>(
@@ -245,7 +245,7 @@ async fn ingest_project_sources_for_provider_bounded_inner<A: SessionIngestAutho
     include_hermes: bool,
     bounds: IngestPassBounds,
     cancellation: &ObservationCancellation,
-    codex_discovery: Option<(&crate::runtime::codex::CodexDiscoveryHub, &str)>,
+    codex_discovery: Option<(&crate::runtime::hosts::codex::CodexDiscoveryHub, &str)>,
 ) -> TranscriptIngestOutcome {
     let Some(canonical_project_id) = project_id else {
         return TranscriptIngestOutcome::new(
@@ -441,8 +441,8 @@ async fn ingest_project_sources_for_provider_bounded_inner<A: SessionIngestAutho
     if !cancelled {
         ingest_project_workflow_runs(registered, &canonical_project_id, project_root).await;
     }
-    // A bounded partial pass persists the rotation cursor so the next pass —
-    // in this process or after a daemon restart — resumes at the provider
+    // A bounded partial pass persists the rotation cursor so the next pass,
+    // in this process or after a daemon restart, resumes at the provider
     // after the last one attempted instead of restarting the sweep.
     if let Some(frontier) = rotation_frontier
         && scheduling_write_required(source_outcome.coverage, attempted, cancelled)

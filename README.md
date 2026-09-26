@@ -33,7 +33,7 @@ Instead of repeated `grep`, `glob`, and file reads, agents use MCP tools such as
 
 ```bash
 # Linux and Apple silicon macOS
-curl -fsSL https://github.com/ScriptedAlchemy/tracedecay/releases/latest/download/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ScriptedAlchemy/tracedecay/master/install.sh | bash
 
 # Windows: download the x86_64 Windows archive from the latest release,
 # extract tracedecay.exe, and place it on PATH.
@@ -54,10 +54,22 @@ operating model](docs/V2-OPERATING-MODEL.md).
 
 ```bash
 cd /path/to/your/project
+tracedecay daemon install-service
 tracedecay init
 tracedecay install
 tracedecay status
 ```
+
+The daemon comes first. `tracedecay init` is brokered through the
+daemon-owned code-index scheduler, so without a running daemon it refuses
+before it writes anything:
+
+```
+Error: project route error (code_index_scheduler_unavailable): project initialization requires the daemon-owned code-index scheduler; start the daemon and retry
+```
+
+`tracedecay status` likewise reads the daemon and never starts it. See [the
+user guide](docs/USER-GUIDE.md) for the daemon lifecycle commands.
 
 `tracedecay install` auto-detects supported agents. To target one host:
 
@@ -87,9 +99,9 @@ the installed cache is loaded.
 ## Common Commands
 
 ```bash
+tracedecay daemon install-service   # install + start the daemon (required before init)
 tracedecay init [path]              # enroll a project and publish its first generation
 tracedecay sync [path]              # explicit administrative refresh
-tracedecay sync --force [path]      # explicit full generation refresh
 tracedecay status [path]            # graph stats, freshness, savings, cost
 tracedecay tool                     # list every MCP tool
 tracedecay tool search "<query>"    # CLI symbol search
@@ -111,7 +123,7 @@ list and `tracedecay tool <name> --help` for one tool's parameters.
 
 The MCP server exposes tools grouped around normal coding workflows:
 
-- Discovery: `tracedecay_context`, `tracedecay_search`, `tracedecay_outline`, `tracedecay_files`
+- Discovery: `tracedecay_context`, `tracedecay_search`, `tracedecay_source_outline`, `tracedecay_files`
 - Graph traversal: `tracedecay_callers`, `tracedecay_callees`, `tracedecay_impact`, `tracedecay_affected`
 - Code health: `tracedecay_complexity`, `tracedecay_dead_code`, `tracedecay_unmounted_files`, `tracedecay_coupling`, `tracedecay_test_risk`
 - Git workflow: `tracedecay_diff_context`, `tracedecay_pr_context`, `tracedecay_changelog`, `tracedecay_test_map`
@@ -205,6 +217,10 @@ separate daemon operation with its own preview, receipt, and recovery state.
 Common fixes:
 
 - Not initialized: run `tracedecay init` from the project root.
+- `code_index_scheduler_unavailable` from `init`: no daemon is accepting
+  connections for this profile. Run `tracedecay daemon install-service` (or
+  `tracedecay daemon start` if it is already installed), confirm with
+  `tracedecay daemon status`, then re-run `init`.
 - Agent does not see tools: run `tracedecay doctor`, then restart the agent.
 - Missing symbols: inspect `tracedecay status --json` for the selected
   generation and typed warming/refresh-required coverage; request an explicit
@@ -215,13 +231,15 @@ Common fixes:
 
 ## Build
 
-Building from a source checkout requires Node.js 22+ and npm in addition to
-Rust: `dashboard/app-dist/` is generated output and is not committed, so
-`build.rs` runs `npm ci` and `npm run build` in `dashboard/` before embedding
-the UI. Release users should install the prebuilt, checksummed GitHub archive;
+Building from a source checkout requires Node.js 22+ and pnpm in addition to
+Rust. Run `pnpm install` at the repository root first. It installs the
+dashboard's npm packages and the crates that the committed `.cargo/config.toml`
+builds against; `build.rs` then runs `pnpm run build` in `dashboard/` before
+embedding the UI. Release users should install the prebuilt, checksummed GitHub archive;
 workspace Cargo packages are private.
 
 ```bash
+pnpm install
 cargo build --release
 cargo build --release --features medium
 cargo build --release --no-default-features
@@ -230,6 +248,27 @@ cargo nextest run --workspace --all-features --no-fail-fast
 cargo check --no-default-features
 cargo clippy --workspace --all-targets
 ```
+
+On macOS `tracedecay` is ad-hoc signed as `dev.tracedecay.cli` with
+designated requirement `identifier "dev.tracedecay.cli"`. macOS TCC keys
+removable-volume and file grants on that requirement. The default ad-hoc
+requirement is the binary's cdhash, so an Allow does not survive the next
+rebuild; the linker default identifier (`tracedecay-<hash>`) changes every
+build as well, and the daemon blocks in `open()` until the prompt is
+answered. A release build strips after linking, which mints that identifier
+again from the deps filename. Export
+`CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER="$PWD/scripts/macos-rustc-wrapper.sh"`
+from the checkout root (the macOS CI and release jobs do) and the wrapper
+signs the product once rustc has finished, so `cargo build --release` and
+`cargo install --path crates/tracedecay-cli` keep the stable identity on
+the binary cargo copies into place. The committed Cargo config cannot set
+it, because Cargo has no per-target wrapper and Windows cannot run the
+script. `install.sh` and `tracedecay update`
+apply the same identity to the installed file after the archive checksum
+check when the binary is unsigned or ad-hoc signed, including an ad-hoc
+signature whose identifier already matches but whose requirement is still
+a cdhash. A Developer ID or other team signature is left as published.
+Release jobs do not Apple-sign.
 
 ## Docs
 

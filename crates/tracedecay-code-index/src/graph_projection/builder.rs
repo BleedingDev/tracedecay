@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use rayon::prelude::*;
 
-use crate::chunks::{CodeIndexImportEvidenceV1, published_symbol_spans};
+use crate::chunks::{
+    CodeIndexImportEvidenceV1, CodeIndexUnresolvedReferenceV1, published_symbol_spans,
+    typescript_family_path,
+};
 use crate::lineage::{GenerationSymbolIndexV1, LineageSymbolRecordV1};
 use crate::production::CodeIndexPublishedGenerationV1;
 use tracedecay_domain::{
-    CanonicalRelationEdgeV1, CodeGenerationId, CodeSearchChunkV1, FileOccurrenceId,
-    SanitizedCodeFileV1, SymbolOccurrenceId,
+    CanonicalRelationEdgeV1, CodeGenerationId, CodeSearchChunkV1, EdgeAuthorityV1,
+    FileOccurrenceId, RelationEdgeKindV1, SanitizedCodeFileV1, SymbolOccurrenceId,
 };
 use tracedecay_graph_db::{
     GraphDbError, GraphEntity, GraphEntityId, GraphEntityRef, GraphGenerationManifest,
@@ -24,9 +27,9 @@ use super::schema::{
 };
 use super::{
     CodeGraphProjectionError, CodeGraphSymbolBindingV1, EDGE_LABEL, EDGE_RECORD_PROPERTY,
-    FILE_SYMBOL_EDGE_KIND, SOURCE_EDGE_KIND, SymbolRecordV1, TARGET_EDGE_KIND,
+    FILE_SYMBOL_EDGE_KIND, SymbolRecordV1, TARGET_EDGE_KIND,
     build_code_graph_manifest_inputs_checked, compare_edges, current_generation_entity,
-    symbol_entity, symbol_entity_id, validate_edge,
+    source_edge_kind, symbol_entity, symbol_entity_id, validate_edge,
 };
 
 #[hotpath::measure(label = "code_index.graph.build_manifest")]
@@ -49,12 +52,77 @@ pub fn build_published_code_graph_manifest_checked(
     // and the seat/reconcile duplicate publication of one sealed generation
     // reuse the first complete build instead of re-serializing and re-hashing
     // every entity and relation. Fail-closed: only a fully successful build is
-    // memoized — an interrupted or deadline-exceeded build records nothing —
+    // memoized, an interrupted or deadline-exceeded build records nothing,
     // and the `check` above refuses a cancelled or expired request before a
     // memo hit can be served.
     if let Some(manifest) = generation.memoized_graph_manifest(&projection, projector_revision) {
         return Ok(manifest);
     }
+    let mut site_candidates = BTreeMap::new();
+    for (_, reference) in generation.unresolved_references() {
+        check()?;
+        reference
+            .validate()
+            .map_err(|error| CodeGraphProjectionError::Corrupt(error.to_string()))?;
+        if reference.kind == RelationEdgeKindV1::Calls && !reference.reference_name.contains('.') {
+            site_candidates
+                .entry((&reference.from_occurrence, reference.evidence_span))
+                .and_modify(|candidate| *candidate = None)
+                .or_insert(Some(reference.reference_name.as_str()));
+        }
+    }
+    let mut resolved_sites = BTreeMap::new();
+    for edge in generation.edges() {
+        check()?;
+        if edge.kind == RelationEdgeKindV1::Calls && edge.authority == EdgeAuthorityV1::NameResolved
+        {
+            let site = (&edge.from_occurrence, edge.evidence_span);
+            // NameResolved is emitted only by the canonical retained-reference
+            // resolver. A unique qualified candidate ties that edge to this
+            // exact receiver site; bare or competing candidates cannot do so.
+            if let Some(Some(candidate)) = site_candidates.get(&site)
+                && let Some((owner, member)) = candidate.rsplit_once("::")
+                && !owner.is_empty()
+                && !member.is_empty()
+            {
+                resolved_sites.insert(site, member);
+            }
+        }
+    }
+    let mut unresolved_calls = Vec::new();
+    for (logical_path, reference) in generation.unresolved_references() {
+        check()?;
+        // TypeScript member calls are retained only through an imported
+        // namespace; the module resolver below decides which are gaps.
+        if typescript_family_path(logical_path) {
+            continue;
+        }
+        // An enclosing-symbol fallback is not exact call-site proof, even
+        // when another relation carries the same broad source span.
+        let resolved_method_token =
+            reference
+                .reference_name
+                .rsplit('.')
+                .next()
+                .is_some_and(|member| {
+                    reference.evidence_span.len() == member.len() as u64
+                        && resolved_sites
+                            .get(&(&reference.from_occurrence, reference.evidence_span))
+                            == Some(&member)
+                });
+        if reference.kind == RelationEdgeKindV1::Calls
+            && reference.reference_name.contains('.')
+            && !resolved_method_token
+        {
+            unresolved_calls.push(reference.clone());
+        }
+    }
+    // A TypeScript call whose import names project code the seal could not
+    // bind is the same kind of disclosed gap as an unresolved Rust receiver.
+    check()?;
+    unresolved_calls.extend(generation.unresolved_typescript_import_calls());
+    unresolved_calls.sort();
+    unresolved_calls.dedup();
     let manifest = Arc::new(build_code_graph_manifest_inputs_checked(
         projection.clone(),
         generation_id,
@@ -64,6 +132,7 @@ pub fn build_published_code_graph_manifest_checked(
             files: &generation.snapshot().files,
             symbols: generation.symbols(),
             imports: generation.imports(),
+            unresolved_calls: &unresolved_calls,
         }),
         projector_revision,
         check,
@@ -87,6 +156,7 @@ pub(super) struct ProductionCodeGraphInputs<'a> {
     pub(super) files: &'a [SanitizedCodeFileV1],
     pub(super) symbols: &'a GenerationSymbolIndexV1,
     pub(super) imports: &'a [CodeIndexImportEvidenceV1],
+    pub(super) unresolved_calls: &'a [CodeIndexUnresolvedReferenceV1],
 }
 
 fn collect_graph_rows_ordered<T, R>(
@@ -144,6 +214,17 @@ pub(super) fn build_projection(
     generation
         .validate()
         .map_err(|error| CodeGraphProjectionError::Contract(error.to_string()))?;
+    let mut unresolved_by_source = BTreeMap::<_, Vec<_>>::new();
+    for reference in production
+        .into_iter()
+        .flat_map(|inputs| inputs.unresolved_calls)
+    {
+        check()?;
+        unresolved_by_source
+            .entry(&reference.from_occurrence)
+            .or_default()
+            .push(reference.clone());
+    }
     let (files, symbol_metadata, imports, bindings, retained_edges, occurrences) =
         hotpath::measure_block!("code_index.seal.collect.bind", {
             let files = production
@@ -279,9 +360,9 @@ pub(super) fn build_projection(
             ))
         })?;
     // Chunks bind symbols to files and spans above; they are not graph rows.
-    // No reader addresses a chunk through the graph — traversal alternates
+    // No reader addresses a chunk through the graph, traversal alternates
     // symbol and edge-evidence entities, and a symbol's binding already
-    // names its chunk — so projecting one entity plus one relation per chunk
+    // names its chunk, so projecting one entity plus one relation per chunk
     // only multiplied every graph artifact by the chunk count.
     hotpath::measure_block!("code_index.seal.collect.emit", {
         let mut entities = Vec::with_capacity(
@@ -349,6 +430,10 @@ pub(super) fn build_projection(
                         .get(occurrence)
                         .map(|record| LineageSymbolRecordV1::clone(record)),
                     occurrence: occurrence.clone(),
+                    unresolved_calls: unresolved_by_source
+                        .get(occurrence)
+                        .cloned()
+                        .unwrap_or_default(),
                 };
                 symbol_entity(identity, record)
             })?);
@@ -441,7 +526,7 @@ fn edge_artifacts(
         GraphRelationId::new(stable_identity("source", identity.as_str()))?,
         GraphEntityRef::new(projection.clone(), from.clone()),
         GraphEntityRef::new(projection.clone(), identity.clone()),
-        GraphRelationKind::new(SOURCE_EDGE_KIND)?,
+        GraphRelationKind::new(source_edge_kind(edge.kind))?,
         BTreeMap::new(),
     )?;
     let target = GraphGenerationRelation::new(

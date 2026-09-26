@@ -6,6 +6,7 @@ pub mod dispatch;
 pub mod dispatch_ceiling;
 pub mod render;
 pub mod renderers;
+pub mod response_trailers;
 
 use serde_json::Value;
 use std::fmt::Write as _;
@@ -39,6 +40,12 @@ pub struct ToolResult {
     /// populate analytics `failure_reason` without re-deriving it from
     /// rendered response text.
     failure_message: Option<String>,
+    /// Set once the shared renderer accounted this result, so the transport
+    /// persists those figures instead of appending a second footer.
+    token_accounting: Option<response_trailers::ToolTokenAccounting>,
+    /// What the read cost its stores, recorded by
+    /// [`response_trailers::append_request_cost`] beside its trailer.
+    cost: Option<tracedecay_contracts::RequestCostReceiptV1>,
 }
 
 impl ToolResult {
@@ -50,7 +57,14 @@ impl ToolResult {
             context_memory_contribution: None,
             semantic_error: None,
             failure_message: None,
+            token_accounting: None,
+            cost: None,
         }
+    }
+
+    /// What the read cost its stores, when the call was metered.
+    pub fn cost(&self) -> Option<tracedecay_contracts::RequestCostReceiptV1> {
+        self.cost
     }
 
     #[must_use]
@@ -105,6 +119,18 @@ impl ToolResult {
     /// The handler-provided failure reason, if one was set.
     pub fn failure_message(&self) -> Option<&str> {
         self.failure_message.as_deref()
+    }
+
+    pub(crate) fn set_token_accounting(
+        &mut self,
+        accounting: response_trailers::ToolTokenAccounting,
+    ) {
+        self.token_accounting = Some(accounting);
+    }
+
+    /// The figures the shared renderer accounted, if it did.
+    pub fn token_accounting(&self) -> Option<response_trailers::ToolTokenAccounting> {
+        self.token_accounting
     }
 }
 
@@ -371,7 +397,7 @@ fn param_shape_note(schema: &Value, ty: &str) -> Option<String> {
             .and_then(Value::as_object)
             .is_some()
         {
-            return Some("object — pass JSON via --args".to_string());
+            return Some("object, pass JSON via --args".to_string());
         }
         return None;
     }
@@ -381,8 +407,8 @@ fn param_shape_note(schema: &Value, ty: &str) -> Option<String> {
             .and_then(|items| items.get("type"))
             .and_then(Value::as_str)?;
         return Some(match items_type {
-            "array" => "array of arrays — pass JSON via --args".to_string(),
-            "object" => "array of objects — pass JSON via --args".to_string(),
+            "array" => "array of arrays, pass JSON via --args".to_string(),
+            "object" => "array of objects, pass JSON via --args".to_string(),
             other => format!("array of {other}s"),
         });
     }
@@ -396,8 +422,8 @@ const EXAMPLE_MAX_DEPTH: usize = 6;
 /// A mechanical `--args` example object: every required property plus the
 /// non-scalar optional ones, with placeholder values derived from the schema.
 ///
-/// Object-valued properties are expanded recursively. Emitting `{}` for them —
-/// as this did before — produced an example the daemon rejects outright
+/// Object-valued properties are expanded recursively. Emitting `{}` for them,
+/// as this did before, produced an example the daemon rejects outright
 /// whenever the nested schema has required keys of its own.
 fn example_args_object(
     root: &Value,
@@ -740,8 +766,8 @@ mod tests {
         let definition = tracedecay_mcp_catalog::get_tool_definitions()
             .expect("tool definitions")
             .into_iter()
-            .find(|definition| definition.name == "tracedecay_code_implementations")
-            .expect("code_implementations is advertised");
+            .find(|definition| definition.name == "tracedecay_implementations")
+            .expect("implementations is advertised");
 
         let help = render_tool_cli_help(&definition);
         let example = help

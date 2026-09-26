@@ -14,9 +14,7 @@ pub mod copilot;
 pub mod cursor;
 pub(crate) mod cursor_diagnostics;
 pub mod devin;
-/// Legacy Cursor `serve` log marker; the root crate's `src/serve.rs`
-/// re-exports this instead of declaring its own copy.
-pub use cursor_diagnostics::DEGRADED_SERVE_STDERR_MARKER;
+pub mod droid;
 pub mod gemini;
 mod git_post_commit_hook;
 pub mod hermes;
@@ -30,29 +28,30 @@ pub mod kimi;
 pub mod kiro;
 mod mcp_registration;
 pub mod opencode;
+pub mod pi;
 pub mod plugin_bundle;
 pub mod prompt_rules;
 mod text_file_transaction;
 pub(crate) use text_file_transaction::{
-    TextFileMutation, update_config_file_transactionally, update_text_file_transactionally,
-    update_two_config_files_transactionally,
+    TextFileMutation, update_text_file_transactionally, update_two_config_files_transactionally,
 };
-pub(crate) mod retired_memory_digest;
 pub mod roo_code;
 pub mod vibe;
 pub mod zed;
 
 use std::path::{Path, PathBuf};
 
-use tracedecay_automation_runtime::automation::host_io::ManagedSkillExportReport;
+use tracedecay_automation_runtime::automation::host_io::{
+    ManagedSkillExportReport, uses_default_user_profile,
+};
 use tracedecay_automation_runtime::automation::skill_targets::SkillInstallSummary;
 use tracedecay_domain::errors::Result;
 use tracedecay_domain::errors::TraceDecayError;
 
 pub use antigravity::AntigravityIntegration;
 pub(crate) use bundle_identity::{
-    is_auto_discovered_entrypoint, observed_bundle_content_digest,
-    observed_bundle_discovery_matches, rendered_bundle_content_digest,
+    observed_bundle_content_digest, observed_bundle_discovery_matches,
+    rendered_bundle_content_digest, unexpected_bundle_entrypoints,
 };
 pub use claude::ClaudeIntegration;
 pub use cline::ClineIntegration;
@@ -60,49 +59,44 @@ pub use codex::CodexIntegration;
 pub use copilot::CopilotIntegration;
 pub use cursor::CursorIntegration;
 pub use devin::DevinIntegration;
+pub use droid::DroidIntegration;
 pub use gemini::GeminiIntegration;
 pub use hermes::HermesIntegration;
 pub use kilo::KiloIntegration;
 pub use kimi::KimiIntegration;
 pub use kiro::KiroIntegration;
 pub use opencode::OpenCodeIntegration;
+pub use pi::PiIntegration;
 pub use roo_code::RooCodeIntegration;
 pub use vibe::VibeIntegration;
 pub use zed::ZedIntegration;
 
-pub use git_post_commit_hook::{
-    install_git_post_commit_hook, reconcile_git_post_commit_hook,
-    report_git_post_commit_hook_status,
-};
+pub use git_post_commit_hook::{install_git_post_commit_hook, report_git_post_commit_hook_status};
 pub use host_config_io::{
-    HostFileMetadataIdentityV1, JsonConfigDialect, backup_config_file, capture_host_file_metadata,
-    config_backup_path, copilot_cli_dir, home_dir, host_config_write_intent_path, kiro_data_dir,
-    load_json_file, load_json_file_strict, load_jsonc_file, load_jsonc_file_strict, load_toml_file,
-    parse_jsonc, resolve_lifecycle_executable, restore_config_backup, restore_host_file_metadata,
-    safe_remove_host_file, safe_write_bytes_file, safe_write_bytes_file_with_metadata,
-    safe_write_json_file, safe_write_text_file, vscode_data_dir, vscode_insiders_data_dir,
-    which_tracedecay, which_tracedecay_path, with_host_config_write_intents, write_json_file,
-    write_toml_file,
+    HostFileMetadataIdentityV1, JsonConfigDialect, capture_host_file_metadata, copilot_cli_dir,
+    home_dir, host_config_write_intent_path, kiro_data_dir, load_json_file, load_json_file_strict,
+    load_jsonc_file, load_jsonc_file_strict, load_toml_file, parse_jsonc,
+    restore_host_file_metadata, safe_remove_host_file, safe_write_bytes_file,
+    safe_write_bytes_file_with_metadata, safe_write_json_file, safe_write_text_file,
+    vscode_data_dir, vscode_insiders_data_dir, which_tracedecay, which_tracedecay_path,
+    with_host_config_write_intents,
 };
 pub(crate) use host_config_io::{
     JsonConfigMutation, collect_regular_files, ensure_project_local_safe_path,
-    ensure_project_local_safe_paths, hook_command, host_home_override,
-    record_host_config_observation_bytes, sweep_superseded_plugin_siblings,
-    update_json_config_transactionally, update_toml_config_transactionally,
+    ensure_project_local_safe_paths, hook_command, host_home_override, is_process_home,
+    record_host_config_observation_bytes, update_json_config_transactionally,
+    update_toml_config_transactionally,
 };
-// Host adapters under this module reach these through `super::` / `crate::agents::`.
 #[cfg(test)]
 use host_config_io::{
     TestHostConfigWritePauseController, pause_next_host_config_write_after_validation,
     pause_next_host_config_write_at_publication,
 };
-use host_config_io::{render_json_config, strip_jsonc_comments};
 pub(crate) use mcp_registration::doctor_check_prompt_contains_tracedecay;
 pub use mcp_registration::{
-    McpDoctorLabels, McpUninstallPolicy, doctor_check_mcp_registration, expected_tool_perms,
-    install_mcp_server_entry, mcp_config_has_tracedecay, mcp_registration_entry,
-    mcp_servers_registration_state, read_only_tool_names, report_mcp_registration, tool_names,
-    uninstall_mcp_server_entry,
+    McpDoctorLabels, McpUninstallPolicy, doctor_check_mcp_registration, install_mcp_server_entry,
+    mcp_config_has_tracedecay, mcp_registration_entry, mcp_servers_registration_state,
+    read_only_tool_names, report_mcp_registration, tool_names, uninstall_mcp_server_entry,
 };
 
 #[hotpath::measure(label = "agent_hosts.agents.managed_skill.install_index")]
@@ -115,8 +109,6 @@ pub(crate) fn install_managed_skill_prompt_index(
         tracedecay_automation_runtime::automation::skill_targets::profile_root_for_agent_home(
             profile_home,
         );
-    retired_memory_digest::remove_state(&profile_root)?;
-    retired_memory_digest::remove_prompt_block(prompt_path)?;
     tracedecay_automation_runtime::automation::skill_targets::install_managed_skills(
         &crate::host_io(),
         &profile_root,
@@ -128,25 +120,60 @@ pub(crate) fn install_managed_skill_prompt_index(
 
 #[hotpath::measure(label = "agent_hosts.agents.managed_skill.remove_index")]
 pub(crate) fn remove_managed_skill_prompt_index(
-    profile_home: &Path,
     prompt_path: &Path,
     target: tracedecay_automation_runtime::automation::skill_targets::SkillInstallTarget,
 ) -> Result<()> {
-    let profile_root =
-        tracedecay_automation_runtime::automation::skill_targets::profile_root_for_agent_home(
-            profile_home,
-        );
-    retired_memory_digest::remove_state(&profile_root)?;
     tracedecay_automation_runtime::automation::skill_targets::remove_prompt_skill_index_for_target(
         &crate::host_io(),
         prompt_path,
         target,
-    )?;
-    retired_memory_digest::remove_prompt_block(prompt_path)
+    )
 }
 
-pub(crate) fn uses_default_user_profile(home: &Path, profile_root: &Path) -> bool {
-    profile_root == home.join(".tracedecay")
+/// Warns for each of a host's managed-skill prompt indexes that still
+/// advertises skills the profile's store no longer holds.
+///
+/// A host owns a *set* of index files (per-user and per-project spellings, and
+/// for some hosts one per installed editor profile), and each converges only
+/// when a lifecycle pass re-exports that file. Taking the whole set keeps one
+/// call per host answering for every index that host writes, so an unchecked
+/// spelling cannot survive by being the one the call site forgot.
+///
+/// A stale block means the host is reading a skill list the store cannot
+/// serve, so doctor names the deploy command that reconverges it. Absent files
+/// and files with no managed block read as converged, so a host the operator
+/// does not use stays silent. Doctor never repairs.
+#[hotpath::measure(label = "agent_hosts.agents.managed_skill.doctor_index")]
+pub(crate) fn doctor_check_managed_skill_prompt_indexes(
+    dc: &mut DoctorCounters,
+    profile_home: &Path,
+    prompt_paths: &[PathBuf],
+    target: tracedecay_automation_runtime::automation::skill_targets::SkillInstallTarget,
+) {
+    let profile_root =
+        tracedecay_automation_runtime::automation::skill_targets::profile_root_for_agent_home(
+            profile_home,
+        );
+    for prompt_path in prompt_paths {
+        match tracedecay_automation_runtime::automation::skill_targets::stale_prompt_index_ids(
+            &profile_root,
+            prompt_path,
+            target,
+        ) {
+            Ok(stale) if stale.is_empty() => {}
+            Ok(stale) => dc.warn(&format!(
+                "managed-skill index in {} still lists {} skill(s) absent from the managed-skill \
+                 store ({}); run `tracedecay automation skills deploy` to refresh it",
+                prompt_path.display(),
+                stale.len(),
+                stale.join(", ")
+            )),
+            Err(err) => dc.warn(&format!(
+                "could not check the managed-skill index in {}: {err}",
+                prompt_path.display()
+            )),
+        }
+    }
 }
 
 /// Re-runs the managed-skill overlay/prompt-index export for every agent
@@ -240,25 +267,15 @@ pub trait AgentIntegration {
         false
     }
 
-    /// Validate non-interactive install readiness without changing host state.
+    /// Whether the host has already activated what this version deploys,
+    /// read without changing host state.
     ///
-    /// This is the read-only counterpart to
-    /// [`AgentIntegration::prepare_non_interactive_install`]. Hosts that need
-    /// manual activation report the same typed deferral without staging files.
+    /// Most integrations activate through their own host CLI inside the
+    /// component transaction and are always `Ready` here. A host whose only
+    /// activation route is interactive reports a typed deferral naming the
+    /// host action; the transaction then commits the staged source it owns
+    /// and surfaces that remediation instead of claiming activation.
     fn preflight_non_interactive_install(
-        &self,
-        _ctx: &InstallContext,
-    ) -> Result<NonInteractiveInstallOutcome> {
-        Ok(NonInteractiveInstallOutcome::Ready)
-    }
-
-    /// Prepare an install requested from a non-interactive orchestration path.
-    ///
-    /// Most integrations are immediately ready. Hosts whose official lifecycle
-    /// requires user interaction may stage verified artifacts and return a
-    /// typed deferral instead. Explicit install commands still surface that
-    /// deferral as an error, while maintenance can warn and continue.
-    fn prepare_non_interactive_install(
         &self,
         _ctx: &InstallContext,
     ) -> Result<NonInteractiveInstallOutcome> {
@@ -269,11 +286,10 @@ pub trait AgentIntegration {
     /// through an interactive UI, or `None` for a host TraceDecay can activate
     /// non-interactively.
     ///
-    /// This is the read-only capability twin of the typed deferral
-    /// [`AgentIntegration::prepare_non_interactive_install`] returns: doctor
-    /// needs the same fact without an `InstallContext` and without staging
-    /// anything. Every integration returning `Some` here must also return
-    /// [`NonInteractiveInstallOutcome::DeferredUserAction`] from preflight —
+    /// This is the capability twin of the typed deferral
+    /// [`AgentIntegration::preflight_non_interactive_install`] returns: doctor
+    /// needs the same fact without an `InstallContext`. Every integration returning `Some` here must also return
+    /// [`NonInteractiveInstallOutcome::DeferredUserAction`] from preflight,
     /// otherwise doctor would downgrade a state that an unattended reinstall
     /// could actually have repaired.
     fn interactive_activation_guidance(&self) -> Option<String> {
@@ -286,7 +302,7 @@ pub trait AgentIntegration {
     ///
     /// The removal twin of [`AgentIntegration::interactive_activation_guidance`].
     /// A host that activates only through an interactive UI also *deactivates*
-    /// only there, so `Uninstall` must refuse while the registration stands —
+    /// only there, so `Uninstall` must refuse while the registration stands,
     /// deleting the receipt-owned artifacts underneath a live registration
     /// leaves the host resolving a bundle that no longer exists. The refusal
     /// travels as [`host_bundle::HostBundleError::NativeRemovalRequired`],
@@ -300,20 +316,6 @@ pub trait AgentIntegration {
         None
     }
 
-    /// Refresh tracedecay-generated artifacts (plugin code, baked binary
-    /// paths, embedded assets) for every *detected* existing installation,
-    /// without writing to any agent config file. Pins, MCP registrations,
-    /// settings, and prompt rules are left byte-for-byte intact.
-    ///
-    /// The default reports [`UpdatePluginOutcome::ConfigOnly`]: most agents
-    /// keep their entire tracedecay integration inside shared config files
-    /// (MCP entries, hook blocks, prompt rules), so there is nothing to
-    /// refresh that would not be a config write — `tracedecay reinstall`
-    /// remains the path that reconciles those.
-    fn update_plugin(&self, _ctx: &InstallContext) -> Result<UpdatePluginOutcome> {
-        Ok(UpdatePluginOutcome::ConfigOnly)
-    }
-
     /// Re-export the profile's active managed skills into every export
     /// destination this agent's existing installation owns (native overlay
     /// or prompt index), without touching any other config. Returns one
@@ -321,7 +323,7 @@ pub trait AgentIntegration {
     /// empty list for agents that either do not distribute managed skills
     /// or have no detected tracedecay installation under `home`.
     ///
-    /// Implementors must never create a new installation here — only refresh
+    /// Implementors must never create a new installation here, only refresh
     /// artifacts already owned by a catalog receipt.
     fn export_managed_skills(
         &self,
@@ -399,6 +401,18 @@ pub trait AgentIntegration {
         self.host_component_registration(component, health)
     }
 
+    /// Auto-discovered entrypoints inside TraceDecay's deployed bundle that no
+    /// TraceDecay release shipped. The host loads them as part of the
+    /// TraceDecay plugin, so activating `components` cannot converge while
+    /// they remain; lifecycle preflight refuses them as an ownership conflict.
+    fn foreign_bundle_entrypoints(
+        &self,
+        _components: &[host_bundle::HostComponentV1],
+        _home: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
+
     /// Returns true if this agent appears to be installed on the system
     /// (its config directory exists).
     fn is_detected(&self, _home: &Path) -> bool {
@@ -424,8 +438,9 @@ pub trait AgentIntegration {
     }
 
     /// Every mutable host registration/configuration path participating in an
-    /// aggregate component-set lifecycle. The transaction stages backups for
-    /// all returned paths before invoking the host registration authority.
+    /// aggregate component-set lifecycle. The transaction snapshots all
+    /// returned paths in memory before invoking the host registration
+    /// authority.
     fn host_registration_paths(&self, home: &Path) -> Vec<PathBuf> {
         self.primary_config_path(home).into_iter().collect()
     }
@@ -441,7 +456,7 @@ pub trait AgentIntegration {
         self.host_registration_paths(home)
     }
 
-    /// Fallible exact registration inventory used by the transaction backup.
+    /// Fallible exact registration inventory used by the transaction snapshot.
     ///
     /// Hosts whose paths depend on validated profile data override this rather
     /// than silently dropping files from rollback ownership.
@@ -514,9 +529,10 @@ pub trait AgentIntegration {
 
     /// Apply only this host's project-scoped registration projection.
     ///
-    /// The component-set transaction calls this boundary after it has staged
-    /// exact registration backups. Implementations must mutate only bounded
-    /// project registration paths; they must not install global assets.
+    /// The component-set transaction calls this boundary after it has
+    /// snapshotted the exact registration paths. Implementations must mutate
+    /// only bounded project registration paths; they must not install global
+    /// assets.
     fn activate_project_host_component_registration(
         &self,
         _components: &[host_bundle::HostComponentV1],
@@ -553,8 +569,8 @@ pub trait AgentIntegration {
 pub struct DeferredUserAction {
     /// Exact operator-facing remediation.
     pub remediation: String,
-    /// Verified artifacts staged for the user to apply through the host.
-    pub staged_paths: Vec<PathBuf>,
+    /// The exact host command the operator runs to finish the operation.
+    pub command: String,
 }
 
 /// Result of preparing an install for a non-interactive caller.
@@ -566,27 +582,10 @@ pub enum NonInteractiveInstallOutcome {
     DeferredUserAction(DeferredUserAction),
 }
 
-/// Outcome of [`AgentIntegration::update_plugin`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum UpdatePluginOutcome {
-    /// Generated artifacts were refreshed at these locations.
-    Refreshed(Vec<PathBuf>),
-    /// The integration ships generated artifacts, but none were detected on
-    /// this machine — nothing was written.
-    NotInstalled,
-    /// The integration only writes shared config files; there are no
-    /// tracedecay-generated artifacts to refresh without touching config.
-    ConfigOnly,
-    /// Verified artifacts were staged, but the host requires explicit user
-    /// action before it can activate them.
-    DeferredUserAction(DeferredUserAction),
-}
-
 /// Context passed to catalog-backed host registration and refresh operations.
 pub struct InstallContext {
     pub home: PathBuf,
     pub tracedecay_bin: String,
-    pub tool_permissions: Vec<String>,
     /// Codex update/uninstall can use this as an explicit repo-local plugin
     /// target. Other integrations ignore it.
     pub project_root: Option<PathBuf>,
@@ -641,6 +640,8 @@ pub fn get_integration(id: &str) -> Result<Box<dyn AgentIntegration>> {
         "kiro" => Ok(Box::new(KiroIntegration)),
         "kimi" => Ok(Box::new(KimiIntegration)),
         "vibe" => Ok(Box::new(VibeIntegration)),
+        "pi" => Ok(Box::new(PiIntegration)),
+        "droid" => Ok(Box::new(DroidIntegration)),
         _ => Err(TraceDecayError::Config {
             message: format!(
                 "unknown agent: \"{id}\". Available agents: {}",
@@ -669,6 +670,8 @@ pub fn all_integrations() -> Vec<Box<dyn AgentIntegration>> {
         Box::new(KiroIntegration),
         Box::new(KimiIntegration),
         Box::new(VibeIntegration),
+        Box::new(PiIntegration),
+        Box::new(DroidIntegration),
     ]
 }
 
@@ -691,6 +694,8 @@ pub fn available_integrations() -> Vec<&'static str> {
         "kiro",
         "kimi",
         "vibe",
+        "pi",
+        "droid",
     ]
 }
 
@@ -713,6 +718,8 @@ pub fn integration_id_for_host(host: host_bundle::HostKindV1) -> &'static str {
         host_bundle::HostKindV1::OpenCode => "opencode",
         host_bundle::HostKindV1::Gemini => "gemini",
         host_bundle::HostKindV1::Copilot => "copilot",
+        host_bundle::HostKindV1::Pi => "pi",
+        host_bundle::HostKindV1::FactoryDroid => "droid",
     }
 }
 
@@ -796,7 +803,7 @@ impl DoctorCounters {
 #[macro_export]
 macro_rules! cli_fallback_args_invocation_lit {
     () => {
-        "`tracedecay tool <name> --args '<json>'` — the same JSON arguments object as the MCP tool; \
+        "`tracedecay tool <name> --args '<json>'`, the same JSON arguments object as the MCP tool; \
 pipe it via `--args -` (a quoted heredoc) when it contains quotes or newlines"
     };
 }
@@ -818,61 +825,75 @@ Do not query private databases as a fallback. If the daemon is unavailable or in
 report that state rather than starting or replacing it."
 );
 
-/// True when a `SKILL.md` carries a TraceDecay authorship marker. Retired
-/// plugin artifacts use this narrow check so same-name user workflows remain
-/// outside TraceDecay's cleanup authority.
-pub(crate) fn skill_contents_have_tracedecay_marker(contents: &str) -> bool {
-    contents.lines().map(str::trim).any(|line| {
-        line.starts_with("name: tracedecay:")
-            || line.starts_with("description: TraceDecay ")
-            || line.contains("TraceDecay MCP")
-            || line.contains("tracedecay_")
-            || line.contains("`tracedecay:")
-    })
-}
-
-/// Choose which detected agents `tracedecay install` should configure.
+/// Choose which detected agents `tracedecay install` should configure, or
+/// `None` when this machine has no supported agent yet.
 ///
 /// The install verb is already the authorization. Detected agents that are not
 /// yet installed are selected and already-installed agents are kept. This never
 /// reads stdin and never uninstalls: removal is a separate destructive command.
 ///
-/// Returns `(to_install, to_uninstall)`. `to_uninstall` is always empty.
-pub fn select_detected_integrations(
-    home: &Path,
-    installed: &[String],
-) -> Result<(Vec<String>, Vec<String>)> {
+/// Finding nothing to configure used to be an error, so the first thing a user
+/// ran on a fresh machine exited 1 and read as a broken install. It is an
+/// ordinary outcome of a setup command; the caller reports
+/// [`no_detected_integrations_notice`] and succeeds.
+pub fn select_detected_integrations(home: &Path, installed: &[String]) -> Option<Vec<String>> {
     let detected: Vec<Box<dyn AgentIntegration>> = all_integrations()
         .into_iter()
         .filter(|ag| ag.is_detected(home))
         .collect();
 
     if detected.is_empty() {
-        return Err(TraceDecayError::Config {
-            message: "No supported agents detected on this system".to_string(),
-        });
+        return None;
     }
 
-    let to_install = detected
-        .iter()
-        .map(|agent| agent.id().to_string())
-        .filter(|id| !installed.contains(id))
-        .collect();
-    Ok((to_install, Vec::new()))
+    Some(
+        detected
+            .iter()
+            .map(|agent| agent.id().to_string())
+            .filter(|id| !installed.contains(id))
+            .collect(),
+    )
+}
+
+/// What to tell a user whose machine has no supported agent installed yet.
+///
+/// Built from [`all_integrations`] so the list cannot drift from the set
+/// `tracedecay install` actually detects, and it names the directory that was
+/// searched: an unexpected `HOME` is the other reason this comes up empty.
+pub fn no_detected_integrations_notice(home: &Path) -> String {
+    let integrations = all_integrations();
+    let mut names: Vec<&str> = integrations.iter().map(|agent| agent.name()).collect();
+    names.sort_unstable();
+    format!(
+        "No supported agents detected under {}.\n\
+         TraceDecay configures {}.\n\
+         Install one of them, then run `tracedecay install` again.",
+        home.display(),
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod select_detected_integrations_tests {
-    use super::select_detected_integrations;
+    use super::{no_detected_integrations_notice, select_detected_integrations};
 
     #[test]
-    fn empty_home_is_an_error_not_a_prompt() {
+    fn empty_home_selects_nothing_instead_of_failing() {
         let home = tempfile::tempdir().unwrap();
-        let error = select_detected_integrations(home.path(), &[]).expect_err("no detected agents");
+        assert!(select_detected_integrations(home.path(), &[]).is_none());
+    }
+
+    #[test]
+    fn the_empty_home_notice_names_the_agents_and_the_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let notice = no_detected_integrations_notice(home.path());
+        assert!(notice.contains("Claude Code"), "{notice}");
+        assert!(notice.contains("Cursor"), "{notice}");
+        assert!(notice.contains("tracedecay install"), "{notice}");
         assert!(
-            error.to_string().contains("No supported agents detected"),
-            "{error}"
+            notice.contains(&home.path().display().to_string()),
+            "{notice}"
         );
     }
 
@@ -882,11 +903,199 @@ mod select_detected_integrations_tests {
         std::fs::create_dir(home.path().join(".cursor")).unwrap();
         std::fs::create_dir(home.path().join(".claude")).unwrap();
 
-        let (to_install, to_uninstall) =
+        let to_install =
             select_detected_integrations(home.path(), &["cursor".to_string()]).unwrap();
 
-        assert!(to_uninstall.is_empty(), "install must not uninstall");
         assert!(!to_install.iter().any(|id| id == "cursor"));
         assert!(to_install.iter().any(|id| id == "claude"));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod managed_skill_prompt_index_doctor_tests {
+    use super::{DoctorCounters, HealthcheckContext, get_integration};
+    use std::path::{Path, PathBuf};
+
+    /// One managed-skill index a host writes, and what it takes for that
+    /// host's `healthcheck` to reach the index check at all.
+    struct IndexRow {
+        integration: &'static str,
+        /// Which of the host's index files this row exercises, so a failure
+        /// names the spelling that went unchecked.
+        scope: &'static str,
+        /// Marker slug the target's block is written under.
+        slug: &'static str,
+        index_path: fn(&Path, &Path) -> PathBuf,
+        /// Minimum state that makes the host read as installed.
+        seed: fn(&Path, &Path),
+    }
+
+    fn seed_nothing(_home: &Path, _project: &Path) {}
+
+    /// Kiro's healthcheck returns before every installed-only check unless its
+    /// registry carries the tracedecay server.
+    fn seed_kiro_registry(home: &Path, _project: &Path) {
+        let mcp_path = super::kiro::mcp_config_path(home);
+        std::fs::create_dir_all(mcp_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &mcp_path,
+            br#"{"mcpServers":{"tracedecay":{"command":"/bin/tracedecay","args":["serve"],"disabled":false}}}"#,
+        )
+        .unwrap();
+    }
+
+    /// A managed block listing exactly `entries`, so the baseline and the
+    /// stale-index run differ in nothing but the listed ids.
+    fn write_index_block(path: &Path, slug: &str, entries: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            format!(
+                "<!-- TRACEDECAY MANAGED SKILLS START {slug} -->\n{entries}\
+                 <!-- TRACEDECAY MANAGED SKILLS END {slug} -->\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    const GHOST_ENTRY: &str = "- `ghost-skill`: Ghost Skill. Summary: no longer in the store.\n";
+
+    fn index_rows() -> Vec<IndexRow> {
+        vec![
+            IndexRow {
+                integration: "claude",
+                scope: "user CLAUDE.md",
+                slug: "claude",
+                index_path: |home, _| home.join(".claude").join("CLAUDE.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "claude",
+                scope: "project CLAUDE.md",
+                slug: "claude",
+                index_path: |_, project| project.join(".claude/CLAUDE.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "vibe",
+                scope: "user prompts/cli.md",
+                slug: "agents",
+                index_path: |home, _| super::vibe::vibe_prompt_path(home),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "vibe",
+                scope: "project prompts/cli.md",
+                slug: "agents",
+                index_path: |_, project| project.join(".vibe/prompts/cli.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "copilot",
+                scope: "CLI copilot-instructions.md",
+                slug: "agents",
+                index_path: |home, _| super::copilot_cli_dir(home).join("copilot-instructions.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "copilot",
+                scope: "project copilot-instructions.md",
+                slug: "agents",
+                index_path: |_, project| project.join(".github/copilot-instructions.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "opencode",
+                scope: "user AGENTS.md",
+                slug: "opencode",
+                index_path: |home, _| super::opencode::opencode_prompt_path(home),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "opencode",
+                scope: "project AGENTS.md",
+                slug: "opencode",
+                index_path: |_, project| project.join("AGENTS.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "kimi",
+                scope: "project AGENTS.md",
+                slug: "kimi",
+                index_path: |_, project| project.join("AGENTS.md"),
+                seed: seed_nothing,
+            },
+            IndexRow {
+                integration: "kiro",
+                scope: "user steering index",
+                slug: "kiro",
+                index_path: |home, _| super::kiro::managed_skill_index_path(home),
+                seed: seed_kiro_registry,
+            },
+            IndexRow {
+                integration: "kiro",
+                scope: "project steering index",
+                slug: "kiro",
+                index_path: |_, project| {
+                    project.join(".kiro/steering/tracedecay-managed-skills.md")
+                },
+                seed: seed_kiro_registry,
+            },
+        ]
+    }
+
+    /// Every prompt index a host writes must also be read back by that host's
+    /// own `healthcheck`.
+    ///
+    /// Asserting the warning delta across two runs of the same healthcheck,
+    /// rather than an absolute count, keeps the unrelated warnings these hosts
+    /// emit for an unconfigured home out of the verdict. The baseline run
+    /// already has the index file in place holding an empty managed block, so
+    /// the ghost id is the only thing that changes on disk between the runs
+    /// and a rise can come from nowhere but the index check. Creating the file
+    /// only for the second run would not do: several hosts also read these
+    /// paths for their prompt rules, and vibe reclassifies an absent prompt
+    /// (warning) as a prompt missing rules (issue) once one appears, which
+    /// leaves the warning count flat while the index check is firing.
+    ///
+    /// A host wired for only some of its index files fails on the spelling it
+    /// skipped, which a check of `stale_prompt_index_ids` in isolation would
+    /// not catch.
+    #[test]
+    fn every_prompt_index_a_host_writes_is_read_back_by_its_healthcheck() {
+        for row in index_rows() {
+            let home = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let (home, project) = (home.path(), project.path());
+            let case = format!("{} ({})", row.integration, row.scope);
+
+            // An empty store makes every id the index lists stale.
+            std::fs::create_dir_all(home.join(".tracedecay/agent_managed/skills")).unwrap();
+            (row.seed)(home, project);
+
+            let integration = get_integration(row.integration).unwrap();
+            let ctx = HealthcheckContext {
+                home: home.to_path_buf(),
+                project_path: project.to_path_buf(),
+            };
+            let index = (row.index_path)(home, project);
+            write_index_block(&index, row.slug, "");
+            let mut before = DoctorCounters::new();
+            integration.healthcheck(&mut before, &ctx);
+
+            write_index_block(&index, row.slug, GHOST_ENTRY);
+            let mut after = DoctorCounters::new();
+            integration.healthcheck(&mut after, &ctx);
+
+            assert!(
+                after.warnings > before.warnings,
+                "{case} healthcheck must warn about the stale managed-skill index at {} \
+                 (warnings {} -> {})",
+                index.display(),
+                before.warnings,
+                after.warnings
+            );
+        }
     }
 }

@@ -92,6 +92,7 @@ def invoke(
     targets: dict[str, object],
     profile: str = "stable",
     sidecars: bool = False,
+    allow_missing: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     manifest = root / "targets.json"
     manifest.write_text(json.dumps(targets), encoding="utf-8")
@@ -126,7 +127,17 @@ def invoke(
                 str(root / "2fc72f1d81f543224d8e7d8ef19195b026ba855f.json"),
             ]
         )
+    if allow_missing:
+        command.append("--allow-missing-targets")
     return subprocess.run(command, capture_output=True, text=True)
+
+
+def clear(root: Path, *children: str) -> None:
+    for child in children:
+        directory = root / child
+        if directory.is_dir():
+            for item in directory.iterdir():
+                item.unlink()
 
 
 def write_cli_assets(root: Path, targets: dict[str, object], profile: str = "stable") -> None:
@@ -347,6 +358,42 @@ def main() -> int:
                 item.unlink()
         write_cli_assets(root, LEGACY_TARGETS, profile="beta")
         assert invoke(root, targets=LEGACY_TARGETS, profile="beta").returncode == 0
+        (root / "binaries" / "tracedecay-beta-v1.2.3-linux.tar.gz").unlink()
+        assert invoke(root, targets=LEGACY_TARGETS, profile="beta").returncode != 0
+
+        # Partial publish: a whole missing target is accepted, a half target
+        # (archive without MCPB) is not, a foreign file is not, and an empty
+        # set is not.
+        assert (
+            invoke(root, targets=LEGACY_TARGETS, profile="beta", allow_missing=True).returncode
+            != 0
+        )
+        (root / "mcpbs" / "tracedecay-beta-v1.2.3-linux.mcpb").unlink()
+        completed = invoke(root, targets=LEGACY_TARGETS, profile="beta", allow_missing=True)
+        assert completed.returncode == 0, completed.stderr
+        (root / "binaries" / "stray.tar.gz").write_bytes(b"artifact")
+        assert (
+            invoke(root, targets=LEGACY_TARGETS, profile="beta", allow_missing=True).returncode
+            != 0
+        )
+        (root / "binaries" / "stray.tar.gz").unlink()
+        (root / "binaries" / "tracedecay-beta-v1.2.3-windows.zip").unlink()
+        (root / "mcpbs" / "tracedecay-beta-v1.2.3-windows.mcpb").unlink()
+        assert (
+            invoke(root, targets=LEGACY_TARGETS, profile="beta", allow_missing=True).returncode
+            != 0
+        )
+
+        # An MCPB that leaked into the binaries directory (a `tracedecay-beta-*`
+        # artifact glob did this) is foreign there, in both modes.
+        clear(root, "binaries", "mcpbs")
+        write_cli_assets(root, LEGACY_TARGETS, profile="beta")
+        (root / "binaries" / "tracedecay-beta-v1.2.3-linux.mcpb").write_bytes(b"artifact")
+        assert invoke(root, targets=LEGACY_TARGETS, profile="beta").returncode != 0
+        assert (
+            invoke(root, targets=LEGACY_TARGETS, profile="beta", allow_missing=True).returncode
+            != 0
+        )
 
         (root / "worker-platforms.json").write_text(
             json.dumps(NCM_POLICY), encoding="utf-8"
@@ -389,6 +436,38 @@ def main() -> int:
         assert (
             invoke(root, targets=NCM_TARGETS, profile="beta", sidecars=True).returncode
             == 0
+        )
+
+        # Partial publish with NCM: the sidecar belongs to its target. A lost
+        # arm64 macOS target drops its sidecar too; a present one still needs it.
+        (root / "binaries" / "tracedecay-beta-v1.2.3-linux.tar.gz").unlink()
+        (root / "mcpbs" / "tracedecay-beta-v1.2.3-linux.mcpb").unlink()
+        completed = invoke(
+            root, targets=NCM_TARGETS, profile="beta", sidecars=True, allow_missing=True
+        )
+        assert completed.returncode == 0, completed.stderr
+        clear(root, "sidecars")
+        assert (
+            invoke(
+                root, targets=NCM_TARGETS, profile="beta", sidecars=True, allow_missing=True
+            ).returncode
+            != 0
+        )
+        clear(root, "binaries", "mcpbs")
+        write_cli_assets(root, NCM_TARGETS, profile="beta")
+        (root / "binaries" / "tracedecay-beta-v1.2.3-aarch64-macos.tar.gz").unlink()
+        (root / "mcpbs" / "tracedecay-beta-v1.2.3-aarch64-macos.mcpb").unlink()
+        completed = invoke(
+            root, targets=NCM_TARGETS, profile="beta", sidecars=True, allow_missing=True
+        )
+        assert completed.returncode == 0, completed.stderr
+        # A sidecar for the missing target is foreign and must not ship.
+        write_sidecar(root, profile="beta")
+        assert (
+            invoke(
+                root, targets=NCM_TARGETS, profile="beta", sidecars=True, allow_missing=True
+            ).returncode
+            != 0
         )
 
     print("release artifact validator tests passed")

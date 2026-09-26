@@ -4,7 +4,7 @@
  * Four of these sit abreast, and the whole design is that they are
  * independent. Each carries its own header state, its own headline count,
  * its own rows and its own footer, so a ready lane beside an unavailable one
- * reads as two facts about two authorities — never as one search that mostly
+ * reads as two facts about two authorities, never as one search that mostly
  * worked. Nothing in a lane is computed from another lane.
  */
 import { type KeyboardEvent, type ReactNode } from 'react';
@@ -104,13 +104,13 @@ export function Lane({
             {answered ? loaded.toLocaleString() : '—'}
           </span>
         </div>
-        <span className="flex items-center justify-between gap-2 text-3xs text-text-muted">
+        <span className="flex items-center justify-between gap-2 text-sm text-text-muted">
           <span className="flex min-w-0 items-center gap-1.5">
             {/* How well the count is known, on the shared pattern axis: solid
               * when the source reported a real denominator, hatched when rows
               * arrived without one. Distinct from the record grade beside it. */}
             {answered ? (
-              <EvidencePattern quality={laneEvidence(read)} className="shrink-0 text-3xs" />
+              <EvidencePattern quality={laneEvidence(read)} className="shrink-0 text-sm" />
             ) : null}
             <span className="truncate">
               {answered
@@ -135,7 +135,7 @@ export function Lane({
         </span>
         {share !== null ? <Meter fraction={share} className="w-full" tone="bg-accent/80" /> : null}
         {answered && read.unreadableRows > 0 ? (
-          <span className="text-3xs text-state-partial">
+          <span className="text-sm text-state-partial">
             {read.unreadableRows.toLocaleString()} returned rows could not be read
           </span>
         ) : null}
@@ -153,8 +153,8 @@ export function Lane({
         onPeek={onPeek}
       />
 
-      <footer className="flex shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-0.5 border-t border-edge-subtle px-2.5 py-1 text-3xs text-text-muted">
-        <span className="td-value text-3xs text-text-muted">
+      <footer className="flex shrink-0 flex-wrap items-center justify-between gap-x-2 gap-y-0.5 border-t border-edge-subtle px-2.5 py-1 text-sm text-text-muted">
+        <span className="td-value text-xs text-text-muted">
           {answered ? `${rows.length.toLocaleString()} shown` : '—'}
           {answered && read.hasMore === true ? ' · more rows remain past this page' : ''}
           {/* The source's own freshness word and watermark, so a served page
@@ -255,7 +255,7 @@ function LaneBody({
           ? {
               title: 'Served empty',
               body: searching
-                ? `${spec.label} answered and found no rows for “${query}”. This is the source's own answer, not a gap.`
+                ? `${spec.label} answered and found no rows for "${query}". This is the source's own answer, not a gap.`
                 : `The overview answered with no rows: nothing is indexed here yet.`,
             }
           : {
@@ -326,7 +326,7 @@ function LaneBody({
       case 'indeterminate':
         return {
           title: 'Indeterminate',
-          body: read.detail ?? `The transport reported “${read.domainState}”, which carries no lane reading.`,
+          body: read.detail ?? `The transport reported "${read.domainState}", which carries no lane reading.`,
         };
       default: {
         const exhaustive: never = read;
@@ -345,14 +345,14 @@ function LaneBody({
     >
       <StateChip kind={laneStateKind(read)} />
       <p className="text-xs font-medium text-text-primary">{condition.title}</p>
-      <p className="max-w-[18rem] text-2xs leading-relaxed text-text-muted">{condition.body}</p>
+      <p className="max-w-[18rem] text-body leading-relaxed text-text-muted">{condition.body}</p>
     </div>
   );
 }
 
 /**
- * One result row. Pointer hover and keyboard focus both PEEK — the inspector
- * shows the row without any state changing — and click or Enter SELECTS,
+ * One result row. Pointer hover and keyboard focus both PEEK, the inspector
+ * shows the row without any state changing, and click or Enter SELECTS,
  * which persists as the cyan gutter. Hover therefore never substitutes for
  * focus, and the keyboard reaches every inspection the pointer can.
  */
@@ -415,15 +415,15 @@ function LaneRow({
         <Highlight
           text={hit.context}
           terms={terms}
-          className="min-w-0 truncate font-mono text-2xs text-text-muted"
+          className="min-w-0 truncate font-mono text-sm text-text-muted"
         />
       ) : hit.body ? (
-        <Highlight text={hit.body} terms={terms} className="min-w-0 truncate text-2xs text-text-muted" />
+        <Highlight text={hit.body} terms={terms} className="min-w-0 truncate text-body text-text-muted" />
       ) : (
-        <span className="text-2xs text-text-muted">{hit.titleField}</span>
+        <span className="text-body text-text-muted">{hit.titleField}</span>
       )}
-      <span className="flex min-w-0 items-center gap-2 text-3xs text-text-muted">
-        <span className="td-value text-3xs text-text-muted" data-cell="numeric">
+      <span className="flex min-w-0 items-center gap-2 text-sm text-text-muted">
+        <span className="td-value text-xs text-text-muted" data-cell="numeric">
           #{hit.rank}
         </span>
         {hit.signal ? (
@@ -514,8 +514,8 @@ export function LaneGrid({ children }: { children: ReactNode }) {
       className={cn(
         'td-stagger grid gap-2 p-2 [grid-template-columns:repeat(auto-fit,minmax(15rem,1fr))]',
         // One row at `lg` and above: the grid takes the aperture's height and
-        // each lane scrolls its own rows. Where the lanes wrap — narrow
-        // viewports, 200% zoom — every row is a fixed lane height instead of
+        // each lane scrolls its own rows. Where the lanes wrap, narrow
+        // viewports, 200% zoom, every row is a fixed lane height instead of
         // a share of a height too small to hold them, so wrapped lanes stack
         // and the page scrolls rather than the rows overlapping.
         'lg:min-h-0 lg:flex-1 lg:auto-rows-fr',

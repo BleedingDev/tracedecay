@@ -34,14 +34,19 @@ const CLI_FALLBACK_HEADROOM: Duration = Duration::from_millis(250);
 /// Default probe budget for synchronous discovery without an explicit deadline.
 ///
 /// Authority and CLI fallback share one deadline. The total is the modelled
-/// first-phase cost plus reserved CLI headroom — not the first-phase cost
-/// alone — so a slow unreadable authority cannot starve the supported fallback.
+/// first-phase cost plus reserved CLI headroom, not the first-phase cost
+/// alone, so a slow unreadable authority cannot starve the supported fallback.
 const DEFAULT_DISCOVERY_TIMEOUT: Duration =
     MODELLED_SLOW_AUTHORITY_WALK.saturating_add(CLI_FALLBACK_HEADROOM);
 /// Upper bound between `try_wait` polls. Keep slices short enough that cancel
 /// and deadline still interrupt quickly, but avoid waking every 10 ms for the
 /// full discovery budget on a blocking pool worker.
 const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Wire reason a route stays unresolved because repository discovery did not
+/// finish inside its budget. Shared with daemon status and Doctor so a blocked
+/// walk is one typed refusal, not a closed connection.
+pub const REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE: &str = "repository_discovery_deferred";
+
 const REPOSITORY_IDENTITY_ARGS: [&str; 4] = [
     "rev-parse",
     "--show-toplevel",
@@ -224,8 +229,8 @@ fn join_identity_resolution(
     tokio::task::spawn_blocking(move || {
         let result = resolve_identity_from_authority(&retire.0);
         // Retired before publishing, so a caller arriving after the answer
-        // starts a fresh resolution — which the retained topology answers
-        // without a walk — instead of joining a resolution that is history.
+        // starts a fresh resolution, which the retained topology answers
+        // without a walk, instead of joining a resolution that is history.
         drop(retire);
         let _ = publish.send(Some(result));
     });
@@ -263,7 +268,7 @@ fn resolve_identity_from_authority(path: &Path) -> IdentityResolutionResult {
 ///
 /// Live defect this exists for: this function promises discovery "without
 /// blocking the async executor", but the in-process authority probe ran inline
-/// on the calling worker with no bound at all — only the `git` subprocess
+/// on the calling worker with no bound at all, only the `git` subprocess
 /// fallback below ever observed the deadline. On a slow volume every tokio
 /// worker serving daemon connections sat inside `gix` discovery at once, so
 /// the accept loop was never polled and the listening socket refused new
@@ -294,10 +299,30 @@ async fn authority_identity_off_executor(
         () = cancellation.cancelled() => {
             AuthorityProbe::Interrupted(GitDiscoveryUnknown::Cancelled)
         }
+        // A test block parks the walk on a channel. That is the deadline for
+        // this caller: the project is discovery-blocked, and waiting out the
+        // wall-clock budget would hold admission open for the whole hang.
+        () = discovery_block_budget(directory) => {
+            AuthorityProbe::Interrupted(GitDiscoveryUnknown::DeadlineExceeded)
+        }
         () = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.instant())) => {
             AuthorityProbe::Interrupted(GitDiscoveryUnknown::DeadlineExceeded)
         }
     }
+}
+
+/// Completes when a test has parked discovery for `directory`.
+///
+/// Production builds and unblocked paths pend forever so the caller's own
+/// deadline remains the only timer.
+async fn discovery_block_budget(directory: &Path) {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if crate::git_repository::wait_until_repository_discovery_blocks(directory).await {
+        return;
+    }
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let _ = directory;
+    std::future::pending::<()>().await;
 }
 
 /// Await the answer a joined resolution publishes, or `None` when the
@@ -452,6 +477,11 @@ fn repository_identity_from_authority(directory: &Path) -> Option<GitRepositoryI
         Err(crate::git_repository::GitRepositoryError::NotARepository { .. }) => {
             Some(GitRepositoryIdentityOutcome::NotRepository)
         }
+        // The walk is already owned by another thread. Falling through to the
+        // git CLI would start a second blocking probe of the same volume.
+        Err(crate::git_repository::GitRepositoryError::DiscoveryBlocked { .. }) => Some(
+            GitRepositoryIdentityOutcome::Unknown(GitDiscoveryUnknown::DeadlineExceeded),
+        ),
         Err(_) => None,
     }
 }
@@ -597,7 +627,7 @@ mod tests {
             .args(args)
             .current_dir(cwd)
             .status()
-            .expect("git not on PATH — required for identity tests");
+            .expect("git not on PATH, required for identity tests");
         assert!(status.success(), "git {args:?} failed in {}", cwd.display());
     }
 
@@ -782,7 +812,7 @@ mod tests {
     ///
     /// Live wedge this covers: the topology memo only short-circuited topology
     /// questions. Every route resolution still read HEAD through a complete
-    /// `gix::discover`, so a deferred root on a slow volume was rediscovered
+    /// repository discovery, so a deferred root on a slow volume was rediscovered
     /// from scratch on every retry and the deferral never converged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_head_read_after_a_published_topology_does_not_walk_again() {

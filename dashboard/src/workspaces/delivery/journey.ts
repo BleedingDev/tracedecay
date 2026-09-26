@@ -1,6 +1,10 @@
 import type {
+  DeliveryAgentUsageRowV1,
+  DeliveryAgentUsageV1,
   DeliveryCiCheckV1,
   DeliveryCommitV1,
+  DeliveryGitHubQuarantinedCommentV1,
+  DeliveryGitHubQuarantineReasonV1,
   DeliveryInboxPullRequestV1,
   DeliveryMembershipEdgeV1,
   DeliveryOverviewV1,
@@ -20,12 +24,11 @@ import {
 import { checkStatusKind, compareHref, latestObservation } from './review.ts';
 
 /**
- * The PR journey: one deterministic horizontal projection over the sources
- * Delivery can really join today. Time is X; the lane is Y. Every episode
- * carries its source class, its evidence grade and — when the record has no
- * timestamp of its own — an honest place in the undated gutter rather than an
- * invented position on the axis. Observation time (when the daemon read the
- * provider) is labelled as such and never presented as event time.
+ * The PR journey model: the episodes Delivery can really join today, one lane
+ * per source authority. Every episode carries its source class, its evidence
+ * grade and, when the record has no timestamp of its own, `undated` rather
+ * than an invented time. Observation time (when the daemon read the provider)
+ * is labelled as such and never presented as event time.
  */
 export const JOURNEY_LANES = [
   'objective',
@@ -55,6 +58,7 @@ export type EpisodeRef =
   | { readonly kind: 'work_objective'; readonly workItemId: string }
   | { readonly kind: 'session'; readonly sessionId: string; readonly commitId: string }
   | { readonly kind: 'agent'; readonly agentId: string }
+  | { readonly kind: 'agent_usage'; readonly branch: string; readonly usage: DeliveryAgentUsageRowV1 }
   | { readonly kind: 'handoff'; readonly handoffId: string }
   | { readonly kind: 'commit'; readonly commit: DeliveryCommitV1 }
   | { readonly kind: 'pull_request'; readonly pullRequest: DeliveryPullRequestV1 }
@@ -103,7 +107,7 @@ export interface JourneyModel {
   readonly gaps: readonly string[];
 }
 
-/** The eight projections share one state ladder; only `value` differs. */
+/** The projections share one state ladder; only `value` differs. */
 type AnyProjection = DeliveryOverviewV1[keyof DeliveryOverviewV1];
 
 export function projectionLaneState(projection: AnyProjection, source: string): LaneState {
@@ -262,6 +266,25 @@ function shortSha(sha: string): string {
   return sha.slice(0, 12);
 }
 
+function quarantineReasonLabel(reason: DeliveryGitHubQuarantineReasonV1): string {
+  switch (reason) {
+    case 'privacy_sanitizer':
+      return 'privacy sanitizer';
+    case 'body_out_of_bounds':
+      return 'body out of bounds';
+    default: {
+      const unhandled: never = reason;
+      return unhandled;
+    }
+  }
+}
+
+function quarantinedDetail(quarantined: readonly DeliveryGitHubQuarantinedCommentV1[]): string[] {
+  if (quarantined.length === 0) return [];
+  const reasons = [...new Set(quarantined.map((item) => quarantineReasonLabel(item.reason)))];
+  return [`${quarantined.length} quarantined (${reasons.join(', ')})`];
+}
+
 export interface JourneySelection {
   readonly row: DeliveryInboxPullRequestV1;
   readonly edges: readonly DeliveryMembershipEdgeV1[];
@@ -316,6 +339,27 @@ export function buildJourney(
     }
     return null;
   });
+
+  const usageValue = projectionValue(overview.agent_usage);
+  const usageOnBranch = usageValue !== null && shortBranch(headBranch) === usageValue.branch;
+  const agentUsage: JourneyEpisode[] =
+    usageValue === null || !usageOnBranch
+      ? []
+      : usageValue.agents.map((usage) => ({
+          id: `agents:usage:${usage.provider}:${usage.agent ?? ''}`,
+          lane: 'agents',
+          label: usage.agent ?? `Unattributed ${usage.provider} sessions`,
+          detail: agentUsageDetail(usage),
+          source: 'agent',
+          // Sessions are placed on the branch by recorded Git spans, not by a
+          // join to this pull request's own identity.
+          grade: 'inferred',
+          at: null,
+          timeKind: 'undated',
+          status: null,
+          href: null,
+          ref: { kind: 'agent_usage', branch: usageValue.branch, usage },
+        }));
 
   const commitsValue = projectionValue(overview.commits);
   const commits: JourneyEpisode[] = (commitsValue?.items ?? []).map((commit) => ({
@@ -375,7 +419,12 @@ export function buildJourney(
           id: `pull_request:${item.id}:${operation.operation}`,
           lane: 'pull_request',
           label: `${operation.operation.replaceAll('_', ' ')} read`,
-          detail: `${snapshot.outcome} · ${snapshot.coverage} · head ${shortSha(snapshot.provider_head_commit_id)}`,
+          detail: [
+            snapshot.outcome,
+            snapshot.coverage,
+            ...quarantinedDetail(snapshot.quarantined),
+            `head ${shortSha(snapshot.provider_head_commit_id)}`,
+          ].join(' · '),
           source: 'provider_observation',
           grade: snapshot.outcome === 'stale' ? 'stale' : snapshot.outcome === 'complete' ? 'exact' : 'unavailable',
           at: snapshot.fetched_at_micros,
@@ -483,11 +532,13 @@ export function buildJourney(
       sessions,
       'No session–Git relation is joined to this pull request; transcript provenance is not inferred.',
     ),
-    membershipLane(
-      'agents',
-      agents,
-      'No agent attribution or handoff token is joined to this pull request.',
-    ),
+    {
+      id: 'agents',
+      label: laneLabel('agents'),
+      source: laneSource('agents'),
+      state: agentLaneState(overview.agent_usage, usageValue, headBranch, agents.length > 0),
+      episodes: [...agents, ...agentUsage],
+    },
     projectionLane('commits', overview.commits, commits),
     projectionLane('pull_request', overview.pull_requests, pullRequest),
     projectionLane('reviews', overview.review_comments, reviews),
@@ -511,6 +562,58 @@ export function buildJourney(
   };
 }
 
+function shortBranch(ref: string): string {
+  return ref.replace(/^refs\/heads\//, '');
+}
+
+/** Tokens as the provider reported them: the total when every session sent
+ * one, else input plus output, and a lower bound whenever a session is
+ * missing usage. Nothing is estimated from transcript text. */
+export function agentTokenLabel(usage: DeliveryAgentUsageRowV1): string {
+  if (usage.sessions_with_usage === 0) return 'tokens not reported';
+  const { total_tokens, input_tokens, output_tokens } = usage.counters;
+  const tokens =
+    total_tokens ?? (input_tokens !== null && output_tokens !== null ? input_tokens + output_tokens : null);
+  if (tokens === null) return 'token counters incomplete';
+  const figure = `${tokens.toLocaleString('en-US')} tokens`;
+  if (usage.usage_complete) return figure;
+  return `≥${figure} (usage for ${usage.sessions_with_usage} of ${usage.sessions} sessions)`;
+}
+
+function agentUsageDetail(usage: DeliveryAgentUsageRowV1): string {
+  const sessions = `${usage.sessions} ${usage.sessions === 1 ? 'session' : 'sessions'}`;
+  return `${usage.provider} · ${sessions} · ${agentTokenLabel(usage)} · ${usage.tool_calls.toLocaleString('en-US')} tool calls`;
+}
+
+function agentLaneState(
+  projection: DeliveryOverviewV1['agent_usage'],
+  usage: DeliveryAgentUsageV1 | null,
+  headBranch: string,
+  hasMembership: boolean,
+): LaneState {
+  if (usage !== null && usage.branch !== shortBranch(headBranch)) {
+    return {
+      kind: 'unavailable',
+      detail: `Agent usage was read for the checkout's branch ${usage.branch}, not this pull request's head ${shortBranch(headBranch)}.`,
+      requiredAuthority: 'session-Git correlation index',
+    };
+  }
+  if (usage !== null && projection.state === 'partial') {
+    const reasons = [
+      usage.truncated ? 'the correlation read reached its session ceiling' : null,
+      usage.usage_coverage === 'complete'
+        ? null
+        : `provider usage coverage is ${usage.usage_coverage}, so token counts are lower bounds`,
+    ].filter((reason): reason is string => reason !== null);
+    return { kind: 'partial', detail: `Agent usage: ${reasons.join('; ')}` };
+  }
+  const projected = projectionLaneState(projection, 'Agent usage');
+  if (hasMembership && !laneServes(projected)) {
+    return { kind: 'served', detail: `Agent usage: ${projected.detail}` };
+  }
+  return projected;
+}
+
 function membershipLabel(ref: EpisodeRef): string {
   switch (ref.kind) {
     case 'work_objective':
@@ -521,6 +624,7 @@ function membershipLabel(ref: EpisodeRef): string {
       return `Agent ${ref.agentId}`;
     case 'handoff':
       return `Handoff ${ref.handoffId}`;
+    case 'agent_usage':
     case 'commit':
     case 'pull_request':
     case 'provider_observation':
@@ -533,204 +637,4 @@ function membershipLabel(ref: EpisodeRef): string {
       return unhandled;
     }
   }
-}
-
-/* ------------------------------------------------------------------------ */
-/* Deterministic layout                                                       */
-/* ------------------------------------------------------------------------ */
-
-export interface JourneyPoint {
-  readonly episode: JourneyEpisode;
-  readonly x: number;
-  readonly y: number;
-}
-
-export interface JourneyTick {
-  readonly x: number;
-  readonly at: number;
-  readonly label: string;
-}
-
-export interface JourneyBreak {
-  readonly x: number;
-  readonly fromMicros: number;
-  readonly toMicros: number;
-}
-
-export interface JourneyLayout {
-  readonly width: number;
-  readonly height: number;
-  readonly gutterWidth: number;
-  readonly laneHeight: number;
-  readonly rows: readonly { readonly lane: JourneyLane; readonly y: number }[];
-  readonly points: readonly JourneyPoint[];
-  readonly ticks: readonly JourneyTick[];
-  readonly breaks: readonly JourneyBreak[];
-}
-
-export const JOURNEY_GUTTER_WIDTH = 72;
-export const JOURNEY_LANE_HEIGHT = 40;
-const AXIS_PAD = 18;
-const BREAK_WIDTH = 28;
-/** Gaps longer than this share of the dated span are compressed to a break. */
-const BREAK_SHARE = 0.35;
-const MAX_TICKS = 8;
-/** Ruler labels closer than this overprint; the later tick yields. */
-const MIN_TICK_GAP = 44;
-/** Same-lane points within this many pixels are stacked, not overprinted. */
-const COINCIDENT_GAP = 8;
-const STACK_STEP = 9;
-
-/**
- * Episodes recorded at (nearly) the same instant on one lane would hide each
- * other. They fan out vertically around the lane line in a fixed order, so the
- * count of visible marks stays honest and the layout stays deterministic.
- */
-function stackCoincident(points: readonly JourneyPoint[]): JourneyPoint[] {
-  const byLane = new Map<JourneyLaneId, JourneyPoint[]>();
-  for (const point of points) {
-    const list = byLane.get(point.episode.lane) ?? [];
-    list.push(point);
-    byLane.set(point.episode.lane, list);
-  }
-  const stacked = new Map<string, number>();
-  for (const list of byLane.values()) {
-    const ordered = [...list].sort(
-      (left, right) => left.x - right.x || left.episode.id.localeCompare(right.episode.id),
-    );
-    let run: JourneyPoint[] = [];
-    const flush = () => {
-      run.forEach((point, index) => {
-        const magnitude = Math.ceil(index / 2) * STACK_STEP;
-        stacked.set(point.episode.id, index % 2 === 0 ? magnitude : -magnitude);
-      });
-      run = [];
-    };
-    for (const point of ordered) {
-      const previous = run[run.length - 1];
-      if (previous !== undefined && point.x - previous.x >= COINCIDENT_GAP) flush();
-      run.push(point);
-    }
-    flush();
-  }
-  return points.map((point) => ({ ...point, y: point.y + (stacked.get(point.episode.id) ?? 0) }));
-}
-
-/**
- * Maps recorded time onto X. Empty time longer than `BREAK_SHARE` of the span
- * is compressed to a fixed break so a review that landed a week after the
- * last commit does not push every earlier episode into one pixel. Identical
- * inputs produce identical coordinates; nothing here depends on the renderer.
- */
-function timeScale(
-  times: readonly number[],
-  x0: number,
-  x1: number,
-): { map: (at: number) => number; breaks: JourneyBreak[]; anchors: number[] } {
-  const unique = [...new Set(times)].sort((left, right) => left - right);
-  if (unique.length === 0) return { map: () => (x0 + x1) / 2, breaks: [], anchors: [] };
-  if (unique.length === 1) {
-    return { map: () => (x0 + x1) / 2, breaks: [], anchors: unique };
-  }
-  const total = unique[unique.length - 1]! - unique[0]!;
-  const cap = total * BREAK_SHARE;
-  const segments: { from: number; to: number; compressed: boolean; length: number }[] = [];
-  for (let index = 1; index < unique.length; index += 1) {
-    const from = unique[index - 1]!;
-    const to = unique[index]!;
-    const gap = to - from;
-    const compressed = unique.length > 2 && gap > cap;
-    segments.push({ from, to, compressed, length: compressed ? 0 : gap });
-  }
-  const timeLength = segments.reduce((sum, segment) => sum + segment.length, 0);
-  const breakCount = segments.filter((segment) => segment.compressed).length;
-  const pixels = x1 - x0 - breakCount * BREAK_WIDTH;
-  const perMicro = timeLength === 0 ? 0 : pixels / timeLength;
-  const starts = new Map<number, number>();
-  const breaks: JourneyBreak[] = [];
-  let cursor = x0;
-  starts.set(unique[0]!, cursor);
-  for (const segment of segments) {
-    if (segment.compressed) {
-      breaks.push({ x: cursor + BREAK_WIDTH / 2, fromMicros: segment.from, toMicros: segment.to });
-      cursor += BREAK_WIDTH;
-    } else {
-      cursor += segment.length * perMicro;
-    }
-    starts.set(segment.to, cursor);
-  }
-  const map = (at: number): number => {
-    let previous = unique[0]!;
-    for (const anchor of unique) {
-      if (anchor >= at) {
-        if (anchor === at) return starts.get(anchor)!;
-        const segment = segments.find((candidate) => candidate.from === previous && candidate.to === anchor)!;
-        const fromX = starts.get(previous)!;
-        if (segment.compressed) return fromX + BREAK_WIDTH / 2;
-        return fromX + (at - previous) * perMicro;
-      }
-      previous = anchor;
-    }
-    return starts.get(unique[unique.length - 1]!)!;
-  };
-  return { map, breaks, anchors: unique };
-}
-
-function tickLabel(at: number, spanMicros: number): string {
-  const iso = new Date(Math.floor(at / 1000)).toISOString();
-  return spanMicros > 86_400_000_000 ? iso.slice(5, 16).replace('T', ' ') : iso.slice(11, 16);
-}
-
-export function layoutJourney(
-  model: JourneyModel,
-  viewport: { readonly width: number },
-): JourneyLayout {
-  const width = Math.max(320, Math.floor(viewport.width));
-  const gutterWidth = model.undated > 0 ? JOURNEY_GUTTER_WIDTH : 0;
-  const x0 = gutterWidth + AXIS_PAD;
-  const x1 = width - AXIS_PAD;
-  const dated = model.episodes.filter((episode) => episode.at !== null).map((episode) => episode.at as number);
-  const scale = timeScale(dated, x0, x1);
-  const rows = model.lanes.map((lane, index) => ({
-    lane,
-    y: index * JOURNEY_LANE_HEIGHT + JOURNEY_LANE_HEIGHT / 2,
-  }));
-  const rowY = new Map(rows.map((row) => [row.lane.id, row.y]));
-  const undatedPerLane = new Map<JourneyLaneId, number>();
-  const points: JourneyPoint[] = stackCoincident(
-    model.episodes.map((episode) => {
-      const y = rowY.get(episode.lane) ?? 0;
-      if (episode.at === null) {
-        const slot = undatedPerLane.get(episode.lane) ?? 0;
-        undatedPerLane.set(episode.lane, slot + 1);
-        const step = gutterWidth / 4;
-        return { episode, x: Math.min(gutterWidth - 10, 12 + slot * step), y };
-      }
-      return { episode, x: scale.map(episode.at), y };
-    }),
-  );
-  const spanMicros = model.span === null ? 0 : model.span.end - model.span.start;
-  const anchors = scale.anchors;
-  const stride = Math.max(1, Math.ceil(anchors.length / MAX_TICKS));
-  const ticks: JourneyTick[] = [];
-  anchors.forEach((at, index) => {
-    if (index % stride !== 0 && index !== anchors.length - 1) return;
-    const x = scale.map(at);
-    const previous = ticks[ticks.length - 1];
-    if (previous !== undefined && x - previous.x < MIN_TICK_GAP) {
-      if (index === anchors.length - 1) ticks.pop();
-      else return;
-    }
-    ticks.push({ x, at, label: tickLabel(at, spanMicros) });
-  });
-  return {
-    width,
-    height: rows.length * JOURNEY_LANE_HEIGHT,
-    gutterWidth,
-    laneHeight: JOURNEY_LANE_HEIGHT,
-    rows,
-    points,
-    ticks,
-    breaks: scale.breaks,
-  };
 }

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use super::{StoreAdministration, StoreOwnerKey};
 use tracedecay_store_runtime::{ShutdownTaskOutcome, ShutdownTaskReceipt, ShutdownTaskStatus};
 
@@ -24,7 +22,6 @@ pub(super) struct ProjectServerRetirement {
     pub(super) owner: StoreOwnerKey,
     completion: tokio::sync::watch::Receiver<ProjectServerRetirementStatus>,
     _task: tokio::task::JoinHandle<()>,
-    _fence: Option<std::sync::Arc<ProjectRetirementFenceV1>>,
     capacity_reuse: bool,
 }
 
@@ -130,33 +127,9 @@ impl ProjectServerRetirementAdmission<'_> {
             owner,
             completion: completion.clone(),
             _task: task,
-            _fence: None,
             capacity_reuse: true,
         });
         ProjectServerCapacityRetirementCompletion { completion }
-    }
-}
-
-pub(in crate::daemon) struct ProjectRetirementFenceV1 {
-    // Field order is lifecycle order: reopen roots before releasing the store
-    // writer gate so a deletion owner can never have its permanent fence
-    // removed by this temporary recovery guard.
-    _invocation: tracedecay_daemon_service::ProjectRuntimeRootQuiescenceV1,
-    _project_open: crate::daemon::project_open_admission::ProjectOpenIdentityQuiescenceV1,
-    _writer: tracedecay_store_runtime::WriterAdmissionGuard,
-}
-
-impl ProjectRetirementFenceV1 {
-    pub(super) fn new(
-        invocation: tracedecay_daemon_service::ProjectRuntimeRootQuiescenceV1,
-        project_open: crate::daemon::project_open_admission::ProjectOpenIdentityQuiescenceV1,
-        writer: tracedecay_store_runtime::WriterAdmissionGuard,
-    ) -> Self {
-        Self {
-            _invocation: invocation,
-            _project_open: project_open,
-            _writer: writer,
-        }
     }
 }
 
@@ -258,7 +231,6 @@ fn track_project_server_retirement_after_admission(
         owner,
         completion,
         _task: task,
-        _fence: None,
         capacity_reuse: false,
     });
 }
@@ -278,25 +250,6 @@ async fn track_project_server_retirement(
     );
 }
 
-pub(super) async fn attach_project_retirement_fence(
-    retirements: &tokio::sync::Mutex<Vec<ProjectServerRetirement>>,
-    profile_root: &std::path::Path,
-    project_id: &str,
-    fence: std::sync::Arc<ProjectRetirementFenceV1>,
-) {
-    let mut retirements = retirements.lock().await;
-    for retirement in retirements.iter_mut().filter(|retirement| {
-        retirement.owner.profile_root == profile_root
-            && retirement.owner.project_id.as_deref() == Some(project_id)
-            && !matches!(
-                &*retirement.completion.borrow(),
-                ProjectServerRetirementStatus::Clean
-            )
-    }) {
-        retirement._fence.get_or_insert_with(|| Arc::clone(&fence));
-    }
-}
-
 pub(super) async fn track_retirement_task(
     retirements: &tokio::sync::Mutex<Vec<ProjectServerRetirement>>,
     owner: StoreOwnerKey,
@@ -311,6 +264,30 @@ pub(super) async fn track_aborted_retirement_task(
     task: tokio::task::JoinHandle<()>,
 ) {
     track_project_server_retirement(retirements, owner, task, true).await;
+}
+
+async fn shutdown_receipt(
+    completions: Vec<(
+        String,
+        tokio::sync::watch::Receiver<ProjectServerRetirementStatus>,
+    )>,
+    deadline: tokio::time::Instant,
+) -> ShutdownTaskReceipt {
+    let mut receipt = ShutdownTaskReceipt::default();
+    for (owner, completion) in completions {
+        let status =
+            match tokio::time::timeout_at(deadline, wait_for_project_server_retirement(completion))
+                .await
+            {
+                Ok(ProjectServerRetirementStatus::Clean) => ShutdownTaskStatus::Clean,
+                Ok(ProjectServerRetirementStatus::Failed(error)) => {
+                    ShutdownTaskStatus::Failed(error)
+                }
+                Ok(ProjectServerRetirementStatus::Pending) | Err(_) => ShutdownTaskStatus::TimedOut,
+            };
+        receipt.outcomes.push(ShutdownTaskOutcome { owner, status });
+    }
+    receipt
 }
 
 pub(super) async fn settle_project_retirements(
@@ -334,21 +311,7 @@ pub(super) async fn settle_project_retirements(
             )
         })
         .collect::<Vec<_>>();
-    let mut receipt = ShutdownTaskReceipt::default();
-    for (owner, completion) in completions {
-        let status =
-            match tokio::time::timeout_at(deadline, wait_for_project_server_retirement(completion))
-                .await
-            {
-                Ok(ProjectServerRetirementStatus::Clean) => ShutdownTaskStatus::Clean,
-                Ok(ProjectServerRetirementStatus::Failed(error)) => {
-                    ShutdownTaskStatus::Failed(error)
-                }
-                Ok(ProjectServerRetirementStatus::Pending) => ShutdownTaskStatus::TimedOut,
-                Err(_) => ShutdownTaskStatus::TimedOut,
-            };
-        receipt.outcomes.push(ShutdownTaskOutcome { owner, status });
-    }
+    let receipt = shutdown_receipt(completions, deadline).await;
     retirements.lock().await.retain(|retirement| {
         !matches!(
             &*retirement.completion.borrow(),
@@ -449,23 +412,7 @@ impl StoreAdministration {
                     return ShutdownTaskReceipt::timed_out("project_server_retirement_registry");
                 }
             };
-        let mut receipt = ShutdownTaskReceipt::default();
-        for (owner, completion) in completions {
-            let status = match tokio::time::timeout_at(
-                deadline,
-                wait_for_project_server_retirement(completion),
-            )
-            .await
-            {
-                Ok(ProjectServerRetirementStatus::Clean) => ShutdownTaskStatus::Clean,
-                Ok(ProjectServerRetirementStatus::Failed(error)) => {
-                    ShutdownTaskStatus::Failed(error)
-                }
-                Ok(ProjectServerRetirementStatus::Pending) => ShutdownTaskStatus::TimedOut,
-                Err(_) => ShutdownTaskStatus::TimedOut,
-            };
-            receipt.outcomes.push(ShutdownTaskOutcome { owner, status });
-        }
+        let receipt = shutdown_receipt(completions, deadline).await;
         if let Ok(mut retirements) =
             tokio::time::timeout_at(deadline, self.project_server_retirements.lock()).await
         {
@@ -487,7 +434,6 @@ mod tests {
 
     use super::*;
     use crate::daemon::project_server_lifecycle;
-    use tracedecay_store_runtime::{StoreWriterClass, WriterScope};
 
     fn owner(project_id: &str) -> StoreOwnerKey {
         isolated_owner(std::path::Path::new("/profile"), project_id)
@@ -511,24 +457,25 @@ mod tests {
         project_root: &std::path::Path,
         project_id: &str,
     ) -> (
-        crate::project::TraceDecay,
-        crate::test_support::host_admission::HostAdmissionTestRuntimeV1,
+        tracedecay_project::project::TraceDecay,
+        tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1,
     ) {
         std::fs::create_dir_all(profile_root).expect("isolated profile root");
         std::fs::create_dir_all(project_root).expect("isolated project root");
         let project_id = tracedecay_domain::ProjectId::new(project_id.to_owned())
             .expect("typed project identity");
-        let runtime = crate::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
-            profile_root,
-            project_root,
-            project_id,
-        )
-        .await
-        .expect("isolated host-admission runtime");
+        let runtime =
+            tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+                profile_root,
+                project_root,
+                project_id,
+            )
+            .await
+            .expect("isolated host-admission runtime");
         let graph = runtime
             .initialize_project_graph_for_test(
                 project_root,
-                crate::project::TraceDecayOpenOptions {
+                tracedecay_project::project::TraceDecayOpenOptions {
                     profile_root: Some(profile_root.to_path_buf()),
                     global_db_path: None,
                 },
@@ -539,13 +486,13 @@ mod tests {
     }
 
     async fn isolated_sibling_graph(
-        runtime: &crate::test_support::host_admission::HostAdmissionTestRuntimeV1,
+        runtime: &tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1,
         profile_root: &std::path::Path,
         project_root: &std::path::Path,
         project_id: &str,
     ) -> (
-        crate::project::TraceDecay,
-        crate::test_support::host_admission::HostAdmissionTestRuntimeV1,
+        tracedecay_project::project::TraceDecay,
+        tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1,
     ) {
         std::fs::create_dir_all(project_root).expect("isolated sibling project root");
         let project_id = tracedecay_domain::ProjectId::new(project_id.to_owned())
@@ -557,7 +504,7 @@ mod tests {
         let graph = sibling
             .initialize_project_graph_for_test(
                 project_root,
-                crate::project::TraceDecayOpenOptions {
+                tracedecay_project::project::TraceDecayOpenOptions {
                     profile_root: Some(profile_root.to_path_buf()),
                     global_db_path: None,
                 },
@@ -653,35 +600,6 @@ mod tests {
         });
         track_retirement_task(retirements, owner("project-a"), second_task).await;
 
-        let roots = [std::path::PathBuf::from("/repository")]
-            .into_iter()
-            .collect();
-        let invocation_registry = tracedecay_daemon_service::ProjectRuntimeRegistryV1::default();
-        let invocation = invocation_registry
-            .quiesce_roots(&roots)
-            .await
-            .expect("quiesce invocation roots");
-        let open_tasks = crate::daemon::project_open_admission::ProjectOpenTasks::default();
-        let project_open = open_tasks
-            .quiesce_project_identity(std::path::Path::new("/profile"), "project-a", &roots)
-            .await
-            .expect("quiesce project-open identity");
-        let scope = WriterScope::store("/profile/projects/project-a", StoreWriterClass::Owner);
-        let writer = administration.gate.acquire(&scope).await;
-        let fence = Arc::new(ProjectRetirementFenceV1::new(
-            invocation,
-            project_open,
-            writer,
-        ));
-        attach_project_retirement_fence(
-            retirements,
-            std::path::Path::new("/profile"),
-            "project-a",
-            Arc::clone(&fence),
-        )
-        .await;
-        drop(fence);
-
         let first = settle_project_retirements(
             retirements,
             std::path::Path::new("/profile"),
@@ -691,10 +609,6 @@ mod tests {
         .await;
         assert_eq!(first.status(), ShutdownTaskStatus::TimedOut);
         assert_eq!(retirements.lock().await.len(), 2);
-        assert!(
-            administration.gate.try_acquire(&scope).is_none(),
-            "a timed-out retirement must keep replacement publication fenced"
-        );
 
         first_release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -712,10 +626,6 @@ mod tests {
         })
         .await
         .expect("first retirement owner should complete before the test deadline");
-        assert!(
-            administration.gate.try_acquire(&scope).is_none(),
-            "one completed owner cannot release the aggregate project fence"
-        );
         let partially_settled = settle_project_retirements(
             retirements,
             std::path::Path::new("/profile"),
@@ -725,10 +635,6 @@ mod tests {
         .await;
         assert_eq!(partially_settled.status(), ShutdownTaskStatus::TimedOut);
         assert_eq!(retirements.lock().await.len(), 1);
-        assert!(
-            administration.gate.try_acquire(&scope).is_none(),
-            "the remaining owner retains its copy of the aggregate project fence"
-        );
         second_release.notify_one();
         let second = settle_project_retirements(
             retirements,
@@ -739,10 +645,6 @@ mod tests {
         .await;
         assert!(second.is_clean());
         assert!(retirements.lock().await.is_empty());
-        assert!(
-            administration.gate.try_acquire(&scope).is_some(),
-            "retry releases the fence only after observing the retained owner complete"
-        );
     }
 
     #[tokio::test]

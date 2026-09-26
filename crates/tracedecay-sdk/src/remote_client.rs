@@ -22,9 +22,7 @@ use tracedecay_contracts::remote::query::{
     RemoteQueryRequestV1, RemoteQueryResultV1, remote_exact_observation_query_result_contract_v1,
 };
 use tracedecay_contracts::remote::recovery::{
-    BackupOperationStateV1, BackupRequestV1, PromotionCasReceiptV1, PromotionConfirmationV1,
-    StagedRestoreConfirmationV1, StagedRestoreProgressV1, remote_backup_result_contract_v1,
-    remote_promotion_result_contract_v1, remote_restore_result_contract_v1,
+    PromotionCasReceiptV1, PromotionConfirmationV1, remote_promotion_result_contract_v1,
 };
 use tracedecay_contracts::remote::replay::{RemoteReplayOutcomeV1, RemoteReplayRequestV1};
 use tracedecay_contracts::remote::transfer::{
@@ -272,32 +270,6 @@ impl EnrolledRemoteClient {
             remote_exact_observation_query_result_contract_v1(),
             RemoteSuccessKind::Evidence,
             |result: &RemoteQueryResultV1| result.validate().is_ok(),
-        )
-    }
-
-    pub fn backup(
-        &self,
-        request: &RemoteProtocolRequestV1<BackupRequestV1>,
-    ) -> Result<RemoteProtocolResponseV1<BackupOperationStateV1>, RemoteClientError> {
-        self.execute_authenticated(
-            "backup",
-            request,
-            remote_backup_result_contract_v1().map_err(protocol_error)?,
-            RemoteSuccessKind::Effect,
-            |_| true,
-        )
-    }
-
-    pub fn restore(
-        &self,
-        request: &RemoteProtocolRequestV1<StagedRestoreConfirmationV1>,
-    ) -> Result<RemoteProtocolResponseV1<StagedRestoreProgressV1>, RemoteClientError> {
-        self.execute_authenticated(
-            "restore",
-            request,
-            remote_restore_result_contract_v1().map_err(protocol_error)?,
-            RemoteSuccessKind::Effect,
-            |_| true,
         )
     }
 
@@ -564,22 +536,7 @@ fn take_response_field<T: DeserializeOwned>(
 }
 
 fn status_matches_problem(status: reqwest::StatusCode, kind: ApplicationProblemKind) -> bool {
-    let expected = match kind {
-        ApplicationProblemKind::InvalidRequest => reqwest::StatusCode::BAD_REQUEST,
-        ApplicationProblemKind::NotFoundOrNotAuthorized => reqwest::StatusCode::NOT_FOUND,
-        ApplicationProblemKind::Conflict
-        | ApplicationProblemKind::PartialEffect
-        | ApplicationProblemKind::Stale => reqwest::StatusCode::CONFLICT,
-        ApplicationProblemKind::Unsupported => reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-        ApplicationProblemKind::Unavailable | ApplicationProblemKind::ResetRequired => {
-            reqwest::StatusCode::SERVICE_UNAVAILABLE
-        }
-        ApplicationProblemKind::ExecutionFailed => reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-        ApplicationProblemKind::Saturated => reqwest::StatusCode::TOO_MANY_REQUESTS,
-        ApplicationProblemKind::Cancelled => reqwest::StatusCode::REQUEST_TIMEOUT,
-        ApplicationProblemKind::TimedOut => reqwest::StatusCode::GATEWAY_TIMEOUT,
-    };
-    status == expected
+    status.as_u16() == tracedecay_api::application_problem_status(kind).as_u16()
 }
 
 #[cfg(test)]

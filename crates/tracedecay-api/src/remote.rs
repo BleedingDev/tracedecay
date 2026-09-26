@@ -32,14 +32,11 @@ use tracedecay_contracts::remote::protocol::{
 };
 use tracedecay_contracts::remote::protocol_owner::RemoteOperationProtocolPortsV1;
 use tracedecay_contracts::remote::query::RemoteQueryRequestV1;
-use tracedecay_contracts::remote::recovery::{
-    BackupRequestV1, PromotionConfirmationV1, StagedRestoreConfirmationV1,
-};
+use tracedecay_contracts::remote::recovery::PromotionConfirmationV1;
 use tracedecay_contracts::remote::replay::RemoteReplayRequestV1;
 use tracedecay_contracts::remote::transfer::RemoteFrameTransferRequestV1;
 use tracedecay_contracts::{
-    ApplicationContractError, ApplicationProblemKind, CancellationSignal, RequestId,
-    ResultContractRef,
+    ApplicationContractError, CancellationSignal, RequestId, ResultContractRef,
 };
 use tracedecay_domain::UtcMicros;
 use tracedecay_tool_catalog::SchemaId;
@@ -289,8 +286,6 @@ pub fn remote_protocol_router(
         "/replay" => RemoteReplayRequestV1, operations.replay;
         "/frames/transfer" => RemoteFrameTransferRequestV1, operations.frame_transfer;
         "/query" => RemoteQueryRequestV1, operations.query;
-        "/backup" => BackupRequestV1, operations.backup;
-        "/restore" => StagedRestoreConfirmationV1, operations.restore;
         "/failover" => PromotionConfirmationV1, operations.promotion;
     }
     .layer(DefaultBodyLimit::max(MAX_REMOTE_HTTP_BODY_BYTES))
@@ -452,21 +447,7 @@ fn remote_protocol_response<T: Serialize>(response: RemoteHttpResponseV1<T>) -> 
         Err(problem) => {
             let kind = problem.problem.kind();
             crate::observe::record_error_class(kind);
-            match kind {
-                ApplicationProblemKind::InvalidRequest => StatusCode::BAD_REQUEST,
-                ApplicationProblemKind::NotFoundOrNotAuthorized => StatusCode::NOT_FOUND,
-                ApplicationProblemKind::Conflict
-                | ApplicationProblemKind::PartialEffect
-                | ApplicationProblemKind::Stale => StatusCode::CONFLICT,
-                ApplicationProblemKind::Unsupported => StatusCode::UNPROCESSABLE_ENTITY,
-                ApplicationProblemKind::ResetRequired | ApplicationProblemKind::Unavailable => {
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
-                ApplicationProblemKind::ExecutionFailed => StatusCode::INTERNAL_SERVER_ERROR,
-                ApplicationProblemKind::Saturated => StatusCode::TOO_MANY_REQUESTS,
-                ApplicationProblemKind::Cancelled => StatusCode::REQUEST_TIMEOUT,
-                ApplicationProblemKind::TimedOut => StatusCode::GATEWAY_TIMEOUT,
-            }
+            crate::application_problem_status(kind)
         }
     };
     crate::observe::json_response(status, &response)

@@ -1,9 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use serde::Serialize;
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
 use tracedecay_code_index::is_test_file;
+use tracedecay_contracts::retrieval::{
+    TestAttributionMethodV1, TestRiskAttributionSummaryV1, TestRiskBucketSummaryV1,
+    TestRiskConfidenceV1, TestRiskEntryV1, TestRiskResultV1, TestRiskSummaryV1,
+};
 use tracedecay_domain::code_intelligence::NodeKind;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_domain::{ComplexityAnalysisV1, RelationEdgeKindV1, SymbolOccurrenceId};
@@ -14,63 +17,6 @@ use tracedecay_runtime_core::git::churn::file_churn;
 const ATTRIBUTION_DEPTH: usize = 3;
 const MAX_TEST_RISK_SYMBOLS: usize = 500_000;
 const MAX_TEST_RISK_RELATIONS: usize = 2_000_000;
-
-#[derive(Debug, Serialize)]
-pub struct TestRiskReport {
-    pub risks: Vec<TestRiskEntry>,
-    pub summary: TestRiskSummary,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TestRiskEntry {
-    pub id: String,
-    pub name: String,
-    pub file: String,
-    pub line: u32,
-    /// `None` when `complexity_analysis` reports the bounded walk did not
-    /// cover the body; `risk` then weighs the lower-bound counters.
-    pub complexity: Option<u32>,
-    pub complexity_analysis: ComplexityAnalysisV1,
-    pub fan_in: usize,
-    pub has_test: bool,
-    pub attribution_method: &'static str,
-    pub attribution_depth: Option<usize>,
-    pub risk: f64,
-    pub churn: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TestRiskSummary {
-    pub total_functions: usize,
-    pub tested: usize,
-    pub skipped: usize,
-    pub coverage_pct: f64,
-    pub top_risk_untested: String,
-    pub top_risk_unattributed: String,
-    pub attribution: TestRiskAttributionSummary,
-    pub buckets: TestRiskBucketSummary,
-    pub confidence: &'static str,
-    pub confidence_note: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TestRiskAttributionSummary {
-    pub depth: usize,
-    pub direct_unit_attributed: usize,
-    pub closure_attributed: usize,
-    pub trait_resolved_attributed: usize,
-    pub public_api_attributed: usize,
-    pub cli_entry_attributed: usize,
-    pub total_attributed: usize,
-}
-
-#[derive(Debug, Serialize)]
-pub struct TestRiskBucketSummary {
-    pub attributed: usize,
-    pub reachable_unattributed: usize,
-    pub orphan_entry: usize,
-    pub excluded: usize,
-}
 
 struct RiskEntry {
     id: String,
@@ -91,9 +37,9 @@ impl RiskEntry {
         self.attribution_method != TestAttributionMethod::None
     }
 
-    fn into_public(self) -> TestRiskEntry {
+    fn into_public(self) -> TestRiskEntryV1 {
         let has_test = self.has_test();
-        TestRiskEntry {
+        TestRiskEntryV1 {
             id: self.id,
             name: self.name,
             file: self.file,
@@ -103,12 +49,12 @@ impl RiskEntry {
                 .is_complete()
                 .then_some(self.complexity),
             complexity_analysis: self.complexity_analysis,
-            fan_in: self.fan_in,
+            fan_in: self.fan_in as u64,
             has_test,
-            attribution_method: self.attribution_method.as_str(),
-            attribution_depth: self.attribution_depth,
+            attribution_method: self.attribution_method.wire(),
+            attribution_depth: self.attribution_depth.map(|depth| depth as u64),
             risk: (self.risk * 100.0).round() / 100.0,
-            churn: self.churn,
+            churn: self.churn as u64,
         }
     }
 }
@@ -121,11 +67,11 @@ enum TestAttributionMethod {
 }
 
 impl TestAttributionMethod {
-    fn as_str(self) -> &'static str {
+    fn wire(self) -> TestAttributionMethodV1 {
         match self {
-            Self::None => "none",
-            Self::DirectUnit => "direct_unit",
-            Self::Closure => "closure",
+            Self::None => TestAttributionMethodV1::None,
+            Self::DirectUnit => TestAttributionMethodV1::DirectUnit,
+            Self::Closure => TestAttributionMethodV1::Closure,
         }
     }
 
@@ -144,7 +90,7 @@ pub async fn analyze_test_risk(
     path_prefix: Option<&str>,
     include_tested: bool,
     limit: usize,
-) -> Result<TestRiskReport> {
+) -> Result<TestRiskResultV1> {
     let evidence = verified_test_evidence(graph, path_prefix)?;
     let eligible_fns: Vec<_> = evidence
         .symbols
@@ -159,7 +105,7 @@ pub async fn analyze_test_risk(
                 && !n.skip_test_coverage
                 && !n.qualified_name.contains("::tests::")
         })
-        .filter(|n| tracedecay_runtime_core::path_scope::path_matches_scope(&n.file, path_prefix))
+        .filter(|n| tracedecay_domain::path_matches_scope(&n.file, path_prefix))
         .collect();
 
     let excluded_count = eligible_fns
@@ -208,7 +154,7 @@ pub async fn analyze_test_risk(
                 && n.skip_test_coverage
                 && !is_test_file(&n.file)
                 && is_source_file(&n.file)
-                && tracedecay_runtime_core::path_scope::path_matches_scope(&n.file, path_prefix)
+                && tracedecay_domain::path_matches_scope(&n.file, path_prefix)
                 && !n.qualified_name.contains("::tests::")
         })
         .count();
@@ -280,32 +226,32 @@ pub async fn analyze_test_risk(
     };
 
     risks.truncate(limit);
-    Ok(TestRiskReport {
+    Ok(TestRiskResultV1 {
         risks: risks.into_iter().map(RiskEntry::into_public).collect(),
-        summary: TestRiskSummary {
-            total_functions,
-            tested: attributed_count,
-            skipped: skipped_count,
+        summary: TestRiskSummaryV1 {
+            total_functions: total_functions as u64,
+            tested: attributed_count as u64,
+            skipped: skipped_count as u64,
             coverage_pct,
             top_risk_untested: top_risk_untested.clone(),
             top_risk_unattributed: top_risk_untested,
-            attribution: TestRiskAttributionSummary {
-                depth: ATTRIBUTION_DEPTH,
-                direct_unit_attributed,
-                closure_attributed,
+            attribution: TestRiskAttributionSummaryV1 {
+                depth: ATTRIBUTION_DEPTH as u64,
+                direct_unit_attributed: direct_unit_attributed as u64,
+                closure_attributed: closure_attributed as u64,
                 trait_resolved_attributed: 0,
                 public_api_attributed: 0,
                 cli_entry_attributed: 0,
-                total_attributed: attributed_count,
+                total_attributed: attributed_count as u64,
             },
-            buckets: TestRiskBucketSummary {
-                attributed: attributed_count,
-                reachable_unattributed,
-                orphan_entry,
-                excluded: excluded_count,
+            buckets: TestRiskBucketSummaryV1 {
+                attributed: attributed_count as u64,
+                reachable_unattributed: reachable_unattributed as u64,
+                orphan_entry: orphan_entry as u64,
+                excluded: excluded_count as u64,
             },
-            confidence: "static_lower_bound",
-            confidence_note: "coverage_pct is a depth-3 static attribution lower bound over the admitted generation; complexity uses extraction-attested branches, loops, and maximum nesting, and is null (with risk weighing lower-bound counters) when complexity_analysis reports an incomplete walk; direct_unit is strongest, while closure retains higher residual risk.",
+            confidence: TestRiskConfidenceV1::StaticLowerBound,
+            confidence_note: "coverage_pct is a depth-3 static attribution lower bound over the admitted generation; complexity uses extraction-attested branches, loops, and maximum nesting, and is null (with risk weighing lower-bound counters) when complexity_analysis reports an incomplete walk; direct_unit is strongest, while closure retains higher residual risk.".to_owned(),
         },
     })
 }
@@ -341,9 +287,7 @@ pub fn verified_test_evidence(
                 files
                     .into_iter()
                     .map(|file| file.logical_path)
-                    .filter(|path| {
-                        tracedecay_runtime_core::path_scope::path_matches_scope(path, Some(prefix))
-                    })
+                    .filter(|path| tracedecay_domain::path_matches_scope(path, Some(prefix)))
                     .collect::<HashSet<_>>()
             })
         })
@@ -406,13 +350,13 @@ pub fn verified_test_evidence(
     let mut calls = Vec::new();
     let mut test_annotated = HashSet::new();
     for edge in edges {
-        match edge.edge.kind {
+        match edge.kind {
             RelationEdgeKindV1::Calls => calls.push((
-                edge.edge.from_occurrence.as_str().to_owned(),
-                edge.edge.to_occurrence.as_str().to_owned(),
+                edge.from_occurrence.as_str().to_owned(),
+                edge.to_occurrence.as_str().to_owned(),
             )),
-            RelationEdgeKindV1::Annotates if test_markers.contains(&edge.edge.from_occurrence) => {
-                test_annotated.insert(edge.edge.to_occurrence.as_str().to_owned());
+            RelationEdgeKindV1::Annotates if test_markers.contains(&edge.from_occurrence) => {
+                test_annotated.insert(edge.to_occurrence.as_str().to_owned());
             }
             _ => {}
         }
@@ -430,7 +374,7 @@ fn scoped_test_edges(
     occurrences: &[SymbolOccurrenceId],
     files: &mut HashMap<String, String>,
     test_markers: &mut HashSet<SymbolOccurrenceId>,
-) -> Result<Vec<tracedecay_code_index::graph_projection::CodeGraphSemanticEdgeV1>> {
+) -> Result<Vec<tracedecay_domain::CanonicalRelationEdgeV1>> {
     let mut edges = Vec::new();
     let mut seen = occurrences.iter().cloned().collect::<HashSet<_>>();
     let mut frontier = occurrences.to_vec();
@@ -468,7 +412,7 @@ fn scoped_test_edges(
                 test_markers.insert(edge.neighbor.occurrence.clone());
             }
         }
-        edges.extend(incoming);
+        edges.extend(incoming.into_iter().map(|edge| edge.edge));
         frontier = next;
     }
     if seen.is_empty() {
@@ -504,7 +448,7 @@ fn scoped_test_edges(
             test_markers.insert(edge.neighbor.occurrence.clone());
         }
     }
-    edges.extend(annotated);
+    edges.extend(annotated.into_iter().map(|edge| edge.edge));
     Ok(edges)
 }
 

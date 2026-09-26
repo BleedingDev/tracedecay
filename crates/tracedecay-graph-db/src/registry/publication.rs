@@ -15,7 +15,6 @@ use tracedecay_store::runtime::{
     MAX_GRAPH_PUBLICATION_PROJECTION_PAGE_RECORDS_V1, MAX_GRAPH_REPLAY_PAGE_RECORDS_V1,
 };
 
-use super::code_graph_namespace::is_legacy_per_generation_code_graph_namespace_str;
 use super::path::canonical_graph_database_file;
 use super::publication_support::{
     RegisteredGraphDbOperationV1, check_all, clear_retiring_fence, collect_closure,
@@ -39,72 +38,12 @@ use crate::{
     SupersededReplayRetirement, VerifiedGraphCommit,
 };
 
-/// Exact persisted identity emitted by the shipped per-generation code-graph
-/// layout. This predicate gates destructive cleanup, so the broader reporting
-/// classifier is deliberately insufficient here.
-fn is_shipped_legacy_code_graph_projection(projection: &GraphProjectionIdentityV1) -> bool {
-    let Some(digest) = projection
-        .namespace
-        .as_str()
-        .strip_prefix(crate::LEGACY_PER_GENERATION_CODE_GRAPH_NAMESPACE_PREFIX)
-    else {
-        return false;
-    };
-    projection.projection.as_str() == "code-graph"
-        && digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-#[cfg(test)]
-mod legacy_cleanup_identity_tests {
-    use super::is_shipped_legacy_code_graph_projection;
-    use tracedecay_domain::{BrainId, ProjectId, UserProfileId};
-    use tracedecay_store::{
-        GraphNamespaceV1, GraphProjectionIdV1, GraphProjectionIdentityV1, StoreShardIdV1,
-    };
-
-    fn projection(namespace: String, projection: &str) -> GraphProjectionIdentityV1 {
-        GraphProjectionIdentityV1 {
-            shard_id: StoreShardIdV1::project(
-                BrainId::new("brain.legacy-cleanup").unwrap(),
-                UserProfileId::new("profile.legacy-cleanup").unwrap(),
-                ProjectId::new("project.legacy-cleanup").unwrap(),
-            ),
-            namespace: GraphNamespaceV1::new(namespace).unwrap(),
-            projection: GraphProjectionIdV1::new(projection).unwrap(),
-        }
-    }
-
-    #[test]
-    fn destructive_legacy_cleanup_requires_the_exact_shipped_projection_identity() {
-        let prefix = crate::LEGACY_PER_GENERATION_CODE_GRAPH_NAMESPACE_PREFIX;
-        assert!(is_shipped_legacy_code_graph_projection(&projection(
-            format!("{prefix}{}", "1a".repeat(32)),
-            "code-graph",
-        )));
-        assert!(!is_shipped_legacy_code_graph_projection(&projection(
-            format!("{prefix}{}", "a".repeat(63)),
-            "code-graph",
-        )));
-        assert!(!is_shipped_legacy_code_graph_projection(&projection(
-            format!("{prefix}{}", "A".repeat(64)),
-            "code-graph",
-        )));
-        assert!(!is_shipped_legacy_code_graph_projection(&projection(
-            format!("{prefix}{}", "b".repeat(64)),
-            "other-projection",
-        )));
-    }
-}
-
 /// A publication whose durable generation proof completed but whose
 /// relational verified-head CAS has not yet run.
 ///
 /// This is the boundary that lets a serving gate cover only the atomic swap:
-/// everything in here — native staging, the sealed-store build, and the
-/// recovered-digest proof — reads the immutable staged generation and writes
+/// everything in here, native staging, the sealed-store build, and the
+/// recovered-digest proof, reads the immutable staged generation and writes
 /// derived artifacts, so it runs without any publication gate held. The CAS
 /// and the read-side lease install in
 /// [`GraphDbRegistry::complete_verified_publication`] are the only phases a
@@ -236,93 +175,23 @@ impl GraphDbRegistry {
         let relational_head = authority
             .verified_head(projection, context)
             .map_err(GraphDbError::from)?;
-        let (key, direct_dependencies, canonical_replay_source, relational_recovered_digest) =
-            if let Some(head) = &relational_head {
-                let replay = authority
-                    .replay(&head.key, context)
-                    .map_err(GraphDbError::from)?;
-                let replay = require_active_replay_evidence(
-                    replay,
-                    "verified graph head has no durable active replay",
-                )?;
-                require_head_replay(head, &replay)?;
-                (
-                    replay.publication.key,
-                    replay.publication.direct_dependency_generations,
-                    replay.publication.canonical_replay_source,
-                    head.recovered_digest.clone(),
-                )
-            } else {
-                if !is_shipped_legacy_code_graph_projection(projection)
-                    || authority
-                        .pending_replay(projection, context)
-                        .map_err(GraphDbError::from)?
-                        .is_some()
-                {
-                    return Ok(SealedStagingRelease::Retained(
-                        SealedStagingRetentionReason::NoVerifiedLease,
-                    ));
-                }
-                // The shipped pre-cutover layout put one code generation in one
-                // projection. Its head and active replay are retired atomically;
-                // the retained cleanup tombstone is the durable proof that the
-                // publication completed and that only derived native bytes remain.
-                // An active replay without a head is always pending in the
-                // production authority and can never authorize deletion.
-                let mut selected = None;
-                let mut after = None;
-                loop {
-                    let request = GraphPublicationRetiredCleanupPageRequestV1::new(
-                        projection.clone(),
-                        after.clone(),
-                        MAX_GRAPH_REPLAY_PAGE_RECORDS_V1,
-                    )
-                    .map_err(|error| GraphDbError::invalid(error.to_string()))?;
-                    let page = authority
-                        .retired_cleanup_page(&request, context)
-                        .map_err(GraphDbError::from)?;
-                    for tombstone in page.records {
-                        if tombstone.key.projection != *projection {
-                            return Err(GraphDbError::Corrupt {
-                                message: "legacy graph cleanup page escaped its projection"
-                                    .to_owned(),
-                            });
-                        }
-                        if selected.replace(tombstone).is_some() {
-                            return Ok(SealedStagingRelease::Retained(
-                                SealedStagingRetentionReason::NoVerifiedLease,
-                            ));
-                        }
-                    }
-                    let Some(continuation) = page.continuation else {
-                        break;
-                    };
-                    validate_replay_cursor(
-                        projection,
-                        after.as_ref(),
-                        &continuation,
-                        "legacy graph cleanup staging release",
-                    )?;
-                    after = Some(continuation);
-                }
-                let Some(tombstone) = selected else {
-                    return Ok(SealedStagingRelease::Retained(
-                        SealedStagingRetentionReason::NoVerifiedLease,
-                    ));
-                };
-                let source =
-                    tombstone
-                        .canonical_replay_source
-                        .ok_or_else(|| GraphDbError::Corrupt {
-                            message: "legacy graph cleanup lost its replay source".to_owned(),
-                        })?;
-                (
-                    tombstone.key,
-                    tombstone.direct_dependency_generations,
-                    source,
-                    tombstone.expected_recovered_digest,
-                )
-            };
+        let Some(head) = &relational_head else {
+            return Ok(SealedStagingRelease::Retained(
+                SealedStagingRetentionReason::NoVerifiedLease,
+            ));
+        };
+        let replay = authority
+            .replay(&head.key, context)
+            .map_err(GraphDbError::from)?;
+        let replay = require_active_replay_evidence(
+            replay,
+            "verified graph head has no durable active replay",
+        )?;
+        require_head_replay(head, &replay)?;
+        let key = replay.publication.key;
+        let direct_dependencies = replay.publication.direct_dependency_generations;
+        let canonical_replay_source = replay.publication.canonical_replay_source;
+        let relational_recovered_digest = head.recovered_digest.clone();
         if !direct_dependencies.is_empty() {
             return Ok(SealedStagingRelease::Retained(
                 SealedStagingRetentionReason::DependencyBearing,
@@ -338,11 +207,9 @@ impl GraphDbRegistry {
             ));
         }
         let locator = locator_from_key(&key)?;
-        // Relational publication evidence is the authority for which sealed
-        // artifact may stand in for the staging rows: normally the verified
-        // head, or the unique cleanup tombstone for a shipped legacy
-        // per-generation projection after its head and replay were retired.
-        // Release authorizes from that evidence plus the on-disk receipt or a
+        // Relational publication evidence (the verified head) is the
+        // authority for which sealed artifact may stand in for the staging
+        // rows. Release authorizes from that evidence plus the on-disk receipt or a
         // seated reader already in this process. It does not recover or prove
         // the sealed generation; that work belongs to activation.
         if database.installed_verified_generation(&locator)?.is_none()
@@ -644,32 +511,13 @@ impl GraphDbRegistry {
         match retirement_outcome {
             GraphReplayRetirementOutcomeV1::Retired(_)
             | GraphReplayRetirementOutcomeV1::ExactReplay(_) => {
-                let legacy_layout = is_legacy_per_generation_code_graph_namespace_str(
-                    replay.publication.key.projection.namespace.as_str(),
-                );
                 if selected_head.is_some() {
                     tracing::info!(
                         event = "graph_replay_head_retired",
                         generation = generation.as_str(),
                         graph_generation = %locator.generation,
                         replay_sequence = replay.sequence.get(),
-                        legacy_layout,
                         "verified per-generation graph replay head retired"
-                    );
-                }
-                if legacy_layout {
-                    // Migration evidence for issue #836: this projection was
-                    // written under the retired per-generation namespace, so
-                    // reclaiming it is the explicit drain of pre-cutover
-                    // persisted state, not ordinary supersession.
-                    tracing::info!(
-                        event = "graph_legacy_code_graph_projection_retired",
-                        generation = generation.as_str(),
-                        graph_generation = %locator.generation,
-                        namespace = replay.publication.key.projection.namespace.as_str(),
-                        head_retired = selected_head.is_some(),
-                        "reclaimed a code-graph projection persisted under the retired \
-                         per-generation namespace layout"
                     );
                 }
                 // Retirement is the linearization point. A failure after it
@@ -927,7 +775,7 @@ impl GraphDbRegistry {
     /// Publishing generation N+1 supersedes N through the verified-head
     /// compare-and-swap, but N's journal row, native staging rows, and sealed
     /// artifact stayed on disk until code-index retention happened to delete
-    /// the code generation naming them — and projections with no code-index
+    /// the code generation naming them, and projections with no code-index
     /// owner (session git evidence, memory relations) never retired at all.
     /// This is the ordinary reclaim: every active replay of `projection`
     /// other than the head that is not pending, not a dependency of any
@@ -1208,7 +1056,8 @@ impl GraphDbRegistry {
                     return Err(GraphDbError::invalid(error.to_string()));
                 }
             };
-            let outcome = match authority.retire_replay(&retirement, context) {
+            // Every retirement step is its own durable commit.
+            let outcome = match authority.retire_replay(&retirement, &context.next_commit()) {
                 Ok(outcome) => outcome,
                 Err(error) => {
                     clear_retiring_fence(database, &locator)?;
@@ -1306,7 +1155,7 @@ impl GraphDbRegistry {
             return Ok(());
         }
         match authority
-            .finalize_retired_replay_cleanup(retirement, context)
+            .finalize_retired_replay_cleanup(retirement, &context.next_commit())
             .map_err(GraphDbError::from)?
         {
             GraphRetiredReplayCleanupFinalizeOutcomeV1::Finalized(_)
@@ -1365,9 +1214,9 @@ impl GraphDbRegistry {
         )
     }
 
-    /// Runs the gateless phase of one verified publication — replay
+    /// Runs the gateless phase of one verified publication, replay
     /// resolution, native staging, the sealed-store build, and the durable
-    /// recovered-digest proof — without advancing the relational verified
+    /// recovered-digest proof, without advancing the relational verified
     /// head or installing a read-side lease.
     ///
     /// A publication that turns out to be already durably linearized
@@ -1501,7 +1350,7 @@ impl GraphDbRegistry {
         // sealed straight from that manifest: the journal (and the code
         // generation it names) is the recovery source for every failure
         // boundary of the build, so no staging copy is ever needed. Inline
-        // and supplied manifests keep the staging proof — their rows have no
+        // and supplied manifests keep the staging proof, their rows have no
         // durable home other than the staging database.
         let direct_seal_source =
             matches!(source, GraphGenerationReplaySource::SealedCodeGeneration(_));
@@ -2856,7 +2705,9 @@ mod historical_publication_reuse_tests {
             _request: &GraphPublicationReplayPageRequestV1,
             _context: &GraphPublicationOperationContextV1,
         ) -> GraphPublicationStoreResultV1<GraphPublicationReplayPageV1> {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn projection_page(
@@ -2864,7 +2715,9 @@ mod historical_publication_reuse_tests {
             _request: &GraphPublicationProjectionPageRequestV1,
             _context: &GraphPublicationOperationContextV1,
         ) -> GraphPublicationStoreResultV1<GraphPublicationProjectionPageV1> {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn retire_replay(
@@ -2872,7 +2725,9 @@ mod historical_publication_reuse_tests {
             _request: &GraphPublicationReplayRetirementV1,
             _context: &GraphPublicationOperationContextV1,
         ) -> GraphPublicationStoreResultV1<GraphReplayRetirementOutcomeV1> {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn retire_verified_head_replay(
@@ -2881,7 +2736,9 @@ mod historical_publication_reuse_tests {
             _expected_head: &GraphVerifiedHeadV1,
             _context: &GraphPublicationOperationContextV1,
         ) -> GraphPublicationStoreResultV1<GraphReplayRetirementOutcomeV1> {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn discard_pending_replay(
@@ -2891,7 +2748,9 @@ mod historical_publication_reuse_tests {
         ) -> GraphPublicationStoreResultV1<
             tracedecay_store::runtime::GraphPendingReplayDiscardOutcomeV1,
         > {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn retired_cleanup_page(
@@ -2899,7 +2758,9 @@ mod historical_publication_reuse_tests {
             _request: &GraphPublicationRetiredCleanupPageRequestV1,
             _context: &GraphPublicationOperationContextV1,
         ) -> GraphPublicationStoreResultV1<GraphPublicationRetiredCleanupPageV1> {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn finalize_retired_replay_cleanup(
@@ -2907,7 +2768,9 @@ mod historical_publication_reuse_tests {
             _request: &GraphPublicationReplayRetirementV1,
             _context: &GraphPublicationOperationContextV1,
         ) -> GraphPublicationStoreResultV1<GraphRetiredReplayCleanupFinalizeOutcomeV1> {
-            Err(GraphPublicationStoreErrorV1::Infrastructure)
+            Err(GraphPublicationStoreErrorV1::Infrastructure(
+                "not supported by this test authority".to_owned(),
+            ))
         }
 
         fn verified_head(
@@ -2927,7 +2790,11 @@ mod historical_publication_reuse_tests {
                 .records
                 .get(&request.publication_key)
                 .cloned()
-                .ok_or(GraphPublicationStoreErrorV1::Infrastructure)?;
+                .ok_or_else(|| {
+                    GraphPublicationStoreErrorV1::Infrastructure(
+                        "unstaged test publication".to_owned(),
+                    )
+                })?;
             if self.heads.get(&request.publication_key.projection)
                 != request.expected_prior_head.as_ref()
             {
@@ -3226,8 +3093,8 @@ mod historical_publication_reuse_tests {
 
     /// The recover-after-publish idempotent arm: republishing the exact
     /// journaled key whose verified head is already current must reuse the
-    /// lease this same mounted instance proved moments earlier — zero
-    /// additional stored-row enumerations — and still seat the head for
+    /// lease this same mounted instance proved moments earlier, zero
+    /// additional stored-row enumerations, and still seat the head for
     /// reads. A follow-up recover on the same instance stays cache-served.
     #[test]
     fn recover_after_publish_reuses_the_instance_proof() {
@@ -3295,7 +3162,7 @@ mod historical_publication_reuse_tests {
     }
 
     /// A crash-recovery republication on a genuinely fresh-from-disk
-    /// instance must pay the full recovered-digest proof — but exactly once.
+    /// instance must pay the full recovered-digest proof, but exactly once.
     /// Before the duplicate-proof fix this path enumerated the stored rows
     /// twice: once for the close/reopen digest proof and once more re-loading
     /// the head it had just proven.
@@ -3347,7 +3214,7 @@ mod historical_publication_reuse_tests {
     /// A remount that recovers the generation adopts the on-disk sealed
     /// artifact through its verify-once marker: the artifact's bytes are the
     /// ones the build's post-reopen proof ran over, so adoption resolves by
-    /// stat instead of re-streaming the sealed row proof — which is exactly
+    /// stat instead of re-streaming the sealed row proof, which is exactly
     /// the second half of the boot-from-sealed double verification.
     #[test]
     fn a_fresh_from_disk_recover_adopts_the_sealed_artifact_by_marker() {

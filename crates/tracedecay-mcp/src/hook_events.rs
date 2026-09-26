@@ -4,12 +4,12 @@
 //! effects such as branch tracking, sync execution, and token-map refreshes.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Shared with hook emitters so the receiver accepts the same agent keys.
-pub use tracedecay_hooks::core_events::HookAgent;
+use tracedecay_domain::HostIntegrationIdV1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEventKind {
@@ -53,7 +53,7 @@ impl HookEventKind {
 }
 
 pub struct HookEvent {
-    pub agent: HookAgent,
+    pub agent: HostIntegrationIdV1,
     pub kind: HookEventKind,
     pub rel_paths: Vec<String>,
     pub had_command: bool,
@@ -144,13 +144,13 @@ pub enum HookEventPlan {
     AddBranchAt {
         root: PathBuf,
         branch: String,
-        agent: HookAgent,
+        agent: HostIntegrationIdV1,
     },
     SyncCurrentBranch {
         branch: String,
-        agent: HookAgent,
+        agent: HostIntegrationIdV1,
     },
-    DebouncedIncrementalSync(HookAgent),
+    DebouncedIncrementalSync(HostIntegrationIdV1),
     RecordTerminalReceipt {
         route: Option<tracedecay_hooks::core_events::HookRouteMetadata>,
         receipt: tracedecay_hooks::core_events::HookTerminalReceipt,
@@ -442,19 +442,21 @@ fn runtime_plan_from_durable(
                 .map_err(|()| DurableHookEventDecodeError::Malformed)?,
             branch: durable_bound_required_str(&branch, DURABLE_MAX_BRANCH_BYTES)
                 .map_err(|()| DurableHookEventDecodeError::Malformed)?,
-            agent: HookAgent::from_wire(&agent).ok_or(DurableHookEventDecodeError::Malformed)?,
+            agent: HostIntegrationIdV1::from_wire(&agent)
+                .ok_or(DurableHookEventDecodeError::Malformed)?,
         }),
         DurableHookEventPlan::SyncCurrentBranch { branch, agent } => {
             Ok(HookEventPlan::SyncCurrentBranch {
                 branch: durable_bound_required_str(&branch, DURABLE_MAX_BRANCH_BYTES)
                     .map_err(|()| DurableHookEventDecodeError::Malformed)?,
-                agent: HookAgent::from_wire(&agent)
+                agent: HostIntegrationIdV1::from_wire(&agent)
                     .ok_or(DurableHookEventDecodeError::Malformed)?,
             })
         }
         DurableHookEventPlan::DebouncedIncrementalSync { agent } => {
             Ok(HookEventPlan::DebouncedIncrementalSync(
-                HookAgent::from_wire(&agent).ok_or(DurableHookEventDecodeError::Malformed)?,
+                HostIntegrationIdV1::from_wire(&agent)
+                    .ok_or(DurableHookEventDecodeError::Malformed)?,
             ))
         }
         DurableHookEventPlan::RecordTerminalReceipt { route, receipt } => {
@@ -516,7 +518,7 @@ pub fn parse_hook_event(params: Option<&Value>) -> Option<HookEvent> {
         protect_hook_receipt_structural_ids(receipt).ok()?;
     }
     Some(HookEvent {
-        agent: HookAgent::from_wire(&event.agent)?,
+        agent: HostIntegrationIdV1::from_wire(&event.agent)?,
         kind: HookEventKind::from_wire(&event.event)?,
         rel_paths: safe_hook_rel_paths(&event.rel_paths),
         // Shell text is an untyped observation. Keep only a content-free
@@ -584,7 +586,7 @@ pub fn plan_hook_event(
     }
 }
 
-pub fn sync_marker_path(data_root: &Path, agent: HookAgent) -> PathBuf {
+pub fn sync_marker_path(data_root: &Path, agent: HostIntegrationIdV1) -> PathBuf {
     data_root.join(agent.sync_marker_file())
 }
 
@@ -629,15 +631,19 @@ fn safe_hook_rel_paths(paths: &[String]) -> Vec<String> {
 /// instead of the read-only fallback-ancestor DB. The downstream
 /// `add_hook_branch_tracking` returns `AlreadyTracked` cheaply and
 /// idempotently, so re-planning `AddBranchAt` for an already-tracked worktree
-/// branch is a no-op — we do not need branch-meta visibility here.
+/// branch is a no-op, we do not need branch-meta visibility here.
 fn plan_session_start_hook_event(
     event: &HookEvent,
     project_root: &Path,
     current_branch: Option<&str>,
 ) -> HookEventPlan {
     let cwd = event.cwd.as_deref().unwrap_or(project_root);
-    if let Some(plan) = plan_linked_worktree_branch_add(event, cwd, project_root) {
-        return plan;
+    match plan_linked_worktree_branch_add(event, cwd, project_root) {
+        Ok(Some(plan)) => return plan,
+        Ok(None) => {}
+        // Discovery did not decide membership. Do not sync the registered
+        // project's branch as if this cwd were the main checkout.
+        Err(_) => return HookEventPlan::Noop,
     }
     current_branch
         .filter(|branch| !branch.is_empty())
@@ -655,27 +661,76 @@ fn plan_linked_worktree_branch_add(
     event: &HookEvent,
     cwd: &Path,
     project_root: &Path,
-) -> Option<HookEventPlan> {
-    let worktree_root = tracedecay_runtime_core::worktree::git_worktree_root(cwd)?;
+) -> Result<Option<HookEventPlan>, tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown> {
+    let budget = hook_discovery_budget();
+    let identity = match hook_repository_identity(cwd, &budget) {
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
+            identity,
+        ) => identity,
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::NotRepository => {
+            return Ok(None);
+        }
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(reason) => {
+            return Err(reason);
+        }
+    };
+    let worktree_root = identity.worktree_root;
     // A linked worktree's git common dir lives outside its own working tree
     // (it points back at the main checkout's `.git`). In the main checkout the
     // common dir is `<root>/.git`, so the two paths match and we bail out.
-    let common_dir = tracedecay_runtime_core::worktree::git_common_dir(&worktree_root)?;
+    let common_dir = identity.common_dir;
     if path_is_inside(&common_dir, &worktree_root) {
-        return None;
+        return Ok(None);
     }
-    if !git_roots_share_common_dir(&worktree_root, project_root) {
-        return None;
+    let project_common = match hook_repository_identity(project_root, &budget) {
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
+            identity,
+        ) => identity.common_dir,
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::NotRepository => {
+            return Ok(None);
+        }
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(reason) => {
+            return Err(reason);
+        }
+    };
+    if !paths_same(&common_dir, &project_common) {
+        return Ok(None);
     }
-    let branch = tracedecay_runtime_core::branch::current_branch(&worktree_root)?;
+    let Some(branch) = tracedecay_runtime_core::branch::current_branch(&worktree_root) else {
+        return Ok(None);
+    };
     if branch.is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some(HookEventPlan::AddBranchAt {
+    Ok(Some(HookEventPlan::AddBranchAt {
         root: worktree_root,
         branch,
         agent: event.agent,
-    })
+    }))
+}
+
+fn hook_discovery_budget() -> (
+    tracedecay_runtime_core::cancellation::MonotonicDeadline,
+    tracedecay_runtime_core::cancellation::CancellationToken,
+) {
+    (
+        tracedecay_runtime_core::cancellation::MonotonicDeadline::at(
+            Instant::now() + Duration::from_secs(2),
+        ),
+        tracedecay_runtime_core::cancellation::CancellationToken::new(),
+    )
+}
+
+fn hook_repository_identity(
+    path: &Path,
+    budget: &(
+        tracedecay_runtime_core::cancellation::MonotonicDeadline,
+        tracedecay_runtime_core::cancellation::CancellationToken,
+    ),
+) -> tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome {
+    tracedecay_runtime_core::git_discovery::discover_repository_identity_with_control(
+        path, budget.0, &budget.1,
+    )
 }
 
 /// Effect-time authorization failure for durable branch-write plans
@@ -691,6 +746,7 @@ pub enum AddBranchAtRootAuthError {
     Unbounded,
     Unresolvable,
     Unauthorized,
+    DiscoveryUnavailable,
 }
 
 impl AddBranchAtRootAuthError {
@@ -702,6 +758,7 @@ impl AddBranchAtRootAuthError {
             | Self::Unbounded
             | Self::Unresolvable
             | Self::Unauthorized => "stale_branch_authorization",
+            Self::DiscoveryUnavailable => "repository_discovery_unavailable",
         }
     }
 }
@@ -722,16 +779,43 @@ pub fn authorize_add_branch_at_root(
     let canonical = bounded
         .canonicalize()
         .map_err(|_| AddBranchAtRootAuthError::Unresolvable)?;
-    let live_worktree_root = tracedecay_runtime_core::worktree::git_worktree_root(&canonical)
-        .and_then(|root| root.canonicalize().ok())
-        .ok_or(AddBranchAtRootAuthError::Unauthorized)?;
+    let budget = hook_discovery_budget();
+    let live = match hook_repository_identity(&canonical, &budget) {
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
+            identity,
+        ) => identity,
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::NotRepository => {
+            return Err(AddBranchAtRootAuthError::Unauthorized);
+        }
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(_) => {
+            return Err(AddBranchAtRootAuthError::DiscoveryUnavailable);
+        }
+    };
+    let live_worktree_root = live
+        .worktree_root
+        .canonicalize()
+        .map_err(|_| AddBranchAtRootAuthError::Unresolvable)?;
     if live_worktree_root != canonical {
         return Err(AddBranchAtRootAuthError::Unauthorized);
     }
     let project_canonical = project_root
         .canonicalize()
         .map_err(|_| AddBranchAtRootAuthError::Unresolvable)?;
-    if !root_belongs_to_project(&canonical, &project_canonical) {
+    if paths_same(&canonical, &project_canonical) {
+        return Ok(canonical);
+    }
+    let project_common = match hook_repository_identity(&project_canonical, &budget) {
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
+            identity,
+        ) => identity.common_dir,
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::NotRepository => {
+            return Err(AddBranchAtRootAuthError::Unauthorized);
+        }
+        tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(_) => {
+            return Err(AddBranchAtRootAuthError::DiscoveryUnavailable);
+        }
+    };
+    if !paths_same(&live.common_dir, &project_common) {
         return Err(AddBranchAtRootAuthError::Unauthorized);
     }
     Ok(canonical)
@@ -786,23 +870,10 @@ fn bound_absolute_add_branch_at_root(path: &Path) -> Result<PathBuf, AddBranchAt
     Ok(normalized)
 }
 
-fn root_belongs_to_project(root: &Path, project_root: &Path) -> bool {
-    paths_same(root, project_root) || git_roots_share_common_dir(root, project_root)
-}
-
 fn path_is_inside(path: &Path, root: &Path) -> bool {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     path.starts_with(root)
-}
-
-fn git_roots_share_common_dir(a: &Path, b: &Path) -> bool {
-    let a_common = tracedecay_runtime_core::worktree::git_common_dir(a);
-    let b_common = tracedecay_runtime_core::worktree::git_common_dir(b);
-    a_common
-        .as_ref()
-        .zip(b_common.as_ref())
-        .is_some_and(|(a_common, b_common)| paths_same(a_common, b_common))
 }
 
 fn paths_same(a: &Path, b: &Path) -> bool {
@@ -824,12 +895,26 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
+    #[test]
+    fn cancelled_hook_discovery_is_unknown_not_absent() {
+        let budget = super::hook_discovery_budget();
+        budget.1.cancel();
+        let outcome = super::hook_repository_identity(Path::new("."), &budget);
+        assert_eq!(
+            outcome,
+            tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(
+                tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown::Cancelled
+            )
+        );
+    }
+
     use serde_json::json;
 
     use super::{
-        AddBranchAtRootAuthError, DurableHookEventDecodeError, HookAgent, HookEvent, HookEventKind,
-        HookEventPlan, authorize_add_branch_at_root, decode_durable_hook_event_plan,
-        encode_durable_hook_event_plan, parse_hook_event, plan_hook_event,
+        AddBranchAtRootAuthError, DurableHookEventDecodeError, HookEvent, HookEventKind,
+        HookEventPlan, HostIntegrationIdV1, authorize_add_branch_at_root,
+        decode_durable_hook_event_plan, encode_durable_hook_event_plan, parse_hook_event,
+        plan_hook_event,
     };
 
     fn parse_or_panic(params: &serde_json::Value) -> HookEvent {
@@ -961,7 +1046,7 @@ mod tests {
             "planned root {root:?} should match expected root {expected_root:?}"
         );
         assert_eq!(branch, expected_branch);
-        assert_eq!(agent, HookAgent::Codex);
+        assert_eq!(agent, HostIntegrationIdV1::Codex);
     }
 
     #[test]
@@ -991,7 +1076,7 @@ mod tests {
                 PathBuf::from("/project"),
             ),
             tracedecay_hooks::core_events::DaemonHookEvent::post_tool_use_shell(
-                HookAgent::Codex,
+                HostIntegrationIdV1::Codex,
                 PathBuf::from("/project"),
             ),
         ] {
@@ -1026,10 +1111,10 @@ mod tests {
     #[test]
     fn accepts_every_constructible_hook_agent() {
         for agent in [
-            HookAgent::Claude,
-            HookAgent::Codex,
-            HookAgent::Cursor,
-            HookAgent::Kiro,
+            HostIntegrationIdV1::Claude,
+            HostIntegrationIdV1::Codex,
+            HostIntegrationIdV1::Cursor,
+            HostIntegrationIdV1::Kiro,
         ] {
             let params = json!({
                 "agent": agent.as_wire(),
@@ -1128,13 +1213,13 @@ mod tests {
             HookEventPlan::AddBranchAt {
                 root: worktree_root,
                 branch: "feature/test".to_string(),
-                agent: HookAgent::Codex,
+                agent: HostIntegrationIdV1::Codex,
             },
             HookEventPlan::SyncCurrentBranch {
                 branch: "main".to_string(),
-                agent: HookAgent::Claude,
+                agent: HostIntegrationIdV1::Claude,
             },
-            HookEventPlan::DebouncedIncrementalSync(HookAgent::Cursor),
+            HookEventPlan::DebouncedIncrementalSync(HostIntegrationIdV1::Cursor),
             HookEventPlan::RecordTerminalReceipt {
                 route: route.clone(),
                 receipt: receipt.clone(),
@@ -1278,7 +1363,7 @@ mod tests {
             encode_durable_hook_event_plan(&HookEventPlan::AddBranchAt {
                 root: PathBuf::from("/tmp/worktree/../escape"),
                 branch: "feature".to_string(),
-                agent: HookAgent::Codex,
+                agent: HostIntegrationIdV1::Codex,
             })
             .is_err()
         );
@@ -1291,7 +1376,7 @@ mod tests {
         // The sender-side wire shape the Hermes plugin emits; production only
         // deserializes these events.
         let params = serde_json::to_value(tracedecay_hooks::core_events::DaemonHookEvent {
-            agent: HookAgent::Hermes.as_wire().to_string(),
+            agent: HostIntegrationIdV1::Hermes.as_wire().to_string(),
             event: "terminalReceipt".to_string(),
             rel_paths: Vec::new(),
             command: None,

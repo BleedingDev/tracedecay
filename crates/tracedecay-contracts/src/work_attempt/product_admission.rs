@@ -11,19 +11,18 @@ use tracedecay_domain::{
 };
 
 use crate::{
-    ApplicationProblem, RequestAdmission, RequestContext, WorkGraphReadPortV1,
-    WorkGraphReadRequestV1, WorkGraphReadV1, WorkProductApplicationErrorV1,
-    WorkProductAttemptAdmissionErrorV1, WorkProductAttemptAdmissionOutcomeV1,
-    WorkProductAttemptAdmissionPortV1, WorkProductAttemptAdmissionV1, WorkProductBindingV1,
+    ApplicationProblem, RequestContext, WorkGraphReadPortV1, WorkGraphReadRequestV1,
+    WorkProductApplicationErrorV1, WorkProductAttemptAdmissionErrorV1,
+    WorkProductAttemptAdmissionOutcomeV1, WorkProductAttemptAdmissionPortV1,
+    WorkProductAttemptAdmissionV1, WorkProductAuthorizedRelationScopeV1, WorkProductBindingV1,
     WorkProductEventDraftV1, WorkProductOwnerAuthorizationErrorV1,
     WorkProductOwnerAuthorizationPortV1, WorkProductPortContextV1, WorkProductRevisionPinsV1,
-    WorkProductSelectionScopeV1, WorkRelationScopeV1,
+    WorkProductSelectionScopeV1,
 };
 
 use super::{
     StartWorkAttemptCommand, WorkAttemptAdmissionKind, WorkAttemptStorageError,
-    WorkAttemptStoragePort, conflict_problem, contract_problem, denied_problem, not_found_problem,
-    storage_problem,
+    WorkAttemptStoragePort, contract_problem, denied_problem, not_found_problem, storage_problem,
 };
 
 const WORK_PRODUCT_START_INPUT_DIGEST_DOMAIN: &str =
@@ -50,11 +49,7 @@ pub(crate) fn admit_product_attempt_request(
     if !context.allows(binding.capability_id(), binding.use_case_id()) {
         return Err(not_found_problem());
     }
-    match context.admission_at(observed_at) {
-        RequestAdmission::Admitted => Ok(()),
-        RequestAdmission::Cancelled => Err(ApplicationProblem::cancelled_before_admission()),
-        RequestAdmission::TimedOut => Err(ApplicationProblem::timed_out_before_admission()),
-    }
+    ApplicationProblem::ensure_admitted(context, observed_at)
 }
 
 pub(crate) fn replayed_attempt_matches_command(
@@ -95,12 +90,13 @@ where
     S: WorkGraphReadPortV1 + WorkProductOwnerAuthorizationPortV1,
 {
     admit_product_attempt_request(context, binding, observed_at)?;
-    let selection =
-        WorkProductSelectionScopeV1::relations(BTreeSet::from([WorkRelationScopeV1::Repository {
+    let selection = WorkProductSelectionScopeV1::relations(BTreeSet::from([
+        WorkProductAuthorizedRelationScopeV1::Repository {
             project_id: context.scope().project_id.clone(),
             repository_id: context.scope().repository_id.clone(),
-        }]))
-        .map_err(|_| invalid_start_problem())?;
+        },
+    ]))
+    .map_err(|_| invalid_start_problem())?;
     let authorized_scope = storage
         .authorize_scope(context, &selection, observed_at)
         .map_err(owner_problem)?;
@@ -118,19 +114,20 @@ where
         .map_err(|error| product_problem(WorkProductApplicationErrorV1::from(error)))?;
     crate::work_product::validate_result(&request, product_context.authorized_scope(), &read)
         .map_err(product_problem)?;
-    // Admission appends to the journal, so it needs the journal's head — not
+    // Admission appends to the journal, so it needs the journal's head, not
     // the head of whatever slice this selection covers.
     if read.selection_coverage().is_partial() {
         return Err(product_problem(
             WorkProductApplicationErrorV1::SelectionCoverageIncomplete,
         ));
     }
-    let WorkGraphReadV1::Current { snapshot, .. } = read else {
-        return Err(ApplicationProblem::unavailable(crate::SafeDiagnostic {
+    let snapshot = read.into_current_snapshot().map_err(|error| match error {
+        WorkProductApplicationErrorV1::NotFoundOrNotAuthorized => product_problem(error),
+        _ => ApplicationProblem::unavailable(crate::SafeDiagnostic {
             code: "application.work-attempt.product-read-unavailable".to_owned(),
             message: "The canonical Work product graph is unavailable.".to_owned(),
-        }));
-    };
+        }),
+    })?;
     Ok(CurrentWorkProductAttemptGraphV1 {
         context: product_context,
         verified: snapshot.verified_version().clone(),
@@ -208,38 +205,28 @@ pub(crate) fn product_admission_problem(
 ) -> ApplicationProblem {
     match error {
         WorkProductAttemptAdmissionErrorV1::InvalidAdmission => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: crate::SafeDiagnostic {
-                    code: "application.work-attempt.invalid-product-admission".to_owned(),
-                    message: "The Work attempt does not match the canonical product graph."
-                        .to_owned(),
-                },
-                retry: crate::RetryDirective::Never,
-                legal_actions: vec![crate::LegalAction::CorrectRequest],
-            }
+            ApplicationProblem::invalid_request(
+                "application.work-attempt.invalid-product-admission",
+                "The Work attempt does not match the canonical product graph.",
+            )
         }
         WorkProductAttemptAdmissionErrorV1::NotFoundOrNotAuthorized => not_found_problem(),
-        WorkProductAttemptAdmissionErrorV1::VersionConflict => conflict_problem(
+        WorkProductAttemptAdmissionErrorV1::VersionConflict => ApplicationProblem::conflict(
             "application.work-attempt.product-version-conflict",
             "The canonical Work product graph changed before attempt admission.",
         ),
-        WorkProductAttemptAdmissionErrorV1::IdentityConflict => conflict_problem(
+        WorkProductAttemptAdmissionErrorV1::IdentityConflict => ApplicationProblem::conflict(
             "application.work-attempt.identity-conflict",
             "The Work attempt identity was already used with different content.",
         ),
-        WorkProductAttemptAdmissionErrorV1::IdempotencyConflict => conflict_problem(
+        WorkProductAttemptAdmissionErrorV1::IdempotencyConflict => ApplicationProblem::conflict(
             "application.work-attempt.idempotency-conflict",
             "The Work attempt command identity was already used with different input.",
         ),
-        WorkProductAttemptAdmissionErrorV1::CapacityExceeded => ApplicationProblem::Saturated {
-            diagnostic: crate::SafeDiagnostic {
-                code: "application.work-attempt.capacity-exhausted".to_owned(),
-                message: "The registered Work topology has no parallel attempt capacity."
-                    .to_owned(),
-            },
-            retry: crate::RetryDirective::AfterDelay,
-            legal_actions: vec![crate::LegalAction::Retry],
-        },
+        WorkProductAttemptAdmissionErrorV1::CapacityExceeded => ApplicationProblem::saturated(
+            "application.work-attempt.capacity-exhausted",
+            "The registered Work topology has no parallel attempt capacity.",
+        ),
         WorkProductAttemptAdmissionErrorV1::Unavailable => {
             ApplicationProblem::unavailable(crate::SafeDiagnostic {
                 code: "application.work-attempt.product-admission-unavailable".to_owned(),
@@ -291,7 +278,7 @@ where
     ) -> Result<WorkAttemptV1, ApplicationProblem> {
         admit_product_attempt_request(context, binding, command.occurred_at)?;
         if command.execution_snapshot.topology() != topology {
-            return Err(conflict_problem(
+            return Err(ApplicationProblem::conflict(
                 "application.work-attempt.topology-conflict",
                 "The Work attempt topology does not match the registered runtime authority.",
             ));
@@ -312,7 +299,7 @@ where
                 if admission_kind != WorkAttemptAdmissionKind::Ordinary
                     || !replayed_attempt_matches_command(context, &command, &identity, &existing)?
                 {
-                    return Err(conflict_problem(
+                    return Err(ApplicationProblem::conflict(
                         "application.work-attempt.identity-conflict",
                         "The Work attempt identity was already used with different content.",
                     ));
@@ -470,7 +457,7 @@ fn product_problem(error: WorkProductApplicationErrorV1) -> ApplicationProblem {
         }
         WorkProductApplicationErrorV1::TimedOut => ApplicationProblem::timed_out_before_admission(),
         WorkProductApplicationErrorV1::VersionConflict
-        | WorkProductApplicationErrorV1::RevisionConflict => conflict_problem(
+        | WorkProductApplicationErrorV1::RevisionConflict => ApplicationProblem::conflict(
             "application.work-attempt.product-version-conflict",
             "The canonical Work product graph changed before attempt admission.",
         ),
@@ -482,7 +469,7 @@ fn product_problem(error: WorkProductApplicationErrorV1) -> ApplicationProblem {
                         .to_owned(),
             })
         }
-        WorkProductApplicationErrorV1::IdempotencyConflict => conflict_problem(
+        WorkProductApplicationErrorV1::IdempotencyConflict => ApplicationProblem::conflict(
             "application.work-attempt.product-idempotency-conflict",
             "The canonical Work product admission identity conflicts.",
         ),
@@ -491,18 +478,12 @@ fn product_problem(error: WorkProductApplicationErrorV1) -> ApplicationProblem {
         // and the remedy are both specific: the selection covers a slice of
         // the journal, and widening it is what makes admission possible.
         WorkProductApplicationErrorV1::SelectionCoverageIncomplete => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: crate::SafeDiagnostic {
-                    code: "application.work-attempt.product-selection-coverage-incomplete"
-                        .to_owned(),
-                    message: "The Work selection covers only part of the owner's journal, so \
+            ApplicationProblem::invalid_request(
+                "application.work-attempt.product-selection-coverage-incomplete",
+                "The Work selection covers only part of the owner's journal, so \
                               no attempt can be admitted against it; widen the selection to \
-                              the relation scopes the excluded events were admitted under."
-                        .to_owned(),
-                },
-                retry: crate::RetryDirective::Never,
-                legal_actions: vec![crate::LegalAction::CorrectRequest],
-            }
+                              the relation scopes the excluded events were admitted under.",
+            )
         }
         WorkProductApplicationErrorV1::EventAuthorityUnavailable
         | WorkProductApplicationErrorV1::GraphAuthorityUnavailable
@@ -517,14 +498,10 @@ fn product_problem(error: WorkProductApplicationErrorV1) -> ApplicationProblem {
 }
 
 fn invalid_start_problem() -> ApplicationProblem {
-    ApplicationProblem::InvalidRequest {
-        diagnostic: crate::SafeDiagnostic {
-            code: "application.work-attempt.invalid-product-admission".to_owned(),
-            message: "The Work attempt command is invalid.".to_owned(),
-        },
-        retry: crate::RetryDirective::Never,
-        legal_actions: vec![crate::LegalAction::CorrectRequest],
-    }
+    ApplicationProblem::invalid_request(
+        "application.work-attempt.invalid-product-admission",
+        "The Work attempt command is invalid.",
+    )
 }
 
 #[cfg(test)]

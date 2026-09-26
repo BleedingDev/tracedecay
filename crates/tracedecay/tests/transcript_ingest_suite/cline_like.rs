@@ -3,7 +3,7 @@ use tracedecay_domain::{ClineTranscriptStream, ObservationSourceCursorV1, Provid
 use tracedecay_global_db::ParseOffset;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::SessionProvider;
-use tracedecay_sessions::runtime::cline_like::ClineLikeSource;
+use tracedecay_sessions::runtime::hosts::cline_like::ClineLikeSource;
 use tracedecay_sessions::runtime::source::{StoredCursor, TranscriptIngestError, TranscriptSource};
 #[cfg(not(windows))]
 use tracedecay_store::ObservationProjectionStore;
@@ -865,8 +865,8 @@ async fn cline_like_replacement_projection_replay_is_deterministic() {
             committed_ui, prefix_ui,
             "{provider}: API replacement leaves UI generation and frontier unchanged"
         );
-        // Full coverage of the replacement snapshot — three conversation rows
-        // plus the uncorrelated ui_messages usage record — commits before
+        // Full coverage of the replacement snapshot, three conversation rows
+        // plus the uncorrelated ui_messages usage record, commits before
         // projection acknowledgement; the failed projection replays from the
         // durable queue rather than wedging the observation frontier.
         assert_eq!(

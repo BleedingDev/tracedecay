@@ -9,13 +9,16 @@ use tracedecay_domain::{
 };
 use tracedecay_runtime_core::db::engine::{Executor, TestConnection};
 use tracedecay_temporal_query::candidates::CandidateChannel;
-use tracedecay_temporal_query::ports::{
-    BindingDigest, ExecutionControl, KernelVersions, TemporalCandidateFilterV1,
-    TemporalExecutionSnapshot, TemporalPortError, TemporalSessionScopeFilterV1,
-    TemporalSnapshotRequest, TemporalWatermarks,
-};
+use tracedecay_temporal_query::execution::TemporalPortError;
+use tracedecay_temporal_query::execution::{BindingDigest, ExecutionControl};
 use tracedecay_temporal_query::ranking::RankingCandidate;
 use tracedecay_temporal_query::resolution::ValidatedAuthorization;
+use tracedecay_temporal_query::snapshot::{
+    KernelVersions, TemporalExecutionSnapshot, TemporalWatermarks,
+};
+use tracedecay_temporal_query::snapshot::{
+    TemporalCandidateFilterV1, TemporalSessionScopeFilterV1, TemporalSnapshotRequest,
+};
 
 use super::SessionTemporalReadPort;
 use crate::relations::{
@@ -23,9 +26,7 @@ use crate::relations::{
     WorkflowAgentMembership,
 };
 
-fn digest(byte: char) -> String {
-    format!("sha256:{}", byte.to_string().repeat(64))
-}
+use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
 fn project() -> ProjectId {
     ProjectId::new("project-retrieval").expect("project")

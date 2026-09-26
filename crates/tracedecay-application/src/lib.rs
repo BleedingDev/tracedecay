@@ -22,9 +22,11 @@
 //! - [`tracedecay_configuration::PinnedRuntimeConfigurationCachePort`], installed
 //!   via [`tracedecay_configuration::install_pinned_runtime_configuration_cache`]
 //!   by the composition root, which owns opening durable configuration.
-//!   Configuration value and persistence contracts live in
-//!   `tracedecay-configuration` (re-exported from
-//!   `tracedecay_global_db::configuration::contracts`), not duplicated here.
+//!   Configuration
+//!   value/persistence contracts live in `tracedecay-configuration` (re-exported
+//!   from `tracedecay_global_db::configuration::contracts`), not duplicated here.
+//!   `config::retrieval` stays in this crate because it is production-load-bearing
+//!   on search-eval.
 //! - Transport-independent response handles live in
 //!   `tracedecay_session_memory::response_handles`; MCP adapters should call
 //!   that module rather than keep a parallel handle store.
@@ -35,7 +37,7 @@
 /// `Database::publish_test_runtime` materialises a profile-scoped sidecar shard
 /// that the kernel initialises through
 /// `tracedecay_runtime_core::ports::registered_schema`. That port fails closed
-/// until the real schema — owned by `tracedecay-global-db` — is registered.
+/// until the real schema, owned by `tracedecay-global-db`, is registered.
 /// Production wires it from the daemon composition root; this crate's test
 /// target reuses the identical installer through its `test-helpers`
 /// dev-dependency. Idempotent: the port keeps the first registration, so every
@@ -54,6 +56,7 @@ pub mod code_index;
 pub mod dashboard_diagnostics;
 pub mod delivery;
 pub mod diagnose;
+pub mod diagnostics_producer;
 pub mod diagnostics_publication;
 pub mod diagnostics_query;
 pub mod diagnostics_store;

@@ -1,11 +1,11 @@
-//! `GET /api/events` — the dashboard's typed Server-Sent Events stream.
+//! `GET /api/events`, the dashboard's typed Server-Sent Events stream.
 //!
 //! The dashboard frontend replaces polling with one revision-monotone SSE path.
 //! Every event
 //! carries stream/run identity, a monotone event revision, an entity revision,
 //! exact scope, observation time, an optional source watermark, and coverage.
 //! The client reducer deduplicates by `(stream, event_revision)`, rejects stale
-//! generations, and refetches the canonical read model on a revision gap — so
+//! generations, and refetches the canonical read model on a revision gap, so
 //! this endpoint deliberately emits **coarse invalidation** events, never full
 //! read-model payloads. A periodic heartbeat (both a typed `heartbeat` event and
 //! transport-level keep-alive comment frames) proves liveness.
@@ -17,14 +17,14 @@
 //! Two kinds of source feed this endpoint.
 //!
 //! **Polled digests** (cheap, within dashboard territory):
-//! - `project_registry_changed` — polled from the project registry snapshot
+//! - `project_registry_changed`, polled from the project registry snapshot
 //!   digest (real end-to-end);
-//! - `storage_telemetry_invalidated` — polled coarsely from the summed store
+//! - `storage_telemetry_invalidated`, polled coarsely from the summed store
 //!   size (a real change signal that tells the client to refetch
 //!   `/api/storage/telemetry`).
 //!
 //! **Durable activity records** (via [`tracedecay_session_memory::event_lane`]): the daemon
-//! observes real agent work continuously — host hooks admitted on the MCP
+//! observes real agent work continuously, host hooks admitted on the MCP
 //! boundary, transcript messages persisted, touched paths queued for indexing,
 //! tool calls dispatched. Each producer durably publishes its own project
 //! scope before waking live consumers, and this endpoint turns those records into
@@ -35,7 +35,7 @@
 //! running many agents produces hook and index pulses far faster than any
 //! visualization can render, and the client's queue is bounded. So pulses
 //! accumulate into one bucket per `(family, project)` and flush on a fixed
-//! [`ACTIVITY_FLUSH_INTERVAL`] tick — at most **two events per second per family
+//! [`ACTIVITY_FLUSH_INTERVAL`] tick, at most **two events per second per family
 //! per project**, each carrying the coalesced `count`/`units` in its payload.
 //! Slow or lagged consumers replay from the persisted producer frontier.
 //! Retention eviction and rejected oversized records advance explicit drop and
@@ -396,7 +396,7 @@ impl EventStreamState {
 
     /// Resolve the registered project id for an observed project root. Prefers
     /// the id the producer already supplied; falls back to the registry map,
-    /// canonicalizing once (only here, at flush time — never on the producer's
+    /// canonicalizing once (only here, at flush time, never on the producer's
     /// hot path).
     fn resolve_project_id(&self, root: &Path, supplied: Option<String>) -> Option<String> {
         if supplied.is_some() {
@@ -412,7 +412,7 @@ impl EventStreamState {
     /// Turn one coalesced bucket into an envelope-disciplined event. `base` is
     /// the serving dashboard's scope: the observed project's id replaces
     /// `project_id`, while the storage identity stays the store this daemon
-    /// actually observed the work in — which is exactly where the observation
+    /// actually observed the work in, which is exactly where the observation
     /// was recorded.
     fn activity_event(
         &mut self,
@@ -526,18 +526,9 @@ pub async fn events(State(state): State<DashboardState>, headers: HeaderMap) -> 
     let requested = parse_last_event_id(&headers);
     let activity_db = state.lcm_db.clone();
     let activity_project_id = state.project_id.clone();
-    let initial_replay = match (activity_db.as_deref(), activity_project_id.as_deref()) {
-        (Some(db), Some(project_id)) => {
-            tracedecay_session_memory::event_lane::replay_after(
-                db,
-                project_id,
-                requested.as_ref().map(|resume| resume.sequence),
-            )
-            .await
-        }
-        _ => Ok(None),
-    };
 
+    // The response returns before any store is read, so the stream opens
+    // even while the session store is busy.
     tokio::spawn(async move {
         let delivery_settlements = Arc::clone(&state.delivery_settlements);
         let connection_ref = crate::events_delivery::connection_ref(&run_id, &scope);
@@ -545,6 +536,31 @@ pub async fn events(State(state): State<DashboardState>, headers: HeaderMap) -> 
         async {
         let activity_run_id = run_id.clone();
         let mut stream_state = EventStreamState::new(run_id);
+        // The first frame proves the stream is live before the activity
+        // replay or the source baselines read a store.
+        let connected = stream_state.heartbeat(&scope);
+        if send_event(
+            &tx,
+            delivery_settlements.as_ref(),
+            connection_ref_for_stream.as_deref(),
+            connected,
+        )
+        .await
+        .is_err()
+        {
+            return;
+        }
+        let initial_replay = match (activity_db.as_deref(), activity_project_id.as_deref()) {
+            (Some(db), Some(project_id)) => {
+                tracedecay_session_memory::event_lane::replay_after(
+                    db,
+                    project_id,
+                    requested.as_ref().map(|resume| resume.sequence),
+                )
+                .await
+            }
+            _ => Ok(None),
+        };
         let mut interval = tokio::time::interval(POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut flush = tokio::time::interval(ACTIVITY_FLUSH_INTERVAL);
@@ -1033,6 +1049,8 @@ pub(crate) async fn dashboard_state_fixture(
         lcm_db: None,
         lcm_db_path: String::new(),
         lcm_scope: "unavailable".to_owned(),
+        session_authority: crate::DashboardSessionAuthorityStateV1::Unavailable,
+        session_resolver: None,
         lcm_read_authority: None,
         git_correlation_read_authority: None,
         delivery_read_authority: None,
@@ -1044,7 +1062,6 @@ pub(crate) async fn dashboard_state_fixture(
         pr_autotrack_reader: None,
         storage_mode: "profile_sharded".to_owned(),
         store_root,
-        config_path: project.path().join("config.json"),
         dashboard_root,
         retention_config: tracedecay_configuration::RetentionConfig::default(),
         user_settings: Arc::new(ProductionUserSettingsDaemonClient::default()),
@@ -1360,28 +1377,19 @@ mod tests {
     }
 
     #[test]
-    fn activity_families_serialize_with_their_own_family_tags() {
-        for family in ActivityFamilyV1::ALL {
-            let kind = DashboardEventKindV1::activity(family, 1, 1, None);
-            let value = serde_json::to_value(&kind).unwrap();
-            let tag = value["family"].as_str().expect("family tag").to_string();
-            assert!(
-                tag.ends_with("_activity"),
-                "activity families are tagged as activity: {tag}"
-            );
-            // The SSE event name must be the one the frontend subscribes to.
-            assert_eq!(kind.stream(), family.stream_name());
-        }
+    fn tool_call_activity_serializes_its_family_tag_and_sse_stream() {
+        let kind = DashboardEventKindV1::activity(
+            ActivityFamilyV1::ToolCall,
+            4,
+            4,
+            Some("tracedecay_context".into()),
+        );
         assert_eq!(
-            serde_json::to_value(DashboardEventKindV1::activity(
-                ActivityFamilyV1::ToolCall,
-                4,
-                4,
-                Some("tracedecay_context".into()),
-            ))
-            .unwrap()["family"],
+            serde_json::to_value(&kind).unwrap()["family"],
             "tool_call_activity"
         );
+        // The SSE event name the frontend subscribes to.
+        assert_eq!(kind.stream(), "tool_call");
     }
 
     #[test]

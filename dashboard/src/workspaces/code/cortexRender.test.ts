@@ -2,8 +2,8 @@
  * The renderer's geometry, tested where it can be tested without a canvas.
  *
  * `createCortexRenderer` needs a 2D context, but the three functions that
- * decide WHERE a mark lands — the outline, its extent, and the hit test that
- * has to agree with both — are pure, and they are the ones that can silently
+ * decide WHERE a mark lands, the outline, its extent, and the hit test that
+ * has to agree with both, are pure, and they are the ones that can silently
  * disagree with the model. A hit test that does not match the drawn shape is a
  * surface where clicking a region selects a different one.
  */
@@ -47,13 +47,10 @@ function twoRegionModel() {
     ideal_depth: 2,
     max_depth: 3,
     scan: {
-      budget_ms: 4000,
       cache_scope: 'graph_generation',
       cache_state: 'hit',
       dependency_edges_examined: 100,
       files_examined: 44,
-      max_dependency_edges: 40_000,
-      max_files: 20_000,
     },
   };
   return buildCortexModel(measurement);

@@ -1,4 +1,6 @@
-//! `tracedecay_files` — indexed file listing with prefix and glob filters.
+//! `tracedecay_files`, indexed file listing with prefix and glob filters.
+
+use std::path::Path;
 
 use crate::ToolResult;
 use crate::path_tree::format_compact_annotated_path_list;
@@ -12,6 +14,7 @@ use super::verified::{self, indexed_files};
 
 #[hotpath::measure(future = true, label = "mcp.info.files.total")]
 pub async fn handle_files(
+    response_handle_root: &Path,
     graph: &VerifiedGraphQuery,
     args: Value,
     scope_prefix: Option<&str>,
@@ -25,12 +28,7 @@ pub async fn handle_files(
     .await?;
 
     if let Some(dir) = effective_path(&args, scope_prefix) {
-        let prefix = if dir.ends_with('/') {
-            dir.to_string()
-        } else {
-            format!("{dir}/")
-        };
-        files.retain(|f| f.path.starts_with(&prefix) || f.path == dir);
+        files.retain(|f| tracedecay_domain::path_matches_scope(&f.path, Some(dir)));
     }
 
     if let Some(pat) = args.get("pattern").and_then(|v| v.as_str()) {
@@ -40,7 +38,7 @@ pub async fn handle_files(
         files.retain(|f| glob.matches(&f.path));
     }
 
-    // Listing files is metadata-only — no source code is served, so no tokens saved.
+    // Listing files is metadata-only, no source code is served, so no tokens saved.
     let touched_files = vec![];
 
     let layout = args
@@ -60,7 +58,7 @@ pub async fn handle_files(
         })
     });
     Ok(rendered_tool_result(
-        Some(project_root),
+        Some(response_handle_root),
         &args,
         &payload,
         touched_files,

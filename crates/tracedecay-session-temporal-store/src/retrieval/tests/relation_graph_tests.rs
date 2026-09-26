@@ -315,8 +315,7 @@ async fn copy_lineage_comes_from_grafeo_without_a_sql_relation_table() {
                  session_id, generation, occurrence_id, source_observation_id,
                  source_provider, projection_output_ordinal, retrieval_anchor_id,
                  role, knowledge_at, valid_time_json, evidence_json,
-                 sanitized_content_digest, sanitized_content_bytes,
-                 snippet_text, index_text
+                 sanitized_content_digest, sanitized_content_bytes, index_text
              ) VALUES
                  ('session-b', 1, '{target_value}', 'observation-shared',
                   'fixture-provider', 2, 'graph-target-anchor', 'user', 6,
@@ -326,7 +325,7 @@ async fn copy_lineage_comes_from_grafeo_without_a_sql_relation_table() {
                     \"sanitization_receipt\":{{
                       \"receipt_id\":\"receipt-1\",\"sanitizer_version\":\"fixture\"
                     }}}}',
-                  '{content_digest}', 6, 'target', 'target'),
+                  '{content_digest}', 6, 'target'),
                  ('session-b', 1, '{graph_source_value}', 'observation-shared',
                   'fixture-provider', 3, 'graph-source-anchor', 'user', 5,
                   '{{\"kind\":\"unknown\"}}',
@@ -335,7 +334,7 @@ async fn copy_lineage_comes_from_grafeo_without_a_sql_relation_table() {
                     \"sanitization_receipt\":{{
                       \"receipt_id\":\"receipt-1\",\"sanitizer_version\":\"fixture\"
                     }}}}',
-                  '{content_digest}', 5, 'graph', 'graph');"
+                  '{content_digest}', 5, 'graph');"
         ),
     )
     .await
@@ -876,7 +875,7 @@ async fn anchor_lookups_that_resolve_a_summary_read_its_summary_relations() {
     let read = runtime.retrieval_read_for_test().await;
     // A summary describe hydrates over the summary's own anchor, so its
     // candidate arrives on the anchor channel carrying the summary's evidence
-    // role and summary identity — never an occurrence identity.
+    // role and summary identity, never an occurrence identity.
     let mut candidate = candidate_for_anchor("anchor-summary-provider");
     candidate.channel = CandidateChannel::Anchor;
     candidate.evidence_role = Some("summary".to_string());

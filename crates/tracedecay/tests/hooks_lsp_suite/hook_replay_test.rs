@@ -1,6 +1,6 @@
 //! End-to-end hook replay: drives response and capture hook subcommands through
 //! the real binary with representative event payloads, then asserts the full
-//! telemetry wiring — every native callback, response-capable or capture-only,
+//! telemetry wiring, every native callback, response-capable or capture-only,
 //! records one attributed `hook_analytics.jsonl` row, and `tracedecay analytics
 //! sync` bridges those rows into durable analytics events. Capture-only
 //! callbacks additionally persist delivery receipts; that durable spool journey
@@ -16,8 +16,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
-use tracedecay_global_db::AnalyticsEventQuery;
+use tracedecay_global_db::{AnalyticsEventQuery, RegisteredGlobalDb};
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_runtime_core::storage::{StorageMode, default_profile_sharded_layout};
 
 use crate::common::{git_program, spawn_tracedecay_daemon_with, tracedecay_command_with_home};
@@ -26,7 +26,7 @@ use crate::common::{git_program, spawn_tracedecay_daemon_with, tracedecay_comman
 /// processes never touch the operator's real accounting store. This test's
 /// subject is the bridge from hook JSONL into the durable `analytics_events`
 /// table, which lives in the registered profile accounting database, so it must
-/// opt back in — against its own hermetic temp profile, never a live one.
+/// opt back in, against its own hermetic temp profile, never a live one.
 fn enable_profile_accounting(command: &mut Command) -> &mut Command {
     command.env("TRACEDECAY_ENABLE_GLOBAL_DB", "1")
 }
@@ -211,6 +211,31 @@ fn replays(root: &str) -> Vec<Replay> {
                 "cwd": root,
                 "tool_name": "fsWrite",
                 "file_path": format!("{root}/src/lib.rs"),
+            })),
+            tool_input_env: None,
+        },
+        Replay {
+            subcommand: "hook-pi-event",
+            agent: "pi",
+            hook_name: "session_start",
+            stdin: Some(json!({
+                "hook_event_name": "session_start",
+                "id": "pi-e1",
+                "session_id": "pi-s1",
+                "cwd": root,
+                "reason": "startup",
+            })),
+            tool_input_env: None,
+        },
+        Replay {
+            subcommand: "hook-pi-event",
+            agent: "pi",
+            hook_name: "agent_end",
+            stdin: Some(json!({
+                "hook_event_name": "agent_end",
+                "id": "pi-e2",
+                "session_id": "pi-s1",
+                "cwd": root,
             })),
             tool_input_env: None,
         },
@@ -439,7 +464,7 @@ async fn replayed_provider_hooks_record_attributed_rows_and_bridge_to_analytics_
         replays.len(),
         "every native callback's timing row must bridge into analytics_events"
     );
-    let canonical_project = HostAdmissionTestRuntimeV1::canonical_project_key(&project_root);
+    let canonical_project = RegisteredGlobalDb::canonical_project_key(&project_root);
     for replay in &replays {
         let provider = format!("hook_{}", replay.agent);
         let event = events

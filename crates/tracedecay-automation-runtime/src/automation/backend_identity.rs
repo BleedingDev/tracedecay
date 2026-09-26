@@ -1,7 +1,7 @@
 //! The durable identity a run's backend and configuration executed under.
 //!
-//! A deterministic backend failure — a typed permanent protocol or
-//! configuration fault, as opposed to transient I/O — reproduces exactly as
+//! A deterministic backend failure is a typed permanent protocol or
+//! configuration fault, as opposed to transient I/O. It reproduces exactly as
 //! long as nothing about the backend or the configuration changes. Retrying
 //! it is not recovery: it burns a scheduler tick, spawns the provider again,
 //! and settles on the same terminal state. Such a failure must settle **once**
@@ -10,20 +10,22 @@
 //! That requires a real identity to key on, not a timer and not an attempt
 //! counter. This module computes one: a content digest over
 //!
-//! * the **effective automation configuration revision** — the full
+//! * the **effective automation configuration revision**, the full
 //!   [`AutomationConfig`] the run executed under. A content digest is the
 //!   configuration's revision: it changes exactly when the effective settings
 //!   change, and (unlike a monotonic revision counter) never advances for a
 //!   rewrite that leaves the settings identical. Backend kind, host mode,
 //!   model, timeout, and every per-task setting are inside it.
-//! * the **backend executable identity** — the opened `codex` binary the port
-//!   will actually spawn. The component carries stable opened-file identity
-//!   (Unix `dev`/`ino`, Windows volume serial / file index / link count) plus
-//!   revision evidence (length, mtime, and a `sha256:` content digest). A
-//!   missing or unreadable executable is a typed `spec` + `unreadable`
-//!   component, not a hasher error. Pointing the backend at a different or
-//!   upgraded executable is a backend change even when no setting moved.
-//! * the **protocol revision** — [`AGENT_BACKEND_PROTOCOL_REVISION`], our own
+//! * the **backend executable identity**, the opened `codex` binary the port
+//!   will actually spawn, as the configuration authority bound it. The
+//!   component carries stable opened-file identity (Unix `dev`/`ino`, Windows
+//!   volume serial / file index / link count) plus revision evidence (length,
+//!   mtime, and a `sha256:` content digest). A missing or unreadable
+//!   executable is a typed `path` + `unreadable` component, and an
+//!   unconfigured one is `null`, never a hasher error. Pointing the backend at
+//!   a different or upgraded executable is a backend change even when no
+//!   automation setting moved.
+//! * the **protocol revision**, `AGENT_BACKEND_PROTOCOL_REVISION`, our own
 //!   side of the transport contract. The app-server handshake, framing, and
 //!   process lifetime are ours, so shipping a transport fix is a backend
 //!   change. Without this component a suppression recorded by a broken build
@@ -45,7 +47,6 @@ use tracedecay_domain::canonical_sha256;
 use super::backend::AgentTaskFailureClass;
 use super::config::{AutomationBackend, AutomationConfig};
 use super::config_error;
-use crate::ports::codex_app_server::SummaryConfig as CodexAppServerSummaryConfig;
 use tracedecay_domain::errors::Result;
 
 /// Skip reason published when a settled deterministic backend failure
@@ -60,9 +61,9 @@ pub const BACKEND_IDENTITY_SUPPRESSED: &str = "backend_identity_suppressed";
 /// does not move when the workspace is released, so a suppression written
 /// today would otherwise outlive its own fix forever.
 ///
-/// **Bump this whenever the transport contract changes** — the handshake,
-/// the request framing, the process lifetime, or which provider methods a
-/// turn depends on. Every task settled against the previous revision is
+/// **Bump this whenever the transport contract changes.** That includes the
+/// handshake, the request framing, the process lifetime, and which provider
+/// methods a turn depends on. Every task settled against the previous revision is
 /// re-admitted on the next tick, which is exactly the intended effect of
 /// shipping a transport fix.
 ///
@@ -90,13 +91,15 @@ fn executable_digest_cache() -> &'static Mutex<HashMap<ExecutableDigestCacheKey,
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Computes the durable backend/configuration identity for `config`.
+/// Computes the durable backend/configuration identity for `config` and the
+/// executable the backend spawns (`AgentTaskBackend::executable`).
 ///
-/// The executable component is read from the same environment overrides the
-/// port itself honours, so the identity tracks the binary that would actually
-/// be spawned rather than a nominal default. Envelope hashing stays
-/// [`canonical_sha256`]; hasher failures are `config_error` results.
-pub fn backend_identity(config: &AutomationConfig) -> Result<String> {
+/// `executable` is the configured path the port itself would spawn, so the
+/// identity tracks the binary that would actually run; `None` records that
+/// the backend spawns nothing (disabled, in-process, or unconfigured).
+/// Envelope hashing stays [`canonical_sha256`]; hasher failures are
+/// `config_error` results.
+pub fn backend_identity(config: &AutomationConfig, executable: Option<&Path>) -> Result<String> {
     // `canonical_sha256` is the crate's one identity primitive: key-ordered,
     // whitespace-free, and already used to derive the configuration identity
     // that curation decisions are bound to.
@@ -107,7 +110,7 @@ pub fn backend_identity(config: &AutomationConfig) -> Result<String> {
         "kind": "automation.backend_identity.v1",
         "configuration_revision": configuration_revision.as_str(),
         "backend": config.backend.as_str(),
-        "executable": backend_executable_identity(config),
+        "executable": backend_executable_identity(config, executable),
         "protocol_revision": AGENT_BACKEND_PROTOCOL_REVISION,
     }))
     .map(|digest| digest.as_str().to_owned())
@@ -117,62 +120,33 @@ pub fn backend_identity(config: &AutomationConfig) -> Result<String> {
 /// The executable the configured backend would spawn, or `None` for a backend
 /// that spawns nothing.
 ///
-/// The component is the opened file, not the resolved path alone: stable
+/// The component is the opened file, not the configured path alone: stable
 /// device/index identity plus length, mtime, and a receipt-tagged content
 /// digest. A missing or unreadable executable stays a typed
-/// `spec` + `unreadable` component so identity remains computable.
-fn backend_executable_identity(config: &AutomationConfig) -> Option<Value> {
+/// `path` + `unreadable` component so identity remains computable.
+fn backend_executable_identity(
+    config: &AutomationConfig,
+    executable: Option<&Path>,
+) -> Option<Value> {
     match config.backend {
         AutomationBackend::Disabled => None,
-        AutomationBackend::CodexAppServer => {
-            let spec = CodexAppServerSummaryConfig::from_env().codex_bin;
-            Some(codex_executable_identity(&spec))
-        }
-    }
-}
-
-fn codex_executable_identity(spec: &str) -> Value {
-    match locate_backend_executable(spec) {
-        Ok(Some(path)) => opened_executable_identity(spec, &path)
-            .unwrap_or_else(|| unreadable_executable_identity(spec, Some(path.as_path()))),
-        Ok(None) => unreadable_executable_identity(spec, None),
-        Err(error) => json!({
-            "spec": spec,
-            "state": "host_io_unavailable",
-            "error": error.to_string(),
+        AutomationBackend::CodexAppServer => executable.map(|path| {
+            opened_executable_identity(path).unwrap_or_else(|| {
+                json!({
+                    "path": path.to_string_lossy(),
+                    "state": "unreadable",
+                })
+            })
         }),
     }
 }
 
-fn locate_backend_executable(spec: &str) -> Result<Option<PathBuf>> {
-    let spec_path = Path::new(spec);
-    if spec_path.is_absolute() || spec.contains(std::path::MAIN_SEPARATOR) {
-        return Ok(spec_path.is_file().then(|| spec_path.to_path_buf()));
-    }
-    super::executable_lookup::resolve_on_path(spec, std::env::var_os("PATH").as_deref())
-}
-
-fn unreadable_executable_identity(spec: &str, path: Option<&Path>) -> Value {
-    match path {
-        Some(path) => json!({
-            "spec": spec,
-            "path": path.to_string_lossy(),
-            "state": "unreadable",
-        }),
-        None => json!({
-            "spec": spec,
-            "state": "unreadable",
-        }),
-    }
-}
-
-fn opened_executable_identity(spec: &str, path: &Path) -> Option<Value> {
+fn opened_executable_identity(path: &Path) -> Option<Value> {
     let mut file = File::open(path).ok()?;
     let metadata = file.metadata().ok()?;
     let revision = opened_file_revision(&file, &metadata)?;
     let content = cached_executable_content_digest(&revision, path, &mut file)?;
     let mut identity = revision.fields;
-    identity["spec"] = json!(spec);
     identity["path"] = json!(path.to_string_lossy());
     identity["content"] = json!(content);
     Some(identity)
@@ -286,7 +260,7 @@ fn digest_opened_file(file: &mut File) -> std::io::Result<String> {
 /// Whether a failure class is deterministic under a fixed backend and
 /// configuration.
 ///
-/// Only [`AgentTaskFailureClass::Permanent`] stands as identity suppress.
+/// Only [`AgentTaskFailureClass::Permanent`] is identity suppress.
 /// `Unavailable`, `Denied`, `Disconnected`, `MalformedOutput`, `Timeout`, and
 /// `Retryable` can change without a backend or configuration revision
 /// (installation, credentials, provider policy, load), so they keep the
@@ -294,42 +268,6 @@ fn digest_opened_file(file: &mut File) -> std::io::Result<String> {
 #[must_use]
 pub fn is_deterministic_failure_class(class: AgentTaskFailureClass) -> bool {
     matches!(class, AgentTaskFailureClass::Permanent)
-}
-
-#[cfg(test)]
-pub(crate) struct CodexBinEnvGuard {
-    previous: Option<std::ffi::OsString>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl CodexBinEnvGuard {
-    pub(crate) fn set(path: &std::path::Path) -> Self {
-        let lock = tracedecay_runtime_core::config::lock_user_data_dir_test_env();
-        let previous = std::env::var_os("TRACEDECAY_CODEX_BIN");
-        // SAFETY: the shared user-data-dir lock is held for the guard
-        // lifetime, so sibling env tests cannot observe this override.
-        unsafe {
-            std::env::set_var("TRACEDECAY_CODEX_BIN", path);
-        }
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for CodexBinEnvGuard {
-    fn drop(&mut self) {
-        // SAFETY: see `CodexBinEnvGuard::set`.
-        unsafe {
-            match self.previous.take() {
-                Some(previous) => std::env::set_var("TRACEDECAY_CODEX_BIN", previous),
-                None => std::env::remove_var("TRACEDECAY_CODEX_BIN"),
-            }
-        }
-    }
 }
 
 #[cfg(test)]

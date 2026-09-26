@@ -1,7 +1,5 @@
 use std::fmt;
-use std::future::Future;
 use std::path::Path;
-use std::pin::Pin;
 
 use tracedecay_contracts::now_micros;
 use tracedecay_domain::canonical_text::{is_lowercase_hex, sha256_hex};
@@ -17,31 +15,41 @@ use zeroize::Zeroizing;
 use crate::relations::{
     SessionRelationError, SessionRelationGraphStore, SessionRelationScope, SummarySourceVisitKind,
 };
-use crate::support::{
-    derive_projection, record_hydration_emitted_bytes, record_hydration_verified_bytes,
-};
+use crate::support::{record_hydration_emitted_bytes, record_hydration_verified_bytes};
 use tracedecay_lcm::payload::{
     PayloadStreamError, VerifiedPayloadStream, open_verified_payload_stream,
 };
 use tracedecay_lcm::{LcmStorageKind, raw};
+use tracedecay_store::{derive_canonical_projection, message_metadata_with_envelope};
+use tracedecay_temporal_query::execution::ExecutionControl;
+use tracedecay_temporal_query::execution::TemporalPortError;
 use tracedecay_temporal_query::hydration::{
     HydrationAuthorization, HydrationDenial, HydrationError, HydrationFuture, HydrationGrant,
     HydrationSink, TemporalHydrationPort,
 };
-use tracedecay_temporal_query::ports::{
-    ExecutionControl, TemporalExecutionSnapshot, TemporalPortError, TemporalRetrievalScope,
-    TemporalSourceAccess,
-};
+use tracedecay_temporal_query::snapshot::TemporalRetrievalScope;
+use tracedecay_temporal_query::snapshot::{TemporalExecutionSnapshot, TemporalSourceAccess};
 
 use super::operations::CanonicalPublicationManifest;
 use super::sql::TemporalSqlRead;
 use super::store::execution_control_graph_cancellation;
 
-type BackendFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HydrationError>> + Send + 'a>>;
 const MAX_SUMMARY_SOURCE_RELATIONS: usize = 256;
 /// Window a file-backed payload is proven through; emission uses the grant's
 /// chunk size instead, so neither pass holds more than one window.
 const PAYLOAD_PROOF_WINDOW_BYTES: usize = 64 * 1024;
+/// The occurrence's source observation envelope. Message rows store only the
+/// metadata the envelope lacks, so the record's full metadata joins it back.
+/// Stored message metadata without the raw authority's ingest-protection
+/// receipts, which are storage bookkeeping rather than message metadata.
+const SERVED_MESSAGE_METADATA_COLUMN: &str = "CASE WHEN json_valid(message.metadata_json)
+      THEN NULLIF(json_remove(message.metadata_json, '$.ingest_protection'), '{}')
+      ELSE message.metadata_json END";
+
+const OCCURRENCE_ENVELOPE_COLUMN: &str =
+    "(SELECT json_extract(observation.observation_json, '$.payload')
+   FROM observations AS observation
+   WHERE observation.observation_id = occurrence.source_observation_id)";
 
 mod external;
 use external::resolve_external_manifest;
@@ -165,44 +173,11 @@ impl BoundedPayload {
     }
 }
 
-pub trait TemporalHydrationBackend: Send + Sync {
-    /// Snapshot-backed production reads cannot observe mid-hydration drift, so
-    /// the adapter may skip the post-read `resolve_current` recheck. Mutable
-    /// test doubles keep the default and still exercise revocation.
-    fn snapshot_is_stable(&self) -> bool {
-        false
-    }
-
-    fn resolve_current<'a>(
-        &'a self,
-        snapshot: &'a TemporalExecutionSnapshot,
-        anchor_id: &'a RetrievalAnchorId,
-    ) -> BackendFuture<'a, HydrationResolution>;
-
-    /// Opens the payload behind `descriptor` without exposing its bytes to a
-    /// sink. A file-backed payload is proven against the descriptor while it
-    /// is opened; an owned buffer is proven by the adapter afterwards. Either
-    /// way no chunk leaves the adapter before the proof passes.
-    fn open_bounded<'a>(
-        &'a self,
-        descriptor: &'a PayloadDescriptor,
-        max_bytes: usize,
-        control: &'a ExecutionControl,
-    ) -> BackendFuture<'a, BoundedPayload>;
+pub struct SessionTemporalHydrationAdapter<'snapshot> {
+    backend: SessionTemporalHydrationBackend<'snapshot>,
 }
 
-pub struct SessionTemporalHydrationAdapter<B> {
-    backend: B,
-}
-
-impl<B> SessionTemporalHydrationAdapter<B> {
-    #[hotpath::skip]
-    pub const fn new(backend: B) -> Self {
-        Self { backend }
-    }
-}
-
-impl<B: TemporalHydrationBackend> SessionTemporalHydrationAdapter<B> {
+impl SessionTemporalHydrationAdapter<'_> {
     async fn authorize(
         &self,
         snapshot: &TemporalExecutionSnapshot,
@@ -219,6 +194,10 @@ impl<B: TemporalHydrationBackend> SessionTemporalHydrationAdapter<B> {
         }
     }
 
+    /// Resolves `anchor_id` again under the frozen read snapshot and reads the
+    /// payload it names. The snapshot pins every row, so a revocation cannot
+    /// land between resolution and read; only the payload file lives outside
+    /// it, and [`Self::read_descriptor`] proves that file before emission.
     #[hotpath::skip]
     async fn read_after_recheck(
         &self,
@@ -234,6 +213,18 @@ impl<B: TemporalHydrationBackend> SessionTemporalHydrationAdapter<B> {
             HydrationResolution::Available(descriptor) => descriptor,
             HydrationResolution::Unavailable(_) => return Err(HydrationError::Unavailable),
         };
+        self.read_descriptor(control, &descriptor, max_bytes, max_chunk_bytes, emit)
+            .await
+    }
+
+    async fn read_descriptor(
+        &self,
+        control: &ExecutionControl,
+        descriptor: &PayloadDescriptor,
+        max_bytes: usize,
+        max_chunk_bytes: usize,
+        emit: &mut (dyn FnMut(&[u8]) -> Result<(), HydrationError> + Send),
+    ) -> Result<(), HydrationError> {
         if descriptor.byte_count > max_bytes {
             return Err(HydrationError::BudgetExceeded {
                 resource: "payload bytes",
@@ -242,22 +233,13 @@ impl<B: TemporalHydrationBackend> SessionTemporalHydrationAdapter<B> {
         control.checkpoint()?;
         let payload = self
             .backend
-            .open_bounded(&descriptor, max_bytes, control)
+            .open_bounded(descriptor, max_bytes, control)
             .await?;
-        if !payload.matches(&descriptor) {
+        if !payload.matches(descriptor) {
             return Err(HydrationError::Unavailable);
         }
         record_hydration_verified_bytes(descriptor.byte_count);
         control.checkpoint()?;
-        if !self.backend.snapshot_is_stable() {
-            let current = match self.backend.resolve_current(snapshot, anchor_id).await? {
-                HydrationResolution::Available(current) => current,
-                HydrationResolution::Unavailable(_) => return Err(HydrationError::Unavailable),
-            };
-            if !same_payload_descriptor(&descriptor, &current) {
-                return Err(HydrationError::Unavailable);
-            }
-        }
         if max_chunk_bytes == 0 && descriptor.byte_count > 0 {
             return Err(HydrationError::BudgetExceeded {
                 resource: "chunk bytes",
@@ -315,66 +297,7 @@ fn open_payload_file(
     .map_err(hydration_stream_failure)
 }
 
-fn same_payload_descriptor(left: &PayloadDescriptor, right: &PayloadDescriptor) -> bool {
-    left.byte_count == right.byte_count
-        && left.content_hash == right.content_hash
-        && match (&left.source, &right.source) {
-            (
-                PayloadSource::Occurrence {
-                    provider: left_provider,
-                    session_id: left_session,
-                    message_id: left_message,
-                    source_observation_id: left_observation,
-                    projection_output_ordinal: left_ordinal,
-                },
-                PayloadSource::Occurrence {
-                    provider: right_provider,
-                    session_id: right_session,
-                    message_id: right_message,
-                    source_observation_id: right_observation,
-                    projection_output_ordinal: right_ordinal,
-                },
-            ) => {
-                left_provider == right_provider
-                    && left_session == right_session
-                    && left_message == right_message
-                    && left_observation == right_observation
-                    && left_ordinal == right_ordinal
-            }
-            (
-                PayloadSource::Summary {
-                    session_id: left_session,
-                    summary_id: left_summary,
-                },
-                PayloadSource::Summary {
-                    session_id: right_session,
-                    summary_id: right_summary,
-                },
-            ) => left_session == right_session && left_summary == right_summary,
-            (
-                PayloadSource::External {
-                    provider: left_provider,
-                    session_id: left_session,
-                    payload_ref: left_ref,
-                    char_count: left_chars,
-                },
-                PayloadSource::External {
-                    provider: right_provider,
-                    session_id: right_session,
-                    payload_ref: right_ref,
-                    char_count: right_chars,
-                },
-            ) => {
-                left_provider == right_provider
-                    && left_session == right_session
-                    && left_ref == right_ref
-                    && left_chars == right_chars
-            }
-            _ => false,
-        }
-}
-
-impl<B: TemporalHydrationBackend> TemporalHydrationPort for SessionTemporalHydrationAdapter<B> {
+impl TemporalHydrationPort for SessionTemporalHydrationAdapter<'_> {
     fn authorize_hydration<'a>(
         &'a self,
         snapshot: &'a TemporalExecutionSnapshot,
@@ -440,19 +363,15 @@ impl<'snapshot> SessionTemporalHydrationBackend<'snapshot> {
     }
 }
 
-pub type GlobalDbTemporalHydrationPort<'snapshot> =
-    SessionTemporalHydrationAdapter<SessionTemporalHydrationBackend<'snapshot>>;
-
-impl<'snapshot> SessionTemporalHydrationAdapter<SessionTemporalHydrationBackend<'snapshot>> {
+impl<'snapshot> SessionTemporalHydrationAdapter<'snapshot> {
     #[hotpath::skip]
     pub const fn for_registered_snapshot(
         read: &'snapshot DatabaseEngineReadSnapshot,
         storage_root: &'snapshot Path,
     ) -> Self {
-        Self::new(SessionTemporalHydrationBackend::new_registered(
-            read,
-            storage_root,
-        ))
+        Self {
+            backend: SessionTemporalHydrationBackend::new_registered(read, storage_root),
+        }
     }
 
     #[hotpath::skip]
@@ -462,14 +381,14 @@ impl<'snapshot> SessionTemporalHydrationAdapter<SessionTemporalHydrationBackend<
         scope: &'snapshot SessionRelationScope,
         store: SessionRelationGraphStore,
     ) -> Self {
-        Self::new(
-            SessionTemporalHydrationBackend::new_registered_with_relations(
+        Self {
+            backend: SessionTemporalHydrationBackend::new_registered_with_relations(
                 read,
                 storage_root,
                 scope,
                 store,
             ),
-        )
+        }
     }
 }
 
@@ -497,16 +416,18 @@ pub(super) async fn session_message_from_hydrated_bytes(
                 return Err(HydrationError::Unavailable);
             }
             read.query(
-                "SELECT occurrence.message_id, occurrence.role,
+                &format!(
+                    "SELECT occurrence.message_id, occurrence.role,
                         occurrence.projection_output_ordinal,
                         source.provider, occurrence.session_id,
                         message.timestamp, message.kind, message.model,
                         message.tool_names, message.source_path, message.source_offset,
-                        message.metadata_json, message.role, message.session_id
+                        {SERVED_MESSAGE_METADATA_COLUMN}, message.role, message.session_id,
+                        {OCCURRENCE_ENVELOPE_COLUMN}
                  FROM session_occurrences AS occurrence
                  JOIN sessions AS source
                    ON source.session_id = occurrence.session_id
-                 LEFT JOIN session_messages AS message
+                 LEFT JOIN lcm_raw_messages AS message
                    ON message.provider = source.provider
                   AND message.message_id = occurrence.message_id
                   AND message.session_id = occurrence.session_id
@@ -516,7 +437,8 @@ pub(super) async fn session_message_from_hydrated_bytes(
                    AND source.project_key = ?4
                    AND source.provider = ?5
                  ORDER BY occurrence.occurrence_id
-                 LIMIT 2",
+                 LIMIT 2"
+                ),
                 params![
                     session_id.as_str(),
                     generation,
@@ -529,12 +451,14 @@ pub(super) async fn session_message_from_hydrated_bytes(
         }
         TemporalRetrievalScope::AllSessionsInAuthorizedRoot => {
             read.query(
-                "SELECT occurrence.message_id, occurrence.role,
+                &format!(
+                    "SELECT occurrence.message_id, occurrence.role,
                         occurrence.projection_output_ordinal,
                         source.provider, occurrence.session_id,
                         message.timestamp, message.kind, message.model,
                         message.tool_names, message.source_path, message.source_offset,
-                        message.metadata_json, message.role, message.session_id
+                        {SERVED_MESSAGE_METADATA_COLUMN}, message.role, message.session_id,
+                        {OCCURRENCE_ENVELOPE_COLUMN}
                  FROM session_occurrences AS occurrence
                  JOIN session_temporal_generations AS generation
                    ON generation.session_id = occurrence.session_id
@@ -542,7 +466,7 @@ pub(super) async fn session_message_from_hydrated_bytes(
                   AND generation.state = 'active'
                  JOIN sessions AS source
                    ON source.session_id = occurrence.session_id
-                 LEFT JOIN session_messages AS message
+                 LEFT JOIN lcm_raw_messages AS message
                    ON message.provider = source.provider
                   AND message.message_id = occurrence.message_id
                   AND message.session_id = occurrence.session_id
@@ -551,7 +475,8 @@ pub(super) async fn session_message_from_hydrated_bytes(
                    AND occurrence.session_id = ?3
                    AND source.provider = ?4
                  ORDER BY occurrence.session_id, occurrence.occurrence_id
-                 LIMIT 2",
+                 LIMIT 2"
+                ),
                 params![
                     anchor_id.as_str(),
                     project_key,
@@ -579,9 +504,20 @@ pub(super) async fn session_message_from_hydrated_bytes(
     let tool_names = row.get(8).ok();
     let source_path = row.get(9).ok();
     let source_offset = row.get(10).ok();
-    let metadata_json = row.get(11).ok();
+    let stored_metadata: Option<String> = row.get(11).ok();
     let compatibility_role: Option<String> = row.get(12).ok();
     let compatibility_session: Option<String> = row.get(13).ok();
+    let envelope: Option<String> = row.get(14).ok();
+    let metadata_json = match (&compatibility_role, envelope) {
+        (Some(_), Some(envelope)) => Some(
+            message_metadata_with_envelope(
+                stored_metadata.as_deref(),
+                &serde_json::from_str(&envelope).map_err(hydration_failure)?,
+            )
+            .map_err(hydration_failure)?,
+        ),
+        _ => stored_metadata,
+    };
     if compatibility_role
         .as_deref()
         .is_some_and(|compatibility_role| compatibility_role != role)
@@ -615,7 +551,7 @@ fn canonical_projected_message(
     output_ordinal: i64,
 ) -> Option<SessionMessageRecord> {
     let output_ordinal = u32::try_from(output_ordinal).ok()?;
-    let projection = derive_projection(observation).ok()?;
+    let projection = derive_canonical_projection(observation).ok()?;
     projection
         .messages()
         .find(|output| {
@@ -721,29 +657,6 @@ impl SessionTemporalHydrationBackend<'_> {
     }
 }
 
-impl TemporalHydrationBackend for SessionTemporalHydrationBackend<'_> {
-    fn snapshot_is_stable(&self) -> bool {
-        true
-    }
-
-    fn resolve_current<'a>(
-        &'a self,
-        snapshot: &'a TemporalExecutionSnapshot,
-        anchor_id: &'a RetrievalAnchorId,
-    ) -> BackendFuture<'a, HydrationResolution> {
-        Box::pin(self.resolve_current(snapshot, anchor_id))
-    }
-
-    fn open_bounded<'a>(
-        &'a self,
-        descriptor: &'a PayloadDescriptor,
-        max_bytes: usize,
-        control: &'a ExecutionControl,
-    ) -> BackendFuture<'a, BoundedPayload> {
-        Box::pin(self.open_bounded(descriptor, max_bytes, control))
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn open_occurrence_content(
     conn: &TemporalSqlRead<'_>,
@@ -842,7 +755,7 @@ async fn open_occurrence_content(
 
 fn content_matches_descriptor(content: &[u8], descriptor: &PayloadDescriptor) -> bool {
     content.len() == descriptor.byte_count
-        && content_hash_matches(&descriptor.content_hash, content)
+        && content_hash_equals(&descriptor.content_hash, &sha256_hex(content))
 }
 
 pub(super) fn hydration_failure(error: impl std::fmt::Display) -> HydrationError {
@@ -875,7 +788,7 @@ async fn resolve_current(
         Ok(anchor) => anchor,
         Err(_) => {
             return Ok(HydrationResolution::Unavailable(
-                HydrationStateV1::UnverifiableLegacy,
+                HydrationStateV1::Unverifiable,
             ));
         }
     };
@@ -884,7 +797,7 @@ async fn resolve_current(
         || serde_json::to_string(anchor.owner()).ok().as_deref() != Some(owner_json.as_str())
     {
         return Ok(HydrationResolution::Unavailable(
-            HydrationStateV1::UnverifiableLegacy,
+            HydrationStateV1::Unverifiable,
         ));
     }
     if anchor.authorization().validate().is_err()
@@ -932,7 +845,7 @@ async fn resolve_current(
         return Ok(resolution);
     }
     Ok(HydrationResolution::Unavailable(
-        HydrationStateV1::UnverifiableLegacy,
+        HydrationStateV1::Unverifiable,
     ))
 }
 
@@ -1021,7 +934,7 @@ async fn resolve_occurrence(
             .any(|observation_id| observation_id.as_str() == source_observation_id)
     {
         return Ok(Some(HydrationResolution::Unavailable(
-            HydrationStateV1::UnverifiableLegacy,
+            HydrationStateV1::Unverifiable,
         )));
     }
     if let Some(state) = participant_access_state(snapshot, &session_id, &provider) {
@@ -1134,14 +1047,14 @@ async fn resolve_summary(
     }
     if publication_json.is_empty() {
         return Ok(Some(HydrationResolution::Unavailable(
-            HydrationStateV1::UnverifiableLegacy,
+            HydrationStateV1::Unverifiable,
         )));
     }
     let manifest: CanonicalPublicationManifest = match serde_json::from_str(&publication_json) {
         Ok(manifest) => manifest,
         Err(_) => {
             return Ok(Some(HydrationResolution::Unavailable(
-                HydrationStateV1::UnverifiableLegacy,
+                HydrationStateV1::Unverifiable,
             )));
         }
     };
@@ -1376,7 +1289,6 @@ fn source_access_hydration_state(access: TemporalSourceAccess) -> Option<Hydrati
         TemporalSourceAccess::RetentionWithheld => Some(HydrationStateV1::RetentionExpired),
         TemporalSourceAccess::Deleted => Some(HydrationStateV1::Deleted),
         TemporalSourceAccess::Redacted => Some(HydrationStateV1::Redacted),
-        TemporalSourceAccess::LegacyUnauthorized => Some(HydrationStateV1::Unauthorized),
     }
 }
 
@@ -1417,10 +1329,6 @@ fn nonnegative_usize(value: Option<i64>) -> Result<usize, HydrationError> {
         .ok_or_else(|| hydration_failure("payload size is not a nonnegative usize"))
 }
 
-fn content_hash_matches(expected: &str, bytes: &[u8]) -> bool {
-    content_hash_equals(expected, &sha256_hex(bytes))
-}
-
 fn content_hash_equals(expected: &str, actual_hex: &str) -> bool {
     sha256_hex_suffix(expected).unwrap_or(expected) == actual_hex
 }
@@ -1436,11 +1344,7 @@ mod graph_relation_tests;
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::future::Future;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll, Wake, Waker};
-    use std::thread;
     use std::time::{Duration, Instant};
 
     use serde_json::{Value, json};
@@ -1462,16 +1366,16 @@ mod tests {
     };
     use tracedecay_store::{
         AnchoredObservationWrite, ObservationStore, ObservationWrite,
-        build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
+        build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
     };
 
     use super::*;
     use tracedecay_global_db::tests::harness::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
-    use tracedecay_temporal_query::ports::{
-        BindingDigest, ExecutionLimits, KernelVersions, TemporalAuthorizedRoot, TemporalPortError,
-        TemporalSnapshotRequest, TemporalWatermarks,
-    };
+    use tracedecay_temporal_query::execution::BindingDigest;
+    use tracedecay_temporal_query::execution::TemporalPortError;
     use tracedecay_temporal_query::resolution::ValidatedAuthorization;
+    use tracedecay_temporal_query::snapshot::{KernelVersions, TemporalWatermarks};
+    use tracedecay_temporal_query::snapshot::{TemporalAuthorizedRoot, TemporalSnapshotRequest};
 
     struct RegisteredHydrationRead {
         read: DatabaseEngineReadSnapshot,
@@ -1486,8 +1390,8 @@ mod tests {
     }
 
     impl RegisteredHydrationRead {
-        fn adapter(&self) -> GlobalDbTemporalHydrationPort<'_> {
-            GlobalDbTemporalHydrationPort::for_registered_snapshot(
+        fn adapter(&self) -> SessionTemporalHydrationAdapter<'_> {
+            SessionTemporalHydrationAdapter::for_registered_snapshot(
                 &self.read,
                 self.storage_root.as_path(),
             )
@@ -1534,6 +1438,7 @@ mod tests {
         );
         fn hydration_storage_fingerprint_for_test(&self) -> HydrationStorageFingerprint;
         async fn drift_hydration_anchor_owner_for_test(&self, anchor_id: &RetrievalAnchorId);
+        async fn redact_hydration_anchor_for_test(&self, anchor_id: &RetrievalAnchorId);
     }
 
     impl HostAdmissionHydrationFixture for HostAdmissionTestRuntimeV1 {
@@ -1632,11 +1537,10 @@ mod tests {
                     session_id, generation, occurrence_id, source_observation_id,
                     source_provider, projection_output_ordinal, retrieval_anchor_id,
                     message_id, role, knowledge_at, valid_time_json, evidence_json,
-                    sanitized_content_digest, sanitized_content_bytes,
-                    snippet_text, index_text
+                    sanitized_content_digest, sanitized_content_bytes, index_text
                  ) VALUES (
                     ?1, 1, 'occurrence-1', ?2, ?3, 0, ?4, ?5,
-                    'assistant', 1, '{\"kind\":\"unknown\"}', '{}', ?6, ?7, ?8, ?8
+                    'assistant', 1, '{\"kind\":\"unknown\"}', '{}', ?6, ?7, ?8
                  )",
                 params![
                     session_id,
@@ -1730,11 +1634,10 @@ mod tests {
                 &writer,
                 "INSERT INTO lcm_raw_messages (
                     provider, message_id, session_id, role, ordinal, timestamp,
-                    content, content_hash, storage_kind, payload_ref,
-                    snippet_text, index_text, legacy_source, legacy_truncated
+                    content, content_hash, storage_kind, payload_ref
                  ) VALUES (
                     ?1, 'message-1', 'session-2', 'assistant', 1, 1,
-                    ?2, ?3, 'inline', NULL, ?2, ?2, 0, 0
+                    ?2, ?3, 'inline', NULL
                  )",
                 params![
                     provider,
@@ -1750,11 +1653,10 @@ mod tests {
                     session_id, generation, occurrence_id, source_observation_id,
                     source_provider, projection_output_ordinal, retrieval_anchor_id,
                     message_id, role, knowledge_at, valid_time_json, evidence_json,
-                    sanitized_content_digest, sanitized_content_bytes,
-                    snippet_text, index_text
+                    sanitized_content_digest, sanitized_content_bytes, index_text
                  ) VALUES (
                     'session-2', 1, 'occurrence-1', ?1, ?2, 0, ?3, 'message-1',
-                    'assistant', 1, '{\"kind\":\"unknown\"}', '{}', ?4, ?5, ?6, ?6
+                    'assistant', 1, '{\"kind\":\"unknown\"}', '{}', ?4, ?5, ?6
                  )",
                 params![
                     observation.observation_id().as_str(),
@@ -1846,10 +1748,10 @@ mod tests {
                 "INSERT INTO lcm_raw_messages (
                     provider, message_id, session_id, role, ordinal, timestamp,
                     content, content_hash, storage_kind, payload_ref,
-                    snippet_text, index_text, legacy_source, legacy_truncated
+                    placeholder_text
                  ) VALUES (
                     ?1, 'message-1', 'session-1', 'assistant', 1, 1,
-                    NULL, ?2, 'external', ?3, ?4, ?4, 0, 0
+                    NULL, ?2, 'external', ?3, ?4
                  )",
                 params![
                     provider,
@@ -1896,11 +1798,12 @@ mod tests {
             Executor::execute(
                 &writer,
                 "INSERT INTO session_summary_nodes (
-                    summary_id, session_id, summary_anchor_id, summary_text,
-                    index_text, source_horizon_json, publication_json, created_at
+                    summary_id, session_id, provider, conversation_id, depth,
+                    summary_anchor_id, summary_text, summary_hash, summary_token_count,
+                    source_token_count, source_horizon_json, publication_json, created_at
                  ) VALUES (
-                    'summary-authority', 'session-1', ?1, 'authority',
-                    'authority', '{}', ?2, 1
+                    'summary-authority', 'session-1', 'test', 'session-1', 0, ?1,
+                    'authority', 'hash', 1, 1, '{}', ?2, 1
                  )",
                 params![authority_anchor.anchor_id().as_str(), authority_publication],
             )
@@ -1925,13 +1828,11 @@ mod tests {
                     session_id, generation, occurrence_id, source_observation_id,
                     source_provider, projection_output_ordinal, retrieval_anchor_id,
                     message_id, role, knowledge_at, valid_time_json, evidence_json,
-                    sanitized_content_digest, sanitized_content_bytes,
-                    snippet_text, index_text
+                    sanitized_content_digest, sanitized_content_bytes, index_text
                  ) VALUES (
                     'session-1', 1, 'occurrence-1', ?1, ?2, 0, ?3, 'message-1',
                     'assistant', 1, '{\"kind\":\"unknown\"}', '{}',
-                    ?4, ?5,
-                    'non-empty occurrence payload', 'non-empty occurrence payload'
+                    ?4, ?5, 'non-empty occurrence payload'
                  )",
                 {
                     let canonical =
@@ -1982,9 +1883,11 @@ mod tests {
             Executor::execute(
                 &writer,
                 "INSERT INTO session_summary_nodes (
-                    summary_id, session_id, summary_anchor_id, summary_text,
-                    index_text, source_horizon_json, publication_json, created_at
-                 ) VALUES ('summary-1', 'session-1', ?1, ?2, ?2, '{}', ?3, 1)",
+                    summary_id, session_id, provider, conversation_id, depth,
+                    summary_anchor_id, summary_text, summary_hash, summary_token_count,
+                    source_token_count, source_horizon_json, publication_json, created_at
+                 ) VALUES ('summary-1', 'session-1', 'test', 'session-1', 0, ?1, ?2, 'hash',
+                           1, 1, '{}', ?3, 1)",
                 params![
                     summary_anchor.anchor_id().as_str(),
                     summary_payload,
@@ -2048,147 +1951,34 @@ mod tests {
             .await
             .expect("drift anchor owner");
         }
-    }
 
-    struct ThreadWake(thread::Thread);
-
-    impl Wake for ThreadWake {
-        fn wake(self: Arc<Self>) {
-            self.0.unpark();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-
-    fn block_on<F: Future>(future: F) -> F::Output {
-        let mut future = Box::pin(future);
-        let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-        let mut context = Context::from_waker(&waker);
-        loop {
-            match future.as_mut().poll(&mut context) {
-                Poll::Ready(output) => return output,
-                Poll::Pending => thread::park_timeout(Duration::from_millis(10)),
-            }
-        }
-    }
-
-    struct FakeBackend {
-        resolutions: Mutex<Vec<HydrationResolution>>,
-        payload: Mutex<Result<Vec<u8>, HydrationError>>,
-        calls: Mutex<Vec<&'static str>>,
-    }
-
-    impl FakeBackend {
-        fn available(payload: &[u8]) -> Self {
-            Self {
-                resolutions: Mutex::new(vec![
-                    available(payload.len(), &hash(payload)),
-                    available(payload.len(), &hash(payload)),
-                ]),
-                payload: Mutex::new(Ok(payload.to_vec())),
-                calls: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn denied(state: HydrationStateV1) -> Self {
-            Self {
-                resolutions: Mutex::new(vec![HydrationResolution::Unavailable(state)]),
-                payload: Mutex::new(Ok(Vec::new())),
-                calls: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl TemporalHydrationBackend for FakeBackend {
-        fn resolve_current<'a>(
-            &'a self,
-            _snapshot: &'a TemporalExecutionSnapshot,
-            _anchor_id: &'a RetrievalAnchorId,
-        ) -> BackendFuture<'a, HydrationResolution> {
-            Box::pin(async move {
-                self.calls.lock().expect("calls").push("resolve");
-                let mut resolutions = self.resolutions.lock().expect("resolutions");
-                if resolutions.len() > 1 {
-                    Ok(resolutions.remove(0))
-                } else {
-                    Ok(resolutions[0].clone())
-                }
-            })
-        }
-
-        fn open_bounded<'a>(
-            &'a self,
-            _descriptor: &'a PayloadDescriptor,
-            _max_bytes: usize,
-            control: &'a ExecutionControl,
-        ) -> BackendFuture<'a, BoundedPayload> {
-            Box::pin(async move {
-                self.calls.lock().expect("calls").push("read");
-                control.checkpoint()?;
-                match &*self.payload.lock().expect("payload") {
-                    Ok(payload) => Ok(BoundedPayload::Owned(Zeroizing::new(payload.clone()))),
-                    Err(error) => Err(error.clone()),
-                }
-            })
-        }
-    }
-
-    fn available(byte_count: usize, content_hash: &str) -> HydrationResolution {
-        HydrationResolution::Available(PayloadDescriptor {
-            source: PayloadSource::Summary {
-                session_id: "session-1".to_string(),
-                summary_id: "summary-1".to_string(),
-            },
-            byte_count,
-            content_hash: content_hash.to_string(),
-        })
-    }
-
-    fn anchor() -> RetrievalAnchorId {
-        RetrievalAnchorId::new("anchor-1").expect("anchor")
-    }
-
-    fn digest(byte: char) -> String {
-        format!("sha256:{}", byte.to_string().repeat(64))
-    }
-
-    fn snapshot(control: ExecutionControl) -> TemporalExecutionSnapshot {
-        TemporalExecutionSnapshot::new_authorized(
-            TemporalSnapshotRequest::new(
-                SessionId::new("session-1").expect("session"),
-                digest('0'),
-                digest('1'),
-                digest('2'),
-                TemporalModeV1::Current,
-                RetrievalGrainV1::LogicalMessage,
+        async fn redact_hydration_anchor_for_test(&self, anchor_id: &RetrievalAnchorId) {
+            let database = self
+                .registered_database(HostAdmissionScope::Profile)
+                .expect("registered profile database");
+            Executor::execute_batch(
+                &database
+                    .writer_connection()
+                    .expect("registered profile writer"),
+                "DROP TRIGGER retrieval_anchors_immutable_update;",
             )
-            .expect("request")
-            .with_limits(ExecutionLimits {
-                hydration_payload_bytes: 32,
-                hydration_chunk_bytes: 4,
-                ..ExecutionLimits::default()
-            })
-            .with_execution_control(control),
-            TemporalWatermarks {
-                generation: 1,
-                source: 2,
-                projection: 3,
-                index: 4,
-                summary: 5,
-            },
-            KernelVersions {
-                schema: 1,
-                ranking: 1,
-                configuration_digest: BindingDigest::new("configuration", digest('3'))
-                    .expect("digest"),
-            },
-            None,
-            ValidatedAuthorization::Authorized,
-        )
-        .expect("snapshot")
+            .await
+            .expect("allow redaction fixture");
+            Executor::execute(
+                &database
+                    .writer_connection()
+                    .expect("registered profile writer"),
+                "UPDATE retrieval_anchors
+                 SET anchor_json = json_set(anchor_json, '$.payload_access', 'redacted')
+                 WHERE anchor_id = ?1",
+                [anchor_id.as_str()],
+            )
+            .await
+            .expect("redact anchor");
+        }
     }
+
+    use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
     fn hash(bytes: &[u8]) -> String {
         use std::fmt::Write as _;
@@ -2419,7 +2209,7 @@ mod tests {
         let authorization =
             build_observation_resolution_authorization_v1(write.observation(), "snapshot-test")
                 .expect("authorization");
-        let anchor = build_observation_retrieval_anchor_v2(
+        let anchor = build_observation_retrieval_anchor(
             write.observation(),
             projection.clone(),
             UtcMicros(1),
@@ -2439,24 +2229,34 @@ mod tests {
     }
 
     fn authorized_snapshot(anchor: &RetrievalAnchorRecord) -> TemporalExecutionSnapshot {
+        controlled_snapshot(anchor, ExecutionControl::default())
+    }
+
+    fn controlled_snapshot(
+        anchor: &RetrievalAnchorRecord,
+        control: ExecutionControl,
+    ) -> TemporalExecutionSnapshot {
         authorized_snapshot_for_scope(
             anchor,
-            tracedecay_temporal_query::ports::TemporalRetrievalScope::Session(
+            tracedecay_temporal_query::snapshot::TemporalRetrievalScope::Session(
                 SessionId::new("session-1").expect("session"),
             ),
+            control,
         )
     }
 
     fn authorized_root_snapshot(anchor: &RetrievalAnchorRecord) -> TemporalExecutionSnapshot {
         authorized_snapshot_for_scope(
             anchor,
-            tracedecay_temporal_query::ports::TemporalRetrievalScope::AllSessionsInAuthorizedRoot,
+            tracedecay_temporal_query::snapshot::TemporalRetrievalScope::AllSessionsInAuthorizedRoot,
+            ExecutionControl::default(),
         )
     }
 
     fn authorized_snapshot_for_scope(
         anchor: &RetrievalAnchorRecord,
-        scope: tracedecay_temporal_query::ports::TemporalRetrievalScope,
+        scope: tracedecay_temporal_query::snapshot::TemporalRetrievalScope,
+        control: ExecutionControl,
     ) -> TemporalExecutionSnapshot {
         TemporalExecutionSnapshot::new_authorized(
             TemporalSnapshotRequest::new(
@@ -2473,7 +2273,8 @@ mod tests {
                     .expect("profile root"),
             )
             .expect("authorized root")
-            .with_retrieval_scope(scope),
+            .with_retrieval_scope(scope)
+            .with_execution_control(control),
             TemporalWatermarks {
                 generation: 1,
                 source: 0,
@@ -2544,7 +2345,7 @@ mod tests {
             matches!(
                 authorization,
                 Ok(HydrationAuthorization::Denied(ref denial))
-                    if denial.state() == HydrationStateV1::UnverifiableLegacy
+                    if denial.state() == HydrationStateV1::Unverifiable
             ),
             "{authorization:?}"
         );
@@ -2578,12 +2379,10 @@ mod tests {
                 .expect("registered profile writer"),
             "INSERT INTO lcm_raw_messages (
                 provider, message_id, session_id, role, ordinal, timestamp,
-                content, content_hash, storage_kind, payload_ref,
-                snippet_text, index_text, legacy_source, legacy_truncated
+                content, content_hash, storage_kind, payload_ref
              ) VALUES (
                 ?1, 'message-1', 'session-1', 'assistant', 1, 1,
-                'raw-content-canary', 'invalid-content-hash', 'inline', NULL,
-                'raw-content-canary', 'raw-content-canary', 0, 0
+                'raw-content-canary', 'invalid-content-hash', 'inline', NULL
              )",
             [provider],
         )
@@ -2738,7 +2537,7 @@ mod tests {
                 .authorize(&snapshot, occurrence_anchor.anchor_id())
                 .await,
             Ok(HydrationAuthorization::Denied(ref denial))
-                if denial.state() == HydrationStateV1::UnverifiableLegacy
+                if denial.state() == HydrationStateV1::Unverifiable
         ));
         let mut denied_output = Vec::new();
         assert_eq!(
@@ -2761,9 +2560,9 @@ mod tests {
 
     /// An occurrence whose `message_id` was projected from the stable record id
     /// (because the canonical envelope carries no `relations.message_id`) must
-    /// hydrate; refusing it as `UnverifiableLegacy` drops real
+    /// hydrate; refusing it as `Unverifiable` drops real
     /// `lcm_grep`/`lcm_expand` matches into
-    /// `omissions: reason=unverifiable_legacy`.
+    /// `omissions: reason=unverifiable`.
     #[tokio::test]
     async fn occurrence_keyed_on_stable_record_id_resolves_when_relations_message_id_absent() {
         let dir = tempdir().expect("temporary directory");
@@ -2840,119 +2639,105 @@ mod tests {
         assert!(corrupted_output.is_empty());
     }
 
-    #[test]
-    fn authorization_revocation_after_read_emits_no_payload() {
-        block_on(async {
-            let payload = b"buffered-until-live-recheck";
-            let backend = FakeBackend {
-                resolutions: Mutex::new(vec![
-                    available(payload.len(), &hash(payload)),
-                    available(payload.len(), &hash(payload)),
-                    HydrationResolution::Unavailable(HydrationStateV1::Unauthorized),
-                ]),
-                payload: Mutex::new(Ok(payload.to_vec())),
-                calls: Mutex::new(Vec::new()),
-            };
-            let adapter = SessionTemporalHydrationAdapter::new(backend);
-            let snapshot = snapshot(ExecutionControl::default());
-
-            assert_eq!(
-                adapter.authorize(&snapshot, &anchor()).await,
-                Ok(HydrationAuthorization::Authorized)
-            );
-            let mut output = Vec::new();
-            assert_eq!(
-                adapter
-                    .read_after_recheck(&snapshot, &anchor(), payload.len(), 8, &mut |chunk| {
-                        output.extend_from_slice(chunk);
-                        Ok(())
-                    })
-                    .await,
-                Err(HydrationError::Unavailable)
-            );
-            assert!(output.is_empty());
-            assert_eq!(
-                adapter.backend.calls.lock().expect("calls").as_slice(),
-                ["resolve", "resolve", "read", "resolve"]
-            );
-        });
+    /// Seeds one hydratable `payload-1` occurrence and returns its anchor.
+    async fn seeded_occurrence(runtime: &HostAdmissionTestRuntimeV1) -> RetrievalAnchorRecord {
+        let (observation, anchor) =
+            Box::pin(persist_anchor_for_session(runtime, 1, "session-1")).await;
+        runtime
+            .seed_session_occurrence_for_test(
+                observation.source().provider().as_str(),
+                "session-1",
+                &observation,
+                &anchor,
+                "message-1",
+                "payload-1",
+            )
+            .await;
+        anchor
     }
 
-    #[test]
-    fn denial_has_no_payload_and_never_reads() {
-        block_on(async {
-            let adapter = SessionTemporalHydrationAdapter::new(FakeBackend::denied(
-                HydrationStateV1::Redacted,
-            ));
-            let snapshot = snapshot(ExecutionControl::default());
-            let authorization = adapter
-                .authorize(&snapshot, &anchor())
-                .await
-                .expect("typed denial");
-            assert!(matches!(
-                authorization,
-                HydrationAuthorization::Denied(ref denial)
-                    if denial.state() == HydrationStateV1::Redacted
-            ));
-            assert_eq!(
-                adapter.backend.calls.lock().expect("calls").as_slice(),
-                ["resolve"]
-            );
-        });
+    async fn hydrate(
+        adapter: &SessionTemporalHydrationAdapter<'_>,
+        snapshot: &TemporalExecutionSnapshot,
+        anchor_id: &RetrievalAnchorId,
+        max_bytes: usize,
+    ) -> (Result<(), HydrationError>, Vec<u8>) {
+        let mut output = Vec::new();
+        let result = adapter
+            .read_after_recheck(snapshot, anchor_id, max_bytes, 4, &mut |chunk| {
+                output.extend_from_slice(chunk);
+                Ok(())
+            })
+            .await;
+        (result, output)
     }
 
-    #[test]
-    fn declared_oversize_is_rejected_before_read() {
-        block_on(async {
-            let backend = FakeBackend {
-                resolutions: Mutex::new(vec![available(9, &hash(b"123456789"))]),
-                payload: Mutex::new(Ok(b"123456789".to_vec())),
-                calls: Mutex::new(Vec::new()),
-            };
-            let adapter = SessionTemporalHydrationAdapter::new(backend);
-            let snapshot = snapshot(ExecutionControl::default());
-            let mut output = Vec::new();
-            assert_eq!(
-                adapter
-                    .read_after_recheck(&snapshot, &anchor(), 8, 4, &mut |chunk| {
-                        output.extend_from_slice(chunk);
-                        Ok(())
-                    })
-                    .await,
+    #[tokio::test]
+    async fn redacted_anchor_is_a_typed_denial_that_emits_no_payload() {
+        let dir = tempdir().expect("temporary directory");
+        let runtime = HostAdmissionTestRuntimeV1::profile(dir.path())
+            .await
+            .expect("registered profile runtime");
+        let anchor = seeded_occurrence(&runtime).await;
+        let snapshot = authorized_snapshot(&anchor);
+        let eligible = runtime.hydration_read_for_test().await;
+        assert_eq!(
+            eligible
+                .adapter()
+                .authorize(&snapshot, anchor.anchor_id())
+                .await,
+            Ok(HydrationAuthorization::Authorized)
+        );
+        assert_eq!(
+            hydrate(&eligible.adapter(), &snapshot, anchor.anchor_id(), 1024).await,
+            (Ok(()), b"payload-1".to_vec())
+        );
+        drop(eligible);
+
+        runtime
+            .redact_hydration_anchor_for_test(anchor.anchor_id())
+            .await;
+        let redacted = runtime.hydration_read_for_test().await;
+        let authorization = redacted
+            .adapter()
+            .authorize(&snapshot, anchor.anchor_id())
+            .await
+            .expect("typed denial");
+        assert!(matches!(
+            authorization,
+            HydrationAuthorization::Denied(ref denial)
+                if denial.state() == HydrationStateV1::Redacted
+        ));
+        assert_eq!(
+            hydrate(&redacted.adapter(), &snapshot, anchor.anchor_id(), 1024).await,
+            (Err(HydrationError::Unavailable), Vec::new())
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_is_rejected_before_read() {
+        let dir = tempdir().expect("temporary directory");
+        let runtime = HostAdmissionTestRuntimeV1::profile(dir.path())
+            .await
+            .expect("registered profile runtime");
+        let anchor = seeded_occurrence(&runtime).await;
+        let snapshot = authorized_snapshot(&anchor);
+        let read = runtime.hydration_read_for_test().await;
+        let adapter = read.adapter();
+
+        assert_eq!(
+            hydrate(&adapter, &snapshot, anchor.anchor_id(), 8).await,
+            (
                 Err(HydrationError::BudgetExceeded {
                     resource: "payload bytes"
-                })
-            );
-            assert!(output.is_empty());
-            assert_eq!(
-                adapter.backend.calls.lock().expect("calls").as_slice(),
-                ["resolve"]
-            );
-        });
-    }
-
-    #[test]
-    fn integrity_failure_emits_no_payload() {
-        block_on(async {
-            let backend = FakeBackend {
-                resolutions: Mutex::new(vec![available(4, &hash(b"good"))]),
-                payload: Mutex::new(Ok(b"evil".to_vec())),
-                calls: Mutex::new(Vec::new()),
-            };
-            let adapter = SessionTemporalHydrationAdapter::new(backend);
-            let snapshot = snapshot(ExecutionControl::default());
-            let mut output = Vec::new();
-            assert_eq!(
-                adapter
-                    .read_after_recheck(&snapshot, &anchor(), 4, 4, &mut |chunk| {
-                        output.extend_from_slice(chunk);
-                        Ok(())
-                    })
-                    .await,
-                Err(HydrationError::Unavailable)
-            );
-            assert!(output.is_empty());
-        });
+                }),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            hydrate(&adapter, &snapshot, anchor.anchor_id(), 9).await,
+            (Ok(()), b"payload-1".to_vec())
+        );
     }
 
     #[test]
@@ -3018,52 +2803,42 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cancellation_and_deadline_interrupt_before_read() {
-        block_on(async {
-            let cancelled = ExecutionControl::default();
-            cancelled.cancel();
-            let cancelled_adapter =
-                SessionTemporalHydrationAdapter::new(FakeBackend::available(b"payload"));
-            assert_eq!(
-                cancelled_adapter
-                    .authorize(&snapshot(cancelled), &anchor())
-                    .await,
-                Err(HydrationError::Interrupted(TemporalPortError::Cancelled))
-            );
-            assert!(
-                cancelled_adapter
-                    .backend
-                    .calls
-                    .lock()
-                    .expect("calls")
-                    .is_empty()
-            );
+    #[tokio::test]
+    async fn cancellation_and_deadline_interrupt_before_read() {
+        let dir = tempdir().expect("temporary directory");
+        let runtime = HostAdmissionTestRuntimeV1::profile(dir.path())
+            .await
+            .expect("registered profile runtime");
+        let anchor = seeded_occurrence(&runtime).await;
+        let read = runtime.hydration_read_for_test().await;
+        let adapter = read.adapter();
 
-            let deadline = ExecutionControl::new(Some(
-                Instant::now()
-                    .checked_sub(Duration::from_millis(1))
-                    .expect("past deadline"),
-            ));
-            let deadline_adapter =
-                SessionTemporalHydrationAdapter::new(FakeBackend::available(b"payload"));
+        let cancelled = ExecutionControl::default();
+        cancelled.cancel();
+        let deadline = ExecutionControl::new(Some(
+            Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("past deadline"),
+        ));
+        for (control, expected) in [
+            (cancelled, TemporalPortError::Cancelled),
+            (deadline, TemporalPortError::DeadlineExceeded),
+        ] {
+            let snapshot = controlled_snapshot(&anchor, control);
             assert_eq!(
-                deadline_adapter
-                    .authorize(&snapshot(deadline), &anchor())
-                    .await,
-                Err(HydrationError::Interrupted(
-                    TemporalPortError::DeadlineExceeded
-                ))
+                adapter.authorize(&snapshot, anchor.anchor_id()).await,
+                Err(HydrationError::Interrupted(expected.clone()))
             );
-            assert!(
-                deadline_adapter
-                    .backend
-                    .calls
-                    .lock()
-                    .expect("calls")
-                    .is_empty()
+            assert_eq!(
+                hydrate(&adapter, &snapshot, anchor.anchor_id(), 1024).await,
+                (Err(HydrationError::Interrupted(expected)), Vec::new())
             );
-        });
+        }
+        let live = authorized_snapshot(&anchor);
+        assert_eq!(
+            adapter.authorize(&live, anchor.anchor_id()).await,
+            Ok(HydrationAuthorization::Authorized)
+        );
     }
 
     #[test]

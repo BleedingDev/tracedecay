@@ -41,7 +41,9 @@ public:
 "#;
 
 fn extract() -> ExtractionResult {
-    let result = MetalExtractor.extract("shader.metal", SHADER);
+    let result = MetalExtractor
+        .extract_artifact("shader.metal", SHADER)
+        .result;
     assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
     result
 }
@@ -55,13 +57,7 @@ fn names(result: &ExtractionResult, kind: NodeKind) -> Vec<&str> {
         .collect()
 }
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Display,
-{
-    T::try_from(value.to_owned()).unwrap_or_else(|error| panic!("{value}: {error}"))
-}
+use tracedecay_domain::test_fixtures::id;
 
 #[test]
 fn metal_dispatches_on_its_extension() {
@@ -134,7 +130,7 @@ fn metal_retained_tree_extraction_matches_cold_extraction() {
     assert_eq!(report.reuse, ParseReuse::Initial);
 
     let retained = document
-        .extract_canonical(&MetalExtractor, &report, None)
+        .extract_canonical_artifact(&MetalExtractor, &report, None)
         .expect("retained extraction");
     assert_eq!(
         retained.disposition,
@@ -142,7 +138,7 @@ fn metal_retained_tree_extraction_matches_cold_extraction() {
     );
 
     let mut cold = extract();
-    let mut retained = retained.result;
+    let mut retained = retained.artifact.result;
     for result in [&mut cold, &mut retained] {
         result.duration_ms = 0;
         for node in &mut result.nodes {

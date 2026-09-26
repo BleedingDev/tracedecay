@@ -13,7 +13,7 @@ use super::compression_decision::{
     CondensationDecision, CondensationDecisionInput, OverflowRecoveryCapInput,
     PreflightDecisionInput,
 };
-use super::compression_policy::is_policy_anchor_role;
+use super::compression_policy::{is_policy_anchor_role, source_token_count};
 use super::extraction;
 use super::summarizer::CompressionSummarizerAdapter;
 use super::types::{LcmExtractionResult, LcmRelationProjectionStatus, LcmSummarySourceRange};
@@ -40,7 +40,7 @@ struct IngestedActiveMessages {
 enum PreparedActiveMessage {
     /// Message without a real role: never stored (a fabricated role would
     /// enter identity hashes) but still carried verbatim into the replay
-    /// output — dropping it would silently lose conversation content.
+    /// output, dropping it would silently lose conversation content.
     ReplayVerbatim { source_index: usize },
     Ingest {
         source_index: usize,
@@ -114,14 +114,7 @@ pub async fn update_lifecycle(
     conn: &impl Executor,
     update: LcmLifecycleUpdate,
 ) -> Result<LcmLifecycleState, LcmError> {
-    upsert_lifecycle_state(conn, &update).await?;
-    replace_maintenance_debt(
-        conn,
-        &update.provider,
-        &update.conversation_id,
-        &update.maintenance_debt,
-    )
-    .await?;
+    persist_lifecycle_update(conn, &update).await?;
     lifecycle_state(conn, &update.provider, &update.conversation_id).await
 }
 
@@ -207,14 +200,6 @@ async fn link_session_boundary(
     request: &LcmSessionBoundaryRequest,
     old_session_id: &str,
 ) -> Result<LcmSessionBoundaryResponse, LcmError> {
-    link_in_transaction(conn, request, old_session_id).await
-}
-
-async fn link_in_transaction(
-    conn: &impl Executor,
-    request: &LcmSessionBoundaryRequest,
-    old_session_id: &str,
-) -> Result<LcmSessionBoundaryResponse, LcmError> {
     ensure_session(conn, &request.provider, &request.session_id).await?;
     let old_state =
         lifecycle_state_or_default(conn, &request.provider, old_session_id, old_session_id).await?;
@@ -237,14 +222,7 @@ async fn link_in_transaction(
         last_finalized_frontier_store_id: carried_frontier,
         maintenance_debt: old_state.maintenance_debt.clone(),
     };
-    upsert_lifecycle_state(conn, &update).await?;
-    replace_maintenance_debt(
-        conn,
-        &update.provider,
-        &update.conversation_id,
-        &update.maintenance_debt,
-    )
-    .await?;
+    persist_lifecycle_update(conn, &update).await?;
 
     Ok(session_boundary_response(
         true,
@@ -1050,20 +1028,27 @@ async fn persist_compression_transaction_writes<'a>(
         last_finalized_frontier_store_id: write.existing_frontier.last_finalized_frontier_store_id,
         maintenance_debt: debt_for_deferred_backlog(remaining_backlog),
     };
-    upsert_lifecycle_state(conn, &update).await?;
-    replace_maintenance_debt(
-        conn,
-        &update.provider,
-        &update.conversation_id,
-        &update.maintenance_debt,
-    )
-    .await?;
+    persist_lifecycle_update(conn, &update).await?;
 
     Ok(CompressionTransactionWriteResult {
         created_summaries,
         frontier: lifecycle_state(conn, &update.provider, &update.conversation_id).await?,
         remaining_backlog,
     })
+}
+
+async fn persist_lifecycle_update(
+    conn: &impl Executor,
+    update: &LcmLifecycleUpdate,
+) -> Result<(), LcmError> {
+    upsert_lifecycle_state(conn, update).await?;
+    replace_maintenance_debt(
+        conn,
+        &update.provider,
+        &update.conversation_id,
+        &update.maintenance_debt,
+    )
+    .await
 }
 
 async fn upsert_lifecycle_state(
@@ -1673,7 +1658,6 @@ fn compression_response_with_attempt_state(
         replay_token_estimate,
         replay_over_budget: replay_exceeds_budget(replay_token_estimate, max_assembly_tokens),
         compression_attempts,
-        fallback_used: false,
         context_recovery_hint,
         retry_status: retry_status.map(str::to_string),
         relation_projection_status,
@@ -1852,14 +1836,7 @@ async fn condense_summary_nodes_if_ready(
         last_finalized_frontier_store_id: existing_frontier.last_finalized_frontier_store_id,
         maintenance_debt: existing_frontier.maintenance_debt.clone(),
     };
-    upsert_lifecycle_state(conn, &update).await?;
-    replace_maintenance_debt(
-        conn,
-        &update.provider,
-        &update.conversation_id,
-        &update.maintenance_debt,
-    )
-    .await?;
+    persist_lifecycle_update(conn, &update).await?;
     let frontier = lifecycle_state(conn, &update.provider, &update.conversation_id).await?;
     // Mirrors hermes-lcm: `_assemble_context` always follows
     // `_maybe_condense`, so a condensation-only pass still returns the
@@ -1898,26 +1875,28 @@ async fn load_condensation_candidates(
     let mut rows = conn
         .query(
             "WITH source_order AS (
-               SELECT lcm_summary_sources.node_id, MIN(CAST(source_id AS INTEGER)) AS first_source_id
-               FROM lcm_summary_sources
+               SELECT session_summary_sources.summary_id,
+                      MIN(CAST(source_id AS INTEGER)) AS first_source_id
+               FROM session_summary_sources
                WHERE source_kind = 'raw_message'
-               GROUP BY lcm_summary_sources.node_id
+               GROUP BY session_summary_sources.summary_id
              ),
              unparented AS (
-               SELECT n.node_id, n.provider, n.conversation_id, n.session_id, n.depth, n.summary_text,
-                      n.summary_hash, n.summary_token_count, n.source_token_count, n.source_time_start,
-                      n.source_time_end, n.expand_hint, n.metadata_json, n.created_at,
+               SELECT n.summary_id, n.provider, n.conversation_id, n.session_id, n.depth,
+                      n.summary_text, n.summary_hash, n.summary_token_count,
+                      n.source_token_count, n.source_time_start, n.source_time_end,
+                      n.expand_hint, n.metadata_json, n.created_at,
                       source_order.first_source_id
-               FROM lcm_summary_nodes n
+               FROM session_summary_nodes n
                JOIN session_temporal_generations generation
                  ON generation.session_id = n.session_id
                 AND generation.state = 'active'
                JOIN session_summary_availability availability
                  ON availability.session_id = generation.session_id
                 AND availability.generation = generation.generation
-                AND availability.summary_id = n.node_id
+                AND availability.summary_id = n.summary_id
                 AND availability.availability = 'available'
-               LEFT JOIN source_order ON source_order.node_id = n.node_id
+               LEFT JOIN source_order ON source_order.summary_id = n.summary_id
                WHERE n.provider = ?1 AND n.session_id = ?2
                  -- Fail closed only while a raw revision's invalidation
                  -- closure is partially applied: the walk enqueues
@@ -1935,14 +1914,14 @@ async fn load_condensation_candidates(
                  )
                  AND NOT EXISTS (
                    SELECT 1
-                   FROM lcm_summary_sources s
+                   FROM session_summary_sources s
                    JOIN session_summary_availability parent_availability
                      ON parent_availability.session_id = generation.session_id
                     AND parent_availability.generation = generation.generation
-                    AND parent_availability.summary_id = s.node_id
+                    AND parent_availability.summary_id = s.summary_id
                     AND parent_availability.availability = 'available'
                    WHERE s.source_kind = 'summary_node'
-                     AND s.source_id = n.node_id
+                     AND s.source_id = n.summary_id
                  )
              ),
              eligible_depth AS (
@@ -1954,24 +1933,18 @@ async fn load_condensation_candidates(
                ORDER BY depth
                LIMIT 1
              )
-             SELECT node_id, provider, conversation_id, session_id, depth, summary_text,
+             SELECT summary_id, provider, conversation_id, session_id, depth, summary_text,
                     summary_hash, summary_token_count, source_token_count, source_time_start,
                     source_time_end, expand_hint, metadata_json, created_at
              FROM unparented
              WHERE depth = (SELECT depth FROM eligible_depth)
              ORDER BY source_time_start IS NULL, source_time_start,
                       first_source_id IS NULL, first_source_id,
-                      created_at, node_id
+                      created_at, summary_id
              LIMIT ?3",
-            params![
-                provider,
-                session_id,
-                fan_in as i64,
-                incremental_max_depth
-            ],
+            params![provider, session_id, fan_in as i64, incremental_max_depth],
         )
-        .await
-        ?;
+        .await?;
     let mut nodes = Vec::new();
     while let Some(row) = rows.next().await? {
         nodes.push(LcmSummaryNode {
@@ -2319,8 +2292,8 @@ async fn message_ids_for_store_ids(
     Ok(message_ids)
 }
 
-/// Stored LCM rows require a real role. Missing or empty role is a typed skip
-/// — never a fabricated `"user"` that would persist and enter identity hashes.
+/// Stored LCM rows require a real role. Missing or empty role is a typed skip,
+/// never a fabricated `"user"` that would persist and enter identity hashes.
 fn active_message_role(message: &Value) -> Option<&str> {
     message
         .get("role")
@@ -2417,22 +2390,44 @@ async fn update_active_replay_metadata(
     Ok(())
 }
 
-async fn ensure_session(
+/// Project fields on a session row LCM inserts only so foreign keys resolve.
+/// Not a project identity. A later rollout projection overwrites them.
+pub const LCM_UNKNOWN_PROJECT_KEY: &str = "unknown";
+
+/// Historical placeholder `ensure_session` used to write as if it were a project.
+/// Live stores still hold it; projection treats it as unscoped, same as
+/// [`LCM_UNKNOWN_PROJECT_KEY`].
+pub const LCM_LEGACY_PLACEHOLDER_PROJECT_KEY: &str = "lcm-active-context";
+
+/// Whether both project fields are an LCM placeholder rather than a project.
+pub fn lcm_unscoped_session_project(project_key: &str, project_path: &str) -> bool {
+    project_key == project_path
+        && matches!(
+            project_key,
+            LCM_UNKNOWN_PROJECT_KEY | LCM_LEGACY_PLACEHOLDER_PROJECT_KEY | ""
+        )
+}
+
+/// Inserts the session row LCM foreign keys require without claiming a project.
+///
+/// `INSERT OR IGNORE` leaves a row the rollout projection already created.
+/// Callers that run first store [`LCM_UNKNOWN_PROJECT_KEY`] in both project
+/// fields so the projector can replace them with the real project.
+pub async fn ensure_session(
     conn: &impl Executor,
     provider: &str,
     session_id: &str,
 ) -> Result<(), LcmError> {
     conn.execute(
         "INSERT OR IGNORE INTO sessions (
-            provider, session_id, project_key, project_path, title, started_at
+            provider, session_id, project_key, project_path, started_at
          )
-         VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())",
+         VALUES (?1, ?2, ?3, ?4, unixepoch())",
         params![
             provider,
             session_id,
-            "lcm-active-context",
-            "lcm-active-context",
-            "LCM active context",
+            LCM_UNKNOWN_PROJECT_KEY,
+            LCM_UNKNOWN_PROJECT_KEY,
         ],
     )
     .await?;
@@ -2535,7 +2530,7 @@ async fn load_raw_messages_for_session(
                 .query(
                     "SELECT provider, message_id, session_id, store_id, role, ordinal,
                             timestamp, content, content_hash, storage_kind, payload_ref,
-                            snippet_text, legacy_source, legacy_truncated, metadata_json
+                            snippet_text, metadata_json
                      FROM lcm_raw_messages
                      WHERE provider = ?1 AND session_id = ?2
                      ORDER BY store_id",
@@ -2579,7 +2574,7 @@ async fn load_raw_messages_for_session_page(
         .query(
             "SELECT provider, message_id, session_id, store_id, role, ordinal,
                     timestamp, content, content_hash, storage_kind, payload_ref,
-                    snippet_text, legacy_source, legacy_truncated, metadata_json,
+                    snippet_text, metadata_json,
                     length(CAST(COALESCE(content, '') AS BLOB))
                       + length(CAST(snippet_text AS BLOB))
                       + length(CAST(index_text AS BLOB))
@@ -2595,7 +2590,7 @@ async fn load_raw_messages_for_session_page(
     let mut bytes_scanned = 0_u64;
     let mut byte_limited = false;
     while let Some(row) = rows.next().await? {
-        let row_bytes = u64::try_from(row.get::<i64>(15)?).map_err(|error| {
+        let row_bytes = u64::try_from(row.get::<i64>(13)?).map_err(|error| {
             LcmError::Db(format!("invalid retained compression byte count: {error}"))
         })?;
         if bytes_scanned.saturating_add(row_bytes) > limit.byte_limit {
@@ -2638,13 +2633,6 @@ fn summary_replay_message(summary: &LcmSummaryNode) -> Value {
         "content": summary.summary_text,
         "lcm_summary_node_id": summary.node_id,
     })
-}
-
-fn source_token_count(backlog: &[LcmRawMessage]) -> i64 {
-    backlog
-        .iter()
-        .map(|message| crate::lcm_budget_tokens(&message.content))
-        .sum::<i64>()
 }
 
 fn debt_for_deferred_backlog(deferred_backlog: &[LcmRawMessage]) -> Vec<LcmMaintenanceDebt> {
@@ -2798,21 +2786,10 @@ mod authority_tests {
         .unwrap();
         schema::ensure_lcm_schema(&conn).await.unwrap();
         conn.execute_batch(
-            "CREATE TABLE session_temporal_generations (
-                session_id TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                state TEXT NOT NULL
-             );
-             CREATE TABLE session_summary_availability (
-                session_id TEXT NOT NULL,
-                generation INTEGER NOT NULL,
-                summary_id TEXT NOT NULL,
-                availability TEXT NOT NULL
-             );
-             INSERT INTO session_temporal_generations(session_id, generation, state)
+            "INSERT INTO session_temporal_generations(session_id, generation, state)
              VALUES ('active-condensation', 2, 'active');
-             INSERT INTO lcm_summary_nodes(
-                node_id, provider, conversation_id, session_id, depth,
+             INSERT INTO session_summary_nodes(
+                summary_id, provider, conversation_id, session_id, depth,
                 summary_text, summary_hash, summary_token_count, source_token_count,
                 created_at
              ) VALUES
@@ -2820,7 +2797,7 @@ mod authority_tests {
                  'current summary', 'current-hash', 2, 4, 1),
                 ('stale-parent', 'cursor', 'active-condensation', 'active-condensation', 1,
                  'stale summary', 'stale-hash', 2, 4, 2);
-             INSERT INTO lcm_summary_sources(node_id, source_kind, source_id, ordinal) VALUES
+             INSERT INTO session_summary_sources(summary_id, source_kind, source_id, ordinal) VALUES
                 ('current', 'raw_message', '1', 0),
                 ('stale-parent', 'summary_node', 'current', 0);
              INSERT INTO session_summary_availability(

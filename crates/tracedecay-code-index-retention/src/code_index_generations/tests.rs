@@ -1,6 +1,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use super::*;
+use super::{journal, receipt_store};
 use tracedecay_domain::sha256_hex_suffix;
 
 mod graph_replay_pool_lock_tests;
@@ -55,6 +56,8 @@ fn text_artifact(
         artifact_digest: ManifestDigest::new(format!("sha256:{sequence:064x}"))
             .expect("artifact digest"),
         artifact_size_bytes,
+        content_key: ManifestDigest::new(format!("sha256:{}", "c".repeat(64)))
+            .expect("content key"),
     }
 }
 
@@ -69,6 +72,8 @@ fn text_artifact_for_bytes(
         artifact_file: format!("text-artifact-{digest}.bin"),
         artifact_digest: ManifestDigest::from_sha256_bytes(&digest_bytes).expect("artifact digest"),
         artifact_size_bytes: u64::try_from(bytes.len()).expect("artifact byte count"),
+        content_key: ManifestDigest::new(format!("sha256:{}", "c".repeat(64)))
+            .expect("content key"),
     }
 }
 
@@ -161,11 +166,8 @@ fn durable_index_counts_text_bytes_and_never_evicts_the_active_text_head() {
     let mut text_head = indexed_generation(1, now - 3, 32, true);
     let text_head_id =
         CodeGenerationId::new(text_head.generation_id.clone()).expect("text-head generation id");
-    text_head.text_artifact = Some(text_artifact(
-        &text_head_id,
-        1,
-        MAX_DURABLE_GENERATION_INDEX_BYTES_V1,
-    ));
+    text_head.text_artifact =
+        Some(text_artifact(&text_head_id, 1, MAX_DURABLE_GENERATION_INDEX_BYTES_V1).into());
     let mut entries = vec![
         indexed_generation(0, now - 4, 32, true),
         text_head.clone(),
@@ -201,7 +203,7 @@ fn reference_retain_bounded_generation_index(
         });
         let mut artifacts = BTreeSet::new();
         entries.iter().fold(generation_bytes, |total, entry| {
-            let Some(artifact) = entry.text_artifact.as_ref() else {
+            let Some(artifact) = entry.text_artifact() else {
                 return total;
             };
             if artifacts.insert(artifact.artifact_file.as_str()) {
@@ -266,7 +268,7 @@ fn uneven_generation_history() -> (
     let text_head_id =
         CodeGenerationId::new(text_head.generation_id.clone()).expect("text-head generation id");
     let head_artifact = text_artifact(&text_head_id, 1, MAX_DURABLE_GENERATION_INDEX_BYTES_V1 / 4);
-    text_head.text_artifact = Some(head_artifact.clone());
+    text_head.text_artifact = Some(head_artifact.clone().into());
     let mut entries = vec![
         indexed_generation(
             1,
@@ -297,7 +299,7 @@ fn uneven_generation_history() -> (
             8,
             sequence % 2 == 0,
         );
-        entry.text_artifact = Some(shared_artifact.clone());
+        entry.text_artifact = Some(shared_artifact.clone().into());
         entries.push(entry);
     }
     let mut segment_heavy = indexed_generation(10, now - 70, 1, true);
@@ -306,7 +308,7 @@ fn uneven_generation_history() -> (
     // One removable generation shares the protected head's artifact, so its
     // eviction never releases those bytes.
     let mut head_sharer = indexed_generation(30, now - 60, 8, false);
-    head_sharer.text_artifact = Some(head_artifact);
+    head_sharer.text_artifact = Some(head_artifact.into());
     entries.push(head_sharer);
     for sequence in 100..(100 + MAX_DURABLE_GENERATION_INDEX_ENTRIES_V1 + 4) {
         entries.push(indexed_generation(
@@ -420,7 +422,7 @@ fn single_pass_sweep_matches_the_remove_recompute_loop_on_randomized_histories()
                         other => u64::try_from(other).expect("ordinal") * 1_000,
                     };
                     entry.text_artifact =
-                        Some(text_artifact(&artifact_owner, shared, artifact_size));
+                        Some(text_artifact(&artifact_owner, shared, artifact_size).into());
                 }
                 entry
             })
@@ -473,11 +475,14 @@ fn single_pass_sweep_accounting_is_linear_on_thousands_of_shared_artifact_entrie
     for sequence in 1..=entry_count {
         let mut entry = indexed_generation(sequence, now - 1_000 + sequence as i64, 1, false);
         let owner = CodeGenerationId::new(entry.generation_id.clone()).expect("generation id");
-        entry.text_artifact = Some(text_artifact(
-            &owner,
-            sequence / 8,
-            MAX_DURABLE_GENERATION_INDEX_BYTES_V1 / 2,
-        ));
+        entry.text_artifact = Some(
+            text_artifact(
+                &owner,
+                sequence / 8,
+                MAX_DURABLE_GENERATION_INDEX_BYTES_V1 / 2,
+            )
+            .into(),
+        );
         entries.push(entry);
     }
     let mut reference = entries.clone();
@@ -645,52 +650,9 @@ fn verified_text_artifact_attachment_is_durable_and_idempotent_under_the_store_l
         read_active_pointer(fixture.store.path())
             .expect("durable active pointer")
             .generation_index[0]
-            .text_artifact,
+            .text_artifact()
+            .cloned(),
         Some(descriptor)
-    );
-}
-
-#[test]
-fn verified_text_artifact_replacement_is_exact_durable_and_never_clears_the_head() {
-    let fixture = text_artifact_mutation_fixture();
-    let prior = text_artifact(&fixture.generation_id, 7, 4096);
-    let replacement = text_artifact(&fixture.generation_id, 8, 8192);
-    let lock =
-        acquire_code_generation_store_lock(fixture.store.path()).expect("generation store lock");
-    let attached = attach_verified_text_artifact_under_lock(
-        &lock,
-        &fixture.pointer,
-        &fixture.sealed_identity,
-        prior.clone(),
-    )
-    .expect("attach prior artifact");
-
-    let replaced = replace_verified_text_artifact_under_lock(
-        &lock,
-        &attached,
-        &fixture.sealed_identity,
-        &prior,
-        replacement.clone(),
-    )
-    .expect("replace exact artifact");
-    let repeated = replace_verified_text_artifact_under_lock(
-        &lock,
-        &replaced,
-        &fixture.sealed_identity,
-        &prior,
-        replacement.clone(),
-    )
-    .expect("repeat replacement");
-    drop(lock);
-
-    assert_eq!(repeated, replaced);
-    assert_eq!(
-        replaced.generation_index[0].text_artifact,
-        Some(replacement)
-    );
-    assert_eq!(
-        read_active_pointer(fixture.store.path()).expect("durable pointer"),
-        replaced
     );
 }
 
@@ -715,7 +677,7 @@ fn verified_text_artifact_attachment_retires_history_before_enforcing_byte_bound
             source_revision: None,
             source_tree: None,
             cardinality: None,
-            text_artifact: Some(prior_artifact),
+            text_artifact: Some(prior_artifact.into()),
         },
     );
     pointer.generation_index_digest = Some(
@@ -754,7 +716,10 @@ fn verified_text_artifact_attachment_retires_history_before_enforcing_byte_bound
         updated.generation_index[0].generation_id,
         active.id.as_str()
     );
-    assert_eq!(updated.generation_index[0].text_artifact, Some(descriptor));
+    assert_eq!(
+        updated.generation_index[0].text_artifact(),
+        Some(&descriptor)
+    );
     assert_eq!(
         read_active_pointer(store.path()).expect("durable pointer"),
         updated
@@ -826,27 +791,26 @@ fn text_artifact_retention_preserves_references_and_collects_orphans() {
     let active = generations.last().expect("active generation");
     let referenced = attach_fixture_text_artifact(&store, active, b"durably referenced");
     let artifacts_root = code_text_artifacts_root(store.path());
+    let staging_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&staging_root).expect("create staging root");
 
     let orphan = text_artifact_for_bytes(&active.id, b"unreferenced completed bytes");
     let orphan_path = write_text_artifact(&store, &orphan, b"unreferenced completed bytes");
     let staging_name = format!(".text-artifact-{}.staging", "a".repeat(64));
-    let staging_path = artifacts_root.join(&staging_name);
+    let staging_path = staging_root.join(&staging_name);
     std::fs::write(&staging_path, b"abandoned staging").expect("write stale staging");
     let active_staging_name = format!(
         ".text-artifact-{}.staging",
         sha256_hex_suffix(&active.state_digest).expect("active sealed digest")
     );
-    let active_staging_path = artifacts_root.join(&active_staging_name);
+    let active_staging_path = staging_root.join(&active_staging_name);
     std::fs::write(&active_staging_path, b"resumable active staging")
         .expect("write active staging");
-    let corrupt_name = format!("text-artifact-{}.corrupt-incident", "b".repeat(64));
-    let corrupt_path = artifacts_root.join(&corrupt_name);
-    std::fs::write(&corrupt_path, b"corrupt backup").expect("write corrupt backup");
 
     let plan = plan_code_generation_retention(store.path(), &BTreeSet::new())
         .expect("plan artifact retention");
     assert!(plan.collectable_generations.is_empty());
-    assert_eq!(plan.collectable_text_artifacts.len(), 3);
+    assert_eq!(plan.collectable_text_artifacts.len(), 2);
     assert!(plan.has_collectable_work());
     assert_eq!(
         total_text_artifact_bytes(&plan.collectable_text_artifacts),
@@ -856,11 +820,6 @@ fn text_artifact_retention_preserves_references_and_collects_orphans() {
             .saturating_add(
                 std::fs::metadata(&staging_path)
                     .expect("staging metadata")
-                    .len(),
-            )
-            .saturating_add(
-                std::fs::metadata(&corrupt_path)
-                    .expect("corrupt metadata")
                     .len(),
             )
     );
@@ -887,11 +846,11 @@ fn text_artifact_retention_preserves_references_and_collects_orphans() {
     )
     .expect("collect artifact debris");
     assert_eq!(report.deleted_generations.len(), 0);
-    assert_eq!(report.deleted_text_artifacts.len(), 3);
+    assert_eq!(report.deleted_text_artifacts.len(), 2);
     let receipt = report
         .text_artifact_receipt
         .expect("durable artifact retention receipt");
-    assert_eq!(receipt.deleted_artifacts.len(), 3);
+    assert_eq!(receipt.deleted_artifacts.len(), 2);
     assert_eq!(
         receipt.reclaimed_bytes,
         total_text_artifact_bytes(&receipt.deleted_artifacts),
@@ -916,7 +875,6 @@ fn text_artifact_retention_preserves_references_and_collects_orphans() {
     );
     assert!(!orphan_path.exists());
     assert!(!staging_path.exists());
-    assert!(!corrupt_path.exists());
     assert!(
         active_staging_path.is_file(),
         "only the active generation's resumable staging evidence is preserved"
@@ -961,7 +919,7 @@ fn text_artifact_retention_collects_empty_publish_crash_placeholder() {
 #[test]
 fn text_artifact_retention_collects_staging_database_sidecars_with_their_owner() {
     let (store, _generations) = fixture_store(1);
-    let artifacts_root = code_text_artifacts_root(store.path());
+    let artifacts_root = code_text_artifact_staging_root(store.path());
     std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
     let staging_name = format!(".text-artifact-{}.staging", "c".repeat(64));
     let paths = [
@@ -994,6 +952,52 @@ fn text_artifact_retention_collects_staging_database_sidecars_with_their_owner()
     assert!(
         paths.iter().all(|path| !path.exists()),
         "the staging database and every SQLite sidecar must be collected together"
+    );
+}
+
+/// The inventory scans the artifact root without the generation-store lock, so
+/// the text-artifact builder can retire a `.staging` family between the
+/// directory listing and the stat. A vanished entry is already reclaimed and
+/// must leave the plan intact rather than failing it with a storage error.
+#[test]
+fn text_artifact_inventory_skips_an_entry_reclaimed_during_the_scan() {
+    let store = tempfile::TempDir::new().expect("artifact store");
+    let artifacts_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
+    let staging_family = ["a", "b", "c"]
+        .into_iter()
+        .map(|seed| {
+            let path = artifacts_root.join(format!(".text-artifact-{}.staging", seed.repeat(64)));
+            std::fs::write(&path, b"staging").expect("write staging evidence");
+            path
+        })
+        .collect::<Vec<_>>();
+
+    // The scan probes cancellation once on entry and once per directory entry,
+    // before it takes that entry. Retiring from the third probe on leaves the
+    // listing already taken and one entry already inspected, so every further
+    // name the scan holds names a file that is gone from disk.
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    let retire_during_the_scan = || {
+        if probes.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2 {
+            for path in &staging_family {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        false
+    };
+
+    let inventory = plan_collectable_text_artifacts_cancellable(
+        store.path(),
+        None,
+        GenerationDigestVerificationV1::Full,
+        &retire_during_the_scan,
+    )
+    .expect("an entry reclaimed mid-scan leaves the store plannable");
+    assert!(
+        inventory.candidates.len() < staging_family.len(),
+        "an entry that vanished before its stat is reclaimed, not planned: {:?}",
+        inventory.candidates
     );
 }
 
@@ -1106,12 +1110,12 @@ fn cancellable_artifact_apply_stops_rehash_before_quarantine_and_retries() {
 #[test]
 fn text_artifact_retention_uses_bounded_restartable_batches() {
     let (store, _generations) = fixture_store(1);
-    let artifacts_root = code_text_artifacts_root(store.path());
-    std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
+    let staging_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&staging_root).expect("create staging root");
     for sequence in 0..(MAX_CODE_TEXT_ARTIFACT_RETENTION_BATCH_V1 + 2) {
-        let path = artifacts_root.join(format!("text-artifact-{sequence:064x}.corrupt-restart"));
+        let path = staging_root.join(format!(".text-artifact-{sequence:064x}.staging"));
         std::fs::write(path, [u8::try_from(sequence).expect("small sequence")])
-            .expect("write corrupt backup");
+            .expect("write abandoned staging");
     }
 
     let first =
@@ -1141,8 +1145,8 @@ fn text_artifact_retention_uses_bounded_restartable_batches() {
     )
     .expect("apply second bounded page");
     assert!(
-        std::fs::read_dir(&artifacts_root)
-            .expect("read empty artifact root")
+        std::fs::read_dir(&staging_root)
+            .expect("read empty staging root")
             .next()
             .is_none(),
         "a resumed page must reach later orphan artifacts"
@@ -1152,9 +1156,9 @@ fn text_artifact_retention_uses_bounded_restartable_batches() {
 #[test]
 fn text_artifact_inventory_honors_cancellation_before_marking_or_mutation() {
     let (store, _generations) = fixture_store(1);
-    let artifacts_root = code_text_artifacts_root(store.path());
-    std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
-    let orphan = artifacts_root.join(format!("text-artifact-{}.corrupt-cancel", "c".repeat(64)));
+    let staging_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&staging_root).expect("create staging root");
+    let orphan = staging_root.join(format!(".text-artifact-{}.staging", "c".repeat(64)));
     std::fs::write(&orphan, b"uncollected").expect("write artifact debris");
     let pointer = read_active_pointer(store.path()).expect("pointer");
     let checks = std::sync::atomic::AtomicUsize::new(0);
@@ -1258,8 +1262,12 @@ fn text_artifact_recovery_rolls_back_before_receipt_and_commits_after_receipt() 
         active_pointer: plan.active_pointer.clone(),
         receipt: receipt.clone(),
     };
-    persist_text_artifact_transaction(store.path(), &transaction)
-        .expect("journal artifact retention");
+    journal::persist_journal(
+        store.path(),
+        &TEXT_ARTIFACT_TRANSACTION_JOURNAL,
+        &transaction,
+    )
+    .expect("journal artifact retention");
     stage_collectable_text_artifacts(store.path(), &transaction).expect("quarantine artifact");
     assert!(!orphan_path.exists());
     recover_code_generation_retention(store.path(), &BTreeSet::new(), None)
@@ -1269,11 +1277,21 @@ fn text_artifact_recovery_rolls_back_before_receipt_and_commits_after_receipt() 
         "uncommitted artifact staging must roll back"
     );
 
-    persist_text_artifact_transaction(store.path(), &transaction)
-        .expect("journal second transaction");
+    journal::persist_journal(
+        store.path(),
+        &TEXT_ARTIFACT_TRANSACTION_JOURNAL,
+        &transaction,
+    )
+    .expect("journal second transaction");
     stage_collectable_text_artifacts(store.path(), &transaction)
         .expect("quarantine second artifact");
-    write_text_artifact_receipt(store.path(), &receipt).expect("durably commit artifact receipt");
+    receipt_store::write_receipt(
+        store.path(),
+        &TEXT_ARTIFACT_RECEIPT_STORE,
+        &receipt.receipt_digest,
+        &receipt,
+    )
+    .expect("durably commit artifact receipt");
     recover_code_generation_retention(store.path(), &BTreeSet::new(), None)
         .expect("finish a committed artifact transaction");
     assert!(
@@ -1306,8 +1324,12 @@ fn cancellable_recovery_preserves_pending_artifact_journal_for_retry() {
         active_pointer: plan.active_pointer.clone(),
         receipt,
     };
-    persist_text_artifact_transaction(store.path(), &transaction)
-        .expect("journal artifact retention");
+    journal::persist_journal(
+        store.path(),
+        &TEXT_ARTIFACT_TRANSACTION_JOURNAL,
+        &transaction,
+    )
+    .expect("journal artifact retention");
     stage_collectable_text_artifacts(store.path(), &transaction)
         .expect("quarantine uncommitted candidate");
     assert!(!orphan_path.exists());
@@ -1602,6 +1624,53 @@ fn maintenance_preparation_wakes_for_an_unreferenced_final_segment() {
     );
 }
 
+/// Earlier seals wrote a read bundle beside the generation and its segments.
+/// No reader names those files any more, so ordinary maintenance reclaims
+/// every file of that shape and leaves other names in the roots alone.
+#[test]
+fn maintenance_reclaims_retired_read_bundle_files() {
+    let store = tempfile::TempDir::new().expect("create unpublished store");
+    let generations_root = store.path().join(GENERATIONS_DIRECTORY);
+    let segments_root = store.path().join(GENERATION_SEGMENTS_DIRECTORY);
+    std::fs::create_dir_all(&generations_root).expect("create generation root");
+    std::fs::create_dir_all(&segments_root).expect("create segment root");
+    let hex = "ab".repeat(32);
+    let retired = [
+        generations_root.join(format!("read-bundle-{hex}.json")),
+        generations_root.join(format!(".read-bundle-{hex}.4242.1.tmp")),
+        segments_root.join(format!("read-bundle-artifact-{hex}.bin")),
+    ];
+    for path in &retired {
+        std::fs::write(path, b"retired read bundle bytes").expect("write retired bundle file");
+    }
+    let unrelated = segments_root.join("unrelated.txt");
+    std::fs::write(&unrelated, b"not a retention shape").expect("write unrelated file");
+
+    let plan = prepare_next_code_generation_retention_cancellable(
+        store.path(),
+        &BTreeSet::new(),
+        &|| false,
+        None,
+    )
+    .expect("prepare retired bundle retention unit");
+    assert!(plan.has_collectable_work());
+    let report = execute_code_generation_retention(
+        store.path(),
+        plan,
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(99),
+        None,
+    )
+    .expect("execute retired bundle retention unit");
+
+    assert_eq!(
+        retired.iter().map(|path| path.exists()).collect::<Vec<_>>(),
+        vec![false, false, false]
+    );
+    assert!(unrelated.exists());
+    assert!(report.deleted_generations.is_empty());
+}
+
 #[test]
 fn collectable_maintenance_preparation_escalates_to_full_verification() {
     let (store, _generations) = fixture_store(8);
@@ -1735,7 +1804,8 @@ fn recovery_restores_quarantined_generations_without_a_durable_receipt() {
     let generations_root = store.path().join(GENERATIONS_DIRECTORY);
     let staged_root = transaction_stage_root(store.path(), &receipt);
 
-    persist_transaction(store.path(), &transaction).expect("persist transaction journal");
+    journal::persist_journal(store.path(), &GENERATION_TRANSACTION_JOURNAL, &transaction)
+        .expect("persist transaction journal");
     stage_collectable_generations(store.path(), &transaction).expect("stage generation");
     assert!(!generations_root.join(&collectable.generation_file).exists());
     assert!(staged_root.join(&collectable.generation_file).is_file());
@@ -2320,13 +2390,16 @@ fn scope_recovery_restores_quarantined_scopes_without_a_durable_receipt() {
     let staged_root = scope_stage_root(store.path(), &receipt);
 
     // Crash exactly between quarantine and the durable receipt.
-    persist_scope_transaction(store.path(), &transaction).expect("persist journal");
+    journal::persist_journal(store.path(), &SCOPE_TRANSACTION_JOURNAL, &transaction)
+        .expect("persist journal");
     quarantine
         .stage(&transaction.receipt.collected_scopes)
         .expect("quarantine stranded scope");
     assert!(!store.path().join(&stranded).exists());
     assert!(staged_root.join(&stranded).is_dir());
 
+    // A crashed process cannot keep its quarantine directory capability open.
+    drop(quarantine);
     recover_scope_root_retention(store.path()).expect("recover uncommitted reconciliation");
 
     assert!(
@@ -2366,12 +2439,21 @@ fn scope_recovery_completes_collection_once_the_receipt_is_durable() {
 
     // Crash after the receipt is durable but before the quarantine is
     // unlinked: the decision is committed, so recovery rolls forward.
-    persist_scope_transaction(store.path(), &transaction).expect("persist journal");
+    journal::persist_journal(store.path(), &SCOPE_TRANSACTION_JOURNAL, &transaction)
+        .expect("persist journal");
     quarantine
         .stage(&transaction.receipt.collected_scopes)
         .expect("quarantine stranded scope");
-    write_scope_receipt(store.path(), &receipt).expect("commit reconciliation receipt");
+    receipt_store::write_receipt(
+        store.path(),
+        &SCOPE_RECEIPT_STORE,
+        &receipt.receipt_digest,
+        &receipt,
+    )
+    .expect("commit reconciliation receipt");
 
+    // A crashed process cannot keep its quarantine directory capability open.
+    drop(quarantine);
     recover_scope_root_retention(store.path()).expect("recover committed reconciliation");
 
     assert!(!store.path().join(&stranded).exists());
@@ -2463,6 +2545,142 @@ fn scope_binding_cleanup_intent_replays_after_filesystem_collection_restart() {
     );
 }
 
+#[cfg(windows)]
+#[test]
+fn pending_scope_journal_refuses_new_generation_locks_until_recovery() {
+    let (store, live, stranded) = fixture_scope_store();
+    let proof = fixture_scope_liveness_proof(live.clone(), stranded.clone());
+    let plan = plan_scope_root_retention_with_liveness_proof(
+        store.path(),
+        proof,
+        DEFAULT_STRANDED_SCOPE_MINIMUM_AGE_SECS,
+        AGED_NOW_SECS,
+    )
+    .expect("plan scope collection");
+    let receipt = build_scope_receipt(&plan, plan.collectable_scopes.clone(), UtcMicros(15))
+        .expect("build scope receipt");
+    let quarantine = ScopeQuarantineAuthority::prepare(
+        store.path(),
+        &receipt.receipt_digest,
+        &receipt.collected_scopes,
+    )
+    .expect("prepare exact quarantine");
+    let transaction = ScopeRootRetentionTransactionV1 {
+        schema: SCOPE_RETENTION_TRANSACTION_SCHEMA.to_owned(),
+        receipt,
+        scope_identities: quarantine.scope_identities().clone(),
+    };
+    journal::persist_journal(store.path(), &SCOPE_TRANSACTION_JOURNAL, &transaction)
+        .expect("persist the scope fence before releasing generation locks");
+
+    let scope_root = store.path().join(&stranded);
+    let pass_lock = locking::acquire_scope_retention_lock(store.path())
+        .expect("hold the collector's parent fence");
+    assert!(
+        try_acquire_code_generation_store_lock(&scope_root)
+            .expect("try writer lock")
+            .is_none(),
+        "a writer must not enter after the collector releases its in-scope handle"
+    );
+    assert!(
+        try_acquire_code_generation_store_read_lock(&scope_root)
+            .expect("try reader lock")
+            .is_none(),
+        "a reader must not pin the directory while quarantine renames it"
+    );
+    assert!(
+        !scope_root.join(STORE_LOCK_FILE).exists(),
+        "a refused opener must not create or pin a descendant lock file"
+    );
+    drop(pass_lock);
+    assert!(matches!(
+        acquire_code_generation_store_lock(&scope_root),
+        Err(CodeGenerationRetentionErrorV1::GenerationStoreBusy)
+    ));
+    let live_scope_root = store.path().join(&live);
+    assert!(
+        try_acquire_code_generation_store_lock(&live_scope_root)
+            .expect("try unrelated live writer lock")
+            .is_some(),
+        "the pending journal must not fence a live sibling scope"
+    );
+    assert!(
+        try_acquire_code_generation_store_read_lock(&live_scope_root)
+            .expect("try unrelated live reader lock")
+            .is_some(),
+        "the pending journal must not fence unrelated live readers"
+    );
+
+    drop(quarantine);
+    recover_scope_root_retention(store.path()).expect("roll back the uncommitted journal");
+    assert!(
+        try_acquire_code_generation_store_lock(&scope_root)
+            .expect("retry writer lock")
+            .is_some(),
+        "recovery must reopen the exact scope for generation work"
+    );
+}
+
+#[test]
+fn scope_collection_defers_an_external_generation_owner_then_retries() {
+    let (store, live, stranded) = fixture_scope_store();
+    let proof = fixture_scope_liveness_proof(live, stranded.clone());
+    let plan = plan_scope_root_retention_with_liveness_proof(
+        store.path(),
+        proof.clone(),
+        DEFAULT_STRANDED_SCOPE_MINIMUM_AGE_SECS,
+        AGED_NOW_SECS,
+    )
+    .expect("plan scope collection");
+    let completed_at = UtcMicros(16);
+    prepare_scope_root_binding_cleanup(
+        store.path(),
+        &plan,
+        &stranded,
+        &proof.candidate_binding.source_scope,
+        &proof,
+        completed_at,
+    )
+    .expect("persist binding cleanup intent");
+    let held = try_acquire_code_generation_store_lock(&store.path().join(&stranded))
+        .expect("open external generation owner")
+        .expect("take external generation owner");
+    let error = execute_scope_root_retention(
+        store.path(),
+        plan,
+        &proof,
+        CodeGenerationRetentionModeV1::Apply,
+        AGED_NOW_SECS,
+        completed_at,
+    )
+    .expect_err("a held generation owner must defer scope collection");
+    assert!(matches!(
+        error,
+        CodeGenerationRetentionErrorV1::GenerationStoreBusy
+    ));
+    assert!(store.path().join(&stranded).is_dir());
+    assert!(!scope_transaction_path(store.path()).exists());
+
+    drop(held);
+    let retry = plan_scope_root_retention_with_liveness_proof(
+        store.path(),
+        proof.clone(),
+        DEFAULT_STRANDED_SCOPE_MINIMUM_AGE_SECS,
+        AGED_NOW_SECS,
+    )
+    .expect("replan after external owner leaves");
+    execute_scope_root_retention(
+        store.path(),
+        retry,
+        &proof,
+        CodeGenerationRetentionModeV1::Apply,
+        AGED_NOW_SECS,
+        completed_at,
+    )
+    .expect("collect after the external owner leaves");
+    assert!(!store.path().join(&stranded).exists());
+}
+
 #[test]
 fn scope_transaction_never_journals_a_live_scope() {
     let (store, live, stranded) = fixture_scope_store();
@@ -2542,7 +2760,9 @@ fn metadata_only_census_matches_full_verification() {
     let referenced = attach_fixture_text_artifact(&store, active, b"metadata parity live");
     let orphan = text_artifact_for_bytes(&active.id, b"metadata parity orphan");
     write_text_artifact(&store, &orphan, b"metadata parity orphan");
-    let stale_staging = code_text_artifacts_root(store.path())
+    std::fs::create_dir_all(code_text_artifact_staging_root(store.path()))
+        .expect("create staging root");
+    let stale_staging = code_text_artifact_staging_root(store.path())
         .join(format!(".text-artifact-{}.staging", "e".repeat(64)));
     std::fs::write(&stale_staging, b"metadata parity staging").expect("write stale staging");
 
@@ -2629,13 +2849,14 @@ fn applied_retention_refuses_a_metadata_only_plan() {
 /// The OOM-crash debris shape: sealed generation files and derived artifacts
 /// exist, but the publish never reached its pointer write, so no active
 /// pointer file exists. The pass must reclaim everything through the ordinary
-/// journal/receipt/release machinery — before this, such stores were
+/// journal/receipt/release machinery, before this, such stores were
 /// unreachable by every retention pass while their worktree root stayed live.
 #[test]
 fn unpublished_store_retention_reclaims_orphaned_partial_generations() {
     let (store, generations) = fixture_store(2);
     std::fs::remove_file(store.path().join(ACTIVE_POINTER_FILE)).expect("sever the active pointer");
-    let artifacts_root = code_text_artifacts_root(store.path());
+    let artifacts_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&artifacts_root).expect("create staging root");
     let orphan = text_artifact_for_bytes(&generations[0].id, b"orphan completed bytes");
     let orphan_path = write_text_artifact(&store, &orphan, b"orphan completed bytes");
     let staging_name = format!(".text-artifact-{}.staging", "a".repeat(64));
@@ -2740,7 +2961,7 @@ fn unpublished_store_execution_refuses_when_a_pointer_appears() {
 fn staging_sidecars_share_their_staging_artifact_liveness() {
     let (store, generations) = fixture_store(1);
     let active = generations.last().expect("active generation");
-    let artifacts_root = code_text_artifacts_root(store.path());
+    let artifacts_root = code_text_artifact_staging_root(store.path());
     std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
     let active_digest = sha256_hex_suffix(&active.state_digest).expect("active sealed digest");
     let active_staging = artifacts_root.join(format!(".text-artifact-{active_digest}.staging"));
@@ -2748,11 +2969,21 @@ fn staging_sidecars_share_their_staging_artifact_liveness() {
     let active_sidecar =
         artifacts_root.join(format!(".text-artifact-{active_digest}.staging-journal"));
     std::fs::write(&active_sidecar, b"active staging journal").expect("write active sidecar");
+    let active_compacting =
+        artifacts_root.join(format!(".text-artifact-{active_digest}.staging-compacting"));
+    std::fs::write(&active_compacting, b"active compacted rewrite")
+        .expect("write active compacting sidecar");
     let orphan_staging = artifacts_root.join(format!(".text-artifact-{}.staging", "c".repeat(64)));
     std::fs::write(&orphan_staging, b"abandoned staging").expect("write orphan staging");
     let orphan_sidecar =
         artifacts_root.join(format!(".text-artifact-{}.staging-journal", "c".repeat(64)));
     std::fs::write(&orphan_sidecar, b"abandoned staging journal").expect("write orphan sidecar");
+    let orphan_compacting = artifacts_root.join(format!(
+        ".text-artifact-{}.staging-compacting",
+        "c".repeat(64)
+    ));
+    std::fs::write(&orphan_compacting, b"abandoned compacted rewrite")
+        .expect("write orphan compacting sidecar");
 
     let report = run_code_generation_retention(
         store.path(),
@@ -2763,13 +2994,148 @@ fn staging_sidecars_share_their_staging_artifact_liveness() {
     )
     .expect("apply sidecar-aware retention");
 
-    assert_eq!(report.deleted_text_artifacts.len(), 2);
+    assert_eq!(report.deleted_text_artifacts.len(), 3);
     assert!(
-        active_staging.is_file() && active_sidecar.is_file(),
-        "the active build's staging file and its sidecar must survive"
+        active_staging.is_file() && active_sidecar.is_file() && active_compacting.is_file(),
+        "the active build's staging file and its sidecars must survive"
     );
     assert!(!orphan_staging.exists());
     assert!(!orphan_sidecar.exists());
+    assert!(!orphan_compacting.exists());
+}
+
+/// A daemon killed while `VACUUM INTO` writes the compacted rewrite leaves
+/// SQLite's rollback journal for that rewrite beside it (issue #2127). The
+/// next retention pass must collect it with the rest of the dead build's
+/// staging family, under a receipt, instead of refusing the whole inventory
+/// on every pass, and must leave the active build's copy to its builder.
+#[test]
+fn killed_compaction_journal_is_collected_with_its_staging_family() {
+    let (store, generations) = fixture_store(1);
+    let active = generations.last().expect("active generation");
+    let staging_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&staging_root).expect("create staging root");
+    let active_digest = sha256_hex_suffix(&active.state_digest).expect("active sealed digest");
+    let active_journal = staging_root.join(format!(
+        ".text-artifact-{active_digest}.staging-compacting-journal"
+    ));
+    std::fs::write(&active_journal, b"active rewrite journal").expect("write active journal");
+    let killed = "f148823506c0ab16dccaa6c9442ea2820c73eefa2c40f7893fe20f3d5a288437";
+    let killed_family = [
+        (
+            format!(".text-artifact-{killed}.staging"),
+            &b"killed staging"[..],
+        ),
+        (
+            format!(".text-artifact-{killed}.staging-compacting"),
+            &b"killed rewrite"[..],
+        ),
+        (
+            format!(".text-artifact-{killed}.staging-compacting-journal"),
+            &b"killed rewrite journal"[..],
+        ),
+    ];
+    for (name, bytes) in &killed_family {
+        std::fs::write(staging_root.join(name), bytes).expect("write killed build residue");
+    }
+
+    let report = run_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(23),
+        None,
+    )
+    .expect("retention collects the killed build's residue");
+
+    let mut deleted = report
+        .deleted_text_artifacts
+        .iter()
+        .map(|candidate| (candidate.artifact_file.as_str(), candidate.size_bytes))
+        .collect::<Vec<_>>();
+    deleted.sort_unstable();
+    assert_eq!(
+        deleted,
+        vec![
+            (
+                ".text-artifact-f148823506c0ab16dccaa6c9442ea2820c73eefa2c40f7893fe20f3d5a288437.staging",
+                14
+            ),
+            (
+                ".text-artifact-f148823506c0ab16dccaa6c9442ea2820c73eefa2c40f7893fe20f3d5a288437.staging-compacting",
+                14
+            ),
+            (
+                ".text-artifact-f148823506c0ab16dccaa6c9442ea2820c73eefa2c40f7893fe20f3d5a288437.staging-compacting-journal",
+                22
+            ),
+        ]
+    );
+    let receipt = report
+        .text_artifact_receipt
+        .expect("text-artifact retention receipt");
+    assert_eq!(receipt.reclaimed_bytes, 50);
+    for (name, _) in &killed_family {
+        assert!(
+            !staging_root.join(name).exists(),
+            "{name} must be collected"
+        );
+    }
+    assert!(
+        active_journal.is_file(),
+        "the active build's rewrite journal belongs to its builder"
+    );
+    assert!(!text_artifact_transaction_path(store.path()).exists());
+}
+
+/// A seated successor releases the serving pin on its predecessor, and a
+/// published successor text artifact orphans the incumbent, without waking
+/// maintenance. The plan must report each holder while it holds and stop the
+/// moment it lets go, or maintenance either sleeps a day on debris or never
+/// leaves its short cadence.
+#[test]
+fn transient_holders_keep_retention_awake_exactly_until_release() {
+    let (store, generations) = fixture_store(2);
+    let (superseded, active) = (&generations[0], &generations[1]);
+    let none = BTreeSet::new();
+    let plan = |pins: &BTreeSet<CodeGenerationId>| {
+        plan_code_generation_retention(store.path(), pins).expect("plan retention")
+    };
+
+    let serving_pin = BTreeSet::from([superseded.id.clone()]);
+    let pinned = plan(&serving_pin);
+    assert!(pinned.collectable_generations.is_empty());
+    assert!(pinned.awaits_transient_release(&serving_pin));
+
+    let released = plan(&none);
+    assert_eq!(released.collectable_generations.len(), 1);
+    assert_eq!(
+        released.collectable_generations[0].generation_id,
+        superseded.id
+    );
+    assert!(!released.awaits_transient_release(&none));
+
+    let active_pin = BTreeSet::from([active.id.clone()]);
+    assert!(
+        !plan(&active_pin).awaits_transient_release(&active_pin),
+        "a pin on the active generation is steady state, not a pending release"
+    );
+
+    let artifacts_root = code_text_artifact_staging_root(store.path());
+    std::fs::create_dir_all(&artifacts_root).expect("create artifact root");
+    let active_digest = sha256_hex_suffix(&active.state_digest).expect("active sealed digest");
+    let staging = artifacts_root.join(format!(".text-artifact-{active_digest}.staging"));
+    std::fs::write(&staging, b"cold build").expect("write active staging");
+    assert!(
+        !plan(&none).awaits_transient_release(&none),
+        "a first build orphans nothing when it publishes"
+    );
+
+    attach_fixture_text_artifact(&store, active, b"incumbent artifact");
+    assert!(plan(&none).awaits_transient_release(&none));
+
+    std::fs::remove_file(&staging).expect("successor publication consumes staging");
+    assert!(!plan(&none).awaits_transient_release(&none));
 }
 
 /// A production store's publication pointer names its whole retained history,
@@ -2953,7 +3319,8 @@ fn pointer_rewrite_fixture() -> PointerRewriteFixture {
         active_pointer: Some(original.clone()),
         receipt,
     };
-    persist_transaction(store.path(), &transaction).expect("journal the collection unit");
+    journal::persist_journal(store.path(), &GENERATION_TRANSACTION_JOURNAL, &transaction)
+        .expect("journal the collection unit");
     PointerRewriteFixture {
         store,
         original,
@@ -3031,8 +3398,13 @@ fn recovery_keeps_the_rewritten_index_once_the_receipt_is_durable() {
     .expect("publish the rewritten index");
     stage_collectable_generations(fixture.store.path(), &fixture.transaction)
         .expect("quarantine the collectable generations");
-    write_receipt(fixture.store.path(), &fixture.transaction.receipt)
-        .expect("commit the deletion receipt");
+    receipt_store::write_receipt(
+        fixture.store.path(),
+        &GENERATION_RECEIPT_STORE,
+        &fixture.transaction.receipt.receipt_digest,
+        &fixture.transaction.receipt,
+    )
+    .expect("commit the deletion receipt");
 
     recover_code_generation_retention(fixture.store.path(), &BTreeSet::new(), None)
         .expect("finish a committed collection unit");
@@ -3053,8 +3425,13 @@ fn recovery_completes_a_committed_rewrite_that_never_reached_the_pointer() {
     let fixture = pointer_rewrite_fixture();
     stage_collectable_generations(fixture.store.path(), &fixture.transaction)
         .expect("quarantine the collectable generations");
-    write_receipt(fixture.store.path(), &fixture.transaction.receipt)
-        .expect("commit the deletion receipt");
+    receipt_store::write_receipt(
+        fixture.store.path(),
+        &GENERATION_RECEIPT_STORE,
+        &fixture.transaction.receipt.receipt_digest,
+        &fixture.transaction.receipt,
+    )
+    .expect("commit the deletion receipt");
     assert_eq!(
         read_active_pointer(fixture.store.path()).expect("read pointer"),
         fixture.original,
@@ -3071,4 +3448,121 @@ fn recovery_completes_a_committed_rewrite_that_never_reached_the_pointer() {
     );
     plan_code_generation_retention(fixture.store.path(), &BTreeSet::new())
         .expect("a recovered store must stay plannable");
+}
+
+/// The census opens every name `read_dir` just returned. Publication can
+/// unlink that name first. `NotFound` is the same deferral as a held writer,
+/// not a storage failure. Any other open failure stays storage.
+#[test]
+fn vanished_listed_generation_open_defers_instead_of_storage_loss() {
+    let root = tempfile::tempdir().expect("census root");
+    let missing = root.path().join(format!("generation-{:064x}.json", 1));
+    let error = super::generation_scan::read_generation_format_revision(&missing, &|| false)
+        .expect_err("a vanished listed generation defers the census");
+    assert!(
+        matches!(error, CodeGenerationRetentionErrorV1::GenerationStoreBusy),
+        "a missing listed generation is a publisher race, not a storage failure: {error:?}"
+    );
+
+    let directory = root.path().join("not-a-generation-file");
+    std::fs::create_dir(&directory).expect("directory where a file was listed");
+    let storage_error =
+        super::generation_scan::read_generation_format_revision(&directory, &|| false)
+            .expect_err("a directory is not a vanished file");
+    assert!(
+        matches!(storage_error, CodeGenerationRetentionErrorV1::Storage(_)),
+        "non-NotFound census I/O stays a storage failure: {storage_error:?}"
+    );
+}
+
+#[test]
+fn missing_store_is_an_unpublished_plan_not_a_storage_failure() {
+    let missing = std::env::temp_dir().join(format!(
+        "tracedecay-missing-code-store-{}",
+        std::process::id()
+    ));
+    assert!(!missing.exists());
+    let plan = prepare_next_code_generation_retention_cancellable(
+        &missing,
+        &BTreeSet::new(),
+        &|| false,
+        None,
+    )
+    .expect("a store that has not been opened is unpublished");
+    assert_eq!(plan.active_generation_id, None);
+    assert!(plan.collectable_generations.is_empty());
+    assert!(!plan.has_collectable_work());
+}
+
+/// A descriptor published before artifacts carried a content key keeps the
+/// durable index readable and byte-identical, names nothing a reader may open
+/// or retention must keep, and is replaced by the next attached artifact.
+#[test]
+fn a_pre_key_text_artifact_descriptor_reads_as_retired_and_is_replaced() {
+    let (store, generations) = fixture_store(1);
+    let active = generations.last().expect("active generation");
+    let mut pointer = read_active_pointer(store.path()).expect("fixture pointer");
+    let retired = text_artifact_for_bytes(&active.id, b"pre-key artifact");
+    write_text_artifact(&store, &retired, b"pre-key artifact");
+    let generation_id = pointer.generation_id.clone();
+    let entry = pointer
+        .generation_index
+        .iter_mut()
+        .find(|entry| entry.generation_id == generation_id)
+        .expect("active entry");
+    entry.text_artifact = Some(DurableTextArtifactSlotV1::Retired(
+        RetiredCodeTextArtifactDescriptorV1 {
+            generation_id: retired.generation_id.clone(),
+            artifact_file: retired.artifact_file.clone(),
+            artifact_digest: retired.artifact_digest.clone(),
+            artifact_size_bytes: retired.artifact_size_bytes,
+        },
+    ));
+    pointer.generation_index_digest = Some(
+        durable_generation_index_digest(
+            &pointer.generation_index,
+            pointer.generation_index_truncated,
+        )
+        .expect("index digest"),
+    );
+    write_active_pointer(store.path(), "pre-key-fixture", &pointer).expect("write pointer");
+    let stored = std::fs::read_to_string(store.path().join(ACTIVE_POINTER_FILE))
+        .expect("read stored pointer");
+    assert!(
+        stored.contains(&retired.artifact_file) && !stored.contains("content_key"),
+        "the fixture stores the pre-key descriptor shape"
+    );
+    let reread = read_active_pointer(store.path()).expect("pre-key pointer stays readable");
+    assert_eq!(reread, pointer);
+    assert!(
+        reread
+            .generation_index
+            .iter()
+            .all(|entry| entry.text_artifact().is_none()),
+        "a pre-key descriptor names no openable artifact"
+    );
+    let report = run_code_generation_retention(
+        store.path(),
+        &BTreeSet::new(),
+        CodeGenerationRetentionModeV1::Apply,
+        UtcMicros(99),
+        None,
+    )
+    .expect("retention over a pre-key descriptor");
+    assert!(
+        report
+            .deleted_text_artifacts
+            .iter()
+            .any(|candidate| candidate.artifact_file == retired.artifact_file),
+        "the file a pre-key descriptor names is collected"
+    );
+    let attached = attach_fixture_text_artifact(&store, active, b"current artifact");
+    let after = read_active_pointer(store.path()).expect("pointer after attach");
+    assert!(
+        after
+            .generation_index
+            .iter()
+            .any(|entry| entry.text_artifact() == Some(&attached)),
+        "attaching a current artifact replaces the retired slot"
+    );
 }

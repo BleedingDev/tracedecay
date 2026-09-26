@@ -64,6 +64,16 @@ pub fn require_component_capabilities(
         (HostKindV1::Zed | HostKindV1::Antigravity | HostKindV1::Vibe, Agent | OperatorMcp) => {
             return Err(HostBundleError::UnsupportedCapability);
         }
+        // Pi's Core deploys the extension that carries both the tool bridge
+        // and the lifecycle hooks, so it is admitted against both surfaces
+        // and the checked-in `pi.json` fixture evidence behind `Hooks`.
+        (HostKindV1::Pi, Core) => &[Hooks, Cli],
+        (HostKindV1::Pi, Agent) => &[Cli],
+        // Factory Droid's adopted lifecycle carries two routes: the MCP
+        // registry (`droid mcp add|remove`) and the managed hook merge into
+        // `~/.factory/hooks.json` (SessionStart / Stop calling
+        // `hook-droid-event`), backed by the checked-in captured fixture.
+        (HostKindV1::FactoryDroid, Core) => &[Hooks, Cli],
         (_, ContextMcp | OperatorMcp) => &[Mcp],
         (HostKindV1::CursorDesktop, Agent) => &[NativeDiagnostics],
         (HostKindV1::OpenCode, Agent) => &[Cli],

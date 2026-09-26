@@ -110,24 +110,6 @@ struct RecordingCheckpointAuthority {
     denied_stage: Option<RuntimeWriteAuthorityStage>,
 }
 
-struct DenyThirdBeforeCommitAuthority {
-    before_commit_checks: AtomicU64,
-}
-
-impl RuntimeWriteAuthority for DenyThirdBeforeCommitAuthority {
-    fn verify(&self, stage: RuntimeWriteAuthorityStage) -> Result<(), RuntimeWriteAuthorityError> {
-        if stage == RuntimeWriteAuthorityStage::BeforeCommit
-            && self.before_commit_checks.fetch_add(1, Ordering::SeqCst) >= 2
-        {
-            Err(RuntimeWriteAuthorityError::denied(
-                "test backup authority denied before publication",
-            ))
-        } else {
-            Ok(())
-        }
-    }
-}
-
 impl RuntimeWriteAuthority for RecordingCheckpointAuthority {
     fn verify(&self, stage: RuntimeWriteAuthorityStage) -> Result<(), RuntimeWriteAuthorityError> {
         self.stages.lock().unwrap().push(stage);
@@ -609,8 +591,8 @@ fn competing_write_authority_fails_instead_of_reporting_retryable_saturation() {
 
 /// Every compatible write already waiting must commit in one transaction.
 ///
-/// The guard is a ratio of two exact counters — commands per committed
-/// transaction — and deliberately not a duration: timings on a loaded machine
+/// The guard is a ratio of two exact counters, commands per committed
+/// transaction, and deliberately not a duration: timings on a loaded machine
 /// swing by more than the effect being protected, so an elapsed-time assertion
 /// here would be noise wearing a threshold. Counters do not move with load.
 ///
@@ -765,6 +747,5 @@ fn queued_compatible_writes_commit_in_one_transaction() {
 }
 
 mod authority;
-mod backup;
 mod checkpoint;
 mod interruption;

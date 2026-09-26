@@ -46,7 +46,7 @@ pub struct HostRegistrationEvidenceV1 {
 }
 
 /// One row of [`HOST_REGISTRATIONS`]: a stock host's registration route and
-/// the evidence behind it. It carries no state on purpose — state is
+/// the evidence behind it. It carries no state on purpose, state is
 /// projected from the canonical capability matrix when the row is read, so
 /// the table can never disagree with `tracedecay-domain`.
 #[derive(Clone, Copy, Debug)]
@@ -163,7 +163,7 @@ pub(crate) const HOST_REGISTRATIONS: &[HostRegistrationDescriptor] = host_regist
         Mcp => "src/agents/opencode.rs",
     }
     // The tracedecay Gemini extension declares exactly one registration
-    // route — its own `mcpServers.tracedecay` entry, adopted by
+    // route, its own `mcpServers.tracedecay` entry, adopted by
     // `gemini extensions install`. The extension format admits hooks, but
     // no checked-in native Gemini event fixture exists and the staged
     // manifest declares no hook, so the hook row names the absent fixture.
@@ -176,11 +176,27 @@ pub(crate) const HOST_REGISTRATIONS: &[HostRegistrationDescriptor] = host_regist
     // the `mcpServers.tracedecay` entry that `copilot mcp add` writes into
     // the host-owned `~/.copilot/mcp-config.json`. There is no Copilot hook
     // surface to gather a fixture for, so the hook row names the absent
-    // surface — see the capability row in `tracedecay-domain`.
+    // surface, see the capability row in `tracedecay-domain`.
     Copilot {
         Cli => "src/tool_command.rs",
         Hook => "copilot_host_hook_surface_absent_v1",
         Mcp => "src/agents/copilot.rs",
+    }
+    // Pi's extension registers the tracedecay tool bridge and the lifecycle
+    // hooks in one file; both routes cite it. No MCP route exists: Pi has no
+    // MCP server admission path, matching the capability row.
+    Pi {
+        Cli => "plugin/pi/index.ts",
+        Hook => "plugin/pi/index.ts",
+    }
+    // Factory Droid carries two routes: the `mcpServers.tracedecay` entry
+    // that `droid mcp add` writes into the host-owned `~/.factory/mcp.json`,
+    // and the managed SessionStart / Stop merge into `~/.factory/hooks.json`
+    // whose payloads the checked-in `droid.json` fixture proves.
+    FactoryDroid {
+        Cli => "src/tool_command.rs",
+        Hook => "src/agents/droid.rs",
+        Mcp => "src/agents/droid.rs",
     }
 };
 
@@ -411,6 +427,23 @@ pub fn stock_host_native_fixture_evidence_from_embedded_assets(
             "file.edited,tool.execute.after,session.idle/session.status,lsp.updated",
             &["saved_edit", "post_tool_use"][..],
         ),
+        // The Pi extension forwards only its session boundaries; no edit
+        // callback exists, so the edit boundary stays fixture-limited.
+        HostKindV1::Pi => (
+            "pi",
+            "crates/tracedecay-hooks/fixtures/host_events/pi.json",
+            "session_start,agent_end",
+            &["saved_edit"][..],
+        ),
+        // The captured Droid fixtures prove the session boundaries the
+        // integration deploys (`SessionStart`, `Stop`); no tool-lifecycle
+        // event was captured, so the edit boundary stays unclaimed.
+        HostKindV1::FactoryDroid => (
+            "droid",
+            "crates/tracedecay-hooks/fixtures/host_events/droid.json",
+            "SessionStart,Stop",
+            &[][..],
+        ),
         HostKindV1::CursorCloud
         | HostKindV1::Devin
         | HostKindV1::Zed
@@ -527,6 +560,8 @@ pub fn native_host_edit_stop_conformance_evidence_from_embedded_assets(
         HostKindV1::Kiro,
         HostKindV1::KimiCode,
         HostKindV1::OpenCode,
+        HostKindV1::Pi,
+        HostKindV1::FactoryDroid,
     ]
     .into_iter()
     .filter_map(|host| stock_host_native_fixture_evidence_from_embedded_assets(assets, host))

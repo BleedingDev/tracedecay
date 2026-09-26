@@ -11,12 +11,14 @@ use std::time::{Duration, SystemTime};
 #[cfg(test)]
 use std::cell::RefCell;
 
-use fs2::FileExt;
 use rusqlite::backup::StepResult;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use tracedecay_domain::canonical_text::encode_lowercase_hex;
+use tracedecay_private_fs::FileLease;
 use tracedecay_private_fs::framed_log::rename_noreplace;
+
+use crate::storage::retry_transient_file_op;
 
 #[path = "sqlite_snapshot_connection.rs"]
 mod connection;
@@ -55,44 +57,6 @@ fn before_next_publish(hook: impl FnOnce() -> io::Result<()> + 'static) {
 #[cfg(test)]
 fn after_next_publish(hook: impl FnOnce() + 'static) {
     AFTER_PUBLISH.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-}
-
-pub async fn backup_live_sqlite_database(source: &Path, destination: &Path) -> io::Result<()> {
-    let source = source.to_path_buf();
-    let destination = destination.to_path_buf();
-    tokio::task::spawn_blocking(move || backup_live_sqlite_database_sync(&source, &destination))
-        .await
-        .map_err(|error| io::Error::other(format!("live SQLite backup task failed: {error}")))?
-}
-
-/// Online backup of a possibly-live `SQLite` family. This is the production
-/// Copy-mode authority: committed WAL frames are folded into one standalone
-/// file. Callers must not `fs::copy` a locked Windows store instead (#933).
-///
-/// The source is opened `SQLITE_OPEN_READ_ONLY` without `immutable=1`. That
-/// URI skips locking and ignores WAL/SHM; it is illegal on a changing family.
-/// Each attempt exclusively creates an owned staging file beside
-/// `destination` (`create_new`) and retires only that scratch. A colliding
-/// name is refused, not deleted.
-///
-/// `destination` is a fresh name the caller owns; this helper never replaces
-/// a destination and never removes anything found there. An existing main,
-/// `-wal`, `-shm`, or `-journal` at the destination is refused with
-/// `AlreadyExists` before the source is opened, and publication is a
-/// kernel-atomic no-replace rename, so a main created concurrently keeps its
-/// own family and fails the backup instead. `SQLite` durability is a
-/// family-level invariant: pathname existence cannot prove which main a later
-/// sidecar belongs to, so a displaced family can only be handled by an owner
-/// with lifecycle exclusion (see
-/// [`crate::db::DatabaseAuthority::replace_sqlite_with_rollback_atomically`]).
-/// Production callers publish into a directory they exclusively created and
-/// swap that directory themselves.
-///
-/// A WAL family whose transient `-shm` is absent is copied as an offline
-/// unlocked family and folded in staging — opening it as a reader would
-/// reconstruct SHM in the source directory.
-fn backup_live_sqlite_database_sync(source: &Path, destination: &Path) -> io::Result<()> {
-    backup_live_sqlite_database_with(source, destination, || Ok(()))
 }
 
 fn backup_staging_path(destination: &Path, id: u64) -> PathBuf {
@@ -188,6 +152,31 @@ fn reject_occupied_destination_family(destination: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Online backup of a possibly-live `SQLite` family. This is the production
+/// Copy-mode authority: committed WAL frames are folded into one standalone
+/// file. Callers must not `fs::copy` a locked Windows store instead (#933).
+///
+/// The source is opened `SQLITE_OPEN_READ_ONLY` without `immutable=1`. That
+/// URI skips locking and ignores WAL/SHM; it is illegal on a changing family.
+/// Each attempt exclusively creates an owned staging file beside
+/// `destination` (`create_new`) and retires only that scratch. A colliding
+/// name is refused, not deleted.
+///
+/// `destination` is a fresh name the caller owns; this helper never replaces
+/// a destination and never removes anything found there. An existing main,
+/// `-wal`, `-shm`, or `-journal` at the destination is refused with
+/// `AlreadyExists` before the source is opened, and publication is a
+/// kernel-atomic no-replace rename, so a main created concurrently keeps its
+/// own family and fails the backup instead. `SQLite` durability is a
+/// family-level invariant: pathname existence cannot prove which main a later
+/// sidecar belongs to, so a displaced family can only be handled by an owner
+/// with lifecycle exclusion.
+/// Production callers publish into a directory they exclusively created and
+/// swap that directory themselves.
+///
+/// A WAL family whose transient `-shm` is absent is copied as an offline
+/// unlocked family and folded in staging, opening it as a reader would
+/// reconstruct SHM in the source directory.
 fn backup_live_sqlite_database_with(
     source: &Path,
     destination: &Path,
@@ -385,7 +374,7 @@ pub struct SnapshotDatabase {
     source_state: Vec<FileState>,
     /// The `file:...` URI used to ATTACH this snapshot. Percent-encoded and
     /// carrying `mode=ro`/`immutable=1`, so it is never a valid filesystem
-    /// path — use `identity_path` for anything that touches the filesystem.
+    /// path, use `identity_path` for anything that touches the filesystem.
     path: PathBuf,
     /// The real on-disk file this snapshot reads: the untouched source in
     /// direct-immutable mode, or the scratch copy in copy mode.
@@ -661,7 +650,7 @@ enum SnapshotSourcePolicy {
 
 struct ScratchDirectory {
     path: PathBuf,
-    owner_lock: Option<File>,
+    owner_lock: Option<FileLease>,
 }
 
 impl Drop for ScratchDirectory {
@@ -995,7 +984,7 @@ async fn finish_one(
     }
     control.checkpoint()?;
     // `identity_path` is the real file on disk; `attach_path` is the URI used
-    // to ATTACH it. They are never interchangeable — the URI is percent-encoded
+    // to ATTACH it. They are never interchangeable, the URI is percent-encoded
     // and carries query parameters, so passing it to the filesystem fails.
     let (open_path, attach_path, identity_path, flags, scratch) =
         if matches!(prepared.mode, SnapshotMode::DirectImmutable) {
@@ -1102,7 +1091,8 @@ fn create_scratch_directory(
 ) -> io::Result<ScratchDirectory> {
     ensure_private_root(root, expected_uid)?;
     let cleanup_lock = open_private_lock(&root.join(".cleanup.lock"), true)?;
-    cleanup_lock.lock_exclusive()?;
+    cleanup_lock.lock()?;
+    let cleanup_lock = FileLease::held(cleanup_lock, "sqlite_read_snapshot.cleanup");
     cleanup_stale_directories(root)?;
     for _ in 0..100 {
         let id = NEXT_SNAPSHOT.fetch_add(1, Ordering::Relaxed);
@@ -1110,8 +1100,9 @@ fn create_scratch_directory(
         match create_private_directory(&path) {
             Ok(()) => {
                 let owner_lock = open_private_lock(&path.join(".owner.lock"), true)?;
-                owner_lock.lock_exclusive()?;
-                FileExt::unlock(&cleanup_lock)?;
+                owner_lock.lock()?;
+                let owner_lock = FileLease::held(owner_lock, "sqlite_read_snapshot.owner");
+                cleanup_lock.release()?;
                 return Ok(ScratchDirectory {
                     path,
                     owner_lock: Some(owner_lock),
@@ -1313,17 +1304,33 @@ fn cleanup_stale_directories(root: &Path) -> io::Result<()> {
         if !name.to_string_lossy().starts_with("read-") {
             continue;
         }
-        let path = entry.path();
-        if !fs::symlink_metadata(&path)?.is_dir() {
-            continue;
-        }
-        let removable = match open_private_lock(&path.join(".owner.lock"), false) {
-            Ok(lock) => lock.try_lock_exclusive().is_ok(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        // An owner releases its directory without the cleanup lock, so an
+        // entry listed above can be gone by now. Gone is the state this
+        // sweep wants; only a failure to reach a present entry is an error.
+        // Windows reports an entry mid-release as access denied until its
+        // last handle closes, which the transient-file retry waits out.
+        retry_transient_file_op(|| cleanup_stale_directory(&entry.path()))?;
+    }
+    Ok(())
+}
+
+fn cleanup_stale_directory(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let removable = match open_private_lock(&path.join(".owner.lock"), false) {
+        Ok(lock) => lock.try_lock().map_err(std::io::Error::from).is_ok(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    if removable {
+        match fs::remove_dir_all(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(error),
-        };
-        if removable {
-            fs::remove_dir_all(path)?;
         }
     }
     Ok(())
@@ -1508,6 +1515,37 @@ mod tests {
 
         fs::write(with_suffix(&path, "-wal"), b"live").unwrap();
         assert!(checkpointed_database_has_any_rows(&path, &["durable"]).is_err());
+    }
+
+    /// A snapshot owner removes its own `read-*` directory without the
+    /// cleanup lock, so a cleanup that listed that directory can find it gone
+    /// by the time it inspects or removes it. That is the state cleanup
+    /// wants; it must not fail the open that ran it.
+    #[test]
+    fn stale_directory_cleanup_survives_a_concurrent_owner_release() {
+        for _ in 0..40 {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().to_path_buf();
+            let dirs: Vec<PathBuf> = (0..200)
+                .map(|index| root.join(format!("read-owner-{index}")))
+                .collect();
+            for dir in &dirs {
+                fs::create_dir(dir).unwrap();
+            }
+            let releasing = dirs.clone();
+            let owner = std::thread::spawn(move || {
+                for dir in releasing {
+                    let _ = fs::remove_dir_all(dir);
+                }
+            });
+            let cleaned = cleanup_stale_directories(&root);
+            owner.join().unwrap();
+            cleaned.expect("cleanup tolerates directories released under it");
+            assert!(
+                fs::read_dir(&root).unwrap().next().is_none(),
+                "every stale directory is gone afterwards"
+            );
+        }
     }
 
     #[tokio::test]

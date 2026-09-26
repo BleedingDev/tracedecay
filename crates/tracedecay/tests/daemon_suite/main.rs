@@ -1,7 +1,7 @@
 //! Consolidated daemon test suite.
 //!
 //! Covers the git-metadata watcher (design D3), the backstop scheduler (D5),
-//! the concurrency governor, and branch-store GC (D6) — the freshness path the
+//! the concurrency governor, and branch-store GC (D6), the freshness path the
 //! daemon drives when git operations happen outside a hooked session.
 //!
 //! The `GitWatcher` type itself is a crate-private daemon component, so these
@@ -23,7 +23,11 @@ mod code_index_ignored_dependencies_test;
 #[cfg(unix)]
 mod code_index_journey;
 #[cfg(unix)]
+mod code_index_park_test;
+#[cfg(unix)]
 mod dirty_worktree_symbol_reads_test;
+#[cfg(target_os = "linux")]
+mod fixture_daemon_lifetime_test;
 #[cfg(feature = "test-transport")]
 mod git_watch_test;
 #[cfg(all(unix, feature = "test-transport"))]
@@ -31,8 +35,13 @@ mod indexing_lifecycle_test;
 mod invocation_observability;
 mod invocation_primitives;
 #[cfg(unix)]
+mod sealed_generation_crash_test;
+#[cfg(unix)]
+mod socket_lifecycle_test;
 #[cfg(unix)]
 mod stale_client_resilience_test;
+#[cfg(unix)]
+mod store_shutdown_checkpoint_test;
 mod workflow_handoff_test;
 
 #[test]

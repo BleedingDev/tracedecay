@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use serde_json::json;
 use tracedecay::daemon::call_tool;
-use tracedecay::project::MovedStoreAdoption;
 use tracedecay_daemon_protocol::{DaemonClientIdentity, DaemonHandshake};
+use tracedecay_project::project::MovedStoreAdoption;
 
 use crate::common::{daemon_socket_path, spawn_tracedecay_daemon, tempdir_or_panic};
 
@@ -62,7 +62,7 @@ async fn version_skewed_client_cannot_crash_the_daemon() {
     let profile_root = profile_root_for(home.path());
 
     // A project tool from a projectless connection exercises the full
-    // tools/call dispatch — the poll frame that previously overflowed — and
+    // tools/call dispatch, the poll frame that previously overflowed, and
     // must come back as the daemon's typed refusal, not a dead socket.
     let skewed = projectless_handshake(&profile_root, SKEWED_CLIENT_VERSION, "stale-skewed-client");
     let refusal = tokio::time::timeout(

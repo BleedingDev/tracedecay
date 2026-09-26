@@ -21,7 +21,7 @@ use tracedecay_store::{
     RuntimeRequestProbeV1, RuntimeSubmitOutcomeV1, RuntimeSubmitRequestV1, RuntimeTransactionIdV1,
     RuntimeTransactionScopeV1, StoreClientIdV1, StoreCommitReceiptV1, StoreIdempotencyKeyV1,
     StoreOperationIdV1, StoreOperationMetadataV1, StoreRuntimeBindingV1, VerifiedStoreLocatorV1,
-    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor_v2,
+    build_observation_resolution_authorization_v1, build_observation_retrieval_anchor,
 };
 
 const CHANNEL_CAPACITY: usize = 128;
@@ -42,12 +42,6 @@ enum ReplayCommandV1 {
         reply: mpsc::SyncSender<
             Result<RemoteReplayTransactionOutcomeV1, RemoteReplayTransactionErrorV1>,
         >,
-    },
-    Snapshot {
-        project_id: ProjectId,
-        destination: std::path::PathBuf,
-        probe: Arc<dyn RuntimeRequestProbeV1>,
-        reply: mpsc::SyncSender<Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt, String>>,
     },
     InstallFence {
         project_id: ProjectId,
@@ -96,25 +90,6 @@ impl DaemonRemoteReplayTransactionAuthorityV1 {
                             if reply.send(outcome).is_err() {
                                 tracing::debug!(
                                     "remote replay caller ended before transaction receipt delivery"
-                                );
-                            }
-                        }
-                        ReplayCommandV1::Snapshot {
-                            project_id,
-                            destination,
-                            probe,
-                            reply,
-                        } => {
-                            let outcome = execute_snapshot(
-                                &runtime,
-                                &worker_targets,
-                                &project_id,
-                                destination,
-                                probe,
-                            );
-                            if reply.send(outcome).is_err() {
-                                tracing::debug!(
-                                    "remote backup caller ended before snapshot receipt delivery"
                                 );
                             }
                         }
@@ -236,26 +211,6 @@ impl DaemonRemoteReplayTransactionAuthorityV1 {
         Ok((target.binding.clone(), target.path.clone()))
     }
 
-    pub fn snapshot_target(
-        &self,
-        project_id: ProjectId,
-        destination: std::path::PathBuf,
-        probe: Arc<dyn RuntimeRequestProbeV1>,
-    ) -> Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt, String> {
-        let (reply, response) = mpsc::sync_channel(1);
-        self.sender
-            .try_send(ReplayCommandV1::Snapshot {
-                project_id,
-                destination,
-                probe,
-                reply,
-            })
-            .map_err(|_| "remote backup worker is saturated".to_owned())?;
-        response
-            .recv()
-            .map_err(|_| "remote backup worker ended before replying".to_owned())?
-    }
-
     pub fn install_writer_fence(
         &self,
         project_id: ProjectId,
@@ -294,8 +249,8 @@ impl DaemonRemoteReplayTransactionAuthorityV1 {
             .map_err(|_| "remote recovery fence reader ended before replying".to_owned())?
     }
 
-    /// Returns the already-published canonical project runtime used by replay,
-    /// backup, restore, and remote reads. Query callers receive no locator or
+    /// Returns the already-published canonical project runtime used by replay
+    /// and remote reads. Query callers receive no locator or
     /// physical attachment and cannot open a caller-selected store.
     pub fn registered_query_target(
         &self,
@@ -367,25 +322,6 @@ fn issue_target_lease(
         );
     }
     Ok(lease)
-}
-
-fn execute_snapshot(
-    tokio_runtime: &tokio::runtime::Handle,
-    targets: &RwLock<BTreeMap<ProjectId, ReplayTargetV1>>,
-    project_id: &ProjectId,
-    destination: std::path::PathBuf,
-    probe: Arc<dyn RuntimeRequestProbeV1>,
-) -> Result<tracedecay_rusqlite_runtime::OnlineBackupReceipt, String> {
-    let target = targets
-        .read()
-        .map_err(|_| "remote replay target registry lock is poisoned".to_owned())?
-        .get(project_id)
-        .cloned()
-        .ok_or_else(|| "remote backup target is not registered".to_owned())?;
-    let lease = issue_target_lease(&target)?;
-    tokio_runtime
-        .block_on(lease.snapshot_to_interruptible(&destination, probe))
-        .map_err(|error| format!("registered online backup failed: {error:?}"))
 }
 
 fn execute_fence_install(
@@ -655,7 +591,7 @@ fn prepare_request(
     let authorization =
         build_observation_resolution_authorization_v1(&observation, PROJECTION_GENERATION)
             .map_err(|_| RemoteReplayTransactionErrorV1::CanonicalEffect)?;
-    let anchor = build_observation_retrieval_anchor_v2(
+    let anchor = build_observation_retrieval_anchor(
         &observation,
         projection_generation.clone(),
         committed_at,

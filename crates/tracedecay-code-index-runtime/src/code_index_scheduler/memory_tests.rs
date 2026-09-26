@@ -5,11 +5,13 @@ use std::process::Command;
 use std::sync::Arc;
 
 use tempfile::TempDir;
+use tracedecay_code_index::parallelism::CodeIndexWorkerRuntimeV1;
 use tracedecay_domain::{ProjectId, configuration::CodeIndexWorkerSelectionV1};
 use tracedecay_runtime_core::resident_memory::{
     DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1, ResidentMemoryPressureV1,
 };
 
+use super::tests::OwnerSignals;
 use super::{
     CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorktreeSchedulerV1,
     SharedCodeIndexBytePoolV1,
@@ -47,19 +49,28 @@ fn fixture() -> TempDir {
     root
 }
 
-fn worker_reservation_bytes() -> u64 {
-    let installed = tracedecay_code_index::parallelism::install_worker_plan(
+/// The automatic plan a scheduler builds against the default authority,
+/// bound to `scheduler` so its reservations use exactly this plan.
+fn bind_default_worker_runtime(
+    scheduler: &CodeIndexWorktreeSchedulerV1,
+) -> CodeIndexWorkerRuntimeV1 {
+    let runtime = CodeIndexWorkerRuntimeV1::build(
         CodeIndexWorkerSelectionV1::Automatic {},
         DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get(),
     )
-    .expect("install automatic worker plan");
+    .expect("build automatic worker runtime");
+    scheduler.bind_worker_runtime(runtime.clone());
+    runtime
+}
+
+fn worker_reservation_bytes(runtime: &CodeIndexWorkerRuntimeV1) -> u64 {
     tracedecay_code_index::parallelism::worker_reservation_bytes(usize::from(
-        installed.status.effective_workers,
+        runtime.status().effective_workers,
     ))
 }
 
-fn expected_worker_reservation_on(remaining_bytes: u64) -> u64 {
-    let planned_workers = tracedecay_code_index::parallelism::indexing_workers();
+fn expected_worker_reservation_on(runtime: &CodeIndexWorkerRuntimeV1, remaining_bytes: u64) -> u64 {
+    let planned_workers = usize::from(runtime.status().effective_workers);
     let affordable = tracedecay_code_index::parallelism::memory_safe_worker_count(remaining_bytes);
     tracedecay_code_index::parallelism::worker_reservation_bytes(
         planned_workers.min(affordable).max(1),
@@ -100,8 +111,8 @@ fn captured_source_bytes_are_charged_until_the_snapshot_drops() {
 /// unchanged checkout reuses the active generation's rows instead of
 /// re-reading them, so it retains no source Arcs and holds no charge for
 /// bytes it is not keeping resident. This pins the invariant that survived
-/// that change — the charge always equals what the scheduler still retains,
-/// on the build path and on the no-build path alike — rather than the
+/// that change, the charge always equals what the scheduler still retains,
+/// on the build path and on the no-build path alike, rather than the
 /// pre-proportional behaviour where every reconcile re-captured, and so
 /// re-charged, the whole snapshot.
 #[test]
@@ -198,7 +209,23 @@ fn latest_complete_reuses_the_immutable_generation_allocation() {
         std::ptr::eq(first.generation(), second.generation()),
         "readers must share the sealed generation instead of deep-cloning it"
     );
-    assert!(!first.exact().expect("exact chunks").is_empty());
+    let exact = first.exact().expect("exact chunks");
+    let files = &first.generation().snapshot().files;
+    for admitted in exact.iter() {
+        let path = files
+            .iter()
+            .find(|file| file.file_occurrence_id == admitted.chunk().anchor.file_occurrence_id)
+            .map(|file| file.logical_path.as_str());
+        assert_eq!(path, Some("src/lib.rs"));
+    }
+    assert!(
+        exact.iter().any(|admitted| admitted
+            .chunk()
+            .sanitized_text
+            .as_str()
+            .contains("pub fn retained_generation() -> u32 { 1 }")),
+        "exact chunks must carry the committed fixture source"
+    );
     let generation_id = first.generation().manifest().generation_id.clone();
     drop(first);
     drop(second);
@@ -235,7 +262,7 @@ fn worker_memory_reservation_is_charged_and_released_by_raii() {
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     )
     .expect("open scheduler");
-    let _installed = worker_reservation_bytes();
+    let runtime = bind_default_worker_runtime(&scheduler);
     let authority = Arc::new(ProcessResidentMemoryV1::new(
         DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
     ));
@@ -245,7 +272,7 @@ fn worker_memory_reservation_is_charged_and_released_by_raii() {
         .expect("reserve worker memory");
     assert_eq!(
         authority.snapshot().used_bytes,
-        expected_worker_reservation_on(DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get())
+        expected_worker_reservation_on(&runtime, DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get())
     );
     drop(reservation);
     assert_eq!(authority.snapshot().used_bytes, 0);
@@ -257,7 +284,6 @@ fn worker_memory_reservation_is_charged_and_released_by_raii() {
 /// `reserve_worker_memory` had reserved `remaining / 128MiB` and used==limit.
 #[test]
 fn default_authority_worker_reserve_leaves_typed_snapshot_headroom() {
-    let _installed = worker_reservation_bytes();
     let project = fixture();
     let project_id = ProjectId::new("project.code-index-worker-headroom").expect("valid project");
     let store = TempDir::new().expect("store root");
@@ -268,6 +294,7 @@ fn default_authority_worker_reserve_leaves_typed_snapshot_headroom() {
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     )
     .expect("open scheduler");
+    let runtime = bind_default_worker_runtime(&scheduler);
     let authority = Arc::new(ProcessResidentMemoryV1::new(
         DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1,
     ));
@@ -278,7 +305,7 @@ fn default_authority_worker_reserve_leaves_typed_snapshot_headroom() {
         .expect("6 GiB authority admits a memory-safe worker slab");
     let used = authority.snapshot().used_bytes;
     let limit = DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1.get();
-    assert_eq!(used, expected_worker_reservation_on(limit));
+    assert_eq!(used, expected_worker_reservation_on(&runtime, limit));
     assert!(
         used < limit,
         "worker reserve must leave the typed non-worker headroom: used={used} limit={limit}"
@@ -309,7 +336,7 @@ fn worker_memory_reservation_refusal_is_typed() {
         Arc::new(SharedCodeIndexBytePoolV1::default()),
     )
     .expect("open scheduler");
-    let _installed = worker_reservation_bytes();
+    bind_default_worker_runtime(&scheduler);
     let authority = Arc::new(ProcessResidentMemoryV1::new(
         NonZeroU64::new(
             tracedecay_code_index::parallelism::INDEX_WORKER_RESIDENT_BUDGET_BYTES_V1 - 1,
@@ -341,13 +368,14 @@ async fn registry_reports_retained_generation_bytes_without_scheduler_locks() {
     // the background worker, so an empty store reports no retained bytes until
     // that reconcile lands. Settle on the post-reconcile state instead of
     // racing it; the assertions below are unchanged and must all hold at once.
+    let mut signals = OwnerSignals::subscribe(&registry, project.path()).await;
     let stats = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let stats = registry.memory_stats().await;
             if stats.reconciling_worktrees == 0 && stats.retained_generation_encoded_bytes > 0 {
                 break stats;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -360,7 +388,7 @@ async fn registry_reports_retained_generation_bytes_without_scheduler_locks() {
 }
 
 /// Measured RSS, not the reservation ledger, decides worker admission once a
-/// sample says the process is over budget — and the refusal names the observed
+/// sample says the process is over budget, and the refusal names the observed
 /// and configured bytes so it is never a silent stall.
 #[test]
 fn measured_rss_pressure_refuses_worker_admission_and_readmits_as_it_falls() {
@@ -377,8 +405,9 @@ fn measured_rss_pressure_refuses_worker_admission_and_readmits_as_it_falls() {
 
     // A limit with ample room for the worker plan, so the only thing that can
     // refuse admission below is the injected measurement.
-    let limit =
-        NonZeroU64::new(worker_reservation_bytes().saturating_mul(4)).expect("positive test limit");
+    let runtime = bind_default_worker_runtime(&scheduler);
+    let limit = NonZeroU64::new(worker_reservation_bytes(&runtime).saturating_mul(4))
+        .expect("positive test limit");
     let pressure = Arc::new(ResidentMemoryPressureV1::new(limit));
     scheduler.bind_resident_memory(Arc::new(ProcessResidentMemoryV1::with_pressure(
         limit,

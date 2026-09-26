@@ -9,7 +9,7 @@
 //!
 //! The hook runtime handle ([`HookRuntimeV1`]) is composed here from this
 //! crate's adapters plus the one capability this crate cannot build: the
-//! daemon client ([`DaemonClientPortsV1`] — the tool invoker and the hook
+//! daemon client ([`DaemonClientPortsV1`], the tool invoker and the hook
 //! event notifier that talk to the daemon over its socket). The composition
 //! root owns that client and hands it to [`register_runtime_ports`]; a root
 //! that wants an explicit handle for a hook entry point builds it with
@@ -74,9 +74,6 @@ pub(crate) fn require_runtime_ports() -> Result<DaemonClientPortsV1> {
 fn register_session_ports() {
     use tracedecay_sessions::host_ports;
 
-    host_ports::hermes_profile_pin::register(
-        tracedecay_agent_hosts::agents::hermes::read_config_pinned_project_root,
-    );
     host_ports::unregistered_admission::register(unregistered_admission);
 }
 
@@ -108,9 +105,6 @@ fn register_agent_host_ports() {
     use tracedecay_automation_runtime::ports as automation_ports;
 
     automation_ports::codex_app_server::register(run_codex_app_server_prompt);
-    automation_ports::session_store::register_canonical_project_key(
-        tracedecay_global_db::RegisteredGlobalDb::canonical_project_key,
-    );
 }
 
 /// The hook runtime handle for the registered daemon client, or a typed
@@ -127,7 +121,7 @@ pub fn hook_runtime() -> Result<HookRuntimeV1> {
 ///
 /// Built wherever a hook entry point starts rather than stored: the struct is
 /// plain function pointers, so constructing it is free and there is no slot
-/// for a second composition to lose. Two former slots are absent by design —
+/// for a second composition to lose. Two former slots are absent by design:
 /// the memory-injection gate and the Cursor ingest ceiling were agent-hosts'
 /// own function and constant round-tripped through the root, and their
 /// readers now call them directly.
@@ -191,20 +185,21 @@ fn run_codex_app_server_prompt(
     thread_source: &str,
     response_schema: Option<&Value>,
 ) -> std::result::Result<tracedecay_automation_runtime::ports::codex_app_server::Summary, String> {
-    let config = tracedecay_sessions::runtime::codex_app_server::CodexAppServerSummaryConfig {
-        codex_bin: config.codex_bin.clone(),
-        model: config.model.clone(),
-        timeout: config.timeout,
-    };
+    let config =
+        tracedecay_sessions::runtime::hosts::codex_app_server::CodexAppServerSummaryConfig {
+            codex_bin: config.codex_bin.to_string_lossy().into_owned(),
+            model: config.model.clone(),
+            timeout: config.timeout,
+        };
     let result = if let Some(response_schema) = response_schema {
-        tracedecay_sessions::runtime::codex_app_server::run_prompt_with_codex_app_server_response_schema(
+        tracedecay_sessions::runtime::hosts::codex_app_server::run_prompt_with_codex_app_server_response_schema(
             prompt,
             &config,
             thread_source,
             response_schema,
         )
     } else {
-        tracedecay_sessions::runtime::codex_app_server::run_prompt_with_codex_app_server(
+        tracedecay_sessions::runtime::hosts::codex_app_server::run_prompt_with_codex_app_server(
             prompt,
             &config,
             thread_source,
@@ -275,38 +270,6 @@ mod tests {
         pinned
     }
 
-    /// YAML double-quoted scalars treat `\t`/`\U` as escapes. A Windows
-    /// native path must be written so those separators survive as separators.
-    fn hermes_project_root_yaml(project_root: &str) -> String {
-        format!(
-            "plugins:\n  tracedecay:\n    project_root: '{}'\n",
-            project_root.replace('\'', "''")
-        )
-    }
-
-    #[test]
-    fn hermes_profile_pin_resolves_a_pinned_root_after_registration() {
-        let _pinned = registered();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config = temp.path().join("config.yaml");
-        let pinned = temp.path().join("pinned-project");
-        // Single-quoted so a Windows path's backslashes are not read as YAML
-        // escapes (`\a` -> BEL, `\t` -> TAB).
-        std::fs::write(
-            &config,
-            hermes_project_root_yaml(&pinned.display().to_string()),
-        )
-        .expect("write hermes profile config");
-
-        // Unwired this reads `None`, which makes legacy Hermes state stores
-        // skip rather than attribute to the pinned root.
-        assert_eq!(
-            tracedecay_sessions::host_ports::hermes_profile_pin::resolve(&config),
-            Some(pinned.display().to_string()),
-            "registered resolver must back the hermes profile pin port"
-        );
-    }
-
     /// The hook runtime is one explicit handle of adapters, so this is the
     /// single check that every hook capability this crate composes answers
     /// through it (here: the registered-identity gates for an unregistered
@@ -334,6 +297,17 @@ mod tests {
             .await
             .expect("the root resolves a canonical layout for any checkout");
         assert_eq!(layout.project_root, checkout);
-        assert!(layout.identity.project_id.is_some());
+        let project_id = layout
+            .identity
+            .project_id
+            .expect("the layout carries a project identity");
+        let again = (runtime.store_layout_resolver)(&checkout)
+            .await
+            .expect("the same checkout resolves again");
+        assert_eq!(
+            again.identity.project_id,
+            Some(project_id),
+            "one checkout resolves to one stable project identity"
+        );
     }
 }

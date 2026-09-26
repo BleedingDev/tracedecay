@@ -57,12 +57,6 @@ pub enum RemoteCommand {
     Replay {
         args: RemoteProtocolArgs,
     },
-    Backup {
-        args: RemoteProtocolArgs,
-    },
-    Restore {
-        args: RemoteProtocolArgs,
-    },
     Failover {
         args: RemoteProtocolArgs,
     },
@@ -122,28 +116,6 @@ pub fn run(command: RemoteCommand) -> Result<()> {
                 &hotpath::measure_block!(
                     "serve.remote.replay",
                     client.replay(&request).map_err(map_remote_client_error)?
-                ),
-                args.json,
-            )
-        }
-        RemoteCommand::Backup { args } => {
-            let request = read_protocol_request(&args.request_file)?;
-            let client = build_client(&args)?;
-            emit_protocol_response(
-                &hotpath::measure_block!(
-                    "serve.remote.backup",
-                    client.backup(&request).map_err(map_remote_client_error)?
-                ),
-                args.json,
-            )
-        }
-        RemoteCommand::Restore { args } => {
-            let request = read_protocol_request(&args.request_file)?;
-            let client = build_client(&args)?;
-            emit_protocol_response(
-                &hotpath::measure_block!(
-                    "serve.remote.restore",
-                    client.restore(&request).map_err(map_remote_client_error)?
                 ),
                 args.json,
             )
@@ -296,8 +268,9 @@ fn protocol_exit_status<T>(response: &RemoteProtocolResponseV1<T>) -> Result<()>
         Ok(_) => Ok(()),
         Err(problem) => Err(TraceDecayError::Config {
             message: format!(
-                "Remote Brain request {} failed: {}: {}",
-                response.request_id, problem.problem.code, problem.problem.message
+                "Remote Brain request {} failed: {}",
+                response.request_id,
+                problem.problem.summary()
             ),
         }),
     }
@@ -336,7 +309,9 @@ fn query_payload(
     match &response.result {
         Ok(envelope) => match &envelope.outcome {
             ApplicationOutcome::Evidence(packet) => packet.payload.as_ref(),
-            ApplicationOutcome::Preview(_) | ApplicationOutcome::Effect(_) => None,
+            ApplicationOutcome::Preview(_)
+            | ApplicationOutcome::Effect(_)
+            | ApplicationOutcome::Result(_) => None,
         },
         Err(_) => None,
     }
@@ -463,7 +438,6 @@ Spool pending: {}\n\
 Spool quarantined: {}\n\
 Sequence gap: {}\n\
 Replay coverage complete: {}\n\
-Current backup verified: {}\n\
 Failover in progress: {}\n\
 Recovery required: {}\n",
         readiness_label(status.readiness),
@@ -474,7 +448,6 @@ Recovery required: {}\n",
         status.spool.quarantined_count,
         yes_no(status.spool.has_sequence_gap),
         yes_no(status.replay_coverage_complete),
-        yes_no(status.current_backup_verified),
         yes_no(status.failover_in_progress),
         yes_no(status.recovery_required),
     )
@@ -483,7 +456,7 @@ Recovery required: {}\n",
 fn render_protocol_response<T>(response: &RemoteProtocolResponseV1<T>) -> String {
     let outcome = match &response.result {
         Ok(_) => "ok".to_owned(),
-        Err(problem) => format!("{}: {}", problem.problem.code, problem.problem.message),
+        Err(problem) => problem.problem.summary(),
     };
     format!(
         "Request: {}\nAuthority: {}\nOutcome: {}\n",
@@ -569,7 +542,6 @@ mod tests {
                 "has_sequence_gap": true
             },
             "replay_coverage_complete": false,
-            "current_backup_verified": true,
             "failover_in_progress": false,
             "recovery_required": false,
             "observed_at": 10
@@ -628,7 +600,7 @@ mod tests {
         let Err(problem) = &response.result else {
             panic!("expected typed protocol problem");
         };
-        let outcome = format!("{}: {}", problem.problem.code, problem.problem.message);
+        let outcome = problem.problem.summary();
         assert_eq!(
             render_protocol_response(&response),
             format!("Request: request.cli.remote.7\nAuthority: unavailable\nOutcome: {outcome}\n")

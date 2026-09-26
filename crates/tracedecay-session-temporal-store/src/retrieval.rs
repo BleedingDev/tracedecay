@@ -21,16 +21,24 @@ use tracedecay_domain::{
 #[cfg(test)]
 use tracedecay_runtime_core::db::engine;
 use tracedecay_temporal_query::candidates::{CandidateChannel, CandidatePlan};
-use tracedecay_temporal_query::ports::{
-    CANDIDATE_READ_BUDGET, CandidateFieldCaps, CandidatePageSink, CandidateReadState,
-    MeasuredTemporalValue, PageLimits, PageRequest, PageStatus, PortFuture,
-    TemporalCandidateFilterV1, TemporalCandidatePopulationCount, TemporalExecutionSnapshot,
-    TemporalMessageTypeFilterV1, TemporalPortError, TemporalPreparedCandidateCohort,
-    TemporalReadPort, TemporalRecordPageSink, TemporalRetrievalScope, TemporalSessionScopeFilterV1,
-    TemporalSnapshotRequest, await_controlled, begin_prepared_candidate_pull,
+use tracedecay_temporal_query::execution::TemporalPortError;
+use tracedecay_temporal_query::execution::await_controlled;
+use tracedecay_temporal_query::paging::{
+    CANDIDATE_READ_BUDGET, CandidateFieldCaps, CandidatePageSink, CandidateReadState, PageLimits,
+    PageRequest, PageStatus, TemporalRecordPageSink,
+};
+use tracedecay_temporal_query::paging::{
+    MeasuredTemporalValue, PortFuture, TemporalReadPort, begin_prepared_candidate_pull,
     commit_prepared_candidate_pull,
 };
 use tracedecay_temporal_query::ranking::RankingCandidate;
+use tracedecay_temporal_query::snapshot::{
+    TemporalCandidateFilterV1, TemporalMessageTypeFilterV1, TemporalRetrievalScope,
+    TemporalSessionScopeFilterV1, TemporalSnapshotRequest,
+};
+use tracedecay_temporal_query::snapshot::{
+    TemporalCandidatePopulationCount, TemporalExecutionSnapshot, TemporalPreparedCandidateCohort,
+};
 
 mod candidates;
 mod cursors;
@@ -70,7 +78,7 @@ const ROOT_STRICT_POPULATION_COUNT_LIMIT: usize = 4_096;
 
 fn temporal_relation_error(
     error: SessionRelationError,
-    control: &tracedecay_temporal_query::ports::ExecutionControl,
+    control: &tracedecay_temporal_query::execution::ExecutionControl,
     resource: &'static str,
 ) -> TemporalPortError {
     if error == SessionRelationError::Cancelled
@@ -837,15 +845,15 @@ impl<'a> SessionTemporalReadPort<'a> {
         let caps = request.candidate_field_caps();
         let metadata_cap = caps.map_or(
             request.max_item_bytes(),
-            tracedecay_temporal_query::ports::CandidateFieldCaps::metadata_field_bytes,
+            tracedecay_temporal_query::paging::CandidateFieldCaps::metadata_field_bytes,
         );
         let stable_cap = caps.map_or(
             request.max_item_bytes(),
-            tracedecay_temporal_query::ports::CandidateFieldCaps::stable_id_bytes,
+            tracedecay_temporal_query::paging::CandidateFieldCaps::stable_id_bytes,
         );
         let anchor_cap = caps.map_or(
             request.max_item_bytes(),
-            tracedecay_temporal_query::ports::CandidateFieldCaps::anchor_id_bytes,
+            tracedecay_temporal_query::paging::CandidateFieldCaps::anchor_id_bytes,
         );
         let provider = snapshot_request
             .provider_scope()
@@ -1064,7 +1072,7 @@ impl<'a> SessionTemporalReadPort<'a> {
     ///
     /// `session_temporal_generations` is keyed by `(session_id, generation)` and
     /// `sessions` by `(provider, session_id)`, so the inner join yields at most one
-    /// row per `(session_id, generation, provider)` — the same row the replaced
+    /// row per `(session_id, generation, provider)`, the same row the replaced
     /// per-participant `LIMIT 2` probe would have returned. Rows are still kept in
     /// a vector per key so a schema that ever admitted a duplicate raises the same
     /// "not unique" error the probe did.
@@ -1488,19 +1496,6 @@ impl<'a> SessionTemporalReadPort<'a> {
 }
 
 impl TemporalReadPort for SessionTemporalReadPort<'_> {
-    fn produce_candidate_page<'a>(
-        &'a self,
-        snapshot: &'a TemporalExecutionSnapshot,
-        plan: &'a CandidatePlan,
-        request: PageRequest,
-        sink: &'a mut CandidatePageSink<'_>,
-    ) -> PortFuture<'a, PageStatus> {
-        Box::pin(async move {
-            self.produce_candidates(snapshot.retrieval_scope(), snapshot, plan, &request, sink)
-                .await
-        })
-    }
-
     fn produce_candidate_page_for_scope<'a>(
         &'a self,
         scope: &'a TemporalRetrievalScope,
@@ -1512,25 +1507,6 @@ impl TemporalReadPort for SessionTemporalReadPort<'_> {
         Box::pin(async move {
             self.produce_candidates(scope, snapshot, plan, &request, sink)
                 .await
-        })
-    }
-
-    fn produce_temporal_record_page<'a>(
-        &'a self,
-        snapshot: &'a TemporalExecutionSnapshot,
-        candidates: &'a [RankingCandidate],
-        request: PageRequest,
-        sink: &'a mut TemporalRecordPageSink<'_>,
-    ) -> PortFuture<'a, PageStatus> {
-        Box::pin(async move {
-            self.produce_records(
-                snapshot.retrieval_scope(),
-                snapshot,
-                candidates,
-                &request,
-                sink,
-            )
-            .await
         })
     }
 

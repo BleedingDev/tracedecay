@@ -1,16 +1,23 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 
-use tracedecay_domain::{CanonicalObservationIdV1, DurableObservationV1};
+use tracedecay_domain::{CanonicalObservationIdV1, DurableObservationV1, PayloadDigestV1};
 use tracedecay_store::{
-    ObservationProjection, ProjectionCheckpoint, ProjectionStoreError, ProjectionStoreResult,
-    SESSION_MESSAGE_PROJECTOR_VERSION, SESSION_MESSAGE_PROJECTOR_VERSION_V4,
-    SessionMessageProjection, SessionMessageRecord, SessionRecord,
+    EDITED_FILES_KEY, ObservationProjection, PROJECTION_TERMINAL_RETRY_MICROS,
+    ProjectionCheckpoint, ProjectionStoreError, ProjectionStoreResult,
+    SESSION_MESSAGE_PROJECTOR_VERSION, SESSION_MESSAGE_PROJECTOR_VERSION_V4, SPAWNED_SESSIONS_KEY,
+    SessionMessageProjection, SessionMessageRecord, SessionRecord, message_output_digest,
 };
 
-use tracedecay_lcm::LcmStorageKind;
-use tracedecay_lcm::retrieval_content::{derived_text_for_index, projected_content_hash};
-use tracedecay_runtime_core::db::engine::{Executor, QueryExecutor, Row, params};
+use tracedecay_lcm::raw::stored_message_record_select_columns;
+use tracedecay_lcm::retrieval_content::projected_content_hash;
+use tracedecay_lcm::{LcmError, LcmStorageKind};
+use tracedecay_runtime_core::db::Database;
+use tracedecay_runtime_core::db::engine::{Executor, IntoParams, QueryExecutor, Row, params};
 use tracedecay_sessions::runtime::shared::durable_project_path_key;
+use tracedecay_sessions::runtime::store_access::{
+    message_record_from_row, session_record_from_row,
+};
 
 use super::apply::{derive_projection_with_alias, verify_provenance};
 
@@ -196,21 +203,126 @@ pub(super) async fn projection_retry_state(
     }))
 }
 
+/// Queue rows one re-arm transaction touches.
+pub(crate) const REARM_PROJECTION_RETRY_BATCH_ROWS: i64 = 1_024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RearmedProjectionRetries {
+    pub(crate) rows: u64,
+    pub(crate) batches: u64,
+}
+
 /// A projection retry deadline paces re-attempts within the store mount that
 /// observed the failure. A fresh mount re-arms every queued projection for
-/// immediate replay so restart recovery drains commit-before-ack work on its
-/// first catch-up pass instead of waiting out a dead process's backoff.
-/// Attempt counts and last errors persist, so a projection that fails again
-/// resumes its escalating delay from the recorded attempt history.
+/// immediate replay so restart recovery drains commit-before-ack work instead
+/// of waiting out a dead process's backoff. Attempt counts and last errors
+/// persist, so a projection that fails again resumes its escalating delay from
+/// the recorded attempt history.
+///
+/// The queue grows with session history, so the re-arm walks it in rowid
+/// order, `batch_rows` deferred rows per short writer transaction: no single
+/// statement or transaction scales with the queue, and foreground writes
+/// interleave between batches. Rows queued after the walk starts belong to
+/// this mount and are left alone.
+#[hotpath::measure(
+    future = true,
+    label = "global_db.observation_projection.rearm_retries"
+)]
 pub(crate) async fn rearm_queued_projection_retries(
-    conn: &impl Executor,
-) -> ProjectionStoreResult<u64> {
-    conn.execute(
-        "UPDATE projection_queue SET next_retry_at_micros = 0 WHERE next_retry_at_micros > 0",
+    database: &Database,
+    batch_rows: i64,
+) -> ProjectionStoreResult<RearmedProjectionRetries> {
+    let mut rearmed = RearmedProjectionRetries::default();
+    let Some(last_rowid) = query_optional_i64(
+        &database.read_connection(),
+        "SELECT MAX(rowid) FROM projection_queue",
         params![],
     )
-    .await
-    .map_err(|error| storage("rearm queued projection retries", error))
+    .await?
+    else {
+        return Ok(rearmed);
+    };
+    let mut after_rowid = 0_i64;
+    while let Some((batch_end, rows)) =
+        rearm_projection_retry_batch(database, after_rowid, last_rowid, batch_rows).await?
+    {
+        rearmed.rows += rows;
+        rearmed.batches += 1;
+        after_rowid = batch_end;
+    }
+    Ok(rearmed)
+}
+
+/// Re-arms the next `batch_rows` deferred rows after `after_rowid` in one
+/// writer transaction and returns the last rowid it covered.
+#[hotpath::measure(
+    future = true,
+    label = "global_db.observation_projection.rearm_retries.batch"
+)]
+async fn rearm_projection_retry_batch(
+    database: &Database,
+    after_rowid: i64,
+    last_rowid: i64,
+    batch_rows: i64,
+) -> ProjectionStoreResult<Option<(i64, u64)>> {
+    const OPERATION: &str = "rearm queued projection retries";
+    let transaction = database
+        .begin_write_transaction(OPERATION)
+        .await
+        .map_err(|error| storage(OPERATION, error))?;
+    let Some(batch_end) = query_optional_i64(
+        &transaction,
+        "SELECT MAX(rowid) FROM (
+            SELECT rowid FROM projection_queue
+            WHERE rowid > ?1 AND rowid <= ?2 AND next_retry_at_micros > 0
+            ORDER BY rowid LIMIT ?3
+         )",
+        params![after_rowid, last_rowid, batch_rows],
+    )
+    .await?
+    else {
+        transaction
+            .rollback()
+            .await
+            .map_err(|error| storage(OPERATION, error))?;
+        return Ok(None);
+    };
+    let rows = transaction
+        .execute(
+            "UPDATE projection_queue SET next_retry_at_micros = 0
+             WHERE rowid > ?1 AND rowid <= ?2
+               AND next_retry_at_micros > 0
+               AND next_retry_at_micros < ?3",
+            params![after_rowid, batch_end, PROJECTION_TERMINAL_RETRY_MICROS],
+        )
+        .await
+        .map_err(|error| storage(OPERATION, error))?;
+    transaction
+        .commit()
+        .await
+        .map_err(|error| storage(OPERATION, error))?;
+    Ok(Some((batch_end, rows)))
+}
+
+async fn query_optional_i64(
+    conn: &impl QueryExecutor,
+    sql: &str,
+    params: impl IntoParams,
+) -> ProjectionStoreResult<Option<i64>> {
+    const OPERATION: &str = "read projection retry rearm window";
+    let mut rows = conn
+        .query(sql, params)
+        .await
+        .map_err(|error| storage(OPERATION, error))?;
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|error| storage(OPERATION, error))?
+    else {
+        return Ok(None);
+    };
+    row.get::<Option<i64>>(0)
+        .map_err(|error| storage(OPERATION, error))
 }
 
 pub(super) async fn schedule_projection_retry(
@@ -276,31 +388,9 @@ pub(super) async fn read_session(
     else {
         return Ok(None);
     };
-    macro_rules! cell {
-        ($index:literal) => {
-            row.get($index)
-                .map_err(|error| storage("decode projected session", error))?
-        };
-        ($index:literal, $ty:ty) => {
-            row.get::<$ty>($index)
-                .map_err(|error| storage("decode projected session", error))?
-        };
-    }
-    Ok(Some(SessionRecord {
-        provider: cell!(0),
-        session_id: cell!(1),
-        project_key: cell!(2),
-        project_path: cell!(3),
-        title: cell!(4),
-        started_at: cell!(5),
-        ended_at: cell!(6),
-        transcript_path: cell!(7),
-        metadata_json: cell!(8),
-        parent_session_id: cell!(9),
-        is_subagent: cell!(10, i64) != 0,
-        agent_id: cell!(11),
-        parent_tool_use_id: cell!(12),
-    }))
+    session_record_from_row(&row)
+        .map(Some)
+        .map_err(|error| storage("decode projected session", error.source))
 }
 
 pub(super) async fn read_message(
@@ -308,13 +398,13 @@ pub(super) async fn read_message(
     provider: &str,
     message_id: &str,
 ) -> ProjectionStoreResult<Option<SessionMessageRecord>> {
+    let sql = format!(
+        "SELECT {}
+         FROM lcm_raw_messages AS message WHERE provider = ?1 AND message_id = ?2",
+        stored_message_record_select_columns("message")
+    );
     let mut rows = conn
-        .query(
-            "SELECT provider, message_id, session_id, role, timestamp, ordinal, text, kind,
-                    model, tool_names, source_path, source_offset, metadata_json
-             FROM session_messages WHERE provider = ?1 AND message_id = ?2",
-            params![provider, message_id],
-        )
+        .query(&sql, params![provider, message_id])
         .await
         .map_err(|error| storage("read projected message", error))?;
     let Some(row) = rows
@@ -324,27 +414,9 @@ pub(super) async fn read_message(
     else {
         return Ok(None);
     };
-    macro_rules! cell {
-        ($index:literal) => {
-            row.get($index)
-                .map_err(|error| storage("decode projected message", error))?
-        };
-    }
-    Ok(Some(SessionMessageRecord {
-        provider: cell!(0),
-        message_id: cell!(1),
-        session_id: cell!(2),
-        role: cell!(3),
-        timestamp: cell!(4),
-        ordinal: cell!(5),
-        text: cell!(6),
-        kind: cell!(7),
-        model: cell!(8),
-        tool_names: cell!(9),
-        source_path: cell!(10),
-        source_offset: cell!(11),
-        metadata_json: cell!(12),
-    }))
+    message_record_from_row(&row, 0)
+        .map(Some)
+        .map_err(|error| storage("decode projected message", error.source))
 }
 
 fn output_owner_lookup_sql(select_expr: &str, ordering: &str) -> String {
@@ -449,6 +521,36 @@ pub(super) struct ProjectionOutputState {
     pub(super) owner_count: u64,
 }
 
+async fn projection_cache_tokens(conn: &impl Executor) -> ProjectionStoreResult<(i64, i64)> {
+    let mut version_rows = conn
+        .query("PRAGMA data_version", ())
+        .await
+        .map_err(|error| storage("read projection cache data version", error))?;
+    let data_version = version_rows
+        .next()
+        .await
+        .map_err(|error| storage("read projection cache data version", error))?
+        .ok_or_else(|| storage_message("read projection cache data version", "no row"))?
+        .get::<i64>(0)
+        .map_err(|error| storage("read projection cache data version", error))?;
+    drop(version_rows);
+    let mut rowid_rows = conn
+        .query(
+            "SELECT COALESCE(MAX(rowid), 0) FROM observation_projection_provenance",
+            (),
+        )
+        .await
+        .map_err(|error| storage("read projection cache provenance rowid", error))?;
+    let provenance_rowid = rowid_rows
+        .next()
+        .await
+        .map_err(|error| storage("read projection cache provenance rowid", error))?
+        .ok_or_else(|| storage_message("read projection cache provenance rowid", "no row"))?
+        .get::<i64>(0)
+        .map_err(|error| storage("read projection cache provenance rowid", error))?;
+    Ok((data_version, provenance_rowid))
+}
+
 pub(super) async fn ensure_projection_output_state_cache(
     conn: &impl Executor,
 ) -> ProjectionStoreResult<()> {
@@ -466,39 +568,55 @@ pub(super) async fn ensure_projection_output_state_cache(
         ) WITHOUT ROWID;
         CREATE TEMP TABLE IF NOT EXISTS observation_projection_output_state_meta (
             initialized INTEGER PRIMARY KEY CHECK(initialized = 1),
-            data_version INTEGER NOT NULL CHECK(data_version >= 0)
+            data_version INTEGER NOT NULL CHECK(data_version >= 0),
+            provenance_rowid INTEGER NOT NULL CHECK(provenance_rowid >= 0)
         ) WITHOUT ROWID;",
     )
     .await
     .map_err(|error| storage("create projection output state cache", error))?;
-    let mut version_rows = conn
-        .query("PRAGMA data_version", ())
-        .await
-        .map_err(|error| storage("read projection cache data version", error))?;
-    let data_version = version_rows
-        .next()
-        .await
-        .map_err(|error| storage("read projection cache data version", error))?
-        .ok_or_else(|| storage_message("read projection cache data version", "no row"))?
-        .get::<i64>(0)
-        .map_err(|error| storage("read projection cache data version", error))?;
-    drop(version_rows);
+    let (data_version, provenance_rowid) = projection_cache_tokens(conn).await?;
 
     let mut rows = conn
         .query(
-            "SELECT 1 FROM temp.observation_projection_output_state_meta
-             WHERE initialized = 1 AND data_version = ?1",
-            params![data_version],
+            "SELECT data_version, provenance_rowid
+             FROM temp.observation_projection_output_state_meta
+             WHERE initialized = 1",
+            (),
         )
         .await
         .map_err(|error| storage("read projection output state cache", error))?;
-    let initialized = rows
+    let cached = rows
         .next()
         .await
         .map_err(|error| storage("read projection output state cache", error))?
-        .is_some();
+        .map(|row| -> ProjectionStoreResult<(i64, i64)> {
+            Ok((
+                row.get(0)
+                    .map_err(|error| storage("read projection output state cache", error))?,
+                row.get(1)
+                    .map_err(|error| storage("read projection output state cache", error))?,
+            ))
+        })
+        .transpose()?;
     drop(rows);
-    if initialized {
+    if let Some((stored_version, stored_rowid)) = cached
+        && (stored_rowid == provenance_rowid || stored_version == data_version)
+    {
+        // `data_version` moves when any other connection commits, including
+        // session rows that do not touch provenance. Rebuilding here scans the
+        // whole ownership table once per queued observation. This writer keeps
+        // the temp rows current itself; a foreign provenance insert changes
+        // `MAX(rowid)` and still rebuilds.
+        if stored_version != data_version || stored_rowid != provenance_rowid {
+            conn.execute(
+                "UPDATE temp.observation_projection_output_state_meta
+                 SET data_version = ?1, provenance_rowid = ?2
+                 WHERE initialized = 1",
+                params![data_version, provenance_rowid],
+            )
+            .await
+            .map_err(|error| storage("refresh projection cache token", error))?;
+        }
         return Ok(());
     }
 
@@ -512,9 +630,10 @@ pub(super) async fn ensure_projection_output_state_cache(
         .await
         .map_err(|error| storage("initialize projection output state cache", error))?;
     conn.execute(
-        "INSERT INTO temp.observation_projection_output_state_meta(initialized, data_version)
-         VALUES (1, ?1)",
-        params![data_version],
+        "INSERT INTO temp.observation_projection_output_state_meta(
+            initialized, data_version, provenance_rowid
+         ) VALUES (1, ?1, ?2)",
+        params![data_version, provenance_rowid],
     )
     .await
     .map_err(|error| storage("record projection cache data version", error))?;
@@ -687,6 +806,26 @@ async fn message_projection(
         .ok_or(ProjectionStoreError::ProvenanceCollision)
 }
 
+/// Session row the output verification compares against.
+///
+/// The projection-row batch loads sessions from message rows it found. A
+/// missing or relocated message therefore has no batch entry even when the
+/// expected session row is durable. That absence is not `row_missing`; the
+/// single-output path's [`read_session`] is the authority for it.
+pub(in super::super) async fn load_verified_session<'a>(
+    conn: &impl QueryExecutor,
+    rows: &'a ProjectionRowsBatch,
+    provider: &str,
+    session_id: &str,
+) -> ProjectionStoreResult<Option<Cow<'a, SessionRecord>>> {
+    if let Some(session) = rows.session(provider, session_id) {
+        return Ok(Some(Cow::Borrowed(session)));
+    }
+    Ok(read_session(conn, provider, session_id)
+        .await?
+        .map(Cow::Owned))
+}
+
 pub(in super::super) async fn verify_projection_rows(
     conn: &impl QueryExecutor,
     projection: &SessionMessageProjection,
@@ -716,18 +855,23 @@ pub(in super::super) async fn verify_projection_rows_from_records(
     // expansions (/var -> /private/var) and user symlink families compare equal
     // to the persisted canonical row without putting FS probing into reconcile.
     let expected = canonicalize_session_project_paths(session);
-    if !actual_session.is_some_and(|actual| {
-        session_rows_compatible(&canonicalize_session_project_paths(actual), &expected)
-    }) {
-        return Err(ProjectionStoreError::OutputCollision {
+    let session_conflict = actual_session.map_or(Some("row_missing"), |actual| {
+        reconcile_session_rows_detailed(&canonicalize_session_project_paths(actual), &expected)
+            .err()
+            .map(SessionReconcileConflict::field)
+    });
+    if let Some(field) = session_conflict {
+        return Err(ProjectionStoreError::SessionOutputCollision {
             provider: session.provider.clone(),
-            message_id: format!("session:{}", session.session_id),
+            session_id: session.session_id.clone(),
+            field,
         });
     }
     let message = projection.message();
     let compatible = match actual_message {
         Some(actual) => {
-            actual == message || protected_message_rows_compatible(conn, actual, message).await?
+            stored_row_matches(actual, message)?
+                || protected_message_rows_compatible(conn, actual, message).await?
         }
         None => false,
     };
@@ -785,9 +929,22 @@ pub(in super::super) struct ProjectionOutputAuthority {
     pub(in super::super) canonical: DurableObservationV1,
 }
 
+/// The storage columns of one projected message row. Not part of the output
+/// digest; current provenance still authorizes them because they are derived
+/// from the same observation.
+pub(in super::super) struct ProjectionStorageColumns {
+    pub(in super::super) session_id: String,
+    pub(in super::super) storage_kind: String,
+    pub(in super::super) content: String,
+    pub(in super::super) content_hash: String,
+    pub(in super::super) snippet_text: String,
+    pub(in super::super) index_text: String,
+}
+
 pub(in super::super) struct ProjectionRowsBatch {
     sessions: HashMap<(String, String), SessionRecord>,
     messages: HashMap<(String, String), SessionMessageRecord>,
+    storage_columns: HashMap<(String, String), ProjectionStorageColumns>,
 }
 
 impl ProjectionRowsBatch {
@@ -808,6 +965,15 @@ impl ProjectionRowsBatch {
         self.messages
             .get(&(provider.to_owned(), message_id.to_owned()))
     }
+
+    pub(in super::super) fn storage_columns(
+        &self,
+        provider: &str,
+        message_id: &str,
+    ) -> Option<&ProjectionStorageColumns> {
+        self.storage_columns
+            .get(&(provider.to_owned(), message_id.to_owned()))
+    }
 }
 
 pub(in super::super) async fn read_projection_rows_batch(
@@ -815,6 +981,7 @@ pub(in super::super) async fn read_projection_rows_batch(
     outputs: &BTreeSet<(String, String)>,
 ) -> ProjectionStoreResult<ProjectionRowsBatch> {
     let mut messages = HashMap::with_capacity(outputs.len());
+    let mut storage_columns = HashMap::with_capacity(outputs.len());
     let requested_keys = outputs.iter().collect::<Vec<_>>();
     for chunk in requested_keys.chunks(OUTPUT_AUTHORITY_BATCH_KEYS) {
         let requested = serde_json::to_string(
@@ -826,18 +993,17 @@ pub(in super::super) async fn read_projection_rows_batch(
                 .collect::<Vec<_>>(),
         )
         .map_err(|error| storage("encode projected message request", error))?;
+        let sql = format!(
+            "SELECT {}, message.storage_kind, COALESCE(message.content, ''),
+                    message.content_hash, message.snippet_text, message.index_text
+             FROM json_each(?1) AS requested
+             CROSS JOIN lcm_raw_messages AS message
+             WHERE message.provider = json_extract(requested.value, '$.provider')
+               AND message.message_id = json_extract(requested.value, '$.message_id')",
+            stored_message_record_select_columns("message")
+        );
         let mut rows = conn
-            .query(
-                "SELECT message.provider, message.message_id, message.session_id,
-                        message.role, message.timestamp, message.ordinal, message.text,
-                        message.kind, message.model, message.tool_names, message.source_path,
-                        message.source_offset, message.metadata_json
-                 FROM json_each(?1) AS requested
-                 CROSS JOIN session_messages AS message
-                 WHERE message.provider = json_extract(requested.value, '$.provider')
-                   AND message.message_id = json_extract(requested.value, '$.message_id')",
-                params![requested.as_str()],
-            )
+            .query(&sql, params![requested.as_str()])
             .await
             .map_err(|error| storage("read projected messages", error))?;
         while let Some(row) = rows
@@ -845,31 +1011,23 @@ pub(in super::super) async fn read_projection_rows_batch(
             .await
             .map_err(|error| storage("read projected messages", error))?
         {
-            macro_rules! cell {
-                ($index:literal) => {
-                    row.get($index)
-                        .map_err(|error| storage("decode projected messages", error))?
-                };
-            }
-            let message = SessionMessageRecord {
-                provider: cell!(0),
-                message_id: cell!(1),
-                session_id: cell!(2),
-                role: cell!(3),
-                timestamp: cell!(4),
-                ordinal: cell!(5),
-                text: cell!(6),
-                kind: cell!(7),
-                model: cell!(8),
-                tool_names: cell!(9),
-                source_path: cell!(10),
-                source_offset: cell!(11),
-                metadata_json: cell!(12),
+            let message = message_record_from_row(&row, 0)
+                .map_err(|error| storage("decode projected messages", error.source))?;
+            let decode = |index: i32| {
+                row.get::<String>(index)
+                    .map_err(|error| storage("decode projected message storage", error))
             };
-            messages.insert(
-                (message.provider.clone(), message.message_id.clone()),
-                message,
-            );
+            let columns = ProjectionStorageColumns {
+                session_id: message.session_id.clone(),
+                storage_kind: decode(13)?,
+                content: decode(14)?,
+                content_hash: decode(15)?,
+                snippet_text: decode(16)?,
+                index_text: decode(17)?,
+            };
+            let key = (message.provider.clone(), message.message_id.clone());
+            storage_columns.insert(key.clone(), columns);
+            messages.insert(key, message);
         }
     }
 
@@ -909,31 +1067,8 @@ pub(in super::super) async fn read_projection_rows_batch(
             .await
             .map_err(|error| storage("read projected sessions", error))?
         {
-            macro_rules! cell {
-                ($index:literal) => {
-                    row.get($index)
-                        .map_err(|error| storage("decode projected sessions", error))?
-                };
-                ($index:literal, $ty:ty) => {
-                    row.get::<$ty>($index)
-                        .map_err(|error| storage("decode projected sessions", error))?
-                };
-            }
-            let session = SessionRecord {
-                provider: cell!(0),
-                session_id: cell!(1),
-                project_key: cell!(2),
-                project_path: cell!(3),
-                title: cell!(4),
-                started_at: cell!(5),
-                ended_at: cell!(6),
-                transcript_path: cell!(7),
-                metadata_json: cell!(8),
-                parent_session_id: cell!(9),
-                is_subagent: cell!(10, i64) != 0,
-                agent_id: cell!(11),
-                parent_tool_use_id: cell!(12),
-            };
+            let session = session_record_from_row(&row)
+                .map_err(|error| storage("decode projected sessions", error.source))?;
             sessions.insert(
                 (session.provider.clone(), session.session_id.clone()),
                 session,
@@ -941,7 +1076,11 @@ pub(in super::super) async fn read_projection_rows_batch(
         }
     }
 
-    Ok(ProjectionRowsBatch { sessions, messages })
+    Ok(ProjectionRowsBatch {
+        sessions,
+        messages,
+        storage_columns,
+    })
 }
 
 /// The batched ownership resolution behind [`read_output_authorities`].
@@ -1099,10 +1238,6 @@ pub(in super::super) async fn resolve_output_projection(
     Ok(owner_projection)
 }
 
-pub(super) fn session_rows_compatible(actual: &SessionRecord, expected: &SessionRecord) -> bool {
-    reconcile_session_rows(actual, expected).is_some()
-}
-
 /// Normalize projection rows through the same authority as runtime session writes
 /// and project-scoped reads. Host/display spellings are not durable identity.
 /// Reconciliation remains pure over the normalized stored strings.
@@ -1119,75 +1254,36 @@ pub(super) fn canonicalize_session_project_paths(session: &SessionRecord) -> Ses
 /// Reconcile two stored session rows into one merged row using pure
 /// string/shape logic only. Project-path family identity is resolved earlier,
 /// at the apply-side ingest boundary ([`canonicalize_session_project_paths`]),
-/// so this function — reached from the verify/audit and rebuild paths as well
-/// as apply — never touches the filesystem and stays reproducible from stored
+/// so this function, reached from the verify/audit and rebuild paths as well
+/// as apply, never touches the filesystem and stays reproducible from stored
 /// evidence.
-pub(super) fn reconcile_session_rows(
-    actual: &SessionRecord,
-    expected: &SessionRecord,
-) -> Option<SessionRecord> {
-    if actual.provider != expected.provider || actual.session_id != expected.session_id {
-        return None;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SessionReconcileConflict(&'static str);
+
+impl SessionReconcileConflict {
+    pub(super) const fn field(self) -> &'static str {
+        self.0
     }
-    let (project_key, project_path) = reconcile_session_location(actual, expected)?;
-    Some(SessionRecord {
-        provider: actual.provider.clone(),
-        session_id: actual.session_id.clone(),
-        project_key,
-        project_path,
-        title: actual.title.clone().or_else(|| expected.title.clone()),
-        started_at: actual
-            .started_at
-            .into_iter()
-            .chain(expected.started_at)
-            .min(),
-        ended_at: actual.ended_at.into_iter().chain(expected.ended_at).max(),
-        transcript_path: reconcile_optional(
-            actual.transcript_path.as_ref(),
-            expected.transcript_path.as_ref(),
-        )
-        .ok()?,
-        metadata_json: reconcile_metadata(
-            actual.metadata_json.as_ref(),
-            expected.metadata_json.as_ref(),
-        )
-        .ok()?,
-        parent_session_id: reconcile_optional(
-            actual.parent_session_id.as_ref(),
-            expected.parent_session_id.as_ref(),
-        )
-        .ok()?,
-        is_subagent: actual.is_subagent || expected.is_subagent,
-        agent_id: reconcile_optional(actual.agent_id.as_ref(), expected.agent_id.as_ref()).ok()?,
-        parent_tool_use_id: reconcile_optional(
-            actual.parent_tool_use_id.as_ref(),
-            expected.parent_tool_use_id.as_ref(),
-        )
-        .ok()?,
-    })
 }
 
-/// Resolve the project identity and location of one session seen by two
-/// writers. Transcript ingest records the checkout path as both key and path;
-/// observation projection records the typed project id as the key and may
-/// only know that id as a placeholder path. Both rows live in the same
-/// project-scoped store, so the merge keeps the typed key and the real path.
-fn reconcile_session_location(
+pub(super) fn reconcile_session_rows_detailed(
     actual: &SessionRecord,
     expected: &SessionRecord,
-) -> Option<(String, String)> {
-    let path_keyed =
-        |row: &SessionRecord| row.project_key == row.project_path && row.project_key != "user";
-    if path_keyed(actual) && path_keyed(expected) && actual.project_path != expected.project_path {
-        return match (
-            is_durable_filesystem_path(&actual.project_path),
-            is_durable_filesystem_path(&expected.project_path),
-        ) {
-            (true, false) => Some((expected.project_key.clone(), actual.project_path.clone())),
-            (false, true) => Some((actual.project_key.clone(), expected.project_path.clone())),
-            _ => None,
-        };
+) -> Result<SessionRecord, SessionReconcileConflict> {
+    if actual.provider != expected.provider || actual.session_id != expected.session_id {
+        return Err(SessionReconcileConflict("identity"));
     }
+    // LCM may insert this host session before the rollout projection, with no
+    // project. That row is not a second root: the observation replaces it.
+    if session_project_is_unscoped_placeholder(actual) {
+        return Ok(expected.clone());
+    }
+    // `expected` is the projection being applied now. A typed project id that
+    // changed (re-enroll/reset, or a cwd that now resolves to another
+    // registered project) moves this host session onto that current id.
+    // Two different directory identities used *as* the key are not a rebind:
+    // those rows name different roots and stay distinct.
+    let mut adopt_current_project = false;
     let project_key = if actual.project_key == expected.project_key {
         actual.project_key.clone()
     } else if actual.project_key == "user" {
@@ -1202,43 +1298,93 @@ fn reconcile_session_location(
         && expected.project_path == actual.project_path
     {
         actual.project_key.clone()
+    } else if project_key_is_directory(actual) && project_key_is_directory(expected) {
+        return Err(SessionReconcileConflict("project_key"));
     } else {
-        return None;
+        adopt_current_project = true;
+        expected.project_key.clone()
     };
     let project_path = if actual.project_path == expected.project_path {
         actual.project_path.clone()
-    } else if actual.project_path == actual.project_key {
+    } else if adopt_current_project && expected.project_path != expected.project_key {
+        // The current observation named a real cwd for the new project.
+        expected.project_path.clone()
+    } else if adopt_current_project && actual.project_path != actual.project_key {
+        // The incoming row only carries its project id as a path fallback.
+        // Keep the cwd already stored for this session.
+        actual.project_path.clone()
+    } else if adopt_current_project || actual.project_path == actual.project_key {
+        // A rebind whose paths are both project ids takes the current id.
+        // A stored path-shaped key takes the incoming path.
         expected.project_path.clone()
     } else if expected.project_path == expected.project_key {
         actual.project_path.clone()
     } else {
-        return None;
+        return Err(SessionReconcileConflict("project_path"));
     };
-    Some((project_key, project_path))
+    Ok(SessionRecord {
+        provider: actual.provider.clone(),
+        session_id: actual.session_id.clone(),
+        project_key,
+        project_path,
+        title: actual.title.clone().or_else(|| expected.title.clone()),
+        started_at: actual
+            .started_at
+            .into_iter()
+            .chain(expected.started_at)
+            .min(),
+        ended_at: actual.ended_at.into_iter().chain(expected.ended_at).max(),
+        transcript_path: reconcile_optional(
+            "transcript_path",
+            actual.transcript_path.as_ref(),
+            expected.transcript_path.as_ref(),
+        )?,
+        metadata_json: reconcile_metadata(
+            actual.metadata_json.as_ref(),
+            expected.metadata_json.as_ref(),
+        )?,
+        parent_session_id: reconcile_optional(
+            "parent_session_id",
+            actual.parent_session_id.as_ref(),
+            expected.parent_session_id.as_ref(),
+        )?,
+        is_subagent: actual.is_subagent || expected.is_subagent,
+        agent_id: reconcile_optional(
+            "agent_id",
+            actual.agent_id.as_ref(),
+            expected.agent_id.as_ref(),
+        )?,
+        parent_tool_use_id: reconcile_optional(
+            "parent_tool_use_id",
+            actual.parent_tool_use_id.as_ref(),
+            expected.parent_tool_use_id.as_ref(),
+        )?,
+    })
 }
 
-/// Whether a stored project path names a filesystem location rather than an
-/// opaque project identity. Stored paths are already normalized by
-/// [`durable_project_path_key`]: Unix and UNC paths begin with `/`, and drive
-/// paths use a lowercase letter followed by `:/`.
-fn is_durable_filesystem_path(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    path.starts_with('/')
-        || (bytes.len() >= 3
-            && bytes[0].is_ascii_lowercase()
-            && bytes[1] == b':'
-            && bytes[2] == b'/')
+fn project_key_is_directory(session: &SessionRecord) -> bool {
+    session.project_key == session.project_path
 }
 
-#[derive(Debug)]
-struct ReconcileConflict;
+/// An LCM foreign-key shell: placeholder project fields, no transcript, no metadata.
+fn session_project_is_unscoped_placeholder(session: &SessionRecord) -> bool {
+    session.transcript_path.is_none()
+        && session.metadata_json.is_none()
+        && tracedecay_lcm::compression::lcm_unscoped_session_project(
+            &session.project_key,
+            &session.project_path,
+        )
+}
 
 fn reconcile_optional<T: Clone + Eq>(
+    field: &'static str,
     actual: Option<&T>,
     expected: Option<&T>,
-) -> Result<Option<T>, ReconcileConflict> {
+) -> Result<Option<T>, SessionReconcileConflict> {
     match (actual, expected) {
-        (Some(actual), Some(expected)) if actual != expected => Err(ReconcileConflict),
+        (Some(actual), Some(expected)) if actual != expected => {
+            Err(SessionReconcileConflict(field))
+        }
         (Some(actual), _) => Ok(Some(actual.clone())),
         (_, Some(expected)) => Ok(Some(expected.clone())),
         (None, None) => Ok(None),
@@ -1248,17 +1394,17 @@ fn reconcile_optional<T: Clone + Eq>(
 fn reconcile_metadata(
     actual: Option<&String>,
     expected: Option<&String>,
-) -> Result<Option<String>, ReconcileConflict> {
+) -> Result<Option<String>, SessionReconcileConflict> {
     let (Some(actual), Some(expected)) = (actual, expected) else {
-        return reconcile_optional(actual, expected);
+        return reconcile_optional("metadata_json", actual, expected);
     };
     if actual == expected {
         return Ok(Some(actual.clone()));
     }
     let mut actual: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(actual).map_err(|_| ReconcileConflict)?;
+        serde_json::from_str(actual).map_err(|_| SessionReconcileConflict("metadata_json"))?;
     let expected: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(expected).map_err(|_| ReconcileConflict)?;
+        serde_json::from_str(expected).map_err(|_| SessionReconcileConflict("metadata_json"))?;
     for (key, expected_value) in expected {
         match actual.get_mut(&key) {
             None => {
@@ -1266,16 +1412,33 @@ fn reconcile_metadata(
             }
             Some(actual_value) if *actual_value == expected_value => {}
             Some(actual_value) if key == "usage" => {
-                *actual_value =
-                    reconcile_usage(actual_value, &expected_value).ok_or(ReconcileConflict)?;
+                if let Some(merged) = reconcile_usage(actual_value, &expected_value) {
+                    *actual_value = merged;
+                }
             }
-            Some(_) if key == "source" => {}
-            Some(_) => return Err(ReconcileConflict),
+            // Each record contributes its own file-edit and spawn entries; the
+            // session row keeps the union in first-seen order (re-applying a
+            // record adds nothing).
+            Some(serde_json::Value::Array(actual_entries))
+                if key == EDITED_FILES_KEY || key == SPAWNED_SESSIONS_KEY =>
+            {
+                if let serde_json::Value::Array(expected_entries) = expected_value {
+                    for entry in expected_entries {
+                        if !actual_entries.contains(&entry) {
+                            actual_entries.push(entry);
+                        }
+                    }
+                }
+            }
+            // Host ingest keeps the first annotation (`merge_session_metadata`).
+            // A later observation's source, cwd, or hook label is not a different
+            // session. Session identity stays on provider and session id.
+            Some(_) => {}
         }
     }
     serde_json::to_string(&actual)
         .map(Some)
-        .map_err(|_| ReconcileConflict)
+        .map_err(|_| SessionReconcileConflict("metadata_json"))
 }
 
 fn reconcile_usage(
@@ -1307,129 +1470,123 @@ fn reconcile_usage(
     }
 }
 
+/// The message row the projector stores for `message`: its sanitized body
+/// and protected metadata beside the projection's session columns.
+pub(in super::super) fn projected_stored_message(
+    message: &SessionMessageRecord,
+) -> ProjectionStoreResult<SessionMessageRecord> {
+    tracedecay_lcm::raw::projection_stored_message(message).map_err(|error| match error {
+        LcmError::SanitizationRefused {
+            reason,
+            quarantined,
+        } => ProjectionStoreError::SanitizationRefused {
+            reason,
+            quarantined,
+        },
+        error => storage("derive projected message row", error),
+    })
+}
+
+/// Provenance digest of one projected output: the canonical output digest over
+/// the row the projector stores, so a stored row is always digestible into the
+/// provenance that pairs with it.
+pub(in super::super) fn stored_output_digest(
+    projection: &SessionMessageProjection,
+) -> ProjectionStoreResult<PayloadDigestV1> {
+    message_output_digest(
+        projection.session(),
+        &projected_stored_message(projection.message())?,
+        projection.output_ordinal(),
+    )
+}
+
+/// Whether `actual` is exactly the row the projector stores for `message`.
+///
+/// A Hermes body is written by the Hermes LCM turn authority rather than the
+/// projector, so a Hermes row is compared on its session columns alone. A
+/// body the sanitizer refuses has no projected row to match.
+pub(in super::super) fn stored_row_matches(
+    actual: &SessionMessageRecord,
+    message: &SessionMessageRecord,
+) -> ProjectionStoreResult<bool> {
+    if message.provider == "hermes" {
+        return Ok(same_session_columns(actual, message));
+    }
+    match projected_stored_message(message) {
+        Ok(expected) => Ok(*actual == expected),
+        Err(ProjectionStoreError::SanitizationRefused { .. }) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn same_session_columns(actual: &SessionMessageRecord, expected: &SessionMessageRecord) -> bool {
+    actual.provider == expected.provider
+        && actual.message_id == expected.message_id
+        && actual.session_id == expected.session_id
+        && actual.role == expected.role
+        && actual.timestamp == expected.timestamp
+        && actual.ordinal == expected.ordinal
+        && actual.kind == expected.kind
+        && actual.model == expected.model
+        && actual.tool_names == expected.tool_names
+        && actual.source_path == expected.source_path
+        && actual.source_offset == expected.source_offset
+}
+
+/// Whether a row the transcript ingest wrote (externalized or with its own
+/// protected metadata) is a protected rendering of `expected`.
 pub(super) async fn protected_message_rows_compatible(
     conn: &impl QueryExecutor,
     actual: &SessionMessageRecord,
     expected: &SessionMessageRecord,
 ) -> ProjectionStoreResult<bool> {
-    if actual == expected {
+    if stored_row_matches(actual, expected)? || !same_session_columns(actual, expected) {
         return Ok(false);
     }
-    if actual.provider != expected.provider
-        || actual.message_id != expected.message_id
-        || actual.session_id != expected.session_id
-        || actual.role != expected.role
-        || actual.timestamp != expected.timestamp
-        || actual.ordinal != expected.ordinal
-        || actual.kind != expected.kind
-        || actual.model != expected.model
-        || actual.tool_names != expected.tool_names
-        || actual.source_path != expected.source_path
-        || actual.source_offset != expected.source_offset
-    {
-        return Ok(false);
-    }
-    let Some(metadata) = actual
-        .metadata_json
-        .as_deref()
-        .and_then(|encoded| serde_json::from_str::<serde_json::Value>(encoded).ok())
-    else {
-        return Ok(false);
-    };
-    let payload_ref = metadata
-        .get("payload_ref")
-        .and_then(serde_json::Value::as_str);
-    let expected_hash = projected_content_hash(&expected.text);
-    let external = metadata
-        .get("external_payload")
-        .and_then(serde_json::Value::as_bool)
-        == Some(true)
-        && metadata.get("sha256").and_then(serde_json::Value::as_str)
-            == Some(expected_hash.as_str())
-        && payload_ref.is_some_and(|payload_ref| actual.text.contains(payload_ref));
-    if !external {
-        let raw =
-            tracedecay_lcm::schema::load_raw_message(conn, &actual.provider, &actual.message_id)
-                .await
-                .map_err(|error| storage("read protected projection output", error))?;
-        let Some(raw) = raw else {
-            return Ok(false);
+    // A row that fails its own receipt is not a protected rendering of this
+    // projection. Callers treat that as an ordinary output mismatch and, when
+    // current provenance uniquely owns the output, rewrite it. A database
+    // fault is still a fault.
+    let raw =
+        match tracedecay_lcm::schema::load_raw_message(conn, &actual.provider, &actual.message_id)
+            .await
+        {
+            Ok(Some(raw)) => raw,
+            Ok(None) | Err(LcmError::PayloadIntegrityMismatch) => return Ok(false),
+            Err(error) => return Err(storage("read protected projection output", error)),
         };
-        let Ok(protected) = tracedecay_privacy::sanitize_lcm_payload_text(&expected.text) else {
-            return Ok(false);
-        };
-        return Ok(raw.storage_kind == LcmStorageKind::Inline
-            && raw.provider == actual.provider
-            && raw.message_id == actual.message_id
-            && raw.session_id == actual.session_id
-            && raw.role == actual.role
-            && raw.timestamp == actual.timestamp
-            && raw.ordinal == actual.ordinal
-            && raw.content == protected.sanitized_text()
-            && actual.text == derived_text_for_index(&raw.content)
-            && actual.metadata_json == raw.metadata_json);
-    }
-    let Some(payload_ref) = payload_ref else {
-        return Ok(false);
-    };
-    let mut rows = conn
-        .query(
-            "SELECT CAST(COALESCE(content, '') AS TEXT),
-                    CAST(COALESCE(content_hash, '') AS TEXT),
-                    CAST(COALESCE(storage_kind, '') AS TEXT),
-                    CAST(COALESCE(payload_ref, '') AS TEXT)
-             FROM lcm_raw_messages
-             WHERE provider = ?1 AND message_id = ?2
-             LIMIT 2",
-            params![actual.provider.as_str(), actual.message_id.as_str()],
-        )
-        .await
-        .map_err(|error| storage("read protected projection output", error))?;
-    let Some(row) = rows
-        .next()
-        .await
-        .map_err(|error| storage("read protected projection output", error))?
-    else {
-        return Ok(false);
-    };
-    let compatible = row
-        .get::<String>(0)
-        .map_err(|error| storage("read protected projection output", error))?
-        .is_empty()
-        && row
-            .get::<String>(1)
-            .map_err(|error| storage("read protected projection output", error))?
-            == expected_hash
-        && row
-            .get::<String>(2)
-            .map_err(|error| storage("read protected projection output", error))?
-            == "external"
-        && row
-            .get::<String>(3)
-            .map_err(|error| storage("read protected projection output", error))?
-            == payload_ref;
-    if rows
-        .next()
-        .await
-        .map_err(|error| storage("read protected projection output", error))?
-        .is_some()
-    {
-        return Ok(false);
-    }
-    Ok(compatible)
+    Ok(match raw.storage_kind {
+        LcmStorageKind::Inline => tracedecay_privacy::sanitize_lcm_payload_text(&expected.text)
+            .is_ok_and(|protected| raw.content == protected.sanitized_text()),
+        LcmStorageKind::External => {
+            raw.content_hash == projected_content_hash(&expected.text) && raw.payload_ref.is_some()
+        }
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod reconcile_tests {
-    #[cfg(unix)]
+    use std::collections::BTreeSet;
+
     use crate::tests::harness::RegisteredGlobalDbHarness;
+    use tracedecay_domain::{
+        CanonicalObservationEnvelopeV1, ComponentVersion, ObservationId,
+        ObservationIdentityMaterialV1, ObservationOrderingDomainV1, ObservationScopeV1,
+        ObservationSourceGenerationV1, ObservationSourceIdentityV1, ObservationSourceRangeV1,
+        PayloadReferenceV1, RetentionClass, SanitizationReceiptId, SanitizationReceiptRefV1,
+        SanitizationReceiptV1, SanitizerDispositionV1, SensitivityV1,
+    };
     #[cfg(unix)]
     use tracedecay_runtime_core::db::engine::params;
-    use tracedecay_store::SessionRecord;
+    use tracedecay_store::{
+        ObservationProjection, ProjectionStoreError, SessionMessageRecord, SessionRecord,
+    };
 
-    use super::canonicalize_session_project_paths;
-    use super::reconcile_session_rows;
+    use super::{
+        canonicalize_session_project_paths, load_verified_session, read_projection_rows_batch,
+        reconcile_session_rows_detailed, verify_projection_rows_from_records,
+    };
 
     fn record(project_path: &str) -> SessionRecord {
         SessionRecord {
@@ -1447,6 +1604,47 @@ mod reconcile_tests {
             agent_id: None,
             parent_tool_use_id: None,
         }
+    }
+
+    /// Each record's file-edit rollup joins the session row's array: the union
+    /// keeps every distinct edit, a re-applied record adds nothing, and the
+    /// other first-annotation-wins keys are untouched.
+    #[test]
+    fn edited_files_rollups_union_across_records() {
+        let with_metadata = |metadata: serde_json::Value| SessionRecord {
+            metadata_json: Some(metadata.to_string()),
+            ..record("/work/project")
+        };
+        let first_edit = serde_json::json!({"path": "/work/a.rs", "edited_at_micros": 1_000});
+        let second_edit = serde_json::json!({"path": "/work/b.rs", "edited_at_micros": 2_000});
+        let later_a = serde_json::json!({"path": "/work/a.rs", "edited_at_micros": 3_000});
+        let actual = with_metadata(serde_json::json!({
+            "source": "claude_transcript",
+            "edited_files": [first_edit.clone()]
+        }));
+        let expected = with_metadata(serde_json::json!({
+            "source": "other",
+            "edited_files": [second_edit.clone(), first_edit.clone(), later_a.clone()]
+        }));
+
+        let merged = reconcile_session_rows_detailed(&actual, &expected).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(merged.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata["edited_files"],
+            serde_json::json!([first_edit, second_edit, later_a]),
+            "distinct edits of one path are separate events, duplicates collapse"
+        );
+        assert_eq!(metadata["source"], "claude_transcript");
+
+        let again = reconcile_session_rows_detailed(&merged, &expected).unwrap();
+        assert_eq!(again.metadata_json, merged.metadata_json);
+
+        let no_edits = with_metadata(serde_json::json!({"source": "other"}));
+        let merged = reconcile_session_rows_detailed(&no_edits, &actual).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(merged.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["edited_files"].as_array().unwrap().len(), 1);
     }
 
     #[cfg(unix)]
@@ -1472,23 +1670,24 @@ mod reconcile_tests {
             "user symlink families must converge away from the alias spelling"
         );
 
-        let merged = reconcile_session_rows(&normalized_alias, &normalized_real)
+        let merged = reconcile_session_rows_detailed(&normalized_alias, &normalized_real)
             .expect("normalized symlink families naming one directory must reconcile");
         assert_eq!(merged.project_path, normalized_real.project_path);
         assert_eq!(merged.project_key, normalized_real.project_key);
 
         // Symmetric: order must not change the merged identity.
-        let merged_reversed = reconcile_session_rows(&normalized_real, &normalized_alias).unwrap();
+        let merged_reversed =
+            reconcile_session_rows_detailed(&normalized_real, &normalized_alias).unwrap();
         assert_eq!(merged_reversed.project_path, merged.project_path);
 
         // The audit path stays pure: two live family spellings that were never
         // normalized at ingest do not silently merge via filesystem probing.
         assert!(
-            reconcile_session_rows(
+            reconcile_session_rows_detailed(
                 &record(&aliased.to_string_lossy()),
                 &record(&real.to_string_lossy()),
             )
-            .is_none(),
+            .is_err(),
             "reconcile must not canonicalize; family identity is an ingest concern"
         );
     }
@@ -1545,7 +1744,12 @@ mod reconcile_tests {
         let transaction = harness.registered.begin_write_transaction().await.unwrap();
         assert!(matches!(
             super::super::apply::apply_session(&transaction, &expected).await,
-            Err(tracedecay_store::ProjectionStoreError::OutputCollision { .. })
+            Err(
+                tracedecay_store::ProjectionStoreError::SessionOutputCollision {
+                    field: "project_path",
+                    ..
+                }
+            )
         ));
         transaction.rollback().await.unwrap();
     }
@@ -1600,6 +1804,86 @@ mod reconcile_tests {
     }
 
     #[test]
+    fn lcm_placeholder_project_is_replaced_by_the_rollout_session() {
+        let mut stored = record("lcm-active-context");
+        stored.title = Some("LCM active context".to_owned());
+        let mut rollout = record("/Volumes/bigssd/projects/core");
+        rollout.title = Some("rollout".to_owned());
+        rollout.transcript_path = Some("/Volumes/bigssd/projects/core/session.jsonl".to_owned());
+
+        let merged = reconcile_session_rows_detailed(&stored, &rollout)
+            .expect("an LCM placeholder must take the rollout project");
+
+        assert_eq!(merged.project_key, "/Volumes/bigssd/projects/core");
+        assert_eq!(merged.project_path, "/Volumes/bigssd/projects/core");
+        assert_eq!(merged.title.as_deref(), Some("rollout"));
+        assert_eq!(
+            merged.transcript_path.as_deref(),
+            Some("/Volumes/bigssd/projects/core/session.jsonl")
+        );
+    }
+
+    #[test]
+    fn unknown_project_placeholder_is_replaced_by_the_rollout_session() {
+        let stored = record("unknown");
+        let rollout = record("/work/repo");
+
+        let merged = reconcile_session_rows_detailed(&stored, &rollout)
+            .expect("an unknown project shell must take the rollout project");
+
+        assert_eq!(merged.project_key, "/work/repo");
+        assert_eq!(merged.project_path, "/work/repo");
+    }
+
+    #[test]
+    fn changed_typed_project_key_adopts_the_current_project() {
+        let mut stored = record("/work/repo");
+        stored.project_key = "project.alpha".to_owned();
+        stored.project_path = "/work/repo".to_owned();
+        let mut current = stored.clone();
+        current.project_key = "project.beta".to_owned();
+
+        let merged = reconcile_session_rows_detailed(&stored, &current)
+            .expect("a re-enrolled project id must replace the stored key");
+
+        assert_eq!(merged.project_key, "project.beta");
+        assert_eq!(merged.project_path, "/work/repo");
+        assert_eq!(merged.session_id, stored.session_id);
+    }
+
+    #[test]
+    fn cwd_mapped_to_another_project_adopts_the_current_binding() {
+        let mut stored = record("/work/old");
+        stored.project_key = "project.alpha".to_owned();
+        stored.project_path = "/work/old".to_owned();
+        let mut current = stored.clone();
+        current.project_key = "project.beta".to_owned();
+        current.project_path = "/work/new".to_owned();
+
+        let merged = reconcile_session_rows_detailed(&stored, &current)
+            .expect("a cwd that resolves to another project must rebind");
+
+        assert_eq!(merged.project_key, "project.beta");
+        assert_eq!(merged.project_path, "/work/new");
+    }
+
+    #[test]
+    fn project_id_fallback_does_not_erase_a_stored_cwd() {
+        let mut stored = record("/work/repo");
+        stored.project_key = "project.alpha".to_owned();
+        stored.project_path = "/work/repo".to_owned();
+        let mut current = stored.clone();
+        current.project_key = "project.beta".to_owned();
+        current.project_path = "project.beta".to_owned();
+
+        let merged = reconcile_session_rows_detailed(&stored, &current)
+            .expect("a key change without a cwd must keep the stored path");
+
+        assert_eq!(merged.project_key, "project.beta");
+        assert_eq!(merged.project_path, "/work/repo");
+    }
+
+    #[test]
     fn genuinely_different_roots_still_refuse_to_reconcile() {
         let tmp = tempfile::TempDir::new().unwrap();
         let first = tmp.path().join("first");
@@ -1607,12 +1891,205 @@ mod reconcile_tests {
         std::fs::create_dir_all(&first).unwrap();
         std::fs::create_dir_all(&second).unwrap();
         assert!(
-            reconcile_session_rows(
+            reconcile_session_rows_detailed(
                 &record(&first.to_string_lossy()),
                 &record(&second.to_string_lossy()),
             )
-            .is_none(),
+            .is_err(),
             "distinct directories must never merge"
         );
+    }
+
+    #[test]
+    fn session_reconcile_conflict_names_the_field_without_exposing_its_value() {
+        let mut actual = record("/project");
+        actual.transcript_path = Some("/private/old-transcript.jsonl".to_owned());
+        let mut expected = record("/project");
+        expected.transcript_path = Some("/private/new-transcript.jsonl".to_owned());
+
+        let conflict = reconcile_session_rows_detailed(&actual, &expected)
+            .expect_err("different transcript identities must not merge");
+
+        assert_eq!(conflict.field(), "transcript_path");
+    }
+
+    #[test]
+    fn session_metadata_keeps_stored_annotations_and_merges_usage() {
+        let mut stored = record("/project");
+        stored.metadata_json = Some(
+            r#"{"source":"cursor_transcript","cursor_session_cwd":"/project","cursor_session_worktree":"/project-wt","usage":{"input_tokens":1}}"#
+                .to_owned(),
+        );
+        let mut projected = record("/project");
+        projected.metadata_json = Some(
+            r#"{"source":"cursor_composer","cursor_session_cwd":"/project","cursor_session_worktree":"/project","usage":{"input_tokens":4},"cursor_source":"cursor"}"#
+                .to_owned(),
+        );
+
+        let merged = reconcile_session_rows_detailed(&stored, &projected)
+            .expect("annotation disagreement must not be a session collision");
+        let value: serde_json::Value =
+            serde_json::from_str(merged.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(value["source"], "cursor_transcript");
+        assert_eq!(value["cursor_session_worktree"], "/project-wt");
+        assert_eq!(value["cursor_source"], "cursor");
+        assert_eq!(value["usage"]["input_tokens"], 4);
+    }
+
+    #[test]
+    fn unmergeable_usage_keeps_the_stored_counter() {
+        let mut stored = record("/project");
+        stored.metadata_json = Some(r#"{"usage":{"input_tokens":1}}"#.to_owned());
+        let mut projected = record("/project");
+        projected.metadata_json = Some(r#"{"usage":"not-a-counter"}"#.to_owned());
+
+        let merged = reconcile_session_rows_detailed(&stored, &projected)
+            .expect("an unmergeable counter must not block the session");
+        let value: serde_json::Value =
+            serde_json::from_str(merged.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(value["usage"]["input_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn missing_message_is_an_output_collision_not_a_missing_session() {
+        let mut fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../tests/fixtures/provider_normalization/codex/agent_message.expected_envelope.json"
+        ))
+        .unwrap();
+        fixture["stable_record_id"] =
+            serde_json::Value::String("record.missing-message".to_owned());
+        fixture["relations"]["session_id"] =
+            serde_json::Value::String("session.missing-message".to_owned());
+        fixture["relations"]["thread_id"] =
+            serde_json::Value::String("session.missing-message".to_owned());
+        fixture["relations"]["message_id"] =
+            serde_json::Value::String("record.missing-message".to_owned());
+        let envelope: CanonicalObservationEnvelopeV1 = serde_json::from_value(fixture).unwrap();
+        let source = ObservationSourceIdentityV1::for_provider(
+            envelope.provider().clone(),
+            envelope.relations().session_id().clone(),
+        )
+        .unwrap();
+        let payload = serde_json::to_value(&envelope).unwrap();
+        let receipt = SanitizationReceiptV1::new(
+            SanitizationReceiptRefV1::new(
+                SanitizationReceiptId::new("receipt.missing-message").unwrap(),
+                ComponentVersion::new("sanitizer.missing-message.v1").unwrap(),
+            )
+            .unwrap(),
+            SanitizerDispositionV1::Accepted,
+            SensitivityV1::NonSensitive,
+            Some(PayloadReferenceV1::for_payload(&payload).unwrap()),
+        )
+        .unwrap();
+        let observation = tracedecay_domain::DurableObservationV1::new(
+            ObservationIdentityMaterialV1::for_native_record(
+                source,
+                ObservationScopeV1::Profile,
+                ObservationSourceGenerationV1::new(1).unwrap(),
+                ObservationSourceRangeV1::new(0, 100).unwrap(),
+                ObservationOrderingDomainV1::FileBytes,
+                ObservationId::new("record.missing-message").unwrap(),
+            )
+            .unwrap(),
+            receipt,
+            RetentionClass::new("retention.missing-message").unwrap(),
+            payload,
+        )
+        .unwrap();
+        let session = SessionRecord {
+            provider: "codex".to_owned(),
+            session_id: "session.missing-message".to_owned(),
+            project_key: "user".to_owned(),
+            project_path: "user".to_owned(),
+            title: None,
+            started_at: Some(1),
+            ended_at: Some(2),
+            transcript_path: None,
+            metadata_json: None,
+            parent_session_id: None,
+            is_subagent: false,
+            agent_id: None,
+            parent_tool_use_id: None,
+        };
+        let message = SessionMessageRecord {
+            provider: "codex".to_owned(),
+            message_id: "record.missing-message".to_owned(),
+            session_id: "session.missing-message".to_owned(),
+            role: "assistant".to_owned(),
+            timestamp: Some(1),
+            ordinal: 0,
+            text: "The billing pipeline regression is fixed.".to_owned(),
+            kind: None,
+            model: None,
+            tool_names: None,
+            source_path: None,
+            source_offset: None,
+            metadata_json: None,
+        };
+        let projection = ObservationProjection::for_message(&observation, session, message)
+            .unwrap()
+            .message()
+            .expect("explicit message projection")
+            .clone();
+        let message = projection.message();
+        let session = projection.session();
+        assert_eq!(message.provider, "codex");
+        assert_eq!(message.message_id, "record.missing-message");
+        assert_eq!(session.session_id, "session.missing-message");
+        let outputs = BTreeSet::from([(message.provider.clone(), message.message_id.clone())]);
+
+        let harness = RegisteredGlobalDbHarness::open("missing-message-collision").await;
+        let absent = harness.registered.read_snapshot().await.unwrap();
+        let batch = read_projection_rows_batch(&absent, &outputs).await.unwrap();
+        assert!(batch.message("codex", "record.missing-message").is_none());
+        assert!(
+            load_verified_session(&absent, &batch, "codex", "session.missing-message")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let missing_session = verify_projection_rows_from_records(&absent, &projection, None, None)
+            .await
+            .expect_err("a projection with no stored session is a session collision");
+        assert!(matches!(
+            missing_session,
+            ProjectionStoreError::SessionOutputCollision {
+                field: "row_missing",
+                ..
+            }
+        ));
+
+        assert!(harness.registered.upsert_session(session).await);
+        let present = harness.registered.read_snapshot().await.unwrap();
+        let batch = read_projection_rows_batch(&present, &outputs)
+            .await
+            .unwrap();
+        assert!(
+            batch.session("codex", "session.missing-message").is_none(),
+            "the message-keyed batch still does not see a session the message row never named"
+        );
+        let loaded = load_verified_session(&present, &batch, "codex", "session.missing-message")
+            .await
+            .unwrap()
+            .expect("the durable session row is not missing");
+        let missing_message = verify_projection_rows_from_records(
+            &present,
+            &projection,
+            Some(loaded.as_ref()),
+            batch.message("codex", "record.missing-message"),
+        )
+        .await
+        .expect_err("a missing message with a live session is an output collision");
+        match missing_message {
+            ProjectionStoreError::OutputCollision {
+                provider,
+                message_id,
+            } => {
+                assert_eq!(provider, "codex");
+                assert_eq!(message_id, "record.missing-message");
+            }
+            other => panic!("missing message classified as {other}"),
+        }
     }
 }

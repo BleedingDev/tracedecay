@@ -17,7 +17,7 @@ use tracedecay_domain::{
 use super::{
     ActiveControl, ApplyingProjectionSink, SharedPublicationStore, config, projection_key,
 };
-use crate::support::{RUST_SOURCE, id};
+use crate::support::{PartitionedSealV1, RUST_SOURCE, id};
 
 /// One module's source: a body whose size varies with `index`, so per-file
 /// parse and chunk cost varies widely, plus a uniquely named helper and an
@@ -96,7 +96,7 @@ fn multi_file_request(file_count: usize, sealed_at: i64) -> CodeIndexBuildReques
 }
 
 /// Build the equivalence generation with the indexing pool forced to `width`,
-/// then read from it at that same width — encoding fans out too, so the width
+/// then read from it at that same width, encoding fans out too, so the width
 /// must still be in force when the caller takes what it wants to compare.
 fn at_width<R>(
     width: usize,
@@ -115,10 +115,18 @@ fn at_width<R>(
     read
 }
 
-fn sealed_bytes_at_width(width: usize, file_count: usize) -> Vec<u8> {
-    at_width(width, file_count, |generation| {
-        generation.encode_sealed().expect("sealed encoding")
-    })
+/// Every sealed byte of `generation`: its partitioned manifest followed by
+/// each segment in content-address order.
+fn sealed_bytes(seal: &PartitionedSealV1) -> Vec<u8> {
+    let mut bytes = seal.manifest.clone();
+    for segment in seal.segments.values() {
+        bytes.extend_from_slice(segment);
+    }
+    bytes
+}
+
+fn seal_at_width(width: usize, file_count: usize) -> PartitionedSealV1 {
+    at_width(width, file_count, PartitionedSealV1::of)
 }
 
 /// Every cross-file edge sealing bound, in the generation's own edge order.
@@ -143,7 +151,7 @@ fn name_resolved_edges(generation: &CodeIndexPublishedGenerationV1) -> Vec<Strin
 /// Cross-file references only resolve at sealing, where every file's symbols
 /// finally exist together, and that resolution now fans out per file. A memo
 /// that leaked between files, or a concatenation that lost file order, would
-/// change which edges bind or where they sort — so the resolved edge vector
+/// change which edges bind or where they sort, so the resolved edge vector
 /// must be identical at width 1 and at full machine width. The count is pinned
 /// so a fixture that stopped producing cross-file references cannot make this
 /// pass by comparing two empty vectors.
@@ -171,8 +179,11 @@ pub(super) fn assert_cross_file_resolution_is_width_invariant() {
 pub(super) fn assert_parallel_and_sequential_generations_are_byte_identical() {
     const FILES: usize = 64;
 
-    let sequential = sealed_bytes_at_width(1, FILES);
-    let parallel = sealed_bytes_at_width(parallelism::indexing_worker_target(64), FILES);
+    let sequential = sealed_bytes(&seal_at_width(1, FILES));
+    let parallel = sealed_bytes(&seal_at_width(
+        parallelism::indexing_worker_target(64),
+        FILES,
+    ));
 
     assert_eq!(
         sequential.len(),
@@ -205,10 +216,9 @@ struct DecodedCensus {
     snapshot_files: usize,
 }
 
-fn decode_at_width(width: usize, sealed: &[u8]) -> (Vec<u8>, DecodedCensus) {
+fn decode_at_width(width: usize, sealed: &PartitionedSealV1) -> (Vec<u8>, DecodedCensus) {
     parallelism::force_indexing_workers_for_test(width);
-    let generation =
-        CodeIndexPublishedGenerationV1::decode_sealed(sealed).expect("sealed generation decodes");
+    let generation = sealed.restored();
     let census = DecodedCensus {
         generation_id: generation.manifest().generation_id.as_str().to_owned(),
         state_digest: generation
@@ -225,9 +235,9 @@ fn decode_at_width(width: usize, sealed: &[u8]) -> (Vec<u8>, DecodedCensus) {
         snapshot_files: generation.snapshot().files.len(),
     };
     // Re-encoding is canonical, so identical re-encoded bytes prove the whole
-    // decoded state — every restored row, in order — is identical, not just
+    // decoded state, every restored row, in order, is identical, not just
     // the fields the census names.
-    let reencoded = generation.encode_sealed().expect("sealed re-encoding");
+    let reencoded = sealed_bytes(&PartitionedSealV1::of(&generation));
     parallelism::clear_forced_indexing_workers_for_test();
     (reencoded, census)
 }
@@ -235,11 +245,11 @@ fn decode_at_width(width: usize, sealed: &[u8]) -> (Vec<u8>, DecodedCensus) {
 /// Width is sizing policy on the way in as well as on the way out. Restoring
 /// each file's exact-extraction authority fans out across the indexing pool,
 /// so a generation decoded with that sweep running inline must restore exactly
-/// the state a full-width decode restores — same rows, same order, same bytes.
+/// the state a full-width decode restores, same rows, same order, same bytes.
 pub(super) fn assert_parallel_and_sequential_decodes_are_byte_identical() {
     const FILES: usize = 64;
 
-    let sealed = sealed_bytes_at_width(1, FILES);
+    let sealed = seal_at_width(1, FILES);
 
     let (sequential_bytes, sequential_census) = decode_at_width(1, &sealed);
     let (parallel_bytes, parallel_census) =
@@ -256,7 +266,7 @@ pub(super) fn assert_parallel_and_sequential_decodes_are_byte_identical() {
     // A width-1 decode must reproduce the exact bytes it was handed, so the
     // sequential path is pinned to the seal itself and not merely to itself.
     assert!(
-        sequential_bytes == sealed,
+        sequential_bytes == sealed_bytes(&sealed),
         "width-1 decode did not round-trip the sealed bytes"
     );
     assert_eq!(

@@ -16,9 +16,10 @@ use tracedecay_contracts::{
     RequestId, ResolvedScope, RetainedSurfaceExecutionContextV1, RetrievalEvidence, TemporalState,
     retained_receipts, retained_surface_application_operation,
 };
-use tracedecay_daemon_service::application_surface::retained::decode_request;
+use tracedecay_daemon_protocol::decode_retained_request;
+use tracedecay_daemon_protocol::{RequestedOutputFormat, separate_application_tool_request};
 use tracedecay_domain::{
-    ActorId, ComponentVersion, ManifestDigest, ProjectId, RepositoryId, UtcMicros, WorktreeId,
+    ActorId, ComponentVersion, ProjectId, RepositoryId, UtcMicros, WorktreeId,
 };
 use tracedecay_tool_catalog::SortContractId;
 
@@ -31,9 +32,7 @@ use crate::cli::Cli;
 
 const PROFILE_ID: &str = "profile.0f2f1c3d4e5f60718293a4b5c6d7e8f9";
 
-fn digest(seed: char) -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
-}
+use tracedecay_domain::test_fixtures::digest;
 
 fn scope() -> ResolvedScope {
     ResolvedScope::new(
@@ -98,6 +97,10 @@ fn effect_reply(operation: RetainedSurfaceOperation, result: RetainedSurfaceResu
         request_id: context.request_id().clone(),
         scope: scope(),
         outcome,
+        touched_files: Vec::new(),
+        code_graph: None,
+        analytics: None,
+        cost: None,
     })
     .unwrap()
 }
@@ -144,6 +147,7 @@ fn evidence_reply(result: RetainedSurfaceResultV1) -> Value {
         finished_at: UtcMicros(3),
         budget: Default::default(),
         cancellation: None,
+        cost: None,
     };
     let packet = EvidencePacket::from_retrieval(evidence, authority, receipt).unwrap();
     serde_json::to_value(ApplicationEnvelope::evidence(
@@ -348,14 +352,17 @@ impl SessionRefreshDaemonTransport for FakeDaemonTransport {
 }
 
 /// Every payload the CLI sends must be the exact canonical request the daemon
-/// decodes for that operation: no `action`, no `profile` object, no
-/// transport-only selector.
+/// decodes for that operation once the JSON `format` transport key is
+/// separated: no `action`, no `profile` object, no transport-only selector.
 fn assert_canonical(operation: RetainedSurfaceOperation, payload: &Value) {
-    let decoded = decode_request(operation, payload.clone())
+    let separated = separate_application_tool_request(payload.clone()).unwrap();
+    assert_eq!(separated.requested_format, RequestedOutputFormat::Json);
+    let decoded = decode_retained_request(operation, separated.request.clone())
         .unwrap_or_else(|error| panic!("{} payload must decode: {error}", operation.as_str()));
     assert_eq!(decoded.operation(), operation);
-    let request: SessionRefreshActionRequestV1 = serde_json::from_value(payload.clone()).unwrap();
-    assert_eq!(serde_json::to_value(&request).unwrap(), *payload);
+    let request: SessionRefreshActionRequestV1 =
+        serde_json::from_value(separated.request.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&request).unwrap(), separated.request);
 }
 
 #[tokio::test]

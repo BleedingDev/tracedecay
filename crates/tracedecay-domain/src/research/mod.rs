@@ -1,8 +1,7 @@
 //! Immutable research-provenance and retrieval-anchor contracts.
 //!
-//! This module is a compatibility facade. Ownership-aligned implementation
-//! modules remain directly addressable while all existing
-//! `tracedecay_domain::research::Type` imports continue to resolve.
+//! Each contract family lives in its own submodule; this module re-exports
+//! them so `tracedecay_domain::research::Type` is the one import path.
 
 pub mod anchor;
 pub mod branch_stack;
@@ -47,12 +46,7 @@ mod tests {
 
     use super::*;
 
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String, Error = DomainError>,
-    {
-        T::try_from(value.to_owned()).expect("valid fixture identity")
-    }
+    use crate::test_fixtures::id;
 
     #[test]
     fn ids_reject_invalid_deserialized_values() {

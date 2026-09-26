@@ -20,8 +20,7 @@ use tracedecay_contracts::feedback::{
     FeedbackCycleAdvisoryV1, FeedbackCycleExecutionRequest, FeedbackCycleExecutionResult,
     FeedbackCycleService, FeedbackDiagnosticsReadRequestV1, FeedbackExpandRequestV1,
     FeedbackImpactPort, FeedbackImpactPortOutcome, FeedbackImpactRequest, FeedbackObservationPort,
-    FeedbackPortFuture, FeedbackRuntimeStatePort, FeedbackRuntimeStateV1,
-    GenerationBoundFeedbackDiagnosticsAdapter,
+    FeedbackPortFuture, FeedbackRuntimeStatePort, GenerationBoundFeedbackDiagnosticsAdapter,
 };
 use tracedecay_contracts::retrieval::{
     AffectedTestsRequest, AffectedTestsResult, AffectedTestsRetrievalPort, AnchorExpandRequest,
@@ -32,6 +31,7 @@ use tracedecay_contracts::{
     ApplicationContractError, ApplicationOperation, CoverageCompleteness, FreshnessState,
     PolicyEvaluationV1, RequestAdmission, RequestContext,
 };
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_domain::feedback::{
     FeedbackDurabilityV1, FeedbackFindingId, FeedbackFindingV1, FeedbackImpactStateV1,
     FeedbackImpactV1, FeedbackTriggerV1,
@@ -53,7 +53,9 @@ use tracedecay_graph_query::{
 };
 use tracedecay_runtime_core::db::Database;
 
-use super::concrete::{FeedbackRuntime, ProjectFeedbackRouteAuthorization, ProjectFeedbackStore};
+use super::concrete::{
+    FeedbackRuntime, FeedbackRuntimeError, ProjectFeedbackRouteAuthorization, ProjectFeedbackStore,
+};
 use super::diagnostics::{DatabaseDiagnosticStore, DiagnosticStoreFeedbackProvider};
 use super::observations::FeedbackObservationEmitterV1;
 
@@ -217,6 +219,8 @@ impl Deref for CanonicalFeedbackResultV1 {
 pub enum FeedbackCycleRuntimeError {
     #[error("feedback cycle contract is invalid")]
     Contract(#[from] ApplicationContractError),
+    #[error("feedback cycle runtime failed")]
+    Runtime(#[from] FeedbackRuntimeError),
     #[error("feedback cycle requires at least one managed diagnostic provider")]
     NoManagedDiagnosticProviders,
     #[error("feedback cycle request provider identities differ from its admission set")]
@@ -226,9 +230,13 @@ pub enum FeedbackCycleRuntimeError {
 }
 
 impl FeedbackCycleRuntimeError {
-    fn lsp_failure_class(&self) -> &'static str {
+    pub fn lsp_failure_class(&self) -> &'static str {
         match self {
             Self::Contract(_) => "feedback-cycle-contract",
+            Self::Runtime(FeedbackRuntimeError::HandleStore(TraceDecayError::SyncLock {
+                ..
+            })) => "feedback-cycle-handle-store-busy",
+            Self::Runtime(_) => "feedback-cycle-runtime",
             Self::NoManagedDiagnosticProviders => "feedback-cycle-provider-missing",
             Self::ProviderSetMismatch => "feedback-cycle-provider-mismatch",
             Self::UnsupportedTrigger => "feedback-cycle-trigger-unsupported",
@@ -237,13 +245,13 @@ impl FeedbackCycleRuntimeError {
 }
 
 type ProductionFeedbackCycleService = FeedbackCycleService<
-    SharedFeedbackRuntimeState,
+    Arc<dyn FeedbackRuntimeStatePort + Send + Sync>,
     GenerationBoundFeedbackDiagnosticsAdapter<
         DiagnosticStoreFeedbackProvider<DatabaseDiagnosticStore>,
     >,
     DirectFeedbackImpactAdapter,
     ProjectFeedbackStore,
-    SharedFeedbackObservations,
+    Arc<dyn FeedbackObservationPort + Send + Sync>,
     ProjectFeedbackRouteAuthorization,
 >;
 
@@ -319,18 +327,18 @@ pub fn open_feedback_cycle_runtime(
     let impact = DirectFeedbackImpactAdapter::new(
         project_root,
         code_graph,
-        SharedAffectedTests(affected_tests),
+        affected_tests,
         route_authorization.clone(),
         graph_operation,
         tests_operation,
         code_index_identity,
     );
     let service = FeedbackCycleService::new(
-        SharedFeedbackRuntimeState(runtime_state),
+        runtime_state,
         diagnostics,
         impact,
         publications.clone(),
-        SharedFeedbackObservations(observations),
+        observations,
         route_authorization,
         operation,
     );
@@ -389,11 +397,7 @@ impl FeedbackCycleRuntime {
         let requested_durability = request.input.request.durability();
         let execution = self.service.execute(&context, request).await?;
         crate::hotpath_observe::feedback_query(execution.cycle.findings.len());
-        Ok(compose_canonical_result(
-            &self.feedback,
-            execution,
-            requested_durability,
-        )?)
+        compose_canonical_result(&self.feedback, execution, requested_durability)
     }
 
     /// Runs one canonical feedback cycle with source-backed advisory findings.
@@ -405,13 +409,14 @@ impl FeedbackCycleRuntime {
         context: &RequestContext,
         request: FeedbackCycleExecutionRequest,
         advisory: FeedbackCycleAdvisoryV1,
-    ) -> Result<CanonicalFeedbackResultV1, ApplicationContractError> {
+    ) -> Result<CanonicalFeedbackResultV1, FeedbackCycleRuntimeError> {
         if !self.admits_current_provider_set(&request).await
             || !self.admits_provider_set(&request.providers)
         {
             return Err(ApplicationContractError::Inconsistent {
                 field: "feedback cycle provider set",
-            });
+            }
+            .into());
         }
         let requested_durability = request.input.request.durability();
         let execution = self
@@ -510,65 +515,48 @@ pub(crate) fn compose_canonical_result(
     feedback: &FeedbackRuntime,
     execution: FeedbackCycleExecutionResult,
     requested_durability: FeedbackDurabilityV1,
-) -> Result<CanonicalFeedbackResultV1, ApplicationContractError> {
+) -> Result<CanonicalFeedbackResultV1, FeedbackCycleRuntimeError> {
     if execution.cycle.durability != requested_durability {
         return Err(ApplicationContractError::Inconsistent {
             field: "feedback result durability",
-        });
+        }
+        .into());
     }
     if execution.cycle.durability != FeedbackDurabilityV1::Durable
         || execution.publication.is_none()
     {
-        return CanonicalFeedbackResultV1::new(execution, None, Vec::new());
+        return Ok(CanonicalFeedbackResultV1::new(execution, None, Vec::new())?);
     }
 
     let observed_at = execution.usage.completed_at;
     let read_handles = FeedbackCycleReadHandlesV1 {
-        diagnostics_handle: feedback
-            .mint_diagnostics(
-                feedback_cycle_handle_request_id("diagnostics", &execution)?,
-                FeedbackDiagnosticsReadRequestV1 {
-                    head_commit_id: execution.cycle.scope.head_commit_id.clone(),
-                },
-                observed_at,
-            )
-            .map_err(|_| ApplicationContractError::Inconsistent {
-                field: "feedback diagnostics handle authority",
-            })?,
-        list_handle: feedback
-            .mint_list(
-                feedback_cycle_handle_request_id("list", &execution)?,
-                Some(execution.cycle.scope.head_commit_id.clone()),
-                100,
-                observed_at,
-            )
-            .map_err(|_| ApplicationContractError::Inconsistent {
-                field: "feedback list handle authority",
-            })?,
+        diagnostics_handle: feedback.mint_diagnostics(
+            feedback_cycle_handle_request_id("diagnostics", &execution)?,
+            FeedbackDiagnosticsReadRequestV1 {
+                head_commit_id: execution.cycle.scope.head_commit_id.clone(),
+            },
+            observed_at,
+        )?,
+        list_handle: feedback.mint_list(
+            feedback_cycle_handle_request_id("list", &execution)?,
+            Some(execution.cycle.scope.head_commit_id.clone()),
+            100,
+            observed_at,
+        )?,
     };
     let mut finding_handles = Vec::with_capacity(execution.cycle.findings.len());
     for finding in &execution.cycle.findings {
-        let get_handle = feedback
-            .mint_get(
-                feedback_handle_request_id("get", &execution, finding)?,
-                finding.finding_id.clone(),
-                observed_at,
-            )
-            .map_err(|_| ApplicationContractError::Inconsistent {
-                field: "feedback get handle authority",
-            })?;
+        let get_handle = feedback.mint_get(
+            feedback_handle_request_id("get", &execution, finding)?,
+            finding.finding_id.clone(),
+            observed_at,
+        )?;
         let expansion_handle = if let Some(request) = feedback_expansion_request(finding)? {
-            Some(
-                feedback
-                    .mint_expand(
-                        feedback_handle_request_id("expand", &execution, finding)?,
-                        request,
-                        observed_at,
-                    )
-                    .map_err(|_| ApplicationContractError::Inconsistent {
-                        field: "feedback expansion handle authority",
-                    })?,
-            )
+            Some(feedback.mint_expand(
+                feedback_handle_request_id("expand", &execution, finding)?,
+                request,
+                observed_at,
+            )?)
         } else {
             None
         };
@@ -579,7 +567,11 @@ pub(crate) fn compose_canonical_result(
             expansion_handle,
         });
     }
-    CanonicalFeedbackResultV1::new(execution, Some(read_handles), finding_handles)
+    Ok(CanonicalFeedbackResultV1::new(
+        execution,
+        Some(read_handles),
+        finding_handles,
+    )?)
 }
 
 fn feedback_cycle_handle_request_id(
@@ -639,7 +631,9 @@ impl FeedbackCycleRuntimePort for FeedbackCycleRuntime {
             let invocation = (runtime.lsp_input)(request).await?;
             if !lsp_trigger_matches_invocation(trigger, &invocation) {
                 let duration_micros =
-                    u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                    tracedecay_runtime_core::tracedecay::saturating_duration_micros(
+                        started_at.elapsed(),
+                    );
                 runtime.source_observations.observe_source_event(
                     &invocation.request.input,
                     FeedbackSourceEventV1::ArgumentRejected {
@@ -660,7 +654,9 @@ impl FeedbackCycleRuntimePort for FeedbackCycleRuntime {
             }
             let input = invocation.request.input.clone();
             let admission_duration_micros =
-                u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+                tracedecay_runtime_core::tracedecay::saturating_duration_micros(
+                    started_at.elapsed(),
+                );
             runtime.source_observations.observe_source_event(
                 &input,
                 lsp_method_state_event(
@@ -671,8 +667,9 @@ impl FeedbackCycleRuntimePort for FeedbackCycleRuntime {
                 ),
             );
             let result = Box::pin(runtime.run_once(invocation)).await;
-            let duration_micros =
-                u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let duration_micros = tracedecay_runtime_core::tracedecay::saturating_duration_micros(
+                started_at.elapsed(),
+            );
             let outcome = if result.is_ok() {
                 FeedbackOutcomeV1::Completed
             } else {
@@ -704,26 +701,14 @@ impl FeedbackCycleRuntimePort for FeedbackCycleRuntime {
     }
 }
 
-struct SharedFeedbackRuntimeState(Arc<dyn FeedbackRuntimeStatePort + Send + Sync>);
-
-impl FeedbackRuntimeStatePort for SharedFeedbackRuntimeState {
-    fn resolve<'a>(
-        &'a self,
-        context: &'a RequestContext,
-        input: &'a tracedecay_domain::feedback::FeedbackEvaluationInputV1,
-    ) -> FeedbackPortFuture<'a, Option<FeedbackRuntimeStateV1>> {
-        self.0.resolve(context, input)
-    }
-}
-
 struct DirectFeedbackImpactAdapter {
     project_root: PathBuf,
     code_graph: Arc<dyn CodeGraphProjectionReadPort>,
-    tests: SharedAffectedTests,
+    tests: Arc<dyn AffectedTestsRetrievalPort + Send + Sync>,
     authorization: ProjectFeedbackRouteAuthorization,
     graph_operation: ApplicationOperation,
     tests_operation: ApplicationOperation,
-    /// The code-index generation authority — the single mint for
+    /// The code-index generation authority, the single mint for
     /// `file.daemon.<digest>` file identity. Absent for runtimes opened outside
     /// the daemon, where the adapter reports no affected files rather than
     /// minting raw-path identities the rest of the system cannot match.
@@ -734,7 +719,7 @@ impl DirectFeedbackImpactAdapter {
     fn new(
         project_root: PathBuf,
         code_graph: Arc<dyn CodeGraphProjectionReadPort>,
-        tests: SharedAffectedTests,
+        tests: Arc<dyn AffectedTestsRetrievalPort + Send + Sync>,
         authorization: ProjectFeedbackRouteAuthorization,
         graph_operation: ApplicationOperation,
         tests_operation: ApplicationOperation,
@@ -1098,8 +1083,8 @@ impl FeedbackImpactPort for DirectFeedbackImpactAdapter {
                 // The impact is complete only when both the graph and the
                 // affected-test evidence report complete coverage.
                 // `evidence_anchors` stays empty because this runtime binds no
-                // anchor authority — the graph traversal yields nodes, not
-                // retrieval anchors — and an invented anchor would be worse than
+                // anchor authority, the graph traversal yields nodes, not
+                // retrieval anchors, and an invented anchor would be worse than
                 // none.
                 let state = if graph_state == FeedbackImpactStateV1::Complete
                     && affected_tests_state == FeedbackImpactStateV1::Complete
@@ -1133,18 +1118,6 @@ impl FeedbackImpactPort for DirectFeedbackImpactAdapter {
     }
 }
 
-struct SharedAffectedTests(Arc<dyn AffectedTestsRetrievalPort + Send + Sync>);
-
-impl AffectedTestsRetrievalPort for SharedAffectedTests {
-    fn affected_tests(
-        &self,
-        context: &RetrievalPortContext<'_>,
-        request: &AffectedTestsRequest,
-    ) -> RetrievalPortOutcome<AffectedTestsResult> {
-        self.0.affected_tests(context, request)
-    }
-}
-
 enum DirectAffectedTestsOutcome {
     Evidence {
         tests: Vec<SymbolOccurrenceId>,
@@ -1175,7 +1148,7 @@ fn affected_tests_outcome(
             DirectAffectedTestsOutcome::Evidence {
                 tests: evidence
                     .payload
-                    .map_or_else(Vec::new, |result| result.tests),
+                    .map_or_else(Vec::new, |result| result.current_tests()),
                 state,
             }
         }
@@ -1186,7 +1159,7 @@ fn affected_tests_outcome(
             DirectAffectedTestsOutcome::Evidence {
                 tests: evidence
                     .payload
-                    .map_or_else(Vec::new, |result| result.tests),
+                    .map_or_else(Vec::new, |result| result.current_tests()),
                 state: FeedbackImpactStateV1::Partial,
             }
         }
@@ -1198,18 +1171,6 @@ fn affected_tests_outcome(
                 state: FeedbackImpactStateV1::Unavailable,
             }
         }
-    }
-}
-
-struct SharedFeedbackObservations(Arc<dyn FeedbackObservationPort + Send + Sync>);
-
-impl FeedbackObservationPort for SharedFeedbackObservations {
-    fn observe(
-        &self,
-        input: &tracedecay_domain::feedback::FeedbackEvaluationInputV1,
-        observation: tracedecay_domain::feedback::FeedbackCycleObservationV1,
-    ) {
-        self.0.observe(input, observation);
     }
 }
 

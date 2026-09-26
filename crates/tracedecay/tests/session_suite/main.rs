@@ -12,6 +12,7 @@ mod common;
 
 mod anchor_resolution;
 mod anchor_tombstone_expiry;
+mod claude_records;
 mod fact_anchor_authority;
 mod git_backfill;
 mod global_db;
@@ -27,7 +28,6 @@ mod observation_projection;
 mod observation_store;
 mod observation_workflow_projection;
 mod session_runtime;
-mod temporal_application;
 mod temporal_benchmark;
 #[cfg(unix)]
 mod temporal_benchmark_runner;

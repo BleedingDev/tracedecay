@@ -55,7 +55,7 @@ fn registration_digest_matches(
 
 /// Whether the cached registration may be honored: the digest cache proves
 /// this process registered exactly this digest once, not that the registry
-/// still holds it — a sibling process, the CLI, or any out-of-band upsert can
+/// still holds it, a sibling process, the CLI, or any out-of-band upsert can
 /// re-pin `canonical_root` afterwards. One indexed point-read keeps the skip
 /// honest before it bypasses the stale-canonical-root repair below; the skip
 /// still avoids the registry write lock and every upsert.
@@ -93,10 +93,6 @@ pub async fn register_project_store(
     store_layout: &StoreLayout,
 ) -> Result<()> {
     static REGISTRY_WRITE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    if store_layout.storage_mode != storage::StorageMode::ProfileSharded {
-        return Ok(());
-    }
 
     let project_id = store_layout.identity.project_id.as_deref().ok_or_else(|| {
         registry_registration_error("profile-sharded store has no project identity")
@@ -217,7 +213,7 @@ pub async fn register_project_store(
         });
         if repaired_stale_worktree_root {
             eprintln!(
-                "warning: repaired tracedecay project '{project_id}' canonical_root — \
+                "warning: repaired tracedecay project '{project_id}' canonical_root, \
                  it was pinned to a linked worktree ({}); restored to the primary checkout ({})",
                 project_root.display(),
                 primary_root.display()

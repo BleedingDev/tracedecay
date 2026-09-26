@@ -53,17 +53,17 @@ fn hook_binding_uses_exact_resolved_worktree_and_revision_epoch() {
 #[test]
 fn every_host_with_a_native_advisory_event_receives_a_daemon_binding() {
     let hosts = [
-        HookHostV1::ClaudeCode,
-        HookHostV1::Codex,
-        HookHostV1::CursorDesktop,
-        HookHostV1::CursorCloud,
-        HookHostV1::Hermes,
-        HookHostV1::Kiro,
-        HookHostV1::KimiCode,
-        HookHostV1::OpenCode,
-        HookHostV1::Cline,
-        HookHostV1::RooCode,
-        HookHostV1::Kilo,
+        NativeHostIdentityV1::ClaudeCode,
+        NativeHostIdentityV1::Codex,
+        NativeHostIdentityV1::CursorDesktop,
+        NativeHostIdentityV1::CursorCloud,
+        NativeHostIdentityV1::Hermes,
+        NativeHostIdentityV1::Kiro,
+        NativeHostIdentityV1::KimiCode,
+        NativeHostIdentityV1::OpenCode,
+        NativeHostIdentityV1::Cline,
+        NativeHostIdentityV1::RooCode,
+        NativeHostIdentityV1::Kilo,
     ];
     let families = [
         tracedecay_hooks::HookEventFamily::SessionBoundary,
@@ -162,7 +162,7 @@ fn daemon_feedback_notice_survives_into_host_delivery() {
     let current_envelope = HookEventEnvelopeV2 {
         schema_version: tracedecay_hooks::HOOK_EVENT_SCHEMA_VERSION,
         event_id: [1; 16],
-        producer: HookHostV1::ClaudeCode,
+        producer: NativeHostIdentityV1::ClaudeCode,
         protected_session_id: [2; 32],
         project_id: envelope_identity_hash16("project", notice.scope.project_id.as_str()),
         repository_id: envelope_identity_hash16("repository", notice.scope.repository_id.as_str()),
@@ -312,7 +312,7 @@ fn sample_envelope(
     HookEventEnvelopeV2 {
         schema_version: tracedecay_hooks::HOOK_EVENT_SCHEMA_VERSION,
         event_id: [1; 16],
-        producer: HookHostV1::ClaudeCode,
+        producer: NativeHostIdentityV1::ClaudeCode,
         protected_session_id: [2; 32],
         project_id: envelope_identity_hash16("project", notice.scope.project_id.as_str()),
         repository_id: envelope_identity_hash16("repository", notice.scope.repository_id.as_str()),
@@ -670,7 +670,7 @@ fn retry_identity_and_timestamp_reuse_are_stable() {
     assert_eq!(retry.event_id, first.event_id);
 
     let temporary = tempfile::tempdir().unwrap();
-    let host = HookHostV1::ClaudeCode;
+    let host = NativeHostIdentityV1::ClaudeCode;
     let binding = spool_binding(host, [family]);
     let decoded = tracedecay_hooks::decode_native_hook_event(
         host,
@@ -705,7 +705,7 @@ fn retry_identity_and_timestamp_reuse_are_stable() {
 }
 
 fn spool_binding(
-    host: HookHostV1,
+    host: NativeHostIdentityV1,
     families: impl IntoIterator<Item = tracedecay_hooks::HookEventFamily>,
 ) -> HookScopeBindingV1 {
     HookScopeBindingV1 {
@@ -788,7 +788,8 @@ fn kimi_rendered_hook_fixture_queues_only_native_session_and_call_identity() {
     .unwrap();
 
     let lifecycle =
-        native_context_scout_lifecycle(HookHostV1::KimiCode, &fields, material.event_id).unwrap();
+        native_context_scout_lifecycle(NativeHostIdentityV1::KimiCode, &fields, material.event_id)
+            .unwrap();
 
     assert_eq!(lifecycle.session_id.as_str(), "session.kimi.native");
     assert_eq!(lifecycle.call_id.as_str(), "call.kimi.native");
@@ -855,7 +856,8 @@ fn opencode_rendered_plugin_queues_only_tool_after_lifecycle_identity() {
     )
     .unwrap();
     let lifecycle =
-        native_context_scout_lifecycle(HookHostV1::OpenCode, &fields, material.event_id).unwrap();
+        native_context_scout_lifecycle(NativeHostIdentityV1::OpenCode, &fields, material.event_id)
+            .unwrap();
     assert_eq!(lifecycle.session_id.as_str(), "session.opencode.native");
     assert_eq!(lifecycle.call_id.as_str(), "call.opencode.native");
 
@@ -865,7 +867,7 @@ fn opencode_rendered_plugin_queues_only_tool_after_lifecycle_identity() {
     )
     .unwrap();
     let binding = spool_binding(
-        HookHostV1::OpenCode,
+        NativeHostIdentityV1::OpenCode,
         [tracedecay_hooks::HookEventFamily::SavedEdit],
     );
     let envelope = decoded.into_envelope(&binding, material).unwrap();
@@ -873,7 +875,7 @@ fn opencode_rendered_plugin_queues_only_tool_after_lifecycle_identity() {
     assert_eq!(
         append_for_replay(
             temporary.path(),
-            HookHostV1::OpenCode,
+            NativeHostIdentityV1::OpenCode,
             &envelope,
             Some(lifecycle.clone()),
             &binding,
@@ -884,10 +886,10 @@ fn opencode_rendered_plugin_queues_only_tool_after_lifecycle_identity() {
     let spool_root = temporary
         .path()
         .join("hook-v2-spool")
-        .join(HookHostV1::OpenCode.hook_key());
+        .join(NativeHostIdentityV1::OpenCode.hook_key());
     let (mut spool, _) = HookSpoolV1::open(
         spool_root,
-        HookSpoolConfigV1::stock(HookHostV1::OpenCode),
+        HookSpoolConfigV1::stock(NativeHostIdentityV1::OpenCode),
         UtcMicros(10),
     )
     .unwrap();
@@ -902,5 +904,59 @@ fn opencode_rendered_plugin_queues_only_tool_after_lifecycle_identity() {
         .unwrap()["request"]
         .to_string();
     let fields = serde_json::from_str::<NativeIdentityFields>(&file_edit).unwrap();
-    assert!(native_context_scout_lifecycle(HookHostV1::OpenCode, &fields, [1; 16]).is_none());
+    assert!(
+        native_context_scout_lifecycle(NativeHostIdentityV1::OpenCode, &fields, [1; 16]).is_none()
+    );
+}
+
+/// A hook callback appending to an already-prepared spool holds its writer
+/// lease for one bounded append. Project open republishing the binding at that
+/// moment waits for the peer instead of failing the open with `Busy`.
+#[test]
+fn binding_publication_waits_for_a_live_callback_holding_the_spool() {
+    let _profile = tracedecay_runtime_core::config::PinnedUserDataDir::new();
+    let project = tempfile::tempdir().unwrap();
+    let project_root = project.path().canonicalize().unwrap();
+    tracedecay_runtime_core::storage::pin_fixture_repository_identity(
+        &project_root,
+        "proj_hook_binding_contention",
+    )
+    .unwrap();
+    let layout = tracedecay_runtime_core::storage::profile_sharded_layout(
+        &project_root,
+        &tracedecay_runtime_core::storage::default_profile_root().unwrap(),
+        "proj_hook_binding_contention",
+    )
+    .unwrap();
+    fn contention_scope(_: &Path, _: &ProjectId) -> Result<ResolvedScope, String> {
+        Ok(scope("worktree.binding-contention"))
+    }
+    let runtime = HookRuntimeV1 {
+        scope_resolver: contention_scope,
+        ..crate::ports::hook_runtime::crate_test_runtime()
+    };
+    publish_daemon_bindings(&runtime, &layout).unwrap();
+
+    let host = NativeHostIdentityV1::ClaudeCode;
+    let held = std::time::Duration::from_millis(20);
+    let (capture, _) = HookSpoolV1::open(
+        tracedecay_hooks::hook_v2_spool_root(&layout.data_root, host),
+        HookSpoolConfigV1::stock(host),
+        UtcMicros(1),
+    )
+    .unwrap();
+    let delivery = tracedecay_hooks::HookDeliveryReceiptSpoolV1::open(
+        tracedecay_hooks::hook_delivery_receipt_spool_root(&layout.data_root, host),
+    )
+    .unwrap();
+    let callback = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        drop(capture);
+        drop(delivery);
+    });
+    assert!(held < tracedecay_hooks::HOOK_SYNCHRONOUS_BUDGET);
+
+    publish_daemon_bindings(&runtime, &layout)
+        .expect("publication waits for the live callback instead of failing busy");
+    callback.join().unwrap();
 }

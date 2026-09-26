@@ -23,13 +23,14 @@ use tracedecay_domain::{FactOwnerV1, ObservationScopeV1, ProjectId};
 use tracedecay_session_memory::memory::MemoryApplication;
 use tracedecay_store::{FactReadControl, StoreShardScopeV1};
 
-use tracedecay_automation_runtime::automation::run_ledger::load_run_records;
+use tracedecay_automation_runtime::automation::run_ledger::{
+    canonical_record_started_at_seconds, load_run_records,
+};
 use tracedecay_daemon_service::retained_owner::open_project_retained_memory_target;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{AnalyticsToolCounts, RegisteredGlobalDb};
 use tracedecay_project::project::TraceDecay;
-use tracedecay_project::project::current_timestamp;
-use tracedecay_runtime_core::timeutil::parse_rfc3339_timestamp;
+use tracedecay_runtime_core::tracedecay::current_timestamp;
 use tracedecay_session_memory::fact_store::DatabaseFactStore;
 use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
 
@@ -55,13 +56,11 @@ const NAVIGATION_TOOLS: &[&str] = &[
     "similar",
     "rename_preview",
     "implementations",
-    "callers_for",
     "by_qualified_name",
     "call_chain",
     "file_dependents",
     "find_exact_symbol",
     "signature",
-    "impls",
     "derives",
     "status",
     "active_project",
@@ -70,10 +69,10 @@ const NAVIGATION_TOOLS: &[&str] = &[
     "project_list",
     "project_search",
     "project_context",
-    "body",
+    "source_body",
     "todos",
-    "read",
-    "outline",
+    "source_lines",
+    "source_outline",
     "config",
     "signature_search",
     "port_status",
@@ -531,9 +530,12 @@ pub async fn handle_analytics(
         }
     }
 
-    Ok(tool_json_with_md(Some(&scope.root), &args, &value, || {
-        renderers::analytics_md(&value)
-    }))
+    Ok(tool_json_with_md(
+        Some(&cg.store_layout().response_handle_root),
+        &args,
+        &value,
+        || renderers::analytics_md(&value),
+    ))
 }
 
 #[expect(
@@ -666,21 +668,13 @@ fn tools_section(rows: &[AnalyticsToolCounts]) -> Result<Value> {
         "tiers": tiers,
         "top_tools": top_tools,
         "raw_distinct_event_name_count": per_tool.len(),
-        // Deprecated shipped key: this was always a count of raw persisted
-        // event names, not a public-catalog adoption numerator.
-        "distinct_tools_called": per_tool.len(),
         "called_available_defined_tool_count": called_available_defined.len(),
         "available_defined_tool_count": available_defined.len(),
-        // Deprecated shipped key: it remains the current host-available
-        // catalog count, which the explicit field above now names directly.
-        "defined_tool_count": available_defined.len(),
         "maximal_defined_tool_count": maximal_defined.len(),
         "aliased_call_names": aliased_call_names,
         "bound_internal_call_names": bound_internal_call_names,
         "unavailable_public_call_names": unavailable_public_call_names,
         "unknown_or_retired_call_names": unknown_or_retired_call_names,
-        // Deprecated shipped key preserved as an exact object alias.
-        "zero_call_tools": zero_call_tools.clone(),
         "zero_call_available_defined_tools": zero_call_tools,
     }))
 }
@@ -793,7 +787,7 @@ async fn automation_section(project_root: &Path, since: i64) -> Value {
     let mut in_window = 0usize;
     let mut by_job: BTreeMap<String, BTreeMap<&'static str, i64>> = BTreeMap::new();
     for record in &records {
-        if let Some(started_at) = parse_rfc3339_timestamp(&record.started_at)
+        if let Ok(started_at) = canonical_record_started_at_seconds(record, "analytics window")
             && started_at < since
         {
             continue;

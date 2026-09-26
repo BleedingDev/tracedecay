@@ -169,38 +169,18 @@ impl CodexAppServerLaunchReceipt {
     }
 }
 
-impl Default for CodexAppServerSummaryConfig {
-    fn default() -> Self {
+impl CodexAppServerSummaryConfig {
+    /// Default tuning for an executable the caller resolved through
+    /// configuration (`lcm.summarizer_executables.v1`); the caller applies
+    /// the model and timeout that setting configures. Nothing here reads
+    /// `PATH` or the environment.
+    pub fn for_executable(codex_bin: &Path) -> Self {
         Self {
-            codex_bin: "codex".to_string(),
+            codex_bin: codex_bin.to_string_lossy().into_owned(),
             model: Some("gpt-5.6-sol".to_owned()),
             timeout: Duration::from_secs(90),
         }
     }
-}
-
-impl CodexAppServerSummaryConfig {
-    pub fn from_env() -> Self {
-        let mut config = Self::default();
-        if let Some(bin) = non_empty_env("TRACEDECAY_CODEX_BIN") {
-            config.codex_bin = bin;
-        }
-        if let Some(model) = non_empty_env("TRACEDECAY_CODEX_SUMMARY_MODEL") {
-            config.model = Some(model);
-        }
-        if let Some(secs) = non_empty_env("TRACEDECAY_CODEX_SUMMARY_TIMEOUT_SECS")
-            .and_then(|secs| secs.parse::<u64>().ok())
-        {
-            config.timeout = Duration::from_secs(secs.clamp(5, 300));
-        }
-        config
-    }
-}
-
-fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn configured_model(config: &CodexAppServerSummaryConfig) -> Option<&str> {
@@ -431,7 +411,7 @@ fn run_codex_protocol(
         )?;
 
         // `stdin` stays open for the whole turn. `codex app-server` treats stdin
-        // EOF as a client disconnect and shuts the session down immediately —
+        // EOF as a client disconnect and shuts the session down immediately,
         // measured at 70ms after close, exit status 0, with the in-flight turn
         // cancelled and no `turn/completed` ever emitted. Closing it here to mean
         // "no further requests" therefore killed every automation run before the
@@ -1147,9 +1127,16 @@ mod tests {
         }
         let temp = tempfile::tempdir().unwrap();
         let descendant_pid_path = temp.path().join("descendant.pid");
+        // `>` creates the pid file before the shell writes into it, and a poll
+        // that only checks the path can read it empty. Write to a sibling and
+        // rename so the file appears with its pid already in it.
         let mut command = Command::new("sh");
         command
-            .args(["-c", "sleep 30 & echo $! > \"$1\"; wait", "sh"])
+            .args([
+                "-c",
+                "sleep 30 & echo $! > \"$1.tmp\" && mv \"$1.tmp\" \"$1\"; wait",
+                "sh",
+            ])
             .arg(&descendant_pid_path);
         let child = spawn_codex_app_server(&mut command, "sh").expect("spawn child");
         let mut child = ChildGuard {

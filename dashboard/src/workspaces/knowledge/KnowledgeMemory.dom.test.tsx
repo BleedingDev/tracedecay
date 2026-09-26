@@ -96,10 +96,10 @@ function memoryGraph(facts: readonly MemoryFactRowV1[]): MemoryGraphPayloadV1 {
 }
 
 /** `memory_api::overview` seeds the whole holographic block before it reads
- * anything, so `reads` and `facts_coverage` are always present — a body without
+ * anything, so `reads` and `facts_coverage` are always present, a body without
  * them is one the route cannot produce. */
 function overviewEnvelope(facts: readonly MemoryFactRowV1[] = []) {
-  // The envelope's own header — time, coverage, authorization, version — comes
+  // The envelope's own header, time, coverage, authorization, version, comes
   // from the fixture authority rather than being invented here, so these cases
   // cannot accidentally assert against a truth claim no route makes.
   return fixtureEnvelope({
@@ -441,7 +441,7 @@ describe("Knowledge view switcher", () => {
     const panelId = tab.getAttribute("aria-controls");
     expect(panelId).toBeTruthy();
     // `aria-controls` naming an element that was never drawn is an invalid
-    // reference, not a weaker one — the accessibility gate reads it as a
+    // reference, not a weaker one, the accessibility gate reads it as a
     // failure.
     expect(document.getElementById(panelId ?? "")).toBeTruthy();
   });
@@ -475,6 +475,35 @@ describe("Memory geometry", () => {
     expect(
       await screen.findByText(/projection coverage is bounded; examined 400 under a limit of 400/i),
     ).toBeTruthy();
+  });
+
+  it("states each geometry read as a typed chip and prints pair identities by head and tail", async () => {
+    const longA = `fact.${"a".repeat(64)}.${"0".repeat(58)}000011`;
+    const longB = `fact.${"b".repeat(64)}.${"0".repeat(58)}000012`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.includes("/projection")) {
+          return json({
+            ...PROJECTION,
+            coverage: { completeness: "bounded", examined: 400, limit: 400, omission_reasons: ["request_limit_reached"] },
+          });
+        }
+        if (url.includes("/similarity")) {
+          return json({ ...SIMILARITY, limit: 5, pairs: [{ ...SIMILARITY.pairs[0]!, a_id: longA, b_id: longB }] });
+        }
+        return json(OVERVIEW_ENVELOPE);
+      }),
+    );
+    renderPage("/knowledge?view=geometry");
+    const projection = await screen.findByText("· pca · bounded · request_limit_reached");
+    expect(projection.closest("[data-state]")?.getAttribute("data-state")).toBe("partial");
+    const similarity = await screen.findByText("· 1 pair · list ended below the limit");
+    expect(similarity.closest("[data-state]")?.getAttribute("data-state")).toBe("ready");
+    expect(screen.getByTitle(longA).textContent).toBe("fact.aa…000011");
+    expect(screen.getByTitle(longB).textContent).toBe("fact.bb…000012");
+    expect(screen.getByText("likely duplicate").className).toBe("td-legend");
   });
 
   it("names the pair list so it is reachable by keyboard", async () => {

@@ -12,6 +12,8 @@ use tracedecay_code_index_runtime::{GitWatchSyncConfigV1, git_watch};
 use tracedecay_daemon_identity::profile_identity;
 #[cfg(unix)]
 use tracedecay_daemon_protocol::{client_version_skew, version_skew_action};
+#[cfg(unix)]
+use tracedecay_daemon_service::shutdown::{DAEMON_TASK_ABORT_DEADLINE, DaemonLifecycle};
 use tracedecay_hooks::core_events::HOOK_EVENT_METHOD;
 
 #[cfg(unix)]
@@ -171,19 +173,19 @@ fn ensure_git_index_transactions_for_mutation_owners_inner<'a>(
 
 #[hotpath::measure(label = "daemon.engine.context_scout.ensure_owner")]
 pub(super) fn ensure_context_scout_owner_before_advertising(
-    project: &crate::project::TraceDecay,
+    project: &tracedecay_project::project::TraceDecay,
 ) -> Result<()> {
     if project.store_layout().identity.project_id.is_none() {
         return Ok(());
     }
     let owner = match project.context_scout_owner_lookup() {
-        crate::project::ContextScoutOwnerLookupV1::Ready(owner) => owner,
-        crate::project::ContextScoutOwnerLookupV1::ReadOnly => {
+        tracedecay_project::project::ContextScoutOwnerLookupV1::Ready(owner) => owner,
+        tracedecay_project::project::ContextScoutOwnerLookupV1::ReadOnly => {
             return Err(TraceDecayError::Config {
                 message: "read-only project has no Context Scout owner".to_owned(),
             });
         }
-        crate::project::ContextScoutOwnerLookupV1::Unregistered => {
+        tracedecay_project::project::ContextScoutOwnerLookupV1::Unregistered => {
             return Err(TraceDecayError::Config {
                 message: "project Context Scout owner did not start".to_owned(),
             });
@@ -348,8 +350,8 @@ impl DaemonEngine {
     ///
     /// `catalog_is_provisional` marks a discovery answer served from the
     /// warming bootstrap route, before the project graph is open. That catalog
-    /// is not the published one — its `tracedecay_context` budget is the
-    /// conservative warming budget rather than the node-count budget — so it
+    /// is not the published one, its `tracedecay_context` budget is the
+    /// conservative warming budget rather than the node-count budget, so it
     /// must not mark the client current. Leaving such a client unmarked is
     /// exactly what arms its notification for the first request after warm-up
     /// completes; marking it would strand the provisional catalog for the rest
@@ -680,9 +682,10 @@ impl DaemonEngine {
             // warm-up runs. The open task remains tracked and continues in the
             // background after this bounded wait expires.
             let mut retry_init = handshake.allow_init;
-            let publication_deadline = tokio::time::Instant::now() + PROJECT_OPEN_REQUEST_DEADLINE;
             loop {
                 let claim = Box::pin(self.begin_project_open(handshake.clone(), None)).await?;
+                let publication_deadline =
+                    project_open_publication_deadline(tokio::time::Instant::now());
                 let result = match claim {
                     ProjectOpenTaskClaim::InFlight(state) => {
                         let recorded = state.clone();
@@ -692,7 +695,7 @@ impl DaemonEngine {
                                 // The claim proves an open for this exact route is
                                 // in flight, so each iteration only needs to see
                                 // its publication land on the already-bound route
-                                // alias — never a fresh identity resolution.
+                                // alias, never a fresh identity resolution.
                                 if let Some(server) = self
                                     .route_bound_project_server(handshake, requirement)
                                     .await?
@@ -830,9 +833,8 @@ impl DaemonEngine {
                     message: "project server requested without project_path".to_string(),
                 });
             };
-            let canonical_project_path = project_path
-                .canonicalize()
-                .unwrap_or_else(|_| project_path.clone());
+            let canonical_project_path =
+                tracedecay_runtime_core::path_safety::canonical_root_identity(project_path);
             Box::pin(
                 self.ensure_registered_project_route(&canonical_project_path, handshake.allow_init),
             )

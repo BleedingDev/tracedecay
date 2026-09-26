@@ -11,14 +11,14 @@ use std::{
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay_code_index_retention::code_index_generations::{
-    acquire_code_generation_store_lock, code_text_artifacts_root,
+    acquire_code_generation_store_lock, code_text_artifact_staging_root, code_text_artifacts_root,
 };
 use tracedecay_contracts::{
     CallableCodeOperationKind, CallableCodeQueryPort, CodeQueryScope, CodeRelationRequest,
-    CodeSymbolSearchRequest, ExactOccurrenceRequest, OmissionReason, OpaqueCursor, PageRequest,
-    PhraseSearchRequest, QualifiedNameRequest, ResolvedScope, ResultProjection, RetrievalOrder,
-    RetrievalPortContext, RetrievalPortOutcome, RetrievalRequestMeta, SourceMetadataRequest,
-    callable_code_operation,
+    CodeSymbolSearchRequest, CoverageCompleteness, ExactOccurrenceRequest, OmissionReason,
+    OpaqueCursor, PageRequest, PhraseSearchRequest, QualifiedNameRequest, ResolvedScope,
+    ResultProjection, RetrievalOrder, RetrievalPortContext, RetrievalPortOutcome,
+    RetrievalRequestMeta, SourceMetadataRequest, callable_code_operation,
     retrieval::{
         CodeFacetDimension, CodeFacetRequest, CodeHierarchyRequest, CodeImpactRequest,
         CodeImplementationsRequest, CodeNavigationRequest, CodeTimelineRequest,
@@ -27,39 +27,43 @@ use tracedecay_contracts::{
 };
 use tracedecay_domain::{
     AuthorizationRevision, CodeGenerationId, ComponentRevision, EphemeralSanitizedQueryViewV1,
-    ExactAdmissionRuleRevision, FreshnessVectorDigest, PrincipalId, PrivacyDomainId, ProjectId,
-    ProviderEvaluationStateV1, PublicRetrieverStatus, QueryNormalizationRevision,
-    RelationEdgeKindV1, RetrievalBudget, RetrievalRequest, RetrievalScope, RetrievalSnapshot,
-    RetrieverKind, RetrieverOutcome, SanitizerRevision, ScoreDomainId, SingleRootScopeV1,
-    TemporalModeV1, UtcMicros, VectorWatermark, encode_lowercase_hex, sha256_hex_suffix,
+    ExactAdmissionRuleRevision, FreshnessVectorDigest, ManifestDigest, PrincipalId,
+    PrivacyDomainId, ProjectId, ProviderEvaluationStateV1, PublicRetrieverStatus,
+    QueryNormalizationRevision, RelationEdgeKindV1, RetrievalBudget, RetrievalRequest,
+    RetrievalScope, RetrievalSnapshot, RetrieverKind, RetrieverOutcome, SanitizerRevision,
+    ScoreDomainId, SingleRootScopeV1, TemporalModeV1, UtcMicros, VectorWatermark,
+    encode_lowercase_hex, sha256_hex_suffix,
 };
 use tracedecay_query::retrieval::{
     RetrievalPortError,
     exact::{CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLaneRequest},
     lexical::{
         CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
-        CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1, CodeLexicalArtifactBuilderV1,
+        CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeLexicalArtifactBuilderV1,
         CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactReaderV1, LexicalLaneRequest,
         LexicalRouteKindV1, LexicalRoutingV1,
     },
 };
 use tracedecay_runtime_core::resident_memory::{
-    DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1, ResidentMemoryComponentIdV1,
-    ResidentMemoryPressureV1, sampled_process_resident_bytes_v1,
+    DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1, ResidentMemoryPressureV1,
+    sampled_process_resident_bytes_v1,
 };
 
+use tracedecay_session_temporal_store::SessionTemporalAccess;
+
 use super::{
-    ALPHA_LIB_V1, CALLER_PAGE, GitFixture, ReadyRetrievalControlV1, active_text_artifact_path,
-    application_context, build_progress_snapshot, caller_star_sources, callers_page_meta,
-    core_search_request, decode_hex, git, install_verified_graph_store,
-    install_verified_graph_store_on_text, mount_core_query_authority, mount_query_authority,
-    mounted_core_query_worktree, mounted_core_query_worktree_with_one_permit,
-    moved_reference_scope, progress_snapshot_for_generation, published, query_authority,
-    query_authority_with_candidate_cap, query_meta, quiesced_background_reconcile_admission,
-    ranked_symbol_names, ranks_symbol, rewrite_active_text_artifact_format_revision,
-    routed_core_search_request, scheduler, test_project_id, wait_for_live_complete_generation,
+    ALPHA_LIB_V1, CALLER_PAGE, CALLER_STAR, GitFixture, OwnerSignals, ReadyRetrievalControlV1,
+    active_text_artifact_path, application_context, build_progress_snapshot, callee_fanout_sources,
+    caller_star_sources, callers_page_meta, core_search_request, decode_hex, git,
+    install_verified_graph_store, install_verified_graph_store_on_text, mount_core_query_authority,
+    mount_query_authority, mounted_core_query_worktree,
+    mounted_core_query_worktree_with_one_permit, moved_reference_scope,
+    progress_snapshot_for_generation, published, query_authority, query_meta,
+    quiesced_background_reconcile_admission, ranked_symbol_names, ranks_symbol,
+    rewrite_active_text_artifact_format_revision, routed_core_search_request, scheduler,
+    settle_text_projection, test_project_id, wait_for_live_complete_generation,
     wait_for_queryable_text_generation, wait_for_queryable_text_generation_change,
+    wait_for_settled_owner,
 };
 use crate::{
     code_index::production::{
@@ -72,6 +76,12 @@ use crate::{
         CodeIndexReconcileAdmissionV1, CodeIndexSchedulerRegistryV1, SharedCodeIndexBytePoolV1,
     },
 };
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
+
+/// A content key for publications whose adoption the test does not exercise.
+fn test_content_key() -> ManifestDigest {
+    ManifestDigest::new(format!("sha256:{}", "c".repeat(64))).expect("content key")
+}
 
 #[test]
 fn text_artifact_source_batches_scale_with_build_memory() {
@@ -86,42 +96,6 @@ fn text_artifact_source_batches_scale_with_build_memory() {
             8 * CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1
         ),
         (512, 512 * 1024 * 1024, 1024)
-    );
-}
-
-#[test]
-fn clone_successor_batches_leave_scratch_and_metadata_headroom() {
-    const RESERVATION: usize = 128 * 1024 * 1024;
-    const PAGE: usize = 4 * 1024 * 1024;
-    const SCRATCH: usize = 4 * PAGE;
-    let (pages, bytes) = super::super::clone_successor_source_batch_limits_from_charges(0)
-        .expect("empty metadata fits the successor reservation");
-    assert_eq!(pages, 64);
-    assert_eq!(
-        bytes,
-        RESERVATION - CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1 - SCRATCH
-    );
-    assert_eq!(
-        CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1 + SCRATCH + bytes,
-        RESERVATION
-    );
-    assert!(
-        bytes < 64 * 1024 * 1024,
-        "a 64 MiB page batch would consume the entire remainder after the SQLite cache"
-    );
-
-    let metadata = 8 * 1024 * 1024;
-    let (_, with_metadata) =
-        super::super::clone_successor_source_batch_limits_from_charges(metadata)
-            .expect("modest metadata still leaves a page batch");
-    assert_eq!(with_metadata, bytes - metadata);
-
-    let too_large = RESERVATION
-        .saturating_sub(CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1)
-        .saturating_sub(SCRATCH);
-    assert!(
-        super::super::clone_successor_source_batch_limits_from_charges(too_large).is_err(),
-        "metadata that fills the remainder after cache and scratch must fail closed"
     );
 }
 
@@ -178,7 +152,7 @@ fn foreground_query_owner_read_stays_warming_until_background_projection_finishe
 /// The production text-serving journey with a durable store: build the `SQLite`
 /// lexical artifact in bounded page windows, publish it durably (pointer names
 /// the content-addressed artifact file), then reopen the durable head after a
-/// simulated restart in a single bounded pass — no rebuild — and serve exact
+/// simulated restart in a single bounded pass, no rebuild, and serve exact
 /// and lexical queries from it.
 #[test]
 fn production_text_serving_builds_publishes_and_reopens_the_artifact_head() {
@@ -400,6 +374,7 @@ fn production_text_serving_builds_publishes_and_reopens_the_artifact_head() {
     );
     let exact = owners
         .retrieve_exact(&ExactLaneRequest {
+            control: &ReadyRetrievalControlV1,
             literals: authority.parse_literals(&query_view, &base),
             generation: generation.clone(),
             budget: base.budget,
@@ -674,14 +649,16 @@ fn text_artifact_publication_serializes_pointer_attachment_with_retention() {
 
     impl CodeIndexExecutionControlV1 for PauseAfterExistingArtifactRead {
         fn is_cancelled(&self) -> bool {
-            // One short staging file and one short existing artifact each
-            // checkpoint before open and after their single bounded read. The
-            // fourth checkpoint is therefore after the destination's bytes
-            // were verified but before publication can attach its descriptor.
+            // Publication checkpoints once before the store lock and once
+            // while taking the project's shared segment lock; then one short
+            // staging file and one short existing artifact each checkpoint
+            // before open and after their single bounded read. The sixth
+            // checkpoint is therefore after the destination's bytes were
+            // verified but before publication can attach its descriptor.
             if self
                 .checkpoints
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-                == 3
+                == 5
             {
                 let mut state = self.state.lock().expect("publication pause state");
                 state.0 = true;
@@ -714,10 +691,24 @@ fn text_artifact_publication_serializes_pointer_attachment_with_retention() {
         .expect("sealed generation identity");
     let sealed_hex =
         sha256_hex_suffix(sealed_identity.digest.as_str()).expect("sealed SHA-256 digest");
-    let artifacts_root = store.path().join("code-text-artifacts-v1");
-    tracedecay_private_fs::create_private_directory(&artifacts_root)
-        .expect("create private artifacts root");
-    let staging = artifacts_root.join(format!(".text-artifact-{sealed_hex}.staging"));
+    // Staging stays with the scope that builds it; the completed artifact is
+    // the project's, beside its shared generation segments. A store root that
+    // is not a scope hash is a project of its own, so both live under it.
+    let ensure_private_root =
+        |path: &Path| match tracedecay_private_fs::create_private_directory(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            result => result.expect("create private root"),
+        };
+    let staging_root = code_text_artifact_staging_root(store.path());
+    assert_eq!(
+        staging_root,
+        store.path().join("code-text-artifact-staging-v1")
+    );
+    ensure_private_root(&staging_root);
+    let artifacts_root = code_text_artifacts_root(store.path());
+    assert_eq!(artifacts_root, store.path().join("code-text-artifacts-v1"));
+    ensure_private_root(&artifacts_root);
+    let staging = staging_root.join(format!(".text-artifact-{sealed_hex}.staging"));
     let artifact_bytes = b"already content-addressed artifact";
     let mut staging_file =
         tracedecay_private_fs::create_private_file(&staging).expect("create private staging file");
@@ -743,6 +734,7 @@ fn text_artifact_publication_serializes_pointer_attachment_with_retention() {
             &staging,
             &generation.manifest().generation_id,
             &sealed_identity,
+            &test_content_key(),
             publish_control.as_ref(),
         )
     });
@@ -796,67 +788,15 @@ fn text_artifact_publication_serializes_pointer_attachment_with_retention() {
     );
 }
 
-#[cfg(unix)]
+/// The artifact seals its clone index with its lexical rows, so the owners
+/// that serve search serve clone lookups at once: no work is left behind
+/// the first seal, and the clone status is ready (stale only when the source
+/// moved on).
 #[test]
-fn clone_successor_keeps_lexical_owners_ready_and_cas_replaces_v14() {
+fn clone_index_is_ready_when_the_artifact_first_seals() {
     let fixture = GitFixture::new(&[(
         "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
-    )]);
-    let store = TempDir::new().expect("store root");
-    let mut scheduler = scheduler(
-        &fixture,
-        store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    published(scheduler.reconcile_now().expect("publish generation"));
-    let latest = scheduler.latest_complete().expect("latest generation");
-
-    while !latest.query_owners_are_ready() {
-        latest.advance_text_serving(1).expect("advance V14 build");
-    }
-    assert!(
-        latest.text_projection_needs_work(),
-        "clone successor must continue after lexical owners are seated"
-    );
-    latest
-        .production_query_owners()
-        .expect("lexical owners serve during clone successor");
-    let v14_path = active_text_artifact_path(store.path());
-    let v14_revision: i64 = rusqlite::Connection::open(&v14_path)
-        .expect("open V14 artifact")
-        .query_row(
-            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read V14 revision");
-    assert_eq!(v14_revision, 14);
-
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(16)
-            .expect("advance clone successor");
-    }
-    assert!(latest.query_owners_are_ready());
-    let v16_path = active_text_artifact_path(store.path());
-    assert_ne!(v16_path, v14_path);
-    let v16_revision: i64 = rusqlite::Connection::open(v16_path)
-        .expect("open V16 artifact")
-        .query_row(
-            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read V16 revision");
-    assert_eq!(v16_revision, 16);
-}
-
-#[test]
-fn clone_status_distinguishes_unavailable_backfill_partial_ready_and_stale() {
-    let fixture = GitFixture::new(&[(
-        "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
+        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\npub fn beta() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
     )]);
     let store = TempDir::new().expect("store root");
     let mut scheduler = scheduler(
@@ -871,48 +811,158 @@ fn clone_status_distinguishes_unavailable_backfill_partial_ready_and_stale() {
         tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Unavailable { .. }
     ));
     while !latest.query_owners_are_ready() {
-        latest.advance_text_serving(1).expect("advance V14 build");
+        latest.advance_text_serving(1).expect("advance text build");
     }
-    assert!(matches!(
-        latest.clone_index_status(false, None),
-        tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Backfilling { .. }
-    ));
-    let successor = {
-        let mut slot = latest.text.text_projection_build.lock_slot();
-        std::mem::replace(&mut *slot, super::super::CodeTextProjectionSlotV1::Idle)
-    };
-
-    let tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Partial {
-        observation,
-        omission_reasons,
-    } = latest.clone_index_status(false, None)
-    else {
-        panic!("missing successor must report partial clone coverage");
-    };
-    assert_eq!(observation.coverage.source_bodies, None);
     assert!(
-        omission_reasons
-            .iter()
-            .any(|reason| reason.contains("clone rows are missing"))
+        !latest.text_projection_needs_work(),
+        "the first seal must leave no clone work behind"
     );
-    *latest.text.text_projection_build.lock_slot() = successor;
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(16)
-            .expect("finish clone successor");
-    }
-    assert!(matches!(
-        latest.clone_index_status(false, None),
-        tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready { .. }
-    ));
+    let status = latest.clone_index_status(false, None);
+    let tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready { observation } =
+        status
+    else {
+        panic!("clone data must be available when the artifact first seals, got {status:?}");
+    };
+    assert_eq!(
+        (
+            observation.coverage.source_bodies,
+            observation.coverage.eligible_source_bodies,
+            observation.coverage.near_fingerprint_bodies,
+        ),
+        (Some(2), Some(2), Some(2)),
+        "positional fingerprints cover both eligible bodies at the first seal"
+    );
+    assert!(observation.resources.peak_scratch_memory_bytes.is_some());
+    let revision: i64 = rusqlite::Connection::open(active_text_artifact_path(store.path()))
+        .expect("open sealed artifact")
+        .query_row(
+            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read sealed revision");
+    assert_eq!(revision, 28);
+    let staging = std::fs::read_dir(code_text_artifact_staging_root(store.path()))
+        .expect("artifacts root")
+        .map(|entry| entry.expect("artifact entry").file_name())
+        .filter(|name| name.to_string_lossy().ends_with(".staging"))
+        .collect::<Vec<_>>();
+    assert!(
+        staging.is_empty(),
+        "no second build follows the seal: {staging:?}"
+    );
     assert!(matches!(
         latest.clone_index_status(true, None),
         tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Stale { .. }
     ));
 }
 
+// Holding the text projection slot across the await is the scenario, not an
+// oversight: the read under test must answer without joining a slice that
+// owns the slot. The guard is released before shutdown.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
-async fn query_admission_serves_v14_while_clone_successor_is_pending() {
+async fn dashboard_freshness_does_not_join_a_text_projection_slice() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+        )
+        .await
+        .expect("mount worktree");
+    let latest = wait_for_queryable_text_generation(&registry, fixture.path()).await;
+    while !latest.query_owners_are_ready() {
+        latest.advance_text_serving(1).expect("advance text build");
+    }
+    // Clone readiness reports stale while the seating pass is still verifying
+    // source, so start from the settled owner this test is about.
+    wait_for_settled_owner(&registry, fixture.path()).await;
+
+    let held_slot = latest.text_projection_build.lock_slot();
+    let freshness = tokio::time::timeout(
+        Duration::from_millis(100),
+        registry.dashboard_freshness(fixture.path()),
+    )
+    .await
+    .expect("dashboard freshness must not wait for the text projection slice")
+    .expect("mounted dashboard freshness");
+    assert!(matches!(
+        freshness.clone_index,
+        Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready { .. })
+    ));
+
+    drop(held_slot);
+    registry.shutdown().await;
+}
+
+/// The clone census is a property of the sealed artifact: the seal computes
+/// it once and binds it into the receipt. Status therefore reports it on the
+/// first read after the owners install, and a restarted registry that
+/// reopens the retained artifact reports the same census without computing
+/// it again.
+#[tokio::test]
+async fn dashboard_freshness_reports_the_sealed_clone_census_across_a_restart() {
+    let fixture = GitFixture::new(&[(
+        "src/lib.rs",
+        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\npub fn beta() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
+    )]);
+    let store = TempDir::new().expect("store root");
+    let mut reported = Vec::new();
+    for incarnation in 0..2 {
+        let registry = CodeIndexSchedulerRegistryV1::new(1);
+        registry
+            .mount_worktree(
+                test_project_id(),
+                fixture.path(),
+                store.path().to_path_buf(),
+            )
+            .await
+            .expect("mount worktree");
+        let latest = wait_for_queryable_text_generation(&registry, fixture.path()).await;
+        while !latest.query_owners_are_ready() {
+            latest.advance_text_serving(1).expect("advance text owners");
+        }
+        // Clone readiness reports stale while the seating pass still verifies
+        // source; the census claim is about the settled owner's first read.
+        wait_for_settled_owner(&registry, fixture.path()).await;
+        let freshness = registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .expect("mounted dashboard freshness");
+        let Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready {
+            observation,
+        }) = freshness.clone_index.clone()
+        else {
+            panic!(
+                "incarnation {incarnation}: the sealed census must be ready on the first status read, got {freshness:?}"
+            );
+        };
+        reported.push((
+            observation.coverage.source_bodies,
+            observation.coverage.eligible_source_bodies,
+            observation.coverage.unique_payloads,
+            observation.coverage.near_fingerprint_bodies,
+        ));
+        registry.shutdown().await;
+    }
+    assert_eq!(
+        reported,
+        vec![
+            (Some(2), Some(2), Some(1), Some(2)),
+            (Some(2), Some(2), Some(1), Some(2)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_proven_seat_serves_admission_without_asking_the_worker() {
     let fixture = GitFixture::new(&[(
         "src/lib.rs",
         "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
@@ -926,23 +976,30 @@ async fn query_admission_serves_v14_while_clone_successor_is_pending() {
     published(scheduler.reconcile_now().expect("publish generation"));
     let latest = scheduler.latest_complete().expect("latest generation");
     while !latest.query_owners_are_ready() {
-        latest.advance_text_serving(1).expect("advance V14 build");
+        latest.advance_text_serving(1).expect("advance text build");
     }
-    assert!(
-        latest.text_projection_needs_work(),
-        "the query must enter admission while clone successor work remains"
-    );
 
     let registry_store = TempDir::new().expect("registry store root");
     let (registry, scope) =
         mounted_core_query_worktree_with_one_permit(&fixture, &registry_store).await;
+    // Settle the registry's own worker first so the pending-wake slot this
+    // test reads belongs to the query alone.
+    settle_text_projection(&registry, fixture.path()).await;
     let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
-    registry.clear_pending_wake_for_scope(&scope).await;
     {
         let mounted = registry.mounted.lock().await;
         let worktree = mounted
-            .get(&fixture.path().canonicalize().expect("canonical root"))
+            .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
             .expect("mounted worktree");
+        // Generation identity binds the capture instant (`captured_at` is in
+        // the intake digest), so the crafted owner and the registry's own
+        // capture of the same checkout never share an id. Seat the crafted
+        // owner too: a text owner that is not the seated generation is a state
+        // the daemon never produces.
+        *worktree
+            .serving_generation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(latest.clone());
         *worktree
             .text_generation
             .write()
@@ -961,501 +1018,54 @@ async fn query_admission_serves_v14_while_clone_successor_is_pending() {
         assert_eq!(
             serving_generation,
             latest.metadata().manifest().generation_id,
-            "the test must exercise pending backfill on the seated generation"
+            "the test must search the seated generation"
         );
     }
 
-    let executed = registry
-        .execute_query_search(&scope, core_search_request("alpha"))
-        .await
-        .expect("V14 exact and lexical owners remain admissible");
-    assert!(
-        ranks_symbol(&ranked_symbol_names(&executed, &latest), "alpha"),
-        "the query must return the V14 alpha symbol"
-    );
-    assert!(
-        registry
-            .pending_wake_micros_for_scope(&scope)
-            .await
-            .is_some_and(|pending| pending != 0),
-        "pending clone work must request a background reconcile"
-    );
-
-    drop(admission);
-    registry.shutdown().await;
-}
-
-#[tokio::test]
-async fn expired_source_proof_reschedules_pending_clone_backfill() {
-    let fixture = GitFixture::new(&[(
-        "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
-    )]);
-    let retained_store = TempDir::new().expect("retained store root");
-    let mut scheduler = scheduler(
-        &fixture,
-        retained_store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    published(scheduler.reconcile_now().expect("publish generation"));
-    let latest = scheduler.latest_complete().expect("latest generation");
-    while !latest.query_owners_are_ready() {
-        latest.advance_text_serving(1).expect("advance V14 build");
-    }
-    assert!(
-        latest.text_projection_needs_work(),
-        "the query must enter admission while clone successor work remains"
-    );
-
-    let registry_store = TempDir::new().expect("registry store root");
-    let (registry, scope) =
-        mounted_core_query_worktree_with_one_permit(&fixture, &registry_store).await;
-    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
-    registry.clear_pending_wake_for_scope(&scope).await;
-    {
-        let mounted = registry.mounted.lock().await;
-        let worktree = mounted
-            .get(&fixture.path().canonicalize().expect("canonical root"))
-            .expect("mounted worktree");
-        *worktree
-            .text_generation
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some(latest.text_generation_handle());
-    }
-
+    // Bind the seat's source proof, the state a settled mount reaches. The
+    // read below then has nothing left to verify.
     let source_freshness = registry
         .source_freshness_for_root(fixture.path())
         .await
         .expect("mounted source fence");
-    {
-        let mut state = source_freshness.state.lock().unwrap();
-        state.last_reconciled_at = Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("expire source proof");
-    }
-    assert!(matches!(
-        registry.request_query_background_reconcile(&scope).await,
-        CodeIndexReconcileAdmissionV1::Accepted
-    ));
-    drop(admission);
-    // No second query or external wake: refreshing the proof must hand the
-    // pending clone work to a successor pass by itself.
-    let settled = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if registry
-                .latest_text_serving_for_root(fixture.path())
-                .await
-                .is_some_and(|text| !text.text_projection_needs_work())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await;
-    assert!(
-        settled.is_ok(),
-        "the source refresh stranded clone backfill: pending_wake={:?} reconcile_in_progress={} source_age={:?} receipts={:?}",
+    let witness = source_freshness
+        .source_currency_witness_for(
+            &latest.metadata().manifest().generation_id,
+            &latest.metadata().snapshot().content_identity,
+        )
+        .expect("the seated owner's snapshot is the one the fence proved");
+    *registry
+        .serving_source_witness_for_root(fixture.path())
+        .await
+        .expect("mounted serving witness")
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(witness);
+    // Not cleared: the slot is the only place an outstanding worker tail is
+    // visible, and wiping it here would hide the very state this test reads.
+    assert_eq!(
         registry.pending_wake_micros_for_scope(&scope).await,
-        registry
-            .reconcile_in_progress_for_test(fixture.path())
-            .await,
-        source_freshness
-            .state
-            .lock()
-            .unwrap()
-            .last_reconciled_at
-            .elapsed(),
-        registry.event_to_ready_receipts(),
+        Some(0),
+        "the fixture must reach the search with nothing outstanding"
     );
+
+    let executed = registry
+        .execute_query_search(&scope, core_search_request("alpha"))
+        .await
+        .expect("the seated owners are admissible");
+    assert!(
+        ranks_symbol(&ranked_symbol_names(&executed, &latest), "alpha"),
+        "the query must return the alpha symbol"
+    );
+    assert_eq!(
+        registry.pending_wake_micros_for_scope(&scope).await,
+        Some(0),
+        "a search whose owners are ready under a current proof must ask the \
+         worker for nothing: the pending-wake slot is what the freshness \
+         ladder reports as `verifying`"
+    );
+
+    drop(admission);
     registry.shutdown().await;
-}
-
-#[test]
-fn transient_clone_successor_reservation_refusal_retries_without_cooling_v14_owners() {
-    let fixture = GitFixture::new(&[(
-        "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
-    )]);
-    let store = TempDir::new().expect("store root");
-    {
-        let mut scheduler = scheduler(
-            &fixture,
-            store.path().to_path_buf(),
-            Arc::new(SharedCodeIndexBytePoolV1::default()),
-        );
-        published(scheduler.reconcile_now().expect("publish generation"));
-        let latest = scheduler.latest_complete().expect("latest generation");
-        while !latest.query_owners_are_ready() {
-            latest.advance_text_serving(1).expect("publish V14 head");
-        }
-    }
-
-    let limit = NonZeroU64::new(4 * 1024 * 1024 * 1024).expect("resident-memory limit");
-    let pressure = Arc::new(ResidentMemoryPressureV1::new(limit));
-    let admission_headroom = limit.get().saturating_sub(pressure.high_watermark_bytes());
-    let held_bytes = limit
-        .get()
-        .saturating_sub(admission_headroom)
-        .saturating_sub(
-            u64::try_from(CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1)
-                .expect("reader budget fits u64"),
-        )
-        .saturating_sub(64 * 1024 * 1024);
-    let resident_memory = Arc::new(ProcessResidentMemoryV1::with_pressure(limit, pressure));
-    let held = resident_memory
-        .reserve_process_shared(
-            ResidentMemoryComponentIdV1::new("test.clone-successor-transient")
-                .expect("test component"),
-            NonZeroU64::new(held_bytes).expect("temporary reservation"),
-        )
-        .expect("hold transient competing memory");
-    let mut scheduler = scheduler(
-        &fixture,
-        store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    scheduler.bind_resident_memory(Arc::clone(&resident_memory));
-    let latest = scheduler.latest_complete().expect("restored generation");
-    assert_eq!(
-        latest.advance_text_serving(1),
-        Err(tracedecay_query::retrieval::RetrievalPortError::BudgetExceeded),
-        "the competing reservation must deny the first successor admission"
-    );
-    latest
-        .production_query_owners()
-        .expect("V14 owners remain queryable after successor refusal");
-    assert!(
-        latest.text_projection_needs_work(),
-        "the refused successor must remain pending for a later scheduler wake"
-    );
-
-    drop(held);
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(16)
-            .expect("retry clone successor after transient memory clears");
-    }
-    latest
-        .production_query_owners()
-        .expect("successor retry leaves query owners ready");
-    let revision: i64 = rusqlite::Connection::open(active_text_artifact_path(store.path()))
-        .expect("open successor artifact")
-        .query_row(
-            "SELECT format_revision FROM artifact_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read successor revision");
-    assert_eq!(revision, 16);
-}
-
-fn start_partial_clone_successor(
-    fixture: &GitFixture,
-    store: &TempDir,
-) -> (PathBuf, PathBuf, u64, u64) {
-    let mut scheduler = scheduler(
-        fixture,
-        store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    published(scheduler.reconcile_now().expect("publish generation"));
-    let latest = scheduler.latest_complete().expect("latest generation");
-    while !latest.query_owners_are_ready() {
-        latest.advance_text_serving(1).expect("advance V14 build");
-    }
-    let v14_path = active_text_artifact_path(store.path());
-    assert!(latest.text_projection_needs_work());
-    assert!(
-        !latest
-            .advance_text_serving(1)
-            .expect("append one clone-successor page"),
-        "one page must leave a resumable clone successor"
-    );
-    latest
-        .production_query_owners()
-        .expect("V14 owners remain readable");
-    let staging_path = std::fs::read_dir(store.path().join("code-text-artifacts-v1"))
-        .expect("read text artifact root")
-        .map(|entry| entry.expect("read text artifact entry").path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".staging"))
-        })
-        .expect("partial clone-successor staging");
-    let connection =
-        rusqlite::Connection::open(&staging_path).expect("open clone-successor staging");
-    let next_page: i64 = connection
-        .query_row(
-            "SELECT next_page_ordinal FROM clone_successor_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read clone-successor cursor");
-    let source_pages: i64 = connection
-        .query_row("SELECT COUNT(*) FROM source_pages", [], |row| row.get(0))
-        .expect("count clone-successor source pages");
-    assert!(next_page > 0 && next_page <= source_pages);
-    (
-        v14_path,
-        staging_path,
-        u64::try_from(next_page).expect("nonnegative clone-successor cursor"),
-        u64::try_from(source_pages).expect("nonnegative source page count"),
-    )
-}
-
-#[test]
-fn clone_successor_restart_revalidates_its_source_cursor_and_keeps_v14_readable() {
-    let fixture = GitFixture::new(&[(
-        "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
-    )]);
-    let store = TempDir::new().expect("store root");
-    let (v14_path, staging_path, next_page, source_pages) =
-        start_partial_clone_successor(&fixture, &store);
-
-    let scheduler = scheduler(
-        &fixture,
-        store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    let latest = scheduler.latest_complete().expect("restored generation");
-    let completed = latest
-        .advance_text_serving(1)
-        .expect("resume clone successor after restart");
-    latest
-        .production_query_owners()
-        .expect("V14 owners serve during resumed successor");
-    assert!(
-        !completed,
-        "the first resumed slice must authenticate persisted rows before publishing"
-    );
-    let resumed_page: i64 = rusqlite::Connection::open(&staging_path)
-        .expect("open resumed clone successor")
-        .query_row(
-            "SELECT next_page_ordinal FROM clone_successor_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .expect("read resumed clone-successor cursor");
-    assert_eq!(
-        u64::try_from(resumed_page).expect("nonnegative resumed cursor"),
-        next_page,
-        "source replay must not append past the unauthenticated durable cursor"
-    );
-    assert!(next_page <= source_pages);
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(16)
-            .expect("finish resumed clone successor");
-    }
-    assert_ne!(active_text_artifact_path(store.path()), v14_path);
-}
-
-#[test]
-fn corrupt_clone_successor_staging_is_rebuilt_without_cooling_v14_owners() {
-    let fixture = GitFixture::new(&[(
-        "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
-    )]);
-    let store = TempDir::new().expect("store root");
-    let (v14_path, staging_path, _, _) = start_partial_clone_successor(&fixture, &store);
-    rusqlite::Connection::open(&staging_path)
-        .expect("open clone-successor staging")
-        .execute(
-            "UPDATE clone_successor_state SET next_cursor = ?1 WHERE singleton = 1",
-            [vec![0xff_u8]],
-        )
-        .expect("corrupt clone-successor cursor");
-
-    let scheduler = scheduler(
-        &fixture,
-        store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    let latest = scheduler.latest_complete().expect("restored generation");
-    latest
-        .advance_text_serving(1)
-        .expect("discard corrupt clone successor and rebuild");
-    latest
-        .production_query_owners()
-        .expect("V14 owners serve while successor rebuilds");
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(16)
-            .expect("finish rebuilt clone successor");
-    }
-    assert_ne!(active_text_artifact_path(store.path()), v14_path);
-}
-
-#[test]
-fn tampered_resumed_clone_rows_are_rebuilt_from_the_sealed_source() {
-    let fixture = GitFixture::new(&[(
-        "src/lib.rs",
-        "pub fn alpha() { one(); two(); three(); four(); five(); six(); seven(); eight(); nine(); ten(); }\n",
-    )]);
-    let store = TempDir::new().expect("store root");
-    let (_, staging_path, _, _) = start_partial_clone_successor(&fixture, &store);
-    let connection =
-        rusqlite::Connection::open(&staging_path).expect("open clone-successor staging");
-    let (occurrence_id, original_occurrence): (String, Vec<u8>) = connection
-        .query_row(
-            "SELECT symbol_occurrence_id, occurrence FROM clone_occurrences ORDER BY symbol_occurrence_id LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .expect("read staged clone occurrence");
-    let original_posting: (i64, i64, String, String, String) = connection
-        .query_row(
-            "SELECT class, normalization_revision, digest, symbol_occurrence_id, payload_digest FROM clone_exact_postings ORDER BY class, normalization_revision, digest, symbol_occurrence_id LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-        )
-        .expect("read staged clone posting");
-    let original_fingerprint: (String, i64, i64, i64, String, i64, String, String) = connection
-        .query_row(
-            "SELECT language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest FROM clone_fingerprint_postings ORDER BY language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position LIMIT 1",
-            [],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
-            },
-        )
-        .expect("read staged clone fingerprint");
-    connection
-        .execute_batch(
-            "DROP TRIGGER immutable_clone_occurrences_update;
-             DROP TRIGGER immutable_clone_exact_postings_delete;
-             DROP TRIGGER builder_gate_clone_exact_postings_insert;
-             DROP TRIGGER immutable_clone_fingerprint_postings_delete;
-             DROP TRIGGER builder_gate_clone_fingerprint_postings_insert;",
-        )
-        .expect("remove staging mutation guards for tamper injection");
-    connection
-        .execute(
-            "UPDATE clone_occurrences SET occurrence = X'5B5D' WHERE symbol_occurrence_id = ?1",
-            [&occurrence_id],
-        )
-        .expect("alter one persisted occurrence");
-    connection
-        .execute(
-            "DELETE FROM clone_exact_postings WHERE class = ?1 AND normalization_revision = ?2 AND digest = ?3 AND symbol_occurrence_id = ?4",
-            rusqlite::params![
-                original_posting.0,
-                original_posting.1,
-                original_posting.2,
-                original_posting.3
-            ],
-        )
-        .expect("delete one persisted posting");
-    connection
-        .execute(
-            "INSERT INTO clone_exact_postings(class, normalization_revision, digest, symbol_occurrence_id, payload_digest) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                original_posting.0,
-                original_posting.1,
-                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
-                original_posting.3,
-                original_posting.4
-            ],
-        )
-        .expect("replace the posting while preserving counts and references");
-    connection
-        .execute(
-            "DELETE FROM clone_fingerprint_postings WHERE language = ?1 AND class = ?2 AND normalization_revision = ?3 AND fingerprint = ?4 AND symbol_occurrence_id = ?5 AND token_position = ?6",
-            rusqlite::params![
-                original_fingerprint.0,
-                original_fingerprint.1,
-                original_fingerprint.2,
-                original_fingerprint.3,
-                original_fingerprint.4,
-                original_fingerprint.5,
-            ],
-        )
-        .expect("delete one persisted fingerprint");
-    connection
-        .execute(
-            "INSERT INTO clone_fingerprint_postings(language, class, normalization_revision, fingerprint, symbol_occurrence_id, token_position, payload_digest, body_digest) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                original_fingerprint.0,
-                original_fingerprint.1,
-                original_fingerprint.2,
-                original_fingerprint.3,
-                original_fingerprint.4,
-                original_fingerprint.5 + 1,
-                original_fingerprint.6,
-                original_fingerprint.7,
-            ],
-        )
-        .expect("replace fingerprint at another position");
-    drop(connection);
-
-    let scheduler = scheduler(
-        &fixture,
-        store.path().to_path_buf(),
-        Arc::new(SharedCodeIndexBytePoolV1::default()),
-    );
-    let latest = scheduler.latest_complete().expect("restored generation");
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(16)
-            .expect("revalidate or rebuild resumed clone rows");
-    }
-    let published =
-        rusqlite::Connection::open(active_text_artifact_path(store.path())).expect("open V16 head");
-    let occurrence: Vec<u8> = published
-        .query_row(
-            "SELECT occurrence FROM clone_occurrences WHERE symbol_occurrence_id = ?1",
-            [&occurrence_id],
-            |row| row.get(0),
-        )
-        .expect("read rebuilt clone occurrence");
-    assert_eq!(occurrence, original_occurrence);
-    assert_eq!(
-        published
-            .query_row(
-                "SELECT COUNT(*) FROM clone_exact_postings WHERE class = ?1 AND normalization_revision = ?2 AND digest = ?3 AND symbol_occurrence_id = ?4 AND payload_digest = ?5",
-                rusqlite::params![
-                    original_posting.0,
-                    original_posting.1,
-                    original_posting.2,
-                    original_posting.3,
-                    original_posting.4
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("read rebuilt clone posting"),
-        1
-    );
-    assert_eq!(
-        published
-            .query_row(
-                "SELECT COUNT(*) FROM clone_fingerprint_postings WHERE language = ?1 AND class = ?2 AND normalization_revision = ?3 AND fingerprint = ?4 AND symbol_occurrence_id = ?5 AND token_position = ?6 AND payload_digest = ?7 AND body_digest = ?8",
-                rusqlite::params![
-                    original_fingerprint.0,
-                    original_fingerprint.1,
-                    original_fingerprint.2,
-                    original_fingerprint.3,
-                    original_fingerprint.4,
-                    original_fingerprint.5,
-                    original_fingerprint.6,
-                    original_fingerprint.7,
-                ],
-                |row| row.get::<_, i64>(0),
-            )
-            .expect("read rebuilt clone fingerprint"),
-        1
-    );
 }
 
 #[cfg(unix)]
@@ -1477,7 +1087,7 @@ fn text_artifact_builder_creates_an_owner_private_artifacts_root() {
         .advance_text_serving(1)
         .expect("start text-artifact build");
 
-    let mode = std::fs::symlink_metadata(store.path().join("code-text-artifacts-v1"))
+    let mode = std::fs::symlink_metadata(code_text_artifact_staging_root(store.path()))
         .expect("artifacts-root metadata")
         .permissions()
         .mode()
@@ -1529,6 +1139,7 @@ fn text_artifact_publish_rejects_a_permissive_artifacts_root() {
                 &staging,
                 &generation.manifest().generation_id,
                 &sealed_identity,
+                &test_content_key(),
                 &NeverCancelled,
             ),
             Err(tracedecay_query::retrieval::RetrievalPortError::Contract(_))
@@ -1575,6 +1186,7 @@ fn text_artifact_publish_refuses_a_busy_generation_store_and_retries() {
             &publish_staging,
             &publish_generation,
             &publish_identity,
+            &test_content_key(),
             &UninterruptibleCodeIndexControlV1,
         ))
         .expect("return publication outcome");
@@ -1593,6 +1205,7 @@ fn text_artifact_publish_refuses_a_busy_generation_store_and_retries() {
             &staging,
             &generation_id,
             &sealed_identity,
+            &test_content_key(),
             &UninterruptibleCodeIndexControlV1,
         )
         .expect("publication retries after the store owner releases");
@@ -1641,6 +1254,7 @@ fn text_artifact_publish_rejects_a_symlink_artifacts_root() {
                 &staging,
                 &generation.manifest().generation_id,
                 &sealed_identity,
+                &test_content_key(),
                 &NeverCancelled,
             ),
             Err(tracedecay_query::retrieval::RetrievalPortError::Contract(_))
@@ -1694,7 +1308,7 @@ fn missing_durable_text_artifact_is_withdrawn_and_rebuilt() {
 }
 
 #[test]
-fn cold_owner_warmup_seats_query_owners_before_clone_backfill() {
+fn cold_owner_warmup_seats_every_query_owner_in_one_build() {
     let fixture = GitFixture::new(&[
         ("src/lib.rs", "pub fn cold_activation() {}\n"),
         ("src/second.rs", "pub fn second_unit() -> usize { 2 }\n"),
@@ -1721,22 +1335,15 @@ fn cold_owner_warmup_seats_query_owners_before_clone_backfill() {
         "owner warmup must leave the text serving owners installed"
     );
     assert!(
-        latest.text_projection_needs_work(),
-        "lexical warmup must leave clone backfill as background work"
+        !latest.text_projection_needs_work(),
+        "owner warmup leaves no clone work behind"
     );
-    while latest.text_projection_needs_work() {
-        latest
-            .advance_text_serving(64)
-            .expect("finish clone successor");
-    }
 }
 
 /// `query_owners_are_ready` is the sole exact/lexical bit for the published
-/// seat gate and the full graph-replay skip — both directions.
+/// seat gate and the full graph-replay skip, both directions.
 ///
-/// Owners-ready with clone backfill still unfinished must admit seat/replay;
-/// lexical-incomplete (owners absent) must refuse both. Clone completeness is
-/// `text_projection_needs_work`, not a fork of this predicate.
+/// Owners-ready must admit seat/replay; owners absent must refuse both.
 #[test]
 fn query_owners_ready_admits_seat_and_replay_both_directions() {
     use super::super::registry::GraphSeatGateV1;
@@ -1774,23 +1381,12 @@ fn query_owners_ready_admits_seat_and_replay_both_directions() {
         .production_query_owners()
         .expect("cold owner warmup must install exact/lexical owners");
 
-    // Direction: owners-ready while clone backfill remains → seat admits, replay admits.
-    assert!(
-        latest.query_owners_are_ready(),
-        "exact/lexical owners ready"
-    );
-    assert!(
-        latest.text_projection_needs_work(),
-        "clone backfill must still be unfinished so the two predicates stay distinct"
-    );
+    // Direction: owners-ready → seat admits, replay admits.
+    assert!(latest.query_owners_are_ready(), "query owners ready");
     assert_eq!(
         GraphSeatGateV1::decide(true, false, true, true, latest.query_owners_are_ready()),
         GraphSeatGateV1::Prepare,
-        "published seat gate admits on owners-ready without waiting for clone backfill"
-    );
-    assert!(
-        latest.query_owners_are_ready(),
-        "full graph replay skip clears on the same owners-ready bit; clone backfill is not a wait"
+        "published seat gate admits on owners-ready"
     );
 }
 
@@ -1917,7 +1513,7 @@ fn published_text_artifact_with_stale_search_revision_is_rebuilt() {
         let root = store.path().join("code-text-artifacts-v1");
         tracedecay_private_fs::create_private_directory(&root).expect("private artifacts root");
         let staging = root.join(".previous-search.staging");
-        let mut builder = CodeLexicalArtifactBuilderV1::create(&staging, metadata)
+        let mut builder = CodeLexicalArtifactBuilderV1::create(&staging, metadata.clone())
             .expect("previous-revision artifact builder");
         let source_receipt = loop {
             match source.next_page(&control).expect("verified page") {
@@ -1942,13 +1538,20 @@ fn published_text_artifact_with_stale_search_revision_is_rebuilt() {
         CodeLexicalArtifactReaderV1::open_with_control(
             &staging,
             &verified,
+            &metadata,
             CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
             &control,
         )
         .expect("historical metadata remains readable");
         latest
             .text_artifact_store
-            .publish(&staging, &generation_id, &sealed_identity, &control)
+            .publish(
+                &staging,
+                &generation_id,
+                &sealed_identity,
+                &test_content_key(),
+                &control,
+            )
             .expect("publish previous-revision artifact");
         active_text_artifact_path(store.path())
     };
@@ -1987,7 +1590,7 @@ fn published_text_artifact_with_stale_search_revision_is_rebuilt() {
 /// normalizes the exhausted file position, so its live cursor sits one file
 /// rollover past the last durably accepted page exactly when that page filled
 /// on a file boundary. Holding the builder's durable progress against that
-/// normalized cursor — instead of against the completion receipt — reports a
+/// normalized cursor, instead of against the completion receipt, reports a
 /// deterministic contract violation, which parks the text projection as
 /// unconvergeable and leaves the complete serving seat permanently empty.
 #[test]
@@ -2069,7 +1672,7 @@ fn incompatible_partial_text_artifact_is_discarded_and_rebuilt() {
             "one page must leave resumable staging state"
         );
     }
-    let artifacts_root = store.path().join("code-text-artifacts-v1");
+    let artifacts_root = code_text_artifact_staging_root(store.path());
     let staging_path = std::fs::read_dir(&artifacts_root)
         .expect("read artifacts root")
         .map(|entry| entry.expect("artifact entry").path())
@@ -2143,7 +1746,7 @@ fn invalid_partial_text_artifact_cursor_is_discarded_and_rebuilt() {
             latest.metadata().snapshot().clone(),
         )
     };
-    let artifacts_root = store.path().join("code-text-artifacts-v1");
+    let artifacts_root = code_text_artifact_staging_root(store.path());
     let staging_path = std::fs::read_dir(&artifacts_root)
         .expect("read artifacts root")
         .map(|entry| entry.expect("artifact entry").path())
@@ -2158,7 +1761,7 @@ fn invalid_partial_text_artifact_cursor_is_discarded_and_rebuilt() {
             rusqlite::Connection::open(&staging_path).expect("open partial staging database");
         let cursor_bytes: Vec<u8> = connection
             .query_row(
-                "SELECT next_cursor FROM source_pages ORDER BY page_ordinal DESC LIMIT 1",
+                "SELECT next_cursor FROM source_page_cursors ORDER BY page_ordinal DESC LIMIT 1",
                 [],
                 |row| row.get(0),
             )
@@ -2217,13 +1820,13 @@ fn invalid_partial_text_artifact_cursor_is_discarded_and_rebuilt() {
         ));
         let cursor_bytes = serde_json::to_vec(&cursor).expect("encode invalid persisted cursor");
         connection
-            .execute_batch("DROP TRIGGER immutable_source_pages_update")
+            .execute_batch("DROP TRIGGER immutable_source_page_cursors_update")
             .expect("open immutable page fixture for corruption");
         assert_eq!(
             connection
                 .execute(
-                    "UPDATE source_pages SET next_cursor = ?1 WHERE page_ordinal = \
-                     (SELECT MAX(page_ordinal) FROM source_pages)",
+                    "UPDATE source_page_cursors SET next_cursor = ?1 WHERE page_ordinal = \
+                     (SELECT MAX(page_ordinal) FROM source_page_cursors)",
                     [cursor_bytes],
                 )
                 .expect("rewrite persisted cursor"),
@@ -2231,8 +1834,8 @@ fn invalid_partial_text_artifact_cursor_is_discarded_and_rebuilt() {
         );
         connection
             .execute_batch(
-                "CREATE TRIGGER immutable_source_pages_update BEFORE UPDATE ON source_pages \
-                 BEGIN SELECT RAISE(ABORT, 'immutable lexical source pages'); END",
+                "CREATE TRIGGER immutable_source_page_cursors_update BEFORE UPDATE ON source_page_cursors \
+                 BEGIN SELECT RAISE(ABORT, 'immutable lexical source page cursors'); END",
             )
             .expect("restore immutable page contract");
     }
@@ -2291,9 +1894,11 @@ fn reader_reservation_refusal_precedes_missing_artifact_access() {
         std::num::NonZeroU64::new(1024 * 1024).expect("tight memory limit"),
     )));
     let latest = scheduler.latest_complete().expect("restored generation");
-    assert_eq!(
-        latest.advance_text_serving(1),
-        Err(tracedecay_query::retrieval::RetrievalPortError::BudgetExceeded),
+    assert!(
+        matches!(
+            latest.advance_text_serving(1),
+            Err(tracedecay_query::retrieval::RetrievalPortError::ResidentMemoryRefused(_))
+        ),
         "the reservation gate must win before the missing path is inspected"
     );
     assert!(
@@ -2347,6 +1952,48 @@ fn overlapping_text_builds_share_one_admission_watermark_headroom() {
     }
 }
 
+#[test]
+fn text_build_budget_shrinks_to_available_headroom_without_dropping_below_its_floor() {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    let limit = 26 * GIB;
+    let preferred = limit / 8;
+    let minimum = 1536 * MIB;
+    let watermark_headroom = limit - (limit * 900 / 1000);
+    let observed = 21 * GIB;
+    let available = limit - observed - watermark_headroom;
+
+    assert_eq!(
+        super::super::text_artifact_admitted_build_budget(
+            preferred,
+            minimum,
+            limit,
+            0,
+            observed,
+            watermark_headroom,
+        ),
+        Ok(available),
+        "a replacement build must use the supported smaller budget instead of deadlocking behind the stale graph"
+    );
+    assert_eq!(
+        super::super::text_artifact_admitted_build_budget(
+            preferred,
+            minimum,
+            limit,
+            0,
+            22 * GIB,
+            watermark_headroom,
+        ),
+        Err(
+            tracedecay_query::retrieval::RetrievalPortError::ResidentMemoryRefused(format!(
+                "text-artifact build needs at least {minimum} bytes; {} bytes are available below the resident-memory watermark",
+                limit - 22 * GIB - watermark_headroom
+            ))
+        ),
+        "less than the builder's supported floor must remain a typed capacity refusal"
+    );
+}
+
 /// The artifact build and reader ceilings must reserve through the process
 /// resident-memory authority: an authority too small for the advertised
 /// build ceiling refuses the build as a typed unavailability, and a serving
@@ -2373,9 +2020,9 @@ fn text_artifact_ceilings_reserve_through_process_resident_memory() {
         assert!(
             matches!(
                 denied,
-                Err(tracedecay_query::retrieval::RetrievalPortError::BudgetExceeded)
+                Err(tracedecay_query::retrieval::RetrievalPortError::ResidentMemoryRefused(_))
             ),
-            "an unreservable build ceiling must refuse as a typed budget state: {denied:?}"
+            "an unreservable build ceiling must refuse as a typed memory refusal: {denied:?}"
         );
         assert_eq!(
             tight.snapshot().used_bytes,
@@ -2404,10 +2051,12 @@ fn text_artifact_ceilings_reserve_through_process_resident_memory() {
         let latest = scheduler
             .latest_complete()
             .expect("measured latest generation");
-        assert_eq!(
-            latest.advance_text_serving(1),
-            Err(tracedecay_query::retrieval::RetrievalPortError::BudgetExceeded),
-            "fresh RSS plus the requested build ceiling exceeds the process authority"
+        assert!(
+            matches!(
+                latest.advance_text_serving(1),
+                Err(tracedecay_query::retrieval::RetrievalPortError::ResidentMemoryRefused(_))
+            ),
+            "fresh RSS plus the minimum build ceiling exceeds the process authority"
         );
         assert_eq!(
             measured.snapshot().used_bytes,
@@ -2438,11 +2087,15 @@ fn text_artifact_ceilings_reserve_through_process_resident_memory() {
             .expect("advance artifact build under an adequate authority")
         {}
         let snapshot = adequate.snapshot();
+        let reader_budget = u64::try_from(CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1)
+            .expect("reader budget fits u64");
         assert!(
             snapshot.charges.iter().any(|charge| {
-                charge.key.component.as_str() == "code-text-artifact-reader" && charge.bytes > 0
+                charge.key.component.as_str() == "code-text-artifact-reader"
+                    && charge.bytes == reader_budget
             }),
-            "serving artifact owners must hold the measured reader charge: {snapshot:?}"
+            "serving artifact owners hold exactly the reader budget, not the larger publication \
+             charge they take over: {snapshot:?}"
         );
         assert!(
             !snapshot
@@ -2707,7 +2360,11 @@ fn text_artifact_subdivision_yields_without_advancing_and_stops_at_one_chunk() {
                     Err(tracedecay_query::retrieval::RetrievalPortError::Cancelled)
                 );
             }
-            Err(tracedecay_query::retrieval::RetrievalPortError::BudgetExceeded) => break,
+            Err(tracedecay_query::retrieval::RetrievalPortError::Contract(detail))
+                if detail.contains("page batch exceeds") =>
+            {
+                break;
+            }
             other => panic!("unexpected projection outcome: {other:?}"),
         }
         let slot = latest.text_projection_build.lock_slot();
@@ -2740,8 +2397,13 @@ fn source_window_and_builder_share_one_memory_reservation() {
     );
     assert_eq!(
         super::super::text_artifact_builder_budget(ceiling, ceiling),
-        Err(tracedecay_query::retrieval::RetrievalPortError::BudgetExceeded),
-        "a source consuming the reservation must refuse before builder path access"
+        Err(tracedecay_query::retrieval::RetrievalPortError::Contract(
+            format!(
+                "text-artifact source window needs {ceiling} bytes, exhausting its \
+                 {ceiling}-byte build reservation"
+            )
+        )),
+        "a source consuming the reservation must refuse with the reproducible sizing evidence"
     );
 }
 
@@ -3718,9 +3380,9 @@ async fn query_authority_lookup_preserves_real_mount_identity_isolation() {
 /// The defect this covers: during any generation rebuild search used to
 /// collapse into `GenerationUnavailable` for the whole window while
 /// callers/grep/context kept serving. Holding the scheduler mutex reproduces
-/// exactly that window — the background worker owns the scheduler — while the
+/// exactly that window, the background worker owns the scheduler, while the
 /// last complete generation stays in `serving_generation`. A seat whose
-/// currency witness still re-proves against the unchanged checkout serves as
+/// currency witness still re-proves against the unchanged checkout is
 /// current; once the checkout drifts under the held mutex the witness
 /// disproves and the fallback serves the same complete generation reported
 /// stale.
@@ -3728,7 +3390,7 @@ async fn query_authority_lookup_preserves_real_mount_identity_isolation() {
 /// The ready gate itself no longer abstains for this window. Decoupling
 /// freshness from publication work moved readiness onto the per-worktree
 /// source-freshness state, so the gate reads it without the scheduler and an
-/// unchanged checkout stays ready while a rebuild owns the mutex — which is
+/// unchanged checkout stays ready while a rebuild owns the mutex, which is
 /// the point of the decoupling, and what the witnessed assertion below
 /// already required of the query path.
 // Holding the scheduler guard across the awaits is the scenario, not an
@@ -3757,7 +3419,7 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -3789,7 +3451,7 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
         .expect("search keeps serving through the rebuild instead of failing");
     assert!(
         !witnessed.served_stale,
-        "a seat re-proven current against the unchanged checkout serves as current"
+        "a seat re-proven current against the unchanged checkout is current"
     );
 
     // Drift the checkout while the rebuild still owns the scheduler: the
@@ -3853,7 +3515,7 @@ async fn search_serves_the_last_complete_generation_while_the_scheduler_rebuilds
 /// graph enrichment must neither block nor mark that text owner stale.
 ///
 /// This occupies the decode barrier exactly as activation of a new generation
-/// does — pinned slot empty, one decode in flight — and deliberately leaves the
+/// does, pinned slot empty, one decode in flight, and deliberately leaves the
 /// scheduler mutex FREE, so the ready gate is admitted and would park inside it.
 #[tokio::test]
 async fn search_never_awaits_an_in_flight_decode_while_a_generation_is_servable() {
@@ -3875,7 +3537,7 @@ async fn search_never_awaits_an_in_flight_decode_while_a_generation_is_servable(
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -3931,8 +3593,8 @@ async fn search_never_awaits_an_in_flight_decode_while_a_generation_is_servable(
 
 /// The cold-restore window: a sealed active generation is on disk and the
 /// freshness fences pass, but the serving slot is empty because activation has
-/// not seated anything yet. The typed refusal is already determined — the
-/// activation gate can only ever admit the seated slot — so search resolution
+/// not seated anything yet. The typed refusal is already determined, the
+/// activation gate can only ever admit the seated slot, so search resolution
 /// must deliver that verdict without joining (or starting) the single-flight
 /// O(store) decode. Before the reorder, a cold `search` against a rebuilding
 /// generation parked on that decode for 76 s before returning the refusal the
@@ -3957,7 +3619,7 @@ async fn search_refusal_with_nothing_servable_never_joins_the_decode() {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -4017,7 +3679,7 @@ async fn root_graph_ready_does_not_depend_on_the_publication_decode_cache() {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -4026,6 +3688,30 @@ async fn root_graph_ready_does_not_depend_on_the_publication_decode_cache() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .hold_active_decode();
+
+    // `waiter_count` counts every task parked on this store's active decode,
+    // not this call's. The owner's settle pass decodes the active generation
+    // inside graph prepare and drops its reconcile-pass guard before it gets
+    // there, so no admission or quiescence helper can fence it out of the
+    // hold, and against a bare `== 0` its park reads as a readiness park.
+    //
+    // Park the owner first and take its count as the floor instead. A park
+    // cannot end while the hold is up and the owner is blocked in the step it
+    // parked in, so every later rise is a readiness call joining the flight.
+    registry.request_complete_generation(fixture.path()).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let parked_owner = loop {
+        let parked = held_decode.waiter_count();
+        if parked > 0 {
+            break parked;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "the owner's settle pass never reached the held decode, so its park \
+             cannot be sequenced ahead of the readiness calls"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
 
     let ready = tokio::time::timeout(
         Duration::from_secs(30),
@@ -4041,7 +3727,7 @@ async fn root_graph_ready_does_not_depend_on_the_publication_decode_cache() {
     );
     assert_eq!(
         held_decode.waiter_count(),
-        0,
+        parked_owner,
         "root graph readiness must not join the publication decode flight"
     );
 
@@ -4059,7 +3745,7 @@ async fn root_graph_ready_does_not_depend_on_the_publication_decode_cache() {
     );
     assert_eq!(
         held_decode.waiter_count(),
-        0,
+        parked_owner,
         "scope query readiness must not join the publication decode flight"
     );
 
@@ -4149,9 +3835,9 @@ async fn search_fails_fast_when_no_complete_generation_exists() {
     registry.shutdown().await;
 }
 
-/// The live outage this covers: a scope's branch label moves — a restored
+/// The live outage this covers: a scope's branch label moves, a restored
 /// generation was sealed before a `git switch`, or a retained route scope
-/// pinned the label that was live at project open — while the worktree the
+/// pinned the label that was live at project open, while the worktree the
 /// daemon is serving stays byte-identical. The label is not checkout
 /// identity: the ready ladder has already verified the generation against
 /// the live worktree, so the exact worktree's own graph must keep serving as
@@ -4226,9 +3912,10 @@ async fn moved_reference_label_still_serves_the_exact_worktree_as_current() {
         .expect("the callable-code ladder also serves through a moved reference");
     assert_eq!(ladder.generation.manifest().generation_id, fresh_generation);
 
-    // The root-scope ready gate behind graph reads and the runtime census —
-    // the arms with no stale fallback — must not be orphaned either. Seating
+    // The root-scope ready gate behind graph reads and the runtime census,
+    // the arms with no stale fallback, must not be orphaned either. Seating
     // races the publication event, so the gate is polled bounded.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let decoded = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(decoded) = registry
@@ -4237,7 +3924,7 @@ async fn moved_reference_label_still_serves_the_exact_worktree_as_current() {
             {
                 break decoded;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -4252,7 +3939,7 @@ async fn moved_reference_label_still_serves_the_exact_worktree_as_current() {
 
 /// The second half of the outage: search resolves its generation without ever
 /// running the freshness ladder, so when both arms came up empty nothing
-/// requested the reconcile that would remedy it — the typed failure repeated
+/// requested the reconcile that would remedy it, the typed failure repeated
 /// forever. Search must now ask for its own remedy, exactly once per due
 /// window, and must still never reconcile inline or park.
 // Holding the scheduler guard across the awaits is the scenario: it is how this
@@ -4277,7 +3964,7 @@ async fn search_requests_one_background_reconcile_when_nothing_is_servable() {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -4630,8 +4317,11 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
         .symbols
         .iter()
         .find(|record| {
+            // Trait-impl methods are owned by `<Type as Trait>`, so a
+            // `contains("Processor")` probe also matches every impl of the
+            // trait. Only the declaration itself is owned by the trait.
             record.simple_name == "process"
-                && record.qualified_name.contains("Processor")
+                && record.qualified_name.ends_with("::Processor::process")
                 && record.kind == "method"
         })
         .expect("trait method symbol")
@@ -4807,56 +4497,6 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
             })
     );
     assert!(second_continuation.next_cursor.is_none());
-
-    registry
-        .mount_query_authority(
-            fixture.path(),
-            graph_context.scope(),
-            query_authority_with_candidate_cap(
-                latest.generation.manifest().privacy_domain.clone(),
-                2,
-            ),
-        )
-        .await
-        .expect("mount candidate-capped query authority");
-    let capped_dispatch_request = CodeRelationRequest {
-        node_id: continuation_request.node_id.clone(),
-        maximum_depth: 1,
-        resolve_trait_dispatch: true,
-        scope: scope.clone(),
-        meta: query_meta(),
-    };
-    let capped_dispatch = registry
-        .callees(
-            RetrievalPortContext {
-                request: &graph_context,
-                operation: &graph_operation,
-            },
-            &capped_dispatch_request,
-        )
-        .await;
-    let RetrievalPortOutcome::Partial(capped_dispatch) = capped_dispatch else {
-        panic!("candidate-capped trait dispatch must report partial coverage");
-    };
-    let capped_page = capped_dispatch
-        .payload
-        .expect("candidate-capped trait dispatch page");
-    assert_eq!(capped_page.items.len(), 1);
-    assert_eq!(capped_page.items[0].symbol.node_id, trait_method);
-    assert!(!capped_page.items[0].dispatch_via_trait);
-    assert!(
-        capped_dispatch
-            .omissions
-            .iter()
-            .any(|omission| omission.reason == OmissionReason::Budget)
-    );
-    mount_query_authority(
-        &registry,
-        fixture.path(),
-        &graph_context,
-        latest.generation.manifest().privacy_domain.clone(),
-    )
-    .await;
 
     let qualified_name = latest
         .generation
@@ -5056,7 +4696,7 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
     let warming_text = {
         let mounted = registry.mounted.lock().await;
         mounted
-            .get(&fixture.path().canonicalize().expect("canonical root"))
+            .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
             .expect("mounted worktree")
             .historical_generation_owner
             .published_text_generation(&generation)
@@ -5079,7 +4719,7 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
     let scheduler = {
         let mounted = registry.mounted.lock().await;
         let worktree = mounted
-            .get(&fixture.path().canonicalize().expect("canonical root"))
+            .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
             .expect("mounted worktree");
         *worktree
             .serving_generation
@@ -5115,8 +4755,7 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
         )
         .await
         .expect("cursor key runtime");
-    let cursor_keys = cursor_runtime
-        .profile_database()
+    let cursor_keys = SessionTemporalAccess::new(cursor_runtime.profile_database())
         .load_session_cursor_key_provider_result()
         .await
         .expect("cursor keys");
@@ -5269,8 +4908,11 @@ async fn callable_application_operations_consume_exact_lexical_and_graph_owners(
     registry.shutdown().await;
 }
 
+/// A relation page reports the true relation count, not the fusion lane's
+/// 32-candidate budget, and its cursor walks the whole set while each page
+/// hydrates only its own slice.
 #[tokio::test]
-async fn callers_page_reports_candidate_cap_and_hydrates_only_the_requested_slice() {
+async fn callers_page_reports_the_true_relation_count_and_hydrates_only_the_requested_slice() {
     let sources = caller_star_sources();
     let files = sources
         .iter()
@@ -5330,22 +4972,24 @@ async fn callers_page_reports_candidate_cap_and_hydrates_only_the_requested_slic
             &request,
         )
         .await;
-    let first_page = match first {
-        RetrievalPortOutcome::Partial(evidence) => {
-            assert_eq!(evidence.coverage.eligible, Some(33));
-            assert_eq!(evidence.omissions.len(), 1);
-            assert_eq!(evidence.omissions[0].reason, OmissionReason::Budget);
-            evidence.payload.expect("first callers page")
+    let (first_page, first_cost) = match first {
+        RetrievalPortOutcome::Completed(evidence) => {
+            assert_eq!(
+                evidence.coverage.completeness,
+                CoverageCompleteness::Complete
+            );
+            assert_eq!(evidence.coverage.eligible, Some(CALLER_STAR as u64));
+            assert!(evidence.omissions.is_empty(), "{:?}", evidence.omissions);
+            (evidence.payload.expect("first callers page"), evidence.cost)
         }
-        other => panic!("expected capped callers page, got {other:?}"),
+        other => panic!("expected a complete callers page, got {other:?}"),
     };
     assert_eq!(first_page.items.len(), CALLER_PAGE as usize);
-    assert_eq!(first_page.total, Some(32));
-    let page1_hydrations = registry.take_relation_symbol_hydrations();
+    assert_eq!(first_page.total, Some(CALLER_STAR as u64));
     assert_eq!(
-        page1_hydrations,
-        u64::from(CALLER_PAGE),
-        "page 1 must hydrate only the returned slice; observed {page1_hydrations}"
+        first_cost.map(|cost| cost.total_point_reads()),
+        Some(1 + u64::from(CALLER_PAGE)),
+        "page 1 reads the seed and its returned slice only"
     );
 
     let cursor = first_page.next_cursor.clone().expect("page 2 cursor");
@@ -5365,10 +5009,14 @@ async fn callers_page_reports_candidate_cap_and_hydrates_only_the_requested_slic
             &second_request,
         )
         .await;
-    let second_page = match second {
-        RetrievalPortOutcome::Partial(evidence) => evidence.payload.expect("second callers page"),
-        other => panic!("expected capped callers continuation, got {other:?}"),
+    let (second_page, second_cost) = match second {
+        RetrievalPortOutcome::Completed(evidence) => (
+            evidence.payload.expect("second callers page"),
+            evidence.cost,
+        ),
+        other => panic!("expected a complete callers continuation, got {other:?}"),
     };
+    assert_eq!(second_page.total, Some(CALLER_STAR as u64));
     assert_eq!(second_page.items.len(), CALLER_PAGE as usize);
     assert!(
         second_page
@@ -5377,23 +5025,22 @@ async fn callers_page_reports_candidate_cap_and_hydrates_only_the_requested_slic
             .all(|item| !first_page.items.contains(item)),
         "page 2 must return a disjoint slice"
     );
-    let page2_hydrations = registry.take_relation_symbol_hydrations();
     assert_eq!(
-        page2_hydrations,
-        u64::from(CALLER_PAGE),
-        "page 2 must hydrate only the returned slice; observed {page2_hydrations}"
+        second_cost.map(|cost| cost.total_point_reads()),
+        Some(1 + u64::from(CALLER_PAGE)),
+        "page 2 reads the seed and its returned slice only"
     );
 
-    let mut collected = first_page.items.clone();
-    collected.extend(second_page.items);
-    let mut cursor = second_page.next_cursor;
-    while let Some(next) = cursor {
+    const WALK_PAGE: u32 = 200;
+    let mut collected = Vec::new();
+    let mut cursor = None;
+    loop {
         let page_request = CodeRelationRequest {
             node_id: hub.occurrence.as_str().to_owned(),
             maximum_depth: 1,
             resolve_trait_dispatch: false,
             scope: scope.clone(),
-            meta: callers_page_meta(CALLER_PAGE, Some(next)),
+            meta: callers_page_meta(WALK_PAGE, cursor.take()),
         };
         let page = match registry
             .callers(
@@ -5405,23 +5052,145 @@ async fn callers_page_reports_candidate_cap_and_hydrates_only_the_requested_slic
             )
             .await
         {
-            RetrievalPortOutcome::Partial(evidence) => evidence.payload.expect("callers page"),
-            other => panic!("expected capped callers page, got {other:?}"),
+            RetrievalPortOutcome::Completed(evidence) => evidence.payload.expect("callers page"),
+            other => panic!("expected a complete callers page, got {other:?}"),
         };
+        assert_eq!(page.total, Some(CALLER_STAR as u64));
+        assert_eq!(page.items.len(), WALK_PAGE as usize);
         collected.extend(page.items);
         cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
     }
-    let _ = registry.take_relation_symbol_hydrations();
     assert_eq!(
         collected.len(),
-        32,
-        "the declared candidate cap is enforced"
+        CALLER_STAR,
+        "the cursor walks every relation, not a lane budget's prefix"
     );
     let identities = collected
         .iter()
         .map(|record| record.symbol.node_id.as_str())
         .collect::<BTreeSet<_>>();
-    assert_eq!(identities.len(), collected.len(), "capped rows stay unique");
+    assert_eq!(
+        identities.len(),
+        collected.len(),
+        "each relation is served once"
+    );
+    registry.shutdown().await;
+}
+
+/// `code_callees` shares the compact-key page with `code_callers`: 104 callees
+/// answer as a ten-row first page with `total: 104`, a minted cursor, and
+/// complete coverage, and the cursors walk all 104 exactly once. The fusion
+/// lane's 32-candidate budget used to answer this as `total: 32` without a
+/// continuation.
+#[tokio::test]
+async fn callees_page_reports_the_true_relation_count_and_walks_every_relation() {
+    const RELATIONS: usize = 104;
+    let sources = callee_fanout_sources(RELATIONS);
+    let files = sources
+        .iter()
+        .map(|(path, source)| (path.as_str(), source.as_str()))
+        .collect::<Vec<_>>();
+    let fixture = GitFixture::new(&files);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+        )
+        .await
+        .expect("mount daemon-owned scheduler");
+    let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    install_verified_graph_store(&latest);
+    let generation = latest.generation.manifest().generation_id.clone();
+    let repository = latest.generation.snapshot().repository.clone();
+    let worktree = latest
+        .generation
+        .snapshot()
+        .worktree
+        .clone()
+        .expect("worktree identity");
+    let scope = CodeQueryScope::new(generation.clone(), None).expect("query scope");
+    let fanout = latest
+        .generation
+        .symbols()
+        .symbols
+        .iter()
+        .find(|record| record.qualified_name.ends_with("fanout"))
+        .expect("fanout symbol");
+    let operation = callable_code_operation(CallableCodeOperationKind::Callees).expect("operation");
+    let context = application_context(&operation, repository, worktree);
+    mount_query_authority(
+        &registry,
+        fixture.path(),
+        &context,
+        latest.generation.manifest().privacy_domain.clone(),
+    )
+    .await;
+    let page_request = |cursor: Option<OpaqueCursor>| CodeRelationRequest {
+        node_id: fanout.occurrence.as_str().to_owned(),
+        maximum_depth: 1,
+        resolve_trait_dispatch: false,
+        scope: scope.clone(),
+        meta: callers_page_meta(CALLER_PAGE, cursor),
+    };
+    let mut cursor = None;
+    let mut walked = Vec::new();
+    let mut pages = 0;
+    loop {
+        let outcome = registry
+            .callees(
+                RetrievalPortContext {
+                    request: &context,
+                    operation: &operation,
+                },
+                &page_request(cursor.take()),
+            )
+            .await;
+        let RetrievalPortOutcome::Completed(evidence) = outcome else {
+            panic!("expected a complete callees page, got {outcome:?}");
+        };
+        assert_eq!(
+            evidence.coverage.completeness,
+            CoverageCompleteness::Complete
+        );
+        assert_eq!(evidence.coverage.eligible, Some(RELATIONS as u64));
+        assert!(evidence.omissions.is_empty(), "{:?}", evidence.omissions);
+        let cost = evidence.cost;
+        let page = evidence.payload.expect("callees page");
+        assert_eq!(page.total, Some(RELATIONS as u64));
+        pages += 1;
+        if pages == 1 {
+            assert_eq!(page.items.len(), CALLER_PAGE as usize);
+            assert!(page.next_cursor.is_some(), "page 1 must mint a cursor");
+        }
+        assert_eq!(
+            cost.map(|cost| cost.total_point_reads()),
+            Some(1 + page.items.len() as u64),
+            "each page reads the seed and its own rows"
+        );
+        walked.extend(page.items);
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(pages, RELATIONS.div_ceil(CALLER_PAGE as usize));
+    assert_eq!(walked.len(), RELATIONS);
+    let identities = walked
+        .iter()
+        .map(|record| record.symbol.node_id.as_str())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(identities.len(), RELATIONS, "each callee is served once");
+    assert!(
+        walked
+            .iter()
+            .all(|record| record.edge_kind == "calls" && !record.dispatch_via_trait)
+    );
     registry.shutdown().await;
 }
 
@@ -5501,11 +5270,11 @@ async fn graph_cursor_holds_its_generation_until_the_cursor_expires() {
         )
         .await;
     let (page, expires_at) = match first {
-        RetrievalPortOutcome::Partial(evidence) => {
+        RetrievalPortOutcome::Completed(evidence) => {
             let expires_at = evidence.page.expires_at.expect("minted cursor expiry");
             (evidence.payload.expect("first callers page"), expires_at)
         }
-        other => panic!("expected capped callers page, got {other:?}"),
+        other => panic!("expected a complete callers page, got {other:?}"),
     };
     assert!(page.next_cursor.is_some(), "page 1 must mint a cursor");
     assert_eq!(
@@ -5536,8 +5305,9 @@ async fn graph_cursor_holds_its_generation_until_the_cursor_expires() {
 async fn unpinned_query_resolves_exact_admitted_worktree_scope() {
     let left = GitFixture::new(&[("src/lib.rs", "pub fn left_only() {}\n")]);
     let right = GitFixture::new(&[("src/lib.rs", "pub fn right_only() {}\n")]);
-    let (first, target, target_literal) = if left.path().canonicalize().expect("left root")
-        < right.path().canonicalize().expect("right root")
+    let (first, target, target_literal) = if canonical_existing_identity(left.path())
+        .expect("left root")
+        < canonical_existing_identity(right.path()).expect("right root")
     {
         (&left, &right, "right_only")
     } else {
@@ -5946,7 +5716,7 @@ async fn unpinned_query_serves_freshness_resolved_latest_generation() {
 
     // The unpinned query's ladder checks inline and hands the rebuild to the
     // background worker. Join the text-owner receipt that exact resolution
-    // actually serves — not the later graph-bearing serving swap.
+    // actually serves, not the later graph-bearing serving swap.
     let _ = registry.latest_text_fresh_for_scope(&resolved).await;
     let next = wait_for_queryable_text_generation_change(&registry, fixture.path(), &initial).await;
     let expected = next.metadata().manifest().generation_id.clone();
@@ -6115,7 +5885,10 @@ async fn generation_read_callers_install_exact_affected_test_attribution() {
             ProviderEvaluationStateV1::Partial,
             "the real graph reports its honest partial attribution coverage"
         );
-        let join = read.evidence.expect("generation attribution evidence");
+        let join = read
+            .evidence
+            .as_ref()
+            .expect("generation attribution evidence");
         let record = join
             .records
             .iter()
@@ -6188,7 +5961,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, privacy_domain) = {
         let mut scheduler = scheduler(
@@ -6236,7 +6009,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -6345,6 +6118,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         "mounted graph-off worktree accepts the overflow reconcile"
     );
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let query_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let executed = loop {
         match registry
@@ -6357,7 +6131,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
                     std::time::Instant::now() <= query_deadline,
                     "graph-off text projection never became queryable: {error}"
                 );
-                tokio::time::sleep(Duration::from_millis(2)).await;
+                signals.changed_before(query_deadline).await;
             }
         }
     };
@@ -6365,6 +6139,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
         executed.served_stale,
         "an explicit overflow keeps the currently served text generation stale until reconcile settles"
     );
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let overflow_deadline = std::time::Instant::now() + Duration::from_secs(10);
     let dashboard = loop {
         let overflow_settled = {
@@ -6392,7 +6167,7 @@ async fn graph_off_overflow_preserves_text_owner_progress_without_full_decode() 
             std::time::Instant::now() <= overflow_deadline,
             "graph-off overflow did not settle through a real no-op reconcile"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(overflow_deadline).await;
     };
     let (owner_epoch_after_overflow, progress_after_overflow, decode_count) = {
         let scheduler = scheduler

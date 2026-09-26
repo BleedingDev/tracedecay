@@ -7,7 +7,7 @@ import type {
 /**
  * Delivery test fixtures shaped to the generated contracts. Two registered
  * projects, three admitted pull requests, and membership edges that include
- * the correlating bases the daemon *may* serve — so umbrella grouping,
+ * the correlating bases the daemon *may* serve, so umbrella grouping,
  * cross-project rails and journey lanes can be exercised without inventing a
  * wire shape. Production inboxes today serve only the branch reference; the
  * DOM tests that assert the unavailable-correlation state use `INBOX_BRANCH_ONLY`.
@@ -41,7 +41,7 @@ function pullRequestRow(
     state: 'current',
     pull_request: {
       id: `github:${number}`,
-      label: `Pull request #${number} — ${title}`,
+      label: `Pull request #${number}, ${title}`,
       provider: 'github',
       pull_request_id: number,
       identity: {
@@ -62,6 +62,7 @@ function pullRequestRow(
             outcome: 'complete',
             provider_base_commit_id: BASE_ALPHA,
             provider_head_commit_id: head,
+            quarantined: [],
           },
           latest_attempt: null,
         },
@@ -162,7 +163,7 @@ export const INBOX: DeliveryInboxV1 = {
       branch_ref: 'refs/heads/feature/delivery',
       pull_request: {
         id: 'github:43',
-        label: 'Pull request #43 — Persist retry backoff',
+        label: 'Pull request #43, Persist retry backoff',
         provider: 'github',
         pull_request_id: '43',
         identity: {
@@ -465,6 +466,49 @@ export const OVERVIEW_ALPHA: DeliveryOverviewV1 = {
   generation_freshness: {
     state: 'ready',
     value: { comparison: 'current', head_commit: HEAD_ALPHA, indexed_commit: HEAD_ALPHA },
+  },
+  agent_usage: {
+    state: 'ready',
+    value: {
+      branch: 'feature/delivery',
+      sessions: 3,
+      truncated: false,
+      usage_coverage: 'complete',
+      agents: [
+        {
+          agent: 'planner',
+          provider: 'claude',
+          sessions: 2,
+          sessions_with_usage: 2,
+          usage_complete: true,
+          counters: {
+            input_tokens: 18_400,
+            output_tokens: 3_100,
+            cache_read_tokens: null,
+            cache_write_tokens: null,
+            reasoning_tokens: null,
+            total_tokens: null,
+          },
+          tool_calls: 41,
+        },
+        {
+          agent: null,
+          provider: 'codex',
+          sessions: 1,
+          sessions_with_usage: 0,
+          usage_complete: false,
+          counters: {
+            input_tokens: null,
+            output_tokens: null,
+            cache_read_tokens: null,
+            cache_write_tokens: null,
+            reasoning_tokens: null,
+            total_tokens: null,
+          },
+          tool_calls: 6,
+        },
+      ],
+    },
   },
 };
 

@@ -22,9 +22,9 @@ use url::Url;
 
 use super::concrete::AuthenticatedSymbolGraphCursorAdapter;
 use super::runtime::{
-    DiagnosticPrimitiveRecord, DiagnosticsPrimitiveResult, ManagedTestRunCurrentIdentity,
-    ManagedTestRunCurrentIdentityFuture, ManagedTestRunCurrentScopePort, PrimitiveProjectRuntime,
-    open_primitive_project_runtime,
+    CodeIndexConvergenceParkPortV1, DiagnosticPrimitiveRecord, DiagnosticsPrimitiveResult,
+    ManagedTestRunCurrentIdentity, ManagedTestRunCurrentIdentityFuture,
+    ManagedTestRunCurrentScopePort, PrimitiveProjectRuntime, open_primitive_project_runtime,
 };
 use super::symbol_graph::SymbolGraphCursorPort;
 use crate::code_index::CodeIndexIgnoredDependencyAdmissionPortV1;
@@ -42,15 +42,17 @@ use tracedecay_graph_query::queries::{GraphQueryManager, is_test_marker};
 use tracedecay_graph_query::{
     CodeGraphProjectionReadPort, CodeGraphReadError, CodeGraphReadRequest,
 };
-use tracedecay_session_temporal_store::SessionTemporalCursorKeyProvider;
+use tracedecay_session_temporal_store::{SessionTemporalAccess, SessionTemporalCursorKeyProvider};
+use tracedecay_temporal_query::cursor::SessionCursorAuthenticator;
 use tracedecay_temporal_query::cursor::{
     CURSOR_LIFETIME_MICROS, StableSortKey, encode_cursor, verify_cursor,
 };
-use tracedecay_temporal_query::ports::{
-    BindingDigest, KernelVersions, SessionCursorAuthenticator, TemporalExecutionSnapshot,
-    TemporalSnapshotRequest, TemporalWatermarks,
-};
+use tracedecay_temporal_query::execution::BindingDigest;
 use tracedecay_temporal_query::resolution::ValidatedAuthorization;
+use tracedecay_temporal_query::snapshot::TemporalSnapshotRequest;
+use tracedecay_temporal_query::snapshot::{
+    KernelVersions, TemporalExecutionSnapshot, TemporalWatermarks,
+};
 
 mod affected_tests;
 #[cfg(test)]
@@ -93,6 +95,43 @@ fn completed<T>(
     let Ok(coverage) = EvidenceCoverage::complete(vec![domain], 1, 1, 1) else {
         return failed(domain, finished_at);
     };
+    completed_with_coverage(payload, domain, finished_at, coverage, Vec::new())
+}
+
+/// A payload the graph could only partly witness: one unsupported omission
+/// names the capability gap, and coverage says `partial` so an empty payload
+/// never reads as a proven absence.
+fn completed_unsupported<T>(
+    payload: T,
+    domain: EvidenceDomain,
+    finished_at: UtcMicros,
+) -> RetrievalPortOutcome<T> {
+    let coverage = EvidenceCoverage {
+        requested_domains: vec![domain],
+        visited: Some(1),
+        eligible: Some(1),
+        returned: 1,
+        completeness: CoverageCompleteness::Partial,
+        domains: vec![CoverageDomainState {
+            domain,
+            completeness: CoverageCompleteness::Partial,
+        }],
+    };
+    let omissions = vec![Omission {
+        domain,
+        count: 1,
+        reason: OmissionReason::Unsupported,
+    }];
+    completed_with_coverage(payload, domain, finished_at, coverage, omissions)
+}
+
+fn completed_with_coverage<T>(
+    payload: T,
+    domain: EvidenceDomain,
+    finished_at: UtcMicros,
+    coverage: EvidenceCoverage,
+    omissions: Vec<Omission>,
+) -> RetrievalPortOutcome<T> {
     let Ok(page) = PageState::first_page(PRIMITIVE_SORT_CONTRACT.clone(), 1, Some(1), 1) else {
         return failed(domain, finished_at);
     };
@@ -101,13 +140,14 @@ fn completed<T>(
         temporal: TemporalState::current(finished_at),
         evidence_authorities: Vec::new(),
         coverage,
-        omissions: Vec::new(),
+        omissions,
         scores: Vec::new(),
         contributions: Vec::new(),
         page,
         finished_at,
         budget: OperationBudgetUsage::default(),
         cancellation: None,
+        cost: None,
     })
 }
 
@@ -152,6 +192,7 @@ fn failed<T>(domain: EvidenceDomain, finished_at: UtcMicros) -> RetrievalPortOut
         finished_at,
         budget: OperationBudgetUsage::default(),
         cancellation: None,
+        cost: None,
     })
 }
 
@@ -215,6 +256,7 @@ fn omitted_evidence<T>(
         finished_at,
         budget: OperationBudgetUsage::default(),
         cancellation: None,
+        cost: None,
     }
 }
 
@@ -301,6 +343,7 @@ fn diagnostics_result(
         finished_at,
         budget: OperationBudgetUsage::default(),
         cancellation: None,
+        cost: None,
     };
     RetrievalPortOutcome::Completed(evidence)
 }
@@ -534,8 +577,8 @@ fn test_annotation_evidence(
         .map_err(|_| ())?;
     let evidence = edges
         .into_iter()
-        .filter(|edge| markers.contains(&edge.edge.from_occurrence))
-        .map(|edge| edge.edge.to_occurrence)
+        .filter(|edge| markers.contains(&edge.from_occurrence))
+        .map(|edge| edge.to_occurrence)
         .collect::<std::collections::HashSet<_>>();
     if let Ok(mut guard) = cache.lock() {
         *guard = Some((generation, evidence.clone()));
@@ -567,6 +610,7 @@ pub struct ProductionPrimitiveCodeAuthoritiesV1 {
     pub ignored_dependency_admission: Option<Arc<dyn CodeIndexIgnoredDependencyAdmissionPortV1>>,
     pub code_index: Arc<dyn LspCodeIndexProjectionIdentityPort>,
     pub diagnostic_identity: Arc<dyn CodeIndexPublicationIdentityPortV1>,
+    pub convergence_park: Arc<dyn CodeIndexConvergenceParkPortV1>,
 }
 
 pub struct ProductionPrimitiveOpenRequestV1 {
@@ -577,6 +621,7 @@ pub struct ProductionPrimitiveOpenRequestV1 {
     temporal: Arc<dyn TemporalRetrievalPort + Send + Sync>,
     code_index: Arc<dyn LspCodeIndexProjectionIdentityPort>,
     diagnostic_identity: Arc<dyn CodeIndexPublicationIdentityPortV1>,
+    convergence_park: Arc<dyn CodeIndexConvergenceParkPortV1>,
     access: ProjectSourceAccessSnapshot,
     admitted_root_uri: String,
     operation_events: OperationEventAuthority,
@@ -600,6 +645,7 @@ impl ProductionPrimitiveOpenRequestV1 {
             temporal,
             code_index: code.code_index,
             diagnostic_identity: code.diagnostic_identity,
+            convergence_park: code.convergence_park,
             access,
             admitted_root_uri,
             operation_events,
@@ -620,6 +666,7 @@ pub async fn open_production_primitive_runtime(
         temporal,
         code_index,
         diagnostic_identity,
+        convergence_park,
         access,
         admitted_root_uri,
         operation_events,
@@ -628,8 +675,7 @@ pub async fn open_production_primitive_runtime(
     let project_root = source_runtime.project_root().to_path_buf();
     let scope = access.scope.clone();
     let configuration_digest = access.configuration_digest.clone();
-    let key = session_db
-        .as_ref()
+    let key = SessionTemporalAccess::new(session_db.as_ref())
         .ensure_active_session_cursor_key_result()
         .await
         .map_err(|_| ApplicationContractError::Inconsistent {
@@ -699,6 +745,7 @@ pub async fn open_production_primitive_runtime(
         admitted_root_uri,
         operation_events,
         test_run_scope,
+        convergence_park,
     )
 }
 

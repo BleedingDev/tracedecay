@@ -1,8 +1,10 @@
+mod analysis_report_surface;
 mod callable_code;
 mod callable_code_catalog;
 mod callable_code_service;
 pub mod catalog;
 mod git_topology_anchor;
+mod graph_report_surface;
 pub mod grep_analysis;
 mod ports;
 mod primitive_surface;
@@ -61,6 +63,25 @@ fn validate_current_temporal_meta(
     PageRequest::new(meta.page.page_size, meta.page.cursor.clone()).map(|_| ())
 }
 
+pub use analysis_report_surface::{
+    CircularCycleV1, CircularResultV1, CircularSurfaceRequestV1, ComplexityReportEntryV1,
+    ComplexityReportV1, ComplexitySurfaceRequestV1, ConstructorFieldCoverageV1,
+    ConstructorResolutionReasonV1, ConstructorResolutionStatusV1, ConstructorSiteV1,
+    ConstructorsNotFoundV1, ConstructorsReportV1, ConstructorsResultV1,
+    ConstructorsSurfaceRequestV1, CouplingDirectionV1, CouplingEntryV1, CouplingResultV1,
+    CouplingSurfaceRequestV1, DeadCodeResultV1, DeadCodeSurfaceRequestV1, DeadCodeSymbolV1,
+    DistributionFileV1, DistributionKindCountV1, DistributionResultV1,
+    DistributionSurfaceRequestV1, DistributionViewV1, DocCoverageFileV1, DocCoverageResultV1,
+    DocCoverageSurfaceRequestV1, DocCoverageSymbolV1, FieldSiteV1, FieldSitesResultV1,
+    FieldSitesSurfaceRequestV1, GodClassEntryV1, GodClassResultV1, GodClassSurfaceRequestV1,
+    HotspotV1, HotspotsResultV1, HotspotsSurfaceRequestV1, InheritanceDepthEntryV1,
+    InheritanceDepthResultV1, InheritanceDepthSurfaceRequestV1, LargestEntryV1, LargestResultV1,
+    LargestSurfaceRequestV1, RankDirectionV1, RankEdgeKindV1, RankEntryV1, RankResultV1,
+    RankSurfaceRequestV1, RecursionCycleV1, RecursionResultV1, RecursionSurfaceRequestV1,
+    RecursionSymbolV1, UnmountedEcosystemStatusV1, UnmountedEcosystemV1, UnmountedFileV1,
+    UnmountedFilesResultV1, UnmountedFilesSurfaceRequestV1, UnsafePatternKindV1,
+    UnsafePatternMatchV1, UnsafePatternsResultV1, UnsafePatternsSurfaceRequestV1,
+};
 pub use callable_code::{
     CALLABLE_CODE_OPERATION_COUNT, CallableCodeOperationKind, CallableCodeOperations,
     CodeFacetDimension, CodeFacetRecord, CodeFacetRequest, CodeHierarchyRequest, CodeImpactRequest,
@@ -77,16 +98,27 @@ pub use callable_code_catalog::{
     callable_code_operations, callable_code_request_schema, callable_code_result_schema,
 };
 pub use callable_code_service::{
-    CallableCodeAuthorizationAdmission, CallableCodeAuthorizationFuture,
-    CallableCodeAuthorizationPort, CallableCodeQueryFuture, CallableCodeQueryPort,
-    CallableCodeQueryService, UNPINNED_LATEST_GENERATION_SENTINEL,
+    CallableCodeAuthorizationFuture, CallableCodeAuthorizationPort, CallableCodeQueryFuture,
+    CallableCodeQueryPort, CallableCodeQueryService, UNPINNED_LATEST_GENERATION_SENTINEL,
 };
 pub use git_topology_anchor::{
-    GitTopologyAnchorAuthorityErrorV2, GitTopologyAnchorAuthorityV2, GitTopologyAnchorFutureV2,
-    GitTopologyAnchorPublicationOutcomeV2, GitTopologyAnchorPublicationV2,
-    GitTopologyAnchorResolutionOutcomeV2, GitTopologyAnchorResolutionV2,
-    MAX_GIT_TOPOLOGY_ANCHORS_PER_PUBLICATION_V2,
+    GitTopologyAnchorAuthority, GitTopologyAnchorAuthorityError, GitTopologyAnchorFuture,
+    GitTopologyAnchorPublication, GitTopologyAnchorPublicationOutcome, GitTopologyAnchorResolution,
+    GitTopologyAnchorResolutionOutcome, MAX_GIT_TOPOLOGY_ANCHORS_PER_PUBLICATION,
 };
+pub use graph_report_surface::{
+    DependencyDepthSurfaceRequestV1, DiagnoseItemV1, DiagnosePublicationV1, DiagnoseResultV1,
+    DiagnoseSeverityFilterV1, DiagnoseSeverityV1, DiagnoseSurfaceRequestV1, DiagnoseSymbolV1,
+    DsmClusterV1, DsmMatrixV1, DsmResultV1, DsmShapeV1, DsmStatsV1, DsmSurfaceRequestV1,
+    GiniMetricV1, GiniOutlierV1, GiniResultV1, GiniScopeV1, GiniSurfaceRequestV1,
+    HealthAcyclicityV1, HealthCoverageDisciplineV1, HealthDepthV1, HealthDimensionsV1,
+    HealthEqualityV1, HealthModularityV1, HealthRedundancyV1, HealthResultV1,
+    HealthSurfaceRequestV1, HealthWeightsV1, TestAttributionMethodV1, TestMapResultV1,
+    TestMapSourceCoverageV1, TestMapSurfaceRequestV1, TestMapTestV1, TestMapUncoveredV1,
+    TestRiskAttributionSummaryV1, TestRiskBucketSummaryV1, TestRiskConfidenceV1, TestRiskEntryV1,
+    TestRiskResultV1, TestRiskSummaryV1, TestRiskSurfaceRequestV1,
+};
+pub use grep_analysis::{DependencyDepthChainV1, DependencyDepthResultV1};
 pub use ports::{
     AffectedTestsRetrievalPort, OperationalRetrievalPort, RetrievalPortContext,
     RetrievalPortOutcome, SessionRetrievalBudgetAccountingV1, SessionRetrievalBudgetObservationV1,
@@ -94,9 +126,10 @@ pub use ports::{
     TemporalRetrievalFailure, TemporalRetrievalFuture, TemporalRetrievalPort,
 };
 pub use primitive_surface::{
-    CalleeV1, CalleesResultV1, CalleesSurfaceRequestV1, ContextCodeBlockV1, ContextModeV1,
-    ContextResultV1, ContextSearchMatchV1, ContextSurfaceRequestV1, ImpactNodeV1, ImpactResultV1,
-    ImpactSurfaceRequestV1, MAX_REDUNDANCY_FAMILIES_V1, MAX_REDUNDANCY_PULL_REQUEST_PATHS_V1,
+    ContextCodeBlockV1, ContextExtensionPointV1, ContextLexicalAnchorV1, ContextModeV1,
+    ContextPlanV1, ContextResultV1, ContextRetrievalPlanV1, ContextSearchMatchV1, ContextStageV1,
+    ContextSurfaceRequestV1, ImpactNodeV1, ImpactResultV1, LexicalAnchorDropReasonV1,
+    LexicalAnchorDropV1, MAX_REDUNDANCY_FAMILIES_V1, MAX_REDUNDANCY_PULL_REQUEST_PATHS_V1,
     MAX_REDUNDANCY_WORK_V1, NodeDepthSurfaceRequestV1, NodeDetailsV1, NodeExpansionCostV1,
     NodeResultV1, NodeSurfaceRequestV1, PortCycleAnchorV1, PortCycleFileV1, PortCycleSymbolV1,
     PortCycleV1, PortMatchedSymbolV1, PortOrderLevelV1, PortOrderResultV1,
@@ -142,9 +175,10 @@ pub use source_read::{
 };
 pub use symbol_graph::{
     CodeGraphReadFreshnessV1, ExactSymbolRequest, GraphImpactPrimitiveRequest,
-    GraphRelationRequest, ImplementationSelector, ImplementationsRequest, MAX_SYMBOL_GRAPH_DEPTH,
-    MAX_SYMBOL_GRAPH_FILTERS, MAX_SYMBOL_GRAPH_QUERY_BYTES, PrimitiveFailure, PrimitiveFailureKind,
-    PrimitiveSupportGap, SignatureSearchRequest, SymbolGraphPage, SymbolGraphPortContext,
+    GraphRelationRequest, ImplementationRecord, ImplementationSelector, ImplementationsRequest,
+    MAX_SYMBOL_GRAPH_DEPTH, MAX_SYMBOL_GRAPH_FILTERS, MAX_SYMBOL_GRAPH_QUERY_BYTES,
+    PrimitiveFailure, PrimitiveFailureKind, PrimitiveSupportGap, ServedCodeGraphGenerationV1,
+    SignatureSearchRequest, SymbolGraphItem, SymbolGraphPage, SymbolGraphPortContext,
     SymbolGraphPortFuture, SymbolGraphPortOutcome, SymbolGraphPrimitivePort, SymbolGraphScope,
     SymbolPrimitiveRecord, SymbolRelationRecord, SymbolSearchPrimitiveRequest, TypeHierarchyRecord,
     TypeHierarchyRequest,

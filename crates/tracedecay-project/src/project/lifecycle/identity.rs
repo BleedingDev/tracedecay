@@ -16,16 +16,14 @@ impl TraceDecay {
         open_options: &TraceDecayOpenOptions,
         registry_database: &RegisteredGlobalDb,
     ) -> Result<StoreLayout> {
-        let layout = Self::resolve_store_layout_for_authority(
+        Self::resolve_store_layout_for_authority(
             project_root,
             open_options,
             Some(registry_database),
             false,
             &MovedStoreAdoption::Never,
         )
-        .await?;
-        Self::reject_split_identity_cutover(project_root, open_options, &layout)?;
-        Ok(layout)
+        .await
     }
 
     /// Resolves the store layout for a project that has never been enrolled,
@@ -33,8 +31,8 @@ impl TraceDecay {
     /// `init` can bootstrap it under the daemon's authority.
     ///
     /// This differs from [`Self::resolve_registered_configuration_layout`] only
-    /// in that a project with no enrollment marker or registry match falls
-    /// through to a default identity instead of failing closed.
+    /// in that a project with no repository identity marker or registry match
+    /// falls through to a default identity instead of failing closed.
     #[hotpath::skip]
     pub async fn resolve_first_touch_configuration_layout(
         project_root: &Path,
@@ -51,7 +49,7 @@ impl TraceDecay {
     }
 
     /// First-touch resolution that can remap a moved non-git project whose
-    /// store evidence still names the previous registry root — only under an
+    /// store evidence still names the previous registry root, only under an
     /// explicit operator adoption decision; ambient first-touch passes
     /// [`MovedStoreAdoption::Never`] and always mints fresh.
     #[hotpath::measure(label = "lifecycle.resolve_first_touch_layout", future = true)]
@@ -80,11 +78,28 @@ impl TraceDecay {
         adoption: &MovedStoreAdoption,
     ) -> Result<StoreLayout> {
         let profile_root = open_options.resolved_profile_root()?;
+        storage::refuse_retired_checkout_layout(&profile_root, project_root)?;
         let mut selected = storage::resolve_persisted_layout(project_root, &profile_root)?;
         // Every linked worktree resolves through its repository, attached or
         // not; suppressing this for detached worktrees dropped them onto the
         // path-hashed identity fallback and minted a duplicate store.
-        let git_common_dir = tracedecay_runtime_core::worktree::git_common_dir(project_root);
+        let git_common_dir = match tracedecay_runtime_core::worktree::git_common_dir_outcome(
+            project_root,
+        ) {
+            Ok(git_common_dir) => git_common_dir,
+            Err(
+                tracedecay_runtime_core::git_repository::GitRepositoryError::DiscoveryBlocked {
+                    path,
+                },
+            ) => {
+                return Err(TraceDecayError::project_route(
+                    tracedecay_runtime_core::git_discovery::REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE,
+                    true,
+                    format!("repository discovery blocked on {path}"),
+                ));
+            }
+            Err(_) => None,
+        };
         if selected.is_none()
             && let Some(registry_database) = registry_database
             && let Some(resolution) = registry_database
@@ -94,33 +109,8 @@ impl TraceDecay {
             selected = Some(storage::profile_sharded_layout(
                 project_root,
                 &profile_root,
-                &storage::EnrollmentMarker {
-                    project_id: resolution.project.project_id,
-                    storage_mode: storage::StorageMode::ProfileSharded,
-                },
+                &resolution.project.project_id,
             )?);
-        }
-
-        // One-time legacy adoption: a project enrolled before the working-tree
-        // cutover may carry a retired `<repo>/.tracedecay/enrollment.json` and
-        // no other resolvable identity. Adopt the identity it names so the
-        // following open registers it durably (registry row plus `.git/`
-        // marker); after that, the marker or registry resolves first and the
-        // legacy file is never consulted again. The file itself is left
-        // untouched — users may delete it.
-        if selected.is_none() {
-            let enrollment_root =
-                tracedecay_runtime_core::worktree::repository_identity_root(project_root)
-                    .unwrap_or_else(|| project_root.to_path_buf());
-            if let Some(marker) = storage::read_legacy_enrollment_marker(&enrollment_root)?
-                && marker.storage_mode == storage::StorageMode::ProfileSharded
-            {
-                selected = Some(storage::profile_sharded_layout(
-                    project_root,
-                    &profile_root,
-                    &marker,
-                )?);
-            }
         }
 
         if allow_default_identity
@@ -144,7 +134,7 @@ impl TraceDecay {
                 // The registry refuses to mint a durable authority for a root
                 // under the OS temp directory, but by the time it is asked the
                 // shard directory, hook configs, and databases have already
-                // been materialized from the default layout — which is how a
+                // been materialized from the default layout, which is how a
                 // fixture reaching a daemon under another profile left 111
                 // /tmp-rooted stores in that profile. Refuse here, before any
                 // layout exists to write into.
@@ -189,15 +179,11 @@ impl TraceDecay {
             .and_then(|profile_root| {
                 tracedecay_runtime_core::storage::resolve_layout(project_root, &profile_root)
             })
-            .is_ok_and(|layout| {
-                layout.storage_mode == tracedecay_runtime_core::storage::StorageMode::ProfileSharded
-                    && layout.graph_db_path.exists()
-            });
+            .is_ok_and(|layout| layout.graph_db_path.exists());
         if open_options.profile_root.is_some() || open_options.global_db_path.is_some() {
             return option_resolved_store_exists;
         }
         option_resolved_store_exists
-            || crate::config::has_project_database(project_root)
             || tracedecay_runtime_core::storage::has_repository_identity_marker(project_root)
     }
 
@@ -244,8 +230,9 @@ impl TraceDecay {
         Ok(layout.graph_db_path.is_file().then_some(layout))
     }
 
-    /// Resolves the profile store layout for a local path using enrollment
-    /// markers first, then the global registry aliases for the git identity.
+    /// Resolves the profile store layout for a local path using the `.git/`
+    /// repository identity marker first, then the global registry aliases for
+    /// the git identity. Nothing in the working tree carries identity.
     #[hotpath::skip]
     pub async fn resolve_store_layout_for_identity(project_root: &Path) -> Result<StoreLayout> {
         Self::resolve_store_layout_for_identity_with_options(
@@ -268,61 +255,15 @@ impl TraceDecay {
         project_root: &Path,
         open_options: &TraceDecayOpenOptions,
     ) -> Result<StoreLayout> {
-        let layout = Self::resolve_store_layout_for_authority(
+        Self::resolve_store_layout_for_authority(
             project_root,
             open_options,
             None,
             true,
             &MovedStoreAdoption::Never,
         )
-        .await?;
-        Self::reject_split_identity_cutover(project_root, open_options, &layout)?;
-        Ok(layout)
+        .await
     }
-
-    fn reject_split_identity_cutover(
-        project_root: &Path,
-        open_options: &TraceDecayOpenOptions,
-        selected: &StoreLayout,
-    ) -> Result<()> {
-        let profile_root = open_options.resolved_profile_root()?;
-        let selected_id = selected.identity.project_id.as_deref();
-        let (candidates, _, candidates_match_exact_root) =
-            storage::matching_legacy_profile_layouts(project_root, &profile_root, selected_id)?;
-        // Sibling worktree manifests share a git common dir but name a
-        // different checkout path. They are not a second identity for this
-        // exact root and must not fail a registered exact-root resolution.
-        if !candidates_match_exact_root {
-            return Ok(());
-        }
-        let Some(legacy) = candidates
-            .into_iter()
-            .find(|layout| layout.graph_db_path.is_file())
-        else {
-            return Ok(());
-        };
-        if !selected.graph_db_path.is_file() {
-            return Ok(());
-        }
-        let selected_id = selected_id.unwrap_or("unknown");
-        let legacy_id = legacy.identity.project_id.as_deref().unwrap_or("unknown");
-        let command = format!(
-            "tracedecay migrate consolidate --project {} --source-project-id {legacy_id} --target-project-id {selected_id}",
-            shell_quote(&project_root.to_string_lossy()),
-        );
-        Err(TraceDecayError::Config {
-            message: format!(
-                "identity cutover conflict for '{}': selected [project_id={selected_id} path='{}']; legacy [project_id={legacy_id} path='{}']; choose one shard and retire the other; run the offline dry-run `{command}` before changing the marker; both shards were preserved and no files changed",
-                project_root.display(),
-                selected.data_root.display(),
-                legacy.data_root.display(),
-            ),
-        })
-    }
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
@@ -345,8 +286,8 @@ mod tests {
     }
 
     /// First touch of a root under the OS temp directory against a durable
-    /// profile is refused before any layout — and therefore any shard
-    /// directory — exists. A hermetic (temp) profile still admits temp roots.
+    /// profile is refused before any layout, and therefore any shard
+    /// directory, exists. A hermetic (temp) profile still admits temp roots.
     #[tokio::test]
     async fn first_touch_refuses_an_ephemeral_root_before_minting_a_layout() {
         let ephemeral_project = tempfile::TempDir::new().expect("ephemeral project");
@@ -388,5 +329,43 @@ mod tests {
         .await
         .expect("a throwaway profile still admits throwaway roots");
         assert!(layout.data_root.starts_with(hermetic.path()));
+    }
+
+    #[tokio::test]
+    async fn first_touch_refuses_a_retired_checkout_enrollment_marker() {
+        let project = tempfile::TempDir::new().expect("project");
+        let hermetic = tempfile::TempDir::new().expect("hermetic profile");
+        let options = TraceDecayOpenOptions {
+            profile_root: Some(hermetic.path().join("profile")),
+            global_db_path: Some(hermetic.path().join("profile/registry.db")),
+        };
+        std::fs::create_dir_all(project.path().join(".tracedecay")).expect("retired dir");
+        std::fs::write(
+            project.path().join(".tracedecay/enrollment.json"),
+            r#"{"project_id":"proj_retired","storage_mode":"profile_sharded"}"#,
+        )
+        .expect("retired enrollment marker");
+
+        let error = TraceDecay::resolve_store_layout_for_authority(
+            project.path(),
+            &options,
+            None,
+            true,
+            &MovedStoreAdoption::Never,
+        )
+        .await
+        .expect_err("a retired checkout layout must be refused, not ignored");
+
+        assert_eq!(
+            error
+                .reset_required_context()
+                .map(|(authority, _)| authority),
+            Some("project store"),
+            "{error:?}"
+        );
+        assert!(
+            !hermetic.path().join("profile/projects").exists(),
+            "refusal must mint no store"
+        );
     }
 }

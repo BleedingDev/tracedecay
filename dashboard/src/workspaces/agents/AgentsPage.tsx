@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from 'react';
 import { OverviewCard, OverviewGrid } from '../../ui/archetypes/OverviewGrid';
-import { ReadFailure } from '../../ui/LegacyStates.tsx';
+import { ReadFailure } from '../../ui/ReadFailure.tsx';
 import { ReadSection, envelopeReadState } from '../../ui/ReadSection.tsx';
 import { StateChip } from '../../ui/StateChip.tsx';
 import { MeterRow, Panel, WorkspaceHeader } from '../../ui/instrument.tsx';
@@ -22,7 +22,8 @@ import { AgentHandoffs } from './AgentHandoffs.tsx';
 import { AgentHandoffTokens } from './AgentHandoffTokens.tsx';
 import { AgentInspector, type DiagnosticsForInspector } from './AgentInspector.tsx';
 import { AgentTelemetryRegister } from './AgentTelemetryRegister.tsx';
-import { DelegationTopology } from './DelegationTopology.tsx';
+import { DelegationTimeline } from './DelegationTimeline.tsx';
+import { DelegationTopology, type TopologyInteraction } from './DelegationTopology.tsx';
 import { SubagentTree } from './SubagentTree.tsx';
 import { resolveSubject } from './agentInspector.ts';
 import { useAgentWorkGraph } from './agentWorkQuery.ts';
@@ -33,11 +34,12 @@ import {
   usageAuthority,
   workAuthority,
 } from './authorityRegister.ts';
-import { fitDelegationTopology, markId } from './delegationTopology.ts';
+import { fitDelegationTopology, markId, type FittedTopology } from './delegationTopology.ts';
 import { readAttemptFailures } from './failure.ts';
 import { readHandoffFrontier } from './handoff.ts';
 import { newestTreeSession, useAgentHandoffTokens } from './handoffTokenQuery.ts';
 import { readHandoffTokens } from './handoffTokens.ts';
+import { AgentsViewSwitcher, agentsViewNote, useAgentsView, type AgentsView } from './agentsView.tsx';
 
 const BASE = '/api/plugins/analytics';
 
@@ -45,13 +47,13 @@ const BASE = '/api/plugins/analytics';
  * Agents: who delegated to whom, read from the authorities that record it.
  *
  * The composition is the V2 Agents plate. A register of five independent
- * authorities leads — usage, hierarchy, tokens, Work, failure — each with its
+ * authorities leads, usage, hierarchy, tokens, Work, failure, each with its
  * own state and never a total over them. The hero aperture is the delegation
  * topology: the daemon's subagent tree laid out left to right by generation,
  * hover inspecting and click selecting, with the exact tree beneath it as the
  * synchronized fallback. A workspace-owned inspector reads the inspected or
  * selected session across every authority, and the ledgers that used to be
- * the page — handoff frontier, token frontier, failure context, telemetry —
+ * the page, handoff frontier, token frontier, failure context, telemetry , 
  * remain beneath as the exact evidence the field summarizes.
  *
  * Selection is the only act that reads. Hovering a session changes nothing but
@@ -76,7 +78,7 @@ export function AgentsPage() {
     `${BASE}/underused`,
     AnalyticsUnderusedPayloadV1Schema,
   );
-  // `/diagnostics` is the only endpoint on this plugin that carries a clock —
+  // `/diagnostics` is the only endpoint on this plugin that carries a clock , 
   // `events_per_hour` over the counted window, and the most recent events with
   // their own timestamps. It is also the slowest (it folds the full
   // hook-analytics JSONL), so it lives behind its own boundary and the fast
@@ -106,6 +108,7 @@ export function AgentsPage() {
   const [inspectedId, setInspectedId] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  const [view, setView] = useAgentsView();
   const toggleExpanded = useCallback((id: string) => {
     setExpanded((current) => {
       const next = new Set(current);
@@ -133,7 +136,7 @@ export function AgentsPage() {
   }, [selectedId, treeAvailable]);
 
   // The token frontier is read for a session this page can actually name: the
-  // selected one, or — with nothing selected — the newest top of the tree, and
+  // selected one, or, with nothing selected, the newest top of the tree, and
   // the inspector says which. Without a session there is no question to ask,
   // and the surface says so rather than drawing an empty frontier.
   const newestSession = newestTreeSession(treePayload);
@@ -211,8 +214,11 @@ export function AgentsPage() {
       <WorkspaceHeader
         path="agents"
         title="Agents"
-        note="delegation topology from the session store · handoffs, tokens and failures from their own authorities"
+        note={`${view} · ${agentsViewNote(view)} · handoffs, tokens and failures from their own authorities`}
       />
+      <div className="flex flex-wrap items-center gap-2 border-b border-edge-subtle bg-surface-1 pr-2">
+        <AgentsViewSwitcher active={view} onSelect={setView} />
+      </div>
 
       <AgentAuthorityRegister authorities={authorities} />
 
@@ -222,7 +228,7 @@ export function AgentsPage() {
       <section aria-label="Delegation topology" className="flex shrink-0 flex-col lg:flex-row">
         <div className="flex min-w-0 flex-1 flex-col gap-2 p-2">
           <Panel
-            legend="Delegation topology · read-only"
+            legend={view === 'timeline' ? 'Delegation timeline · read-only' : 'Delegation topology · read-only'}
             // Withdrawn below `sm`: the register above already prints this
             // reading, and in a fixed-height header the detail wraps over the
             // legend at 320px.
@@ -253,17 +259,20 @@ export function AgentsPage() {
                 return (
                   <div className="flex min-w-0 flex-col gap-3">
                     {fit !== null && fit.model.marks.length > 0 ? (
-                      <DelegationTopology
-                        fit={fit}
-                        interaction={{
-                          inspectedId,
-                          selectedId,
-                          onInspect: setInspectedId,
-                          onSelect: select,
-                          expanded,
-                          onToggleExpanded: toggleExpanded,
-                        }}
-                      />
+                      <>
+                        <TopologyRenderer
+                          view={view}
+                          fit={fit}
+                          interaction={{
+                            inspectedId,
+                            selectedId,
+                            onInspect: setInspectedId,
+                            onSelect: select,
+                            expanded,
+                            onToggleExpanded: toggleExpanded,
+                          }}
+                        />
+                      </>
                     ) : null}
                     <details
                       className="border-t border-edge-subtle pt-2"
@@ -391,6 +400,27 @@ export function AgentsPage() {
   );
 }
 
+function TopologyRenderer({
+  view,
+  fit,
+  interaction,
+}: {
+  view: AgentsView;
+  fit: FittedTopology;
+  interaction: TopologyInteraction;
+}) {
+  switch (view) {
+    case 'topology':
+      return <DelegationTopology fit={fit} interaction={interaction} />;
+    case 'timeline':
+      return <DelegationTimeline fit={fit} interaction={interaction} />;
+    default: {
+      const unhandled: never = view;
+      return unhandled;
+    }
+  }
+}
+
 /** The model the inspector is handed before the tree has been read. */
 const EMPTY_MODEL = fitDelegationTopology({
   available: true,
@@ -407,7 +437,7 @@ const EMPTY_MODEL = fitDelegationTopology({
 }).model;
 
 /** Sessions per managed subagent, straight from the session store. A count of
- * delegations, not of work done inside them — that context lives in Loom's
+ * delegations, not of work done inside them, that context lives in Loom's
  * per-thread drill-down. */
 function SubagentSessions({
   rows,

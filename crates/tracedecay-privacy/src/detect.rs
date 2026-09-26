@@ -40,7 +40,7 @@ pub enum PrivacyDetectorV1 {
     SensitiveField,
     HighEntropyToken,
     /// Reserved for public V1 compatibility; malformed input is reported by
-    /// `ClaudeRecordParseErrorV1` before detector findings are constructed.
+    /// `ObservationRecordParseErrorV1` before detector findings are constructed.
     MalformedRecord,
     RecordSizeLimit,
     StructureLimit,
@@ -284,7 +284,7 @@ impl SanitizationFindingV1 {
     ///
     /// Abstention is the specified degradation: a stale, shifted, or
     /// under-supported calibration must not weaken the finding, and the finding
-    /// itself — origin, anchors, coverage, remediation class — is unaffected.
+    /// itself, origin, anchors, coverage, remediation class, is unaffected.
     pub(crate) fn with_assessment(mut self, assessment: SanitizationAssessmentV1) -> Self {
         if validate_assessment(self.confidence, &assessment).is_ok() {
             self.assessment = Some(assessment);
@@ -422,8 +422,8 @@ pub enum DetectionError {
 }
 
 impl DetectionError {
-    /// Whether the sanitizer reached a *verdict* — it proved this content
-    /// cannot be served and withheld it — rather than failing to run.
+    /// Whether the sanitizer reached a *verdict*. It proved this content
+    /// cannot be served and withheld it, rather than failing to run.
     ///
     /// A verdict is a legitimate rendering outcome that a re-render of
     /// already-captured bytes converges to; the remaining variants are

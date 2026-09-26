@@ -10,7 +10,7 @@ use tracedecay_domain::{
 
 use crate::{
     OpaqueCursor, RequestAdmission, RequestContext, WorkAttemptTopologyBindingV1,
-    WorkAttemptTopologyStateV1, WorkRelationScopeV1,
+    WorkAttemptTopologyStateV1, WorkProductAuthorizedRelationScopeV1,
 };
 
 use super::{
@@ -277,7 +277,7 @@ pub enum WorkGraphTimelineCoverageV1 {
 /// event records the relation scopes it was admitted under, and a selection
 /// that does not name them puts that event *outside* the slice. The events
 /// outside a selection do not poison the ones inside it, but they must never be
-/// concealed either — a caller who is shown the covered slice with no way to
+/// concealed either, a caller who is shown the covered slice with no way to
 /// learn that more exists is reading a silently incomplete graph.
 ///
 /// So the read answers over the covered slice and says so, in the same
@@ -472,6 +472,13 @@ pub enum WorkGraphReadV1 {
         selection_coverage: WorkGraphSelectionCoverageV1,
         timeline: WorkGraphTimelineV1,
     },
+    /// A `Current` or `AsOf` point read under an authorized selection that has
+    /// no published graph version at that point: no task has been created yet.
+    /// The caller was authorized; the legal next action is creating a task.
+    Absent {
+        authorized_scope: AuthorizedWorkProductScopeV1,
+        selection_coverage: WorkGraphSelectionCoverageV1,
+    },
 }
 
 impl WorkGraphReadV1 {
@@ -489,13 +496,16 @@ impl WorkGraphReadV1 {
             }
             | Self::Forensic {
                 authorized_scope, ..
+            }
+            | Self::Absent {
+                authorized_scope, ..
             } => authorized_scope,
         }
     }
 
     /// How much of the owner's journal this selection covered. `Partial` means
     /// the entries below are the covered slice and scoped events exist outside
-    /// it — never that the graph is broken.
+    /// it, never that the graph is broken.
     #[hotpath::skip]
     pub const fn selection_coverage(&self) -> &WorkGraphSelectionCoverageV1 {
         match self {
@@ -510,6 +520,9 @@ impl WorkGraphReadV1 {
             }
             | Self::Forensic {
                 selection_coverage, ..
+            }
+            | Self::Absent {
+                selection_coverage, ..
             } => selection_coverage,
         }
     }
@@ -521,6 +534,22 @@ impl WorkGraphReadV1 {
             }
             Self::Evolution { timeline, .. } | Self::Forensic { timeline, .. } => {
                 timeline.entries()
+            }
+            Self::Absent { .. } => &[],
+        }
+    }
+
+    /// The snapshot of a `Current` read, for callers that act on a named task.
+    /// An absent graph holds no task, so it answers not-found; any other mode
+    /// was never requested and marks the graph authority unavailable.
+    pub fn into_current_snapshot(
+        self,
+    ) -> Result<WorkGraphVersionEntryV1, WorkProductApplicationErrorV1> {
+        match self {
+            Self::Current { snapshot, .. } => Ok(snapshot),
+            Self::Absent { .. } => Err(WorkProductApplicationErrorV1::NotFoundOrNotAuthorized),
+            Self::AsOf { .. } | Self::Evolution { .. } | Self::Forensic { .. } => {
+                Err(WorkProductApplicationErrorV1::GraphAuthorityUnavailable)
             }
         }
     }
@@ -642,28 +671,26 @@ where
         observed_at: UtcMicros,
     ) -> Result<WorkAttemptTopologyStateV1, WorkProductApplicationErrorV1> {
         let selection = WorkProductSelectionScopeV1::relations(BTreeSet::from([
-            WorkRelationScopeV1::Repository {
+            WorkProductAuthorizedRelationScopeV1::Repository {
                 project_id: context.scope().project_id.clone(),
                 repository_id: context.scope().repository_id.clone(),
             },
         ]))
         .map_err(|_| WorkProductApplicationErrorV1::InvalidRequest)?;
-        let read = match self.read_graph(
+        match self.read_graph(
             context,
             WorkGraphReadRequestV1::current(selection, observed_at),
-        ) {
-            Ok(read) => read,
-            Err(WorkProductApplicationErrorV1::NotFoundOrNotAuthorized) => {
-                return Ok(WorkAttemptTopologyStateV1::Absent);
+        )? {
+            WorkGraphReadV1::Current { snapshot, .. } => Ok(WorkAttemptTopologyStateV1::Verified(
+                work_product_attempt_topology_binding(&snapshot)?,
+            )),
+            WorkGraphReadV1::Absent { .. } => Ok(WorkAttemptTopologyStateV1::Absent),
+            WorkGraphReadV1::AsOf { .. }
+            | WorkGraphReadV1::Evolution { .. }
+            | WorkGraphReadV1::Forensic { .. } => {
+                Err(WorkProductApplicationErrorV1::GraphAuthorityUnavailable)
             }
-            Err(error) => return Err(error),
-        };
-        let WorkGraphReadV1::Current { snapshot, .. } = read else {
-            return Err(WorkProductApplicationErrorV1::GraphAuthorityUnavailable);
-        };
-        Ok(WorkAttemptTopologyStateV1::Verified(
-            work_product_attempt_topology_binding(&snapshot)?,
-        ))
+        }
     }
 }
 
@@ -705,6 +732,9 @@ pub(crate) fn validate_result(
         ) | (
             WorkGraphReadModeV1::Forensic { .. },
             WorkGraphReadV1::Forensic { .. }
+        ) | (
+            WorkGraphReadModeV1::Current | WorkGraphReadModeV1::AsOf { .. },
+            WorkGraphReadV1::Absent { .. }
         )
     );
     if !mode_matches {

@@ -9,7 +9,7 @@ use tracedecay_domain::{
 use tracedecay_store::ObservationPersistOutcome;
 use tracedecay_store::observation::{ObservationCoverageReason, ObservationCursorAdvance};
 
-use crate::admission::{HostAdmission, is_admission_cancellation};
+use crate::admission::{HostAdmission, HostAdmissionRecovery, is_admission_cancellation};
 use crate::observation::{
     CaptureObservationOutcome, CaptureObservationRequest, ObservationCancellation,
 };
@@ -157,7 +157,7 @@ pub fn snapshot_cursor_after(
 /// Every snapshot provider drives the same loop: bound discovery, defer when
 /// discovery truncated, then charge each discovered path against the sweep
 /// budget before loading and admitting its records. Providers supply only what
-/// actually differs — how paths are discovered, how a path's input bytes are
+/// actually differs, how paths are discovered, how a path's input bytes are
 /// charged, and how a path becomes complete source-generation batches.
 ///
 /// This deliberately re-reads complete snapshots and derives a new source
@@ -471,6 +471,21 @@ impl SnapshotAdmissionRunner {
                     return Err(host_admission_error(provider, error));
                 }
                 if committed {
+                    // The store settled a deterministic refusal itself (an
+                    // identity collision records its marker and coverage in
+                    // one transaction), so this is the only place the skipped
+                    // record can be named; Doctor's census counts it, the log
+                    // has to say which one it was.
+                    if error.recovery == Some(HostAdmissionRecovery::DeterministicContentRefusal) {
+                        tracing::warn!(
+                            provider,
+                            session = source_identity.session_id().as_str(),
+                            position = range.start(),
+                            reason = error.reason_code.unwrap_or("host_admission_refused"),
+                            cause = error.cause.as_deref().unwrap_or("unspecified"),
+                            "admission refused a snapshot record; coverage settled past it"
+                        );
+                    }
                     cursors.remove(source_identity);
                     return Ok(());
                 }

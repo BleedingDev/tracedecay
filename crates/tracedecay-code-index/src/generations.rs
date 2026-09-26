@@ -4,8 +4,8 @@
 //! One immutable logical generation is planned from one fenced, receipt-bound
 //! snapshot. The planner mints monotonic per-repository generation identity,
 //! pins the registry/grammar/extractor/sanitizer/chunker/privacy inputs, and
-//! seals the manifest with [`expected_seal_digest`] — the exact rule the
-//! capability emitter verifies — before rows and the expected digest are
+//! seals the manifest with [`expected_seal_digest`], the exact rule the
+//! capability emitter verifies, before rows and the expected digest are
 //! handed to the store publication port. Planning is pure: the seal timestamp
 //! is an input, so identical inputs produce an identical seal, and re-sealing
 //! a sealed manifest reproduces its digest.
@@ -13,7 +13,7 @@
 //! Incremental reuse is planned, not assumed: given the prior sealed manifest,
 //! the prior snapshot, and the current validated snapshot, the planner emits
 //! the minimal re-extraction plan. Content identity digests are the reuse
-//! authority — a file carries forward only when its content, grammar,
+//! authority, a file carries forward only when its content, grammar,
 //! extractor, sanitizer, and chunker inputs all match; capture-declared
 //! change hints are recorded as evidence but never override a digest.
 //! Incompatible schema, grammar, extractor, sanitizer, chunker, or privacy
@@ -642,31 +642,31 @@ fn repository_discriminator(
         .collect())
 }
 
-/// Parse an identity minted by this planner. Legacy
-/// `generation.v1.<repo>.<seq>` parents remain accepted; current identities
-/// include a SHA-256 invalidation fingerprint suffix.
+/// Parse an identity minted by this planner:
+/// `generation.v1.<repo>.<seq>.<fingerprint>`, where the fingerprint is the
+/// 64-hex SHA-256 invalidation suffix. Any other shape is not ours.
 fn parse_minted_generation_id(generation_id: &CodeGenerationId) -> Option<(String, u64)> {
     let mut parts = generation_id.as_str().split('.');
     let scheme = parts.next()?;
     let version = parts.next()?;
     let discriminator = parts.next()?;
     let sequence = parts.next()?;
-    let fingerprint = parts.next();
-    if scheme != "generation" || version != "v1" || parts.next().is_some() {
-        return None;
-    }
-    if fingerprint.is_some_and(|fingerprint| {
-        fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
+    let fingerprint = parts.next()?;
+    if scheme != "generation"
+        || version != "v1"
+        || parts.next().is_some()
+        || fingerprint.len() != 64
+        || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return None;
     }
     Some((discriminator.to_owned(), sequence.parse().ok()?))
 }
 
-/// A well-formed placeholder digest, replaced by the computed seal before the
-/// manifest is returned. The seal payload excludes the seal itself, so the
-/// placeholder never influences the computed digest.
-fn placeholder_digest() -> ManifestDigest {
+/// Canonical zero digest substituted until the caller computes the real digest.
+/// Callers exclude this placeholder from that computation, so it never
+/// influences the result.
+pub(crate) fn placeholder_digest() -> ManifestDigest {
     ManifestDigest::new(format!("sha256:{}", "0".repeat(64)))
         .expect("a zeroed sha256 digest is canonical")
 }
@@ -689,7 +689,7 @@ pub enum GenerationJoinErrorV1 {
 /// manifest, producing the canonical chunk-to-generation bindings (Plan 25:
 /// every eligible chunk names exactly one code generation and file
 /// occurrence). Cross-generation documents or chunks, undeclared chunks, and
-/// duplicates are typed rejections — never silently joined.
+/// duplicates are typed rejections, never silently joined.
 #[hotpath::measure(label = "code_index.build.generation_join")]
 pub fn join_chunks_to_generation(
     generation: &CodeGenerationManifestV1,
@@ -758,13 +758,7 @@ mod tests {
             .expect("valid digest")
     }
 
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        <T as TryFrom<String>>::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("valid fixture identity")
-    }
+    use tracedecay_domain::test_fixtures::id;
 
     fn repository() -> RepositoryId {
         id("repository.fixture")
@@ -964,11 +958,14 @@ mod tests {
 
         // Foreign parent: an identity this planner never minted.
         let mut foreign = genesis.clone();
-        foreign.generation_id = id("generation.v1.00000002.00000001");
+        let fingerprint = genesis
+            .generation_id
+            .as_str()
+            .rsplit('.')
+            .next()
+            .expect("minted fingerprint");
+        foreign.generation_id = id(&format!("generation.v1.00000002.00000001.{fingerprint}"));
         foreign.parent_generation = None;
-        foreign.invalidation_digest = foreign
-            .expected_legacy_invalidation_digest()
-            .expect("foreign invalidation digest");
         foreign.seal.expected_digest = expected_seal_digest(&foreign).expect("foreign reseal");
         assert_eq!(
             planner.plan_generation(&snapshot, Some(&foreign), UtcMicros(4_000)),

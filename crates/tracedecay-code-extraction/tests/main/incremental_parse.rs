@@ -16,13 +16,7 @@ use tracedecay_domain::{
     RepositoryDirtyStateV1, RepositoryId, SourceSpan, TreeId, WorktreeId,
 };
 
-fn id<T>(value: &str) -> T
-where
-    T: TryFrom<String>,
-    T::Error: std::fmt::Display,
-{
-    T::try_from(value.to_owned()).unwrap_or_else(|error| panic!("{value}: {error}"))
-}
+use tracedecay_domain::test_fixtures::id;
 
 fn identity(commit: &str, tree: &str, dirty: RepositoryDirtyStateV1) -> ParseDocumentIdentity {
     identity_in_worktree(commit, tree, dirty, "worktree.incremental")
@@ -343,7 +337,7 @@ fn canonical_reextraction_visits_only_changed_top_level_syntax() {
     )
     .expect("initial parse");
     let initial = document
-        .extract_canonical(&RustExtractor, &opened, None)
+        .extract_canonical_artifact(&RustExtractor, &opened, None)
         .expect("initial canonical extraction");
     assert_eq!(
         initial.disposition,
@@ -357,7 +351,7 @@ fn canonical_reextraction_visits_only_changed_top_level_syntax() {
         )
         .expect("incremental parse");
     let increment = document
-        .extract_canonical(&RustExtractor, &report, Some(&initial.result))
+        .extract_canonical_artifact(&RustExtractor, &report, Some(&initial.artifact))
         .expect("incremental canonical extraction");
 
     assert_eq!(
@@ -367,6 +361,7 @@ fn canonical_reextraction_visits_only_changed_top_level_syntax() {
     assert_eq!(increment.metrics.visited_top_level_nodes, 1);
     assert!(increment.metrics.visited_bytes < after.len());
     let edited = increment
+        .artifact
         .result
         .nodes
         .iter()
@@ -374,7 +369,7 @@ fn canonical_reextraction_visits_only_changed_top_level_syntax() {
         .expect("edited function");
     assert!(edited.is_async);
     assert!(matches!(
-        document.extract_canonical(&RustExtractor, &opened, Some(&initial.result)),
+        document.extract_canonical_artifact(&RustExtractor, &opened, Some(&initial.artifact)),
         Err(ParseError::StaleReport)
     ));
 }
@@ -437,7 +432,7 @@ fn same_line_column_shifts_reextract_following_top_level_syntax() {
     )
     .expect("initial parse");
     let initial = document
-        .extract_canonical(&RustExtractor, &opened, None)
+        .extract_canonical_artifact(&RustExtractor, &opened, None)
         .expect("initial canonical extraction");
 
     let report = document
@@ -447,9 +442,10 @@ fn same_line_column_shifts_reextract_following_top_level_syntax() {
         )
         .expect("same-line incremental parse");
     let incremental = document
-        .extract_canonical(&RustExtractor, &report, Some(&initial.result))
+        .extract_canonical_artifact(&RustExtractor, &report, Some(&initial.artifact))
         .expect("same-line canonical extraction");
     let following = incremental
+        .artifact
         .result
         .nodes
         .iter()
@@ -478,7 +474,7 @@ fn same_line_method_edit_keeps_both_methods_distinct_after_merge() {
     )
     .expect("initial parse");
     let initial = document
-        .extract_canonical(&RustExtractor, &opened, None)
+        .extract_canonical_artifact(&RustExtractor, &opened, None)
         .expect("initial canonical extraction");
 
     let report = document
@@ -489,7 +485,7 @@ fn same_line_method_edit_keeps_both_methods_distinct_after_merge() {
         .expect("same-line incremental parse");
     assert_eq!(report.reuse, ParseReuse::Incremental);
     let incremental = document
-        .extract_canonical(&RustExtractor, &report, Some(&initial.result))
+        .extract_canonical_artifact(&RustExtractor, &report, Some(&initial.artifact))
         .expect("same-line canonical extraction");
     assert_eq!(
         incremental.disposition,
@@ -497,8 +493,8 @@ fn same_line_method_edit_keeps_both_methods_distinct_after_merge() {
     );
     assert_eq!(incremental.metrics.visited_top_level_nodes, 1);
 
-    let mut cold = RustExtractor.extract("src/lib.rs", after);
-    let mut merged = incremental.result;
+    let mut cold = RustExtractor.extract_artifact("src/lib.rs", after).result;
+    let mut merged = incremental.artifact.result;
     for result in [&mut cold, &mut merged] {
         result.duration_ms = 0;
         for node in &mut result.nodes {
@@ -555,7 +551,7 @@ fn file_root_end_line(result: &ExtractionResult) -> u32 {
 /// through the changed-region path, and after a line-changing edit that takes
 /// the multiline reset path. The last shape moves the terminating newline
 /// without changing the row delta, so the file root's `end_line` changes on a
-/// same-line edit — reusing the prior span would be wrong there.
+/// same-line edit. Reusing the prior span would be wrong there.
 #[test]
 fn file_root_span_matches_cold_extraction_for_every_line_ending_shape() {
     let shapes = [
@@ -582,16 +578,16 @@ fn file_root_span_matches_cold_extraction_for_every_line_ending_shape() {
         )
         .expect("initial parse");
         let initial = document
-            .extract_canonical(&RustExtractor, &opened, None)
+            .extract_canonical_artifact(&RustExtractor, &opened, None)
             .expect("initial canonical extraction");
-        let cold_before = RustExtractor.extract("src/lib.rs", before);
+        let cold_before = RustExtractor.extract_artifact("src/lib.rs", before).result;
         assert_eq!(
-            timeless_rows(&initial.result),
+            timeless_rows(&initial.artifact.result),
             timeless_rows(&cold_before),
             "initial rows for {before:?}"
         );
         assert_eq!(
-            file_root_end_line(&initial.result),
+            file_root_end_line(&initial.artifact.result),
             before.lines().count().saturating_sub(1) as u32,
             "initial file root for {before:?}"
         );
@@ -608,21 +604,21 @@ fn file_root_span_matches_cold_extraction_for_every_line_ending_shape() {
             "{before:?} -> {after:?}"
         );
         let incremental = document
-            .extract_canonical(&RustExtractor, &report, Some(&initial.result))
+            .extract_canonical_artifact(&RustExtractor, &report, Some(&initial.artifact))
             .expect("same-line canonical extraction");
         assert_eq!(
             incremental.disposition,
             ParsedExtractionDisposition::ChangedRegions,
             "{before:?} -> {after:?}"
         );
-        let cold_after = RustExtractor.extract("src/lib.rs", after);
+        let cold_after = RustExtractor.extract_artifact("src/lib.rs", after).result;
         assert_eq!(
-            timeless_rows(&incremental.result),
+            timeless_rows(&incremental.artifact.result),
             timeless_rows(&cold_after),
             "same-line merged rows for {before:?} -> {after:?}"
         );
         assert_eq!(
-            file_root_end_line(&incremental.result),
+            file_root_end_line(&incremental.artifact.result),
             after.lines().count().saturating_sub(1) as u32,
             "same-line file root for {after:?}"
         );
@@ -635,7 +631,7 @@ fn file_root_span_matches_cold_extraction_for_every_line_ending_shape() {
             )
             .expect("multiline incremental parse");
         let reset = document
-            .extract_canonical(&RustExtractor, &report, Some(&incremental.result))
+            .extract_canonical_artifact(&RustExtractor, &report, Some(&incremental.artifact))
             .expect("multiline canonical extraction");
         assert_eq!(
             reset.disposition,
@@ -644,14 +640,16 @@ fn file_root_span_matches_cold_extraction_for_every_line_ending_shape() {
             },
             "{after:?} -> {multiline:?}"
         );
-        let cold_multiline = RustExtractor.extract("src/lib.rs", &multiline);
+        let cold_multiline = RustExtractor
+            .extract_artifact("src/lib.rs", &multiline)
+            .result;
         assert_eq!(
-            timeless_rows(&reset.result),
+            timeless_rows(&reset.artifact.result),
             timeless_rows(&cold_multiline),
             "reset rows for {multiline:?}"
         );
         assert_eq!(
-            file_root_end_line(&reset.result),
+            file_root_end_line(&reset.artifact.result),
             multiline.lines().count().saturating_sub(1) as u32,
             "reset file root for {multiline:?}"
         );

@@ -27,7 +27,9 @@ use tracedecay_domain::feedback::{
 };
 
 use crate::feedback::concrete::{ConcreteFeedbackOwner, ProjectFeedbackStore};
-use crate::feedback::cycle_runtime::{CanonicalFeedbackResultV1, FeedbackCycleRuntime};
+use crate::feedback::cycle_runtime::{
+    CanonicalFeedbackResultV1, FeedbackCycleRuntime, FeedbackCycleRuntimeError,
+};
 use crate::feedback::observations::FeedbackObservationEmitterV1;
 use crate::operation_stream::OperationEmitter;
 use tracedecay_contracts::feedback::observations::{
@@ -36,8 +38,8 @@ use tracedecay_contracts::feedback::observations::{
     FeedbackProximityTransitionV1, FeedbackSourceEventV1,
 };
 use tracedecay_global_db::configuration::contracts::ports::ConfigurationControlStore;
+use tracedecay_runtime_core::cancellation::MonotonicDeadline;
 use tracedecay_runtime_core::db::Database;
-use tracedecay_session_memory::context::MonotonicDeadline;
 
 use super::ci_runtime::{
     CiExactEvidenceAuthorityV1, CiReadOnlyProviderArchiveV1, ConcreteCiFailureLocalizationOwnerV1,

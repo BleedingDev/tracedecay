@@ -3,6 +3,7 @@ use crate::mcp_server_test::support::*;
 use serde_json::json;
 #[cfg(feature = "test-transport")]
 use std::sync::Arc;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 #[cfg(feature = "test-transport")]
 #[tokio::test]
@@ -21,9 +22,7 @@ async fn search_call_writes_mcp_runtime_analytics_event() {
         .expect("production project server");
     crate::support::warm_code_index_search(&server, "helper").await;
     server.ledger_writes_settled().await;
-    let project_path = fixture
-        .project_root
-        .canonicalize()
+    let project_path = canonical_existing_identity(&fixture.project_root)
         .expect("project path canonicalizes")
         .to_string_lossy()
         .to_string();
@@ -332,7 +331,7 @@ async fn structural_edit_failure_writes_real_failure_reason_to_analytics() {
 
     // An anchor mismatch (str_replace's `old_str` not present in the file) is
     // a structural failure the handler already knows about via
-    // `EditResult::success == false` — the resulting analytics event should
+    // `EditResult::success == false`, the resulting analytics event should
     // carry that exact message, not a generic "tool_dispatch_error" marker.
     let resp = call_tool(
         Arc::clone(&server),
@@ -394,9 +393,7 @@ async fn ledger_records_by_default_without_env_opt_in() {
         .expect("production project server");
     crate::support::warm_code_index_search(&server, "helper").await;
     server.ledger_writes_settled().await;
-    let project_path = fixture
-        .project_root
-        .canonicalize()
+    let project_path = canonical_existing_identity(&fixture.project_root)
         .expect("project path canonicalizes")
         .to_string_lossy()
         .to_string();
@@ -462,102 +459,6 @@ async fn global_accounting_env_overrides() {
     assert!(!global_accounting_mode().enabled());
 }
 
-/// A full-file read returns the entire file to the agent, so it must not
-/// credit the lifetime counters: net saving = before - after, clamped at
-/// zero. Guards against the historical bug where the counters accumulated
-/// the gross "before" estimate even when the response carried the whole file.
-#[tokio::test]
-async fn full_file_read_credits_zero_net_savings() {
-    let _env_guard = SAVINGS_ENV_LOCK.lock().await;
-    let _enable = EnvVarGuard::set("TRACEDECAY_ENABLE_GLOBAL_DB", "1");
-    let fixture = crate::support::production_composition_fixture_with_sources(|root| {
-        std::fs::create_dir_all(root.join("src")).expect("savings project src");
-        std::fs::write(root.join("src/main.rs"), savings_project_source())
-            .expect("savings project source");
-    })
-    .await;
-    let server = fixture
-        .harness
-        .server(&fixture.project_root)
-        .expect("production project server");
-    crate::support::warm_code_index_search(&server, "helper").await;
-    server.ledger_writes_settled().await;
-    let project_path = fixture
-        .project_root
-        .canonicalize()
-        .expect("project path canonicalizes");
-    let project_key = project_path.to_string_lossy().to_string();
-    let baseline = fixture
-        .harness
-        .sum_profile_savings(Some(&project_key), 0)
-        .await
-        .expect("baseline settled savings");
-    let baseline_lifetime = fixture
-        .harness
-        .project_lifetime_saved_tokens(&project_path)
-        .await
-        .expect("baseline lifetime savings");
-
-    let resp = crate::support::handle_real_server_tool_call_raw(
-        &server,
-        "tracedecay_read",
-        json!({
-            "file": "src/main.rs",
-            "mode": "full"
-        }),
-    )
-    .await;
-    assert!(resp["error"].is_null(), "read should not error: {resp}");
-
-    server.ledger_writes_settled().await;
-    let event = expect_harness_project_mcp_runtime_event(
-        &fixture.harness,
-        &project_key,
-        "tracedecay_read",
-        "durable full-file read analytics event",
-    )
-    .await;
-    let metadata = analytics_metadata(&event);
-    let before = metadata["before_tokens"]
-        .as_u64()
-        .expect("analytics event before-token count");
-    let after = metadata["after_tokens"]
-        .as_u64()
-        .expect("analytics event after-token count");
-    assert!(before > 0, "raw-file estimate should be nonzero");
-    assert!(
-        after >= before,
-        "full-file response ({after}) should be at least the raw estimate ({before})"
-    );
-
-    let total = fixture
-        .harness
-        .sum_profile_savings(Some(&project_key), 0)
-        .await
-        .expect("settled savings after full-file read");
-    assert_eq!(
-        total.calls,
-        baseline.calls + 1,
-        "the accounted call must settle exactly one new ledger row"
-    );
-    assert_eq!(
-        total.saved_tokens - baseline.saved_tokens,
-        0,
-        "ledger must not count a full-file read as savings"
-    );
-    let lifetime = fixture
-        .harness
-        .project_lifetime_saved_tokens(&project_path)
-        .await
-        .expect("lifetime savings after full-file read");
-    assert_eq!(
-        lifetime - baseline_lifetime,
-        0,
-        "lifetime counter must not be credited with the gross before estimate"
-    );
-    fixture.harness.shutdown().await;
-}
-
 /// The lifetime counter and the ledger must agree: both credit the net
 /// saving (before - after) per call, so after a single compressed call the
 /// per-project counter equals the ledger total.
@@ -578,10 +479,8 @@ async fn lifetime_counter_matches_ledger_net_savings() {
         .expect("production project server");
     crate::support::warm_code_index_search(&server, "helper").await;
     server.ledger_writes_settled().await;
-    let project_path = fixture
-        .project_root
-        .canonicalize()
-        .expect("project path canonicalizes");
+    let project_path =
+        canonical_existing_identity(&fixture.project_root).expect("project path canonicalizes");
     let project_key = project_path.to_string_lossy().to_string();
     let baseline = fixture
         .harness

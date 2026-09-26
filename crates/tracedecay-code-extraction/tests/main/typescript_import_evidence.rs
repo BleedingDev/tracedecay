@@ -461,3 +461,172 @@ fn svelte_artifact_wrapper_does_not_drop_script_type_import_evidence() {
     assert_eq!(row.start_line, 1);
     assert_eq!(row.start_column, 14);
 }
+
+/// `export … from` forwards bindings without binding them locally: each
+/// forwarded name is public import evidence (`is_public`), a `*` forward is a
+/// public glob, and the exported name is the local name so a barrel walk can
+/// follow `export { sum as add }` from `add` back to `sum`. A same-module
+/// `export { local }` names the declaring file as its module.
+#[test]
+fn reexport_statements_are_public_import_evidence() {
+    let source = concat!(
+        "export * from \"./format\";\n",
+        "export { sum as add, type Shape } from \"./math\";\n",
+        "export * as ns from \"./ns\";\n",
+        "import { local } from \"./local\";\n",
+        "export { local };\n",
+    );
+    let artifact = TypeScriptExtractor.extract_artifact("packages/shared/src/index.ts", source);
+    assert!(
+        artifact.result.errors.is_empty(),
+        "{:?}",
+        artifact.result.errors
+    );
+    let rows = artifact
+        .imports
+        .iter()
+        .map(|row| {
+            (
+                row.module_specifier.as_str(),
+                row.imported_name.as_deref(),
+                row.local_name.as_deref(),
+                row.is_public,
+                row.is_glob,
+                row.namespace,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "./format",
+                Some("*"),
+                None,
+                true,
+                true,
+                ImportNamespaceV1::Value
+            ),
+            (
+                "./math",
+                Some("sum"),
+                Some("add"),
+                true,
+                false,
+                ImportNamespaceV1::Value
+            ),
+            (
+                "./math",
+                Some("Shape"),
+                Some("Shape"),
+                true,
+                false,
+                ImportNamespaceV1::Type
+            ),
+            (
+                "./ns",
+                Some("*"),
+                Some("ns"),
+                true,
+                false,
+                ImportNamespaceV1::Value
+            ),
+            (
+                "./local",
+                Some("local"),
+                Some("local"),
+                false,
+                false,
+                ImportNamespaceV1::Value
+            ),
+            (
+                "./index.ts",
+                Some("local"),
+                Some("local"),
+                true,
+                false,
+                ImportNamespaceV1::Value
+            ),
+        ]
+    );
+    assert_eq!(
+        artifact
+            .result
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::Export)
+            .map(|node| node.signature.as_deref())
+            .collect::<Vec<_>>(),
+        [
+            Some("export { sum as add, type Shape } from \"./math\";"),
+            Some("export { local };"),
+        ],
+        "the export-clause statements stay in the graph as their own nodes"
+    );
+}
+
+#[test]
+fn local_and_default_exports_forward_through_the_module_itself() {
+    for (source, expected) in [
+        (
+            "export default function greet(): void {}\n",
+            vec![(Some("greet"), Some("default"), ImportNamespaceV1::Value)],
+        ),
+        (
+            "export default class Greeter {}\n",
+            vec![(Some("Greeter"), Some("default"), ImportNamespaceV1::Value)],
+        ),
+        (
+            "export default interface Shape {}\n",
+            vec![(Some("Shape"), Some("default"), ImportNamespaceV1::Type)],
+        ),
+        (
+            "function farewell(): void {}\nexport default farewell;\n",
+            vec![(Some("farewell"), Some("default"), ImportNamespaceV1::Value)],
+        ),
+        (
+            "function impl(): void {}\ntype T = string;\nexport { impl as default, type T };\n",
+            vec![
+                (Some("impl"), Some("default"), ImportNamespaceV1::Value),
+                (Some("T"), Some("T"), ImportNamespaceV1::Type),
+            ],
+        ),
+        // Anonymous defaults and default expressions name no binding.
+        ("export default function (): void {}\n", Vec::new()),
+        ("export default () => 1;\n", Vec::new()),
+        ("export default { a: 1 };\n", Vec::new()),
+        // A declaration export binds its own name; nothing forwards.
+        ("export function plain(): void {}\n", Vec::new()),
+    ] {
+        let artifact =
+            TypeScriptExtractor.extract_artifact("apps/web/src/defaults/greet.ts", source);
+        assert!(
+            artifact.result.errors.is_empty(),
+            "{source}: {:?}",
+            artifact.result.errors
+        );
+        assert!(
+            artifact
+                .imports
+                .iter()
+                .all(|row| row.module_specifier == "./greet.ts"
+                    && row.is_public
+                    && !row.is_glob
+                    && row.module_kind == ImportModuleKindV1::ProjectRelative),
+            "{source}: {:?}",
+            artifact.imports
+        );
+        let rows = artifact
+            .imports
+            .iter()
+            .map(|row| {
+                (
+                    row.imported_name.as_deref(),
+                    row.local_name.as_deref(),
+                    row.namespace,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected, "{source}");
+    }
+}

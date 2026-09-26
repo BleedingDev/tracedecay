@@ -10,11 +10,6 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use crate::ToolResult;
 use crate::tools::render;
 
-/// Key under which context handlers stash analytics that must reach the server
-/// but never the client. [`rendered_tool_result`] is the one place it is lifted
-/// back out, so no handler has to remember to strip it.
-pub const CONTEXT_MEMORY_ANALYTICS_KEY: &str = "context_memory_analytics";
-
 /// Decodes a paginated read's continuation from the transport arguments.
 ///
 /// The cursor is caller-supplied, so it is bounded before parsing and then
@@ -39,38 +34,18 @@ pub fn retrieval_cursor(args: &Value) -> Result<Option<tracedecay_domain::Retrie
 
 /// The single wrapper every MCP tool handler returns through.
 ///
-/// Lifts internal analytics out of `value` so they travel beside the result
-/// instead of inside the client payload, renders the default-format (markdown)
-/// body with `md`, and records `touched_files`. The `format:"json"` path is
-/// unaffected — [`render::finalize`] serializes `value` compactly there.
+/// Renders the default-format (markdown) body with `md` and records
+/// `touched_files`. The `format:"json"` path is unaffected,
+/// [`render::finalize`] serializes `value` compactly there.
 pub fn rendered_tool_result<F: FnOnce() -> String>(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     args: &Value,
     value: &Value,
     touched_files: Vec<String>,
     md: F,
 ) -> ToolResult {
-    let internal_analytics = value.get(CONTEXT_MEMORY_ANALYTICS_KEY).cloned();
-    let public_value = internal_analytics
-        .as_ref()
-        .and_then(|_| public_value_without_internal_context_memory_analytics(value));
-    let value = public_value.as_ref().unwrap_or(value);
-    let text = render::finalize(project_root, args, value, md);
-    let result = text_tool_result(&text, touched_files);
-    if let Some(internal_analytics) = internal_analytics {
-        result.with_internal_analytics(internal_analytics)
-    } else {
-        result
-    }
-}
-
-fn public_value_without_internal_context_memory_analytics(value: &Value) -> Option<Value> {
-    let mut value = value.clone();
-    take_internal_context_memory_analytics(&mut value).map(|_| value)
-}
-
-pub fn take_internal_context_memory_analytics(value: &mut Value) -> Option<Value> {
-    value.as_object_mut()?.remove(CONTEXT_MEMORY_ANALYTICS_KEY)
+    let text = render::finalize(response_handle_root, args, value, md);
+    text_tool_result(&text, touched_files)
 }
 
 /// A compact JSON payload rendered as the tool's text content.
@@ -87,30 +62,30 @@ pub fn text_tool_result(text: &str, touched_files: Vec<String>) -> ToolResult {
 
 /// [`rendered_tool_result`] for handlers that touch no files.
 pub fn tool_json_with_md<F: FnOnce() -> String>(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     args: &Value,
     value: &Value,
     md: F,
 ) -> ToolResult {
-    rendered_tool_result(project_root, args, value, Vec::new(), md)
+    rendered_tool_result(response_handle_root, args, value, Vec::new(), md)
 }
 
 /// [`rendered_tool_result`] for handlers that don't need a custom markdown
-/// renderer — the default body is [`render::generic_md`] over the same value.
+/// renderer, the default body is [`render::generic_md`] over the same value.
 pub fn generic_tool_result(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     args: &Value,
     value: &Value,
     touched_files: Vec<String>,
 ) -> ToolResult {
-    rendered_tool_result(project_root, args, value, touched_files, || {
+    rendered_tool_result(response_handle_root, args, value, touched_files, || {
         render::generic_md(value)
     })
 }
 
 /// [`generic_tool_result`] for handlers that touch no files.
-pub fn tool_json(project_root: Option<&Path>, args: &Value, value: &Value) -> ToolResult {
-    generic_tool_result(project_root, args, value, Vec::new())
+pub fn tool_json(response_handle_root: Option<&Path>, args: &Value, value: &Value) -> ToolResult {
+    generic_tool_result(response_handle_root, args, value, Vec::new())
 }
 
 /// The single rejection every dispatch family returns for a name it does not own.

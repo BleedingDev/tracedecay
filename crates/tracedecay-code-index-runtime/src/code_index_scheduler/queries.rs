@@ -4,18 +4,17 @@
 //! It selects one already-mounted worktree generation and translates the
 //! generic lane evidence into the typed application-operation records.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicU64;
-#[cfg(any(test, feature = "test-helpers"))]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use serde::Serialize;
 
-use tracedecay_code_index::graph_projection::CodeGraphInteractiveReader;
+use tracedecay_code_index::graph_projection::{
+    CodeGraphInteractiveReader, CodeGraphReadCostMeter, CodeGraphSymbolRefV1,
+};
 use tracedecay_contracts::retrieval::{
     CodeFacetDimension, CodeFacetRecord, CodeFacetRequest, CodeLexicalField, CodeNavigationRequest,
     CodeTimelineRecord, CodeTimelineRequest, SymbolPrimitiveRecord, SymbolRelationRecord,
@@ -29,16 +28,16 @@ use tracedecay_contracts::{
     ExactOccurrenceRecord, ExactOccurrenceRequest, FreshnessState, LexicalOccurrenceRecord,
     ModuleApiRequest, Omission, OmissionReason, OpaqueCursor, OperationBudgetUsage, PageCursor,
     PageState, PhraseSearchRequest, QualifiedNameRequest, RequestAdmission, RequestContext,
-    RetrievalEvidence, RetrievalPortContext, RetrievalPortOutcome, SourceMetadataRecord,
-    SourceMetadataRequest, TemporalState,
+    RequestCostReceiptV1, RetrievalEvidence, RetrievalPortContext, RetrievalPortOutcome,
+    SourceMetadataRecord, SourceMetadataRequest, TemporalState,
 };
 use tracedecay_domain::{
     AuthorizationRevision, CodeGenerationId, CodeSearchChunkId, ComponentRevision,
     ExactAdmissionRuleRevision, FileOccurrenceId, FreshnessVectorDigest, ManifestDigest, NodeKind,
-    PrincipalId, QueryNormalizationRevision, RelationEdgeKindV1, RetrievalAnchorId,
-    RetrievalBudget, RetrievalBudgetUsage, RetrievalFailure, RetrievalRequest, RetrievalScope,
-    RetrievalSnapshot, SanitizerRevision, ScoreDomainId, SingleRootScopeV1, SourceOccurrenceId,
-    SymbolOccurrenceId, TemporalModeV1, UtcMicros, VectorWatermark, canonical_sha256,
+    PrincipalId, QueryNormalizationRevision, RelationEdgeKindV1, RetrievalBudget,
+    RetrievalBudgetUsage, RetrievalFailure, RetrievalRequest, RetrievalScope, RetrievalSnapshot,
+    SanitizerRevision, ScoreDomainId, SingleRootScopeV1, SymbolOccurrenceId, TemporalModeV1,
+    UtcMicros, VectorWatermark, canonical_sha256,
 };
 use tracedecay_tool_catalog::SortContractId;
 
@@ -54,21 +53,18 @@ use tracedecay_query::code_search;
 use tracedecay_query::retrieval::exact::{
     CentralExactAdmissionAuthorityV1, ExactAdmissionAuthority, ExactLaneRequest,
 };
-use tracedecay_query::retrieval::graph::{
-    GraphLaneRequest, GraphLaneRetriever, graph_read_cancellation,
-};
+use tracedecay_query::retrieval::graph::graph_read_cancellation;
 use tracedecay_query::retrieval::lexical::{
     LexicalFieldFilterV1, LexicalFieldV1, LexicalLaneRequest, lexical_query_parts,
 };
 use tracedecay_query::retrieval::ports::{
-    CodeCandidateBindingV1, CodeOccurrenceRefV1, RetrievalExecutionControl,
+    CodeCandidateBindingV1, RetrievalExecutionControl, RetrievalPortError,
 };
 use tracedecay_query::retrieval::{
-    AdmittedGenerationContextV1, NativeCodeOccurrenceV1, NativeExactRecordV1, NativeGraphRecordV1,
-    NativeLaneOutcomeV1, NativeLanePageV1, NativeLexicalRecordV1, NativeRecordReadPortV1,
-    NativeSymbolRecordV1, PreparedQueryBindingsV1, PreparedQueryErrorV1,
-    PreparedQueryRoutingBindingsV1, PreparedQueryV1, QueryExecutionContractErrorV1,
-    route_authenticated_prepared_query_cursor,
+    AdmittedGenerationContextV1, NativeCodeOccurrenceV1, NativeExactRecordV1, NativeLaneOutcomeV1,
+    NativeLanePageV1, NativeLexicalRecordV1, NativeRecordReadPortV1, NativeSymbolRecordV1,
+    PreparedQueryBindingsV1, PreparedQueryErrorV1, PreparedQueryRoutingBindingsV1, PreparedQueryV1,
+    QueryExecutionContractErrorV1, route_authenticated_prepared_query_cursor,
 };
 
 const CALLABLE_CODE_SORT: &str = "sort.application.code-index.v1";
@@ -186,11 +182,6 @@ fn is_unpinned_latest(generation: &CodeGenerationId) -> bool {
 }
 
 impl CodeIndexSchedulerRegistryV1 {
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub fn take_relation_symbol_hydrations(&self) -> u64 {
-        self.relation_symbol_hydrations.swap(0, Ordering::Relaxed)
-    }
-
     /// Compose real exact/lexical/graph lane outcomes only through the query
     /// profile and query/cursor key authority mounted for this exact admitted
     /// scope.
@@ -200,6 +191,7 @@ impl CodeIndexSchedulerRegistryV1 {
         request: &tracedecay_domain::RetrievalRequest,
         query_view: &tracedecay_domain::EphemeralSanitizedQueryViewV1,
         lanes: Vec<tracedecay_query::retrieval::fusion::CompositionLaneInput>,
+        anchor_tiers: &std::collections::BTreeMap<tracedecay_domain::RetrievalAnchorId, u32>,
         page_size: usize,
         cursor: Option<&tracedecay_domain::RetrievalCursor>,
     ) -> Result<
@@ -210,7 +202,7 @@ impl CodeIndexSchedulerRegistryV1 {
             .query_authority_for_scope(scope)
             .await
             .ok_or(tracedecay_query::retrieval::QueryAuthorityErrorV1::AuthorityUnavailable)?;
-        authority.compose(request, query_view, lanes, page_size, cursor)
+        authority.compose(request, query_view, lanes, anchor_tiers, page_size, cursor)
     }
 
     pub async fn generation_for(
@@ -325,7 +317,7 @@ impl CodeIndexSchedulerRegistryV1 {
     /// Resolve the generation a callable-code query serves.
     ///
     /// An explicit, caller-pinned generation is matched exactly and served
-    /// generation-bound and read-only — the freshness ladder is deliberately
+    /// generation-bound and read-only, the freshness ladder is deliberately
     /// bypassed so a pin is a stable, reproducible read. The reserved unpinned
     /// sentinel instead runs the three-tier freshness ladder and serves the
     /// latest complete compatible generation, so out-of-band changes are
@@ -691,6 +683,7 @@ fn unavailable<T>(finished_at: tracedecay_domain::UtcMicros) -> RetrievalPortOut
         finished_at,
         budget: OperationBudgetUsage::default(),
         cancellation: None,
+        cost: None,
     })
 }
 
@@ -809,6 +802,7 @@ fn bounded_result<T>(
         finished_at,
         budget: OperationBudgetUsage::default(),
         cancellation: None,
+        cost: None,
     };
     if is_partial {
         RetrievalPortOutcome::Partial(evidence)
@@ -818,7 +812,7 @@ fn bounded_result<T>(
 }
 
 fn path_is_in_code_query_scope(path: &str, scope: &tracedecay_contracts::CodeQueryScope) -> bool {
-    tracedecay_runtime_core::path_scope::path_matches_scope(path, scope.path_prefix.as_deref())
+    tracedecay_domain::path_matches_scope(path, scope.path_prefix.as_deref())
 }
 
 fn relation_edge_kind_name(kind: RelationEdgeKindV1) -> &'static str {
@@ -1165,11 +1159,6 @@ impl NativeRecordReadPortV1 for LatestCompleteCodeIndexV1 {
     }
 }
 
-struct GraphProjectionNativeRecordReadPortV1 {
-    generation: CodeGenerationId,
-    reader: CodeGraphInteractiveReader,
-}
-
 fn graph_projection_symbol_record(
     summary: tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1,
     symbol: &SymbolOccurrenceId,
@@ -1216,32 +1205,6 @@ fn graph_projection_symbol_record(
         signature: metadata.signature,
         is_async: metadata.is_async,
     })
-}
-
-impl NativeRecordReadPortV1 for GraphProjectionNativeRecordReadPortV1 {
-    fn generation(&self) -> &CodeGenerationId {
-        &self.generation
-    }
-
-    fn occurrence(
-        &self,
-        _binding: &CodeCandidateBindingV1,
-    ) -> Result<NativeCodeOccurrenceV1, QueryExecutionContractErrorV1> {
-        Err(QueryExecutionContractErrorV1::RecordUnavailable)
-    }
-
-    fn symbol(
-        &self,
-        symbol: &SymbolOccurrenceId,
-        file: &FileOccurrenceId,
-    ) -> Result<NativeSymbolRecordV1, QueryExecutionContractErrorV1> {
-        let summary = self
-            .reader
-            .symbol_summary(symbol, Arc::new(tracedecay_graph_db::NeverCancelled))
-            .map_err(|_| QueryExecutionContractErrorV1::RecordUnavailable)?
-            .ok_or(QueryExecutionContractErrorV1::RecordUnavailable)?;
-        graph_projection_symbol_record(summary, symbol, file)
-    }
 }
 
 struct TextArtifactNativeRecordReadPortV1 {
@@ -1315,19 +1278,6 @@ fn application_symbol_record(record: NativeSymbolRecordV1) -> SymbolPrimitiveRec
     }
 }
 
-fn application_graph_record(record: NativeGraphRecordV1) -> SymbolRelationRecord {
-    SymbolRelationRecord {
-        symbol: application_symbol_record(record.symbol),
-        edge_kind: record.edge_kind.map_or_else(
-            || "unknown".to_owned(),
-            |edge| relation_edge_kind_name(edge).to_owned(),
-        ),
-        dispatch_via_trait: false,
-        dispatch_from: None,
-        depth: Some(record.depth),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispatchExpansionStop {
     Cancelled,
@@ -1368,18 +1318,17 @@ fn check_dispatch_control(
 /// claiming complete trait dispatch.
 fn visit_trait_dispatch_targets(
     reader: &CodeGraphInteractiveReader,
-    callee: &SymbolOccurrenceId,
+    callee: &CodeGraphSymbolRefV1,
     scope: &tracedecay_contracts::CodeQueryScope,
     budget: RetrievalBudget,
     control: &Arc<dyn RetrievalExecutionControl>,
-    examined: &mut u64,
     mut visit: impl FnMut(
         &tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1,
     ) -> Result<bool, DispatchExpansionStop>,
 ) -> Result<bool, DispatchExpansionStop> {
     check_dispatch_control(control.as_ref(), budget)?;
     let Some(callee_summary) = reader
-        .symbol_summary(
+        .symbol_summary_for(
             callee,
             graph_read_cancellation(Arc::clone(control), budget.deadline_micros),
         )
@@ -1393,12 +1342,10 @@ fn visit_trait_dispatch_targets(
         .ok_or(DispatchExpansionStop::Unavailable)?
         .simple_name
         .clone();
-    let relation_limit = usize::try_from(budget.max_candidates_per_lane)
-        .unwrap_or(usize::MAX)
-        .max(1);
+    let relation_limit = MAX_RELATION_CANDIDATE_KEYS;
     check_dispatch_control(control.as_ref(), budget)?;
     let parent_batches = match reader.callers(
-        std::slice::from_ref(callee),
+        std::slice::from_ref(&callee_summary.occurrence),
         &[RelationEdgeKindV1::Contains],
         relation_limit,
         graph_read_cancellation(Arc::clone(control), budget.deadline_micros),
@@ -1408,14 +1355,9 @@ fn visit_trait_dispatch_targets(
             tracedecay_code_index::graph_projection::CodeGraphProjectionError::BudgetExhausted {
                 ..
             },
-        ) => {
-            *examined = examined.saturating_add(relation_limit as u64);
-            return Ok(false);
-        }
+        ) => return Ok(false),
         Err(_) => return Err(dispatch_read_stop(control.as_ref(), budget)),
     };
-    let parent_count = parent_batches.iter().map(Vec::len).sum::<usize>();
-    *examined = examined.saturating_add(parent_count as u64);
     let mut traits = Vec::new();
     for edge in parent_batches.into_iter().flatten() {
         let metadata = edge
@@ -1445,14 +1387,9 @@ fn visit_trait_dispatch_targets(
             tracedecay_code_index::graph_projection::CodeGraphProjectionError::BudgetExhausted {
                 ..
             },
-        ) => {
-            *examined = examined.saturating_add(relation_limit as u64);
-            return Ok(false);
-        }
+        ) => return Ok(false),
         Err(_) => return Err(dispatch_read_stop(control.as_ref(), budget)),
     };
-    let implementor_count = implementor_batches.iter().map(Vec::len).sum::<usize>();
-    *examined = examined.saturating_add(implementor_count as u64);
     let implementors = implementor_batches
         .into_iter()
         .flatten()
@@ -1473,14 +1410,9 @@ fn visit_trait_dispatch_targets(
             tracedecay_code_index::graph_projection::CodeGraphProjectionError::BudgetExhausted {
                 ..
             },
-        ) => {
-            *examined = examined.saturating_add(relation_limit as u64);
-            return Ok(false);
-        }
+        ) => return Ok(false),
         Err(_) => return Err(dispatch_read_stop(control.as_ref(), budget)),
     };
-    let child_count = child_batches.iter().map(Vec::len).sum::<usize>();
-    *examined = examined.saturating_add(child_count as u64);
     for child in child_batches
         .into_iter()
         .flatten()
@@ -1510,160 +1442,107 @@ fn visit_trait_dispatch_targets(
     Ok(true)
 }
 
-fn callee_dispatch_usage(
-    page: &NativeLanePageV1<SymbolRelationRecord>,
-    examined: u64,
-    control: &dyn RetrievalExecutionControl,
-) -> RetrievalBudgetUsage {
-    RetrievalBudgetUsage {
-        candidates_examined: page.coverage.examined.saturating_add(examined),
-        candidates_returned: u64::try_from(page.items.len()).unwrap_or(u64::MAX),
-        hydrated_results: u64::try_from(page.items.len()).unwrap_or(u64::MAX),
-        hydration_bytes: 0,
-        elapsed_micros: control.elapsed_micros(),
-    }
-}
-
-fn augment_callee_dispatch_page(
+/// Appends the concrete impl methods reachable through each direct callee's
+/// trait as compact keys (`dispatch_from` names the trait method), so they
+/// page and hydrate like every other relation. Dispatch keys follow the
+/// direct keys in canonical order; a trait fan-out past the key ceiling
+/// leaves the listing incomplete rather than claiming full dispatch.
+fn augment_callee_dispatch_keys(
     reader: &CodeGraphInteractiveReader,
-    page: NativeLanePageV1<NativeGraphRecordV1>,
+    found: &mut GraphRelationKeysV1,
     scope: &tracedecay_contracts::CodeQueryScope,
     budget: RetrievalBudget,
     control: &Arc<dyn RetrievalExecutionControl>,
-) -> Result<NativeLanePageV1<SymbolRelationRecord>, Box<NativeLaneOutcomeV1<SymbolRelationRecord>>>
-{
-    let candidate_cap = usize::try_from(budget.max_candidates_per_lane).unwrap_or(usize::MAX);
-    let mut page = NativeLanePageV1 {
-        generation: page.generation,
-        items: page
-            .items
-            .into_iter()
-            .map(application_graph_record)
-            .collect(),
-        total_eligible: page.total_eligible,
-        coverage: page.coverage,
-    };
-    let direct = page.items.clone();
-    let mut seen = direct
+) -> Result<(), DispatchExpansionStop> {
+    let mut seen = found
+        .keys
         .iter()
-        .map(|record| record.symbol.node_id.clone())
+        .map(|key| key.symbol.clone())
         .collect::<BTreeSet<_>>();
-    let mut examined = 0_u64;
-    let mut eligible = 0_u64;
-
-    'callees: for callee in direct {
-        match check_dispatch_control(control.as_ref(), budget) {
-            Ok(()) => {}
-            Err(DispatchExpansionStop::Cancelled) => {
-                return Err(Box::new(NativeLaneOutcomeV1::Cancelled));
-            }
-            Err(DispatchExpansionStop::TimedOut) => {
-                return Err(Box::new(NativeLaneOutcomeV1::TimedOut(
-                    callee_dispatch_usage(&page, examined, control.as_ref()),
-                )));
-            }
-            Err(DispatchExpansionStop::Unavailable) => {
-                return Err(Box::new(NativeLaneOutcomeV1::Unavailable(
-                    RetrievalFailure::AuthorityUnavailable {
-                        detail: "verified code graph dispatch authority is unavailable".to_owned(),
-                    },
-                )));
-            }
-        }
-        if page.items.len() >= candidate_cap {
-            page.coverage.unknown = page.coverage.unknown.saturating_add(1);
-            break;
-        }
-        let Ok(callee_id) = SymbolOccurrenceId::new(callee.symbol.node_id.clone()) else {
-            continue;
-        };
+    let mut dispatch = Vec::new();
+    for callee in &found.keys {
         let exhausted = visit_trait_dispatch_targets(
             reader,
-            &callee_id,
+            &callee.symbol,
             scope,
             budget,
             control,
-            &mut examined,
             |target| {
-                if !seen.insert(target.occurrence.as_str().to_owned()) {
-                    return Ok(true);
+                let symbol = CodeGraphSymbolRefV1::for_occurrence(&target.occurrence)
+                    .map_err(|_| DispatchExpansionStop::Unavailable)?;
+                if seen.insert(symbol.clone()) {
+                    dispatch.push(RelationKeyV1 {
+                        symbol,
+                        edge_kind: RelationEdgeKindV1::Calls,
+                        dispatch_from: Some(callee.symbol.clone()),
+                        depth: callee.depth,
+                    });
                 }
-                let file = target
-                    .binding
-                    .as_ref()
-                    .map(|binding| &binding.file)
-                    .ok_or(DispatchExpansionStop::Unavailable)?;
-                let symbol =
-                    graph_projection_symbol_record(target.clone(), &target.occurrence, file)
-                        .map(application_symbol_record)
-                        .map_err(|_| DispatchExpansionStop::Unavailable)?;
-                eligible = eligible.saturating_add(1);
-                page.items.push(SymbolRelationRecord {
-                    symbol,
-                    edge_kind: relation_edge_kind_name(RelationEdgeKindV1::Calls).to_owned(),
-                    dispatch_via_trait: true,
-                    dispatch_from: Some(callee.symbol.node_id.clone()),
-                    depth: callee.depth,
-                });
-                Ok(page.items.len() < candidate_cap)
+                Ok(found.keys.len() + dispatch.len() < MAX_RELATION_CANDIDATE_KEYS)
             },
-        );
-        match exhausted {
-            Ok(true) => {}
-            Ok(false) => {
-                page.coverage.unknown = page.coverage.unknown.saturating_add(1);
-                break 'callees;
-            }
-            Err(DispatchExpansionStop::Cancelled) => {
-                return Err(Box::new(NativeLaneOutcomeV1::Cancelled));
-            }
-            Err(DispatchExpansionStop::TimedOut) => {
-                return Err(Box::new(NativeLaneOutcomeV1::TimedOut(
-                    callee_dispatch_usage(&page, examined, control.as_ref()),
-                )));
-            }
-            Err(DispatchExpansionStop::Unavailable) => {
-                return Err(Box::new(NativeLaneOutcomeV1::Unavailable(
-                    RetrievalFailure::AuthorityUnavailable {
-                        detail: "verified code graph dispatch authority is unavailable".to_owned(),
-                    },
-                )));
-            }
+        )?;
+        if !exhausted {
+            found.complete = false;
+            break;
         }
     }
-    page.total_eligible = page.total_eligible.saturating_add(eligible);
-    page.coverage.examined = page.coverage.examined.saturating_add(examined);
-    page.coverage.eligible = page.coverage.eligible.saturating_add(eligible);
-    Ok(page)
+    dispatch.sort_by(|left, right| {
+        left.depth
+            .cmp(&right.depth)
+            .then(left.symbol.cmp(&right.symbol))
+    });
+    found.keys.append(&mut dispatch);
+    Ok(())
 }
 
-fn augment_callee_dispatch(
-    reader: &CodeGraphInteractiveReader,
-    outcome: NativeLaneOutcomeV1<NativeGraphRecordV1>,
-    scope: &tracedecay_contracts::CodeQueryScope,
-    budget: RetrievalBudget,
+/// A relation read that stopped is typed by what stopped it: the request's
+/// cancellation, its deadline, or the graph authority.
+fn relation_read_stop<T>(
+    prepared: &impl PreparedCallableQueryStateV1,
+    stop: DispatchExpansionStop,
     control: &Arc<dyn RetrievalExecutionControl>,
-) -> NativeLaneOutcomeV1<SymbolRelationRecord> {
-    match outcome {
-        NativeLaneOutcomeV1::Complete(page) => {
-            match augment_callee_dispatch_page(reader, page, scope, budget, control) {
-                Ok(page) => NativeLaneOutcomeV1::Complete(page),
-                Err(terminal) => *terminal,
-            }
+) -> RetrievalPortOutcome<CodeQueryPage<T>> {
+    let outcome = relation_read_stop_unmetered(prepared, stop, control);
+    metered(prepared, outcome)
+}
+
+fn relation_read_stop_unmetered<T>(
+    prepared: &impl PreparedCallableQueryStateV1,
+    stop: DispatchExpansionStop,
+    control: &Arc<dyn RetrievalExecutionControl>,
+) -> RetrievalPortOutcome<CodeQueryPage<T>> {
+    let finished_at = query_finished_at();
+    let generation = prepared.generation().clone();
+    match stop {
+        DispatchExpansionStop::Cancelled => {
+            let mut evidence =
+                terminal_lane_evidence(finished_at, generation, OmissionReason::Cancelled);
+            evidence.cancellation = Some(CancellationObservation {
+                stage: CancellationStage::DuringRead,
+                observed_at: finished_at,
+            });
+            RetrievalPortOutcome::Cancelled(evidence)
         }
-        NativeLaneOutcomeV1::Partial { page, reason } => {
-            match augment_callee_dispatch_page(reader, page, scope, budget, control) {
-                Ok(page) => NativeLaneOutcomeV1::Partial { page, reason },
-                Err(terminal) => *terminal,
-            }
+        DispatchExpansionStop::TimedOut => {
+            let mut evidence =
+                terminal_lane_evidence(finished_at, generation, OmissionReason::TimedOut);
+            evidence.budget.elapsed_micros = control.elapsed_micros();
+            RetrievalPortOutcome::TimedOut(evidence)
         }
-        NativeLaneOutcomeV1::Unavailable(reason) => NativeLaneOutcomeV1::Unavailable(reason),
-        NativeLaneOutcomeV1::Denied => NativeLaneOutcomeV1::Denied,
-        NativeLaneOutcomeV1::Stale(source) => NativeLaneOutcomeV1::Stale(source),
-        NativeLaneOutcomeV1::BudgetExceeded(usage) => NativeLaneOutcomeV1::BudgetExceeded(usage),
-        NativeLaneOutcomeV1::TimedOut(usage) => NativeLaneOutcomeV1::TimedOut(usage),
-        NativeLaneOutcomeV1::Cancelled => NativeLaneOutcomeV1::Cancelled,
+        DispatchExpansionStop::Unavailable => unavailable_for_generation(finished_at, generation),
     }
+}
+
+fn relation_read_failure<T>(
+    prepared: &impl PreparedCallableQueryStateV1,
+    control: &Arc<dyn RetrievalExecutionControl>,
+    budget: RetrievalBudget,
+) -> RetrievalPortOutcome<CodeQueryPage<T>> {
+    relation_read_stop(
+        prepared,
+        dispatch_read_stop(control.as_ref(), budget),
+        control,
+    )
 }
 
 fn symbol_record(
@@ -1729,7 +1608,9 @@ struct PreparedTextCallableQueryV1 {
 
 struct PreparedGraphCallableQueryV1 {
     latest: LatestCodeTextGenerationV1,
+    /// Counts every store read on [`Self::cost`].
     reader: CodeGraphInteractiveReader,
+    cost: CodeGraphReadCostMeter,
     query: PreparedQueryV1,
     /// Absent only when the scope unmounted between resolving `latest` and
     /// preparing the query; the page still serves, and no cursor it mints
@@ -1743,6 +1624,21 @@ trait PreparedCallableQueryStateV1 {
     /// A cursor pinned to this generation was minted and stays valid until
     /// `expires_at`. Graph queries bind replay retention to that lifetime.
     fn retain_cursor_generation(&self, _expires_at: UtcMicros, _now: UtcMicros) {}
+    /// What the query has cost its stores, when its reads are metered.
+    fn read_cost(&self) -> Option<RequestCostReceiptV1> {
+        None
+    }
+}
+
+/// `outcome` with the prepared query's read cost recorded on its evidence.
+fn metered<T>(
+    prepared: &impl PreparedCallableQueryStateV1,
+    outcome: RetrievalPortOutcome<T>,
+) -> RetrievalPortOutcome<T> {
+    match prepared.read_cost() {
+        Some(cost) => outcome.with_cost(cost),
+        None => outcome,
+    }
 }
 
 impl PreparedCallableQueryStateV1 for PreparedCallableQueryV1 {
@@ -1778,6 +1674,10 @@ impl PreparedCallableQueryStateV1 for PreparedGraphCallableQueryV1 {
         if let Some(retention) = &self.cursor_retention {
             retention.retain(&self.latest, expires_at, now);
         }
+    }
+
+    fn read_cost(&self) -> Option<RequestCostReceiptV1> {
+        Some(self.cost.receipt())
     }
 }
 
@@ -2003,18 +1903,21 @@ impl CodeIndexSchedulerRegistryV1 {
         let store = latest
             .interactive_graph_store()
             .map_err(|_| CallableCodeCursorError::Unavailable)?;
+        let cost = CodeGraphReadCostMeter::start();
         let reader = store
             .interactive_reader_with_cancellation(
                 &latest.metadata().manifest().generation_id,
                 Arc::new(tracedecay_graph_db::NeverCancelled),
             )
-            .map_err(|_| CallableCodeCursorError::Unavailable)?;
+            .map_err(|_| CallableCodeCursorError::Unavailable)?
+            .metered(&cost);
         let cursor_retention = self
             .graph_cursor_retention_for_scope(context.request.scope())
             .await;
         Ok(PreparedGraphCallableQueryV1 {
             latest,
             reader,
+            cost,
             query,
             cursor_retention,
         })
@@ -2107,6 +2010,58 @@ where
     K: Serialize,
     T: Serialize,
 {
+    let outcome = finish_generation_candidate_page_unmetered(
+        prepared,
+        context,
+        operation,
+        query_binding_digest,
+        keys,
+        hydrate,
+        requested_page,
+        page_label,
+        complete,
+    );
+    metered(prepared, outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_query_with_coverage<T: serde::Serialize>(
+    prepared: &impl PreparedCallableQueryStateV1,
+    context: &RetrievalPortContext<'_>,
+    operation: &'static str,
+    query_binding_digest: ManifestDigest,
+    page: CodeQueryPage<T>,
+    requested_page: &tracedecay_contracts::PageRequest,
+    coverage: tracedecay_domain::RetrieverCoverage,
+) -> RetrievalPortOutcome<CodeQueryPage<T>> {
+    let outcome = finish_query_with_coverage_unmetered(
+        prepared,
+        context,
+        operation,
+        query_binding_digest,
+        page,
+        requested_page,
+        coverage,
+    );
+    metered(prepared, outcome)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_generation_candidate_page_unmetered<K, T>(
+    prepared: &impl PreparedCallableQueryStateV1,
+    context: &RetrievalPortContext<'_>,
+    operation: &'static str,
+    query_binding_digest: ManifestDigest,
+    keys: Vec<K>,
+    hydrate: impl FnOnce(&[K]) -> Result<Vec<T>, PreparedQueryErrorV1>,
+    requested_page: &tracedecay_contracts::PageRequest,
+    page_label: &'static str,
+    complete: bool,
+) -> RetrievalPortOutcome<CodeQueryPage<T>>
+where
+    K: Serialize,
+    T: Serialize,
+{
     let eligible = keys.len() as u64;
     let finished_at = query_finished_at();
     let generation = prepared.generation().clone();
@@ -2181,7 +2136,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finish_query_with_coverage<T: serde::Serialize>(
+fn finish_query_with_coverage_unmetered<T: serde::Serialize>(
     prepared: &impl PreparedCallableQueryStateV1,
     context: &RetrievalPortContext<'_>,
     operation: &'static str,
@@ -2248,15 +2203,16 @@ fn finish_query_with_coverage<T: serde::Serialize>(
     }
 }
 
-/// Compact BFS identity for a relation neighborhood.
+/// Compact BFS identity for a relation neighborhood: graph identities only,
+/// so enumerating keys reads no symbol and a page hydrates just its slice.
 ///
 /// `depth` is the emitted one-based depth (`parent_depth + 1`), matching the
 /// `SymbolRelationRecord::depth` the hydrating path used to store.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct RelationKeyV1 {
-    pub occurrence: SymbolOccurrenceId,
+    pub symbol: CodeGraphSymbolRefV1,
     pub edge_kind: RelationEdgeKindV1,
-    pub dispatch_from: Option<SymbolOccurrenceId>,
+    pub dispatch_from: Option<CodeGraphSymbolRefV1>,
     pub depth: u32,
 }
 
@@ -2264,6 +2220,23 @@ struct GraphRelationKeysV1 {
     keys: Vec<RelationKeyV1>,
     complete: bool,
 }
+
+/// Compact relation keys one navigation query enumerates before it reports
+/// the remainder as unknown (`Partial`, `Budget` omission, `total` = the
+/// admitted count the cursor walks).
+///
+/// This is a runaway guard, not the page budget: the fusion profile's
+/// `max_candidates_per_lane` (32) ranks search candidates and must not bound
+/// an exhaustive relation listing, which is what made `code_callers` and
+/// `code_callees` answer a 104-relation symbol with `total: 32`. Keys are
+/// identities only and rows hydrate per page, so `total` is the true relation
+/// count whenever the neighborhood fits under this ceiling.
+///
+/// Enumeration reads relation rows only, two batched fan-outs per walk level
+/// and no entity, and is paid again on every page (a path-scoped walk also
+/// reads each neighbor for its path). This ceiling bounds that per-page walk
+/// while the request deadline (`TimedOut`) remains the bound on the rest.
+const MAX_RELATION_CANDIDATE_KEYS: usize = 10_000;
 
 fn graph_summary_symbol_record(
     summary: tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1,
@@ -2279,6 +2252,7 @@ fn graph_summary_symbol_record(
         .map_err(|_| PreparedQueryErrorV1::Unavailable)
 }
 
+#[hotpath::measure(label = "query.graph.relation_keys")]
 fn graph_relation_keys(
     reader: &CodeGraphInteractiveReader,
     start: &SymbolOccurrenceId,
@@ -2286,108 +2260,110 @@ fn graph_relation_keys(
     reverse: bool,
     maximum_depth: u32,
     scope: &tracedecay_contracts::CodeQueryScope,
-    cap: usize,
     cancellation: Arc<dyn tracedecay_graph_db::GraphCancellation>,
 ) -> Result<GraphRelationKeysV1, PreparedQueryErrorV1> {
-    let mut queue = VecDeque::from([(start.clone(), 0_u32)]);
+    let cap = MAX_RELATION_CANDIDATE_KEYS;
+    let start = CodeGraphSymbolRefV1::for_occurrence(start)
+        .map_err(|_| PreparedQueryErrorV1::Unavailable)?;
     let mut visited = BTreeSet::from([start.clone()]);
+    let mut frontier = vec![start];
     let mut keys = Vec::new();
     let mut complete = true;
-    while let Some((current, depth)) = queue.pop_front() {
-        if depth >= maximum_depth {
-            continue;
-        }
+    let mut depth = 0_u32;
+    'walk: while !frontier.is_empty() && depth < maximum_depth {
         let remaining = cap.saturating_sub(keys.len());
         if remaining == 0 {
             complete = false;
             break;
         }
-        let limit = remaining.saturating_add(1);
-        let batches = if reverse {
-            reader.callers_truncated(
-                std::slice::from_ref(&current),
+        let step = reader
+            .relation_keys(
+                &frontier,
                 kinds,
-                limit,
+                reverse,
+                remaining.saturating_add(1),
                 Arc::clone(&cancellation),
             )
-        } else {
-            reader.callees_truncated(
-                std::slice::from_ref(&current),
-                kinds,
-                limit,
-                Arc::clone(&cancellation),
-            )
-        }
-        .map_err(|_| PreparedQueryErrorV1::Unavailable)?;
-        let edges = batches.into_iter().next().unwrap_or_default();
-        if edges.len() == limit {
+            .map_err(|_| PreparedQueryErrorV1::Unavailable)?;
+        if step.truncated {
             complete = false;
         }
-        for edge in edges.into_iter().take(remaining) {
-            let next = edge.neighbor.occurrence;
-            if !visited.insert(next.clone()) {
-                continue;
+        let mut next = Vec::new();
+        for (current, seed_keys) in frontier.iter().zip(step.per_seed) {
+            for key in seed_keys {
+                if !visited.insert(key.neighbor.clone()) {
+                    continue;
+                }
+                if keys.len() == cap {
+                    complete = false;
+                    break 'walk;
+                }
+                // ponytail: a path-scoped walk reads each neighbor to test its
+                // path, so its cost stays linear in the neighborhood; a
+                // catalog path lookup by graph identity is the upgrade.
+                if scope.path_prefix.is_some() {
+                    let path = reader
+                        .symbol_summary_for(&key.neighbor, Arc::clone(&cancellation))
+                        .map_err(|_| PreparedQueryErrorV1::Unavailable)?
+                        .and_then(|summary| summary.binding)
+                        .and_then(|binding| binding.logical_path)
+                        .ok_or(PreparedQueryErrorV1::Unavailable)?;
+                    if !path_is_in_code_query_scope(&path, scope) {
+                        continue;
+                    }
+                }
+                keys.push(RelationKeyV1 {
+                    symbol: key.neighbor.clone(),
+                    edge_kind: key.kind,
+                    dispatch_from: (key.kind == RelationEdgeKindV1::Implements)
+                        .then(|| current.clone()),
+                    depth: depth + 1,
+                });
+                next.push(key.neighbor);
             }
-            let path = edge
-                .neighbor
-                .binding
-                .as_ref()
-                .and_then(|binding| binding.logical_path.as_deref())
-                .ok_or(PreparedQueryErrorV1::Unavailable)?;
-            if !path_is_in_code_query_scope(path, scope) {
-                continue;
-            }
-            keys.push(RelationKeyV1 {
-                occurrence: next.clone(),
-                edge_kind: edge.edge.kind,
-                dispatch_from: (edge.edge.kind == RelationEdgeKindV1::Implements)
-                    .then(|| current.clone()),
-                depth: depth + 1,
-            });
-            queue.push_back((next, depth + 1));
         }
         if !complete {
             break;
         }
+        frontier = next;
+        depth += 1;
     }
     keys.sort_by(|left, right| {
         left.depth
             .cmp(&right.depth)
-            .then(left.occurrence.cmp(&right.occurrence))
+            .then(left.symbol.cmp(&right.symbol))
     });
     Ok(GraphRelationKeysV1 { keys, complete })
 }
 
+#[hotpath::measure(label = "query.graph.relation_hydrate")]
 fn hydrate_graph_relation_records(
     reader: &CodeGraphInteractiveReader,
     keys: &[RelationKeyV1],
     cancellation: Arc<dyn tracedecay_graph_db::GraphCancellation>,
-    hydrations: &AtomicU64,
 ) -> Result<Vec<SymbolRelationRecord>, PreparedQueryErrorV1> {
+    let summary = |symbol: &CodeGraphSymbolRefV1| {
+        reader
+            .symbol_summary_for(symbol, Arc::clone(&cancellation))
+            .map_err(|_| PreparedQueryErrorV1::Unavailable)?
+            .ok_or(PreparedQueryErrorV1::Unavailable)
+    };
     keys.iter()
         .map(|key| {
-            record_relation_symbol_hydration(hydrations);
-            let summary = reader
-                .symbol_summary(&key.occurrence, Arc::clone(&cancellation))
-                .map_err(|_| PreparedQueryErrorV1::Unavailable)?
-                .ok_or(PreparedQueryErrorV1::Unavailable)?;
+            let dispatch_from = key
+                .dispatch_from
+                .as_ref()
+                .map(|symbol| summary(symbol).map(|parent| parent.occurrence.as_str().to_owned()))
+                .transpose()?;
             Ok(SymbolRelationRecord {
-                symbol: graph_summary_symbol_record(summary)?,
+                symbol: graph_summary_symbol_record(summary(&key.symbol)?)?,
                 edge_kind: relation_edge_kind_name(key.edge_kind).to_owned(),
-                dispatch_via_trait: key.edge_kind == RelationEdgeKindV1::Implements,
-                dispatch_from: key
-                    .dispatch_from
-                    .as_ref()
-                    .map(|identity| identity.as_str().to_owned()),
+                dispatch_via_trait: dispatch_from.is_some(),
+                dispatch_from,
                 depth: Some(key.depth),
             })
         })
         .collect()
-}
-
-fn record_relation_symbol_hydration(_hydrations: &AtomicU64) {
-    #[cfg(any(test, feature = "test-helpers"))]
-    _hydrations.fetch_add(1, Ordering::Relaxed);
 }
 
 fn retrieval_failure_omission(reason: &RetrievalFailure) -> OmissionReason {
@@ -2597,6 +2573,73 @@ fn application_budget_usage(usage: RetrievalBudgetUsage) -> OperationBudgetUsage
 type PortFuture<'a, T> =
     Pin<Box<dyn Future<Output = RetrievalPortOutcome<CodeQueryPage<T>>> + Send + 'a>>;
 
+fn execute_prepared_exact_query(
+    prepared: &PreparedTextCallableQueryV1,
+    context: &RetrievalPortContext<'_>,
+    request: &ExactOccurrenceRequest,
+    query_binding_digest: ManifestDigest,
+) -> RetrievalPortOutcome<CodeQueryPage<ExactOccurrenceRecord>> {
+    let latest = &prepared.latest;
+    let served_generation = latest.metadata().manifest().generation_id.clone();
+    let finished_at = query_finished_at();
+    let base = prepared.query.request();
+    let Ok(query_view) = tracedecay_domain::EphemeralSanitizedQueryViewV1::sanitize(
+        request.literal.clone(),
+        callable_query_sanitizer_revision(),
+        callable_query_normalization_revision(),
+    ) else {
+        return unavailable(finished_at);
+    };
+    let authority = CentralExactAdmissionAuthorityV1::new(
+        ExactAdmissionRuleRevision::new(tracedecay_query::retrieval::QUERY_EXACT_RULE_REVISION_V1)
+            .unwrap_or_else(|_| panic!("static exact rule revision")),
+    );
+    let exact_control = CallableRetrievalExecutionControl::for_request(context.request);
+    let lane_request = ExactLaneRequest {
+        literals: authority.parse_literals(&query_view, base),
+        generation: served_generation.clone(),
+        budget: base.budget,
+        base: base.clone(),
+        query_view: &query_view,
+        control: exact_control.as_ref(),
+    };
+    let Ok(owners) = latest.production_query_owners_with_budget(&base.budget) else {
+        return unavailable(finished_at);
+    };
+    let records = TextArtifactNativeRecordReadPortV1 {
+        generation: served_generation.clone(),
+        owners: std::sync::Arc::clone(&owners),
+    };
+    let Ok(native_context) =
+        AdmittedGenerationContextV1::admit(served_generation.clone(), &records)
+    else {
+        return unavailable_for_generation(finished_at, served_generation);
+    };
+    let outcome = match owners.retrieve_exact(&lane_request) {
+        Ok(outcome) => {
+            let Ok(outcome) =
+                native_context.exact(outcome, &request.literal, request.kind, |path| {
+                    path_is_in_code_query_scope(path, &request.scope)
+                })
+            else {
+                return unavailable(finished_at);
+            };
+            outcome
+        }
+        Err(RetrievalPortError::Cancelled) => NativeLaneOutcomeV1::Cancelled,
+        Err(_) => return unavailable(finished_at),
+    };
+    finish_native_lane_query(
+        prepared,
+        context,
+        "code_exact_occurrence",
+        query_binding_digest,
+        &request.meta.page,
+        outcome,
+        application_exact_record,
+    )
+}
+
 impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
     fn exact_occurrence<'a>(
         &'a self,
@@ -2618,64 +2661,7 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                     &request.meta.order,
                 )
             );
-            let latest = &prepared.latest;
-            let served_generation = latest.metadata().manifest().generation_id.clone();
-            let finished_at = query_finished_at();
-            let base = prepared.query.request();
-            let Ok(query_view) = tracedecay_domain::EphemeralSanitizedQueryViewV1::sanitize(
-                request.literal.clone(),
-                callable_query_sanitizer_revision(),
-                callable_query_normalization_revision(),
-            ) else {
-                return unavailable(finished_at);
-            };
-            let authority = CentralExactAdmissionAuthorityV1::new(
-                ExactAdmissionRuleRevision::new(
-                    tracedecay_query::retrieval::QUERY_EXACT_RULE_REVISION_V1,
-                )
-                .unwrap_or_else(|_| panic!("static exact rule revision")),
-            );
-            let lane_request = ExactLaneRequest {
-                literals: authority.parse_literals(&query_view, base),
-                generation: served_generation.clone(),
-                budget: base.budget,
-                base: base.clone(),
-                query_view: &query_view,
-            };
-            let Ok(owners) = latest.production_query_owners_with_budget(&base.budget) else {
-                return unavailable(finished_at);
-            };
-            let records = TextArtifactNativeRecordReadPortV1 {
-                generation: served_generation.clone(),
-                owners: std::sync::Arc::clone(&owners),
-            };
-            let Ok(native_context) =
-                AdmittedGenerationContextV1::admit(served_generation.clone(), &records)
-            else {
-                return unavailable_for_generation(finished_at, served_generation);
-            };
-            let outcome = owners.retrieve_exact(&lane_request);
-            match outcome {
-                Ok(outcome) => {
-                    let Ok(outcome) =
-                        native_context.exact(outcome, &request.literal, request.kind, |path| {
-                            path_is_in_code_query_scope(path, &request.scope)
-                        })
-                    else {
-                        return unavailable(finished_at);
-                    };
-                    finish_native_lane_query(
-                        &prepared,
-                        &context,
-                        "code_exact_occurrence",
-                        query_binding_digest,
-                        &request.meta.page,
-                        outcome,
-                        application_exact_record,
-                    )
-                }
-                Err(_) => unavailable(finished_at),
-            }
+            execute_prepared_exact_query(&prepared, &context, request, query_binding_digest)
         })
     }
 
@@ -2764,26 +2750,27 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             else {
                 return unavailable_for_generation(finished_at, served_generation);
             };
-            let outcome = owners.retrieve_lexical(&lane_request);
-            match outcome {
+            let outcome = match owners.retrieve_lexical(&lane_request) {
                 Ok(outcome) => {
                     let Ok(outcome) = native_context.lexical(outcome, |path| {
                         path_is_in_code_query_scope(path, &request.scope)
                     }) else {
                         return unavailable(finished_at);
                     };
-                    finish_native_lane_query(
-                        &prepared,
-                        &context,
-                        "code_phrase_search",
-                        query_binding_digest,
-                        &request.meta.page,
-                        outcome,
-                        application_lexical_record,
-                    )
+                    outcome
                 }
-                Err(_) => unavailable(finished_at),
-            }
+                Err(RetrievalPortError::Cancelled) => NativeLaneOutcomeV1::Cancelled,
+                Err(_) => return unavailable(finished_at),
+            };
+            finish_native_lane_query(
+                &prepared,
+                &context,
+                "code_phrase_search",
+                query_binding_digest,
+                &request.meta.page,
+                outcome,
+                application_lexical_record,
+            )
         })
     }
 
@@ -2793,7 +2780,7 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
         request: &'a CodeRelationRequest,
     ) -> CallableCodeQueryFuture<'a, SymbolRelationRecord> {
         Box::pin(async move {
-            let (prepared, query_binding_digest) = prepare_graph_callable_query_or_return!(
+            let (prepared, binding) = prepare_graph_callable_query_or_return!(
                 self,
                 context,
                 request,
@@ -2808,104 +2795,45 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                     &request.meta.order,
                 )
             );
-            let latest = &prepared.latest;
-            let served_generation = latest.metadata().manifest().generation_id.clone();
-            let finished_at = query_finished_at();
-            let base = prepared.query.request();
-            let Ok(symbol) = typed::<SymbolOccurrenceId>(request.node_id.clone()) else {
-                return unavailable(finished_at);
-            };
-            let Ok(Some(summary)) = prepared
-                .reader
-                .symbol_summary(&symbol, Arc::new(tracedecay_graph_db::NeverCancelled))
-            else {
-                return unavailable_for_generation(finished_at, served_generation);
-            };
-            let Some(symbol_binding) = summary.binding else {
-                return unavailable(finished_at);
-            };
-            let source_occurrence =
-                SourceOccurrenceId::new(format!("code-symbol:{}", symbol.as_str()))
-                    .unwrap_or_else(|_| panic!("validated symbol creates source occurrence"));
-            let seed = CodeCandidateBindingV1 {
-                candidate_anchor: RetrievalAnchorId::new(format!(
-                    "code-symbol:{}",
-                    symbol.as_str()
-                ))
-                .unwrap_or_else(|_| panic!("validated symbol creates anchor")),
-                occurrence: CodeOccurrenceRefV1 {
-                    generation: served_generation.clone(),
-                    file: symbol_binding.file,
-                    symbol: Some(symbol),
-                    chunk: symbol_binding.chunk,
-                },
-                language_descriptor_revision: symbol_binding.language_descriptor_revision,
-                matched_term_kinds: Vec::new(),
-                source_occurrence,
-            };
-            let graph_budget = graph_budget_for_request(base.budget, context.request);
-            let lane_request = GraphLaneRequest {
-                generation: served_generation.clone(),
-                seed_anchors: vec![seed],
-                edge_kinds: vec![RelationEdgeKindV1::Calls],
-                max_depth: request.maximum_depth,
-                budget: graph_budget,
-                base: base.clone(),
-            };
-            let Ok(graph_serving) = latest.production_graph_serving() else {
-                return unavailable(finished_at);
-            };
-            let records = GraphProjectionNativeRecordReadPortV1 {
-                generation: served_generation.clone(),
-                reader: prepared.reader.clone(),
-            };
-            let Ok(native_context) =
-                AdmittedGenerationContextV1::admit(served_generation.clone(), &records)
-            else {
-                return unavailable_for_generation(finished_at, served_generation);
-            };
+            let graph_budget =
+                graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let outcome = graph_serving
-                .graph
-                .retrieve_graph(&lane_request, Arc::clone(&graph_control));
-            match outcome {
-                Ok(outcome) => {
-                    let Ok(outcome) = native_context.graph(outcome, |path| {
-                        path_is_in_code_query_scope(path, &request.scope)
-                    }) else {
-                        return unavailable(finished_at);
-                    };
-                    if request.resolve_trait_dispatch {
-                        let outcome = augment_callee_dispatch(
-                            &prepared.reader,
-                            outcome,
-                            &request.scope,
-                            graph_budget,
-                            &graph_control,
-                        );
-                        finish_native_lane_query(
-                            &prepared,
-                            &context,
-                            "code_callees",
-                            query_binding_digest,
-                            &request.meta.page,
-                            outcome,
-                            |record| record,
-                        )
-                    } else {
-                        finish_native_lane_query(
-                            &prepared,
-                            &context,
-                            "code_callees",
-                            query_binding_digest,
-                            &request.meta.page,
-                            outcome,
-                            application_graph_record,
-                        )
-                    }
-                }
-                Err(_) => unavailable(finished_at),
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
+            let start = resolve_graph_start_symbol!(prepared, request.node_id, cancellation);
+            let Ok(mut found) = graph_relation_keys(
+                &prepared.reader,
+                &start,
+                &[RelationEdgeKindV1::Calls],
+                false,
+                request.maximum_depth,
+                &request.scope,
+                Arc::clone(&cancellation),
+            ) else {
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
+            };
+            if request.resolve_trait_dispatch
+                && let Err(stop) = augment_callee_dispatch_keys(
+                    &prepared.reader,
+                    &mut found,
+                    &request.scope,
+                    graph_budget,
+                    &graph_control,
+                )
+            {
+                return relation_read_stop(&prepared, stop, &graph_control);
             }
+            finish_generation_candidate_page(
+                &prepared,
+                &context,
+                "code_callees",
+                binding,
+                found.keys,
+                |slice| hydrate_graph_relation_records(&prepared.reader, slice, cancellation),
+                &request.meta.page,
+                "callees",
+                found.complete,
+            )
         })
     }
 
@@ -3136,8 +3064,9 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let graph_budget =
                 graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
-            let cap = graph_budget.max_candidates_per_lane as usize;
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
+            let cap = MAX_RELATION_CANDIDATE_KEYS;
             let selector_simple = selector
                 .rsplit_once("::")
                 .map_or(selector.as_str(), |(_, name)| name);
@@ -3156,10 +3085,7 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                     Arc::clone(&cancellation),
                 ),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
             let mut complete = targets.len() <= cap && simple_targets.len() <= cap;
             targets.extend(simple_targets);
@@ -3171,8 +3097,7 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             }
             let mut keys = Vec::new();
             for target in targets {
-                let remaining = cap.saturating_sub(keys.len());
-                if remaining == 0 {
+                if keys.len() >= cap {
                     complete = false;
                     break;
                 }
@@ -3183,33 +3108,26 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                     true,
                     1,
                     &request.scope,
-                    remaining,
                     Arc::clone(&cancellation),
                 ) else {
-                    return unavailable_for_generation(
-                        query_finished_at(),
-                        prepared.generation().clone(),
-                    );
+                    return relation_read_failure(&prepared, &graph_control, graph_budget);
                 };
                 complete &= found.complete;
                 keys.extend(found.keys);
             }
-            keys.sort_by(|left, right| left.occurrence.cmp(&right.occurrence));
-            keys.dedup_by(|left, right| left.occurrence == right.occurrence);
+            keys.sort_by(|left, right| left.symbol.cmp(&right.symbol));
+            keys.dedup_by(|left, right| left.symbol == right.symbol);
+            if keys.len() > cap {
+                keys.truncate(cap);
+                complete = false;
+            }
             finish_generation_candidate_page(
                 &prepared,
                 &context,
                 "code_implementations",
                 binding,
                 keys,
-                |slice| {
-                    hydrate_graph_relation_records(
-                        &prepared.reader,
-                        slice,
-                        cancellation,
-                        &self.relation_symbol_hydrations,
-                    )
-                },
+                |slice| hydrate_graph_relation_records(&prepared.reader, slice, cancellation),
                 &request.meta.page,
                 "implementations",
                 complete,
@@ -3240,7 +3158,8 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let graph_budget =
                 graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
             let start = resolve_graph_start_symbol!(prepared, request.node_id, cancellation);
             let Ok(found) = graph_relation_keys(
                 &prepared.reader,
@@ -3249,13 +3168,9 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 false,
                 request.maximum_depth,
                 &request.scope,
-                graph_budget.max_candidates_per_lane as usize,
                 Arc::clone(&cancellation),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
             let parent_node_id = request.node_id.clone();
             finish_generation_candidate_page(
@@ -3265,23 +3180,19 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 binding,
                 found.keys,
                 |slice| {
-                    hydrate_graph_relation_records(
-                        &prepared.reader,
-                        slice,
-                        cancellation,
-                        &self.relation_symbol_hydrations,
+                    hydrate_graph_relation_records(&prepared.reader, slice, cancellation).map(
+                        |relations| {
+                            relations
+                                .into_iter()
+                                .map(|relation| TypeHierarchyRecord {
+                                    parent_node_id: parent_node_id.clone(),
+                                    edge_kind: relation.edge_kind,
+                                    depth: relation.depth.unwrap_or(1),
+                                    symbol: relation.symbol,
+                                })
+                                .collect()
+                        },
                     )
-                    .map(|relations| {
-                        relations
-                            .into_iter()
-                            .map(|relation| TypeHierarchyRecord {
-                                parent_node_id: parent_node_id.clone(),
-                                edge_kind: relation.edge_kind,
-                                depth: relation.depth.unwrap_or(1),
-                                symbol: relation.symbol,
-                            })
-                            .collect()
-                    })
                 },
                 &request.meta.page,
                 "hierarchy entries",
@@ -3314,7 +3225,8 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let graph_budget =
                 graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
             let start = resolve_graph_start_symbol!(prepared, request.node_id, cancellation);
             let Ok(found) = graph_relation_keys(
                 &prepared.reader,
@@ -3323,32 +3235,71 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 true,
                 request.maximum_depth,
                 &request.scope,
-                graph_budget.max_candidates_per_lane as usize,
                 Arc::clone(&cancellation),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
-            finish_generation_candidate_page(
+            let mut traversed = vec![start];
+            for key in found
+                .keys
+                .iter()
+                .filter(|key| key.depth < request.maximum_depth)
+            {
+                match prepared
+                    .reader
+                    .symbol_summary_for(&key.symbol, Arc::clone(&cancellation))
+                {
+                    Ok(Some(summary)) => traversed.push(summary.occurrence),
+                    _ => {
+                        return unavailable_for_generation(
+                            query_finished_at(),
+                            prepared.generation().clone(),
+                        );
+                    }
+                }
+            }
+            let unsupported = match prepared.reader.has_unresolved_callers(
+                &traversed,
+                request.scope.path_prefix.as_deref(),
+                Arc::clone(&cancellation),
+            ) {
+                Ok(unsupported) => unsupported,
+                Err(_) => {
+                    return unavailable_for_generation(
+                        query_finished_at(),
+                        prepared.generation().clone(),
+                    );
+                }
+            };
+            let outcome = finish_generation_candidate_page(
                 &prepared,
                 &context,
                 "code_callers",
                 binding,
                 found.keys,
-                |slice| {
-                    hydrate_graph_relation_records(
-                        &prepared.reader,
-                        slice,
-                        cancellation,
-                        &self.relation_symbol_hydrations,
-                    )
-                },
+                |slice| hydrate_graph_relation_records(&prepared.reader, slice, cancellation),
                 &request.meta.page,
                 "callers",
                 found.complete,
-            )
+            );
+            match outcome {
+                RetrievalPortOutcome::Completed(mut evidence)
+                | RetrievalPortOutcome::Partial(mut evidence)
+                    if unsupported =>
+                {
+                    evidence.coverage.completeness = CoverageCompleteness::Partial;
+                    for domain in &mut evidence.coverage.domains {
+                        domain.completeness = CoverageCompleteness::Partial;
+                    }
+                    evidence.omissions.push(Omission {
+                        domain: EvidenceDomain::Symbol,
+                        count: 1,
+                        reason: OmissionReason::Unsupported,
+                    });
+                    RetrievalPortOutcome::Partial(evidence)
+                }
+                outcome => outcome,
+            }
         })
     }
 
@@ -3375,7 +3326,8 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let graph_budget =
                 graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
             let start = resolve_graph_start_symbol!(prepared, request.node_id, cancellation);
             let Ok(found) = graph_relation_keys(
                 &prepared.reader,
@@ -3392,13 +3344,9 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 true,
                 request.maximum_depth,
                 &request.scope,
-                graph_budget.max_candidates_per_lane as usize,
                 Arc::clone(&cancellation),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
             finish_generation_candidate_page(
                 &prepared,
@@ -3407,18 +3355,14 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 binding,
                 found.keys,
                 |slice| {
-                    hydrate_graph_relation_records(
-                        &prepared.reader,
-                        slice,
-                        cancellation,
-                        &self.relation_symbol_hydrations,
+                    hydrate_graph_relation_records(&prepared.reader, slice, cancellation).map(
+                        |relations| {
+                            relations
+                                .into_iter()
+                                .map(|relation| relation.symbol)
+                                .collect()
+                        },
                     )
-                    .map(|relations| {
-                        relations
-                            .into_iter()
-                            .map(|relation| relation.symbol)
-                            .collect()
-                    })
                 },
                 &request.meta.page,
                 "symbols",
@@ -3450,8 +3394,9 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let graph_budget =
                 graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
-            let cap = graph_budget.max_candidates_per_lane as usize;
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
+            let cap = MAX_RELATION_CANDIDATE_KEYS;
             let Ok(mut summaries) = prepared.reader.find_symbols(
                 &|_, binding, metadata| {
                     let Some(path) = binding.and_then(|binding| binding.logical_path.as_deref())
@@ -3465,10 +3410,7 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 cap.saturating_add(1),
                 Arc::clone(&cancellation),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
             let complete = summaries.len() <= cap;
             summaries.truncate(cap);
@@ -3745,7 +3687,8 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
             let graph_budget =
                 graph_budget_for_request(prepared.query.request().budget, context.request);
             let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-            let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
+            let cancellation =
+                graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
             let start = resolve_graph_start_symbol!(prepared, request.node_id, cancellation);
             let Ok(found) = graph_relation_keys(
                 &prepared.reader,
@@ -3759,13 +3702,9 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 true,
                 1,
                 &request.scope,
-                graph_budget.max_candidates_per_lane as usize,
                 Arc::clone(&cancellation),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
             finish_generation_candidate_page(
                 &prepared,
@@ -3773,14 +3712,7 @@ impl CallableCodeQueryPort for CodeIndexSchedulerRegistryV1 {
                 "code_references",
                 binding,
                 found.keys,
-                |slice| {
-                    hydrate_graph_relation_records(
-                        &prepared.reader,
-                        slice,
-                        cancellation,
-                        &self.relation_symbol_hydrations,
-                    )
-                },
+                |slice| hydrate_graph_relation_records(&prepared.reader, slice, cancellation),
                 &request.meta.page,
                 "references",
                 found.complete,
@@ -3813,7 +3745,8 @@ fn navigation_symbol_query<'a>(
         let graph_budget =
             graph_budget_for_request(prepared.query.request().budget, context.request);
         let graph_control = CallableRetrievalExecutionControl::for_request(context.request);
-        let cancellation = graph_read_cancellation(graph_control, graph_budget.deadline_micros);
+        let cancellation =
+            graph_read_cancellation(Arc::clone(&graph_control), graph_budget.deadline_micros);
         let start = resolve_graph_start_symbol!(prepared, request.node_id, cancellation);
         let mut items = Vec::new();
         let summary = match prepared
@@ -3851,13 +3784,9 @@ fn navigation_symbol_query<'a>(
                 false,
                 1,
                 &request.scope,
-                graph_budget.max_candidates_per_lane as usize,
                 Arc::clone(&cancellation),
             ) else {
-                return unavailable_for_generation(
-                    query_finished_at(),
-                    prepared.generation().clone(),
-                );
+                return relation_read_failure(&prepared, &graph_control, graph_budget);
             };
             return finish_generation_candidate_page(
                 &prepared,
@@ -3866,18 +3795,14 @@ fn navigation_symbol_query<'a>(
                 binding,
                 found.keys,
                 |slice| {
-                    hydrate_graph_relation_records(
-                        &prepared.reader,
-                        slice,
-                        cancellation,
-                        &registry.relation_symbol_hydrations,
+                    hydrate_graph_relation_records(&prepared.reader, slice, cancellation).map(
+                        |relations| {
+                            relations
+                                .into_iter()
+                                .map(|relation| relation.symbol)
+                                .collect()
+                        },
                     )
-                    .map(|relations| {
-                        relations
-                            .into_iter()
-                            .map(|relation| relation.symbol)
-                            .collect()
-                    })
                 },
                 &request.meta.page,
                 "symbols",
@@ -3900,6 +3825,94 @@ fn navigation_symbol_query<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::code_index_scheduler::tests::{
+        GitFixture, application_context, mounted_core_query_worktree, query_meta,
+        wait_for_queryable_text_generation,
+    };
+    use tracedecay_contracts::{
+        CallableCodeOperationKind, CancellationContext, CodeQueryScope, callable_code_operation,
+    };
+
+    #[tokio::test]
+    async fn callable_exact_read_preserves_cancellation_after_generation_admission() {
+        let fixture = GitFixture::new(&[("src/lib.rs", "pub fn cancellation_target() {}\n")]);
+        let store = tempfile::tempdir().expect("isolated store");
+        let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+        let latest = wait_for_queryable_text_generation(&registry, fixture.path()).await;
+        let generation = latest.metadata().manifest().generation_id.clone();
+        let operation = callable_code_operation(CallableCodeOperationKind::ExactOccurrence)
+            .expect("exact operation");
+        let context = application_context(&operation, scope.repository_id, scope.worktree_id);
+        let request = ExactOccurrenceRequest::new(
+            "cancellation_target",
+            None,
+            CodeQueryScope::new(generation.clone(), None).expect("exact generation scope"),
+            query_meta(),
+        )
+        .expect("exact request");
+        let port_context = RetrievalPortContext {
+            request: &context,
+            operation: &operation,
+        };
+        let binding = canonical_sha256(&(
+            "code_exact_occurrence",
+            &request.literal,
+            &request.kind,
+            &request.scope,
+            &request.meta.projection,
+            &request.meta.order,
+        ))
+        .expect("request binding");
+        let prepared = registry
+            .prepare_text_callable_query(
+                &port_context,
+                &generation,
+                &request.meta.page,
+                request.meta.temporal,
+                "code_exact_occurrence",
+                binding.clone(),
+            )
+            .await
+            .expect("real mounted artifact admission");
+        let active = registry.exact_occurrence(port_context, &request).await;
+        assert!(
+            matches!(active, RetrievalPortOutcome::Completed(_)),
+            "{active:?}"
+        );
+
+        let cancelled = context.with_cancellation(
+            CancellationContext::cancelled("cancel.callable-exact", query_finished_at())
+                .expect("cancelled request context"),
+        );
+        let outcome = execute_prepared_exact_query(
+            &prepared,
+            &RetrievalPortContext {
+                request: &cancelled,
+                operation: &operation,
+            },
+            &request,
+            binding,
+        );
+        let RetrievalPortOutcome::Cancelled(evidence) = outcome else {
+            panic!("a cancelled exact read must retain its typed outcome: {outcome:?}");
+        };
+        assert_eq!(evidence.temporal.source_generation, Some(generation));
+        assert!(evidence.payload.is_none());
+        assert!(
+            evidence
+                .omissions
+                .iter()
+                .any(|omission| omission.reason == OmissionReason::Cancelled)
+        );
+        assert_eq!(
+            evidence
+                .cancellation
+                .expect("cancellation observation")
+                .stage,
+            CancellationStage::DuringRead
+        );
+        registry.shutdown().await;
+    }
 
     #[test]
     fn generation_resolution_wait_reserves_outer_settlement_margin() {

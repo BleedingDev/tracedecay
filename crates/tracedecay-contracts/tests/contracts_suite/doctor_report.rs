@@ -259,14 +259,13 @@ fn doctor_report_coverage_statement_is_truthful_about_unavailable_families() {
     }
 
     let statement = report.coverage().statement().statement();
-    assert!(
-        statement.contains("consulted 1/7"),
-        "statement: {statement}"
-    );
-    assert!(statement.contains("unavailable"), "statement: {statement}");
-    assert!(
-        statement.contains("language_server(unwired)"),
-        "statement: {statement}"
+    // Eight families since retained memory became its own family; only
+    // configuration was wired here.
+    assert_eq!(
+        statement,
+        "consulted 1/8 doctor finding families; unavailable: advisory(unwired), \
+         storage_runtime(unwired), storage(unwired), language_server(unwired), \
+         code_index(unwired), observability(unwired), memory(unwired)"
     );
     // The unwired families carry a truthful non-healthy evidence state.
     let advisory = report
@@ -291,7 +290,6 @@ fn doctor_report_exposes_remote_and_profile_authority_truth_without_replacing_ru
             pending_spool_items: 2,
             quarantined_spool_items: 1,
             replay_coverage_complete: false,
-            backup_verified: true,
             failover_in_progress: false,
             recovery_required: true,
             coverage: DoctorCoverageCompletenessV1::Complete,
@@ -451,7 +449,7 @@ fn doctor_report_healthy_only_under_genuinely_complete_coverage() {
 fn doctor_regression_unavailable_and_drift_families_are_distinct_states() {
     let ctx = context();
     // Executable absent, protocol drift, configuration drift, stuck runtime,
-    // unmounted index, denied storage — each a distinct visible state.
+    // unmounted index, denied storage, each a distinct visible state.
     let configuration = StaticConfiguration(ConfigurationAuthorityReadV1::Resolved {
         drift: ConfigurationDriftV1::Drifted,
         coverage: DoctorCoverageCompletenessV1::Complete,

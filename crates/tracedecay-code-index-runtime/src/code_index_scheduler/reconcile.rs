@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock, PoisonError, RwLock,
-        atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -20,7 +20,7 @@ use tracedecay_application::code_index::{
     DaemonCodeIndexControlV1, ProductionCodeIndexOwnerV1, open_production_code_index_owner_v1,
 };
 use tracedecay_code_index_retention::code_index_generations::{
-    DurablePublicationPointerV1, DurableSealedCodeGenerationIdentityV1,
+    CodeIndexScopeStoreResetV1, DurablePublicationPointerV1, DurableSealedCodeGenerationIdentityV1,
 };
 use tracedecay_contracts::{
     CodeIndexReconcileOptionsV1,
@@ -40,8 +40,9 @@ use tracedecay_graph_db::GraphConflictContextV1;
 use tracedecay_privacy::CODE_SOURCE_SANITIZER_VERSION_V1;
 use tracedecay_runtime_core::resident_memory::{
     ProcessResidentMemoryV1, RESIDENT_MEMORY_PRESSURE_ADMISSION_FLOOR_BYTES_V1,
-    ResidentMemoryAdmissionFailureV1, ResidentMemoryComponentIdV1, ResidentMemoryKeyV1,
-    ResidentMemoryReservationV1, detected_process_resident_memory_limit_v1,
+    RESIDENT_OWNER_IDLE_WINDOW_V1, ResidentMemoryAdmissionFailureV1, ResidentMemoryComponentIdV1,
+    ResidentMemoryKeyV1, ResidentMemoryReservationV1, ResidentOwnersV1,
+    detected_process_resident_memory_limit_v1,
 };
 
 use crate::code_index::{
@@ -73,6 +74,7 @@ use super::{
 };
 #[cfg(test)]
 use super::{HeldActiveDecodeV1, reconcile_panic_guard};
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 const MAX_PENDING_HINTS: usize = 1_024;
 const MAX_SUPERSEDED_RECONCILE_RETRIES: usize = 4;
@@ -298,9 +300,9 @@ impl CodeIndexSchedulerErrorV1 {
     /// for these instead of resealing a duplicate; payload corruption and
     /// identity failures stay terminal so reconcile can rebuild.
     ///
-    /// `Conflict` is a lifecycle or compare-and-swap race — a graph runtime
+    /// `Conflict` is a lifecycle or compare-and-swap race, a graph runtime
     /// mid-close/retire, a concurrent publisher, or a superseded verified
-    /// head — never evidence about the sealed payload. Classifying it
+    /// head, never evidence about the sealed payload. Classifying it
     /// terminal turned one such race into a permanent outage: the seat pass
     /// gave up stale serving, the next reconcile hit the same race, and the
     /// route answered `generation_unverified` until the daemon restarted.
@@ -336,9 +338,9 @@ impl CodeIndexSchedulerErrorV1 {
 
     /// The structured conflict verdict carried by a graph-projection
     /// activation failure, when this error is one. The seat retry loop uses
-    /// it to recognize a deterministic conflict — the same guard site
+    /// it to recognize a deterministic conflict, the same guard site
     /// refusing with identical compared evidence on consecutive attempts
-    /// over the same sealed generation — which no amount of backoff can
+    /// over the same sealed generation, which no amount of backoff can
     /// outwait (issue #765).
     pub fn activation_conflict_context(&self) -> Option<&GraphConflictContextV1> {
         match self {
@@ -373,13 +375,30 @@ impl CodeIndexSchedulerErrorV1 {
         )
     }
 
+    /// A failure the unchanged source reproduces on every pass: not an
+    /// interruption, not capacity another holder releases, not an activation
+    /// or publication race a later pass re-drives, and not the corrupt
+    /// publication the worker resets itself. Retrying it over the same bytes
+    /// only repeats the whole build, so the worker parks it typed until the
+    /// input changes.
+    pub fn reproduces_on_unchanged_input(&self) -> bool {
+        self.reconcile_interruption().is_none()
+            && !self.is_transient_capacity_failure()
+            && !self.is_retryable_activation()
+            && !self.is_publication_authority_corruption()
+            && !matches!(self, Self::PublicationConflict(_))
+    }
+
     pub fn is_graph_activation_refusal(&self) -> bool {
-        matches!(self, Self::GraphActivationRefused(_))
-            || matches!(
-                self,
-                Self::GraphProjection(CodeGraphProjectionError::BudgetExhausted { budget, .. })
-                    if budget == tracedecay_graph_db::GraphBudgetKind::ResidentMemory.as_str()
-            )
+        matches!(self, Self::GraphActivationRefused(_)) || self.is_resident_memory_graph_refusal()
+    }
+
+    /// The native graph publication stopped at the measured-RSS watermark.
+    pub fn is_resident_memory_graph_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::GraphProjection(error) if super::graph_activation::is_resident_memory_refusal(error)
+        )
     }
 
     /// A refusal that is transient *by construction*: this pass was turned away
@@ -394,8 +413,8 @@ impl CodeIndexSchedulerErrorV1 {
     ///
     /// The distinction the admission failure carries is the whole point. A
     /// request that exceeds the *entire* process limit is shaped like a
-    /// capacity refusal and is not one — no other holder can release enough for
-    /// it — so it is classified permanent and never self-retried. Identity
+    /// capacity refusal and is not one, no other holder can release enough for
+    /// it, so it is classified permanent and never self-retried. Identity
     /// failures, git and IO faults, production and privacy refusals, adjustment
     /// invariant breaks, an uninstalled worker plan, and publication conflicts
     /// likewise reproduce over the same input or already have an owner that
@@ -414,28 +433,68 @@ impl CodeIndexSchedulerErrorV1 {
             }
             Self::SnapshotMemoryCapacityUnavailable => true,
             Self::GraphProjection(CodeGraphProjectionError::BudgetExhausted { .. }) => true,
+            // The code-generation store lock is bounded shared capacity: a
+            // concurrent publication in the same store root already holds it,
+            // and it releases on its own without waking this worktree. Every
+            // other `Unavailable` detail names a fault in this store, so only
+            // this one refusal is retried.
+            Self::Production(CodeIndexProductionErrorV1::Publication(
+                CodeIndexPublicationStoreErrorV1::Unavailable(detail),
+            )) => detail == super::publication_store::CODE_GENERATION_STORE_ACTIVE_OWNER_DETAIL_V1,
             _ => false,
         }
     }
 }
 
-/// Counts in-flight owner passes (retained activation or reconcile). A
-/// counter rather than a flag so the background worker can hold the state
-/// across an entire pass — claim of the pending wake through arrival restore —
-/// while the scheduler's own entry points nest inside it without clearing the
-/// in-progress signal early.
-pub struct ReconcilePassGuard(Arc<AtomicUsize>);
+/// Owner passes (retained activation or reconcile) one worktree has entered
+/// and left. Both counts only grow, so a subscriber that looks late still
+/// sees a pass that began and ended before it looked; a running level sampled
+/// on a timer cannot show that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CodeIndexOwnerPassesV1 {
+    pub started: u64,
+    pub settled: u64,
+}
+
+impl CodeIndexOwnerPassesV1 {
+    pub fn running(self) -> bool {
+        self.started != self.settled
+    }
+}
+
+/// Counts in-flight owner passes. A counter rather than a flag so the
+/// background worker can hold the state across an entire pass, claim of the
+/// pending wake through arrival restore, while the scheduler's own entry
+/// points nest inside it without clearing the in-progress signal early.
+#[derive(Debug, Default)]
+pub struct ReconcilePassesV1(tokio::sync::watch::Sender<CodeIndexOwnerPassesV1>);
+
+impl ReconcilePassesV1 {
+    pub fn running(&self) -> bool {
+        self.0.borrow().running()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<CodeIndexOwnerPassesV1> {
+        self.0.subscribe()
+    }
+}
+
+pub struct ReconcilePassGuard(Arc<ReconcilePassesV1>);
 
 impl ReconcilePassGuard {
-    pub fn enter(passes: &Arc<AtomicUsize>) -> Self {
-        passes.fetch_add(1, Ordering::AcqRel);
+    pub fn enter(passes: &Arc<ReconcilePassesV1>) -> Self {
+        passes
+            .0
+            .send_modify(|passes| passes.started = passes.started.wrapping_add(1));
         Self(Arc::clone(passes))
     }
 }
 
 impl Drop for ReconcilePassGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        self.0
+            .0
+            .send_modify(|passes| passes.settled = passes.settled.wrapping_add(1));
     }
 }
 
@@ -461,7 +520,6 @@ pub(super) struct SourceFreshnessFenceStateV1 {
     /// The stat signature (negative cache) and sealed file digests (proof)
     /// the last completed reconcile established; `None` until one has.
     source_witness: Option<ReconciledSourceWitnessV1>,
-    pub(super) staleness_threshold: Duration,
     verified_against_source: bool,
     freshness_unknown: bool,
     reconciled_without_generation: bool,
@@ -469,13 +527,12 @@ pub(super) struct SourceFreshnessFenceStateV1 {
 }
 
 impl SourceFreshnessFenceV1 {
-    fn unverified(staleness_threshold: Duration, source_epoch: Arc<AtomicU64>) -> Self {
+    fn unverified(source_epoch: Arc<AtomicU64>) -> Self {
         Self {
             state: Arc::new(Mutex::new(SourceFreshnessFenceStateV1 {
                 git_metadata: identity::GitMetadataFingerprintV1::default(),
                 last_reconciled_at: Instant::now(),
                 source_witness: None,
-                staleness_threshold,
                 verified_against_source: false,
                 freshness_unknown: true,
                 reconciled_without_generation: false,
@@ -536,7 +593,7 @@ impl SourceFreshnessFenceV1 {
     }
 
     /// Whether canonical source input has advanced beyond the last completed
-    /// proof. An expired proof alone leaves the epochs equal: its background
+    /// proof. Moved Git metadata alone leaves the epochs equal: its background
     /// pass is verification, not evidence that a replacement is being built.
     pub(super) fn source_change_pending(&self) -> bool {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -559,10 +616,19 @@ impl SourceFreshnessFenceV1 {
         shutting_down: &AtomicBool,
     ) -> bool {
         let state = self.snapshot();
-        self.snapshot_is_recently_verified(&state, project_root, shutting_down)
+        self.proof_is_unmoved(&state, project_root, shutting_down)
     }
 
-    fn snapshot_is_recently_verified(
+    /// Whether no source evidence has arrived since the last completed proof.
+    ///
+    /// Age is deliberately not evidence. The proof holds until a hook hint or
+    /// observed change advances the source epoch, or Git metadata moves.
+    /// Unhinted raw writes are the watcher backstop's and the read-refresh
+    /// probe's to find ([`CodeIndexWorktreeSchedulerV1::freshness_probe_verdict`]
+    /// sweeps the sealed digests and posts a wake only on proven movement).
+    /// Expiring the proof on a clock made every read after the window
+    /// schedule a verification pass of an unchanged tree.
+    fn proof_is_unmoved(
         &self,
         state: &SourceFreshnessFenceStateV1,
         project_root: &Path,
@@ -575,7 +641,6 @@ impl SourceFreshnessFenceV1 {
             && self.source_epoch.load(Ordering::Acquire) == state.reconciled_source_epoch
             && !identity::GitMetadataFingerprintV1::capture(project_root)
                 .differs_from(&state.git_metadata)
-            && state.last_reconciled_at.elapsed() < state.staleness_threshold
     }
 
     pub(super) fn source_currency_witness_for(
@@ -598,10 +663,10 @@ impl SourceFreshnessFenceV1 {
         })
     }
 
-    /// Whether the last bounded source proof still admits this exact sealed
-    /// snapshot without walking the worktree. Once that proof ages out, reads
-    /// report the retained owner stale and let the canonical worker renew it.
-    pub(super) fn serves_recently_verified_source(
+    /// Whether the last source proof still admits this exact sealed snapshot
+    /// without walking the worktree. Once source evidence moves, reads report
+    /// the retained owner stale and let the canonical worker renew it.
+    pub(super) fn serves_verified_source(
         &self,
         snapshot_content_identity: &ContentDigest,
         project_root: &Path,
@@ -614,7 +679,47 @@ impl SourceFreshnessFenceV1 {
                     .content_manifest
                     .describes_snapshot(snapshot_content_identity)
             })
-            && self.snapshot_is_recently_verified(&state, project_root, shutting_down)
+            && self.proof_is_unmoved(&state, project_root, shutting_down)
+    }
+
+    /// Whether the last completed proof was sealed from exactly this snapshot.
+    ///
+    /// Clock age is not part of the answer. A seal can outlive the admission
+    /// window without the snapshot changing identity.
+    pub(super) fn proof_describes_snapshot(
+        &self,
+        snapshot_content_identity: &ContentDigest,
+    ) -> bool {
+        let state = self.snapshot();
+        state.verified_against_source
+            && state.source_witness.as_ref().is_some_and(|witness| {
+                witness
+                    .content_manifest
+                    .describes_snapshot(snapshot_content_identity)
+            })
+    }
+
+    /// Age the probe clock past `threshold` without touching source.
+    #[cfg(test)]
+    pub(super) fn age_probe_clock_past_for_test(&self, threshold: Duration) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.last_reconciled_at = Instant::now()
+            .checked_sub(threshold + Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+    }
+
+    /// Refresh the admission clock and the git-metadata sample after the
+    /// sealed digests still matched. The content witness and reconciled
+    /// epoch stay put: this is the same proof, not a new generation.
+    fn rebind_admission_clock(&self, git_metadata: identity::GitMetadataFingerprintV1) {
+        let micros = now_micros().0;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.git_metadata = git_metadata;
+        state.last_reconciled_at = Instant::now();
+        state.verified_against_source = true;
+        state.freshness_unknown = false;
+        self.last_reconciled_at_micros
+            .store(micros, Ordering::Release);
     }
 }
 
@@ -672,6 +777,11 @@ pub struct CodeIndexWorktreeSchedulerV1 {
     /// through. Standalone opens get a private default-limit authority; the
     /// registry rebinds its shared process authority at mount.
     resident_memory: Arc<ProcessResidentMemoryV1>,
+    /// Retained owners an artifact build sheds before its reservation is
+    /// refused. Standalone opens get a private empty inventory; the registry
+    /// rebinds its inventory at mount.
+    resident_owners: Arc<ResidentOwnersV1>,
+    pub(super) worker_runtime: SchedulerWorkerRuntimeV1,
     pub(super) publication: DaemonCodeIndexPublicationStoreV1,
     pub(super) production_config: CodeIndexProductionConfigV1,
     pub(super) owner: ProductionOwner,
@@ -687,9 +797,9 @@ pub struct CodeIndexWorktreeSchedulerV1 {
     pub(super) wake: Arc<tokio::sync::Notify>,
     pub(super) epoch: Arc<AtomicU64>,
     pub(super) shutting_down: Arc<AtomicBool>,
-    /// Number of in-flight owner passes; nonzero means activation or
-    /// reconcile work is running for this worktree.
-    pub(super) reconcile_in_progress: Arc<AtomicUsize>,
+    /// In-flight owner passes; running means activation or reconcile work
+    /// is in progress for this worktree.
+    pub(super) reconcile_in_progress: Arc<ReconcilePassesV1>,
     /// Typed owner-configuration recovery independently readable while a
     /// replacement generation is building.
     generation_recovery: Arc<RwLock<Option<CodeIndexGenerationRecoveryV1>>>,
@@ -697,7 +807,7 @@ pub struct CodeIndexWorktreeSchedulerV1 {
     pub(super) ignored_source_admissions: Vec<CodeIndexIgnoredSourceAdmissionV1>,
     /// Set when a retained generation was refused because its ignored-source
     /// roster no longer verifies. That refusal also clears the roster, so the
-    /// next pass rebuilds without it — but the refused pass has already
+    /// next pass rebuilds without it, but the refused pass has already
     /// consumed the wake that ran it, so nothing scheduled that next pass and
     /// the still-pending source stayed uncaptured with no seat at all. The
     /// worker takes this flag to re-arm exactly one pass; taking it clears it,
@@ -740,6 +850,8 @@ pub struct HistoricalCodeIndexGenerationOwnerV1 {
     pub(super) publication: DaemonCodeIndexPublicationStoreV1,
     store_root: PathBuf,
     resident_memory: Arc<ProcessResidentMemoryV1>,
+    resident_owners: Arc<ResidentOwnersV1>,
+    worker_runtime: SchedulerWorkerRuntimeV1,
     pub(super) project_id: ProjectId,
     worktree_id: WorktreeId,
     shutting_down: Arc<AtomicBool>,
@@ -776,6 +888,8 @@ impl HistoricalCodeIndexGenerationOwnerV1 {
                 &self.store_root,
                 &self.publication,
                 &self.resident_memory,
+                &self.resident_owners,
+                &self.worker_runtime,
                 &self.project_id,
                 &self.worktree_id,
             ),
@@ -930,7 +1044,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         byte_pool: Arc<SharedCodeIndexBytePoolV1>,
         policy: CodeIndexHintPolicyV1,
     ) -> Result<Self, CodeIndexSchedulerErrorV1> {
-        let project_root = project_root.canonicalize()?;
+        let project_root = canonical_existing_identity(project_root)?;
         // Resolve exact identity BEFORE any indexing work. Paths located this
         // checkout; identity authorizes what may be reused.
         let identity = identity::IndexingIdentityV1::resolve(&project_root)
@@ -972,8 +1086,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         let hints = Arc::new(Mutex::new(PendingHintsV1::default()));
         let wake = Arc::new(tokio::sync::Notify::new());
         let epoch = Arc::new(AtomicU64::new(0));
-        let freshness_fence =
-            SourceFreshnessFenceV1::unverified(policy.staleness_threshold, Arc::clone(&epoch));
+        let freshness_fence = SourceFreshnessFenceV1::unverified(Arc::clone(&epoch));
         // Nothing is decoded or served until the retained owner proves the
         // durable generation belongs to this exact identity and its freshness
         // frontier still matches the worktree.
@@ -994,6 +1107,8 @@ impl CodeIndexWorktreeSchedulerV1 {
             resident_memory: Arc::new(ProcessResidentMemoryV1::new(
                 detected_process_resident_memory_limit_v1(),
             )),
+            resident_owners: Arc::new(ResidentOwnersV1::new(RESIDENT_OWNER_IDLE_WINDOW_V1)),
+            worker_runtime: SchedulerWorkerRuntimeV1::default(),
             publication,
             production_config,
             owner,
@@ -1003,7 +1118,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             wake,
             epoch,
             shutting_down,
-            reconcile_in_progress: Arc::new(AtomicUsize::new(0)),
+            reconcile_in_progress: Arc::new(ReconcilePassesV1::default()),
             generation_recovery: Arc::new(RwLock::new(None)),
             latest_content_identity,
             ignored_source_admissions: Vec::new(),
@@ -1029,6 +1144,22 @@ impl CodeIndexWorktreeSchedulerV1 {
     /// this scheduler's private standalone authority.
     pub fn bind_resident_memory(&mut self, resident_memory: Arc<ProcessResidentMemoryV1>) {
         self.resident_memory = resident_memory;
+    }
+
+    pub fn bind_resident_owners(&mut self, resident_owners: Arc<ResidentOwnersV1>) {
+        self.resident_owners = resident_owners;
+    }
+
+    /// Give this scheduler the worker runtime its builds run under.
+    #[cfg(test)]
+    pub(super) fn bind_worker_runtime(
+        &self,
+        runtime: tracedecay_code_index::parallelism::CodeIndexWorkerRuntimeV1,
+    ) {
+        assert!(
+            self.worker_runtime.owned.set(runtime).is_ok(),
+            "a scheduler binds one worker runtime"
+        );
     }
 
     pub fn bind_progress_incarnations(
@@ -1066,6 +1197,8 @@ impl CodeIndexWorktreeSchedulerV1 {
             publication: self.publication.clone(),
             store_root: self.store_root.clone(),
             resident_memory: Arc::clone(&self.resident_memory),
+            resident_owners: Arc::clone(&self.resident_owners),
+            worker_runtime: self.worker_runtime.clone(),
             project_id: self.project_id.clone(),
             worktree_id: self.worktree_id.clone(),
             shutting_down: Arc::clone(&self.shutting_down),
@@ -1080,7 +1213,7 @@ impl CodeIndexWorktreeSchedulerV1 {
     pub(super) fn reserve_worker_memory(
         &self,
     ) -> Result<ResidentMemoryReservationV1, CodeIndexSchedulerErrorV1> {
-        self.ensure_worker_plan()?;
+        let _workers = self.ensure_worker_plan()?;
         let planned_workers = tracedecay_code_index::parallelism::indexing_workers();
         let snapshot = self.resident_memory.snapshot();
         let remaining = snapshot.limit_bytes.saturating_sub(snapshot.used_bytes);
@@ -1195,27 +1328,15 @@ impl CodeIndexWorktreeSchedulerV1 {
         Ok(())
     }
 
-    pub(super) fn ensure_worker_plan(&self) -> Result<(), CodeIndexSchedulerErrorV1> {
-        if tracedecay_code_index::parallelism::installed_worker_status().is_some() {
-            return Ok(());
-        }
-        // The shared scheduler test sources also compile into the composition
-        // root's test binary, where this crate is a dependency built with
-        // `test-helpers` instead of `cfg(test)`; both spellings are the same
-        // fixture surface, so the auto-install fallback must cover both.
-        #[cfg(any(test, feature = "test-helpers"))]
-        {
-            let snapshot = self.resident_memory.snapshot();
-            tracedecay_code_index::parallelism::install_worker_plan(
-                tracedecay_domain::configuration::CodeIndexWorkerSelectionV1::Automatic {},
-                snapshot.limit_bytes.saturating_sub(snapshot.used_bytes),
-            )?;
-            Ok(())
-        }
-        #[cfg(not(any(test, feature = "test-helpers")))]
-        {
-            Err(CodeIndexSchedulerErrorV1::WorkerPlanNotInstalled)
-        }
+    /// The worker runtime this scheduler's build runs under, entered on the
+    /// calling thread for the returned guard's lifetime.
+    pub(super) fn ensure_worker_plan(
+        &self,
+    ) -> Result<
+        Option<tracedecay_code_index::parallelism::EnteredCodeIndexWorkerRuntimeV1>,
+        CodeIndexSchedulerErrorV1,
+    > {
+        self.worker_runtime.enter(&self.resident_memory)
     }
 
     #[cfg(test)]
@@ -1586,8 +1707,8 @@ impl CodeIndexWorktreeSchedulerV1 {
     }
 
     /// Witness + git/stat fence that does not read sealed generation bytes.
-    /// `Some` is the negative cache only — the metadata the witness recorded
-    /// has not moved — and hands back the sweep so the caller can settle
+    /// `Some` is the negative cache only, the metadata the witness recorded
+    /// has not moved, and hands back the sweep so the caller can settle
     /// currency against the retained generation's sealed file digests.
     fn retained_frontier_stat_sweep(
         &self,
@@ -1604,13 +1725,6 @@ impl CodeIndexWorktreeSchedulerV1 {
         self.worktree_stat_sweep()
             .ok()
             .filter(|sweep| witness.stat_signature == sweep.signature)
-    }
-
-    #[cfg(test)]
-    pub fn seat_retained_generation_on_empty_serving_for_test(
-        &mut self,
-    ) -> Result<Option<CodeIndexReconcileOutcomeV1>, CodeIndexSchedulerErrorV1> {
-        self.seat_retained_generation_on_empty_serving()
     }
 
     /// Verify an unchanged retained text generation without decoding the full
@@ -1766,6 +1880,45 @@ impl CodeIndexWorktreeSchedulerV1 {
         Ok(Some(outcome))
     }
 
+    /// Record that `metadata` is the generation the live worktree still seals.
+    ///
+    /// The in-memory fence takes this snapshot. The disk witness, when one
+    /// exists, is rewritten to this generation id so the next open does not
+    /// treat the predecessor's proof as a reason to drop it and reseal.
+    fn accept_unchanged_sealed_snapshot(
+        &mut self,
+        metadata: &VerifiedSealedTextGenerationMetadataV1,
+        git_metadata: identity::GitMetadataFingerprintV1,
+        stat_signature: String,
+        source_manifest: SourceContentManifestV1,
+        prior_witness: Option<&RestoreFreshnessWitnessV1>,
+    ) -> CodeIndexReconcileOutcomeV1 {
+        let snapshot_content_identity = metadata.snapshot().content_identity.clone();
+        self.latest_content_identity = Some(snapshot_content_identity.clone());
+        self.mark_reconciled_retained_generation_state(
+            git_metadata.clone(),
+            Some(ReconciledSourceWitnessV1 {
+                stat_signature: stat_signature.clone(),
+                content_manifest: source_manifest,
+            }),
+        );
+        if let Some(prior) = prior_witness {
+            RestoreFreshnessWitnessV1 {
+                generation_id: metadata.manifest().generation_id.as_str().to_owned(),
+                git_metadata_signature: git_metadata.stable_signature(),
+                stat_signature,
+                repository_parse_identity_digest: prior.repository_parse_identity_digest.clone(),
+                ignored_source_admissions_digest: prior.ignored_source_admissions_digest.clone(),
+                ignored_source_paths: Vec::new(),
+            }
+            .persist(&self.store_root);
+        }
+        CodeIndexReconcileOutcomeV1::Noop(CodeIndexNoopEvidenceV1 {
+            snapshot_content_identity,
+            overflow_reconciled: false,
+        })
+    }
+
     pub(super) fn reconcile_retained_text_generation_with(
         &mut self,
         metadata: &VerifiedSealedTextGenerationMetadataV1,
@@ -1796,10 +1949,14 @@ impl CodeIndexWorktreeSchedulerV1 {
             .observe_retained_text_compatibility(metadata)
             .is_reusable();
         let witness = RestoreFreshnessWitnessV1::load(&self.store_root);
-        if witness.as_ref().is_some_and(|witness| {
-            witness.generation_id != metadata.manifest().generation_id.as_str()
-                || !witness.ignored_source_paths.is_empty()
-        }) || !self.ignored_source_admissions.is_empty()
+        // A predecessor freshness witness is not a reason to drop this
+        // generation. It names the proof that sealed an earlier snapshot.
+        // Ignored-source rosters still require the complete capture: their
+        // digest is not the ordinary file manifest this path compares.
+        if witness
+            .as_ref()
+            .is_some_and(|witness| !witness.ignored_source_paths.is_empty())
+            || !self.ignored_source_admissions.is_empty()
         {
             return Ok(None);
         }
@@ -1826,37 +1983,54 @@ impl CodeIndexWorktreeSchedulerV1 {
         // generation's sealed file digests; its matching stat signature is
         // the negative cache that lets a moved tree skip the byte comparison.
         let source_manifest = SourceContentManifestV1::for_snapshot(metadata.snapshot());
-        if retained_is_reusable
+        let sealed_bytes_match = retained_is_reusable
             && !has_hints
-            && let Some(witness) = witness.as_ref()
-            && witness.git_metadata_signature == sampled_metadata.stable_signature()
-            && witness.stat_signature == sampled_sweep.signature
             && sampled_sweep.content_matches(
                 &self.project_root,
                 &source_manifest,
                 &self.shutting_down,
-            )
-        {
-            let snapshot_content_identity = metadata.snapshot().content_identity.clone();
-            self.latest_content_identity = Some(snapshot_content_identity.clone());
-            self.mark_reconciled_retained_generation_state(
-                sampled_metadata,
-                Some(ReconciledSourceWitnessV1 {
-                    stat_signature: sampled_sweep.signature,
-                    content_manifest: source_manifest,
-                }),
             );
-            return Ok(Some(CodeIndexReconcileOutcomeV1::Noop(
-                CodeIndexNoopEvidenceV1 {
-                    snapshot_content_identity,
-                    overflow_reconciled: false,
-                },
+        let quiet_witness = sealed_bytes_match
+            && witness.as_ref().is_some_and(|witness| {
+                witness.git_metadata_signature == sampled_metadata.stable_signature()
+                    && witness.stat_signature == sampled_sweep.signature
+            });
+        // Identical source bytes do not make a moved commit or branch the same
+        // generation. `finish_retained_reconcile` rebuilds on exactly this
+        // drift, and branch-scoped reads resolve generations by their sealed
+        // `source_revision`, so accepting here would leave the retained
+        // generation attributed to a commit the checkout has left for as long
+        // as the bytes hold still. `self.identity` was re-resolved above, so
+        // this costs no extra walk. A snapshot sealed without a revision
+        // (a dirty capture) has no commit attribution to invalidate.
+        let sealed_attribution_is_current = metadata.snapshot().reference.as_ref()
+            == self.identity.head_ref()
+            && metadata
+                .snapshot()
+                .source_revision
+                .as_ref()
+                .is_none_or(|sealed| self.identity.head_commit() == Some(sealed));
+        // Graph-on refuses to decode the sealed generation just because the
+        // predecessor witness, or a git-index mtime this seal itself moved,
+        // does not name this generation. The sealed digests are the proof.
+        // Graph-off still captures so a metadata-only drift is verified
+        // without a full decode when the quiet witness is absent.
+        if sealed_bytes_match
+            && sealed_attribution_is_current
+            && (quiet_witness || !rebuild_changed_source_without_decode)
+        {
+            return Ok(Some(self.accept_unchanged_sealed_snapshot(
+                metadata,
+                sampled_metadata,
+                sampled_sweep.signature,
+                source_manifest,
+                witness.as_ref(),
             )));
         }
 
-        // A compatible generation whose witness did not prove a quiet tree
-        // falls through to the full graph-on reconcile. An incompatible
-        // lightweight owner rebuilds here without decoding the retained graph.
+        // A compatible generation whose bytes moved falls through to the full
+        // graph-on reconcile. An incompatible lightweight owner rebuilds here
+        // without decoding the retained graph.
         if retained_is_reusable && !rebuild_changed_source_without_decode {
             return Ok(None);
         }
@@ -1922,7 +2096,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         {
             // Live ignored admissions already forced the complete path above.
             // An ordinary unequal capture is a real edit: rebuild under the
-            // exact durable pointer. Do not fall through to reconcile_now —
+            // exact durable pointer. Do not fall through to reconcile_now,
             // that decodes the sealed generation through generations_root,
             // so a transient store failure never reaches publish and the
             // retry extracts the whole worktree again.
@@ -1957,7 +2131,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             let generation = if let Some(pending) = pending {
                 // The previous pass already built this generation and lost
                 // only the durable write. Republish it without a second
-                // whole-store extract — isolated graph-off retries otherwise
+                // whole-store extract, isolated graph-off retries otherwise
                 // miss their deadline waiting on a cold parser warmup.
                 let scope = CodeIndexGenerationScopeV1::for_snapshot(&captured.snapshot);
                 let mut publication = publication;
@@ -2206,6 +2380,8 @@ impl CodeIndexWorktreeSchedulerV1 {
             &self.store_root,
             &self.publication,
             &self.resident_memory,
+            &self.resident_owners,
+            &self.worker_runtime,
             &self.project_id,
             &self.worktree_id,
         );
@@ -2388,8 +2564,8 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     /// Records one attempted reconcile pass against the installed test fault.
     ///
-    /// The worker loop reaches indexing through three branches — a retained
-    /// text generation, retained-owner activation, and a plain reconcile — so
+    /// The worker loop reaches indexing through three branches, a retained
+    /// text generation, retained-owner activation, and a plain reconcile, so
     /// hooking any single one of them counts a subset of the passes the loop
     /// actually makes. This is called once at the top of the loop's blocking
     /// closure instead, which is what `install_reconcile_fault_for_test`
@@ -2400,6 +2576,43 @@ impl CodeIndexWorktreeSchedulerV1 {
             fault.arrive()?;
         }
         Ok(())
+    }
+
+    /// Delete this worktree's corrupt derived publication and forget every
+    /// in-memory derivation of it, so the next pass seals from source.
+    ///
+    /// Only the publication authority (`CorruptionResetRequired`) reaches
+    /// this. The scope store is derived data with no authoritative content,
+    /// so the legal action is deletion and rebuild, never repair. Serving
+    /// seats already handed to the registry are left in place; the rebuilt
+    /// generation replaces them through the ordinary swap.
+    pub fn reset_corrupt_publication_authority(
+        &mut self,
+    ) -> Result<CodeIndexScopeStoreResetV1, CodeIndexSchedulerErrorV1> {
+        let receipt = self
+            .publication
+            .reset_corrupt_store()
+            .map_err(CodeIndexProductionErrorV1::Publication)?;
+        self.latest_content_identity = None;
+        self.retained_snapshot_bytes.clear();
+        self._retained_snapshot_memory.clear();
+        *self
+            .active_snapshot_changed_paths
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .query_owners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .generation_recovery
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .build_progress
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = CodeIndexBuildProgressSlotStateV1::default();
+        Ok(receipt)
     }
 
     /// Retained-owner activation entry point. Foreground reads never call this.
@@ -2441,7 +2654,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(cancelled_code_index_reconcile());
         }
-        self.ensure_worker_plan()?;
+        let _workers = self.ensure_worker_plan()?;
         let _worker_memory = self.reserve_worker_memory()?;
         let _reconcile_guard = ReconcilePassGuard::enter(&self.reconcile_in_progress);
         // Re-resolve exact identity before indexing (tier-3 backstop). The
@@ -2465,7 +2678,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             self.validate_generation_identity(&active)?;
             self.adopt_ignored_source_roster(&active);
         }
-        // Capture may advance `.git/index` mtime (gix::open). The post-reconcile
+        // Capture may advance `.git/index` mtime (git_open::open). The post-reconcile
         // witness is sampled at `mark_reconciled`, after that side effect, so
         // the next ready probe does not see this pass as stale.
         let mut overflow_reconciled = false;
@@ -2899,6 +3112,49 @@ impl CodeIndexWorktreeSchedulerV1 {
             .source_currency_witness_for(generation_id, snapshot_content_identity)
     }
 
+    /// Bind a sealed snapshot to the source proof, rebinding a moved Git
+    /// metadata sample when the sealed digests still match.
+    ///
+    /// This only stops a Git metadata sample the seal itself moved, or a
+    /// predecessor disk witness, from clearing the generation those digests
+    /// already name. A hook epoch or a digest mismatch still refuses.
+    pub(super) fn currency_witness_for_sealed_snapshot(
+        &self,
+        generation_id: &CodeGenerationId,
+        snapshot_content_identity: &ContentDigest,
+    ) -> Option<ServingSourceWitnessV1> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return None;
+        }
+        if self.freshness_fence.serves_verified_source(
+            snapshot_content_identity,
+            &self.project_root,
+            &self.shutting_down,
+        ) {
+            return self
+                .freshness_fence
+                .source_currency_witness_for(generation_id, snapshot_content_identity);
+        }
+        if !self
+            .freshness_fence
+            .proof_describes_snapshot(snapshot_content_identity)
+            || self.freshness_fence.source_change_pending()
+        {
+            return None;
+        }
+        let freshness = self.freshness_fence.snapshot();
+        if !self.source_witness_matches_worktree(&freshness) {
+            return None;
+        }
+        // Sample after the walk. `git_open::open` inside the digest comparison can
+        // move index metadata; storing the post-walk sample is what keeps the
+        // next probe from calling that side effect a new generation.
+        let git_metadata = identity::GitMetadataFingerprintV1::capture(&self.project_root);
+        self.freshness_fence.rebind_admission_clock(git_metadata);
+        self.freshness_fence
+            .source_currency_witness_for(generation_id, snapshot_content_identity)
+    }
+
     /// A cheap stat-level (path, mtime, size) signature of the present source
     /// candidates. It opens gix and runs stat-based status (no byte reads, no
     /// content hashing). A changed signature skips straight to reconcile; an
@@ -2989,21 +3245,31 @@ impl CodeIndexWorktreeSchedulerV1 {
     /// did: it proves the authority exists without walking, hashing, or
     /// classifying anything.
     pub fn git_authority_available(&self) -> bool {
-        gix::open(&self.project_root).is_ok()
+        tracedecay_runtime_core::git_open::open(&self.project_root).is_ok()
     }
 
-    /// Run the cheap Git/stat ladder — unverified restore, tier-1 git
-    /// metadata, tier-2 bounded staleness with the source witness — without
+    /// Run the cheap Git/stat ladder, unverified restore, tier-1 git
+    /// metadata, tier-2 bounded staleness with the source witness, without
     /// posting a worker wake.
     ///
     /// The ladder judges movement from source truth only: Git metadata and the
     /// stat witness. It deliberately does not compare the cancellation epoch
-    /// against the last reconciled epoch — every epoch advance is paired with
+    /// against the last reconciled epoch, every epoch advance is paired with
     /// its own worker wake (a hook hint, an overflow, an observed change), so
     /// that pending pass is already the remedy. Treating a hint-advanced epoch
     /// as movement here made a concurrent query escalate the targeted hint
     /// pass into an overflow rescan and relabel the arrival as its own.
     pub(super) fn freshness_probe_verdict(&mut self) -> FreshnessProbeVerdictV1 {
+        self.freshness_ladder_verdict(true)
+    }
+
+    /// The ladder behind [`Self::freshness_probe_verdict`]. Without the
+    /// bounded-staleness shortcut it always sweeps the source witness, which
+    /// is what a caller waiting for the source as it is now asks for.
+    fn freshness_ladder_verdict(
+        &mut self,
+        trust_recent_reconcile: bool,
+    ) -> FreshnessProbeVerdictV1 {
         let freshness = self.freshness_fence.snapshot();
         if !freshness.verified_against_source {
             return FreshnessProbeVerdictV1::Unverified;
@@ -3013,7 +3279,9 @@ impl CodeIndexWorktreeSchedulerV1 {
         {
             return FreshnessProbeVerdictV1::Moved;
         }
-        if freshness.last_reconciled_at.elapsed() < self.policy.staleness_threshold {
+        if trust_recent_reconcile
+            && freshness.last_reconciled_at.elapsed() < self.policy.staleness_threshold
+        {
             return FreshnessProbeVerdictV1::Current;
         }
         if self.source_witness_matches_worktree(&freshness) {
@@ -3031,27 +3299,27 @@ impl CodeIndexWorktreeSchedulerV1 {
         self.freshness_probe_verdict() != FreshnessProbeVerdictV1::Current
     }
 
-    /// [`Self::ensure_fresh_for_query`] with the O(store) rebuild moved off the
+    /// `Self::ensure_fresh_for_query` with the O(store) rebuild moved off the
     /// request path.
     ///
-    /// Runs the identical ladder — unverified restore, tier-1 git metadata,
-    /// tier-2 bounded staleness — but where `ensure_fresh_for_query` calls
+    /// Runs the identical ladder, unverified restore, tier-1 git metadata,
+    /// tier-2 bounded staleness, but where `ensure_fresh_for_query` calls
     /// `reconcile_now()` inline this only *requests* the background worker.
     /// The ladder's checks never extract or publish; its remedy does, and a
     /// query must never pay for it. Unlike
-    /// [`Self::latest_complete_ready_for_query_with`], this arm still sweeps
-    /// the source witness on an elapsed threshold — stat metadata first, then
-    /// the sealed file digests when the metadata is unchanged — so a quiet
+    /// `Self::latest_complete_ready_for_query_with`, this arm still sweeps
+    /// the source witness on an elapsed threshold, stat metadata first, then
+    /// the sealed file digests when the metadata is unchanged, so a quiet
     /// repository can reset its clock without a capture.
     ///
     /// Returns whether a reconcile was actually requested. A quiet repository
     /// must answer `false` and wake nothing: the ladder suppressing work is the
     /// common case, and waking the worker on every read would turn each query
-    /// into a rebuild trigger — exactly the coupling this change removes.
+    /// into a rebuild trigger, exactly the coupling this change removes.
     ///
     /// Only proven movement is recorded as an observed source change. An owner
-    /// nothing has verified yet — a fresh mount or restart whose first pass is
-    /// still pending — answers "not current" so the caller posts its plain
+    /// nothing has verified yet, a fresh mount or restart whose first pass is
+    /// still pending, answers "not current" so the caller posts its plain
     /// query-admission wake, but nothing was observed to move, so no overflow
     /// hint, observed-change marker, or cancellation epoch is minted for it.
     /// Fabricating that overflow made the restart's own verifying pass skip
@@ -3059,7 +3327,19 @@ impl CodeIndexWorktreeSchedulerV1 {
     /// into the full sealed-generation replay the revision-7 verified-head
     /// recovery exists to avoid.
     pub fn request_fresh_for_query_background(&mut self) -> bool {
-        match self.freshness_probe_verdict() {
+        let verdict = self.freshness_probe_verdict();
+        self.request_reconcile_for_verdict(verdict)
+    }
+
+    /// [`Self::request_fresh_for_query_background`] against the source as it
+    /// is now: the source witness is swept even inside the staleness window.
+    pub fn request_fresh_now_background(&mut self) -> bool {
+        let verdict = self.freshness_ladder_verdict(false);
+        self.request_reconcile_for_verdict(verdict)
+    }
+
+    fn request_reconcile_for_verdict(&mut self, verdict: FreshnessProbeVerdictV1) -> bool {
+        match verdict {
             FreshnessProbeVerdictV1::Current => false,
             FreshnessProbeVerdictV1::Unverified => true,
             FreshnessProbeVerdictV1::Moved => {
@@ -3088,7 +3368,7 @@ impl CodeIndexWorktreeSchedulerV1 {
     }
 
     /// True when reconciliation has verified the live worktree against source
-    /// truth and that verified source publishes no code generation at all —
+    /// truth and that verified source publishes no code generation at all,
     /// the typed state of a project whose files are all unsupported,
     /// unextractable, or absent. Distinct from a warming scheduler, whose
     /// verification has not run yet, and from a publish failure, which leaves
@@ -3296,6 +3576,8 @@ impl CodeIndexWorktreeSchedulerV1 {
                     &self.store_root,
                     &self.publication,
                     &self.resident_memory,
+                    &self.resident_owners,
+                    &self.worker_runtime,
                     &self.project_id,
                     &self.worktree_id,
                 ),
@@ -3314,8 +3596,8 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     /// Decode, validate, mint, and warm the active generation eagerly.
     ///
-    /// Activation — mount with an existing sealed store, or reconcile
-    /// completion — is where a generation's O(store) derivations belong. Run
+    /// Activation, mount with an existing sealed store, or reconcile
+    /// completion, is where a generation's O(store) derivations belong. Run
     /// this on a blocking worker at those points and the first query finds the
     /// decoded generation, its exact-admission sweep, its record indices, and
     /// its lane owners already built. A query that arrives while this is still
@@ -3336,6 +3618,13 @@ impl CodeIndexWorktreeSchedulerV1 {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn sealed_decode_count(&self) -> u64 {
         self.publication.sealed_decode_count()
+    }
+
+    /// Age the probe clock past its own threshold without touching source.
+    #[cfg(test)]
+    pub(super) fn expire_source_proof_for_test(&self) {
+        self.freshness_fence
+            .age_probe_clock_past_for_test(self.policy.staleness_threshold);
     }
 
     #[cfg(any(test, feature = "test-helpers"))]
@@ -3364,7 +3653,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             .map_err(|error| CodeIndexProductionErrorV1::Publication(error).into())
     }
 
-    pub fn reconcile_in_progress(&self) -> Arc<AtomicUsize> {
+    pub fn reconcile_in_progress(&self) -> Arc<ReconcilePassesV1> {
         Arc::clone(&self.reconcile_in_progress)
     }
 
@@ -3378,7 +3667,7 @@ impl CodeIndexWorktreeSchedulerV1 {
 
     /// Read, sanitize, intern and identify one candidate path.
     /// `Ok(None)` means the path is not an indexable source file (vanished,
-    /// no extension, or no language descriptor) — the sequential loop's
+    /// no extension, or no language descriptor), the sequential loop's
     /// `continue` arms. Pure with respect to the shared byte pool: the pool
     /// is content-addressed under its own lock, so concurrent interning
     /// yields the same digests and the same shared buffers.
@@ -3539,7 +3828,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             return Err(cancelled_code_index_reconcile());
         }
         ignored_dependencies::checkpoint_if_present(control)?;
-        let repository = gix::open(&self.project_root)
+        let repository = tracedecay_runtime_core::git_open::open(&self.project_root)
             .map_err(|error| CodeIndexSchedulerErrorV1::Git(error.to_string()))?;
         // Classify committed/staged/unstaged/untracked/deleted/renamed paths
         // truthfully from gix. Deletions drop out of the present candidate set;
@@ -3795,7 +4084,6 @@ impl CodeIndexWorktreeSchedulerV1 {
                 for receipt in &active.snapshot().sanitization_receipts {
                     if file_occurrence_id(
                         &self.repository_id,
-                        &self.worktree_id,
                         &file.logical_path,
                         &file.content_digest,
                         receipt,
@@ -3811,7 +4099,6 @@ impl CodeIndexWorktreeSchedulerV1 {
                 for file in &files {
                     if file_occurrence_id(
                         &self.repository_id,
-                        &self.worktree_id,
                         &file.logical_path,
                         &file.content_digest,
                         &receipt,
@@ -4002,5 +4289,50 @@ mod retained_empty_seat_tests {
         assert!(!retained_empty_seat_settles_source(true, false));
         assert!(!retained_empty_seat_settles_source(false, false));
         assert!(retained_empty_seat_settles_source(true, true));
+    }
+}
+
+/// The worker runtime one scheduler and every text generation it binds run
+/// under. Production enters nothing: the composition root's process plan
+/// applies. A scheduler without a process plan (in-process test fixtures, each
+/// a separate owner) builds and enters its own runtime, so no owner meters its
+/// work against another's plan.
+#[derive(Clone, Default)]
+pub(super) struct SchedulerWorkerRuntimeV1 {
+    owned: Arc<std::sync::OnceLock<tracedecay_code_index::parallelism::CodeIndexWorkerRuntimeV1>>,
+}
+
+impl SchedulerWorkerRuntimeV1 {
+    pub(super) fn enter(
+        &self,
+        resident_memory: &ProcessResidentMemoryV1,
+    ) -> Result<
+        Option<tracedecay_code_index::parallelism::EnteredCodeIndexWorkerRuntimeV1>,
+        CodeIndexSchedulerErrorV1,
+    > {
+        if let Some(runtime) = self.owned.get() {
+            return Ok(Some(runtime.enter()));
+        }
+        if tracedecay_code_index::parallelism::installed_worker_status().is_some() {
+            return Ok(None);
+        }
+        // The shared scheduler test sources also compile into the composition
+        // root's test binary, where this crate is a dependency built with
+        // `test-helpers` instead of `cfg(test)`; both spellings are the same
+        // fixture surface, so the owned-runtime fallback must cover both.
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            let snapshot = resident_memory.snapshot();
+            let runtime = tracedecay_code_index::parallelism::CodeIndexWorkerRuntimeV1::build(
+                tracedecay_domain::configuration::CodeIndexWorkerSelectionV1::Automatic {},
+                snapshot.limit_bytes.saturating_sub(snapshot.used_bytes),
+            )?;
+            Ok(Some(self.owned.get_or_init(|| runtime).enter()))
+        }
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        {
+            let _ = resident_memory;
+            Err(CodeIndexSchedulerErrorV1::WorkerPlanNotInstalled)
+        }
     }
 }

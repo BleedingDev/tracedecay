@@ -13,7 +13,7 @@ use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 use tracedecay::mcp::handle_tool_call;
-use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
 use crate::common::canonical_existing_path;
 use crate::support::extract_text;
@@ -137,7 +137,7 @@ async fn tracedecay_dashboard_tool_starts_and_returns_url_and_serves_capabilitie
             let body: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
             assert_eq!(body.get("name"), Some(&json!("tracedecay-dashboard")));
             assert!(body.get("features").is_some());
-            // success — now stop it via tool for cleanup
+            // success, now stop it via tool for cleanup
             let _stop = handle_real_server_tool_call(
                 &server,
                 "tracedecay_dashboard",

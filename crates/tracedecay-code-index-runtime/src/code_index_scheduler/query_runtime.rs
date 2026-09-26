@@ -36,8 +36,9 @@ use tracedecay_query::retrieval::lexical::{
 use tracedecay_query::retrieval::ports::RetrievalExecutionControl;
 use tracedecay_query::retrieval::{
     AuthorizedQueryFallbackV1, QUERY_EXACT_SCORE_DOMAIN_V1, QUERY_GRAPH_SCORE_DOMAIN_V1,
-    QUERY_LEXICAL_SCORE_DOMAIN_V1, QueryAuthorityErrorV1, QueryAuthorityV1, RawRetrievalRequestV1,
-    RetrievalPortError, SanitizedRetrievalRequestV1,
+    QUERY_LEXICAL_CALIBRATION_CEILING_MICROS_V1, QUERY_LEXICAL_SCORE_DOMAIN_V1,
+    QueryAuthorityErrorV1, QueryAuthorityV1, RawRetrievalRequestV1, RetrievalPortError,
+    SanitizedRetrievalRequestV1,
 };
 
 const QUERY_FALLBACK_PROFILE_ID: &str = "query-fallback";
@@ -249,18 +250,25 @@ fn core_query_policy() -> Result<(FusionProfile, DiversityPolicy), QueryRuntimeM
             RetrieverKind::ExactLiteral,
             QUERY_EXACT_SCORE_DOMAIN_V1,
             1_000_000,
+            1_000_000,
         ),
         (
             RetrieverKind::Lexical,
             QUERY_LEXICAL_SCORE_DOMAIN_V1,
             1_000_000,
+            QUERY_LEXICAL_CALIBRATION_CEILING_MICROS_V1,
         ),
-        (RetrieverKind::Graph, QUERY_GRAPH_SCORE_DOMAIN_V1, 250_000),
+        (
+            RetrieverKind::Graph,
+            QUERY_GRAPH_SCORE_DOMAIN_V1,
+            250_000,
+            1_000_000,
+        ),
     ];
     let mut calibrations = BTreeMap::new();
     let mut score_domain_calibrations = BTreeMap::new();
     let mut weights_micros = BTreeMap::new();
-    for (lane, score_domain, weight_micros) in lanes {
+    for (lane, score_domain, weight_micros, raw_max_micros) in lanes {
         let calibration_profile_id: CalibrationProfileId = fallback_policy_id(&format!(
             "calibration.{}.{QUERY_FALLBACK_PROFILE_ID}",
             lane.as_str()
@@ -273,7 +281,7 @@ fn core_query_policy() -> Result<(FusionProfile, DiversityPolicy), QueryRuntimeM
                 calibration_profile_id,
                 score_domain,
                 raw_min_micros: 0,
-                raw_max_micros: 1_000_000,
+                raw_max_micros,
             },
         );
         weights_micros.insert(lane, weight_micros);
@@ -469,7 +477,7 @@ impl CodeIndexSchedulerRegistryV1 {
         validate_search_policy(&input)?;
         // Stale-while-revalidate, resolved serve-old first. The ready gate
         // admits only an *already current* generation, so it abstains for the
-        // whole window of any rebuild — freshness unknown, git metadata moved,
+        // whole window of any rebuild, freshness unknown, git metadata moved,
         // staleness threshold elapsed. Every other callable code query keeps
         // serving the last complete generation through that window, and search
         // must not be the one lane that collapses.
@@ -580,7 +588,7 @@ impl CodeIndexSchedulerRegistryV1 {
                         // Nothing servable and the ready gate refused. Search is the
                         // one lane whose resolution never runs the freshness ladder,
                         // so nothing else on this path will ever request the rebuild
-                        // that would remedy the failure — it would return this typed
+                        // that would remedy the failure, it would return this typed
                         // error forever. Ask for the remedy exactly once per
                         // admission (debounced on the pending wake), never inline and
                         // never parking, then still fail typed rather than degrade
@@ -626,7 +634,7 @@ impl CodeIndexSchedulerRegistryV1 {
         validate_search_policy(&input)?;
         // Checkout-identity gate: the caller pinned this generation
         // explicitly, so a foreign project/repository/worktree is refused
-        // while a branch-label difference stays servable — the sealed
+        // while a branch-label difference stays servable, the sealed
         // reference is attribution, not identity (see
         // [`super::registry::latest_matches_scope_identity`]).
         if !super::registry::latest_matches_scope_identity(&latest, scope) {
@@ -716,9 +724,10 @@ where
         let sanitized = RawRetrievalRequestV1::new(input.query, request)
             .sanitize(input.sanitizer_revision, input.normalization_revision)?;
         let readiness = text.query_owner_readiness();
-        if !matches!(&readiness, CodeTextQueryOwnerReadinessV1::Ready(_))
-            || text.text_projection_needs_work()
-        {
+        // Only this search's own owners decide whether it needs the worker:
+        // stamping the pending-wake slot on a seat whose source proof is
+        // current makes the freshness ladder answer `verifying`.
+        if !matches!(&readiness, CodeTextQueryOwnerReadinessV1::Ready(_)) {
             match schedulers.request_query_background_reconcile(scope).await {
                 CodeIndexReconcileAdmissionV1::PublicationAuthorityCorrupt(_) => {
                     return Err(QuerySearchExecutionErrorV1::ExactGenerationUnavailable(
@@ -744,6 +753,7 @@ where
             generation: generation.clone(),
             literals: parser.parse_literals(query_view, request),
             budget: request.budget,
+            control: graph_control.as_ref(),
         })
     })?;
     let route_plan = LexicalRoutePlanV1::plan(query_view.as_str(), &input.lexical_routing)?;
@@ -858,6 +868,7 @@ where
             request,
             query_view,
             lanes,
+            &lexical_routes.anchor_tiers(),
             page_size,
             input.cursor.as_ref(),
         ),

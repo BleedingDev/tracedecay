@@ -213,16 +213,14 @@ pub struct CodeCloneIndexCoverageV1 {
     pub hot_posting_rows_skipped: Option<u64>,
     /// Bodies excluded because they are below the automatic-discovery minimum.
     pub excluded_too_small_bodies: Option<u64>,
+    /// Bodies excluded because they exceed the automatic-discovery token maximum.
+    pub excluded_too_large_bodies: Option<u64>,
     /// Bodies excluded because conservative tokenization was incomplete.
     pub excluded_incomplete_tokenization_bodies: Option<u64>,
     /// Eligible bodies whose rename normalization is partial.
     pub rename_partial_bodies: Option<u64>,
     /// Eligible bodies whose language has no rename normalization.
     pub rename_unsupported_bodies: Option<u64>,
-    /// Sealed source pages committed to clone indexing.
-    pub completed_source_pages: u64,
-    /// Sealed source pages in the generation.
-    pub total_source_pages: u64,
 }
 
 /// Fixed per-request clone candidate and verification budgets.
@@ -240,7 +238,7 @@ pub struct CodeCloneIndexBudgetsV1 {
 /// Measured resources and update accounting for one clone-index generation.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct CodeCloneIndexResourcesV1 {
-    /// Current durable artifact or staging-file bytes.
+    /// Durable artifact bytes.
     pub bytes_on_disk: Option<u64>,
     /// Largest measured clone-row serialization scratch during the build.
     pub peak_scratch_memory_bytes: Option<u64>,
@@ -269,10 +267,6 @@ pub struct CodeCloneIndexObservationV1 {
 pub enum CodeCloneIndexStatusV1 {
     /// The sealed lexical artifact or its clone rows cannot be read.
     Unavailable { reason: String },
-    /// A restartable clone successor is consuming sealed source pages.
-    Backfilling {
-        observation: CodeCloneIndexObservationV1,
-    },
     /// Some clone evidence is readable, but required postings are missing.
     Partial {
         observation: CodeCloneIndexObservationV1,
@@ -300,7 +294,7 @@ impl Default for CodeCloneIndexStatusV1 {
 /// Closed staleness ladder for one mounted worktree.
 ///
 /// The scheduler publishes one of these tokens. MCP, the dashboard, and the
-/// CLI must match the variant — not a hand-copied string — so a new ladder
+/// CLI must match the variant, not a hand-copied string, so a new ladder
 /// state cannot appear at one caller and be missed at the others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -546,6 +540,139 @@ pub type CodeIndexFreshnessReadFuture = Pin<
 pub type CodeIndexFreshnessReader =
     Arc<dyn Fn(PathBuf) -> CodeIndexFreshnessReadFuture + Send + Sync + 'static>;
 
+/// The readiness a status caller can wait for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeIndexReadinessTargetV1 {
+    /// A sealed complete generation serves exact and lexical reads for the
+    /// current source: `code_index_freshness.status` is `current`.
+    Fresh,
+    /// `fresh`, and the generation's native code graph also serves.
+    Ready,
+    /// A published generation's native code graph serves and no convergence
+    /// park is set, whatever the source freshness. Waiting for it never
+    /// sweeps the source, so it cannot arm the reconcile it would observe.
+    GraphReady,
+}
+
+/// `tracedecay_status` `wait_for`: hold the status read until the worktree
+/// reaches `state`, for at most the caller's `timeout_ms`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CodeIndexReadinessWaitV1 {
+    pub state: CodeIndexReadinessTargetV1,
+    pub timeout_ms: u64,
+}
+
+/// How a `wait_for` status read ended. The status payload beside it is read
+/// after the wait ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum CodeIndexReadinessWaitOutcomeV1 {
+    Reached,
+    /// The caller's budget elapsed; `last_state` is the last observed
+    /// `code_index_freshness.status`.
+    TimedOut {
+        last_state: String,
+    },
+    /// Waiting cannot reach the target: no scheduler is mounted, graph
+    /// serving was refused, convergence is parked, or the request ended.
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// Whether one freshness reading satisfies a readiness target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodeIndexReadinessV1 {
+    Reached,
+    Pending,
+    /// Waiting cannot change the answer.
+    Unreachable {
+        reason: String,
+    },
+}
+
+impl CodeIndexWorktreeFreshnessV1 {
+    /// A sealed complete generation verified against the current source.
+    #[must_use]
+    pub fn is_authoritative(&self) -> bool {
+        self.latest_generation_id.is_some()
+            && self.coverage == CodeIndexFreshnessCoverageV1::Complete
+            && self.staleness_state == Some(CodeIndexStalenessStateV1::Fresh)
+    }
+
+    #[must_use]
+    pub fn readiness(&self, target: CodeIndexReadinessTargetV1) -> CodeIndexReadinessV1 {
+        if self.staleness_state == Some(CodeIndexStalenessStateV1::Parked) {
+            return CodeIndexReadinessV1::Unreachable {
+                reason: "code_index_convergence_parked".to_owned(),
+            };
+        }
+        if target != CodeIndexReadinessTargetV1::Fresh {
+            match &self.code_graph_serving {
+                Some(CodeGraphServingReadinessV1::Refused { reason }) => {
+                    return CodeIndexReadinessV1::Unreachable {
+                        reason: format!("code_graph_refused: {reason}"),
+                    };
+                }
+                Some(CodeGraphServingReadinessV1::Unavailable { reason })
+                    if reason == "graph_activation_disabled" =>
+                {
+                    return CodeIndexReadinessV1::Unreachable {
+                        reason: reason.clone(),
+                    };
+                }
+                _ => {}
+            }
+        }
+        let graph_serving = self.code_graph_serving == Some(CodeGraphServingReadinessV1::Ready);
+        let reached = match target {
+            CodeIndexReadinessTargetV1::Fresh => self.is_authoritative(),
+            CodeIndexReadinessTargetV1::Ready => self.is_authoritative() && graph_serving,
+            CodeIndexReadinessTargetV1::GraphReady => {
+                self.latest_generation_id.is_some() && graph_serving && self.parked.is_none()
+            }
+        };
+        if reached {
+            CodeIndexReadinessV1::Reached
+        } else {
+            CodeIndexReadinessV1::Pending
+        }
+    }
+}
+
+/// What a readiness wait observed when it ended.
+#[derive(Clone, Debug)]
+pub enum CodeIndexReadinessWaitReadV1 {
+    Reached,
+    /// The budget elapsed; `last` is the last reading, `None` while the root
+    /// was never mounted.
+    TimedOut {
+        last: Option<Box<CodeIndexWorktreeFreshnessV1>>,
+    },
+    Unreachable {
+        reason: String,
+    },
+}
+
+pub type CodeIndexReadinessWaitFuture = Pin<
+    Box<
+        dyn Future<Output = Result<CodeIndexReadinessWaitReadV1, CodeIndexFreshnessReadFailureV1>>
+            + Send
+            + 'static,
+    >,
+>;
+/// Waits on the scheduler registry's own change signals until a project
+/// root reaches a readiness target or the budget elapses. Dropping the
+/// future abandons the wait without side effects.
+pub type CodeIndexReadinessWaiter = Arc<
+    dyn Fn(PathBuf, CodeIndexReadinessTargetV1, std::time::Duration) -> CodeIndexReadinessWaitFuture
+        + Send
+        + Sync
+        + 'static,
+>;
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub struct CodeIndexFreshnessPayloadV1 {
     pub worktrees: Vec<CodeIndexWorktreeFreshnessV1>,
@@ -561,7 +688,7 @@ const UNAVAILABLE_NOTE: &str =
 impl CodeIndexFreshnessPayloadV1 {
     /// Payload after the daemon scheduler registry answered for this project.
     ///
-    /// The `note` is owned here — MCP dispatch and the HTTP freshness route
+    /// The `note` is owned here. MCP dispatch and the HTTP freshness route
     /// must not spell it a second time.
     pub fn from_scheduler_observation(
         worktrees: impl IntoIterator<Item = CodeIndexWorktreeFreshnessV1>,
@@ -842,6 +969,67 @@ mod tests {
         assert_eq!(
             observed.coverage,
             CodeIndexFreshnessCoverageV1::PartialRefreshInProgress
+        );
+    }
+
+    /// `graph_ready` is reached by a published generation whose native graph
+    /// serves even while the source is stale, where `fresh` and `ready` still
+    /// wait; it waits for a pending graph and a set convergence park.
+    #[test]
+    fn graph_ready_is_graph_serving_whatever_the_freshness() {
+        let stale_serving = CodeIndexWorktreeFreshnessV1 {
+            worktree_root: "/project".to_owned(),
+            latest_generation_id: Some("generation.fixture".to_owned()),
+            staleness_state: Some(CodeIndexStalenessStateV1::Stale),
+            coverage: CodeIndexFreshnessCoverageV1::PartialUnverifiedRestore,
+            code_graph_serving: Some(CodeGraphServingReadinessV1::Ready),
+            ..Default::default()
+        };
+        let graph_pending = CodeIndexWorktreeFreshnessV1 {
+            code_graph_serving: Some(CodeGraphServingReadinessV1::Pending),
+            ..stale_serving.clone()
+        };
+        let parked = CodeIndexWorktreeFreshnessV1 {
+            parked: Some(CodeIndexConvergenceParkedV1 {
+                reason: "mode".to_owned(),
+                blocked_reason: None,
+                remediation: "chmod".to_owned(),
+                parked_at_micros: 1,
+                observed_passes: 1,
+                retries_on_wake: true,
+            }),
+            ..stale_serving.clone()
+        };
+        let refused = CodeIndexWorktreeFreshnessV1 {
+            code_graph_serving: Some(CodeGraphServingReadinessV1::Refused {
+                reason: "shape".to_owned(),
+            }),
+            ..stale_serving.clone()
+        };
+        let readiness = |freshness: &CodeIndexWorktreeFreshnessV1| {
+            [
+                CodeIndexReadinessTargetV1::GraphReady,
+                CodeIndexReadinessTargetV1::Fresh,
+                CodeIndexReadinessTargetV1::Ready,
+            ]
+            .map(|target| freshness.readiness(target))
+        };
+
+        assert_eq!(
+            readiness(&stale_serving),
+            [
+                CodeIndexReadinessV1::Reached,
+                CodeIndexReadinessV1::Pending,
+                CodeIndexReadinessV1::Pending,
+            ]
+        );
+        assert_eq!(readiness(&graph_pending)[0], CodeIndexReadinessV1::Pending);
+        assert_eq!(readiness(&parked)[0], CodeIndexReadinessV1::Pending);
+        assert_eq!(
+            readiness(&refused)[0],
+            CodeIndexReadinessV1::Unreachable {
+                reason: "code_graph_refused: shape".to_owned(),
+            }
         );
     }
 }

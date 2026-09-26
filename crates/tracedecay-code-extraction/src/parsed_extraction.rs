@@ -117,14 +117,6 @@ impl ParsedExtractionArtifactV1 {
             metrics: parsed.metrics,
         }
     }
-
-    pub(crate) fn into_parsed(self) -> ParsedExtraction {
-        ParsedExtraction {
-            result: self.artifact.result,
-            disposition: self.disposition,
-            metrics: self.metrics,
-        }
-    }
 }
 
 impl ParsedExtraction {
@@ -309,8 +301,8 @@ pub(crate) fn superseded_previous_nodes<'p>(
     Some(removed)
 }
 
-/// The delta's maximal non-file spans — the complete top-level syntax nodes it
-/// re-extracted — as `(start, end)` positions in the previous source.
+/// The delta's maximal non-file spans, the complete top-level syntax nodes it
+/// re-extracted, as `(start, end)` positions in the previous source.
 fn reextracted_regions(
     delta: &ExtractionResult,
     edit: ParseInputEdit,

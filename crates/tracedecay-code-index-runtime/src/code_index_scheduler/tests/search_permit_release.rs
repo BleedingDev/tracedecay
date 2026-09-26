@@ -2,8 +2,8 @@
 //! not the blocking worker's natural completion.
 //!
 //! `MAX_CONCURRENT_CODE_INDEX_SEARCHES` is one, so a request that its caller
-//! has already abandoned must release the permit as soon as its lexical scan
-//! observes the request control — otherwise every following search fails
+//! has already abandoned must release the permit as soon as its candidate scan
+//! observes the request control, otherwise every following search fails
 //! `search_capacity_unavailable` until the abandoned scan hydrates the rest of
 //! its candidate corpus.
 
@@ -60,9 +60,9 @@ impl CodeIndexMcpReadGrantV1 for FixtureGrant {
 ///
 /// The executor's request control consults `route_is_registered` on every
 /// `is_cancelled` check. Calls from the test's runtime thread (the pre-permit
-/// check and the executor's settlement poll) answer immediately; the first
-/// call from any other thread is the scan itself, running under
-/// `spawn_blocking` with the execution permit already held. That call reports
+/// check and the executor's settlement poll) answer immediately; calls from
+/// other threads are the scan itself, running under
+/// `spawn_blocking` with the execution permit already held. The selected checkpoint reports
 /// the pause to the test and blocks until the test resumes it, so the test
 /// can observe the permit-held state and cancel the request at a point that
 /// is deterministic rather than timing-dependent.
@@ -71,6 +71,7 @@ struct PausingAdmission {
     authority: CodeIndexSearchAuthorityV1,
     runtime_thread: ThreadId,
     scan_checkpoints: Arc<AtomicUsize>,
+    pause_at: usize,
     scan_paused: Arc<tokio::sync::Notify>,
     resume: Arc<StdMutex<mpsc::Receiver<()>>>,
 }
@@ -82,7 +83,7 @@ impl CodeIndexMcpReadAdmissionV1 for PausingAdmission {
         if std::thread::current().id() == self.runtime_thread {
             return true;
         }
-        if self.scan_checkpoints.fetch_add(1, Ordering::SeqCst) == 0 {
+        if self.scan_checkpoints.fetch_add(1, Ordering::SeqCst) == self.pause_at {
             self.scan_paused.notify_one();
             self.resume
                 .lock()
@@ -172,19 +173,30 @@ fn unavailable_reason(
     }
 }
 
-/// Pause a lexical scan at its first control checkpoint after the permit is
+/// Pause a candidate scan at its first control checkpoint after the permit is
 /// acquired, prove the permit is held (a concurrent search is refused with
 /// `search_capacity_unavailable`), cancel the paused request, and prove that
 /// resuming it unwinds with the typed cancellation reason, performs no further
 /// row checkpoints, and hands the permit to the next request, which is
 /// admitted and completes normally.
 #[tokio::test]
-async fn cancelled_lexical_scan_releases_the_search_permit_to_the_next_request() {
-    let sources = (0..16)
+async fn cancelled_scan_releases_the_search_permit_to_the_next_request() {
+    cancelled_scan_releases_permit("alpha", 0, 16).await;
+}
+
+#[tokio::test]
+async fn cancelled_exact_batch_releases_the_search_permit_to_the_next_request() {
+    // Entry into the exact lane and artifact reader, then the first batch.
+    // The fourth observation is the next batch boundary, after 128 candidates.
+    cancelled_scan_releases_permit(r#""return value""#, 3, 384).await;
+}
+
+async fn cancelled_scan_releases_permit(query: &str, pause_at: usize, source_count: usize) {
+    let sources = (0..source_count)
         .map(|ordinal| {
             (
-                format!("src/alpha_{ordinal:02}.rs"),
-                format!("pub fn alpha_{ordinal:02}() -> u32 {{ {ordinal} }}\n"),
+                format!("src/alpha_{ordinal:03}.rs"),
+                format!("pub fn alpha_{ordinal:03}() -> u32 {{ let value = {ordinal}; return value; }}\n"),
             )
         })
         .collect::<Vec<_>>();
@@ -207,6 +219,7 @@ async fn cancelled_lexical_scan_releases_the_search_permit_to_the_next_request()
         },
         runtime_thread: std::thread::current().id(),
         scan_checkpoints: Arc::new(AtomicUsize::new(0)),
+        pause_at,
         scan_paused: Arc::new(tokio::sync::Notify::new()),
         resume: Arc::new(StdMutex::new(resume_rx)),
     };
@@ -219,16 +232,15 @@ async fn cancelled_lexical_scan_releases_the_search_permit_to_the_next_request()
     let cancellation =
         CancellationSignal::active("cancellation.search-permit.fixture").expect("cancellation");
 
-    let abandoned = tokio::spawn(executor(search_request(
-        fixture.path(),
-        Some(cancellation.clone()),
-    )));
+    let mut request = search_request(fixture.path(), Some(cancellation.clone()));
+    request.query = query.to_owned();
+    let abandoned = tokio::spawn(executor(request));
     // Deterministic rendezvous: the scan itself reports when it reaches its
-    // first checkpoint holding the permit. The timeout only bounds a failure
+    // selected checkpoint holding the permit. The timeout only bounds a failure
     // in which the scan never consults the control while it holds the permit.
     tokio::time::timeout(Duration::from_mins(1), admission.scan_paused.notified())
         .await
-        .expect("the lexical scan must consult the request control while holding the permit");
+        .expect("the candidate scan must consult the request control while holding the permit");
 
     let refused = executor(search_request(fixture.path(), None)).await;
     assert_eq!(
@@ -252,7 +264,8 @@ async fn cancelled_lexical_scan_releases_the_search_permit_to_the_next_request()
     );
     let checkpoints = admission.scan_checkpoints.load(Ordering::SeqCst);
     assert_eq!(
-        checkpoints, 1,
+        checkpoints,
+        pause_at + 1,
         "the resumed scan observes cancellation at the checkpoint it paused in and \
          hydrates nothing further"
     );
@@ -336,7 +349,7 @@ async fn map_reporting_search_executor(
     (registry, executor, admitted)
 }
 
-/// A search whose dispatch deadline expires shortly after it is issued —
+/// A search whose dispatch deadline expires shortly after it is issued,
 /// long enough to reach the park each test stages, short enough that the test
 /// observes the settlement rather than the work.
 fn expiring_request(project_root: &Path) -> CodeIndexSearchRequestV1 {
@@ -417,7 +430,7 @@ async fn expired_request_parked_in_generation_resolution_releases_the_permit() {
     admitted.notified().await;
 
     // Queued behind the request, so the map is taken again the instant the
-    // request's authority read releases it — the control-free window,
+    // request's authority read releases it, the control-free window,
     // reproduced with the permit already held.
     let (map_queued, release_map, map_hold) = park_mounted_map_behind_current_waiters(&registry);
     map_queued.notified().await;
@@ -488,7 +501,7 @@ fn similar_settlement(outcome: &CodeIndexSimilarOutcomeV1) -> SimilarSettlementV
 }
 
 /// One family read for `source`, dispatched under a deadline `expires_in` from
-/// now — the shape every dashboard family read has.
+/// now, the shape every dashboard family read has.
 fn family_request(
     project_root: &Path,
     source: &tracedecay_domain::SymbolOccurrenceId,
@@ -518,8 +531,8 @@ fn family_request(
 
 const SHARED_BODY_SOURCE: &str = "pub fn shared_body(input: u32) -> u32 {\n    let doubled = input * 2;\n    let shifted = doubled + 7;\n    let folded = shifted ^ (input >> 1);\n    folded % 13\n}\n";
 
-/// Two clone-family reads dispatched together — the Shared Code page fires
-/// one per match class — must both settle the way either settles alone.
+/// Two clone-family reads dispatched together, the Shared Code page fires
+/// one per match class, must both settle the way either settles alone.
 ///
 /// The single execution permit bounds how many scans run at once. Its loser
 /// used to be refused outright with `CapacityUnavailable`, the reason a
@@ -542,6 +555,9 @@ async fn a_family_read_that_loses_the_permit_race_waits_for_the_permit() {
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
     let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    // Settle the mount's worker first so the reads below observe the permit
+    // handover this test is about, not a warming generation.
+    settle_text_projection(&registry, fixture.path()).await;
     let source = crate::code_index_branch_diff::generation_symbols(
         latest.generation(),
         Some("src/first.rs"),

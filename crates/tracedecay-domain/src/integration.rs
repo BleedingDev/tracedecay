@@ -48,10 +48,12 @@ pub enum HostKindV1 {
     Zed,
     Antigravity,
     Vibe,
+    Pi,
+    FactoryDroid,
 }
 
 impl HostKindV1 {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 20] = [
         Self::ClaudeCode,
         Self::CursorDesktop,
         Self::CursorCloud,
@@ -70,6 +72,8 @@ impl HostKindV1 {
         Self::Zed,
         Self::Antigravity,
         Self::Vibe,
+        Self::Pi,
+        Self::FactoryDroid,
     ];
 
     /// Project a stock host surface into the bounded host observation catalog
@@ -81,6 +85,7 @@ impl HostKindV1 {
             Self::Codex => Some(HostIntegrationIdV1::Codex),
             Self::Hermes => Some(HostIntegrationIdV1::Hermes),
             Self::Kiro => Some(HostIntegrationIdV1::Kiro),
+            Self::Pi => Some(HostIntegrationIdV1::Pi),
             Self::Devin
             | Self::Zed
             | Self::Antigravity
@@ -93,7 +98,8 @@ impl HostKindV1 {
             | Self::KimiCode
             | Self::OpenCode
             | Self::Gemini
-            | Self::Copilot => None,
+            | Self::Copilot
+            | Self::FactoryDroid => None,
         }
     }
 }
@@ -112,7 +118,7 @@ pub enum HostCapabilityV1 {
 
 impl HostCapabilityV1 {
     /// Position of this capability in every stock host capability row.
-    /// [`canonical_stock_host_capabilities`] emits rows in exactly this order,
+    /// `canonical_stock_host_capabilities` emits rows in exactly this order,
     /// so indexing a row by it is total and needs no fallback state.
     pub const fn row_index(self) -> usize {
         match self {
@@ -269,7 +275,7 @@ const fn canonical_stock_host_capabilities(host: HostKindV1) -> [HostCapabilityR
         // `gemini extensions install` adopts. It exposes no LSP registration
         // and no diagnostics API. Its extension format does admit hooks, but
         // no checked-in native Gemini event fixture proves that route, and the
-        // staged extension declares none — claiming Hooks here would report a
+        // staged extension declares none, claiming Hooks here would report a
         // capability this integration cannot drive.
         HostKindV1::Gemini => (
             Unavailable(HostRegistrationUnsupported),
@@ -284,8 +290,8 @@ const fn canonical_stock_host_capabilities(host: HostKindV1) -> [HostCapabilityR
         // `Mcp` and `Cli` are the only supported capabilities.
         //
         // `Hooks` is `HostApiAbsent`, not `CheckedInEvidenceMissing`: unlike
-        // Gemini — whose extension format admits hooks that no fixture yet
-        // proves — Copilot publishes no third-party event or hook registration
+        // Gemini, whose extension format admits hooks that no fixture yet
+        // proves. Copilot publishes no third-party event or hook registration
         // surface at all, in the CLI or in the VS Code extension. There is no
         // route to gather evidence for, so naming the gap "evidence missing"
         // would imply a capability that is one fixture away from working.
@@ -297,6 +303,32 @@ const fn canonical_stock_host_capabilities(host: HostKindV1) -> [HostCapabilityR
             Unavailable(HostRegistrationUnsupported),
             Unavailable(HostApiAbsent),
             Unavailable(HostApiAbsent),
+            Supported,
+            Supported,
+        ),
+        // Pi exposes no MCP server route: its extension API registers
+        // model-callable tools and lifecycle hooks directly, and the shipped
+        // extension bridges the code graph through `tracedecay tool` over the
+        // daemon socket. The CLI remains the scripted fallback surface. Its
+        // lifecycle events reach `hook-pi-event` under the Pi native identity;
+        // the checked-in `pi.json` fixture proves the session-start and stop
+        // boundaries, exactly the evidence Codex's hook row rests on.
+        HostKindV1::Pi => (
+            Unavailable(HostRegistrationUnsupported),
+            Unavailable(HostApiAbsent),
+            Supported,
+            Unavailable(HostRegistrationUnsupported),
+            Supported,
+        ),
+        // Factory Droid's adopted lifecycle drives two routes:
+        // `droid mcp add|remove` owns `~/.factory/mcp.json`, and the managed
+        // hook merge deploys `SessionStart` / `Stop` entries into
+        // `~/.factory/hooks.json` calling `hook-droid-event` under the Droid
+        // native identity. Both are backed by checked-in captured fixtures.
+        HostKindV1::FactoryDroid => (
+            Unavailable(HostRegistrationUnsupported),
+            Unavailable(HostApiAbsent),
+            Supported,
             Supported,
             Supported,
         ),
@@ -335,15 +367,17 @@ pub enum HostIntegrationIdV1 {
     Cursor,
     Hermes,
     Kiro,
+    Pi,
 }
 
 impl HostIntegrationIdV1 {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Claude,
         Self::Codex,
         Self::Cursor,
         Self::Hermes,
         Self::Kiro,
+        Self::Pi,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -353,6 +387,7 @@ impl HostIntegrationIdV1 {
             Self::Cursor => "cursor",
             Self::Hermes => "hermes",
             Self::Kiro => "kiro",
+            Self::Pi => "pi",
         }
     }
 
@@ -373,6 +408,7 @@ impl HostIntegrationIdV1 {
             "cursor" => Some(Self::Cursor),
             "hermes" => Some(Self::Hermes),
             "kiro" => Some(Self::Kiro),
+            "pi" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -385,6 +421,7 @@ impl HostIntegrationIdV1 {
             Self::Cursor => ".cursor_shell_sync_at",
             Self::Hermes => ".hermes_terminal_receipt_at",
             Self::Kiro => ".kiro_post_tool_sync_at",
+            Self::Pi => ".pi_session_sync_at",
         }
     }
 }
@@ -542,6 +579,8 @@ impl HostIntegrationCatalogV1 {
             HostKindV1::Zed => &STOCK_HOST_CAPABILITIES[15],
             HostKindV1::Antigravity => &STOCK_HOST_CAPABILITIES[16],
             HostKindV1::Vibe => &STOCK_HOST_CAPABILITIES[17],
+            HostKindV1::Pi => &STOCK_HOST_CAPABILITIES[18],
+            HostKindV1::FactoryDroid => &STOCK_HOST_CAPABILITIES[19],
         }
     }
 
@@ -632,7 +671,7 @@ impl HostIntegrationCatalogV1 {
     }
 }
 
-const STOCK_HOST_CAPABILITIES: [[HostCapabilityRecordV1; 5]; 18] = [
+const STOCK_HOST_CAPABILITIES: [[HostCapabilityRecordV1; 5]; 20] = [
     canonical_stock_host_capabilities(HostKindV1::ClaudeCode),
     canonical_stock_host_capabilities(HostKindV1::CursorDesktop),
     canonical_stock_host_capabilities(HostKindV1::CursorCloud),
@@ -651,6 +690,8 @@ const STOCK_HOST_CAPABILITIES: [[HostCapabilityRecordV1; 5]; 18] = [
     canonical_stock_host_capabilities(HostKindV1::Zed),
     canonical_stock_host_capabilities(HostKindV1::Antigravity),
     canonical_stock_host_capabilities(HostKindV1::Vibe),
+    canonical_stock_host_capabilities(HostKindV1::Pi),
+    canonical_stock_host_capabilities(HostKindV1::FactoryDroid),
 ];
 
 #[derive(Serialize)]

@@ -12,7 +12,7 @@ Claude Code.
   daemon-owned gateway rather than embedding analyzer logic.
 - **MCP server** (`.mcp.json`): the `graph` stdio server exposing the code
   graph, search, call-graph, impact, memory, and session-recall tools.
-- **Skills** (`skills/`): one skill per common workflow — searching for code,
+- **Skills** (`skills/`): one skill per common workflow, searching for code,
   reading code cheaply, mapping architecture, impact analysis, reviewing diffs,
   recalling project memory and session context, and more. Claude Code
   auto-discovers each `SKILL.md` by its `name`/`description` frontmatter and
@@ -39,7 +39,7 @@ path with spaces.
 
 The LSP bridge, hooks, skills, and CLI bindings form the MCP-free core. The MCP
 registration is an independently installable companion in the signed host
-bundle lifecycle; the compatibility installer composes both.
+bundle lifecycle; `tracedecay install` without `--component` installs both.
 
 ## CLI fallback
 

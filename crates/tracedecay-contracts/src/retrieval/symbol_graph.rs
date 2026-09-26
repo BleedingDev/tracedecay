@@ -33,6 +33,16 @@ impl CodeGraphReadFreshnessV1 {
     }
 }
 
+/// The code-graph generation an operation read and that generation's
+/// freshness. A stale seat answers soundly for its generation but may trail
+/// the live worktree.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ServedCodeGraphGenerationV1 {
+    pub generation: String,
+    pub freshness: CodeGraphReadFreshnessV1,
+}
+
 /// Optional narrowing inside the immutable project/repository/worktree scope
 /// carried by [`RequestContext`]. A path prefix never establishes identity or
 /// authorization.
@@ -80,6 +90,19 @@ pub struct SymbolRelationRecord {
     pub dispatch_via_trait: bool,
     pub dispatch_from: Option<String>,
     pub depth: Option<u32>,
+}
+
+/// One implementation match with its exact source: the implementing
+/// impl/class block (methods included) for a trait selector, or the function
+/// body for a method selector.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ImplementationRecord {
+    pub symbol: SymbolPrimitiveRecord,
+    pub edge_kind: String,
+    /// Trait or interface node a trait-selector match was reached through.
+    pub dispatch_from: Option<String>,
+    pub body: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
@@ -192,6 +215,49 @@ impl<T> SymbolGraphPage<T> {
             related_edge_count: None,
             support_gaps: Vec::new(),
         }
+    }
+}
+
+impl<T: SymbolGraphItem> SymbolGraphPage<T> {
+    /// Distinct project files the page's symbols live in, in page order.
+    pub fn touched_files(&self) -> Vec<String> {
+        let mut files: Vec<String> = Vec::new();
+        for item in &self.items {
+            let file = &item.symbol().file;
+            if !file.is_empty() && !files.contains(file) {
+                files.push(file.clone());
+            }
+        }
+        files
+    }
+}
+
+/// A symbol-graph page item located by one symbol record.
+pub trait SymbolGraphItem {
+    fn symbol(&self) -> &SymbolPrimitiveRecord;
+}
+
+impl SymbolGraphItem for SymbolPrimitiveRecord {
+    fn symbol(&self) -> &SymbolPrimitiveRecord {
+        self
+    }
+}
+
+impl SymbolGraphItem for SymbolRelationRecord {
+    fn symbol(&self) -> &SymbolPrimitiveRecord {
+        &self.symbol
+    }
+}
+
+impl SymbolGraphItem for ImplementationRecord {
+    fn symbol(&self) -> &SymbolPrimitiveRecord {
+        &self.symbol
+    }
+}
+
+impl SymbolGraphItem for TypeHierarchyRecord {
+    fn symbol(&self) -> &SymbolPrimitiveRecord {
+        &self.symbol
     }
 }
 
@@ -479,7 +545,7 @@ pub trait SymbolGraphPrimitivePort {
         &'a self,
         context: SymbolGraphPortContext<'a>,
         request: &'a ImplementationsRequest,
-    ) -> SymbolGraphPortFuture<'a, SymbolRelationRecord>;
+    ) -> SymbolGraphPortFuture<'a, ImplementationRecord>;
 
     fn type_hierarchy<'a>(
         &'a self,

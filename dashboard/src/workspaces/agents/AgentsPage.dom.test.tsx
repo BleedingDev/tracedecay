@@ -1,3 +1,4 @@
+import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -141,7 +142,7 @@ describe('AgentsPage read coverage', () => {
    * The three measures beside the delegation rollup. The stub
    * `fetch` below answers `/api/work/views` with a dashboard envelope rather
    * than the application envelope that route actually carries, so the graph
-   * read is refused as a shape this build cannot decode — which is exactly the
+   * read is refused as a shape this build cannot decode, which is exactly the
    * case the two graph-fed surfaces must render as a refusal rather than as a
    * frontier of nothing and a failure count of zero.
    */
@@ -177,10 +178,24 @@ describe('AgentsPage read coverage', () => {
         recent_events: [
           {
             timestamp: 1_700_000_000,
-            tool_name: 'tracedecay_read',
+            tool_name: 'tracedecay_source_lines',
             outcome: 'error',
             event_kind: 'post_tool_use',
             hook_name: 'post_tool_use',
+          },
+          {
+            timestamp: 1_699_999_990,
+            tool_name: 'tracedecay_callees',
+            outcome: 'success',
+            event_kind: 'mcp_tool_call',
+            hook_name: '',
+            cost: {
+              wall_micros: 12_345,
+              point_reads: { graph_sealed: 21, graph_staging: 2 },
+              adjacency_queries: 1,
+              adjacency_rows: 107,
+              bytes_hydrated: 40_960,
+            },
           },
         ],
       }),
@@ -191,7 +206,7 @@ describe('AgentsPage read coverage', () => {
 
     expect(await screen.findByText('Handoff frontier')).toBeTruthy();
     // Tool activity lives on the demoted telemetry register, which renders
-    // once its own usage read lands — awaited rather than assumed.
+    // once its own usage read lands, awaited rather than assumed.
     expect(await screen.findByText('Tool activity')).toBeTruthy();
     expect(screen.getByText('Failure context')).toBeTruthy();
 
@@ -202,6 +217,14 @@ describe('AgentsPage read coverage', () => {
 
     // The failure accounting off the same read.
     expect(screen.getByText(/5\.00%/)).toBeTruthy();
+
+    // A metered call's row carries its cost receipt; an unmetered one does not.
+    const costs = document.querySelectorAll('[data-request-cost]');
+    expect(costs.length).toBe(1);
+    expect(costs[0]?.textContent).toBe('23 reads · 107 rows · 12.3 ms');
+    expect(costs[0]?.getAttribute('title')).toBe(
+      '21 sealed-store and 2 staging-store point reads, 1 adjacency queries returning 107 rows, 40960 bytes hydrated, 12345 µs wall',
+    );
 
     // Both graph-fed surfaces refuse rather than report a zero.
     expect(document.querySelector('[data-agent-handoffs="refused"]')).toBeTruthy();
@@ -543,7 +566,9 @@ function renderAgents() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <AgentsPage />
+      <MemoryRouter>
+        <AgentsPage />
+      </MemoryRouter>
     </QueryClientProvider>,
   );
 }

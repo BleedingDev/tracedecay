@@ -4,6 +4,7 @@
 
 pub(crate) const TOP_LEVEL_AFTER_HELP: &str = "\
 Quick start:
+  tracedecay daemon install-service     Install + start the daemon (required first)
   tracedecay init                       Index the current repo (once per project)
   tracedecay sync                       Refresh the index after changes
   tracedecay tool                       List every MCP tool callable from the CLI
@@ -27,13 +28,18 @@ flags to target another project.
 For more help on a command: tracedecay <command> --help";
 
 pub(crate) const INIT_LONG_ABOUT: &str = "\
-Walks the project tree, parses sources across the supported languages, and \
-writes the code graph plus memory/session stores under .tracedecay/. Run once \
+Enrolls the repository and publishes its first code generation. Requires a \
+running daemon: init is brokered through the daemon-owned code-index \
+scheduler, and without one it refuses with \
+`code_index_scheduler_unavailable` before writing anything. Start the daemon \
+with `tracedecay daemon install-service` (or `tracedecay daemon start`) and \
+confirm with `tracedecay daemon status`. Storage is daemon-owned. Run once \
 per repository; afterwards `tracedecay sync` keeps the index fresh \
 incrementally. Respects .gitignore by default (see `tracedecay gitignore`).";
 
 pub(crate) const INIT_AFTER_HELP: &str = "\
 Examples:
+  tracedecay daemon install-service              Start the daemon init brokers through
   tracedecay init                                Index the current directory
   tracedecay init /path/to/repo                  Index another repository
   tracedecay init --skip-folder vendor --skip-folder dist
@@ -42,21 +48,20 @@ Examples:
   tracedecay init /new/path --yes                Adopt the unique moved non-git store
   tracedecay init /new/path --fresh              Mint a new identity, never adopt
 
-Related: tracedecay sync (incremental refresh), tracedecay status,
-tracedecay gitignore, tracedecay wipe (delete local stores).";
+Related: tracedecay daemon (the daemon init requires), tracedecay sync
+(incremental refresh), tracedecay status, tracedecay gitignore,
+tracedecay wipe (delete local stores).";
 
 pub(crate) const SYNC_LONG_ABOUT: &str = "\
 Re-parses only files that changed since the last index and updates the code \
 graph in place. Use after editing, switching branches, or pulling; agent \
 hooks usually run it automatically. Incompatible derived lexical staging is \
-replaced automatically. The retained `--force` compatibility flag queues the \
-same authoritative reconciliation; it does not delete or fully rebuild the \
-project store. `--doctor`/`--verbose` explain what a sync actually did.";
+replaced automatically. `--doctor`/`--verbose` explain what a sync actually \
+did.";
 
 pub(crate) const SYNC_AFTER_HELP: &str = "\
 Examples:
   tracedecay sync                                Incremental refresh from cwd
-  tracedecay sync --force                        Compatible explicit refresh
   tracedecay sync --doctor                       List added/modified/removed files
   tracedecay sync --verbose                      Per-phase timings for slow syncs
 
@@ -64,17 +69,16 @@ Related: tracedecay init (first index), tracedecay status (freshness check).";
 
 pub(crate) const STATUS_LONG_ABOUT: &str = "\
 Reports node/edge/file counts, database size, index freshness, active branch, \
-and tokens saved for the resolved project. `--details` adds the node-kind \
-distribution from the verified graph generation. Reach for it first when \
-deciding whether the index is stale or when an agent needs project \
-statistics; `--json` emits the same data machine-readably.";
+and tokens saved for the resolved project. Reach for it first when deciding \
+whether the index is stale or when an agent needs project statistics; \
+`--json` emits the same data machine-readably.";
 
 pub(crate) const STATUS_AFTER_HELP: &str = "\
 Examples:
   tracedecay status                              Human-readable project stats
   tracedecay status --json                       Machine-readable output
   tracedecay status --short                      Header only (version, tokens, sync)
-  tracedecay status --details                    Node-kind distribution
+  tracedecay status --details                    Node-kind breakdown
   tracedecay status --runtime                    PID/RSS/CPU/DB-size snapshot
   tracedecay status --project-id proj_123 --json Inspect another registered project
 
@@ -101,7 +105,7 @@ Examples:
 Related: tracedecay status (index freshness).";
 
 pub(crate) const TOOL_LONG_ABOUT: &str = "\
-Invoke any MCP tool from the shell — the full MCP surface with the same \
+Invoke any MCP tool from the shell. The full MCP surface with the same \
 arguments and the same payloads, no MCP client required. This is the fallback \
 path when an MCP transport fails and the primary path for scripts, hooks, and \
 subagents that only have shell access.
@@ -135,7 +139,7 @@ Notes:
     newlines, or non-scalar values, and for payloads near/over the ~128 KiB
     per-argument shell limit.
   - --dry-run parses, validates, and prints the resolved arguments object
-    without dispatching the tool — pre-flight destructive edits with it.
+    without dispatching the tool, pre-flight destructive edits with it.
   - --json prints the raw JSON payload instead of the human text rendering.
   - Any per-key value starting with @ is read from that file (@- is stdin).
   - --project <path> targets another project; the default is the nearest
@@ -146,30 +150,57 @@ Related: tracedecay serve (same tools over MCP stdio), tracedecay status.";
 
 pub(crate) const LSP_LONG_ABOUT: &str = "\
 Shows which language servers the dashboard's code-diagnostics panel can use \
-on this machine: detected binaries, versions, and install hints for missing \
-ones. Purely informational — nothing is installed or started.";
+for the current project, exactly as the daemon resolved them: which languages \
+are active in the project, each analyzer's live state on the daemon's PATH, and \
+the install step for a missing executable. This is the same read `tracedecay \
+doctor` grades, so the two never disagree. Purely informational. Nothing is \
+installed or started.";
 
 pub(crate) const LSP_AFTER_HELP: &str = "\
 Examples:
-  tracedecay lsp servers                         Table of supported servers
+  tracedecay lsp servers                         Analyzer table for the current project
   tracedecay lsp servers --json                  Machine-readable output
 
-Related: tracedecay dashboard (uses these servers for diagnostics).";
+Related: tracedecay doctor (LanguageServer finding), tracedecay dashboard
+(uses these servers for diagnostics).";
 
 pub(crate) const INSTALL_LONG_ABOUT: &str = "\
-Writes the MCP server registration, permissions, hooks, and prompt rules for \
-an agent host (Cursor, Codex, Claude Code, Hermes, Kiro, and others). \
-With --component, selects one compiled first-party Core or MCP companion \
-and uses the receipt-based host lifecycle instead of the compatibility installer. \
-Configures every detected agent when --agent is omitted, without prompting. \
+Installs an agent host's canonical first-party component set (MCP registration, \
+permissions, hooks, prompt rules) for Cursor, Codex, Claude Code, Hermes, Kiro, and \
+others through one receipt-backed host lifecycle. --component narrows that same \
+lifecycle to one named component; --dry-run prints the signed plan without mutating. \
+Configures every newly detected agent when --agent is omitted, without prompting. \
 Safe to re-run; use it after installing a new agent or moving the tracedecay binary. \
 Pass --git-hook to install the global post-commit sync hook; that flag is explicit \
 because setting core.hooksPath can redirect every repository away from .git/hooks.";
 
-pub(crate) const INSTALL_AFTER_HELP: &str = "\
+/// Exit statuses of every host lifecycle command; one literal so the four
+/// commands cannot drift apart.
+macro_rules! host_lifecycle_exit_status {
+    () => {
+        "
+
+Exit status:
+  0   every host completed, or was skipped: not applicable, or its host CLI
+      is not installed and TraceDecay only found leftover config for it.
+      `uninstall` stops tracking a host whose CLI is not installed and
+      leaves the host-owned registration in place
+  1   a host failed: the lifecycle ran and failed, or an untracked host
+      named with --agent has no host CLI; the per-host summary names each one
+  75  nothing failed, but a host needs an operator step: an interactive
+      host step (Kimi Code's `/plugins install`; `tracedecay doctor` reports
+      it until it is done), or a tracked host's CLI is not installed (install
+      it, or `tracedecay uninstall --agent <host>` to stop tracking it);
+      act on the printed step, then rerun"
+    };
+}
+
+pub(crate) const INSTALL_AFTER_HELP: &str = concat!(
+    "\
 Examples:
   tracedecay install                             Configure every detected agent
   tracedecay install --agent cursor              One agent only
+  tracedecay install --agent cursor --dry-run    Preview the full component-set plan
   tracedecay install --git-hook                  Also install the post-commit hook
   tracedecay install --agent cursor --component core --dry-run
   tracedecay install --agent cursor --component core
@@ -180,40 +211,51 @@ Examples:
   tracedecay install --agent hermes --profile dev
   tracedecay install --local                     Project-local config in cwd
 
-Related: tracedecay uninstall, tracedecay reinstall (refresh settings),
-tracedecay update-plugin (refresh generated assets only), tracedecay doctor.";
+Related: tracedecay uninstall, tracedecay reinstall (repair installed agents),
+tracedecay update-plugin (update installed agents), tracedecay doctor.",
+    host_lifecycle_exit_status!()
+);
 
 pub(crate) const REINSTALL_LONG_ABOUT: &str = "\
-Re-runs the installer for every agent that already has tracedecay configured, \
-rewriting MCP registrations, hooks, and prompt rules with current settings. \
-Use after upgrading the binary manually or when agent config drifted; it \
-never adds integration to agents that were not installed before.";
+Repairs every agent that already has tracedecay configured by re-running its \
+component-set lifecycle, rewriting artifacts, MCP registrations, hooks, and prompt \
+rules with current settings. Use after upgrading the binary manually or when agent \
+config drifted; it never adds integration to agents that were not installed before. \
+--dry-run previews each tracked agent's repair plan without mutating.";
 
-pub(crate) const REINSTALL_AFTER_HELP: &str = "\
+pub(crate) const REINSTALL_AFTER_HELP: &str = concat!(
+    "\
 Examples:
-  tracedecay reinstall                           Refresh all installed agents
+  tracedecay reinstall                           Repair all installed agents
+  tracedecay reinstall --dry-run                 Preview every repair plan
   tracedecay reinstall --component core --dry-run
   tracedecay reinstall --component core          Repair signed Core components
 
 Related: tracedecay install (add an agent), tracedecay update-plugin
-(refresh generated plugin assets without touching config files).";
+(update installed agents to this binary).",
+    host_lifecycle_exit_status!()
+);
 
-pub(crate) const UPDATE_PLUGIN_AFTER_HELP: &str = "\
+pub(crate) const UPDATE_PLUGIN_AFTER_HELP: &str = concat!(
+    "\
 Examples:
-  tracedecay update-plugin                       Refresh generated plugin assets
+  tracedecay update-plugin                       Update all installed agents
   tracedecay update-plugin --component context-mcp --dry-run
   tracedecay update-plugin --component context-mcp
 
-Related: tracedecay reinstall (also rewrites agent config files),
-tracedecay update (binary + plugins + daemon + health pass).";
+Related: tracedecay reinstall (repair installed agents),
+tracedecay update (binary + plugins + daemon + health pass).",
+    host_lifecycle_exit_status!()
+);
 
 pub(crate) const UNINSTALL_LONG_ABOUT: &str = "\
 Removes tracedecay's MCP server registration, permissions, hooks, and prompt \
-rules from agent configuration. Removes every detected agent's integration \
-when --agent is omitted. Project indexes under .tracedecay/ are left intact — \
-use `tracedecay wipe` to delete data.";
+rules from agent configuration through the same component-set lifecycle. Removes \
+every installed agent's integration when --agent is omitted. Project indexes under \
+.tracedecay/ are left intact. use `tracedecay wipe` to delete data.";
 
-pub(crate) const UNINSTALL_AFTER_HELP: &str = "\
+pub(crate) const UNINSTALL_AFTER_HELP: &str = concat!(
+    "\
 Examples:
   tracedecay uninstall                           Remove from every agent
   tracedecay uninstall --agent cursor            Remove from one agent
@@ -221,7 +263,9 @@ Examples:
   tracedecay uninstall --agent cursor --component context-mcp --yes
   tracedecay uninstall --agent hermes --profile dev
 
-Related: tracedecay install, tracedecay wipe (delete project stores).";
+Related: tracedecay install, tracedecay wipe (delete project stores).",
+    host_lifecycle_exit_status!()
+);
 
 pub(crate) const FEEDBACK_ROLLBACK_LONG_ABOUT: &str = "\
 Dry-runs, applies, or restores the direct host feedback-route rollback switch \
@@ -237,34 +281,6 @@ Examples:
 
 Related: tracedecay doctor (surfaces restart-safe rollback state), tracedecay
 install / update-plugin (refresh Core feedback routes).";
-
-pub(crate) const HOST_BUNDLE_LONG_ABOUT: &str = "\
-Inspects and recovers interrupted first-party host component lifecycle \
-transactions, and snapshots or restores one component's managed artifact files. \
-Artifact backup/restore never captures or changes host registration and refuses \
-components whose lifecycle depends on registration state. Each host keeps its \
-own recovery journal; a host whose journal is pending refuses further mutation \
-until it is rolled back. Recovery converges automatically whenever deployed \
-bytes already equal the pre-transaction backup or this transaction's cataloged \
-output.";
-
-pub(crate) const HOST_BUNDLE_AFTER_HELP: &str = "\
-Examples:
-  tracedecay host-bundle status
-  tracedecay host-bundle recover --dry-run
-  tracedecay host-bundle recover --agent opencode --yes
-  tracedecay host-bundle recover --agent opencode --quarantine --yes
-  tracedecay host-bundle artifact-backup --agent opencode --component agent --yes
-  tracedecay host-bundle artifact-restore --agent opencode --component agent --backup-id <32-hex-id> --yes
-
-Quarantine moves the journal aside into the lifecycle control directory and
-leaves every rollback backup on disk; nothing is deleted.
-
-Artifact restore changes only catalog-verified managed files. It fails closed
-when native registration is part of the selected component lifecycle.
-
-Related: tracedecay doctor (surfaces the pending recovery boundary),
-tracedecay reinstall (re-applies each host component set).";
 
 pub(crate) const DASHBOARD_LONG_ABOUT: &str = "\
 Starts the local web dashboard: holographic memory curation, LCM session \
@@ -284,7 +300,7 @@ tracedecay status --runtime (server resource snapshot).";
 
 pub(crate) const SERVE_LONG_ABOUT: &str = "\
 Runs the MCP server on stdin/stdout for a single client. This is the command \
-agent hosts execute from their MCP configuration — you rarely run it by hand \
+agent hosts execute from their MCP configuration, you rarely run it by hand \
 except to debug the protocol. For ad-hoc tool calls from a shell, use \
 `tracedecay tool` instead; both dispatch the same tool registry.";
 
@@ -324,6 +340,11 @@ After a real install, upgrade re-runs install for every configured agent
 integration so a separate `tracedecay reinstall` is not needed. --no-reinstall
 skips that refresh.
 
+Exit status: 0 once the newest binary is installed, even when the refresh
+after it failed or waits on an operator step (both are reported as warnings);
+non-zero only when the upgrade itself fails. Use `tracedecay update` for an
+exit status that also reflects the refresh.
+
 Related: tracedecay update (refresh even when current), tracedecay channel
 (switch stable/beta).";
 
@@ -334,6 +355,16 @@ Examples:
 
 Update re-runs install for every configured agent integration so a separate
 `tracedecay reinstall` is not needed. --no-reinstall skips that refresh.
+
+Exit status (a completed binary upgrade stays installed in every case):
+  0   the binary is current and every host refreshed, or was skipped because
+      its host CLI is not installed and only leftover config was found
+  1   the upgrade failed, or the refresh failed for a host or for the daemon;
+      the per-host summary names each failed host
+  75  the refresh waits on an operator step: an interactive host step (Kimi
+      Code's `/plugins install`), or a tracked host whose CLI is not
+      installed (install it, or `tracedecay uninstall --agent <host>` to
+      stop tracking it); act on the printed step, then rerun
 
 Related: tracedecay upgrade (refresh only after a real install),
 tracedecay update-plugin (plugins only), tracedecay channel.";
@@ -352,7 +383,7 @@ Examples:
 Related: tracedecay upgrade, tracedecay update.";
 
 pub(crate) const CURRENT_COUNTER_LONG_ABOUT: &str = "\
-Prints the project-local resettable token counter — tokens tracedecay saved \
+Prints the project-local resettable token counter, tokens tracedecay saved \
 this project since the last `reset-counter`. Useful for before/after \
 comparisons of a working session; the permanent ledger lives in \
 `tracedecay gain`.";
@@ -379,8 +410,8 @@ Related: tracedecay current-counter, tracedecay gain.";
 
 pub(crate) const DISABLE_UPLOAD_COUNTER_LONG_ABOUT: &str = "\
 Opts this machine out of contributing anonymous token-savings counts to the \
-public worldwide counter. Only aggregate numbers are ever uploaded — never \
-code, paths, or queries — but uploading is entirely optional.";
+public worldwide counter. Only aggregate numbers are ever uploaded, never \
+code, paths, or queries, but uploading is entirely optional.";
 
 pub(crate) const DISABLE_UPLOAD_COUNTER_AFTER_HELP: &str = "\
 Examples:
@@ -392,7 +423,7 @@ is unaffected).";
 pub(crate) const ENABLE_UPLOAD_COUNTER_LONG_ABOUT: &str = "\
 Re-enables contributing anonymous token-savings counts to the public \
 worldwide counter after a previous `disable-upload-counter`. Only aggregate \
-numbers are uploaded — never code, paths, or queries.";
+numbers are uploaded, never code, paths, or queries.";
 
 pub(crate) const ENABLE_UPLOAD_COUNTER_AFTER_HELP: &str = "\
 Examples:
@@ -457,7 +488,7 @@ Related: tracedecay status (index size context).";
 
 pub(crate) const GAIN_LONG_ABOUT: &str = "\
 Reports token savings (and dollar estimates) recorded in the persistent \
-global ledger — the long-term view, unlike the resettable per-project \
+global ledger, the long-term view, unlike the resettable per-project \
 counter. Defaults to the current project over the last 30 days.";
 
 pub(crate) const GAIN_AFTER_HELP: &str = "\
@@ -538,7 +569,7 @@ Queries the global registry of every initialised tracedecay project on this \
 machine: list, search by id/path/alias/remote/branch, or resolve one \
 project's full context. Use it to find the right --project-id/--project-path \
 value for cross-project commands. `projects forget` deregisters exactly one \
-project — registry rows plus its profile store directories — without \
+project, registry rows plus its profile store directories, without \
 touching other projects or any repo-local file, and completes even when the \
 project's runtime is wedged (the managed daemon service is stopped for the \
 removal and restored afterward).";
@@ -608,27 +639,15 @@ install --agent codex --automation (enable at install), tracedecay dashboard
 (automation outcomes), tracedecay memory status.";
 
 pub(crate) const STORAGE_LONG_ABOUT: &str = "\
-Profile-storage maintenance: read-only reporting, complete external backups, \
-backup rehearsal, and the explicit first-party V1-to-V2 replacement flow. \
-Replacement supports `--dry-run` for a no-write plan; applying it requires \
-`--yes`, quiesces the profile, verifies every authority, and keeps the external \
-V1 backup available for downgrade. `--provider native` publishes the shipped \
- Native serving route; `--provider ncm` additionally requires the independently \
-attested NCM worker and model bundle. The migration worker is shipped in this \
-binary; an optional `--worker` path is accepted only for compatibility and is \
-never trusted for the preservation proof.";
+Profile-storage maintenance: read-only per-store size and retention reporting, \
+and scoped reset of a project graph store refused for an incompatible schema. \
+TraceDecay V2 stores are created at their final shape, so there is no \
+cross-version migration workflow.";
 
 pub(crate) const STORAGE_AFTER_HELP: &str = "\
 Examples:
   tracedecay storage report                      Per-store size / free-page ratio (read-only)
-  tracedecay storage backup --to <dir> --backup-id <id>
-  tracedecay storage rehearse-backup --backup <dir> --restore <dir>
-  tracedecay storage replace-v1 --backup-to <dir> --backup-id <id> \
-    --dry-run                                      Preview the V1-to-V2 cutover
-  tracedecay storage replace-v1 --backup-to <dir> --backup-id <id> \
-    --provider native --yes                       Publish the Native serving route
-  tracedecay storage replace-v1 --backup-to <dir> --backup-id <id> \
-    --provider ncm --yes                          Publish the attested NCM route
+  tracedecay storage reset-project-store --project-root <dir> --yes
 
 Related: tracedecay projects (registry view), tracedecay wipe.";
 
@@ -642,7 +661,7 @@ Destructive and unrecoverable; re-create indexes with `tracedecay init`. \
 Prompts for a `go!` confirmation unless `--yes` is passed. When the managed \
 daemon holds the profile (even wedged or hung), wipe stops the installed \
 service within the supervisor's bounded stop, runs offline, and restores the \
-previous service state afterward — it never waits indefinitely.";
+previous service state afterward, it never waits indefinitely.";
 
 pub(crate) const WIPE_AFTER_HELP: &str = "\
 Examples:
@@ -655,7 +674,7 @@ Related: tracedecay list (inspect nearby project stores), tracedecay init
 
 pub(crate) const LIST_LONG_ABOUT: &str = "\
 Lists tracedecay projects relative to the current directory (itself, \
-parents, and children) with their store locations — the quick \"what is \
+parents, and children) with their store locations, the quick \"what is \
 indexed around here?\" check. Use `tracedecay projects` for the global \
 registry with search.";
 
@@ -670,7 +689,7 @@ status (one project's statistics).";
 pub(crate) const REMOTE_LONG_ABOUT: &str = "\
 Operates the Remote Brain production journey from the shell: live mounted \
 status from the running daemon, plus enrolled enroll/capture/query/\
-transfer-frame/replay/backup/restore/failover against an authenticated \
+transfer-frame/replay/failover against an authenticated \
 authority endpoint. `status` never probes local stores; it reads the \
 daemon's in-memory remote mount. `capture` spools one observation on a node \
 whose authority is unreachable, `transfer-frame` moves one encrypted spool \
@@ -695,11 +714,6 @@ Examples:
       --credential-file cred.bin --request-file frame.json --json
   tracedecay remote replay --endpoint https://brain.example/remote/ \\
       --credential-file cred.bin --request-file replay.json
-  tracedecay remote backup --endpoint https://brain.example/remote/ \\
-      --credential-file cred.bin --request-file backup.json --json
-  tracedecay remote restore --endpoint https://brain.example/remote/ \\
-      --credential-file cred.bin --trust-root-file root.pem \\
-      --request-file restore.json --timeout-secs 60
   tracedecay remote failover --endpoint https://brain.example/remote/ \\
       --credential-file cred.bin --request-file failover.json
 

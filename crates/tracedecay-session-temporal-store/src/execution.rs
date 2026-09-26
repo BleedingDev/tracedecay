@@ -1,14 +1,7 @@
-//! Authorized temporal execution contract.
-//!
-//! The only implementation of [`SessionTemporalExecutionPort`] is
-//! [`super::RegisteredGlobalDbSessionTemporalExecution`] in this module.
-//! Use-case callers depend on `global_db`, so the port lives beside its
-//! implementer to avoid a crate cycle.
+//! Authorized temporal execution contract executed by
+//! [`super::RegisteredGlobalDbSessionTemporalExecution`].
 
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use thiserror::Error;
 use tracedecay_contracts::retrieval::{
@@ -24,11 +17,11 @@ use tracedecay_query::retrieval::evidence_lanes::{
     EvidenceLaneExecutionControlV1, TaskSessionBindingV1, TaskSessionCandidateSelectionV1,
     TaskSessionLaneEvidenceV1,
 };
-use tracedecay_temporal_query::context::{ContextBudget, VersionedTokenEstimator};
-use tracedecay_temporal_query::ports::{
-    BudgetObservation, ExecutionLimits, ReadBudgetAccounting, TemporalSnapshotRequest,
-};
+use tracedecay_temporal_query::context::ContextBudget;
+use tracedecay_temporal_query::execution::ExecutionLimits;
+use tracedecay_temporal_query::execution::{BudgetObservation, ReadBudgetAccounting};
 use tracedecay_temporal_query::ranking::DiversityLimits;
+use tracedecay_temporal_query::snapshot::TemporalSnapshotRequest;
 use tracedecay_temporal_query::{TemporalKernelError, TemporalKernelResult};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,7 +122,7 @@ impl AuthorizedTemporalExecutionRequest {
 
     pub fn into_kernel_request(
         self,
-        snapshot: tracedecay_temporal_query::ports::TemporalExecutionSnapshot,
+        snapshot: tracedecay_temporal_query::snapshot::TemporalExecutionSnapshot,
     ) -> tracedecay_temporal_query::TemporalKernelRequest {
         tracedecay_temporal_query::TemporalKernelRequest {
             snapshot,
@@ -240,7 +233,7 @@ pub enum SessionTemporalExecutionError {
     Redacted,
     Deleted,
     Denied,
-    /// The authority a request needs is absent — no store, no manifest, no
+    /// The authority a request needs is absent, no store, no manifest, no
     /// payload. A storage operation that *failed* is [`Self::Storage`]; keeping
     /// them apart is what tells an empty root from a broken read.
     Unavailable,
@@ -307,24 +300,6 @@ impl std::error::Error for SessionTemporalExecutionError {
             _ => None,
         }
     }
-}
-
-pub type TemporalExecutionFuture<'a> = Pin<
-    Box<
-        dyn Future<Output = Result<SessionTemporalExecutionReport, SessionTemporalExecutionError>>
-            + Send
-            + 'a,
-    >,
->;
-
-pub trait SessionTemporalExecutionPort: Send + Sync {
-    fn execute<'a, E>(
-        &'a self,
-        request: AuthorizedTemporalExecutionRequest,
-        estimator: &'a E,
-    ) -> TemporalExecutionFuture<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a;
 }
 
 /// Exact points where the Work owner must prove that the Task/graph/attempt
@@ -399,7 +374,7 @@ impl AuthorizedTaskSessionExecutionRequestV1 {
             let snapshot = temporal.snapshot_request();
             let exact_session = matches!(
                 snapshot.retrieval_scope(),
-                tracedecay_temporal_query::ports::TemporalRetrievalScope::Session(session_id)
+                tracedecay_temporal_query::snapshot::TemporalRetrievalScope::Session(session_id)
                     if session_id == binding.source().session_id()
             );
             if !exact_session
@@ -479,95 +454,6 @@ pub struct TaskSessionTemporalExecutionReportV1 {
 pub enum TaskSessionTemporalExecutionOutcomeV1 {
     Complete(Box<TaskSessionTemporalExecutionReportV1>),
     Omitted(TaskSessionExecutionOmissionV1),
-}
-
-pub type TaskSessionTemporalExecutionFutureV1<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    TaskSessionTemporalExecutionOutcomeV1,
-                    SessionTemporalExecutionError,
-                >,
-            > + Send
-            + 'a,
-    >,
->;
-
-pub trait TaskSessionTemporalExecutionPortV1: Send + Sync {
-    fn execute_task_session<'a, E>(
-        &'a self,
-        request: AuthorizedTaskSessionExecutionRequestV1,
-        selector: &'a dyn TaskSessionRankSelectorV1,
-        estimator: &'a E,
-    ) -> TaskSessionTemporalExecutionFutureV1<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a;
-}
-
-impl<T> TaskSessionTemporalExecutionPortV1 for &T
-where
-    T: TaskSessionTemporalExecutionPortV1 + ?Sized,
-{
-    fn execute_task_session<'a, E>(
-        &'a self,
-        request: AuthorizedTaskSessionExecutionRequestV1,
-        selector: &'a dyn TaskSessionRankSelectorV1,
-        estimator: &'a E,
-    ) -> TaskSessionTemporalExecutionFutureV1<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a,
-    {
-        (**self).execute_task_session(request, selector, estimator)
-    }
-}
-
-impl<T> TaskSessionTemporalExecutionPortV1 for Arc<T>
-where
-    T: TaskSessionTemporalExecutionPortV1 + ?Sized,
-{
-    fn execute_task_session<'a, E>(
-        &'a self,
-        request: AuthorizedTaskSessionExecutionRequestV1,
-        selector: &'a dyn TaskSessionRankSelectorV1,
-        estimator: &'a E,
-    ) -> TaskSessionTemporalExecutionFutureV1<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a,
-    {
-        (**self).execute_task_session(request, selector, estimator)
-    }
-}
-
-impl<T> SessionTemporalExecutionPort for &T
-where
-    T: SessionTemporalExecutionPort + ?Sized,
-{
-    fn execute<'a, E>(
-        &'a self,
-        request: AuthorizedTemporalExecutionRequest,
-        estimator: &'a E,
-    ) -> TemporalExecutionFuture<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a,
-    {
-        (**self).execute(request, estimator)
-    }
-}
-
-impl<T> SessionTemporalExecutionPort for Arc<T>
-where
-    T: SessionTemporalExecutionPort + ?Sized,
-{
-    fn execute<'a, E>(
-        &'a self,
-        request: AuthorizedTemporalExecutionRequest,
-        estimator: &'a E,
-    ) -> TemporalExecutionFuture<'a>
-    where
-        E: VersionedTokenEstimator + Sync + 'a,
-    {
-        (**self).execute(request, estimator)
-    }
 }
 
 /// How current the data behind a temporal execution is.

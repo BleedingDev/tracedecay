@@ -13,10 +13,11 @@ use tracedecay_graph_db::{
 use tracedecay_store::{
     FactReadControl, GraphGenerationIdV1, GraphNamespaceV1, GraphProjectionIdV1,
     GraphProjectionIdentityV1, GraphPublicationIdempotencyKeyV1, GraphPublicationKeyV1,
-    GraphPublicationOperationContextV1, GraphPublicationStoreV1, GraphReplayAppendOutcomeV1,
-    ProjectId, RuntimeCancellationIdV1, RuntimeCancellationIdentityV1, RuntimeDeadlineIdV1,
-    RuntimeDeadlineV1, RuntimeInterruptionV1, RuntimeRequestControlV1, RuntimeRequestProbeV1,
-    StoreShardIdV1, StoreShardScopeV1,
+    GraphPublicationOperationContextV1, GraphPublicationReplayPageRequestV1,
+    GraphPublicationRetiredCleanupPageRequestV1, GraphPublicationStoreV1,
+    GraphReplayAppendOutcomeV1, ProjectId, RuntimeCancellationIdV1, RuntimeCancellationIdentityV1,
+    RuntimeDeadlineIdV1, RuntimeDeadlineV1, RuntimeInterruptionV1, RuntimeRequestControlV1,
+    RuntimeRequestProbeV1, StoreShardIdV1, StoreShardScopeV1,
 };
 
 use super::DaemonSessionRuntimeRegistryV1;
@@ -297,8 +298,8 @@ fn snapshot_through_database(
 /// activated memory graph to the live session lease during mount and on late
 /// attachment, and daemon composition unconditionally binds the
 /// deferred-activation route. Whichever route arrives first wins the single
-/// binding cell, so every later rebind of the same runtime — resolved or
-/// deferred — must stay an idempotent no-op instead of a conflict, and the
+/// binding cell, so every later rebind of the same runtime, resolved or
+/// deferred, must stay an idempotent no-op instead of a conflict, and the
 /// installed route must actually resolve to the mounted runtime rather than
 /// merely exist.
 #[tokio::test]
@@ -634,7 +635,7 @@ async fn project_graph_publications_are_isolated_by_project_shard() {
         .expect("first project publication");
 
     // The second shard never published this projection, so it must observe
-    // the typed empty start — never the first shard's head.
+    // the typed empty start, never the first shard's head.
     assert!(matches!(
         snapshot_through_database(&second_database, &projection),
         Ok(None)
@@ -901,7 +902,7 @@ impl RuntimeRequestProbeV1 for NeverInterruptedProbe {
 
 /// A publish interrupted between the relational journal append and the
 /// verified-head CAS leaves an active replay with no head. The next publish of
-/// the same publication must resume it to a verified snapshot — answering
+/// the same publication must resume it to a verified snapshot, answering
 /// Conflict instead wedges the projection permanently (every later publish and
 /// read fails until the store is deleted).
 #[tokio::test]
@@ -991,8 +992,8 @@ async fn journaled_publication_without_a_head_resumes_to_a_verified_snapshot() {
     assert_eq!(snapshot.generation(), &initial_manifest.generation);
 }
 
-/// An orphaned pending replay — journaled by a publisher that died before its
-/// verified-head CAS and never retried under the same publication key — must
+/// An orphaned pending replay, journaled by a publisher that died before its
+/// verified-head CAS and never retried under the same publication key, must
 /// not block the projection forever. The relational journal is an ordered
 /// log, so a later publication of a NEWER generation completes the
 /// predecessor first and then lands its own head. This is the live wedge
@@ -1077,6 +1078,100 @@ async fn orphaned_pending_replay_is_completed_by_the_next_generations_publicatio
         .expect("verified snapshot after the completion")
         .expect("published verified head");
     assert_eq!(snapshot.generation(), &successor.generation);
+}
+
+/// Every publication of an inline projection supersedes the previous
+/// generation, and the publish must reclaim it: its journal row, tombstone and
+/// native rows. Retirement used to run on the publish's spent commit grant and
+/// failed with an opaque infrastructure error on every publication, so every
+/// superseded generation stayed journaled forever.
+#[tokio::test]
+async fn repeated_publications_leave_exactly_one_live_generation() {
+    let fixture = ContractFixture::new("retire-superseded").await;
+    let project_id = project_id("retire-superseded");
+    let (project_database, _sessions) = fixture.mount_project(&project_id).await;
+    let projection = projection("retire-superseded");
+    for generation in 1..=4 {
+        let published = publish_through_database(
+            &project_database,
+            &manifest(
+                &projection,
+                &format!("retire-{generation}"),
+                &generation.to_string(),
+            ),
+            key(&format!("retire-superseded-{generation}")),
+            false,
+        )
+        .expect("publication installs the next head");
+        assert_eq!(
+            published.generation().as_str(),
+            format!("generation.retire-{generation}")
+        );
+    }
+
+    let identity = profile_identity::load_or_create(&fixture.root.join("profile"))
+        .expect("profile identity authority");
+    let relational_projection = GraphProjectionIdentityV1 {
+        shard_id: StoreShardIdV1::project(
+            identity.brain_id().clone(),
+            identity.profile_id().clone(),
+            project_id.clone(),
+        ),
+        namespace: GraphNamespaceV1::new(projection.namespace.as_str())
+            .expect("relational namespace"),
+        projection: GraphProjectionIdV1::new(projection.projection.as_str())
+            .expect("relational projection"),
+    };
+    let cancellation_identity = RuntimeCancellationIdentityV1 {
+        cancellation_id: RuntimeCancellationIdV1::new("retire-superseded-cancellation")
+            .expect("cancellation id"),
+        generation: 1,
+    };
+    let deadline_identity = RuntimeDeadlineV1 {
+        deadline_id: RuntimeDeadlineIdV1::new("retire-superseded-deadline").expect("deadline id"),
+    };
+    let control = RuntimeRequestControlV1 {
+        requested_at: UtcMicros(1),
+        deadline: deadline_identity.clone(),
+        cancellation: cancellation_identity.clone(),
+    };
+    let probe = NeverInterruptedProbe {
+        cancellation: cancellation_identity,
+        deadline: deadline_identity,
+    };
+    let context = GraphPublicationOperationContextV1::new(&control, &probe)
+        .expect("publication operation context");
+    let mut storage = project_database
+        .graph_publication_storage()
+        .expect("graph publication storage");
+    let replays = storage
+        .replay_page(
+            &GraphPublicationReplayPageRequestV1::new(relational_projection.clone(), None, 64)
+                .expect("replay page request"),
+            &context,
+        )
+        .expect("replay page");
+    assert_eq!(
+        replays
+            .records
+            .iter()
+            .map(|record| record.publication.key.generation.as_str())
+            .collect::<Vec<_>>(),
+        vec!["generation.retire-4"],
+        "only the installed head's generation stays journaled"
+    );
+    let tombstones = storage
+        .retired_cleanup_page(
+            &GraphPublicationRetiredCleanupPageRequestV1::new(relational_projection, None, 64)
+                .expect("retired cleanup page request"),
+            &context,
+        )
+        .expect("retired cleanup page");
+    assert_eq!(
+        tombstones.records.len(),
+        0,
+        "retirement finalized every tombstone"
+    );
 }
 
 #[tokio::test]

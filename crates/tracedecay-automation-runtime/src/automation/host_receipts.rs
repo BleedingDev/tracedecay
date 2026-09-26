@@ -3,12 +3,12 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use super::config_error;
 use tracedecay_domain::errors::Result;
 use tracedecay_hooks::{HookRouteMetadata, HookTerminalReceipt};
+use tracedecay_private_fs::FileLease;
 use tracedecay_runtime_core::storage::PrivateStoreIo;
 use tracedecay_runtime_core::tracedecay::current_timestamp;
 
@@ -107,15 +107,16 @@ fn with_locked_state<T>(
         config_error(format!("failed to create host receipt directory: {error}"))
     })?;
     let (state_path, temp_path, lock_path) = paths(dashboard_root);
-    let mut lock = OpenOptions::new()
+    let lock = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
         .open(&lock_path)
         .map_err(|error| config_error(format!("failed to open host receipt lock: {error}")))?;
-    lock.lock_exclusive()
+    lock.lock()
         .map_err(|error| config_error(format!("failed to lock host receipts: {error}")))?;
+    let mut lock = FileLease::held(lock, "automation.host_receipts");
     let mut state = std::fs::read(&state_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -125,7 +126,7 @@ fn with_locked_state<T>(
     PrivateStoreIo::write_file_atomically(&state_path, &temp_path, &bytes)
         .map_err(|error| config_error(format!("failed to persist host receipts: {error}")))?;
     let _ = lock.flush();
-    let _ = lock.unlock();
+    drop(lock);
     Ok(output)
 }
 

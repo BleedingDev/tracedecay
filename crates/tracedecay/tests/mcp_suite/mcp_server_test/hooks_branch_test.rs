@@ -1,3 +1,4 @@
+use crate::common::fixture::git_run as git;
 use crate::mcp_server_test::support::*;
 use serde_json::{Value, json};
 use std::fs;
@@ -5,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracedecay::mcp::McpServer;
-use tracedecay::project::{TraceDecay, TraceDecayOpenOptions};
-use tracedecay::test_support::host_admission::{
+use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
+use tracedecay_project::test_support::host_admission::{
     HostAdmissionTestRuntimeV1, ProjectScopedTestRuntimeV1,
 };
 
@@ -188,7 +189,7 @@ impl RoutedProjects {
     ///
     /// `TraceDecay::init` registered each store under its own identity id, so
     /// re-registering under a synthetic id would leave the root's alias
-    /// pointing at a project row that owns no store — the ambiguity
+    /// pointing at a project row that owns no store, the ambiguity
     /// [`hook_route_to_ambiguously_registered_project_fails_closed`] covers
     /// deliberately.
     async fn registered_runtime(&self) -> ProjectScopedTestRuntimeV1 {
@@ -225,36 +226,37 @@ impl RoutedProjects {
     }
 }
 
-/// A `workspaceOpen` notification naming the workspace `cwd` a host just
-/// opened, with no route identity — it can only steer follow-up calls on the
-/// same connection.
+/// A hook event in the form the daemon hook client delivers it: a stateless
+/// request, since a notification has no `initialize` session to ride on a
+/// connection it opens. Its id cannot collide with the numeric tool-call ids.
+fn hook_event(params: Value) -> String {
+    jsonrpc_request(json!("hook"), "tracedecay/hookEvent", params)
+}
+
+/// A `workspaceOpen` hook naming the workspace `cwd` a host just opened, with
+/// no route identity, it can only steer follow-up calls on the same
+/// connection.
 fn workspace_open(cwd: &Path) -> String {
-    jsonrpc_notification_with_params(
-        "tracedecay/hookEvent",
-        json!({
-            "agent": "codex",
-            "event": "workspaceOpen",
-            "cwd": cwd.to_string_lossy()
-        }),
-    )
+    hook_event(json!({
+        "agent": "codex",
+        "event": "workspaceOpen",
+        "cwd": cwd.to_string_lossy()
+    }))
 }
 
 /// A `workspaceOpen` carrying route identity, the shape every real host sends.
 /// The session id is what lets the route survive to the agent's own socket.
 fn workspace_open_for_session(cwd: &Path, session_id: &str) -> String {
-    jsonrpc_notification_with_params(
-        "tracedecay/hookEvent",
-        json!({
-            "agent": "codex",
-            "event": "workspaceOpen",
+    hook_event(json!({
+        "agent": "codex",
+        "event": "workspaceOpen",
+        "cwd": cwd.to_string_lossy(),
+        "route": {
+            "session_id": session_id,
             "cwd": cwd.to_string_lossy(),
-            "route": {
-                "session_id": session_id,
-                "cwd": cwd.to_string_lossy(),
-                "worktree": cwd.to_string_lossy(),
-            }
-        }),
-    )
+            "worktree": cwd.to_string_lossy(),
+        }
+    }))
 }
 
 fn files_call(id: i64) -> String {

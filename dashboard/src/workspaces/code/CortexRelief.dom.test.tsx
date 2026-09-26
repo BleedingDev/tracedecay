@@ -23,7 +23,7 @@ import { CortexRelief } from './CortexRelief.tsx';
 import { MAX_DRAWN_REGIONS } from './cortexRelief.ts';
 
 /** The canonical envelope from a shipped fixture, with this route's payload
- * swapped in — so the test exercises the real envelope acceptance path rather
+ * swapped in, so the test exercises the real envelope acceptance path rather
  * than a hand-rolled wrapper that could drift from it. */
 function envelope(payload: unknown) {
   const base = resolveFixture('/api/plugins/graph/overview') as Record<string, unknown>;
@@ -74,13 +74,10 @@ function wideMeasurement(): StrataMeasurementV1 {
     ideal_depth: 3,
     max_depth: 3,
     scan: {
-      budget_ms: 4000,
       cache_scope: 'graph_generation',
       cache_state: 'hit',
       dependency_edges_examined: 1200,
       files_examined: 240,
-      max_dependency_edges: 40_000,
-      max_files: 20_000,
     },
   };
 }
@@ -118,7 +115,7 @@ afterEach(() => {
 });
 
 describe('CortexRelief', () => {
-  it('carries every aggregated region in an accessible equivalent, not just on the canvas', async () => {
+  it('carries every aggregated region on the canvas and in an accessible equivalent', async () => {
     const measurement = wideMeasurement();
     serve(envelope({ status: 'measured', measurement }));
     const { container } = renderCortex();

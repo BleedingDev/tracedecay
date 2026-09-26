@@ -4,18 +4,20 @@ use std::fmt::Write as _;
 use std::future::Future;
 use std::sync::Arc;
 
-use serde_json::{Value, json};
 use tracedecay_contracts::memory::CognitiveRecallTemporalMode;
 use tracedecay_contracts::retained_surfaces::{
     FactCategoryV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
 };
 use tracedecay_contracts::retrieval::{
-    ContextMemoryTemporalCoverageV1, ContextSurfaceRequestV1, MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS,
+    ContextMemoryTemporalCoverageV1, ContextStageV1, ContextSurfaceRequestV1,
+    MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS,
 };
 use tracedecay_contracts::{
-    CancellationSignal, Deadline, now_micros, retained_surface_execution_problem,
+    CancellationSignal, ContextMemoryAnalyticsV1, Deadline, now_micros,
+    retained_surface_execution_problem,
 };
 use tracedecay_domain::Confidence;
+use tracedecay_domain::collapse_whitespace;
 use tracedecay_session_memory::memory::memory_application_error;
 use tracedecay_store::{
     FactReadControl, ProjectMemoryFactSearchFilterV1, ProjectMemoryFactSearchKindV1,
@@ -159,7 +161,7 @@ pub(super) fn context_memory_section(
                 context_fact_category(hit.fact.category),
                 f64::from(hit.fact.trust_score_millionths) / 1_000_000.0,
                 f64::from(hit.scores.score_millionths) / 1_000_000.0,
-                compact_memory_content(&hit.fact.content)
+                collapse_whitespace(&hit.fact.content)
             );
         }
         section.push('\n');
@@ -175,10 +177,6 @@ pub(super) fn context_memory_section(
         return Some(section);
     }
     None
-}
-
-fn compact_memory_content(content: &str) -> String {
-    content.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 const fn context_fact_category(category: FactCategoryV1) -> &'static str {
@@ -247,23 +245,43 @@ pub(super) fn context_memory_read_control(
     }))))
 }
 
-pub(super) fn context_memory_analytics_value(
+pub(super) fn context_memory_analytics(
     options: &ContextMemoryOptions,
     memory_matches: &[FactSearchHitV1],
     memory_matches_error: Option<&str>,
-) -> Value {
-    let fact_ids: Vec<Value> = memory_matches
-        .iter()
-        .map(|hit| Value::String(hit.fact.fact_id.as_str().to_owned()))
-        .collect();
-    json!({
-        "include_memory": options.include_memory,
-        "limit": options.limit,
-        "min_trust": options.min_trust,
-        "match_count": fact_ids.len(),
-        "fact_ids": fact_ids,
-        "error": memory_matches_error,
-    })
+) -> ContextMemoryAnalyticsV1 {
+    ContextMemoryAnalyticsV1 {
+        include_memory: options.include_memory,
+        limit: u32::try_from(options.limit).unwrap_or(u32::MAX),
+        min_trust_millionths: (options.min_trust * 1_000_000.0).round() as u32,
+        fact_ids: memory_matches
+            .iter()
+            .map(|hit| hit.fact.fact_id.as_str().to_owned())
+            .collect(),
+        error: memory_matches_error.map(str::to_owned),
+    }
+}
+
+/// The memory stage of the context retrieval plan. A full page of hits
+/// reached `memory_limit`, so more facts may match.
+pub(super) fn context_memory_stage(
+    options: &ContextMemoryOptions,
+    memory_matches: &[FactSearchHitV1],
+    memory_matches_error: Option<&str>,
+) -> ContextStageV1 {
+    if !options.include_memory {
+        ContextStageV1::NotRequested
+    } else if options.temporal_coverage.is_some() || memory_matches_error.is_some() {
+        // A non-current temporal policy withholds the current-only fact
+        // search: the stage's authority cannot answer that request.
+        ContextStageV1::Unavailable
+    } else {
+        ContextStageV1::ran(
+            options.limit,
+            memory_matches.len(),
+            memory_matches.len() >= options.limit,
+        )
+    }
 }
 
 pub(super) struct ContextMemoryMatches {
@@ -380,6 +398,7 @@ pub(super) async fn context_memory_matches(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tracedecay_contracts::memory::CognitiveRecallTemporalQuery;
     use tracedecay_domain::UtcMicros;

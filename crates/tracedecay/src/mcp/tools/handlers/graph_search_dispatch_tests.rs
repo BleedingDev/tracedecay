@@ -9,7 +9,7 @@ use tracedecay_domain::ExactClass;
 use tracedecay_mcp::ToolResult;
 use tracedecay_query::retrieval::lexical::LexicalRoutingV1;
 
-use crate::project::TraceDecay;
+use tracedecay_project::project::TraceDecay;
 
 fn completed_sparse_search() -> tracedecay_query::code_search::CodeIndexSearchOutcomeV1 {
     completed_sparse_search_for_generation("generation.mcp-verified-graph-fixture.1")
@@ -70,6 +70,8 @@ fn completed_sparse_search_for_generation(
             lexical_routes: tracedecay_query::retrieval::lexical::LexicalRouteReceiptV1 {
                 routes: vec![tracedecay_query::retrieval::lexical::LexicalRouteKindV1::Query],
                 matches_by_anchor: std::collections::BTreeMap::new(),
+                anchors: Vec::new(),
+                dropped_sites: std::collections::BTreeMap::new(),
             },
         },
     )
@@ -112,7 +114,7 @@ fn search_test_options<'a>(
 }
 
 fn run_with_locked_user_data_dir(test: impl Future<Output = ()>) {
-    let _env_lock = crate::config::lock_user_data_dir_test_env();
+    let _env_lock = tracedecay_project::config::lock_user_data_dir_test_env();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -448,6 +450,8 @@ fn completed_sparse_search_with_anchor_route(
                 spelling_variants: Vec::new(),
             }],
         )]),
+        anchors: Vec::new(),
+        dropped_sites: std::collections::BTreeMap::new(),
     };
     tracedecay_query::code_search::CodeIndexSearchOutcomeV1::Complete(complete)
 }
@@ -628,7 +632,7 @@ async fn search_forwards_lexical_routing_and_renders_route_evidence_case() {
     assert!(routing.prefer_symbol);
     let text = response_text(&result);
     assert!(
-        text.contains("**SparseLexicalWidget** (function, approximate) — rank 1 · utility 1 · via anchor:SparseLexicalWidget"),
+        text.contains("**SparseLexicalWidget** (function, approximate), rank 1 · utility 1 · via anchor:SparseLexicalWidget"),
         "each result names the routes that ranked it: {text}"
     );
     assert!(

@@ -51,7 +51,7 @@ pub fn codex_current_user_message(payload: &Value) -> Option<CodexCurrentUserMes
         .filter(|item_id| !item_id.is_empty())?;
     ObservationId::new(item_id).ok()?;
     let content = item.get("content")?;
-    let visible_text = codex_message_visible_text(content);
+    let visible_text = tracedecay_store::codex_message_visible_text(content);
     if visible_text.trim().is_empty() {
         return None;
     }
@@ -76,18 +76,13 @@ pub fn codex_response_goal_context(payload: &Value) -> Option<CodexResponseGoalC
         return None;
     }
     let content = payload.get("content")?;
-    let visible_text = codex_message_visible_text(content);
+    let visible_text = tracedecay_store::codex_message_visible_text(content);
     tracedecay_store::codex_goal_context_from_text(&visible_text)?;
     Some(CodexResponseGoalContext {
         item_id,
         content,
         visible_text,
     })
-}
-
-/// Collect the visible text carried by current and legacy Codex content bags.
-pub fn codex_message_visible_text(value: &Value) -> String {
-    tracedecay_store::codex_message_visible_text(value)
 }
 
 pub fn codex_observation_record_supported(value: &Value) -> bool {
@@ -339,7 +334,8 @@ fn append_codex_session_meta_agent_relations(
     native_thread_id: Option<&str>,
 ) -> CanonicalObservationRelationsV1 {
     let parent_session_id = string_field(payload, "forked_from_id")
-        .or_else(|| nested_string_field(payload, "/source/subagent/thread_spawn/parent_thread_id"));
+        .or_else(|| nested_string_field(payload, "/source/subagent/thread_spawn/parent_thread_id"))
+        .or_else(|| string_field(payload, "parent_thread_id"));
     let thread_source = string_field(payload, "thread_source");
     let is_subagent = thread_source.as_deref() == Some("subagent")
         || parent_session_id.is_some()
@@ -353,9 +349,16 @@ fn append_codex_session_meta_agent_relations(
     if let Some(agent_id) = native_thread_id.and_then(observation_id_from_native) {
         relations = relations.with_agent_id(agent_id);
     }
-    if let Some(parent_agent_id) = parent_session_id.and_then(|id| observation_id_from_native(&id))
-    {
-        relations = relations.with_parent_agent_id(parent_agent_id);
+    // The spawning `spawn_agent` call id is recorded only in the parent's
+    // rollout (`SubAgentActivity` `started` item), never in the child's; the
+    // parent's spawn rollup binds it once both sessions are projected.
+    if let Some(parent) = parent_session_id {
+        if let Some(parent_agent_id) = observation_id_from_native(&parent) {
+            relations = relations.with_parent_agent_id(parent_agent_id);
+        }
+        if let Ok(parent_session_id) = SessionId::new(parent) {
+            relations = relations.with_parent_session_id(parent_session_id);
+        }
     }
     relations
 }
@@ -392,6 +395,16 @@ fn append_codex_event_facts(
                 });
                 return;
             };
+            if item.get("type").and_then(Value::as_str) == Some("FileChange") {
+                append_codex_file_change_facts(payload, item, timestamp, facts);
+                return;
+            }
+            if item.get("type").and_then(Value::as_str) == Some("SubAgentActivity")
+                && item.get("kind").and_then(Value::as_str) == Some("started")
+            {
+                append_codex_subagent_spawn_fact(item, facts);
+                return;
+            }
             if item.get("type").and_then(Value::as_str) != Some("UserMessage") {
                 facts.push(CanonicalObservationFactV1::Unknown {
                     native_kind: "item_completed".to_string(),
@@ -460,6 +473,99 @@ fn append_codex_event_facts(
             native_kind: "event_msg".to_string(),
             state: CanonicalUnknownStateV1::Absent,
         }),
+    }
+}
+
+/// One `item_completed` `SubAgentActivity` `started` item: the parent
+/// rollout's only record binding a spawned thread (`agent_thread_id`) to the
+/// `spawn_agent` call that started it (`id`, the call's `call_id`). Either
+/// missing leaves the item typed malformed rather than a partial spawn.
+fn append_codex_subagent_spawn_fact(item: &Value, facts: &mut Vec<CanonicalObservationFactV1>) {
+    let text = |key: &str| {
+        item.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let (Some(child), Some(call_id)) = (text("agent_thread_id"), text("id")) else {
+        facts.push(CanonicalObservationFactV1::Unknown {
+            native_kind: "item_completed.SubAgentActivity".to_string(),
+            state: CanonicalUnknownStateV1::Malformed,
+        });
+        return;
+    };
+    let mut content = serde_json::Map::new();
+    content.insert(
+        "tool_use_id".to_string(),
+        Value::String(call_id.to_string()),
+    );
+    if let Some(agent_path) = text("agent_path") {
+        content.insert("text".to_string(), Value::String(agent_path.to_string()));
+    }
+    facts.push(CanonicalObservationFactV1::Workflow {
+        evidence_kind: CanonicalWorkflowEvidenceKindV1::Subagent,
+        reference: Some(child.to_string()),
+        content: Some(Value::Object(content)),
+    });
+}
+
+/// One `item_completed` `FileChange` item: Codex's record of an applied patch.
+/// `changes` maps each path to `{type: add|update|delete, ...}`; `status`
+/// reports whether the apply succeeded. Only a completed apply becomes
+/// file-edit evidence, one fact per path, timed by the item's own
+/// `completed_at_ms` when present and the record timestamp otherwise. Diff
+/// bodies and file contents never leave the native record.
+fn append_codex_file_change_facts(
+    payload: &Value,
+    item: &Value,
+    timestamp: Option<i64>,
+    facts: &mut Vec<CanonicalObservationFactV1>,
+) {
+    let Some(changes) = item.get("changes").and_then(Value::as_object) else {
+        facts.push(CanonicalObservationFactV1::Unknown {
+            native_kind: "item_completed.FileChange".to_string(),
+            state: CanonicalUnknownStateV1::Malformed,
+        });
+        return;
+    };
+    if item.get("status").and_then(Value::as_str) != Some("completed") {
+        facts.push(CanonicalObservationFactV1::Unknown {
+            native_kind: "item_completed.FileChange".to_string(),
+            state: CanonicalUnknownStateV1::Unsupported,
+        });
+        return;
+    }
+    let edited_at_micros = payload
+        .get("completed_at_ms")
+        .and_then(Value::as_i64)
+        .and_then(|millis| millis.checked_mul(1_000))
+        .or_else(|| timestamp.and_then(|secs| secs.checked_mul(1_000_000)));
+    for (path, change) in changes.iter().filter(|(path, _)| !path.is_empty()) {
+        let mut content = serde_json::Map::new();
+        content.insert("type".to_string(), Value::String("FileChange".to_string()));
+        if let Some(id) = item.get("id").filter(|id| id.is_string()) {
+            content.insert("id".to_string(), id.clone());
+        }
+        if let Some(edited_at_micros) = edited_at_micros {
+            content.insert(
+                "edited_at_micros".to_string(),
+                Value::from(edited_at_micros),
+            );
+        }
+        if let Some(change_type) = change.get("type").and_then(Value::as_str) {
+            content.insert(
+                "change_type".to_string(),
+                Value::String(change_type.to_string()),
+            );
+        }
+        if let Some(diff) = change.get("unified_diff").and_then(Value::as_str) {
+            let hunks = diff.lines().filter(|line| line.starts_with("@@")).count();
+            content.insert("hunks".to_string(), Value::from(hunks));
+        }
+        facts.push(CanonicalObservationFactV1::Git {
+            evidence_kind: CanonicalGitEvidenceKindV1::FileEdit,
+            reference: Some(path.clone()),
+            content: Some(Value::Object(content)),
+        });
     }
 }
 
@@ -636,13 +742,13 @@ fn append_codex_turn_lifecycle_fact(
 ) {
     // Exact singular task_complete / task_started / turn_aborted only
     // (write_codex_rollout_with_structured_events, task_events_become_turn_boundary_rows).
-    // Do not index last_agent_message as content — classic turn rows exclude it.
+    // Do not index last_agent_message as content. Classic turn rows exclude it.
     let provider_reference = payload
         .get("turn_id")
         .and_then(Value::as_str)
         .filter(|turn_id| !turn_id.is_empty())
         .map(str::to_string);
-    // Keep native `reason` in content only — do not promote it to status
+    // Keep native `reason` in content only. Do not promote it to status
     // (no fixture evidence that abort reason is a workflow status vocabulary).
     let mut content = serde_json::Map::new();
     content.insert("type".to_string(), Value::String(event.to_string()));
@@ -744,7 +850,7 @@ fn append_codex_response_item_facts(
                     return;
                 }
                 facts.push(CanonicalObservationFactV1::Message {
-                    role: canonical_message_role(role),
+                    role: crate::content::canonical_message_role(role),
                     content,
                     model: payload
                         .get("model")
@@ -893,16 +999,6 @@ fn timestamp_from_record(record: &Value) -> Option<i64> {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(parse_rfc3339_timestamp)
-}
-
-fn canonical_message_role(role: Option<&str>) -> CanonicalMessageRoleV1 {
-    match role {
-        Some("user") => CanonicalMessageRoleV1::User,
-        Some("assistant") => CanonicalMessageRoleV1::Assistant,
-        Some("system" | "developer") => CanonicalMessageRoleV1::System,
-        Some("tool") => CanonicalMessageRoleV1::Tool,
-        _ => CanonicalMessageRoleV1::Unknown,
-    }
 }
 
 fn canonical_native_observation_id(
@@ -1146,5 +1242,61 @@ mod provider_usage_tests {
             envelope.relations().message_id().map(ObservationId::as_str),
             Some("user-item-1")
         );
+    }
+
+    fn subagent_activity(item: serde_json::Value) -> Vec<CanonicalObservationFactV1> {
+        let native = json!({
+            "timestamp": "2026-09-02T00:39:03.193Z",
+            "type": "event_msg",
+            "payload": {"type": "item_completed", "thread_id": "parent-thread", "item": item}
+        });
+        super::normalize_codex_observation(
+            &native,
+            "parent-thread",
+            Some("parent-thread"),
+            ObservationId::new("record.fixture").unwrap(),
+            ObservationSourceRangeV1::new(10, 20).unwrap(),
+        )
+        .unwrap()
+        .facts()
+        .to_vec()
+    }
+
+    #[test]
+    fn subagent_activity_started_records_the_spawned_thread_and_its_call() {
+        let facts = subagent_activity(json!({
+            "type": "SubAgentActivity", "id": "call_oRAA9a98",
+            "kind": "started", "agent_thread_id": "child-thread", "agent_path": "/root/explorer"
+        }));
+        assert_eq!(
+            facts,
+            vec![CanonicalObservationFactV1::Workflow {
+                evidence_kind: tracedecay_domain::CanonicalWorkflowEvidenceKindV1::Subagent,
+                reference: Some("child-thread".to_owned()),
+                content: Some(json!({"tool_use_id": "call_oRAA9a98", "text": "/root/explorer"})),
+            }]
+        );
+
+        let interacted = subagent_activity(json!({
+            "type": "SubAgentActivity", "id": "call_later",
+            "kind": "interacted", "agent_thread_id": "child-thread"
+        }));
+        assert!(
+            interacted
+                .iter()
+                .all(|fact| !matches!(fact, CanonicalObservationFactV1::Workflow { .. })),
+            "only the started item names the spawning call: {interacted:?}"
+        );
+
+        let unnamed = subagent_activity(json!({
+            "type": "SubAgentActivity", "id": "call_x", "kind": "started"
+        }));
+        assert!(matches!(
+            unnamed.as_slice(),
+            [CanonicalObservationFactV1::Unknown {
+                state: tracedecay_domain::CanonicalUnknownStateV1::Malformed,
+                ..
+            }]
+        ));
     }
 }

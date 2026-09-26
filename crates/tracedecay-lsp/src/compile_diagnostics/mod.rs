@@ -1,6 +1,6 @@
 //! Compile/type-check diagnostics, normalised across languages.
 //!
-//! 5.0 ships the Rust driver (`cargo check --message-format=json`) — the
+//! 5.0 ships the Rust driver (`cargo check --message-format=json`), the
 //! largest single Bash:tracedecay gap in the 2026-05-04 telemetry scan
 //! (777 invocations). TypeScript (`tsc --noEmit`) and Python (`pyright`)
 //! drivers land in follow-up commits.
@@ -14,6 +14,7 @@ mod cache;
 mod fingerprint;
 pub mod python;
 pub mod rust;
+pub mod tsconfig;
 pub mod typescript;
 
 use std::path::{Path, PathBuf};
@@ -36,6 +37,8 @@ pub struct Diagnostic {
     pub line_start: u32,
     /// 1-based inclusive end line. Equal to `line_start` for single-line spans.
     pub line_end: u32,
+    /// 1-based start column; `1` when the compiler reported none.
+    pub column: u32,
     /// Severity. Common values: `"error"`, `"warning"`, `"note"`. Drivers
     /// pass through whatever the compiler reports.
     pub level: String,
@@ -44,7 +47,7 @@ pub struct Diagnostic {
     pub code: String,
     /// Human-readable message.
     pub message: String,
-    /// Driver source — `"rust"`, `"typescript"`, etc. Useful when a project
+    /// Driver source, `"rust"`, `"typescript"`, etc. Useful when a project
     /// runs multiple drivers in one pass.
     pub driver: &'static str,
 }
@@ -68,7 +71,7 @@ pub trait Driver {
     fn name(&self) -> &'static str;
 
     /// True when `project_root` looks like the kind of project this driver
-    /// handles. Cheap probe — typically existence of a manifest file.
+    /// handles. Cheap probe, typically existence of a manifest file.
     fn detect(&self, project_root: &Path) -> bool;
 
     /// Run the diagnostic pass over `scope`. Implementations are async
@@ -102,7 +105,7 @@ pub async fn run_all(project_root: &Path, scope: &Scope) -> Result<Vec<Diagnosti
     Ok(all)
 }
 
-/// Whether the Rust diagnostics build is "cold" — i.e. the private cargo
+/// Whether the Rust diagnostics build is "cold", i.e. the private cargo
 /// target dir does not exist yet or is effectively empty. The first
 /// `cargo check` against a cold tree builds every dependency from scratch and
 /// can block for minutes on a large workspace; the MCP layer uses this to
@@ -210,6 +213,7 @@ mod tests {
             file: "src/lib.rs".to_string(),
             line_start: 1,
             line_end: 1,
+            column: 1,
             level: "error".to_string(),
             code: "E0000".to_string(),
             message: message.to_string(),

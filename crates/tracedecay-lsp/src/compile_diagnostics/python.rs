@@ -7,7 +7,7 @@
 //! the rule name into the `code` slot.
 //!
 //! Detection probes for `pyrightconfig.json` or `pyproject.toml`. Either
-//! one is enough — pyright resolves Python sources from there. We do not
+//! one is enough, pyright resolves Python sources from there. We do not
 //! probe loose `.py` trees because pyright's defaults in that case skip
 //! cross-file resolution and the diagnostics it emits are mostly
 //! "missing imports" noise rather than real errors.
@@ -67,7 +67,7 @@ impl Driver for PyrightDriver {
 }
 
 /// Parse a pyright `--outputjson` document into a flat diagnostic list.
-/// Returns an empty Vec for unparseable input rather than erroring — a
+/// Returns an empty Vec for unparseable input rather than erroring, a
 /// pyright crash shouldn't take down a sync.
 #[hotpath::measure(label = "compile_diagnostics.python.parse")]
 pub fn parse_pyright_output(stdout: &str, project_root: &Path) -> Vec<Diagnostic> {
@@ -88,6 +88,8 @@ pub fn parse_pyright_output(stdout: &str, project_root: &Path) -> Vec<Diagnostic
                 file,
                 line_start,
                 line_end,
+                // pyright characters are 0-based; normalise to 1-based.
+                column: d.range.start.character.saturating_add(1),
                 level: d.severity,
                 code: d.rule.unwrap_or_default(),
                 message: d.message,
@@ -122,6 +124,8 @@ struct PyrightRange {
 #[derive(Debug, Deserialize, Clone, Copy)]
 struct PyrightPosition {
     line: u32,
+    #[serde(default)]
+    character: u32,
 }
 
 #[cfg(test)]

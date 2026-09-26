@@ -1,7 +1,7 @@
 //! The TypeScript/JavaScript half of the unmounted-file audit.
 //!
 //! "Unmounted" is a weaker claim here than in cargo, and the report says so
-//! rather than borrowing Rust's certainty. Rust has one authority — a file the
+//! rather than borrowing Rust's certainty. Rust has one authority, a file the
 //! module tree does not reach is a file the compiler never parses. A TS project
 //! has two: the bundler follows imports from an entry point, while `tsc`
 //! type-checks everything a `tsconfig` `include` glob matches whether or not
@@ -21,7 +21,7 @@
 //! named in `scripts`), the string literals in root-level `*.config.*` files
 //! (this is how `rsbuild.config.ts`'s `source.entry` and `vitest.config.ts`'s
 //! `setupFiles` are found without executing them), `tsconfig` `files`, and the
-//! conventional roots a runner discovers on its own — tests, stories, ambient
+//! conventional roots a runner discovers on its own, tests, stories, ambient
 //! `.d.ts`, `src/index.*`, and the Next.js `app/`+`pages/` route files.
 //!
 //! Package discovery walks to every `package.json`, exactly as the cargo half
@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use tracedecay_code_extraction::{LanguageExtractor, TypeScriptExtractor};
+use tracedecay_domain::blank_json_comments;
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tree_sitter::Node;
 
@@ -51,14 +52,14 @@ const RESOLUTION_EXTENSIONS: [&str; 9] =
     ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "d.ts"];
 
 const TYPESCRIPT_VERDICT: &str = "no static import, require, or export-from path reaches this file from any declared entry \
-     point — nothing links it into a program (`tsc` may still type-check it via a tsconfig \
+     point, nothing links it into a program (`tsc` may still type-check it via a tsconfig \
      `include`)";
 
 const TYPESCRIPT_BLIND_SPOTS: [&str; 6] = [
     "a dynamic `import(expr)` or `require(expr)` whose specifier is not a literal is not \
      followed, so a file reached only that way reads as unmounted",
-    "aliases declared outside tsconfig `paths` — webpack/vite/rspack `resolve.alias`, jest \
-     `moduleNameMapper` — are not resolved",
+    "aliases declared outside tsconfig `paths`, webpack/vite/rspack `resolve.alias`, jest \
+     `moduleNameMapper`, are not resolved",
     "glob imports (`import.meta.glob`, `require.context`) and plugin-generated virtual modules \
      are not expanded",
     "a file reached only from HTML, CSS, a JSON manifest, or a runtime string is not seen",
@@ -165,7 +166,7 @@ pub(super) fn audit(files: &ProjectFiles) -> Result<EcosystemAudit> {
             package: package.name.clone(),
             manifest: package.manifest.clone(),
             // An unimported file has no "nearest mounted parent" to repair
-            // against, and no single import line would be the right fix — the
+            // against, and no single import line would be the right fix, the
             // file is either dead or reached through a blind spot. Inventing a
             // suggestion here would invent a caller.
             nearest_mounted_parent: None,
@@ -192,7 +193,7 @@ pub(super) fn audit(files: &ProjectFiles) -> Result<EcosystemAudit> {
 
 /// The manifest directory that owns `file`: the deepest one above it.
 ///
-/// A nested package is a claim boundary exactly as a nested `Cargo.toml` is —
+/// A nested package is a claim boundary exactly as a nested `Cargo.toml` is,
 /// an outer package must never be blamed for, nor credited with, a file that
 /// belongs to an inner one.
 fn deepest_package_dir<'a>(dirs: &'a [PathBuf], file: &Path) -> Option<&'a Path> {
@@ -238,7 +239,7 @@ fn node_package(
         }
         collect_string_leaves(manifest.get("bin"), &mut specifiers);
         collect_string_leaves(manifest.get("exports"), &mut specifiers);
-        // `scripts` names the files a repository actually runs — `tsx
+        // `scripts` names the files a repository actually runs, `tsx
         // codegen/src/cli.ts generate` is an entry point in every sense that
         // matters, and it is nowhere else in the manifest.
         if let Some(scripts) = manifest.get("scripts").and_then(Value::as_object) {
@@ -305,7 +306,7 @@ fn node_package(
         }
     }
 
-    // Roots a runner discovers by convention rather than by declaration —
+    // Roots a runner discovers by convention rather than by declaration,
     // only this package's own, never a nested package's.
     for candidate in owned
         .iter()
@@ -325,7 +326,7 @@ fn node_package(
     })
 }
 
-/// Every string value anywhere inside a JSON value — how `exports` and `bin`
+/// Every string value anywhere inside a JSON value, how `exports` and `bin`
 /// name files without a fixed shape.
 fn collect_string_leaves(value: Option<&Value>, out: &mut Vec<String>) {
     match value {
@@ -391,7 +392,7 @@ fn is_conventional_entry(package_dir: &Path, file: &Path) -> bool {
             // Next.js routes: every `page`/`layout`/`route`/… file under
             // `app/` or `pages/` (at the package root or under `src/`) is an
             // entry the framework mounts itself. The directory test is narrow
-            // on purpose — treating any `src/**/page.tsx` as an entry would
+            // on purpose, treating any `src/**/page.tsx` as an entry would
             // silently mount a plain component in a router-less app.
             let router_root = match segments.as_slice() {
                 [first, ..] if first == "app" || first == "pages" => true,
@@ -483,52 +484,7 @@ fn tsconfig_declarations(dir: &Path) -> (Vec<AliasRule>, Vec<PathBuf>, Vec<Strin
 /// Parses a tsconfig, which is JSON with comments in practice.
 fn read_jsonc(path: &Path) -> Option<Value> {
     let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Value>(&strip_json_comments(&text)).ok()
-}
-
-/// Removes `//` and `/* … */` comments without touching string contents.
-fn strip_json_comments(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(current) = chars.next() {
-        match current {
-            '"' => {
-                out.push(current);
-                while let Some(inner) = chars.next() {
-                    out.push(inner);
-                    match inner {
-                        '\\' => {
-                            if let Some(escaped) = chars.next() {
-                                out.push(escaped);
-                            }
-                        }
-                        '"' => break,
-                        _ => {}
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                for inner in chars.by_ref() {
-                    if inner == '\n' {
-                        out.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut previous = '\0';
-                for inner in chars.by_ref() {
-                    if previous == '*' && inner == '/' {
-                        break;
-                    }
-                    previous = inner;
-                }
-            }
-            _ => out.push(current),
-        }
-    }
-    out
+    serde_json::from_str::<Value>(&blank_json_comments(&text)).ok()
 }
 
 /// Every static string literal in a config file's syntax tree.
@@ -599,8 +555,8 @@ fn walk_imports(package: &NodePackage, mounted: &mut HashSet<PathBuf>) {
 ///
 /// `import` statements come from the same extractor the code graph is built
 /// from, so the audit and the graph cannot disagree about what a file imports.
-/// The three remaining specifier-bearing forms — `export … from`,
-/// `require(…)`, and dynamic `import(…)` — are read off the same tree-sitter
+/// The three remaining specifier-bearing forms, `export … from`,
+/// `require(…)`, and dynamic `import(…)`, are read off the same tree-sitter
 /// grammar the extractor uses, because the extractor does not emit them as
 /// import evidence today.
 fn module_specifiers(file: &Path, source: &str) -> Vec<String> {
@@ -681,12 +637,12 @@ fn unquote(text: &str) -> Option<String> {
 
 /// The files a specifier may name, from the importing file's position.
 fn resolve_specifier(package: &NodePackage, from: &Path, specifier: &str) -> Vec<PathBuf> {
-    // `./x?raw`, `./x?url` — bundler query suffixes name the same file.
+    // `./x?raw`, `./x?url`, bundler query suffixes name the same file.
     let specifier = specifier.split(['?', '#']).next().unwrap_or(specifier);
     if specifier.is_empty() {
         return Vec::new();
     }
-    // `.`, `..`, `./x`, `../x` — every form that names a sibling rather than a
+    // `.`, `..`, `./x`, `../x`, every form that names a sibling rather than a
     // package. A bare `.` is a directory import and resolves to its `index`.
     if matches!(specifier, "." | "..")
         || specifier.starts_with("./")
@@ -793,10 +749,8 @@ fn names_javascript(path: &Path) -> bool {
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use serde_json::Value;
-
     use super::super::tests::{project, write};
-    use super::{AliasRule, EcosystemAudit, audit, strip_json_comments};
+    use super::{AliasRule, EcosystemAudit, audit};
 
     fn audit_typescript(root: &Path) -> EcosystemAudit {
         audit(&project(root)).expect("TypeScript audit")
@@ -1115,15 +1069,6 @@ mod tests {
         let audit = audit_typescript(root);
         assert!(audit.unmounted.is_empty());
         assert_eq!(audit.unclaimed_file_count, 1);
-    }
-
-    #[test]
-    fn json_comments_are_stripped_without_touching_strings() {
-        let stripped =
-            strip_json_comments("{\n // a\n \"url\": \"http://x/y\", /* b */ \"n\": 1\n}");
-        let parsed = serde_json::from_str::<Value>(&stripped).expect("json");
-        assert_eq!(parsed["url"], Value::from("http://x/y"));
-        assert_eq!(parsed["n"], Value::from(1));
     }
 
     #[test]

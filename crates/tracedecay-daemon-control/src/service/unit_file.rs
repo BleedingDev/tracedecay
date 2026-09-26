@@ -8,7 +8,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 use super::runner::ServicePlatform;
 use super::{
     DaemonServiceSpec, SERVICE_TEMP_SEQUENCE, ServiceNamespace, home_for_service_env,
-    plist_xml_escape, plist_xml_unescape, windows_task,
+    windows_task, xml_escape, xml_unescape,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,11 +115,6 @@ pub(super) fn atomic_replace_service_unit_with(
     replacement_result
 }
 
-pub(super) fn write_service_unit(spec: &DaemonServiceSpec) -> Result<PathBuf> {
-    let namespace = ServiceNamespace::current()?;
-    write_service_unit_for(spec, &namespace)
-}
-
 pub(super) fn write_service_unit_for(
     spec: &DaemonServiceSpec,
     namespace: &ServiceNamespace,
@@ -152,11 +147,6 @@ pub(super) fn installed_service_socket_path_for(
     Ok(socket_path_from_unit_text(&unit))
 }
 
-pub(super) fn read_service_unit(service_path: &Path) -> Result<String> {
-    let namespace = ServiceNamespace::current()?;
-    read_service_unit_for(service_path, &namespace)
-}
-
 pub(super) fn read_service_unit_for(
     service_path: &Path,
     namespace: &ServiceNamespace,
@@ -164,14 +154,11 @@ pub(super) fn read_service_unit_for(
     match ServicePlatform::current()? {
         ServicePlatform::WindowsTask => windows_task::registered_task_xml_for(namespace)?
             .ok_or_else(|| TraceDecayError::Config {
-                message: format!(
-                    "daemon task \"{}\" is not registered",
-                    service_path.display()
-                ),
+                message: format!("daemon task '{}' is not registered", service_path.display()),
             }),
         ServicePlatform::Systemd | ServicePlatform::Launchd => {
             std::fs::read_to_string(service_path).map_err(|e| TraceDecayError::Config {
-                message: format!("failed to read service \"{}\": {e}", service_path.display()),
+                message: format!("failed to read service '{}': {e}", service_path.display()),
             })
         }
     }
@@ -193,12 +180,6 @@ pub(super) fn service_unit_exists_for(
 }
 
 #[hotpath::measure(label = "daemon.service.unit.remove")]
-pub(super) fn remove_service_unit(service_path: &Path) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    remove_service_unit_for(service_path, &namespace)
-}
-
-#[hotpath::measure(label = "daemon.service.unit.remove")]
 pub(super) fn remove_service_unit_for(
     service_path: &Path,
     namespace: &ServiceNamespace,
@@ -211,7 +192,7 @@ pub(super) fn remove_service_unit_for(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(TraceDecayError::Config {
                     message: format!(
-                        "failed to remove service \"{}\": {error}",
+                        "failed to remove service '{}': {error}",
                         service_path.display()
                     ),
                 }),
@@ -390,38 +371,38 @@ pub(super) fn remote_tls_from_service_unit(
 }
 
 pub(super) fn socket_path_from_launchd_plist(plist: &str) -> Option<PathBuf> {
-    let program_arguments_start = plist.find("<key>ProgramArguments</key>")?;
-    let arguments_text = &plist[program_arguments_start..];
-    let array_start = arguments_text.find("<array>")? + "<array>".len();
-    let after_array_start = &arguments_text[array_start..];
-    let array_end = after_array_start.find("</array>")?;
-    let array_text = &after_array_start[..array_end];
-    let strings = plist_string_values(array_text);
-
+    let strings = launchd_program_arguments(plist).ok()??;
     socket_path_from_args(strings.iter().map(String::as_str))
 }
 
 pub(super) fn remote_tls_from_launchd_plist(
     plist: &str,
 ) -> Result<Option<crate::RemoteBrainTlsConfig>> {
+    let Some(strings) = launchd_program_arguments(plist)? else {
+        return Ok(None);
+    };
+    remote_tls_from_args(strings.iter().map(String::as_str))
+}
+
+fn launchd_program_arguments(plist: &str) -> Result<Option<Vec<String>>> {
     let Some(program_arguments_start) = plist.find("<key>ProgramArguments</key>") else {
         return Ok(None);
     };
     let arguments_text = &plist[program_arguments_start..];
-    let array_start = arguments_text
-        .find("<array>")
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "installed launchd daemon service has malformed program arguments".to_string(),
-        })?
-        + "<array>".len();
-    let after_array_start = &arguments_text[array_start..];
-    let array_end = after_array_start
-        .find("</array>")
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "installed launchd daemon service has malformed program arguments".to_string(),
-        })?;
-    let strings = plist_string_values(&after_array_start[..array_end]);
-    remote_tls_from_args(strings.iter().map(String::as_str))
+    let Some(array_relative) = arguments_text.find("<array>") else {
+        return Err(malformed_launchd_program_arguments());
+    };
+    let after_array_start = &arguments_text[array_relative + "<array>".len()..];
+    let Some(array_end) = after_array_start.find("</array>") else {
+        return Err(malformed_launchd_program_arguments());
+    };
+    Ok(Some(plist_string_values(&after_array_start[..array_end])))
+}
+
+fn malformed_launchd_program_arguments() -> TraceDecayError {
+    TraceDecayError::Config {
+        message: "installed launchd daemon service has malformed program arguments".to_string(),
+    }
 }
 
 pub(super) fn launchd_plist_env_value(plist: &str, name: &str) -> Option<String> {
@@ -432,7 +413,7 @@ pub(super) fn launchd_plist_env_value(plist: &str, name: &str) -> Option<String>
     let dict_end = after_dict_start.find("</dict>")?;
     let dict_text = &after_dict_start[..dict_end];
 
-    let key_tag = format!("<key>{}</key>", plist_xml_escape(name));
+    let key_tag = format!("<key>{}</key>", xml_escape(name));
     let key_end = dict_text.find(&key_tag)? + key_tag.len();
     plist_string_values(&dict_text[key_end..])
         .into_iter()
@@ -462,7 +443,7 @@ pub(super) fn service_env_value_from_unit(unit: &str, name: &str) -> Result<Opti
 }
 
 fn launchd_env_value(plist: &str, name: &str) -> Result<Option<String>> {
-    let key_tag = format!("<key>{}</key>", plist_xml_escape(name));
+    let key_tag = format!("<key>{}</key>", xml_escape(name));
     let env_start = plist.find("<key>EnvironmentVariables</key>");
     if let Some(env_start) = env_start {
         let after_env = &plist[env_start..];
@@ -518,7 +499,7 @@ fn plist_string_values(text: &str) -> Vec<String> {
         let Some(end) = after_start.find("</string>") else {
             break;
         };
-        values.push(plist_xml_unescape(&after_start[..end]));
+        values.push(xml_unescape(&after_start[..end]));
         remaining = &after_start[end + "</string>".len()..];
     }
     values

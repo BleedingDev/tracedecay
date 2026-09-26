@@ -31,15 +31,33 @@ class SdkPublishWorkflowPolicyTests(unittest.TestCase):
         self.assertNotEqual(workflow, self.workflow, "mutation must change the workflow")
         with tempfile.TemporaryDirectory() as scratch:
             path = Path(scratch) / "release.yml"
-            path.write_text(workflow, encoding="utf-8")
             self.checker.WORKFLOW_PATH = path
+            path.write_text(self.workflow, encoding="utf-8")
+            self.checker.main()
+            path.write_text(workflow, encoding="utf-8")
             with self.assertRaises(SystemExit):
                 self.checker.main()
 
-    def test_rejects_dropping_the_release_trigger(self) -> None:
+    def test_rejects_dropping_the_release_dispatch(self) -> None:
         mutated = self.workflow.replace(
-            "on:\n  release:\n    types: [published]\n  workflow_dispatch:",
-            "on:\n  workflow_dispatch:",
+            "on:\n"
+            "  workflow_dispatch:\n"
+            "    inputs:\n"
+            "      release_tag:\n"
+            '        description: "Stable release tag to build or recover"\n'
+            "        required: true\n"
+            "        type: string\n",
+            "on:\n"
+            "  push:\n"
+            "    branches: [master]\n",
+            1,
+        )
+        self.assert_rejected(mutated)
+
+    def test_rejects_restoring_the_release_trigger(self) -> None:
+        mutated = self.workflow.replace(
+            "on:\n  workflow_dispatch:\n",
+            "on:\n  release:\n    types: [published]\n  workflow_dispatch:\n",
             1,
         )
         self.assert_rejected(mutated)
@@ -121,8 +139,9 @@ class SdkPublishWorkflowPolicyTests(unittest.TestCase):
 
     def test_rejects_missing_sdk_registry_client_parity_gate(self) -> None:
         mutated = self.workflow.replace(
-            "      - name: Verify canonical SDK registry-client parity\n"
-            "        run: scripts/check-sdk-codegen.sh\n\n",
+            "      - name: Verify generated contracts and SDK sources\n"
+            "        working-directory: dashboard\n"
+            "        run: pnpm run contracts:check\n\n",
             "",
             1,
         )

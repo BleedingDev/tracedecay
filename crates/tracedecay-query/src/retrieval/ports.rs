@@ -29,6 +29,20 @@ pub trait RetrievalExecutionControl: Send + Sync {
     fn elapsed_micros(&self) -> u64;
 }
 
+/// One sealed lexical artifact page's worth of candidate work. Readers keep
+/// streaming rows, but consult request authority before starting the next page.
+pub const RETRIEVAL_CANDIDATE_BATCH_SIZE: usize = 128;
+
+pub(crate) fn retrieval_checkpoint(
+    control: &dyn RetrievalExecutionControl,
+) -> Result<(), RetrievalPortError> {
+    if control.is_cancelled() {
+        Err(RetrievalPortError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
 /// Incompatible indexes or models never trigger silent fallback.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RetrievalPortError {
@@ -40,6 +54,10 @@ pub enum RetrievalPortError {
     GenerationMismatch,
     #[error("lane authority is unavailable: {0}")]
     AuthorityUnavailable(String),
+    /// The process resident-memory authority refused the work's reservation.
+    /// Retrying before memory is given back reproduces the refusal.
+    #[error("resident memory refused the work: {0}")]
+    ResidentMemoryRefused(String),
     #[error("lane projection is incompatible with the request profile")]
     IncompatibleProjection,
     #[error("the read port observed stale evidence")]
@@ -54,7 +72,7 @@ pub enum RetrievalPortError {
 
 impl RetrievalPortError {
     /// True when this failure is a deterministic contract violation that the
-    /// same input reproduces on every pass — a wrong filesystem mode, a
+    /// same input reproduces on every pass, a wrong filesystem mode, a
     /// symlinked or non-directory store path, a corrupt identity. Background
     /// workers park these visibly instead of masking them as warming, unlike
     /// transient capacity, availability, staleness, and cancellation failures
@@ -69,7 +87,10 @@ impl From<RetrievalPortError> for RetrievalError {
         match error {
             RetrievalPortError::CapabilityManifestRejected => Self::CapabilityManifestRejected,
             RetrievalPortError::GenerationMismatch => Self::GenerationMismatch,
-            RetrievalPortError::AuthorityUnavailable(detail) => Self::AuthorityUnavailable(detail),
+            RetrievalPortError::AuthorityUnavailable(detail)
+            | RetrievalPortError::ResidentMemoryRefused(detail) => {
+                Self::AuthorityUnavailable(detail)
+            }
             RetrievalPortError::IncompatibleProjection => Self::IncompatibleProjection,
             RetrievalPortError::StaleEvidence => Self::StaleEvidence,
             RetrievalPortError::Cancelled => Self::Cancelled,

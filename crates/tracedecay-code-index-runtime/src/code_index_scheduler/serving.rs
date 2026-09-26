@@ -1,14 +1,11 @@
 //! Serving handles for the latest complete generation: query owners, the
 //! durable lexical text artifact, and graph activation state.
 mod family_report;
-#[cfg(test)]
-mod similar_tests;
 
 use std::{
     collections::VecDeque,
-    fs::File,
     io::Read,
-    num::{NonZeroU64, NonZeroUsize},
+    num::NonZeroU64,
     path::{Path, PathBuf},
     sync::{
         Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, RwLock,
@@ -26,8 +23,9 @@ use tracedecay_code_extraction::{
 };
 use tracedecay_code_index_retention::code_index_generations::{
     CodeGenerationStoreLockV1, DurableCodeTextArtifactDescriptorV1, DurablePublicationPointerV1,
-    DurableSealedCodeGenerationIdentityV1, attach_verified_text_artifact_under_lock,
-    code_text_artifact_path, code_text_artifacts_root, replace_verified_text_artifact_under_lock,
+    DurableSealedCodeGenerationIdentityV1, acquire_generation_segments_publication_lock,
+    attach_verified_text_artifact_under_lock, code_text_artifact_path,
+    code_text_artifact_staging_root, code_text_artifacts_root, find_shared_text_artifact,
     try_acquire_code_generation_store_lock, withdraw_verified_text_artifact_under_lock,
 };
 use tracedecay_contracts::{
@@ -41,15 +39,14 @@ use tracedecay_contracts::{
 use tracedecay_domain::{
     CodeGenerationId, CodeGenerationSourceCommitmentsV1, ComponentRevision,
     ExactAdmissionRuleRevision, ManifestDigest, ProjectId, RetrievalBudget, RetrieverBatch,
-    RetrieverOutcome, ScoreDomainId, WorktreeId, canonical_sha256,
-    canonical_text::encode_lowercase_hex, sha256_hex_suffix,
+    RetrieverOutcome, ScoreDomainId, WorktreeId, canonical_text::encode_lowercase_hex,
+    sha256_hex_suffix,
 };
-use tracedecay_private_fs::{
-    make_private_directory, open_private_file, validate_private_directory,
-};
+use tracedecay_private_fs::{open_private_file, validate_private_directory};
 use tracedecay_runtime_core::resident_memory::{
     ProcessResidentMemoryV1, ResidentMemoryComponentIdV1, ResidentMemoryKeyV1,
-    ResidentMemoryReservationV1, sampled_process_resident_bytes_v1,
+    ResidentMemoryReservationV1, ResidentOwnersV1, log_resident_owner_release_v1,
+    release_process_allocator_memory_v1, sampled_process_resident_bytes_v1,
 };
 
 use crate::{
@@ -59,10 +56,9 @@ use crate::{
             CodeIndexExecutionControlV1, CodeIndexProductionErrorV1,
             CodeIndexPublicationStoreErrorV1, CodeIndexPublishedGenerationV1,
             SealedGenerationSegmentReadV1, VerifiedSealedLexicalCursorRestoreErrorV1,
-            VerifiedSealedLexicalCursorV1, VerifiedSealedLexicalPageBatchBoundsV1,
-            VerifiedSealedLexicalPageBatchReadV1, VerifiedSealedLexicalPageReadV1,
-            VerifiedSealedLexicalPageSourceV1, VerifiedSealedLexicalPageV1,
-            VerifiedSealedLexicalSourceReceiptV1, VerifiedSealedTextGenerationMetadataV1,
+            VerifiedSealedLexicalPageBatchBoundsV1, VerifiedSealedLexicalPageBatchReadV1,
+            VerifiedSealedLexicalPageSourceV1, VerifiedSealedLexicalSourceReceiptV1,
+            VerifiedSealedTextGenerationMetadataV1,
         },
     },
     query::retrieval::{
@@ -72,39 +68,33 @@ use crate::{
         },
         graph::{GraphLane, production_code_index_freshness},
         lexical::{
-            AuthenticatedCloneFingerprintArtifactReadV1,
-            AuthenticatedCloneSelectedBlockArtifactReadV1,
             CLONE_FINGERPRINT_CANDIDATE_BODY_BUDGET_V1, CLONE_FINGERPRINT_HOT_POSTING_THRESHOLD_V1,
             CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1, CLONE_NEAR_MATCH_BODY_COMPARISON_BUDGET_V1,
             CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1, CLONE_NEAR_MATCH_TOKEN_WORK_BUDGET_V1,
             CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
-            CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1, CloneFingerprintPartialReasonV1,
-            CloneFingerprintReadAccountingV1, CloneFingerprintStreamDescriptorV1,
-            CloneSelectedBlockV1, CodeExactLexicalArtifactReaderV1, CodeLexicalArtifactBuilderV1,
-            CodeLexicalArtifactErrorV1, CodeLexicalArtifactFinalizationPhaseV1,
-            CodeLexicalArtifactFinalizationStepV1, CodeLexicalArtifactOccurrenceV1,
-            CodeLexicalArtifactReaderV1, CodeLexicalArtifactWriterRevisionV1,
-            CodeLexicalCloneIndexCensusV1, CodeLexicalCloneSuccessorV1,
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1, CodeExactLexicalArtifactReaderV1,
+            CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
+            CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
+            CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
+            CodeLexicalCloneIndexCensusV1, CodeLexicalCloneRouteV1,
             CodeLexicalProjectionMetadataV1, LexicalLane, LexicalLaneEvidence, LexicalLaneRequest,
-            LexicalLaneRetriever, code_lexical_artifact_build_memory_budget_for,
+            LexicalLaneRetriever, PreparedCodeLexicalArtifactPageV1,
+            code_lexical_artifact_build_memory_budget_for, code_lexical_artifact_content_key,
         },
-        ports::RetrievalPortError,
+        ports::{RETRIEVAL_CANDIDATE_BATCH_SIZE, RetrievalPortError},
     },
 };
 
-use super::{DaemonCodeIndexPublicationStoreV1, ProfiledStdMutex, queries};
+use super::{
+    CodeIndexSchedulerErrorV1, DaemonCodeIndexPublicationStoreV1, ProfiledStdMutex, queries,
+};
 
 /// Page bounds for streaming one sealed generation into the durable lexical
 /// text artifact. One page is one bounded unit of background build progress.
-pub(super) const TEXT_ARTIFACT_PAGE_CHUNKS_V1: usize = 128;
+pub(super) const TEXT_ARTIFACT_PAGE_CHUNKS_V1: usize = RETRIEVAL_CANDIDATE_BATCH_SIZE;
 const TEXT_ARTIFACT_PAGE_BYTES_V1: usize = 4 * 1024 * 1024;
-const CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1: usize = 128 * 1024 * 1024;
 const TEXT_ARTIFACT_BASE_BATCH_PAGES_V1: usize = 64;
 const TEXT_ARTIFACT_BASE_BATCH_BYTES_V1: usize = 64 * 1024 * 1024;
-/// Live JSON copies `append_clone_rows` holds for one clone body while the
-/// staged pages remain live: payload, occurrence, stored payload, comparison.
-const CLONE_SUCCESSOR_APPEND_LIVE_COPIES_V1: usize = 4;
 const TEXT_ARTIFACT_MAXIMUM_BATCH_SCALE_V1: usize = 8;
 /// One synchronous activation advances only this many page/finalization
 /// operations. Larger caller hints are clamped so work accounting cannot
@@ -124,60 +114,6 @@ pub(super) fn text_artifact_source_batch_limits(
     (pages, bytes, pages * 2)
 }
 
-/// Clone-successor page-batch bounds from the 128 MiB reservation ledger.
-///
-/// `open_builder_connection` grants the full `SQLite` cache. `append_clone_rows`
-/// then serializes payload/occurrence, reads the stored payload, and compares
-/// a second serialization while the batch's pages stay live, and the builder
-/// retains metadata. The batch byte ceiling is the remainder after those
-/// charges so resident-memory admission is not filled to the last byte.
-///
-/// The ceiling is capped at the scale-1 first-pass batch (64 MiB), while
-/// the first pass itself scales up to 8x, so a single page retained above
-/// this ceiling would be admitted there and refused here as a `Contract`
-/// error. That is unreachable in practice only because the sealed source
-/// caps every page at `TEXT_ARTIFACT_PAGE_BYTES_V1` (4 MiB) serialized.
-pub(super) fn clone_successor_source_batch_limits(
-    metadata: &CodeLexicalProjectionMetadataV1,
-) -> Result<(usize, usize), RetrievalPortError> {
-    clone_successor_source_batch_limits_from_charges(metadata.retained_owned_bytes())
-}
-
-pub(super) fn clone_successor_source_batch_limits_from_charges(
-    metadata_bytes: usize,
-) -> Result<(usize, usize), RetrievalPortError> {
-    let scratch = CLONE_SUCCESSOR_APPEND_LIVE_COPIES_V1
-        .checked_mul(TEXT_ARTIFACT_PAGE_BYTES_V1)
-        .ok_or_else(|| {
-            RetrievalPortError::Contract(
-                "clone-successor append-scratch ledger overflowed".to_owned(),
-            )
-        })?;
-    let fixed = CODE_LEXICAL_ARTIFACT_SQLITE_CACHE_BYTES_V1
-        .checked_add(metadata_bytes)
-        .and_then(|bytes| bytes.checked_add(scratch))
-        .ok_or_else(|| {
-            RetrievalPortError::Contract("clone-successor fixed ledger overflowed".to_owned())
-        })?;
-    if fixed >= CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1 {
-        return Err(RetrievalPortError::Contract(format!(
-            "clone-successor SQLite cache, metadata, and append scratch exhaust the {CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1}-byte reservation"
-        )));
-    }
-    let remaining = CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1 - fixed;
-    if remaining < TEXT_ARTIFACT_PAGE_BYTES_V1 {
-        return Err(RetrievalPortError::Contract(format!(
-            "clone-successor reservation leaves {remaining} bytes for pages, under the {TEXT_ARTIFACT_PAGE_BYTES_V1}-byte source page bound"
-        )));
-    }
-    let bytes = remaining.min(TEXT_ARTIFACT_BASE_BATCH_BYTES_V1);
-    let slot = std::mem::size_of::<VerifiedSealedLexicalPageV1>();
-    let pages = TEXT_ARTIFACT_BASE_BATCH_PAGES_V1
-        .min(bytes / slot.max(1))
-        .max(1);
-    Ok((pages, bytes))
-}
-
 /// Cancellation-checkpoint cadence for a wake parked behind another wake's
 /// corpus-sized verified head open. The parked wake re-checks its typed
 /// cancellation state at this interval, so shutdown or supersession surfaces
@@ -185,23 +121,10 @@ pub(super) fn clone_successor_source_batch_limits_from_charges(
 /// digest call that has not yet reached its own checkpoint.
 const TEXT_HEAD_OPEN_CANCELLATION_CHECK_INTERVAL_V1: Duration = Duration::from_millis(100);
 const TEXT_ARTIFACT_MAXIMUM_OWNER_WARMUP_ADVANCES_V1: usize = 10_000;
-/// Clone-fingerprint backfill slices a request may drive inline. The retained
-/// worker owns the rest after `request_query_background_reconcile`; more than
-/// one advance here re-owns the whole successor encode on a Tokio thread.
-const TEXT_ARTIFACT_MAXIMUM_CLONE_WARMUP_ADVANCES_V1: usize = 1;
 /// Rows digested by one scheduler finalization operation. The builder persists
 /// its exact section/row cursor after this bounded slice, avoiding both a
 /// corpus-sized wake and one scheduler wake per individual `SQLite` row.
 const TEXT_ARTIFACT_FINALIZATION_ROWS_PER_OPERATION_V1: usize = 4 * 1024;
-
-/// Outcome of the one-slice clone-fingerprint warmup on a similar/redundancy
-/// request. `Pending` means the retained worker owns remaining backfill —
-/// never collapse that into a hard `GenerationUnavailable` miss.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CloneSimilarityWarmupForRequestV1 {
-    Ready,
-    Pending,
-}
 
 pub(super) type GenerationServingCachesV1 = (
     CodeGenerationId,
@@ -520,8 +443,7 @@ pub struct LatestCodeTextGenerationV1 {
     /// A cold graph-off bind authenticates the sealed source once and hands
     /// that same reader to the artifact build. The full generation is never
     /// decoded merely to discover text metadata or source layout.
-    pub(super) preopened_source:
-        Arc<ProfiledStdMutex<Option<VerifiedSealedLexicalPageSourceV1<File>>>>,
+    pub(super) preopened_source: Arc<ProfiledStdMutex<Option<VerifiedSealedLexicalPageSourceV1>>>,
     pub(super) publication_binding: Option<Arc<DurableActiveSealedGenerationBindingV1>>,
 }
 
@@ -565,11 +487,9 @@ pub struct ProductionCodeIndexQueryOwnersV1 {
 }
 
 struct CloneIndexArtifactSnapshotV1 {
-    census: Option<CodeLexicalCloneIndexCensusV1>,
+    census: CodeLexicalCloneIndexCensusV1,
     format_revision: u32,
     bytes_on_disk: u64,
-    source_pages: u64,
-    has_fingerprints: bool,
 }
 
 impl ProductionCodeIndexQueryOwnersV1 {
@@ -597,18 +517,13 @@ impl ProductionCodeIndexQueryOwnersV1 {
         }
     }
 
-    fn clone_index_artifact(&self) -> Result<CloneIndexArtifactSnapshotV1, RetrievalPortError> {
-        Ok(CloneIndexArtifactSnapshotV1 {
-            census: self
-                .hydration
-                .clone_index_census()
-                .map_err(|error| RetrievalPortError::AuthorityUnavailable(error.to_string()))?
-                .map(|census| census.as_ref().clone()),
-            format_revision: self.hydration.artifact_format_revision(),
-            bytes_on_disk: self.hydration.verified_artifact().file_size_bytes(),
-            source_pages: self.hydration.verified_artifact().page_count(),
-            has_fingerprints: self.hydration.has_clone_fingerprints(),
-        })
+    fn clone_index_artifact(&self) -> CloneIndexArtifactSnapshotV1 {
+        let artifact = self.hydration.verified_artifact();
+        CloneIndexArtifactSnapshotV1 {
+            census: artifact.clone_index_census().clone(),
+            format_revision: artifact.format_revision(),
+            bytes_on_disk: artifact.file_size_bytes(),
+        }
     }
 
     pub(super) fn occurrence_by_binding(
@@ -659,16 +574,12 @@ impl ProductionCodeIndexQueryOwnersV1 {
     pub(crate) fn similar(
         &self,
         request: &tracedecay_query::code_search::CodeIndexSimilarRequestV1,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<
         Option<tracedecay_query::code_search::CodeIndexSimilarCompletedV1>,
         RetrievalPortError,
     > {
-        check_similar_control(control)?;
+        checkpoint_text_artifact_control(control)?;
         let source = match &request.target {
             tracedecay_query::code_search::CodeIndexSimilarTargetV1::SymbolOccurrence(
                 occurrence,
@@ -677,558 +588,56 @@ impl ProductionCodeIndexQueryOwnersV1 {
                 self.hydration.clone_body_by_source_range(path, *span)
             }
         }
-        .map_err(map_text_artifact_error)?;
+        .map_err(family_report::clone_artifact_error)?;
         let Some(source) = source else {
             return Ok(None);
         };
-        check_similar_control(control)?;
-        self.validate_similar_source(&source)?;
-        let similar_descriptor = similar_query_descriptor(
-            request,
-            &source,
-            self.hydration.verified_artifact().artifact_digest(),
-        )?;
-
-        let cursor_position = request
-            .cursor
-            .as_deref()
-            .map(|encoded| {
-                let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
-                    query_authority,
-                    retrieval_request,
-                )
-                .map_err(map_clone_cursor_error)?;
-                let decoded = codec
-                    .decode_artifact_unbound(
-                        encoded,
-                        self.hydration.verified_artifact().artifact_digest(),
-                        &self.hydration.metadata().generation,
-                        snapshot_digest,
-                        now,
-                    )
-                    .map_err(map_clone_cursor_error)?;
-                // Legacy ccclone2 payloads without the optional Similar
-                // descriptor remain authenticated at the codec boundary,
-                // but cannot safely resume a Similar request whose complete
-                // class set and source extent are unknown. Refuse them as
-                // stale here rather than silently weakening the binding.
-                if decoded.similar_query_descriptor.as_ref() != Some(&similar_descriptor) {
-                    return Err(RetrievalPortError::StaleEvidence);
-                }
-                Ok(decoded.after)
-            })
-            .transpose()?;
-        // A fingerprint cursor continues the near lane. Replaying it through
-        // the exact reader would fail its request-digest check, so the exact
-        // lane is deliberately omitted on that continuation. A near-start
-        // cursor is the authenticated phase boundary emitted when exact work
-        // filled the request page; it also skips exact, but is consumed before
-        // the near reader so the reader starts from its true beginning.
-        // Exact cursors continue exact families while the additive near lane
-        // starts a new page; the two readers have intentionally distinct
-        // cursor domains.
-        let continue_near = cursor_position.as_ref().is_some_and(|position| {
-            matches!(
-                position,
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
-                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
-                        ..
-                    }
-                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
-                        ..
-                    }
-            )
-        });
-        let near_phase_cursor = cursor_position.as_ref().is_some_and(|position| {
-            matches!(
-                position,
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
-            )
-        });
-        let near_cursor = (!near_phase_cursor && continue_near)
-            .then(|| request.cursor.as_deref())
-            .flatten();
-        let near_phase_cursor = near_phase_cursor
-            .then(|| request.cursor.as_deref())
-            .flatten();
-        let continue_near = near_cursor.is_some() || near_phase_cursor.is_some();
         // Request-wide budgets: share result_limit and work_limit across match
-        // classes instead of resetting a per-family page size on each key. An
-        // exact page may fill the whole request page. When that happens, the
-        // signed NearStart boundary below makes the additive near lane
-        // reachable on the following request without minting a synthetic
-        // non-advancing fingerprint cursor.
-        let (exact_result_budget, exact_work_budget) =
-            similar_exact_lane_budget(request.result_limit, request.work_limit);
-        let mut exact_results_remaining = exact_result_budget;
-        let mut exact_work_remaining = exact_work_budget;
-        let mut exact_results_spent = 0usize;
-        let mut exact_work_spent = 0usize;
-        let exact_keys = source
+        // classes instead of resetting a per-family page size on each key.
+        let mut remaining_results = request.result_limit;
+        let mut remaining_work = request.work_limit.saturating_sub(1);
+        let mut exact_groups = Vec::new();
+        for key in source
             .payload
             .exact_keys(source.occurrence.eligibility)
             .into_iter()
             .filter(|key| request.match_classes.contains(&key.class))
-            .collect::<Vec<_>>();
-        let exact_cursor_key_index = if continue_near {
-            None
-        } else if let Some(cursor) = request.cursor.as_deref() {
-            let mut matching_key = None;
-            for (key_index, key) in exact_keys.iter().enumerate() {
-                if self
-                    .hydration
-                    .clone_exact_cursor_matches_key_authenticated_with_similar_descriptor(
-                        &source.occurrence,
-                        key,
-                        cursor,
-                        query_authority,
-                        retrieval_request,
-                        snapshot_digest,
-                        Some(&similar_descriptor),
-                        now,
-                    )
-                    .map_err(map_clone_cursor_read_error)?
-                {
-                    if matching_key.replace(key_index).is_some() {
-                        return Err(RetrievalPortError::Contract(
-                            "clone exact cursor matches multiple requested keys".to_owned(),
-                        ));
-                    }
-                }
+        {
+            checkpoint_text_artifact_control(control)?;
+            if remaining_results == 0 || remaining_work == 0 {
+                break;
             }
-            Some(matching_key.ok_or_else(|| RetrievalPortError::StaleEvidence)?)
-        } else {
-            None
-        };
-        let mut exact_groups = Vec::new();
-        let mut exact_lane_complete = true;
-        if !continue_near {
-            let exact_key_start = exact_cursor_key_index.unwrap_or(0);
-            for (key_index, key) in exact_keys.iter().cloned().enumerate().skip(exact_key_start) {
-                let page_limit =
-                    exact_results_remaining.min(exact_page_read_limit(exact_work_remaining));
-                if page_limit == 0 {
-                    if exact_results_remaining > 0 && exact_work_remaining > 0 {
-                        // Reserve the lookahead needed to decide whether the
-                        // next exact key has a row. Charging this reservation
-                        // before the near lane runs keeps the hard request
-                        // work limit intact even when no SQL page can be
-                        // opened with a safe `limit + 1` fetch.
-                        exact_work_spent = exact_work_spent.saturating_add(1);
-                        exact_work_remaining = exact_work_remaining.saturating_sub(1);
-                    }
-                    // Return one authenticated continuation for the first key
-                    // that was not opened. Later keys are intentionally left
-                    // out of this page; replaying this cursor walks them in
-                    // canonical key order without exposing an incomplete key
-                    // that has no way to advance.
-                    exact_lane_complete = false;
-                    let next_cursor = if exact_cursor_key_index == Some(key_index) {
-                        // The current key was already selected by an
-                        // authenticated continuation. With only the one
-                        // reserved lookahead unit left, reusing that cursor
-                        // would make work_limit == 2 replay the same
-                        // ExactStart forever. The partial group below is a
-                        // bounded terminal response for this request; a
-                        // caller that needs the remaining rows must raise the
-                        // request work budget.
-                        None
-                    } else {
-                        Some(self.issue_similar_exact_start_cursor(
-                            &source,
-                            &key,
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            &similar_descriptor,
-                            now,
-                        )?)
-                    };
-                    if let Some(next_cursor) = next_cursor {
-                        exact_groups.push(incomplete_exact_group(key, next_cursor));
-                    } else if exact_cursor_key_index == Some(key_index) {
-                        exact_groups.push(terminal_incomplete_exact_group(key));
-                    } else {
-                        return Err(RetrievalPortError::Contract(
-                            "unvisited exact key has no authenticated continuation".to_owned(),
-                        ));
-                    }
-                    break;
-                }
-                let page = self.verified_exact_clone_page(
-                    &source,
-                    &key,
-                    (exact_cursor_key_index == Some(key_index))
-                        .then(|| request.cursor.as_deref())
-                        .flatten(),
-                    page_limit,
-                    exact_work_remaining,
-                    query_authority,
-                    retrieval_request,
-                    snapshot_digest,
-                    &similar_descriptor,
-                    now,
-                    control,
-                )?;
-                exact_results_spent = exact_results_spent.saturating_add(page.members.len());
-                // The reader reports every decoded posting row, including rows
-                // rejected by the source/payload verification and the lookahead
-                // row. Counting only returned members lets a hot or invalid
-                // stream consume the shared budget without being accounted for.
-                let work_spent = page.work_spent.max(1);
-                exact_work_spent = exact_work_spent.saturating_add(work_spent);
-                exact_results_remaining =
-                    exact_results_remaining.saturating_sub(page.members.len());
-                exact_work_remaining = exact_work_remaining.saturating_sub(work_spent);
-                if !page.complete || page.next_cursor.is_some() {
-                    exact_lane_complete = false;
-                }
-                if !page.members.is_empty() || !page.complete {
-                    let next_cursor = if !page.complete && page.next_cursor.is_none() {
-                        Some(self.issue_similar_exact_start_cursor(
-                            &source,
-                            &key,
-                            query_authority,
-                            retrieval_request,
-                            snapshot_digest,
-                            &similar_descriptor,
-                            now,
-                        )?)
-                    } else {
-                        page.next_cursor
-                    };
-                    exact_groups.push(
-                        tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-                            key,
-                            members: page.members,
-                            complete: page.complete,
-                            next_cursor,
-                        },
-                    );
-                }
-            }
-        }
-
-        let remaining_results = request.result_limit.saturating_sub(exact_results_spent);
-        let remaining_work = request
-            .work_limit
-            .saturating_sub(1)
-            .saturating_sub(exact_work_spent);
-        let near_budget_exhausted = remaining_results == 0 || remaining_work == 0;
-        let mut near = self.read_similar_near(
-            &source,
-            &request.source_extent,
-            &request.match_classes,
-            remaining_results,
-            remaining_work,
-            near_cursor,
-            near_phase_cursor,
-            query_authority,
-            retrieval_request,
-            snapshot_digest,
-            &similar_descriptor,
-            now,
-            control,
-        )?;
-        let near_route_available = similar_near_route_is_available(
-            &source,
-            &request.source_extent,
-            &request.match_classes,
-        );
-        if similar_near_phase_cursor_needed(
-            continue_near,
-            exact_lane_complete,
-            near_budget_exhausted,
-            near_route_available,
-            similar_near_read_is_partial_without_cursor(&near),
-        ) {
-            if let Some(next_cursor) = self.issue_similar_near_phase_cursor(
+            let page_limit = remaining_results.min(remaining_work);
+            let (members, complete, next_cursor) = self.verified_exact_clone_page(
                 &source,
-                &request.source_extent,
-                query_authority,
-                retrieval_request,
-                snapshot_digest,
-                &similar_descriptor,
-                now,
-            )? {
-                set_similar_near_next_cursor(&mut near, next_cursor);
+                &key,
+                request.cursor.as_ref(),
+                page_limit,
+                control,
+            )?;
+            remaining_results = remaining_results.saturating_sub(members.len());
+            // Count verified members plus one lookahead slot consumed by the
+            // last exact-page fetch when the postings continue.
+            let work_spent = members.len() + usize::from(next_cursor.is_some());
+            remaining_work = remaining_work.saturating_sub(work_spent.max(1));
+            if !members.is_empty() || !complete {
+                exact_groups.push(
+                    tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
+                        key,
+                        members,
+                        complete,
+                        next_cursor,
+                    },
+                );
             }
         }
+        checkpoint_text_artifact_control(control)?;
         Ok(Some(
             tracedecay_query::code_search::CodeIndexSimilarCompletedV1 {
                 source,
                 exact_groups,
-                near,
             },
         ))
-    }
-
-    fn validate_similar_source(
-        &self,
-        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    ) -> Result<(), RetrievalPortError> {
-        let metadata = self.hydration.metadata();
-        if metadata.repository_id.as_ref() != Some(&source.occurrence.repository_id) {
-            return Err(RetrievalPortError::AuthorityUnavailable(
-                "similar source repository authority is unavailable".to_owned(),
-            ));
-        }
-        if metadata.generation != source.occurrence.source_generation {
-            return Err(RetrievalPortError::AuthorityUnavailable(
-                "similar source generation is stale".to_owned(),
-            ));
-        }
-        if source.occurrence.payload_digest != source.payload.payload_digest
-            || source.payload.validate().is_err()
-        {
-            return Err(RetrievalPortError::Contract(
-                "similar source payload does not match its occurrence".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    fn read_similar_near(
-        &self,
-        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-        extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
-        requested_classes: &[tracedecay_code_index::clones::CloneNormalizationClassV1],
-        result_limit: usize,
-        work_limit: usize,
-        cursor: Option<&str>,
-        phase_cursor: Option<&str>,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        similar_query_descriptor: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<tracedecay_query::code_search::CodeIndexSimilarNearReadV1, RetrievalPortError> {
-        let selected = similar_near_selected_block(source, extent)?;
-        if let Some(cursor) = cursor.or(phase_cursor) {
-            self.validate_similar_near_cursor(
-                source,
-                selected.as_ref(),
-                cursor,
-                query_authority,
-                retrieval_request,
-                snapshot_digest,
-                similar_query_descriptor,
-                now,
-            )?;
-        }
-        let source_class = source
-            .payload
-            .fingerprint_stream(source.occurrence.eligibility)
-            .map(|stream| stream.class);
-        if let Some(source_class) = source_class
-            && !requested_classes.contains(&source_class)
-        {
-            return Ok(
-                tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(
-                    tracedecay_query::code_search::CodeIndexSearchUnavailableReasonV1::CapabilityUnavailable,
-                ),
-            );
-        }
-
-        let page_limit = result_limit
-            .min(work_limit)
-            .min(tracedecay_query::retrieval::lexical::MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1);
-        match extent {
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => {
-                if page_limit == 0 {
-                    return Ok(similar_near_budget_exhausted_whole_body(source));
-                }
-                let read = self
-                    .hydration
-                    .clone_fingerprint_page_authenticated_with_similar_descriptor(
-                        &source.occurrence,
-                        &source.payload,
-                        cursor,
-                        page_limit,
-                        query_authority,
-                        retrieval_request,
-                        snapshot_digest,
-                        Some(similar_query_descriptor),
-                        now,
-                        control,
-                    )
-                    .map_err(map_clone_cursor_read_error)?;
-                Ok(tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read))
-            }
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-                ..
-            } => {
-                if source.occurrence.eligibility
-                    != tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
-                {
-                    return Ok(similar_near_budget_exhausted_selected_range(source));
-                }
-                let selected = selected
-                    .as_ref()
-                    .expect("eligible selected range was built before serving");
-                if page_limit == 0 {
-                    return Ok(similar_near_budget_exhausted_selected_block(selected));
-                }
-                let read = self
-                    .hydration
-                    .clone_selected_block_page_authenticated_with_similar_descriptor(
-                        &source.occurrence,
-                        &source.payload,
-                        selected,
-                        cursor,
-                        page_limit,
-                        query_authority,
-                        retrieval_request,
-                        snapshot_digest,
-                        Some(similar_query_descriptor),
-                        now,
-                        control,
-                    )
-                    .map_err(map_clone_cursor_read_error)?;
-                Ok(
-                    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
-                        read,
-                    ),
-                )
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn issue_similar_near_phase_cursor(
-        &self,
-        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-        extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        similar_query_descriptor: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
-    ) -> Result<Option<String>, RetrievalPortError> {
-        let selected = similar_near_selected_block(source, extent)?;
-        let Some(query_descriptor) = similar_near_query_descriptor(
-            source,
-            self.hydration.verified_artifact().artifact_digest(),
-            selected.as_ref(),
-        )?
-        else {
-            return Ok(None);
-        };
-        let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
-            query_authority,
-            retrieval_request,
-        )
-        .map_err(map_clone_cursor_error)?;
-        codec
-            .issue_artifact_with_similar_descriptor(
-                self.hydration.verified_artifact().artifact_digest().clone(),
-                self.hydration.metadata().generation.clone(),
-                snapshot_digest.clone(),
-                query_descriptor,
-                Some(similar_query_descriptor.clone()),
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart,
-                now,
-            )
-            .map(Some)
-            .map_err(map_clone_cursor_error)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn issue_similar_exact_start_cursor(
-        &self,
-        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-        key: &tracedecay_code_index::clones::CloneExactKeyV1,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        similar_query_descriptor: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
-    ) -> Result<String, RetrievalPortError> {
-        self.hydration
-            .clone_exact_start_cursor_authenticated(
-                &source.occurrence,
-                key,
-                query_authority,
-                retrieval_request,
-                snapshot_digest,
-                similar_query_descriptor,
-                now,
-            )
-            .map_err(map_clone_cursor_read_error)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn validate_similar_near_cursor(
-        &self,
-        source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-        selected: Option<&CloneSelectedBlockV1>,
-        cursor: &str,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        similar_query_descriptor: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
-    ) -> Result<(), RetrievalPortError> {
-        let codec = tracedecay_query::retrieval::lexical::CloneCursorCodecV1::new(
-            query_authority,
-            retrieval_request,
-        )
-        .map_err(map_clone_cursor_error)?;
-        let artifact_digest = self.hydration.verified_artifact().artifact_digest();
-        let generation = &self.hydration.metadata().generation;
-        let Some(query_descriptor) =
-            similar_near_query_descriptor(source, artifact_digest, selected)?
-        else {
-            let cursor = codec
-                .decode_artifact_unbound(cursor, artifact_digest, generation, snapshot_digest, now)
-                .map_err(map_clone_cursor_error)?;
-            if !matches!(
-                cursor.after,
-                tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
-                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
-                    ..
-                }
-                    | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
-                    ..
-                }
-            ) {
-                return Err(RetrievalPortError::Contract(
-                    "clone cursor position does not match a fingerprint read".to_owned(),
-                ));
-            }
-            return Err(RetrievalPortError::Contract(
-                "similar source has no fingerprint stream".to_owned(),
-            ));
-        };
-        let cursor = codec
-            .decode_artifact(
-                cursor,
-                artifact_digest,
-                generation,
-                snapshot_digest,
-                &query_descriptor,
-                now,
-            )
-            .map_err(map_clone_cursor_error)?;
-        if cursor.similar_query_descriptor.as_ref() != Some(similar_query_descriptor) {
-            return Err(RetrievalPortError::StaleEvidence);
-        }
-        if !matches!(
-            cursor.after,
-            tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::NearStart
-                | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::Fingerprint {
-                ..
-            }
-                | tracedecay_query::retrieval::lexical::CloneArtifactCursorPositionV2::FingerprintDiscovery {
-                ..
-            }
-        ) {
-            return Err(RetrievalPortError::Contract(
-                "clone cursor position does not match a fingerprint read".to_owned(),
-            ));
-        }
-        Ok(())
     }
 
     /// Continue paging past filter rejects until `limit` verified members exist.
@@ -1236,74 +645,30 @@ impl ProductionCodeIndexQueryOwnersV1 {
         &self,
         source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
         key: &tracedecay_code_index::clones::CloneExactKeyV1,
-        start_cursor: Option<&str>,
+        start_cursor: Option<&tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
         limit: usize,
-        work_limit: usize,
-        query_authority: &tracedecay_query::retrieval::QueryAuthorityV1,
-        retrieval_request: &tracedecay_domain::RetrievalRequest,
-        snapshot_digest: &ManifestDigest,
-        similar_query_descriptor: &ManifestDigest,
-        now: tracedecay_domain::UtcMicros,
         control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<VerifiedExactClonePageV1, RetrievalPortError> {
+    ) -> Result<
+        (
+            Vec<tracedecay_query::retrieval::lexical::CloneExactArtifactMemberV1>,
+            bool,
+            Option<tracedecay_query::retrieval::lexical::CloneArtifactCursorV1>,
+        ),
+        RetrievalPortError,
+    > {
         let mut members = Vec::new();
-        let mut cursor = start_cursor.map(str::to_owned);
+        let mut cursor = start_cursor.cloned();
         let mut complete = false;
-        let mut work_spent = 0usize;
-        while members.len() < limit && work_spent < work_limit {
-            let page_limit = limit
-                .saturating_sub(members.len())
-                .min(exact_page_read_limit(work_limit.saturating_sub(work_spent)));
-            if page_limit == 0 {
-                let next_cursor = match cursor {
-                    Some(cursor) => Some(cursor),
-                    None => Some(self.issue_similar_exact_start_cursor(
-                        source,
-                        key,
-                        query_authority,
-                        retrieval_request,
-                        snapshot_digest,
-                        similar_query_descriptor,
-                        now,
-                    )?),
-                };
-                return Ok(VerifiedExactClonePageV1 {
-                    members,
-                    complete: false,
-                    next_cursor,
-                    work_spent,
-                });
-            }
+        while members.len() < limit {
+            checkpoint_text_artifact_control(control)?;
             let page = self
                 .hydration
-                .clone_exact_page_authenticated_with_similar_descriptor(
-                    &source.occurrence,
-                    key,
-                    cursor.as_deref(),
-                    page_limit,
-                    query_authority,
-                    retrieval_request,
-                    snapshot_digest,
-                    Some(similar_query_descriptor),
-                    now,
-                    control,
-                )
-                .map_err(map_clone_cursor_read_error)?;
-            // `clone_exact_page` fetches one lookahead row when a continuation
-            // exists. Count the whole decoded page, including members later
-            // rejected by the source/payload verification below and that
-            // lookahead row. The authenticated page intentionally truncates
-            // the lookahead before returning it, so its continuation is the
-            // observable marker for the extra fetched row.
-            let fetched_rows =
-                exact_page_work_spent(page.members.len(), page.next_cursor.is_some());
-            if fetched_rows > work_limit.saturating_sub(work_spent) {
-                return Err(RetrievalPortError::Contract(
-                    "clone exact lookahead exceeded the request work budget".to_owned(),
-                ));
-            }
-            work_spent = work_spent.saturating_add(fetched_rows);
-            for member in page.members {
+                .clone_exact_page(&source.occurrence, key, cursor.as_ref(), limit, control)
+                .map_err(family_report::clone_artifact_error)?;
+            for (ordinal, member) in page.members.into_iter().enumerate() {
+                if ordinal.is_multiple_of(RETRIEVAL_CANDIDATE_BATCH_SIZE) {
+                    checkpoint_text_artifact_control(control)?;
+                }
                 if member.occurrence.symbol_occurrence_id == source.occurrence.symbol_occurrence_id
                 {
                     continue;
@@ -1320,489 +685,22 @@ impl ProductionCodeIndexQueryOwnersV1 {
                     break;
                 }
             }
+            checkpoint_text_artifact_control(control)?;
             match page.next_cursor {
                 Some(next) if members.len() < limit => cursor = Some(next),
-                Some(next) => {
-                    return Ok(VerifiedExactClonePageV1 {
-                        members,
-                        complete: false,
-                        next_cursor: Some(next),
-                        work_spent,
-                    });
-                }
+                Some(next) => return Ok((members, false, Some(next))),
                 None => {
                     complete = true;
                     break;
                 }
             }
         }
-        if members.len() < limit && !complete && work_spent >= work_limit {
-            return Ok(VerifiedExactClonePageV1 {
-                members,
-                complete: false,
-                next_cursor: cursor,
-                work_spent,
-            });
-        }
-        Ok(VerifiedExactClonePageV1 {
-            members,
-            complete,
-            next_cursor: None,
-            work_spent,
-        })
+        Ok((members, complete, None))
     }
 
     #[cfg(test)]
     pub fn is_artifact_backed(&self) -> bool {
         true
-    }
-}
-
-/// Verified exact members and the raw artifact rows consumed to obtain them.
-/// The latter is internal accounting for a request-wide similarity budget;
-/// it never becomes part of the public result contract.
-struct VerifiedExactClonePageV1 {
-    members: Vec<tracedecay_query::retrieval::lexical::CloneExactArtifactMemberV1>,
-    complete: bool,
-    next_cursor: Option<String>,
-    work_spent: usize,
-}
-
-/// Construct the explicit first-unvisited exact group returned at a shared
-/// budget boundary. The serving loop supplies an authenticated ExactStart
-/// cursor; keeping the helper cursor-bearing makes the incomplete state
-/// impossible to confuse with an empty complete stream.
-fn incomplete_exact_group(
-    key: tracedecay_code_index::clones::CloneExactKeyV1,
-    next_cursor: String,
-) -> tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-    tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-        key,
-        members: Vec::new(),
-        complete: false,
-        next_cursor: Some(next_cursor),
-    }
-}
-
-/// Construct the bounded terminal group returned when an authenticated exact
-/// continuation reaches a request-wide budget boundary before another row
-/// can be fetched. The key has already been visited by the continuation, so a
-/// missing cursor cannot strand an unvisited key and avoids replaying the same
-/// authenticated cursor forever.
-fn terminal_incomplete_exact_group(
-    key: tracedecay_code_index::clones::CloneExactKeyV1,
-) -> tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-    tracedecay_query::code_search::CodeIndexSimilarExactGroupV1 {
-        key,
-        members: Vec::new(),
-        complete: false,
-        next_cursor: None,
-    }
-}
-
-fn similar_near_selected_block(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
-) -> Result<Option<CloneSelectedBlockV1>, RetrievalPortError> {
-    match extent {
-        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-            start,
-            end,
-        } if source.occurrence.eligibility
-            == tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible =>
-        {
-            Ok(Some(
-                CloneSelectedBlockV1::from_payload(
-                    &source.payload,
-                    source.occurrence.eligibility,
-                    *start..*end,
-                )
-                .map_err(RetrievalPortError::Contract)?,
-            ))
-        }
-        _ => Ok(None),
-    }
-}
-
-fn similar_near_read_is_partial_without_cursor(
-    read: &tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
-) -> bool {
-    match read {
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) => {
-            read.page.next_cursor.is_none()
-                && (!read.partial_reasons.is_empty()
-                    || read.coverage.unknown > 0
-                    || read.coverage.capped > 0)
-        }
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(read) => {
-            read.page.next_cursor.is_none()
-                && (!read.partial_reasons.is_empty()
-                    || read.coverage.unknown > 0
-                    || read.coverage.capped > 0)
-        }
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(_) => false,
-    }
-}
-
-fn similar_near_phase_cursor_needed(
-    continue_near: bool,
-    exact_lane_complete: bool,
-    near_budget_exhausted: bool,
-    near_route_available: bool,
-    near_partial_without_cursor: bool,
-) -> bool {
-    !continue_near
-        && exact_lane_complete
-        && near_budget_exhausted
-        && near_route_available
-        && near_partial_without_cursor
-}
-
-fn set_similar_near_next_cursor(
-    read: &mut tracedecay_query::code_search::CodeIndexSimilarNearReadV1,
-    next_cursor: String,
-) {
-    match read {
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(read) => {
-            read.page.next_cursor = Some(next_cursor);
-        }
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(read) => {
-            read.page.next_cursor = Some(next_cursor);
-        }
-        tracedecay_query::code_search::CodeIndexSimilarNearReadV1::Unavailable(_) => {}
-    }
-}
-
-fn check_similar_control(
-    control: &dyn CodeIndexExecutionControlV1,
-) -> Result<(), RetrievalPortError> {
-    if control.is_cancelled() {
-        Err(RetrievalPortError::Cancelled)
-    } else if control.is_deadline_exceeded() {
-        Err(RetrievalPortError::BudgetExceeded)
-    } else {
-        Ok(())
-    }
-}
-
-fn map_clone_cursor_error(
-    error: tracedecay_query::retrieval::lexical::CloneCursorErrorV1,
-) -> RetrievalPortError {
-    use tracedecay_query::retrieval::lexical::CloneCursorErrorV1;
-
-    match error {
-        CloneCursorErrorV1::Invalid => {
-            RetrievalPortError::Contract("clone cursor is invalid".to_owned())
-        }
-        CloneCursorErrorV1::Tampered => {
-            RetrievalPortError::Contract("clone cursor authentication failed".to_owned())
-        }
-        CloneCursorErrorV1::Stale => RetrievalPortError::StaleEvidence,
-        CloneCursorErrorV1::Unavailable(detail) => RetrievalPortError::AuthorityUnavailable(detail),
-    }
-}
-
-fn map_clone_cursor_read_error(
-    error: tracedecay_query::retrieval::lexical::CloneCursorReadErrorV1,
-) -> RetrievalPortError {
-    match error {
-        tracedecay_query::retrieval::lexical::CloneCursorReadErrorV1::Cursor(error) => {
-            map_clone_cursor_error(error)
-        }
-        tracedecay_query::retrieval::lexical::CloneCursorReadErrorV1::Artifact(error) => {
-            RetrievalPortError::AuthorityUnavailable(error.to_string())
-        }
-    }
-}
-
-fn similar_stream_descriptor(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-) -> Option<CloneFingerprintStreamDescriptorV1> {
-    source
-        .payload
-        .fingerprint_stream(source.occurrence.eligibility)
-        .map(|stream| CloneFingerprintStreamDescriptorV1 {
-            language: source.payload.language.clone(),
-            class: stream.class,
-            normalization_revision: stream.normalization_revision,
-            rename_tier_unavailable: stream.rename_tier_unavailable,
-        })
-}
-
-fn similar_near_route_is_available(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    extent: &tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1,
-    requested_classes: &[tracedecay_code_index::clones::CloneNormalizationClassV1],
-) -> bool {
-    let Some(stream) = source
-        .payload
-        .fingerprint_stream(source.occurrence.eligibility)
-    else {
-        return false;
-    };
-    requested_classes.contains(&stream.class)
-        && match extent {
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => true,
-            tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-                ..
-            } => {
-                source.occurrence.eligibility
-                    == tracedecay_code_index::clones::CloneBodyEligibilityV1::Eligible
-            }
-        }
-}
-
-fn similar_exact_lane_budget(result_limit: usize, work_limit: usize) -> (usize, usize) {
-    (
-        result_limit,
-        work_limit.saturating_sub(1), // The source lookup consumes one unit before exact/near lanes.
-                                      // Exact lookahead rows are charged by `verified_exact_clone_page`.
-    )
-}
-
-fn exact_page_work_spent(member_count: usize, has_continuation: bool) -> usize {
-    member_count.saturating_add(usize::from(has_continuation))
-}
-
-/// The exact artifact reader always fetches one lookahead row so it can tell
-/// whether a page has a continuation. Reserve that row before opening the
-/// stream; otherwise a page with `work_limit == remaining_work` could spend
-/// one unit beyond the request-wide hard bound.
-fn exact_page_read_limit(remaining_work: usize) -> usize {
-    remaining_work.saturating_sub(1)
-}
-
-#[derive(serde::Serialize)]
-enum SimilarQueryTargetDescriptorV1 {
-    SymbolOccurrence(String),
-}
-
-#[derive(serde::Serialize)]
-enum SimilarQueryExtentDescriptorV1 {
-    WholeBody,
-    SelectedTokenRange { start: u64, end: u64 },
-}
-
-/// Canonical identity of one complete Similar request. It is carried in the
-/// authenticated clone cursor alongside the operation-specific reader
-/// descriptor so adding/removing a class or changing the selected source
-/// extent cannot reuse an exact, near, or NearStart continuation.
-fn similar_query_descriptor(
-    request: &tracedecay_query::code_search::CodeIndexSimilarRequestV1,
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    artifact_digest: &ManifestDigest,
-) -> Result<ManifestDigest, RetrievalPortError> {
-    let authority_digest = canonical_sha256(&(
-        "tracedecay.clone-exact-authority.v1",
-        &source.occurrence.project_id,
-        &source.occurrence.repository_id,
-        &source.occurrence.worktree_id,
-        &source.occurrence.source_generation,
-        &source.occurrence.snapshot_digest,
-        &source.occurrence.symbol_occurrence_id,
-    ))
-    .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-    // Bind the resolved source identity rather than the surface spelling of
-    // the target. A source-range lookup and a symbol-occurrence lookup that
-    // resolve to the same immutable body are the same Similar stream, while
-    // a different source still changes the authority digest above.
-    let target = SimilarQueryTargetDescriptorV1::SymbolOccurrence(
-        source.occurrence.symbol_occurrence_id.as_str().to_owned(),
-    );
-    let extent = match &request.source_extent {
-        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody => {
-            SimilarQueryExtentDescriptorV1::WholeBody
-        }
-        tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::SelectedTokenRange {
-            start,
-            end,
-        } => SimilarQueryExtentDescriptorV1::SelectedTokenRange {
-            start: *start as u64,
-            end: *end as u64,
-        },
-    };
-    let mut classes = request.match_classes.clone();
-    classes.sort_unstable();
-    classes.dedup();
-    canonical_sha256(&(
-        "tracedecay.clone-similar-request.v2",
-        artifact_digest,
-        &authority_digest,
-        &source.payload.payload_digest,
-        &source.payload.body_digest,
-        target,
-        extent,
-        classes,
-    ))
-    .map_err(|error| RetrievalPortError::Contract(error.to_string()))
-}
-
-fn similar_near_query_descriptor(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-    artifact_digest: &ManifestDigest,
-    selected: Option<&CloneSelectedBlockV1>,
-) -> Result<Option<ManifestDigest>, RetrievalPortError> {
-    let stream = match selected {
-        Some(selected) => CloneFingerprintStreamDescriptorV1 {
-            language: selected.language().to_owned(),
-            class: selected.class(),
-            normalization_revision: selected.normalization_revision(),
-            rename_tier_unavailable: selected.rename_tier_unavailable(),
-        },
-        None => match similar_stream_descriptor(source) {
-            Some(stream) => stream,
-            None => return Ok(None),
-        },
-    };
-    let authority_digest = canonical_sha256(&(
-        "tracedecay.clone-exact-authority.v1",
-        &source.occurrence.project_id,
-        &source.occurrence.repository_id,
-        &source.occurrence.worktree_id,
-        &source.occurrence.source_generation,
-        &source.occurrence.snapshot_digest,
-        &source.occurrence.symbol_occurrence_id,
-    ))
-    .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-    canonical_sha256(&(
-        "tracedecay.clone-fingerprint-request.v1",
-        artifact_digest,
-        &authority_digest,
-        &source.payload.payload_digest,
-        &source.payload.body_digest,
-        &stream.language,
-        stream.class,
-        stream.normalization_revision,
-        selected.map(|selected| {
-            (
-                selected.source_token_start(),
-                selected.source_token_end(),
-                selected.tokens(),
-            )
-        }),
-    ))
-    .map(Some)
-    .map_err(|error| RetrievalPortError::Contract(error.to_string()))
-}
-
-fn fallback_similar_stream_descriptor(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-) -> CloneFingerprintStreamDescriptorV1 {
-    CloneFingerprintStreamDescriptorV1 {
-        language: source.payload.language.clone(),
-        class: tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
-        normalization_revision: source.payload.conservative_normalization_revision,
-        rename_tier_unavailable: Some(source.payload.rename_coverage),
-    }
-}
-
-fn similar_near_partial_coverage() -> tracedecay_domain::RetrieverCoverage {
-    tracedecay_domain::RetrieverCoverage {
-        capped: 1,
-        ..tracedecay_domain::RetrieverCoverage::default()
-    }
-}
-
-fn similar_near_budget_reason() -> Vec<CloneFingerprintPartialReasonV1> {
-    vec![CloneFingerprintPartialReasonV1::VerificationWorkBudget]
-}
-
-fn similar_near_budget_exhausted_whole_body(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
-    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::WholeBody(
-        AuthenticatedCloneFingerprintArtifactReadV1 {
-            page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
-                members: Vec::new(),
-                next_cursor: None,
-            },
-            stream: similar_stream_descriptor(source),
-            source_eligibility: source.occurrence.eligibility,
-            minimum_directional_coverage_millionths:
-                CLONE_NEAR_MATCH_MINIMUM_COVERAGE_MILLIONTHS_V1,
-            coverage: similar_near_partial_coverage(),
-            partial_reasons: similar_near_budget_reason(),
-            accounting: CloneFingerprintReadAccountingV1::default(),
-        },
-    )
-}
-
-fn similar_near_budget_exhausted_selected_range(
-    source: &tracedecay_code_index::clones::CodeIndexCloneBodyV1,
-) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
-    let stream = similar_stream_descriptor(source)
-        .unwrap_or_else(|| fallback_similar_stream_descriptor(source));
-    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
-        AuthenticatedCloneSelectedBlockArtifactReadV1 {
-            page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
-                members: Vec::new(),
-                next_cursor: None,
-            },
-            stream,
-            coverage: similar_near_partial_coverage(),
-            partial_reasons: similar_near_budget_reason(),
-            accounting: CloneFingerprintReadAccountingV1::default(),
-        },
-    )
-}
-
-fn similar_near_budget_exhausted_selected_block(
-    selected: &CloneSelectedBlockV1,
-) -> tracedecay_query::code_search::CodeIndexSimilarNearReadV1 {
-    tracedecay_query::code_search::CodeIndexSimilarNearReadV1::SelectedTokenRange(
-        AuthenticatedCloneSelectedBlockArtifactReadV1 {
-            page: tracedecay_query::retrieval::lexical::AuthenticatedCloneArtifactPageV1 {
-                members: Vec::new(),
-                next_cursor: None,
-            },
-            stream: CloneFingerprintStreamDescriptorV1 {
-                language: selected.language().to_owned(),
-                class: selected.class(),
-                normalization_revision: selected.normalization_revision(),
-                rename_tier_unavailable: selected.rename_tier_unavailable(),
-            },
-            coverage: similar_near_partial_coverage(),
-            partial_reasons: similar_near_budget_reason(),
-            accounting: CloneFingerprintReadAccountingV1::default(),
-        },
-    )
-}
-
-#[cfg(test)]
-mod similar_serving_tests {
-    use super::*;
-
-    fn exact_key(
-        class: tracedecay_code_index::clones::CloneNormalizationClassV1,
-        fill: char,
-    ) -> tracedecay_code_index::clones::CloneExactKeyV1 {
-        tracedecay_code_index::clones::CloneExactKeyV1 {
-            class,
-            normalization_revision: 1,
-            digest: ManifestDigest::new(format!("sha256:{}", fill.to_string().repeat(64)))
-                .expect("valid exact key digest"),
-        }
-    }
-
-    #[test]
-    fn unvisited_exact_classes_are_explicitly_incomplete_and_restartable() {
-        let keys = [
-            exact_key(
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
-                'a',
-            ),
-            exact_key(
-                tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,
-                'b',
-            ),
-        ];
-
-        let group = incomplete_exact_group(keys[0].clone(), "authenticated-exact-start".to_owned());
-
-        assert_eq!(group.key, keys[0]);
-        assert!(!group.complete);
-        assert!(group.members.is_empty());
-        assert!(group.next_cursor.is_some());
     }
 }
 
@@ -1816,8 +714,10 @@ pub(super) enum CodeTextQueryOwnerReadinessV1 {
 /// verified page source over this generation's durable sealed file.
 pub(super) struct CodeTextArtifactBuildV1 {
     pub(super) builder: CodeLexicalArtifactBuilderV1,
-    pub(super) source: VerifiedSealedLexicalPageSourceV1<File>,
+    pub(super) source: VerifiedSealedLexicalPageSourceV1,
     sealed_identity: DurableSealedCodeGenerationIdentityV1,
+    /// The key the artifact is published under, derived before the build.
+    content_key: ManifestDigest,
     source_receipt: Option<VerifiedSealedLexicalSourceReceiptV1>,
     pub(super) staging_path: PathBuf,
     /// Holds the builder's advertised memory ceiling reserved in the
@@ -1825,29 +725,12 @@ pub(super) struct CodeTextArtifactBuildV1 {
     _build_reservation: ResidentMemoryReservationV1,
 }
 
-pub(super) struct CodeTextCloneSuccessorBuildV1 {
-    builder: Option<CodeLexicalCloneSuccessorV1>,
-    source: VerifiedSealedLexicalPageSourceV1<File>,
-    source_position: CloneSuccessorSourcePositionV1,
-    sealed_identity: DurableSealedCodeGenerationIdentityV1,
-    source_receipt: Option<VerifiedSealedLexicalSourceReceiptV1>,
-    prior: tracedecay_query::retrieval::lexical::VerifiedCodeLexicalArtifactV1,
-    prior_descriptor: DurableCodeTextArtifactDescriptorV1,
-    staging_path: PathBuf,
-    build_reservation: Option<ResidentMemoryReservationV1>,
-}
-
-enum CloneSuccessorSourcePositionV1 {
-    Appending,
-    Revalidating(VerifiedSealedLexicalCursorV1),
-}
-
 /// Singleflight authority for one generation's durable text projection.
 ///
 /// The slot is the generation-owned partial-state authority; the condvar
 /// wakes arrivals parked behind a `HeadOpening` claim. A corpus-sized
 /// verified open (the published-head reopen or the publication tail's
-/// reopen — two full SHA-256 passes plus `SQLite` verification each) runs
+/// reopen, two full SHA-256 passes plus `SQLite` verification each) runs
 /// with the slot lock released, so a concurrent wake parks with typed
 /// cancellation instead of blocking on the mutex for the whole open. This
 /// stays a plain `std::sync::Mutex` rather than `hotpath::mutex!` because
@@ -1869,8 +752,6 @@ pub(super) enum CodeTextProjectionSlotV1 {
     /// The resumable staging build; each wake advances one bounded slice
     /// under the slot lock.
     Building(Box<CodeTextArtifactBuildV1>),
-    CloneSuccessorPending,
-    BuildingCloneSuccessor(Box<CodeTextCloneSuccessorBuildV1>),
 }
 
 impl CodeTextProjectionStateV1 {
@@ -1886,32 +767,16 @@ impl CodeTextProjectionStateV1 {
             self.slot.lock().unwrap_or_else(PoisonError::into_inner)
         })
     }
-
-    fn retain_clone_successor_retry(&self) -> Result<(), RetrievalPortError> {
-        let mut slot = self.lock_slot();
-        if !matches!(&*slot, CodeTextProjectionSlotV1::HeadOpening) {
-            return Err(RetrievalPortError::Contract(
-                "clone-successor retry requires an active head-open claim".to_owned(),
-            ));
-        }
-        *slot = CodeTextProjectionSlotV1::CloneSuccessorPending;
-        Ok(())
-    }
 }
 
 /// One wake's exclusive claim on a corpus-sized verified head open.
 ///
 /// Restores the slot to `Idle` and wakes every parked arrival on all exit
-/// paths — success, typed failure, and unwind — so a failed open can never
+/// paths, success, typed failure, and unwind, so a failed open can never
 /// strand concurrent wakes behind a stale `HeadOpening` marker.
 struct TextHeadOpenClaimV1<'a> {
     state: &'a CodeTextProjectionStateV1,
     armed: bool,
-}
-
-enum TextHeadOpenBuildV1 {
-    Artifact(Box<CodeTextArtifactBuildV1>),
-    CloneSuccessor(Box<CodeTextCloneSuccessorBuildV1>),
 }
 
 impl<'a> TextHeadOpenClaimV1<'a> {
@@ -1921,15 +786,13 @@ impl<'a> TextHeadOpenClaimV1<'a> {
         Self { state, armed: true }
     }
 
-    fn install(&mut self, build: TextHeadOpenBuildV1) -> MutexGuard<'a, CodeTextProjectionSlotV1> {
+    fn install(
+        &mut self,
+        build: Box<CodeTextArtifactBuildV1>,
+    ) -> MutexGuard<'a, CodeTextProjectionSlotV1> {
         self.armed = false;
         let mut slot = self.state.lock_slot();
-        *slot = match build {
-            TextHeadOpenBuildV1::Artifact(build) => CodeTextProjectionSlotV1::Building(build),
-            TextHeadOpenBuildV1::CloneSuccessor(build) => {
-                CodeTextProjectionSlotV1::BuildingCloneSuccessor(build)
-            }
-        };
+        *slot = CodeTextProjectionSlotV1::Building(build);
         self.state.ready.notify_all();
         slot
     }
@@ -1958,7 +821,6 @@ pub(super) enum TextHeadOpenOutcomeV1 {
     /// No published head was servable; the resumable staging build begins
     /// (or resumes) from its durable staging file.
     Build(Box<CodeTextArtifactBuildV1>),
-    BuildCloneSuccessor(Box<CodeTextCloneSuccessorBuildV1>),
 }
 
 fn map_text_artifact_error(error: CodeLexicalArtifactErrorV1) -> RetrievalPortError {
@@ -1972,8 +834,17 @@ fn map_text_artifact_error(error: CodeLexicalArtifactErrorV1) -> RetrievalPortEr
         CodeLexicalArtifactErrorV1::Incompatible(_) => RetrievalPortError::IncompatibleProjection,
         CodeLexicalArtifactErrorV1::Contract(detail) => RetrievalPortError::Contract(detail),
         CodeLexicalArtifactErrorV1::Corrupt(detail) => RetrievalPortError::Contract(detail),
-        CodeLexicalArtifactErrorV1::Unreserved(_)
-        | CodeLexicalArtifactErrorV1::BatchTooLarge { .. } => RetrievalPortError::BudgetExceeded,
+        CodeLexicalArtifactErrorV1::Unreserved(detail) => RetrievalPortError::AuthorityUnavailable(
+            format!("lexical artifact reservation is unavailable: {detail}"),
+        ),
+        error @ CodeLexicalArtifactErrorV1::BatchTooLarge { .. } => {
+            // The builder has already tightened the source to one record
+            // before this mapping. The same record and fixed budget reproduce
+            // this refusal forever; calling it a request budget timeout made
+            // the background worker retry it as transient work and discarded
+            // the required/maximum evidence.
+            RetrievalPortError::Contract(error.to_string())
+        }
         CodeLexicalArtifactErrorV1::Io(detail) | CodeLexicalArtifactErrorV1::Missing(detail) => {
             RetrievalPortError::AuthorityUnavailable(detail)
         }
@@ -2002,6 +873,35 @@ fn text_artifact_unavailable(error: impl std::fmt::Display) -> RetrievalPortErro
     RetrievalPortError::AuthorityUnavailable(error.to_string())
 }
 
+/// Name a held publication charge as the reader and shrink it to the reader
+/// budget. The bytes never leave the ledger, so the handoff is not a new
+/// admission and measured RSS cannot refuse a charge that was already held.
+fn reader_charge_from_held_reservation(
+    mut held: ResidentMemoryReservationV1,
+) -> Result<ResidentMemoryReservationV1, RetrievalPortError> {
+    let reader_budget =
+        u64::try_from(CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1).map_err(|_| {
+            RetrievalPortError::Contract("text-artifact reader budget exceeds u64".to_owned())
+        })?;
+    if held.reserved_bytes() < reader_budget {
+        return Err(RetrievalPortError::Contract(format!(
+            "text-artifact publication charge {} is below the reader budget {reader_budget}",
+            held.reserved_bytes()
+        )));
+    }
+    let component = ResidentMemoryComponentIdV1::new("code-text-artifact-reader")
+        .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
+    held.transfer_component(component, reader_budget)
+        .map_err(|error| {
+            RetrievalPortError::Contract(format!(
+                "text-artifact reader charge could not take over its held reservation: reserved \
+                 {} measured {}",
+                error.reserved_bytes, error.measured_bytes
+            ))
+        })?;
+    Ok(held)
+}
+
 /// Durable text-artifact store bound to one worktree's generation store root.
 ///
 /// Publishes finalized staging artifacts under `code-text-artifacts-v1/` and
@@ -2015,6 +915,11 @@ pub struct DaemonCodeTextArtifactStoreV1 {
     /// ceilings are reserved here before they are allocated, so the
     /// advertised budgets are admission-controlled, not just documented.
     resident_memory: Arc<ProcessResidentMemoryV1>,
+    /// Retained state other worktrees and generations hold. A build sheds it
+    /// before refusing, so a stale decode never outranks a fresh index.
+    resident_owners: Arc<ResidentOwnersV1>,
+    /// The owning scheduler's worker runtime; text serving fans out under it.
+    worker_runtime: super::reconcile::SchedulerWorkerRuntimeV1,
     project_id: ProjectId,
     worktree_id: WorktreeId,
 }
@@ -2048,11 +953,41 @@ pub(super) fn text_artifact_resident_memory_charges(
     Ok((accounted, retained))
 }
 
+pub(super) fn text_artifact_admitted_build_budget(
+    preferred_bytes: u64,
+    minimum_bytes: u64,
+    limit_bytes: u64,
+    used_bytes: u64,
+    observed_bytes: u64,
+    watermark_headroom: u64,
+) -> Result<u64, RetrievalPortError> {
+    if minimum_bytes == 0 || preferred_bytes < minimum_bytes {
+        return Err(RetrievalPortError::Contract(
+            "text-artifact build budget bounds are invalid".to_owned(),
+        ));
+    }
+    let unmodeled_live_bytes = observed_bytes.saturating_sub(used_bytes);
+    let available_for_growth = limit_bytes
+        .saturating_sub(used_bytes)
+        .saturating_sub(unmodeled_live_bytes)
+        .saturating_sub(watermark_headroom);
+    let admitted_bytes = preferred_bytes.min(available_for_growth);
+    if admitted_bytes < minimum_bytes {
+        return Err(RetrievalPortError::ResidentMemoryRefused(format!(
+            "text-artifact build needs at least {minimum_bytes} bytes; \
+             {available_for_growth} bytes are available below the resident-memory watermark"
+        )));
+    }
+    Ok(admitted_bytes)
+}
+
 impl DaemonCodeTextArtifactStoreV1 {
     pub(super) fn bind(
         store_root: &Path,
         publication: &DaemonCodeIndexPublicationStoreV1,
         resident_memory: &Arc<ProcessResidentMemoryV1>,
+        resident_owners: &Arc<ResidentOwnersV1>,
+        worker_runtime: &super::reconcile::SchedulerWorkerRuntimeV1,
         project_id: &ProjectId,
         worktree_id: &WorktreeId,
     ) -> Self {
@@ -2060,6 +995,8 @@ impl DaemonCodeTextArtifactStoreV1 {
             store_root: store_root.to_path_buf(),
             publication: publication.clone(),
             resident_memory: Arc::clone(resident_memory),
+            resident_owners: Arc::clone(resident_owners),
+            worker_runtime: worker_runtime.clone(),
             project_id: project_id.clone(),
             worktree_id: worktree_id.clone(),
         }
@@ -2080,16 +1017,17 @@ impl DaemonCodeTextArtifactStoreV1 {
         component: &'static str,
         bytes: usize,
     ) -> Result<ResidentMemoryReservationV1, RetrievalPortError> {
-        let component = ResidentMemoryComponentIdV1::new(component)
-            .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-        let requested = u64::try_from(bytes)
-            .ok()
-            .and_then(std::num::NonZeroU64::new)
-            .ok_or_else(|| {
-                RetrievalPortError::Contract(
-                    "text-artifact resident-memory reservation must be nonzero".to_owned(),
-                )
-            })?;
+        self.reserve_resident_memory_up_to(generation_id, component, bytes, bytes)
+            .map(|(reservation, _)| reservation)
+    }
+
+    /// Measure headroom and size the build: `(observed, unmodeled live,
+    /// watermark headroom, admitted)` bytes.
+    fn text_artifact_admission(
+        &self,
+        preferred: NonZeroU64,
+        minimum: NonZeroU64,
+    ) -> Result<(u64, u64, u64, u64), RetrievalPortError> {
         let snapshot = self.resident_memory.snapshot();
         let observed_bytes = sampled_process_resident_bytes_v1().map_or(0, |observed| {
             self.resident_memory
@@ -2105,8 +1043,77 @@ impl DaemonCodeTextArtifactStoreV1 {
             .high_watermark_bytes()
             .min(snapshot.limit_bytes);
         let watermark_headroom = snapshot.limit_bytes.saturating_sub(admission_watermark);
+        let admitted_bytes = text_artifact_admitted_build_budget(
+            preferred.get(),
+            minimum.get(),
+            snapshot.limit_bytes,
+            snapshot.used_bytes,
+            observed_bytes,
+            watermark_headroom,
+        )?;
+        Ok((
+            observed_bytes,
+            unmodeled_live_bytes,
+            watermark_headroom,
+            admitted_bytes,
+        ))
+    }
+
+    fn reserve_resident_memory_up_to(
+        &self,
+        generation_id: &CodeGenerationId,
+        component: &'static str,
+        preferred_bytes: usize,
+        minimum_bytes: usize,
+    ) -> Result<(ResidentMemoryReservationV1, usize), RetrievalPortError> {
+        let component = ResidentMemoryComponentIdV1::new(component)
+            .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
+        let preferred = u64::try_from(preferred_bytes)
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                RetrievalPortError::Contract(
+                    "text-artifact resident-memory reservation must be nonzero".to_owned(),
+                )
+            })?;
+        let minimum = u64::try_from(minimum_bytes)
+            .ok()
+            .and_then(std::num::NonZeroU64::new)
+            .ok_or_else(|| {
+                RetrievalPortError::Contract(
+                    "text-artifact minimum resident-memory reservation must be nonzero".to_owned(),
+                )
+            })?;
+        let (observed_bytes, unmodeled_live_bytes, watermark_headroom, admitted_bytes) =
+            match self.text_artifact_admission(preferred, minimum) {
+                Err(RetrievalPortError::ResidentMemoryRefused(detail)) => {
+                    let released = self
+                        .resident_owners
+                        .shed(minimum.get(), std::time::Instant::now());
+                    if released.is_empty() {
+                        return Err(RetrievalPortError::ResidentMemoryRefused(detail));
+                    }
+                    for release in &released {
+                        log_resident_owner_release_v1(release);
+                    }
+                    let trim = release_process_allocator_memory_v1();
+                    tracing::info!(
+                        event = "code_text_artifact_build_shed_retained_state",
+                        released_owners = released.len(),
+                        trimmed_bytes = trim.released_bytes(),
+                        "text-artifact build shed retained state before re-measuring headroom"
+                    );
+                    self.text_artifact_admission(preferred, minimum)
+                }
+                admission => admission,
+            }?;
+        let admitted = NonZeroU64::new(admitted_bytes).ok_or_else(|| {
+            RetrievalPortError::Contract(
+                "text-artifact admitted resident-memory reservation must be nonzero".to_owned(),
+            )
+        })?;
         let (accounted, retained) = text_artifact_resident_memory_charges(
-            requested,
+            admitted,
             unmodeled_live_bytes,
             watermark_headroom,
         )?;
@@ -2115,7 +1122,9 @@ impl DaemonCodeTextArtifactStoreV1 {
         hotpath::gauge!("query.artifact.admission.unmodeled_live_bytes")
             .set(unmodeled_live_bytes as f64);
         hotpath::gauge!("query.artifact.admission.requested_growth_bytes")
-            .set(requested.get() as f64);
+            .set(preferred.get() as f64);
+        hotpath::gauge!("query.artifact.admission.admitted_growth_bytes")
+            .set(admitted.get() as f64);
         hotpath::gauge!("query.artifact.admission.accounted_bytes").set(accounted.get() as f64);
         hotpath::gauge!("query.artifact.admission.retained_bytes").set(retained.get() as f64);
         let mut reservation = self
@@ -2129,13 +1138,22 @@ impl DaemonCodeTextArtifactStoreV1 {
                 },
                 accounted,
             )
-            .map_err(|_| RetrievalPortError::BudgetExceeded)?;
+            .map_err(|error| {
+                RetrievalPortError::ResidentMemoryRefused(format!(
+                    "text-artifact resident-memory admission was refused: {error}"
+                ))
+            })?;
         reservation.shrink_to(retained.get()).map_err(|error| {
             RetrievalPortError::Contract(format!(
                 "text-artifact resident-memory headroom release failed: {error}"
             ))
         })?;
-        Ok(reservation)
+        let admitted = usize::try_from(admitted.get()).map_err(|error| {
+            RetrievalPortError::Contract(format!(
+                "text-artifact admitted reservation exceeds the platform limit: {error}"
+            ))
+        })?;
+        Ok((reservation, admitted))
     }
 
     fn acquire_store_write_lock(&self) -> Result<CodeGenerationStoreLockV1, RetrievalPortError> {
@@ -2165,17 +1183,17 @@ impl DaemonCodeTextArtifactStoreV1 {
             .generation_index
             .iter()
             .find(|entry| entry.generation_id == generation_id.as_str())
-            .and_then(|entry| entry.text_artifact.clone()))
+            .and_then(|entry| entry.text_artifact().cloned()))
     }
 
     /// Withdraw one exact missing/corrupt derived artifact so the immutable
-    /// sealed generation can rebuild it. A corrupt regular file is moved out
-    /// of the content-addressed namespace before the durable pointer is
-    /// cleared; non-regular objects are preserved and refused fail-closed.
+    /// sealed generation can rebuild it. A corrupt regular file is deleted
+    /// before the durable pointer is cleared; non-regular objects are
+    /// preserved and refused fail-closed.
     fn withdraw_unavailable_descriptor(
         &self,
         descriptor: &DurableCodeTextArtifactDescriptorV1,
-        quarantine_corrupt_file: bool,
+        delete_corrupt_file: bool,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<(), RetrievalPortError> {
         checkpoint_text_artifact_control(control)?;
@@ -2193,15 +1211,17 @@ impl DaemonCodeTextArtifactStoreV1 {
             .generation_index
             .iter()
             .find(|entry| entry.generation_id == descriptor.generation_id.as_str())
-            .and_then(|entry| entry.text_artifact.as_ref());
+            .and_then(|entry| entry.text_artifact());
         if current != Some(descriptor) {
             return Err(RetrievalPortError::AuthorityUnavailable(
                 "durable text-artifact attachment changed during repair".to_owned(),
             ));
         }
 
-        let mut quarantined = None;
-        if quarantine_corrupt_file {
+        // A corrupt file is deleted before its descriptor is withdrawn: a crash
+        // between the two leaves a descriptor naming a missing file, which the
+        // next open withdraws, and never a second copy of damaged bytes.
+        if delete_corrupt_file {
             let path = code_text_artifact_path(&self.store_root, descriptor)
                 .map_err(text_artifact_unavailable)?;
             let metadata = path.symlink_metadata().map_err(text_artifact_unavailable)?;
@@ -2210,29 +1230,14 @@ impl DaemonCodeTextArtifactStoreV1 {
                     "corrupt code text artifact is not a regular file".to_owned(),
                 ));
             }
-            let quarantine =
-                path.with_extension(format!("corrupt-{}-{}", std::process::id(), now_micros().0));
-            std::fs::rename(&path, &quarantine).map_err(text_artifact_unavailable)?;
+            std::fs::remove_file(&path).map_err(text_artifact_unavailable)?;
             DaemonCodeIndexPublicationStoreV1::sync_directory(path.parent().ok_or_else(|| {
                 RetrievalPortError::Contract("code text artifact path has no parent".to_owned())
             })?)
             .map_err(text_artifact_unavailable)?;
-            quarantined = Some(quarantine);
         }
-
         withdraw_verified_text_artifact_under_lock(&lock, &pointer, descriptor)
             .map_err(text_artifact_unavailable)?;
-        if let Some(quarantine) = quarantined {
-            std::fs::remove_file(&quarantine).map_err(text_artifact_unavailable)?;
-            DaemonCodeIndexPublicationStoreV1::sync_directory(quarantine.parent().ok_or_else(
-                || {
-                    RetrievalPortError::Contract(
-                        "quarantined code text artifact has no parent".to_owned(),
-                    )
-                },
-            )?)
-            .map_err(text_artifact_unavailable)?;
-        }
         Ok(())
     }
 
@@ -2246,7 +1251,7 @@ impl DaemonCodeTextArtifactStoreV1 {
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<(), RetrievalPortError> {
         checkpoint_text_artifact_control(control)?;
-        let artifacts_root = code_text_artifacts_root(&self.store_root);
+        let artifacts_root = code_text_artifact_staging_root(&self.store_root);
         if staging_path.parent() != Some(artifacts_root.as_path()) {
             return Err(RetrievalPortError::Contract(
                 "text-artifact staging path is outside its canonical root".to_owned(),
@@ -2254,15 +1259,29 @@ impl DaemonCodeTextArtifactStoreV1 {
         }
         let _lock = self.acquire_store_write_lock()?;
         checkpoint_text_artifact_control(control)?;
-        let metadata = staging_path
-            .symlink_metadata()
-            .map_err(text_artifact_unavailable)?;
-        if !metadata.file_type().is_file() {
-            return Err(RetrievalPortError::Contract(
-                "incompatible text-artifact staging path is not a regular file".to_owned(),
-            ));
+        match staging_path.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                retire_text_artifact_staging_family(staging_path)
+                    .map_err(text_artifact_unavailable)?;
+            }
+            Ok(_) => {
+                return Err(RetrievalPortError::Contract(
+                    "incompatible text-artifact staging path is not a regular file".to_owned(),
+                ));
+            }
+            // A concurrent build may retire this staging file first. Discard
+            // wants it gone, so finding it already gone is the end state, not
+            // an unavailable authority: reporting one aborts the caller's
+            // reopen and the clone lane answers a non-retryable failure for a
+            // state that has already resolved. Sidecars can outlive the
+            // database after a crash, so sweep them the way
+            // `prepare_absent_text_artifact_staging` does.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                clear_text_artifact_staging_sidecars(staging_path)
+                    .map_err(text_artifact_unavailable)?;
+            }
+            Err(error) => return Err(text_artifact_unavailable(error)),
         }
-        retire_text_artifact_staging_family(staging_path).map_err(text_artifact_unavailable)?;
         DaemonCodeIndexPublicationStoreV1::sync_directory(&artifacts_root)
             .map_err(text_artifact_unavailable)
     }
@@ -2300,13 +1319,13 @@ impl DaemonCodeTextArtifactStoreV1 {
     }
 
     /// Open the exact durable sealed file after the caller has admitted the
-    /// build's resident-memory ceiling. The lexical source verifies the whole
-    /// file content address during its one bounded structural scan.
+    /// build's resident-memory ceiling. The manifest is verified against its
+    /// content address here; each segment authenticates as the source reads it.
     pub(super) fn open_sealed_source(
         &self,
         identity: &DurableSealedCodeGenerationIdentityV1,
         control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<VerifiedSealedLexicalPageSourceV1<File>, RetrievalPortError> {
+    ) -> Result<VerifiedSealedLexicalPageSourceV1, RetrievalPortError> {
         self.open_sealed_source_with_progress(identity, control, |_, _| {})
     }
 
@@ -2315,7 +1334,7 @@ impl DaemonCodeTextArtifactStoreV1 {
         identity: &DurableSealedCodeGenerationIdentityV1,
         control: &dyn CodeIndexExecutionControlV1,
         mut progress: F,
-    ) -> Result<VerifiedSealedLexicalPageSourceV1<File>, RetrievalPortError>
+    ) -> Result<VerifiedSealedLexicalPageSourceV1, RetrievalPortError>
     where
         F: FnMut(u64, u64),
     {
@@ -2340,11 +1359,9 @@ impl DaemonCodeTextArtifactStoreV1 {
             ));
         }
         progress(identity.size_bytes, identity.size_bytes);
-        let manifest = File::open(path).map_err(text_artifact_unavailable)?;
         let publication = self.publication.clone();
         let source_identity = identity.clone();
         VerifiedSealedLexicalPageSourceV1::open_partitioned_sealed(
-            manifest,
             &manifest_bytes,
             identity.digest.clone(),
             move |digest, expected_size, buffer, control| {
@@ -2361,12 +1378,7 @@ impl DaemonCodeTextArtifactStoreV1 {
             TEXT_ARTIFACT_PAGE_CHUNKS_V1,
             TEXT_ARTIFACT_PAGE_BYTES_V1,
         )
-        .map_err(map_sealed_page_source_error)?
-        .ok_or_else(|| {
-            RetrievalPortError::Contract(
-                "partitioned sealed lexical source is incompatible".to_owned(),
-            )
-        })
+        .map_err(map_sealed_page_source_error)
     }
 
     /// Durably publish one finalized staging artifact: content-address it,
@@ -2377,17 +1389,7 @@ impl DaemonCodeTextArtifactStoreV1 {
         staging_path: &Path,
         generation_id: &CodeGenerationId,
         sealed_identity: &DurableSealedCodeGenerationIdentityV1,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<DurableCodeTextArtifactDescriptorV1, RetrievalPortError> {
-        self.publish_with_prior(staging_path, generation_id, sealed_identity, None, control)
-    }
-
-    fn publish_with_prior(
-        &self,
-        staging_path: &Path,
-        generation_id: &CodeGenerationId,
-        sealed_identity: &DurableSealedCodeGenerationIdentityV1,
-        prior: Option<&DurableCodeTextArtifactDescriptorV1>,
+        content_key: &ManifestDigest,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<DurableCodeTextArtifactDescriptorV1, RetrievalPortError> {
         hotpath::measure_block!("query.artifact.store.publish", {
@@ -2399,6 +1401,14 @@ impl DaemonCodeTextArtifactStoreV1 {
             // a plan made before the descriptor was attached.
             checkpoint_text_artifact_control(control)?;
             let lock = self.acquire_store_write_lock()?;
+            // The completed artifact is the project's: from the moment this
+            // publication finds or places it until its descriptor is durable,
+            // no scope's retention may collect it.
+            let _project_lock =
+                acquire_generation_segments_publication_lock(&self.store_root, &|| {
+                    checkpoint_text_artifact_control(control).is_err()
+                })
+                .map_err(text_artifact_unavailable)?;
             let (artifact_sha256, artifact_size_bytes) = hotpath::measure_block!(
                 "query.artifact.store.state_digest",
                 sha256_private_file_and_size(staging_path, control)
@@ -2414,39 +1424,41 @@ impl DaemonCodeTextArtifactStoreV1 {
                 artifact_digest: ManifestDigest::from_sha256_bytes(&artifact_sha256)
                     .map_err(text_artifact_unavailable)?,
                 artifact_size_bytes,
+                content_key: content_key.clone(),
             };
             let final_path = artifacts_root.join(&descriptor.artifact_file);
-            match final_path.symlink_metadata() {
-                Ok(_) => {
-                    // A digest-derived name is not proof that an existing filesystem
-                    // object contains the named bytes. Verify the stable destination
-                    // before withdrawing staging evidence; a symlink, non-regular
-                    // object, truncated file, or same-name collision fails closed.
-                    let (existing_sha256, existing_size_bytes) = hotpath::measure_block!(
-                        "query.artifact.store.dedupe_compare",
-                        sha256_private_file_and_size(&final_path, control)
-                    )?;
-                    if existing_size_bytes != artifact_size_bytes {
-                        return Err(RetrievalPortError::Contract(
-                            "existing code text artifact does not match its content address"
-                                .to_owned(),
-                        ));
-                    }
-                    if existing_sha256 != artifact_sha256 {
-                        return Err(RetrievalPortError::Contract(
-                            "existing code text artifact contains different bytes".to_owned(),
-                        ));
-                    }
-                    retire_text_artifact_staging_family(staging_path)
-                        .map_err(text_artifact_unavailable)?;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::rename(staging_path, &final_path)
-                        .map_err(text_artifact_unavailable)?;
-                    clear_text_artifact_staging_sidecars(staging_path)
-                        .map_err(text_artifact_unavailable)?;
-                }
+            // A digest-derived name is not proof that an existing filesystem
+            // object contains the named bytes. A regular file that does not
+            // hash to its name is a damaged copy some worktree published: the
+            // verified staging file replaces it and its bytes are gone. A
+            // symlink or other non-regular object fails closed.
+            let existing = match final_path.symlink_metadata() {
+                Ok(_) => Some(hotpath::measure_block!(
+                    "query.artifact.store.dedupe_compare",
+                    sha256_private_file_and_size(&final_path, control)
+                )?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(text_artifact_unavailable(error)),
+            };
+            if existing == Some((artifact_sha256, artifact_size_bytes)) {
+                retire_text_artifact_staging_family(staging_path)
+                    .map_err(text_artifact_unavailable)?;
+            } else {
+                // Renaming over the damaged file unlinks it atomically.
+                if existing.is_some() {
+                    tracing::warn!(
+                        event = "code_index_shared_text_artifact_replaced",
+                        artifact = %descriptor.artifact_file,
+                        "a text artifact that did not match its content address was replaced"
+                    );
+                }
+                std::fs::rename(staging_path, &final_path).map_err(text_artifact_unavailable)?;
+                clear_text_artifact_staging_sidecars(staging_path)
+                    .map_err(text_artifact_unavailable)?;
+                if let Some(staging_root) = staging_path.parent() {
+                    DaemonCodeIndexPublicationStoreV1::sync_directory(staging_root)
+                        .map_err(text_artifact_unavailable)?;
+                }
             }
             hotpath::measure_block!(
                 "query.artifact.store.seal_fsync",
@@ -2464,21 +1476,12 @@ impl DaemonCodeTextArtifactStoreV1 {
                     )
                 })?;
             hotpath::measure_block!("query.artifact.store.pointer_commit", {
-                match prior {
-                    Some(prior) => replace_verified_text_artifact_under_lock(
-                        &lock,
-                        &pointer,
-                        sealed_identity,
-                        prior,
-                        descriptor.clone(),
-                    ),
-                    None => attach_verified_text_artifact_under_lock(
-                        &lock,
-                        &pointer,
-                        sealed_identity,
-                        descriptor.clone(),
-                    ),
-                }
+                attach_verified_text_artifact_under_lock(
+                    &lock,
+                    &pointer,
+                    sealed_identity,
+                    descriptor.clone(),
+                )
                 .map_err(text_artifact_unavailable)
             })?;
             Ok(descriptor)
@@ -2542,7 +1545,7 @@ impl LatestCompleteCodeIndexV1 {
     ///
     /// Built at most once per generation and shared by every clone of this
     /// handle (and therefore by every concurrent query), the same way
-    /// [`Self::production_query_owners`] shares its lane owners. Serving a
+    /// `Self::production_query_owners` shares its lane owners. Serving a
     /// query never rebuilds the indices; only loading a new generation does.
     pub fn record_index(&self) -> &queries::GenerationRecordIndexV1 {
         self.record_index
@@ -2610,10 +1613,9 @@ impl LatestCodeTextGenerationV1 {
     /// Exact and lexical query owners are installed for this generation.
     ///
     /// This is the sole readiness predicate for a publication's graph seat
-    /// gate and for admitting a full sealed-generation graph replay. Clone
-    /// fingerprint backfill may still be unfinished when this returns true —
-    /// that remaining work is [`Self::text_projection_needs_work`], not a
-    /// seat or replay precondition.
+    /// gate and for admitting a full sealed-generation graph replay. The
+    /// artifact seals its clone index with its lexical rows, so ready owners
+    /// serve clone lookups too.
     pub fn query_owners_are_ready(&self) -> bool {
         matches!(
             self.query_owner_readiness(),
@@ -2644,9 +1646,8 @@ impl LatestCodeTextGenerationV1 {
             return true;
         }
         // A read probe must not queue behind an advance: a wake holds the
-        // slot lock for its whole bounded slice, and a clone-fingerprint
-        // backfill slice over a large sealed source runs for seconds. A
-        // contended slot is by definition work in progress.
+        // slot lock for its whole bounded slice. A contended slot is by
+        // definition work in progress.
         match self.text_projection_build.slot.try_lock() {
             Ok(slot) => !matches!(&*slot, CodeTextProjectionSlotV1::Idle),
             Err(std::sync::TryLockError::WouldBlock) => true,
@@ -2679,37 +1680,8 @@ impl LatestCodeTextGenerationV1 {
                 };
             }
         };
-        let artifact = match owners.clone_index_artifact() {
-            Ok(artifact) => artifact,
-            Err(error) => {
-                return CodeCloneIndexStatusV1::Unavailable {
-                    reason: format!("clone-index census is unavailable: {error}"),
-                };
-            }
-        };
-        let successor = self.clone_successor_progress();
-        let (completed_source_pages, total_source_pages, bytes_on_disk) = successor.map_or(
-            (
-                artifact.source_pages,
-                artifact.source_pages,
-                Some(artifact.bytes_on_disk),
-            ),
-            |progress| {
-                (
-                    progress.completed_source_pages,
-                    progress.total_source_pages,
-                    progress.bytes_on_disk.or(Some(artifact.bytes_on_disk)),
-                )
-            },
-        );
-        let observation = clone_index_observation(
-            self,
-            &artifact,
-            update,
-            completed_source_pages,
-            total_source_pages,
-            bytes_on_disk,
-        );
+        let artifact = owners.clone_index_artifact();
+        let observation = clone_index_observation(self, &artifact, update);
         if source_is_stale {
             return CodeCloneIndexStatusV1::Stale {
                 observation,
@@ -2717,10 +1689,7 @@ impl LatestCodeTextGenerationV1 {
                     .to_owned(),
             };
         }
-        if successor.is_some() {
-            return CodeCloneIndexStatusV1::Backfilling { observation };
-        }
-        let omission_reasons = clone_index_omission_reasons(&artifact);
+        let omission_reasons = clone_index_omission_reasons(&artifact.census);
         if omission_reasons.is_empty() {
             CodeCloneIndexStatusV1::Ready { observation }
         } else {
@@ -2728,43 +1697,6 @@ impl LatestCodeTextGenerationV1 {
                 observation,
                 omission_reasons,
             }
-        }
-    }
-
-    fn clone_successor_progress(&self) -> Option<CloneSuccessorProgressV1> {
-        let slot = self.text_projection_build.lock_slot();
-        match &*slot {
-            CodeTextProjectionSlotV1::CloneSuccessorPending => {
-                let owners = match self.query_owner_readiness() {
-                    CodeTextQueryOwnerReadinessV1::Ready(owners) => owners,
-                    CodeTextQueryOwnerReadinessV1::Pending
-                    | CodeTextQueryOwnerReadinessV1::Invalid => return None,
-                };
-                Some(CloneSuccessorProgressV1 {
-                    completed_source_pages: 0,
-                    total_source_pages: owners.hydration.verified_artifact().page_count(),
-                    bytes_on_disk: None,
-                })
-            }
-            CodeTextProjectionSlotV1::BuildingCloneSuccessor(build) => {
-                let completed_source_pages = build
-                    .builder
-                    .as_ref()
-                    .and_then(|builder| builder.next_cursor().ok().flatten())
-                    .map_or(0, |cursor| cursor.next_page_ordinal());
-                Some(CloneSuccessorProgressV1 {
-                    completed_source_pages,
-                    total_source_pages: build.prior.page_count(),
-                    bytes_on_disk: build
-                        .staging_path
-                        .metadata()
-                        .ok()
-                        .map(|metadata| metadata.len()),
-                })
-            }
-            CodeTextProjectionSlotV1::Idle
-            | CodeTextProjectionSlotV1::HeadOpening
-            | CodeTextProjectionSlotV1::Building(_) => None,
         }
     }
 
@@ -2777,22 +1709,12 @@ impl LatestCodeTextGenerationV1 {
     }
 }
 
-#[derive(Clone, Copy)]
-struct CloneSuccessorProgressV1 {
-    completed_source_pages: u64,
-    total_source_pages: u64,
-    bytes_on_disk: Option<u64>,
-}
-
 fn clone_index_observation(
     text: &LatestCodeTextGenerationV1,
     artifact: &CloneIndexArtifactSnapshotV1,
     update: Option<super::cadence::CodeIndexCloneUpdateV1>,
-    completed_source_pages: u64,
-    total_source_pages: u64,
-    bytes_on_disk: Option<u64>,
 ) -> CodeCloneIndexObservationV1 {
-    let census = artifact.census.as_ref();
+    let census = &artifact.census;
     let peak_scratch_memory_bytes = text
         .text_progress_state
         .lock()
@@ -2813,37 +1735,24 @@ fn clone_index_observation(
         conservative_normalization_revision: CONSERVATIVE_CLONE_NORMALIZATION_REVISION_V1,
         rename_normalization_revision: RENAME_CLONE_NORMALIZATION_REVISION_V1,
         coverage: CodeCloneIndexCoverageV1 {
-            source_bodies: census.map(|census| census.source_bodies),
-            eligible_source_bodies: census.map(|census| census.eligible_source_bodies),
-            conservative_normalized_bodies: census
-                .map(|census| census.conservative_normalized_bodies),
-            rename_normalized_bodies: census.map(|census| census.rename_normalized_bodies),
-            unique_payloads: census.map(|census| census.unique_payloads),
+            source_bodies: Some(census.source_bodies),
+            eligible_source_bodies: Some(census.eligible_source_bodies),
+            conservative_normalized_bodies: Some(census.conservative_normalized_bodies),
+            rename_normalized_bodies: Some(census.rename_normalized_bodies),
+            unique_payloads: Some(census.unique_payloads),
             payloads_reused: update.and_then(|update| update.payloads_reused),
-            exact_postings: census.map(|census| census.exact_postings),
-            near_fingerprint_bodies: artifact
-                .has_fingerprints
-                .then(|| census.map(|census| census.near_fingerprint_bodies))
-                .flatten(),
-            near_fingerprint_postings: artifact
-                .has_fingerprints
-                .then(|| census.map(|census| census.near_fingerprint_postings))
-                .flatten(),
-            hot_postings_skipped: artifact
-                .has_fingerprints
-                .then(|| census.map(|census| census.hot_postings))
-                .flatten(),
-            hot_posting_rows_skipped: artifact
-                .has_fingerprints
-                .then(|| census.map(|census| census.hot_posting_rows))
-                .flatten(),
-            excluded_too_small_bodies: census.map(|census| census.excluded_too_small_bodies),
-            excluded_incomplete_tokenization_bodies: census
-                .map(|census| census.excluded_incomplete_tokenization_bodies),
-            rename_partial_bodies: census.map(|census| census.rename_partial_bodies),
-            rename_unsupported_bodies: census.map(|census| census.rename_unsupported_bodies),
-            completed_source_pages,
-            total_source_pages,
+            exact_postings: Some(census.exact_postings),
+            near_fingerprint_bodies: Some(census.near_fingerprint_bodies),
+            near_fingerprint_postings: Some(census.near_fingerprint_postings),
+            hot_postings_skipped: Some(census.hot_postings),
+            hot_posting_rows_skipped: Some(census.hot_posting_rows),
+            excluded_too_small_bodies: Some(census.excluded_too_small_bodies),
+            excluded_too_large_bodies: Some(census.excluded_too_large_bodies),
+            excluded_incomplete_tokenization_bodies: Some(
+                census.excluded_incomplete_tokenization_bodies,
+            ),
+            rename_partial_bodies: Some(census.rename_partial_bodies),
+            rename_unsupported_bodies: Some(census.rename_unsupported_bodies),
         },
         budgets: CodeCloneIndexBudgetsV1 {
             posting_rows: CLONE_FINGERPRINT_POSTING_ROW_BUDGET_V1,
@@ -2858,7 +1767,7 @@ fn clone_index_observation(
             ),
         },
         resources: CodeCloneIndexResourcesV1 {
-            bytes_on_disk,
+            bytes_on_disk: Some(artifact.bytes_on_disk),
             peak_scratch_memory_bytes,
             changed_symbol_update_micros: update
                 .and_then(|update| update.changed_symbol_update_micros),
@@ -2867,20 +1776,14 @@ fn clone_index_observation(
     }
 }
 
-fn clone_index_omission_reasons(artifact: &CloneIndexArtifactSnapshotV1) -> Vec<String> {
+fn clone_index_omission_reasons(census: &CodeLexicalCloneIndexCensusV1) -> Vec<String> {
     let mut reasons = Vec::new();
-    let Some(census) = artifact.census.as_ref() else {
-        reasons.push("clone rows are missing from the sealed lexical artifact".to_owned());
-        return reasons;
-    };
     if census.conservative_normalized_bodies != census.eligible_source_bodies {
         reasons.push(
             "conservative normalization postings do not cover every eligible body".to_owned(),
         );
     }
-    if !artifact.has_fingerprints {
-        reasons.push("positional fingerprint backfill is not active".to_owned());
-    } else if census.near_fingerprint_bodies != census.eligible_source_bodies {
+    if census.near_fingerprint_bodies != census.eligible_source_bodies {
         reasons.push("positional fingerprints do not cover every eligible body".to_owned());
     }
     reasons
@@ -2910,20 +1813,10 @@ impl LatestCompleteCodeIndexV1 {
     pub fn lexical(&self) -> &[Arc<tracedecay_domain::CodeSearchChunkV1>] {
         self.generation.chunks().chunks()
     }
-
-    #[cfg(test)]
-    pub fn graph_edges(&self) -> &[tracedecay_domain::CanonicalRelationEdgeV1] {
-        self.generation.edges()
-    }
-
-    #[cfg(test)]
-    pub fn graph_abstentions(&self) -> &[crate::code_index::chunks::CodeIndexEdgeAbstentionV1] {
-        self.generation.edge_abstentions()
-    }
 }
 
 impl LatestCodeTextGenerationV1 {
-    /// Return exact and lexical owners without waiting for clone backfill.
+    /// Warm and return the exact, lexical, and clone query owners.
     #[cfg(any(test, feature = "test-helpers"))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn production_query_owners(
@@ -2958,37 +1851,6 @@ impl LatestCodeTextGenerationV1 {
             }
         }
         Ok(true)
-    }
-
-    /// Advance text projection until clone successor fingerprints are sealed.
-    ///
-    /// Lexical owners can be Ready while clone backfill is still background
-    /// work. `tracedecay_similar` needs those postings; ordinary search does not
-    /// wait here. Drive at most one bounded slice inline and leave the rest to
-    /// the retained worker wake the caller must have requested — owning the
-    /// whole successor on the request thread was the #1339 S1 regression.
-    pub(crate) fn finish_clone_similarity_warmup_for_request(
-        &self,
-        request_control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<CloneSimilarityWarmupForRequestV1, RetrievalPortError> {
-        let mut advances = 0_usize;
-        while self.text_projection_needs_work() {
-            self.advance_text_serving_for_request(
-                TEXT_ARTIFACT_MAXIMUM_WORK_PER_ADVANCE_V1,
-                request_control,
-            )?;
-            advances += 1;
-            if advances >= TEXT_ARTIFACT_MAXIMUM_CLONE_WARMUP_ADVANCES_V1 {
-                return Ok(if self.text_projection_needs_work() {
-                    // Background owns the remainder; do not collapse this into
-                    // a hard GenerationUnavailable miss at the executor.
-                    CloneSimilarityWarmupForRequestV1::Pending
-                } else {
-                    CloneSimilarityWarmupForRequestV1::Ready
-                });
-            }
-        }
-        Ok(CloneSimilarityWarmupForRequestV1::Ready)
     }
 
     pub(crate) fn production_query_owners_with_budget(
@@ -3125,6 +1987,25 @@ impl LatestCodeTextGenerationV1 {
         }
     }
 
+    /// Return a graph refused for resident memory to `Pending`, so the next
+    /// pass activates it again. Other refusals are configuration or terminal
+    /// verdicts and stay.
+    pub(super) fn retry_resident_memory_graph_refusal(&self) -> bool {
+        let mut state = self
+            .graph_activation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let refused_for_memory = matches!(
+            *state,
+            CodeGraphActivationStateV1::Refused(reason)
+                if reason == super::graph_activation::RESIDENT_MEMORY_GRAPH_REFUSAL_REASON
+        );
+        if refused_for_memory {
+            *state = CodeGraphActivationStateV1::Pending;
+        }
+        refused_for_memory
+    }
+
     fn refuse_graph_activation(&self, reason: &'static str) {
         let mut state = self
             .graph_activation
@@ -3185,6 +2066,11 @@ impl LatestCodeTextGenerationV1 {
                 tracedecay_query::retrieval::QUERY_EXACT_SCORE_DOMAIN_V1,
             )
             .map_err(|error| RetrievalPortError::Contract(error.to_string()))?,
+            clone_route: Some(CodeLexicalCloneRouteV1 {
+                project_id: self.metadata.manifest().project_id.clone(),
+                worktree_id: self.metadata.snapshot().worktree.clone(),
+                snapshot_digest: self.metadata.manifest().snapshot_digest.clone(),
+            }),
         })
     }
 
@@ -3205,7 +2091,7 @@ impl LatestCodeTextGenerationV1 {
             // cursor sits one file rollover beyond the last durably accepted
             // page whenever that page filled exactly at a file's last record.
             // The completion receipt is the accepted-source authority from
-            // here on — the same one the builder seals the artifact against —
+            // here on, the same one the builder seals the artifact against,
             // and it binds the source state digest, the page count, every
             // emitted counter, and both digest chains.
             Some(receipt) => receipt
@@ -3308,11 +2194,11 @@ impl LatestCodeTextGenerationV1 {
         &self,
         reader: &CodeLexicalArtifactReaderV1,
         sealed_identity: &DurableSealedCodeGenerationIdentityV1,
-        source: &VerifiedSealedLexicalPageSourceV1<File>,
+        source: &VerifiedSealedLexicalPageSourceV1,
     ) -> Result<CodeIndexBuildProgressV1, RetrievalPortError> {
         let artifact = reader.verified_artifact();
         let generation_id = &self.metadata.manifest().generation_id;
-        if artifact.generation() != generation_id {
+        if &reader.metadata().generation != generation_id {
             return Err(RetrievalPortError::GenerationMismatch);
         }
         let elapsed_micros = self
@@ -3476,6 +2362,20 @@ impl LatestCodeTextGenerationV1 {
         maximum_work: usize,
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<bool, RetrievalPortError> {
+        let _workers = self
+            .text_artifact_store
+            .worker_runtime
+            .enter(&self.text_artifact_store.resident_memory)
+            .map_err(|error| match error {
+                CodeIndexSchedulerErrorV1::WorkerPlan(
+                    tracedecay_code_index::parallelism::CodeIndexWorkerPlanInstallErrorV1::Invalid(
+                        tracedecay_code_index::parallelism::CodeIndexWorkerPlanErrorV1::NoMemorySafeWorker {
+                            ..
+                        },
+                    ),
+                ) => RetrievalPortError::ResidentMemoryRefused(error.to_string()),
+                other => RetrievalPortError::AuthorityUnavailable(other.to_string()),
+            })?;
         let result = self.advance_text_serving_inner(maximum_work, control);
         if matches!(&result, Err(RetrievalPortError::Cancelled)) {
             #[cfg(feature = "hotpath")]
@@ -3532,7 +2432,7 @@ impl LatestCodeTextGenerationV1 {
         &self,
         sealed_identity: &DurableSealedCodeGenerationIdentityV1,
         control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<VerifiedSealedLexicalPageSourceV1<File>, RetrievalPortError> {
+    ) -> Result<VerifiedSealedLexicalPageSourceV1, RetrievalPortError> {
         if let Some(source) = self
             .preopened_source
             .lock()
@@ -3541,94 +2441,8 @@ impl LatestCodeTextGenerationV1 {
         {
             return Ok(source);
         }
-        let mut source = self
-            .text_artifact_store
-            .open_sealed_source(sealed_identity, control)?;
-        if let Ok(Some(published)) = self
-            .text_artifact_store
-            .publication
-            .active_already_decoded()
-            && published.manifest().generation_id == self.metadata.manifest().generation_id
-        {
-            let _ = source.attach_published_files(&published);
-        }
-        Ok(source)
-    }
-
-    fn begin_clone_successor(
-        &self,
-        prior_descriptor: DurableCodeTextArtifactDescriptorV1,
-        prior: tracedecay_query::retrieval::lexical::VerifiedCodeLexicalArtifactV1,
-        sealed_identity: DurableSealedCodeGenerationIdentityV1,
-        source: VerifiedSealedLexicalPageSourceV1<File>,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<Box<CodeTextCloneSuccessorBuildV1>, RetrievalPortError> {
-        let generation_id = &self.metadata.manifest().generation_id;
-        let reservation = self.text_artifact_store.reserve_resident_memory(
-            generation_id,
-            "code-text-clone-successor",
-            CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1,
-        )?;
-        let artifacts_root = code_text_artifacts_root(self.text_artifact_store.store_root());
-        ensure_private_text_artifacts_root(&artifacts_root)?;
-        let prior_path =
-            code_text_artifact_path(self.text_artifact_store.store_root(), &prior_descriptor)
-                .map_err(text_artifact_unavailable)?;
-        let sealed_hex = sha256_hex_suffix(sealed_identity.digest.as_str()).ok_or_else(|| {
-            RetrievalPortError::Contract(
-                "clone-successor sealed generation digest is not SHA-256".to_owned(),
-            )
-        })?;
-        let staging_path = artifacts_root.join(format!(".text-artifact-{sealed_hex}.staging"));
-        prepare_absent_text_artifact_staging(&staging_path).map_err(text_artifact_unavailable)?;
-        let metadata = self.text_projection_metadata()?;
-        let open_builder = || {
-            CodeLexicalCloneSuccessorV1::open_or_create(
-                &prior_path,
-                &staging_path,
-                prior.clone(),
-                metadata.clone(),
-                CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1,
-            )
-        };
-        let mut builder = match open_builder() {
-            Ok(builder) => builder,
-            Err(
-                CodeLexicalArtifactErrorV1::Incompatible(_)
-                | CodeLexicalArtifactErrorV1::Corrupt(_),
-            ) => {
-                self.text_artifact_store
-                    .discard_incompatible_staging(&staging_path, control)?;
-                open_builder().map_err(map_text_artifact_error)?
-            }
-            Err(error) => return Err(map_text_artifact_error(error)),
-        };
-        let source_position = match builder.next_cursor() {
-            Ok(Some(cursor)) => CloneSuccessorSourcePositionV1::Revalidating(cursor),
-            Ok(None) => CloneSuccessorSourcePositionV1::Appending,
-            Err(
-                CodeLexicalArtifactErrorV1::Incompatible(_)
-                | CodeLexicalArtifactErrorV1::Corrupt(_),
-            ) => {
-                drop(builder);
-                self.text_artifact_store
-                    .discard_incompatible_staging(&staging_path, control)?;
-                builder = open_builder().map_err(map_text_artifact_error)?;
-                CloneSuccessorSourcePositionV1::Appending
-            }
-            Err(error) => return Err(map_text_artifact_error(error)),
-        };
-        Ok(Box::new(CodeTextCloneSuccessorBuildV1 {
-            builder: Some(builder),
-            source,
-            source_position,
-            sealed_identity,
-            source_receipt: None,
-            prior,
-            prior_descriptor,
-            staging_path,
-            build_reservation: Some(reservation),
-        }))
+        self.text_artifact_store
+            .open_sealed_source(sealed_identity, control)
     }
 
     fn open_published_text_artifact(
@@ -3649,37 +2463,18 @@ impl LatestCodeTextGenerationV1 {
             path,
             &descriptor.artifact_digest,
             descriptor.artifact_size_bytes,
+            &self.text_projection_metadata()?,
             CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
             control,
-        )
-        .and_then(|reader| {
-            let expected_metadata = self
-                .text_projection_metadata()
-                .map_err(|error| CodeLexicalArtifactErrorV1::Contract(error.to_string()))?;
-            if reader.metadata() != &expected_metadata {
-                return Err(CodeLexicalArtifactErrorV1::Incompatible(
-                    "published lexical metadata does not match the current projection".to_owned(),
-                ));
-            }
-            Ok(reader)
-        });
+        );
         match reader {
             Ok(reader) => {
                 let sealed_identity = store.sealed_identity(generation_id)?;
                 let source = self.take_preopened_source_or_open(&sealed_identity, control)?;
                 let ready_progress =
                     self.ready_text_progress_snapshot(&reader, &sealed_identity, &source)?;
-                let needs_clone_successor = !reader.has_clone_fingerprints();
-                let prior = reader.verified_artifact().clone();
                 self.install_artifact_owners(reader, reader_reservation)?;
                 self.publish_text_progress_snapshot(ready_progress);
-                if needs_clone_successor {
-                    self.text_projection_build.retain_clone_successor_retry()?;
-                    return self
-                        .begin_clone_successor(descriptor, prior, sealed_identity, source, control)
-                        .map(TextHeadOpenOutcomeV1::BuildCloneSuccessor)
-                        .map(Some);
-                }
                 drop(source);
                 Ok(Some(TextHeadOpenOutcomeV1::Served))
             }
@@ -3702,6 +2497,102 @@ impl LatestCodeTextGenerationV1 {
         }
     }
 
+    /// Serve an artifact a sibling worktree published for the same content
+    /// instead of building one. The content key is derived before any build
+    /// from the sealed source and the projection; a descriptor under that key
+    /// is adopted only after its file opens against its content address and
+    /// this generation's projection, and anything else falls through to the
+    /// build. The project lock is held shared from the lookup until the
+    /// descriptor is durable, so no retention collects the file meanwhile.
+    fn adopt_shared_text_artifact(
+        &self,
+        generation_id: &CodeGenerationId,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<Option<TextHeadOpenOutcomeV1>, RetrievalPortError> {
+        let store = &self.text_artifact_store;
+        let sealed_identity = store.sealed_identity(generation_id)?;
+        let reader_reservation = store.reserve_resident_memory(
+            generation_id,
+            "code-text-artifact-reader",
+            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+        )?;
+        let source = self.take_preopened_source_or_open(&sealed_identity, control)?;
+        let metadata = self.text_projection_metadata()?;
+        let content_key = text_artifact_content_key(&source, &metadata)?;
+        let adopted = (|| {
+            let lock = store.acquire_store_write_lock()?;
+            let _project_lock =
+                acquire_generation_segments_publication_lock(store.store_root(), &|| {
+                    checkpoint_text_artifact_control(control).is_err()
+                })
+                .map_err(text_artifact_unavailable)?;
+            let Some(shared) = find_shared_text_artifact(store.store_root(), &content_key)
+                .map_err(text_artifact_unavailable)?
+            else {
+                return Ok(None);
+            };
+            let path = code_text_artifact_path(store.store_root(), &shared)
+                .map_err(text_artifact_unavailable)?;
+            let reader = match CodeLexicalArtifactReaderV1::open_content_addressed(
+                path,
+                &shared.artifact_digest,
+                shared.artifact_size_bytes,
+                &metadata,
+                CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+                control,
+            ) {
+                Ok(reader) => reader,
+                Err(error @ CodeLexicalArtifactErrorV1::Interrupted(_)) => {
+                    return Err(map_text_artifact_error(error));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        event = "code_index_shared_text_artifact_refused",
+                        artifact = %shared.artifact_file,
+                        %error,
+                        "a shared text artifact under this content key failed verification; building one"
+                    );
+                    return Ok(None);
+                }
+            };
+            let descriptor = DurableCodeTextArtifactDescriptorV1 {
+                generation_id: generation_id.clone(),
+                artifact_file: shared.artifact_file,
+                artifact_digest: shared.artifact_digest,
+                artifact_size_bytes: shared.artifact_size_bytes,
+                content_key: content_key.clone(),
+            };
+            let pointer = store
+                .publication
+                .read_publication_pointer()
+                .map_err(text_artifact_unavailable)?
+                .ok_or_else(|| {
+                    RetrievalPortError::AuthorityUnavailable(
+                        "no durable publication pointer exists for text-artifact attachment"
+                            .to_owned(),
+                    )
+                })?;
+            attach_verified_text_artifact_under_lock(&lock, &pointer, &sealed_identity, descriptor)
+                .map_err(text_artifact_unavailable)?;
+            Ok(Some(reader))
+        })();
+        let Some(reader) = adopted? else {
+            // The build reads the same source; hand it over rather than
+            // reopen it.
+            *self
+                .preopened_source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(source);
+            return Ok(None);
+        };
+        hotpath::gauge!("query.artifact.shared_adoptions_total").inc(1u64);
+        let ready_progress =
+            self.ready_text_progress_snapshot(&reader, &sealed_identity, &source)?;
+        self.install_artifact_owners(reader, reader_reservation)?;
+        self.publish_text_progress_snapshot(ready_progress);
+        Ok(Some(TextHeadOpenOutcomeV1::Served))
+    }
+
     /// One claimed head-open pass, run with the slot lock released: reopen
     /// the published durable head when one exists, otherwise authenticate the
     /// sealed source and begin (or resume) the staging build. Fail-closed:
@@ -3713,14 +2604,9 @@ impl LatestCodeTextGenerationV1 {
         control: &dyn CodeIndexExecutionControlV1,
     ) -> Result<TextHeadOpenOutcomeV1, RetrievalPortError> {
         let store = &self.text_artifact_store;
-        let build_memory_budget = code_lexical_artifact_build_memory_budget_for(
+        let preferred_build_memory_budget = code_lexical_artifact_build_memory_budget_for(
             store.resident_memory.snapshot().limit_bytes,
         );
-        let (source_batch_pages, source_batch_bytes, _) =
-            text_artifact_source_batch_limits(build_memory_budget);
-        hotpath::gauge!("query.artifact.build_memory_budget_bytes").set(build_memory_budget);
-        hotpath::gauge!("query.artifact.source_batch_pages_max").set(source_batch_pages);
-        hotpath::gauge!("query.artifact.source_batch_bytes_max").set(source_batch_bytes);
         let generation_id = self.metadata.manifest().generation_id.clone();
         if let Some(descriptor) = store.published_descriptor(&generation_id)?
             && let Some(outcome) =
@@ -3728,27 +2614,43 @@ impl LatestCodeTextGenerationV1 {
         {
             return Ok(outcome);
         }
+        if let Some(outcome) = self.adopt_shared_text_artifact(&generation_id, control)? {
+            return Ok(outcome);
+        }
         // The builder's advertised memory ceiling is reserved through the
-        // process resident-memory authority before the build allocates.
-        let build_reservation = store.reserve_resident_memory(
+        // process resident-memory authority before the build allocates. The
+        // host-scaled figure is a preferred ceiling, not a minimum: under a
+        // large stale serving graph, admit any supported budget down to the
+        // builder's established 1.5 GiB floor so the replacement can finish
+        // and release that graph.
+        let (build_reservation, build_memory_budget) = store.reserve_resident_memory_up_to(
             &generation_id,
             "code-text-artifact-build",
-            build_memory_budget,
+            preferred_build_memory_budget,
+            CODE_LEXICAL_ARTIFACT_BUILD_MEMORY_BUDGET_BYTES_V1,
         )?;
+        let (source_batch_pages, source_batch_bytes, _) =
+            text_artifact_source_batch_limits(build_memory_budget);
+        hotpath::gauge!("query.artifact.preferred_build_memory_budget_bytes")
+            .set(preferred_build_memory_budget);
+        hotpath::gauge!("query.artifact.build_memory_budget_bytes").set(build_memory_budget);
+        hotpath::gauge!("query.artifact.source_batch_pages_max").set(source_batch_pages);
+        hotpath::gauge!("query.artifact.source_batch_bytes_max").set(source_batch_bytes);
         let sealed_identity = store.sealed_identity(&generation_id)?;
         let sealed_hex = sha256_hex_suffix(sealed_identity.digest.as_str()).ok_or_else(|| {
             RetrievalPortError::Contract(
                 "durable sealed lexical source digest is not SHA-256".to_owned(),
             )
         })?;
-        let artifacts_root = code_text_artifacts_root(store.store_root());
-        ensure_private_text_artifacts_root(&artifacts_root)?;
-        let staging_path = artifacts_root.join(format!(".text-artifact-{sealed_hex}.staging"));
+        let staging_root = code_text_artifact_staging_root(store.store_root());
+        ensure_private_text_artifacts_root(&staging_root)?;
+        let staging_path = staging_root.join(format!(".text-artifact-{sealed_hex}.staging"));
         prepare_absent_text_artifact_staging(&staging_path).map_err(text_artifact_unavailable)?;
         let mut source = self.take_preopened_source_or_open(&sealed_identity, control)?;
         let builder_budget =
             text_artifact_builder_budget(build_memory_budget, source.staging_window_bytes())?;
         let metadata = self.text_projection_metadata()?;
+        let content_key = text_artifact_content_key(&source, &metadata)?;
         let mut builder = if staging_path.exists() {
             match CodeLexicalArtifactBuilderV1::open_or_resume_with_memory_budget_and_control(
                 &staging_path,
@@ -3759,24 +2661,39 @@ impl LatestCodeTextGenerationV1 {
                 Ok(builder) => Ok(builder),
                 Err(CodeLexicalArtifactErrorV1::Incompatible(_)) => {
                     store.discard_incompatible_staging(&staging_path, control)?;
-                    CodeLexicalArtifactBuilderV1::create_with_memory_budget_and_format_revision(
+                    CodeLexicalArtifactBuilderV1::create_with_memory_budget(
                         &staging_path,
                         metadata.clone(),
                         builder_budget,
-                        CodeLexicalArtifactWriterRevisionV1::V14,
                     )
                 }
                 Err(error) => Err(error),
             }
         } else {
-            CodeLexicalArtifactBuilderV1::create_with_memory_budget_and_format_revision(
+            CodeLexicalArtifactBuilderV1::create_with_memory_budget(
                 &staging_path,
                 metadata.clone(),
                 builder_budget,
-                CodeLexicalArtifactWriterRevisionV1::V14,
             )
         }
         .map_err(map_text_artifact_error)?;
+        // A staging file sealed before its publication was interrupted keeps
+        // no source cursor; it is complete and is published as it stands.
+        if builder
+            .sealed_receipt()
+            .map_err(map_text_artifact_error)?
+            .is_some()
+        {
+            drop(builder);
+            drop(source);
+            return self.publish_sealed_text_artifact(
+                &staging_path,
+                &sealed_identity,
+                &content_key,
+                build_reservation,
+                control,
+            );
+        }
         let mut progress = builder.progress().map_err(map_text_artifact_error)?;
         if let Some(cursor) = progress.next_cursor.as_ref() {
             match source.restore_cursor_classified(cursor, control) {
@@ -3784,14 +2701,10 @@ impl LatestCodeTextGenerationV1 {
                 Err(VerifiedSealedLexicalCursorRestoreErrorV1::IncompatiblePosition) => {
                     drop(builder);
                     store.discard_incompatible_staging(&staging_path, control)?;
-                    // Keep the same V14 admission writer as the cold create path.
-                    // Defaulting to V16 here would admit clone fingerprints on the
-                    // rebuild lane and diverge from the successor-backed cutover.
-                    builder = CodeLexicalArtifactBuilderV1::create_with_memory_budget_and_format_revision(
+                    builder = CodeLexicalArtifactBuilderV1::create_with_memory_budget(
                         &staging_path,
                         metadata,
                         builder_budget,
-                        CodeLexicalArtifactWriterRevisionV1::V14,
                     )
                     .map_err(map_text_artifact_error)?;
                     progress = builder.progress().map_err(map_text_artifact_error)?;
@@ -3805,6 +2718,7 @@ impl LatestCodeTextGenerationV1 {
             builder,
             source,
             sealed_identity,
+            content_key,
             source_receipt: None,
             staging_path,
             _build_reservation: build_reservation,
@@ -3843,10 +2757,7 @@ impl LatestCodeTextGenerationV1 {
             }
             let guard = self.text_projection_build.lock_slot();
             match &*guard {
-                CodeTextProjectionSlotV1::Idle
-                | CodeTextProjectionSlotV1::CloneSuccessorPending
-                | CodeTextProjectionSlotV1::Building(_)
-                | CodeTextProjectionSlotV1::BuildingCloneSuccessor(_) => {
+                CodeTextProjectionSlotV1::Idle | CodeTextProjectionSlotV1::Building(_) => {
                     break guard;
                 }
                 CodeTextProjectionSlotV1::HeadOpening => {
@@ -3866,11 +2777,8 @@ impl LatestCodeTextGenerationV1 {
                 }
             }
         };
-        if matches!(
-            &*slot,
-            CodeTextProjectionSlotV1::Idle | CodeTextProjectionSlotV1::CloneSuccessorPending
-        ) {
-            if matches!(&*slot, CodeTextProjectionSlotV1::Idle) && self.query_owners_are_ready() {
+        if matches!(&*slot, CodeTextProjectionSlotV1::Idle) {
+            if self.query_owners_are_ready() {
                 return Ok(true);
             }
             *slot = CodeTextProjectionSlotV1::HeadOpening;
@@ -3883,29 +2791,9 @@ impl LatestCodeTextGenerationV1 {
             match outcome {
                 TextHeadOpenOutcomeV1::Served => return Ok(true),
                 TextHeadOpenOutcomeV1::Build(initialized) => {
-                    slot = claim.install(TextHeadOpenBuildV1::Artifact(initialized));
-                }
-                TextHeadOpenOutcomeV1::BuildCloneSuccessor(initialized) => {
-                    slot = claim.install(TextHeadOpenBuildV1::CloneSuccessor(initialized));
+                    slot = claim.install(initialized);
                 }
             }
-        }
-        if matches!(&*slot, CodeTextProjectionSlotV1::BuildingCloneSuccessor(_)) {
-            let done = match &mut *slot {
-                CodeTextProjectionSlotV1::BuildingCloneSuccessor(successor) => {
-                    self.advance_clone_successor(successor, maximum_work, control)?
-                }
-                _ => {
-                    return Err(RetrievalPortError::Contract(
-                        "clone-successor build state changed under its lock".to_owned(),
-                    ));
-                }
-            };
-            if done {
-                *slot = CodeTextProjectionSlotV1::Idle;
-                self.text_projection_build.ready.notify_all();
-            }
-            return Ok(done);
         }
         let CodeTextProjectionSlotV1::Building(artifact_build) = &mut *slot else {
             return Err(RetrievalPortError::Contract(
@@ -3933,6 +2821,7 @@ impl LatestCodeTextGenerationV1 {
             self.publish_text_progress_phase(CodeIndexBuildPhaseV1::SourceScan, 0, 0);
             let mut durable_progress = None;
             let mut commit_latency_micros = None;
+            let mut clone_scratch_bytes = 0_usize;
             let admitted = {
                 let (source, builder) = (&mut artifact_build.source, &mut artifact_build.builder);
                 source.next_page_batch_if(control, bounds, |pages| {
@@ -3985,6 +2874,12 @@ impl LatestCodeTextGenerationV1 {
                                 batch_pages,
                                 batch_payload_bytes,
                             );
+                            clone_scratch_bytes = prepared
+                                .prepared_pages()
+                                .iter()
+                                .map(PreparedCodeLexicalArtifactPageV1::clone_body_peak_bytes)
+                                .max()
+                                .unwrap_or(0);
                             let commit_started = Instant::now();
                             let progress = builder
                                 .append_prepared_pages(prepared.prepared_pages(), control)?;
@@ -4051,6 +2946,12 @@ impl LatestCodeTextGenerationV1 {
                             true,
                         )
                     )?;
+                    self.text_progress_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .observe_clone_scratch(
+                            u64::try_from(clone_scratch_bytes).unwrap_or(u64::MAX),
+                        );
                     #[cfg(feature = "hotpath")]
                     {
                         let committed_lexical_units = artifact_build
@@ -4157,21 +3058,11 @@ impl LatestCodeTextGenerationV1 {
             }
             CodeLexicalArtifactFinalizationStepV1::Ready(_) => CodeIndexBuildPhaseV1::Verification,
         };
-        let progress = artifact_build
-            .builder
-            .progress()
-            .map_err(map_text_artifact_error)?;
-        self.publish_text_progress_boundary(
-            artifact_build,
-            &progress,
-            finalization_phase,
-            0,
-            0,
-            None,
-            false,
-        )?;
+        // The sealed file keeps no source cursor, so the phase is published
+        // over the last boundary's counters.
+        self.publish_text_progress_phase(finalization_phase, 0, 0);
         // The publication tail content-addresses the finalized staging file
-        // and reopens it verified — corpus-sized digest work — so it runs
+        // and reopens it verified, corpus-sized digest work, so it runs
         // under a fresh `HeadOpening` claim with the slot lock released, the
         // same discipline as the durable-head reopen. On failure the claim
         // restores `Idle` and the durable staging file resumes on a later
@@ -4185,11 +3076,12 @@ impl LatestCodeTextGenerationV1 {
             ));
         };
         drop(slot);
-        let mut publish_claim = TextHeadOpenClaimV1::new(&self.text_projection_build);
+        let _publish_claim = TextHeadOpenClaimV1::new(&self.text_projection_build);
         let CodeTextArtifactBuildV1 {
             builder,
             source,
             sealed_identity,
+            content_key,
             source_receipt: _,
             staging_path,
             _build_reservation: build_reservation,
@@ -4198,272 +3090,57 @@ impl LatestCodeTextGenerationV1 {
         // finalized staging file.
         drop(builder);
         drop(source);
-        let descriptor = store.publish(
+        self.publish_sealed_text_artifact(
             &staging_path,
-            &self.metadata.manifest().generation_id,
             &sealed_identity,
+            &content_key,
+            build_reservation,
             control,
         )?;
-        // The builder and source are gone, so its transient reservation no
-        // longer owns bytes. Release it before sampling the reader admission;
-        // the reader guard then carries the still-live unmodeled baseline.
-        drop(build_reservation);
-        let reader_reservation = store.reserve_resident_memory(
+        Ok(true)
+    }
+
+    /// Publish one sealed staging file, open it verified, and install its
+    /// owners.
+    fn publish_sealed_text_artifact(
+        &self,
+        staging_path: &Path,
+        sealed_identity: &DurableSealedCodeGenerationIdentityV1,
+        content_key: &ManifestDigest,
+        build_reservation: ResidentMemoryReservationV1,
+        control: &dyn CodeIndexExecutionControlV1,
+    ) -> Result<TextHeadOpenOutcomeV1, RetrievalPortError> {
+        let store = &self.text_artifact_store;
+        let descriptor = store.publish(
+            staging_path,
             &self.metadata.manifest().generation_id,
-            "code-text-artifact-reader",
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
+            sealed_identity,
+            content_key,
+            control,
         )?;
+        // The reader is a smaller charge of the bytes this build already
+        // holds. Dropping the build reservation and reserving the reader
+        // again is a gap: an overlapping graph replay can sit on the process
+        // RSS watermark, and the new admission is then refused forever.
+        let reader_reservation = reader_charge_from_held_reservation(build_reservation)?;
         let final_path = code_text_artifact_path(store.store_root(), &descriptor)
             .map_err(text_artifact_unavailable)?;
         let reader = CodeLexicalArtifactReaderV1::open_content_addressed(
             final_path,
             &descriptor.artifact_digest,
             descriptor.artifact_size_bytes,
+            &self.text_projection_metadata()?,
             CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
             control,
         )
         .map_err(map_text_artifact_error)?;
-        let needs_clone_successor = !reader.has_clone_fingerprints();
-        let prior = reader.verified_artifact().clone();
         // Match the cold-open path: install owners first, then publish Ready.
         // Publishing Ready before a failed install (admission ceiling / shrink)
         // would leave dashboard/MCP progress claiming a ready generation that
         // cannot serve queries.
         self.install_artifact_owners(reader, reader_reservation)?;
         self.publish_text_progress_phase(CodeIndexBuildPhaseV1::Ready, 0, 0);
-        if needs_clone_successor {
-            let source = store.open_sealed_source(&sealed_identity, control)?;
-            let build =
-                self.begin_clone_successor(descriptor, prior, sealed_identity, source, control)?;
-            drop(publish_claim.install(TextHeadOpenBuildV1::CloneSuccessor(build)));
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn advance_clone_successor(
-        &self,
-        build: &mut CodeTextCloneSuccessorBuildV1,
-        maximum_work: usize,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<bool, RetrievalPortError> {
-        if build.builder.is_none() {
-            self.rebuild_clone_successor(build, control)?;
-        }
-        let (batch_pages, batch_bytes) = clone_successor_source_batch_limits(
-            build
-                .builder
-                .as_ref()
-                .ok_or_else(|| {
-                    RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
-                })?
-                .projection_metadata(),
-        )?;
-        let mut remaining = maximum_work.max(1);
-        while remaining > 0 && build.source_receipt.is_none() {
-            if let CloneSuccessorSourcePositionV1::Revalidating(target) = &build.source_position {
-                // Resume revalidation replays already-committed pages one at a
-                // time until the persisted successor cursor is reached.
-                let target = target.clone();
-                let read = build
-                    .source
-                    .next_page(control)
-                    .map_err(map_sealed_page_source_error)?;
-                match read {
-                    VerifiedSealedLexicalPageReadV1::Page(page) => {
-                        if !self.revalidate_clone_successor_page(build, target, &page, control)? {
-                            return Ok(false);
-                        }
-                        remaining -= 1;
-                    }
-                    VerifiedSealedLexicalPageReadV1::Complete(_) => {
-                        self.rebuild_clone_successor(build, control)?;
-                        return Ok(false);
-                    }
-                }
-                continue;
-            }
-            let bounds = VerifiedSealedLexicalPageBatchBoundsV1::new(
-                remaining.clamp(1, batch_pages),
-                batch_bytes,
-            )
-            .map_err(map_sealed_page_source_error)?;
-            match self.append_clone_successor_batch(build, bounds, control)? {
-                VerifiedSealedLexicalPageBatchReadV1::Pages(batch) => {
-                    remaining = remaining.checked_sub(batch.len()).ok_or_else(|| {
-                        RetrievalPortError::Contract(
-                            "clone-successor batch delivered more pages than the remaining work bound"
-                                .to_owned(),
-                        )
-                    })?;
-                }
-                VerifiedSealedLexicalPageBatchReadV1::Complete(receipt) => {
-                    build.source_receipt = Some(receipt);
-                }
-            }
-        }
-        let Some(source_receipt) = build.source_receipt.as_ref() else {
-            return Ok(false);
-        };
-        if remaining == 0 {
-            return Ok(false);
-        }
-        let _receipt = build
-            .builder
-            .as_mut()
-            .ok_or_else(|| {
-                RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
-            })?
-            .finish(source_receipt, control)
-            .map_err(map_text_artifact_error)?;
-        drop(build.builder.take());
-        drop(build.build_reservation.take());
-        let descriptor = self.text_artifact_store.publish_with_prior(
-            &build.staging_path,
-            &self.metadata.manifest().generation_id,
-            &build.sealed_identity,
-            Some(&build.prior_descriptor),
-            control,
-        )?;
-        let reader_reservation = self.text_artifact_store.reserve_resident_memory(
-            &self.metadata.manifest().generation_id,
-            "code-text-artifact-reader",
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
-        )?;
-        let final_path =
-            code_text_artifact_path(self.text_artifact_store.store_root(), &descriptor)
-                .map_err(text_artifact_unavailable)?;
-        let reader = CodeLexicalArtifactReaderV1::open_content_addressed(
-            final_path,
-            &descriptor.artifact_digest,
-            descriptor.artifact_size_bytes,
-            CODE_LEXICAL_ARTIFACT_QUERY_CACHE_BUDGET_BYTES_V1,
-            control,
-        )
-        .map_err(map_text_artifact_error)?;
-        self.install_artifact_owners(reader, reader_reservation)?;
-        Ok(true)
-    }
-
-    /// Stage one bounded ordered page batch from the sealed source and append
-    /// it to the clone successor under one durable commit. The source cursor
-    /// only advances through pages the successor accepted, so a failed batch
-    /// leaves both authorities at their pre-batch position.
-    fn append_clone_successor_batch(
-        &self,
-        build: &mut CodeTextCloneSuccessorBuildV1,
-        bounds: VerifiedSealedLexicalPageBatchBoundsV1,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<VerifiedSealedLexicalPageBatchReadV1, RetrievalPortError> {
-        let (source, builder) = (&mut build.source, &mut build.builder);
-        let builder = builder.as_mut().ok_or_else(|| {
-            RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
-        })?;
-        source
-            .next_page_batch_if(control, bounds, |pages| {
-                for page in pages {
-                    self.observe_clone_page_scratch(page)?;
-                }
-                builder
-                    .append_pages(pages, control)
-                    .map_err(map_text_artifact_error)?;
-                NonZeroUsize::new(pages.len()).ok_or_else(|| {
-                    RetrievalPortError::Contract(
-                        "sealed lexical source staged an empty clone-successor batch".to_owned(),
-                    )
-                })
-            })
-            .map_err(map_sealed_page_source_error)?
-    }
-
-    fn observe_clone_page_scratch(
-        &self,
-        page: &VerifiedSealedLexicalPageV1,
-    ) -> Result<(), RetrievalPortError> {
-        let scratch_bytes = page.clone_bodies().iter().try_fold(0_u64, |peak, body| {
-            let payload = serde_json::to_vec(&body.payload)
-                .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-            let occurrence = serde_json::to_vec(&body.occurrence)
-                .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-            let bytes = u64::try_from(payload.len().saturating_add(occurrence.len()))
-                .map_err(|error| RetrievalPortError::Contract(error.to_string()))?;
-            Ok::<_, RetrievalPortError>(peak.max(bytes))
-        })?;
-        self.text_progress_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .observe_clone_scratch(scratch_bytes);
-        Ok(())
-    }
-
-    /// Replay one already-committed page against the resumed successor while
-    /// it is `Revalidating` toward `target`. Returns `false` when the
-    /// successor had to be rebuilt and the slice must stop.
-    fn revalidate_clone_successor_page(
-        &self,
-        build: &mut CodeTextCloneSuccessorBuildV1,
-        target: VerifiedSealedLexicalCursorV1,
-        page: &VerifiedSealedLexicalPageV1,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<bool, RetrievalPortError> {
-        self.observe_clone_page_scratch(page)?;
-        let verification = build
-            .builder
-            .as_ref()
-            .ok_or_else(|| {
-                RetrievalPortError::Contract("clone-successor builder is missing".to_owned())
-            })?
-            .verify_resumed_page(page, control);
-        if matches!(
-            verification,
-            Err(CodeLexicalArtifactErrorV1::Incompatible(_)
-                | CodeLexicalArtifactErrorV1::Corrupt(_))
-        ) || page.next_cursor().next_page_ordinal() > target.next_page_ordinal()
-        {
-            self.rebuild_clone_successor(build, control)?;
-            return Ok(false);
-        }
-        verification.map_err(map_text_artifact_error)?;
-        if page.next_cursor().next_page_ordinal() == target.next_page_ordinal() {
-            if page.next_cursor() != &target {
-                self.rebuild_clone_successor(build, control)?;
-                return Ok(false);
-            }
-            build.source_position = CloneSuccessorSourcePositionV1::Appending;
-        }
-        Ok(true)
-    }
-
-    fn rebuild_clone_successor(
-        &self,
-        build: &mut CodeTextCloneSuccessorBuildV1,
-        control: &dyn CodeIndexExecutionControlV1,
-    ) -> Result<(), RetrievalPortError> {
-        drop(build.builder.take());
-        self.text_artifact_store
-            .discard_incompatible_staging(&build.staging_path, control)?;
-        prepare_absent_text_artifact_staging(&build.staging_path)
-            .map_err(text_artifact_unavailable)?;
-        let prior_path = code_text_artifact_path(
-            self.text_artifact_store.store_root(),
-            &build.prior_descriptor,
-        )
-        .map_err(text_artifact_unavailable)?;
-        let builder = CodeLexicalCloneSuccessorV1::open_or_create(
-            prior_path,
-            &build.staging_path,
-            build.prior.clone(),
-            self.text_projection_metadata()?,
-            CLONE_SUCCESSOR_MEMORY_BUDGET_BYTES_V1,
-        )
-        .map_err(map_text_artifact_error)?;
-        build.source = self
-            .text_artifact_store
-            .open_sealed_source(&build.sealed_identity, control)?;
-        build.source_position = CloneSuccessorSourcePositionV1::Appending;
-        build.source_receipt = None;
-        build.builder = Some(builder);
-        Ok(())
+        Ok(TextHeadOpenOutcomeV1::Served)
     }
 
     fn install_artifact_owners(
@@ -4609,42 +3286,34 @@ pub(super) fn sha256_private_file_and_size(
     Ok((hasher.finalize().into(), file_metadata.len()))
 }
 
+/// The content key the text artifact of `source` under `metadata` is
+/// published with.
+fn text_artifact_content_key(
+    source: &VerifiedSealedLexicalPageSourceV1,
+    metadata: &CodeLexicalProjectionMetadataV1,
+) -> Result<ManifestDigest, RetrievalPortError> {
+    code_lexical_artifact_content_key(
+        &source.content_key().map_err(map_sealed_page_source_error)?,
+        metadata,
+    )
+    .map_err(map_text_artifact_error)
+}
+
 fn ensure_private_text_artifacts_root(path: &Path) -> Result<(), RetrievalPortError> {
     match tracedecay_private_fs::create_private_directory(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let validation_error = match validate_private_directory(path) {
-                Ok(()) => return Ok(()),
-                Err(error) => error,
-            };
-            // A pre-existing root that fails owner-privacy validation is most
-            // often a legacy directory an older binary created under a
-            // permissive umask. Ownership is the proof this process may
-            // tighten it in place; a root it does not own — or that is not a
-            // directory at all — stays a typed deterministic contract
-            // violation for the operator instead of an endless silent retry.
-            match make_private_directory(path) {
-                Ok(receipt) => {
-                    let previous_mode = receipt
-                        .previous_unix_mode
-                        .map_or_else(|| "platform-acl".to_owned(), |mode| format!("{mode:o}"));
-                    tracing::info!(
-                        event = "code_index_text_artifacts_root_privacy_healed",
-                        previous_mode = %previous_mode,
-                        "legacy code text artifacts root was re-permissioned to owner-private"
-                    );
-                    Ok(())
-                }
-                Err(heal_error) => Err(RetrievalPortError::Contract(format!(
+            validate_private_directory(path).map_err(|validation_error| {
+                RetrievalPortError::Contract(format!(
                     "code text artifacts root '{}' is not owner-private{}: {validation_error}; \
-                     self-heal refused: {heal_error}; restore owner-only access (chmod 700 and \
-                     chown to the daemon user) or re-enroll the store",
+                     restore owner-only access (chmod 700 and chown to the daemon user) or \
+                     re-enroll the store",
                     path.display(),
                     observed_unix_mode(path)
                         .map(|mode| format!(" (mode {mode:o}, need 700)"))
                         .unwrap_or_default(),
-                ))),
-            }
+                ))
+            })
         }
         Err(error) => Err(text_artifact_unavailable(error)),
     }
@@ -4680,7 +3349,7 @@ fn checkpoint_text_artifact_control(
 ///
 /// DELETE-mode recovery applies `path-journal` into whatever file is later
 /// opened at `path`. A crash that unlinked the database and left the journal
-/// would otherwise roll that journal into the next successor copy.
+/// would otherwise roll that journal into the next staging database.
 fn prepare_absent_text_artifact_staging(staging_path: &Path) -> std::io::Result<()> {
     match staging_path.symlink_metadata() {
         Ok(metadata) if metadata.file_type().is_file() => Ok(()),
@@ -4720,7 +3389,15 @@ fn clear_text_artifact_staging_sidecars(staging_path: &Path) -> std::io::Result<
             "text-artifact staging path has no file name",
         ));
     };
-    for suffix in ["-journal", "-wal", "-shm"] {
+    // The compacted rewrite's own rollback journal goes before the rewrite,
+    // for the same reason the staging journal goes before the staging file.
+    for suffix in [
+        "-journal",
+        "-wal",
+        "-shm",
+        "-compacting-journal",
+        "-compacting",
+    ] {
         let mut sidecar_name = name.to_os_string();
         sidecar_name.push(suffix);
         let sidecar = staging_path.with_file_name(sidecar_name);
@@ -4750,7 +3427,12 @@ pub(super) fn text_artifact_builder_budget(
     build_memory_budget
         .checked_sub(source_window_bytes)
         .filter(|remaining| *remaining > 0)
-        .ok_or(RetrievalPortError::BudgetExceeded)
+        .ok_or_else(|| {
+            RetrievalPortError::Contract(format!(
+                "text-artifact source window needs {source_window_bytes} bytes, exhausting its \
+                 {build_memory_budget}-byte build reservation"
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -4770,11 +3452,20 @@ mod staging_sidecar_tests {
         prepare_absent_text_artifact_staging(&staging).expect("clear orphan journal");
         assert!(!journal.exists());
 
-        std::fs::write(&staging, b"prior-copy").expect("fresh successor copy");
+        std::fs::write(&staging, b"staged").expect("fresh staging database");
         std::fs::write(&journal, b"rollback").expect("replant journal");
+        let compacting = root.path().join(".text-artifact-ab.staging-compacting");
+        std::fs::write(&compacting, b"compacted").expect("plant compacted rewrite");
+        let compacting_journal = root
+            .path()
+            .join(".text-artifact-ab.staging-compacting-journal");
+        std::fs::write(&compacting_journal, b"rewrite rollback")
+            .expect("plant compacted rewrite journal");
         retire_text_artifact_staging_family(&staging).expect("retire family");
         assert!(!staging.exists());
         assert!(!journal.exists());
+        assert!(!compacting.exists());
+        assert!(!compacting_journal.exists());
 
         std::fs::write(root.path().join(".text-artifact-ab.staging-wal"), b"wal")
             .expect("plant wal");

@@ -20,13 +20,13 @@ use tracedecay_domain::configuration::{
     ConfigurationAuditEventKindV1, ConfigurationCandidateV1, ConfigurationIdempotencyKey,
     ConfigurationLayerIdV1, ConfigurationReceiptId, ConfigurationRevisionId,
     ConfigurationSnapshotV1, ConfigurationValueV1, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
-    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, ProtectedChange, ProtectedChangePlan,
-    ProtectedChangeSnapshotError, RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect,
+    LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    ProtectedChange, ProtectedChangePlan, ProtectedChangeSnapshotError,
+    RETIRED_CORE_SETTING_KEYS_V1, RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect,
     SEMANTIC_RUNTIME_SETTING_KEY_V2, SOURCE_BINDINGS_SETTING_KEY,
-    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1, ScopeSourceBinding,
-    SettingKey, SourceKindV1, USER_CODE_INDEX_WORKERS_SETTING_KEY, UserProfileId,
-    WORK_TOPOLOGY_POLICY_SETTING_KEY,
+    SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1, SettingKey, SourceKindV1,
+    USER_CODE_INDEX_WORKERS_SETTING_KEY, UserProfileId, WORK_TOPOLOGY_POLICY_SETTING_KEY,
 };
 use tracedecay_domain::{AccessPolicyDigest, ActorId, ManifestDigest, UtcMicros, canonical_sha256};
 #[cfg(test)]
@@ -56,8 +56,7 @@ use activation::{
 use codec::{StoredConfigurationProtectedOperationV1, invalid_store_data, unavailable_store};
 use mutation::{
     ConfigurationCommitDraft, commit_direct_in_transaction_with_registry,
-    current_state_from_transaction, derived_identifier, map_protected_change_snapshot_error,
-    map_store_error,
+    current_state_from_transaction, derived_identifier, map_store_error,
 };
 use read::read_revision_from_executor;
 use read::{
@@ -65,7 +64,9 @@ use read::{
 };
 use revision::{insert_revision, insert_revision_with_registry};
 
-pub use mutation::{ConfigurationDirectCommitOutcomeV1, commit_direct_in_transaction};
+pub use mutation::{
+    ConfigurationDirectCommitOutcomeV1, commit_direct_in_transaction, protected_change_snapshot_v1,
+};
 
 #[derive(Debug, Error)]
 pub enum ConfigurationStorageError {
@@ -267,28 +268,37 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
         }
     }
 
-    /// Republishes the daemon-owned project source binding with the locator
-    /// digest of a moved or renamed checkout whose identity the registry has
-    /// already re-verified.
+    /// Publishes one daemon-owned source binding: the project-open binding
+    /// rebound to a moved checkout's locator digest, or the GitHub binding
+    /// derived from the checkout's `origin` remote.
     ///
-    /// This is a daemon-owned identity-preserving heal, not an operator scope
-    /// change: the caller must have already resolved `binding.authority` to
-    /// the exact registered project for the current root, and the stored
-    /// binding must match on binding id, source kind, and authority so only
-    /// the derived locator digest changes. The write is a compare-and-swap
-    /// against the revision the caller read; concurrent mutation surfaces as
-    /// a typed `RevisionConflict` and the caller re-reads.
+    /// This is a daemon-owned identity-preserving write, not an operator
+    /// scope change: the caller derives `binding` from identity it already
+    /// holds (the registered project and its checkout). Only `BindSource` and
+    /// `RebindSource` are accepted, and both pass the same validator as a
+    /// protected apply. The write is a compare-and-swap against the revision
+    /// the caller read; concurrent mutation surfaces as a typed
+    /// `RevisionConflict` and the caller re-reads.
     #[hotpath::measure(future = true, label = "global_db.configuration.persist.rebind")]
-    pub async fn rebind_daemon_project_source_binding(
+    pub async fn publish_daemon_source_binding(
         &self,
         expected_revision_id: &ConfigurationRevisionId,
-        binding: &ScopeSourceBinding,
+        change: &ProtectedChange,
         occurred_at: UtcMicros,
     ) -> Result<ConfigurationCurrentStateV1, ConfigurationError> {
         expected_revision_id
             .validate()
             .map_err(ConfigurationError::validation)?;
-        binding.validate().map_err(ConfigurationError::validation)?;
+        let operation_kind = match change {
+            ProtectedChange::BindSource(_) => "daemon_source_binding_bind",
+            ProtectedChange::RebindSource(_) => "daemon_source_binding_rebind",
+            _ => {
+                return Err(ConfigurationError::validation_message(
+                    "a daemon-owned source binding write must bind or rebind a source",
+                ));
+            }
+        };
+        change.validate().map_err(ConfigurationError::validation)?;
         let transaction = self
             .db
             .begin_write_transaction()
@@ -299,11 +309,9 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
             if &current.revision_id != expected_revision_id {
                 return Err(ConfigurationError::RevisionConflict);
             }
-            let operation_digest = canonical_sha256(&(
-                "tracedecay.configuration.daemon-source-binding-rebind.v1",
-                binding,
-            ))
-            .map_err(ConfigurationError::validation)?;
+            let operation_digest =
+                canonical_sha256(&("tracedecay.configuration.daemon-source-binding.v1", change))
+                    .map_err(ConfigurationError::validation)?;
             let next_revision_id: ConfigurationRevisionId = derived_identifier(
                 "configuration.revision.v1",
                 &canonical_sha256(&(
@@ -312,24 +320,19 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                     &operation_digest,
                 ))
                 .map_err(ConfigurationError::validation)?,
-                "configuration rebind revision id",
+                "configuration daemon source binding revision id",
             )?;
-            let snapshot = current
-                .snapshot
-                .apply_protected_change(
-                    &ProtectedChange::RebindSource(binding.clone()),
-                    &next_revision_id,
-                )
-                .map_err(map_protected_change_snapshot_error)?;
+            let snapshot =
+                protected_change_snapshot_v1(&current.snapshot, change, &next_revision_id)?;
             validate_snapshot_registry_completeness(&snapshot).map_err(map_store_error)?;
-            let actor_id = ActorId::new("actor.tracedecay-daemon.source-binding-rebind".to_owned())
+            let actor_id = ActorId::new("actor.tracedecay-daemon.source-binding".to_owned())
                 .map_err(ConfigurationError::validation)?;
             let revision = ConfigurationRevisionRecordV1 {
                 revision_id: next_revision_id.clone(),
                 parent_revision_id: Some(expected_revision_id.clone()),
                 snapshot,
                 actor_id,
-                operation_kind: "daemon_source_binding_rebind".to_owned(),
+                operation_kind: operation_kind.to_owned(),
                 created_at: occurred_at,
             };
             insert_revision(&transaction, &revision)
@@ -356,15 +359,16 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
         }
     }
 
-    /// Publish registry-added defaults into a snapshot created before those
-    /// settings existed.
+    /// Converge a snapshot written by an earlier published registry onto the
+    /// current one: registry-added settings receive their typed defaults and
+    /// retired settings are dropped.
     ///
     /// This is exact schema convergence, not a runtime fallback: only the
-    /// closed set of known additive keys is accepted. Registered typed defaults
-    /// and default provenance are written into an immutable child revision,
-    /// and the expected parent is checked under the store's write transaction.
+    /// closed sets of known additive keys and known retired keys are accepted.
+    /// The result is an immutable child revision, and the expected parent is
+    /// checked under the store's write transaction.
     #[hotpath::measure(future = true, label = "global_db.configuration.persist.converge")]
-    pub async fn converge_registered_additive_defaults(
+    pub async fn converge_registered_registry_shape(
         &self,
         expected_revision_id: &ConfigurationRevisionId,
         occurred_at: UtcMicros,
@@ -385,6 +389,7 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
             let registry = ConfigurationRegistry::core().map_err(ConfigurationError::validation)?;
             let additive_keys = [
                 INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
+                LCM_SUMMARIZER_EXECUTABLES_SETTING_KEY,
                 MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
                 MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
                 MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
@@ -395,13 +400,12 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
             .map(SettingKey::new)
             .collect::<Result<std::collections::BTreeSet<_>, _>>()
             .map_err(ConfigurationError::validation)?;
-            if additive_keys
+            let retired_keys = RETIRED_CORE_SETTING_KEYS_V1
                 .iter()
-                .all(|key| current.snapshot.effective_values.contains_key(key))
-            {
-                validate_snapshot_registry_completeness(&current.snapshot).map_err(map_store_error)?;
-                return Ok(current);
-            }
+                .copied()
+                .map(SettingKey::new)
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .map_err(ConfigurationError::validation)?;
             let expected_keys = registry
                 .definitions()
                 .map(|definition| definition.key.clone())
@@ -416,12 +420,23 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                 .difference(&actual_keys)
                 .cloned()
                 .collect::<Vec<_>>();
-            if missing_keys.is_empty()
-                || missing_keys.iter().any(|key| !additive_keys.contains(key))
-                || !actual_keys.is_subset(&expected_keys)
+            let removals = actual_keys
+                .intersection(&retired_keys)
+                .cloned()
+                .collect::<Vec<_>>();
+            if missing_keys.is_empty() && removals.is_empty() {
+                validate_snapshot_registry_completeness(&current.snapshot).map_err(map_store_error)?;
+                return Ok(current);
+            }
+            let surviving_keys = actual_keys
+                .difference(&retired_keys)
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>();
+            if missing_keys.iter().any(|key| !additive_keys.contains(key))
+                || !surviving_keys.is_subset(&expected_keys)
             {
                 return Err(ConfigurationError::ResetRequired {
-                    reason: "configuration snapshot registry drift is not a registered additive-default upgrade"
+                    reason: "configuration snapshot registry drift is not a registered additive-default or retired-key upgrade"
                         .to_owned(),
                 });
             }
@@ -435,9 +450,10 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ConfigurationError::validation)?;
             let operation_digest = canonical_sha256(&(
-                "tracedecay.configuration.additive-default-convergence.v1",
+                "tracedecay.configuration.registry-shape-convergence.v1",
                 expected_revision_id,
                 &additions,
+                &removals,
             ))
             .map_err(ConfigurationError::validation)?;
             let next_revision_id: ConfigurationRevisionId = derived_identifier(
@@ -448,10 +464,14 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                     &operation_digest,
                 ))
                 .map_err(ConfigurationError::validation)?,
-                "configuration additive default revision id",
+                "configuration registry shape revision id",
             )?;
             let mut effective_values = current.snapshot.effective_values.clone();
             let mut provenance = current.snapshot.provenance.clone();
+            for key in &removals {
+                effective_values.remove(key);
+                provenance.remove(key);
+            }
             for (key, default_value) in additions {
                 effective_values.insert(key.clone(), default_value);
                 provenance.insert(
@@ -467,10 +487,10 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                 parent_revision_id: Some(expected_revision_id.clone()),
                 snapshot,
                 actor_id: ActorId::new(
-                    "actor.tracedecay-daemon.additive-default-convergence".to_owned(),
+                    "actor.tracedecay-daemon.registry-shape-convergence".to_owned(),
                 )
                 .map_err(ConfigurationError::validation)?,
-                operation_kind: "additive_default_convergence".to_owned(),
+                operation_kind: "registry_shape_convergence".to_owned(),
                 created_at: occurred_at,
             };
             insert_revision(&transaction, &revision)

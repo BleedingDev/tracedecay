@@ -7,7 +7,7 @@ use tracedecay_contracts::retained_surfaces::{
     RetainedSurfaceOperation, RetainedSurfaceRequestV1, SessionRefreshActionRequestV1,
     SessionRefreshActionV1, SessionRefreshFrontierV1, SessionRefreshGrainV1,
     SessionRefreshRequestV1, SessionRefreshScopeV1, SessionRefreshSessionV1,
-    SessionRefreshSourceV1, SessionRefreshTargetV1, SessionRefreshTemporalModeV1,
+    SessionRefreshSourceV1, SessionRefreshTargetV1,
 };
 use tracedecay_contracts::{
     ApplicationProblem, ApplicationProblemKind, CancellationContext, CancellationSignal,
@@ -18,7 +18,8 @@ use tracedecay_contracts::{
 };
 use tracedecay_domain::{
     ActorId, ManifestDigest, ProjectId, RefId, RepositoryId, SessionId,
-    SessionRefreshOperationIdV1, UserProfileId, UtcMicros, WorktreeId, canonical_sha256,
+    SessionRefreshOperationIdV1, TemporalModeV1, UserProfileId, UtcMicros, WorktreeId,
+    canonical_sha256,
 };
 use tracedecay_session_memory::context::{BranchId, ProfileId, SessionRootId, SessionStoreId};
 use tracedecay_sessions::admission::HostAdmissionScope;
@@ -176,7 +177,7 @@ impl RetiredRefreshFixture {
                     scope: "cursor".to_owned(),
                 },
                 target: SessionRefreshTargetV1 {
-                    temporal_mode: SessionRefreshTemporalModeV1::Current,
+                    temporal_mode: TemporalModeV1::Current,
                     grain: SessionRefreshGrainV1::LogicalMessage,
                     frontier: SessionRefreshFrontierV1 {
                         observed_through: 0,
@@ -184,7 +185,6 @@ impl RetiredRefreshFixture {
                     },
                 },
                 handle,
-                format: None,
             },
         )
     }
@@ -272,7 +272,7 @@ fn assert_partial_effect(
     assert_eq!(receipt.outcome, EffectTermination::Partial);
     // `PreparedRetainedEffect::material_committed_state_digest` binds four
     // elements: the domain tag, the retained operation, the prepared effect's
-    // durable operation id, and the committed-state material — the serialized
+    // durable operation id, and the committed-state material, the serialized
     // state the effect actually committed. `session_refresh_effect_outcome`
     // hands the durable operation id itself as that material, because the
     // durable refresh row keyed by that id *is* what committed before the
@@ -339,6 +339,66 @@ async fn reopen_and_settle(
     assert_eq!(receipt.operation_id().as_str(), operation_id);
     assert_eq!(receipt.state(), SessionRefreshTerminalStateV1::Complete);
     registry.shutdown().await;
+}
+
+#[tokio::test]
+async fn refresh_begin_store_failure_reports_its_cause_instead_of_bare_unavailable() {
+    let temp = TempDir::new().expect("temporary fixture");
+    let fixture = RetiredRefreshFixture::open(&temp, "store-failure").await;
+    let writer = fixture
+        .database
+        .begin_write_transaction()
+        .await
+        .expect("refresh store writer");
+    writer
+        .execute_batch("DROP TABLE session_refresh_operations")
+        .await
+        .expect("remove the durable refresh operations table");
+    writer.commit().await.expect("commit refresh store damage");
+    let session_id = SessionId::new("session.retained.store-failure").expect("session id");
+    let request = fixture.request(SessionRefreshActionV1::Begin, &session_id, None);
+
+    let (context, signal) = application_context(&fixture, &request, "request.store-failure");
+    let command = admitted_session_refresh_command(
+        &request,
+        &context,
+        &signal,
+        &fixture.mounted_authority(&context),
+    )
+    .expect("admitted begin command");
+    let SessionRefreshServiceOutcome::Unavailable { reason } =
+        fixture.refresh.execute(command).await
+    else {
+        panic!("a failed refresh store must be unavailable");
+    };
+    assert!(
+        reason.starts_with("session refresh store failed: ")
+            && reason.contains("session_refresh_operations"),
+        "the unavailable outcome must carry the store error: {reason}"
+    );
+
+    let (context, signal) =
+        application_context(&fixture, &request, "request.store-failure-application");
+    let problem = fixture
+        .application
+        .execute(
+            &context,
+            &signal,
+            UtcMicros(2),
+            &RetainedSurfaceRequestV1::SessionRefresh(request),
+        )
+        .await
+        .expect_err("a failed refresh store cannot begin");
+    assert_eq!(problem.kind(), ApplicationProblemKind::Unavailable);
+    let encoded = serde_json::to_value(&problem).expect("serialized problem");
+    let message = encoded["diagnostic"]["message"]
+        .as_str()
+        .expect("problem diagnostic message");
+    assert!(
+        message.contains(&reason),
+        "the application problem must carry the refresh cause: {message}"
+    );
+    fixture.registry.shutdown().await;
 }
 
 #[tokio::test]

@@ -11,9 +11,12 @@ use tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1;
 use tracedecay_domain::ProjectId;
 
 use super::super::graph_activation::install_injected_activation_gate;
+use super::super::tests::move_git_metadata;
 use super::{
     CodeIndexCadenceOutcomeV1, CodeIndexSchedulerRegistryV1, dashboard_generation_is_ready,
+    serving_seat_matches_advertised_generation,
 };
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 /// Failure bound on an owner pass finishing once the worker is parked. Nothing
 /// here passes because time elapsed; a pass that never ends fails loudly.
@@ -52,32 +55,100 @@ fn dashboard_ready_requires_text_and_graph_lane_owners() {
     }
 }
 
+/// The graph-rebuild receipt (transport acceptance, both ~90s attempts): lane
+/// owners were ready on the replacement text generation while search still
+/// served the predecessor seat. Status must not call that split terminal.
+#[test]
+fn graph_rebuild_split_is_not_terminal_freshness() {
+    assert!(
+        dashboard_generation_is_ready(None, true, true, &Some(CodeGraphServingReadinessV1::Ready)),
+        "the receipt's text owner and graph activation were ready"
+    );
+    assert!(
+        !serving_seat_matches_advertised_generation(
+            true,
+            Some("generation.predecessor"),
+            Some("generation.head"),
+        ),
+        "search served the predecessor while status advertised the head"
+    );
+    assert!(
+        !serving_seat_matches_advertised_generation(true, None, Some("generation.head")),
+        "a text owner installed before the serving swap is not yet the served generation"
+    );
+    assert!(serving_seat_matches_advertised_generation(
+        true,
+        Some("generation.head"),
+        Some("generation.head"),
+    ));
+    assert!(serving_seat_matches_advertised_generation(
+        true,
+        Some("generation.head"),
+        None,
+    ));
+    assert!(serving_seat_matches_advertised_generation(true, None, None));
+}
+
+/// A graph-off mount serves its text owner directly and never seats the
+/// decoded generation; the empty seat is not a lagging seat.
+#[test]
+fn graph_off_text_owner_is_terminal_without_a_seat() {
+    assert!(serving_seat_matches_advertised_generation(
+        false,
+        None,
+        Some("generation.head"),
+    ));
+    assert!(serving_seat_matches_advertised_generation(
+        false,
+        Some("generation.predecessor"),
+        Some("generation.head"),
+    ));
+}
+
 /// Park the background worker and wait out whatever pass is already in flight.
 ///
-/// The worker releases its admission permit after source reconciliation but
-/// keeps its owner-pass guard through text seating, so winning the permit only
-/// proves that no *new* pass can start. A pass still running past that point
-/// installs a serving generation and signals `serving_generation_changed`,
-/// which a test sampling that watch would then attribute to its own next step.
+/// The worker releases its admission permit after source reconciliation, so
+/// winning the permit only proves that no *new* pass can start. A pass still
+/// running past that point installs a serving generation, renews the source
+/// proof behind it, and signals `serving_generation_changed`, which a test
+/// sampling that watch would then attribute to its own next step.
+///
+/// `reconcile_in_progress` cannot bound that pass. It answers the narrower
+/// question of whether exact or lexical rebuild work is in flight, and a pass
+/// deliberately lowers it before optional graph work (#1103, #1339) while it
+/// still owns the seat and the proof. The build/publication lock is what the
+/// pass actually holds for its whole iteration, so hold that instead of
+/// sampling a flag.
 async fn quiesced_background_reconcile_admission(
     registry: &CodeIndexSchedulerRegistryV1,
     project_root: &Path,
-) -> tokio::sync::OwnedSemaphorePermit {
+) -> (
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::sync::OwnedMutexGuard<()>,
+) {
     let admission = registry
         .background_reconcile_admission()
         .acquire_owned()
         .await
         .expect("hold the background worker at its dequeue point");
-    let deadline = Instant::now() + OWNER_PASS_QUIESCENCE_CEILING;
-    while registry.reconcile_in_progress_for_test(project_root).await {
-        assert!(
-            Instant::now() <= deadline,
+    // Same order the worker takes them in, so this cannot invert against a
+    // pass that already owns the permit.
+    let build_publication = registry
+        .build_publication_lock_handle(project_root)
+        .await
+        .expect("mounted worktree");
+    let build_publication = tokio::time::timeout(
+        OWNER_PASS_QUIESCENCE_CEILING,
+        build_publication.lock_owned(),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
             "the owner pass for {} never finished",
             project_root.display()
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    admission
+        )
+    });
+    (admission, build_publication)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -181,38 +252,35 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
             .iter()
             .any(|symbol| symbol.simple_name == "branch_probe")
     );
-    let canonical_project = project.canonicalize().expect("canonical project");
-    let freshness = {
-        let mounted = registry.mounted.lock().await;
-        mounted
-            .get(&canonical_project)
-            .expect("mounted worktree")
-            .source_freshness
-            .clone()
-    };
-    let admission = quiesced_background_reconcile_admission(&registry, &project).await;
-    {
-        let mut state = freshness.state.lock().expect("freshness state");
-        state.last_reconciled_at = std::time::Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("age the readiness proof");
-    }
+    let canonical_project = canonical_existing_identity(&project).expect("canonical project");
+    let parked_worker = quiesced_background_reconcile_admission(&registry, &project).await;
+    move_git_metadata(&project);
     changes.borrow_and_update();
-    let serving_seat_before_expiry = *serving_seats.borrow_and_update();
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(250),
-            registry.latest_complete_ready(&project)
-        )
-        .await
-        .expect("expired readiness returns without walking source")
-        .is_none(),
-        "an expired proof cannot be promoted current before the worker renews it"
-    );
+    let serving_seat_before_move = *serving_seats.borrow_and_update();
+    // One sample at millisecond zero cannot tell a parked worker from a pass
+    // that advertised itself idle and is still about to publish its seat and
+    // renew the source proof. Sample the whole window.
+    let unproven_window = Instant::now() + Duration::from_millis(250);
+    loop {
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                registry.latest_complete_ready(&project)
+            )
+            .await
+            .expect("moved-metadata readiness returns without walking source")
+            .is_none(),
+            "moved Git metadata cannot be promoted current before the worker renews the proof"
+        );
+        if Instant::now() >= unproven_window {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     assert_eq!(
         *serving_seats.borrow(),
-        serving_seat_before_expiry,
-        "expired readiness admission cannot install another serving generation"
+        serving_seat_before_move,
+        "moved-metadata readiness admission cannot install another serving generation"
     );
     assert!(
         registry
@@ -228,7 +296,7 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
             .is_some_and(|pending| pending != 0),
         "the read coalesces one verification wake on the retained worker"
     );
-    drop(admission);
+    drop(parked_worker);
     let ready = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             changes.changed().await.expect("source proof renewal");
@@ -244,7 +312,7 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
         published.generation_id
     );
 
-    let admission = quiesced_background_reconcile_admission(&registry, &project).await;
+    let parked_worker = quiesced_background_reconcile_admission(&registry, &project).await;
     changes.borrow_and_update();
     let seat_epoch = {
         let mounted = registry.mounted.lock().await;
@@ -270,9 +338,9 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
     }
     assert!(
         registry.latest_complete_ready(&project).await.is_none(),
-        "a true source hint invalidates the seated proof even inside the fresh clock window"
+        "a true source hint invalidates the seated proof"
     );
-    drop(admission);
+    drop(parked_worker);
     let revalidated = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             changes
@@ -323,15 +391,10 @@ async fn serving_waiter_tracks_installation_freshness_and_retirement() {
         "pub fn changed_branch_probe() {}\n",
     )
     .expect("drift source after the retained generation");
-    {
-        let mut state = freshness.state.lock().expect("freshness state");
-        state.last_reconciled_at = std::time::Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("age the readiness proof");
-    }
+    move_git_metadata(&project);
     assert!(
         registry.latest_complete_ready(&project).await.is_none(),
-        "expired proof must not admit a source that changed"
+        "moved Git metadata must not admit a source that changed"
     );
     assert_eq!(
         registry

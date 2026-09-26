@@ -8,8 +8,8 @@ use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
 use tracedecay_project::project::TraceDecay;
 use tracedecay_session_memory::session::lcm::{
-    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmAuthorityUnavailableReason,
-    LcmCompactionCommand, LcmCompressionEvidence, LcmHostProtocol,
+    LcmAuthorityOutcome, LcmAuthorityPayload, LcmAuthorityRequest, LcmCompactionCommand,
+    LcmCompressionEvidence, LcmHostProtocol,
 };
 use tracedecay_sessions::admission::{
     HostAdmissionOutcome, HostAdmissionScope, HostAdmissionStatus,
@@ -67,24 +67,15 @@ fn host_admission_facade<'a>(
     let authority = match scope {
         HostAdmissionScope::Project => match (authorities.project, authorities.profile_identity) {
             (Some(registered), Some(identity)) => {
-                let cg = cg.ok_or_else(|| config_error("project admission requires a project"))?;
-                let project_id = project_observation_id(cg)?;
-                let provenance = tracedecay_runtime_core::storage::read_repository_identity_marker(cg.project_root())
-                    .ok().flatten().and_then(|marker| {
-                        tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext::from_authoritative_project_marker(
-                            cg.project_root(), &project_id, &marker,
-                        )
-                    });
-                let authority = HostAdmissionAuthorities::for_project(
+                let project_id = project_observation_id(
+                    cg.ok_or_else(|| config_error("project admission requires a project"))?,
+                )?;
+                HostAdmissionAuthorities::for_project(
                     identity.brain_id().clone(),
                     identity.profile_id().clone(),
                     project_id,
                     registered,
-                );
-                match provenance {
-                    Some(context) => authority.with_repository_provenance(context),
-                    None => authority,
-                }
+                )
             }
             (Some(_), None) | (None, _) => HostAdmissionAuthorities::default(),
         },
@@ -123,36 +114,24 @@ fn project_observation_id(cg: &TraceDecay) -> Result<ProjectId> {
 /// silently consuming the cap and reporting the pass as complete.
 async fn admit_codex_project_rollouts(
     admission: &HostAdmissionFacade<'_>,
-    source: &tracedecay_sessions::runtime::codex::CodexSource,
+    source: &tracedecay_sessions::runtime::hosts::codex::CodexSource,
     project_root: &Path,
     project_id: ProjectId,
-    session_id: Option<&str>,
     max_new_bytes: Option<u64>,
     cancellation: &ObservationCancellation,
-) -> Result<bool> {
+) -> Result<CodexRolloutAdmission> {
     let mut budget = max_new_bytes;
-    let (paths, mut deferred) = match session_id {
-        Some(session_id) => {
-            let source = source.clone();
-            let session_id = session_id.to_owned();
-            let lookup = tokio::task::spawn_blocking(move || {
-                source.find_session_transcript_paths_bounded(&session_id)
-            })
-            .await
-            .map_err(|_| config_error("Codex exact-session discovery task failed"))?
-            .map_err(|error| map_transcript_ingest_error(&error))?;
-            (lookup.paths, lookup.source_deferred)
-        }
-        None => (source.transcript_paths(project_root), false),
-    };
-    let mut paths = paths.into_iter().peekable();
+    let mut deferred = false;
+    let mut observations_committed = 0_u64;
+    let mut scanned = 0_u64;
+    let mut replayed = 0_u64;
+    let mut paths = source.transcript_paths(project_root).into_iter().peekable();
     while let Some(path) = paths.next() {
         let progress =
-            tracedecay_sessions::runtime::codex::try_admit_codex_jsonl_observations_for_project_with_admission_and_cancellation(
+            tracedecay_sessions::runtime::hosts::codex::try_admit_codex_jsonl_observations_for_project_with_admission_and_cancellation(
                 &path,
                 project_root,
                 project_id.clone(),
-                session_id,
                 admission,
                 budget,
                 cancellation,
@@ -160,6 +139,11 @@ async fn admit_codex_project_rollouts(
             .await
             .map_err(|error| map_transcript_ingest_error(&error))?;
         deferred |= progress.source_deferred;
+        observations_committed = observations_committed.saturating_add(progress.frames_persisted);
+        scanned = scanned.saturating_add(1);
+        if progress.resumed && progress.frames_persisted == 0 {
+            replayed = replayed.saturating_add(1);
+        }
         if let Some(remaining) = budget.as_mut() {
             *remaining = remaining.saturating_sub(progress.bytes_consumed);
             if *remaining == 0 {
@@ -168,7 +152,27 @@ async fn admit_codex_project_rollouts(
             }
         }
     }
-    Ok(deferred)
+    Ok(CodexRolloutAdmission {
+        deferred,
+        // Only when every scanned rollout was a pure replay. One rollout with
+        // new frames makes the pass a commit, not a duplicate, and a pass that
+        // scanned nothing has nothing to call durable.
+        exact_duplicate: scanned > 0 && scanned == replayed,
+        observations_committed,
+    })
+}
+
+/// What one Codex rollout admission pass committed, apart from what its own
+/// projection drain later catches. The projection queue is shared per scope
+/// with the project catch-up sweep, which can consume these rows first.
+pub(super) struct CodexRolloutAdmission {
+    pub(super) deferred: bool,
+    /// Every scanned rollout resumed at its stored cursor with nothing new to
+    /// persist, so the transcript was already durable when this pass ran.
+    /// `JsonlObservationAdmissionProgress::resumed` is what separates that from
+    /// an empty source, so a first-ever scan is never called a duplicate.
+    pub(super) exact_duplicate: bool,
+    pub(super) observations_committed: u64,
 }
 
 async fn drain_host_observation_projections(
@@ -176,7 +180,7 @@ async fn drain_host_observation_projections(
     scope: &ObservationScopeV1,
     cancellation: &ObservationCancellation,
 ) -> Result<u64> {
-    let stats = tracedecay_sessions::runtime::claude_observation::drain_projection_queue(
+    let stats = tracedecay_sessions::runtime::hosts::claude_observation::drain_projection_queue(
         admission,
         scope,
         cancellation,
@@ -266,7 +270,7 @@ const COMPACTION_INGEST_RETRY_DELAY: Duration = Duration::from_millis(400);
 /// `project_authority_unbound` is listed explicitly because the authority
 /// itself reports it as non-retryable: it means the project's write authority
 /// has not been bound *yet*, which the project-open sequence resolves. A
-/// mismatched authority is deliberately absent — that never converges by
+/// mismatched authority is deliberately absent, that never converges by
 /// waiting.
 const COMPACTION_INGEST_CONVERGING_REASONS: &[&str] = &[
     "cursor_conflict",
@@ -330,7 +334,7 @@ async fn admit_codex_rollouts_once(
     ) {
         return Err(rejection);
     }
-    let source = tracedecay_sessions::runtime::codex::CodexSource::new()
+    let source = tracedecay_sessions::runtime::hosts::codex::CodexSource::new()
         .ok_or_else(|| config_error("Codex transcript source is unavailable"))?;
     let project_id = project_observation_id(cg)?;
     let scope = ObservationScopeV1::Project {
@@ -342,7 +346,6 @@ async fn admit_codex_rollouts_once(
         &source,
         cg.project_root(),
         project_id,
-        None,
         None,
         &cancellation,
     )
@@ -451,26 +454,13 @@ fn compaction_response_json(
     json!({
         "action": action,
         "status": "unavailable",
-        "reason": compaction_unavailable_reason(&response.outcome),
+        "reason": "lcm_daemon_authority_rejected",
         "authority_outcome": response.outcome,
         "committed_state": response.receipt.committed_state,
         "summary_nodes_created": 0,
         "summary_node_ids": [],
         "messages_upserted": 0,
     })
-}
-
-fn compaction_unavailable_reason(outcome: &LcmAuthorityOutcome) -> &'static str {
-    if matches!(
-        outcome,
-        LcmAuthorityOutcome::Unavailable {
-            reason: LcmAuthorityUnavailableReason::HostPayloadUnavailable
-        }
-    ) {
-        "host_payload_unavailable"
-    } else {
-        "lcm_daemon_authority_rejected"
-    }
 }
 
 fn cursor_compact_skipped(reason: impl Into<String>) -> Value {
@@ -506,7 +496,7 @@ fn pressure_only_command(
     fresh_tail_count: Option<usize>,
     protocol: LcmHostProtocol,
 ) -> LcmAuthorityRequest {
-    LcmAuthorityRequest::Compact(LcmCompactionCommand {
+    LcmAuthorityRequest::Compact(Box::new(LcmCompactionCommand {
         preflight: tracedecay_lcm::LcmPreflightRequest {
             provider: provider.to_owned(),
             session_id: session_id.to_string(),
@@ -527,7 +517,7 @@ fn pressure_only_command(
             reserve_tokens_floor: None,
         },
         evidence: LcmCompressionEvidence::PressureOnly { protocol },
-    })
+    }))
 }
 
 #[hotpath::measure(future = true, label = "mcp.hook_runtime.accounting")]
@@ -599,17 +589,13 @@ pub(super) async fn ingest_transcript(
     .await
 }
 
-/// Absence of a retained checkpoint is distinct from an ordinary source scan.
-#[derive(Clone, Debug)]
-pub(super) enum CodexStopSourceBound {
-    Deferred,
-    Sealed(tracedecay_sessions::runtime::codex::SealedJsonlSourceBound),
-}
-
 #[hotpath::measure(future = true, label = "mcp.hook_runtime.ingest")]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Transcript ingest is one cancelled-aware write through the capture authority."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Transcript ingest is one cancelled-aware write through the capture authority."
+    )
 )]
 pub async fn ingest_transcript_with_cancellation(
     cg: Option<&TraceDecay>,
@@ -619,30 +605,6 @@ pub async fn ingest_transcript_with_cancellation(
     accounting_db: Option<&RegisteredGlobalDb>,
     session_authorities: SessionAuthorities<'_>,
     cancellation: &ObservationCancellation,
-) -> Result<Value> {
-    ingest_transcript_with_stop_bound(
-        cg,
-        args,
-        profile_root,
-        global_db,
-        accounting_db,
-        session_authorities,
-        cancellation,
-        None,
-    )
-    .await
-}
-
-#[hotpath::measure(future = true, label = "mcp.hook_runtime.ingest")]
-pub(super) async fn ingest_transcript_with_stop_bound(
-    cg: Option<&TraceDecay>,
-    args: &Value,
-    profile_root: Option<&Path>,
-    global_db: Option<&RegisteredGlobalDb>,
-    accounting_db: Option<&RegisteredGlobalDb>,
-    session_authorities: SessionAuthorities<'_>,
-    cancellation: &ObservationCancellation,
-    codex_stop_bound: Option<&CodexStopSourceBound>,
 ) -> Result<Value> {
     let provider = required_str(args, "provider")?;
     let user_scope = args
@@ -686,8 +648,7 @@ pub(super) async fn ingest_transcript_with_stop_bound(
             session_authorities: session_authorities.clone(),
             facade: &facade,
             max_new_bytes,
-            cancellation,
-            codex_stop_bound
+            cancellation
         }),
         label = "mcp.hook_runtime.capture"
     )
@@ -697,37 +658,43 @@ pub(super) async fn ingest_transcript_with_stop_bound(
         snapshot: snapshot_capture,
         claude_observation: claude_observation_stats,
         source_deferred,
-        lcm_receipt,
-        route_admission,
+        observations_committed: route_observations_committed,
+        exact_duplicate: route_exact_duplicate,
+        admission_owns_commit,
     } = capture;
-    let authority_changed = messages_upserted > 0
-        || snapshot_capture
+    let verdict = ingest_commit_verdict(&IngestCommitAccount {
+        admission_owns_commit,
+        observations_committed: route_observations_committed,
+        route_exact_duplicate,
+        messages_upserted,
+        snapshot_messages_upserted: snapshot_capture
             .as_ref()
-            .is_some_and(|capture| capture.stats.messages_upserted > 0)
-        || claude_observation_stats
+            .map_or(0, |capture| capture.stats.messages_upserted),
+        claude_observations_committed: claude_observation_stats
             .as_ref()
-            .is_some_and(|stats| stats.observations_committed > 0 || stats.cursor_advances > 0);
-    let exact_duplicate = !authority_changed
-        && claude_observation_stats
+            .map_or(0, |stats| stats.observations_committed),
+        claude_cursor_advances: claude_observation_stats
             .as_ref()
-            .is_some_and(|stats| stats.observation_duplicates > 0 || stats.cursor_duplicates > 0);
+            .map_or(0, |stats| stats.cursor_advances),
+        claude_observation_duplicates: claude_observation_stats
+            .as_ref()
+            .map_or(0, |stats| stats.observation_duplicates),
+        claude_cursor_duplicates: claude_observation_stats
+            .as_ref()
+            .map_or(0, |stats| stats.cursor_duplicates),
+    });
+    let authority_changed = verdict.authority_changed;
+    let exact_duplicate = verdict.exact_duplicate;
     let deferred_by_byte_cap = source_deferred
         || snapshot_capture
             .as_ref()
             .is_some_and(|capture| capture.deferred_by_byte_cap);
-    // A route whose own authority refused the pass reports that verdict here;
-    // otherwise the replay completes against the admission that opened it.
-    let route_reason = route_admission
-        .as_ref()
-        .and_then(|admission| admission.reason_code);
-    let admission = route_admission.unwrap_or_else(|| {
-        complete_ingest_admission(
-            admission,
-            authority_changed,
-            exact_duplicate,
-            deferred_by_byte_cap,
-        )
-    });
+    let admission = complete_ingest_admission(
+        admission,
+        authority_changed,
+        exact_duplicate,
+        deferred_by_byte_cap,
+    );
     let mut output = json!({
         "action": "ingest_transcript",
         "provider": provider,
@@ -737,13 +704,6 @@ pub(super) async fn ingest_transcript_with_stop_bound(
         "admission": admission,
         "messages_upserted": messages_upserted,
     });
-    if let Some(reason) = route_reason {
-        output["reason"] = json!(reason);
-    }
-    if let Some(receipt) = lcm_receipt {
-        output["authority_outcome"] = json!(receipt.outcome);
-        output["committed_state"] = json!(receipt.receipt.committed_state);
-    }
     // Project-scope ingest is the production moment new post-hint session
     // activity becomes durable, so settle emitted hook hints into
     // `hint_outcome` analytics events here. Best-effort: unavailable or
@@ -760,12 +720,18 @@ pub(super) async fn ingest_transcript_with_stop_bound(
                     cg.project_root()
                 )),
                 cg.project_root(),
-                tracedecay_project::project::current_timestamp()
+                tracedecay_runtime_core::tracedecay::current_timestamp()
             ),
             label = "mcp.hook_runtime.hint_settle"
         )
         .await;
         output["hint_outcomes"] = settlement.as_json();
+    }
+    // Routes that admit observations directly report what they committed, so a
+    // `messages_upserted: 0` pass is readable without guessing which drainer
+    // won. The snapshot and Claude blocks below own the key for their routes.
+    if route_observations_committed > 0 {
+        output["observations_committed"] = json!(route_observations_committed);
     }
     if let Some(capture) = snapshot_capture {
         output["observations_committed"] = json!(capture.stats.messages_upserted);
@@ -786,6 +752,57 @@ pub(super) async fn ingest_transcript_with_stop_bound(
         output["source_bytes_scanned"] = json!(stats.source_bytes_scanned);
     }
     Ok(output)
+}
+
+/// The counters a capture route hands the terminal-status assembly.
+///
+/// `admission_owns_commit` routes (Cursor, Codex project) already know whether
+/// they persisted frames. Their projection drain reads a queue the project
+/// catch-up also empties, so `messages_upserted` on those routes is a residual
+/// of that queue, not a second copy of the commit.
+pub(super) struct IngestCommitAccount {
+    pub(super) admission_owns_commit: bool,
+    pub(super) observations_committed: u64,
+    pub(super) route_exact_duplicate: bool,
+    pub(super) messages_upserted: u64,
+    pub(super) snapshot_messages_upserted: u64,
+    pub(super) claude_observations_committed: u64,
+    pub(super) claude_cursor_advances: u64,
+    pub(super) claude_observation_duplicates: u64,
+    pub(super) claude_cursor_duplicates: u64,
+}
+
+pub(super) struct IngestCommitVerdict {
+    pub(super) authority_changed: bool,
+    pub(super) exact_duplicate: bool,
+}
+
+/// Commit status from the route that owns it.
+///
+/// When admission owns the commit, a non-zero drain residual cannot promote a
+/// pass that persisted nothing into `committed`, and a zero drain cannot hide
+/// frames this pass did persist. Routes without an admission tally still read
+/// their own message and duplicate counters.
+pub(super) fn ingest_commit_verdict(account: &IngestCommitAccount) -> IngestCommitVerdict {
+    if account.admission_owns_commit {
+        let authority_changed = account.observations_committed > 0;
+        return IngestCommitVerdict {
+            authority_changed,
+            exact_duplicate: !authority_changed && account.route_exact_duplicate,
+        };
+    }
+    let authority_changed = account.messages_upserted > 0
+        || account.observations_committed > 0
+        || account.snapshot_messages_upserted > 0
+        || account.claude_observations_committed > 0
+        || account.claude_cursor_advances > 0;
+    IngestCommitVerdict {
+        authority_changed,
+        exact_duplicate: !authority_changed
+            && (account.route_exact_duplicate
+                || account.claude_observation_duplicates > 0
+                || account.claude_cursor_duplicates > 0),
+    }
 }
 
 pub(super) fn complete_ingest_admission(

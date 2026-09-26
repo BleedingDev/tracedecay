@@ -9,7 +9,6 @@ use cap_std::fs::Dir;
 use cap_std::fs::OpenOptionsExt;
 use cap_std::time::SystemClock;
 use serde::{Deserialize, Serialize};
-use tracedecay_automation::config::validate_schedule as validate_leaf_schedule;
 pub use tracedecay_automation::config::{AutomationSchedule, CronSchedule, parse_schedule};
 use tracedecay_automation::evidence_budget::{
     SessionEvidenceBudgetBackoff, SessionEvidenceBudgetExceeded, SessionEvidenceBudgetGate,
@@ -27,9 +26,10 @@ use super::run_ledger::{
     canonical_record_started_at_seconds, is_session_evidence_budget_exhausted_reason,
     latest_record_by_canonical_completion, latest_record_by_canonical_completion_key,
 };
-use crate::ports::session_store::AutomationSessionStore;
 use tracedecay_contracts::retained_surfaces::AutomationSkipReasonV1;
 use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_global_db::RegisteredGlobalDb;
+use tracedecay_private_fs::FileLease;
 
 const DEFAULT_FAILURE_COOLDOWN_SECS: u64 = 300;
 const DEFAULT_STALE_LOCK_SECS: u64 = 6 * 60 * 60;
@@ -70,12 +70,23 @@ impl SessionActivity {
 ///
 /// This reads from the read-only store using bounded indexed timestamp lookups,
 /// so it is cheap and race-safe to call from every scheduler tick; concurrent
-/// ingest writers only ever move the value forward.
+/// ingest writers only ever move the value forward. A failed read is logged and
+/// reported as no activity: a store the scheduler cannot read has no observable
+/// new activity, so automation stays idle instead of running against it.
 #[hotpath::measure(label = "automation.run.load_session_activity", future = true)]
-pub async fn load_session_activity(sessions_db: &dyn AutomationSessionStore) -> SessionActivity {
-    SessionActivity {
-        last_activity_secs: sessions_db.latest_session_activity_secs().await,
-    }
+pub async fn load_session_activity(sessions_db: &RegisteredGlobalDb) -> SessionActivity {
+    let last_activity_secs = match sessions_db.latest_session_activity_secs().await {
+        Ok(latest) => latest,
+        Err(error) => {
+            tracing::warn!(
+                database = %sessions_db.db_path().display(),
+                %error,
+                "session-activity read failed; scheduler observes no new activity"
+            );
+            None
+        }
+    };
+    SessionActivity { last_activity_secs }
 }
 
 /// Consecutive project-open failures after which one scheduler loop exits.
@@ -277,15 +288,15 @@ impl AutomationTaskLock {
 /// Task-lock release must be synchronous: callers (and tests such as
 /// `retained_settlement_guard_owns_task_lock_until_drop`) rely on the lock file
 /// being gone the instant `drop` returns. The cleanup itself is genuinely
-/// blocking — an fs2 coordination lock, `sync_all`/parent-directory fsyncs, and
-/// `std::thread::sleep` backoff between retries — so it is tempting to hand the
+/// blocking, a file coordination lock, `sync_all`/parent-directory fsyncs, and
+/// `std::thread::sleep` backoff between retries, so it is tempting to hand the
 /// owning worker's run queue away with `tokio::task::block_in_place`.
 ///
 /// That is not sound here, because this guard is reachable from inside tokio's
 /// own blocking-pool spawn path. When a runtime has begun shutting down,
 /// `blocking::pool::Spawner::spawn_task` (tokio 1.53.1) shuts a refused task
 /// down *while holding* the pool's non-reentrant `parking_lot` mutex, which
-/// drops the task's future — and with it any `AutomationTaskLock` the future
+/// drops the task's future, and with it any `AutomationTaskLock` the future
 /// owned, such as the `Arc<RetainedAutomationSettlementState>` captured by
 /// `start_retained_automation_settlement_inner`. `block_in_place` re-enters
 /// `spawn_task` on that same thread to hand off the worker core, so the release
@@ -350,36 +361,52 @@ where
 }
 
 #[hotpath::measure(label = "automation.scheduler.decision")]
+/// Decides whether `task` is due under `config`, given the ledger `records`
+/// and the executable the backend now in force would spawn
+/// (`AgentTaskBackend::executable`); the latter is part of the backend
+/// identity a settled deterministic failure is judged against.
 pub fn schedule_decision(
     config: &AutomationConfig,
+    executable: Option<&Path>,
     task: AgentTaskKind,
     records: &[AutomationRunLedgerRecord],
     activity: SessionActivity,
     now_secs: i64,
 ) -> AutomationScheduleDecision {
-    schedule_decision_or_history_denial(config, task, records, activity, now_secs, true)
+    schedule_decision_or_history_denial(config, executable, task, records, activity, now_secs, true)
 }
 
 pub fn host_receipt_decision(
     config: &AutomationConfig,
+    executable: Option<&Path>,
     task: AgentTaskKind,
     records: &[AutomationRunLedgerRecord],
     activity: SessionActivity,
     now_secs: i64,
 ) -> AutomationScheduleDecision {
-    schedule_decision_or_history_denial(config, task, records, activity, now_secs, false)
+    schedule_decision_or_history_denial(
+        config, executable, task, records, activity, now_secs, false,
+    )
 }
 
 fn schedule_decision_or_history_denial(
     config: &AutomationConfig,
+    executable: Option<&Path>,
     task: AgentTaskKind,
     records: &[AutomationRunLedgerRecord],
     activity: SessionActivity,
     now_secs: i64,
     enforce_schedule: bool,
 ) -> AutomationScheduleDecision {
-    match schedule_decision_for_trigger(config, task, records, activity, now_secs, enforce_schedule)
-    {
+    match schedule_decision_for_trigger(
+        config,
+        executable,
+        task,
+        records,
+        activity,
+        now_secs,
+        enforce_schedule,
+    ) {
         Ok(decision) => decision,
         Err(_) => {
             AutomationScheduleDecision::skipped(AutomationSkipReasonV1::SchedulerHistoryInvalid)
@@ -389,6 +416,7 @@ fn schedule_decision_or_history_denial(
 
 fn schedule_decision_for_trigger(
     config: &AutomationConfig,
+    executable: Option<&Path>,
     task: AgentTaskKind,
     records: &[AutomationRunLedgerRecord],
     activity: SessionActivity,
@@ -504,7 +532,7 @@ fn schedule_decision_for_trigger(
             );
             // Identity-stand first: a deterministic failure stamped under the
             // current backend stays suppressed until that identity changes.
-            match deterministic_backend_failure_standing(record, config) {
+            match deterministic_backend_failure_standing(record, config, executable) {
                 Ok(BackendFailureStanding::Stands) => {
                     return Ok(AutomationScheduleDecision::skipped(
                         AutomationSkipReasonV1::BackendIdentitySuppressed,
@@ -630,7 +658,7 @@ enum BackendFailureStanding {
 /// each rules out a different kind of false positive:
 ///
 /// 1. The failure class is deterministic under a fixed backend and
-///    configuration — typed `Permanent` only. `Unavailable`, `Denied`,
+///    configuration, typed `Permanent` only. `Unavailable`, `Denied`,
 ///    `Disconnected`, `MalformedOutput`, `Timeout`, and `Retryable` keep the
 ///    ordinary failure cooldown.
 /// 2. Every attempt the backend made failed that same way. A class that got
@@ -648,6 +676,7 @@ enum BackendFailureStanding {
 fn deterministic_backend_failure_standing(
     record: &AutomationRunLedgerRecord,
     config: &AutomationConfig,
+    executable: Option<&Path>,
 ) -> Result<BackendFailureStanding> {
     let Some(classification) = record.error_classification else {
         return Ok(BackendFailureStanding::NotSettled);
@@ -658,7 +687,7 @@ fn deterministic_backend_failure_standing(
     let Some(recorded_identity) = record.backend_identity.as_deref() else {
         return Ok(BackendFailureStanding::NotSettled);
     };
-    if backend_identity(config)? != recorded_identity {
+    if backend_identity(config, executable)? != recorded_identity {
         return Ok(BackendFailureStanding::IdentityChanged);
     }
     let ladder_reproduced_the_class = !record.backend_attempts.is_empty()
@@ -749,10 +778,6 @@ pub fn stale_lock_secs(config: &AutomationConfig, task: AgentTaskKind) -> Option
         .or(Some(DEFAULT_STALE_LOCK_SECS))
 }
 
-pub fn validate_schedule(schedule: Option<&str>) -> Result<()> {
-    Ok(validate_leaf_schedule(schedule)?)
-}
-
 /// User jobs carry their own schedule/enabled state (see
 /// `automation::jobs`), so the fixed-task config lookup falls back to a
 /// disabled default that makes the fixed-task gates skip them.
@@ -800,15 +825,8 @@ fn latest_cadence_terminal_record(
 /// next real attempt. Other settled skips did enter the task and consume its
 /// evidence/review opportunity, so their completion starts the next interval.
 fn is_scheduler_diagnostic_skip(reason: Option<&str>) -> bool {
-    let Some(reason) = reason else {
-        return false;
-    };
-    // Retired intermediate label. Current producers emit the task-specific
-    // disabled variant. Historical rows must stay cadence-neutral.
-    if reason == "task_disabled" {
-        return true;
-    }
-    AutomationSkipReasonV1::from_ledger_reason(reason)
+    reason
+        .and_then(AutomationSkipReasonV1::from_ledger_reason)
         .is_some_and(AutomationSkipReasonV1::is_cadence_diagnostic)
 }
 
@@ -816,7 +834,7 @@ fn parse_started_at(record: &AutomationRunLedgerRecord) -> Result<i64> {
     canonical_record_started_at_seconds(record, &format!("run '{}' started_at", record.run_id))
 }
 
-fn elapsed_secs(completed_at: i64, now_secs: i64) -> u64 {
+pub(crate) fn elapsed_secs(completed_at: i64, now_secs: i64) -> u64 {
     if now_secs < completed_at {
         return 0;
     }
@@ -1209,7 +1227,7 @@ fn remove_owned_task_lock_blocking(path: &Path, ownership_token: &str) -> std::i
     tracedecay_runtime_core::storage::PrivateStoreIo::remove_file_durable(path).map(|_| ())
 }
 
-fn acquire_task_lock_coordination(path: &Path) -> std::io::Result<std::fs::File> {
+fn acquire_task_lock_coordination(path: &Path) -> std::io::Result<FileLease> {
     let path = resolve_task_lock_parent(path)?;
     let coordination_path = tracedecay_runtime_core::storage::append_lock_path(&path);
     tracedecay_runtime_core::storage::reject_symlink_components(
@@ -1256,7 +1274,8 @@ fn acquire_task_lock_coordination(path: &Path) -> std::io::Result<std::fs::File>
         }
         file
     };
-    fs2::FileExt::lock_exclusive(&file)?;
+    file.lock()?;
+    let file = FileLease::held(file, "automation.task_lock.coordination");
     file.sync_all()?;
     tracedecay_private_fs::framed_log::sync_parent_directory(
         &coordination_path,
@@ -1622,6 +1641,7 @@ mod tests {
             backend_attempt_count: 0,
             backend_attempts: Vec::new(),
             fallback_status: None,
+            session_evidence_budget_stage: None,
             report_ref: None,
             artifacts: Vec::new(),
             started_at: completed_at.to_string(),
@@ -1654,6 +1674,7 @@ mod tests {
     /// every attempt, stamped with `identity`.
     fn settled_backend_failure(
         config: &AutomationConfig,
+        executable: Option<&Path>,
         error: &str,
         classification: AgentTaskFailureClass,
         attempts: u32,
@@ -1678,7 +1699,7 @@ mod tests {
                 backoff_millis: 0,
             })
             .collect();
-        record.backend_identity = identity.or_else(|| backend_identity(config).ok());
+        record.backend_identity = identity.or_else(|| backend_identity(config, executable).ok());
         record
     }
 
@@ -1688,13 +1709,10 @@ disconnected: config error: codex app-server closed stdout before completing";
 
     #[test]
     fn deterministic_backend_failure_settles_once_and_never_relaunches() {
-        // The executable override is process-global. Keep the stamped
-        // identity and every later suppression read under one environment
-        // lock so the same-path replacement test cannot interleave them.
-        let _env_lock = tracedecay_runtime_core::config::lock_user_data_dir_test_env();
         let config = curator_config();
         let records = vec![settled_backend_failure(
             &config,
+            None,
             PERMANENT_PROTOCOL_ERROR,
             AgentTaskFailureClass::Permanent,
             3,
@@ -1703,7 +1721,7 @@ disconnected: config error: codex app-server closed stdout before completing";
         )];
 
         // The failure cooldown is the only thing that used to gate this, and
-        // it elapses. Every tick after it — including a full day later — must
+        // it elapses. Every tick after it, including a full day later, must
         // still refuse to spawn the backend again.
         for now_secs in [
             2_001,
@@ -1714,6 +1732,7 @@ disconnected: config error: codex app-server closed stdout before completing";
             assert_eq!(
                 schedule_decision(
                     &config,
+                    None,
                     AgentTaskKind::MemoryCurator,
                     &records,
                     SessionActivity::none(),
@@ -1732,6 +1751,7 @@ disconnected: config error: codex app-server closed stdout before completing";
         let config = curator_config();
         let mut record = settled_backend_failure(
             &config,
+            None,
             DISCONNECT_ERROR,
             AgentTaskFailureClass::Disconnected,
             3,
@@ -1744,6 +1764,7 @@ disconnected: config error: codex app-server closed stdout before completing";
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::MemoryCurator,
                 &records,
                 SessionActivity::none(),
@@ -1763,10 +1784,11 @@ evidence about it",
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("codex-backend");
         std::fs::write(&path, b"backend-revision-one").unwrap();
-        let _env = super::super::backend_identity::CodexBinEnvGuard::set(&path);
+        let executable = Some(path.as_path());
         let config = curator_config();
         let records = vec![settled_backend_failure(
             &config,
+            executable,
             PERMANENT_PROTOCOL_ERROR,
             AgentTaskFailureClass::Permanent,
             3,
@@ -1777,6 +1799,7 @@ evidence about it",
         assert_eq!(
             schedule_decision(
                 &config,
+                executable,
                 AgentTaskKind::MemoryCurator,
                 &records,
                 SessionActivity::none(),
@@ -1790,6 +1813,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                executable,
                 AgentTaskKind::MemoryCurator,
                 &records,
                 SessionActivity::none(),
@@ -1823,6 +1847,7 @@ evidence about it",
         ] {
             let records = vec![settled_backend_failure(
                 &config,
+                None,
                 error,
                 classification,
                 3,
@@ -1834,6 +1859,7 @@ evidence about it",
             assert_eq!(
                 schedule_decision(
                     &config,
+                    None,
                     AgentTaskKind::MemoryCurator,
                     &records,
                     SessionActivity::none(),
@@ -1848,6 +1874,7 @@ evidence about it",
             assert!(
                 schedule_decision(
                     &config,
+                    None,
                     AgentTaskKind::MemoryCurator,
                     &records,
                     SessionActivity::none(),
@@ -1864,6 +1891,7 @@ evidence about it",
         let config = curator_config();
         let mut record = settled_backend_failure(
             &config,
+            None,
             DISCONNECT_ERROR,
             AgentTaskFailureClass::Disconnected,
             3,
@@ -1878,6 +1906,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::MemoryCurator,
                 &records,
                 SessionActivity::none(),
@@ -1916,59 +1945,41 @@ evidence about it",
     }
 
     #[test]
-    fn legacy_and_stage_specific_budget_reasons_share_the_same_backoff() {
-        const EXHAUSTION_REASONS: &[&str] = &[
-            SESSION_EVIDENCE_BUDGET_EXHAUSTED,
-            "session_evidence_budget_exhausted_request_result_limit",
-            "session_evidence_budget_exhausted_request_hydration_limit",
-            "session_evidence_budget_exhausted_request_context_bytes",
-            "session_evidence_budget_exhausted_request_candidate_bytes",
-            "session_evidence_budget_exhausted_request_record_bytes",
-            "session_evidence_budget_exhausted_request_hydration_bytes",
-            "session_evidence_budget_exhausted_estimator_version_mismatch",
-            "session_evidence_budget_exhausted_execution_work_exhausted",
-            "session_evidence_budget_exhausted_kernel_result_limit",
-            "session_evidence_budget_exhausted_participant_manifest_participants",
-            "session_evidence_budget_exhausted_participant_manifest_canonical_bytes",
-            "session_evidence_budget_exhausted_hydration_bytes",
-            "session_evidence_budget_exhausted_context_bytes",
-            "session_evidence_budget_exhausted_context_tokens",
-        ];
-
+    fn only_the_canonical_budget_token_activates_the_backoff() {
         let config = session_evidence_config();
-        for reason in EXHAUSTION_REASONS {
-            let records = vec![budget_exhausted_skip_with_reason(
-                "run-exhausted",
+        let decision_at = |reason: &'static str, now: i64| {
+            schedule_decision(
+                &config,
+                None,
                 AgentTaskKind::SessionReflector,
-                reason,
-                2_000,
-            )];
-
-            assert_eq!(
-                schedule_decision(
-                    &config,
+                &[budget_exhausted_skip_with_reason(
+                    "run-exhausted",
                     AgentTaskKind::SessionReflector,
-                    &records,
-                    SessionActivity::at(2_500),
-                    2_060,
-                )
+                    reason,
+                    2_000,
+                )],
+                SessionActivity::at(2_500),
+                now,
+            )
+        };
+
+        assert_eq!(
+            decision_at(SESSION_EVIDENCE_BUDGET_EXHAUSTED, 2_060)
                 .skip_reason()
                 .map(AutomationSkipReasonV1::as_str),
-                Some(SESSION_EVIDENCE_BUDGET_SUPPRESSED),
-                "{reason} must activate the same backoff",
-            );
-            assert!(
-                schedule_decision(
-                    &config,
-                    AgentTaskKind::SessionReflector,
-                    &records,
-                    SessionActivity::at(2_500),
-                    2_000 + 3_600,
-                )
-                .is_due(),
-                "{reason} must release at the same boundary",
-            );
-        }
+            Some(SESSION_EVIDENCE_BUDGET_SUPPRESSED),
+        );
+        assert!(decision_at(SESSION_EVIDENCE_BUDGET_EXHAUSTED, 2_000 + 3_600).is_due());
+        assert_ne!(
+            decision_at(
+                "session_evidence_budget_exhausted_request_candidate_bytes",
+                2_060
+            )
+            .skip_reason()
+            .map(AutomationSkipReasonV1::as_str),
+            Some(SESSION_EVIDENCE_BUDGET_SUPPRESSED),
+            "stage-suffixed reasons are not a budget-exhaustion wire form",
+        );
     }
 
     #[test]
@@ -1990,6 +2001,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SessionReflector,
                 &records,
                 SessionActivity::at(2_500),
@@ -2017,6 +2029,7 @@ evidence about it",
         assert_eq!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SessionReflector,
                 &[exhausted, earlier_success],
                 SessionActivity::at(2_500),
@@ -2047,6 +2060,7 @@ evidence about it",
         assert_eq!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SkillWriter,
                 &records,
                 SessionActivity::at(2_500),
@@ -2059,6 +2073,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SkillWriter,
                 &records,
                 SessionActivity::at(2_500),
@@ -2085,6 +2100,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SkillWriter,
                 &records,
                 SessionActivity::at(2_500),
@@ -2108,6 +2124,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SessionReflector,
                 &records,
                 SessionActivity::at(2_500),
@@ -2141,6 +2158,7 @@ evidence about it",
         assert_eq!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SessionReflector,
                 std::slice::from_ref(&timeout),
                 SessionActivity::at(1_500),
@@ -2153,6 +2171,7 @@ evidence about it",
         assert!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SessionReflector,
                 std::slice::from_ref(&timeout),
                 SessionActivity::at(1_500),
@@ -2177,6 +2196,7 @@ evidence about it",
         assert_eq!(
             schedule_decision(
                 &config,
+                None,
                 AgentTaskKind::SessionReflector,
                 &[cancelled],
                 SessionActivity::at(1_500),
@@ -2600,7 +2620,7 @@ evidence about it",
     /// shutting down, and tokio's `blocking::pool::Spawner::spawn_task` shuts
     /// the refused task down *while holding* the pool's non-reentrant mutex.
     /// The refused closure owns this guard, so its release runs under that
-    /// mutex — and a release that re-enters the runtime never returns, leaving
+    /// mutex, and a release that re-enters the runtime never returns, leaving
     /// `BlockingPool::shutdown` waiting for the thread forever.
     ///
     /// Ordering is fixed by channels, not timing: the worker is parked until

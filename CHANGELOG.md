@@ -5,6 +5,853 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-beta.54](https://github.com/ScriptedAlchemy/tracedecay/compare/v1.0.0-beta.53...v1.0.0-beta.54) (2026-09-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* delete identity/config legacy paths; refuse old layouts ([#2134](https://github.com/ScriptedAlchemy/tracedecay/issues/2134))
+* **sessions:** `TRACEDECAY_{CURSOR,CODEX}_SUMMARY_{MODEL,TIMEOUT_SECS}` and `TRACEDECAY_CURSOR_SUMMARY_WORKSPACE` no longer tune summarizers; set `model` and `timeout_secs` on the `lcm.summarizer_executables.v1` entry.
+
+### Features
+
+* **agent-hosts:** add Factory Droid integration ([#2021](https://github.com/ScriptedAlchemy/tracedecay/issues/2021)) ([160d0e6](https://github.com/ScriptedAlchemy/tracedecay/commit/160d0e6fa7564fe19a26b523f2cf2bd5cd8c40b5))
+* **agent-hosts:** add first-party Pi integration ([#2013](https://github.com/ScriptedAlchemy/tracedecay/issues/2013)) ([1591b31](https://github.com/ScriptedAlchemy/tracedecay/commit/1591b314dcec670b9bb1ef4828bed7ece9edb635))
+* **code-index:** publish owner activity signals and await them in tests ([#2107](https://github.com/ScriptedAlchemy/tracedecay/issues/2107)) ([802e84c](https://github.com/ScriptedAlchemy/tracedecay/commit/802e84cca3f9e73072e9b15d0d53b9712b8d2a3d))
+* **dashboard:** serve agent usage under a PR and Brain symbol kinds ([#2120](https://github.com/ScriptedAlchemy/tracedecay/issues/2120)) ([9a85099](https://github.com/ScriptedAlchemy/tracedecay/commit/9a8509974bccdc6ef5ace2b8e24e9a02d833e386))
+* **pi:** prove Pi hooks, name analytics host, ingest sessions ([#2069](https://github.com/ScriptedAlchemy/tracedecay/issues/2069)) ([622467e](https://github.com/ScriptedAlchemy/tracedecay/commit/622467e6d2c1daef8b71e20af2f5735072955eaa))
+* **scripts:** own lane cleanup with squash-aware worktree GC ([#2079](https://github.com/ScriptedAlchemy/tracedecay/issues/2079)) ([78ff33e](https://github.com/ScriptedAlchemy/tracedecay/commit/78ff33efe2b925bf8aac83f40c6b8461443c8713))
+* **sessions:** bind subagent forks to the host spawning call ([#2154](https://github.com/ScriptedAlchemy/tracedecay/issues/2154)) ([92e490c](https://github.com/ScriptedAlchemy/tracedecay/commit/92e490c2c1b7d3c987331db8b72455f62e7a3b5a))
+
+
+### Bug Fixes
+
+* allow 8-arg rmcp helpers; drop doctor catalog-size pin ([21c64a2](https://github.com/ScriptedAlchemy/tracedecay/commit/21c64a2eea3e6939bb26443a3dbdbd8e5890cb43))
+* **automation:** reset refused effect journal and index shapes ([#2061](https://github.com/ScriptedAlchemy/tracedecay/issues/2061)) ([a9dedc7](https://github.com/ScriptedAlchemy/tracedecay/commit/a9dedc78e58268fb06f01e9c9b2dc682ba1ea293))
+* **automation:** reset released persisted shapes, drop readers ([#2148](https://github.com/ScriptedAlchemy/tracedecay/issues/2148)) ([c8a727d](https://github.com/ScriptedAlchemy/tracedecay/commit/c8a727d60bdde6c94e50da710bb33316fd419ba4))
+* **build:** pin macOS ad-hoc designated requirement ([c3e35ac](https://github.com/ScriptedAlchemy/tracedecay/commit/c3e35ac75f4562210475edd91578b5197c6480f8))
+* **build:** pin macOS ad-hoc designated requirement ([c21747b](https://github.com/ScriptedAlchemy/tracedecay/commit/c21747bed7a16a2c8b3ce8ed72c02deb2c1102ae))
+* **build:** re-sign tracedecay after release strip ([26b43e3](https://github.com/ScriptedAlchemy/tracedecay/commit/26b43e39341d41b81bc264e83ddeaff33ce95f51))
+* **build:** re-sign tracedecay after release strip ([5d77fa9](https://github.com/ScriptedAlchemy/tracedecay/commit/5d77fa95e9357df5a29ebb8bcac5d2d6a0e2d8df))
+* **build:** share kache entries across pnpm worktrees; document Cargo flows ([#2144](https://github.com/ScriptedAlchemy/tracedecay/issues/2144)) ([70aec44](https://github.com/ScriptedAlchemy/tracedecay/commit/70aec44dbd39a49fa79a615ac5be16620aefbad4))
+* **build:** sign tracedecay when cargo omits -o ([4217396](https://github.com/ScriptedAlchemy/tracedecay/commit/4217396c3ca58857910e84c853d4f15bd78fdf2e))
+* **build:** sign tracedecay when cargo omits -o ([d44b65c](https://github.com/ScriptedAlchemy/tracedecay/commit/d44b65c3bc305c8a617a7bd0f802199091021c88))
+* **build:** stable macOS codesign id and worktree scan ([abe9ba0](https://github.com/ScriptedAlchemy/tracedecay/commit/abe9ba0127adf6a5a57f98644e9b193a6e7d18a1))
+* **build:** stable macOS codesign id and worktree scan ([62f4372](https://github.com/ScriptedAlchemy/tracedecay/commit/62f4372623c191feb6ba5c54b7bbfff7d05e5c50))
+* **cli:** Kimi operator exit and refresh cancel receipt ([876e23d](https://github.com/ScriptedAlchemy/tracedecay/commit/876e23d722026c05d5dcdaed5c90ce051d6e4ebb))
+* **clippy:** allow many-arg windows broker serving helpers ([f4d9e45](https://github.com/ScriptedAlchemy/tracedecay/commit/f4d9e45b6a8988447e95a7d8b2bbcfe3090c9637))
+* **clippy:** macOS and [#2095](https://github.com/ScriptedAlchemy/tracedecay/issues/2095) clippy blockers ([ed77183](https://github.com/ScriptedAlchemy/tracedecay/commit/ed77183fdf1210ec588798c95e57157718633dc0))
+* **clippy:** silence macOS-only dead code in memory log and upgrade ([e09e2ab](https://github.com/ScriptedAlchemy/tracedecay/commit/e09e2ab46d25f5e6733d468e881441a90877df86))
+* **cli:** type host sweep outcomes and exit truthfully ([#2075](https://github.com/ScriptedAlchemy/tracedecay/issues/2075)) ([562aad8](https://github.com/ScriptedAlchemy/tracedecay/commit/562aad8f370a693c105628e2bce52803cc88b909))
+* **code-extraction:** index `use ::krate` paths like their bare form ([#2171](https://github.com/ScriptedAlchemy/tracedecay/issues/2171)) ([4c9360b](https://github.com/ScriptedAlchemy/tracedecay/commit/4c9360b7ec1a86238c36798ce798ae3c068aed0f)), closes [#2114](https://github.com/ScriptedAlchemy/tracedecay/issues/2114)
+* **code-index:** bind TS same-module exports and scope shadowing ([#2070](https://github.com/ScriptedAlchemy/tracedecay/issues/2070)) ([97c5a7c](https://github.com/ScriptedAlchemy/tracedecay/commit/97c5a7c094650c3f8b53c4d2627a1d4842d803ac))
+* **code-index:** bind TypeScript default and namespace imports ([#2142](https://github.com/ScriptedAlchemy/tracedecay/issues/2142)) ([e489466](https://github.com/ScriptedAlchemy/tracedecay/commit/e489466972d6aa7e6b18e8236292b39ca9b7ae07))
+* **code-index:** collect a killed compaction's rollback journal ([#2166](https://github.com/ScriptedAlchemy/tracedecay/issues/2166)) ([acf5621](https://github.com/ScriptedAlchemy/tracedecay/commit/acf562185adc4c2273a500d00a297fa2b1ade535)), closes [#2127](https://github.com/ScriptedAlchemy/tracedecay/issues/2127)
+* **code-index:** park reproducing failures instead of indexing forever ([#2124](https://github.com/ScriptedAlchemy/tracedecay/issues/2124)) ([2e286fe](https://github.com/ScriptedAlchemy/tracedecay/commit/2e286fe63a155b27fabd49c023bac84d86508b44)), closes [#2057](https://github.com/ScriptedAlchemy/tracedecay/issues/2057)
+* **code-index:** refuse queries on a parked worktree without retry ([#2174](https://github.com/ScriptedAlchemy/tracedecay/issues/2174)) ([2da5e69](https://github.com/ScriptedAlchemy/tracedecay/commit/2da5e699066d8cee2eae6b6d563105bd2847d252)), closes [#2128](https://github.com/ScriptedAlchemy/tracedecay/issues/2128)
+* **code-index:** seal the clone census into the lexical artifact ([#2087](https://github.com/ScriptedAlchemy/tracedecay/issues/2087)) ([0d66e04](https://github.com/ScriptedAlchemy/tracedecay/commit/0d66e042c5cc6094846db42046a23e2d9832f788))
+* **codex:** retire released plugin skills and refuse foreign ones ([#2043](https://github.com/ScriptedAlchemy/tracedecay/issues/2043)) ([af7f15e](https://github.com/ScriptedAlchemy/tracedecay/commit/af7f15e8c32ec6a1f9e3e4c8487e3c24afd25ac0))
+* **configuration:** retire sync.orphan_db_gc_days.v1 setting key ([#2047](https://github.com/ScriptedAlchemy/tracedecay/issues/2047)) ([cb37c63](https://github.com/ScriptedAlchemy/tracedecay/commit/cb37c630df528addbd265a2431dae4a3755a4c13))
+* **context:** return admitted anchor sites and count what was returned ([#2090](https://github.com/ScriptedAlchemy/tracedecay/issues/2090)) ([f145ee3](https://github.com/ScriptedAlchemy/tracedecay/commit/f145ee352f744d7c4af7a282e45d868da90c1fd5)), closes [#2024](https://github.com/ScriptedAlchemy/tracedecay/issues/2024)
+* **daemon-control:** size service memory limits from physical RAM ([#2133](https://github.com/ScriptedAlchemy/tracedecay/issues/2133)) ([ed2d4b3](https://github.com/ScriptedAlchemy/tracedecay/commit/ed2d4b35bd2ead98e42f4bd29be27c71bf165b22)), closes [#2052](https://github.com/ScriptedAlchemy/tracedecay/issues/2052)
+* **daemon:** allow eight-arg routed rmcp connection helpers ([69c2c76](https://github.com/ScriptedAlchemy/tracedecay/commit/69c2c76c1e76a90eaf3f96801f1532a773b0cde8)), closes [#2048](https://github.com/ScriptedAlchemy/tracedecay/issues/2048)
+* **daemon:** deliver early shutdown without waiting on scheduler maps ([#2170](https://github.com/ScriptedAlchemy/tracedecay/issues/2170)) ([f897428](https://github.com/ScriptedAlchemy/tracedecay/commit/f897428e5131a368c5a82cf28bbd0fb8617f0d72))
+* **daemon:** isolate blocked repository discovery ([91a2a74](https://github.com/ScriptedAlchemy/tracedecay/commit/91a2a74e719972b094553d0f68d3774d062b0aec))
+* **daemon:** isolate blocked repository discovery ([418a6fb](https://github.com/ScriptedAlchemy/tracedecay/commit/418a6fbc033bc44caa43b5eddfdd4863337f7158))
+* **daemon:** lead status with the daemon state, not systemd ([#2095](https://github.com/ScriptedAlchemy/tracedecay/issues/2095)) ([d4b6950](https://github.com/ScriptedAlchemy/tracedecay/commit/d4b6950124977238570f8235969c963477b303c1))
+* **daemon:** make macOS service and path-alias tests pass ([#2042](https://github.com/ScriptedAlchemy/tracedecay/issues/2042)) ([fdf5a37](https://github.com/ScriptedAlchemy/tracedecay/commit/fdf5a37e39b883e2759e3441207bbde8b4d4445d))
+* **daemon:** name blocked checkout in discovery deferral ([d639ff3](https://github.com/ScriptedAlchemy/tracedecay/commit/d639ff3aad523337e64ea77459516b64c3504b25))
+* **daemon:** queue same-project source edits and branch lifecycles ([#2175](https://github.com/ScriptedAlchemy/tracedecay/issues/2175)) ([051a83b](https://github.com/ScriptedAlchemy/tracedecay/commit/051a83b8b97928f0f588e0d4ba9a5f6c65255559))
+* **daemon:** serve registry reads without project warmup ([#2072](https://github.com/ScriptedAlchemy/tracedecay/issues/2072)) ([fde5adf](https://github.com/ScriptedAlchemy/tracedecay/commit/fde5adfbc785310030b970adb1f8ddf134111f4d)), closes [#2026](https://github.com/ScriptedAlchemy/tracedecay/issues/2026)
+* **dashboard:** answer graph reads without a whole-census load ([#2140](https://github.com/ScriptedAlchemy/tracedecay/issues/2140)) ([ec9eb1a](https://github.com/ScriptedAlchemy/tracedecay/commit/ec9eb1a2be10a41bfa480418771154118ca16290))
+* **dashboard:** audit real fixtures; keep Brain rail rows inside ([#2074](https://github.com/ScriptedAlchemy/tracedecay/issues/2074)) ([53ed211](https://github.com/ScriptedAlchemy/tracedecay/commit/53ed21150681b23e2c30ece01ea2695a3759014f)), closes [#2038](https://github.com/ScriptedAlchemy/tracedecay/issues/2038) [#2039](https://github.com/ScriptedAlchemy/tracedecay/issues/2039)
+* **dashboard:** bound Loom reads to the page and type their timeouts ([#2119](https://github.com/ScriptedAlchemy/tracedecay/issues/2119)) ([0adb82c](https://github.com/ScriptedAlchemy/tracedecay/commit/0adb82c5cb716c8597be1d67ac6e6366953e0169)), closes [#2035](https://github.com/ScriptedAlchemy/tracedecay/issues/2035)
+* **dashboard:** clear field hover when the pointer leaves a mark ([#2028](https://github.com/ScriptedAlchemy/tracedecay/issues/2028)) ([4822c9e](https://github.com/ScriptedAlchemy/tracedecay/commit/4822c9e4badeaee609a677e760a9956b775593d3))
+* **dashboard:** repair defects found in the dashboard proof sweep ([#2046](https://github.com/ScriptedAlchemy/tracedecay/issues/2046)) ([6db084d](https://github.com/ScriptedAlchemy/tracedecay/commit/6db084dcb7acb24dedf1937398e8a0d38f2a9583))
+* **delivery:** admit PRs on any-language and fork-headed checkouts ([#2173](https://github.com/ScriptedAlchemy/tracedecay/issues/2173)) ([1016f47](https://github.com/ScriptedAlchemy/tracedecay/commit/1016f47e6ba2cf53cac938d68266332fb50ef95c))
+* **diagnostics:** check the tsconfig that owns a TypeScript file ([#2068](https://github.com/ScriptedAlchemy/tracedecay/issues/2068)) ([2b17c74](https://github.com/ScriptedAlchemy/tracedecay/commit/2b17c74611a8f55b7dda0914dfab9d37a63dc4ce)), closes [#2025](https://github.com/ScriptedAlchemy/tracedecay/issues/2025)
+* **feedback:** keep the typed handle-store cause in cycle errors ([#2147](https://github.com/ScriptedAlchemy/tracedecay/issues/2147)) ([53014e3](https://github.com/ScriptedAlchemy/tracedecay/commit/53014e38678443a9f1d9b18c181b123329c34984))
+* **hooks:** let the daemon own admission ledgers and wait for spools ([#2135](https://github.com/ScriptedAlchemy/tracedecay/issues/2135)) ([e7ff155](https://github.com/ScriptedAlchemy/tracedecay/commit/e7ff15503aeaa60a02e422ab52a09d995254f5eb))
+* **hooks:** widen spool lock wait on macOS for F_FULLFSYNC cost ([467540e](https://github.com/ScriptedAlchemy/tracedecay/commit/467540ebfca033f89a2a06ac8cf077241e83714b))
+* **hooks:** widen spool lock wait on macOS for F_FULLFSYNC cost ([682b47b](https://github.com/ScriptedAlchemy/tracedecay/commit/682b47b99bc92af90c022da09af43e62694ab4cc))
+* **hosts:** adopt Claude installs and report unenrolled doctor ([62600a7](https://github.com/ScriptedAlchemy/tracedecay/commit/62600a7a0104cad406c7cc732c2d0563dc33f759))
+* **hosts:** adopt Claude installs and report unenrolled doctor ([e7563ac](https://github.com/ScriptedAlchemy/tracedecay/commit/e7563ac344d2e7986f2960f36280b9b825ba23f0))
+* **lcm:** resume parked summaries when the summarizer changes ([#2113](https://github.com/ScriptedAlchemy/tracedecay/issues/2113)) ([c58653d](https://github.com/ScriptedAlchemy/tracedecay/commit/c58653d2947ed0468e7e141770d12aac908b1ee8)), closes [#2054](https://github.com/ScriptedAlchemy/tracedecay/issues/2054)
+* **lsp:** wait for operation tables instead of refusing busy ([#2088](https://github.com/ScriptedAlchemy/tracedecay/issues/2088)) ([d9d2e54](https://github.com/ScriptedAlchemy/tracedecay/commit/d9d2e5407f8fa34f51c6fe892f50b46803f1199e))
+* **maintenance:** resolve registered graph scopes from the profile root ([#2145](https://github.com/ScriptedAlchemy/tracedecay/issues/2145)) ([7d9b91d](https://github.com/ScriptedAlchemy/tracedecay/commit/7d9b91d69e803926dd55d098c1b65b11be57485d))
+* **observability:** record every storage-status sample per store ([#2169](https://github.com/ScriptedAlchemy/tracedecay/issues/2169)) ([ebe6edf](https://github.com/ScriptedAlchemy/tracedecay/commit/ebe6edfc7be89f9cb73255e7f4826bfd6bfdb06d))
+* **pr-autotrack:** reset undecodable managed PR entries ([#2065](https://github.com/ScriptedAlchemy/tracedecay/issues/2065)) ([57ed366](https://github.com/ScriptedAlchemy/tracedecay/commit/57ed366c8b21c99cae24eb06c35e00ae4c8f70e8))
+* **projection:** rebind session project_key without blocking catch-up ([3c5df79](https://github.com/ScriptedAlchemy/tracedecay/commit/3c5df79afe4c4cf317e6ae5c0417c336d8b28e1a))
+* **projection:** upgrade LCM placeholder sessions during catch-up ([36f4d4c](https://github.com/ScriptedAlchemy/tracedecay/commit/36f4d4c5642c265c6d600bc351c01d511d673c79))
+* **projection:** upgrade LCM placeholder sessions during catch-up ([67d7ed8](https://github.com/ScriptedAlchemy/tracedecay/commit/67d7ed85de5fc0398aedbb7d343ff39d3a48eaed))
+* **registry:** report the checkout's live HEAD branch ([f454d99](https://github.com/ScriptedAlchemy/tracedecay/commit/f454d99f0039cc40c0c852a1943c68158efd2a27))
+* **registry:** report the checkout's live HEAD branch ([9024ab0](https://github.com/ScriptedAlchemy/tracedecay/commit/9024ab03008fb38efac1871ad0add60c32a212fe)), closes [#2037](https://github.com/ScriptedAlchemy/tracedecay/issues/2037)
+* repair [#863](https://github.com/ScriptedAlchemy/tracedecay/issues/863) fixture, hotspot, WAL and startup failures ([#2019](https://github.com/ScriptedAlchemy/tracedecay/issues/2019)) ([a3c2909](https://github.com/ScriptedAlchemy/tracedecay/commit/a3c29091b1aa58488f0625443e503136d0498cb6))
+* restore lexical ranking strength and await typed Work retries ([#2022](https://github.com/ScriptedAlchemy/tracedecay/issues/2022)) ([67c6336](https://github.com/ScriptedAlchemy/tracedecay/commit/67c6336b894a952d9c33cf83afc1b97fc5555dd8)), closes [#863](https://github.com/ScriptedAlchemy/tracedecay/issues/863)
+* **retention:** collect retired branches/*.db store layout ([#2094](https://github.com/ScriptedAlchemy/tracedecay/issues/2094)) ([8ee8c25](https://github.com/ScriptedAlchemy/tracedecay/commit/8ee8c2503875f6dd358ce6a14d2ba24a55b16fd9))
+* **runtime-core:** add production discovery-block probe stub ([2567a0e](https://github.com/ScriptedAlchemy/tracedecay/commit/2567a0ed9469bc72f844d3fa8780ecdf87495d87))
+* **runtime-core:** add production discovery-block probe stub ([c28d0ad](https://github.com/ScriptedAlchemy/tracedecay/commit/c28d0ad6ee7672cf498d22de079e596e916c4891))
+* **scripts:** find the user manager from non-login shells ([#2080](https://github.com/ScriptedAlchemy/tracedecay/issues/2080)) ([afd6172](https://github.com/ScriptedAlchemy/tracedecay/commit/afd6172c7652a39c8a598df0be4066502fbd47d1))
+* **scripts:** refuse worktree GC on a shallow repository ([#2099](https://github.com/ScriptedAlchemy/tracedecay/issues/2099)) ([ad14df3](https://github.com/ScriptedAlchemy/tracedecay/commit/ad14df37e4ec06dbf27dc2596b460b62c97fd6c4))
+* **session-memory:** queue response-handle writers on the root lock ([#2116](https://github.com/ScriptedAlchemy/tracedecay/issues/2116)) ([b1a100b](https://github.com/ScriptedAlchemy/tracedecay/commit/b1a100bbe25be59d9469019c85aacb91eda9f4a6))
+* **sessions:** begin refresh at the committed frontier ([#2152](https://github.com/ScriptedAlchemy/tracedecay/issues/2152)) ([c4ad179](https://github.com/ScriptedAlchemy/tracedecay/commit/c4ad179da3b79cd05fcca39d60f4b91b00676180))
+* **sessions:** keep a finished refresh receipt on cancel ([5e2cb98](https://github.com/ScriptedAlchemy/tracedecay/commit/5e2cb9801dc5a14c06c9862e67611dec5e2681c7))
+* **sessions:** page the Cursor transcript sweep with a durable frontier ([#2160](https://github.com/ScriptedAlchemy/tracedecay/issues/2160)) ([77f9a51](https://github.com/ScriptedAlchemy/tracedecay/commit/77f9a515f526210d674d50679aafc7430b089145))
+* **sessions:** rebuild pre-index Git evidence heads during convergence ([#2044](https://github.com/ScriptedAlchemy/tracedecay/issues/2044)) ([c6f0154](https://github.com/ScriptedAlchemy/tracedecay/commit/c6f01540bb0e404aab7785d44988fa4ca42efaaa))
+* **sessions:** skip Cursor subagent top-level copies past the walk cap ([#2102](https://github.com/ScriptedAlchemy/tracedecay/issues/2102)) ([2982ecf](https://github.com/ScriptedAlchemy/tracedecay/commit/2982ecfc22d6cc74a416b8ad96ba5423faa6bea1))
+* **sessions:** tune LCM summarizers only through configuration ([#2089](https://github.com/ScriptedAlchemy/tracedecay/issues/2089)) ([21766f6](https://github.com/ScriptedAlchemy/tracedecay/commit/21766f6fef3ce4c66f5ade3090a544091e03a984))
+* stop keeping database copies and leftover test homes ([#2143](https://github.com/ScriptedAlchemy/tracedecay/issues/2143)) ([26e63ce](https://github.com/ScriptedAlchemy/tracedecay/commit/26e63ce79582e750723a6bf3e311ba01638eab33))
+* **test:** add dropped_sites to lexical route receipt fixtures ([f6cbe1d](https://github.com/ScriptedAlchemy/tracedecay/commit/f6cbe1db905ac872bead0864cf502fd496a0c16a))
+* **test:** add dropped_sites to lexical route receipt fixtures ([2879f1c](https://github.com/ScriptedAlchemy/tracedecay/commit/2879f1c53a78ddafa3c85f871e51f22016b985ef))
+* **tests:** kill fixture daemons when their test process dies ([#2092](https://github.com/ScriptedAlchemy/tracedecay/issues/2092)) ([e483ab5](https://github.com/ScriptedAlchemy/tracedecay/commit/e483ab55db4e97ae9440e23bee8216a9724c4929)), closes [#2051](https://github.com/ScriptedAlchemy/tracedecay/issues/2051)
+* **work:** answer an absent Work graph as a typed state, not a denial ([#2150](https://github.com/ScriptedAlchemy/tracedecay/issues/2150)) ([e580d11](https://github.com/ScriptedAlchemy/tracedecay/commit/e580d1150cd8b53ee8bdcfcea2b4149f4bd6aeab))
+
+
+### Performance Improvements
+
+* **code-index:** cut redundant n-gram and clone-digest work ([#2023](https://github.com/ScriptedAlchemy/tracedecay/issues/2023)) ([45e7d20](https://github.com/ScriptedAlchemy/tracedecay/commit/45e7d20dfcdb9fc868687742da239a81402eb6fd))
+* **code-index:** stop decoded generations owning per-token names ([#2118](https://github.com/ScriptedAlchemy/tracedecay/issues/2118)) ([775661e](https://github.com/ScriptedAlchemy/tracedecay/commit/775661e491f2fa720380c8a9f1b7d2caa4f65c8f))
+* **code-index:** store segment facts once, cut journal churn ([eac2322](https://github.com/ScriptedAlchemy/tracedecay/commit/eac2322033a9810506ead08087ac80a1cff9d28d))
+* **graph:** rank Cortex hubs from catalog-recorded degrees ([#2055](https://github.com/ScriptedAlchemy/tracedecay/issues/2055)) ([2ee728d](https://github.com/ScriptedAlchemy/tracedecay/commit/2ee728d21c0d4111f480e9c8d25629a71d9de3e1))
+* **mcp:** cut per-poll status, monitor and handle writes ([#2111](https://github.com/ScriptedAlchemy/tracedecay/issues/2111)) ([9a29edf](https://github.com/ScriptedAlchemy/tracedecay/commit/9a29edf8e6d30c48b780f9eae77141b002dd6a8e))
+* **scripts:** skip squash diffs whose paths no landed commit touches ([#2086](https://github.com/ScriptedAlchemy/tracedecay/issues/2086)) ([dbf7f13](https://github.com/ScriptedAlchemy/tracedecay/commit/dbf7f13a258f1e4195cd9d585d60bacef45a9061))
+
+
+### Code Refactoring
+
+* delete identity/config legacy paths; refuse old layouts ([#2134](https://github.com/ScriptedAlchemy/tracedecay/issues/2134)) ([937b85d](https://github.com/ScriptedAlchemy/tracedecay/commit/937b85d334ae848fa9f4b4e416e58ba731101bc3))
+
+## [1.0.0-beta.53](https://github.com/ScriptedAlchemy/tracedecay/compare/v1.0.0-beta.52...v1.0.0-beta.53) (2026-09-25)
+
+
+### Bug Fixes
+
+* **code-index:** compute the clone census off the status path ([#2017](https://github.com/ScriptedAlchemy/tracedecay/issues/2017)) ([7cf1a4f](https://github.com/ScriptedAlchemy/tracedecay/commit/7cf1a4fff10541d7a91b167ca1b60a0b75d02df5)), closes [#2016](https://github.com/ScriptedAlchemy/tracedecay/issues/2016)
+* **code-index:** stop copying test attribution per ready query ([#2011](https://github.com/ScriptedAlchemy/tracedecay/issues/2011)) ([70c91ca](https://github.com/ScriptedAlchemy/tracedecay/commit/70c91ca9415b4fa4a732dd1399ed649a90f6ef33)), closes [#2001](https://github.com/ScriptedAlchemy/tracedecay/issues/2001)
+* **daemon:** deliver dropped hooks; compact artifact in one write ([#2014](https://github.com/ScriptedAlchemy/tracedecay/issues/2014)) ([16a8914](https://github.com/ScriptedAlchemy/tracedecay/commit/16a891499444a0fbe0089650e1f025ab7c8e6e2d)), closes [#1226](https://github.com/ScriptedAlchemy/tracedecay/issues/1226)
+* **graph-db:** open each serving graph once, never on the read path ([#2015](https://github.com/ScriptedAlchemy/tracedecay/issues/2015)) ([05221f4](https://github.com/ScriptedAlchemy/tracedecay/commit/05221f4232dff3aa6498a0dd8a2c3cbfcbb3cbb0)), closes [#2012](https://github.com/ScriptedAlchemy/tracedecay/issues/2012)
+* **test:** repair full-lane isolation and stale failures ([#2009](https://github.com/ScriptedAlchemy/tracedecay/issues/2009)) ([2e963c5](https://github.com/ScriptedAlchemy/tracedecay/commit/2e963c56cb533e3cb5b5a4d3bc180740c78c1570))
+* **test:** stop two fixtures from hanging until the slow-timeout ([#2007](https://github.com/ScriptedAlchemy/tracedecay/issues/2007)) ([d0bad63](https://github.com/ScriptedAlchemy/tracedecay/commit/d0bad630ab1a9e6e31518746883828b8b479a584)), closes [#2005](https://github.com/ScriptedAlchemy/tracedecay/issues/2005)
+* **update:** request JSON from the post-update profile probe ([#2010](https://github.com/ScriptedAlchemy/tracedecay/issues/2010)) ([0438ed9](https://github.com/ScriptedAlchemy/tracedecay/commit/0438ed9a03cbeac772b48943b664108d20c58d35))
+
+## [1.0.0-beta.52](https://github.com/ScriptedAlchemy/tracedecay/compare/v1.0.0-beta.51...v1.0.0-beta.52) (2026-09-25)
+
+
+### Bug Fixes
+
+* **code-index:** key watcher ingress by the product root identity ([#1994](https://github.com/ScriptedAlchemy/tracedecay/issues/1994)) ([76bddad](https://github.com/ScriptedAlchemy/tracedecay/commit/76bddad5103d95b5d663a46f3ecd9284e10444f7))
+* **code-index:** resolve TypeScript cross-file imports ([#1998](https://github.com/ScriptedAlchemy/tracedecay/issues/1998)) ([293e283](https://github.com/ScriptedAlchemy/tracedecay/commit/293e2838027a60b5a293f3d3947712f1c00ad2bb)), closes [#1975](https://github.com/ScriptedAlchemy/tracedecay/issues/1975)
+* **context:** make lexical anchors must-have evidence ([#1999](https://github.com/ScriptedAlchemy/tracedecay/issues/1999)) ([b874719](https://github.com/ScriptedAlchemy/tracedecay/commit/b874719fd0be90c10ae7153aaf85844867de0c91))
+* held-capability quarantine and canonical root identity routing ([#2002](https://github.com/ScriptedAlchemy/tracedecay/issues/2002)) ([0933cce](https://github.com/ScriptedAlchemy/tracedecay/commit/0933ccea88c5d1ae0ed39c35d49d25e011b30973))
+* **lint:** unpin workspace-versioned path deps and clear clippy errors ([#1995](https://github.com/ScriptedAlchemy/tracedecay/issues/1995)) ([8b1213e](https://github.com/ScriptedAlchemy/tracedecay/commit/8b1213e4c75495267451f193bb3e9e0a0acf2cee))
+* **release:** accept master-dispatched attestation digests ([#2003](https://github.com/ScriptedAlchemy/tracedecay/issues/2003)) ([a887e08](https://github.com/ScriptedAlchemy/tracedecay/commit/a887e08a96f6a36deb7b9244a422cb877390fd3a))
+
+
+### Performance Improvements
+
+* **ci:** balance macOS groups by measured partition cost ([#2004](https://github.com/ScriptedAlchemy/tracedecay/issues/2004)) ([9f341bf](https://github.com/ScriptedAlchemy/tracedecay/commit/9f341bf29a6f1fd45e898fa823da92f7f17ebbc1))
+* **ci:** partition Windows tests and regroup macOS by resolution ([#1989](https://github.com/ScriptedAlchemy/tracedecay/issues/1989)) ([b050ee8](https://github.com/ScriptedAlchemy/tracedecay/commit/b050ee8abd71d4a3a4163f956b5fadb546d1b7b9))
+* unblock 772-file restart receipt (THP, n-gram, plan merge) ([#2006](https://github.com/ScriptedAlchemy/tracedecay/issues/2006)) ([fdec3c9](https://github.com/ScriptedAlchemy/tracedecay/commit/fdec3c9fb5cf295a6ecaecf1d888a449a7863286))
+
+## [1.0.0-beta.51](https://github.com/ScriptedAlchemy/tracedecay/compare/v1.0.0-beta.50...v1.0.0-beta.51) (2026-09-25)
+
+
+### Bug Fixes
+
+* **doctor:** name missing analyzers; stop Hermes float-identity refusals ([#1992](https://github.com/ScriptedAlchemy/tracedecay/issues/1992)) ([10e5560](https://github.com/ScriptedAlchemy/tracedecay/commit/10e556037c51e1c75b657ccd6f728f80c2f65e94))
+* fresh init leaves the tree clean and TypeScript diagnostics have a producer ([#1991](https://github.com/ScriptedAlchemy/tracedecay/issues/1991)) ([bec5c1f](https://github.com/ScriptedAlchemy/tracedecay/commit/bec5c1fca25807e327ee16431343d9968daf0774)), closes [#1986](https://github.com/ScriptedAlchemy/tracedecay/issues/1986)
+* **mcp:** answer project-less serve initialize with a typed state ([#1987](https://github.com/ScriptedAlchemy/tracedecay/issues/1987)) ([c9e0328](https://github.com/ScriptedAlchemy/tracedecay/commit/c9e03289af5e4f79a7cc2e8306031dea771e0717))
+* one-command upgrade journey for stale hosts, daemon lease, and refused stores ([#1996](https://github.com/ScriptedAlchemy/tracedecay/issues/1996)) ([a2e6ec0](https://github.com/ScriptedAlchemy/tracedecay/commit/a2e6ec097150a09aa037ac1836586d7a3a1c9f73)), closes [#1982](https://github.com/ScriptedAlchemy/tracedecay/issues/1982)
+* self-heal a corrupt code-index publication and bound the daemon log ([#1990](https://github.com/ScriptedAlchemy/tracedecay/issues/1990)) ([02acfed](https://github.com/ScriptedAlchemy/tracedecay/commit/02acfedb8225c578aad521658c6d25ca0c380a66)), closes [#1981](https://github.com/ScriptedAlchemy/tracedecay/issues/1981)
+
+## [1.0.0-beta.50](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.50...v1.0.0-beta.50) (2026-09-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **sessions:** one summary authority for LCM reads
+* **mcp:** serve graph and port reads through their daemon owner
+* **sessions:** `TRACEDECAY_CURSOR_AGENT_BIN` and `TRACEDECAY_CODEX_BIN` no longer select the LCM summarizer executable; configure `lcm.summarizer_executables.v1` on the project layer instead.
+* **sessions:** store message text once in lcm_raw_messages
+* **cli:** drop the automation config scope flag
+* **dashboard:** delete the Sigma graph renderer
+* **automation:** refuse managed skill records without timestamps
+* **retention:** stop collecting per-scope segment directories
+* **fs:** refuse unsafe roots instead of healing old layouts
+* **search-eval:** evaluate on the production lexical artifact
+* **sessions:** prune settled cursor advance rows
+* **automation:** one wire form for skips and skill proposals
+* **fs:** unlock file leases before close; continue legacy removal
+* **dashboard:** generated contracts only; docs and SDK
+* **daemon:** collapse dual daemon, MCP and contract paths
+* **hosts:** one install path; drop backups and old cleanup
+* **storage:** delete legacy store formats and upgrade paths
+* **code-index:** shrink index artifacts, share across worktrees
+
+### Features
+
+* **dashboard:** agents rings and timeline; fitted and matrix work views ([a757213](https://github.com/ScriptedAlchemy/tracedecay/commit/a7572132fe761531428b507cdf91939c23a674af))
+* **dashboard:** agents topology reads per-node provider usage ([25167d6](https://github.com/ScriptedAlchemy/tracedecay/commit/25167d69de58db017fbf2f3bd38f299038dc5c3f))
+* **dashboard:** brain registry as a measured point field ([0b84bab](https://github.com/ScriptedAlchemy/tracedecay/commit/0b84bab7b87090fd49cff34c5f449265d7ff2414))
+* **dashboard:** code cortex as a relief field ([dcca5df](https://github.com/ScriptedAlchemy/tracedecay/commit/dcca5dfe0e9245a9b90728b320bf3e8066737f8a))
+* **dashboard:** delivery lanes inbox and transit journey ([4ac9710](https://github.com/ScriptedAlchemy/tracedecay/commit/4ac9710d9cd873d732d04cf6cc295288a167818c))
+* **dashboard:** explore agents and work renderers ([1df028f](https://github.com/ScriptedAlchemy/tracedecay/commit/1df028febcac77891351790fe5abce3eb31248ac))
+* **dashboard:** explore three brain field renderers ([94b51f1](https://github.com/ScriptedAlchemy/tracedecay/commit/94b51f1c44988cdaa7ee1e2a9653218281636c69))
+* **dashboard:** explore three cortex renderers ([e8e1191](https://github.com/ScriptedAlchemy/tracedecay/commit/e8e11918c0b921ce51d1958209a9eba24bc4ea2f))
+* **dashboard:** explore three delivery renderers ([49b0bae](https://github.com/ScriptedAlchemy/tracedecay/commit/49b0baeb61ff231c1664a6e11340d374a29e0f03))
+* **dashboard:** explore three knowledge renderers ([eb3726f](https://github.com/ScriptedAlchemy/tracedecay/commit/eb3726fc94bb2a958dc23935b2653768fa1eac8d))
+* **dashboard:** explore three loom scene renderers ([73b66dd](https://github.com/ScriptedAlchemy/tracedecay/commit/73b66dd89cdccf3bf8eaa24d6db34c6550765982))
+* **dashboard:** explore three trace renderers ([052849e](https://github.com/ScriptedAlchemy/tracedecay/commit/052849eeb487dfa39c6df3e979e24409d0e288e8))
+* **dashboard:** knowledge facts as provenance cameras ([46d0132](https://github.com/ScriptedAlchemy/tracedecay/commit/46d0132ceccd623711ba14ecbc3989135da1b0e8))
+* **dashboard:** loom branches from session parentage ([d89196b](https://github.com/ScriptedAlchemy/tracedecay/commit/d89196ba162d0d757c63412f29f772025f638065))
+* **dashboard:** one luminous loom scene with density zoom ([6ab055c](https://github.com/ScriptedAlchemy/tracedecay/commit/6ab055c8b42ffe5e9e520379db2e157f8a43c5ea))
+* **dashboard:** trace as a symbol anatomy plate ([ec7949c](https://github.com/ScriptedAlchemy/tracedecay/commit/ec7949ca909a9c433fe23f59dee9694de82ee1c8))
+* **loom:** carry session parentage and edit timestamps on the wire ([9323d44](https://github.com/ScriptedAlchemy/tracedecay/commit/9323d44ba03314d9c70935f6cb204c411e7ed2d0))
+* **sessions:** record edit times and tool-use ids on the wire ([8806c07](https://github.com/ScriptedAlchemy/tracedecay/commit/8806c07657e1425fdf90c8aada674f00d65a63b0))
+
+
+### Bug Fixes
+
+* **automation:** refuse managed skill records without timestamps ([fac6223](https://github.com/ScriptedAlchemy/tracedecay/commit/fac62231df31fce19413527a45b23835ae8dd0d9))
+* **automation:** report invalid skill records as one config error ([ef5fe39](https://github.com/ScriptedAlchemy/tracedecay/commit/ef5fe39156db49ff46d6908be75e875c912b29d1))
+* **bench:** clean hosts after late census failures ([cee5b99](https://github.com/ScriptedAlchemy/tracedecay/commit/cee5b99f3ea2bc90e7ea748fa80ca1679e11faeb))
+* **bench:** count portable process groups exactly ([76a458c](https://github.com/ScriptedAlchemy/tracedecay/commit/76a458c9135b69beae485938307eb95ade332253))
+* **bench:** count portable process groups exactly ([1fc5abd](https://github.com/ScriptedAlchemy/tracedecay/commit/1fc5abdd98b749ce81aeed772b996e6015e4be71))
+* **code-index:** scope receiver-call revision to Rust extraction ([859df31](https://github.com/ScriptedAlchemy/tracedecay/commit/859df31713c4bc8b5867e3d02510716ba92fc96e))
+* **contracts:** page callees at the lane budget; probe per-op pages ([74146ce](https://github.com/ScriptedAlchemy/tracedecay/commit/74146ce69270dca989acac6c001f5a7b6ed6e7e4))
+* **daemon:** await retryable cold-root admission ([#1962](https://github.com/ScriptedAlchemy/tracedecay/issues/1962)) ([7130b6f](https://github.com/ScriptedAlchemy/tracedecay/commit/7130b6fd124f9b1d7e4432708ec36ca5e8e88927))
+* **daemon:** close released store runtimes at shutdown ([6dd079b](https://github.com/ScriptedAlchemy/tracedecay/commit/6dd079b370a66ede845e1dbecb04254d77592ae1))
+* **daemon:** keep live operation streams across composition shutdown ([c761af6](https://github.com/ScriptedAlchemy/tracedecay/commit/c761af61dbdeefd709bc55de8483611e52586247))
+* **daemon:** release profile and scout store leases at shutdown ([dbb14c6](https://github.com/ScriptedAlchemy/tracedecay/commit/dbb14c68123872af7c7fded0de0cde3172412dc2))
+* **daemon:** unify Windows project root identity ([#1969](https://github.com/ScriptedAlchemy/tracedecay/issues/1969)) ([ca4ebd1](https://github.com/ScriptedAlchemy/tracedecay/commit/ca4ebd1a45615abfe8fb494c871f3608a6fd5b95))
+* **dashboard:** 44px targets and 320px reflow on canvas workspaces ([127c7f2](https://github.com/ScriptedAlchemy/tracedecay/commit/127c7f2c2d48eb3675946d6edf741b046584c84a))
+* **dashboard:** a camera frame with withheld facts comes first ([35c35a8](https://github.com/ScriptedAlchemy/tracedecay/commit/35c35a8dce6d16e06b19a2eb3d8b2305c4a42ca1))
+* **dashboard:** contain the Brain field at 320 ([6e74ffe](https://github.com/ScriptedAlchemy/tracedecay/commit/6e74ffe56679bec3f092e56977f9445cb7be904f))
+* **dashboard:** Delivery hint strip no longer covers the last lane ([89dd8d1](https://github.com/ScriptedAlchemy/tracedecay/commit/89dd8d1ffc5bef9cc9ddaef1128f0bc276a35e5a))
+* **dashboard:** draw a withheld fact and count only undrawn ones ([a761c4c](https://github.com/ScriptedAlchemy/tracedecay/commit/a761c4c4c410a10801ec1972c2224b01505ee746))
+* **dashboard:** draw kinds from a fixed cool ordinal ramp ([e5a1f00](https://github.com/ScriptedAlchemy/tracedecay/commit/e5a1f0037862b9adbf56f7d6d5bfd5a2f33a9dee))
+* **dashboard:** fit the cortex camera once, not from k = 1 ([9712d72](https://github.com/ScriptedAlchemy/tracedecay/commit/9712d721d537a8033021326c273b6b09fc22b62f))
+* **dashboard:** give observatory titles and lane select 44px targets ([8ded446](https://github.com/ScriptedAlchemy/tracedecay/commit/8ded446eb8f921d7b01be507d461dfa5f9882592))
+* **dashboard:** give workflows panel radii and subtle hairlines ([633844c](https://github.com/ScriptedAlchemy/tracedecay/commit/633844c538f85eb97dc5be16102c566f2c79e388))
+* **dashboard:** keep night ink inside the optical window in light ([4f9ee93](https://github.com/ScriptedAlchemy/tracedecay/commit/4f9ee936af8d1fb1823586696ae23f53e2d4d051))
+* **dashboard:** legend sentences in Plex Sans, values in Mono ([2ff3548](https://github.com/ScriptedAlchemy/tracedecay/commit/2ff3548e1e805ebdecf15be3a0677a04cad32e08))
+* **dashboard:** night ink for the cortex HUD in light ([aef4760](https://github.com/ScriptedAlchemy/tracedecay/commit/aef476099976046262402bfff911416750c7a933))
+* **dashboard:** one hover, selection and grade language on canvases ([3e700a3](https://github.com/ScriptedAlchemy/tracedecay/commit/3e700a37af4f09c35efaab66b01667a303fba9a9))
+* **dashboard:** one Loom tab stop with an arrow-key event walk ([bfc5855](https://github.com/ScriptedAlchemy/tracedecay/commit/bfc58555b31815cb8eb957656a72aa4736a3c544))
+* **dashboard:** reflow Loom's zoom and tail controls at 320 ([338ffb7](https://github.com/ScriptedAlchemy/tracedecay/commit/338ffb798957eb4f642d09372fb1b93ee8fb3571))
+* **dashboard:** register the scatter series the memory projection draws ([e553287](https://github.com/ScriptedAlchemy/tracedecay/commit/e553287424d16b0135ece525d8aad3453476c6e8))
+* **dashboard:** restore agents and cortex files swept into 0b84bab7b8 ([cf77177](https://github.com/ScriptedAlchemy/tracedecay/commit/cf771775f9ce346b02aaac7854b2054615e2605d))
+* **dashboard:** restore the cortex relief field reverted by ee7a83f146 ([933858a](https://github.com/ScriptedAlchemy/tracedecay/commit/933858af6a2aedffd2dffd787e34b67892afda6e))
+* **dashboard:** set shell and owned workspaces on 14px body type ([2bb6411](https://github.com/ScriptedAlchemy/tracedecay/commit/2bb6411d6ed5f76ae92e1d7792f34e38cbc4a4c3))
+* **dashboard:** size loom tick pitch to its label ([fbafa57](https://github.com/ScriptedAlchemy/tracedecay/commit/fbafa57f0887ecd68b002753c55eac1d28d79742))
+* **dashboard:** stack the shell register below sm ([c74a0c2](https://github.com/ScriptedAlchemy/tracedecay/commit/c74a0c2e8ad503df5ba46040be2440ee8273c02b))
+* **dashboard:** Work relation kinds ride end markers, not dashes ([1fbc75b](https://github.com/ScriptedAlchemy/tracedecay/commit/1fbc75b687aaa7c675175f71b1564d21cec9065d))
+* **extraction:** keep BASIC underscore names, adjacent C docstrings ([a2d66e7](https://github.com/ScriptedAlchemy/tracedecay/commit/a2d66e738510294d0dc38708eaa91f256bd54fa0))
+* **fs:** unlock file leases before close; continue legacy removal ([0c1e2d1](https://github.com/ScriptedAlchemy/tracedecay/commit/0c1e2d154797d7ac140a5265b568c55b7a14d7bb))
+* **global-db:** type authority schema drift as a reset refusal ([e1182fd](https://github.com/ScriptedAlchemy/tracedecay/commit/e1182fd5cef1c779a995f9d402d44fa70a0b788a))
+* **graph:** disclose incomplete Rust method caller coverage ([4c556ba](https://github.com/ScriptedAlchemy/tracedecay/commit/4c556ba3c0f239b3ef1611b0cff83818e6259f8c))
+* **graph:** report partial callers for unresolved receivers ([6d0329f](https://github.com/ScriptedAlchemy/tracedecay/commit/6d0329fe4f5f58bd9e2a43ae4c813a6a9df0da8a))
+* **graph:** retain parser member identity across Rust call trivia ([a194558](https://github.com/ScriptedAlchemy/tracedecay/commit/a194558d53cd8795e57e659c822f9aed1b6994ad))
+* **graph:** suppress proved call sites from caller omissions ([ce9c043](https://github.com/ScriptedAlchemy/tracedecay/commit/ce9c0431e83541daefc4d24d2a2fa7006a9d715f))
+* **hosts:** activate Gemini's context-MCP component set ([#1977](https://github.com/ScriptedAlchemy/tracedecay/issues/1977)) ([05e0d1e](https://github.com/ScriptedAlchemy/tracedecay/commit/05e0d1e8e220ac90bfa85aa79e13af8a4ac88c90))
+* **hosts:** edit Codex config.toml in place, keep operator bytes ([0b9171f](https://github.com/ScriptedAlchemy/tracedecay/commit/0b9171fdd4f8044b32bb04e496c023d49689998f))
+* **hosts:** edit JSON host configs in place, keep operator bytes ([b3b4229](https://github.com/ScriptedAlchemy/tracedecay/commit/b3b42294452ef28c10fc45139c33fd819c74c937))
+* **hosts:** reinstall a stale same-version Claude plugin cache ([#1976](https://github.com/ScriptedAlchemy/tracedecay/issues/1976)) ([ca0017d](https://github.com/ScriptedAlchemy/tracedecay/commit/ca0017d0e992d1982569702bd5d44b4fdc2b014b))
+* **hosts:** unlock abandoned host config locks explicitly ([759c5a3](https://github.com/ScriptedAlchemy/tracedecay/commit/759c5a340d6d6dc64580cc8d43282b362bdf0ca2))
+* **install:** match release assets without a SIGPIPE-prone pipe ([3c88d55](https://github.com/ScriptedAlchemy/tracedecay/commit/3c88d55c97812e655210c976f137ed226a4e8d87))
+* **install:** match release assets without a SIGPIPE-prone pipe ([51add02](https://github.com/ScriptedAlchemy/tracedecay/commit/51add02e9ecd6efca4a9a4a7b5e238eec471a5eb))
+* **lint:** box oversized results and clear workspace clippy denials ([7b85689](https://github.com/ScriptedAlchemy/tracedecay/commit/7b85689d8cb50509a62a618447b46afad8fafe1a))
+* **mcp:** answer ping on stateless rmcp connections ([aff170d](https://github.com/ScriptedAlchemy/tracedecay/commit/aff170dc588717c7bcf959364edf63e10404d0fc))
+* **mcp:** carry typed tool problems as MCP structured content ([b81a3bd](https://github.com/ScriptedAlchemy/tracedecay/commit/b81a3bd70a913b7c539573a4f1175b28a2dff7c7))
+* **mcp:** drop notifications after a refused rmcp initialize ([d043d74](https://github.com/ScriptedAlchemy/tracedecay/commit/d043d740f3074c9ef5f0f508d30c2b0d01431cd3))
+* **mcp:** treat params emptied by lifted _meta as absent ([9b18616](https://github.com/ScriptedAlchemy/tracedecay/commit/9b18616d79053728d24f7f6dcf39ec52f0c94277))
+* **runtime:** page true relation counts and share tool trailers ([b0a219b](https://github.com/ScriptedAlchemy/tracedecay/commit/b0a219baae95cb04c0c10e5b03ef169be787d1ea))
+* **sessions:** anchor summaries built from summaries ([1c4410d](https://github.com/ScriptedAlchemy/tracedecay/commit/1c4410d5924afa53f1c32e3c126f41235c453d63))
+* **sessions:** resolve summarizer binaries only through configuration ([b418065](https://github.com/ScriptedAlchemy/tracedecay/commit/b4180653f4613895f88b53ddbb00c829ca29a202))
+* **test:** gate the shell summarizer fixtures to Unix ([a72d799](https://github.com/ScriptedAlchemy/tracedecay/commit/a72d7992e5f0034b2e304035a451386d62f2c674))
+* **test:** gate the systemd socket snapshot test to Unix ([d36d4f2](https://github.com/ScriptedAlchemy/tracedecay/commit/d36d4f246bfcf7a4549bb329c1eb6b378b157afd))
+* **test:** isolate response-handle fixture profile ([#1965](https://github.com/ScriptedAlchemy/tracedecay/issues/1965)) ([338773e](https://github.com/ScriptedAlchemy/tracedecay/commit/338773ef9df97e3934d1d759c9ad8b6c0efb395f))
+* **test:** mount the host CLI fixture provisioner on Windows ([423f7c9](https://github.com/ScriptedAlchemy/tracedecay/commit/423f7c9d0e225b8f3853fa8d6c46eb7a32f33e6e))
+* **test:** release production fixture leases ([#1966](https://github.com/ScriptedAlchemy/tracedecay/issues/1966)) ([9dffa1a](https://github.com/ScriptedAlchemy/tracedecay/commit/9dffa1a16f339b221eaa551648425bf2e6cbe7f2))
+* **windows:** compare admitted roots in their published spelling ([434f18d](https://github.com/ScriptedAlchemy/tracedecay/commit/434f18d8498bbfb469201db2edff2aea97a7c822))
+* **windows:** honor held handles in file lifecycle checks ([145ca13](https://github.com/ScriptedAlchemy/tracedecay/commit/145ca1341630d638fd20ccbf7ade73b24a3a0789))
+* **windows:** look up transcript checkpoints by identity key ([4e3da64](https://github.com/ScriptedAlchemy/tracedecay/commit/4e3da64702b6914636dc7a2de3a2d2f56bbfa1c9))
+* **windows:** recover scope retention and long private archives ([#1958](https://github.com/ScriptedAlchemy/tracedecay/issues/1958)) ([348d940](https://github.com/ScriptedAlchemy/tracedecay/commit/348d940b94e0ee298e5e4dd53a3d28b7f418a514))
+* **windows:** recover scope retention and long private archives ([#1958](https://github.com/ScriptedAlchemy/tracedecay/issues/1958)) ([7db00b0](https://github.com/ScriptedAlchemy/tracedecay/commit/7db00b06e080bcbe9b4ff3eb18a25ab10eaa9b0e))
+
+
+### Performance Improvements
+
+* **code-index:** shrink index artifacts, share across worktrees ([a7b08f2](https://github.com/ScriptedAlchemy/tracedecay/commit/a7b08f2032abce63884a4129a2b60aaabe6c88c5))
+* **rusqlite:** retire external-source history incrementally ([65fce46](https://github.com/ScriptedAlchemy/tracedecay/commit/65fce46352fba03e96415db418725bc027503db7))
+* **sessions:** one summary authority for LCM reads ([39523e5](https://github.com/ScriptedAlchemy/tracedecay/commit/39523e5553cedd0bdc2b513c51ba0dcae7ac58ea))
+* **sessions:** prune settled cursor advance rows ([364feb8](https://github.com/ScriptedAlchemy/tracedecay/commit/364feb8e1cd3029149b7f793751c27843fe8e36d))
+* **sessions:** store message text once in lcm_raw_messages ([bee48b9](https://github.com/ScriptedAlchemy/tracedecay/commit/bee48b916456993b2c97afa27eba8dcd851902d1))
+
+
+### Code Refactoring
+
+* **automation:** one wire form for skips and skill proposals ([807fac2](https://github.com/ScriptedAlchemy/tracedecay/commit/807fac208b9c3c1460b04a9ee521358540f30441))
+* **cli:** drop the automation config scope flag ([6688478](https://github.com/ScriptedAlchemy/tracedecay/commit/668847844b9e27b448505e17bf7f84557cb6cfe1))
+* **daemon:** collapse dual daemon, MCP and contract paths ([de31b69](https://github.com/ScriptedAlchemy/tracedecay/commit/de31b6935fe3b8b47b144cca869e6cfb55346c30))
+* **dashboard:** delete the Sigma graph renderer ([1e91ac5](https://github.com/ScriptedAlchemy/tracedecay/commit/1e91ac57b388041a510f7887a3cd3e58baf88354))
+* **dashboard:** generated contracts only; docs and SDK ([e489a10](https://github.com/ScriptedAlchemy/tracedecay/commit/e489a10badbede5407ebe966f148928621da666f))
+* **fs:** refuse unsafe roots instead of healing old layouts ([4b100b2](https://github.com/ScriptedAlchemy/tracedecay/commit/4b100b2fec87782f92fcc7c804e7feb618c4c130))
+* **hosts:** one install path; drop backups and old cleanup ([d69afda](https://github.com/ScriptedAlchemy/tracedecay/commit/d69afda0c2317552e45c0e9ab75adf91ffd23644))
+* **mcp:** serve graph and port reads through their daemon owner ([b0e807f](https://github.com/ScriptedAlchemy/tracedecay/commit/b0e807f118e29be1aebb80d6801e75b79a107833))
+* **retention:** stop collecting per-scope segment directories ([067f3a6](https://github.com/ScriptedAlchemy/tracedecay/commit/067f3a60b5361185a6396aef12e212711776c17f))
+* **search-eval:** evaluate on the production lexical artifact ([671f746](https://github.com/ScriptedAlchemy/tracedecay/commit/671f746f2e34cedc01b8e31ac332daa473988e30))
+* **storage:** delete legacy store formats and upgrade paths ([713e496](https://github.com/ScriptedAlchemy/tracedecay/commit/713e496559dc489d50b35d9f3b0e5ceb65a2e8ea))
+
+## [0.1.0-beta.50](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.49...v0.1.0-beta.50) (2026-09-22)
+
+
+### Performance Improvements
+
+* **dist:** remove redundant acceptance rebuilds ([151122a](https://github.com/ScriptedAlchemy/tracedecay/commit/151122a20cffc31a5a768d0aad7fade9a69260ac))
+
+## [0.1.0-beta.49](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.48...v0.1.0-beta.49) (2026-09-22)
+
+
+### Bug Fixes
+
+* **deps:** pin find-msvc-tools 0.1.12 for Windows cc ([09fdd74](https://github.com/ScriptedAlchemy/tracedecay/commit/09fdd74279d7b4f62ae2db29bc627ea72a0b065f))
+* **deps:** pin find-msvc-tools 0.1.12 for Windows release builds ([9f90cb3](https://github.com/ScriptedAlchemy/tracedecay/commit/9f90cb37cdbb80e48a9dcb9cb8ecf77b5975c550))
+* **sdk:** sync AuthorizedScopeSet description link ([1955e56](https://github.com/ScriptedAlchemy/tracedecay/commit/1955e5691e1066b82c12922aed2068cfdc6abdb0))
+* **sdk:** sync AuthorizedScopeSet description link ([aca8add](https://github.com/ScriptedAlchemy/tracedecay/commit/aca8add400398bf9a54334c354cca07fa688ddc4))
+
+## [0.1.0-beta.48](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.47...v0.1.0-beta.48) (2026-09-21)
+
+
+### Bug Fixes
+
+* **automation:** drop the needless borrow on the search check ([1df55d9](https://github.com/ScriptedAlchemy/tracedecay/commit/1df55d9ac1a9ed5e64d2a979a5e1222065d52da0))
+* clear clippy and rustfmt failures across the merged batch ([debc48c](https://github.com/ScriptedAlchemy/tracedecay/commit/debc48cee8109d876b43c75396eba8fc39c18aca))
+* clear the deterministic master CI failures ([094f5b4](https://github.com/ScriptedAlchemy/tracedecay/commit/094f5b44e0438522c2eb14e17397f72b587f4956))
+* clear the deterministic master CI failures ([eeb1ec1](https://github.com/ScriptedAlchemy/tracedecay/commit/eeb1ec1d1c4f0c658292f5340660e1302f9ff481))
+* clear the gates CI does not run ([d27c76a](https://github.com/ScriptedAlchemy/tracedecay/commit/d27c76a1cf9543476474fa0187ab4656019ee098))
+* **cli:** broker init through a connectable daemon socket ([2af65b1](https://github.com/ScriptedAlchemy/tracedecay/commit/2af65b1461168cf7564b221626a02523ad05436f))
+* **cli:** broker init through a connectable daemon socket ([9dfacab](https://github.com/ScriptedAlchemy/tracedecay/commit/9dfacabdebb06c930fc18d87e84b0c009c8e02ce))
+* **clippy:** scope too_many_lines expectations to non-hotpath builds ([47cc46b](https://github.com/ScriptedAlchemy/tracedecay/commit/47cc46b7d12d203dda65844d34620af4d755c116))
+* **cli:** probe the daemon for init on every platform ([8225446](https://github.com/ScriptedAlchemy/tracedecay/commit/8225446d70581f89183b8926f7d04fb946caef3b))
+* **cli:** succeed when install finds no agent yet ([172dbff](https://github.com/ScriptedAlchemy/tracedecay/commit/172dbff709079a6354d41ffbd7af13bc690cc497))
+* **code-index-runtime:** keep the index lock file one type ([9ded6cd](https://github.com/ScriptedAlchemy/tracedecay/commit/9ded6cd762d4b4058c6041897322d8d575c0fee5))
+* **code-index:** bind a seat's source proof under the scheduler lock ([e49f1ae](https://github.com/ScriptedAlchemy/tracedecay/commit/e49f1ae4d67ab02d10805e28297171818a8311b3))
+* **code-index:** hold the head-open claim across the clone copy ([cacf79a](https://github.com/ScriptedAlchemy/tracedecay/commit/cacf79a8d2e31620021c0d294e1a4fdb431fbc27))
+* **code-index:** hold the head-open claim across the clone successor copy ([83d9a3c](https://github.com/ScriptedAlchemy/tracedecay/commit/83d9a3cc02bbe962ce73d95ac5399cf430974bd9))
+* **code-index:** keep a terminal park reason in dashboard progress ([52b3772](https://github.com/ScriptedAlchemy/tracedecay/commit/52b3772241598e73424b031469b45eebe1e133cc))
+* **code-index:** keep clone copy off the freshness receipt ([76c58af](https://github.com/ScriptedAlchemy/tracedecay/commit/76c58af7e25dde6daa330bab74af5ee281d98c61))
+* **code-index:** keep sealed generation when proof expires ([c6aadcb](https://github.com/ScriptedAlchemy/tracedecay/commit/c6aadcb57790482fb3e76a19c73265359e8fd197))
+* **code-index:** keep the park reason in progress; fence the load-sensitive scheduler tests ([c7e9b75](https://github.com/ScriptedAlchemy/tracedecay/commit/c7e9b756acd800a51afb7b777ab4fd05d620eacd))
+* **code-index:** keep the reader charge on both publication tails ([09ef75e](https://github.com/ScriptedAlchemy/tracedecay/commit/09ef75ecae5fd96105e6129c4942fb73c392e827))
+* **code-index:** keep the reader charge on both publication tails ([a4318a6](https://github.com/ScriptedAlchemy/tracedecay/commit/a4318a6da9aaddb5ff633c18afdce6281199e088))
+* **code-index:** let a retired clone staging discard converge ([024364a](https://github.com/ScriptedAlchemy/tracedecay/commit/024364a1f112f0d84970e0444d9895efcc36bb10))
+* **code-index:** refuse a sealed generation the checkout moved past ([c1633dd](https://github.com/ScriptedAlchemy/tracedecay/commit/c1633dd96bb0f70d89d5a33cc64c3d5c35d71dfa))
+* **code-index:** seat text through retryable graph activation ([a82ad6c](https://github.com/ScriptedAlchemy/tracedecay/commit/a82ad6c300e22d3c8c87d1de6f83e24bd63a6950))
+* **code-index:** stop continuation receipts looking like probe wakes ([3510cf7](https://github.com/ScriptedAlchemy/tracedecay/commit/3510cf76e149cfdc6357699f9b3e765dadfab45e))
+* **code-index:** stop searches waking a proven seat for clone work ([b58ca33](https://github.com/ScriptedAlchemy/tracedecay/commit/b58ca3366a5a7cfdf6dc83cb1777cc9ca6b0ce98))
+* **code-index:** stop searches waking a proven seat for clone work ([48fc925](https://github.com/ScriptedAlchemy/tracedecay/commit/48fc9257b920bb013a26249914bec0ade8e8ca44))
+* **config:** resolve a registered setting to its registry default ([4f67e44](https://github.com/ScriptedAlchemy/tracedecay/commit/4f67e44514594a3f26081101df707f5bfb670085))
+* **daemon:** fix three lib tests that fail under suite load ([61e8534](https://github.com/ScriptedAlchemy/tracedecay/commit/61e8534261424a3a8e16e3a80c6beee34472f91e))
+* **daemon:** keep a published owner ahead of a recorded failure ([e3860bf](https://github.com/ScriptedAlchemy/tracedecay/commit/e3860bf9c199177a3e4bd2f53e3edfaa6b23001a))
+* **daemon:** pin the composed transcript home in test-transport builds ([36be57a](https://github.com/ScriptedAlchemy/tracedecay/commit/36be57afcfebd9f90185ac7a5fb1767bda7d85d5))
+* **daemon:** pin the composed transcript home in test-transport builds ([83d9c11](https://github.com/ScriptedAlchemy/tracedecay/commit/83d9c11ec3f6044790b54d6b46fbfd10169ef375))
+* **daemon:** start open publication bound at claim ([a3c37a4](https://github.com/ScriptedAlchemy/tracedecay/commit/a3c37a475704d4ef4c84be14391348e32e14ee60))
+* **dist:** match the test-API probe refusal by error code ([ac649b3](https://github.com/ScriptedAlchemy/tracedecay/commit/ac649b36b5f25ac7bb7c9ea8315a701a5c56c928))
+* **dist:** pass the generator commit to the packaged host bundle calls ([70517b8](https://github.com/ScriptedAlchemy/tracedecay/commit/70517b833785191ca9e0ae9df24056535876be8a))
+* **dist:** retry the packaged MCP suite before failing the battery ([50c359f](https://github.com/ScriptedAlchemy/tracedecay/commit/50c359f68ca32e7dc34ed8ac2488040859256845))
+* **dist:** run the packaged MCP suite from an untouched snapshot ([a496f5c](https://github.com/ScriptedAlchemy/tracedecay/commit/a496f5cc9a13b8b66236917715bfb0855868ebf6))
+* **dist:** run the packaged MCP suite from the staged snapshot ([f727c9c](https://github.com/ScriptedAlchemy/tracedecay/commit/f727c9ca09b362da40dab4945210af4a9fc77d47))
+* **dist:** seed the consumer crates with the workspace lockfile ([5d3b849](https://github.com/ScriptedAlchemy/tracedecay/commit/5d3b849aee55dd57ad5adb00a0b4644929c9950a))
+* **dist:** stage package assets onto a cleared destination ([1d7dee1](https://github.com/ScriptedAlchemy/tracedecay/commit/1d7dee1a68c5e339f1aa2a12e7de68112850c3c9))
+* **doctor:** check every managed-skill prompt index a host writes ([4024326](https://github.com/ScriptedAlchemy/tracedecay/commit/4024326752771f0a958c9472229f9a7a91884660))
+* **doctor:** check every managed-skill prompt index a host writes ([031920f](https://github.com/ScriptedAlchemy/tracedecay/commit/031920f2598d11d0dc3b6d33b6201e264966bf67))
+* **global-db:** page rebuild overlap reconciliation ([e7c3124](https://github.com/ScriptedAlchemy/tracedecay/commit/e7c312474f1b3d9339cf1625fa8a90ed9ba63aa6))
+* **graph-publication:** bound begin by wall clock, not one attempt ([2283a44](https://github.com/ScriptedAlchemy/tracedecay/commit/2283a446b5762aff76609229e2469699b074b38c))
+* **graph-publication:** surface a failed reader instead of deferring ([ba62697](https://github.com/ScriptedAlchemy/tracedecay/commit/ba62697f0d2ae946e5273341688c949a007cb2ec))
+* **graph-publication:** surface a failed reader instead of deferring ([54d8c91](https://github.com/ScriptedAlchemy/tracedecay/commit/54d8c9134d8f0a00c97086082dd9c32d5279938e))
+* **graph-query:** answer file neighbors for an unpublished path ([f0994a9](https://github.com/ScriptedAlchemy/tracedecay/commit/f0994a9cf997fefdb46f6b271b879d2180a9cfdc))
+* **hotpath-guard:** drop the leaf backend feature selector ([5234ef1](https://github.com/ScriptedAlchemy/tracedecay/commit/5234ef1704a086d857404d15a54790f8efa6a5d4))
+* **hotpath-guard:** drop the leaf backend feature selector ([8372962](https://github.com/ScriptedAlchemy/tracedecay/commit/8372962aaf7f690bfd9375d74eb3e31d2fa2d216))
+* **install:** make the documented install path deliver the current release ([064f425](https://github.com/ScriptedAlchemy/tracedecay/commit/064f425ad4147cf67ba276220e096133b8dfc0b9))
+* **install:** resolve prerelease assets and tags ([82dfcf4](https://github.com/ScriptedAlchemy/tracedecay/commit/82dfcf4bcd670b977e121accee4bd1e8fecd7aea))
+* **install:** skip incomplete prereleases in default path ([ab677fe](https://github.com/ScriptedAlchemy/tracedecay/commit/ab677feaa63ca6e708dac2f77d530b5c2b3815e3))
+* keep hotpath-instrumented values one type across feature sets ([efabbb3](https://github.com/ScriptedAlchemy/tracedecay/commit/efabbb3e502e2be027f41fd65674d5bc3d7589b5))
+* **kiro:** report repairable while a retired artifact remains ([df4e286](https://github.com/ScriptedAlchemy/tracedecay/commit/df4e28605c0e517ed9fb7aa13ad601e5a2b98825))
+* **kiro:** sweep retired artifacts on install, not only uninstall ([1c391fc](https://github.com/ScriptedAlchemy/tracedecay/commit/1c391fc2df7c26bc20dfdd024c0ba618bf8f27ac))
+* **mcp-catalog:** bind memory schema closure to 'static operations ([2071daf](https://github.com/ScriptedAlchemy/tracedecay/commit/2071daff7119da9df8aa9bb2860576261672616a))
+* **mcp:** keep cancel registration until dispatch settles ([dfe6c7d](https://github.com/ScriptedAlchemy/tracedecay/commit/dfe6c7de23d45eb0a746ba779d688ddccfde64de))
+* **mcp:** keep grep lexical when enrichment refuses ([13d89e0](https://github.com/ScriptedAlchemy/tracedecay/commit/13d89e04f038f6adbb209c3f4162fe5d925c93fc))
+* **mcp:** keep grep lexical when graph enrichment refuses ([ba45baa](https://github.com/ScriptedAlchemy/tracedecay/commit/ba45baa54681115b21d6c9a6cd2948c48fc10c55))
+* **mcp:** keep the stdio transport halves one type ([e3caf72](https://github.com/ScriptedAlchemy/tracedecay/commit/e3caf7209a17f425bacb2be7edb1e7ad9b3d80c2))
+* **mcp:** return ServerConfig from the rmcp handler ([152f268](https://github.com/ScriptedAlchemy/tracedecay/commit/152f268044f6c6c8e29145fd9b615ae9e9034a6e))
+* **mcp:** scope tool dispatch to the pinned transcript home ([cb3111d](https://github.com/ScriptedAlchemy/tracedecay/commit/cb3111d47049afb43ef8c480f5bb4aa4a5190456))
+* **mcp:** scope tool dispatch to the pinned transcript home ([0148783](https://github.com/ScriptedAlchemy/tracedecay/commit/0148783b6871a47f3520c889a2b035b0cf97161b))
+* **mcp:** use rmcp ServerConfig, the alias ServerInfo is deprecated ([08b5860](https://github.com/ScriptedAlchemy/tracedecay/commit/08b5860fa5a0069e50523654f3a8a71acda1e84f))
+* **mcp:** use rmcp ServerConfig, the alias ServerInfo is deprecated ([e09bd69](https://github.com/ScriptedAlchemy/tracedecay/commit/e09bd694fe46fecef220ce4b4dc0b7c4bff1ffa8))
+* **perf-gate:** measure indexing through the daemon, not the request ([21977c3](https://github.com/ScriptedAlchemy/tracedecay/commit/21977c3feafce30e46ff67494a84f6ce3f2c3f72))
+* **perf-gate:** measure indexing through the daemon, not the request ([b5aa4f3](https://github.com/ScriptedAlchemy/tracedecay/commit/b5aa4f339473293db84cc2d8adfd1e1194a00f04))
+* **query:** rank TaskSession on core fallback authority ([90f6448](https://github.com/ScriptedAlchemy/tracedecay/commit/90f6448bafccec222bf15f85cd867f8ba8981e67))
+* **query:** rank TaskSession on the core fallback authority ([ee548c4](https://github.com/ScriptedAlchemy/tracedecay/commit/ee548c4032442b1da11dea9e4303f93a5aafed56))
+* **query:** span the temporal range in TaskSession calibration ([df6bd75](https://github.com/ScriptedAlchemy/tracedecay/commit/df6bd75ada621e3ce2bdc6c10367c4981a91c4b4))
+* **release:** keep the transitive feature check on the release path ([cc28eeb](https://github.com/ScriptedAlchemy/tracedecay/commit/cc28eeb53b2a6fd1d075ec301039b38b032eca08))
+* **release:** publish install.sh with every prerelease ([8ca4241](https://github.com/ScriptedAlchemy/tracedecay/commit/8ca4241884ef230620994bb353c1e286479f08d3))
+* **remote:** scope the node store's schema check to its tables ([e94513e](https://github.com/ScriptedAlchemy/tracedecay/commit/e94513ef61b6cdd3052f189791a55143cf4112f3))
+* **remote:** scope the node store's schema check to its tables ([68b6e49](https://github.com/ScriptedAlchemy/tracedecay/commit/68b6e49fac39802d30c9bef78cf4d75abac03937))
+* repair three doctor findings at their cause ([76f9c23](https://github.com/ScriptedAlchemy/tracedecay/commit/76f9c23e18fd3ae29cb3572ca1c5a1114822406a))
+* require the daemon before init, in docs and on Windows ([1a6bdc6](https://github.com/ScriptedAlchemy/tracedecay/commit/1a6bdc647e8c564cefa275a6b15813afa86c0f06))
+* restore the pinned corpus fixture and a transport test import ([42597b2](https://github.com/ScriptedAlchemy/tracedecay/commit/42597b2c6910d3fb44c10376de85b94a894063e1))
+* **retention:** bound store locks by cancel and deadlines ([2b803ca](https://github.com/ScriptedAlchemy/tracedecay/commit/2b803caed912432023de85ace4bca085de9b2deb))
+* **retention:** one contract for a missing scope root ([735bfbd](https://github.com/ScriptedAlchemy/tracedecay/commit/735bfbde8f090a5064ba928d0825373b82f7f162))
+* **runtime-core:** tolerate a released snapshot dir during cleanup ([54800e5](https://github.com/ScriptedAlchemy/tracedecay/commit/54800e51aaefc5bc1ff9a8017606e2fff4ac998d))
+* **runtime-core:** tolerate a released snapshot dir during cleanup ([9ebe9a7](https://github.com/ScriptedAlchemy/tracedecay/commit/9ebe9a7768fef53987359877b43ce87833e1d9e3))
+* **sessions:** drop a no-op file-length conversion ([b243795](https://github.com/ScriptedAlchemy/tracedecay/commit/b243795a74631f2adc5d31f6007245fb86f653ad))
+* **sessions:** drop the u64 identity conversion clippy rejects ([e130045](https://github.com/ScriptedAlchemy/tracedecay/commit/e1300458e4333902b37cd6772e9e5742e0ac885e))
+* **sessions:** drop the u64 identity conversion clippy rejects ([17b1022](https://github.com/ScriptedAlchemy/tracedecay/commit/17b102208151832ec2a6ad142d317c9f7146483b))
+* **sessions:** drop the u64 identity conversion clippy rejects ([cb730a9](https://github.com/ScriptedAlchemy/tracedecay/commit/cb730a980cf66f3334bab4df729c58b101d0e6ae))
+* **sessions:** drop useless u64 conversion of file length ([d4ebe94](https://github.com/ScriptedAlchemy/tracedecay/commit/d4ebe949650f48eb619a8ba02f5a8e484339cfe4))
+* **sessions:** keep one stalled source from blocking history ([0c46b24](https://github.com/ScriptedAlchemy/tracedecay/commit/0c46b24cd27145792a1fb9291a65607134d98fff))
+* **sessions:** land the parked refresh cuts on master ([f1609c6](https://github.com/ScriptedAlchemy/tracedecay/commit/f1609c62d0f88ea1fb4504d8a2ead0fc604724b7))
+* **sessions:** put the sweep hotpath label back on the async fn ([894a1f1](https://github.com/ScriptedAlchemy/tracedecay/commit/894a1f1c4aecd92e95599585f53feec72aee1410))
+* **sessions:** wake temporal refresh from hook ingest ([993f5e3](https://github.com/ScriptedAlchemy/tracedecay/commit/993f5e3c9bce4cc2a03dc43ac0621f1f6ab85819))
+* **skills:** converge the prompt index on every lifecycle pass ([f16b013](https://github.com/ScriptedAlchemy/tracedecay/commit/f16b013c39c7303fd9afec7f9e739ecd42188bff))
+* **store:** release the Tokio worker while awaiting the writer ([97f67b5](https://github.com/ScriptedAlchemy/tracedecay/commit/97f67b5982950c2b279f2f56e35c7fb54182657c))
+* **store:** release the Tokio worker while awaiting the writer ([b82a73e](https://github.com/ScriptedAlchemy/tracedecay/commit/b82a73e8bde618b152c477dcecdcadf2f405a957))
+* **test:** one process env lock, and three load-sensitive daemon tests ([6071090](https://github.com/ScriptedAlchemy/tracedecay/commit/6071090972ee7b78cb482c79b6959db478fb3e42))
+* **test:** pin every HOME writer to one process env lock ([54e3476](https://github.com/ScriptedAlchemy/tracedecay/commit/54e3476eb3fa2eadf32bbbc6c1316ac7ad814303))
+
+
+### Performance Improvements
+
+* **code-extraction:** borrow grammar kinds in clone tokens ([caa981b](https://github.com/ScriptedAlchemy/tracedecay/commit/caa981b9f624430731b220cf93810ed953a39524))
+* **code-extraction:** borrow grammar kinds in clone tokens ([1c5a539](https://github.com/ScriptedAlchemy/tracedecay/commit/1c5a5393fa117f69cc751f2e9baf83420da0e248))
+* **code-extraction:** carry the token-tree answer down the walk ([7b86674](https://github.com/ScriptedAlchemy/tracedecay/commit/7b86674849c3d2095c021c8954340508ef452f1e))
+* **code-extraction:** cut whole-repository extraction by 37% ([0a7c52d](https://github.com/ScriptedAlchemy/tracedecay/commit/0a7c52d7d43e30e74c877979ee248c79cf703981))
+* **code-extraction:** emit both clone streams in one walk ([f9809df](https://github.com/ScriptedAlchemy/tracedecay/commit/f9809df3b16ca06bae672fc4fed870d3c108c719))
+* **code-extraction:** read each node's kind once per visit ([4f3b5e4](https://github.com/ScriptedAlchemy/tracedecay/commit/4f3b5e40c7bb44fc1689d412b92793f408f378a5))
+* **code-extraction:** read the preserved-identifier field from the walk ([9d8bd65](https://github.com/ScriptedAlchemy/tracedecay/commit/9d8bd653e28128ff6092bf46dbd5735dc93108a3))
+* **code-extraction:** walk a body once for rename normalization ([6ee0560](https://github.com/ScriptedAlchemy/tracedecay/commit/6ee05606e0f27803c24db7f0f3ea64ec071c502f))
+* **code-index:** batch edges_among and drop neighbor hydration ([20a5de2](https://github.com/ScriptedAlchemy/tracedecay/commit/20a5de2a13adb79b207447e20093a733defd4392))
+* **code-index:** batch the edges_among edge read ([936b9fd](https://github.com/ScriptedAlchemy/tracedecay/commit/936b9fd7dfcb8ce7dc1150e5c9bb3c0dec2274fc))
+* **code-index:** edges_among returns bare edges ([7fec32a](https://github.com/ScriptedAlchemy/tracedecay/commit/7fec32aa12b292bbef6443d025d9be41b5de85b6))
+* **code-index:** sample git metadata through retained topology ([56bf72c](https://github.com/ScriptedAlchemy/tracedecay/commit/56bf72c816008b6759e962bf479b5cf71506f796))
+* **code-index:** stop the readiness waits competing with the rebuild ([7054463](https://github.com/ScriptedAlchemy/tracedecay/commit/7054463a56d574af04d5f062fa7f67fad9eaa500))
+* **code-index:** walk qualified Rust paths once per reference ([8eddbc8](https://github.com/ScriptedAlchemy/tracedecay/commit/8eddbc89015f6606c86c384dad0c6b7729522a59))
+* **daemon:** wake the composition code-index wait on seat changes ([996140a](https://github.com/ScriptedAlchemy/tracedecay/commit/996140af1952517f659b2607915df3222896fa05))
+* **mcp:** box the oversized futures on instrumented await paths ([88507a2](https://github.com/ScriptedAlchemy/tracedecay/commit/88507a283ec6302ed8f9b56b68f0eb2281c306ac))
+* port measured git-metadata and clone-census improvements from [#1577](https://github.com/ScriptedAlchemy/tracedecay/issues/1577)/[#1580](https://github.com/ScriptedAlchemy/tracedecay/issues/1580) ([ac4e0b8](https://github.com/ScriptedAlchemy/tracedecay/commit/ac4e0b83e689a5c2b7206b1d790e4328beed5faa))
+* **query:** validate each stored clone payload once per census ([c18b3e6](https://github.com/ScriptedAlchemy/tracedecay/commit/c18b3e611da19db2ebf555eb2811cefcffff4a9b))
+
+
+### Reverts
+
+* **code-index:** keep the terminal clone-warmup verdict ([ab0bd06](https://github.com/ScriptedAlchemy/tracedecay/commit/ab0bd0652d9eeb66d1091243ec7fd66ef1d3aa31))
+
+## [0.1.0-beta.47](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.46...v0.1.0-beta.47) (2026-09-18)
+
+
+### Bug Fixes
+
+* **cli:** cap repeated completed tool results at three attempts ([77c5504](https://github.com/ScriptedAlchemy/tracedecay/commit/77c55040d6421c1a7ef9e268343fbb6cfdabb9a2))
+* **cli:** cap repeated completed tool results at three attempts ([c857075](https://github.com/ScriptedAlchemy/tracedecay/commit/c8570754ba35bdf06bf1ab5b48dace7cbfe22e5f))
+* **clones:** bound body bytes before tokenizing large literals ([542d28c](https://github.com/ScriptedAlchemy/tracedecay/commit/542d28c4c04c6a074630e9b3ac22e2d878bf9305))
+* **clones:** bound body bytes before tokenizing large literals ([941d908](https://github.com/ScriptedAlchemy/tracedecay/commit/941d908ba92c043c561ff4d69a6f1370ca7c3d41))
+* **code-index:** shrink text builds to available memory headroom ([2a138f6](https://github.com/ScriptedAlchemy/tracedecay/commit/2a138f68d9c7a9eba02a6a1741e09412c62d8bde))
+* **code-index:** shrink text builds to available memory headroom ([0ae9fad](https://github.com/ScriptedAlchemy/tracedecay/commit/0ae9fad50e4daa2ac92e1e51c00fea5b2348132a))
+
+## [0.1.0-beta.46](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.45...v0.1.0-beta.46) (2026-09-18)
+
+
+### Bug Fixes
+
+* **code-index:** never join clone backfill from a freshness read ([b3e3d4a](https://github.com/ScriptedAlchemy/tracedecay/commit/b3e3d4ab7a77a89ed5dab8c6195b027507762190))
+* **code-index:** never join clone backfill from a freshness read ([d86fd22](https://github.com/ScriptedAlchemy/tracedecay/commit/d86fd22b4901d4b209894142fb50683ae673d1a5))
+* **code-index:** preserve deterministic text sizing evidence ([9aae729](https://github.com/ScriptedAlchemy/tracedecay/commit/9aae7293a0139c03e569a88846dfc787514a319f))
+* **code-index:** preserve deterministic text sizing evidence ([8e75b08](https://github.com/ScriptedAlchemy/tracedecay/commit/8e75b0873aeb17a0123d00ecc740471c0c6a31cd))
+* **code-index:** prune nested repositories from the parent source walk ([89384bc](https://github.com/ScriptedAlchemy/tracedecay/commit/89384bcd33184478cc38228413c48ddc0a9368c2))
+* **code-index:** prune nested repositories from the parent source walk ([836c366](https://github.com/ScriptedAlchemy/tracedecay/commit/836c3665c168a92a056bb6381b658a739cd09f36))
+* **code-index:** restore queued rebuild truth and decoded seats ([c3c57ad](https://github.com/ScriptedAlchemy/tracedecay/commit/c3c57addb1e3d309e723f27d983d5be058cf73de))
+* **code-index:** restore queued rebuild truth and decoded seats ([f1c025e](https://github.com/ScriptedAlchemy/tracedecay/commit/f1c025ebe0535d91e2383362f640492d3b30e1bd))
+* **global-db:** name the exact field in a session projection collision ([bfd53c0](https://github.com/ScriptedAlchemy/tracedecay/commit/bfd53c0171aefc6bd23bab0c7a0adbc49dc30270))
+* **global-db:** name the exact field in a session projection collision ([b92d95b](https://github.com/ScriptedAlchemy/tracedecay/commit/b92d95b6b4b545387c9d58b28fdb6c19f400d00d))
+* **global-db:** repair stale projection rows under current provenance ([19ab9f8](https://github.com/ScriptedAlchemy/tracedecay/commit/19ab9f89379c96d4f5b68de8f1e41af6bf06f494))
+* **global-db:** repair stale projection rows under current provenance ([c55058a](https://github.com/ScriptedAlchemy/tracedecay/commit/c55058a3ac4802f9203f7ffd6c1900c0813d6bbc))
+* **global-db:** restore a missing uniquely owned projection session ([905758b](https://github.com/ScriptedAlchemy/tracedecay/commit/905758b38ed1dfd757a89fad17489ee523508907))
+* **global-db:** restore a missing uniquely owned projection session ([b7c9b0d](https://github.com/ScriptedAlchemy/tracedecay/commit/b7c9b0d2b547f147926966fe6245f88afb12ba57))
+* **host-admission:** classify typed session projection collisions ([da8da59](https://github.com/ScriptedAlchemy/tracedecay/commit/da8da5970b998fdd6349d0783eabf9e324a7f421))
+* **host-admission:** classify typed session projection collisions ([582bc92](https://github.com/ScriptedAlchemy/tracedecay/commit/582bc929f638161b62ad9e89b32fb89d41488cae))
+* **lcm:** return unavailable health as the doctor's partial answer ([b2170aa](https://github.com/ScriptedAlchemy/tracedecay/commit/b2170aaf1f7e3ca98df66bded43fedc8bd8bdffc))
+* **lcm:** return unavailable health as the doctor's partial answer ([93b1415](https://github.com/ScriptedAlchemy/tracedecay/commit/93b141560e39bdad57c55e9f4aa35f40369b1f9a))
+* **memory:** apply host reserve before the cgroup service ceiling ([a4cf384](https://github.com/ScriptedAlchemy/tracedecay/commit/a4cf384941ff9d4e113129103a1178ce29ead0ff))
+* **memory:** apply host reserve before the cgroup service ceiling ([74f6c14](https://github.com/ScriptedAlchemy/tracedecay/commit/74f6c149db76883673ee586623bdd119b0929a46))
+* **release:** verify attestations from the master-ref ship workflow ([612a7bd](https://github.com/ScriptedAlchemy/tracedecay/commit/612a7bd9c0ec7af04eca22f71054923798de20e8))
+* **release:** verify attestations from the master-ref ship workflow ([08fac7d](https://github.com/ScriptedAlchemy/tracedecay/commit/08fac7d69e7586ee1496d0b42abfd37ca88d4648))
+
+## [0.1.0-beta.45](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.44...v0.1.0-beta.45) (2026-09-18)
+
+
+### Bug Fixes
+
+* **clones:** bound clone bodies by tokens, not source bytes ([a10c021](https://github.com/ScriptedAlchemy/tracedecay/commit/a10c0211bb02301b2af10aae0bd3389335453936))
+* **clones:** bound clone bodies by tokens, not source bytes ([7f19751](https://github.com/ScriptedAlchemy/tracedecay/commit/7f19751069e154faa427d10fc23775f64683e8fe))
+* **code-index:** move every extractor revision for the clone-body bound ([c7eb62e](https://github.com/ScriptedAlchemy/tracedecay/commit/c7eb62eaea31bfbe707fcf5181b9aa519db75344))
+* **code-index:** move every extractor revision for the clone-body bound ([fe58bba](https://github.com/ScriptedAlchemy/tracedecay/commit/fe58bba408d9a9014030646e0d6b48e52d5f35b3))
+
+
+### Performance Improvements
+
+* **cli:** ship mimalloc in the production feature ([c183290](https://github.com/ScriptedAlchemy/tracedecay/commit/c1832900046af7ec6c79a1def6a08d0e556c69e3))
+* **cli:** ship mimalloc in the production feature ([9981f98](https://github.com/ScriptedAlchemy/tracedecay/commit/9981f9819669d4100006464c5caa54916ae67b81))
+* **release:** run tag builds on master so dependency caches survive ([049289a](https://github.com/ScriptedAlchemy/tracedecay/commit/049289aabe1d6044282adcfacc95467013d0f16a))
+* **release:** run tag builds on master so dependency caches survive ([3ac7ae1](https://github.com/ScriptedAlchemy/tracedecay/commit/3ac7ae16406d8539b32ca58f34628cdf64f95bdc))
+
+## [0.1.0-beta.44](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.43...v0.1.0-beta.44) (2026-09-18)
+
+
+### Bug Fixes
+
+* **clones:** exclude oversized bodies instead of parking the projection ([3d64ef5](https://github.com/ScriptedAlchemy/tracedecay/commit/3d64ef5b2dc1d7be5034ce452e51f069c34b2955))
+* **clones:** exclude oversized bodies instead of parking the projection ([51db8b9](https://github.com/ScriptedAlchemy/tracedecay/commit/51db8b98bb1588286b926245dc94ecabeec02d9d))
+* **release:** upload only the beta archive as the binary artifact ([2f44a63](https://github.com/ScriptedAlchemy/tracedecay/commit/2f44a63aa3f0d19655da74df974037dfbe0503fd))
+* **release:** upload only the beta archive as the binary artifact ([ba2bf3c](https://github.com/ScriptedAlchemy/tracedecay/commit/ba2bf3c49e0dd60fe9ca9ab397be74a5288d3cd4))
+
+## [0.1.0-beta.43](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.42...v0.1.0-beta.43) (2026-09-18)
+
+
+### Bug Fixes
+
+* **release:** publish every target that built instead of none ([de16f23](https://github.com/ScriptedAlchemy/tracedecay/commit/de16f2339080da5f6b17ac941d9414237b882b24))
+* **release:** publish every target that built instead of none ([2c66895](https://github.com/ScriptedAlchemy/tracedecay/commit/2c66895288706d2c1f60cc5f0b7e5de130da9f5a))
+* **release:** verify the MCPB with unzip so the recorded mode survives ([5a032b3](https://github.com/ScriptedAlchemy/tracedecay/commit/5a032b3cfbd9fbd6440f9bc05dcda6f5a735f400))
+* **release:** verify the MCPB with unzip so the recorded mode survives ([8d145b4](https://github.com/ScriptedAlchemy/tracedecay/commit/8d145b4675164c285753a10516126b9562a4e8ee))
+
+## [0.1.0-beta.42](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.41...v0.1.0-beta.42) (2026-09-18)
+
+
+### Performance Improvements
+
+* **daemon:** stop capping glibc malloc arenas in the service unit ([717c223](https://github.com/ScriptedAlchemy/tracedecay/commit/717c223670c4d5bc730c07ed50a5a28681d02c4c))
+* **daemon:** stop capping glibc malloc arenas in the service unit ([4d72053](https://github.com/ScriptedAlchemy/tracedecay/commit/4d72053e770bb8146ceea16f2cdc798bb0765a5e))
+* **release:** take dist acceptance off the beta ship path ([#1587](https://github.com/ScriptedAlchemy/tracedecay/issues/1587)) ([e19b95a](https://github.com/ScriptedAlchemy/tracedecay/commit/e19b95ab05bb959335615506f5cd1c32b8b8285b))
+
+## [0.1.0-beta.41](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.40...v0.1.0-beta.41) (2026-09-18)
+
+
+### Bug Fixes
+
+* **code-index:** keep graph-off text serving terminal without a seat ([#1569](https://github.com/ScriptedAlchemy/tracedecay/issues/1569)) ([44acc8a](https://github.com/ScriptedAlchemy/tracedecay/commit/44acc8a1bca47e4dc3ae7d8be93bd6c6c44b6d0f))
+* **code-index:** withhold current while the serving seat lags ([5cf3482](https://github.com/ScriptedAlchemy/tracedecay/commit/5cf3482fa85c94309301e2fb7547ecc6b92f2d76))
+* **configuration:** converge retired core settings out of old snapshots ([4d8c365](https://github.com/ScriptedAlchemy/tracedecay/commit/4d8c36597ddd8e0a30dc798f3aa438c878cee0b8))
+* **configuration:** converge retired core settings out of old snapshots ([475fb53](https://github.com/ScriptedAlchemy/tracedecay/commit/475fb53f734c38e55ea03caa14c8bdc1a5823161))
+* **release:** build packaged crates against the workspace lockfile ([89a3423](https://github.com/ScriptedAlchemy/tracedecay/commit/89a34237d86b41d7e6ed66a41bbddfa30107e133))
+* **release:** re-apply workspace path patches in distribution acceptance ([34fa6d0](https://github.com/ScriptedAlchemy/tracedecay/commit/34fa6d0e98718d08295b1f73030084c0153e8d84))
+* **surface:** name the field a refused application request failed on ([3352774](https://github.com/ScriptedAlchemy/tracedecay/commit/33527745b0b73d01e686af8c287a55eba11ff5ba))
+* **surface:** name the field a refused application request failed on ([729ca26](https://github.com/ScriptedAlchemy/tracedecay/commit/729ca26a7335cde8fe78ee9f1eda6a815a273d6e))
+
+
+### Performance Improvements
+
+* **index:** share clone-body tokens; scan secrets with the DFA ([1e454ff](https://github.com/ScriptedAlchemy/tracedecay/commit/1e454fffb8f913b6d25bb8efec5b02b82fb69b14))
+* **index:** share clone-body tokens; scan secrets with the DFA ([1518721](https://github.com/ScriptedAlchemy/tracedecay/commit/1518721f370cf31db954a226a559898ca78da66a))
+
+## [0.1.0-beta.40](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.39...v0.1.0-beta.40) (2026-09-17)
+
+
+### Features
+
+* **agents:** add deterministic delegation topology layout ([6ad0cf6](https://github.com/ScriptedAlchemy/tracedecay/commit/6ad0cf6ae2627b5a9911fa6d07cd010f9efab91f))
+* **agents:** compose topology, inspector and authority register ([13bec38](https://github.com/ScriptedAlchemy/tracedecay/commit/13bec38b3a5a6d81305125717f814c2e4b7aca08))
+* **automations:** implement lookbook V2 scheduler and run ledger ([073b214](https://github.com/ScriptedAlchemy/tracedecay/commit/073b214ad1efc6c3b4be33b5aad5b2877209b0a7))
+* **brain:** draw the registry field as a luminous Three.js scene ([a32836a](https://github.com/ScriptedAlchemy/tracedecay/commit/a32836a8f10d8476dd1fabcc75003a4a065b0e4d))
+* **code:** implement the Cortex lens as the semantic cortex plate ([fa9bb7f](https://github.com/ScriptedAlchemy/tracedecay/commit/fa9bb7fbee4971c556e90f1da3c79db77834aa7f))
+* **dashboard-api:** type savings models route with provider attribution ([274392a](https://github.com/ScriptedAlchemy/tracedecay/commit/274392afd887dbc7a1e130bbaaa780181595ffb2))
+* **dashboard:** adopt V2 night-glass tokens and Archivo display face ([cd99fb7](https://github.com/ScriptedAlchemy/tracedecay/commit/cd99fb7bc62c77f319c9975f8203acc363cdabc9))
+* **dashboard:** rebuild shell chrome on the V2 lookbook rail ([153ea00](https://github.com/ScriptedAlchemy/tracedecay/commit/153ea008713d627e030c1aa4944521d3bb9863b9))
+* **dashboard:** redesign Costs as provider spend attribution ([b79de0e](https://github.com/ScriptedAlchemy/tracedecay/commit/b79de0e34717123579830a5dc7de2b1d65649930))
+* **delivery:** add evidence ladder, umbrella, journey and review models ([9033ea8](https://github.com/ScriptedAlchemy/tracedecay/commit/9033ea86e20411e2e1181705751e31be61359757))
+* **delivery:** add the exact review workspace over provider projections ([f49bfa9](https://github.com/ScriptedAlchemy/tracedecay/commit/f49bfa98afe74dafdda9d66c7954ea99b5c011fd))
+* **delivery:** add the horizontal PR journey field and episode table ([f310a35](https://github.com/ScriptedAlchemy/tracedecay/commit/f310a354949096273d1914c54c7f8b1caed096af))
+* **delivery:** add umbrella outcomes and local-first wing ([250c57a](https://github.com/ScriptedAlchemy/tracedecay/commit/250c57a6a10738c5721809c008c7ba3f1c2a8e3b))
+* **delivery:** admit inbox HTTP proof and proximity attention ([76bf002](https://github.com/ScriptedAlchemy/tracedecay/commit/76bf0025c4c4ad4580b77f982ffafbc93445bb2e))
+* **delivery:** join proximity into attention sources ([6893029](https://github.com/ScriptedAlchemy/tracedecay/commit/689302920c6b112152e2a4d4ba68c6340330043e))
+* **delivery:** own proximity join on typed server authority ([658b062](https://github.com/ScriptedAlchemy/tracedecay/commit/658b062e4a35a0a986233d1eaf72c26e063e9bc7))
+* **delivery:** rebuild inbox with field, filters, inspector, table ([a88e432](https://github.com/ScriptedAlchemy/tracedecay/commit/a88e4327105eae919cb532e144772e14bbd62b06))
+* **delivery:** wire proximity attention into the delivery ui ([0802af2](https://github.com/ScriptedAlchemy/tracedecay/commit/0802af2afd333b86d70ecc399cfad39e4ae57d48))
+* **explorer:** four independent lanes, hover-inspect, typed absences ([a685d76](https://github.com/ScriptedAlchemy/tracedecay/commit/a685d76c8c54ea56608b496b438c85f056eb7af2))
+* **explorer:** surface source freshness and count evidence per lane ([cc23d9a](https://github.com/ScriptedAlchemy/tracedecay/commit/cc23d9afe713181318d45f74149a6e936e9d01d4))
+* **extraction:** name dotted Rust calls on typed bindings by type ([aa0a5c5](https://github.com/ScriptedAlchemy/tracedecay/commit/aa0a5c5ff54e46941466525b6cb80145d9853651))
+* **knowledge:** bring the selected fact's ledger row into view ([d126207](https://github.com/ScriptedAlchemy/tracedecay/commit/d126207eb977f4487965b70fffcb8a8ccf6fc344))
+* **knowledge:** compose facts camera as constellation and inspector ([97f6cff](https://github.com/ScriptedAlchemy/tracedecay/commit/97f6cff320b627ceac8510e15cab892021edd08f))
+* **loom:** add hybrid canvas and svg temporal scene renderer ([d8bcb11](https://github.com/ScriptedAlchemy/tracedecay/commit/d8bcb11b0722f50b0e7d4b283af816ce3aa29ddd))
+* **loom:** add renderer-neutral temporal journey projection and layout ([2d59c3b](https://github.com/ScriptedAlchemy/tracedecay/commit/2d59c3b21987c5d5bdbb124e91ffe43841d74b98))
+* **loom:** replace weave lane chart with temporal execution field ([1396c78](https://github.com/ScriptedAlchemy/tracedecay/commit/1396c7891af0b6433e8c3a3618a766b9c14615e0))
+* **observatory:** system evidence overview with inspector ([1efa12c](https://github.com/ScriptedAlchemy/tracedecay/commit/1efa12cde6bf72a9990c96aaaf394f25a148c23f))
+* **sessions:** implement lookbook V2 timeline, index and inspector ([2df0adb](https://github.com/ScriptedAlchemy/tracedecay/commit/2df0adb88ec9328a63b50dd0f44ac243c8cc81a9))
+* **settings:** implement effective configuration review surface ([d2acb82](https://github.com/ScriptedAlchemy/tracedecay/commit/d2acb82bec6c41e1a91d9e07d757311a5606984a))
+* **shell:** let status registers carry their own glyph ([ecba682](https://github.com/ScriptedAlchemy/tracedecay/commit/ecba6820b43b54e3b3d62f2213c89408a717f9d1))
+* **shell:** let workspaces publish status-strip registers ([7c05dda](https://github.com/ScriptedAlchemy/tracedecay/commit/7c05dda96fb13156dfc7b85c8cc28fc2a3b1dff6))
+* TraceDecay V2 delivery (PR8–PR13) + daemon performance, memory, and reliability overhaul ([e13a353](https://github.com/ScriptedAlchemy/tracedecay/commit/e13a35319f1c5de99e310a32d180dab3f54a802a))
+* **ui:** add evidence-grade tag and UTC clock formatter ([33f4e3a](https://github.com/ScriptedAlchemy/tracedecay/commit/33f4e3a7f14525bebf4b1926b37967788c1c3482))
+* **viz:** add a HUD overlay slot over the graph canvas box ([43de885](https://github.com/ScriptedAlchemy/tracedecay/commit/43de885762aef5f66740e81c144e9d9d01728959))
+* **work:** compose inspector, activity ledger, and register strip ([b938d4c](https://github.com/ScriptedAlchemy/tracedecay/commit/b938d4c36c1cc897e9419aebf3d77eb766bb290c))
+* **work:** draw the task dependency board from the graph authority ([8cc3873](https://github.com/ScriptedAlchemy/tracedecay/commit/8cc38737460fcd514282644d263f18bf4397e747))
+* **workflows:** implement the V2 definition lifecycle ledger ([0b59d18](https://github.com/ScriptedAlchemy/tracedecay/commit/0b59d1864c91edb607ce324e150ef102ef65daeb))
+
+
+### Bug Fixes
+
+* **agents:** keep aperture labels legible on the light shell ([bdaf23e](https://github.com/ScriptedAlchemy/tracedecay/commit/bdaf23ea89db21b5a5a97572dc3857644d6035c4))
+* **agents:** resolve review findings on inspection and folding ([31f2e80](https://github.com/ScriptedAlchemy/tracedecay/commit/31f2e8058c4bacbd7ff2efc97ddd5098df3613f2))
+* **automation:** store skill usage in per-skill files ([0cb1012](https://github.com/ScriptedAlchemy/tracedecay/commit/0cb1012b6f56abbac1b7fb70b1e6d3939ad28ef9))
+* **boundary:** validate at edges and stop re-parsing admitted values ([0620a6c](https://github.com/ScriptedAlchemy/tracedecay/commit/0620a6c2f48e6162253fa322297084e92b10780f))
+* **brain:** keep scene controls accessible and release GL contexts ([35d36c5](https://github.com/ScriptedAlchemy/tracedecay/commit/35d36c5e2c97fc9c98db61a0f1c498d7e7f2e5d7))
+* **brain:** place labels whole, cool heat under reduced motion ([b966589](https://github.com/ScriptedAlchemy/tracedecay/commit/b966589b697c914e2c2ea1a7f305ac65bd640fe9))
+* **build:** clear clippy on the second merged PR train ([bcbac20](https://github.com/ScriptedAlchemy/tracedecay/commit/bcbac206bcd8edc671e2e982de9e9d72fea0c778))
+* **ci:** repair documentation, dogfood, and Hawk gates ([ca3dab8](https://github.com/ScriptedAlchemy/tracedecay/commit/ca3dab8df1d3214fab0301a38f2028d29241a9db))
+* **ci:** use the configured Hawk production entry point ([1fe860b](https://github.com/ScriptedAlchemy/tracedecay/commit/1fe860bb9055251732b1f31477808e6d488afb95))
+* clear tip Format and Clippy failures ([5a0e9f1](https://github.com/ScriptedAlchemy/tracedecay/commit/5a0e9f14f83ac60838fa160d6aa036ed1cf01618))
+* **cli:** honour explicit --project verbatim for registry reads ([3902b36](https://github.com/ScriptedAlchemy/tracedecay/commit/3902b368bdc82349d454175fb33739352a6ccf42))
+* **cli:** proceed on reversible work without a human prompt ([3ea6373](https://github.com/ScriptedAlchemy/tracedecay/commit/3ea6373e9b68d77f09f8205eeb88fef9849049c7))
+* **code-index-runtime:** clear clippy lints from merged lanes ([5941902](https://github.com/ScriptedAlchemy/tracedecay/commit/5941902bb246a33914ec925181faa2fb33f87a07))
+* **code-index-runtime:** count the clone backfill apart from passes ([aa78e4d](https://github.com/ScriptedAlchemy/tracedecay/commit/aa78e4d82fd0077ccd1a84573d315ef3acde1f56))
+* **code-index-runtime:** defer clone backfill until seat matches ([b6aafa5](https://github.com/ScriptedAlchemy/tracedecay/commit/b6aafa5b067cf1ae26de87b609ad716a5a9d73f8))
+* **code-index-runtime:** drive the clone backfill on demand after seat ([dcc942b](https://github.com/ScriptedAlchemy/tracedecay/commit/dcc942b89b361cf7a3ab650d80ffa27d3d095662))
+* **code-index-runtime:** drop stray brace from wedge-sync merge ([90726f9](https://github.com/ScriptedAlchemy/tracedecay/commit/90726f915a613e1d4d2fb8a4d8ec500a383471c3))
+* **code-index-runtime:** keep freshness fresh during clone backfill ([1461c7e](https://github.com/ScriptedAlchemy/tracedecay/commit/1461c7e37ae659b8c3326cf43df1cc71c437fcb3))
+* **code-index-runtime:** probe text projection work without waiting ([292a5ef](https://github.com/ScriptedAlchemy/tracedecay/commit/292a5ef7f5047b2737b639d0c7b5ebc9ec13be74))
+* **code-index-runtime:** read retained segments under a shared lock ([8c78bdd](https://github.com/ScriptedAlchemy/tracedecay/commit/8c78bddae63f07c74d61d544a654139e95a8cd3e))
+* **code-index-runtime:** read retained segments under a shared lock ([e0c0c81](https://github.com/ScriptedAlchemy/tracedecay/commit/e0c0c81452cd970a9ae8231045690bcff217e6e7))
+* **code-index-runtime:** run the clone backfill outside the pass guard ([5cc401a](https://github.com/ScriptedAlchemy/tracedecay/commit/5cc401a1df0601672ef6d70ed4e6c20e0f1edaca))
+* **code-index-runtime:** seat before clone backfill; share owners-ready ([#1103](https://github.com/ScriptedAlchemy/tracedecay/issues/1103)) ([0dbf47e](https://github.com/ScriptedAlchemy/tracedecay/commit/0dbf47e9e41493e31a9a627a4edf606b08b66908))
+* **code-index-runtime:** seat the graph before the clone backfill ([ef6fb44](https://github.com/ScriptedAlchemy/tracedecay/commit/ef6fb4422f574f97990427bb0d53c1ae655aefab))
+* **code-index-runtime:** share owners-ready for seat and replay ([05bd656](https://github.com/ScriptedAlchemy/tracedecay/commit/05bd656972ef2b4476efe61982c6286f218816b3))
+* **code-index-runtime:** wake clone backfill after the seat ([06e318f](https://github.com/ScriptedAlchemy/tracedecay/commit/06e318f4c7ccc4242c245b3b9258bdd899017b8f))
+* **code-index-runtime:** wake deferred mount after root insert ([d9488c8](https://github.com/ScriptedAlchemy/tracedecay/commit/d9488c8aff0dd2b90dddd2254f907c1d8a321786))
+* **code-index:** abstain from constructor-name type inference ([2ef6aa2](https://github.com/ScriptedAlchemy/tracedecay/commit/2ef6aa29609ac18cf7f1892dbfd2bd6ba084049c))
+* **code-index:** admit non-git project initialization ([a3c351e](https://github.com/ScriptedAlchemy/tracedecay/commit/a3c351e084958e4155a218a6b880b67be652f189))
+* **code-index:** admit non-git project initialization ([d9855d1](https://github.com/ScriptedAlchemy/tracedecay/commit/d9855d110332c2bc256e28d87b12445718a21984))
+* **code-index:** admit public trait method callers ([a8c1059](https://github.com/ScriptedAlchemy/tracedecay/commit/a8c1059ab232158565f2e29c47318a97acb73bd7))
+* **code-index:** admit via typed convergence park ([a1c9fca](https://github.com/ScriptedAlchemy/tracedecay/commit/a1c9fca3fd80abad648519adf51582f0c4200dc3))
+* **code-index:** bind inherent methods only to their own type definition ([9027a7d](https://github.com/ScriptedAlchemy/tracedecay/commit/9027a7dba015dc04fcb78f65d0678f5571743231))
+* **code-index:** bind inherent methods only to their own type definition ([690c161](https://github.com/ScriptedAlchemy/tracedecay/commit/690c161b4365588a179d9437596092d23ebcad72))
+* **code-index:** bind qualified Rust paths through crate re-exports ([30be440](https://github.com/ScriptedAlchemy/tracedecay/commit/30be440211b2da79305f53e08d1f70325c1912e0))
+* **code-index:** bind renewed source proof to an unproven seat ([e4904c8](https://github.com/ScriptedAlchemy/tracedecay/commit/e4904c88a2da7224e529f7e4b7faede84efe1598))
+* **code-index:** bound all generation store locks ([35fd34a](https://github.com/ScriptedAlchemy/tracedecay/commit/35fd34ae2d31490976229a1951bb03290858daa7))
+* **code-index:** box the non-canonical clone order detail ([f6619c2](https://github.com/ScriptedAlchemy/tracedecay/commit/f6619c2296daf629f3eba65a0ece1a218d98c3c8))
+* **code-index:** clear clippy denials in scheduler ([713660a](https://github.com/ScriptedAlchemy/tracedecay/commit/713660acb7bc9465e8bccab83bc5ad61c47cd2d6))
+* **code-index:** compile against non-enumerated reuse ([49dc83e](https://github.com/ScriptedAlchemy/tracedecay/commit/49dc83e8fbb47152fb3f4c6ad1ec56c53023c0ff))
+* **code-index:** consult the publication park, not a worker bool ([7a383ee](https://github.com/ScriptedAlchemy/tracedecay/commit/7a383ee638e653829294ae5554b1118c9f06f35f))
+* **code-index:** contain later chunk panics in the sweep ([2ede030](https://github.com/ScriptedAlchemy/tracedecay/commit/2ede0308cb2c94b7e538ab3f68c096fe84eda413))
+* **code-index:** deduplicate admission test imports ([92e44cc](https://github.com/ScriptedAlchemy/tracedecay/commit/92e44cc09ab997c686d5a5a41a0fd664582f704e))
+* **code-index:** drop removed reused chunk list ([6a5982e](https://github.com/ScriptedAlchemy/tracedecay/commit/6a5982e2446ef7675bb2dd4a310967612605742d))
+* **code-index:** drop unreachable admission arm ([626367a](https://github.com/ScriptedAlchemy/tracedecay/commit/626367a409cb72992aabd03d39ccffb411926d52))
+* **code-index:** durable Arc-share lineage and reused seal ([132b6cd](https://github.com/ScriptedAlchemy/tracedecay/commit/132b6cd99880d7ba37079761576deab51574e125))
+* **code-index:** durable Arc-share lineage and reused seal ([48008ec](https://github.com/ScriptedAlchemy/tracedecay/commit/48008ec85df06e91eb90bfea496baebacb1d9b48))
+* **code-index:** fail closed on query reconcile admission ([b955793](https://github.com/ScriptedAlchemy/tracedecay/commit/b955793fc64b137cb80861603a4bbdcff5d6bb18))
+* **code-index:** fold final scheduler closeout into [#707](https://github.com/ScriptedAlchemy/tracedecay/issues/707) ([aeea959](https://github.com/ScriptedAlchemy/tracedecay/commit/aeea959669fb259f5f58abd8829bf1911da62826))
+* **code-index:** fold public trait method callers into [#707](https://github.com/ScriptedAlchemy/tracedecay/issues/707) ([9fbf169](https://github.com/ScriptedAlchemy/tracedecay/commit/9fbf169fe6ef3a9822d64016760266f49ca21cf9))
+* **code-index:** keep activation and caller outcomes truthful ([94485c5](https://github.com/ScriptedAlchemy/tracedecay/commit/94485c5d88adc7e2757779327a991bcb5b8c1419))
+* **code-index:** keep chunk verification ordered ([0f6bef7](https://github.com/ScriptedAlchemy/tracedecay/commit/0f6bef7c0d586c328122b5212d2ef0711f70d29b))
+* **code-index:** keep pool failures out of identity_validation ([5ff0ebb](https://github.com/ScriptedAlchemy/tracedecay/commit/5ff0ebb56726a827c8a0856f60dade90e56f6882))
+* **code-index:** keep pool failures out of identity_validation ([1bdf810](https://github.com/ScriptedAlchemy/tracedecay/commit/1bdf810fe788fc26e273cc0e0030da545d681487))
+* **code-index:** keep restricted re-exports and shared reads truthful ([9b16f30](https://github.com/ScriptedAlchemy/tracedecay/commit/9b16f302b37318215b9536ec5657a941e7033093))
+* **code-index:** keep reused_chunks as u64 through cadence ([7ab493e](https://github.com/ScriptedAlchemy/tracedecay/commit/7ab493ecce3e35c1fe7512a2059ccd916f86a122))
+* **code-index:** keep std module paths off same-stem project files ([57aaf7d](https://github.com/ScriptedAlchemy/tracedecay/commit/57aaf7d6f35be067f312df44836dccc10076c581))
+* **code-index:** keep std module paths off same-stem project files ([8036482](https://github.com/ScriptedAlchemy/tracedecay/commit/80364826e747cb12ff6b31c3829f3e23d1b6fb04))
+* **code-index:** map DomainError to 1:1 reason codes ([584fb80](https://github.com/ScriptedAlchemy/tracedecay/commit/584fb80eac65feae34afa2bece678ab02b69fc69))
+* **code-index:** match generic impls by nominal owner ([cbfd6d4](https://github.com/ScriptedAlchemy/tracedecay/commit/cbfd6d47a64f237014579d9566269695061f8182))
+* **code-index:** preserve admitted branch generation wake ([07e827f](https://github.com/ScriptedAlchemy/tracedecay/commit/07e827f737442e36d6368cf3661e3a500c4841e0))
+* **code-index:** preserve pending clone backfill wake ([ec3f5f7](https://github.com/ScriptedAlchemy/tracedecay/commit/ec3f5f781aa1e315b79c33762190b38ea9d4ef65))
+* **code-index:** preserve semantics across train merges ([8afb9f7](https://github.com/ScriptedAlchemy/tracedecay/commit/8afb9f7f19171fa7e42cb4e0f2bf6886341c35c0))
+* **code-index:** preserve semantics across train merges ([5d91f84](https://github.com/ScriptedAlchemy/tracedecay/commit/5d91f84ccbd1fa0de154a6e812fa81557a0ce2f7))
+* **code-index:** preserve typed causes after tip rebase ([ec15f93](https://github.com/ScriptedAlchemy/tracedecay/commit/ec15f932d85a1e510a42f3438f4dd578caea8665))
+* **code-index:** prove each reused chunk before the seal ([413cc4d](https://github.com/ScriptedAlchemy/tracedecay/commit/413cc4dedb4715260206058ad7d9d3d17565684f))
+* **code-index:** prove reused complement before accepting seal ([f84f494](https://github.com/ScriptedAlchemy/tracedecay/commit/f84f49414f13bbb7720e7a4c05d39f8fe6fc64a3))
+* **code-index:** prove reused complement before accepting seal ([b1125f6](https://github.com/ScriptedAlchemy/tracedecay/commit/b1125f6daade3649003577b3632cf792f87462ce))
+* **code-index:** read terminal publication park not a local flag ([dd88cb6](https://github.com/ScriptedAlchemy/tracedecay/commit/dd88cb68ff2d00ee7f59ee347b9af8624ea7f54e))
+* **code-index:** require reembed rows on profile replay ([2a68b3e](https://github.com/ScriptedAlchemy/tracedecay/commit/2a68b3e40d8c81be512f7be02b8289e6cbf669ee))
+* **code-index:** resolve inherent impls of submodule re-exported types ([844b89c](https://github.com/ScriptedAlchemy/tracedecay/commit/844b89c11645b1fe12b32a2b937305b2271e0d5e))
+* **code-index:** resolve inherent impls of submodule re-exported types ([6903957](https://github.com/ScriptedAlchemy/tracedecay/commit/690395730dc33cf9f22cc598ca54798d15fc2484))
+* **code-index:** resolve qualified Rust paths and typed-receiver callers ([3128498](https://github.com/ScriptedAlchemy/tracedecay/commit/312849889c041ba067f75cd914f9f08d4b786c83))
+* **code-index:** restore Arc-share seals without live parent ([bbff983](https://github.com/ScriptedAlchemy/tracedecay/commit/bbff98322106e59c8f8031d6eaad8f77887a7309))
+* **code-index:** restore nested admission fix lost in integration ([7586101](https://github.com/ScriptedAlchemy/tracedecay/commit/758610142dd27501c104f00e1136402c761e5443))
+* **code-index:** restore nested admission fix lost in integration ([76a8e78](https://github.com/ScriptedAlchemy/tracedecay/commit/76a8e78384b21dfbc39b4703c91ce8450e440fca))
+* **code-index:** restore Type::method recall for trait-impl UFCS ([fd62fe8](https://github.com/ScriptedAlchemy/tracedecay/commit/fd62fe8564ee47fed8801baf4fe01f43958e998f))
+* **code-index:** retire sealed revision 11 for parent-delta seals ([c2d6438](https://github.com/ScriptedAlchemy/tracedecay/commit/c2d6438624dd66a99408aaaa6175d030e393e654))
+* **code-index:** retire sealed revision 11 for parent-delta seals ([e358627](https://github.com/ScriptedAlchemy/tracedecay/commit/e358627c60892841716dc1da6721f0ef4966351d))
+* **code-index:** return terminal sync admission ([2d741c1](https://github.com/ScriptedAlchemy/tracedecay/commit/2d741c17e4e48796ffd13e66a8c4c7e9f803c3a6))
+* **code-index:** satisfy clippy on typed freshness reads ([e42c83c](https://github.com/ScriptedAlchemy/tracedecay/commit/e42c83c5ef6ae243af735ccab5db2c9454b8f445))
+* **code-index:** settle ignored dependency admission ([4d95670](https://github.com/ScriptedAlchemy/tracedecay/commit/4d9567034d37ffa7563afe40ceeb40c15724fc38))
+* **code-index:** stabilize Fresh reads and dirty retained seats ([a5206f6](https://github.com/ScriptedAlchemy/tracedecay/commit/a5206f6dd87cf76a2b96df2d7c53c45017aeeb7f))
+* **code-index:** stop a cancelled redundancy scan before the next family ([b9ba671](https://github.com/ScriptedAlchemy/tracedecay/commit/b9ba67160c17267e85b11773165bf4067785770b))
+* **code-index:** stop a cancelled redundancy scan before the next family ([50a2080](https://github.com/ScriptedAlchemy/tracedecay/commit/50a20807b5cc5dbd1261eee361a18e2e38ecc40f))
+* **code-index:** stop a cancelled similar scan before the next page ([aacb4c1](https://github.com/ScriptedAlchemy/tracedecay/commit/aacb4c11721267ae68df136c336432cea6318f4a))
+* **code-index:** stop a cancelled similar scan before the next page ([1cb1f36](https://github.com/ScriptedAlchemy/tracedecay/commit/1cb1f365f929dcd4599d5eb4483b056d07fe2571))
+* **code-index:** stop arc-share seal before a divergent chunk ([376614c](https://github.com/ScriptedAlchemy/tracedecay/commit/376614caf781c0b9f64bec73e170deba56e9ecc8))
+* **code-index:** stop repeated roles from sticking to one actor ([b28ea54](https://github.com/ScriptedAlchemy/tracedecay/commit/b28ea54712d5a32cd6010f639d99d2cd6cfc509c))
+* **code-index:** type NonCanonical causes with reason codes ([d039bee](https://github.com/ScriptedAlchemy/tracedecay/commit/d039bee8928ffa5d73cf2eb73672825b24087ddc))
+* **code-index:** type NonCanonical causes with reason codes ([db94991](https://github.com/ScriptedAlchemy/tracedecay/commit/db94991ce205f443cd7e02a1f238c42d55c7cfc1))
+* **code-index:** type NonCanonical causes with reason codes ([1c1c199](https://github.com/ScriptedAlchemy/tracedecay/commit/1c1c199c4f6ddf2138b95f4f960da78ceebd502c))
+* **code-index:** use question mark for method owner ([2b02cc2](https://github.com/ScriptedAlchemy/tracedecay/commit/2b02cc2d16f1e9250121125dfa5811afea329108))
+* **code-index:** yield background-cpu units around chunk fan-outs ([3c311c7](https://github.com/ScriptedAlchemy/tracedecay/commit/3c311c7865dbab6fc65dc665c0fe8491090e7ed3))
+* **code-index:** yield background-cpu units around chunk fan-outs ([f81df3b](https://github.com/ScriptedAlchemy/tracedecay/commit/f81df3b34f6588035a0043560fad0fd95a9e3d75))
+* **code:** stack hover previews over the pin; bind Escape globally ([004bdfe](https://github.com/ScriptedAlchemy/tracedecay/commit/004bdfea95d082c71e59731f3f5d935b919103bb))
+* **contracts:** alias similar/redundancy legacy wire schemas ([dfdd8d6](https://github.com/ScriptedAlchemy/tracedecay/commit/dfdd8d6010fa295bb8c0d499e3fdadf68624c773))
+* **contracts:** represent similar protocol via revision range ([a402f9f](https://github.com/ScriptedAlchemy/tracedecay/commit/a402f9f59b77df9b82e9ab33a4db7cad8d138bec))
+* converge retries after crash residue ([1d8f54f](https://github.com/ScriptedAlchemy/tracedecay/commit/1d8f54f479105256216058c6a971b2b385298f0a))
+* **daemon:** classify stalled reads by reason code ([6f05293](https://github.com/ScriptedAlchemy/tracedecay/commit/6f0529324da185dd51ec8bb9c09b47409a5a99ed))
+* **daemon:** decode partitioned generation in fan-out wait ([f40f81f](https://github.com/ScriptedAlchemy/tracedecay/commit/f40f81f9ea2bf7936712addc1829295dcc25996f))
+* **daemon:** decode partitioned sealed gens in fan-out wait ([7d87d65](https://github.com/ScriptedAlchemy/tracedecay/commit/7d87d655ad187b2d6e4e2da683284bcc37e4bb04))
+* **daemon:** decode partitioned sealed gens in fan-out wait ([2db3aad](https://github.com/ScriptedAlchemy/tracedecay/commit/2db3aad853aee788d85210c3b638ac8e0d29fbae))
+* **daemon:** deliver proxied responses after host EOF ([31da7e6](https://github.com/ScriptedAlchemy/tracedecay/commit/31da7e67b3418f2b0ed2e8f0f2ffc255fcf1d2a9))
+* **daemon:** deliver proxied responses after host EOF ([fb2af2d](https://github.com/ScriptedAlchemy/tracedecay/commit/fb2af2d8aaa3ef9c16b78c09fd31deb17fde874b))
+* **daemon:** drop English graph-publication retry matchers ([f60afb1](https://github.com/ScriptedAlchemy/tracedecay/commit/f60afb1ad91fa319181e9f4f0746021db556e355))
+* **daemon:** mount proximity early and align init wording ([41d3e24](https://github.com/ScriptedAlchemy/tracedecay/commit/41d3e2404b397904344a4e94465e72c22ae45f21))
+* **daemon:** retry saturated opens by typed reason ([91c6f94](https://github.com/ScriptedAlchemy/tracedecay/commit/91c6f94924095d3776ce2c2b0886cb7c056c01d7))
+* **daemon:** share one discovery deadline per initialize request ([5e4ee66](https://github.com/ScriptedAlchemy/tracedecay/commit/5e4ee66d600b9b28cd44ddbb6e3589f3ca87bb38))
+* **daemon:** type journey transport retry reasons ([58e85f6](https://github.com/ScriptedAlchemy/tracedecay/commit/58e85f651ea794ef14b52a437fd8be796b451c3f))
+* **dashboard-api:** name noncurrent freshness states ([20d2c01](https://github.com/ScriptedAlchemy/tracedecay/commit/20d2c01b1c88aac179b56d6d982a6f4ada07e734))
+* **dashboard-api:** name noncurrent freshness states ([4bc30a7](https://github.com/ScriptedAlchemy/tracedecay/commit/4bc30a73477bed2dd2bbeacc891c2038cde9b288))
+* **dashboard:** close freshness and relief claim gaps ([63ccb1f](https://github.com/ScriptedAlchemy/tracedecay/commit/63ccb1fed35592e65ae426208cd30f3b092cb3ea))
+* **dashboard:** close freshness and relief claim gaps ([1e8b7b8](https://github.com/ScriptedAlchemy/tracedecay/commit/1e8b7b83673c2d430cffc2fe612c468ef6637f50))
+* **dashboard:** drop controls that cannot finish ([bbc60d0](https://github.com/ScriptedAlchemy/tracedecay/commit/bbc60d0b00348310a4bb7fbb507f98ac6c43c426))
+* **dashboard:** exhaust delivery coverage states ([c11caae](https://github.com/ScriptedAlchemy/tracedecay/commit/c11caae1514c937d95a2dcd5b95e3e2fe10cea20))
+* **dashboard:** poll while the first index is mounting ([e8e5a3c](https://github.com/ScriptedAlchemy/tracedecay/commit/e8e5a3cd72fd9ca93793eec803810f4adeb45f0d))
+* **dashboard:** preserve moving builds and readable relief regions ([663fffe](https://github.com/ScriptedAlchemy/tracedecay/commit/663fffe75c3d989b4365667f678e6497c704ea97))
+* **dashboard:** preserve moving builds and readable relief regions ([36ccff8](https://github.com/ScriptedAlchemy/tracedecay/commit/36ccff8cef3da2f54e54c14adf5cbc8b1d347fad))
+* **dashboard:** reconcile final lookbook integrations ([1576094](https://github.com/ScriptedAlchemy/tracedecay/commit/157609459f24abaa8a375ba8cf5ccac5e6be9549))
+* **dashboard:** reconcile lookbook feature contracts ([9ed3058](https://github.com/ScriptedAlchemy/tracedecay/commit/9ed305827d6dc321f7077a25811d98122e166daf))
+* **dashboard:** reflow Costs aperture and keep query register visible ([4bc6c11](https://github.com/ScriptedAlchemy/tracedecay/commit/4bc6c11d43f18f6809ee90d24e790ef718e97b08))
+* **dashboard:** unify shared evidence grade contracts ([da00b45](https://github.com/ScriptedAlchemy/tracedecay/commit/da00b4587d9937ae18e92bf3b6d8fb4984a04cad))
+* **delivery:** keep unmeasured divergence unsupported ([fd0ca95](https://github.com/ScriptedAlchemy/tracedecay/commit/fd0ca95c6b7460f1a3299ac0105cd7fe7ba23f76))
+* **delivery:** measure outcome field, stack coincident marks ([39ae360](https://github.com/ScriptedAlchemy/tracedecay/commit/39ae360edf17fc39bd3c7cbe2b54482a2bdf853b))
+* **delivery:** pass inbox request control without Extension wrap ([6e276b2](https://github.com/ScriptedAlchemy/tracedecay/commit/6e276b29355a3b526ff906bced03e2365a9bfec0))
+* **delivery:** preserve Denied proximity and skip shared-code promotion ([de4d320](https://github.com/ScriptedAlchemy/tracedecay/commit/de4d32076f7338a12ea8b4b4411aa962c88a2dc5))
+* **delivery:** preserve partial and stale proximity coverage ([e11552c](https://github.com/ScriptedAlchemy/tracedecay/commit/e11552c20df844bd50a7655a3b60862554465ca3))
+* **delivery:** preserve proximity decode failures ([d1586e4](https://github.com/ScriptedAlchemy/tracedecay/commit/d1586e4aebbfb1999ea91ec46efccccc794f99cb))
+* **delivery:** preserve proximity decode failures ([ce248a4](https://github.com/ScriptedAlchemy/tracedecay/commit/ce248a41eb7a12058fcfd8523d295f7e70b0a9c7))
+* **delivery:** type the all-omitted and not-configured inbox states ([ac0c7a9](https://github.com/ScriptedAlchemy/tracedecay/commit/ac0c7a90f749a6750144056c62f8e0188c11fecc))
+* **delivery:** wrap mode tabs at narrow widths ([352988f](https://github.com/ScriptedAlchemy/tracedecay/commit/352988f5be74525c157da3c77d0a1565535c9614))
+* **docs:** reserve rustdoc output for the public library ([059070a](https://github.com/ScriptedAlchemy/tracedecay/commit/059070a6010a0f99728275c7714cc5196d79e92e))
+* **doctor:** preserve convergence details in text output ([d99cb1b](https://github.com/ScriptedAlchemy/tracedecay/commit/d99cb1b8b3b342a10ec54229b886505985a5f76a))
+* **doctor:** preserve convergence details in text output ([cb51bbe](https://github.com/ScriptedAlchemy/tracedecay/commit/cb51bbe7f3a735be4b38f5ef6f8161b76942e285))
+* **doctor:** prove daemon and store health from the artifact ([4de82b0](https://github.com/ScriptedAlchemy/tracedecay/commit/4de82b03e728f6d1e3e2ffa6af20a32061ec8818))
+* **evals:** default hermetic runs to their own checkout ([d6d7e41](https://github.com/ScriptedAlchemy/tracedecay/commit/d6d7e4118b3d7ce77cf07ad838958fb5d4d939e7))
+* **explorer:** clip the lane footer watermark ([c5cf8c8](https://github.com/ScriptedAlchemy/tracedecay/commit/c5cf8c87ed26582a364b317d29d76caa2a82d446))
+* **explorer:** keep facet selects inside the aperture at 320px ([5c1e74c](https://github.com/ScriptedAlchemy/tracedecay/commit/5c1e74c0a3b0b896af33f58357b11273ab1b7684))
+* **explorer:** report scope refusal in the run register ([5c3aada](https://github.com/ScriptedAlchemy/tracedecay/commit/5c3aadad41c8f378268632007cca17f3f69d9c44))
+* **explorer:** stack wrapped lanes, align lane headers, add hover halo ([e67e488](https://github.com/ScriptedAlchemy/tracedecay/commit/e67e48846eb1183497b4089e7aedde42bf8a4107))
+* **global-db:** refuse non-final temporal schemas ([d7eb232](https://github.com/ScriptedAlchemy/tracedecay/commit/d7eb232b688a513051d738370690a93cb1ea1c0d))
+* **graph-db:** clear tip Clippy and sdk packages reds ([b4c9dcf](https://github.com/ScriptedAlchemy/tracedecay/commit/b4c9dcf6d3742a985bcd54a5ecb32670777d2c5c))
+* **hooks:** bound worktree discovery instead of an open git walk ([52e7ae0](https://github.com/ScriptedAlchemy/tracedecay/commit/52e7ae0a8d2ccc32b667740d997f40ceb88a7126))
+* **hooks:** bound worktree discovery instead of an open git walk ([97f97d7](https://github.com/ScriptedAlchemy/tracedecay/commit/97f97d7afb297839975ff5e14289f5ba67e552dd))
+* **hosts:** give each host its own bundle journal and lock ([9a609b9](https://github.com/ScriptedAlchemy/tracedecay/commit/9a609b92da43a98ebdc5c0af2c4532fc7f86fdf7))
+* **hosts:** release advisory writer locks explicitly ([e39201a](https://github.com/ScriptedAlchemy/tracedecay/commit/e39201a0286e73e49655eb4a2be0f0a798535434))
+* **hosts:** release advisory writer locks explicitly ([04fdbbd](https://github.com/ScriptedAlchemy/tracedecay/commit/04fdbbd3c19a61f337dfdd4d064e854500d298c4))
+* **kiro:** close doctor migration advisory gaps ([8ef8fd0](https://github.com/ScriptedAlchemy/tracedecay/commit/8ef8fd03d38ddcd5a3029221cfebba5ee71525fe))
+* **kiro:** emit doctor migration advisories for retired globals ([1da3507](https://github.com/ScriptedAlchemy/tracedecay/commit/1da35073d9855d269cff949c5eca8b1cd552f47d))
+* **knowledge:** keep the ledger in view and inspect on pointer movement ([710eca8](https://github.com/ScriptedAlchemy/tracedecay/commit/710eca8baef722373c366314b25c189051174bce))
+* **knowledge:** let inspector provenance terms wrap in the bay ([216d450](https://github.com/ScriptedAlchemy/tracedecay/commit/216d4503ceb9f2e478c057409381d4da2d995a86))
+* **loom:** meet the touch-target floor on dense rows ([573a27a](https://github.com/ScriptedAlchemy/tracedecay/commit/573a27ad8d58ae05a7821607478562a7b15c34ee))
+* **loom:** reveal nothing past a dated playback cursor ([00e5f6e](https://github.com/ScriptedAlchemy/tracedecay/commit/00e5f6e8d206eb3dd03027f1b4f08c5c47348f69))
+* **lsp:** bound rustup probes and gate them on rustup &gt;= 1.28.1 ([b919b06](https://github.com/ScriptedAlchemy/tracedecay/commit/b919b06f93d568bb04edf23725b6dc5899c9c3fb))
+* **lsp:** clear a recorded launch refusal on the next successful probe ([3f9f260](https://github.com/ScriptedAlchemy/tracedecay/commit/3f9f26072ef1491ee60b9992eb1ddaecfb05c733))
+* **lsp:** evict a retained launch its refresh could not start ([e4ab7c7](https://github.com/ScriptedAlchemy/tracedecay/commit/e4ab7c7f7a48c13deb8fd47c6a41f046fde11a15))
+* **lsp:** keep prewarm cargo and failed probes install-free ([16d16e4](https://github.com/ScriptedAlchemy/tracedecay/commit/16d16e4ba8c8a1e162309f35355de3777a8e0192))
+* **lsp:** record failed admission probes as unavailable ([f52e65a](https://github.com/ScriptedAlchemy/tracedecay/commit/f52e65a734da8636111718ae8ef3a5ab792c8178))
+* **lsp:** resolve the analyzer launch per workspace root ([8d851bc](https://github.com/ScriptedAlchemy/tracedecay/commit/8d851bc800fe6958de1dac75458e29c8b7eb784a))
+* **lsp:** run compile-diagnostics cargo with RUSTUP_AUTO_INSTALL=0 ([b4e912d](https://github.com/ScriptedAlchemy/tracedecay/commit/b4e912d1417f8802ffb19c9eb2b52ddc833fbfca))
+* **mcp:** assert retired clone-lane opaque reasons gone ([2961427](https://github.com/ScriptedAlchemy/tracedecay/commit/2961427c968102d0ed34c0fda15865d9039a35da))
+* **mcp:** backtick proximity kinds in delivery adapter doc ([f3b1d77](https://github.com/ScriptedAlchemy/tracedecay/commit/f3b1d7781c7244f52727f86671ba5386e8b3ca09))
+* **mcp:** bound initialize discovery on one parent deadline ([49d7f64](https://github.com/ScriptedAlchemy/tracedecay/commit/49d7f6460b287f6e4fc4211420827b703885f0b3))
+* **mcp:** bound initialize discovery on one parent deadline ([20cc517](https://github.com/ScriptedAlchemy/tracedecay/commit/20cc517a0f0b78ebf6ab06e085f9229c9f6a5223))
+* **mcp:** fail Hermes hook captures on skipped sources ([f27f919](https://github.com/ScriptedAlchemy/tracedecay/commit/f27f919e6fc0ef170aaf1da6e9b5de7057b36958))
+* **mcp:** keep injected agent context on summaries ([a7a3a7e](https://github.com/ScriptedAlchemy/tracedecay/commit/a7a3a7ec9e28580899f2c94566bc6930e9f85151))
+* **mcp:** pin demand unavailable causes at host wire ([9e711e4](https://github.com/ScriptedAlchemy/tracedecay/commit/9e711e4b4f0f471496e9c0a233649987f7959962))
+* **mcp:** render schema resource from admitted DDL ([cb2b432](https://github.com/ScriptedAlchemy/tracedecay/commit/cb2b4321b6606bd317b9e5f572dac598ff9b382e))
+* **mcp:** restore status ingest and schema catalog contracts ([e9e186a](https://github.com/ScriptedAlchemy/tracedecay/commit/e9e186ade069f5f6dbe2e800a9c6d5bfc319a730))
+* **mcp:** route missing clone lanes through the reason enum ([b67c0bc](https://github.com/ScriptedAlchemy/tracedecay/commit/b67c0bc3966bad56f00fd5fdbb890123e62a4f13))
+* **mcp:** unify clone lane unavailable wire protocol ([0872941](https://github.com/ScriptedAlchemy/tracedecay/commit/0872941abf21c64c6b40fc5c56fd39fdef2b2e8b))
+* **memory:** mark transport barrier content as feature-bound ([417831a](https://github.com/ScriptedAlchemy/tracedecay/commit/417831a1742f85d63d22892ca543094c3c611757))
+* **observatory:** cluster crowded timeline reads and pin the inspector ([68d480b](https://github.com/ScriptedAlchemy/tracedecay/commit/68d480b61e4e6419890c9694d0b93c05a0b144b7))
+* **private-fs:** match rename contract to null-root payload ([30f07e8](https://github.com/ScriptedAlchemy/tracedecay/commit/30f07e874b0b08876c1d88cc6fe10b851f074b7c))
+* **query:** cancel candidate work at bounded batch checkpoints ([e221b91](https://github.com/ScriptedAlchemy/tracedecay/commit/e221b911d32e725f94915d2f4f5f958decd84012))
+* **query:** preserve callable and rebuild cancellation ([2aff0f6](https://github.com/ScriptedAlchemy/tracedecay/commit/2aff0f6f6f702497bc4e5b073fe153b246632234))
+* **query:** stamp serving gen on in-memory projection rows ([a5b06f4](https://github.com/ScriptedAlchemy/tracedecay/commit/a5b06f47540aff778d1cff844eb8f32470e24b68))
+* **query:** stamp serving gen on in-memory projection rows ([207d6ad](https://github.com/ScriptedAlchemy/tracedecay/commit/207d6ad0c1c92eefad59615c7cd68084af183f47))
+* **redesign:** clear integrated compile errors ([7cbbe7d](https://github.com/ScriptedAlchemy/tracedecay/commit/7cbbe7d47748d0c9a1ac0ab4dfb1519d7e5b5a2a))
+* **redesign:** close outstanding review findings ([878ae3e](https://github.com/ScriptedAlchemy/tracedecay/commit/878ae3ee5524955ba37e8500b69c1c1b10bc23d1))
+* **release:** stop beta releases bumping the SDK ([46d9e1e](https://github.com/ScriptedAlchemy/tracedecay/commit/46d9e1e80f726ed43db37c99f90949d19d09714a))
+* **review:** close remaining scheduler and dashboard findings ([d4faefb](https://github.com/ScriptedAlchemy/tracedecay/commit/d4faefbfa7e5716a1d255b15172c0d90a87605d3))
+* **review:** close remaining scheduler and dashboard findings ([2b166c5](https://github.com/ScriptedAlchemy/tracedecay/commit/2b166c5715fa8600b849282be37f92925ef121da))
+* **review:** close remaining scheduler and dashboard findings ([8467dbc](https://github.com/ScriptedAlchemy/tracedecay/commit/8467dbc0c0aba40ab7107051c810bb5eed11d9a9))
+* **sdk:** regenerate TS ops for similar wire aliases ([0c45808](https://github.com/ScriptedAlchemy/tracedecay/commit/0c4580867bc7b8b13e5a8f5fd61e21c228851f39))
+* **sdk:** regenerate TS ops for similar wire aliases ([60f535a](https://github.com/ScriptedAlchemy/tracedecay/commit/60f535a36db971aa089726df4c24ef3ccf44c495))
+* **search-quality:** derive offline from run evidence ([cf086d0](https://github.com/ScriptedAlchemy/tracedecay/commit/cf086d0315d93dec5a084495f78096a5373e1ee3))
+* **session-runtime:** pass profile refresh status into retrieval ([e26fa0c](https://github.com/ScriptedAlchemy/tracedecay/commit/e26fa0c8d8be1624264d529f8152c0466eb24dd6))
+* **session-runtime:** refuse RequireFresh without a refresh worker ([630702a](https://github.com/ScriptedAlchemy/tracedecay/commit/630702adb4cfd27890f39c07f3cefdb893fa15a5))
+* **session-runtime:** refuse RequireFresh without a refresh worker ([c6a217a](https://github.com/ScriptedAlchemy/tracedecay/commit/c6a217aff8b77e29a8883821ec1d6f032e3b166b))
+* **sessions:** do not treat a missing refresh worker as catch-up ([5d6929a](https://github.com/ScriptedAlchemy/tracedecay/commit/5d6929a690502ebd67308e4464a88d205e1dd5ea))
+* **sessions:** do not treat a missing refresh worker as catch-up ([c54b94b](https://github.com/ScriptedAlchemy/tracedecay/commit/c54b94b0f280ec42f09c161d4a1e0479803d780c))
+* **sessions:** preserve health reads during writes ([5e5453c](https://github.com/ScriptedAlchemy/tracedecay/commit/5e5453ca11ef200d5d6817092100e38269afe97c))
+* **sessions:** preserve health reads during writes ([8c1553e](https://github.com/ScriptedAlchemy/tracedecay/commit/8c1553eb3e5d17dcb4423d03a6e4072601e540cb))
+* **settings:** guard in-flight writes and keep focus in the edited input ([de613c1](https://github.com/ScriptedAlchemy/tracedecay/commit/de613c19a532b666d2204b4be60f4d24ea534e6a))
+* **settings:** keep held reviews visible after their panel closes ([33790c3](https://github.com/ScriptedAlchemy/tracedecay/commit/33790c36cb9143b6ae371a7caa208046d3926388))
+* **shell:** let register qualifiers yield below 2xl ([2708dca](https://github.com/ScriptedAlchemy/tracedecay/commit/2708dca37671d391b4857dbbaf718955980e403a))
+* **skills:** preserve executable mirror modes ([b55062b](https://github.com/ScriptedAlchemy/tracedecay/commit/b55062b8a1d7ccd9aa42accbadc27972febb4772))
+* **sqlite:** bound busy begin below idle lease ([68dd9df](https://github.com/ScriptedAlchemy/tracedecay/commit/68dd9df6cf89d62022fbf5c056246ccc21966eb2))
+* **sqlite:** wait on idle deadline for busy begin retries ([e317e78](https://github.com/ScriptedAlchemy/tracedecay/commit/e317e787de3a75e38e1d892fa6ca6d933e0b08ba))
+* **sqlite:** wait on idle deadline for busy begin retries ([1fa09a7](https://github.com/ScriptedAlchemy/tracedecay/commit/1fa09a72d2b3afb4f2d7de69660445ab3bc02b91))
+* **storage:** admit the live dogfood staging shape ([f6b85a8](https://github.com/ScriptedAlchemy/tracedecay/commit/f6b85a89c0e5041cf179e5e599af52fee7a18623))
+* **storage:** preserve released project stores without reset ([6948293](https://github.com/ScriptedAlchemy/tracedecay/commit/69482932bade4faae8f3567069ebe0ce8ee735e8))
+* **storage:** preserve released project stores without reset ([3c56c62](https://github.com/ScriptedAlchemy/tracedecay/commit/3c56c62063b3984db9d2a340c9fef433404d810d))
+* **storage:** time migration chunk headroom on the statement ([d72898b](https://github.com/ScriptedAlchemy/tracedecay/commit/d72898b6ce955e70d761aca120a335b646837b97))
+* **test:** gate skip-reason import on test-transport ([045a725](https://github.com/ScriptedAlchemy/tracedecay/commit/045a725479ea89c3b8765cfde8559cd91fcafbba))
+* **text-artifact:** charge successor batches from reservation ledger ([5d0874c](https://github.com/ScriptedAlchemy/tracedecay/commit/5d0874c934745b433c04f30d28118dca4b17b74c))
+* **tool-sweep:** reject unavailable plain-text resources ([cd99e40](https://github.com/ScriptedAlchemy/tracedecay/commit/cd99e40fea14ab7e02e1ea8edbc8384cf063a586))
+* **tool-sweep:** reject unavailable plain-text resources ([ef28e96](https://github.com/ScriptedAlchemy/tracedecay/commit/ef28e969bd63765d0d165a0051836e7da0374776))
+* **transport:** clear LCM, proxy, codex, partial, rebuild reds ([7bdc33d](https://github.com/ScriptedAlchemy/tracedecay/commit/7bdc33d3cb1646cc3fc96809485a80398ef5db38))
+* **types:** close skip-reason and park identity drift ([11ff972](https://github.com/ScriptedAlchemy/tracedecay/commit/11ff9729af3eebd874f0106ff2fd244080099923))
+* **ui-code:** commit cortex contours to coupling ratio ([21e7abc](https://github.com/ScriptedAlchemy/tracedecay/commit/21e7abce249490e4c5ed764565889c91e6349d28))
+* **ui-code:** poll real builds and fold crowded cortex ([4c43f3a](https://github.com/ScriptedAlchemy/tracedecay/commit/4c43f3ab2734eed89d5ab447a7479a06b10c6626))
+* **ui-code:** poll real builds and fold crowded cortex ([7f7d45c](https://github.com/ScriptedAlchemy/tracedecay/commit/7f7d45cb0942dce77d0ebff686b3a0216b2ecfc2))
+* **ui-code:** poll while source verification is active ([e0da20c](https://github.com/ScriptedAlchemy/tracedecay/commit/e0da20c39fba3fd91b30874fb34e3239fe53a77b))
+* **ui-code:** refresh all-scope freshness and keep stratum population ([7b50e6a](https://github.com/ScriptedAlchemy/tracedecay/commit/7b50e6a9ce34377a5761737d2bec7c4ada68e6a9))
+* **ui-code:** restore space-driven cortex radius ([08d61ae](https://github.com/ScriptedAlchemy/tracedecay/commit/08d61ae6ab22aa1c0cfa60a70d372a9968cb3ce4))
+* **work:** fit wide graphs to the field and wrap grade chips ([feb2eb7](https://github.com/ScriptedAlchemy/tracedecay/commit/feb2eb719529cc0e28f5fa5645e456e840de2c0c))
+* **workflows:** fit ledger tables inside their bays ([0f11370](https://github.com/ScriptedAlchemy/tracedecay/commit/0f11370344cc3147359db70bab898204836d70a5))
+* **workflows:** keep definition facts unclipped in the centre bay ([863e57a](https://github.com/ScriptedAlchemy/tracedecay/commit/863e57aefad6295546136ac414ea7eb0845fb012))
+* **work:** replay synthesis before hydrating source context ([5fa23f7](https://github.com/ScriptedAlchemy/tracedecay/commit/5fa23f733795fef98d7a733114b9ef6a36fd3d07))
+* **work:** replay synthesis before hydrating source context ([7a39c70](https://github.com/ScriptedAlchemy/tracedecay/commit/7a39c7010c7527ee4c554084aa85de02ff951efd))
+
+
+### Performance Improvements
+
+* **ci:** avoid process imports for monotonic clock probes ([2a503be](https://github.com/ScriptedAlchemy/tracedecay/commit/2a503be870e73527b533b3ec60acb58815b48e8a))
+* **clones:** land parent-delta Arc-share envelope stack ([d9dfca5](https://github.com/ScriptedAlchemy/tracedecay/commit/d9dfca5e0b664bdb889b440811d63db2ae724443))
+* **clones:** land parent-delta Arc-share envelope stack ([5fef3cc](https://github.com/ScriptedAlchemy/tracedecay/commit/5fef3cc809bff6a7fd86eac8ba2112056797a75c))
+* **clones:** seal reused complement without storing rows ([4d95906](https://github.com/ScriptedAlchemy/tracedecay/commit/4d95906c846c6c73520be24b1020f1b2895d9ae3))
+* **code-index:** Arc-share unchanged file pages on carry ([fa64253](https://github.com/ScriptedAlchemy/tracedecay/commit/fa64253948c6db107f39b083a9f6f62a4ee7a3f2))
+* **code-index:** Arc-share unchanged file pages on carry ([734cc0d](https://github.com/ScriptedAlchemy/tracedecay/commit/734cc0d2436d9ed47f6b1404eba7b079f8855ab7))
+* **code-index:** flat published-generation Arc-share assemble ([fbf0d98](https://github.com/ScriptedAlchemy/tracedecay/commit/fbf0d98a7e7861975d58822a70e27e1bc5859f87))
+* **code-index:** flat published-generation Arc-share assemble ([4a1c0e7](https://github.com/ScriptedAlchemy/tracedecay/commit/4a1c0e793926faf2df1ec50f6640192c2b142a6a))
+* **code-index:** merge parent deltas in one pass ([8608232](https://github.com/ScriptedAlchemy/tracedecay/commit/8608232f579d155ed15a6a2c6513c793eb584648))
+* **code-index:** parent-sealed Arc-share reuse under envelope ([bcae388](https://github.com/ScriptedAlchemy/tracedecay/commit/bcae388243508d99539edb1ad355a1f3ce196509))
+* **code-index:** parent-sealed Arc-share reuse under envelope ([6c7d3f3](https://github.com/ScriptedAlchemy/tracedecay/commit/6c7d3f3bd739cc2388fe1b30171915321f4c1ff0))
+* **code-index:** seal full_replay as parent-delta digest ([989a5d7](https://github.com/ScriptedAlchemy/tracedecay/commit/989a5d77fa9b586f82b1cf58d51999f0df7ec57b))
+* **code-index:** seal full_replay as parent-delta digest ([16ca243](https://github.com/ScriptedAlchemy/tracedecay/commit/16ca2434d1c74644a79cdc7068bb9903c0eadda6))
+* **code-index:** seal reused complement without storing rows ([2415b9d](https://github.com/ScriptedAlchemy/tracedecay/commit/2415b9dd9669557068723137403ec47f6a6bbc2e))
+* **code-index:** seal reused complement without storing rows ([c6a118c](https://github.com/ScriptedAlchemy/tracedecay/commit/c6a118c6d8e6ca1bf5c3b4af3a9fcb9ee3e686c9))
+* **dashboard:** overlap delivery inbox project reads ([672132e](https://github.com/ScriptedAlchemy/tracedecay/commit/672132e566de37b604806b3b96c2c32fbc114bbf))
+* **query:** avoid cloning admitted lexical scores twice ([22cd13b](https://github.com/ScriptedAlchemy/tracedecay/commit/22cd13b6fcc8d0ce8d5ea4a326c7c19b4728320b))
+* **query:** avoid cloning admitted lexical scores twice ([f78da6b](https://github.com/ScriptedAlchemy/tracedecay/commit/f78da6bc6bdadbd035e55d3a53d1de025ece4dd9))
+* **text-artifact:** commit clone-successor pages in batches ([fd500ec](https://github.com/ScriptedAlchemy/tracedecay/commit/fd500ece0292e09fde486980dfe0d1c3a4380b94))
+
+
+### Reverts
+
+* **sqlite:** drop busy-begin idle-deadline change from lsp lane ([fae97ca](https://github.com/ScriptedAlchemy/tracedecay/commit/fae97ca4429eccec2aa006bbbe0d77377a55feea))
+
 ## [0.1.0-beta.39](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.1.0-beta.38...v0.1.0-beta.39) (2026-09-17)
 
 
@@ -583,7 +1430,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **cli:** require confirmed host adoption ([a275cc5](https://github.com/ScriptedAlchemy/tracedecay/commit/a275cc5b0c63ca2b8df5cde4209d6bb4dd1d2481))
 * **cli:** skip install checks for nested inspections ([89c1951](https://github.com/ScriptedAlchemy/tracedecay/commit/89c195195146808ff75a33ea7e330c7a2e21be49))
 * **cli:** update explicit reinstall test imports ([6424fd0](https://github.com/ScriptedAlchemy/tracedecay/commit/6424fd02f36dfd1570f69e5173516bdce78c58b5))
-* **code-index:** code-index leftover slice for [#421](https://github.com/ScriptedAlchemy/tracedecay/issues/421) — full-scope dispatch, sealed-branch shard key ([fa37dd9](https://github.com/ScriptedAlchemy/tracedecay/commit/fa37dd9779bb31a3d87d8692ba4885436f7f10aa))
+* **code-index:** code-index leftover slice for [#421](https://github.com/ScriptedAlchemy/tracedecay/issues/421), full-scope dispatch, sealed-branch shard key ([fa37dd9](https://github.com/ScriptedAlchemy/tracedecay/commit/fa37dd9779bb31a3d87d8692ba4885436f7f10aa))
 * **code-index:** compile graph policy without test authority ([2dbc2ea](https://github.com/ScriptedAlchemy/tracedecay/commit/2dbc2ead8815fe55d29440e50c4c73e06ca886e0))
 * **code-index:** dispatch active generations by exact full scope ([49f8acc](https://github.com/ScriptedAlchemy/tracedecay/commit/49f8acc7c097bb2a68b03ce745c9d58d78112bfe))
 * **code-index:** fail closed on late ceiling install ([63b012c](https://github.com/ScriptedAlchemy/tracedecay/commit/63b012ccaf3496532927edade960f364f57e02de))
@@ -1052,7 +1899,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **automation:** share evidence budget labels ([7002612](https://github.com/ScriptedAlchemy/tracedecay/commit/70026120a4967e1db541a486829066cf32e8c2e5))
 * **build:** preserve lean feature compilation ([060046f](https://github.com/ScriptedAlchemy/tracedecay/commit/060046fc1bd2e9f554d17d49114cdd239b6300de))
 * **cli:** carry the status deadline into daemon tool calls ([dfa752a](https://github.com/ScriptedAlchemy/tracedecay/commit/dfa752a31f79b8edfbf7d975cbacc5797efac401))
-* **code-index:** code-index leftover slice for [#421](https://github.com/ScriptedAlchemy/tracedecay/issues/421) — full-scope dispatch, sealed-branch shard key ([fa37dd9](https://github.com/ScriptedAlchemy/tracedecay/commit/fa37dd9779bb31a3d87d8692ba4885436f7f10aa))
+* **code-index:** code-index leftover slice for [#421](https://github.com/ScriptedAlchemy/tracedecay/issues/421), full-scope dispatch, sealed-branch shard key ([fa37dd9](https://github.com/ScriptedAlchemy/tracedecay/commit/fa37dd9779bb31a3d87d8692ba4885436f7f10aa))
 * **daemon:** mount budget-aware lexical projection build ([906eea1](https://github.com/ScriptedAlchemy/tracedecay/commit/906eea12c5c299b1f57a311c77c9539e9d72ec20))
 * **daemon:** Scout P1 follow-up after [#521](https://github.com/ScriptedAlchemy/tracedecay/issues/521) ([d6a273c](https://github.com/ScriptedAlchemy/tracedecay/commit/d6a273c94317274fe3f66d7926b8c38a1e976bf6))
 * **global-db:** restore measured WAL reclaim to registered checkpoint ([28135a5](https://github.com/ScriptedAlchemy/tracedecay/commit/28135a5dc50976eb77a3e2e6aae00c4e313dffdc))
@@ -1304,6 +2151,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Selection). Published `view=topology` links resolve to `cortex`.
 
 ### Fixed
+
+- *(admission)* `NotApplicable` is a terminal no-op in the shared replay-pass
+  decision. A closed status that leaves the spool unchanged now stops until
+  the next kick instead of entering the retryable backoff arm.
 
 - *(code-index)* the background worker consults the typed publication-authority
   park instead of a loop-local bool, so a park it has not yet observed still
@@ -1973,16 +2824,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Claude Code installs now register `SessionStart` and `PostToolUse` lifecycle hooks, matching the freshness/steering coverage Cursor, Codex, and Kiro already had: `SessionStart` reports index freshness and injects the LCM context-recovery hint after compaction; `PostToolUse` notifies the daemon for targeted incremental sync after edits and shell commands. Existing installs pick the hooks up via the post-upgrade backfill or `tracedecay doctor`.
-- The CLI-fallback steering ("if MCP fails, use `tracedecay tool ...`") now reaches every host with a prompt-rules surface — Claude Code, Copilot/VS Code, Gemini, OpenCode, Kimi, Vibe, and Kiro — instead of only the Cursor rule and Codex session hook.
+- The CLI-fallback steering ("if MCP fails, use `tracedecay tool ...`") now reaches every host with a prompt-rules surface: Claude Code, Copilot/VS Code, Gemini, OpenCode, Kimi, Vibe, and Kiro, instead of only the Cursor rule and Codex session hook.
 
 ### Fixed
 
-- **`serve` no longer exits when project resolution fails at startup** — MCP hosts (Cursor especially) never retry a failed server spawn, so one startup exit over a recoverable config problem (uninitialized project, ambiguous global fallback, bad `--path`) turned every later tool call in the session into "Timed out waiting for connection". `serve` now stays alive in a degraded mode: it completes the MCP handshake, lists the real tools, and answers each tool call with an actionable error naming the failure, the fix, and the `tracedecay tool …` CLI fallback. It rechecks the project on every tool call and recovers in-session once `tracedecay init` (or a corrected path) makes resolution succeed — no server toggle or window reload needed.
-- **`serve` now tolerates a literal unexpanded `--path ${workspaceFolder}`** — Cursor's headless agent-session MCP scopes spawn the plugin's serve command without expanding the template variable and never retry the failed scope, which surfaced as "Timed out waiting for connection" on every tool call. `serve` now discards an unexpanded `${...}` template value with a stderr warning and falls back to project discovery where possible, requiring a unique registered project when discovery reaches the global registry in this mode. Rationale and details in `cursor-plugin/README.md`.
+- **`serve` no longer exits when project resolution fails at startup**. MCP hosts (Cursor especially) never retry a failed server spawn, so one startup exit over a recoverable config problem (uninitialized project, ambiguous global fallback, bad `--path`) turned every later tool call in the session into "Timed out waiting for connection". `serve` now stays alive in a degraded mode: it completes the MCP handshake, lists the real tools, and answers each tool call with an actionable error naming the failure, the fix, and the `tracedecay tool …` CLI fallback. It rechecks the project on every tool call and recovers in-session once `tracedecay init` (or a corrected path) makes resolution succeed, no server toggle or window reload needed.
+- **`serve` now tolerates a literal unexpanded `--path ${workspaceFolder}`**. Cursor's headless agent-session MCP scopes spawn the plugin's serve command without expanding the template variable and never retry the failed scope, which surfaced as "Timed out waiting for connection" on every tool call. `serve` now discards an unexpanded `${...}` template value with a stderr warning and falls back to project discovery where possible, requiring a unique registered project when discovery reaches the global registry in this mode. Rationale and details in `cursor-plugin/README.md`.
 
 ### Added
 
-- **`tracedecay doctor --agent cursor` now diagnoses dead Cursor MCP scopes** — best-effort scan of Cursor's recent MCP logs for tracedecay spawn failures (literal unexpanded `${workspaceFolder}` paths, `Connection failed: MCP error -32000`, degraded-mode notices) with concrete remediation ("toggle the MCP server in Cursor Settings → MCP or reload the window"), plus a plugin-bundle-version-vs-binary-version staleness check that points at `tracedecay update-plugin`.
+- **`tracedecay doctor --agent cursor` now diagnoses dead Cursor MCP scopes**, best-effort scan of Cursor's recent MCP logs for tracedecay spawn failures (literal unexpanded `${workspaceFolder}` paths, `Connection failed: MCP error -32000`, degraded-mode notices) with concrete remediation ("toggle the MCP server in Cursor Settings → MCP or reload the window"), plus a plugin-bundle-version-vs-binary-version staleness check that points at `tracedecay update-plugin`.
 
 ## [0.0.23](https://github.com/ScriptedAlchemy/tracedecay/compare/v0.0.22...v0.0.23) - 2026-07-02
 
@@ -2169,7 +3020,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Markdown is now the default MCP tool output format.** Read/list/analysis/context tools (≈70 tools across `search`, `callers`, `callees`, `impact`, `outline`, `body`, `status`, `complexity`, `hotspots`, `health`, `test_map`, `pr_context`, …) now return compact markdown — bullets and GitHub-flavored tables — instead of pretty-printed JSON. Markdown is denser (no per-row key repetition, no brace/indentation overhead), scans better for models, and pushes responses away from the 15K-char truncation cliff. Symbol identifiers (`node_id`, `qualified_name`, `signature`) are preserved inline in backticks so follow-up calls (`body`/`callers`/`callees`) still chain cleanly. `tracedecay_context` was already markdown and is unchanged for the default path.
+- **Markdown is now the default MCP tool output format.** Read/list/analysis/context tools (≈70 tools across `search`, `callers`, `callees`, `impact`, `outline`, `body`, `status`, `complexity`, `hotspots`, `health`, `test_map`, `pr_context`, …) now return compact markdown, bullets and GitHub-flavored tables, instead of pretty-printed JSON. Markdown is denser (no per-row key repetition, no brace/indentation overhead), scans better for models, and pushes responses away from the 15K-char truncation cliff. Symbol identifiers (`node_id`, `qualified_name`, `signature`) are preserved inline in backticks so follow-up calls (`body`/`callers`/`callees`) still chain cleanly. `tracedecay_context` was already markdown and is unchanged for the default path.
 - **New `format` argument** on every markdown-capable tool: pass `format: "json"` to get compact machine-readable JSON (for programmatic consumers); the default is `format: "markdown"`. Unrecognized values fall back to markdown.
 - **JSON output is never pretty-printed anymore.** Tools that intentionally stay JSON (edit primitives, `dashboard`, `fact_store`/`fact_feedback`, retrieval handles, and the LCM/session lifecycle tools) now emit compact `serde_json::to_string` rather than `to_string_pretty`, a ~30–40% byte reduction with no semantic change. `tracedecay_files` (grouped/flat text) and `tracedecay_type_hierarchy` (text tree) already returned dense text and are unchanged.
 - Shared `src/mcp/tools/render.rs` module centralizes format selection, format-aware truncation, and the generic JSON→markdown renderer used by tools without a bespoke layout.
@@ -2258,32 +3109,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Local web dashboard (`tracedecay dashboard` + `tracedecay_dashboard` MCP tool).** A self-contained axum server with compile-time-embedded UI assets serving three tabs: **Holographic Memory** (fact/entity/bank inspector, 2D PCA semantic map, association graph, phase-cosine similarity explorer with brushable histogram, and feature-flagged curation), **LCM** (overview, FTS search with role/source/session facets, session/node drilldowns, timeline, compression analytics over the global DB), and **Code Graph** (overview analytics plus a force-directed canvas explorer with search-to-focus, progressive neighbor expansion, callers/callees, filters, and shortest-path mode). CLI flags: `--path`, `--host`, `--port` (0 = auto, parseable URL on stdout), `--open`. The `tracedecay_dashboard` MCP tool starts/stops the same server as a background task and returns the URL. `GET /api/capabilities` advertises feature flags (`memory`, `lcm`, `graph`, `curation`, `llm_curation`) for host/UI feature detection. Dark + light themes, responsive down to ~420px.
-- **Memory curation with hard-delete semantics.** `POST /api/plugins/holographic/curate` proposes (dry-run) or applies similarity-based deduplication: the lower-trust fact of each `likely_duplicate` pair is permanently deleted via the canonical store path (FK-cascaded entity links, FTS trigger cleanup, bank dirty-marking) — no archive state, no restore. `POST /curate/apply` exposes a generic delete/merge ops contract for external (e.g. LLM-backed) planners; per-op failures are reported per-op. Migration v13 only cleans up a never-shipped archive-column experiment from local dev databases.
+- **Memory curation with hard-delete semantics.** `POST /api/plugins/holographic/curate` proposes (dry-run) or applies similarity-based deduplication: the lower-trust fact of each `likely_duplicate` pair is permanently deleted via the canonical store path (FK-cascaded entity links, FTS trigger cleanup, bank dirty-marking), no archive state, no restore. `POST /curate/apply` exposes a generic delete/merge ops contract for external (e.g. LLM-backed) planners; per-op failures are reported per-op. Migration v13 only cleans up a never-shipped archive-column experiment from local dev databases.
 - **Hermes wrapper for the dashboard.** `dashboard/hermes-wrapper/` (canonical; deployed to the hermes-agent working tree) reverse-proxies `/holographic/*`, `/lcm/*`, and `/graph/*` to a spawned or externally configured tracedecay dashboard, re-hosts the same UI bundles under the combined "TraceDecay" tab, layers an optional LLM curation planner on the `/curate/apply` contract, and hardens the subprocess lifecycle (stderr drain, parent-death signal, spawn-failure backoff).
 - **Dashboard build + test infrastructure.** `dashboard/` npm workspace (esbuild) building all bundles, 16 frontend unit tests (`node run-unit-tests.mjs`), Playwright smoke (`npm run smoke -- --expect-lcm=empty|non-empty`), Rust integration suites (`tests/dashboard_api_test.rs`, `dashboard_lcm_fixes_test.rs`, `dashboard_graph_api_test.rs`, `mcp_dashboard_tool_test.rs`), a dashboard CI job, and `build.rs` rerun-if-changed guards so frontend dist changes force re-embedding.
 - **Curation previews survive dashboard restarts.** The last dry-run curation plan is mirrored to a `.tracedecay/dashboard/curation_preview.json` sidecar and re-hydrated when the server starts; applying curation (or any `/curate/apply` mutation) clears both the in-memory copy and the sidecar. The `GET /curation/preview` API shape is unchanged, and staleness is still recomputed against the live fact count on every read.
-- **`tracedecay install --agent hermes` deploys the dashboard plugin page.** The Hermes wrapper (manifest, `plugin_api.py` reverse proxy, and the UI bundles — all embedded in the binary, no source checkout needed) is now written to `<hermes_home>/plugins/tracedecay/dashboard/` as part of the default install, where Hermes' dashboard-plugin discovery (stock and forked) picks it up as a "TraceDecay" tab with Memory / LCM / Code Graph / Savings sub-tabs. The deployed proxy bakes in the installing binary path and the profile's pinned `project_root` as spawn-mode defaults (`TRACEDECAY_BIN` / `TRACEDECAY_DASHBOARD_PROJECT` env vars still win); reinstalls preserve the pin, `--no-dashboard` opts out (and removes a previous deploy), and uninstall cleans the page up. The wrapper also gained the Savings sub-tab (`/savings/*` proxy to `/api/plugins/savings/*`). On Hermes versions without dashboard-plugin discovery the deployed directory is inert.
-- **Dashboard assets build themselves on fresh checkouts.** When the embedded `dashboard/*/dist` bundles are missing, `build.rs` now runs the frontend build automatically (`npm ci`, falling back to `npm install`, then `npm run build`) with progress reported as build warnings — so `cargo build` / `cargo install --path .` work from a clean clone. If npm is unavailable, the build still fails fast with actionable instructions. `Cargo.toml` switched to an explicit `package.include` whitelist that ships the prebuilt dist bundles inside the crate package, making `cargo package`/`cargo publish` verifiable and letting crates.io/docs.rs builds proceed with no Node.js toolchain. The release workflows (`release.yml` build + publish-crate jobs, `release-beta.yml`) gained the same dashboard prebuild step as CI.
+- **`tracedecay install --agent hermes` deploys the dashboard plugin page.** The Hermes wrapper (manifest, `plugin_api.py` reverse proxy, and the UI bundles, all embedded in the binary, no source checkout needed) is now written to `<hermes_home>/plugins/tracedecay/dashboard/` as part of the default install, where Hermes' dashboard-plugin discovery (stock and forked) picks it up as a "TraceDecay" tab with Memory / LCM / Code Graph / Savings sub-tabs. The deployed proxy bakes in the installing binary path and the profile's pinned `project_root` as spawn-mode defaults (`TRACEDECAY_BIN` / `TRACEDECAY_DASHBOARD_PROJECT` env vars still win); reinstalls preserve the pin, `--no-dashboard` opts out (and removes a previous deploy), and uninstall cleans the page up. The wrapper also gained the Savings sub-tab (`/savings/*` proxy to `/api/plugins/savings/*`). On Hermes versions without dashboard-plugin discovery the deployed directory is inert.
+- **Dashboard assets build themselves on fresh checkouts.** When the embedded `dashboard/*/dist` bundles are missing, `build.rs` now runs the frontend build automatically (`npm ci`, falling back to `npm install`, then `npm run build`) with progress reported as build warnings, so `cargo build` / `cargo install --path .` work from a clean clone. If npm is unavailable, the build still fails fast with actionable instructions. `Cargo.toml` switched to an explicit `package.include` whitelist that ships the prebuilt dist bundles inside the crate package, making `cargo package`/`cargo publish` verifiable and letting crates.io/docs.rs builds proceed with no Node.js toolchain. The release workflows (`release.yml` build + publish-crate jobs, `release-beta.yml`) gained the same dashboard prebuild step as CI.
 
-- **Tokenizer-backed cost tier for the Savings & Cost tab (`token-counting` feature, on by default).** When transcripts carry no usage counters (all Cursor stores — verified to contain none — plus cline/vibe and any Codex/Claude rows without usage), stored message text is now counted with a real BPE tokenizer (tiktoken-rs, `o200k_base`/`cl100k_base`) instead of the chars/4 heuristic: exact for OpenAI-family models, a labeled `≈` approximation for vendors without a public tokenizer (Claude/Gemini). The API gains a third `cost_basis` value `"tokenized"` (between `"actual"` and `"estimated"`; `"mixed"` semantics unchanged), additive `tokenized` token blocks, `tokenized_messages` counts, and per-model `tokenizer` provenance (`{"encoder", "exact"}`); the UI shows tier badges and an updated methodology note. Counts are cached per message (in-process map + a `dashboard_token_counts` sidecar table in the global accounting DB, keyed by message identity with a text-length guard) and pre-warmed in the background at dashboard startup, so 15k+-message stores pay the BPE pass once instead of per request. Disable the feature for a leaner binary (~4 MB embedded vocabularies, lazily decoded) — everything degrades to the chars/4 tier.
+- **Tokenizer-backed cost tier for the Savings & Cost tab (`token-counting` feature, on by default).** When transcripts carry no usage counters (all Cursor stores, verified to contain none, plus cline/vibe and any Codex/Claude rows without usage), stored message text is now counted with a real BPE tokenizer (tiktoken-rs, `o200k_base`/`cl100k_base`) instead of the chars/4 heuristic: exact for OpenAI-family models, a labeled `≈` approximation for vendors without a public tokenizer (Claude/Gemini). The API gains a third `cost_basis` value `"tokenized"` (between `"actual"` and `"estimated"`; `"mixed"` semantics unchanged), additive `tokenized` token blocks, `tokenized_messages` counts, and per-model `tokenizer` provenance (`{"encoder", "exact"}`); the UI shows tier badges and an updated methodology note. Counts are cached per message (in-process map + a `dashboard_token_counts` sidecar table in the global accounting DB, keyed by message identity with a text-length guard) and pre-warmed in the background at dashboard startup, so 15k+-message stores pay the BPE pass once instead of per request. Disable the feature for a leaner binary (~4 MB embedded vocabularies, lazily decoded), everything degrades to the chars/4 tier.
 
 ### Fixed
-- **The savings ledger records by default again — the Savings tab is no longer empty while lifetime counters grow.** The holographic-fact-store commit made the MCP server's global accounting DB opt-in via `TRACEDECAY_ENABLE_GLOBAL_DB`, which silently disabled `savings_ledger` writes (and worldwide-counter flushes) for every default install: tool calls still printed `tracedecay_metrics` lines and CLI paths kept growing `projects.tokens_saved`, but the dashboard showed "ledger calls: 0 / no events yet". Global accounting is now **on by default**; opt out with `TRACEDECAY_DISABLE_GLOBAL_DB=1` (set automatically for cargo-launched processes via `.cargo/config.toml` so test runs stay hermetic) or `TRACEDECAY_ENABLE_GLOBAL_DB=0`, with an explicit `TRACEDECAY_ENABLE_GLOBAL_DB=1` always winning. The dashboard now also surfaces the gate verdict (`savings.recording` in the overview API, a `recording: on/off` badge, and an honest explanation when the ledger is empty — including the "restart your MCP server to pick this up" case) instead of an unconditional "no events yet". Covered by a default-on ledger regression test plus env-precedence unit tests; long-running MCP servers must be restarted/reloaded to pick up the fix.
-- **Hermes wrapper spawn mode no longer drops its child server after idle periods.** The wrapper's Linux parent-death guard (`PR_SET_PDEATHSIG`) fires when the *thread* that forked the child exits — and FastAPI sync endpoints run on anyio threadpool workers that are reaped after ~10s idle, so the spawned `tracedecay dashboard` was SIGTERMed shortly after quiet spells (surfacing as intermittent 502 "connection reset by peer" on the next tab click). `plugin_api.py` now spawns from a single long-lived worker thread, binding the child's lifetime to the Hermes host process as intended.
+- **The savings ledger records by default again, the Savings tab is no longer empty while lifetime counters grow.** The holographic-fact-store commit made the MCP server's global accounting DB opt-in via `TRACEDECAY_ENABLE_GLOBAL_DB`, which silently disabled `savings_ledger` writes (and worldwide-counter flushes) for every default install: tool calls still printed `tracedecay_metrics` lines and CLI paths kept growing `projects.tokens_saved`, but the dashboard showed "ledger calls: 0 / no events yet". Global accounting is now **on by default**; opt out with `TRACEDECAY_DISABLE_GLOBAL_DB=1` (set automatically for cargo-launched processes via `.cargo/config.toml` so test runs stay hermetic) or `TRACEDECAY_ENABLE_GLOBAL_DB=0`, with an explicit `TRACEDECAY_ENABLE_GLOBAL_DB=1` always winning. The dashboard now also surfaces the gate verdict (`savings.recording` in the overview API, a `recording: on/off` badge, and an honest explanation when the ledger is empty, including the "restart your MCP server to pick this up" case) instead of an unconditional "no events yet". Covered by a default-on ledger regression test plus env-precedence unit tests; long-running MCP servers must be restarted/reloaded to pick up the fix.
+- **Hermes wrapper spawn mode no longer drops its child server after idle periods.** The wrapper's Linux parent-death guard (`PR_SET_PDEATHSIG`) fires when the *thread* that forked the child exits, and FastAPI sync endpoints run on anyio threadpool workers that are reaped after ~10s idle, so the spawned `tracedecay dashboard` was SIGTERMed shortly after quiet spells (surfacing as intermittent 502 "connection reset by peer" on the next tab click). `plugin_api.py` now spawns from a single long-lived worker thread, binding the child's lifetime to the Hermes host process as intended.
 - **Hermes wrapper cold starts no longer 502.** After spawning, the wrapper now waits (bounded, 30s) for the engine's `/api/capabilities` to answer before proxying the first request, returns a clear `503` with `Retry-After` if the engine truly fails to come up, and transparently retries GET proxies once after re-resolving the upstream (which reaps and respawns a dead child). POSTs are never retried so curation applies cannot run twice.
 - **Fallback branch DBs are now read-only for sync/index writes.** `tracedecay sync`, lazy single-file syncs, and full indexing now refuse to write when the active git branch is being served from an ancestor branch database, preventing branch-only files from being indexed into the fallback DB.
-- **`tracedecay install --agent hermes` generates a plugin that loads on newer Hermes hosts.** Four generator/installer fixes: (1) the generated `TraceDecayContextEngine` implements the now-abstract `update_from_response(usage)` method (normalizes `prompt/input`, `completion/output`, and `total` token counts into `last_*_tokens` attributes), so plugin load no longer dies with `Can't instantiate abstract class`; (2) the skill registers under the bare name `tracedecay` — newer Hermes derives the namespace from the plugin and rejects `:` in skill names; (3) the installer now matches the existing indentation of `plugins.enabled`/`plugins.disabled` lists (Hermes writes 2-space items) instead of always inserting 4-space items, which produced unparseable mixed-indent YAML; and (4) flow-style empty lists (`disabled: []`, which Hermes itself writes) are accepted instead of failing with "unsupported Hermes plugins config" — an empty `enabled: []` is rewritten to a block list. The generated context engine additionally honors a `project_root` config key so profiles can pin the indexed project (explicit host kwargs win; the session cwd stays the last fallback).
+- **`tracedecay install --agent hermes` generates a plugin that loads on newer Hermes hosts.** Four generator/installer fixes: (1) the generated `TraceDecayContextEngine` implements the now-abstract `update_from_response(usage)` method (normalizes `prompt/input`, `completion/output`, and `total` token counts into `last_*_tokens` attributes), so plugin load no longer dies with `Can't instantiate abstract class`; (2) the skill registers under the bare name `tracedecay`, newer Hermes derives the namespace from the plugin and rejects `:` in skill names; (3) the installer now matches the existing indentation of `plugins.enabled`/`plugins.disabled` lists (Hermes writes 2-space items) instead of always inserting 4-space items, which produced unparseable mixed-indent YAML; and (4) flow-style empty lists (`disabled: []`, which Hermes itself writes) are accepted instead of failing with "unsupported Hermes plugins config", an empty `enabled: []` is rewritten to a block list. The generated context engine additionally honors a `project_root` config key so profiles can pin the indexed project (explicit host kwargs win; the session cwd stays the last fallback).
 - **`tracedecay install --agent hermes --project-root <abs path>` pins a profile's plugin to one project.** The pin is written into the generated plugin (`PINNED_PROJECT_ROOT` in `tools.py`): every plugin tool call then passes `--project <pin>` so memory + LCM stores resolve to `<pin>/.tracedecay/` regardless of the Hermes process cwd, and the context engine uses it ahead of cwd inference (kwargs > config > pin > cwd). Reinstalls without the flag preserve an existing pin; the flag is hermes-only, requires an absolute path, and conflicts with `--all-profiles` (pins are per-profile).
 - **`tracedecay tool` now walks up from subdirectories to the nearest initialised project** when `--project` is not given, matching how `sync`, `status`, `serve`, and `dashboard` resolve project roots.
 - **Cursor hook hints use the quote-aware shell parser.** `tool_hints` classified search commands with a naive `split_whitespace`, so a quoted pattern like `grep "needle -r" file` leaked a fake `-r` flag and misclassified as a recursive search. It now shares `hooks.rs`'s quote/escape-aware `shell_words` parser (single shared implementation, regression-tested).
 - **Hermes generated plugin files are written atomically.** `write_text_file` now uses the write-to-`.new`-then-rename pattern (like the config writer), so a mid-write crash can no longer leave a truncated `__init__.py`/`tools.py` behind. Unsupported-config errors during install also name the exact retry command (`tracedecay install --agent hermes`).
-- **v13 archive-column cleanup handles generated-column dev databases.** The migration enumerated columns with `PRAGMA table_info`, which hides GENERATED columns — so a dev DB where the abandoned archive revision left `superseded_by` as a generated column referencing `merged_into` skipped that drop and then failed with `no such column: merged_into`. The migration now uses `PRAGMA table_xinfo` and drops the columns in reverse-addition order (dependent generated columns first). Covered by a regression test seeding exactly that odd state.
+- **v13 archive-column cleanup handles generated-column dev databases.** The migration enumerated columns with `PRAGMA table_info`, which hides GENERATED columns, so a dev DB where the abandoned archive revision left `superseded_by` as a generated column referencing `merged_into` skipped that drop and then failed with `no such column: merged_into`. The migration now uses `PRAGMA table_xinfo` and drops the columns in reverse-addition order (dependent generated columns first). Covered by a regression test seeding exactly that odd state.
 - **Archive-semantics purge (policy: deleted memories are permanently hard-deleted).** Removed the last UI remnants of the never-shipped archive feature: the CurationPanel no longer recognizes/renders `archive` or `supersede` ops (neither planner can produce them; the curate ops contract is delete/merge only), the `archive` action field is gone from the frontend types, and stale Hermes-wrapper docstrings naming `archive`/`archive/{fact_id}/restore` routes were corrected. A new store-level test pins the full hard-delete cascade: `MemoryStore::remove_fact` removes the fact row, its FTS mirror row, its entity links, and its feedback events, and marks the fact's banks dirty.
 
 ## [6.1.3] - 2026-06-04
 
 ### Fixed
-- **Write/exec MCP tools no longer advertise `readOnlyHint: true` (#94).** `tracedecay_replace_symbol`, `tracedecay_insert_at_symbol`, and `tracedecay_run_affected_tests` mutate source files or run a `cargo test` subprocess, but were annotated read-only via the shared `def()` helper — so harnesses that auto-approve read-only tools could edit files or compile and execute project code without prompting. They now use a new `def_rw()` helper that stamps `readOnlyHint: false`, matching the other edit tools. A regression test asserts every write/exec tool is non-read-only.
+- **Write/exec MCP tools no longer advertise `readOnlyHint: true` (#94).** `tracedecay_replace_symbol`, `tracedecay_insert_at_symbol`, and `tracedecay_run_affected_tests` mutate source files or run a `cargo test` subprocess, but were annotated read-only via the shared `def()` helper, so harnesses that auto-approve read-only tools could edit files or compile and execute project code without prompting. They now use a new `def_rw()` helper that stamps `readOnlyHint: false`, matching the other edit tools. A regression test asserts every write/exec tool is non-read-only.
 
 ## [6.1.2] - 2026-05-30
 
@@ -2297,13 +3148,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [6.1.1] - 2026-05-26
 
 ### Added
-- **Borrowed-worktree detection on every MCP read tool.** When a git worktree is nested inside the main checkout (e.g. agent tooling that puts worktrees under `.claude/worktrees/<name>/` or `.worktrees/<name>/`), tracedecay's `discover_project_root` walks up and silently resolves the MAIN checkout's `.tracedecay/` — returning results for the wrong branch with no warning, while symbols changed only in the worktree are invisible. New `src/worktree.rs` runs `git rev-parse --show-toplevel` on the caller's CWD and on the resolved index root; when they belong to different working trees, the verbose warning is included in `tracedecay_status` and a one-line notice is prefixed to every read tool response. Detection runs once at server startup (≤2 `git rev-parse` spawns total per session). Ported from codegraph #312.
-- **Catch-up sync on MCP connect.** `McpServer::new` now spawns a non-blocking task that runs `find_stale_files` + `sync_if_stale_silent` + `refresh_file_token_map` once at startup, bypassing the 30 s cooldown. Picks up changes made while the server was down — terminal `git pull`, IDE edits before the agent launched, files touched by another tool — so the first tool call sees a fresh index instead of waiting through the cooldown. Ported from codegraph #414.
+- **Borrowed-worktree detection on every MCP read tool.** When a git worktree is nested inside the main checkout (e.g. agent tooling that puts worktrees under `.claude/worktrees/<name>/` or `.worktrees/<name>/`), tracedecay's `discover_project_root` walks up and silently resolves the MAIN checkout's `.tracedecay/`, returning results for the wrong branch with no warning, while symbols changed only in the worktree are invisible. New `src/worktree.rs` runs `git rev-parse --show-toplevel` on the caller's CWD and on the resolved index root; when they belong to different working trees, the verbose warning is included in `tracedecay_status` and a one-line notice is prefixed to every read tool response. Detection runs once at server startup (≤2 `git rev-parse` spawns total per session). Ported from codegraph #312.
+- **Catch-up sync on MCP connect.** `McpServer::new` now spawns a non-blocking task that runs `find_stale_files` + `sync_if_stale_silent` + `refresh_file_token_map` once at startup, bypassing the 30 s cooldown. Picks up changes made while the server was down, terminal `git pull`, IDE edits before the agent launched, files touched by another tool, so the first tool call sees a fresh index instead of waiting through the cooldown. Ported from codegraph #414.
 - **`scripts/prepare-release.py` to auto-promote `[Unreleased]` → `[<version>]` in CHANGELOG.md.** Idempotently renames the `[Unreleased]` block to a dated `[<version>]` block at release time (Case A), or merges into a pre-existing `[<version>]` block by sub-section (Case B). Avoids the codegraph v0.9.5 failure mode where a sparse hand-staged `[<version>]` block silently shadowed the much-larger `[Unreleased]` section above it during release-notes extraction. Ported from codegraph #436. Wire into the release workflow when a version bump lands.
 
 ### Changed
-- **Embedded MCP watcher replaced with on-demand staleness check (#80).** The `notify-debouncer-full` watcher was the source of severe CPU and memory pressure on large monorepos: top-level-only filtering of `IGNORED_DIRS` meant nested `apps/*/node_modules`, `packages/*/target`, `**/dist` were watched at the OS level, producing event storms and unbounded `RecommendedCache` growth (one user reported the process climbing to 19 GB before being killed). The watcher is now gone — along with the `notify-debouncer-full` dependency. Index freshness is maintained by a lazy `find_stale_files` walk (same gitignore-aware logic `sync()` uses) gated by a 30-second cooldown and invoked at the top of every MCP `tools/call`. Cost: walks on the cold tool call after a quiet window add tens of ms to milliseconds depending on repo size; in exchange, the unbounded-memory class of bug is structurally gone. Reported by @AGiorgetti and @ottob.
-- **Per-file staleness banner replaces the binary "STALE INDEX" warning.** Tool responses that referenced files whose in-line sync couldn't refresh now get a focused banner naming exactly those files with their edit ages (e.g. `src/foo.rs (edited 3m ago)`) and an explicit instruction to `Read` those files directly — while telling the agent the rest of the response is authoritative. Replaces the previous all-or-nothing wording that made agents distrust the entire response. The machine-readable `tracedecay_graph_stale` marker is preserved. Ported from codegraph #428.
+- **Embedded MCP watcher replaced with on-demand staleness check (#80).** The `notify-debouncer-full` watcher was the source of severe CPU and memory pressure on large monorepos: top-level-only filtering of `IGNORED_DIRS` meant nested `apps/*/node_modules`, `packages/*/target`, `**/dist` were watched at the OS level, producing event storms and unbounded `RecommendedCache` growth (one user reported the process climbing to 19 GB before being killed). The watcher is now gone, along with the `notify-debouncer-full` dependency. Index freshness is maintained by a lazy `find_stale_files` walk (same gitignore-aware logic `sync()` uses) gated by a 30-second cooldown and invoked at the top of every MCP `tools/call`. Cost: walks on the cold tool call after a quiet window add tens of ms to milliseconds depending on repo size; in exchange, the unbounded-memory class of bug is structurally gone. Reported by @AGiorgetti and @ottob.
+- **Per-file staleness banner replaces the binary "STALE INDEX" warning.** Tool responses that referenced files whose in-line sync couldn't refresh now get a focused banner naming exactly those files with their edit ages (e.g. `src/foo.rs (edited 3m ago)`) and an explicit instruction to `Read` those files directly, while telling the agent the rest of the response is authoritative. Replaces the previous all-or-nothing wording that made agents distrust the entire response. The machine-readable `tracedecay_graph_stale` marker is preserved. Ported from codegraph #428.
 - **Kiro steering is loaded as a resource.** The Kiro installer now writes `~/.kiro/steering/tracedecay.md`, loads it from the managed agent's `resources` list with an absolute `file://` URI, leaves the custom-agent `prompt` unset so Kiro's default prompt is preserved, keeps MCP approval policy out of `mcp.json`, and installs permissive `tools: ["*"]` plus `allowedTools: ["@builtin", "@tracedecay"]` defaults for the managed agent.
 
 ### Fixed
@@ -2312,24 +3163,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [6.1.0] - 2026-05-25
 
 ### Added
-- **`tracedecay tool <name>` — schema-driven CLI dispatcher.** Every MCP tool is now reachable from the command line through a single dynamic subcommand that introspects each tool's JSON schema and coerces `--key value` flags accordingly. `tracedecay tool` (no args) lists tools grouped by category; `tracedecay tool <name> --help` prints schema-derived parameters. Reserved flags: `--json` (raw response), `--project <path>`, `--args <json>`, `-h`/`--help`. Positional args bind to required string properties (e.g. `tracedecay tool search foo`). `@file` values are read from disk for multi-line strings. Replaces seven hand-rolled subcommands (`query`, `context`, `body`, `impact`, `callers`, `files`, `affected`); `query` is kept as an alias for the renamed `search`. New file: `src/tool_command.rs` (~729 LoC).
-- **`tracedecay_find_exact_symbol` MCP tool.** Bare-name lookup against `idx_nodes_name` — a single O(log n) index probe with no BM25 ranking, no fuzzy match, no qualified-name suffix walk. Use this when the symbol name is already known; use `tracedecay_search` for relevance-ranked discovery. ~30–200 µs per lookup vs. ~700 µs for the BM25 path.
+- **`tracedecay tool <name>`, schema-driven CLI dispatcher.** Every MCP tool is now reachable from the command line through a single dynamic subcommand that introspects each tool's JSON schema and coerces `--key value` flags accordingly. `tracedecay tool` (no args) lists tools grouped by category; `tracedecay tool <name> --help` prints schema-derived parameters. Reserved flags: `--json` (raw response), `--project <path>`, `--args <json>`, `-h`/`--help`. Positional args bind to required string properties (e.g. `tracedecay tool search foo`). `@file` values are read from disk for multi-line strings. Replaces seven hand-rolled subcommands (`query`, `context`, `body`, `impact`, `callers`, `files`, `affected`); `query` is kept as an alias for the renamed `search`. New file: `src/tool_command.rs` (~729 LoC).
+- **`tracedecay_find_exact_symbol` MCP tool.** Bare-name lookup against `idx_nodes_name`, a single O(log n) index probe with no BM25 ranking, no fuzzy match, no qualified-name suffix walk. Use this when the symbol name is already known; use `tracedecay_search` for relevance-ranked discovery. ~30–200 µs per lookup vs. ~700 µs for the BM25 path.
 - **`tracedecay_call_chain` MCP tool.** Finds the shortest *directed* call chain between two node IDs along outgoing `calls` edges only. New `find_path_directed` BFS in `graph/traversal.rs` (the existing `find_path` is bidirectional and wrong for "how does A reach B" questions). Bounded by `max_depth` (default 8, max 20).
 - **`tracedecay_file_dependents` MCP tool.** Lists every indexed file that imports or otherwise depends on the given file. Thin wrapper around the existing `TraceDecay::get_file_dependents` that was previously only reachable through `tracedecay_affected`'s test-rollup path.
 - **`tracedecay_replace_symbol` MCP tool.** Symbol-aware body replacement: resolves a name via exact qualified-name match, narrows to callable kinds on ambiguity, and refuses the edit rather than picking the wrong site if more than one callable matches. Reads the file, splices the symbol's `start_line..=end_line` range with `new_source`, writes back, and reindexes the touched file. Plays the role of token-savior's `replace_symbol_source`.
-- **`tracedecay_insert_at_symbol` MCP tool.** Inserts content immediately before or after a named symbol's source range — same resolution semantics as `tracedecay_replace_symbol`. `position` is `"before"` or `"after"` (default after). Plays the role of token-savior's `insert_near_symbol`.
+- **`tracedecay_insert_at_symbol` MCP tool.** Inserts content immediately before or after a named symbol's source range, same resolution semantics as `tracedecay_replace_symbol`. `position` is `"before"` or `"after"` (default after). Plays the role of token-savior's `insert_near_symbol`.
 - **`tracedecay serve --timings` flag.** When set, every `tools/call` response gains a `_meta.duration_us` field reporting the handler's pure execution time in microseconds. Lets clients (and benchmarks) attribute latency to actual query work vs. JSON-RPC / stdio / Python-parse overhead. Toggleable at runtime through the new `McpServer::set_timings_enabled` setter so embedders can flip it per-session.
-- **Indexer benchmark harness** at `benchmark_data/run_benchmarks.py` — adapts `Mibayy/token-savior`'s `run_benchmarks.py` to drive both tools side-by-side on the same clone of FastAPI, sharing a random symbol sample (seed=42) so per-query rows are directly comparable. tracedecay is driven through a long-lived `tracedecay serve --timings` MCP session for the query column. Latest report (`benchmark_data/comparison-report.md`): cold index 2.9× faster, impact analysis 43× faster than token-savior.
-- **tsbench fork** at `benchmark_data/tsbench/` — patch + reproduction README + per-run summary for running `Mibayy/tsbench` (token-savior's own 96-task agent benchmark) against tracedecay. First-attempt untuned result: 184/192 = 95.8% vs. token-savior's audited 97.9%. The harness rewrites `SYSTEM_PROMPT_TS` to map each token-savior tool to its tracedecay equivalent and relaxes the `--disallowedTools` list to allow `Read`/`Edit` fallback on the four task categories tracedecay has no direct tool for.
-- **`docs/TRACEDECAY-VS-TOKENSAVIOR.md`** — full capability + performance comparison document covering parsing strategy (regex annotators vs. tree-sitter grammars), the 11 health-analytics tools that have no token-savior equivalent, query-latency numbers (apples-to-apples find / body / impact), the tsbench 184/192 result with per-task failure analysis, and an honest "when to use which" guide.
+- **Indexer benchmark harness** at `benchmark_data/run_benchmarks.py`, adapts `Mibayy/token-savior`'s `run_benchmarks.py` to drive both tools side-by-side on the same clone of FastAPI, sharing a random symbol sample (seed=42) so per-query rows are directly comparable. tracedecay is driven through a long-lived `tracedecay serve --timings` MCP session for the query column. Latest report (`benchmark_data/comparison-report.md`): cold index 2.9× faster, impact analysis 43× faster than token-savior.
+- **tsbench fork** at `benchmark_data/tsbench/`, patch + reproduction README + per-run summary for running `Mibayy/tsbench` (token-savior's own 96-task agent benchmark) against tracedecay. First-attempt untuned result: 184/192 = 95.8% vs. token-savior's audited 97.9%. The harness rewrites `SYSTEM_PROMPT_TS` to map each token-savior tool to its tracedecay equivalent and relaxes the `--disallowedTools` list to allow `Read`/`Edit` fallback on the four task categories tracedecay has no direct tool for.
+- **`docs/TRACEDECAY-VS-TOKENSAVIOR.md`**, full capability + performance comparison document covering parsing strategy (regex annotators vs. tree-sitter grammars), the 11 health-analytics tools that have no token-savior equivalent, query-latency numbers (apples-to-apples find / body / impact), the tsbench 184/192 result with per-task failure analysis, and an honest "when to use which" guide.
 
 ### Fixed
-- **`tracedecay serve` no longer blocks MCP `initialize` on the watcher's filesystem walk (#84).** Constructing the embedded `notify_debouncer_full` watcher does a synchronous `walkdir` over every registered subtree to seed its file-id map. On a large JS/TS monorepo with multi-gigabyte `node_modules` / `.next` / `dist` trees this can take 30+ seconds — long enough to blow the client's `initialize` timeout. Fix: `ProjectWatcher::new` now runs inside `tokio::task::spawn_blocking` from a detached `tokio::spawn`, so `McpServer::new` returns immediately and the MCP stdio loop can answer `initialize` / `tools/list` in milliseconds. The `CancellationToken` is stored on the server up front so `shutdown` can cancel mid-walk if the agent disconnects before the watcher finishes initialising. Reported by @ottob with a sample-trace and an FSEvents-sandbox repro that left zero ambiguity about root cause.
+- **`tracedecay serve` no longer blocks MCP `initialize` on the watcher's filesystem walk (#84).** Constructing the embedded `notify_debouncer_full` watcher does a synchronous `walkdir` over every registered subtree to seed its file-id map. On a large JS/TS monorepo with multi-gigabyte `node_modules` / `.next` / `dist` trees this can take 30+ seconds, long enough to blow the client's `initialize` timeout. Fix: `ProjectWatcher::new` now runs inside `tokio::task::spawn_blocking` from a detached `tokio::spawn`, so `McpServer::new` returns immediately and the MCP stdio loop can answer `initialize` / `tools/list` in milliseconds. The `CancellationToken` is stored on the server up front so `shutdown` can cancel mid-walk if the agent disconnects before the watcher finishes initialising. Reported by @ottob with a sample-trace and an FSEvents-sandbox repro that left zero ambiguity about root cause.
 - **`tracedecay serve` no longer runs pre-serve maintenance work (#84).** `Commands::Serve` was running `try_flush` (synchronous HTTP round-trip to the worldwide counter), `check_install_stale`, and the silent-reinstall loop over every tracked agent before the MCP stdio loop even started. All three are now gated behind `should_skip_agent_install_maintenance`, alongside `Install` / `Reinstall` / `Uninstall` / `Doctor`. Same maintenance still runs on the user's next interactive `tracedecay …` invocation.
 - **`tracedecay install --agent antigravity` now registers in both the IDE config and the CLI plugin directory (#85).** Previously only `~/.gemini/antigravity/mcp_config.json` was written, leaving the Antigravity CLI (`agy`) unable to see tracedecay in `/mcp`. New: also writes `~/.gemini/antigravity-cli/plugins/tracedecay.json` with the same `{"mcpServers": {"tracedecay": {...}}}` shape. `uninstall` removes both, `doctor` reports both, `is_detected` triggers on either path. Reported by @ottob.
 - **MCP `last synced N ago` warning no longer fires after a no-change sync (#86).** The warning was reading `MAX(files.indexed_at)`, which only advances when a file is actually reindexed. On quiet repos a successful `tracedecay sync` (0 added / 0 modified / 0 removed) left `indexed_at` stuck and the warning fired forever. New: the warning is computed from the `last_sync_at` metadata key, which `sync()` writes unconditionally on every successful invocation. Falls back to `MAX(indexed_at)` only when the metadata key is missing (e.g. a freshly-initialised project that has never been synced). New `TraceDecay::last_sync_timestamp()` helper exposes this for embedders. Reported by @uwe-sure.
-- **`files_by_language` status output now uses real language names instead of bucketing everything as `Other`.** The SQL `CASE` in `Database::get_stats` only recognised four languages (Rust / Go / Java / Scala) and dumped everything else — Python, TypeScript, C, Swift, Kotlin, etc. — into `"Other"`. Replaced with a Rust-side bucketing helper covering 46 extractor languages; Python files in the FastAPI benchmark now correctly report as `Python` instead of `Other`. Includes special-case basename matching for extensionless `Dockerfile` / `Makefile`.
-- **Pre-existing breakage in `tests/mcp_server_test.rs` repaired.** The whole `test-transport`-gated integration suite (31 tests) had been silently failing to compile since `McpServer::new` switched its return type to `Arc<McpServer>` — `setup_server` and `run_server_with_messages` still expected bare `McpServer`. Switched both helpers to `Arc<McpServer>` and bumped the resource-count assertion (`tracedecay://status/files/overview/branches`) from 4 to 5 to include the newer `tracedecay://schema` resource. All 31 tests now pass.
+- **`files_by_language` status output now uses real language names instead of bucketing everything as `Other`.** The SQL `CASE` in `Database::get_stats` only recognised four languages (Rust / Go / Java / Scala) and dumped everything else. Python, TypeScript, C, Swift, Kotlin, etc., into `"Other"`. Replaced with a Rust-side bucketing helper covering 46 extractor languages; Python files in the FastAPI benchmark now correctly report as `Python` instead of `Other`. Includes special-case basename matching for extensionless `Dockerfile` / `Makefile`.
+- **Pre-existing breakage in `tests/mcp_server_test.rs` repaired.** The whole `test-transport`-gated integration suite (31 tests) had been silently failing to compile since `McpServer::new` switched its return type to `Arc<McpServer>`. `setup_server` and `run_server_with_messages` still expected bare `McpServer`. Switched both helpers to `Arc<McpServer>` and bumped the resource-count assertion (`tracedecay://status/files/overview/branches`) from 4 to 5 to include the newer `tracedecay://schema` resource. All 31 tests now pass.
 
 ### Changed
 - **Seven hand-rolled CLI subcommands replaced by the unified `tracedecay tool <name>` dispatcher.** `query`, `context`, `body`, `impact`, `callers`, `files`, `affected` were each ~50–150 LoC of clap glue duplicating what the MCP tool already declares in its schema. All seven are gone; the same operations are reached as `tracedecay tool query …`, `tracedecay tool body …`, etc. Drops ~600 LoC of dispatch boilerplate from `src/main.rs`. `query` is kept as an alias for the renamed `search` so muscle memory still works.
@@ -2343,19 +3194,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [6.0.0] - 2026-05-25
 
 ### Breaking
-- **Daemon mode removed.** The `tracedecay daemon` subcommand, autostart flags (`--enable-autostart` / `--disable-autostart`), foreground mode, and all `daemon-kit`-backed service registration are gone. ~1,100 lines of platform glue (launchd plists, systemd user units, Windows SCM, PID files, UAC elevation) deleted. File-watching now lives inside the MCP server itself — it spawns a `notify`-backed watcher that runs `sync_if_stale_silent` for the duration of the agent session, and exits when the agent disconnects. Multiple MCP peers on the same project converge through the existing per-project sync lock plus `sync_if_stale_silent`'s peer-coordination check; no new primitive was needed. Users with a registered autostart service should unload it manually — see "Migration" in `docs/TRACEDECAY-WHATSNEW.md` §6.0.0.
+- **Daemon mode removed.** The `tracedecay daemon` subcommand, autostart flags (`--enable-autostart` / `--disable-autostart`), foreground mode, and all `daemon-kit`-backed service registration are gone. ~1,100 lines of platform glue (launchd plists, systemd user units, Windows SCM, PID files, UAC elevation) deleted. File-watching now lives inside the MCP server itself, it spawns a `notify`-backed watcher that runs `sync_if_stale_silent` for the duration of the agent session, and exits when the agent disconnects. Multiple MCP peers on the same project converge through the existing per-project sync lock plus `sync_if_stale_silent`'s peer-coordination check; no new primitive was needed. Users with a registered autostart service should unload it manually, see "Migration" in `docs/TRACEDECAY-WHATSNEW.md` §6.0.0.
 - **`UserConfig::daemon_debounce` renamed to `watcher_debounce`.** TOML load is backwards-compatible via `#[serde(alias = "daemon_debounce")]` and any config-mutating command rewrites the file with the new name; Rust struct literals referencing the old name are a compile-time break.
 - **`McpServer::new` now returns `Arc<Self>`.** The embedded watcher task captures a `Weak<Self>` so it cannot extend the server's lifetime. Embedders that bound the return value continue to compile; destructuring by value or storing into a non-`Arc` field needs to adapt.
 - **`tracedecay install --agent claude` writes the modern hook shape `{type, command, args}`.** Legacy single-string `"command": "<bin> <subcmd>"` entries are detected by `tracedecay doctor` and auto-rewritten using `current_exe()` as the binary path (issue #81). This is a breaking change for any external tooling that introspects `~/.claude/settings.json` and assumed the legacy concatenated form.
 - **Beta release channel disabled.** `.github/workflows/release-beta.yml` is gated behind `BETA_CHANNEL_ENABLED=false` and a `workflow_dispatch`-only trigger. The code is preserved for future revival; no `*-beta.*` versions will ship from this commit forward.
 
 ### Added
-- **`tracedecay_redundancy` MCP tool (#83).** AST-level functional-duplicate detector. Computes four signals per function/method body via tree-sitter — AST shape hash, control-flow-graph hash, ordered call-sequence hash, and a 5-gram token-shingle set — then blends them into a `[0, 1]` composite similarity score (weights 0.40 / 0.25 / 0.20 / 0.15). Pairs are bucketed `definite` / `likely` / `naming_only` and ranked by score. Language-agnostic by design: kind walks use raw tree-sitter strings, so the same code path works for every supported grammar. Computation is lazy — fingerprints land in a new `node_fingerprints` table (schema v10) keyed by `(node_id, body source hash)` and persist across MCP sessions. Pairwise comparison is bucketed by body-token count (±25 % window) so it stays sub-quadratic on large repos.
+- **`tracedecay_redundancy` MCP tool (#83).** AST-level functional-duplicate detector. Computes four signals per function/method body via tree-sitter. AST shape hash, control-flow-graph hash, ordered call-sequence hash, and a 5-gram token-shingle set, then blends them into a `[0, 1]` composite similarity score (weights 0.40 / 0.25 / 0.20 / 0.15). Pairs are bucketed `definite` / `likely` / `naming_only` and ranked by score. Language-agnostic by design: kind walks use raw tree-sitter strings, so the same code path works for every supported grammar. Computation is lazy, fingerprints land in a new `node_fingerprints` table (schema v10) keyed by `(node_id, body source hash)` and persist across MCP sessions. Pairwise comparison is bucketed by body-token count (±25 % window) so it stays sub-quadratic on large repos.
 - **`tracedecay_runtime` MCP tool + `tracedecay status --runtime` flag (#80).** Captures a process + database telemetry snapshot: PID, RSS, virtual size, sustained CPU% sampled over 200 ms, uptime, host CPU count, total system memory, DB / WAL / SHM file sizes, `journal_mode` PRAGMA, total indexed source bytes, node and edge counts, and a derived `db / source` bloat ratio. Lets users hitting unexpected resource pressure attach a structured snapshot to a bug report. Text report mirrors the `tracedecay status` layout; JSON output via `--json` for machine consumption.
 - **`tracedecay_health` `details=true` sub-score breakdown (#82).** Returns per-dimension `{ score, interpretation, raw_count, source }` objects covering acyclicity (with `edges_in_cycles`), depth (`max_chain` / `ideal_chain`), equality (gini + textual interpretation), redundancy (`dead_count` / `total_fns`), modularity (textual label + components-after-hub-removal), and coverage discipline (`skip_test_coverage_count`). The composite `quality_signal` (geometric mean × 10 000) is preserved as the headline figure.
 
 ### Changed
-- **File-watcher rewritten around `notify-debouncer-full` 0.8.0-rc.2.** Replaces the DIY tokio debounce timer with the maintained library, which coalesces rename pairs, suppresses redundant modify-after-create, and batches event bursts cross-platform. Drop-in transparent to callers — `ProjectWatcher::new(root, debounce)` signature unchanged.
+- **File-watcher rewritten around `notify-debouncer-full` 0.8.0-rc.2.** Replaces the DIY tokio debounce timer with the maintained library, which coalesces rename pairs, suppresses redundant modify-after-create, and batches event bursts cross-platform. Drop-in transparent to callers. `ProjectWatcher::new(root, debounce)` signature unchanged.
 - **Watcher no longer recursive-watches the project root.** Top-level entries are enumerated at startup; `IGNORED_DIRS` (`target/`, `node_modules/`, `.git/`, …) and dotdirs (`.vscode`, `.idea`, …) are *never registered as watches*, so the kernel never reports events for them. The root itself is watched non-recursively to surface new top-level directories appearing after startup. This is the primary mitigation for the high CPU/RAM symptoms reported in #80 on Windows, where `ReadDirectoryChangesW`'s per-watch buffer could be overwhelmed by churn inside a large `node_modules`.
 - **Direct `notify` dependency dropped.** Pulled transitively through `notify-debouncer-full`; project_watcher imports types via `notify_debouncer_full::notify` to keep a single crate instance in the resolver graph (debouncer 0.8.0-rc.2 depends on `notify` 9.0.0-rc.4).
 - **`doctor` auto-repair logic for hook entries.** Modern-shape hooks with the wrong subcommand are fixed in place (preserving the user's bin path); legacy single-string hooks are rewritten using `current_exe()` since the embedded path cannot be parsed unambiguously when it contains spaces. Breaks the doctor → install loop that issue #81 reported on Windows path-with-spaces installs.
@@ -2387,11 +3238,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [5.1.1] - 2026-05-16
 
 ### Performance
-- **`tracedecay_dead_code` no longer times out on chromium-scale repos.** The pre-4.14.8 form ran the leading-wildcard `LIKE '%::test'` chain inside a correlated `NOT EXISTS` on every dead-code candidate row — fast on scirs (0.097 s, 76 K `annotation_usage`) but timed out at the 25 s probe ceiling on chromium, cascade-poisoning every subsequent MCP tool call via JSON-RPC id reuse. 4.14.8's `WITH test_marker_ids AS (...)` CTE attempt regressed scirs from 0.1 s to >60 s because SQLite inlined the single-reference CTE, so the wildcard scan ran per candidate row instead of once; that attempt was reverted in 4.14.9. A first attempt that put marker ids into a single TEMP table and probed via `e2.source IN (SELECT id FROM temp.test_markers)` ALSO failed on chromium: SQLite picked `idx_edges_unique (source, target, kind)` for the correlated subquery and iterated every marker as the outer driver for every candidate (~13 K markers × ~134 K candidates ≈ 1.7 B probes), >60 s. New shape — **three-step resolve + pre-join + probe via TWO TEMP tables**:
+- **`tracedecay_dead_code` no longer times out on chromium-scale repos.** The pre-4.14.8 form ran the leading-wildcard `LIKE '%::test'` chain inside a correlated `NOT EXISTS` on every dead-code candidate row, fast on scirs (0.097 s, 76 K `annotation_usage`) but timed out at the 25 s probe ceiling on chromium, cascade-poisoning every subsequent MCP tool call via JSON-RPC id reuse. 4.14.8's `WITH test_marker_ids AS (...)` CTE attempt regressed scirs from 0.1 s to >60 s because SQLite inlined the single-reference CTE, so the wildcard scan ran per candidate row instead of once; that attempt was reverted in 4.14.9. A first attempt that put marker ids into a single TEMP table and probed via `e2.source IN (SELECT id FROM temp.test_markers)` ALSO failed on chromium: SQLite picked `idx_edges_unique (source, target, kind)` for the correlated subquery and iterated every marker as the outer driver for every candidate (~13 K markers × ~134 K candidates ≈ 1.7 B probes), >60 s. New shape. **three-step resolve + pre-join + probe via TWO TEMP tables**:
   - `Database::collect_test_marker_ids` runs the marker `SELECT` exactly once over the `kind = 'annotation_usage'` partition (indexed via `idx_nodes_kind`).
   - `Database::populate_test_marker_temp_table` drops + recreates `temp.test_markers` (with `PRIMARY KEY` on `id` so SQLite builds a real B-tree) and bulk-inserts in 500-id chunks.
   - `Database::populate_test_annotated_targets_temp_table` joins `edges WHERE kind = 'annotates' AND source IN temp.test_markers` once, materialising "which node ids are annotated by any test marker" into `temp.test_annotated_targets` (PK on `target`). ~15 K rows on chromium.
-  - `find_dead_code`'s outer SELECT then uses `nodes.id NOT IN (SELECT target FROM temp.test_annotated_targets)` — a single PK probe per candidate against a small indexed lookup table, the optimiser cannot re-shape this into a per-marker iteration.
+  - `find_dead_code`'s outer SELECT then uses `nodes.id NOT IN (SELECT target FROM temp.test_annotated_targets)`, a single PK probe per candidate against a small indexed lookup table, the optimiser cannot re-shape this into a per-marker iteration.
   - Both temp tables are unconditionally dropped on the wrap path so a failed query does not leak rows to the next caller on the same connection.
 
   Inline comment block on `find_dead_code` documents all three prior pathologies (pre-4.14.8, 4.14.8 CTE, single-temp-table attempt) and a `DO NOT regress this` warning to forestall the next attempt.
@@ -2406,7 +3257,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `dead_code {path: "src"}` | 1.10 s | warm |
   | `dead_code {path: "lib"}` | 1.09 s | warm |
 
-  Was 5/5 TIMEOUT @ 25 s pre-fix, cascade-poisoning every subsequent tool in the probe matrix. Direct `sqlite3` runtime measurement (no MCP layer): 0.75 s end-to-end (markers 42 ms → targets 102 ms → main 600 ms). On scirs (76 K `annotation_usage`): 0.6 s end-to-end — a regression-acceptable trade-off vs. the 0.097 s pre-4.14.8 baseline given that chromium went from >25 s timeout to <1.1 s steady-state. The synthetic regression test `tests/graph_test.rs::dead_code_marker_resolve_is_single_pass` (50 K `annotation_usage` / 5 K functions) runs in 1.3 s release / 3.6 s debug with a 5 s assertion ceiling.
+  Was 5/5 TIMEOUT @ 25 s pre-fix, cascade-poisoning every subsequent tool in the probe matrix. Direct `sqlite3` runtime measurement (no MCP layer): 0.75 s end-to-end (markers 42 ms → targets 102 ms → main 600 ms). On scirs (76 K `annotation_usage`): 0.6 s end-to-end, a regression-acceptable trade-off vs. the 0.097 s pre-4.14.8 baseline given that chromium went from >25 s timeout to <1.1 s steady-state. The synthetic regression test `tests/graph_test.rs::dead_code_marker_resolve_is_single_pass` (50 K `annotation_usage` / 5 K functions) runs in 1.3 s release / 3.6 s debug with a 5 s assertion ceiling.
 
 ## [5.0.0] - 2026-05-16
 
@@ -2414,21 +3265,21 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 
 ### Added
 
-- **`tracedecay_read`** — mode-aware file read (`full`, `lines`, `map`, `signatures`) with cross-session cache. `map` and `signatures` are graph-only — no source bytes are touched. A re-call on an unchanged file returns a ~30-token `{"unchanged": true, …}` stub. The cache key folds `last_sync_at` for graph-backed modes so a force-reindex correctly invalidates derived rows.
-- **`tracedecay_outline`** — flat list of every top-level symbol in a file, with optional kind filter. The cheapest way to orient before zooming into a large file.
-- **`tracedecay_implementations`** — find every type implementing a given trait, or every body of a given method name. Returns method bodies with signatures.
-- **`tracedecay_unsafe_patterns`** — surface `.unwrap()` / `.expect()` / `panic!` / `todo!` / `unimplemented!` / `unsafe { }` sites with an `in_test` flag. Word-boundary matching avoids `.unwrap_or` false positives; an `exclude_tests` option skips test-shaped paths.
-- **`tracedecay_diagnostics`** — runs the project's compile / type checker (cargo / tsc / pyright) and returns structured errors mapped to graph nodes. Replaces the recurring "shell out → parse text → read file" loop with one structured response. Cargo target dir is forced to `.tracedecay/target/` so it can't race with the user's interactive cargo runs.
-- **`tracedecay_config`** — query TOML / JSON config files by dotted key path. Single file (`path`) or glob (`glob`); returns parsed value plus a heuristic line number. DB-free — works on uninitialized projects.
-- **`tracedecay_signature_search`** — find functions / methods by signature shape: return type, parameter substring, async flag, path filter. All filters AND-compose.
-- **`tracedecay_constructors`** — locate every literal-instantiation site of a struct (`Foo { … }`) and report which fields each site sets — plus `missing_fields` relative to the struct's current definition. The classic "I added a required field, what breaks?" question. String- / char-literal awareness and `match` / `if let` / `while let` pattern filtering keep the result list clean.
-- **`tracedecay_field_sites`** — partition every `.<field>` reference into reads and writes. Writes include `=`, compound assignments, and `&mut x.field` borrows; `==` and `=>` correctly count as reads.
-- **`tracedecay bench` colored console output** — default `tracedecay bench` is now a fixed-width colored table instead of a markdown dump. Compact `k` / `M` numeric units; savings percentages colored by tier (green ≥80 %, yellow ≥50 %, red <50 %); aggregate footer in the same tier color. `--json` is unchanged.
+- **`tracedecay_read`**, mode-aware file read (`full`, `lines`, `map`, `signatures`) with cross-session cache. `map` and `signatures` are graph-only, no source bytes are touched. A re-call on an unchanged file returns a ~30-token `{"unchanged": true, …}` stub. The cache key folds `last_sync_at` for graph-backed modes so a force-reindex correctly invalidates derived rows.
+- **`tracedecay_outline`**, flat list of every top-level symbol in a file, with optional kind filter. The cheapest way to orient before zooming into a large file.
+- **`tracedecay_implementations`**, find every type implementing a given trait, or every body of a given method name. Returns method bodies with signatures.
+- **`tracedecay_unsafe_patterns`**, surface `.unwrap()` / `.expect()` / `panic!` / `todo!` / `unimplemented!` / `unsafe { }` sites with an `in_test` flag. Word-boundary matching avoids `.unwrap_or` false positives; an `exclude_tests` option skips test-shaped paths.
+- **`tracedecay_diagnostics`**, runs the project's compile / type checker (cargo / tsc / pyright) and returns structured errors mapped to graph nodes. Replaces the recurring "shell out → parse text → read file" loop with one structured response. Cargo target dir is forced to `.tracedecay/target/` so it can't race with the user's interactive cargo runs.
+- **`tracedecay_config`**, query TOML / JSON config files by dotted key path. Single file (`path`) or glob (`glob`); returns parsed value plus a heuristic line number. DB-free, works on uninitialized projects.
+- **`tracedecay_signature_search`**, find functions / methods by signature shape: return type, parameter substring, async flag, path filter. All filters AND-compose.
+- **`tracedecay_constructors`**, locate every literal-instantiation site of a struct (`Foo { … }`) and report which fields each site sets, plus `missing_fields` relative to the struct's current definition. The classic "I added a required field, what breaks?" question. String- / char-literal awareness and `match` / `if let` / `while let` pattern filtering keep the result list clean.
+- **`tracedecay_field_sites`**, partition every `.<field>` reference into reads and writes. Writes include `=`, compound assignments, and `&mut x.field` borrows; `==` and `=>` correctly count as reads.
+- **`tracedecay bench` colored console output**, default `tracedecay bench` is now a fixed-width colored table instead of a markdown dump. Compact `k` / `M` numeric units; savings percentages colored by tier (green ≥80 %, yellow ≥50 %, red <50 %); aggregate footer in the same tier color. `--json` is unchanged.
 
 ### Changed
 
 - **Schema v9: cross-session response cache.** New `read_cache` table keyed by `(project_id, session_id, file_path, mode, args_hash)` with `mtime_ns` for freshness. Backs `tracedecay_read`.
-- **Schema v9: `Contains` edges denormalized into `nodes.parent_id`.** The same migration folds containment off the edges table and onto a new column. Cleaner queries — `get_children_of(parent_id)` is one indexed lookup — and the read-only SQL layer no longer has to filter by edge kind for every "find members of this container" question. Extractors keep emitting `Contains` edges as before; the storage layer hoists them into `parent_id` at insert time and skips persisting the row.
+- **Schema v9: `Contains` edges denormalized into `nodes.parent_id`.** The same migration folds containment off the edges table and onto a new column. Cleaner queries. `get_children_of(parent_id)` is one indexed lookup, and the read-only SQL layer no longer has to filter by edge kind for every "find members of this container" question. Extractors keep emitting `Contains` edges as before; the storage layer hoists them into `parent_id` at insert time and skips persisting the row.
 
 ### Migration notes
 
@@ -2440,64 +3291,64 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 
 ### Performance
 - **Same `node.child(i)` O(N²) trap fixed in `batch_extractor.rs`.** `visit_top_level`, `visit_label`, `extract_docstring`, and `extract_label_call_sites` all walked top-level children of the Batch program via `root.child(i)` in an index loop. Refactored: `visit_top_level` materialises children once into a `Vec<TsNode>` via cursor (`collect_children` helper) and downstream helpers take `&[TsNode]` + index instead of `(root, index)`. One O(N) allocation up front, O(1) lookups thereafter, no behavior change.
-- **Same trap fixed in `powershell_extractor.rs::find_descendant_by_kind`.** The iterative DFS pushed children with `current.child(i)` in a `for i in (0..N).rev()` loop. Replaced with a `TreeCursor` walk + `stack[start..].reverse()` to preserve first-child-pops-first order — matches the `complexity.rs::push_children` pattern from 4.14.10.
+- **Same trap fixed in `powershell_extractor.rs::find_descendant_by_kind`.** The iterative DFS pushed children with `current.child(i)` in a `for i in (0..N).rev()` loop. Replaced with a `TreeCursor` walk + `stack[start..].reverse()` to preserve first-child-pops-first order, matches the `complexity.rs::push_children` pattern from 4.14.10.
 - **Same trap fixed in `clojure_extractor.rs::extract_calls`.** Top-level form iteration over `list_lit` children used `node.child(i)` indexed loop. Replaced with cursor stepping (with `goto_next_sibling` `skip` times for the `skip` parameter). Particularly relevant on Clojure files with hundreds of top-level forms.
-- **Same trap fixed in `cobol_extractor.rs::visit_procedure_division`.** The seed pass that collects PROCEDURE DIVISION children into a `Vec` for multi-pass paragraph grouping used `node.child(i)` in a loop — bites on monolithic COBOL files with many paragraphs. Switched to cursor walk; same O(N) materialisation, O(1) downstream indexing.
+- **Same trap fixed in `cobol_extractor.rs::visit_procedure_division`.** The seed pass that collects PROCEDURE DIVISION children into a `Vec` for multi-pass paragraph grouping used `node.child(i)` in a loop, bites on monolithic COBOL files with many paragraphs. Switched to cursor walk; same O(N) materialisation, O(1) downstream indexing.
 
 ## [4.14.10] - 2026-05-16
 
 ### Performance
-- **`count_complexity` (called from every extractor on every function) no longer hits an O(N²) trap on high-fanout AST nodes.** The body-walk in `src/extraction/complexity.rs` seeded its stack and pushed children with `node.child(i)` inside a `for i in 0..N` loop. Tree-sitter's `node.child(i)` is **O(i)** — it walks the linked sibling chain from the first child — so the seed + per-pop push pair was O(N²) for every node along the way. On `kernel/bpf/verifier.c` (20 K lines, monster switch statements with thousands of cases) a single `tracedecay init` showed the progress bar wedged on that one file long enough that users reported it as "stuck"; chromium had files taking ~3 min individually. New `push_children` helper uses a `TreeCursor` (O(1) per sibling step) and reverses the appended slice so LIFO pop order still produces left-to-right traversal. Same fix applied to `extract_call_name`, `extract_macro_name`, and `rightmost_identifier` — all three did the same O(N²) `child(i)` scan over identifier candidates. Measured on `verifier.c` after the fix: 78 ms end-to-end (file read + parse + extract). Includes `examples/bench_extract.rs` so you can re-measure with `cargo run --release --example bench_extract <path-to-c-file>`.
+- **`count_complexity` (called from every extractor on every function) no longer hits an O(N²) trap on high-fanout AST nodes.** The body-walk in `src/extraction/complexity.rs` seeded its stack and pushed children with `node.child(i)` inside a `for i in 0..N` loop. Tree-sitter's `node.child(i)` is **O(i)**, it walks the linked sibling chain from the first child, so the seed + per-pop push pair was O(N²) for every node along the way. On `kernel/bpf/verifier.c` (20 K lines, monster switch statements with thousands of cases) a single `tracedecay init` showed the progress bar wedged on that one file long enough that users reported it as "stuck"; chromium had files taking ~3 min individually. New `push_children` helper uses a `TreeCursor` (O(1) per sibling step) and reverses the appended slice so LIFO pop order still produces left-to-right traversal. Same fix applied to `extract_call_name`, `extract_macro_name`, and `rightmost_identifier`, all three did the same O(N²) `child(i)` scan over identifier candidates. Measured on `verifier.c` after the fix: 78 ms end-to-end (file read + parse + extract). Includes `examples/bench_extract.rs` so you can re-measure with `cargo run --release --example bench_extract <path-to-c-file>`.
 
 ## [4.14.9] - 2026-05-16
 
 ### Fixed
-- **Revert the 4.14.8 `find_dead_code` CTE refactor — it was a massive regression on real repos.** 4.14.8 moved the test-marker name match into `WITH test_marker_ids AS (...)` thinking that would amortise the leading-wildcard `LIKE`. In practice SQLite does not always materialise a single-reference CTE, and `e2.source IN (SELECT id FROM test_marker_ids)` inside a correlated `NOT EXISTS` degenerated into a per-row scan of the full `annotation_usage` table. On scirs (76 K annotation_usage rows, 153 K annotates edges) `tracedecay_dead_code` went from **0.097 s** (pre-4.14.8) to **>60 s timeout**, which hung the MCP probe matrix — every subsequent tool then appeared to time out because the late response poisoned the JSON-RPC id matching (the cascade caveat in `scripts/mcp_probe/README.md`). The original `JOIN nodes a ON a.id = e2.source` form works because `idx_edges_target_kind` narrows to the (typically 0-3) annotates edges per candidate first, then joins via the nodes PK, so the LIKE only runs on that small per-candidate slice. A `Do NOT lift this into a CTE` comment is left at the call site so future refactors don't repeat the mistake. Other 4.14.8 perf changes (SCC frame clone, multi-source BFS, lines cache, dedup'd FTS terms, file-content cache, cycle-path borrowing, inheritance-depth CTE shape, has_bare_call fast path, placeholder builder) are kept as-is.
+- **Revert the 4.14.8 `find_dead_code` CTE refactor, it was a massive regression on real repos.** 4.14.8 moved the test-marker name match into `WITH test_marker_ids AS (...)` thinking that would amortise the leading-wildcard `LIKE`. In practice SQLite does not always materialise a single-reference CTE, and `e2.source IN (SELECT id FROM test_marker_ids)` inside a correlated `NOT EXISTS` degenerated into a per-row scan of the full `annotation_usage` table. On scirs (76 K annotation_usage rows, 153 K annotates edges) `tracedecay_dead_code` went from **0.097 s** (pre-4.14.8) to **>60 s timeout**, which hung the MCP probe matrix, every subsequent tool then appeared to time out because the late response poisoned the JSON-RPC id matching (the cascade caveat in `scripts/mcp_probe/README.md`). The original `JOIN nodes a ON a.id = e2.source` form works because `idx_edges_target_kind` narrows to the (typically 0-3) annotates edges per candidate first, then joins via the nodes PK, so the LIKE only runs on that small per-candidate slice. A `Do NOT lift this into a CTE` comment is left at the call site so future refactors don't repeat the mistake. Other 4.14.8 perf changes (SCC frame clone, multi-source BFS, lines cache, dedup'd FTS terms, file-content cache, cycle-path borrowing, inheritance-depth CTE shape, has_bare_call fast path, placeholder builder) are kept as-is.
 
 ## [4.14.8] - 2026-05-16
 
 ### Performance
-- **Tarjan SCC no longer clones the entire neighbor list per edge visited.** The iterative DFS in `graph/scc.rs` used `work.last_mut().cloned()` on each loop iteration — that deep-copies the top tuple `(node, neighbors, idx)` including the whole `Vec<N>` of neighbors, once per neighbor visited (so ~`out-degree × visits` full Vec clones during a node's life). Rewrote the loop to peek the top frame with `work.last_mut()` and clone only the two values actually needed (`node` and `next`) before any `work.push(...)`. Every SCC consumer benefits: `tracedecay_circular`, `tracedecay_port_order`, and (since 4.14.7) `tracedecay_recursion`.
-- **`tracedecay_diff_context` walks the impact radius once for the union of modified symbols, not once per symbol.** The old loop called `get_impact_radius(node.id, depth)` for every modified node — each call ran an independent BFS from scratch, so any downstream node reachable from K modified ancestors got re-traversed K times. New `GraphTraverser::get_impact_radius_multi(seed_ids, max_depth)` does one BFS seeded with all modified node IDs and a single shared `visited` set; the result has every reachable node visited at most once. Surfaces as `TraceDecay::get_impact_radius_multi`. Particularly impactful on diamond-dependency hotspots (shared utility files reachable from every changed module).
-- **`tracedecay_recursion` caches source-file lines instead of re-splitting on every self-edge check.** `is_direct_self_call` was caching the raw `String` source but then doing `let lines: Vec<&str> = source.lines().collect();` on each call — for a 10 k-line file with N self-edges, that's N × 10 k allocations purely to throw away. Cache changed to `HashMap<String, Option<Vec<String>>>` so the line vector is built once per file.
+- **Tarjan SCC no longer clones the entire neighbor list per edge visited.** The iterative DFS in `graph/scc.rs` used `work.last_mut().cloned()` on each loop iteration, that deep-copies the top tuple `(node, neighbors, idx)` including the whole `Vec<N>` of neighbors, once per neighbor visited (so ~`out-degree × visits` full Vec clones during a node's life). Rewrote the loop to peek the top frame with `work.last_mut()` and clone only the two values actually needed (`node` and `next`) before any `work.push(...)`. Every SCC consumer benefits: `tracedecay_circular`, `tracedecay_port_order`, and (since 4.14.7) `tracedecay_recursion`.
+- **`tracedecay_diff_context` walks the impact radius once for the union of modified symbols, not once per symbol.** The old loop called `get_impact_radius(node.id, depth)` for every modified node, each call ran an independent BFS from scratch, so any downstream node reachable from K modified ancestors got re-traversed K times. New `GraphTraverser::get_impact_radius_multi(seed_ids, max_depth)` does one BFS seeded with all modified node IDs and a single shared `visited` set; the result has every reachable node visited at most once. Surfaces as `TraceDecay::get_impact_radius_multi`. Particularly impactful on diamond-dependency hotspots (shared utility files reachable from every changed module).
+- **`tracedecay_recursion` caches source-file lines instead of re-splitting on every self-edge check.** `is_direct_self_call` was caching the raw `String` source but then doing `let lines: Vec<&str> = source.lines().collect();` on each call, for a 10 k-line file with N self-edges, that's N × 10 k allocations purely to throw away. Cache changed to `HashMap<String, Option<Vec<String>>>` so the line vector is built once per file.
 - **`tracedecay_recursion` cycle-path DFS uses borrowed `&str` and stops once the limit is hit.** `cycle_path_for_scc` / `dfs_cycle_path` previously used `Vec<String>` / `HashSet<String>` on hot paths, allocating a `String` per neighbor visit even though every id already lived in `scc_set`. Switched to `&str` borrows over the SCC's existing storage. The outer loop also sorts SCCs by length first and short-circuits as soon as `cycles.len() == limit`, so we no longer enumerate every cycle in a giant mutually-recursive graph before truncating.
 - **`tracedecay_inheritance_depth` CTE collapses the hierarchy before joining `nodes`.** The recursive CTE produced one row per (leaf, depth) pair across the full hierarchy; the outer SELECT then ran the `file_path LIKE ?` filter over all of them. Wrapped the hierarchy in a `leaf_depths` CTE that `GROUP BY leaf_id` first, so the path filter and node join only see distinct leaves.
-- **`tracedecay_dead_code` resolves the test-marker annotation set in a single CTE pass.** Each candidate dead-code row previously re-evaluated `a.name LIKE '%::test'` (and three more leading-wildcard `LIKE`s) — none of those can use an index, so the cost scaled with `dead-candidates × annotation_usage`. New `WITH test_marker_ids AS (…)` resolves the marker ids once; the dead-code subquery then checks `e2.source IN (SELECT id FROM test_marker_ids)`.
-- **`ContextBuilder::find_entry_points` deduplicates FTS terms across the five search rounds.** Full query, extracted symbols, stem variants, and agent-provided extra keywords overlap heavily (e.g. `symbol "foo"` and `keyword "foo"` produce identical FTS results); each duplicate term cost a full DB roundtrip on the single-connection libsql. Terms are now collected into one ordered, deduplicated list before any `search_nodes` calls — original priority preserved (full query → symbols → stems → keywords) so the `cap`-based early exit still favours higher-signal terms first.
+- **`tracedecay_dead_code` resolves the test-marker annotation set in a single CTE pass.** Each candidate dead-code row previously re-evaluated `a.name LIKE '%::test'` (and three more leading-wildcard `LIKE`s), none of those can use an index, so the cost scaled with `dead-candidates × annotation_usage`. New `WITH test_marker_ids AS (…)` resolves the marker ids once; the dead-code subquery then checks `e2.source IN (SELECT id FROM test_marker_ids)`.
+- **`ContextBuilder::find_entry_points` deduplicates FTS terms across the five search rounds.** Full query, extracted symbols, stem variants, and agent-provided extra keywords overlap heavily (e.g. `symbol "foo"` and `keyword "foo"` produce identical FTS results); each duplicate term cost a full DB roundtrip on the single-connection libsql. Terms are now collected into one ordered, deduplicated list before any `search_nodes` calls, original priority preserved (full query → symbols → stems → keywords) so the `cap`-based early exit still favours higher-signal terms first.
 - **`ContextBuilder` reads each source file at most once per `build_context`.** Both `extract_code_blocks` and `merge_adjacent_blocks` previously called `get_code(node)` which did its own `fs::read_to_string` per call; merging K adjacent blocks meant K disk reads of the same file. Introduced `get_code_cached(node, file_cache)` that consults a shared `HashMap<String, Option<String>>`; `build_context` allocates one cache for the request and threads it through both phases.
-- **`has_bare_call` short-circuits lines with no `(` and rejects substring matches on both identifier boundaries.** Common short names like `new` / `get` / `len` triggered `line.match_indices(name)` over the full line and then filtered post-hoc — pathological on comment/docstring lines that mention the name without calling it. Added a `line.contains('(')` fast path plus an after-byte identifier-boundary check (so `new` no longer pre-matches inside `newer`).
-- **`get_nodes_by_ids` and friends build their `IN (?, ?, …)` placeholder string in one allocation.** Previous `(1..=ids.len()).map(|i| format!("?{i}")).collect()` allocated one `String` per id and an intermediate `Vec<String>` per call — visible on profiles because `traverse_bfs` invokes `get_nodes_by_ids` once per BFS level. New `build_qmark_placeholders(n)` writes `?, ?, ?, …` into a single pre-sized `String`; libsql binds anonymous markers positionally so behaviour is unchanged. Applied at `get_nodes_by_ids`, `batch_incoming_call_counts`, and `search_nodes_by_exact_name`.
+- **`has_bare_call` short-circuits lines with no `(` and rejects substring matches on both identifier boundaries.** Common short names like `new` / `get` / `len` triggered `line.match_indices(name)` over the full line and then filtered post-hoc, pathological on comment/docstring lines that mention the name without calling it. Added a `line.contains('(')` fast path plus an after-byte identifier-boundary check (so `new` no longer pre-matches inside `newer`).
+- **`get_nodes_by_ids` and friends build their `IN (?, ?, …)` placeholder string in one allocation.** Previous `(1..=ids.len()).map(|i| format!("?{i}")).collect()` allocated one `String` per id and an intermediate `Vec<String>` per call, visible on profiles because `traverse_bfs` invokes `get_nodes_by_ids` once per BFS level. New `build_qmark_placeholders(n)` writes `?, ?, ?, …` into a single pre-sized `String`; libsql binds anonymous markers positionally so behaviour is unchanged. Applied at `get_nodes_by_ids`, `batch_incoming_call_counts`, and `search_nodes_by_exact_name`.
 
 ## [4.14.5] - 2026-05-16
 
 ### Fixed
-- **`tracedecay_inheritance_depth` no longer explodes on cyclic / near-cyclic trait-bound graphs.** The recursive CTE in `get_inheritance_depth` had a depth bound of 50 but no cycle detection, so any cycle in the `extends` graph (common in Rust workspaces where generic trait bounds form indirect cycles) made the CTE traverse the cycle up to the depth limit from every entry point. On polkadot-sdk (959 `extends` edges) the query took >60 s and timed out; smaller workspaces (sotf 89, scirs 90, sonium 5) were fine. Fix tracks visited node IDs in a path column and skips recursion when the next target is already in the path — query completes in 0.55 s on polkadot end-to-end through MCP. Regression test `test_get_inheritance_depth_terminates_on_cycle` constructs a 3-node graph with an A↔B cycle and a C→A edge, then asserts the query returns in <2 s with all three nodes reported at finite, bounded depth.
+- **`tracedecay_inheritance_depth` no longer explodes on cyclic / near-cyclic trait-bound graphs.** The recursive CTE in `get_inheritance_depth` had a depth bound of 50 but no cycle detection, so any cycle in the `extends` graph (common in Rust workspaces where generic trait bounds form indirect cycles) made the CTE traverse the cycle up to the depth limit from every entry point. On polkadot-sdk (959 `extends` edges) the query took >60 s and timed out; smaller workspaces (sotf 89, scirs 90, sonium 5) were fine. Fix tracks visited node IDs in a path column and skips recursion when the next target is already in the path, query completes in 0.55 s on polkadot end-to-end through MCP. Regression test `test_get_inheritance_depth_terminates_on_cycle` constructs a 3-node graph with an A↔B cycle and a C→A edge, then asserts the query returns in <2 s with all three nodes reported at finite, bounded depth.
 
 ### Added
-- **`scripts/mcp_probe/` — MCP test-matrix harness.** Drives a fresh `tracedecay serve` MCP server over stdio against a configurable set of real repos and exercises every read-only tool with 5 query variants per language, producing a per-tool / per-repo status table that flags tools needing investigation (errors, timeouts, empty results, perf regressions). Same harness doubles as a benchmark — per-call timings are logged, repos serve as a fixed corpus for cross-version perf comparison. Pluggable per-language probe modules under `tools/`; Rust ships included (`tools/rust.py` exercises all 50 MCP tools). `repos.toml` (overridable via `$TRACEDECAY_PROBE_REPOS`) holds the repo set. JSON-RPC ids are strictly matched in `probe.py::McpClient` so a slow call cannot poison subsequent ones; `isolated.py` adds a fresh-server-per-tool retry loop for tools that already showed a real timeout. `build_matrix.py` renders the log to markdown. Used to find and prove this release's `inheritance_depth` cycle bug; same harness verifies the 4.14.4 fixes stay green across the four real repos (sotf, sonium, scirs, polkadot-sdk).
+- **`scripts/mcp_probe/`. MCP test-matrix harness.** Drives a fresh `tracedecay serve` MCP server over stdio against a configurable set of real repos and exercises every read-only tool with 5 query variants per language, producing a per-tool / per-repo status table that flags tools needing investigation (errors, timeouts, empty results, perf regressions). Same harness doubles as a benchmark, per-call timings are logged, repos serve as a fixed corpus for cross-version perf comparison. Pluggable per-language probe modules under `tools/`; Rust ships included (`tools/rust.py` exercises all 50 MCP tools). `repos.toml` (overridable via `$TRACEDECAY_PROBE_REPOS`) holds the repo set. JSON-RPC ids are strictly matched in `probe.py::McpClient` so a slow call cannot poison subsequent ones; `isolated.py` adds a fresh-server-per-tool retry loop for tools that already showed a real timeout. `build_matrix.py` renders the log to markdown. Used to find and prove this release's `inheritance_depth` cycle bug; same harness verifies the 4.14.4 fixes stay green across the four real repos (sotf, sonium, scirs, polkadot-sdk).
 
 ## [4.14.4] - 2026-05-16
 
 ### Fixed
-- **`tracedecay_doc_coverage` reports public fields, enum variants, constants, statics, type aliases, properties, …** The query previously filtered to `kind IN ('function', 'method', 'class', 'interface', 'trait', 'struct', 'enum', 'module')` — so a Rust file full of `pub` undocumented struct fields reported `total_undocumented: 0` even though `tracedecay_module_api` listed dozens of public symbols on the same file. Kind allow-list expanded to include `field`, `enum_variant`, `const`, `static`, `type_alias`, `property`, `csharp_property`, `record`, `data_class`, `sealed_class`, `object`, `case_class`, `kotlin_object`, `inner_class`, `abstract_method`, `constructor`, `struct_method`, `val`, `var`, `mixin`, `extension`, `union`, `typedef`. Excludes `namespace` and `package` — those are aggregators that almost never carry their own doc and would just drown out actionable items. Single `const` deduplicates the prefix and no-prefix branches. Verified end-to-end on real DBs: `biquad.rs` in sotf went from 0 → 23 undocumented public symbols; polkadot-sdk reports ~51 K with a sensible per-kind breakdown. Regression test `test_get_undocumented_public_symbols_includes_fields_and_variants`.
+- **`tracedecay_doc_coverage` reports public fields, enum variants, constants, statics, type aliases, properties, …** The query previously filtered to `kind IN ('function', 'method', 'class', 'interface', 'trait', 'struct', 'enum', 'module')`, so a Rust file full of `pub` undocumented struct fields reported `total_undocumented: 0` even though `tracedecay_module_api` listed dozens of public symbols on the same file. Kind allow-list expanded to include `field`, `enum_variant`, `const`, `static`, `type_alias`, `property`, `csharp_property`, `record`, `data_class`, `sealed_class`, `object`, `case_class`, `kotlin_object`, `inner_class`, `abstract_method`, `constructor`, `struct_method`, `val`, `var`, `mixin`, `extension`, `union`, `typedef`. Excludes `namespace` and `package`, those are aggregators that almost never carry their own doc and would just drown out actionable items. Single `const` deduplicates the prefix and no-prefix branches. Verified end-to-end on real DBs: `biquad.rs` in sotf went from 0 → 23 undocumented public symbols; polkadot-sdk reports ~51 K with a sensible per-kind breakdown. Regression test `test_get_undocumented_public_symbols_includes_fields_and_variants`.
 - **`tracedecay_dead_code` excludes `#[test]`-annotated functions whose name does NOT start with `test`.** The previous filter was name-prefix-only (`name NOT LIKE 'test%'`), so `#[test] fn from_measurement_slope_excludes_lfe()` and similar leaked through. The libtest harness is an implicit caller that never appears as a graph edge, so without this filter most Rust tests with non-`test*` names got misreported as dead. Detection now walks the `annotates` edges and excludes any node whose annotation_usage name is `'test'`, `'…::test'` (covers `tokio::test`, `async_std::test`), `'wasm_bindgen_test'`, or `'…::wasm_bindgen_test'`. The JOIN is constrained to `a.kind = 'annotation_usage'` to avoid accidental matches. Real-DB impact: sotf 1794 → 540 dead functions (-70 %), sonium 778 → 209 (-73 %), scirs 4 839 → 2 469 (-49 %), polkadot-sdk **12 136 → 2 295 (-81 %)**. Manual spot-check on polkadot confirmed every dropped name is unambiguously a `#[test]` function. Regression test `test_find_dead_code_excludes_test_annotated`.
-- **`tracedecay_ast_grep_rewrite` surfaces a useful message when `ast-grep` exits non-zero with empty stderr.** ast-grep returns exit 1 with completely silent stdout/stderr when its pattern matches 0 nodes or when the file's language can't be inferred from the extension (`.txt`). The previous error string was `"ast-grep failed: "` — empty trailer, no actionable info. New handler falls back through stderr → stdout → an explicit explanation listing likely causes (pattern matched 0 nodes, language not inferred, invalid pattern), plus the exit code and the file + pattern that failed. Regression test `ast_grep_rewrite_surfaces_useful_error_on_empty_stderr`.
-- **`tracedecay_port_status` no longer cross-matches methods that share a name but belong to different parent types.** The match key was `(name.to_lowercase(), kind_compat_group)`, so `Biquad::new` matched `Adaa::new`, `Biquad::process` matched any other `process`, and so on — useless on Rust workspaces where every type has a `new`, `process`, `fmt`, `reset`, etc. Match key now also includes the parent qualifier (stripped of generics — `Biquad<T>` and `Biquad` resolve identically) for kinds that have one (`method`, `field`, `enum_variant`, `struct_method`, `abstract_method`, `constructor`, `csharp_property`, `property`, `val`, `var`); top-level kinds (struct, function, enum, trait) keep name-only matching since their containing context in `qualified_name` is just a file path. Regression tests `port_status_does_not_match_methods_of_different_parents` (Biquad in dir A, Adaa in dir B — must NOT match) and `port_status_matches_methods_with_same_parent_type` (Biquad in both dirs — must match).
-- **`tracedecay_branch_diff` returns an empty diff when base == head instead of erroring.** Previous behaviour was `MCP error -32603: base and head are the same branch`, inconsistent with `tracedecay_pr_context` which already handled the same case by returning empty arrays. Same-ref now returns the normal JSON shape with `summary: {added:0, removed:0, changed:0}`, empty `added`/`removed`/`changed` arrays, and a `note` field explaining the equality — so callers can rely on a single response shape. Regression test `branch_diff_returns_empty_when_base_equals_head`.
+- **`tracedecay_ast_grep_rewrite` surfaces a useful message when `ast-grep` exits non-zero with empty stderr.** ast-grep returns exit 1 with completely silent stdout/stderr when its pattern matches 0 nodes or when the file's language can't be inferred from the extension (`.txt`). The previous error string was `"ast-grep failed: "`, empty trailer, no actionable info. New handler falls back through stderr → stdout → an explicit explanation listing likely causes (pattern matched 0 nodes, language not inferred, invalid pattern), plus the exit code and the file + pattern that failed. Regression test `ast_grep_rewrite_surfaces_useful_error_on_empty_stderr`.
+- **`tracedecay_port_status` no longer cross-matches methods that share a name but belong to different parent types.** The match key was `(name.to_lowercase(), kind_compat_group)`, so `Biquad::new` matched `Adaa::new`, `Biquad::process` matched any other `process`, and so on, useless on Rust workspaces where every type has a `new`, `process`, `fmt`, `reset`, etc. Match key now also includes the parent qualifier (stripped of generics. `Biquad<T>` and `Biquad` resolve identically) for kinds that have one (`method`, `field`, `enum_variant`, `struct_method`, `abstract_method`, `constructor`, `csharp_property`, `property`, `val`, `var`); top-level kinds (struct, function, enum, trait) keep name-only matching since their containing context in `qualified_name` is just a file path. Regression tests `port_status_does_not_match_methods_of_different_parents` (Biquad in dir A, Adaa in dir B, must NOT match) and `port_status_matches_methods_with_same_parent_type` (Biquad in both dirs, must match).
+- **`tracedecay_branch_diff` returns an empty diff when base == head instead of erroring.** Previous behaviour was `MCP error -32603: base and head are the same branch`, inconsistent with `tracedecay_pr_context` which already handled the same case by returning empty arrays. Same-ref now returns the normal JSON shape with `summary: {added:0, removed:0, changed:0}`, empty `added`/`removed`/`changed` arrays, and a `note` field explaining the equality, so callers can rely on a single response shape. Regression test `branch_diff_returns_empty_when_base_equals_head`.
 
 ## [4.14.1] - 2026-05-15
 
 ### Fixed
 - **`tracedecay_search` always ranks definitions above `use` re-exports.** BM25 was scoring short `pub use crate::operator::LinearOperator;` rows highly enough that five re-exports outranked the actual `pub trait LinearOperator { … }` definition. Sort now uses a coarse `kind_tier` as the primary key (defs tier 0, impl tier 1, values/members tier 2, modules tier 3, `use`/`include`/annotation usage tier 4); BM25 score is secondary within a tier. Added a per-row exact-name match boost (+10) so a trait named exactly `Foo` beats a `Method` whose qualified name happens to contain `Foo`. Regression test `search_ranks_trait_definition_above_use_reexports` constructs a trait plus five `pub use` re-exports across sibling modules and asserts the trait is hit #1.
-- **`tracedecay_dead_code` no longer treats `annotates` / `derives_macro` / `contains` edges as "this function is alive" evidence.** Real-world Rust pervasively uses `#[inline]`, `#[derive(Debug)]`, and similar attributes — every annotation_usage node creates an `annotates` edge pointing at the function, which the previous `kind != 'contains'` filter accepted as a live reference. Result on the sonium codebase: 0 dead functions across 5,715. Narrowed the SQL filter to an explicit allowlist of real-use edges: `calls`, `implements`, `extends`, `type_of`, `returns`, `receives`, `uses`. Regression test `dead_code_flags_unreferenced_fn_with_attribute` exercises the `#[inline]` case.
-- **`tracedecay_unused_imports` handles grouped imports (`use std::collections::{HashMap, HashSet};`).** The previous parser treated the literal string `{HashMap, HashSet}` as one identifier and never matched it against the file body, so every grouped import was effectively ignored — explaining the user's "0 unused across 3,404 use nodes" report. A new `identifiers_from_use_path` helper splits grouped/aliased/nested forms (`foo::bar`, `foo::bar as baz`, `foo::{a, b as c}`, `foo::{a, nested::b}`, `foo::{self, bar}`), and the handler now reports one entry per truly-unused identifier with an `unused: <identifier>` field. Regression test `unused_imports_handles_grouped_use` verifies the unused half of a grouped use is flagged while the used half is not.
-- **`tracedecay_changelog` filters deleted-subtree directory entries.** When an entire subtree was removed in a diff, gix yielded a directory-mode deletion entry whose path was gone from disk by the time the post-hoc `is_dir()` check ran — so directories like `crates/sonium-bem` slipped through as `removed_or_not_indexed`. `git_diff_files` now inspects `entry_mode.is_tree()` on each gix `Change` record (addition/modification/deletion/rewrite) and never pushes a tree entry into the changed-files list. The disk-based `is_dir()` filter is kept as belt-and-suspenders for additions/modifications. Regression test `changelog_filters_deleted_directory_entries` synthesises a `git rm -r crates/` commit and asserts no non-`.rs` paths appear in `changed_files`.
-- **`tracedecay_diff_context.modified_symbols` dedupes by node id and dedupes the input `files` array.** Callers that synthesised the file list from upstream tooling (directory walks, multi-source mergers) sometimes passed the same path multiple times — `hmatrix.rs` was reported up to 7× in a row. Added a `modified_seen: HashSet<String>` to guard pushes and an early `files` dedup pass. Regression test `diff_context_dedupes_modified_symbols_on_duplicate_input` passes the same path three times and asserts unique node ids in the output.
+- **`tracedecay_dead_code` no longer treats `annotates` / `derives_macro` / `contains` edges as "this function is alive" evidence.** Real-world Rust pervasively uses `#[inline]`, `#[derive(Debug)]`, and similar attributes, every annotation_usage node creates an `annotates` edge pointing at the function, which the previous `kind != 'contains'` filter accepted as a live reference. Result on the sonium codebase: 0 dead functions across 5,715. Narrowed the SQL filter to an explicit allowlist of real-use edges: `calls`, `implements`, `extends`, `type_of`, `returns`, `receives`, `uses`. Regression test `dead_code_flags_unreferenced_fn_with_attribute` exercises the `#[inline]` case.
+- **`tracedecay_unused_imports` handles grouped imports (`use std::collections::{HashMap, HashSet};`).** The previous parser treated the literal string `{HashMap, HashSet}` as one identifier and never matched it against the file body, so every grouped import was effectively ignored, explaining the user's "0 unused across 3,404 use nodes" report. A new `identifiers_from_use_path` helper splits grouped/aliased/nested forms (`foo::bar`, `foo::bar as baz`, `foo::{a, b as c}`, `foo::{a, nested::b}`, `foo::{self, bar}`), and the handler now reports one entry per truly-unused identifier with an `unused: <identifier>` field. Regression test `unused_imports_handles_grouped_use` verifies the unused half of a grouped use is flagged while the used half is not.
+- **`tracedecay_changelog` filters deleted-subtree directory entries.** When an entire subtree was removed in a diff, gix yielded a directory-mode deletion entry whose path was gone from disk by the time the post-hoc `is_dir()` check ran, so directories like `crates/sonium-bem` slipped through as `removed_or_not_indexed`. `git_diff_files` now inspects `entry_mode.is_tree()` on each gix `Change` record (addition/modification/deletion/rewrite) and never pushes a tree entry into the changed-files list. The disk-based `is_dir()` filter is kept as belt-and-suspenders for additions/modifications. Regression test `changelog_filters_deleted_directory_entries` synthesises a `git rm -r crates/` commit and asserts no non-`.rs` paths appear in `changed_files`.
+- **`tracedecay_diff_context.modified_symbols` dedupes by node id and dedupes the input `files` array.** Callers that synthesised the file list from upstream tooling (directory walks, multi-source mergers) sometimes passed the same path multiple times. `hmatrix.rs` was reported up to 7× in a row. Added a `modified_seen: HashSet<String>` to guard pushes and an early `files` dedup pass. Regression test `diff_context_dedupes_modified_symbols_on_duplicate_input` passes the same path three times and asserts unique node ids in the output.
 - **`tracedecay_pr_context` collapses Cargo.toml into a single `config_summary` entry.** Behaviour was already present; added the regression test `pr_context_collapses_cargo_toml_keys` which synthesises a real git history with a 50-dependency Cargo.toml bump and asserts at most one Cargo.toml entry surfaces (kind = `config_summary`).
-- **`tracedecay_circular` SCC disjointness stress test.** Added `circular_emits_disjoint_sccs_under_load` — five 3-file cycles connected by non-cyclic DAG-style tails — to guard against any future SCC implementation drift that might let a file leak into more than one cycle entry.
+- **`tracedecay_circular` SCC disjointness stress test.** Added `circular_emits_disjoint_sccs_under_load`, five 3-file cycles connected by non-cyclic DAG-style tails, to guard against any future SCC implementation drift that might let a file leak into more than one cycle entry.
 
 ### Added
-- **`tracedecay_port_order` surfaces intra-cycle ordering signals.** Each cycle entry now reports per-symbol `in_cycle_in_degree` and `in_cycle_out_degree`, a file-level `members_in_cycle` breakdown ranked by member count, an explicit `entry_point` (the SCC member with the smallest in-cycle out-degree — leaf-most, the natural starting point), and a `break_point_candidate` (the highest in-cycle in-degree node, the hub whose call sites are the most-effective refactor target). Replaces the previous flat blob of 200+ symbols with no guidance on where to start. Regression test `port_order_provides_intra_cycle_ordering` wires a 4-node SCC with one obvious hub and asserts `break_point_candidate.name == "h"`.
+- **`tracedecay_port_order` surfaces intra-cycle ordering signals.** Each cycle entry now reports per-symbol `in_cycle_in_degree` and `in_cycle_out_degree`, a file-level `members_in_cycle` breakdown ranked by member count, an explicit `entry_point` (the SCC member with the smallest in-cycle out-degree, leaf-most, the natural starting point), and a `break_point_candidate` (the highest in-cycle in-degree node, the hub whose call sites are the most-effective refactor target). Replaces the previous flat blob of 200+ symbols with no guidance on where to start. Regression test `port_order_provides_intra_cycle_ordering` wires a 4-node SCC with one obvious hub and asserts `break_point_candidate.name == "h"`.
 
 ### Changed
 - **`tracedecay_ast_grep_rewrite` is conditionally registered.** The tool is only advertised via `tools/list` when the external `ast-grep` binary is on PATH at server-startup time (cached via `OnceLock` so we don't fork on every `tools/list` request). When the binary is missing, models never see a tool that would immediately return "ast-grep is not installed" on first call. `tracedecay::mcp::tools::ast_grep_available()` is now public; tests in `mcp_handler_test::test_tool_definitions_complete` and `mcp_test::test_tool_definitions_count` branch on it so they pass on hosts with or without the binary installed.
@@ -2505,15 +3356,15 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [4.14.0] - 2026-05-15
 
 ### Fixed
-- **`tracedecay_run_affected_tests` dispatches directly-changed test files.** Previously the handler only walked callers of every node in `changed_paths` — `#[test]` functions are leaves with no callers, so a PR that only touched `tests/foo.rs` returned "no tests cover the changed paths" and skipped running anything. The handler now also dispatches test functions whose file is itself in `changed_paths` (either via `is_test_file` path heuristic or `#[test]` annotation), with the test recorded as covering itself in `covers_source_ids`.
+- **`tracedecay_run_affected_tests` dispatches directly-changed test files.** Previously the handler only walked callers of every node in `changed_paths`. `#[test]` functions are leaves with no callers, so a PR that only touched `tests/foo.rs` returned "no tests cover the changed paths" and skipped running anything. The handler now also dispatches test functions whose file is itself in `changed_paths` (either via `is_test_file` path heuristic or `#[test]` annotation), with the test recorded as covering itself in `covers_source_ids`.
 - **`parse_derives_in_attr_block` handles rustfmt's multi-line derive blocks.** The previous line-bounded scanner only matched `#[derive(...)]` when the closing `)` was on the same line, so rustfmt's split form (`#[derive(\n    Debug,\n    Clone,\n)]`) dropped every derive. The parser now joins the attribute-block lines and scans for `#[derive(` ... `)` across the whole region. Two new unit tests (`parses_multiline_derive_attribute`, `parses_multiline_derive_mixed_with_single_line`) cover the split form.
 - **`tracedecay_diagnose` normalises absolute and backslash paths.** Cargo emits absolute spans when `--manifest-path` points outside cwd, and Windows cargo emits backslash-separated paths; neither matches the indexed forward-slash, project-relative form. `node_at_location` now calls a new `normalize_lookup_path` helper that (1) replaces `\` with `/`, (2) strips the canonicalised project-root prefix for absolutes, and (3) falls back to a raw prefix strip when canonicalisation fails. A diagnostic spanning either form now maps to the correct node.
-- **Resolver kind-compatibility filter now applies to the same-file blocklist branches (bug #11 follow-up).** PR8's filter was wired into the main `try_exact_name_match` / `try_qualified_match` paths but not the two `CROSS_FILE_BLOCKLIST` branches in `try_exact_name_match` and `try_exact_name_match_simple`. Common blocklisted names (`new`, `default`, `clone`, …) could still bind a `Calls` reference to a same-file non-callable — a struct or const sharing the name. Both branches now filter candidates through `kind_compatible` before declaring a same-file match. Regression test `resolver_blocklist_branch_respects_kind_filter` reproduces the case (`struct new` + `caller() { let _ = new(); }`) and asserts callees only include callable kinds.
+- **Resolver kind-compatibility filter now applies to the same-file blocklist branches (bug #11 follow-up).** PR8's filter was wired into the main `try_exact_name_match` / `try_qualified_match` paths but not the two `CROSS_FILE_BLOCKLIST` branches in `try_exact_name_match` and `try_exact_name_match_simple`. Common blocklisted names (`new`, `default`, `clone`, …) could still bind a `Calls` reference to a same-file non-callable, a struct or const sharing the name. Both branches now filter candidates through `kind_compatible` before declaring a same-file match. Regression test `resolver_blocklist_branch_respects_kind_filter` reproduces the case (`struct new` + `caller() { let _ = new(); }`) and asserts callees only include callable kinds.
 
 ## [4.13.0] - 2026-05-15
 
 ### Fixed
-- **Resolver kind-compatibility filter (bug #11)** — `tracedecay_rank --edge-kind implements` (and every downstream tool: `tracedecay_impls`, `tracedecay_type_hierarchy`, `tracedecay_callees`'s trait dispatch, …) was poisoned by the resolver fuzzy-binding `impl Default for X` to whatever local node happened to share the name `Default`. The sonium codebase had a parser `Token` enum with a `Default` variant; 150 manual `impl Default for X` blocks all bound to that one `enum_variant`, swamping the rank tool with junk.
+- **Resolver kind-compatibility filter (bug #11)**. `tracedecay_rank --edge-kind implements` (and every downstream tool: `tracedecay_impls`, `tracedecay_type_hierarchy`, `tracedecay_callees`'s trait dispatch, …) was poisoned by the resolver fuzzy-binding `impl Default for X` to whatever local node happened to share the name `Default`. The sonium codebase had a parser `Token` enum with a `Default` variant; 150 manual `impl Default for X` blocks all bound to that one `enum_variant`, swamping the rank tool with junk.
 - New `kind_compatible(ref_kind, target_kind)` helper in `src/resolution/resolver.rs` enforces a structural matrix:
   - `Implements` / `Extends` / `DerivesMacro` → must target trait/interface/class/abstract-method/sealed-class/annotation/type-alias kinds
   - `Calls` → must target a callable (function/method/struct-method/constructor/abstract-method/arrow-function/procedure/macro)
@@ -2525,153 +3376,153 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [4.12.0] - 2026-05-15
 
 ### Added
-- **`src/graph/scc.rs` — Tarjan's strongly-connected-components algorithm.** Iterative (no recursion, no stack-blow risk on deep graphs), generic over node-id type, returns components in reverse-topological order matching what port ranking needs. Used by both `tracedecay_circular` and `tracedecay_port_order`. Five unit tests cover DAGs, two-node cycles, three-cycle-plus-tail, self-loops, and reverse-topo emission order.
+- **`src/graph/scc.rs`. Tarjan's strongly-connected-components algorithm.** Iterative (no recursion, no stack-blow risk on deep graphs), generic over node-id type, returns components in reverse-topological order matching what port ranking needs. Used by both `tracedecay_circular` and `tracedecay_port_order`. Five unit tests cover DAGs, two-node cycles, three-cycle-plus-tail, self-loops, and reverse-topo emission order.
 
 ### Fixed
-- **`tracedecay_circular` reports one entry per SCC, not per DFS walk (bug #10)** — the previous implementation emitted every distinct DFS path through a cycle, producing 73 overlapping cycle entries on the sonium codebase that all shared a long common tail. `find_circular_dependencies` now computes SCCs via Tarjan and emits one entry per genuine mutually-recursive group, filtering out trivial single-node components that don't have self-loops. The legacy `dfs_cycle_detect` helper and `_legacy_walk_cycles` shim were removed.
-- **`tracedecay_port_order` exposes per-SCC cycle groups (bug #12)** — previously, every unsorted node after Kahn's topological sort was lumped into a single "Mutual dependency — port together" entry, so two disjoint mutually-recursive pairs `(a,b)` and `(c,d)` would render as one mega-cycle and lose all signal. The handler now runs Tarjan on the subgraph of unsorted nodes and emits one cycle entry per non-trivial SCC, with the `files` set of each cycle surfaced so the user has a concrete "break this edge" target. Each entry carries `symbols`, `files`, `size`, and a refined `note`.
+- **`tracedecay_circular` reports one entry per SCC, not per DFS walk (bug #10)**, the previous implementation emitted every distinct DFS path through a cycle, producing 73 overlapping cycle entries on the sonium codebase that all shared a long common tail. `find_circular_dependencies` now computes SCCs via Tarjan and emits one entry per genuine mutually-recursive group, filtering out trivial single-node components that don't have self-loops. The legacy `dfs_cycle_detect` helper and `_legacy_walk_cycles` shim were removed.
+- **`tracedecay_port_order` exposes per-SCC cycle groups (bug #12)**, previously, every unsorted node after Kahn's topological sort was lumped into a single "Mutual dependency, port together" entry, so two disjoint mutually-recursive pairs `(a,b)` and `(c,d)` would render as one mega-cycle and lose all signal. The handler now runs Tarjan on the subgraph of unsorted nodes and emits one cycle entry per non-trivial SCC, with the `files` set of each cycle surfaced so the user has a concrete "break this edge" target. Each entry carries `symbols`, `files`, `size`, and a refined `note`.
 
 ## [4.11.0] - 2026-05-15
 
 ### Fixed
-- **`tracedecay_dependency_depth` no longer follows `implements`/`extends` edges (bug #7)** — the resolver fuzzy-binds `impl Debug for T` and similar across unrelated files, producing chains of spurious file-to-file deps (the report observed a 19-level chain spanning 17 unrelated files terminating in a foreign crate). `build_file_adjacency` now follows only `calls` and `uses` edges. Existing `tracedecay_health` and `tracedecay_circular` callers benefit too — they share the same adjacency builder.
-- **`tracedecay_dead_code` no longer reports 0 on `pub`-heavy codebases (bug #8a)** — two fixes: (1) the `NOT EXISTS` subquery now excludes `Contains` edges, which previously masked every node behind its parent's bookkeeping edge; (2) new `include_public: true` argument opts into auditing pub items with no indexed callers, useful for workspace-internal cleanup. Default behaviour (no flag) still excludes pub items as before.
-- **`tracedecay_unused_imports` no longer returns 0 on real codebases (bug #8b)** — the previous graph-only check tested `incoming.is_empty()`, but every Use node has at least one Contains edge from its parent, so the predicate never fired. New heuristic reads the source file once (cached per file) and checks whether the imported identifier appears as a whole-word token outside the use statement itself; matches what `cargo`'s own unused-import lint does. `pub use` re-exports, glob imports, and `use self::...` are skipped (intentional aliases / out-of-scope for textual heuristics). Three regression tests cover unused-detection, the dead-code Contains-edge bug, and the new `include_public` opt-in.
+- **`tracedecay_dependency_depth` no longer follows `implements`/`extends` edges (bug #7)**, the resolver fuzzy-binds `impl Debug for T` and similar across unrelated files, producing chains of spurious file-to-file deps (the report observed a 19-level chain spanning 17 unrelated files terminating in a foreign crate). `build_file_adjacency` now follows only `calls` and `uses` edges. Existing `tracedecay_health` and `tracedecay_circular` callers benefit too, they share the same adjacency builder.
+- **`tracedecay_dead_code` no longer reports 0 on `pub`-heavy codebases (bug #8a)**, two fixes: (1) the `NOT EXISTS` subquery now excludes `Contains` edges, which previously masked every node behind its parent's bookkeeping edge; (2) new `include_public: true` argument opts into auditing pub items with no indexed callers, useful for workspace-internal cleanup. Default behaviour (no flag) still excludes pub items as before.
+- **`tracedecay_unused_imports` no longer returns 0 on real codebases (bug #8b)**, the previous graph-only check tested `incoming.is_empty()`, but every Use node has at least one Contains edge from its parent, so the predicate never fired. New heuristic reads the source file once (cached per file) and checks whether the imported identifier appears as a whole-word token outside the use statement itself; matches what `cargo`'s own unused-import lint does. `pub use` re-exports, glob imports, and `use self::...` are skipped (intentional aliases / out-of-scope for textual heuristics). Three regression tests cover unused-detection, the dead-code Contains-edge bug, and the new `include_public` opt-in.
 
 ### Changed
-- **`TraceDecay::find_dead_code` signature** — gained an `include_public: bool` parameter. Existing callers (`tracedecay_health`, internal tests) updated to pass `false` to preserve previous semantics.
+- **`TraceDecay::find_dead_code` signature**, gained an `include_public: bool` parameter. Existing callers (`tracedecay_health`, internal tests) updated to pass `false` to preserve previous semantics.
 
 ## [4.10.0] - 2026-05-15
 
 ### Fixed
-- **`tracedecay_body` prefers callable kinds over same-named fields (bug #1)** — sonium hit a case where querying `gmres` returned only a struct field literally named `gmres` and missed the obvious `pub fn gmres(...)`. The handler now does an exact-name DB lookup first (via the PR1 suffix-fallback path) so the function isn't buried under BM25 noise, then sorts matches by `body_kind_preference()`: callable (0) > type def (1) > impl (2) > value (3) > field/variant (4) > use (5).
-- **`tracedecay_changelog` / `commit_context` / `pr_context` no longer list directories (bug #4)** — gix's `for_each_to_obtain_tree` yields directory-level entries when an entire subtree changes. `git_diff_files` now filters out any path that resolves to a directory on disk, so callers see only file paths.
-- **`tracedecay_diff_context.impacted_symbols` dedupes by node id (bug #5)** — diamond dependencies caused the same downstream node to appear 6+ times consecutively. `impacted_seen: HashSet<String>` now guards inserts.
-- **`tracedecay_recursion` drops length-1 self-cycles (bug #6)** — single-node cycles are almost always either resolver fuzzy-binding (`self.push()` cross-bound across distinct impls of the same name) or trivial self-recursion. Cycles with `< 2` distinct nodes are now filtered out before being added to the result set.
-- **`tracedecay_commit_context` / `tracedecay_pr_context` collapse config-file symbols (bug #3)** — Cargo.toml's 50+ dependency keys used to each enumerate as a separate "modified symbol", blowing past 50K tokens on a real diff. Both handlers now emit a single `{kind: "config_summary", file, config_keys: N}` entry per file with role `config` (`*.toml` / `*.yaml` / `*.json` / `*.ini` / `*.cfg` / `*.lock`).
-- **`classify_file_role` no longer flags source files with inline tests as "test" (bug #3 follow-up)** — a `src/foo.rs` with `#[cfg(test)] mod tests` at the bottom keeps role `source`. The "test" bucket is reserved for files that exist purely to host tests (path-based check via `is_test_file`). Three unit tests in `mcp::tools::handlers::git::tests` cover the classification matrix.
-- **Rust extractor emits `Extends` edges for supertrait bounds (bug #9)** — `trait Leaf: Middle + Base` now produces unresolved refs with `EdgeKind::Extends` for each bound, so `tracedecay_inheritance_depth`'s recursive CTE walks Rust supertrait chains correctly. Bound extraction handles `type_identifier`, `scoped_type_identifier`, `generic_type`, and `higher_ranked_trait_bound`. Existing DBs need a re-index (`tracedecay sync --force`) to pick up the new edges.
+- **`tracedecay_body` prefers callable kinds over same-named fields (bug #1)**, sonium hit a case where querying `gmres` returned only a struct field literally named `gmres` and missed the obvious `pub fn gmres(...)`. The handler now does an exact-name DB lookup first (via the PR1 suffix-fallback path) so the function isn't buried under BM25 noise, then sorts matches by `body_kind_preference()`: callable (0) > type def (1) > impl (2) > value (3) > field/variant (4) > use (5).
+- **`tracedecay_changelog` / `commit_context` / `pr_context` no longer list directories (bug #4)**, gix's `for_each_to_obtain_tree` yields directory-level entries when an entire subtree changes. `git_diff_files` now filters out any path that resolves to a directory on disk, so callers see only file paths.
+- **`tracedecay_diff_context.impacted_symbols` dedupes by node id (bug #5)**, diamond dependencies caused the same downstream node to appear 6+ times consecutively. `impacted_seen: HashSet<String>` now guards inserts.
+- **`tracedecay_recursion` drops length-1 self-cycles (bug #6)**, single-node cycles are almost always either resolver fuzzy-binding (`self.push()` cross-bound across distinct impls of the same name) or trivial self-recursion. Cycles with `< 2` distinct nodes are now filtered out before being added to the result set.
+- **`tracedecay_commit_context` / `tracedecay_pr_context` collapse config-file symbols (bug #3)**. Cargo.toml's 50+ dependency keys used to each enumerate as a separate "modified symbol", blowing past 50K tokens on a real diff. Both handlers now emit a single `{kind: "config_summary", file, config_keys: N}` entry per file with role `config` (`*.toml` / `*.yaml` / `*.json` / `*.ini` / `*.cfg` / `*.lock`).
+- **`classify_file_role` no longer flags source files with inline tests as "test" (bug #3 follow-up)**, a `src/foo.rs` with `#[cfg(test)] mod tests` at the bottom keeps role `source`. The "test" bucket is reserved for files that exist purely to host tests (path-based check via `is_test_file`). Three unit tests in `mcp::tools::handlers::git::tests` cover the classification matrix.
+- **Rust extractor emits `Extends` edges for supertrait bounds (bug #9)**. `trait Leaf: Middle + Base` now produces unresolved refs with `EdgeKind::Extends` for each bound, so `tracedecay_inheritance_depth`'s recursive CTE walks Rust supertrait chains correctly. Bound extraction handles `type_identifier`, `scoped_type_identifier`, `generic_type`, and `higher_ranked_trait_bound`. Existing DBs need a re-index (`tracedecay sync --force`) to pick up the new edges.
 
 ## [4.9.0] - 2026-05-15
 
 ### Added
-- **`tracedecay_derives` tool** — surfaces the `#[derive(...)]` macros attached to a type plus the trait + method names each one synthesizes. Closes the dead-end-search gap where calls like `.clone()`, `format!("{:?}", x)`, or `serde_json::to_string(&x)` resolve to methods that never appear in the graph (the impl is generated by the proc-macro at compile time). Accepts either `qualified_name` or `node_id`. Well-known derives carry full info (trait path, method list, source crate); unknown / proc-macro derives surface with `well_known: false` and just the derive name.
-- **`derive_table` module** (`src/derive_table.rs`) — static knowledge of well-known derives (`Debug`, `Clone`, `Copy`, `Default`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Serialize`, `Deserialize`, `Display`, `Error`), each mapped to its canonical trait path and method names. Five unit tests cover known + unknown derives and the `enrich` wrapper.
-- **`derives` field on `tracedecay_node` output for type nodes** — when the queried node is a `Struct` / `Enum` / `Union` / `Record` / `CaseClass` / `DataClass` / `PascalRecord`, the response now includes a `derives` array so callers don't need a second roundtrip just to learn what derives are present.
-- **`TraceDecay::get_derives_for_node(node_id)`** — public helper that re-reads the node's source-file attribute block and parses `#[derive(...)]` directly. The graph's `DerivesMacro` edges are unreliable: the resolver fuzzy-binds std-trait names like `Debug` to nonsense targets (e.g. a `Debug` enum variant in an unrelated test fixture), and the unique constraint on `(source, target, kind, line)` then collapses multiple derives on the same type onto a single edge. Re-parsing from source costs one `fs::read` per node lookup (cheap at typical Rust source sizes) and recovers the full derive list. Five unit tests in `derive_parse_tests` cover single/multi-block derives, qualified paths, mixed attribute kinds, and dedup.
+- **`tracedecay_derives` tool**, surfaces the `#[derive(...)]` macros attached to a type plus the trait + method names each one synthesizes. Closes the dead-end-search gap where calls like `.clone()`, `format!("{:?}", x)`, or `serde_json::to_string(&x)` resolve to methods that never appear in the graph (the impl is generated by the proc-macro at compile time). Accepts either `qualified_name` or `node_id`. Well-known derives carry full info (trait path, method list, source crate); unknown / proc-macro derives surface with `well_known: false` and just the derive name.
+- **`derive_table` module** (`src/derive_table.rs`), static knowledge of well-known derives (`Debug`, `Clone`, `Copy`, `Default`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Hash`, `Serialize`, `Deserialize`, `Display`, `Error`), each mapped to its canonical trait path and method names. Five unit tests cover known + unknown derives and the `enrich` wrapper.
+- **`derives` field on `tracedecay_node` output for type nodes**, when the queried node is a `Struct` / `Enum` / `Union` / `Record` / `CaseClass` / `DataClass` / `PascalRecord`, the response now includes a `derives` array so callers don't need a second roundtrip just to learn what derives are present.
+- **`TraceDecay::get_derives_for_node(node_id)`**, public helper that re-reads the node's source-file attribute block and parses `#[derive(...)]` directly. The graph's `DerivesMacro` edges are unreliable: the resolver fuzzy-binds std-trait names like `Debug` to nonsense targets (e.g. a `Debug` enum variant in an unrelated test fixture), and the unique constraint on `(source, target, kind, line)` then collapses multiple derives on the same type onto a single edge. Re-parsing from source costs one `fs::read` per node lookup (cheap at typical Rust source sizes) and recovers the full derive list. Five unit tests in `derive_parse_tests` cover single/multi-block derives, qualified paths, mixed attribute kinds, and dedup.
 
 ### Changed
-- **Total MCP tools: 59 → 60** — `tracedecay_derives` added.
+- **Total MCP tools: 59 → 60**. `tracedecay_derives` added.
 
 ## [4.8.0] - 2026-05-15
 
 ### Added
-- **`tracedecay_diagnose` tool** — parses raw `cargo check` / `cargo clippy` / `rustc` stderr into structured diagnostics, then maps each one to the smallest containing graph node and (by default) pre-attaches up to 5 callers. Closes the today-an-agent-hand-parses gap: the response includes severity, optional error code (`E0308`, clippy lint name), message, file/line/column, the owning node (id, kind, qualified_name, span), and the call sites the broken code is reachable from. Diagnostics without a `--> file:line:col` span are dropped — they cannot be located. Accepts a `severity` filter (`error` / `warning` / `all`) and a `max_diagnostics` cap (default 50, hard cap 500).
-- **`tracedecay_run_affected_tests` tool** — closes the loop opened by `tracedecay_test_map` / `tracedecay_test_risk`. Given `changed_paths` (or, by default, `git diff --name-only HEAD`), the handler walks the graph to find every test that covers a function/method in those files, then runs `cargo test --no-fail-fast -- <names>` with `kill_on_drop` and a configurable `timeout_secs` (default 300). Parses libtest stdout into JSON `{ test, passed, covers_source_ids[] }` entries plus pass/fail counts and the cargo exit code; trailing stdout/stderr are tailed at 2 KB each so the response stays in budget. `max_tests` defaults to 100 (hard cap 500) so a refactor touching everything doesn't dispatch an unbounded list.
-- **`src/diagnose.rs`** — standalone parser module. Five unit tests cover typed errors (`error[E0308]`), clippy-style headers without codes, summary lines without spans (correctly dropped), multi-diagnostic blocks, and ANSI-prefixed lines.
-- **`TraceDecay::node_at_location(file, line_1based)`** — public helper that returns the smallest-span node containing a 1-based source location. Used by `tracedecay_diagnose`; converts to the internal 0-based representation transparently.
+- **`tracedecay_diagnose` tool**, parses raw `cargo check` / `cargo clippy` / `rustc` stderr into structured diagnostics, then maps each one to the smallest containing graph node and (by default) pre-attaches up to 5 callers. Closes the today-an-agent-hand-parses gap: the response includes severity, optional error code (`E0308`, clippy lint name), message, file/line/column, the owning node (id, kind, qualified_name, span), and the call sites the broken code is reachable from. Diagnostics without a `--> file:line:col` span are dropped, they cannot be located. Accepts a `severity` filter (`error` / `warning` / `all`) and a `max_diagnostics` cap (default 50, hard cap 500).
+- **`tracedecay_run_affected_tests` tool**, closes the loop opened by `tracedecay_test_map` / `tracedecay_test_risk`. Given `changed_paths` (or, by default, `git diff --name-only HEAD`), the handler walks the graph to find every test that covers a function/method in those files, then runs `cargo test --no-fail-fast -- <names>` with `kill_on_drop` and a configurable `timeout_secs` (default 300). Parses libtest stdout into JSON `{ test, passed, covers_source_ids[] }` entries plus pass/fail counts and the cargo exit code; trailing stdout/stderr are tailed at 2 KB each so the response stays in budget. `max_tests` defaults to 100 (hard cap 500) so a refactor touching everything doesn't dispatch an unbounded list.
+- **`src/diagnose.rs`**, standalone parser module. Five unit tests cover typed errors (`error[E0308]`), clippy-style headers without codes, summary lines without spans (correctly dropped), multi-diagnostic blocks, and ANSI-prefixed lines.
+- **`TraceDecay::node_at_location(file, line_1based)`**, public helper that returns the smallest-span node containing a 1-based source location. Used by `tracedecay_diagnose`; converts to the internal 0-based representation transparently.
 
 ### Changed
-- **Total MCP tools: 57 → 59** — `tracedecay_diagnose` and `tracedecay_run_affected_tests` added.
-- **New handler module `src/mcp/tools/handlers/workflow.rs`** — keeps cargo/libtest plumbing out of `graph.rs`, which is for code-graph queries.
+- **Total MCP tools: 57 → 59**. `tracedecay_diagnose` and `tracedecay_run_affected_tests` added.
+- **New handler module `src/mcp/tools/handlers/workflow.rs`**, keeps cargo/libtest plumbing out of `graph.rs`, which is for code-graph queries.
 
 ## [4.7.0] - 2026-05-15
 
 ### Added
-- **`tracedecay_impls` tool** — index of `impl Trait for Type` blocks. Accepts optional `trait` and `type` filters (both short and qualified names). With neither, returns every impl in the graph. Surfaces information that was previously buried behind the second-class `Implements` edge: which types satisfy a given trait, which traits a type implements, and the impl blocks themselves with their files and signatures.
-- **Trait dispatch resolution on `tracedecay_callees`** — when a callee resolves to a method whose enclosing scope is a trait, the handler walks back via `Implements` edges to surface the concrete impl methods reachable through that trait. New entries are tagged `dispatch_via_trait: true` and carry a `dispatch_from` pointer to the trait method. Pass `resolve_dispatch: false` to opt out and get only direct call edges.
-- **`TraceDecay::get_impls(trait, type)`** — public helper backing the new tool.
-- **`TraceDecay::get_trait_dispatch_targets(method)`** — public helper that returns every impl-method satisfying a given trait method, used by `handle_callees` to surface dispatch targets.
+- **`tracedecay_impls` tool**, index of `impl Trait for Type` blocks. Accepts optional `trait` and `type` filters (both short and qualified names). With neither, returns every impl in the graph. Surfaces information that was previously buried behind the second-class `Implements` edge: which types satisfy a given trait, which traits a type implements, and the impl blocks themselves with their files and signatures.
+- **Trait dispatch resolution on `tracedecay_callees`**, when a callee resolves to a method whose enclosing scope is a trait, the handler walks back via `Implements` edges to surface the concrete impl methods reachable through that trait. New entries are tagged `dispatch_via_trait: true` and carry a `dispatch_from` pointer to the trait method. Pass `resolve_dispatch: false` to opt out and get only direct call edges.
+- **`TraceDecay::get_impls(trait, type)`**, public helper backing the new tool.
+- **`TraceDecay::get_trait_dispatch_targets(method)`**, public helper that returns every impl-method satisfying a given trait method, used by `handle_callees` to surface dispatch targets.
 
 ### Changed
-- **Total MCP tools: 56 → 57** — `tracedecay_impls` added.
+- **Total MCP tools: 56 → 57**. `tracedecay_impls` added.
 - **`tracedecay_callees` description and schema** updated to advertise dispatch resolution and the new `resolve_dispatch` argument.
 
 ### Fixed
-- **`tracedecay_search` ranks definitions above references (PR1 follow-up)** — BM25 alone was placing `use foo` statements ahead of the actual `pub fn foo()` definition because both score similarly when the symbol name matches. `TraceDecay::search` now over-fetches and re-ranks: every `NodeKind` carries an explicit bonus (callable defs +3.0, type defs / proto defs +2.5, impl blocks +2.0, values / macros / enum variants +1.0, members +0.5, neutral 0.0, container modules -1.5, annotation usages -2.0, `use` / `include` -3.0). The match is exhaustive so adding a new `NodeKind` forces a re-tune here. Result: searching for `gmres` returns the function before its imports.
-- **`get_nodes_by_qualified_name` falls back to suffix or bare-name match (PR1 follow-up + user feedback)** — strict equality match remains primary. On empty results: queries with `::` retry as `qualified_name LIKE '%::<query>'` (full scan, `LIMIT 50`); queries without `::` retry as `name = ?` using `idx_nodes_name`. Both forms now resolve, e.g. `get_impls`, `TraceDecay::get_impls`, and the full doubled path all return the same row. `tracedecay_signature` and `tracedecay_by_qualified_name` share the lookup so they agree.
-- **Rust extractor no longer doubles the file path in `qualified_name`** — `qualified_prefix()` prepended `self.file_path` even though the file root was already pushed onto `node_stack` at extraction start, producing qnames like `src/foo.rs::src/foo.rs::Type::method`. Now iterates the stack only, yielding `src/foo.rs::Type::method`. Existing DBs will keep the old form until re-indexed (`tracedecay sync --force`).
-- **`get_impls` batches the trait lookup (PR2 review follow-up)** — previously one `get_node_by_id` per impl block (N+1). Now collects every Implements-edge target then issues a single `get_nodes_by_ids` to populate the trait map.
-- **`graph_stale` insertion asserts on non-object results (PR1 review follow-up)** — `handle_tools_call` now `debug_assert!`s that the wrapped tool result is a JSON object before attaching the `graph_stale` field, matching the "crash hard on unknown value" convention so a future handler returning a non-object is caught immediately instead of silently dropping the structured staleness signal.
-- **`cost_to_expand` body heuristic documented as Rust-tuned (PR1 review follow-up)** — the `20 tokens/line` rate over-estimates Haskell/Python by ~2-3x; the doc comment now explicitly says so and notes the single-line floor of 20 tokens, since this number is part of the public tool contract.
+- **`tracedecay_search` ranks definitions above references (PR1 follow-up)**. BM25 alone was placing `use foo` statements ahead of the actual `pub fn foo()` definition because both score similarly when the symbol name matches. `TraceDecay::search` now over-fetches and re-ranks: every `NodeKind` carries an explicit bonus (callable defs +3.0, type defs / proto defs +2.5, impl blocks +2.0, values / macros / enum variants +1.0, members +0.5, neutral 0.0, container modules -1.5, annotation usages -2.0, `use` / `include` -3.0). The match is exhaustive so adding a new `NodeKind` forces a re-tune here. Result: searching for `gmres` returns the function before its imports.
+- **`get_nodes_by_qualified_name` falls back to suffix or bare-name match (PR1 follow-up + user feedback)**, strict equality match remains primary. On empty results: queries with `::` retry as `qualified_name LIKE '%::<query>'` (full scan, `LIMIT 50`); queries without `::` retry as `name = ?` using `idx_nodes_name`. Both forms now resolve, e.g. `get_impls`, `TraceDecay::get_impls`, and the full doubled path all return the same row. `tracedecay_signature` and `tracedecay_by_qualified_name` share the lookup so they agree.
+- **Rust extractor no longer doubles the file path in `qualified_name`**. `qualified_prefix()` prepended `self.file_path` even though the file root was already pushed onto `node_stack` at extraction start, producing qnames like `src/foo.rs::src/foo.rs::Type::method`. Now iterates the stack only, yielding `src/foo.rs::Type::method`. Existing DBs will keep the old form until re-indexed (`tracedecay sync --force`).
+- **`get_impls` batches the trait lookup (PR2 review follow-up)**, previously one `get_node_by_id` per impl block (N+1). Now collects every Implements-edge target then issues a single `get_nodes_by_ids` to populate the trait map.
+- **`graph_stale` insertion asserts on non-object results (PR1 review follow-up)**. `handle_tools_call` now `debug_assert!`s that the wrapped tool result is a JSON object before attaching the `graph_stale` field, matching the "crash hard on unknown value" convention so a future handler returning a non-object is caught immediately instead of silently dropping the structured staleness signal.
+- **`cost_to_expand` body heuristic documented as Rust-tuned (PR1 review follow-up)**, the `20 tokens/line` rate over-estimates Haskell/Python by ~2-3x; the doc comment now explicitly says so and notes the single-line floor of 20 tokens, since this number is part of the public tool contract.
 
 ## [4.6.0] - 2026-05-15
 
 ### Added
-- **`tracedecay_signature` tool** — signature-only lookup by `qualified_name` or `node_id`. Returns visibility, signature string (generics, params, return type, where clauses), docstring, kind, and async flag for matching nodes. No body content. Replaces most agent `Read` calls when only the public-API surface of a symbol is needed.
-- **`graph_stale` field on tool results** — when files referenced by a tool result remain stale after the post-call sync attempt, the JSON-RPC response now carries a top-level `graph_stale: ["path", …]` array plus a machine-parseable `tracedecay_graph_stale: [...]` text marker. The existing human-readable WARNING is preserved. Closes the silent-drift gap where renamed/deleted symbols could return phantom callers/callees without a programmatic signal.
-- **`cost_to_expand` annotation on node results** — `tracedecay_node` and `tracedecay_signature` responses now include `cost_to_expand: { body, full_file }` (approximate tokens) so callers can decide whether to set `include_code=true` before re-querying. Body estimate uses ~20 tokens/line; `full_file` uses indexed `files.size / 4`.
-- **`tracedecay://schema` MCP resource** — markdown resource documenting the on-disk `.tracedecay/tracedecay.db` schema: tables, columns, indexes, FKs, common query recipes (impl-of-trait, top callers, largest functions), and gotchas (content-hashed IDs, trait dispatch, derive macros). Makes the SQLite escape hatch usable without trial-and-error.
-- **`TraceDecay::get_file_size_bytes(path)`** — public helper that returns the indexed byte size of a file (0 when unknown). Backs the `cost_to_expand` full-file estimate.
+- **`tracedecay_signature` tool**, signature-only lookup by `qualified_name` or `node_id`. Returns visibility, signature string (generics, params, return type, where clauses), docstring, kind, and async flag for matching nodes. No body content. Replaces most agent `Read` calls when only the public-API surface of a symbol is needed.
+- **`graph_stale` field on tool results**, when files referenced by a tool result remain stale after the post-call sync attempt, the JSON-RPC response now carries a top-level `graph_stale: ["path", …]` array plus a machine-parseable `tracedecay_graph_stale: [...]` text marker. The existing human-readable WARNING is preserved. Closes the silent-drift gap where renamed/deleted symbols could return phantom callers/callees without a programmatic signal.
+- **`cost_to_expand` annotation on node results**. `tracedecay_node` and `tracedecay_signature` responses now include `cost_to_expand: { body, full_file }` (approximate tokens) so callers can decide whether to set `include_code=true` before re-querying. Body estimate uses ~20 tokens/line; `full_file` uses indexed `files.size / 4`.
+- **`tracedecay://schema` MCP resource**, markdown resource documenting the on-disk `.tracedecay/tracedecay.db` schema: tables, columns, indexes, FKs, common query recipes (impl-of-trait, top callers, largest functions), and gotchas (content-hashed IDs, trait dispatch, derive macros). Makes the SQLite escape hatch usable without trial-and-error.
+- **`TraceDecay::get_file_size_bytes(path)`**, public helper that returns the indexed byte size of a file (0 when unknown). Backs the `cost_to_expand` full-file estimate.
 
 ### Changed
-- **Total MCP tools: 55 → 56** — `tracedecay_signature` added; all existing tools unchanged.
+- **Total MCP tools: 55 → 56**. `tracedecay_signature` added; all existing tools unchanged.
 
 ### Fixed
-- **Clippy: project-wide cleanup to restore `-D warnings`** — 43 pre-existing lib errors and 3 bin errors resolved without behavioral change: module doc comments wrap snake_case tool names in backticks; `bench.rs` uses `write!` instead of `format!(..).push_str`; `extraction_worker.rs` converted to `let…else`; redundant closures in `agents/copilot.rs`, `extraction/haskell_extractor.rs`, `mcp/tools/handlers/memory.rs` replaced with method references; `resolution/resolver.rs` merges identical match arms; `serve.rs` uses `sort_by_key`; `upgrade.rs` uses `is_ok_and`; `main.rs` drops a useless `.into()`.
+- **Clippy: project-wide cleanup to restore `-D warnings`**. 43 pre-existing lib errors and 3 bin errors resolved without behavioral change: module doc comments wrap snake_case tool names in backticks; `bench.rs` uses `write!` instead of `format!(..).push_str`; `extraction_worker.rs` converted to `let…else`; redundant closures in `agents/copilot.rs`, `extraction/haskell_extractor.rs`, `mcp/tools/handlers/memory.rs` replaced with method references; `resolution/resolver.rs` merges identical match arms; `serve.rs` uses `sort_by_key`; `upgrade.rs` uses `is_ok_and`; `main.rs` drops a useless `.into()`.
 
 ## [4.5.1] - 2026-05-15
 
 ### Added
-- **`tracedecay monitor` highlights the last 3 updates** — the most recently active (project, tool) pair renders green, second-to-last orange, third-to-last yellow. Re-firing the same tool moves it to the front rather than duplicating. Cleared on Ctrl+R.
-- **Welcome banner on fresh installs** — when `tracedecay` is invoked with no subcommand and the global DB has zero registered projects, print a cyan welcome that explicitly suggests `tracedecay init` before the existing "Create one now?" prompt. Returning users see no change.
+- **`tracedecay monitor` highlights the last 3 updates**, the most recently active (project, tool) pair renders green, second-to-last orange, third-to-last yellow. Re-firing the same tool moves it to the front rather than duplicating. Cleared on Ctrl+R.
+- **Welcome banner on fresh installs**, when `tracedecay` is invoked with no subcommand and the global DB has zero registered projects, print a cyan welcome that explicitly suggests `tracedecay init` before the existing "Create one now?" prompt. Returning users see no change.
 
 ### Fixed
-- **CI: `clippy::items_after_test_module` denied under Rust 1.95.0** — two test modules from the v4.5.0 work (`gain_tests` in `src/commands.rs`, `gain_format_tests` in `src/display.rs`) were inserted mid-file. Rust 1.95.0 promoted this lint into `clippy::all`, which the project denies project-wide. Both moved to file end.
-- **CI: `cargo fmt` drift across 11 files** — accumulated unwrapped one-line `println!` / `match` / struct literals from the v4.5.0 features; re-formatted to match `rustfmt` expectations.
+- **CI: `clippy::items_after_test_module` denied under Rust 1.95.0**, two test modules from the v4.5.0 work (`gain_tests` in `src/commands.rs`, `gain_format_tests` in `src/display.rs`) were inserted mid-file. Rust 1.95.0 promoted this lint into `clippy::all`, which the project denies project-wide. Both moved to file end.
+- **CI: `cargo fmt` drift across 11 files**, accumulated unwrapped one-line `println!` / `match` / struct literals from the v4.5.0 features; re-formatted to match `rustfmt` expectations.
 
 ## [4.5.0] - 2026-05-15
 
 ### Added
-- **Cross-session memory primitives (3 new MCP tools)** — `tracedecay_record_decision`, `tracedecay_record_code_area`, and `tracedecay_session_recall` persist agent decisions and worked-on paths in the per-project DB so they survive across sessions. `session_recall` uses FTS5 for fuzzy retrieval. Backed by two new tables and an FTS mirror added in schema migration v8.
-- **`tracedecay gain` CLI for the savings ledger** — every MCP tool call now writes an append-only row to a new `savings_ledger` table in the global DB. `tracedecay gain [--all] [--history] [--range 7d] [--json]` reports tokens saved + dollar estimates (Sonnet input pricing, refreshed daily via LiteLLM).
-- **`tracedecay bench` reproducible retrieval benchmark** — runs a fixed query set through `tracedecay_context` and reports retrieval savings vs a full-file baseline (CCE-style methodology). Ships with a 10-query generic default set embedded into the binary (no external file dependency); `--queries <file>` accepts a custom set. Measured **93% mean retrieval savings on tracedecay's own repo** (180K → 3.4K tokens across 10 generic queries).
+- **Cross-session memory primitives (3 new MCP tools)**. `tracedecay_record_decision`, `tracedecay_record_code_area`, and `tracedecay_session_recall` persist agent decisions and worked-on paths in the per-project DB so they survive across sessions. `session_recall` uses FTS5 for fuzzy retrieval. Backed by two new tables and an FTS mirror added in schema migration v8.
+- **`tracedecay gain` CLI for the savings ledger**, every MCP tool call now writes an append-only row to a new `savings_ledger` table in the global DB. `tracedecay gain [--all] [--history] [--range 7d] [--json]` reports tokens saved + dollar estimates (Sonnet input pricing, refreshed daily via LiteLLM).
+- **`tracedecay bench` reproducible retrieval benchmark**, runs a fixed query set through `tracedecay_context` and reports retrieval savings vs a full-file baseline (CCE-style methodology). Ships with a 10-query generic default set embedded into the binary (no external file dependency); `--queries <file>` accepts a custom set. Measured **93% mean retrieval savings on tracedecay's own repo** (180K → 3.4K tokens across 10 generic queries).
 
 ### Changed
-- **Schema bumped from v7 to v8** — adds `memory_decisions`, `memory_code_areas`, and the `memory_decisions_fts` virtual table. Existing user DBs upgrade idempotently via `migrate_v8`; fresh installs use the mirrored DDL in `create_schema`. No breaking changes; existing tools and queries continue to work.
-- **`GlobalDb::open()` refactored to delegate to `GlobalDb::open_at(path)`** — enables test isolation via `tempfile::TempDir` without process-wide `HOME` mutation. The public `open()` API is unchanged.
-- **Total MCP tools: 52 → 55** — three new memory tools added; all existing tools unchanged.
+- **Schema bumped from v7 to v8**, adds `memory_decisions`, `memory_code_areas`, and the `memory_decisions_fts` virtual table. Existing user DBs upgrade idempotently via `migrate_v8`; fresh installs use the mirrored DDL in `create_schema`. No breaking changes; existing tools and queries continue to work.
+- **`GlobalDb::open()` refactored to delegate to `GlobalDb::open_at(path)`**, enables test isolation via `tempfile::TempDir` without process-wide `HOME` mutation. The public `open()` API is unchanged.
+- **Total MCP tools: 52 → 55**, three new memory tools added; all existing tools unchanged.
 
 ### Fixed
-- **`coverage_discipline` health penalty reduced from 10% to 2% (issue #76)** — annotating genuinely untestable functions with `/// skip-test-coverage` was dropping `quality_signal` despite improving `coverage_pct`, because the penalty had no positive counterbalance (coverage doesn't feed into the composite health score). Max penalty reduced so honest annotation is not punished.
+- **`coverage_discipline` health penalty reduced from 10% to 2% (issue #76)**, annotating genuinely untestable functions with `/// skip-test-coverage` was dropping `quality_signal` despite improving `coverage_pct`, because the penalty had no positive counterbalance (coverage doesn't feed into the composite health score). Max penalty reduced so honest annotation is not punished.
 
 ## [4.4.0] - 2026-05-14
 
 ### Fixed
-- **Rust extractor now detects function calls inside macro invocations (issue #72)** — `assert!(check_count(5))` previously only created a Calls edge to `assert`, missing `check_count`. The extractor now walks into `token_tree` nodes inside macros to find nested call patterns.
-- **`test_risk` denominator no longer includes test functions (issue #73)** — functions with `#[test]` annotations and functions inside `::tests::` modules are now excluded from `total_functions` and the coverage percentage denominator.
-- **Rust extractor resolves instance method calls (issue #74)** — `instance.method()` now emits an additional unresolved ref with just the method name, allowing the resolver to match it against `impl` method definitions. Previously only associated function calls (`Type::new()`) were resolved.
+- **Rust extractor now detects function calls inside macro invocations (issue #72)**. `assert!(check_count(5))` previously only created a Calls edge to `assert`, missing `check_count`. The extractor now walks into `token_tree` nodes inside macros to find nested call patterns.
+- **`test_risk` denominator no longer includes test functions (issue #73)**, functions with `#[test]` annotations and functions inside `::tests::` modules are now excluded from `total_functions` and the coverage percentage denominator.
+- **Rust extractor resolves instance method calls (issue #74)**. `instance.method()` now emits an additional unresolved ref with just the method name, allowing the resolver to match it against `impl` method definitions. Previously only associated function calls (`Type::new()`) were resolved.
 
 ### Added
-- **`/// skip-test-coverage` doc comment convention (issue #75)** — mark genuinely untestable functions to exclude them from `test_risk` coverage calculations. The `skipped` count appears in the summary. A `coverage_discipline` health dimension penalises overuse (up to 10% quality signal reduction).
-- **VS Code Insiders support for the Copilot installer (issue #69)** — `tracedecay install --agent copilot` now also configures `Code - Insiders/User/settings.json` alongside the regular VS Code path.
-- **Copilot prompt instructions (issue #70)** — the Copilot installer now writes `copilot-instructions.md` with tracedecay MCP tool guidance to VS Code (`User/prompts/`), VS Code Insiders, and Copilot CLI (`~/.copilot/`).
+- **`/// skip-test-coverage` doc comment convention (issue #75)**, mark genuinely untestable functions to exclude them from `test_risk` coverage calculations. The `skipped` count appears in the summary. A `coverage_discipline` health dimension penalises overuse (up to 10% quality signal reduction).
+- **VS Code Insiders support for the Copilot installer (issue #69)**. `tracedecay install --agent copilot` now also configures `Code - Insiders/User/settings.json` alongside the regular VS Code path.
+- **Copilot prompt instructions (issue #70)**, the Copilot installer now writes `copilot-instructions.md` with tracedecay MCP tool guidance to VS Code (`User/prompts/`), VS Code Insiders, and Copilot CLI (`~/.copilot/`).
 
 ## [4.3.18] - 2026-05-14
 
 ### Fixed
-- **Inline `#[cfg(test)]` test modules are now recognized as test coverage** — `test_map`, `health`, `test_risk`, `affected`, `impact`, and `commit_context` previously only detected tests by file path patterns (`tests/`, `_test.`, etc.). Functions annotated with `#[test]` inside inline `#[cfg(test)] mod tests { ... }` blocks in source files (226 such functions in tracedecay's own codebase) were invisible to coverage analysis. The Rust extractor now emits `Annotates` edges from `#[cfg(test)]` to modules, and all test-detection handlers query `#[test]` annotations via the graph in addition to checking file paths.
-- **`tracedecay serve` resolves the correct project in multi-folder workspaces (issue #66 reopened)** — when multiple projects are registered in the global DB, the `serve` fallback now picks the project closest to cwd (ancestor match first, then descendant match) instead of failing with an ambiguity error. As a last resort, the server peeks at the MCP `initialize` request's `roots` array to discover the workspace folder the client is working in.
+- **Inline `#[cfg(test)]` test modules are now recognized as test coverage**. `test_map`, `health`, `test_risk`, `affected`, `impact`, and `commit_context` previously only detected tests by file path patterns (`tests/`, `_test.`, etc.). Functions annotated with `#[test]` inside inline `#[cfg(test)] mod tests { ... }` blocks in source files (226 such functions in tracedecay's own codebase) were invisible to coverage analysis. The Rust extractor now emits `Annotates` edges from `#[cfg(test)]` to modules, and all test-detection handlers query `#[test]` annotations via the graph in addition to checking file paths.
+- **`tracedecay serve` resolves the correct project in multi-folder workspaces (issue #66 reopened)**, when multiple projects are registered in the global DB, the `serve` fallback now picks the project closest to cwd (ancestor match first, then descendant match) instead of failing with an ambiguity error. As a last resort, the server peeks at the MCP `initialize` request's `roots` array to discover the workspace folder the client is working in.
 
 ## [4.3.17] - 2026-05-14
 
 ### Fixed
-- **`tracedecay upgrade` no longer breaks Homebrew installs (issue #67)** — previously, self-upgrading a Homebrew-managed install mutated the Cellar directly, leaving Homebrew's recorded keg state inconsistent and causing later `brew upgrade` to fail. `tracedecay upgrade` now detects Homebrew installs and delegates to `brew update && brew upgrade tracedecay`. (PR #68, thanks @lesbass)
-- **Exclude globs now match nested directories (issue #64)** — the default `node_modules/**` pattern only excluded top-level `node_modules/`, not nested ones like `projectA/node_modules/`. Changed default to `**/node_modules/**`. Also added `is_excluded_dir()` so bare patterns like `**/dist` correctly prune directories during scanning without requiring a trailing `/**`.
-- **VS Code multi-folder workspaces can now start the Copilot MCP server (issue #66)** — the Copilot config used `${workspaceFolder}` which VS Code cannot resolve in multi-folder workspaces. Dropped in favour of the serve command's built-in project discovery, matching every other agent integration.
+- **`tracedecay upgrade` no longer breaks Homebrew installs (issue #67)**, previously, self-upgrading a Homebrew-managed install mutated the Cellar directly, leaving Homebrew's recorded keg state inconsistent and causing later `brew upgrade` to fail. `tracedecay upgrade` now detects Homebrew installs and delegates to `brew update && brew upgrade tracedecay`. (PR #68, thanks @lesbass)
+- **Exclude globs now match nested directories (issue #64)**, the default `node_modules/**` pattern only excluded top-level `node_modules/`, not nested ones like `projectA/node_modules/`. Changed default to `**/node_modules/**`. Also added `is_excluded_dir()` so bare patterns like `**/dist` correctly prune directories during scanning without requiring a trailing `/**`.
+- **VS Code multi-folder workspaces can now start the Copilot MCP server (issue #66)**, the Copilot config used `${workspaceFolder}` which VS Code cannot resolve in multi-folder workspaces. Dropped in favour of the serve command's built-in project discovery, matching every other agent integration.
 
 ## [4.3.16] - 2026-05-11
 
 ### Fixed
-- **Windows CI failure introduced by v4.3.15's zed regression test** — `test_zed_install_preserves_existing_config` seeded `AppData/Roaming/Zed/settings.json` on Windows, but `zed_config_dir` actually uses `.config/zed/settings.json` on every non-macOS platform (Linux *and* Windows). The hand-written `#[cfg(target_os = "windows")]` branch in the test silently diverged from the production helper, so the test wrote the seed to one path and the install wrote to another — backup never appeared at the seeded location and the test failed. The Windows job (Linux passed, since its branch happened to be correct) was the only one to catch the drift.
+- **Windows CI failure introduced by v4.3.15's zed regression test**. `test_zed_install_preserves_existing_config` seeded `AppData/Roaming/Zed/settings.json` on Windows, but `zed_config_dir` actually uses `.config/zed/settings.json` on every non-macOS platform (Linux *and* Windows). The hand-written `#[cfg(target_os = "windows")]` branch in the test silently diverged from the production helper, so the test wrote the seed to one path and the install wrote to another, backup never appeared at the seeded location and the test failed. The Windows job (Linux passed, since its branch happened to be correct) was the only one to catch the drift.
 
 ### Changed
-- **`AgentIntegration::primary_config_path(home) -> Option<PathBuf>`** — new trait method that returns the single config file the integration rewrites on install/uninstall. Every agent that goes through `safe_write_json_file` or `write_toml_file` implements it (claude, gemini, cursor, opencode, zed, cline, roo-code, copilot, kilo, antigravity, codex); vibe leaves the default `None` because its TOML config is append-only and has no rewrite path. Regression tests in `tests/agent_test.rs` now call `agent.primary_config_path(home)` instead of duplicating platform-conditional path logic — the production helper is the single source of truth, so a future `zed_config_dir`-style change can't drift between tests and reality. A meta-test (`test_every_tested_agent_advertises_primary_config_path`) walks every integration covered by the install regression suite and asserts the method returns `Some(path)` under the test home, so a new integration added without wiring it up fails fast with a clear message instead of producing a confusing missing-backup panic later.
+- **`AgentIntegration::primary_config_path(home) -> Option<PathBuf>`**, new trait method that returns the single config file the integration rewrites on install/uninstall. Every agent that goes through `safe_write_json_file` or `write_toml_file` implements it (claude, gemini, cursor, opencode, zed, cline, roo-code, copilot, kilo, antigravity, codex); vibe leaves the default `None` because its TOML config is append-only and has no rewrite path. Regression tests in `tests/agent_test.rs` now call `agent.primary_config_path(home)` instead of duplicating platform-conditional path logic, the production helper is the single source of truth, so a future `zed_config_dir`-style change can't drift between tests and reality. A meta-test (`test_every_tested_agent_advertises_primary_config_path`) walks every integration covered by the install regression suite and asserts the method returns `Some(path)` under the test home, so a new integration added without wiring it up fails fast with a clear message instead of producing a confusing missing-backup panic later.
 
 ## [4.3.15] - 2026-05-11
 
 ### Fixed
-- **Installing the Codex integration no longer wipes `~/.codex/config.toml` (issue #63)** — `load_toml_file` used `contents.parse::<toml::Value>()`, which in the `toml = "1"` crate parses a single TOML *value* rather than a *document*. Any well-formed `config.toml` therefore parsed as an error and silently fell back to an empty table; `install_mcp_server` then serialized that empty-plus-tracedecay table back over the file, erasing every other key the user had set (model, approval_policy, other `[mcp_servers.*]` entries, comments). `load_toml_file` now uses `toml::from_str::<toml::Table>` so real documents round-trip, returns `Result` instead of swallowing errors, and refuses to overwrite when an existing file cannot be parsed (so a typo or partial edit leaves the original intact for the user to fix). `doctor_check_config`, `install_mcp_server`, `uninstall_mcp_server`, and `CodexIntegration::has_tracedecay` were updated to handle the `Result` shape — the doctor now reports parse errors as a failed check, and `has_tracedecay` returns `false` on parse error rather than panicking.
+- **Installing the Codex integration no longer wipes `~/.codex/config.toml` (issue #63)**. `load_toml_file` used `contents.parse::<toml::Value>()`, which in the `toml = "1"` crate parses a single TOML *value* rather than a *document*. Any well-formed `config.toml` therefore parsed as an error and silently fell back to an empty table; `install_mcp_server` then serialized that empty-plus-tracedecay table back over the file, erasing every other key the user had set (model, approval_policy, other `[mcp_servers.*]` entries, comments). `load_toml_file` now uses `toml::from_str::<toml::Table>` so real documents round-trip, returns `Result` instead of swallowing errors, and refuses to overwrite when an existing file cannot be parsed (so a typo or partial edit leaves the original intact for the user to fix). `doctor_check_config`, `install_mcp_server`, `uninstall_mcp_server`, and `CodexIntegration::has_tracedecay` were updated to handle the `Result` shape, the doctor now reports parse errors as a failed check, and `has_tracedecay` returns `false` on parse error rather than panicking.
 
 ### Changed
 - **Every config-file write across all agent integrations now leaves a `.bak` copy first.** Previously only install paths went through `backup_config_file`; uninstall paths and `doctor` auto-repair paths called `std::fs::write` directly, so a corrupted serialization or a bug in the rewrite logic could destroy the user's settings with no recovery. A new shared `backup_and_write_json` helper (in `src/agents/mod.rs`) wraps `backup_config_file` + `safe_write_json_file` with best-effort error handling suited to uninstall flows. Every agent's uninstall path (claude, cursor, copilot, cline, zed, kilo, roo-code, opencode, gemini) now goes through this helper, as do the claude `doctor` auto-repair and local-settings-cleanup paths. The Codex TOML write path (`write_toml_file`) also creates a `.bak` before writing for the same reason. Eight per-agent install-side regression tests plus a cursor uninstall-side regression test were added to `tests/agent_test.rs` to guard the new invariant.
@@ -2679,152 +3530,152 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [4.3.14] - 2026-05-11
 
 ### Fixed
-- **`tracedecay_body` no longer drops the function's outer closing brace (issue #62)** — `handle_body` returned the source spanning `start_line..end_line`, but stored line fields are tree-sitter rows (0-based) while `extract_lines` was written assuming 1-based inclusive inputs. The mismatch meant `lines[start..end_line]` exclusive — one short, lopping off the trailing `}` (or any language's outer block closer sitting on its own line). Inner braces were unaffected because they were never on the boundary. `extract_lines` now treats inputs as 0-based row indices and slices inclusively, so the returned body is byte-exact usable as an `Edit` tool `old_string`. Regression added in `test_body_returns_full_function_source` (`tests/mcp_handler_test.rs`) — verified failing pre-fix with `body: "\nfn format_greeting(name: &str) -> String {\n    format!(\"Hello, {}!\", name)"` (closing `}` missing).
+- **`tracedecay_body` no longer drops the function's outer closing brace (issue #62)**. `handle_body` returned the source spanning `start_line..end_line`, but stored line fields are tree-sitter rows (0-based) while `extract_lines` was written assuming 1-based inclusive inputs. The mismatch meant `lines[start..end_line]` exclusive, one short, lopping off the trailing `}` (or any language's outer block closer sitting on its own line). Inner braces were unaffected because they were never on the boundary. `extract_lines` now treats inputs as 0-based row indices and slices inclusively, so the returned body is byte-exact usable as an `Edit` tool `old_string`. Regression added in `test_body_returns_full_function_source` (`tests/mcp_handler_test.rs`), verified failing pre-fix with `body: "\nfn format_greeting(name: &str) -> String {\n    format!(\"Hello, {}!\", name)"` (closing `}` missing).
 
 ### Changed
-- **`tracedecay_body` now exposes `start_line` / `end_line` as 1-based file line numbers** — they were previously the raw 0-based tree-sitter row indices, which read as "off by one" against the line numbers any editor or `Edit`-style tool displays. The values now match what users see when they open the file, so the reported `end_line` is the line containing the function's closing brace. The shift is local to `handle_body`; other handlers still expose `node.start_line` as-is.
+- **`tracedecay_body` now exposes `start_line` / `end_line` as 1-based file line numbers**, they were previously the raw 0-based tree-sitter row indices, which read as "off by one" against the line numbers any editor or `Edit`-style tool displays. The values now match what users see when they open the file, so the reported `end_line` is the line containing the function's closing brace. The shift is local to `handle_body`; other handlers still expose `node.start_line` as-is.
 
 ## [4.3.13] - 2026-05-10
 
 ### Changed
-- **Switched to `tree-sitter-grammars/tree-sitter-markdown` (block + inline split parsers)** — the previously-vendored `ikatyang/tree-sitter-markdown` (last updated 2023, GLR-heavy without native frontmatter handling) hung the indexer on otherwise-fine markdown files containing YAML frontmatter. Specifically, the old grammar parsed `---\n…\n---` content as ordinary markdown, where 6/8/10-space-indented YAML lines were simultaneously valid as both deeply-nested list-item continuations and as indented code blocks; tree-sitter's GLR explored all alternatives in parallel, with the surviving-versions count growing exponentially per line. A real-world 18 KB resume.md hung the worker indefinitely; a 4.4 KB minimal reproducer was bisected and is now a regression fixture (`crates/tracedecay-code-extraction/tests/fixtures/markdown_yaml_frontmatter_hang.md`). The new grammar emits an opaque `(minus_metadata)` / `(plus_metadata)` node for frontmatter, so the markdown rules never see the YAML — the same 4.4 KB reproducer parses in ~7 ms, the full 18 KB file in ~16 ms. The markdown extractor was rewritten for the new AST (block parser produces `(atx_heading … heading_content: (inline …))`, headings still become `Module` nodes; the inline parser is run over each `(inline)` byte range via `set_included_ranges` to extract `(inline_link)` for `Uses` edges). All 16 existing markdown extraction tests still pass; 3 new regression tests guard the migration.
+- **Switched to `tree-sitter-grammars/tree-sitter-markdown` (block + inline split parsers)**, the previously-vendored `ikatyang/tree-sitter-markdown` (last updated 2023, GLR-heavy without native frontmatter handling) hung the indexer on otherwise-fine markdown files containing YAML frontmatter. Specifically, the old grammar parsed `---\n…\n---` content as ordinary markdown, where 6/8/10-space-indented YAML lines were simultaneously valid as both deeply-nested list-item continuations and as indented code blocks; tree-sitter's GLR explored all alternatives in parallel, with the surviving-versions count growing exponentially per line. A real-world 18 KB resume.md hung the worker indefinitely; a 4.4 KB minimal reproducer was bisected and is now a regression fixture (`crates/tracedecay-code-extraction/tests/fixtures/markdown_yaml_frontmatter_hang.md`). The new grammar emits an opaque `(minus_metadata)` / `(plus_metadata)` node for frontmatter, so the markdown rules never see the YAML, the same 4.4 KB reproducer parses in ~7 ms, the full 18 KB file in ~16 ms. The markdown extractor was rewritten for the new AST (block parser produces `(atx_heading … heading_content: (inline …))`, headings still become `Module` nodes; the inline parser is run over each `(inline)` byte range via `set_included_ranges` to extract `(inline_link)` for `Uses` edges). All 16 existing markdown extraction tests still pass; 3 new regression tests guard the migration.
 
 ### Added
-- **Per-file extraction timeout** — every extractor round trip is now wrapped in a watchdog (configurable via `extraction_timeout_secs` in `~/.tracedecay/config.toml`, default 60 s). A file whose extractor doesn't respond in time has its worker subprocess killed via `Child::kill()` and is recorded in `SyncResult.skipped_paths` with reason `"extractor timed out (>Ns)"`. Worker crashes (the existing failure path) are now also recorded with reason `"extractor crashed (...)"` instead of disappearing silently. This bounds the worst case for any future grammar pathology — `tracedecay sync` can no longer hang forever on a single malformed file.
+- **Per-file extraction timeout**, every extractor round trip is now wrapped in a watchdog (configurable via `extraction_timeout_secs` in `~/.tracedecay/config.toml`, default 60 s). A file whose extractor doesn't respond in time has its worker subprocess killed via `Child::kill()` and is recorded in `SyncResult.skipped_paths` with reason `"extractor timed out (>Ns)"`. Worker crashes (the existing failure path) are now also recorded with reason `"extractor crashed (...)"` instead of disappearing silently. This bounds the worst case for any future grammar pathology. `tracedecay sync` can no longer hang forever on a single malformed file.
 
 ## [4.3.12] - 2026-05-09
 
 ### Changed
-- **The beta channel is open again** — `tracedecay channel beta` was hard-gated to `"the beta channel is not available at this time"` while the prior 4.5.x beta line was being merged into stable. With v5.0.0-beta.1 published on the prerelease channel, the gate is removed: `switch_channel` now resolves `"beta"` through the same path as `"stable"` and downloads the latest GitHub prerelease. The `unknown channel` error message also lists `beta` as a valid target again.
+- **The beta channel is open again**. `tracedecay channel beta` was hard-gated to `"the beta channel is not available at this time"` while the prior 4.5.x beta line was being merged into stable. With v5.0.0-beta.1 published on the prerelease channel, the gate is removed: `switch_channel` now resolves `"beta"` through the same path as `"stable"` and downloads the latest GitHub prerelease. The `unknown channel` error message also lists `beta` as a valid target again.
 - **Retired the "beta channel has been merged into stable" nudge** in `main.rs`. Beta users (anyone whose binary version contains `-`) used to see the nudge on every invocation; with the channel reopened the nudge is no longer correct. Beta users now stay on beta until they explicitly run `tracedecay channel stable`.
 
 ### Fixed
-- **`tracedecay wipe` no longer leaks the global DB into the wipe set when `$HOME` is symlinked** — the home `.tracedecay` skip relied on lexical path equality, so a user whose `$HOME` resolves through a symlink (e.g. macOS `/Users/x` vs the canonical `/private/var/...`) could see `~/.tracedecay` show up as a wipe target if the descendant walk reached it via the canonical chain. The skip now canonicalizes both the home path and every candidate before comparing.
+- **`tracedecay wipe` no longer leaks the global DB into the wipe set when `$HOME` is symlinked**, the home `.tracedecay` skip relied on lexical path equality, so a user whose `$HOME` resolves through a symlink (e.g. macOS `/Users/x` vs the canonical `/private/var/...`) could see `~/.tracedecay` show up as a wipe target if the descendant walk reached it via the canonical chain. The skip now canonicalizes both the home path and every candidate before comparing.
 
 ### Changed (carried forward from the prior unreleased section)
-- **Descendant walk for `tracedecay wipe` / `tracedecay list` is now iterative with cycle protection** — `find_descendant_tracedecay` used to recurse, which made deep trees a stack-overflow risk and relied entirely on `file_type()` skipping symlinks for cycle safety. It now uses an explicit worklist plus a canonical-path `visited` set, so the walk is bounded even if a directory cycle slips past the symlink filter (e.g. Windows junctions).
-- **`tracedecay doctor` purges stale global-DB entries in batched statements** — purging used to issue one `DELETE` per stale row, which meant N serial round-trips against libsql for a stale-store cleanup (the case that prompted this: 216 deletes). A new `GlobalDb::delete_projects(&[String])` issues one `DELETE … WHERE path IN (…)` per chunk of 256, so the same 216-row purge is now one round-trip.
-- **`gather_local_projects_from` is now a separately-exported helper** — extracts the pure discovery logic from the cwd-driven `gather_local_projects` wrapper so the ancestor + descendant walk can be unit-tested without mutating the process's working directory. Backed by 7 new tests covering cwd / ancestor-only / descendant-only / ancestor+descendant dedup / `node_modules` skip / canonical home-skip / empty-dir.
-- **Cleared `clippy::map_unwrap_or` warning in `display::shuffle_flags`** — the xorshift seed now uses `map_or` instead of `map(...).unwrap_or(...)`. Behavior unchanged.
+- **Descendant walk for `tracedecay wipe` / `tracedecay list` is now iterative with cycle protection**. `find_descendant_tracedecay` used to recurse, which made deep trees a stack-overflow risk and relied entirely on `file_type()` skipping symlinks for cycle safety. It now uses an explicit worklist plus a canonical-path `visited` set, so the walk is bounded even if a directory cycle slips past the symlink filter (e.g. Windows junctions).
+- **`tracedecay doctor` purges stale global-DB entries in batched statements**, purging used to issue one `DELETE` per stale row, which meant N serial round-trips against libsql for a stale-store cleanup (the case that prompted this: 216 deletes). A new `GlobalDb::delete_projects(&[String])` issues one `DELETE … WHERE path IN (…)` per chunk of 256, so the same 216-row purge is now one round-trip.
+- **`gather_local_projects_from` is now a separately-exported helper**, extracts the pure discovery logic from the cwd-driven `gather_local_projects` wrapper so the ancestor + descendant walk can be unit-tested without mutating the process's working directory. Backed by 7 new tests covering cwd / ancestor-only / descendant-only / ancestor+descendant dedup / `node_modules` skip / canonical home-skip / empty-dir.
+- **Cleared `clippy::map_unwrap_or` warning in `display::shuffle_flags`**, the xorshift seed now uses `map_or` instead of `map(...).unwrap_or(...)`. Behavior unchanged.
 
 ## [4.3.11] - 2026-05-09
 
 ### Added
-- **`tracedecay doctor` now reports stale entries in the global DB and offers to purge them** — projects registered in `~/.tracedecay/global.db` whose `.tracedecay/` directory is gone (deleted, moved, or scratch dirs cleaned up by the OS) are listed under the "Global database" section. Up to 10 paths are shown with an "… and N more" tail. When run interactively, the doctor prompts `Purge N stale row(s) from the global DB? [Y/n]`; on confirmation each stale row is deleted via `GlobalDb::delete_project`. When stdin is not a terminal (CI, piped invocation), the stale list is shown as a warning with a hint to re-run interactively.
+- **`tracedecay doctor` now reports stale entries in the global DB and offers to purge them**, projects registered in `~/.tracedecay/global.db` whose `.tracedecay/` directory is gone (deleted, moved, or scratch dirs cleaned up by the OS) are listed under the "Global database" section. Up to 10 paths are shown with an "… and N more" tail. When run interactively, the doctor prompts `Purge N stale row(s) from the global DB? [Y/n]`; on confirmation each stale row is deleted via `GlobalDb::delete_project`. When stdin is not a terminal (CI, piped invocation), the stale list is shown as a warning with a hint to re-run interactively.
 
 ### Fixed
-- **`tracedecay reinstall` now refreshes every detected agent, not just the first one ever installed** — `migrate_installed_agents` previously returned early as soon as `installed_agents` was non-empty. A user who installed agent A and later configured agent B (e.g. installed Copilot first, then Claude) would have only A in the list, so `reinstall` silently skipped B and its tool permissions never got refreshed when new tools shipped. The migration now scans every agent on each call and additively appends any whose tracedecay config exists on disk but is missing from the tracked list. Side effect: a stale `tracedecay install` warning ("N new tracedecay tool(s) not yet permitted") could persist across reinstalls — that no longer happens. The detection logic is also extracted into a pure `detect_missing_installed_agents` helper covered by a regression test that reproduces the original "claude missing when copilot is tracked" scenario.
-- **`tracedecay wipe` warning banner now reaches full width** — the colored title row was 49 visual columns while the `═` rules above and below were 64, producing a short red strip floating between long horizontal lines. The title is now centered and padded with red-background spaces, sandwiched between two blank red rows so the warning reads as a single fixed-width block.
+- **`tracedecay reinstall` now refreshes every detected agent, not just the first one ever installed**. `migrate_installed_agents` previously returned early as soon as `installed_agents` was non-empty. A user who installed agent A and later configured agent B (e.g. installed Copilot first, then Claude) would have only A in the list, so `reinstall` silently skipped B and its tool permissions never got refreshed when new tools shipped. The migration now scans every agent on each call and additively appends any whose tracedecay config exists on disk but is missing from the tracked list. Side effect: a stale `tracedecay install` warning ("N new tracedecay tool(s) not yet permitted") could persist across reinstalls, that no longer happens. The detection logic is also extracted into a pure `detect_missing_installed_agents` helper covered by a regression test that reproduces the original "claude missing when copilot is tracked" scenario.
+- **`tracedecay wipe` warning banner now reaches full width**, the colored title row was 49 visual columns while the `═` rules above and below were 64, producing a short red strip floating between long horizontal lines. The title is now centered and padded with red-background spaces, sandwiched between two blank red rows so the warning reads as a single fixed-width block.
 
 ## [4.3.10] - 2026-05-09
 
 ### Added
-- **`tracedecay list` command for inspecting tracked projects** — `list` shows the same projects `wipe` would target (current folder, ancestors, and descendants), with on-disk `.tracedecay/` size and tokens-saved per row, sorted by tokens-saved descending. `tracedecay list --all` (or `-a`) lists every project tracked in `~/.tracedecay/global.db`, marking entries whose `.tracedecay/` directory has been removed as `(stale)`.
+- **`tracedecay list` command for inspecting tracked projects**. `list` shows the same projects `wipe` would target (current folder, ancestors, and descendants), with on-disk `.tracedecay/` size and tokens-saved per row, sorted by tokens-saved descending. `tracedecay list --all` (or `-a`) lists every project tracked in `~/.tracedecay/global.db`, marking entries whose `.tracedecay/` directory has been removed as `(stale)`.
 
 ### Changed
-- **Country flags in `tracedecay status` are now shuffled on every render** — when more flags are tracked than fit on the line, the row used to always show the same prefix and `…` truncate the rest. Each `status` invocation now applies a Fisher-Yates shuffle (xorshift64 seeded from time + PID) before truncation, so a different sample of contributing countries is shown each time.
+- **Country flags in `tracedecay status` are now shuffled on every render**, when more flags are tracked than fit on the line, the row used to always show the same prefix and `…` truncate the rest. Each `status` invocation now applies a Fisher-Yates shuffle (xorshift64 seeded from time + PID) before truncation, so a different sample of contributing countries is shown each time.
 
 ### Fixed
-- **Tool-permission warning now points at `tracedecay reinstall`** — when new tracedecay tools are detected that aren't yet permitted in the agent config, the warning previously said "Run `tracedecay install` to update", which would re-do the full install. The warning now reads "Run `tracedecay reinstall` to update permissions", which is the right command for refreshing permissions on already-installed agents.
+- **Tool-permission warning now points at `tracedecay reinstall`**, when new tracedecay tools are detected that aren't yet permitted in the agent config, the warning previously said "Run `tracedecay install` to update", which would re-do the full install. The warning now reads "Run `tracedecay reinstall` to update permissions", which is the right command for refreshing permissions on already-installed agents.
 
 ## [4.3.9] - 2026-05-09
 
 ### Added
-- **`tracedecay wipe` command for clearing local DBs** — `wipe` finds every `.tracedecay/tracedecay.db` project in the current folder, all its ancestors, and all its descendants (skipping `node_modules`, `target`, `.git`, `vendor`, `dist`, `build`, `.next`, `.venv`, `__pycache__`, and the user-level `~/.tracedecay/`), then prompts for a `go!` confirmation before removing each `.tracedecay/` directory and its row in the global DB. `tracedecay wipe --all` (or `-a`) instead wipes every project tracked in `~/.tracedecay/global.db` and then deletes the global DB itself, leaving it empty. Both flows display a bordered, blinking warning that lists every target before asking for confirmation.
+- **`tracedecay wipe` command for clearing local DBs**. `wipe` finds every `.tracedecay/tracedecay.db` project in the current folder, all its ancestors, and all its descendants (skipping `node_modules`, `target`, `.git`, `vendor`, `dist`, `build`, `.next`, `.venv`, `__pycache__`, and the user-level `~/.tracedecay/`), then prompts for a `go!` confirmation before removing each `.tracedecay/` directory and its row in the global DB. `tracedecay wipe --all` (or `-a`) instead wipes every project tracked in `~/.tracedecay/global.db` and then deletes the global DB itself, leaving it empty. Both flows display a bordered, blinking warning that lists every target before asking for confirmation.
 
 ## [4.3.8] - 2026-05-06
 
 ### Added
-- **`DISABLE_TRACEDECAY=true` environment variable to opt out per-project (#19)** — when set in the MCP server configuration, the `serve` command exits cleanly without initializing. This lets users selectively disable tracedecay for large projects that consume too much RAM, without removing it from their global agent config.
+- **`DISABLE_TRACEDECAY=true` environment variable to opt out per-project (#19)**, when set in the MCP server configuration, the `serve` command exits cleanly without initializing. This lets users selectively disable tracedecay for large projects that consume too much RAM, without removing it from their global agent config.
 
 ## [4.3.7] - 2026-05-06
 
 ### Fixed
-- **Incremental sync no longer aborts on cross-file edge references (#58)** — `insert_edges` now uses a conditional INSERT that silently skips edges whose source or target node does not yet exist in the database. Additionally, both incremental sync loops now insert all nodes first and queue edges for a second pass, so cross-file edges within the same sync batch always find their targets. Previously, `INSERT OR IGNORE` did not suppress FK violations, causing the sync to abort with `FOREIGN KEY constraint failed`.
+- **Incremental sync no longer aborts on cross-file edge references (#58)**. `insert_edges` now uses a conditional INSERT that silently skips edges whose source or target node does not yet exist in the database. Both incremental sync loops now insert all nodes first and queue edges for a second pass, so cross-file edges within the same sync batch always find their targets. Previously, `INSERT OR IGNORE` did not suppress FK violations, causing the sync to abort with `FOREIGN KEY constraint failed`.
 
 ## [4.3.6] - 2026-05-06
 
 ### Fixed
-- **`upgrade` no longer stops the daemon when release assets aren't ready yet** — the preflight asset check now runs before stopping the daemon, so if CI hasn't finished building the release binaries, the command exits cleanly without disrupting the running MCP server.
+- **`upgrade` no longer stops the daemon when release assets aren't ready yet**, the preflight asset check now runs before stopping the daemon, so if CI hasn't finished building the release binaries, the command exits cleanly without disrupting the running MCP server.
 
 ## [4.3.5] - 2026-05-06
 
 ### Changed
-- **Copilot MCP server now passes the workspace folder to `serve`** — both the VS Code (`mcp.servers.tracedecay`) and the Copilot CLI (`mcpServers.tracedecay`) registrations now launch the daemon as `tracedecay serve -p ${workspaceFolder}` instead of plain `tracedecay serve`. This lets the MCP server scope its index to the active workspace automatically without requiring a manual `-p` flag.
-- **Copilot agent args validation tightened** — tests for `CopilotIntegration` now verify that `"serve"` is strictly the first argument and that all remaining args are limited to `-p` / `${workspaceFolder}`. This prevents silent regressions where extra or reordered flags could be injected into the MCP server launch command.
+- **Copilot MCP server now passes the workspace folder to `serve`**, both the VS Code (`mcp.servers.tracedecay`) and the Copilot CLI (`mcpServers.tracedecay`) registrations now launch the daemon as `tracedecay serve -p ${workspaceFolder}` instead of plain `tracedecay serve`. This lets the MCP server scope its index to the active workspace automatically without requiring a manual `-p` flag.
+- **Copilot agent args validation tightened**, tests for `CopilotIntegration` now verify that `"serve"` is strictly the first argument and that all remaining args are limited to `-p` / `${workspaceFolder}`. This prevents silent regressions where extra or reordered flags could be injected into the MCP server launch command.
 
 ### Fixed
-- **`serve` now falls back to the global project database when CWD discovery fails (#55)** — when VS Code Copilot (or another host) launches `tracedecay serve` with the working directory set to the user's home folder and `${workspaceFolder}` fails to resolve, the server now checks `~/.tracedecay/global.db` for registered projects. If exactly one project is found, it is used automatically; if multiple are found, they are listed on stderr with guidance to pass `-p <path>`.
-- **`insert_at` no longer strips the trailing newline from edited files (#57)** — `str::lines()` discards the final `\n`, so the file was silently rewritten without its POSIX-required trailing newline. The join result now re-appends `\n` when the original file ended with one.
-- **Clippy CI failures resolved** — fixed 6 `deny`-level clippy errors across extractors (identical `if`/`else` blocks in clojure, redundant `trim()` before `split_whitespace` in haskell, `map_or` → `is_some_and`, `Iterator::last` → `next_back` in SQL, `too_many_arguments` allow in haskell `emit`).
-- **Foreign-key violations during incremental sync now point at the recovery path** — when an extractor produces an edge whose source or target is not in the same file's node set, `tracedecay sync` would die with `failed to insert edge: SQLite failure: FOREIGN KEY constraint failed` and no guidance. Full re-index masks this because bulk load disables FK enforcement, so the top-level error handler now detects this specific failure and suggests `tracedecay sync -f`.
-- **Spinner no longer leaks on early exit** — added `Drop` for `Spinner` so when `?` propagates an error mid-sync the worker thread is joined, the line is cleared, and the cursor is restored. Previously the cursor stayed hidden after a failed sync.
+- **`serve` now falls back to the global project database when CWD discovery fails (#55)**, when VS Code Copilot (or another host) launches `tracedecay serve` with the working directory set to the user's home folder and `${workspaceFolder}` fails to resolve, the server now checks `~/.tracedecay/global.db` for registered projects. If exactly one project is found, it is used automatically; if multiple are found, they are listed on stderr with guidance to pass `-p <path>`.
+- **`insert_at` no longer strips the trailing newline from edited files (#57)**. `str::lines()` discards the final `\n`, so the file was silently rewritten without its POSIX-required trailing newline. The join result now re-appends `\n` when the original file ended with one.
+- **Clippy CI failures resolved**, fixed 6 `deny`-level clippy errors across extractors (identical `if`/`else` blocks in clojure, redundant `trim()` before `split_whitespace` in haskell, `map_or` → `is_some_and`, `Iterator::last` → `next_back` in SQL, `too_many_arguments` allow in haskell `emit`).
+- **Foreign-key violations during incremental sync now point at the recovery path**, when an extractor produces an edge whose source or target is not in the same file's node set, `tracedecay sync` would die with `failed to insert edge: SQLite failure: FOREIGN KEY constraint failed` and no guidance. Full re-index masks this because bulk load disables FK enforcement, so the top-level error handler now detects this specific failure and suggests `tracedecay sync -f`.
+- **Spinner no longer leaks on early exit**, added `Drop` for `Spinner` so when `?` propagates an error mid-sync the worker thread is joined, the line is cleared, and the cursor is restored. Previously the cursor stayed hidden after a failed sync.
 
 ## [4.3.4] - 2026-05-02
 
 ### Fixed
-- **`tracedecay sync` no longer hangs on large monorepos with `node_modules` symlinks** — the directory walker now prunes excluded directories (e.g. `node_modules`, `vendor`, `build`) at the `filter_entry` level before descending into them. Previously, exclusions were only checked per-file after the walker had already entered the directory, so monorepo setups where a package manager creates symlinks inside `node_modules` pointing back into source directories (e.g. `../../api`) could cause the scanner to spin indefinitely. Closes #36.
+- **`tracedecay sync` no longer hangs on large monorepos with `node_modules` symlinks**, the directory walker now prunes excluded directories (e.g. `node_modules`, `vendor`, `build`) at the `filter_entry` level before descending into them. Previously, exclusions were only checked per-file after the walker had already entered the directory, so monorepo setups where a package manager creates symlinks inside `node_modules` pointing back into source directories (e.g. `../../api`) could cause the scanner to spin indefinitely. Closes #36.
 
 ## [4.3.3] - 2026-05-02
 
 ### Added
-- **`tracedecay_body`** — new MCP tool that returns the full source body of a symbol by name (function, struct, const, etc.). Collapses search + node lookup + file read into a single call; returns multiple ranked matches when the name is ambiguous.
-- **`tracedecay_todos`** — new MCP tool that finds TODO, FIXME, XXX, HACK, WIP, NOTE, and UNIMPLEMENTED markers across the project. Each result includes the marker kind, file, line, the comment text, and the enclosing symbol name. Filterable by marker kind and path prefix.
+- **`tracedecay_body`**, new MCP tool that returns the full source body of a symbol by name (function, struct, const, etc.). Collapses search + node lookup + file read into a single call; returns multiple ranked matches when the name is ambiguous.
+- **`tracedecay_todos`**, new MCP tool that finds TODO, FIXME, XXX, HACK, WIP, NOTE, and UNIMPLEMENTED markers across the project. Each result includes the marker kind, file, line, the comment text, and the enclosing symbol name. Filterable by marker kind and path prefix.
 
 ### Fixed
-- **SQL (and 8 other new-language) files no longer panic during sync** — `tracedecay-large-treesitters 0.4.0` is now published to crates.io and `Cargo.toml` references the registry version instead of a local path. Users who built 4.3.2 via `cargo install` received the old 0.3.2 grammar bundle (no SQL), causing a panic per `.sql` file. Closes #53.
+- **SQL (and 8 other new-language) files no longer panic during sync**. `tracedecay-large-treesitters 0.4.0` is now published to crates.io and `Cargo.toml` references the registry version instead of a local path. Users who built 4.3.2 via `cargo install` received the old 0.3.2 grammar bundle (no SQL), causing a panic per `.sql` file. Closes #53.
 
 ### Changed
-- **`tracedecay-large-treesitters` dependency pinned to published 0.4.0** — switched from a local path dependency to `"0.4.0"` so `cargo install tracedecay` picks up the full grammar set including SQL, R, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, and F#.
+- **`tracedecay-large-treesitters` dependency pinned to published 0.4.0**, switched from a local path dependency to `"0.4.0"` so `cargo install tracedecay` picks up the full grammar set including SQL, R, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, and F#.
 
 ### Internal
-- **Grammar completeness test** — `ts_provider::tests::all_extractor_keys_are_registered` verifies every language key an extractor passes to `ts_provider::language()` is present in the bundled grammar table. CI will catch mismatches before a release ships.
+- **Grammar completeness test**. `ts_provider::tests::all_extractor_keys_are_registered` verifies every language key an extractor passes to `ts_provider::language()` is present in the bundled grammar table. CI will catch mismatches before a release ships.
 
 ## [4.3.2] - 2026-05-01
 
 ### Added
-- **9 new language extractors — R, SQL, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, F#** — closes the gap between tracedecay and sentrux for functional and data-science languages. Each extractor handles the language's primary top-level constructs and is gated behind its own `lang-*` feature flag, all included in `full`:
-  - **R** (`.r`, `.R`) — function assignments (`foo <- function(...)`), call sites, roxygen2 docstrings. Requires `tracedecay-large-treesitters` ≥ 0.4.0.
-  - **SQL** (`.sql`) — `CREATE TABLE`, `CREATE VIEW`, `CREATE FUNCTION`, `CREATE PROCEDURE` via `tree-sitter-sequel`.
-  - **Julia** (`.jl`) — `function`, `macro`, `struct`, `abstract_definition`, `module` definitions; import/using nodes.
-  - **Haskell** (`.hs`, `.lhs`) — `function`/`bind` declarations, `data_type`/`newtype`, `class`, `instance`, `import` nodes.
-  - **OCaml** (`.ml`, `.mli`) — top-level `let_binding` (function vs const), `type_definition`, `module_definition`, `class_definition`, `open` nodes.
-  - **Clojure** (`.clj`, `.cljs`, `.cljc`) — `defn`/`defmacro`, `ns`, `def`/`defonce`, `defprotocol`/`defrecord`/`deftype` via `list_lit` dispatch on the first symbol.
-  - **Erlang** (`.erl`, `.hrl`) — `fun_decl` with arity-qualified names (`foo/2`), `-module` attribute, `-type`/`-opaque` declarations.
-  - **Elixir** (`.ex`, `.exs`) — `def`/`defp`, `defmodule`, `defmacro`/`defmacrop`, `defstruct` via `call`-node dispatch on the function head.
-  - **F#** (`.fs`, `.fsi`, `.fsx`) — `function_or_value_defn`, `type_definition`, `module_defn`, `namespace`, `open_decl` nodes.
-- **Complexity configs for all 9 new languages** — `R_COMPLEXITY`, `SQL_COMPLEXITY`, `JULIA_COMPLEXITY`, `HASKELL_COMPLEXITY`, `OCAML_COMPLEXITY`, `CLOJURE_COMPLEXITY`, `ERLANG_COMPLEXITY`, `ELIXIR_COMPLEXITY`, `FSHARP_COMPLEXITY` added to `src/extraction/complexity.rs`.
-- **`tracedecay-large-treesitters` 0.4.0** — bundles the 9 new tree-sitter grammars: `tree-sitter-r`, `tree-sitter-sequel`, `tree-sitter-julia`, `tree-sitter-haskell`, `tree-sitter-ocaml`, `tree-sitter-clojure-orchard`, `tree-sitter-erlang`, `tree-sitter-elixir`, `tree-sitter-fsharp`.
+- **9 new language extractors. R, SQL, Julia, Haskell, OCaml, Clojure, Erlang, Elixir, F#**, closes the gap between tracedecay and sentrux for functional and data-science languages. Each extractor handles the language's primary top-level constructs and is gated behind its own `lang-*` feature flag, all included in `full`:
+  - **R** (`.r`, `.R`), function assignments (`foo <- function(...)`), call sites, roxygen2 docstrings. Requires `tracedecay-large-treesitters` ≥ 0.4.0.
+  - **SQL** (`.sql`). `CREATE TABLE`, `CREATE VIEW`, `CREATE FUNCTION`, `CREATE PROCEDURE` via `tree-sitter-sequel`.
+  - **Julia** (`.jl`). `function`, `macro`, `struct`, `abstract_definition`, `module` definitions; import/using nodes.
+  - **Haskell** (`.hs`, `.lhs`). `function`/`bind` declarations, `data_type`/`newtype`, `class`, `instance`, `import` nodes.
+  - **OCaml** (`.ml`, `.mli`), top-level `let_binding` (function vs const), `type_definition`, `module_definition`, `class_definition`, `open` nodes.
+  - **Clojure** (`.clj`, `.cljs`, `.cljc`). `defn`/`defmacro`, `ns`, `def`/`defonce`, `defprotocol`/`defrecord`/`deftype` via `list_lit` dispatch on the first symbol.
+  - **Erlang** (`.erl`, `.hrl`). `fun_decl` with arity-qualified names (`foo/2`), `-module` attribute, `-type`/`-opaque` declarations.
+  - **Elixir** (`.ex`, `.exs`). `def`/`defp`, `defmodule`, `defmacro`/`defmacrop`, `defstruct` via `call`-node dispatch on the function head.
+  - **F#** (`.fs`, `.fsi`, `.fsx`). `function_or_value_defn`, `type_definition`, `module_defn`, `namespace`, `open_decl` nodes.
+- **Complexity configs for all 9 new languages**. `R_COMPLEXITY`, `SQL_COMPLEXITY`, `JULIA_COMPLEXITY`, `HASKELL_COMPLEXITY`, `OCAML_COMPLEXITY`, `CLOJURE_COMPLEXITY`, `ERLANG_COMPLEXITY`, `ELIXIR_COMPLEXITY`, `FSHARP_COMPLEXITY` added to `src/extraction/complexity.rs`.
+- **`tracedecay-large-treesitters` 0.4.0**, bundles the 9 new tree-sitter grammars: `tree-sitter-r`, `tree-sitter-sequel`, `tree-sitter-julia`, `tree-sitter-haskell`, `tree-sitter-ocaml`, `tree-sitter-clojure-orchard`, `tree-sitter-erlang`, `tree-sitter-elixir`, `tree-sitter-fsharp`.
 
 ### Fixed
-- **`tracedecay monitor` displayed temp directories as projects** — MCP clients that create per-request temp directories (names matching `.tmp…`) were appearing as project entries in the monitor. These are now filtered out at render time; the TOTAL line reflects only real projects.
+- **`tracedecay monitor` displayed temp directories as projects**. MCP clients that create per-request temp directories (names matching `.tmp…`) were appearing as project entries in the monitor. These are now filtered out at render time; the TOTAL line reflects only real projects.
 
 ### Changed
-- **`tracedecay monitor` now supports scrolling** — Up/Down arrows scroll one line at a time; PageUp/PageDown scroll one screen. Scroll offset is clamped to the available content and resets to zero on Ctrl+R. Footer hint updated accordingly.
+- **`tracedecay monitor` now supports scrolling**. Up/Down arrows scroll one line at a time; PageUp/PageDown scroll one screen. Scroll offset is clamped to the available content and resets to zero on Ctrl+R. Footer hint updated accordingly.
 
 ## [4.3.1] - 2026-05-01
 
 ### Fixed
-- **`tracedecay_str_replace`, `tracedecay_multi_str_replace`, and `tracedecay_insert_at` silently mutated files for unsupported types (issue #51)** — all three tools write the file to disk and then call `reindex_file` to update the graph. For file types without a registered extractor (e.g. `.css`, `.html`), `reindex_file` returned `Err("unsupported file type: …")`; the `?` propagated that error to the caller, which reported tool failure — but the write had already been committed. The fix changes `reindex_file` to return `Ok(())` early when no extractor is found, so edits to unsupported file types succeed and the graph simply skips reindexing for those files.
+- **`tracedecay_str_replace`, `tracedecay_multi_str_replace`, and `tracedecay_insert_at` silently mutated files for unsupported types (issue #51)**, all three tools write the file to disk and then call `reindex_file` to update the graph. For file types without a registered extractor (e.g. `.css`, `.html`), `reindex_file` returned `Err("unsupported file type: …")`; the `?` propagated that error to the caller, which reported tool failure, but the write had already been committed. The fix changes `reindex_file` to return `Ok(())` early when no extractor is found, so edits to unsupported file types succeed and the graph simply skips reindexing for those files.
 
 ### Changed
-- **Sync duration is now tracked and displayed** — `GraphStats` gains a `last_sync_duration_ms` field persisted to the metadata store. All three sync paths (full index, `sync_single_files`, `sync_with_progress_verbose`) write this value. The status table's sync row now shows the duration inline: `Last sync 2m ago (1.2s)  Full sync 1d ago`. Duration is omitted when the value is unknown (existing databases before this change).
+- **Sync duration is now tracked and displayed**. `GraphStats` gains a `last_sync_duration_ms` field persisted to the metadata store. All three sync paths (full index, `sync_single_files`, `sync_with_progress_verbose`) write this value. The status table's sync row now shows the duration inline: `Last sync 2m ago (1.2s)  Full sync 1d ago`. Duration is omitted when the value is unknown (existing databases before this change).
 
 ## [4.3.0] - 2026-04-30
 
 ### Added
-- **Subprocess-isolated extraction** — every file is now parsed inside a short-lived worker process rather than in the sync process itself. If a tree-sitter grammar segfaults, calls `abort()`, or otherwise terminates by a path Rust cannot intercept, only the worker dies; the pool respawns it, the offending file is logged and skipped, and sync continues. This is a stronger guarantee than the v4.2.1 `catch_unwind` defense, which could only catch Rust panics.
+- **Subprocess-isolated extraction**, every file is now parsed inside a short-lived worker process rather than in the sync process itself. If a tree-sitter grammar segfaults, calls `abort()`, or otherwise terminates by a path Rust cannot intercept, only the worker dies; the pool respawns it, the offending file is logged and skipped, and sync continues. This is a stronger guarantee than the v4.2.1 `catch_unwind` defense, which could only catch Rust panics.
   - The worker is exposed via a hidden subcommand (`tracedecay extract-worker`) that authenticates against the parent through a 256-bit per-spawn token: required as both an env var and as the first 32 bytes on stdin. A user invoking the binary directly hits the missing-env check and exits non-zero. The subcommand is also hidden from `--help`.
   - When `current_exe()` does not point at a real `tracedecay` binary (e.g. under `cargo test`, where the test harness is the running binary), extraction transparently falls back to the in-process path. Tests therefore continue to exercise extractors directly without needing to spawn subprocesses.
   - Defaults to `available_parallelism()` workers; opt out via `TRACEDECAY_DISABLE_SUBPROCESS=1` if needed.
 
 ### Changed
-- Single-file extraction (used by the `tracedecay_str_replace`, `tracedecay_insert_at`, etc. edit tools) still runs in-process — the subprocess overhead is unjustified for one-shot operations and these tools are interactive enough that an extractor crash is immediately visible.
+- Single-file extraction (used by the `tracedecay_str_replace`, `tracedecay_insert_at`, etc. edit tools) still runs in-process, the subprocess overhead is unjustified for one-shot operations and these tools are interactive enough that an extractor crash is immediately visible.
 
 ## [4.2.1] - 2026-04-30
 
 ### Fixed
-- **Sync no longer aborts when a tree-sitter grammar hits an internal assertion (issue #49)** — the vendored `tree-sitter-markdown` C++ scanner contains `assert()` calls that, on certain autolink constructs, called `abort()` and killed the entire `tracedecay sync` process (core-dumped on Linux). Two layers of defense:
+- **Sync no longer aborts when a tree-sitter grammar hits an internal assertion (issue #49)**, the vendored `tree-sitter-markdown` C++ scanner contains `assert()` calls that, on certain autolink constructs, called `abort()` and killed the entire `tracedecay sync` process (core-dumped on Linux). Two layers of defense:
   - Added `.cargo/config.toml` with `CFLAGS=-DNDEBUG` and `CXXFLAGS=-DNDEBUG`. `cc-rs` reads these env vars when compiling vendored grammars in `tracedecay-large-treesitters`'s build script, disabling C/C++ assertions in release builds. A failed assertion now degrades to a malformed parse tree (which the extractor handles gracefully) instead of `SIGABRT`.
   - Added a `safe_extract` helper that wraps every `extractor.extract()` call site with `std::panic::catch_unwind`. A Rust panic from any extractor (malformed input, future bugs) now logs the file path and skips it instead of bringing down the whole sync.
 - See issue #50 for the broader follow-up: migrating to pure-Rust generated parsers via the `--rust` fork of tree-sitter to eliminate this class of failure entirely.
@@ -2832,161 +3683,161 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [4.2.0] - 2026-04-30
 
 ### Added
-- **Health & structural analysis tools** — seven new MCP tools that expose quality insights from the existing code graph:
-  - `tracedecay_health` — composite quality signal (0–10000) from five independent dimensions: acyclicity, depth, equality, redundancy, and modularity. Uses geometric mean so no single dimension can be gamed. Supports `details: true` for per-dimension breakdown.
-  - `tracedecay_gini` — Gini inequality coefficient for any metric (complexity, lines, fan_in, fan_out, members) across files or symbols. Identifies god files and uneven complexity distribution with interpretive labels and ranked outliers.
-  - `tracedecay_dependency_depth` — longest file-level dependency chains (Lakos levelization). Shows transitive fragility that direct coupling metrics miss, with full chain reconstruction after cycle-breaking via Tarjan's SCC.
-  - `tracedecay_dsm` — Design Structure Matrix in three output formats: `stats` (density, cluster count), `clusters` (per-directory edge analysis), and `matrix` (NxN grid with short filenames). Reveals hidden coupling patterns and layering violations.
-  - `tracedecay_test_risk` — risk-weighted test gap analysis combining complexity, fan-in, test coverage, and git churn (90-day window) into a single score. Answers "where should the next test go?" with `include_tested` option for finding weak-test candidates.
-  - `tracedecay_session_start` — saves current health metrics as a JSON baseline for later comparison. Call before starting an AI coding session.
-  - `tracedecay_session_end` — re-computes health and diffs against the session baseline. Reports per-dimension deltas with improved/degraded/unchanged labels, overall pass/fail, and cleans up the baseline file.
-- **Git churn integration** — new `src/graph/git.rs` module shells out to `git log` at runtime to compute per-file commit frequency. Used by `tracedecay_test_risk` as a risk multiplier (log2-scaled) without persisting any data to the tracedecay DB.
-- **File-level DAG builder** — new `build_file_adjacency` method on `GraphQueryManager` constructs a directed file dependency graph from the existing edge data in a single SQL query. Shared foundation for health, depth, DSM, and modularity computations.
+- **Health & structural analysis tools**, seven new MCP tools that expose quality insights from the existing code graph:
+  - `tracedecay_health`, composite quality signal (0–10000) from five independent dimensions: acyclicity, depth, equality, redundancy, and modularity. Uses geometric mean so no single dimension can be gamed. Supports `details: true` for per-dimension breakdown.
+  - `tracedecay_gini`. Gini inequality coefficient for any metric (complexity, lines, fan_in, fan_out, members) across files or symbols. Identifies god files and uneven complexity distribution with interpretive labels and ranked outliers.
+  - `tracedecay_dependency_depth`, longest file-level dependency chains (Lakos levelization). Shows transitive fragility that direct coupling metrics miss, with full chain reconstruction after cycle-breaking via Tarjan's SCC.
+  - `tracedecay_dsm`. Design Structure Matrix in three output formats: `stats` (density, cluster count), `clusters` (per-directory edge analysis), and `matrix` (NxN grid with short filenames). Reveals hidden coupling patterns and layering violations.
+  - `tracedecay_test_risk`, risk-weighted test gap analysis combining complexity, fan-in, test coverage, and git churn (90-day window) into a single score. Answers "where should the next test go?" with `include_tested` option for finding weak-test candidates.
+  - `tracedecay_session_start`, saves current health metrics as a JSON baseline for later comparison. Call before starting an AI coding session.
+  - `tracedecay_session_end`, re-computes health and diffs against the session baseline. Reports per-dimension deltas with improved/degraded/unchanged labels, overall pass/fail, and cleans up the baseline file.
+- **Git churn integration**, new `src/graph/git.rs` module shells out to `git log` at runtime to compute per-file commit frequency. Used by `tracedecay_test_risk` as a risk multiplier (log2-scaled) without persisting any data to the tracedecay DB.
+- **File-level DAG builder**, new `build_file_adjacency` method on `GraphQueryManager` constructs a directed file dependency graph from the existing edge data in a single SQL query. Shared foundation for health, depth, DSM, and modularity computations.
 
 ## [4.1.8] - 2026-04-30
 
 ### Added
-- **`include` config glob** — new `include` field in `.tracedecay/config.json` lets users whitelist hidden (dot-prefixed) paths for indexing. By default, all dot-directories are skipped during sync; paths matching an `include` glob (e.g. `[".github/**"]`) are now walked and indexed. The `exclude` list still applies after inclusion, so `.git/**` and `.tracedecay/**` remain filtered even with broad include patterns.
-- **Markdown extraction** — tree-sitter based markdown parser that extracts headers as `Module` nodes with hierarchical `Contains` edges, and code links as `Uses` edges for cross-reference tracking (PR #47)
+- **`include` config glob**, new `include` field in `.tracedecay/config.json` lets users whitelist hidden (dot-prefixed) paths for indexing. By default, all dot-directories are skipped during sync; paths matching an `include` glob (e.g. `[".github/**"]`) are now walked and indexed. The `exclude` list still applies after inclusion, so `.git/**` and `.tracedecay/**` remain filtered even with broad include patterns.
+- **Markdown extraction**, tree-sitter based markdown parser that extracts headers as `Module` nodes with hierarchical `Contains` edges, and code links as `Uses` edges for cross-reference tracking (PR #47)
 
 ## [4.1.7] - 2026-04-29
 
 ### Fixed
-- **Nested `.gitignore` files were silently ignored** — `git_ignore(true)` in the `ignore` crate relies on git repository detection (walking up to find `.git`) to build the gitignore rule stack. When the walk root was outside a git repo — or in a subdirectory that the crate couldn't trace back to a `.git` — rules in nested `.gitignore` files were never applied. Added `add_custom_ignore_filename(".gitignore")` to the `WalkBuilder`, which makes the crate read every `.gitignore` it encounters as a standalone ignore source regardless of git repo presence. Five regression tests cover: subdirectory exclusion, scope isolation, negation overrides, deep descendant exclusion, and a direct `ignore`-crate sanity check.
+- **Nested `.gitignore` files were silently ignored**. `git_ignore(true)` in the `ignore` crate relies on git repository detection (walking up to find `.git`) to build the gitignore rule stack. When the walk root was outside a git repo, or in a subdirectory that the crate couldn't trace back to a `.git`, rules in nested `.gitignore` files were never applied. Added `add_custom_ignore_filename(".gitignore")` to the `WalkBuilder`, which makes the crate read every `.gitignore` it encounters as a standalone ignore source regardless of git repo presence. Five regression tests cover: subdirectory exclusion, scope isolation, negation overrides, deep descendant exclusion, and a direct `ignore`-crate sanity check.
 
 ## [4.1.6] - 2026-04-29
 
 ### Fixed
-- **`logging/setLevel` returned MethodNotFound on every session start** — the server correctly advertised the `logging` capability in its `initialize` response (required for the `notifications/message` version-warning feature), but had no handler for the `logging/setLevel` request that MCP clients send immediately after. Every session produced a `-32601` error in the client log. The handler now returns an empty success as required by the MCP spec (RFC 5424 log-level filtering is advisory; the server continues to emit notifications at its own discretion).
-- **`java_extraction` panic on empty Javadoc** — parsing a Java file containing a docstring with no content caused a panic (fixes #44).
+- **`logging/setLevel` returned MethodNotFound on every session start**, the server correctly advertised the `logging` capability in its `initialize` response (required for the `notifications/message` version-warning feature), but had no handler for the `logging/setLevel` request that MCP clients send immediately after. Every session produced a `-32601` error in the client log. The handler now returns an empty success as required by the MCP spec (RFC 5424 log-level filtering is advisory; the server continues to emit notifications at its own discretion).
+- **`java_extraction` panic on empty Javadoc**, parsing a Java file containing a docstring with no content caused a panic (fixes #44).
 
 ## [4.1.5] - 2026-04-29
 
 ### Added
-- **Edit primitives for code modification** — four new MCP tools enable Claude and friends to edit files without regex or shell quoting hazards (PR #43 by @pierreaubert):
-  - `tracedecay_str_replace` — replaces a unique `old_str` with `new_str`; fails if 0 or >1 matches, protecting against multi-edit bugs
-  - `tracedecay_multi_str_replace` — applies N `(old, new)` replacements atomically; all-or-nothing transaction
-  - `tracedecay_insert_at` — inserts content before or after a unique anchor string or line number
-  - `tracedecay_ast_grep_rewrite` — structural code rewrite via ast-grep CLI (`--rewrite` mode)
-- **Auto re-indexing** — all four edit tools automatically re-index the modified file in the code graph after writing, keeping the graph in sync without manual steps (PR #43 by @pierreaubert)
+- **Edit primitives for code modification**, four new MCP tools enable Claude and friends to edit files without regex or shell quoting hazards (PR #43 by @pierreaubert):
+  - `tracedecay_str_replace`, replaces a unique `old_str` with `new_str`; fails if 0 or >1 matches, protecting against multi-edit bugs
+  - `tracedecay_multi_str_replace`, applies N `(old, new)` replacements atomically; all-or-nothing transaction
+  - `tracedecay_insert_at`, inserts content before or after a unique anchor string or line number
+  - `tracedecay_ast_grep_rewrite`, structural code rewrite via ast-grep CLI (`--rewrite` mode)
+- **Auto re-indexing**, all four edit tools automatically re-index the modified file in the code graph after writing, keeping the graph in sync without manual steps (PR #43 by @pierreaubert)
 
 ### Performance
-- **Fixed N+1 query patterns in graph traversal** — `traverse_bfs`, `traverse_dfs`, `get_callers`, `get_callees`, `get_file_dependencies`, `get_file_dependents`, and `find_dead_code` were each making a separate database query per node, causing excessive CPU usage on large codebases. All methods now batch-fetch nodes using a single `WHERE id IN (...)` query, reducing database roundtrips from O(N) to O(1). (PR #40 by @pierreaubert)
+- **Fixed N+1 query patterns in graph traversal**. `traverse_bfs`, `traverse_dfs`, `get_callers`, `get_callees`, `get_file_dependencies`, `get_file_dependents`, and `find_dead_code` were each making a separate database query per node, causing excessive CPU usage on large codebases. All methods now batch-fetch nodes using a single `WHERE id IN (...)` query, reducing database roundtrips from O(N) to O(1). (PR #40 by @pierreaubert)
 
 ### Fixed
-- **`find_dead_code` hit SQLite variable limit on large codebases** — the query used `IN (?, ?, …)` binds which SQLite caps at 999 variables; replaced with `NOT EXISTS (SELECT 1 FROM edges WHERE …)` to avoid the limit entirely. (PR #43 by @pierreaubert)
-- **`tracedecay_test_map` failed to resolve cross-crate qualified calls** — when a reference contained `::` (e.g. `crate_name::func`), a failed qualified-name match returned `None` without falling back to a simple-name lookup, breaking test coverage queries for integration tests that call across crate boundaries. Fixed by removing the early return and adding a simple-name fallback that strips the qualifier before matching. (PR #43 by @pierreaubert)
-- **Sync frequency reduced and stale-warning auto-sync added** — sync interval dropped from its previous default to 2 s (configurable); the MCP server now automatically triggers a live sync when an agent receives a stale-graph warning, avoiding a manual `tracedecay sync` round-trip. (PR #43 by @pierreaubert)
-- **`TOOL_NAMES` and `EXPECTED_TOOL_PERMS` were static** — `doctor` and `install` would not detect or register newly-introduced MCP tools. Both lists are now built dynamically so adding a tool automatically propagates to health checks and permission installation. (PR #43 by @pierreaubert)
-- **`tracedecay monitor` now groups output per project then per tool** — previously all tool calls were listed in a flat stream; entries are now grouped by project path first, then by tool name, making it easier to see which project is driving activity. (PR #43 by @pierreaubert)
+- **`find_dead_code` hit SQLite variable limit on large codebases**, the query used `IN (?, ?, …)` binds which SQLite caps at 999 variables; replaced with `NOT EXISTS (SELECT 1 FROM edges WHERE …)` to avoid the limit entirely. (PR #43 by @pierreaubert)
+- **`tracedecay_test_map` failed to resolve cross-crate qualified calls**, when a reference contained `::` (e.g. `crate_name::func`), a failed qualified-name match returned `None` without falling back to a simple-name lookup, breaking test coverage queries for integration tests that call across crate boundaries. Fixed by removing the early return and adding a simple-name fallback that strips the qualifier before matching. (PR #43 by @pierreaubert)
+- **Sync frequency reduced and stale-warning auto-sync added**, sync interval dropped from its previous default to 2 s (configurable); the MCP server now automatically triggers a live sync when an agent receives a stale-graph warning, avoiding a manual `tracedecay sync` round-trip. (PR #43 by @pierreaubert)
+- **`TOOL_NAMES` and `EXPECTED_TOOL_PERMS` were static**. `doctor` and `install` would not detect or register newly-introduced MCP tools. Both lists are now built dynamically so adding a tool automatically propagates to health checks and permission installation. (PR #43 by @pierreaubert)
+- **`tracedecay monitor` now groups output per project then per tool**, previously all tool calls were listed in a flat stream; entries are now grouped by project path first, then by tool name, making it easier to see which project is driving activity. (PR #43 by @pierreaubert)
 
 ## [4.1.4] - 2026-04-25
 
 ### Fixed
-- **`tracedecay monitor` panicked on macOS/Linux with "Cannot start a runtime from within a runtime" (issue #39)** — the previous fix for the Windows panic kept a Unix-only branch that built a new `tokio::runtime` and called `block_on` from inside `#[tokio::main]`, which panics on every platform, not just Windows. `refresh_cost_cache` now uses `block_in_place + Handle::current().block_on` unconditionally, since `monitor::run()` is always invoked from the existing multi-threaded runtime.
+- **`tracedecay monitor` panicked on macOS/Linux with "Cannot start a runtime from within a runtime" (issue #39)**, the previous fix for the Windows panic kept a Unix-only branch that built a new `tokio::runtime` and called `block_on` from inside `#[tokio::main]`, which panics on every platform, not just Windows. `refresh_cost_cache` now uses `block_in_place + Handle::current().block_on` unconditionally, since `monitor::run()` is always invoked from the existing multi-threaded runtime.
 
 ## [4.1.3] - 2026-04-24
 
 ### Fixed
-- **Backslashed Windows hook paths never self-healed (issue #38)** — the v4.0.2 fix for #20 normalized `which_tracedecay()` output but could not rewrite existing settings. `install_single_hook` is idempotent by presence, so when a tracedecay hook already existed with a backslashed path, the silent backfill in `check_install_stale` left it untouched. Additionally, the backfill only scanned `~/.claude/settings.json` — project-level `.claude/settings.json` and `.claude/settings.local.json` were never touched, so opening a previously-configured project could still trigger `bash: C:Usersalkamscoopappstracedecaycurrenttracedecay.exe: command not found`. Fixed with a new `normalize_hook_command_paths` pass that rewrites any backslash-containing tracedecay hook command to forward slashes, and by extending the backfill to the current project's `.claude` directory.
+- **Backslashed Windows hook paths never self-healed (issue #38)**, the v4.0.2 fix for #20 normalized `which_tracedecay()` output but could not rewrite existing settings. `install_single_hook` is idempotent by presence, so when a tracedecay hook already existed with a backslashed path, the silent backfill in `check_install_stale` left it untouched. The backfill only scanned `~/.claude/settings.json`, project-level `.claude/settings.json` and `.claude/settings.local.json` were never touched, so opening a previously-configured project could still trigger `bash: C:Usersalkamscoopappstracedecaycurrenttracedecay.exe: command not found`. Fixed with a new `normalize_hook_command_paths` pass that rewrites any backslash-containing tracedecay hook command to forward slashes, and by extending the backfill to the current project's `.claude` directory.
 
 ## [4.1.2] - 2026-04-22
 
 ### Added
-- **Mistral Vibe agent integration** — `tracedecay install --agent vibe` registers the tracedecay MCP server in Vibe's `~/.vibe/config.toml` as a `[[mcp_servers]]` stdio entry, and appends prompt rules to `~/.vibe/prompts/cli.md`. Supports install, uninstall, and healthcheck. Respects the `VIBE_HOME` environment variable. Closes #37.
+- **Mistral Vibe agent integration**. `tracedecay install --agent vibe` registers the tracedecay MCP server in Vibe's `~/.vibe/config.toml` as a `[[mcp_servers]]` stdio entry, and appends prompt rules to `~/.vibe/prompts/cli.md`. Supports install, uninstall, and healthcheck. Respects the `VIBE_HOME` environment variable. Closes #37.
 
 ## [4.1.1] - 2026-04-22
 
 ### Added
-- **`tracedecay sync --verbose` (`-v`)** — prints per-phase diagnostic lines during sync to help diagnose slow or stuck syncs on large repos. Shows file counts, change breakdowns, and timings for each phase (scan, stat-check, hash, content check, index, resolve, DB write). Also works with `--force` full re-index. Addresses #36.
+- **`tracedecay sync --verbose` (`-v`)**, prints per-phase diagnostic lines during sync to help diagnose slow or stuck syncs on large repos. Shows file counts, change breakdowns, and timings for each phase (scan, stat-check, hash, content check, index, resolve, DB write). Also works with `--force` full re-index. Addresses #36.
 
 ## [4.1.0] - 2026-04-20
 
 ### Added
-- **Walk-up project discovery** — `tracedecay serve`, `tracedecay sync`, and `tracedecay status` now walk up the directory tree to find the nearest `.tracedecay/` database when no `--path` is given. This means you can launch an AI agent from a subdirectory of your project and tracedecay will find the index automatically — similar to how git finds `.git/`. `tracedecay init` is unchanged and always creates a new project at the target directory.
-- **Subdirectory scope filtering** — when the MCP server is started from a subdirectory, listing and discovery tools (`tracedecay_files`, `tracedecay_search`, `tracedecay_context`, `tracedecay_dead_code`, `tracedecay_rank`, `tracedecay_largest`, `tracedecay_coupling`, `tracedecay_complexity`, `tracedecay_doc_coverage`, `tracedecay_god_class`, `tracedecay_unused_imports`, `tracedecay_hotspots`, and others) automatically scope results to that subdirectory. Graph traversal tools (`tracedecay_callers`, `tracedecay_callees`, `tracedecay_impact`, `tracedecay_affected`, `tracedecay_type_hierarchy`) remain unscoped so cross-directory relationships are preserved. The user can always override the scope by providing an explicit `path` parameter. `tracedecay_status` reports the active scope prefix when one is in effect.
+- **Walk-up project discovery**. `tracedecay serve`, `tracedecay sync`, and `tracedecay status` now walk up the directory tree to find the nearest `.tracedecay/` database when no `--path` is given. This means you can launch an AI agent from a subdirectory of your project and tracedecay will find the index automatically, similar to how git finds `.git/`. `tracedecay init` is unchanged and always creates a new project at the target directory.
+- **Subdirectory scope filtering**, when the MCP server is started from a subdirectory, listing and discovery tools (`tracedecay_files`, `tracedecay_search`, `tracedecay_context`, `tracedecay_dead_code`, `tracedecay_rank`, `tracedecay_largest`, `tracedecay_coupling`, `tracedecay_complexity`, `tracedecay_doc_coverage`, `tracedecay_god_class`, `tracedecay_unused_imports`, `tracedecay_hotspots`, and others) automatically scope results to that subdirectory. Graph traversal tools (`tracedecay_callers`, `tracedecay_callees`, `tracedecay_impact`, `tracedecay_affected`, `tracedecay_type_hierarchy`) remain unscoped so cross-directory relationships are preserved. The user can always override the scope by providing an explicit `path` parameter. `tracedecay_status` reports the active scope prefix when one is in effect.
 
 ## [4.0.7] - 2026-04-18
 
 ### Fixed
-- **Symlinked source directories were not indexed** — both the plain `walkdir` and `.gitignore`-aware `ignore::WalkBuilder` file discovery paths now follow symlinks (`follow_links(true)`), so projects that expose source code through symlinked directories are fully indexed. (PR #34 by @lesbass)
+- **Symlinked source directories were not indexed**, both the plain `walkdir` and `.gitignore`-aware `ignore::WalkBuilder` file discovery paths now follow symlinks (`follow_links(true)`), so projects that expose source code through symlinked directories are fully indexed. (PR #34 by @lesbass)
 
 ## [4.0.6] - 2026-04-18
 
 ### Added
-- **GLSL language support** — new tree-sitter-based extractor for OpenGL shading language files (`.glsl`, `.vert`, `.frag`, `.geom`, `.comp`, `.tesc`, `.tese`). Extracts functions, structs with fields, uniform/in/out/varying declarations, preprocessor defines, call sites, and complexity metrics. Requires `tracedecay-large-treesitters` 0.3.0. Feature-gated as `lang-glsl` in the Full tier. Closes #35.
+- **GLSL language support**, new tree-sitter-based extractor for OpenGL shading language files (`.glsl`, `.vert`, `.frag`, `.geom`, `.comp`, `.tesc`, `.tese`). Extracts functions, structs with fields, uniform/in/out/varying declarations, preprocessor defines, call sites, and complexity metrics. Requires `tracedecay-large-treesitters` 0.3.0. Feature-gated as `lang-glsl` in the Full tier. Closes #35.
 
 ### Fixed
-- **`tracedecay upgrade` fails on Homebrew installs** — `self_replace` failed with `ENOENT` on Homebrew symlinks because it resolved relative symlink targets from CWD instead of the symlink's parent. Now dispatches to install-method-aware replacement: Homebrew bypasses `self_replace` and atomically replaces the binary at the canonical Cellar path, renames the version directory, and updates the symlink + `INSTALL_RECEIPT.json` so `brew` reports the correct version. Scoop updates the version directory, junction, and `manifest.json`. Other symlinked installs get a canonicalization fallback. Supersedes PR #33.
+- **`tracedecay upgrade` fails on Homebrew installs**. `self_replace` failed with `ENOENT` on Homebrew symlinks because it resolved relative symlink targets from CWD instead of the symlink's parent. Now dispatches to install-method-aware replacement: Homebrew bypasses `self_replace` and atomically replaces the binary at the canonical Cellar path, renames the version directory, and updates the symlink + `INSTALL_RECEIPT.json` so `brew` reports the correct version. Scoop updates the version directory, junction, and `manifest.json`. Other symlinked installs get a canonicalization fallback. Supersedes PR #33.
 
 ## [4.0.5] - 2026-04-17
 
 ### Changed
-- **Separate `tracedecay init` from `tracedecay sync`** — previously, `tracedecay sync` silently created a new database if none existed. This was a problem because the global git post-commit hook runs `tracedecay sync` in every repo after each commit, causing phantom `.tracedecay/` databases to appear in projects that never opted in. Now `tracedecay init` handles first-time project setup (creates DB + full index) and errors if already initialized, while `tracedecay sync` only performs incremental updates and errors if the project was never initialized. The git hook (`tracedecay sync >/dev/null 2>&1 &`) now safely exits with an error in non-enrolled repos — no database created. All agent setup messages and documentation updated to reference `tracedecay init` for first-time use.
+- **Separate `tracedecay init` from `tracedecay sync`**, previously, `tracedecay sync` silently created a new database if none existed. This was a problem because the global git post-commit hook runs `tracedecay sync` in every repo after each commit, causing phantom `.tracedecay/` databases to appear in projects that never opted in. Now `tracedecay init` handles first-time project setup (creates DB + full index) and errors if already initialized, while `tracedecay sync` only performs incremental updates and errors if the project was never initialized. The git hook (`tracedecay sync >/dev/null 2>&1 &`) now safely exits with an error in non-enrolled repos, no database created. All agent setup messages and documentation updated to reference `tracedecay init` for first-time use.
 
 ## [4.0.4] - 2026-04-17
 
 ### Added
-- **Google Antigravity support** — new `tracedecay install --agent antigravity` registers the MCP server in `~/.gemini/antigravity/mcp_config.json`. Includes install, uninstall, healthcheck, and auto-detection. Closes #24.
-- **Kilo CLI support** — new `tracedecay install --agent kilo` registers the MCP server in `~/.config/kilo/kilo.jsonc` using Kilo's `mcp` key with `type: "local"` format. Includes install, uninstall, healthcheck, and auto-detection. Closes #31.
+- **Google Antigravity support**, new `tracedecay install --agent antigravity` registers the MCP server in `~/.gemini/antigravity/mcp_config.json`. Includes install, uninstall, healthcheck, and auto-detection. Closes #24.
+- **Kilo CLI support**, new `tracedecay install --agent kilo` registers the MCP server in `~/.config/kilo/kilo.jsonc` using Kilo's `mcp` key with `type: "local"` format. Includes install, uninstall, healthcheck, and auto-detection. Closes #31.
 
 ### Changed
-- **Simpler install prompts** — `tracedecay install` now asks a Y/n question per detected agent instead of showing a multi-select dialog box. Prints a +/- summary of changes at the end. Removed `dialoguer` dependency.
-- **No-op upgrade is no longer an error** — `tracedecay upgrade` when already on the latest version now exits successfully instead of printing a misleading error. Same for `tracedecay channel` when already on the requested channel. (PR #30 by @lesbass)
+- **Simpler install prompts**. `tracedecay install` now asks a Y/n question per detected agent instead of showing a multi-select dialog box. Prints a +/- summary of changes at the end. Removed `dialoguer` dependency.
+- **No-op upgrade is no longer an error**. `tracedecay upgrade` when already on the latest version now exits successfully instead of printing a misleading error. Same for `tracedecay channel` when already on the requested channel. (PR #30 by @lesbass)
 
 ### Fixed
-- **Default branch detection wrote `"HEAD"` instead of actual branch name** — `detect_default_branch()` used `reference.name()` on the `refs/remotes/origin/HEAD` symbolic ref, which returns the ref's own name. Now resolves through `reference.follow()` to get the target (e.g. `refs/remotes/origin/master`), then strips the prefix correctly. (PR #26 by @LucioPg)
-- **Branch detection in git worktrees** — `current_branch()` read `.git/HEAD` directly as a plain file, which fails in git worktrees where `.git` is a pointer file (not a directory). Fixed with a two-tier approach: `gix::open()` first, then `git symbolic-ref -q HEAD` subprocess fallback. (PR #28 by @LucioPg)
-- **Windows monitor nested runtime panic** — `tracedecay monitor` cost cache refresh panicked on Windows due to nested tokio runtimes. Now uses `block_in_place` + `Handle::current()` on Windows. (PR #29 by @LucioPg)
-- **Clippy clean** — resolved all clippy errors across the codebase; CI clippy step now passes.
+- **Default branch detection wrote `"HEAD"` instead of actual branch name**. `detect_default_branch()` used `reference.name()` on the `refs/remotes/origin/HEAD` symbolic ref, which returns the ref's own name. Now resolves through `reference.follow()` to get the target (e.g. `refs/remotes/origin/master`), then strips the prefix correctly. (PR #26 by @LucioPg)
+- **Branch detection in git worktrees**. `current_branch()` read `.git/HEAD` directly as a plain file, which fails in git worktrees where `.git` is a pointer file (not a directory). Fixed with a two-tier approach: `gix::open()` first, then `git symbolic-ref -q HEAD` subprocess fallback. (PR #28 by @LucioPg)
+- **Windows monitor nested runtime panic**. `tracedecay monitor` cost cache refresh panicked on Windows due to nested tokio runtimes. Now uses `block_in_place` + `Handle::current()` on Windows. (PR #29 by @LucioPg)
+- **Clippy clean**, resolved all clippy errors across the codebase; CI clippy step now passes.
 
 ## [4.0.3] - 2026-04-16
 
 ### Fixed
-- **Windows daemon nested runtime panic** — `tracedecay daemon` panicked on Windows because `daemon-kit` runs the closure inline (no fork), creating a nested tokio runtime. Now uses `block_in_place` + `Handle::current()` on Windows while keeping `Runtime::new()` on Unix where the forked child genuinely has no runtime.
+- **Windows daemon nested runtime panic**. `tracedecay daemon` panicked on Windows because `daemon-kit` runs the closure inline (no fork), creating a nested tokio runtime. Now uses `block_in_place` + `Handle::current()` on Windows while keeping `Runtime::new()` on Unix where the forked child genuinely has no runtime.
 
 ## [4.0.2] - 2026-04-14
 
 ### Added
-- **Token cost observability** — new `tracedecay cost` command parses Claude Code session transcripts (`~/.claude/projects/**/*.jsonl`), classifies each API turn into 13 task categories (coding, debugging, exploration, ...), and computes dollar cost per model. Supports `--by-model`, `--by-task`, `--export json|csv`, and time ranges (`today`, `7d`, `30d`, `all`). Model pricing is refreshed from LiteLLM every 24 hours and cached at `~/.tracedecay/pricing.json`. Cost data is stored in the existing `~/.tracedecay/global.db`. The `tracedecay status` header now shows today's cost, 7-day cost, and efficiency ratio. The `tracedecay monitor` TUI includes a cost panel. The `hook_stop` handler prints a session cost receipt. Task classification adapted from [AgentSeal/codeburn](https://github.com/AgentSeal/codeburn).
-- **`tracedecay status --details`** — the node-kind breakdown table is now opt-in via the `--details` flag. Default status output is more compact.
-- **Per-file diversity caps** — `tracedecay_context` now limits how many symbols from a single file appear in results (default: `max_nodes/3`, minimum 3), preventing one large file from dominating context output. Configurable via the new `max_per_file` parameter.
-- **Exact name match supplementing** — context search now supplements FTS5 results with exact case-insensitive name lookups, so perfect symbol name matches are never buried by BM25 noise.
-- **Stem variant search expansion** — search terms are expanded with suffix-based stem variants (e.g. "authenticate" also finds "authentication", "authenticator") via 13 derivational suffix rules, improving recall for conceptual queries.
-- **Co-occurrence boosting** — when a query has multiple terms, symbols where 2+ terms co-locate in name, qualified name, or file path get a multiplicative score boost, improving precision on multi-word searches.
-- **Edge recovery after node trimming** — when BFS subgraph expansion trims nodes to fit `max_nodes`, edges are now filtered to retain only those connecting surviving nodes, keeping the returned subgraph consistent.
-- **Adaptive SQLite pragmas** — `cache_size` and `mmap_size` now scale to the DB file size instead of using fixed 64 MB / 256 MB values. Small projects (5 MB DB) drop from ~320 MB baseline to ~12 MB; large projects keep the same performance.
-- **`tracedecay reinstall` command** — re-runs install for all already-configured agents, refreshing MCP server registration, hooks, permissions, and prompt rules without the interactive picker.
+- **Token cost observability**, new `tracedecay cost` command parses Claude Code session transcripts (`~/.claude/projects/**/*.jsonl`), classifies each API turn into 13 task categories (coding, debugging, exploration, ...), and computes dollar cost per model. Supports `--by-model`, `--by-task`, `--export json|csv`, and time ranges (`today`, `7d`, `30d`, `all`). Model pricing is refreshed from LiteLLM every 24 hours and cached at `~/.tracedecay/pricing.json`. Cost data is stored in the existing `~/.tracedecay/global.db`. The `tracedecay status` header now shows today's cost, 7-day cost, and efficiency ratio. The `tracedecay monitor` TUI includes a cost panel. The `hook_stop` handler prints a session cost receipt. Task classification adapted from [AgentSeal/codeburn](https://github.com/AgentSeal/codeburn).
+- **`tracedecay status --details`**, the node-kind breakdown table is now opt-in via the `--details` flag. Default status output is more compact.
+- **Per-file diversity caps**. `tracedecay_context` now limits how many symbols from a single file appear in results (default: `max_nodes/3`, minimum 3), preventing one large file from dominating context output. Configurable via the new `max_per_file` parameter.
+- **Exact name match supplementing**, context search now supplements FTS5 results with exact case-insensitive name lookups, so perfect symbol name matches are never buried by BM25 noise.
+- **Stem variant search expansion**, search terms are expanded with suffix-based stem variants (e.g. "authenticate" also finds "authentication", "authenticator") via 13 derivational suffix rules, improving recall for conceptual queries.
+- **Co-occurrence boosting**, when a query has multiple terms, symbols where 2+ terms co-locate in name, qualified name, or file path get a multiplicative score boost, improving precision on multi-word searches.
+- **Edge recovery after node trimming**, when BFS subgraph expansion trims nodes to fit `max_nodes`, edges are now filtered to retain only those connecting surviving nodes, keeping the returned subgraph consistent.
+- **Adaptive SQLite pragmas**. `cache_size` and `mmap_size` now scale to the DB file size instead of using fixed 64 MB / 256 MB values. Small projects (5 MB DB) drop from ~320 MB baseline to ~12 MB; large projects keep the same performance.
+- **`tracedecay reinstall` command**, re-runs install for all already-configured agents, refreshing MCP server registration, hooks, permissions, and prompt rules without the interactive picker.
 
 ### Removed
-- **Graph visualizer** — `tracedecay visualize` command, `src/visualizer.rs`, and the embedded HTML file have been removed. The upstream CodeGraph project also removed its visualizer in the same period.
+- **Graph visualizer**. `tracedecay visualize` command, `src/visualizer.rs`, and the embedded HTML file have been removed. The upstream CodeGraph project also removed its visualizer in the same period.
 
 ### Fixed
-- **Windows path separators in hooks and MCP config** — `which_tracedecay()` now normalizes backslash paths to forward slashes, fixing broken hook command execution on Windows (e.g. Scoop installs). Existing settings with backslash paths are also normalized when read back.
+- **Windows path separators in hooks and MCP config**. `which_tracedecay()` now normalizes backslash paths to forward slashes, fixing broken hook command execution on Windows (e.g. Scoop installs). Existing settings with backslash paths are also normalized when read back.
 
 ## [4.0.0] - 2026-04-13
 
 ### Added
-- **Multi-branch indexing** — opt-in per-branch databases so switching branches never gives stale results. `tracedecay branch add` tracks a branch by copying the nearest ancestor DB and syncing only changed files. `tracedecay branch list`, `tracedecay branch remove`, `tracedecay branch removeall`, and `tracedecay branch gc` manage tracked branches.
-- **`tracedecay branch removeall`** — remove all tracked branches except the default in one command, deleting their DB files.
-- **`tracedecay_branch_search`** MCP tool — search symbols in another branch's code graph without switching your checkout.
-- **`tracedecay_branch_diff`** MCP tool — compare code graphs between two branches: shows symbols added, removed, and changed (signature differs). Supports file and kind filters.
-- **`tracedecay_branch_list`** MCP tool and **`tracedecay://branches`** MCP resource — list tracked branches with DB sizes, parent branch, sync times.
-- **Branch fallback warnings** — when the MCP server serves from an ancestor branch DB (current branch not tracked), every tool response warns to `tracedecay branch add`.
-- **`keywords` parameter for `tracedecay_context`** — agent-driven synonym expansion. Pass extra search terms (e.g. `["login", "session", "token"]` for "authentication") and the context builder searches each keyword independently, bridging conceptual queries to lexically-unrelated symbol names without embedding models.
-- **`tracedecay monitor` CLI command** — global live TUI showing MCP tool calls from all projects in real time via a shared memory-mapped ring buffer at `~/.tracedecay/monitor.mmap`. Entries show `prefix - project - tool_name` so multiple tool suites and projects are distinguishable. Uses `memmap2` with file locking for concurrent writer safety.
-- **`path` filter on 7 analytics MCP tools** — `tracedecay_god_class`, `tracedecay_largest`, `tracedecay_complexity`, `tracedecay_rank`, `tracedecay_coupling`, `tracedecay_inheritance_depth`, and `tracedecay_recursion` now accept an optional `path` parameter to scope results to a directory (e.g. `"path": "src/main/java"`), preventing large languages from dominating global rankings.
-- **Right-click context menu in graph visualizer** — callers, callees, call graph, and impact actions on node right-click.
-- **Type annotation references** — TypeScript, Java, and Kotlin type annotation references now tracked as edges in the graph.
-- **Graph visualizer** — interactive Cytoscape.js-based code graph visualization served via `tracedecay visualize`.
-- **Daemon version mismatch detection** — `tracedecay daemon --status` warns when the daemon version differs from the CLI with a corrective restart command.
-- **Parent branch in status output** — `tracedecay status` and `tracedecay_status` now show which branch a tracked branch was seeded from.
+- **Multi-branch indexing**, opt-in per-branch databases so switching branches never gives stale results. `tracedecay branch add` tracks a branch by copying the nearest ancestor DB and syncing only changed files. `tracedecay branch list`, `tracedecay branch remove`, `tracedecay branch removeall`, and `tracedecay branch gc` manage tracked branches.
+- **`tracedecay branch removeall`**, remove all tracked branches except the default in one command, deleting their DB files.
+- **`tracedecay_branch_search`** MCP tool, search symbols in another branch's code graph without switching your checkout.
+- **`tracedecay_branch_diff`** MCP tool, compare code graphs between two branches: shows symbols added, removed, and changed (signature differs). Supports file and kind filters.
+- **`tracedecay_branch_list`** MCP tool and **`tracedecay://branches`** MCP resource, list tracked branches with DB sizes, parent branch, sync times.
+- **Branch fallback warnings**, when the MCP server serves from an ancestor branch DB (current branch not tracked), every tool response warns to `tracedecay branch add`.
+- **`keywords` parameter for `tracedecay_context`**, agent-driven synonym expansion. Pass extra search terms (e.g. `["login", "session", "token"]` for "authentication") and the context builder searches each keyword independently, bridging conceptual queries to lexically-unrelated symbol names without embedding models.
+- **`tracedecay monitor` CLI command**, global live TUI showing MCP tool calls from all projects in real time via a shared memory-mapped ring buffer at `~/.tracedecay/monitor.mmap`. Entries show `prefix - project - tool_name` so multiple tool suites and projects are distinguishable. Uses `memmap2` with file locking for concurrent writer safety.
+- **`path` filter on 7 analytics MCP tools**. `tracedecay_god_class`, `tracedecay_largest`, `tracedecay_complexity`, `tracedecay_rank`, `tracedecay_coupling`, `tracedecay_inheritance_depth`, and `tracedecay_recursion` now accept an optional `path` parameter to scope results to a directory (e.g. `"path": "src/main/java"`), preventing large languages from dominating global rankings.
+- **Right-click context menu in graph visualizer**, callers, callees, call graph, and impact actions on node right-click.
+- **Type annotation references**. TypeScript, Java, and Kotlin type annotation references now tracked as edges in the graph.
+- **Graph visualizer**, interactive Cytoscape.js-based code graph visualization served via `tracedecay visualize`.
+- **Daemon version mismatch detection**. `tracedecay daemon --status` warns when the daemon version differs from the CLI with a corrective restart command.
+- **Parent branch in status output**. `tracedecay status` and `tracedecay_status` now show which branch a tracked branch was seeded from.
 
 ### Removed
-- **Vector/embedding module** — removed `src/vectors/`, `enable_embeddings` config field, and `Vector` error variant. The `keywords` parameter on `tracedecay_context` replaces the need for local embedding models. The `vectors` DB table is retained (empty, harmless) to avoid migration issues.
+- **Vector/embedding module**, removed `src/vectors/`, `enable_embeddings` config field, and `Vector` error variant. The `keywords` parameter on `tracedecay_context` replaces the need for local embedding models. The `vectors` DB table is retained (empty, harmless) to avoid migration issues.
 
 ### Changed
-- **Monitor is now global** — moved from per-project (`<project>/.tracedecay/monitor.mmap`) to machine-level (`~/.tracedecay/monitor.mmap`). `tracedecay monitor` no longer takes a `--path` flag.
+- **Monitor is now global**, moved from per-project (`<project>/.tracedecay/monitor.mmap`) to machine-level (`~/.tracedecay/monitor.mmap`). `tracedecay monitor` no longer takes a `--path` flag.
 - Quality improvements to resolution, search, and traversal.
 - Tool count increased from 34 to 37.
 
@@ -2996,29 +3847,29 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [3.5.1] - 2026-04-13
 
 ### Fixed
-- **Doctor validates hook subcommands** — `tracedecay doctor` now checks that each hook event uses the correct tracedecay subcommand (e.g. `hook-prompt-submit` for `UserPromptSubmit`, not an invalid or mismatched command).
-- **Doctor auto-repairs broken hooks** — when a hook has a wrong subcommand or is missing entirely, `tracedecay doctor` replaces it with the correct command automatically.
+- **Doctor validates hook subcommands**. `tracedecay doctor` now checks that each hook event uses the correct tracedecay subcommand (e.g. `hook-prompt-submit` for `UserPromptSubmit`, not an invalid or mismatched command).
+- **Doctor auto-repairs broken hooks**, when a hook has a wrong subcommand or is missing entirely, `tracedecay doctor` replaces it with the correct command automatically.
 
 ### Added
-- **18 unit tests for Claude hook lifecycle** — install, uninstall, doctor detection, and doctor auto-repair for all three hook events.
+- **18 unit tests for Claude hook lifecycle**, install, uninstall, doctor detection, and doctor auto-repair for all three hook events.
 
 ## [3.5.0] - 2026-04-13
 
 ### Added
-- **Per-call token savings reported inline** — every MCP tool response now appends a `tracedecay_metrics: before=N after=M` line showing how many raw-file tokens were avoided.
-- **`UserPromptSubmit` and `Stop` hooks** — `tracedecay install` now registers three hooks (PreToolUse, UserPromptSubmit, Stop) instead of just PreToolUse. Existing installs are silently backfilled on startup.
-- **`tracedecay current-counter` / `reset-counter` commands** — expose and reset a per-project local token counter, separate from the lifetime total.
+- **Per-call token savings reported inline**, every MCP tool response now appends a `tracedecay_metrics: before=N after=M` line showing how many raw-file tokens were avoided.
+- **`UserPromptSubmit` and `Stop` hooks**. `tracedecay install` now registers three hooks (PreToolUse, UserPromptSubmit, Stop) instead of just PreToolUse. Existing installs are silently backfilled on startup.
+- **`tracedecay current-counter` / `reset-counter` commands**, expose and reset a per-project local token counter, separate from the lifetime total.
 - **Respect global gitignore** for `.tracedecay` warning.
 
 ### Changed
-- **Hook install/uninstall generalized** — `install_hook` and `uninstall_hook` now iterate over all three hook events.
-- **Sync uses mtime/size pre-filter** — skips hashing unchanged files, only reads files whose mtime or size changed since last sync.
-- **Dependency upgrades** — dialoguer 0.11→0.12, notify 7→8, sha2 0.10→0.11, zip 6→8, windows-sys 0.59→0.61.
+- **Hook install/uninstall generalized**. `install_hook` and `uninstall_hook` now iterate over all three hook events.
+- **Sync uses mtime/size pre-filter**, skips hashing unchanged files, only reads files whose mtime or size changed since last sync.
+- **Dependency upgrades**, dialoguer 0.11→0.12, notify 7→8, sha2 0.10→0.11, zip 6→8, windows-sys 0.59→0.61.
 
 ## [3.4.6] - 2026-04-07
 
 ### Fixed
-- **SQLite FTS corruption from interrupted sync** — handle UTF-16 encoded files, report unreadable files during sync.
+- **SQLite FTS corruption from interrupted sync**, handle UTF-16 encoded files, report unreadable files during sync.
 
 ## [3.4.5] - 2026-04-07
 
@@ -3041,7 +3892,7 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [3.4.2] - 2026-04-07
 
 ### Added
-- **`tracedecay channel` command** — show or switch the update channel (stable/beta).
+- **`tracedecay channel` command**, show or switch the update channel (stable/beta).
 
 ### Fixed
 - Cross-workflow Homebrew/Scoop failures on wrong release type.
@@ -3050,16 +3901,16 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [3.4.1] - 2026-04-07
 
 ### Fixed
-- Beta Homebrew bottle 404 — fix bottle archive naming.
+- Beta Homebrew bottle 404, fix bottle archive naming.
 - Update notices now suggest `tracedecay upgrade` instead of platform-specific commands.
 
 ## [3.4.0] - 2026-04-07
 
 ### Added
-- **`tracedecay upgrade` command** — self-update the binary directly from GitHub releases. Detects the current channel, downloads the correct platform-specific archive, and replaces the running binary.
-- **Annotation/attribute extraction for 7 languages** — Rust, Swift, Dart, Scala, PHP, C++, and VB.NET. All create `AnnotationUsage` nodes with `Annotates` edges. Brings annotation support to 12 of 31 languages.
-- **McpTransport trait** — zero-cost abstraction for MCP server I/O, enabling in-memory test transports.
-- **370+ new tests** — line coverage 71% → 84%.
+- **`tracedecay upgrade` command**, self-update the binary directly from GitHub releases. Detects the current channel, downloads the correct platform-specific archive, and replaces the running binary.
+- **Annotation/attribute extraction for 7 languages**. Rust, Swift, Dart, Scala, PHP, C++, and VB.NET. All create `AnnotationUsage` nodes with `Annotates` edges. Brings annotation support to 12 of 31 languages.
+- **McpTransport trait**, zero-cost abstraction for MCP server I/O, enabling in-memory test transports.
+- **370+ new tests**, line coverage 71% → 84%.
 
 ## [3.3.3] - 2026-04-05
 
@@ -3069,20 +3920,20 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [3.3.2] - 2026-04-05
 
 ### Fixed
-- **Windows build failure blocking Homebrew/Scoop updates** — `SHELLEXECUTEINFOW` in `windows-sys` 0.59 requires the `Win32_System_Registry` feature flag, which was missing. This caused Windows CI builds to fail since v3.2.0, and because the release workflow used `fail-fast: true`, the failure cascaded to skip the Homebrew tap and Scoop bucket update jobs entirely. Users on Homebrew were stuck on v3.1.0. ([#12](https://github.com/ScriptedAlchemy/tracedecay/issues/12))
-- **`HANDLE` type mismatch on Windows** — `windows-sys` 0.59 changed `HANDLE` from `usize` to `*mut c_void`. The UAC elevation code now uses `std::ptr::null_mut()` and `.is_null()` instead of literal `0`.
-- **Release workflow resilience** — changed build matrix to `fail-fast: false` and downstream jobs (`update-homebrew`, `update-scoop`) to `if: !cancelled()`, so a single platform build failure no longer blocks formula/manifest updates for platforms that succeeded.
+- **Windows build failure blocking Homebrew/Scoop updates**. `SHELLEXECUTEINFOW` in `windows-sys` 0.59 requires the `Win32_System_Registry` feature flag, which was missing. This caused Windows CI builds to fail since v3.2.0, and because the release workflow used `fail-fast: true`, the failure cascaded to skip the Homebrew tap and Scoop bucket update jobs entirely. Users on Homebrew were stuck on v3.1.0. ([#12](https://github.com/ScriptedAlchemy/tracedecay/issues/12))
+- **`HANDLE` type mismatch on Windows**. `windows-sys` 0.59 changed `HANDLE` from `usize` to `*mut c_void`. The UAC elevation code now uses `std::ptr::null_mut()` and `.is_null()` instead of literal `0`.
+- **Release workflow resilience**, changed build matrix to `fail-fast: false` and downstream jobs (`update-homebrew`, `update-scoop`) to `if: !cancelled()`, so a single platform build failure no longer blocks formula/manifest updates for platforms that succeeded.
 
 ## [3.3.1] - 2026-04-05
 
 ### Fixed
-- **Windows `is_installed()` always returned `false`** — the daemon autostart check via `daemon-kit` used a file-path probe that returns `None` on Windows, so `is_service_installed()` never detected an existing service. This caused `tracedecay install` to re-offer autostart every time. Now dispatches to the Windows SCM query that was already implemented but never wired up. (daemon-kit 0.1.4)
-- **Windows `--enable-autostart` failed on reinstall** — running `tracedecay daemon --enable-autostart` twice would error with "service already exists". The installer now stops and removes the old service before re-creating, making the operation idempotent. (daemon-kit 0.1.4)
+- **Windows `is_installed()` always returned `false`**, the daemon autostart check via `daemon-kit` used a file-path probe that returns `None` on Windows, so `is_service_installed()` never detected an existing service. This caused `tracedecay install` to re-offer autostart every time. Now dispatches to the Windows SCM query that was already implemented but never wired up. (daemon-kit 0.1.4)
+- **Windows `--enable-autostart` failed on reinstall**, running `tracedecay daemon --enable-autostart` twice would error with "service already exists". The installer now stops and removes the old service before re-creating, making the operation idempotent. (daemon-kit 0.1.4)
 
 ### Added
-- **Upgrade-aware daemon restart** — the background daemon now snapshots its own binary's mtime and size at startup and checks every 60 seconds. When an upgrade is detected (via `brew upgrade`, `cargo install`, `scoop update`, or any package manager), the daemon flushes pending syncs, logs the event, and exits. The service manager (launchd `KeepAlive`, systemd `Restart=on-failure`, Windows SCM failure actions) automatically relaunches with the new binary. Previously the old version ran until the next reboot or manual restart.
-- **Windows SCM failure recovery** — the Windows service is now configured with `ServiceFailureActions` (restart after 5s, then 10s) so the SCM relaunches the daemon after upgrade-triggered exits.
-- **Daemon version logging** — the daemon startup log now includes the version (`v3.3.1 started, watching N projects`) so log readers can confirm which version is running after an upgrade restart.
+- **Upgrade-aware daemon restart**, the background daemon now snapshots its own binary's mtime and size at startup and checks every 60 seconds. When an upgrade is detected (via `brew upgrade`, `cargo install`, `scoop update`, or any package manager), the daemon flushes pending syncs, logs the event, and exits. The service manager (launchd `KeepAlive`, systemd `Restart=on-failure`, Windows SCM failure actions) automatically relaunches with the new binary. Previously the old version ran until the next reboot or manual restart.
+- **Windows SCM failure recovery**, the Windows service is now configured with `ServiceFailureActions` (restart after 5s, then 10s) so the SCM relaunches the daemon after upgrade-triggered exits.
+- **Daemon version logging**, the daemon startup log now includes the version (`v3.3.1 started, watching N projects`) so log readers can confirm which version is running after an upgrade restart.
 
 ### Changed
 - Bumped `daemon-kit` dependency from 0.1.3 to 0.1.4.
@@ -3090,22 +3941,22 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [3.3.0] - 2026-04-05
 
 ### Changed
-- **Sync progress now matches full-index display** — `tracedecay sync` now shows `[current/total] syncing file (ETA: Ns)` with the braille spinner and path truncation, matching the progress display used during initial indexing. Previously sync only showed phase names without file counters or ETA.
+- **Sync progress now matches full-index display**. `tracedecay sync` now shows `[current/total] syncing file (ETA: Ns)` with the braille spinner and path truncation, matching the progress display used during initial indexing. Previously sync only showed phase names without file counters or ETA.
 
 ### Added
-- **MCP tool annotations** — all 34 tools now include `readOnlyHint: true` and a human-friendly `title` in their MCP annotations. Clients that support annotations can run all tracedecay tools concurrently without permission prompts and display cleaner tool names.
-- **`_meta["anthropic/alwaysLoad"]`** on core tools — `tracedecay_context`, `tracedecay_search`, and `tracedecay_status` are marked for immediate loading, bypassing the client's tool-search round-trip on first use.
-- **Server instructions** — the MCP `initialize` response now includes an `instructions` field guiding the model to start with `tracedecay_context` and noting all tools are read-only and safe to call in parallel.
-- **MCP resources** — three resources exposed via `resources/list` and `resources/read`:
-  - `tracedecay://status` — graph statistics as JSON
-  - `tracedecay://files` — indexed file tree grouped by directory
-  - `tracedecay://overview` — project summary with language distribution and symbol kinds
-- **`tracedecay_commit_context`** — semantic summary of uncommitted changes for commit message drafting. Returns changed symbols grouped by file role (source/test/config/docs), a suggested commit category, and recent commit subjects for style matching.
-- **`tracedecay_pr_context`** — semantic diff between two git refs for pull request descriptions. Returns commit log, symbols added/modified, affected tests, and impacted modules.
-- **`tracedecay_simplify_scan`** — quality analysis of changed files: detects symbol duplications, dead code introductions, complexity hotspots, and high-coupling files.
-- **`tracedecay_test_map`** — source-to-test mapping at the symbol level. Shows which test functions call which source functions and identifies uncovered symbols.
-- **`tracedecay_type_hierarchy`** — recursive type hierarchy tree for traits, interfaces, and classes showing all implementors and extenders with file locations.
-- **`tracedecay_context` extended** — new `include_code` parameter includes source code snippets for key symbols (wires through to the existing context builder). New `mode: "plan"` parameter appends extension points (public traits/interfaces with implementor counts) and test coverage for related modules.
+- **MCP tool annotations**, all 34 tools now include `readOnlyHint: true` and a human-friendly `title` in their MCP annotations. Clients that support annotations can run all tracedecay tools concurrently without permission prompts and display cleaner tool names.
+- **`_meta["anthropic/alwaysLoad"]`** on core tools. `tracedecay_context`, `tracedecay_search`, and `tracedecay_status` are marked for immediate loading, bypassing the client's tool-search round-trip on first use.
+- **Server instructions**, the MCP `initialize` response now includes an `instructions` field guiding the model to start with `tracedecay_context` and noting all tools are read-only and safe to call in parallel.
+- **MCP resources**, three resources exposed via `resources/list` and `resources/read`:
+  - `tracedecay://status`, graph statistics as JSON
+  - `tracedecay://files`, indexed file tree grouped by directory
+  - `tracedecay://overview`, project summary with language distribution and symbol kinds
+- **`tracedecay_commit_context`**, semantic summary of uncommitted changes for commit message drafting. Returns changed symbols grouped by file role (source/test/config/docs), a suggested commit category, and recent commit subjects for style matching.
+- **`tracedecay_pr_context`**, semantic diff between two git refs for pull request descriptions. Returns commit log, symbols added/modified, affected tests, and impacted modules.
+- **`tracedecay_simplify_scan`**, quality analysis of changed files: detects symbol duplications, dead code introductions, complexity hotspots, and high-coupling files.
+- **`tracedecay_test_map`**, source-to-test mapping at the symbol level. Shows which test functions call which source functions and identifies uncovered symbols.
+- **`tracedecay_type_hierarchy`**, recursive type hierarchy tree for traits, interfaces, and classes showing all implementors and extenders with file locations.
+- **`tracedecay_context` extended**, new `include_code` parameter includes source code snippets for key symbols (wires through to the existing context builder). New `mode: "plan"` parameter appends extension points (public traits/interfaces with implementor counts) and test coverage for related modules.
 
 ### Changed
 - Tool count increased from 29 to 34.
@@ -3114,64 +3965,64 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [3.2.2] - 2026-04-05
 
 ### Fixed
-- **MCP tools no longer warn on patch-only updates** — the `tracedecay_status` MCP tool now uses `is_newer_minor_version` instead of `is_newer_version`, so patch-level releases (e.g. 3.2.0 → 3.2.1) no longer trigger update warnings in MCP tool output. The CLI status command continues to show all available updates.
-- **Separate beta/stable update channels** — `is_newer_version` now returns `false` for cross-channel comparisons (beta vs stable). Previously a beta user could be told to upgrade to a stable release, or vice versa. Each channel now only sees updates from its own channel.
+- **MCP tools no longer warn on patch-only updates**, the `tracedecay_status` MCP tool now uses `is_newer_minor_version` instead of `is_newer_version`, so patch-level releases (e.g. 3.2.0 → 3.2.1) no longer trigger update warnings in MCP tool output. The CLI status command continues to show all available updates.
+- **Separate beta/stable update channels**. `is_newer_version` now returns `false` for cross-channel comparisons (beta vs stable). Previously a beta user could be told to upgrade to a stable release, or vice versa. Each channel now only sees updates from its own channel.
 
 ## [3.1.1] - 2026-04-02
 
 ### Fixed
-- **Windows daemon service installation** — `tracedecay install` and `tracedecay daemon --enable-autostart` no longer fail on non-elevated Windows terminals. When administrator privileges are required to register the Windows Service, the process now automatically requests UAC elevation for just the service installation step; everything else continues non-elevated. ([#7](https://github.com/ScriptedAlchemy/tracedecay/issues/7))
-- **Quieter version update warnings** — the CLI no longer warns about patch-only releases (e.g. 3.2.0 → 3.2.1); warnings now appear only for minor or major version bumps. The status page (`tracedecay_status` MCP tool) continues to show all available updates.
+- **Windows daemon service installation**. `tracedecay install` and `tracedecay daemon --enable-autostart` no longer fail on non-elevated Windows terminals. When administrator privileges are required to register the Windows Service, the process now automatically requests UAC elevation for just the service installation step; everything else continues non-elevated. ([#7](https://github.com/ScriptedAlchemy/tracedecay/issues/7))
+- **Quieter version update warnings**, the CLI no longer warns about patch-only releases (e.g. 3.2.0 → 3.2.1); warnings now appear only for minor or major version bumps. The status page (`tracedecay_status` MCP tool) continues to show all available updates.
 
 ## [3.1.0] - 2026-04-01
 
 ### Fixed
-- **Edge duplication during incremental sync** — reference resolution was re-resolving ALL unresolved refs on every sync (not just from changed files) and inserting duplicate edges with no deduplication. Over many syncs this caused unbounded DB growth (e.g. 5.1 GB for a 108 MB codebase). A unique index on edges and `INSERT OR IGNORE` now prevent duplicates entirely. A V5 migration automatically deduplicates existing databases on upgrade. ([#5](https://github.com/ScriptedAlchemy/tracedecay/issues/5))
+- **Edge duplication during incremental sync**, reference resolution was re-resolving ALL unresolved refs on every sync (not just from changed files) and inserting duplicate edges with no deduplication. Over many syncs this caused unbounded DB growth (e.g. 5.1 GB for a 108 MB codebase). A unique index on edges and `INSERT OR IGNORE` now prevent duplicates entirely. A V5 migration automatically deduplicates existing databases on upgrade. ([#5](https://github.com/ScriptedAlchemy/tracedecay/issues/5))
 
 ### Added
-- **Concurrent sync prevention** — a PID-based lockfile (`.tracedecay/sync.lock`) prevents the CLI and the background daemon from running sync simultaneously. If a sync is already in progress, the second attempt fails immediately with a clear error message. Stale locks from crashed processes are reclaimed automatically.
-- **`doctor` database compaction** — `tracedecay doctor` now opens the project database, reports its size, and runs `VACUUM + ANALYZE` to reclaim space. Particularly useful after upgrading from versions affected by edge duplication.
-- **Index design documentation** — new `docs/INDEX-DESIGN.md` describes the full indexing pipeline, database schema, extraction process, reference resolution, incremental sync, and how `diff_context` uses the graph.
+- **Concurrent sync prevention**, a PID-based lockfile (`.tracedecay/sync.lock`) prevents the CLI and the background daemon from running sync simultaneously. If a sync is already in progress, the second attempt fails immediately with a clear error message. Stale locks from crashed processes are reclaimed automatically.
+- **`doctor` database compaction**. `tracedecay doctor` now opens the project database, reports its size, and runs `VACUUM + ANALYZE` to reclaim space. Particularly useful after upgrading from versions affected by edge duplication.
+- **Index design documentation**, new `docs/INDEX-DESIGN.md` describes the full indexing pipeline, database schema, extraction process, reference resolution, incremental sync, and how `diff_context` uses the graph.
 
 ## [3.0.1] - 2026-04-01
 
 ### Fixed
-- **Safe JSON config editing** — `tracedecay install` no longer silently destroys agent config files (e.g. `opencode.json`, `settings.json`) when they contain invalid or unparseable JSON. Previously, a parse failure caused the file to be silently replaced with an empty object plus the tracedecay entry, wiping all existing configuration.
+- **Safe JSON config editing**. `tracedecay install` no longer silently destroys agent config files (e.g. `opencode.json`, `settings.json`) when they contain invalid or unparseable JSON. Previously, a parse failure caused the file to be silently replaced with an empty object plus the tracedecay entry, wiping all existing configuration.
 
 ### Added
-- **Atomic backup before config writes** — a `.bak` copy of the original file is created (via atomic staging) before any modification. If the install fails at any point, the original file is untouched and the backup is preserved.
-- **Strict JSON/JSONC loading for edits** — new `load_json_file_strict` and `load_jsonc_file_strict` functions return an error (with a helpful hint) when an existing file cannot be parsed, instead of silently returning `{}`.
-- **Atomic config writes** — new content is written to a `.new` sibling file first, then atomically renamed into place via `rename(2)`. The original file is never opened for writing, so a crash or interruption cannot leave it half-written.
+- **Atomic backup before config writes**, a `.bak` copy of the original file is created (via atomic staging) before any modification. If the install fails at any point, the original file is untouched and the backup is preserved.
+- **Strict JSON/JSONC loading for edits**, new `load_json_file_strict` and `load_jsonc_file_strict` functions return an error (with a helpful hint) when an existing file cannot be parsed, instead of silently returning `{}`.
+- **Atomic config writes**, new content is written to a `.new` sibling file first, then atomically renamed into place via `rename(2)`. The original file is never opened for writing, so a crash or interruption cannot leave it half-written.
 - **20 regression tests** covering backup creation, strict loading, atomic writes, round-trip validation, and the end-to-end install cycle for both valid and corrupt config files.
 
 ## [3.0.0] - 2026-03-28
 
 ### Changed
-- **Bundled tree-sitter grammars** — all 31 language grammars now come from the `tracedecay-large-treesitters` crate (which includes `tracedecay-medium-treesitters` and `tracedecay-lite-treesitters`). Zero individual `tree-sitter-*` crate dependencies remain in tracedecay itself. The grammar provider (`ts_provider`) is a single `LazyLock<HashMap>` lookup, replacing 100+ lines of per-crate match arms.
-- **Removed vendored C grammars** — the Protobuf and COBOL grammars previously compiled from C source via `build.rs` are now vendored inside the bundled crate. tracedecay no longer needs `cc` as a build dependency.
-- **Simplified feature flags** — the `lang-*` feature flags still control which extractors are compiled, but no longer pull in individual grammar crate dependencies (all grammars are always present via the bundle). The `ts-ffi`/`ts-rust`/`ts-both` grammar source selection flags have been removed.
+- **Bundled tree-sitter grammars**, all 31 language grammars now come from the `tracedecay-large-treesitters` crate (which includes `tracedecay-medium-treesitters` and `tracedecay-lite-treesitters`). Zero individual `tree-sitter-*` crate dependencies remain in tracedecay itself. The grammar provider (`ts_provider`) is a single `LazyLock<HashMap>` lookup, replacing 100+ lines of per-crate match arms.
+- **Removed vendored C grammars**, the Protobuf and COBOL grammars previously compiled from C source via `build.rs` are now vendored inside the bundled crate. tracedecay no longer needs `cc` as a build dependency.
+- **Simplified feature flags**, the `lang-*` feature flags still control which extractors are compiled, but no longer pull in individual grammar crate dependencies (all grammars are always present via the bundle). The `ts-ffi`/`ts-rust`/`ts-both` grammar source selection flags have been removed.
 
 ### Added
-- **Daemon install prompt** — `tracedecay install` now offers to install the background daemon as an autostart service (launchd on macOS, systemd on Linux) after agent configuration. Skips silently in non-interactive mode or when the service is already installed.
-- **Last sync / Full sync in status** — the status table header now shows a third row with relative timestamps for the most recent incremental sync and the most recent full reindex, stored in the metadata table.
+- **Daemon install prompt**. `tracedecay install` now offers to install the background daemon as an autostart service (launchd on macOS, systemd on Linux) after agent configuration. Skips silently in non-interactive mode or when the service is already installed.
+- **Last sync / Full sync in status**, the status table header now shows a third row with relative timestamps for the most recent incremental sync and the most recent full reindex, stored in the metadata table.
 
 ## [2.4.0] - 2026-03-27
 
 ### Added
-- **Daemon mode** — `tracedecay daemon` watches all tracked projects for file changes and runs incremental syncs automatically; debounce configurable via `daemon_debounce` in `~/.tracedecay/config.toml` (default `"15s"`)
-- **Daemon management** — `--stop`, `--status`, `--foreground` flags for process control; PID file at `~/.tracedecay/daemon.pid`
-- **Autostart service** — `--enable-autostart` / `--disable-autostart` generates and manages a launchd plist (macOS) or systemd user unit (Linux); cross-platform via `daemon-kit` crate
-- **Doctor daemon checks** — `tracedecay doctor` now reports daemon running status and autostart configuration
-- **`daemon-kit` crate** — new standalone cross-platform daemon/service toolkit published to crates.io, using `daemonize2` on Unix and `windows-service` on Windows
+- **Daemon mode**. `tracedecay daemon` watches all tracked projects for file changes and runs incremental syncs automatically; debounce configurable via `daemon_debounce` in `~/.tracedecay/config.toml` (default `"15s"`)
+- **Daemon management**. `--stop`, `--status`, `--foreground` flags for process control; PID file at `~/.tracedecay/daemon.pid`
+- **Autostart service**. `--enable-autostart` / `--disable-autostart` generates and manages a launchd plist (macOS) or systemd user unit (Linux); cross-platform via `daemon-kit` crate
+- **Doctor daemon checks**. `tracedecay doctor` now reports daemon running status and autostart configuration
+- **`daemon-kit` crate**, new standalone cross-platform daemon/service toolkit published to crates.io, using `daemonize2` on Unix and `windows-service` on Windows
 
 ## [2.3.2] - 2026-03-27
 
 ### Added
-- **5 new agent integrations** — Copilot (VS Code), Cursor, Zed, Cline, and Roo Code now supported via `tracedecay install --agent <id>`; each registers the MCP server in the agent's native config format (VS Code `settings.json`, `~/.cursor/mcp.json`, Zed `settings.json`, Cline/Roo Code `cline_mcp_settings.json`)
-- **Auto-detect agents** — running `tracedecay install` without `--agent` detects which agents are installed by checking their config directories; if one is found it installs directly, if multiple are found an interactive checkbox selector is shown
-- **Installed-agent tracking** — `installed_agents` list in `~/.tracedecay/config.toml` tracks which integrations are active; on upgrade from older versions the list is backfilled by scanning existing configs
-- **Uninstall-all** — `tracedecay uninstall` without `--agent` silently removes all tracked integrations
-- **JSONC parser** — VS Code and Zed settings files (JSON with comments and trailing commas) are now parsed correctly
+- **5 new agent integrations**. Copilot (VS Code), Cursor, Zed, Cline, and Roo Code now supported via `tracedecay install --agent <id>`; each registers the MCP server in the agent's native config format (VS Code `settings.json`, `~/.cursor/mcp.json`, Zed `settings.json`, Cline/Roo Code `cline_mcp_settings.json`)
+- **Auto-detect agents**, running `tracedecay install` without `--agent` detects which agents are installed by checking their config directories; if one is found it installs directly, if multiple are found an interactive checkbox selector is shown
+- **Installed-agent tracking**. `installed_agents` list in `~/.tracedecay/config.toml` tracks which integrations are active; on upgrade from older versions the list is backfilled by scanning existing configs
+- **Uninstall-all**. `tracedecay uninstall` without `--agent` silently removes all tracked integrations
+- **JSONC parser**. VS Code and Zed settings files (JSON with comments and trailing commas) are now parsed correctly
 
 ### Changed
 - **Renamed `Agent` trait to `AgentIntegration`** and all struct names from `XxxAgent` to `XxxIntegration` for consistency; functions renamed accordingly (`get_integration`, `all_integrations`, etc.)
@@ -3179,13 +4030,13 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [2.3.1] - 2026-03-27
 
 ### Changed
-- **Version-update warning suppressed for 15 minutes** — the "Update available" notice shown after `sync` and in MCP tool responses is now suppressed for 15 minutes after it was last displayed, reducing noise for frequent users; `tracedecay status` always shows the warning regardless of suppression
+- **Version-update warning suppressed for 15 minutes**, the "Update available" notice shown after `sync` and in MCP tool responses is now suppressed for 15 minutes after it was last displayed, reducing noise for frequent users; `tracedecay status` always shows the warning regardless of suppression
 
 ## [2.3.0] - 2026-03-27
 
 ### Added
-- **`--skip-folder` flag for sync** — accepts one or more folder names to exclude during indexing (e.g. `tracedecay sync --skip-folder tests benches`); each folder is converted to a `folder/**` glob pattern at runtime
-- **ETA during full index** — the progress spinner now shows `[current/total]` file counts and an estimated time remaining (e.g. `[12/150] indexing src/main.rs (ETA: 8s)`)
+- **`--skip-folder` flag for sync**, accepts one or more folder names to exclude during indexing (e.g. `tracedecay sync --skip-folder tests benches`); each folder is converted to a `folder/**` glob pattern at runtime
+- **ETA during full index**, the progress spinner now shows `[current/total]` file counts and an estimated time remaining (e.g. `[12/150] indexing src/main.rs (ETA: 8s)`)
 
 ### Changed
 - `index_all_with_progress` callback signature now provides `(current, total, path)` for richer progress reporting
@@ -3194,37 +4045,37 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ## [2.2.0] - 2026-03-27
 
 ### Changed
-- **Status table title split into two rows** — top row shows version (left) and country flags (right); bottom row shows token counts right-aligned in green
-- **Country flags always shown** — removed `--show-flags` option; flags are now fetched automatically and cached for 30 minutes
-- **Fixed table width** — cell width capped at 32 columns (max table width 100), with a derived maximum of 25 display flags
-- **Upgraded gix to v0.81.0** — from v0.72.1; added explicit `sha1` feature flag and adapted to new `ControlFlow`-based tree diff API
+- **Status table title split into two rows**, top row shows version (left) and country flags (right); bottom row shows token counts right-aligned in green
+- **Country flags always shown**, removed `--show-flags` option; flags are now fetched automatically and cached for 30 minutes
+- **Fixed table width**, cell width capped at 32 columns (max table width 100), with a derived maximum of 25 display flags
+- **Upgraded gix to v0.81.0**, from v0.72.1; added explicit `sha1` feature flag and adapted to new `ControlFlow`-based tree diff API
 
 ## [2.1.0] - 2026-03-26
 
 ### Added
-- **QuickBASIC 4.5 language support** — new `QuickBasicExtractor` handles `.bi` (include) and `.bm` (module) files, sharing the QBasic grammar under the existing `lang-qbasic` feature flag (31 languages total)
-- **`gix` for native git operations** — replaced `Command::new("git")` shell-outs with the `gix` crate (minimal features: `revision` + `blob-diff`), removing the runtime dependency on a `git` binary for commit counting and tree diffing
-- **Test coverage improvements** — 77 new tests across 6 files:
-  - `complexity_test.rs` (18 tests) — direct tests for the complexity counting algorithm: branches, loops, nesting, unsafe blocks, unwrap/expect detection, assertion counting
-  - `rust_extraction_test.rs` (17 tests) — Rust extractor: functions, structs, enums, traits, impls, modules, async, visibility, derive macros, call sites
-  - `display_test.rs` (10 tests) — formatting functions with boundary values
-  - `php_extraction_test.rs` (11 tests) — classes, interfaces, traits, namespaces, enums, visibility, inheritance
-  - `ruby_extraction_test.rs` (9 tests) — classes, modules, methods, inheritance, constants, nested classes
-  - `quickbasic_extraction_test.rs` (12 tests) — QB4.5-specific parsing (REDIM, SLEEP, ERASE), SUBs, FUNCTIONs, TYPEs, call sites
+- **QuickBASIC 4.5 language support**, new `QuickBasicExtractor` handles `.bi` (include) and `.bm` (module) files, sharing the QBasic grammar under the existing `lang-qbasic` feature flag (31 languages total)
+- **`gix` for native git operations**, replaced `Command::new("git")` shell-outs with the `gix` crate (minimal features: `revision` + `blob-diff`), removing the runtime dependency on a `git` binary for commit counting and tree diffing
+- **Test coverage improvements**. 77 new tests across 6 files:
+  - `complexity_test.rs` (18 tests), direct tests for the complexity counting algorithm: branches, loops, nesting, unsafe blocks, unwrap/expect detection, assertion counting
+  - `rust_extraction_test.rs` (17 tests). Rust extractor: functions, structs, enums, traits, impls, modules, async, visibility, derive macros, call sites
+  - `display_test.rs` (10 tests), formatting functions with boundary values
+  - `php_extraction_test.rs` (11 tests), classes, interfaces, traits, namespaces, enums, visibility, inheritance
+  - `ruby_extraction_test.rs` (9 tests), classes, modules, methods, inheritance, constants, nested classes
+  - `quickbasic_extraction_test.rs` (12 tests). QB4.5-specific parsing (REDIM, SLEEP, ERASE), SUBs, FUNCTIONs, TYPEs, call sites
 
 ### Changed
-- **Legacy BASIC grammars updated to 0.2.0** — `tree-sitter-qbasic`, `tree-sitter-msbasic2`, and `tree-sitter-gwbasic` bumped from 0.1 to 0.2, adding 27 new AST node types for QuickBasic 4.5 constructs (REDIM, SLEEP, ERASE, SHELL, metacommands, and more)
+- **Legacy BASIC grammars updated to 0.2.0**. `tree-sitter-qbasic`, `tree-sitter-msbasic2`, and `tree-sitter-gwbasic` bumped from 0.1 to 0.2, adding 27 new AST node types for QuickBasic 4.5 constructs (REDIM, SLEEP, ERASE, SHELL, metacommands, and more)
 - `git_commits_since` now uses `gix` revision walk with `ByCommitTimeCutoff` sorting, which is more efficient than the previous `git log` approach as gix stops walking once all queued commits are older than the cutoff
 - `handle_changelog` tree diff now uses `gix` tree-to-tree comparison with rename tracking, replacing `git diff --name-only`
 
 ## [2.0.3] - 2026-03-26
 
 ### Fixed
-- **Windows: sync re-adding files** — normalize all relative file paths to forward slashes in the scanner, preventing path mismatch between index and sync on Windows
-- **Windows: wrong upgrade command** — detect Scoop installations (`\scoop\` in binary path) and suggest `scoop update tracedecay` instead of `cargo install tracedecay`
-- **Windows: git hook backslashes** — write forward slashes in `core.hooksPath` and the post-commit hook snippet, since Git's shell expects `/` separators
-- **Scoop bucket structure** — moved manifest to `bucket/` subdirectory for better compatibility with `scoop update`
-- **Double-counted token savings** — "Global" total no longer includes the current project's count; display now shows "Project" and "All projects" labels
+- **Windows: sync re-adding files**, normalize all relative file paths to forward slashes in the scanner, preventing path mismatch between index and sync on Windows
+- **Windows: wrong upgrade command**, detect Scoop installations (`\scoop\` in binary path) and suggest `scoop update tracedecay` instead of `cargo install tracedecay`
+- **Windows: git hook backslashes**, write forward slashes in `core.hooksPath` and the post-commit hook snippet, since Git's shell expects `/` separators
+- **Scoop bucket structure**, moved manifest to `bucket/` subdirectory for better compatibility with `scoop update`
+- **Double-counted token savings**. "Global" total no longer includes the current project's count; display now shows "Project" and "All projects" labels
 
 ## [2.0.2] - 2026-03-26
 
@@ -3236,27 +4087,27 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ### Added
 
 #### 16 new language extractors (15 → 30 languages)
-- **Swift** — classes, structs, protocols, enums, extensions, init constructors, async methods, visibility modifiers, inheritance
-- **Bash** — functions, `readonly` constants, `source` imports, command call sites, comment docstrings
-- **Lua** — functions, colon-methods (OOP via metatables), `require()` imports, LDoc comments, `local` constants
-- **Zig** — structs, enums, unions, pub/private visibility, `@import` resolution, `test` blocks as functions, doc comments
-- **Protobuf** — `message` → `ProtoMessage`, `service` → `ProtoService`, `rpc` → `ProtoRpc` (new node kinds), enums, fields with type signatures, nested messages, `oneof`, package, imports
-- **Nix** — functions, modules (attrsets), constants, `inherit` as imports, `apply_expression` call sites, `#` comments
-- **VB.NET** — classes, structures, interfaces, modules, enums, `Sub`/`Function`, `Sub New` constructors, properties, `Inherits`/`Implements`, XML doc comments
-- **PowerShell** — functions, typed constants, `Import-Module` / dot-source imports, command call sites, `<# ... #>` block comments
-- **Batch/CMD** — labels as functions, `SET` as constants, `CALL :label` as call sites, `REM` docstrings (no complexity counting — too flat)
-- **Perl** — `sub` functions/methods, `package` as modules, `use`/`require` imports, `our` constants, method invocations (`->`), `#` comments
-- **Objective-C** — `@interface`/`@implementation`/`@protocol`, instance (`-`) and class (`+`) methods, `@property`, `NS_ENUM`, `#import`, message expression call sites, inheritance and protocol conformance
-- **Fortran** — `module`, `program`, `subroutine`, `function`, derived `type` with fields, `type extends()` inheritance, `interface`, `parameter` constants, `use` imports, `!` comments
-- **COBOL** — `PROGRAM-ID` as module, paragraph labels as functions, `WORKING-STORAGE` data items as fields/constants, `PERFORM` as call sites, `REM` comments (vendored grammar)
-- **MS BASIC 2.0** — subroutine synthesis from `REM...RETURN` blocks, `LET` constants, `GOSUB`/`GOTO` call sites
-- **GW-BASIC** — `DEF FN` functions, `WHILE/WEND` loops, subroutine synthesis, typed constants
-- **QBasic** — `SUB`/`FUNCTION` blocks, `TYPE...END TYPE` as structs with fields, `CONST`, `DIM SHARED`, `CALL` sites, `SELECT CASE`
+- **Swift**, classes, structs, protocols, enums, extensions, init constructors, async methods, visibility modifiers, inheritance
+- **Bash**, functions, `readonly` constants, `source` imports, command call sites, comment docstrings
+- **Lua**, functions, colon-methods (OOP via metatables), `require()` imports, LDoc comments, `local` constants
+- **Zig**, structs, enums, unions, pub/private visibility, `@import` resolution, `test` blocks as functions, doc comments
+- **Protobuf**. `message` → `ProtoMessage`, `service` → `ProtoService`, `rpc` → `ProtoRpc` (new node kinds), enums, fields with type signatures, nested messages, `oneof`, package, imports
+- **Nix**, functions, modules (attrsets), constants, `inherit` as imports, `apply_expression` call sites, `#` comments
+- **VB.NET**, classes, structures, interfaces, modules, enums, `Sub`/`Function`, `Sub New` constructors, properties, `Inherits`/`Implements`, XML doc comments
+- **PowerShell**, functions, typed constants, `Import-Module` / dot-source imports, command call sites, `<# ... #>` block comments
+- **Batch/CMD**, labels as functions, `SET` as constants, `CALL :label` as call sites, `REM` docstrings (no complexity counting, too flat)
+- **Perl**. `sub` functions/methods, `package` as modules, `use`/`require` imports, `our` constants, method invocations (`->`), `#` comments
+- **Objective-C**. `@interface`/`@implementation`/`@protocol`, instance (`-`) and class (`+`) methods, `@property`, `NS_ENUM`, `#import`, message expression call sites, inheritance and protocol conformance
+- **Fortran**. `module`, `program`, `subroutine`, `function`, derived `type` with fields, `type extends()` inheritance, `interface`, `parameter` constants, `use` imports, `!` comments
+- **COBOL**. `PROGRAM-ID` as module, paragraph labels as functions, `WORKING-STORAGE` data items as fields/constants, `PERFORM` as call sites, `REM` comments (vendored grammar)
+- **MS BASIC 2.0**, subroutine synthesis from `REM...RETURN` blocks, `LET` constants, `GOSUB`/`GOTO` call sites
+- **GW-BASIC**. `DEF FN` functions, `WHILE/WEND` loops, subroutine synthesis, typed constants
+- **QBasic**. `SUB`/`FUNCTION` blocks, `TYPE...END TYPE` as structs with fields, `CONST`, `DIM SHARED`, `CALL` sites, `SELECT CASE`
 
 #### Enhanced Nix extraction
-- **Derivation field extraction** — `mkDerivation`, `mkShell`, `buildPythonPackage`, `buildGoModule`, `buildRustPackage`, `buildNpmPackage` calls have their attrset arguments extracted as `Field` nodes (`pname`, `version`, `buildInputs`, `nativeBuildInputs`, `src`, `meta`, etc.)
-- **Import path resolution** — `import ./path.nix` creates a `Use` node with a `Uses` unresolved ref, enabling cross-file dependency tracking via `tracedecay_callers` and `tracedecay_impact`
-- **Flake output schema awareness** — in `flake.nix` files, standard output attributes (`packages`, `devShells`, `apps`, `nixosModules`, `nixosConfigurations`, `overlays`, `lib`, `checks`, `formatter`) are force-classified as `Module` nodes with recursive child extraction
+- **Derivation field extraction**. `mkDerivation`, `mkShell`, `buildPythonPackage`, `buildGoModule`, `buildRustPackage`, `buildNpmPackage` calls have their attrset arguments extracted as `Field` nodes (`pname`, `version`, `buildInputs`, `nativeBuildInputs`, `src`, `meta`, etc.)
+- **Import path resolution**. `import ./path.nix` creates a `Use` node with a `Uses` unresolved ref, enabling cross-file dependency tracking via `tracedecay_callers` and `tracedecay_impact`
+- **Flake output schema awareness**, in `flake.nix` files, standard output attributes (`packages`, `devShells`, `apps`, `nixosModules`, `nixosConfigurations`, `overlays`, `lib`, `checks`, `formatter`) are force-classified as `Module` nodes with recursive child extraction
 
 #### Feature flag tiers
 - Three compilation tiers via Cargo feature flags to control binary size:
@@ -3264,20 +4115,20 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
   - **`medium`** (20 languages): lite + Dart, Pascal, PHP, Ruby, Bash, Protobuf, PowerShell, Nix, VB.NET
   - **`full`** (30 languages, default): medium + Lua, Zig, Objective-C, Perl, Batch/CMD, Fortran, COBOL, MS BASIC 2.0, GW-BASIC, QBasic
 - Individual `lang-*` feature flags for cherry-picking languages (e.g., `--no-default-features --features lang-nix,lang-bash`)
-- `default = ["full"]` — existing users get all 30 languages with no config changes
+- `default = ["full"]`, existing users get all 30 languages with no config changes
 
 #### New node kinds
-- `ProtoMessage` — Protobuf message definitions
-- `ProtoService` — Protobuf service definitions
-- `ProtoRpc` — Protobuf RPC method definitions
+- `ProtoMessage`. Protobuf message definitions
+- `ProtoService`. Protobuf service definitions
+- `ProtoRpc`. Protobuf RPC method definitions
 
 #### Porting assessment tools
-- **`tracedecay_port_status`** — compare symbols between source and target directories within the same project to track porting progress; matches by name with cross-language kind compatibility (`class` ↔ `struct`, `interface` ↔ `trait`); reports matched/unmatched/target-only counts and coverage percentage
-- **`tracedecay_port_order`** — topological sort of source symbols for porting; uses Kahn's algorithm on the internal dependency graph to produce levels (port leaves first, then dependents); detects and reports dependency cycles
+- **`tracedecay_port_status`**, compare symbols between source and target directories within the same project to track porting progress; matches by name with cross-language kind compatibility (`class` ↔ `struct`, `interface` ↔ `trait`); reports matched/unmatched/target-only counts and coverage percentage
+- **`tracedecay_port_order`**, topological sort of source symbols for porting; uses Kahn's algorithm on the internal dependency graph to produce levels (port leaves first, then dependents); detects and reports dependency cycles
 
 #### Agent prompt improvements
-- **SQLite fallback instruction** — agents are told to query `.tracedecay/tracedecay.db` directly via SQL when MCP tools can't answer a code analysis question
-- **Improvement feedback loop** — agents propose opening a GitHub issue when they discover an extractor/schema/tool gap, reminding the user to strip sensitive data
+- **SQLite fallback instruction**, agents are told to query `.tracedecay/tracedecay.db` directly via SQL when MCP tools can't answer a code analysis question
+- **Improvement feedback loop**, agents propose opening a GitHub issue when they discover an extractor/schema/tool gap, reminding the user to strip sensitive data
 
 ### Changed
 - Cargo.toml `description` now lists lite-tier languages with "and many more" instead of all 30
@@ -3286,7 +4137,7 @@ The largest functional jump since 4.0: nine new MCP tools, a cross-session respo
 ### Breaking
 - Tree-sitter grammar dependencies for medium/full tier languages are now **optional** behind feature flags. Downstream crates depending on specific extractors must enable the corresponding `lang-*` feature.
 - `cargo install tracedecay --no-default-features` now builds a **lite** binary (11 languages) instead of the previous 15. To get the old behavior, use `cargo install tracedecay` (default = full, 30 languages).
-- Three new `NodeKind` variants (`ProtoMessage`, `ProtoService`, `ProtoRpc`) added — code matching exhaustively on `NodeKind` will need updating.
+- Three new `NodeKind` variants (`ProtoMessage`, `ProtoService`, `ProtoRpc`) added, code matching exhaustively on `NodeKind` will need updating.
 
 ### Upgrade guide
 ```bash
@@ -3298,8 +4149,8 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.10.0] - 2026-03-26
 
 ### Added
-- **Version update notifications** — the MCP server checks GitHub releases (with a 5-minute cache) and warns users when a newer version is available, via both a `notifications/message` logging notification and a text block prepended to tool responses
-- **Global git post-commit hook** — `tracedecay install` now offers to install a global `post-commit` hook that auto-runs `tracedecay sync` after each commit, keeping the index up to date without manual intervention
+- **Version update notifications**, the MCP server checks GitHub releases (with a 5-minute cache) and warns users when a newer version is available, via both a `notifications/message` logging notification and a text block prepended to tool responses
+- **Global git post-commit hook**. `tracedecay install` now offers to install a global `post-commit` hook that auto-runs `tracedecay sync` after each commit, keeping the index up to date without manual intervention
 - MCP `logging` capability advertised in `initialize` response
 - Minimal gitconfig parser for reading `core.hooksPath` from `~/.gitconfig` and `~/.config/git/config` without shelling out to `git`
 - 12 unit tests for gitconfig parsing, insertion, and tilde expansion
@@ -3308,7 +4159,7 @@ tracedecay sync --force           # re-index to pick up new language extractors
 
 ### Fixed
 - OpenCode MCP config uses `mcp` key (not `mcpServers`) with `"type": "local"` and `"command": [bin, "serve"]` array format, matching the current OpenCode schema
-- Removed legacy `~/.opencode.json` fallback — config always writes to `~/.config/opencode/opencode.json` (or `$XDG_CONFIG_HOME`)
+- Removed legacy `~/.opencode.json` fallback, config always writes to `~/.config/opencode/opencode.json` (or `$XDG_CONFIG_HOME`)
 - Healthcheck validates the `command` array contains `"serve"` instead of checking `args`
 
 ## [1.8.2] - 2026-03-26
@@ -3320,21 +4171,21 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.8.1] - 2026-03-26
 
 ### Added
-- **OpenCode agent** (`tracedecay install --agent opencode`) — registers MCP server in `.opencode.json`, appends prompt rules to `OPENCODE.md`; healthcheck validates config and prompt file
-- **Codex CLI agent** (`tracedecay install --agent codex`) — registers MCP server in `~/.codex/config.toml` with auto-approval for all 27 tools, appends prompt rules to `~/.codex/AGENTS.md`; healthcheck validates config, tool approval counts, and prompt file
+- **OpenCode agent** (`tracedecay install --agent opencode`), registers MCP server in `.opencode.json`, appends prompt rules to `OPENCODE.md`; healthcheck validates config and prompt file
+- **Codex CLI agent** (`tracedecay install --agent codex`), registers MCP server in `~/.codex/config.toml` with auto-approval for all 27 tools, appends prompt rules to `~/.codex/AGENTS.md`; healthcheck validates config, tool approval counts, and prompt file
 - TOML helpers (`load_toml_file`, `write_toml_file`) in agents module for Codex config support
 - `TOOL_NAMES` constant with bare tool names (without agent-specific prefix) for cross-agent use
 
 ### New files
-- `src/agents/opencode.rs` — `OpenCodeAgent` implementing `Agent`
-- `src/agents/codex.rs` — `CodexAgent` implementing `Agent`
+- `src/agents/opencode.rs`. `OpenCodeAgent` implementing `Agent`
+- `src/agents/codex.rs`. `CodexAgent` implementing `Agent`
 
 ## [1.8.0] - 2026-03-26
 
 ### Added
 - **Multi-agent architecture** with a trait-based `Agent` abstraction (`install`, `uninstall`, `healthcheck`) to support CLI agents beyond Claude Code
-- `tracedecay install [--agent NAME]` replaces `claude-install` — defaults to `claude` when no agent is specified
-- `tracedecay uninstall [--agent NAME]` replaces `claude-uninstall` — defaults to `claude`
+- `tracedecay install [--agent NAME]` replaces `claude-install`, defaults to `claude` when no agent is specified
+- `tracedecay uninstall [--agent NAME]` replaces `claude-uninstall`, defaults to `claude`
 - `tracedecay doctor [--agent NAME]` now checks all registered agents by default; use `--agent` to narrow to one
 - Agent registry with `get_agent()`, `all_agents()`, and `available_agents()` for programmatic access
 - `tracedecay install --agent unknown` returns a clear error listing available agents
@@ -3346,8 +4197,8 @@ tracedecay sync --force           # re-index to pick up new language extractors
 - Backward compatibility preserved: `tracedecay claude-install` and `tracedecay claude-uninstall` still work as aliases
 
 ### New files
-- `src/agents/mod.rs` — `Agent` trait, `InstallContext`, `HealthcheckContext`, `DoctorCounters`, agent registry, shared helpers
-- `src/agents/claude.rs` — `ClaudeAgent` implementing `Agent`
+- `src/agents/mod.rs`. `Agent` trait, `InstallContext`, `HealthcheckContext`, `DoctorCounters`, agent registry, shared helpers
+- `src/agents/claude.rs`. `ClaudeAgent` implementing `Agent`
 
 ## [1.7.1] - 2026-03-25
 
@@ -3368,9 +4219,9 @@ tracedecay sync --force           # re-index to pick up new language extractors
 
 ### Added
 - **3 new safety metrics on every function/method node** extracted from the AST during indexing, enabling NASA Power of 10 compliance audits without grep:
-  - `unsafe_blocks` — counts unsafe blocks/statements (Rust `unsafe {}`, C# `unsafe {}`)
-  - `unchecked_calls` — counts force-unwrap and unchecked operations (Rust `.unwrap()`/`.expect()`, TypeScript `!`, Kotlin `!!`, Java `.get()` on Optional, Scala `.get()`, Ruby `.fetch()`)
-  - `assertions` — counts assertion calls per function (Rust `assert!`/`debug_assert!`, Java `assertEquals`, Python `assertEqual`, Go `require`, C++ `EXPECT_EQ`/`ASSERT_TRUE`, and framework-specific variants for all 15 languages)
+  - `unsafe_blocks`, counts unsafe blocks/statements (Rust `unsafe {}`, C# `unsafe {}`)
+  - `unchecked_calls`, counts force-unwrap and unchecked operations (Rust `.unwrap()`/`.expect()`, TypeScript `!`, Kotlin `!!`, Java `.get()` on Optional, Scala `.get()`, Ruby `.fetch()`)
+  - `assertions`, counts assertion calls per function (Rust `assert!`/`debug_assert!`, Java `assertEquals`, Python `assertEqual`, Go `require`, C++ `EXPECT_EQ`/`ASSERT_TRUE`, and framework-specific variants for all 15 languages)
 - Extended `ComplexityConfig` with 6 new fields (`unsafe_types`, `unchecked_types`, `unchecked_methods`, `call_expression_types`, `call_method_field`, `assertion_names`, `macro_invocation_types`) to support cross-language detection
 - `count_complexity` now accepts source bytes for method-name and macro-name matching in call expressions
 - DB migration V4 adds `unsafe_blocks`, `unchecked_calls`, and `assertions` columns to the nodes table
@@ -3385,7 +4236,7 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.6.1] - 2026-03-25
 
 ### Fixed
-- `claude-install` now registers all 27 tool permissions — 9 tools added in v1.6.0 (`complexity`, `coupling`, `distribution`, `doc_coverage`, `god_class`, `inheritance_depth`, `largest`, `rank`, `recursion`) were missing from `EXPECTED_TOOL_PERMS`, so `claude-install` didn't grant them and `doctor` didn't flag them
+- `claude-install` now registers all 27 tool permissions. 9 tools added in v1.6.0 (`complexity`, `coupling`, `distribution`, `doc_coverage`, `god_class`, `inheritance_depth`, `largest`, `rank`, `recursion`) were missing from `EXPECTED_TOOL_PERMS`, so `claude-install` didn't grant them and `doctor` didn't flag them
 - README permissions example updated to show all 27 tools (was showing only 9)
 - README: fixed MCP server location reference (`~/.claude.json`, not `~/.claude/settings.json`)
 
@@ -3393,20 +4244,20 @@ tracedecay sync --force           # re-index to pick up new language extractors
 
 ### Added
 - 9 new MCP tools (27 total) for codebase analytics, code quality, and guideline compliance:
-  - `tracedecay_rank` — rank nodes by relationship count with direction support (incoming/outgoing); answers "most implemented interface", "class that implements the most interfaces", etc.
-  - `tracedecay_largest` — rank nodes by line count; find largest classes, longest methods
-  - `tracedecay_coupling` — rank files by fan-in (most depended-on) or fan-out (most dependencies)
-  - `tracedecay_inheritance_depth` — find deepest class hierarchies via recursive CTE on extends chains
-  - `tracedecay_distribution` — node kind breakdown per file/directory with summary mode
-  - `tracedecay_recursion` — detect recursive/mutually-recursive call cycles (NASA Power of 10, Rule 1)
-  - `tracedecay_complexity` — rank functions by composite complexity score with real cyclomatic complexity from AST
-  - `tracedecay_doc_coverage` — find public symbols missing documentation (Rust guidelines M-CANONICAL-DOCS)
-  - `tracedecay_god_class` — find classes with the most members (methods + fields)
-- **Complexity metrics on every function/method node** — 4 new columns extracted from the AST during indexing:
-  - `branches` — branching statements (if, match/switch arms, ternary, catch). CC = branches + 1.
-  - `loops` — loop constructs (for, while, loop, do). Enables NASA Rule 2 audits.
-  - `returns` — early exits (return, break, continue, throw).
-  - `max_nesting` — deepest brace nesting level. Enables NASA Rule 1 (≤4 levels) audits.
+  - `tracedecay_rank`, rank nodes by relationship count with direction support (incoming/outgoing); answers "most implemented interface", "class that implements the most interfaces", etc.
+  - `tracedecay_largest`, rank nodes by line count; find largest classes, longest methods
+  - `tracedecay_coupling`, rank files by fan-in (most depended-on) or fan-out (most dependencies)
+  - `tracedecay_inheritance_depth`, find deepest class hierarchies via recursive CTE on extends chains
+  - `tracedecay_distribution`, node kind breakdown per file/directory with summary mode
+  - `tracedecay_recursion`, detect recursive/mutually-recursive call cycles (NASA Power of 10, Rule 1)
+  - `tracedecay_complexity`, rank functions by composite complexity score with real cyclomatic complexity from AST
+  - `tracedecay_doc_coverage`, find public symbols missing documentation (Rust guidelines M-CANONICAL-DOCS)
+  - `tracedecay_god_class`, find classes with the most members (methods + fields)
+- **Complexity metrics on every function/method node**. 4 new columns extracted from the AST during indexing:
+  - `branches`, branching statements (if, match/switch arms, ternary, catch). CC = branches + 1.
+  - `loops`, loop constructs (for, while, loop, do). Enables NASA Rule 2 audits.
+  - `returns`, early exits (return, break, continue, throw).
+  - `max_nesting`, deepest brace nesting level. Enables NASA Rule 1 (≤4 levels) audits.
 - Generic `count_complexity()` helper with per-language configs for all 15 supported languages
 - DB migration V3 adds the 4 complexity columns to the nodes table
 - All new tools use efficient SQL queries (JOINs, GROUP BY, recursive CTEs) instead of loading all edges into memory
@@ -3421,20 +4272,20 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.5.1] - 2026-03-25
 
 ### Added
-- `tracedecay doctor` command — comprehensive health check of binary, project index, global DB, user config, Claude Code integration (MCP server, hook, permissions, CLAUDE.md), and network connectivity
+- `tracedecay doctor` command, comprehensive health check of binary, project index, global DB, user config, Claude Code integration (MCP server, hook, permissions, CLAUDE.md), and network connectivity
 - Stale install warning: automatically detects when `claude-install` needs re-running due to new tool permissions and warns on every CLI command
 
 ### Added
 - 9 new MCP tools (18 total):
-  - `tracedecay_dead_code` — find unreachable symbols with no incoming edges
-  - `tracedecay_diff_context` — semantic context for changed files (modified symbols, dependencies, affected tests)
-  - `tracedecay_module_api` — public API surface of a file or directory
-  - `tracedecay_circular` — detect circular file dependencies
-  - `tracedecay_hotspots` — most connected symbols by edge count
-  - `tracedecay_similar` — find symbols with similar names
-  - `tracedecay_rename_preview` — all references to a symbol
-  - `tracedecay_unused_imports` — import statements never referenced
-  - `tracedecay_changelog` — semantic diff between two git refs
+  - `tracedecay_dead_code`, find unreachable symbols with no incoming edges
+  - `tracedecay_diff_context`, semantic context for changed files (modified symbols, dependencies, affected tests)
+  - `tracedecay_module_api`, public API surface of a file or directory
+  - `tracedecay_circular`, detect circular file dependencies
+  - `tracedecay_hotspots`, most connected symbols by edge count
+  - `tracedecay_similar`, find symbols with similar names
+  - `tracedecay_rename_preview`, all references to a symbol
+  - `tracedecay_unused_imports`, import statements never referenced
+  - `tracedecay_changelog`, semantic diff between two git refs
 - `get_all_edges()`, `get_nodes_by_file()`, `get_all_nodes()`, `get_incoming_edges()`, `get_outgoing_edges()` delegation methods on `TraceDecay`
 - `find_circular_dependencies()` graph query for file-level cycle detection
 - `tracedecay status` prompts to create index if none exists (Y/n)
@@ -3443,20 +4294,20 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.4.3] - 2026-03-25
 
 ### Added
-- Country flags row in `tracedecay status` — shows emoji flags of countries where tracedecay is used, centered below the token counters
+- Country flags row in `tracedecay status`, shows emoji flags of countries where tracedecay is used, centered below the token counters
 - `fetch_country_flags()` in cloud module (500ms timeout, best-effort)
 - Flags truncated with ellipsis if they exceed the available table width
 
 ## [1.4.2] - 2026-03-25
 
 ### Added
-- PHP language support (`.php`) — functions, classes, methods, traits, interfaces, enums, constants, properties, namespaces, imports, and call sites
-- Ruby language support (`.rb`) — methods, classes, modules, constants, inheritance, and call sites
+- PHP language support (`.php`), functions, classes, methods, traits, interfaces, enums, constants, properties, namespaces, imports, and call sites
+- Ruby language support (`.rb`), methods, classes, modules, constants, inheritance, and call sites
 
 ## [1.4.1] - 2026-03-25
 
 ### Added
-- Cross-platform release workflow — GitHub Actions builds prebuilt binaries for macOS (ARM), Linux (x86_64, ARM64), and Windows (x86_64) on every release
+- Cross-platform release workflow. GitHub Actions builds prebuilt binaries for macOS (ARM), Linux (x86_64, ARM64), and Windows (x86_64) on every release
 - Scoop package manager support for Windows (`scoop install tracedecay`)
 - Automated Scoop bucket updates on release
 - Automated Homebrew formula + bottle updates on release
@@ -3467,7 +4318,7 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.4.0] - 2026-03-25
 
 ### Added
-- Worldwide tracedecayd counter — aggregates anonymous token counts across all tracedecay users via Cloudflare Worker + Upstash Redis
+- Worldwide tracedecayd counter, aggregates anonymous token counts across all tracedecay users via Cloudflare Worker + Upstash Redis
 - `tracedecay status` shows three tiers: Local, Global, and Worldwide token counts
 - `tracedecay disable-upload-counter` / `tracedecay enable-upload-counter` commands to opt out of uploading
 - All upload state stored transparently in `~/.tracedecay/config.toml`
@@ -3503,20 +4354,20 @@ tracedecay sync --force           # re-index to pick up new language extractors
 ## [1.2.0] - 2026-03-24
 
 ### Added
-- `claude-install` CLI command — configures Claude Code integration (MCP server, permissions, hook, CLAUDE.md rules) in a single step, replacing the bash `setup.sh` script
-- `hook-pre-tool-use` hidden CLI command — cross-platform PreToolUse hook handler written in pure Rust (no bash/jq dependency), blocks Explore agents and exploration-style prompts
+- `claude-install` CLI command, configures Claude Code integration (MCP server, permissions, hook, CLAUDE.md rules) in a single step, replacing the bash `setup.sh` script
+- `hook-pre-tool-use` hidden CLI command, cross-platform PreToolUse hook handler written in pure Rust (no bash/jq dependency), blocks Explore agents and exploration-style prompts
 
 ### Removed
-- Embedded bash hook script — the hook is now a native Rust subcommand
+- Embedded bash hook script, the hook is now a native Rust subcommand
 
 ## [1.1.0] - 2026-03-24
 
 ### Added
-- `tracedecay files` CLI command — list indexed files with `--filter` (directory prefix), `--pattern` (glob), and `--json` output
-- `tracedecay affected` CLI command — BFS through file dependency graph to find test files impacted by source changes; supports `--stdin` (pipe from `git diff --name-only`), `--depth`, `--filter`, `--json`, `--quiet`
-- `tracedecay_files` MCP tool — file listing with path/pattern filtering, flat or grouped-by-directory output
-- `tracedecay_affected` MCP tool — find affected test files via file-level dependency traversal
-- Graceful shutdown handler for MCP server — persists tokens-saved counter, checkpoints SQLite WAL, and logs session summary on SIGINT/SIGTERM
+- `tracedecay files` CLI command, list indexed files with `--filter` (directory prefix), `--pattern` (glob), and `--json` output
+- `tracedecay affected` CLI command. BFS through file dependency graph to find test files impacted by source changes; supports `--stdin` (pipe from `git diff --name-only`), `--depth`, `--filter`, `--json`, `--quiet`
+- `tracedecay_files` MCP tool, file listing with path/pattern filtering, flat or grouped-by-directory output
+- `tracedecay_affected` MCP tool, find affected test files via file-level dependency traversal
+- Graceful shutdown handler for MCP server, persists tokens-saved counter, checkpoints SQLite WAL, and logs session summary on SIGINT/SIGTERM
 - `Database::checkpoint()` method for WAL cleanup on shutdown
 
 ## [1.0.1] - 2026-03-24

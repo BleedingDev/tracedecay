@@ -1,4 +1,4 @@
-//! Daemon-only `tracedecay_admin_sync` — still needs the code-index reconcile sink.
+//! Daemon-only `tracedecay_admin_sync`, still needs the code-index reconcile sink.
 
 use super::*;
 use tracedecay_code_index_runtime::code_index_scheduler::{
@@ -11,22 +11,8 @@ use tracedecay_code_index_runtime::code_index_scheduler::{
 #[hotpath::measure(label = "mcp.info.admin_sync.total")]
 pub(crate) async fn handle_admin_sync(
     cg: &TraceDecay,
-    args: Value,
     reconcile_sink: Option<&crate::mcp::server::CodeIndexReconcileSink>,
 ) -> Result<ToolResult> {
-    let request =
-        tracedecay_contracts::CodeIndexReconcileRequestV1::from_json(args).map_err(|error| {
-            TraceDecayError::Config {
-                message: error.to_string(),
-            }
-        })?;
-    let force = request.force;
-    let options_digest = request
-        .options
-        .digest()
-        .map_err(|error| TraceDecayError::Config {
-            message: error.to_string(),
-        })?;
     let project_root = cg.project_root().to_path_buf();
     let reconcile_sink = reconcile_sink.ok_or_else(|| {
         TraceDecayError::project_route(
@@ -37,13 +23,8 @@ pub(crate) async fn handle_admin_sync(
     })?;
     // The operator named this route (`tracedecay init` / `tracedecay sync`):
     // the one demand that may index a route the watcher policy keeps quiet.
-    let demand = if request.options.is_default() {
-        CodeIndexDemandV1::OperatorReconcile
-    } else {
-        CodeIndexDemandV1::OperatorReconcileWithOptions(request.options.clone())
-    };
     let admission = hotpath::future!(
-        reconcile_sink(project_root.clone(), demand),
+        reconcile_sink(project_root.clone(), CodeIndexDemandV1::OperatorReconcile,),
         label = "mcp.info.admin_sync.reconcile"
     )
     .await;
@@ -61,13 +42,9 @@ pub(crate) async fn handle_admin_sync(
         }
     };
     let output = json!({
-        "requested_mode": if force { "force" } else { "refresh" },
         "reconcile_scope": "authoritative_project",
         "status": status,
         "project_root": cg.project_root(),
-        "skip_folders": request.options.skip_folders,
-        "include_folders": request.options.include_folders,
-        "options_digest": options_digest,
     });
     let text = serde_json::to_string(&output)?;
     Ok(ToolResult::new(

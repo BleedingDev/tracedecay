@@ -504,6 +504,8 @@ pub struct FusionStageInput {
 /// final scalar utility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FusionComparatorRecordV1 {
+    /// Distinct caller anchors the candidate carries; the leading key.
+    pub anchor_tier: u32,
     pub exact_class: ExactClass,
     pub utility_micros: u64,
     pub source_validity_rank: u8,
@@ -569,10 +571,25 @@ impl CompositionKernel {
         input: &FusionStageInput,
         policy: &tracedecay_domain::DiversityPolicy,
     ) -> Result<CompositionOutputV1, FusionStageError> {
+        self.compose_with_anchor_tiers(input, policy, &BTreeMap::new())
+    }
+
+    /// Compose with caller-anchor tiers: a fused candidate carrying more
+    /// caller anchors ranks ahead of every candidate carrying fewer, exact
+    /// class included, before dedupe, diversity caps, and pagination see the
+    /// order. Anchors are the caller's statement of what the answer is about;
+    /// a lane score cannot carry that through calibration.
+    pub fn compose_with_anchor_tiers(
+        &self,
+        input: &FusionStageInput,
+        policy: &tracedecay_domain::DiversityPolicy,
+        anchor_tiers: &BTreeMap<RetrievalAnchorId, u32>,
+    ) -> Result<CompositionOutputV1, FusionStageError> {
         self.compose_required(
             input,
             policy,
             &[RetrieverKind::ExactLiteral, RetrieverKind::Lexical],
+            anchor_tiers,
             &[],
         )
     }
@@ -593,6 +610,7 @@ impl CompositionKernel {
             input,
             policy,
             &[RetrieverKind::ExactLiteral, RetrieverKind::Lexical],
+            &BTreeMap::new(),
             incumbents,
         )
     }
@@ -606,7 +624,7 @@ impl CompositionKernel {
         policy: &tracedecay_domain::DiversityPolicy,
         lane: RetrieverKind,
     ) -> Result<CompositionOutputV1, FusionStageError> {
-        self.compose_required(input, policy, &[lane], &[])
+        self.compose_required(input, policy, &[lane], &BTreeMap::new(), &[])
     }
 
     #[hotpath::measure(label = "query.fusion")]
@@ -615,6 +633,7 @@ impl CompositionKernel {
         input: &FusionStageInput,
         policy: &tracedecay_domain::DiversityPolicy,
         required_lanes: &[RetrieverKind],
+        anchor_tiers: &BTreeMap<RetrievalAnchorId, u32>,
         cap_incumbents: &[RankedCandidate],
     ) -> Result<CompositionOutputV1, FusionStageError> {
         let admitted = admitted_lanes(input, required_lanes)?;
@@ -627,7 +646,7 @@ impl CompositionKernel {
         // One sort with the final comparator establishes the order every
         // later stage preserves; representative selection and diversity caps
         // only filter it.
-        let (ordered, comparator_records) = self.fusion.order_fused(fused);
+        let (ordered, comparator_records) = self.fusion.order_fused(fused, anchor_tiers);
         let (deduped, mut copy_decisions) = self
             .dedupe
             .select_representatives_with_decisions(ordered)
@@ -1005,10 +1024,6 @@ impl DeterministicFixedPointFusion {
                 decisions: Vec::new(),
             });
             entry.exact_class = strongest_exact_class(entry.exact_class, exact_class);
-            entry.utility_micros = entry
-                .utility_micros
-                .checked_add(weighted_contribution_micros)
-                .ok_or(FusionStageError::FixedPointOverflow)?;
             entry.occurrences.push(occurrence);
             entry.contributions.push(contribution);
             entry.freshness.push(candidate.freshness.clone());
@@ -1025,6 +1040,7 @@ impl DeterministicFixedPointFusion {
 
         let mut fused = fused.into_values().collect::<Vec<_>>();
         for candidate in &mut fused {
+            candidate.utility_micros = lane_saturated_utility_micros(&candidate.contributions)?;
             candidate.occurrences.sort_by(occurrence_cmp);
             candidate.occurrences.dedup();
             candidate.contributions.sort_by(contribution_cmp);
@@ -1045,12 +1061,17 @@ impl DeterministicFixedPointFusion {
     fn order_fused(
         &self,
         candidates: Vec<FusedCandidate>,
+        anchor_tiers: &BTreeMap<RetrievalAnchorId, u32>,
     ) -> (OrderedFusedCandidates, Vec<FusionComparatorRecordV1>) {
-        let mut ordered = OrderedFusedCandidates::sort(candidates);
+        let mut ordered = OrderedFusedCandidates::sort(candidates, anchor_tiers);
         let records = ordered
             .iter_mut()
             .map(|candidate| {
-                let record = self.comparator_record(candidate);
+                let anchor_tier = anchor_tiers
+                    .get(&candidate.anchor_id)
+                    .copied()
+                    .unwrap_or(0);
+                let record = self.comparator_record(candidate, anchor_tier);
                 candidate.decisions.push(RankingDecision {
                     kind: RankingDecisionKind::ComparatorProvenance,
                     retriever: None,
@@ -1060,7 +1081,8 @@ impl DeterministicFixedPointFusion {
                         .first()
                         .map(|occurrence| occurrence.retriever_evidence_anchor.clone()),
                     detail: format!(
-                        "exact={:?};utility={};source_validity={};domain_scores=[{}];evidence_anchors=[{}];occurrences=[{}];revision={}",
+                        "anchor_tier={};exact={:?};utility={};source_validity={};domain_scores=[{}];evidence_anchors=[{}];occurrences=[{}];revision={}",
+                        record.anchor_tier,
                         record.exact_class,
                         record.utility_micros,
                         record.source_validity_rank,
@@ -1085,9 +1107,14 @@ impl DeterministicFixedPointFusion {
         (ordered, records)
     }
 
-    pub fn comparator_record(&self, candidate: &FusedCandidate) -> FusionComparatorRecordV1 {
+    pub fn comparator_record(
+        &self,
+        candidate: &FusedCandidate,
+        anchor_tier: u32,
+    ) -> FusionComparatorRecordV1 {
         stage_counters::record_comparator_record();
         FusionComparatorRecordV1 {
+            anchor_tier,
             exact_class: candidate.exact_class,
             utility_micros: candidate.utility_micros,
             source_validity_rank: source_validity_rank(candidate),
@@ -1105,6 +1132,26 @@ impl DeterministicFixedPointFusion {
             comparator_revision: self.comparator_revision.clone(),
         }
     }
+}
+
+/// Utility is the sum over lanes of each lane's strongest weighted
+/// contribution, so a lane never counts more than its profile weight for one
+/// candidate. Summing every occurrence instead made utility scale with how
+/// many chunks a candidate was split into: an oversized generated symbol whose
+/// thirteen fallback windows each saturated the lexical calibration outranked
+/// a two-chunk symbol thirteen to two on chunk count alone.
+fn lane_saturated_utility_micros(
+    contributions: &[CandidateContribution],
+) -> Result<u64, FusionStageError> {
+    let mut strongest_by_lane = BTreeMap::<RetrieverKind, u64>::new();
+    for contribution in contributions {
+        let strongest = strongest_by_lane.entry(contribution.retriever).or_default();
+        *strongest = (*strongest).max(contribution.weighted_contribution_micros);
+    }
+    strongest_by_lane
+        .into_values()
+        .try_fold(0_u64, |utility, lane| utility.checked_add(lane))
+        .ok_or(FusionStageError::FixedPointOverflow)
 }
 
 fn compact_candidate_cmp(left: &CompactCandidate, right: &CompactCandidate) -> Ordering {
@@ -1298,7 +1345,6 @@ fn build_cursor(
         signature: QueryMac::new(format!("hmac-sha256:{}", "0".repeat(64)))?,
     };
     cursor.signature = keyring.sign_cursor(&cursor)?;
-    cursor.validate()?;
     Ok(cursor)
 }
 
@@ -1424,13 +1470,7 @@ mod attach_same_source_decisions_tests {
     use super::*;
     use tracedecay_domain::{EvidenceRole, FreshnessCompatibilityV1};
 
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        <T as TryFrom<String>>::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("valid fixture identity")
-    }
+    use tracedecay_domain::test_fixtures::id;
 
     fn freshness() -> SourceFreshness {
         SourceFreshness {

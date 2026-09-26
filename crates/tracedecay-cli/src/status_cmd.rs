@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::path::Path;
@@ -5,6 +6,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::time::{Instant, timeout_at};
+use tracedecay_application::advisory::github_runtime::{
+    GitHubPullRequestDiscoveryKindV1, GitHubSourceStateV1, GitHubSourceStatusV1,
+};
 use tracedecay_contracts::project_open::{
     ProjectOpenStatusReasonV1, ProjectOpenStatusStateV1, ProjectOpenStatusV1,
 };
@@ -12,7 +16,6 @@ use tracedecay_contracts::retained_surfaces::{FactCommitOwnerV1, MemoryStatusV1}
 use tracedecay_contracts::storage::{
     SchemaConvergenceFindingV1, SchemaConvergenceProgressV1, SchemaConvergenceStateV1,
 };
-use tracedecay_runtime_core::text::format_number;
 
 use crate::commands::reject_truncation_envelope;
 use crate::{commands, current_unix_timestamp, global, resolve_cli_project_root};
@@ -75,10 +78,6 @@ async fn await_daemon_tool_result<T>(
 
 fn should_print_status_logo(short: bool, stdout_is_terminal: bool) -> bool {
     !short && stdout_is_terminal
-}
-
-fn should_fetch_online_status_embellishments(stdout_is_terminal: bool) -> bool {
-    stdout_is_terminal
 }
 
 /// Cache lifetimes of the two decorative worldwide-counter reads. The status
@@ -186,94 +185,41 @@ fn compact_status_tool_args() -> Value {
     })
 }
 
-fn status_details_tool_args() -> Value {
-    serde_json::json!({
-        "format": "json",
-        "summary": true,
-    })
+/// One status line naming how the project's GitHub source is read, followed
+/// by the operator remedy when it is not credential-bound.
+fn github_source_line(source: &GitHubSourceStatusV1) -> String {
+    let state = match source.state {
+        GitHubSourceStateV1::Bound => "bound",
+        GitHubSourceStateV1::UnauthenticatedPublic => "unauthenticated_public",
+        GitHubSourceStateV1::DeniedNoCredential => "denied_no_credential",
+    };
+    let discovery = match (source.pull_request_discovery, source.pull_request) {
+        (GitHubPullRequestDiscoveryKindV1::Found, Some(number)) => format!(
+            "PR #{number} found (head {})",
+            source
+                .head_repository
+                .as_deref()
+                .unwrap_or(&source.repository)
+        ),
+        (kind, _) => format!("PR discovery {}", pull_request_discovery_label(kind)),
+    };
+    let mut line = format!("GitHub {}: {state} · {discovery}", source.repository);
+    if let Some(remedy) = &source.remedy {
+        let _ = write!(line, "\n  remedy: {remedy}");
+    }
+    line
 }
 
-/// Decodes the current verified distribution route before it is rendered or
-/// attached to the status JSON. The status command must fail closed if the
-/// route changes shape instead of displaying a partial or fabricated report.
-fn node_kind_distribution_entries(
-    value: &Value,
-) -> tracedecay_domain::errors::Result<Vec<(String, u64)>> {
-    let mode = value.get("mode").and_then(Value::as_str).ok_or_else(|| {
-        tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay_distribution omitted its mode".to_owned(),
-        }
-    })?;
-    if mode != "summary" {
-        return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: format!(
-                "tracedecay_distribution returned mode {mode:?}; status details require summary"
-            ),
-        });
+const fn pull_request_discovery_label(kind: GitHubPullRequestDiscoveryKindV1) -> &'static str {
+    match kind {
+        GitHubPullRequestDiscoveryKindV1::Found => "found",
+        GitHubPullRequestDiscoveryKindV1::NotFound => "not_found",
+        GitHubPullRequestDiscoveryKindV1::Ambiguous => "ambiguous",
+        GitHubPullRequestDiscoveryKindV1::RateLimited => "rate_limited",
+        GitHubPullRequestDiscoveryKindV1::Denied => "denied",
+        GitHubPullRequestDiscoveryKindV1::Unavailable => "unavailable",
+        GitHubPullRequestDiscoveryKindV1::NotAttempted => "not_attempted",
     }
-    let distribution = value
-        .get("distribution")
-        .and_then(Value::as_array)
-        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay_distribution omitted its distribution".to_owned(),
-        })?;
-    if let Some(total_kinds) = value.get("total_kinds").and_then(Value::as_u64)
-        && total_kinds != u64::try_from(distribution.len()).unwrap_or(u64::MAX)
-    {
-        return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: format!(
-                "tracedecay_distribution reported {total_kinds} kinds but returned {}",
-                distribution.len()
-            ),
-        });
-    }
-    distribution
-        .iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            let kind = entry.get("kind").and_then(Value::as_str).ok_or_else(|| {
-                tracedecay_domain::errors::TraceDecayError::Config {
-                    message: format!("tracedecay_distribution entry {index} omitted its kind"),
-                }
-            })?;
-            let count = entry.get("count").and_then(Value::as_u64).ok_or_else(|| {
-                tracedecay_domain::errors::TraceDecayError::Config {
-                    message: format!("tracedecay_distribution entry {index} omitted its count"),
-                }
-            })?;
-            Ok((kind.to_owned(), count))
-        })
-        .collect()
-}
-
-fn format_node_kind_distribution(value: &Value) -> tracedecay_domain::errors::Result<String> {
-    let entries = node_kind_distribution_entries(value)?;
-    let mut report = String::from("Node-kind distribution\n");
-    if entries.is_empty() {
-        report.push_str("  (none)\n");
-        return Ok(report);
-    }
-    for (kind, count) in entries {
-        report.push_str("  ");
-        report.push_str(&kind);
-        report.push_str(": ");
-        report.push_str(&format_number(count));
-        report.push('\n');
-    }
-    Ok(report)
-}
-
-fn attach_node_kind_distribution(
-    status: &mut Value,
-    distribution: Value,
-) -> tracedecay_domain::errors::Result<()> {
-    if !status.is_object() {
-        return Err(tracedecay_domain::errors::TraceDecayError::Config {
-            message: "tracedecay_status returned a non-object payload".to_owned(),
-        });
-    }
-    status["node_kind_distribution"] = distribution;
-    Ok(())
 }
 
 fn schema_convergence_line(finding: &SchemaConvergenceFindingV1) -> String {
@@ -393,7 +339,6 @@ pub(crate) async fn handle_status_command(
     project_path: Option<String>,
     json: bool,
     short: bool,
-    details: bool,
     runtime: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     let budget = status_command_deadline()?;
@@ -418,7 +363,6 @@ pub(crate) async fn handle_status_command(
             project_path,
             json,
             short,
-            details,
             runtime,
         ),
     )
@@ -426,7 +370,7 @@ pub(crate) async fn handle_status_command(
     .map_err(|_| tracedecay_domain::errors::TraceDecayError::Config {
         message: format!(
             "status did not complete within {}s; the daemon may still be \
-             starting or opening this project — retry, or raise \
+             starting or opening this project, retry, or raise \
              {STATUS_DEADLINE_ENV}",
             budget.as_secs()
         ),
@@ -442,7 +386,6 @@ async fn handle_status_command_within(
     project_path: Option<String>,
     json: bool,
     short: bool,
-    details: bool,
     runtime: bool,
 ) -> tracedecay_domain::errors::Result<()> {
     let project_path = resolve_cli_project_root(path, project_id, project_path).await?;
@@ -467,7 +410,7 @@ async fn handle_status_command_within(
         }
         return Ok(());
     }
-    let mut daemon_status = daemon_tool_json_within(
+    let daemon_status = daemon_tool_json_within(
         deadline,
         server_deadline,
         &project_path,
@@ -476,24 +419,7 @@ async fn handle_status_command_within(
     )
     .await?;
     reject_truncation_envelope(&daemon_status, "tracedecay_status")?;
-    let node_kind_distribution = if details {
-        let distribution = daemon_tool_json_within(
-            deadline,
-            server_deadline,
-            &project_path,
-            "tracedecay_distribution",
-            status_details_tool_args(),
-        )
-        .await?;
-        node_kind_distribution_entries(&distribution)?;
-        Some(distribution)
-    } else {
-        None
-    };
     if json {
-        if let Some(distribution) = node_kind_distribution {
-            attach_node_kind_distribution(&mut daemon_status, distribution)?;
-        }
         println!("{}", serde_json::to_string_pretty(&daemon_status)?);
         return Ok(());
     }
@@ -564,8 +490,13 @@ async fn handle_status_command_within(
         .map(serde_json::from_value)
         .transpose()?
         .unwrap_or_default();
-    let show_online =
-        should_fetch_online_status_embellishments(stdout_is_terminal) && upload_enabled;
+    let github_source: Option<GitHubSourceStatusV1> = daemon_status
+        .get("github_source")
+        .filter(|source| source.get("state") != Some(&Value::from("not_observed")))
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?;
+    let show_online = stdout_is_terminal && upload_enabled;
     // The worldwide counter and country flags are decoration served from the
     // local cache: the render below never waits on the network. When a cache
     // has expired, one refresh for the next invocation starts here so its
@@ -589,17 +520,7 @@ async fn handle_status_command_within(
             // scripts/render-logo-ansi.sh when the artwork changes.
             print!("{}", include_str!("resources/logo.ansi"));
         }
-        let branch_info = daemon_status
-            .get("serving_branch")
-            .and_then(Value::as_str)
-            .map(|branch| crate::display::BranchInfo {
-                branch: branch.to_string(),
-                parent: daemon_status
-                    .get("parent_branch")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                is_fallback: false,
-            });
+        let branch_info = status_branch_info(&project_path, &daemon_status);
         let cost_info = None;
         if short {
             crate::display::print_status_header(
@@ -634,11 +555,10 @@ async fn handle_status_command_within(
                 }
             }
         }
+        if let Some(source) = &github_source {
+            println!("{}", github_source_line(source));
+        }
     });
-
-    if let Some(distribution) = node_kind_distribution.as_ref() {
-        print!("\n{}", format_node_kind_distribution(distribution)?);
-    }
 
     // A parked deterministic contract violation must be visible on the plain
     // status journey, not only inside the JSON payload: name the exact reason
@@ -660,20 +580,6 @@ async fn handle_status_command_within(
         }
     }
 
-    if !tracedecay_configuration::is_in_gitignore(&project_path) {
-        let dir_name = tracedecay::config::active_data_dir_name(&project_path);
-        if stderr_is_terminal {
-            eprintln!(
-                "\n\x1b[33mWarning: {dir_name} is not in .gitignore — \
-                 run `echo {dir_name} >> .gitignore` to exclude it from git.\x1b[0m"
-            );
-        } else {
-            eprintln!(
-                "\nWarning: {dir_name} is not in .gitignore — \
-                 run `echo {dir_name} >> .gitignore` to exclude it from git."
-            );
-        }
-    }
     if let Some(refresh) = refresh
         && let Some(fresh) = await_online_refresh(deadline, refresh).await
         && fresh.apply(&mut config, now)
@@ -687,14 +593,53 @@ async fn handle_status_command_within(
     Ok(())
 }
 
+/// Branch row for the human status banner.
+///
+/// `serving_branch` is the branch the index is publishing. The banner names
+/// the checkout the operator is on, which moves on `git switch` before that
+/// publish does. A detached HEAD is reported as detached so the enrolled or
+/// serving name is not left in its place. When the checkout cannot be read,
+/// the serving branch remains the only name available.
+fn status_branch_info(
+    project_path: &Path,
+    daemon_status: &Value,
+) -> Option<crate::display::BranchInfo> {
+    let serving = daemon_status.get("serving_branch").and_then(Value::as_str);
+    let parent = daemon_status
+        .get("parent_branch")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    match tracedecay_runtime_core::branch::checkout_head(project_path) {
+        Some(tracedecay_runtime_core::branch::CheckoutHead::Branch(branch)) => {
+            let parent = parent.filter(|_| serving.is_some_and(|serving| serving == branch));
+            Some(crate::display::BranchInfo {
+                branch,
+                parent,
+                is_fallback: false,
+            })
+        }
+        Some(tracedecay_runtime_core::branch::CheckoutHead::Detached) => {
+            Some(crate::display::BranchInfo {
+                branch: "detached HEAD".to_owned(),
+                parent: None,
+                is_fallback: false,
+            })
+        }
+        None => serving.map(|branch| crate::display::BranchInfo {
+            branch: branch.to_owned(),
+            parent,
+            is_fallback: false,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         COUNTRY_FLAGS_MAX_AGE_SECS, OnlineRefresh, OnlineRefreshPlan, WORLDWIDE_TOTAL_MAX_AGE_SECS,
-        attach_node_kind_distribution, await_daemon_tool_result, await_online_refresh,
-        format_node_kind_distribution, node_kind_distribution_entries, project_open_line,
-        reject_truncation_envelope, schema_convergence_line, status_command_deadline_from,
-        status_server_request_budget,
+        await_daemon_tool_result, await_online_refresh, project_open_line,
+        reject_truncation_envelope, schema_convergence_line, status_branch_info,
+        status_command_deadline_from, status_server_request_budget,
     };
     use serde_json::json;
     use std::time::Duration;
@@ -858,49 +803,6 @@ mod tests {
     }
 
     #[test]
-    fn status_details_use_the_verified_distribution_shape() {
-        let distribution = json!({
-            "mode": "summary",
-            "total_kinds": 2,
-            "distribution": [
-                {"kind": "function", "count": 7},
-                {"kind": "struct", "count": 3}
-            ]
-        });
-        assert_eq!(
-            node_kind_distribution_entries(&distribution).expect("valid distribution"),
-            vec![("function".to_owned(), 7), ("struct".to_owned(), 3)]
-        );
-        assert_eq!(
-            format_node_kind_distribution(&distribution).expect("rendered distribution"),
-            "Node-kind distribution\n  function: 7\n  struct: 3\n"
-        );
-
-        let mut status = json!({"graph_statistics": {"state": "unavailable"}});
-        attach_node_kind_distribution(&mut status, distribution.clone())
-            .expect("status is an object");
-        assert_eq!(status["node_kind_distribution"], distribution);
-    }
-
-    #[test]
-    fn status_details_reject_malformed_or_non_summary_payloads() {
-        for payload in [
-            json!({"mode": "per_file", "distribution": []}),
-            json!({"mode": "summary"}),
-            json!({
-                "mode": "summary",
-                "total_kinds": 1,
-                "distribution": [{"kind": "function"}]
-            }),
-        ] {
-            assert!(
-                node_kind_distribution_entries(&payload).is_err(),
-                "malformed status details must fail closed: {payload}"
-            );
-        }
-    }
-
-    #[test]
     fn compact_lines_preserve_convergence_progress_and_project_open_reason() {
         let convergence = SchemaConvergenceFindingV1 {
             store: "profile-sessions".to_owned(),
@@ -929,6 +831,55 @@ mod tests {
             project_open_line(&project_open),
             "project open: deferred repository discovery, retry after 250 ms: \
              git probe exceeded its deadline"
+        );
+    }
+
+    #[test]
+    fn status_banner_follows_the_checkout_after_a_branch_switch() {
+        let root = tempfile::tempdir().expect("checkout");
+        git_in(root.path(), &["init", "-q", "-b", "enrolled"]);
+        std::fs::write(root.path().join("README.md"), "hi").expect("readme");
+        git_in(root.path(), &["add", "README.md"]);
+        git_in(
+            root.path(),
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        git_in(root.path(), &["checkout", "-q", "-b", "switched-head"]);
+
+        let serving = json!({
+            "serving_branch": "enrolled",
+            "parent_branch": "enrolled-parent",
+        });
+        let attached = status_branch_info(root.path(), &serving).expect("attached checkout");
+        assert_eq!(attached.branch, "switched-head");
+        assert!(attached.parent.is_none());
+
+        git_in(root.path(), &["checkout", "-q", "--detach"]);
+        let detached = status_branch_info(root.path(), &serving).expect("detached checkout");
+        assert_eq!(detached.branch, "detached HEAD");
+        assert!(detached.parent.is_none());
+    }
+
+    fn git_in(cwd: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(["-c", "core.hooksPath=.git/no-hooks"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap_or_else(|error| panic!("git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 }

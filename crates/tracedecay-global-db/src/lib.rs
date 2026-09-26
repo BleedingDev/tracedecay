@@ -4,16 +4,15 @@
 //! with the project's database path and its cumulative tokens-saved count.
 //! Every read and write in this crate reports its outcome as a typed state:
 //! absence is a truthful `Ok(None)` / empty page, and a failed snapshot,
-//! query, decode, or commit is an error naming the failing operation — never
+//! query, decode, or commit is an error naming the failing operation, never
 //! a silent zero, empty result, or fabricated timestamp. Callers decide at
 //! the call site whether to fail closed or degrade with a named warning.
 //!
 //! ## Dependency edges
 //!
-//! Depends on `tracedecay-runtime-core` (kernel db/errors/storage/config),
+//! Depends on `tracedecay-runtime-core` (kernel db/errors/storage/config) and
 //! `tracedecay-sessions` (session runtime, `lcm::contracts`,
-//! `retrieval_content`), and `tracedecay-semantic` (resource ceilings, default
-//! embedding model). All three are proven acyclic — `cargo tree -p <dep> -e
+//! `retrieval_content`). Both edges are acyclic: `cargo tree -p <dep> -e
 //! normal` never names this crate. `RuntimeExternalSourceStore` and
 //! `GlobalDbObservationStore` is deliberately a root-owned adapter. It takes
 //! a guarded database client issued by the registered owner, so the composition
@@ -45,10 +44,8 @@ mod registered_provider_usage;
 mod stack_delivery_tests;
 mod support;
 pub use discovery_queue::HostDiscoveryQueueEntry;
-pub use git_correlation_adapter::{
-    GitEvidenceConvergenceOutcome, GitEvidenceConvergenceStats, GlobalDbGitCorrelationStore,
-};
-pub use git_topology_anchor::RegisteredGitTopologyAnchorAuthorityV2;
+pub use git_correlation_adapter::{GitSessionEvidence, GlobalDbGitCorrelationStore};
+pub use git_topology_anchor::RegisteredGitTopologyAnchorAuthority;
 pub use observability_rollup::{
     ObservabilityRollupCompactionCandidateV1, ObservabilityRollupCompactionReceiptV1,
     ObservabilityRollupCompactionV1, ObservabilityRollupDirtyDayClaimV1,
@@ -63,8 +60,6 @@ pub use observation_projection::{
     converge_projection_predecessor, project_observation, project_queued_observations,
     rebuild_projection,
 };
-#[cfg(test)]
-pub use observation_projection::{project_observation_with_engine, rebuild_projection_with_engine};
 pub use tracedecay_domain::CoverageStateV1;
 pub use workflow_adapter::GlobalDbWorkflowStore;
 mod observation_store;
@@ -76,7 +71,6 @@ mod registered_analytics;
 mod registered_dashboard;
 mod registered_lcm;
 mod registered_lcm_privacy;
-mod registered_legacy_relations;
 mod registered_session_sync;
 mod registered_sessions;
 pub mod registry_maintenance;
@@ -102,7 +96,7 @@ pub use stack_delivery::{
 /// the kernel. Production wires the same installer through the daemon
 /// (`register_registered_schema_installer`); this helper lets the root crate's
 /// integration suites (and this crate's own tests) register the identical real
-/// schema without reaching into daemon internals. Idempotent — the port keeps
+/// schema without reaching into daemon internals. Idempotent, the port keeps
 /// the first registration; without registration it remains fail-closed.
 pub fn register_registered_schema_installer() {
     tracedecay_runtime_core::ports::registered_schema::register(|connection| {
@@ -171,9 +165,6 @@ use support::{
     global_db_operation_error, global_db_operation_message, like_pattern, normalize_git_remote_url,
     push_optional_analytics_filter, repo_identity_aliases, row_to_analytics_event,
 };
-/// Compatibility re-export: workflow search filters now live beside the
-/// workflow-index contracts in [`tracedecay_sessions::runtime::workflow_index`].
-pub use tracedecay_sessions::runtime::workflow_index::WorkflowScopeFilter;
 #[cfg(all(test, not(windows)))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod checkpoint_tests;
@@ -190,6 +181,9 @@ mod observation_batch_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod observation_collision_tests;
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod session_project_rebind_tests;
 #[cfg(any(test, feature = "test-helpers"))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 pub mod tests;

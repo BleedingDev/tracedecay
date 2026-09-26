@@ -18,10 +18,11 @@ use super::daemon::daemon_tool_json;
 const PROFILE_OFFLINE_LEASE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const PROFILE_SQLITE_DATABASES: [&str; 3] = ["global.db", "user-sessions.db", "user-memory.db"];
-const PROFILE_DATABASE_PATHS: [&str; 8] = [
+const PROFILE_DATABASE_PATHS: [&str; 9] = [
     "projects",
     "stores",
     "remote",
+    "agent_managed",
     "user-sessions.grafeo",
     "user-sessions.grafeo.wal",
     "user-memory.grafeo",
@@ -142,8 +143,8 @@ fn remove_fixed_profile_path(
 
 /// The exclusive maintenance window a destructive profile command runs in.
 ///
-/// The fast path is an uncontended lease. When the lease is busy — most often
-/// because the managed daemon retains a shared lease for its whole lifetime —
+/// The fast path is an uncontended lease. When the lease is busy, most often
+/// because the managed daemon retains a shared lease for its whole lifetime.
 /// the profile is taken offline by quiescing the installed service (bounded
 /// by the supervisor's stop timeout, which SIGKILLs a hung or wedged daemon),
 /// and [`Self::finish`] restores the captured service state afterward.
@@ -220,11 +221,11 @@ pub(crate) async fn try_admit_profile_registry(
 }
 
 /// Takes the whole profile offline for a destructive maintenance command,
-/// within a bound, or refuses typed — never "retry after it finishes".
+/// within a bound, or refuses typed, never "retry after it finishes".
 ///
 /// The managed daemon holds a shared lifecycle lease for its entire lifetime,
 /// and a daemon wedged in a terminal retry loop (issue #765's unseatable
-/// sealed generation) never exits, so a bare lease attempt refuses forever —
+/// sealed generation) never exits, so a bare lease attempt refuses forever.
 /// exactly when the operator most needs the escape hatch. On contention this
 /// stops the installed service (the supervisor bounds the stop and SIGKILLs a
 /// hung daemon), waits a bounded interval for the lease, and restores the
@@ -308,6 +309,45 @@ fn wipe_complete_profile_database_state(
 #[allow(clippy::expect_used)]
 mod wipe_safety_tests {
     use super::*;
+
+    #[test]
+    fn reset_refusals_name_the_authority_and_the_exact_reset_command() {
+        let profile = annotate_reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
+                "session temporal",
+                "persisted session temporal schema is the published v3 shape",
+            ),
+            None,
+        )
+        .to_string();
+        assert!(profile.contains("session temporal persisted shape requires reset"));
+        assert!(profile.contains("refused authority: session temporal"));
+        assert!(
+            profile.contains("\n  tracedecay wipe --all --yes"),
+            "{profile}"
+        );
+
+        let project = annotate_reset_required(
+            tracedecay_domain::errors::TraceDecayError::reset_required(
+                "project store",
+                "schema v26 is incompatible",
+            ),
+            Some(Path::new("/repo/example")),
+        )
+        .to_string();
+        assert!(
+            project.contains("reset-project-store --project-root /repo/example --yes"),
+            "{project}"
+        );
+
+        let untouched = annotate_reset_required(
+            tracedecay_domain::errors::TraceDecayError::Config {
+                message: "unrelated".to_owned(),
+            },
+            None,
+        );
+        assert_eq!(untouched.to_string(), "config error: unrelated");
+    }
 
     #[test]
     fn nonterminal_wipe_without_yes_does_not_wait_on_stdin() {
@@ -435,6 +475,27 @@ fn handle_wipe_inner(
     })
 }
 
+/// Attaches the exact reset command to a typed reset refusal so the operator
+/// never has to translate the authority name into a recovery step.
+pub(crate) fn annotate_reset_required(
+    error: tracedecay_domain::errors::TraceDecayError,
+    project_root: Option<&Path>,
+) -> tracedecay_domain::errors::TraceDecayError {
+    let authority = match &error {
+        tracedecay_domain::errors::TraceDecayError::ResetRequired { authority, .. } => {
+            authority.as_str()
+        }
+        tracedecay_domain::errors::TraceDecayError::ProfileResetRequired { component, .. } => {
+            component
+        }
+        _ => return error,
+    };
+    let remedy = tracedecay_mcp::reset_required_remedy(authority, project_root);
+    tracedecay_domain::errors::TraceDecayError::Config {
+        message: format!("{error}\n\n{remedy}"),
+    }
+}
+
 /// Combines a destructive command's outcome with the daemon-restore outcome
 /// so neither failure can shadow the other.
 pub(crate) fn join_outcome_and_restore(
@@ -497,7 +558,7 @@ async fn wipe_under_profile_offline(
         let project_paths = if all {
             Vec::new()
         } else {
-            global::gather_target_projects(false, home_tracedecay).await?
+            global::gather_target_projects(false).await?
         };
         let mut targets = Vec::new();
         for path in &project_paths {
@@ -507,13 +568,7 @@ async fn wipe_under_profile_offline(
                 home_tracedecay.as_deref(),
             )
             .await?;
-            // A prior partial wipe may have removed the profile shard while a
-            // marker deletion failed. Keep that marker-backed target selectable so
-            // the same command can finish the cleanup without deleting its registry
-            // retry authority on the failed attempt.
-            if location.status.is_live() || location.marker_root.is_some() {
-                targets.push(location);
-            }
+            targets.push(location);
         }
 
         if !all && targets.is_empty() {
@@ -524,7 +579,7 @@ async fn wipe_under_profile_offline(
         global::print_flash_warning(all, &targets);
 
         if assume_yes {
-            eprintln!("\x1b[33m--yes supplied — proceeding without the interactive prompt.\x1b[0m");
+            eprintln!("\x1b[33m--yes supplied, proceeding without the interactive prompt.\x1b[0m");
         } else if wipe_must_not_wait_for_stdin(assume_yes, io::stdin().is_terminal()) {
             // Wipe deletes stores. A non-terminal caller must pass `--yes`.
             // Reading stdin here hangs an agent whose pipe stays open.
@@ -541,7 +596,7 @@ async fn wipe_under_profile_offline(
                 }
             })?;
             if answer.trim() != "go!" {
-                eprintln!("\x1b[33mAborted — nothing was wiped.\x1b[0m");
+                eprintln!("\x1b[33mAborted. Nothing was wiped.\x1b[0m");
                 return Ok(());
             }
         }
@@ -555,17 +610,12 @@ async fn wipe_under_profile_offline(
             return Ok(());
         }
 
-        let mut removed = 0usize;
         let mut failures = Vec::new();
         let mut wiped_paths: Vec<PathBuf> = Vec::new();
-        let mut marker_cleanup = Vec::new();
 
         for location in &targets {
             match remove_store_directory(&location.data_root) {
-                Ok(_) => {
-                    wiped_paths.push(location.project_root.clone());
-                    marker_cleanup.push(location);
-                }
+                Ok(_) => wiped_paths.push(location.project_root.clone()),
                 Err(error) => {
                     eprintln!(
                         "  \x1b[31m✗\x1b[0m {} ({error})",
@@ -576,29 +626,15 @@ async fn wipe_under_profile_offline(
             }
         }
 
-        // Keep repository markers intact until the registry transaction succeeds.
-        // If it fails after a shard was removed, the marker remains the durable
-        // local discovery authority for a retry.
-        if !wiped_paths.is_empty() {
-            if let Some(registry) = registry.as_ref() {
-                registry.delete_project_paths(&wiped_paths).await?;
-            }
+        if !wiped_paths.is_empty()
+            && let Some(registry) = registry.as_ref()
+        {
+            registry.delete_project_paths(&wiped_paths).await?;
         }
-
-        for location in marker_cleanup {
-            if let Some(marker_root) = &location.marker_root
-                && let Err(error) = remove_store_directory(marker_root)
-            {
-                eprintln!("  \x1b[31m✗\x1b[0m {} ({error})", marker_root.display());
-                failures.push(format!("{} ({error})", marker_root.display()));
-                continue;
-            }
-            removed += 1;
-            eprintln!(
-                "  \x1b[32m✔\x1b[0m wiped {}",
-                location.project_root.display()
-            );
+        for path in &wiped_paths {
+            eprintln!("  \x1b[32m✔\x1b[0m wiped {}", path.display());
         }
+        let removed = wiped_paths.len();
 
         if !failures.is_empty() {
             return Err(tracedecay_domain::errors::TraceDecayError::Config {
@@ -632,8 +668,8 @@ fn handle_list_inner(
     Box::pin(async move {
         use tracedecay_runtime_core::text::format_token_count;
 
-        let home_tracedecay = tracedecay::config::user_data_dir();
-        let project_paths = global::gather_target_projects(all, &home_tracedecay).await?;
+        let home_tracedecay = tracedecay_runtime_core::config::user_data_dir();
+        let project_paths = global::gather_target_projects(all).await?;
 
         if !all && project_paths.is_empty() {
             println!("No tracedecay projects found in current folder, parents, or children.");
@@ -658,7 +694,7 @@ fn handle_list_inner(
         let mut token_errors: Vec<String> = Vec::new();
 
         for path in &project_paths {
-            let mut location = global::classify_project_storage(path);
+            let mut location = global::classify_project_storage(path)?;
             if location.status == global::ProjectStorageStatus::Stale
                 && let Some(profile_root) = home_tracedecay.as_deref()
             {
@@ -826,7 +862,7 @@ fn append_orphan_manifest_rows(
         .collect();
     let report = tracedecay_global_db::registry_maintenance::inspect_profile_store_orphans(
         profile_root,
-        tracedecay::project::current_timestamp(),
+        tracedecay_runtime_core::tracedecay::current_timestamp(),
     );
     for plan in report.plans {
         if plan.status

@@ -10,10 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracedecay_application::advisory::GitHubRepositoryTargetV1;
+use tracedecay_application::advisory::github_runtime::github_repository_from_remote_v1;
 use tracedecay_application::project_open_authorization::project_open_work_grant;
 use tracedecay_contracts::{ApplicationContractError, ResolvedScope, now_micros};
-use tracedecay_domain::feedback::GitHubPullRequestIdV1;
 use tracedecay_domain::{ProjectId, UtcMicros, canonical_sha256};
 
 use super::DaemonInvocationState;
@@ -38,13 +37,14 @@ use tracedecay_daemon_service::{
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_lsp::analyzer::broker::AdmittedLspProvider;
 use tracedecay_lsp::analyzer::client::LspRefreshTimeouts;
-use tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalPortV1;
+use tracedecay_session_temporal_store::SessionTemporalAccess;
 
 mod advisory_runtime;
 mod automation_effect_recovery;
 #[cfg(test)]
 #[path = "project_open_owners/code_index_reads/ignored_dependency_admission_tests.rs"]
 mod code_index_ignored_dependency_admission_tests;
+mod compiler_diagnostics_producer;
 mod primitive_runtime;
 mod query_authority_upgrade;
 
@@ -81,7 +81,7 @@ async fn install_project_open_source_edit_owners(
 
 pub(crate) async fn install_project_open_source_edit_preview_owner(
     server: &McpServer,
-    graph: Arc<crate::project::TraceDecay>,
+    graph: Arc<tracedecay_project::project::TraceDecay>,
     code_graph: Arc<dyn tracedecay_graph_query::CodeGraphProjectionReadPort>,
     project_root: &Path,
     project_id: &str,
@@ -131,6 +131,11 @@ pub(crate) async fn install_project_open_source_edit_owners_for_test(
     if server.daemon_invocation_service().is_none() {
         return Ok(false);
     }
+    if let Some(scope) = server.admitted_project_scope() {
+        server
+            .register_graph_tool_owner(graph.project_root(), scope)
+            .await?;
+    }
     let Some(code_graph) = server.code_graph_projection_read_port() else {
         // A directly constructed test server carries no production code-graph
         // projection port, so the daemon-owned source-edit authority cannot
@@ -158,157 +163,14 @@ pub(crate) async fn install_project_open_source_edit_owners_for_test(
     Ok(true)
 }
 
-/// Publish the callable-code authorization and primitive runtime carried by
-/// the admitted core route. Provider and full-owner activation happens later;
-/// failures there must not remove these already-usable read authorities.
-pub(super) async fn register_project_open_core_read_owners(
-    invocation: &DaemonInvocationState,
-    project_root: &Path,
-    project_id: &str,
-    graph: Arc<crate::project::TraceDecay>,
-    code_graph: crate::mcp::server::CodeGraphProjectionReadPort,
-    ignored_dependency_admission: crate::mcp::server::CodeIndexIgnoredDependencyAdmissionPort,
-    session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-    session_retrieval: Arc<dyn SessionApplicationRetrievalPortV1>,
-) -> Result<()> {
-    let owner_registration_started = Instant::now();
-    let mut owner_phase_started = owner_registration_started;
-    let project_id =
-        ProjectId::new(project_id.to_owned()).map_err(|_| TraceDecayError::Config {
-            message: "project-open core read owners require authoritative project identity"
-                .to_owned(),
-        })?;
-    let database = graph.db().clone();
-    let scope =
-        tracedecay_code_index_runtime::resolved_scope_for_project(project_root, &project_id)
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("project-open core read scope denied: {error}"),
-            })?;
-    let configuration = graph
-        .configuration_runtime()
-        .client()
-        .current()
-        .await
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("project-open core read configuration failed: {error}"),
-        })?;
-    let access =
-        daemon_owned_project_source_access_at(&scope, project_root, &configuration, now_micros())
-            .map_err(|error| TraceDecayError::Config {
-            message: format!("project-open core read source access denied: {error}"),
-        })?;
-    match hotpath::future!(
-        invocation.feedback_runtime_registrar().open_and_register(
-            database,
-            project_root.to_path_buf(),
-            scope.clone(),
-            access.clone(),
-            Arc::new(DaemonCallableCodeAuthorizationSource::production(
-                project_root.to_path_buf(),
-                scope,
-                Arc::clone(graph.configuration_runtime()),
-            )),
-        ),
-        label = "daemon.project.open.owners.feedback"
-    )
-    .await
-    {
-        Ok(_) | Err(DaemonFeedbackRuntimeRegistrationError::AlreadyRegistered) => {}
-        Err(error) => {
-            return Err(TraceDecayError::Config {
-                message: format!("project-open feedback runtime registration failed: {error:?}"),
-            });
-        }
-    }
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "feedback_runtime_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    owner_phase_started = Instant::now();
-    let admitted_root_uri =
-        admitted_root_uri_for_project(project_root).map_err(|error| TraceDecayError::Config {
-            message: format!("project-open admitted root URI denied: {error}"),
-        })?;
-    let source = graph
-        .source_read_context()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project-open primitive runtime requires an exact registered source identity"
-                .to_owned(),
-        })?;
-    open_and_register_project_primitive_runtime(
-        invocation,
-        project_root,
-        source,
-        code_graph,
-        ignored_dependency_admission,
-        session_db,
-        session_retrieval,
-        access,
-        &admitted_root_uri,
-    )
-    .await?;
-    tracing::info!(
-        event = "project_open_owner_phase",
-        project = %project_root.display(),
-        phase = "primitive_runtime_registered",
-        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
-        elapsed_ms = owner_registration_started.elapsed().as_millis(),
-    );
-    Ok(())
-}
-
-/// Memory belongs to core publication; session and LCM join once mounted.
-pub(super) async fn register_project_open_retained_owner(
-    invocation: &DaemonInvocationState,
-    project_root: &Path,
-    server: &McpServer,
-    access: &ProjectSourceAccessSnapshot,
-) -> Result<()> {
-    let retained_observed_at = now_micros();
-    let retained_grant =
-        project_open_retained_grant(access, retained_observed_at).map_err(|error| {
-            TraceDecayError::Config {
-                message: format!("project-open retained grant is invalid: {error}"),
-            }
-        })?;
-    let profile_id = server
-        .profile_identity()
-        .ok_or_else(|| TraceDecayError::Config {
-            message: "project-open retained runtime requires exact profile authority".to_owned(),
-        })?
-        .profile_id()
-        .clone();
-    let retained_ports = server.retained_surface_ports(
-        project_root,
-        access.scope.project_id.clone(),
-        access.configuration_digest.clone(),
-    );
-    hotpath::future!(
-        invocation.retained_runtime_registrar().register(
-            profile_id,
-            project_root.to_path_buf(),
-            access.scope.clone(),
-            access.requester.clone(),
-            retained_grant,
-            retained_ports,
-        ),
-        label = "daemon.project.open.owners.retained"
-    )
-    .await
-    .map_err(|error| TraceDecayError::Config {
-        message: format!("project-open retained runtime registration failed: {error}"),
-    })?;
-    Ok(())
-}
-
 /// Registers code-index-independent owners for one newly inserted project.
 #[hotpath::measure(label = "daemon.project.owners.register", future = true)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Production owner registration is one ordered phase list for a project open."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Production owner registration is one ordered phase list for a project open."
+    )
 )]
 pub(super) async fn register_project_open_production_owners(
     invocation: &DaemonInvocationState,
@@ -316,7 +178,7 @@ pub(super) async fn register_project_open_production_owners(
     native_integration: &DaemonNativeIntegrationServiceRegistry,
     project_root: &Path,
     project_id: &str,
-    server: &Arc<McpServer>,
+    server: &McpServer,
     source_edit_mutation: Arc<SourceEditMutationGate>,
 ) -> Result<ProjectOpenDependentOwnerState> {
     // Retain the admitted owner state once across its asynchronous phases.
@@ -430,10 +292,71 @@ pub(super) async fn register_project_open_production_owners(
         })?;
     let grant_expires_at = access.grant_expires_at;
     let requester = access.requester.clone();
+    // Primitive reads are part of the admitted core route. Publish their
+    // runtime and callable-code authorization before the slower mutation,
+    // delivery, native-integration, and Work owners finish mounting.
+    match hotpath::future!(
+        invocation.feedback_runtime_registrar().open_and_register(
+            database.clone(),
+            project_root.to_path_buf(),
+            graph.store_layout().response_handle_root.clone(),
+            scope.clone(),
+            access.clone(),
+            Arc::new(DaemonCallableCodeAuthorizationSource::production(
+                project_root.to_path_buf(),
+                scope.clone(),
+                Arc::clone(graph.configuration_runtime()),
+            )),
+        ),
+        label = "daemon.project.open.owners.feedback"
+    )
+    .await
+    {
+        Ok(_) | Err(DaemonFeedbackRuntimeRegistrationError::AlreadyRegistered) => {}
+        Err(error) => {
+            return Err(TraceDecayError::Config {
+                message: format!("project-open feedback runtime registration failed: {error:?}"),
+            });
+        }
+    }
+    tracing::info!(
+        event = "project_open_owner_phase",
+        project = %project_root.display(),
+        phase = "feedback_runtime_registered",
+        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
+        elapsed_ms = owner_registration_started.elapsed().as_millis(),
+    );
+    owner_phase_started = Instant::now();
+
     let admitted_root_uri =
         admitted_root_uri_for_project(project_root).map_err(|error| TraceDecayError::Config {
             message: format!("project-open admitted root URI denied: {error}"),
         })?;
+    let source = graph
+        .source_read_context()
+        .ok_or_else(|| TraceDecayError::Config {
+            message: "project-open primitive runtime requires an exact registered source identity"
+                .to_owned(),
+        })?;
+    open_and_register_project_primitive_runtime(
+        invocation,
+        project_root,
+        source,
+        server,
+        session_db.clone(),
+        access.clone(),
+        &admitted_root_uri,
+    )
+    .await?;
+    tracing::info!(
+        event = "project_open_owner_phase",
+        project = %project_root.display(),
+        phase = "primitive_runtime_registered",
+        step_elapsed_ms = owner_phase_started.elapsed().as_millis(),
+        elapsed_ms = owner_registration_started.elapsed().as_millis(),
+    );
+    owner_phase_started = Instant::now();
+
     // One worktree discovery serves both the Git transaction authority here
     // and the native-integration mount below.
     let repository_root = tracedecay_runtime_core::worktree::git_worktree_root(project_root);
@@ -490,7 +413,32 @@ pub(super) async fn register_project_open_production_owners(
     .map_err(|error| TraceDecayError::Config {
         message: format!("project-open configuration runtime registration failed: {error}"),
     })?;
-    register_project_open_retained_owner(invocation, project_root, server, &access).await?;
+    let retained_observed_at = now_micros();
+    let retained_grant =
+        project_open_retained_grant(&access, retained_observed_at).map_err(|error| {
+            TraceDecayError::Config {
+                message: format!("project-open retained grant is invalid: {error}"),
+            }
+        })?;
+    let retained_ports = server.retained_surface_ports(
+        project_root,
+        scope.project_id.clone(),
+        access.configuration_digest.clone(),
+    );
+    hotpath::future!(
+        invocation.retained_runtime_registrar().register(
+            project_root.to_path_buf(),
+            scope.clone(),
+            requester.clone(),
+            retained_grant,
+            retained_ports,
+        ),
+        label = "daemon.project.open.owners.retained"
+    )
+    .await
+    .map_err(|error| TraceDecayError::Config {
+        message: format!("project-open retained runtime registration failed: {error}"),
+    })?;
     // Mount the native-integration authority under the same pinned policy
     // digest the configuration runtime just registered, so the coordinator's
     // stale/denied predicates and the handler's minted grants agree on one
@@ -558,7 +506,7 @@ pub(super) async fn register_project_open_production_owners(
     // the sole producer of canonical provider observations and anchors.
     if tracedecay_runtime_core::git::git_remote_url(project_root)
         .as_deref()
-        .and_then(github_repository_from_remote)
+        .and_then(github_repository_from_remote_v1)
         .is_some()
     {
         let stack_coordinator = invocation.github_stack_coordinator();
@@ -777,7 +725,6 @@ pub(super) async fn register_project_open_production_owners(
         })?;
     crate::daemon::hook_v2_replay_consumer::register_hook_v2_replay_consumer(
         Arc::clone(&graph),
-        server,
         delivery_settlements,
         session_db.clone(),
         server.background_cpu_authority().ok_or_else(|| TraceDecayError::Config {
@@ -838,6 +785,19 @@ pub(super) async fn register_project_open_production_owners(
         .await;
     });
 
+    // A TypeScript project with its own compiler gets an automatic diagnostics
+    // producer: bounded background work after each complete generation, so
+    // `tracedecay_diagnostics` has a publication to read without a caller
+    // pasting compiler output first.
+    let _typescript_producer_admitted =
+        compiler_diagnostics_producer::spawn_typescript_diagnostics_producer(
+            server,
+            invocation.clone(),
+            project_root.to_path_buf(),
+            &scope,
+            Arc::clone(&graph),
+        );
+
     tracing::info!(
         event = "project_open_owner_phase",
         project = %project_root.display(),
@@ -872,7 +832,10 @@ async fn register_project_query_authority(
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
     scope: ResolvedScope,
 ) {
-    let cursor_keys = match session_db.load_session_cursor_key_provider_result().await {
+    let cursor_keys = match SessionTemporalAccess::new(&*session_db)
+        .load_session_cursor_key_provider_result()
+        .await
+    {
         Ok(cursor_keys) => cursor_keys,
         Err(error) => {
             tracing::debug!(
@@ -945,48 +908,6 @@ async fn register_production_lsp_owner(
             gateway_capabilities,
         )
         .await
-}
-
-fn github_repository_from_remote(remote: &str) -> Option<(String, String)> {
-    let (owner, repository) = if let Ok(url) = url::Url::parse(remote) {
-        if (url.scheme() != "https" && url.scheme() != "ssh")
-            || !url.host_str()?.eq_ignore_ascii_case("github.com")
-            || url.password().is_some()
-            || (url.scheme() == "https" && !url.username().is_empty())
-            || (url.scheme() == "ssh" && url.username() != "git")
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return None;
-        }
-        let segments = url.path_segments()?.collect::<Vec<_>>();
-        if segments.len() != 2 {
-            return None;
-        }
-        (segments[0].to_owned(), segments[1].to_owned())
-    } else {
-        let remote = remote.strip_prefix("git@github.com:")?;
-        let mut segments = remote.split('/');
-        let owner = segments.next()?;
-        let repository = segments.next()?;
-        if segments.next().is_some() {
-            return None;
-        }
-        (owner.to_owned(), repository.to_owned())
-    };
-    let repository = repository
-        .strip_suffix(".git")
-        .unwrap_or(&repository)
-        .to_owned();
-    let target = GitHubRepositoryTargetV1 {
-        owner,
-        repository,
-        pull_request_number: 1,
-        pull_request_id: GitHubPullRequestIdV1::new("1").ok()?,
-    };
-    target
-        .validate()
-        .then_some((target.owner, target.repository))
 }
 
 pub(super) fn project_open_retained_grant(

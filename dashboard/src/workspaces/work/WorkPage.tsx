@@ -42,17 +42,21 @@ import { WorkTimelineView } from './views/WorkTimelineView.tsx';
 import { WorkTopologyView } from './views/WorkTopologyView.tsx';
 import { WorkWorkloadView } from './views/WorkWorkloadView.tsx';
 import type { WorkResult } from './workApi.ts';
-import { currentWorkProductView, type WorkProductView } from './workProductView.ts';
+import {
+  currentWorkProductView,
+  type WorkProductView,
+  type WorkProductViewResult,
+} from './workProductView.ts';
 import { workDagReading } from './workViewsModel.ts';
 
 /**
- * Work — channel thirteen.
+ * Work, channel thirteen.
  *
  * This page reads one current `WorkGraphReadV1` and
  * reduces its exact product-graph entry to the local camera model; the legacy
  * projection snapshot is not a second authority. A route that refuses is
  * reported as the refusal it was. Execution belongs to the Workflow runtime,
- * which has its own workspace — this channel is the task graph.
+ * which has its own workspace, this channel is the task graph.
  *
  * Six projections over ONE product graph version. The switcher moves the camera and the
  * graph does not change underneath it: a task selected in any projection
@@ -144,6 +148,10 @@ function WorkProjectionView({
       return (
         <WorkDagView snapshot={snapshot} graph={graph} selected={selected} onSelect={onSelect} />
       );
+    case 'matrix':
+      return (
+        <WorkDagView snapshot={snapshot} graph={graph} selected={selected} onSelect={onSelect} view="matrix" />
+      );
     case 'timeline':
       return (
         <WorkTimelineView
@@ -226,12 +234,15 @@ function RegisterCell({
 
 function graphRegister(
   pending: boolean,
-  result: WorkResult<WorkProductView> | undefined,
+  result: WorkProductViewResult | undefined,
 ): { tone: string | null; text: string; state: DomainStateKind } {
   if (pending) return { tone: 'bg-state-loading', text: 'reading', state: 'loading' };
   if (result === undefined) return { tone: null, text: 'unread', state: 'unknown' };
   if (result.outcome === 'refused') {
     return { tone: 'bg-state-error', text: result.state.replaceAll('_', ' '), state: result.state };
+  }
+  if (result.outcome === 'absent') {
+    return { tone: 'bg-state-complete-zero', text: 'no graph yet', state: 'complete_zero_findings' };
   }
   return {
     tone: result.value.projections.length === 0 ? 'bg-state-complete-zero' : 'bg-state-ready',
@@ -243,7 +254,7 @@ function graphRegister(
 /**
  * The Work register: four independent facts about this page, in the same
  * grammar as the shell's status strip. The graph read, the immutable version,
- * the selection, and the camera are separate facts — a served graph does not
+ * the selection, and the camera are separate facts, a served graph does not
  * imply a selection, and a selection does not imply a fresh read.
  */
 function WorkRegister({
@@ -253,7 +264,7 @@ function WorkRegister({
   projection,
 }: {
   pending: boolean;
-  result: WorkResult<WorkProductView> | undefined;
+  result: WorkProductViewResult | undefined;
   selected: string | null;
   projection: WorkProjectionKind;
 }) {
@@ -378,7 +389,7 @@ export function WorkPage() {
               {/* The region the camera points at, drawn in every state rather than
                 * only when there is a projection to put in it. The tabs above
                 * declare that they control this region, so it has to exist for as
-                * long as they do — and under a refusal it is where a reader who
+                * long as they do, and under a refusal it is where a reader who
                 * just moved the camera looks to find out why nothing moved. */}
               <div
                 role="tabpanel"
@@ -405,6 +416,18 @@ export function WorkPage() {
                   </Panel>
                 ) : null}
 
+                {result?.outcome === 'absent' ? (
+                  <Panel legend="Work read model">
+                    <div data-work-graph="absent">
+                      <StateChip kind="complete_zero_findings" detail="no Work graph yet" />
+                      <p className="mt-1 text-3xs text-text-muted">
+                        This selection is authorized and holds no task yet. Create a task to
+                        start the Work graph.
+                      </p>
+                    </div>
+                  </Panel>
+                ) : null}
+
                 {value === undefined ? null : (
                   <WorkProjectionView
                     kind={concurrent.active}
@@ -428,7 +451,9 @@ export function WorkPage() {
             </div>
 
             <div className="flex min-w-0 flex-col gap-3" data-work-inspector-column>
-              {value === undefined ? (
+              {result?.outcome === 'absent' ? (
+                <WorkCreate graph={graph.data} />
+              ) : value === undefined ? (
                 <Panel legend="Selected task">
                   {graph.isPending ? (
                     <StateChip kind="loading" detail="the inspector opens once the graph read answers" />

@@ -25,6 +25,7 @@ describe('DoctorInspector', () => {
               report_coverage: null,
               known_families: ['configuration'],
               schema_convergences: [],
+              storage_kind_statuses: [],
               note: 'no admitted Doctor report source is available for this dashboard scope',
             },
             'unsupported',
@@ -49,7 +50,7 @@ describe('DoctorInspector', () => {
   });
 
   /** The three named degradation reasons must render as the observations they
-   * are — an unreachable source, a rebuild-required source, a corrupt source —
+   * are, an unreachable source, a rebuild-required source, a corrupt source,
    * and never collapse back into the undetermined "unknown" they were carried
    * as before the reasons were named. */
   it('names each degraded source coverage gap with its own reason', async () => {
@@ -293,6 +294,7 @@ function findingsEnvelope() {
       },
       known_families: ['configuration'],
       schema_convergences: [],
+      storage_kind_statuses: [],
       note: 'configuration drift observed',
     },
     'partial',

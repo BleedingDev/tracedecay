@@ -22,8 +22,8 @@ use tracedecay_domain::{
     CanonicalObservationIdV1, ObservationScopeV1, ObservationSourceCursorV1,
     ObservationSourceIdentityV1, SanitizationReceiptV1,
 };
+use tracedecay_store::ParseOffset;
 use tracedecay_store::observation::{CursorAdvanceOutcome, ObservationCursorAdvance};
-use tracedecay_store::{ObservationBatchFallbackCause, ParseOffset};
 
 use crate::observation::{
     CaptureObservationOutcome, CaptureObservationRequest, ObservationCancellation,
@@ -69,18 +69,20 @@ pub struct HostAdmissionOutcome {
     /// from strings at another layer.
     #[serde(skip)]
     pub recovery: Option<HostAdmissionRecovery>,
-    /// Operator-only storage cause for [`ObservationStoreError::Storage`].
+    /// Operator-only cause behind the reason code: the storage error for
+    /// `ObservationStoreError::Storage`, or the sanitizer's typed error for a
+    /// `privacy_boundary_failed` refusal. Without it a deterministic refusal is
+    /// one indistinguishable code across every failure the sanitizer can name.
     ///
     /// Host wire output stays reason-code-only. Admission callers that already
-    /// carry a detail/message slot (MCP hook JSON-RPC `detail`) may copy this
-    /// text; it is never reconstructed into a reason code.
+    /// carry a detail/message slot (MCP hook JSON-RPC `detail`, ingest logs)
+    /// may copy this text; it is never reconstructed into a reason code.
     #[serde(skip)]
-    pub storage_cause: Option<String>,
+    pub cause: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostAdmissionRecovery {
-    BatchRequiresScalarFallback(ObservationBatchFallbackCause),
     DeterministicContentRefusal,
 }
 
@@ -112,18 +114,7 @@ impl HostAdmissionOutcome {
             retryable,
             reason_code,
             recovery: None,
-            storage_cause: None,
-        }
-    }
-
-    #[hotpath::skip]
-    pub const fn batch_requires_scalar_fallback(cause: ObservationBatchFallbackCause) -> Self {
-        Self {
-            status: HostAdmissionStatus::Backpressured,
-            retryable: true,
-            reason_code: Some("batch_requires_scalar_fallback"),
-            recovery: Some(HostAdmissionRecovery::BatchRequiresScalarFallback(cause)),
-            storage_cause: None,
+            cause: None,
         }
     }
 
@@ -134,7 +125,20 @@ impl HostAdmissionOutcome {
             retryable: false,
             reason_code: Some(reason_code),
             recovery: Some(HostAdmissionRecovery::DeterministicContentRefusal),
-            storage_cause: None,
+            cause: None,
+        }
+    }
+
+    /// A deterministic refusal that keeps the refusing authority's own
+    /// operator-facing cause beside the bounded reason code.
+    #[hotpath::skip]
+    pub fn deterministic_content_refusal_with_cause(
+        reason_code: &'static str,
+        cause: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            cause: Some(cause.to_string()),
+            ..Self::deterministic_content_refusal(reason_code)
         }
     }
 
@@ -942,6 +946,7 @@ pub(crate) mod test_support {
         projection_failure: Arc<Mutex<Option<(HostAdmissionOutcome, ObservationCancellation)>>>,
         cancel_on_discovery_queue_read: Arc<Mutex<Option<ObservationCancellation>>>,
         session_backfill_page_pause: Arc<Mutex<Option<SessionBackfillPagePause>>>,
+        deterministic_capture_refusal: Arc<Mutex<Option<&'static str>>>,
     }
 
     impl MemoryHostAdmission {
@@ -956,6 +961,16 @@ pub(crate) mod test_support {
 
         pub(crate) fn fail_next_capture(&self) {
             self.store.state().capture_failures_remaining = 1;
+        }
+
+        /// Refuse every capture the way a deterministic content refusal does:
+        /// the same record fails identically on every retry, so callers must
+        /// converge past it rather than re-attempt the source forever.
+        pub(crate) fn refuse_captures_deterministically(&self, reason: &'static str) {
+            *self
+                .deterministic_capture_refusal
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(reason);
         }
 
         /// Make the next `count` session-message lookups report the store as
@@ -1046,9 +1061,6 @@ pub(crate) mod test_support {
                 ObservationApplicationError::Cancelled => {
                     HostAdmissionOutcome::retained_backpressured("admission_cancelled")
                 }
-                ObservationApplicationError::Store(
-                    ObservationStoreError::BatchRequiresScalarFallback { cause },
-                ) => HostAdmissionOutcome::batch_requires_scalar_fallback(cause),
                 _ => HostAdmissionOutcome::registered_authority_unavailable(),
             }
         }
@@ -1060,6 +1072,13 @@ pub(crate) mod test_support {
             request: CaptureObservationRequest,
         ) -> AdmissionFuture<'a, CaptureObservationOutcome> {
             Box::pin(async move {
+                if let Some(reason) = *self
+                    .deterministic_capture_refusal
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                {
+                    return Err(HostAdmissionOutcome::deterministic_content_refusal(reason));
+                }
                 {
                     let mut state = self.store.state();
                     state.scalar_capture_calls = state.scalar_capture_calls.saturating_add(1);

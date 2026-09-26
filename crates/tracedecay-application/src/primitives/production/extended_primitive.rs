@@ -1,7 +1,8 @@
 //! Extended primitive port: module API, qualified names, diagnostics, and storage status history.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use sha2::{Digest, Sha256};
 use tracedecay_code_index::graph_projection::CodeGraphSymbolSummaryV1;
@@ -28,11 +29,12 @@ use super::super::runtime::{
     SourceOutlinePrimitiveRequest, SourceOutlinePrimitiveResult, StorageStatusHistoryPointV1,
     StorageStatusPrimitiveRequest, StorageStatusPrimitiveResult,
 };
-use super::super::symbol_graph::symbol_record;
+use super::super::symbol_graph::{read_symbol_source_body, symbol_record};
 use super::{
     AuthenticatedDiagnosticCursorAuthorityV1, DIAGNOSTIC_CURSOR_LANE_WORKSPACE,
-    all_code_graph_symbols, completed, diagnostics_result, diagnostics_unavailable,
-    evidence_unavailable, failed, graph_read_outcome, now_observed, open_code_graph,
+    all_code_graph_symbols, completed, completed_unsupported, diagnostics_result,
+    diagnostics_unavailable, evidence_unavailable, failed, graph_read_outcome, now_observed,
+    open_code_graph,
 };
 use crate::diagnostics_publication::CodeIndexPublicationIdentityPortV1;
 use crate::diagnostics_query::{DiagnosticPageRequest, DiagnosticQueryCoverage, DiagnosticsQuery};
@@ -43,11 +45,6 @@ pub(super) fn public_module_symbols(
     nodes: Vec<CodeGraphSymbolSummaryV1>,
     path: &str,
 ) -> Result<Vec<SymbolPrimitiveRecord>, ()> {
-    let prefix = if path.ends_with('/') {
-        path.to_owned()
-    } else {
-        format!("{path}/")
-    };
     let mut pub_nodes: Vec<CodeGraphSymbolSummaryV1> = nodes
         .into_iter()
         .filter(|node| {
@@ -61,7 +58,8 @@ pub(super) fn public_module_symbols(
             else {
                 return false;
             };
-            metadata.visibility == "public" && (file_path == path || file_path.starts_with(&prefix))
+            metadata.visibility == "public"
+                && tracedecay_domain::path_matches_scope(file_path, Some(path))
         })
         .collect();
     pub_nodes.sort_by(|left, right| {
@@ -130,9 +128,18 @@ pub(super) struct DurableStorageStatusHistoryV1 {
     samples: Vec<StorageStatusHistoryPointV1>,
 }
 
-pub(super) fn storage_status_history_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+/// One lock per history file: concurrent reads of one store serialize their
+/// read-modify-write so no sample is dropped, and reads of different stores
+/// never wait on each other.
+// ponytail: entries are never evicted; the map holds one empty mutex per
+// store history path this daemon has read, bounded by its registered stores.
+fn storage_status_history_lock(history_path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(locks.entry(history_path.to_path_buf()).or_default())
 }
 
 pub(super) fn storage_status_history_path(
@@ -156,50 +163,8 @@ pub(super) fn update_storage_status_history(
     database_bytes: u64,
     observed_at: i64,
 ) -> (Vec<StorageStatusHistoryPointV1>, String) {
-    update_storage_status_history_with_lock(
-        storage_status_history_lock(),
-        history_path,
-        project_id,
-        store_path,
-        database_bytes,
-        observed_at,
-    )
-}
-
-pub(super) fn update_storage_status_history_with_lock(
-    history_lock: &Mutex<()>,
-    history_path: &Path,
-    project_id: Option<String>,
-    store_path: String,
-    database_bytes: u64,
-    observed_at: i64,
-) -> (Vec<StorageStatusHistoryPointV1>, String) {
-    // The production lock serializes the read-modify-write of one history
-    // file, but is process-global: every project's storage-status read funnels
-    // through it. A blocking acquire let one stalled write convoy every
-    // concurrent status read daemon-wide, so contention degrades to the
-    // current sample as a typed bounded state instead of waiting.
-    let _guard = match history_lock.try_lock() {
-        Ok(guard) => guard,
-        Err(std::sync::TryLockError::WouldBlock) => {
-            return (
-                vec![StorageStatusHistoryPointV1 {
-                    observed_at,
-                    database_bytes,
-                }],
-                "current_sample_only_history_lock_contended".to_owned(),
-            );
-        }
-        Err(std::sync::TryLockError::Poisoned(_)) => {
-            return (
-                vec![StorageStatusHistoryPointV1 {
-                    observed_at,
-                    database_bytes,
-                }],
-                "current_sample_only_history_lock_failed".to_owned(),
-            );
-        }
-    };
+    let history_lock = storage_status_history_lock(history_path);
+    let _guard = history_lock.lock().unwrap_or_else(PoisonError::into_inner);
     let stored = std::fs::read(history_path).ok();
     let restored = stored
         .as_deref()
@@ -516,7 +481,7 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                     }
                 };
                 let query = GraphQueryManager::new(&reader, cancellation);
-                let Ok(dependent_files) = query.get_file_dependents(&request.file).await else {
+                let Ok(dependents) = query.get_file_dependents(&request.file).await else {
                     return evidence_unavailable(
                         EvidenceDomain::Graph,
                         now_observed(),
@@ -524,14 +489,15 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                         0,
                     );
                 };
-                completed(
-                    FileDependentsPrimitiveResult {
-                        file: request.file.clone(),
-                        dependent_files,
-                    },
-                    EvidenceDomain::Graph,
-                    now_observed(),
-                )
+                let payload = FileDependentsPrimitiveResult {
+                    file: request.file.clone(),
+                    dependent_files: dependents.files,
+                };
+                if dependents.unresolved_callers {
+                    completed_unsupported(payload, EvidenceDomain::Graph, now_observed())
+                } else {
+                    completed(payload, EvidenceDomain::Graph, now_observed())
+                }
             },
             label = "usecases.primitives.file_dependents"
         ))
@@ -575,18 +541,16 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                 let Some(end_line) = metadata.start_line.checked_add(line_span) else {
                     return failed(EvidenceDomain::Source, now_observed());
                 };
-                let path = self.source_runtime.project_root().join(&file);
-                let Ok(content) = tokio::fs::read_to_string(&path).await else {
+                let Ok(body) = read_symbol_source_body(
+                    self.source_runtime.project_root(),
+                    &file,
+                    metadata.start_line,
+                    end_line,
+                )
+                .await
+                else {
                     return failed(EvidenceDomain::Source, now_observed());
                 };
-                let start = metadata.start_line as usize;
-                let end = end_line as usize;
-                let body = content
-                    .lines()
-                    .skip(start)
-                    .take(end.saturating_sub(start).saturating_add(1))
-                    .collect::<Vec<_>>()
-                    .join("\n");
                 completed(
                     SourceBodyPrimitiveResult {
                         node_id: occurrence.as_str().to_owned(),

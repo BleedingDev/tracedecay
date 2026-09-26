@@ -23,6 +23,7 @@ use tracedecay_code_index_runtime::code_index_scheduler::{
     CodeGraphActivationPolicyV1, CodeIndexSchedulerRegistryV1, LatestCompleteCodeIndexV1,
 };
 use tracedecay_code_index_runtime::project_reads::project_code_index_ignored_dependency_admission_port;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 const PROJECT_ID: &str = "project.project-open-ignored-dependency";
 
@@ -360,7 +361,7 @@ async fn wait_for_initial_generation(registry: &CodeIndexSchedulerRegistryV1, pr
     if registry.latest_generation_id(project_root).await.is_some() {
         return;
     }
-    let canonical_root = project_root.canonicalize().expect("canonical fixture root");
+    let canonical_root = canonical_existing_identity(project_root).expect("canonical fixture root");
     let mut publications = registry.subscribe_generation_publications();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -386,8 +387,13 @@ async fn latest(
     project_root: &Path,
 ) -> LatestCompleteCodeIndexV1 {
     // Lightweight publication precedes complete-generation seating. Demand
-    // that complete state before using its imports as admission evidence.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // that complete state before using its imports as admission evidence. The
+    // seat is background work behind the scheduler mutex; under a loaded CI
+    // runner it has taken over 5 s, so the bound is a minute. Polling the
+    // query read is safe: a read that finds the owner holding the scheduler
+    // does not schedule the successor the dashboard would project as
+    // `Verifying`.
+    tokio::time::timeout(Duration::from_mins(1), async {
         loop {
             let _ = registry.latest_complete_fresh(project_root).await;
             if registry

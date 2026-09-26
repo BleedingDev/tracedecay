@@ -87,6 +87,9 @@ fn build_language_table() -> HashMap<&'static str, Language> {
     #[cfg(feature = "lang-wgsl")]
     let languages = languages.chain(std::iter::once(("wgsl", wgsl_grammar::LANGUAGE.into())));
 
+    #[cfg(feature = "lang-json")]
+    let languages = languages.chain(std::iter::once(("json", tree_sitter_json::LANGUAGE.into())));
+
     // HLSL uses the newer LanguageFn API.
     #[cfg(feature = "lang-hlsl")]
     let languages = languages.chain(std::iter::once((
@@ -95,6 +98,50 @@ fn build_language_table() -> HashMap<&'static str, Language> {
     )));
 
     languages.collect()
+}
+
+/// Every distinct node-kind name of every registered grammar, as the grammar's
+/// own `&'static str`, numbered. The numbers are process-local: clone token
+/// streams hold them in memory and always write the name.
+struct GrammarNodeKinds {
+    ids: HashMap<&'static str, u32>,
+    names: Vec<&'static str>,
+}
+
+static GRAMMAR_NODE_KINDS: LazyLock<GrammarNodeKinds> = LazyLock::new(|| {
+    let mut kinds = GrammarNodeKinds {
+        ids: HashMap::new(),
+        names: Vec::new(),
+    };
+    for language in LANGUAGES.values() {
+        for id in 0..u16::try_from(language.node_kind_count()).unwrap_or(u16::MAX) {
+            let Some(name) = language.node_kind_for_id(id) else {
+                continue;
+            };
+            let Ok(next) = u32::try_from(kinds.names.len()) else {
+                break;
+            };
+            kinds.ids.entry(name).or_insert_with(|| {
+                kinds.names.push(name);
+                next
+            });
+        }
+    }
+    kinds
+});
+
+/// The number of the grammar node kind named `name`, when some registered
+/// grammar declares one.
+pub(crate) fn grammar_kind_id(name: &str) -> Option<u32> {
+    GRAMMAR_NODE_KINDS.ids.get(name).copied()
+}
+
+/// The grammar's static name for kind number `id`.
+pub(crate) fn grammar_kind_name(id: u32) -> Option<&'static str> {
+    usize::try_from(id)
+        .ok()
+        .and_then(|id| GRAMMAR_NODE_KINDS.names.get(id))
+        .copied()
 }
 
 /// Returns the `tree_sitter::Language` for the given extractor language key.

@@ -1,5 +1,6 @@
 use super::*;
 use sha2::{Digest as _, Sha256};
+use tracedecay_runtime_core::path_safety::canonical_root_identity;
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,20 +12,24 @@ impl HostAdmissionTestRuntimeV1 {
         self.profile_database.checkpoint().await;
     }
 
+    /// Writes a standalone copy of the live profile database for inspection.
     #[doc(hidden)]
     pub async fn snapshot_profile_database_for_test(&self, destination: &Path) -> Result<()> {
-        self.profile_database.snapshot_to(destination).await
+        vacuum_into_for_test(self.profile_database.db_path(), destination).await
     }
 
+    /// Writes a standalone copy of the live session database for inspection.
     #[doc(hidden)]
     pub async fn snapshot_session_database_for_test(
         &self,
         scope: HostAdmissionScope,
         destination: &Path,
     ) -> Result<()> {
-        self.session_database_for_test(scope)?
-            .snapshot_to(destination)
-            .await
+        vacuum_into_for_test(
+            self.session_database_for_test(scope)?.db_path(),
+            destination,
+        )
+        .await
     }
 
     #[doc(hidden)]
@@ -55,7 +60,8 @@ impl HostAdmissionTestRuntimeV1 {
                     operation: "resolve test profile-relative path".to_owned(),
                     message: "profile database has no parent directory".to_owned(),
                 })?;
-        path.strip_prefix(profile_root)
+        canonical_root_identity(path)
+            .strip_prefix(canonical_root_identity(profile_root))
             .map(Path::to_path_buf)
             .map_err(|error| TraceDecayError::Database {
                 operation: "resolve test profile-relative path".to_owned(),
@@ -218,36 +224,6 @@ impl HostAdmissionTestRuntimeV1 {
     }
 
     #[doc(hidden)]
-    pub async fn apply_registry_orphan_relink_report(
-        &self,
-        report: &tracedecay_global_db::registry_maintenance::RegistryOrphanRelinkReport,
-    ) -> std::result::Result<
-        tracedecay_global_db::registry_maintenance::RegistryOrphanRelinkApplyReport,
-        Vec<String>,
-    > {
-        tracedecay_global_db::registry_maintenance::apply_registry_orphan_relink_report(
-            self.profile_database.as_ref(),
-            report,
-        )
-        .await
-    }
-
-    #[doc(hidden)]
-    pub async fn apply_single_registry_orphan_relink_report(
-        &self,
-        report: &tracedecay_global_db::registry_maintenance::RegistryOrphanRelinkReport,
-    ) -> std::result::Result<
-        tracedecay_global_db::registry_maintenance::RegistryOrphanRelinkApplyReport,
-        Vec<String>,
-    > {
-        tracedecay_global_db::registry_maintenance::apply_single_registry_orphan_relink_report(
-            self.profile_database.as_ref(),
-            report,
-        )
-        .await
-    }
-
-    #[doc(hidden)]
     pub async fn upsert_graph_scope(
         &self,
         upsert: tracedecay_global_db::GraphScopeUpsert,
@@ -344,4 +320,31 @@ fn registered_registry_reap_entry(
         missing_path: entry.missing_path.clone(),
         project_id: entry.project_id.clone(),
     }
+}
+
+/// `VACUUM INTO` over a read-only connection: one read transaction yields a
+/// consistent standalone image of the live WAL database without the writer.
+async fn vacuum_into_for_test(source: &Path, destination: &Path) -> Result<()> {
+    let source = source.to_path_buf();
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let connection = rusqlite::Connection::open_with_flags(
+            &source,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        connection.execute(
+            "VACUUM INTO ?1",
+            [destination.to_string_lossy().into_owned()],
+        )?;
+        Ok::<(), rusqlite::Error>(())
+    })
+    .await
+    .map_err(|error| TraceDecayError::Database {
+        operation: "join test database copy".to_owned(),
+        message: error.to_string(),
+    })?
+    .map_err(|error| TraceDecayError::Database {
+        operation: "copy test database".to_owned(),
+        message: error.to_string(),
+    })
 }

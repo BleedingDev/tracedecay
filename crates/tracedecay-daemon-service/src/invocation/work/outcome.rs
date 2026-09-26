@@ -21,8 +21,8 @@ use tracedecay_daemon_protocol::{
 };
 
 use super::super::administrative_effect::administrative_command_effect;
-use super::super::current_micros;
 use super::{RegisteredWorkRuntime, application_problem};
+use tracedecay_contracts::now_micros;
 
 pub(super) fn offer_work_blocked_interval_receipts(
     durable_write_signal: &super::WorkDurableWriteSignalV1,
@@ -69,32 +69,23 @@ pub(super) fn work_product_problem(error: WorkProductApplicationErrorV1) -> Appl
             ApplicationProblem::cancelled_before_admission()
         }
         WorkProductApplicationErrorV1::TimedOut => ApplicationProblem::timed_out_before_admission(),
-        WorkProductApplicationErrorV1::InvalidRequest => ApplicationProblem::InvalidRequest {
-            diagnostic: SafeDiagnostic {
-                code: "work.invalid_graph_operation".to_owned(),
-                message: "The Work graph request is invalid".to_owned(),
-            },
-            retry: RetryDirective::Never,
-            legal_actions: vec![tracedecay_contracts::LegalAction::CorrectRequest],
-        },
+        WorkProductApplicationErrorV1::InvalidRequest => ApplicationProblem::invalid_request(
+            "work.invalid_graph_operation",
+            "The Work graph request is invalid",
+        ),
         // A read under this selection succeeds and discloses what it left out;
         // a mutation cannot, because the head it would pin is the covered
         // slice's, not the journal's. The refusal therefore names the cause and
         // the remedy instead of hiding behind the concealed not-found answer
         // the old fail-closed refusal produced.
         WorkProductApplicationErrorV1::SelectionCoverageIncomplete => {
-            ApplicationProblem::InvalidRequest {
-                diagnostic: SafeDiagnostic {
-                    code: "work.selection_coverage_incomplete".to_owned(),
-                    message: "The Work selection covers only part of the owner's journal, so no \
+            ApplicationProblem::invalid_request(
+                "work.selection_coverage_incomplete",
+                "The Work selection covers only part of the owner's journal, so no \
                               graph mutation can be prepared or submitted against it; widen the \
                               selection to the relation scopes the excluded events were admitted \
-                              under"
-                        .to_owned(),
-                },
-                retry: RetryDirective::Never,
-                legal_actions: vec![tracedecay_contracts::LegalAction::CorrectRequest],
-            }
+                              under",
+            )
         }
         WorkProductApplicationErrorV1::VersionConflict => {
             ApplicationProblem::stale(SafeDiagnostic {
@@ -151,9 +142,7 @@ pub(crate) fn work_background_context(
         identity.attempt_id().as_str()
     ))?;
     let deadline = Deadline::new(UtcMicros(
-        current_micros()
-            .0
-            .saturating_add(BACKGROUND_DEADLINE_MICROS),
+        now_micros().0.saturating_add(BACKGROUND_DEADLINE_MICROS),
     ))?;
     let cancellation = CancellationContext::active(format!(
         "work-attempt-exec-{}",
@@ -179,9 +168,7 @@ pub(crate) fn work_blocked_interval_recovery_context(
     const BACKGROUND_DEADLINE_MICROS: i64 = 86_400_000_000;
     let request_id = RequestId::new("work-blocked-interval-recovery")?;
     let deadline = Deadline::new(UtcMicros(
-        current_micros()
-            .0
-            .saturating_add(BACKGROUND_DEADLINE_MICROS),
+        now_micros().0.saturating_add(BACKGROUND_DEADLINE_MICROS),
     ))?;
     let cancellation = CancellationContext::active("cancel.work-blocked-interval-recovery")?;
     RequestContext::new(
@@ -393,7 +380,7 @@ where
         })?;
     let execution = OperationReceipt::completed(
         observed_at,
-        current_micros(),
+        now_micros(),
         deadline,
         OperationBudgetUsage::default(),
     )?;

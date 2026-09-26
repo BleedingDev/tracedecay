@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use super::registered_http::invoke_registered_http;
+use super::require_public_catalog_route;
 use axum::response::Response;
 use tracedecay_api::HandoffOperation;
 use tracedecay_contracts::{
@@ -7,9 +9,6 @@ use tracedecay_contracts::{
     ListTaskHandoffsResultV1, OpenInvestigationHandoffRequestV1, OpenInvestigationHandoffResultV1,
     OpenTaskHandoffRequestV1, OpenTaskHandoffResultV1,
 };
-use tracedecay_tool_catalog::RouteExposureV1;
-
-use super::registered_http::invoke_registered_http;
 use tracedecay_daemon_protocol::ApplicationSurfaceAdapterError;
 use tracedecay_daemon_protocol::DaemonInvocationExecutor;
 use tracedecay_daemon_protocol::{HandoffApplicationInvocationV1, HandoffApplicationOutcomeV1};
@@ -30,18 +29,7 @@ pub(super) fn validate_catalog_bindings() -> Result<(), ApplicationSurfaceAdapte
         let operation_id =
             tracedecay_tool_catalog::OperationId::new(operation.operation_id_str().to_owned())
                 .map_err(ApplicationSurfaceAdapterError::Identifier)?;
-        let Some(binding) = registry
-            .get(&operation_id)
-            .and_then(|availability| availability.binding())
-        else {
-            return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
-        };
-        let RouteExposureV1::Public { route_path, .. } = binding.exposure() else {
-            return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
-        };
-        if route_path != operation.application_route_path() {
-            return Err(ApplicationSurfaceAdapterError::UnknownOrNotAuthorized);
-        }
+        require_public_catalog_route(&registry, &operation_id, operation.application_route_path())?;
     }
     Ok(())
 }
@@ -80,7 +68,7 @@ async fn invoke_operation(
                 tracedecay_daemon_protocol::DaemonInvocationRequest::handoff_application(
                     request_id.as_str(),
                     HandoffApplicationInvocationV1::IssueTaskHandoff(decoded),
-                    tracedecay_daemon_protocol::invocation_now_micros(),
+                    tracedecay_contracts::now_micros(),
                     controls.deadline.clone(),
                     controls.cancellation.context(),
                 );
@@ -114,7 +102,7 @@ async fn invoke_operation(
                 tracedecay_daemon_protocol::DaemonInvocationRequest::handoff_application(
                     request_id.as_str(),
                     HandoffApplicationInvocationV1::ListTaskHandoffs(decoded),
-                    tracedecay_daemon_protocol::invocation_now_micros(),
+                    tracedecay_contracts::now_micros(),
                     controls.deadline.clone(),
                     controls.cancellation.context(),
                 );
@@ -152,7 +140,7 @@ async fn invoke_operation(
                 tracedecay_daemon_protocol::DaemonInvocationRequest::handoff_application(
                     request_id.as_str(),
                     HandoffApplicationInvocationV1::OpenInvestigationHandoff(decoded),
-                    tracedecay_daemon_protocol::invocation_now_micros(),
+                    tracedecay_contracts::now_micros(),
                     controls.deadline.clone(),
                     controls.cancellation.context(),
                 );
@@ -186,7 +174,7 @@ async fn invoke_operation(
                 tracedecay_daemon_protocol::DaemonInvocationRequest::handoff_application(
                     request_id.as_str(),
                     HandoffApplicationInvocationV1::OpenTaskHandoff(decoded),
-                    tracedecay_daemon_protocol::invocation_now_micros(),
+                    tracedecay_contracts::now_micros(),
                     controls.deadline.clone(),
                     controls.cancellation.context(),
                 );

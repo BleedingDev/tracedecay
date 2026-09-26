@@ -44,8 +44,8 @@ fn daemon_client_admission_reports_saturation_and_recovers() {
 /// in ten minutes against a cap of 64 while the reader pool was completely idle
 /// (0 leased, 0 waiting). The slots were held by requests asleep on project
 /// warm-up, on the writer gate, and on the single-flight generation decode, so
-/// calls that needed no generation at all — `tracedecay_diff_context`, session,
-/// memory, and git tools — were rejected by work that was doing nothing.
+/// calls that needed no generation at all, `tracedecay_diff_context`, session,
+/// memory, and git tools, were rejected by work that was doing nothing.
 ///
 /// The acceptance property: while every general slot is held by a parked
 /// request, a fresh call still admits as `General` and completes; the parked
@@ -391,15 +391,28 @@ fn project_server_capacity_response_is_typed_json_rpc_data() {
         serde_json::Value::Null,
         &super::super::project_server_capacity_error(),
     );
-    let data = response
-        .error
-        .expect("error response")
-        .data
-        .expect("typed data");
+    let error = response.error.expect("error response");
+    let refusal = serde_json::to_value(&error).expect("serialize capacity refusal");
+    assert!(
+        super::super::json_rpc_error_is_project_open_retryable(&refusal),
+        "branch add and the proxy must retry this refusal: {refusal}"
+    );
+    let data = error.data.expect("typed data");
 
+    assert_eq!(data["reason_code"], "project_server_capacity_reached");
     assert_eq!(data["kind"], "project_server_capacity_reached");
     assert_eq!(data["retryable"], true);
     assert_eq!(data["capacity"], super::super::MAX_CACHED_PROJECT_SERVERS);
+    assert!(super::super::error_is_project_open_retryable(
+        &super::super::project_server_capacity_error()
+    ));
+    let prose = tracedecay_domain::errors::TraceDecayError::Config {
+        message: "daemon project server capacity reached".to_owned(),
+    };
+    assert!(
+        !super::super::error_is_project_open_retryable(&prose),
+        "capacity English prose must not decide project-open retry"
+    );
 }
 
 #[tokio::test]
@@ -640,6 +653,7 @@ async fn tools_list_answers_under_general_saturation() {
 async fn one_shot_tool_call_receives_a_matching_saturation_response() {
     let temp = TempDir::new().expect("temp dir");
     let socket = temp.path().join("daemon.sock");
+    let _authority = seed_socket_authority(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept tool call");
@@ -876,6 +890,7 @@ async fn portable_broker_requests_reuse_one_authenticated_project_owner() {
 async fn one_shot_tool_call_aborts_when_daemon_liveness_fails_after_write() {
     let temp = TempDir::new().expect("temp dir");
     let socket = temp.path().join("daemon.sock");
+    let _authority = seed_socket_authority(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
     let server = tokio::spawn(async move {
         let (_stream, _) = listener.accept().await.expect("accept tool call");
@@ -913,6 +928,7 @@ async fn one_shot_tool_call_aborts_when_daemon_liveness_fails_after_write() {
 async fn proxied_request_uses_shared_liveness_boundary_after_write() {
     let temp = TempDir::new().expect("temp dir");
     let socket = temp.path().join("daemon.sock");
+    let _authority = seed_socket_authority(&socket);
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
     let server = tokio::spawn(async move {
         let (_stream, _) = listener.accept().await.expect("accept proxied request");
@@ -954,16 +970,14 @@ async fn proxied_request_uses_shared_liveness_boundary_after_write() {
 async fn post_write_disconnect_reports_ambiguous_outcome_without_retry() {
     let temp = TempDir::new().expect("temp dir");
     let socket = temp.path().join("daemon.sock");
+    let authority = seed_socket_authority(&socket);
+    let token = authority.auth_token().to_string();
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept proxied request");
         let (reader, _writer) = stream.into_split();
         let mut lines = tokio::io::BufReader::new(reader).lines();
-        lines
-            .next_line()
-            .await
-            .expect("read handshake")
-            .expect("handshake line");
+        read_authenticated_handshake(&mut lines, &token).await;
         lines
             .next_line()
             .await
@@ -1002,16 +1016,14 @@ async fn post_write_disconnect_reports_ambiguous_outcome_without_retry() {
 async fn one_shot_tool_call_allows_long_response_while_daemon_stays_live() {
     let temp = TempDir::new().expect("temp dir");
     let socket = temp.path().join("daemon.sock");
+    let authority = seed_socket_authority(&socket);
+    let token = authority.auth_token().to_string();
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept tool call");
         let (reader, mut writer) = stream.into_split();
         let mut lines = tokio::io::BufReader::new(reader).lines();
-        lines
-            .next_line()
-            .await
-            .expect("read handshake")
-            .expect("handshake line");
+        read_authenticated_handshake(&mut lines, &token).await;
         let request_line = lines
             .next_line()
             .await
@@ -1064,16 +1076,14 @@ async fn one_shot_tool_call_allows_long_response_while_daemon_stays_live() {
 async fn one_shot_tool_call_preserves_response_split_across_liveness_poll() {
     let temp = TempDir::new().expect("temp dir");
     let socket = temp.path().join("daemon.sock");
+    let authority = seed_socket_authority(&socket);
+    let token = authority.auth_token().to_string();
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept tool call");
         let (reader, mut writer) = stream.into_split();
         let mut lines = tokio::io::BufReader::new(reader).lines();
-        lines
-            .next_line()
-            .await
-            .expect("read handshake")
-            .expect("handshake line");
+        read_authenticated_handshake(&mut lines, &token).await;
         let request_line = lines
             .next_line()
             .await
@@ -1146,7 +1156,10 @@ async fn persistent_idle_client_closes_on_draining_without_timeout() {
     )
     .await;
 
-    assert_eq!(receipt.clients, super::super::ShutdownStatus::Clean);
+    assert_eq!(
+        receipt.clients,
+        tracedecay_daemon_service::shutdown::ShutdownStatus::Clean
+    );
     assert!(lifecycle.try_enter().is_none());
 }
 
@@ -1175,7 +1188,7 @@ async fn draining_waits_for_one_bounded_in_flight_request() {
 /// different admission states:
 ///
 /// * a connection that panics while it still holds its slot, and
-/// * a connection that panics *while parked* — `park_admission` has already
+/// * a connection that panics *while parked*, `park_admission` has already
 ///   surrendered the slot and will never reach its re-acquire, so the unwind
 ///   must not double-release it or leave it unaccounted.
 ///

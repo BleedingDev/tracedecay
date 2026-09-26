@@ -1,19 +1,17 @@
 use std::io::Write as _;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tracedecay_runtime_core::db::engine::{
     Executor, QueryExecutor, ReadSnapshot, TestConnection, Transaction, TransactionBehavior, params,
 };
-use tracedecay_runtime_core::shard_runtime::VerifiedGraphRuntimePortV1;
 
 use super::*;
-use crate::runtime::git_correlation::test_support::MemoryEvidenceGraphRuntime;
 use crate::runtime::git_correlation::{
-    ensure_git_correlation_receipt_schema_in_transaction, read_meta_value,
+    GitEvidenceBatch, GitEvidencePass, GitEvidenceWriter, converge_git_evidence_pass,
+    ensure_git_correlation_receipt_schema_in_transaction, open_git_evidence_view, read_meta_value,
 };
 
 impl GitCorrelationWriteTxn for Transaction {
@@ -26,24 +24,13 @@ impl GitCorrelationWriteTxn for Transaction {
 
 struct TestStore {
     connection: TestConnection,
-    graph: std::sync::Arc<MemoryEvidenceGraphRuntime>,
     fail_next_write: AtomicBool,
 }
 
 impl TestStore {
     fn open(path: &Path) -> Self {
-        Self::open_with_graph(
-            path,
-            std::sync::Arc::new(MemoryEvidenceGraphRuntime::default()),
-        )
-    }
-
-    /// Reopen against the graph state a prior store instance published, the
-    /// way a restarted daemon sees the durable graph next to its receipts.
-    fn open_with_graph(path: &Path, graph: std::sync::Arc<MemoryEvidenceGraphRuntime>) -> Self {
         Self {
             connection: TestConnection::open(path),
-            graph,
             fail_next_write: AtomicBool::new(false),
         }
     }
@@ -78,16 +65,6 @@ impl GitCorrelationSessionStore for TestStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await
             .map_err(GitCorrelationError::from)
-    }
-
-    fn git_evidence_publication_lock(
-        &self,
-    ) -> Result<Arc<std::sync::Mutex<()>>, GitCorrelationError> {
-        Ok(self.graph.git_evidence_publication_lock())
-    }
-
-    fn graph_runtime(&self) -> Result<&dyn VerifiedGraphRuntimePortV1, GitCorrelationError> {
-        Ok(self.graph.as_ref())
     }
 }
 
@@ -219,7 +196,7 @@ fn append_linear_history(path: &Path, commit_count: usize) {
 }
 
 fn head_commit_time(path: &Path) -> i64 {
-    gix::discover(path)
+    tracedecay_runtime_core::git_open::discover(path)
         .unwrap()
         .head_commit()
         .unwrap()
@@ -244,12 +221,12 @@ async fn prepare_store(path: &Path, project_path: &Path) -> TestStore {
                 ended_at INTEGER,
                 PRIMARY KEY(provider, session_id)
             );
-            CREATE TABLE session_messages (
+            CREATE TABLE lcm_raw_messages (
                 provider TEXT NOT NULL,
                 message_id TEXT NOT NULL,
                 session_id TEXT NOT NULL,
                 timestamp INTEGER,
-                PRIMARY KEY(provider, message_id)
+                UNIQUE(provider, message_id)
             );",
         )
         .await
@@ -266,88 +243,114 @@ async fn prepare_store(path: &Path, project_path: &Path) -> TestStore {
     store
 }
 
+/// The evidence rows, the attribution mark, and the history frontier commit
+/// in one transaction: a pass whose write fails leaves nothing behind, and a
+/// pass with nothing new installs no generation.
 #[tokio::test]
-async fn incremental_publication_failure_holds_frontier_until_retry_succeeds() {
-    let repository = repository_fixture();
-    let directory = tempfile::tempdir().unwrap();
-    let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
-    store.graph.fail_next_publication();
-
-    let failed = run_incremental_backfill(&store, &SystemGit, 1)
-        .await
-        .unwrap();
-    assert_eq!(failed.sessions_scanned, 1);
-    assert_eq!(failed.skipped_git_error, 1);
-    assert_eq!(
-        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
-            .await
-            .unwrap(),
-        None,
-        "a transient graph failure must not settle the source tuple"
-    );
-
-    let retried = run_incremental_backfill(&store, &SystemGit, 1)
-        .await
-        .unwrap();
-    assert_eq!(retried.sessions_scanned, 1);
-    assert_eq!(retried.skipped_git_error, 0);
-    assert!(retried.spans_written > 0);
-    assert_eq!(
-        read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
-            .await
-            .unwrap(),
-        Some(i64::MAX)
-    );
-    assert_eq!(
-        run_incremental_backfill(&store, &SystemGit, 1)
-            .await
-            .unwrap()
-            .sessions_scanned,
-        0
-    );
-}
-
-#[tokio::test]
-async fn later_frontier_failure_returns_committed_graph_progress() {
+async fn convergence_writes_evidence_and_frontier_atomically() {
     let repository = repository_fixture();
     let directory = tempfile::tempdir().unwrap();
     let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
     store.fail_next_write();
 
-    let partial = run_incremental_backfill_outcome(&store, &SystemGit, 1)
+    let failed = converge_git_evidence_pass(&store, &SystemGit)
         .await
-        .unwrap();
-    assert!(partial.stats.spans_written > 0);
-    assert!(!partial.stats.frontier_advanced);
-    assert!(matches!(
-        partial.later_failure,
-        Some(GitCorrelationError::Db(_))
-    ));
+        .unwrap_err();
+    assert!(matches!(failed, GitCorrelationError::Db(_)));
     assert_eq!(
         read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
             .await
             .unwrap(),
-        None
+        None,
+        "a failed pass must not settle the source tuple"
+    );
+    assert!(
+        open_git_evidence_view(&store.connection)
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed pass must not leave evidence rows"
     );
 
-    let retried = run_incremental_backfill(&store, &SystemGit, 1)
+    let retried = converge_git_evidence_pass(&store, &SystemGit)
         .await
         .unwrap();
-    assert!(retried.frontier_advanced);
+    assert_eq!(retried.later_failure, None);
+    assert_eq!(retried.pass.backfill.sessions_scanned, 1);
+    assert_eq!(retried.pass.backfill.skipped_git_error, 0);
+    assert!(retried.pass.backfill.spans_written > 0);
+    assert_eq!(
+        retried.pass.frontier,
+        GitHistoryIndexFrontier {
+            activity_timestamp: i64::MAX,
+            source_rowid: 1,
+        }
+    );
+    let installed = retried
+        .pass
+        .generation
+        .expect("new evidence installs a generation");
+    assert_eq!(installed.sequence, 1);
+
+    let settled = converge_git_evidence_pass(&store, &SystemGit)
+        .await
+        .unwrap();
+    assert_eq!(settled.pass.backfill.sessions_scanned, 0);
+    assert_eq!(
+        settled.pass.generation, None,
+        "a pass without new evidence installs no generation"
+    );
+    assert_eq!(
+        open_git_evidence_view(&store.connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation(),
+        &installed
+    );
 }
 
+/// A fresh project has never recorded Git evidence. Reporting that as a
+/// retryable unavailability put every fresh project's ingest into an endless
+/// retry loop.
 #[tokio::test]
-async fn unavailable_attribution_target_is_a_retryable_error() {
+async fn never_recorded_evidence_converges_as_a_typed_no_op() {
     let repository = repository_fixture();
     let directory = tempfile::tempdir().unwrap();
     let store = prepare_store(&directory.path().join("sessions.db"), repository.path()).await;
-    run_incremental_backfill(&store, &SystemGit, 1)
+    store
+        .connection
+        .execute_batch("DELETE FROM sessions")
         .await
         .unwrap();
 
-    let error = run_commit_attribution_sweep(&store, 0, |_| TargetScan::Unavailable)
+    let outcome = converge_git_evidence_pass(&store, &SystemGit)
         .await
-        .unwrap_err();
+        .unwrap();
+    assert_eq!(outcome.later_failure, None);
+    assert_eq!(
+        outcome.pass,
+        GitEvidencePass {
+            backfill: BackfillStats::default(),
+            frontier: GitHistoryIndexFrontier {
+                activity_timestamp: 0,
+                source_rowid: 0,
+            },
+            generation: None,
+        }
+    );
+    assert!(
+        open_git_evidence_view(&store.connection)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn unavailable_attribution_target_is_a_retryable_error() {
+    let span = stable_backfill_span("codex", "session-1", Some("main"), "/repo", 1, 2);
+    let error = attribute_commits(&[span], 0, |_| TargetScan::Unavailable).unwrap_err();
     assert!(matches!(error, GitCorrelationError::Unavailable(_)));
 }
 
@@ -368,36 +371,43 @@ async fn archived_branch_is_limited_coverage_without_losing_observed_span() {
         event_count: 2,
         source: crate::runtime::git_correlation::SpanSource::Ingest,
     };
-    publish_graph_evidence(&store, "archived", &[archived], &[]).unwrap();
-
-    let attribution = run_commit_attribution_sweep(&store, DEFAULT_SPAN_MERGE_GAP_SECS, |target| {
+    ensure_git_correlation_receipt_schema_in_transaction(&store.connection)
+        .await
+        .unwrap();
+    let transaction = store.open_write_transaction().await.unwrap();
+    let mut writer = GitEvidenceWriter::open(&transaction).await.unwrap();
+    writer
+        .apply(GitEvidenceBatch {
+            spans: vec![archived],
+            merge_gap_secs: DEFAULT_SPAN_MERGE_GAP_SECS,
+            ..GitEvidenceBatch::default()
+        })
+        .await
+        .unwrap();
+    writer.finish().await.unwrap();
+    transaction.commit().await.unwrap();
+    let view = open_git_evidence_view(&store.connection)
+        .await
+        .unwrap()
+        .unwrap();
+    let (spans, _) = view
+        .session_evidence(&std::collections::BTreeSet::from([
+            "archived-session".to_owned()
+        ]))
+        .await
+        .unwrap();
+    let attribution = attribute_commits(&spans, DEFAULT_SPAN_MERGE_GAP_SECS, |target| {
         scan_span_target(&SystemGit, target, DEFAULT_SPAN_MERGE_GAP_SECS, usize::MAX)
     })
-    .await
     .unwrap();
-    assert_eq!(attribution.commits_attributed, 0);
+    assert_eq!(attribution.records, Vec::new());
     assert_eq!(attribution.unavailable_references, 1);
-
-    let identity = crate::runtime::git_correlation::git_evidence_projection_identity(
-        tracedecay_graph_db::GraphNamespace::new("project").unwrap(),
-    )
-    .unwrap();
-    let evidence = crate::runtime::git_correlation::recover_git_evidence_projection(
-        GitCorrelationSessionStore::graph_runtime(&store).unwrap(),
-        &identity,
-        Arc::new(AtomicBool::new(false)),
-    )
-    .unwrap()
-    .unwrap();
-    assert_eq!(evidence.projection().spans().len(), 1);
-    assert_eq!(
-        evidence.projection().spans()[0].branch.as_deref(),
-        Some("codex/archived")
-    );
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].branch.as_deref(), Some("codex/archived"));
 }
 
 #[tokio::test]
-async fn incremental_permanent_exclusion_advances_frontier() {
+async fn convergence_permanent_exclusion_advances_frontier() {
     let plain_directory = tempfile::tempdir().unwrap();
     let database_directory = tempfile::tempdir().unwrap();
     let store = prepare_store(
@@ -406,13 +416,14 @@ async fn incremental_permanent_exclusion_advances_frontier() {
     )
     .await;
 
-    let excluded = run_incremental_backfill(&store, &SystemGit, 1)
+    let excluded = converge_git_evidence_pass(&store, &SystemGit)
         .await
-        .unwrap();
+        .unwrap()
+        .pass;
 
-    assert_eq!(excluded.sessions_scanned, 1);
-    assert_eq!(excluded.skipped_not_worktree, 1);
-    assert!(excluded.frontier_advanced);
+    assert_eq!(excluded.backfill.sessions_scanned, 1);
+    assert_eq!(excluded.backfill.skipped_not_worktree, 1);
+    assert!(excluded.backfill.frontier_advanced);
     assert_eq!(
         read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
             .await
@@ -462,10 +473,9 @@ async fn persisted_partial_reopens_and_converges_exactly_once() {
         scalar(&store, "SELECT COUNT(*) FROM git_history_index_progress").await,
         1
     );
-    let durable_graph = std::sync::Arc::clone(&store.graph);
     drop(store);
 
-    let reopened = TestStore::open_with_graph(&database, durable_graph);
+    let reopened = TestStore::open(&database);
     let completed = run_bounded_history_index_page(
         &reopened,
         &options(false),
@@ -509,11 +519,9 @@ async fn incremental_unborn_history_settles_without_masking_source_failures() {
         calls: AtomicUsize::new(0),
         fail_on: usize::MAX,
     };
-    let failed = run_incremental_backfill_outcome(&store, &source, 1)
-        .await
-        .unwrap();
-    assert_eq!(failed.stats.skipped_git_error, 1);
-    assert!(!failed.stats.frontier_advanced);
+    let failed = converge_git_evidence_pass(&store, &source).await.unwrap();
+    assert_eq!(failed.pass.backfill.skipped_git_error, 1);
+    assert!(!failed.pass.backfill.frontier_advanced);
     assert_eq!(
         read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
             .await
@@ -521,24 +529,24 @@ async fn incremental_unborn_history_settles_without_masking_source_failures() {
         None
     );
 
-    let settled = run_incremental_backfill_outcome(&store, &SystemGit, 1)
+    let settled = converge_git_evidence_pass(&store, &SystemGit)
         .await
         .unwrap();
     assert_eq!(settled.later_failure, None);
-    assert_eq!(settled.stats.skipped_git_error, 0);
-    assert!(settled.stats.frontier_advanced);
-    assert_eq!(settled.stats.spans_written, 0);
-    assert_eq!(settled.stats.commits_attributed, 0);
+    assert_eq!(settled.pass.backfill.skipped_git_error, 0);
+    assert!(settled.pass.backfill.frontier_advanced);
+    assert_eq!(settled.pass.backfill.spans_written, 0);
+    assert_eq!(settled.pass.backfill.commits_attributed, 0);
     assert_eq!(
         read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
             .await
             .unwrap(),
         Some(1)
     );
-    let repeated = run_incremental_backfill_outcome(&store, &SystemGit, 1)
+    let repeated = converge_git_evidence_pass(&store, &SystemGit)
         .await
         .unwrap();
-    assert_eq!(repeated.stats.sessions_scanned, 0);
+    assert_eq!(repeated.pass.backfill.sessions_scanned, 0);
     assert_eq!(repeated.later_failure, None);
 
     // A historical commit makes the epoch-zero scan independent of whether
@@ -576,14 +584,14 @@ async fn incremental_unborn_history_settles_without_masking_source_failures() {
         .execute("UPDATE sessions SET ended_at = ?1", params![timestamp])
         .await
         .unwrap();
-    let settled = run_incremental_backfill_outcome(&store, &SystemGit, 1)
+    let settled = converge_git_evidence_pass(&store, &SystemGit)
         .await
         .unwrap();
     assert_eq!(settled.later_failure, None);
-    assert_eq!(settled.stats.skipped_git_error, 0);
-    assert!(settled.stats.frontier_advanced);
-    assert!(settled.stats.spans_written > 0);
-    assert!(settled.stats.commits_attributed > 0);
+    assert_eq!(settled.pass.backfill.skipped_git_error, 0);
+    assert!(settled.pass.backfill.frontier_advanced);
+    assert!(settled.pass.backfill.spans_written > 0);
+    assert!(settled.pass.backfill.commits_attributed > 0);
     assert_eq!(
         read_meta_value(&store.connection, AUTO_BACKFILL_WATERMARK_KEY)
             .await

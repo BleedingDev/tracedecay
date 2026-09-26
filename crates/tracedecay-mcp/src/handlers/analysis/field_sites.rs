@@ -1,27 +1,22 @@
-//! `tracedecay_field_sites` — read and write references to a named field.
+//! `tracedecay_field_sites`, read and write references to a named field.
+
+use tracedecay_contracts::retrieval::{
+    FieldSiteV1, FieldSitesResultV1, FieldSitesSurfaceRequestV1,
+};
 
 use super::*;
 
 #[hotpath::measure(future = true, label = "mcp.analysis.field_sites.total")]
-pub async fn handle_field_sites(
+pub(super) async fn compute_field_sites(
     graph: &tracedecay_graph_query::VerifiedGraphQuery,
     args: Value,
     scope_prefix: Option<&str>,
-) -> Result<ToolResult> {
-    let raw =
-        args.get("field")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| TraceDecayError::Config {
-                message: "tracedecay_field_sites requires a 'field' argument".to_string(),
-            })?;
-    let writes_only = args
-        .get("writes_only")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    let limit = args
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .map_or(200, |v| v.clamp(1, 2000) as usize);
+) -> Result<GraphToolCompletionV1> {
+    let request: FieldSitesSurfaceRequestV1 =
+        decode_primitive_request(&args, "tracedecay_field_sites")?;
+    let raw = request.field.as_str();
+    let writes_only = request.writes_only.unwrap_or(false);
+    let limit = request.limit.map_or(200, |v| v.clamp(1, 2000) as usize);
 
     let (qualifier, field_name) = match raw.rsplit_once("::") {
         Some((q, f)) => (Some(q.to_string()), f.to_string()),
@@ -47,13 +42,12 @@ pub async fn handle_field_sites(
     // Graph phase is done. The source walk reads every candidate file, so it
     // belongs on a blocking worker like the sibling analysis scans.
     let project_root = graph.project_root()?.to_path_buf();
-    let response_project_root = project_root.clone();
     let (writes, reads, touched) = hotpath::future!(
         tokio::task::spawn_blocking(move || {
             let mut files = symbols_by_file.keys().cloned().collect::<Vec<_>>();
             files.sort();
-            let mut writes: Vec<Value> = Vec::new();
-            let mut reads: Vec<Value> = Vec::new();
+            let mut writes: Vec<FieldSiteV1> = Vec::new();
+            let mut reads: Vec<FieldSiteV1> = Vec::new();
             let mut touched: Vec<String> = Vec::new();
 
             'outer: for file in &files {
@@ -64,18 +58,17 @@ pub async fn handle_field_sites(
 
                 // Cheap textual pre-filter before any per-file store read. Most
                 // files in a repository never mention the field, and fetching their
-                // nodes anyway cost one daemon round trip per file in the project —
+                // nodes anyway cost one daemon round trip per file in the project,
                 // O(store) work to answer a question whose result is a handful of
                 // sites.
-                let masked = if path_is_rust(file) {
+                let masked = path_is_rust(file).then(|| {
                     tracedecay_code_extraction::source_mask::masked_rust_source_with(
                         &source,
                         tracedecay_code_extraction::source_mask::MaskOptions::CODE_SCAN,
                     )
-                } else {
-                    source.clone()
-                };
-                let sites = find_field_references(&masked, &field_name);
+                });
+                let sites =
+                    find_field_references(masked.as_deref().unwrap_or(&source), &field_name);
                 if sites.is_empty() {
                     continue;
                 }
@@ -92,13 +85,12 @@ pub async fn handle_field_sites(
 
                 for site in sites {
                     let line_text = line_at(&source, site.byte).unwrap_or("");
-                    let enclosing = nodes
-                        .iter()
-                        .filter(|n| {
-                            let line = site.line.saturating_sub(1);
-                            n.metadata.start_line <= line && line <= n.end_line()
-                        })
-                        .min_by_key(|n| n.metadata.line_span);
+                    // Attribute by byte containment: a read and a write of the
+                    // same field can share one line, and two declarations can
+                    // too, so a line number cannot say which declaration a
+                    // site is inside. Masking preserves byte layout, so the
+                    // offset the scan reports indexes `source` unchanged.
+                    let enclosing = enclosing_declaration(nodes, site.byte as u64);
                     if let Some(scope) = &qualified_scope {
                         if !scope.target_exists {
                             continue;
@@ -126,12 +118,12 @@ pub async fn handle_field_sites(
                         }
                     }
                     let enclosing = enclosing.map(|n| n.metadata.qualified_name.clone());
-                    let entry = json!({
-                        "file": file,
-                        "line": site.line,
-                        "enclosing": enclosing,
-                        "snippet": line_text.trim(),
-                    });
+                    let entry = FieldSiteV1 {
+                        file: file.clone(),
+                        line: site.line,
+                        enclosing,
+                        snippet: line_text.trim().to_owned(),
+                    };
                     if !touched.contains(file) {
                         touched.push(file.clone());
                     }
@@ -164,31 +156,21 @@ pub async fn handle_field_sites(
     })??;
 
     let qualifier_applied = qualifier.is_some();
-    let payload = hotpath::measure_block!("mcp.analysis.field_sites.assemble", {
-        if writes_only {
-            json!({
-                "field": raw,
-                "qualifier": qualifier,
-                "qualifier_applied": qualifier_applied,
-                "write_count": writes.len(),
-                "write_sites": writes,
-            })
-        } else {
-            json!({
-                "field": raw,
-                "qualifier": qualifier,
-                "qualifier_applied": qualifier_applied,
-                "write_count": writes.len(),
-                "read_count": reads.len(),
-                "write_sites": writes,
-                "read_sites": reads,
-            })
-        }
-    });
-    Ok(generic_tool_result(
-        Some(&response_project_root),
-        &args,
-        &payload,
+    let (read_count, read_sites) = if writes_only {
+        (None, None)
+    } else {
+        (Some(reads.len() as u64), Some(reads))
+    };
+    Ok(graph_tool_completion(
+        GraphToolResultV1::FieldSites(FieldSitesResultV1 {
+            qualifier,
+            qualifier_applied,
+            write_count: writes.len() as u64,
+            read_count,
+            write_sites: writes,
+            read_sites,
+            field: request.field,
+        }),
         touched,
     ))
 }
@@ -269,18 +251,18 @@ fn qualified_field_scope(
     let all_owners = edges
         .iter()
         .filter(|edge| {
-            edge.edge.kind == RelationEdgeKindV1::Contains
-                && field_occurrences.contains(&edge.edge.to_occurrence)
+            edge.kind == RelationEdgeKindV1::Contains
+                && field_occurrences.contains(&edge.to_occurrence)
         })
-        .map(|edge| edge.edge.from_occurrence.clone())
+        .map(|edge| edge.from_occurrence.clone())
         .collect::<HashSet<_>>();
     let selected_owners = edges
         .iter()
         .filter(|edge| {
-            edge.edge.kind == RelationEdgeKindV1::Contains
-                && selected_fields.contains(&edge.edge.to_occurrence)
+            edge.kind == RelationEdgeKindV1::Contains
+                && selected_fields.contains(&edge.to_occurrence)
         })
-        .map(|edge| edge.edge.from_occurrence.clone())
+        .map(|edge| edge.from_occurrence.clone())
         .collect::<HashSet<_>>();
     if selected_owners.is_empty() {
         return Err(verified_analysis_unavailable(
@@ -291,13 +273,11 @@ fn qualified_field_scope(
 
     let mut enclosing_owners = HashMap::<SymbolOccurrenceId, HashSet<SymbolOccurrenceId>>::new();
     for edge in &edges {
-        if edge.edge.kind == RelationEdgeKindV1::TypeOf
-            && all_owners.contains(&edge.edge.to_occurrence)
-        {
+        if edge.kind == RelationEdgeKindV1::TypeOf && all_owners.contains(&edge.to_occurrence) {
             enclosing_owners
-                .entry(edge.edge.from_occurrence.clone())
+                .entry(edge.from_occurrence.clone())
                 .or_default()
-                .insert(edge.edge.to_occurrence.clone());
+                .insert(edge.to_occurrence.clone());
         }
     }
     let owner_names = symbols
@@ -324,11 +304,11 @@ fn qualified_field_scope(
         })
         .collect::<HashMap<_, _>>();
     for edge in &edges {
-        if edge.edge.kind == RelationEdgeKindV1::Contains
-            && let Some(owner) = impl_owners.get(&edge.edge.from_occurrence)
+        if edge.kind == RelationEdgeKindV1::Contains
+            && let Some(owner) = impl_owners.get(&edge.from_occurrence)
         {
             enclosing_owners
-                .entry(edge.edge.to_occurrence.clone())
+                .entry(edge.to_occurrence.clone())
                 .or_default()
                 .insert(owner.clone());
         }
@@ -359,7 +339,6 @@ fn qualified_type_matches(qualified_name: &str, type_name: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with("::"))
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_field_receiver_types(source: &str, field: &str) -> Result<HashMap<usize, String>> {
     let tree =
         tracedecay_code_extraction::ts_provider::parse_extractor_source("rust", "Rust", source)
@@ -376,15 +355,6 @@ fn rust_field_receiver_types(source: &str, field: &str) -> Result<HashMap<usize,
     Ok(receivers)
 }
 
-#[cfg(not(feature = "source-analysis"))]
-fn rust_field_receiver_types(_source: &str, _field: &str) -> Result<HashMap<usize, String>> {
-    Err(verified_analysis_unavailable(
-        "field-qualifier",
-        "Rust field receiver parsing is not mounted",
-    ))
-}
-
-#[cfg(feature = "source-analysis")]
 fn collect_rust_field_receiver_types(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -407,7 +377,6 @@ fn collect_rust_field_receiver_types(
     }
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &str, receiver: &str) -> Option<String> {
     let function = rust_ancestor(node, "function_item")?;
     if receiver == "self" {
@@ -430,7 +399,6 @@ fn rust_receiver_type(node: tree_sitter::Node<'_>, source: &str, receiver: &str)
     (!rust_receiver_is_shadowed(node, function, source, receiver)).then_some(parameter_type)
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_ancestor<'tree>(
     mut node: tree_sitter::Node<'tree>,
     kind: &str,
@@ -444,7 +412,6 @@ fn rust_ancestor<'tree>(
     None
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_receiver_is_shadowed(
     node: tree_sitter::Node<'_>,
     function: tree_sitter::Node<'_>,
@@ -494,7 +461,6 @@ fn rust_receiver_is_shadowed(
     true
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_condition_binds(node: tree_sitter::Node<'_>, source: &str, name: &str) -> bool {
     if node.kind() == "let_condition" {
         return node
@@ -506,7 +472,6 @@ fn rust_condition_binds(node: tree_sitter::Node<'_>, source: &str, name: &str) -
         .any(|child| rust_condition_binds(child, source, name))
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_pattern_binds(node: tree_sitter::Node<'_>, source: &str, name: &str) -> bool {
     if node.kind() == "identifier" && node_text(source, node) == Some(name) {
         return true;
@@ -516,7 +481,6 @@ fn rust_pattern_binds(node: tree_sitter::Node<'_>, source: &str, name: &str) -> 
         .any(|child| rust_pattern_binds(child, source, name))
 }
 
-#[cfg(feature = "source-analysis")]
 fn rust_simple_type(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
     match node.kind() {
         "type_identifier" | "scoped_type_identifier" => node_text(source, node).map(str::to_owned),
@@ -527,7 +491,6 @@ fn rust_simple_type(node: tree_sitter::Node<'_>, source: &str) -> Option<String>
     }
 }
 
-#[cfg(feature = "source-analysis")]
 fn node_text<'a>(source: &'a str, node: tree_sitter::Node<'_>) -> Option<&'a str> {
     source.get(node.byte_range())
 }
@@ -648,4 +611,80 @@ fn line_is_comment(source: &str, byte: usize) -> bool {
     let line = &source[line_start..];
     let trimmed = line.trim_start();
     trimmed.starts_with("//")
+}
+
+#[cfg(test)]
+mod field_site_attribution_tests {
+    use super::*;
+    use tracedecay_domain::{ComplexityAnalysisV1, SourceSpan};
+
+    fn digest<T>(byte: char) -> T
+    where
+        T: TryFrom<String>,
+        <T as TryFrom<String>>::Error: std::fmt::Debug,
+    {
+        T::try_from(format!("sha256:{}", byte.to_string().repeat(64))).expect("digest")
+    }
+
+    fn declaration(name: &str, span: std::ops::Range<usize>) -> VerifiedAnalysisSymbol {
+        VerifiedAnalysisSymbol {
+            occurrence: SymbolOccurrenceId::new(format!("occurrence.{name}")).expect("occurrence"),
+            path: "src/lib.rs".to_owned(),
+            source_span: Some(SourceSpan {
+                start_byte: span.start as u64,
+                end_byte: span.end as u64,
+            }),
+            metadata: LineageSymbolRecordV1 {
+                occurrence: SymbolOccurrenceId::new(format!("occurrence.{name}"))
+                    .expect("occurrence"),
+                identity: digest('1'),
+                qualified_name: name.to_owned(),
+                simple_name: name.to_owned(),
+                kind: "function".to_owned(),
+                visibility: "private".to_owned(),
+                branches: 0,
+                loops: 0,
+                max_nesting: 0,
+                complexity_analysis: ComplexityAnalysisV1::Complete,
+                // Both declarations live on line 1: the shape that made
+                // line-based attribution a coin flip.
+                line_span: 1,
+                start_line: 0,
+                signature: None,
+                docstring: None,
+                is_async: false,
+                derives: Vec::new(),
+                skip_test_coverage: false,
+                file_identity: digest('2'),
+                content_digest: digest('3'),
+            },
+        }
+    }
+
+    /// A read and a write of one field, inside two functions that share a
+    /// line, each belong to the function whose bytes contain them. Every
+    /// candidate has `line_span == 1` here, so the old smallest-line-span
+    /// selection had nothing to break the tie with and returned whichever
+    /// symbol the graph page happened to yield first.
+    #[test]
+    fn attributes_a_read_and_a_write_sharing_one_line() {
+        let source = "fn r(s: &S) -> u32 { s.count } fn w(s: &mut S) { s.count = 1; }";
+        let write_start = source.find("fn w").expect("second function");
+        let nodes = vec![
+            declaration("r", 0..write_start),
+            declaration("w", write_start..source.len()),
+        ];
+
+        let sites = find_field_references(source, "count");
+        assert_eq!(sites.len(), 2, "one read and one write: {sites:?}");
+        assert!(matches!(sites[0].kind, FieldRefKind::Read));
+        assert!(matches!(sites[1].kind, FieldRefKind::Write));
+        assert_eq!(sites[0].line, sites[1].line, "both sites share one line");
+
+        for (site, expected) in sites.iter().zip(["r", "w"]) {
+            let enclosing = enclosing_declaration(&nodes, site.byte as u64)
+                .map(|node| node.metadata.qualified_name.as_str());
+            assert_eq!(enclosing, Some(expected), "site {site:?}");
+        }
+    }
 }

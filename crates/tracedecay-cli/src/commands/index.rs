@@ -1,11 +1,11 @@
 use std::path::{Path, PathBuf};
 
-use tracedecay::project::TraceDecay;
+use tracedecay_project::project::TraceDecay;
 
 use super::daemon::daemon_tool_json;
 
 /// True when the global DB has zero registered projects (or can't be opened
-/// at all) — i.e. the user has not run `tracedecay init` anywhere yet.
+/// at all), i.e. the user has not run `tracedecay init` anywhere yet.
 async fn is_fresh_install() -> bool {
     daemon_tool_json(
         None,
@@ -22,7 +22,7 @@ async fn is_fresh_install() -> bool {
 pub(crate) async fn handle_no_command() -> tracedecay_domain::errors::Result<()> {
     let project_path = tracedecay_configuration::resolve_path(None);
     if TraceDecay::has_initialized_store(&project_path).await {
-        // Already initialized — show help via clap
+        // Already initialized, show help via clap
         let _ = <crate::cli::Cli as clap::CommandFactory>::command().print_help();
         eprintln!();
         return Ok(());
@@ -69,10 +69,7 @@ pub(crate) async fn handle_init(
         true,
     )?;
     handshake.moved_store_adoption = adoption;
-    #[cfg(unix)]
-    let daemon_available = tracedecay_daemon_control::daemon_reachable();
-    #[cfg(not(unix))]
-    let daemon_available = true;
+    let daemon_available = init_daemon_available();
 
     let project_path_for_remedy = project_path.clone();
     handle_init_with_daemon_availability(
@@ -86,6 +83,24 @@ pub(crate) async fn handle_init(
     .map_err(|error| annotate_reset_required_init_error(error, &project_path_for_remedy))
 }
 
+/// Whether a daemon is accepting connections for this profile.
+///
+/// A connectable endpoint is the whole precondition: `brokered_init` carries
+/// its own 120 s bootstrap deadline, so a daemon that has not finished
+/// answering initialize within the one-second reachability probe is still the
+/// daemon this init must broker through. Requiring the identity proof here
+/// refused cold starts on CPU-constrained hosts and told the operator to start
+/// a daemon that was already running.
+///
+/// This resolves through the daemon-control authority on every platform rather
+/// than a `cfg` split. The unix socket and the Windows loopback authority are
+/// both behind `daemon_socket_connectable`, so assuming availability wherever
+/// the transport differs would let init proceed on Windows without the
+/// scheduler it then requires.
+fn init_daemon_available() -> bool {
+    tracedecay_daemon_control::daemon_socket_connectable()
+}
+
 /// Maps explicit `tracedecay init` flags to the adoption request the daemon
 /// honors. Only init escalates past `Never`: `--adopt-project` names the
 /// project, bare `--yes` confirms a unique candidate, `--fresh` opts out of
@@ -95,7 +110,7 @@ fn moved_store_adoption_request(
     adopt_project: Option<String>,
     fresh: bool,
     assume_yes: bool,
-) -> tracedecay_domain::errors::Result<tracedecay::project::MovedStoreAdoption> {
+) -> tracedecay_domain::errors::Result<tracedecay_project::project::MovedStoreAdoption> {
     if fresh && adopt_project.is_some() {
         return Err(tracedecay_domain::errors::TraceDecayError::Config {
             message: "--fresh mints a new project identity and contradicts --adopt-project; \
@@ -104,10 +119,12 @@ fn moved_store_adoption_request(
         });
     }
     Ok(match (adopt_project, fresh, assume_yes) {
-        (Some(project_id), _, _) => tracedecay::project::MovedStoreAdoption::AdoptNamed(project_id),
-        (None, true, _) => tracedecay::project::MovedStoreAdoption::Never,
-        (None, false, true) => tracedecay::project::MovedStoreAdoption::AdoptUnique,
-        (None, false, false) => tracedecay::project::MovedStoreAdoption::OfferCandidates,
+        (Some(project_id), _, _) => {
+            tracedecay_project::project::MovedStoreAdoption::AdoptNamed(project_id)
+        }
+        (None, true, _) => tracedecay_project::project::MovedStoreAdoption::Never,
+        (None, false, true) => tracedecay_project::project::MovedStoreAdoption::AdoptUnique,
+        (None, false, false) => tracedecay_project::project::MovedStoreAdoption::OfferCandidates,
     })
 }
 
@@ -119,13 +136,7 @@ fn annotate_reset_required_init_error(
     error: tracedecay_domain::errors::TraceDecayError,
     project_path: &Path,
 ) -> tracedecay_domain::errors::TraceDecayError {
-    let is_reset_required = match &error {
-        tracedecay_domain::errors::TraceDecayError::ResetRequired { .. } => true,
-        // Daemon-brokered opens serialize the typed state over JSON-RPC; the
-        // schema-shape refusal text is the stable marker that survives it.
-        other => other.to_string().contains("shape this binary creates"),
-    };
-    if !is_reset_required {
+    if error.reset_required_context().is_none() {
         return error;
     }
     let project_path = project_path.to_string_lossy();
@@ -142,7 +153,7 @@ fn annotate_reset_required_init_error(
         message: format!(
             "{error}\n\nthis store cannot be opened until it is reset; run:\n  \
              {reset_command}\n\
-             then re-run `{init_command}` — sessions re-ingest from the \
+             then re-run `{init_command}`, sessions re-ingest from the \
              preserved transcripts"
         ),
     }
@@ -155,10 +166,6 @@ async fn handle_init_with_daemon_availability(
     handshake: tracedecay_daemon_protocol::DaemonHandshake,
     daemon_available: bool,
 ) -> tracedecay_domain::errors::Result<()> {
-    // Validate operator input before checking daemon availability so a bad
-    // path is reported deterministically even when the daemon is offline.
-    // The brokered request validates again at the transport boundary.
-    validated_reconcile_request(false, &skip_folders, &include_folders)?;
     if daemon_available {
         return brokered_init(&project_path, &skip_folders, &include_folders, &handshake).await;
     }
@@ -175,7 +182,11 @@ async fn brokered_init(
     include_folders: &[String],
     handshake: &tracedecay_daemon_protocol::DaemonHandshake,
 ) -> tracedecay_domain::errors::Result<()> {
-    let request = validated_reconcile_request(false, skip_folders, include_folders)?;
+    reject_brokered_folder_options(
+        skip_folders,
+        include_folders,
+        "brokered init does not yet support --skip-folders/--include-folders; configure tracedecay.toml first",
+    )?;
     // Init deliberately triggers a cold project open behind this single
     // status call. The default warming-retry grace is far tighter than a cold
     // open can take on a debug build or slow shared runner, which surfaced as
@@ -198,7 +209,7 @@ async fn brokered_init(
     let reconcile = tracedecay::daemon::call_default_tool_awaiting_project_open(
         handshake,
         "tracedecay_admin_sync",
-        serde_json::to_value(request)?,
+        serde_json::json!({}),
         init_deadline,
     )
     .await;
@@ -219,7 +230,7 @@ async fn brokered_init(
         // Status `queued` means the daemon accepted the reconcile demand into
         // its pre-mount queue. Init's user-facing confirmation names that
         // request (`requested`), matching the brokered-init contract tests and
-        // dogfood journeys — not the internal queue noun.
+        // dogfood journeys, not the internal queue noun.
         Some("queued") => eprintln!(
             "initialized {}; daemon code-index reconciliation requested",
             project_path.display()
@@ -240,18 +251,16 @@ async fn brokered_init(
     Ok(())
 }
 
-fn validated_reconcile_request(
-    force: bool,
+fn reject_brokered_folder_options(
     skip_folders: &[String],
     include_folders: &[String],
-) -> tracedecay_domain::errors::Result<tracedecay_contracts::CodeIndexReconcileRequestV1> {
-    tracedecay_contracts::CodeIndexReconcileRequestV1::new(
-        force,
-        skip_folders.iter().cloned(),
-        include_folders.iter().cloned(),
-    )
-    .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
-        message: error.to_string(),
+    message: &'static str,
+) -> tracedecay_domain::errors::Result<()> {
+    if skip_folders.is_empty() && include_folders.is_empty() {
+        return Ok(());
+    }
+    Err(tracedecay_domain::errors::TraceDecayError::Config {
+        message: message.to_owned(),
     })
 }
 
@@ -292,6 +301,58 @@ async fn code_index_reconciliation_is_optional(
     )
 }
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod daemon_precondition_tests {
+    use std::path::Path;
+
+    pub(super) struct SocketEnvGuard {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SocketEnvGuard {
+        pub(super) fn set(value: &Path) -> Self {
+            let previous = std::env::var_os(tracedecay_daemon_protocol::SOCKET_ENV);
+            unsafe {
+                std::env::set_var(tracedecay_daemon_protocol::SOCKET_ENV, value);
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for SocketEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.previous.take() {
+                    Some(previous) => {
+                        std::env::set_var(tracedecay_daemon_protocol::SOCKET_ENV, previous);
+                    }
+                    None => std::env::remove_var(tracedecay_daemon_protocol::SOCKET_ENV),
+                }
+            }
+        }
+    }
+
+    /// Init's daemon precondition is a probe on every platform, not a `cfg`.
+    ///
+    /// This test is deliberately not gated to unix. On Windows the endpoint is
+    /// the loopback authority rather than a socket file, and a profile that
+    /// has no authority record has no daemon to broker through, so the answer
+    /// must be `false` there exactly as it is on unix. Hardcoding availability
+    /// off-unix let init run past the scheduler it then requires, and that
+    /// regression is only observable from a test the Windows shard compiles.
+    #[test]
+    fn init_daemon_availability_is_probed_on_every_platform() {
+        let profile = tempfile::TempDir::new().expect("temp profile");
+        let _socket = SocketEnvGuard::set(&profile.path().join("absent.sock"));
+
+        assert!(
+            !super::init_daemon_available(),
+            "an endpoint with no listener must not count as an available daemon"
+        );
+    }
+}
+
 #[cfg(all(test, unix))]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod init_bootstrap_tests {
@@ -315,7 +376,7 @@ mod init_bootstrap_tests {
             client_instance_id: "commands-init-test".to_string(),
             tool_list_changed_capable: false,
             catalog_version: String::new(),
-            moved_store_adoption: tracedecay::project::MovedStoreAdoption::Never,
+            moved_store_adoption: tracedecay_project::project::MovedStoreAdoption::Never,
         }
     }
 
@@ -349,32 +410,7 @@ mod init_bootstrap_tests {
         );
     }
 
-    struct SocketEnvGuard {
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl SocketEnvGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var_os(tracedecay_daemon_protocol::SOCKET_ENV);
-            unsafe {
-                std::env::set_var(tracedecay_daemon_protocol::SOCKET_ENV, value);
-            }
-            Self { previous }
-        }
-    }
-
-    impl Drop for SocketEnvGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match self.previous.take() {
-                    Some(previous) => {
-                        std::env::set_var(tracedecay_daemon_protocol::SOCKET_ENV, previous);
-                    }
-                    None => std::env::remove_var(tracedecay_daemon_protocol::SOCKET_ENV),
-                }
-            }
-        }
-    }
+    use super::daemon_precondition_tests::SocketEnvGuard;
 
     /// Init's "daemon code-index reconciliation requested" must describe a
     /// request that actually crossed the wire: admission first, then the
@@ -392,6 +428,13 @@ mod init_bootstrap_tests {
         let profile = temp.path().join("profile");
         std::fs::create_dir_all(&project).unwrap();
         let socket = temp.path().join("daemon.sock");
+        let authority = tracedecay_daemon_identity::authority::DaemonAuthority::acquire(
+            temp.path(),
+            &tracedecay_daemon_protocol::DaemonEndpoint::Unix(socket.clone()),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("publish the fixture daemon's authority record");
+        let auth_token = authority.auth_token().to_owned();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         let _socket_env = SocketEnvGuard::set(&socket);
 
@@ -404,6 +447,13 @@ mod init_bootstrap_tests {
                     let (stream, _addr) = listener.accept().await.unwrap();
                     let (reader, mut writer) = stream.into_split();
                     let mut lines = tokio::io::BufReader::new(reader).lines();
+                    let preface = lines.next_line().await.unwrap().unwrap();
+                    assert!(
+                        tracedecay_daemon_protocol::DaemonAuthPreface::from_line(preface.trim())
+                            .expect("auth preface")
+                            .authenticate(&auth_token),
+                        "init must present the daemon token"
+                    );
                     let _handshake_line = lines.next_line().await.unwrap().unwrap();
                     let request_line = lines.next_line().await.unwrap().unwrap();
                     let request: serde_json::Value = serde_json::from_str(&request_line).unwrap();
@@ -430,14 +480,9 @@ mod init_bootstrap_tests {
         };
 
         let handshake = test_handshake(&project, &profile);
-        brokered_init(
-            &project,
-            &["vendor".to_owned(), "dist".to_owned()],
-            &["dist/generated".to_owned()],
-            &handshake,
-        )
-        .await
-        .expect("brokered init against the fixture daemon");
+        brokered_init(&project, &[], &[], &handshake)
+            .await
+            .expect("brokered init against the fixture daemon");
         tokio::time::timeout(std::time::Duration::from_secs(5), responder)
             .await
             .expect("fixture daemon must observe both requests")
@@ -455,20 +500,10 @@ mod init_bootstrap_tests {
             serde_json::json!(true),
             "the bootstrap status call stays admission-only"
         );
-        assert_eq!(
-            recorded[1].1["skip_folders"],
-            serde_json::json!(["dist", "vendor"]),
-            "init sends canonical per-invocation skip folders through V2"
-        );
-        assert_eq!(
-            recorded[1].1["include_folders"],
-            serde_json::json!(["dist/generated"]),
-            "init sends canonical per-invocation include folders through V2"
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn brokered_init_rejects_invalid_folder_options_before_sending_request() {
+    async fn brokered_init_retains_folder_option_error_before_sending_request() {
         let temp = tempfile::TempDir::new().unwrap();
         let project = temp.path().join("project");
         let profile = temp.path().join("profile");
@@ -477,7 +512,7 @@ mod init_bootstrap_tests {
 
         let error = handle_init_with_daemon_availability(
             project,
-            vec!["../generated".to_string()],
+            vec!["generated".to_string()],
             Vec::new(),
             handshake,
             true,
@@ -488,7 +523,7 @@ mod init_bootstrap_tests {
         assert!(
             error
                 .to_string()
-                .contains("skip_folders folder `../generated` is invalid"),
+                .contains("brokered init does not yet support --skip-folders/--include-folders"),
             "unexpected brokered-init error: {error}"
         );
         assert!(
@@ -573,27 +608,25 @@ mod init_bootstrap_tests {
 #[hotpath::measure(label = "cli.sync.run", future = true)]
 pub(crate) async fn handle_sync(
     path: Option<String>,
-    force: bool,
     skip_folders: Vec<String>,
     include_folders: Vec<String>,
     doctor: bool,
     verbose: bool,
 ) -> tracedecay_domain::errors::Result<()> {
-    let request = validated_reconcile_request(force, &skip_folders, &include_folders)?;
+    reject_brokered_folder_options(
+        &skip_folders,
+        &include_folders,
+        "brokered sync does not yet support --skip-folders/--include-folders; update tracedecay.toml first",
+    )?;
     let resolved = super::scope::resolve_project_scope(
         tracedecay_configuration::resolve_path_with_discovery(path),
     )
     .await?;
-    let handshake = tracedecay::daemon::handshake_for_current_client(
-        Some(resolved.project_path.clone()),
-        None,
-        false,
-        false,
-    )?;
+    let handshake = super::daemon::client_handshake(Some(&resolved.project_path))?;
     let result = tracedecay::daemon::call_default_tool(
         &handshake,
         "tracedecay_admin_sync",
-        serde_json::to_value(request)?,
+        serde_json::json!({}),
     )
     .await?;
     if verbose {
@@ -621,7 +654,11 @@ pub(crate) async fn handle_sync(
         ),
     }
     if doctor {
-        tracedecay::doctor::run_doctor(crate::cloud::doctor_network_probes()).await?;
+        tracedecay::doctor::run_doctor(
+            &tracedecay_runtime_core::storage::default_profile_root()?,
+            crate::cloud::doctor_network_probes(),
+        )
+        .await?;
     }
     Ok(())
 }

@@ -1,8 +1,8 @@
 #![allow(dead_code)] // shared test support: each suite binary compiles this module and uses a subset
 
 pub mod fixture;
-#[path = "../product_memory_provider/harness_binary.rs"]
-pub mod harness_binary;
+#[cfg(feature = "test-transport")]
+pub mod mcp_response;
 pub mod repository_layout;
 
 use std::ffi::{OsStr, OsString};
@@ -14,25 +14,24 @@ use std::net::TcpListener;
 #[cfg(not(unix))]
 use std::net::TcpStream;
 #[cfg(unix)]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+#[cfg(unix)]
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-#[cfg(unix)]
-use sha2::{Digest, Sha256};
 #[cfg(not(windows))]
 use tempfile::NamedTempFile;
 use tempfile::TempDir;
 use tokio::sync::OnceCell;
-use tracedecay::config::USER_DATA_DIR_ENV;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_runtime_core::config::USER_DATA_DIR_ENV;
 use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 use tracedecay_runtime_core::storage::PrivateStoreIo;
 use tracedecay_sessions::admission::{HostAdmissionOutcome, HostAdmissionScope};
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
@@ -68,7 +67,7 @@ static EMPTY_GRAPH_DB_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
 /// `Config { "no product runtime provider is registered; the generating binary
 /// must register one at process start" }` when the entry point never registered
 /// one. Only `tracedecay-cli`'s `main` performs that registration in production,
-/// and no test binary runs it — nextest gives every test its own process, so a
+/// and no test binary runs it, nextest gives every test its own process, so a
 /// suite fixture that builds a handshake must register the fixture provider
 /// itself.
 ///
@@ -76,7 +75,7 @@ static EMPTY_GRAPH_DB_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
 /// from every fixture entry point is safe, idempotent, and always observes the
 /// identical runtime regardless of test order.
 pub fn register_process_product_runtime() {
-    tracedecay::product_runtime::register_fixture_product_runtime();
+    tracedecay_project::product_runtime::register_fixture_product_runtime();
 }
 
 /// Registers the composition root's runtime ports for this test process.
@@ -121,44 +120,12 @@ pub async fn open_test_database(
     Database::publish_test_runtime(path, &authority, TestDatabaseRuntimeMode::Existing).await
 }
 
-/// Sets (or removes) an environment variable for its lifetime, restoring the
-/// previous value on drop.
-pub struct EnvVarGuard {
-    key: &'static str,
-    previous: Option<OsString>,
-}
-
-impl EnvVarGuard {
-    pub fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, previous }
-    }
-
-    /// Removes `key` for the guard's lifetime, so tests can exercise the
-    /// no-override path.
-    pub fn unset(key: &'static str) -> Self {
-        let previous = std::env::var_os(key);
-        unsafe {
-            std::env::remove_var(key);
-        }
-        Self { key, previous }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        unsafe {
-            if let Some(previous) = self.previous.take() {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
+#[path = "../../../../tests/support/isolated_profile.rs"]
+mod isolated_profile;
+#[allow(unused_imports)] // each suite binary uses a subset
+pub use isolated_profile::{
+    EnvVarGuard, apply_isolated_profile_env, die_with_test_process, run_ok,
+};
 
 /// Query lanes a terminal code-index answer must report as `"complete"`.
 /// Daemon journeys and the MCP readiness wait share this set.
@@ -200,10 +167,107 @@ pub fn lock_global_db_env() -> std::sync::MutexGuard<'static, ()> {
     lock_recovering_poison(&GLOBAL_DB_ENV_LOCK)
 }
 
-/// Serializes [`IsolatedEnv`] users within one test binary: storage isolation
-/// swaps process-wide env vars (`HOME`, `TRACEDECAY_DATA_DIR`, ...), so tests
-/// must not overlap.
-static ISOLATED_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Proof that the holder owns [`PROCESS_ENV_LOCK`], the one lock every
+/// fixture in a binary uses to pin process-wide env vars.
+///
+/// The field is private, so [`lock_process_env`] and
+/// [`lock_process_env_blocking`] are the only ways to obtain one. A fixture
+/// that pins `HOME` takes this by reference, which is what makes "every
+/// `HOME` writer holds the same lock" a compile error to break rather than a
+/// convention: a suite that reached for a lock of its own interleaved with
+/// [`IsolatedEnv`] and read another fixture's home out of `$HOME`.
+pub struct ProcessEnvGuard {
+    root_holder: bool,
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Thread whose test body, rather than a task it spawned, holds
+/// [`PROCESS_ENV_LOCK`]. A test body runs as its thread's only root future
+/// (no tokio task id), so that root asking again can never be woken: its
+/// own guard would have to drop first.
+static PROCESS_ENV_ROOT_HOLDER: std::sync::Mutex<Option<std::thread::ThreadId>> =
+    std::sync::Mutex::new(None);
+
+impl ProcessEnvGuard {
+    fn refuse_root_reentry() -> bool {
+        if tokio::task::try_id().is_some() {
+            return false;
+        }
+        let current = std::thread::current().id();
+        assert_ne!(
+            *lock_recovering_poison(&PROCESS_ENV_ROOT_HOLDER),
+            Some(current),
+            "this test already holds PROCESS_ENV_LOCK (an IsolatedEnv or fixture that owns \
+             one is still alive); acquiring it again would deadlock"
+        );
+        true
+    }
+
+    fn held(guard: tokio::sync::MutexGuard<'static, ()>, root_holder: bool) -> Self {
+        if root_holder {
+            *lock_recovering_poison(&PROCESS_ENV_ROOT_HOLDER) = Some(std::thread::current().id());
+        }
+        pin_toolchain_environment();
+        Self {
+            root_holder,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for ProcessEnvGuard {
+    fn drop(&mut self) {
+        if self.root_holder {
+            *lock_recovering_poison(&PROCESS_ENV_ROOT_HOLDER) = None;
+        }
+    }
+}
+
+/// Acquires [`PROCESS_ENV_LOCK`] for an async test.
+pub async fn lock_process_env() -> ProcessEnvGuard {
+    let root_holder = ProcessEnvGuard::refuse_root_reentry();
+    ProcessEnvGuard::held(PROCESS_ENV_LOCK.lock().await, root_holder)
+}
+
+/// Sync counterpart of [`lock_process_env`]; panics inside an async context.
+pub fn lock_process_env_blocking() -> ProcessEnvGuard {
+    let root_holder = ProcessEnvGuard::refuse_root_reentry();
+    ProcessEnvGuard::held(PROCESS_ENV_LOCK.blocking_lock(), root_holder)
+}
+
+/// Resolves `RUSTUP_HOME` and `CARGO_HOME` to absolute paths before the first
+/// fixture in this binary swaps `$HOME`.
+///
+/// The rustup shims choose a toolchain through `RUSTUP_HOME`, falling back to
+/// `$HOME/.rustup`. A fixture that swaps `$HOME` therefore breaks `rustc` and
+/// `cargo` for every *other* test running at that moment, including ones that
+/// hold no lock and never touch the environment: five `mcp_suite` tests that
+/// shell out to the toolchain failed with "rustup could not choose a version
+/// of rustc to run" whenever a sibling held a swapped home. Resolving these
+/// once, here, takes `$HOME` out of that lookup for the rest of the run.
+fn pin_toolchain_environment() {
+    static PINNED: std::sync::Once = std::sync::Once::new();
+    PINNED.call_once(|| {
+        let home =
+            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+        for (key, directory) in [("RUSTUP_HOME", ".rustup"), ("CARGO_HOME", ".cargo")] {
+            if std::env::var_os(key).is_some() {
+                continue;
+            }
+            let Some(resolved) = home.as_ref().map(|home| home.join(directory)) else {
+                continue;
+            };
+            if !resolved.is_dir() {
+                continue;
+            }
+            // SAFETY: the process env lock is held, this runs once, and it
+            // runs before any fixture in this binary has swapped `$HOME`.
+            unsafe {
+                std::env::set_var(key, resolved);
+            }
+        }
+    });
+}
 
 /// The canonical way to isolate env-mutating tests: serializes tests within
 /// one binary and keeps every test's project registration, store manifests,
@@ -227,16 +291,16 @@ pub struct IsolatedEnv {
     // cargo `target/test-profile` socket, and a swapped `HOME` emptied the
     // Claude transcript root under a running provider fixture.
     _global_db_env_lock: std::sync::MutexGuard<'static, ()>,
-    _env_lock: tokio::sync::MutexGuard<'static, ()>,
+    _env_lock: ProcessEnvGuard,
 }
 
 impl IsolatedEnv {
-    fn build(env_lock: tokio::sync::MutexGuard<'static, ()>) -> (Self, PathBuf) {
+    fn build(env_lock: ProcessEnvGuard) -> (Self, PathBuf) {
         let global_db_env_lock = lock_global_db_env();
         // Every fixture built on top of this guard eventually asks the shipped
         // daemon for a handshake, which reads the registered product runtime.
-        // Registering here — the single choke point both `acquire` paths share
-        // — keeps that out of every individual suite fixture. The runtime
+        // Registering here, the single choke point both `acquire` paths share,
+        // keeps that out of every individual suite fixture. The runtime
         // ports follow for the same reason: a standalone project open in this
         // environment needs them registered first.
         register_process_product_runtime();
@@ -288,15 +352,15 @@ impl IsolatedEnv {
     }
 
     pub async fn acquire() -> (Self, PathBuf) {
-        Self::build(ISOLATED_ENV_LOCK.lock().await)
+        Self::build(lock_process_env().await)
     }
 
     /// Sync counterpart of [`IsolatedEnv::acquire`] for plain `#[test]` fns.
     ///
     /// Warning: this uses `blocking_lock`, which panics if called from within
-    /// an async context — use [`IsolatedEnv::acquire`] there instead.
+    /// an async context, use [`IsolatedEnv::acquire`] there instead.
     pub fn acquire_blocking() -> (Self, PathBuf) {
-        Self::build(ISOLATED_ENV_LOCK.blocking_lock())
+        Self::build(lock_process_env_blocking())
     }
 
     pub fn home(&self) -> &Path {
@@ -429,8 +493,8 @@ impl TraceDecayStorageEnvGuard {
             // reaches. An ambient `TRACEDECAY_DAEMON_SOCKET` (an operator's
             // shell, another lane's private daemon) would route this fixture's
             // requests to a daemon running under a *different* profile, which
-            // then materializes the fixture's project — hook configs, session
-            // and graph databases, a manifest naming /tmp roots — under its own
+            // then materializes the fixture's project, hook configs, session
+            // and graph databases, a manifest naming /tmp roots, under its own
             // home. One operator profile accumulated 111 such stores. Pin the
             // socket inside the isolated profile so a fixture can only ever
             // talk to a daemon it started itself.
@@ -466,14 +530,14 @@ impl TraceDecayStorageEnvGuard {
 /// the env pin alive until just before the lock is released.
 pub struct AgentEnvLock {
     _pin: EnvVarGuard,
-    _lock: tokio::sync::MutexGuard<'static, ()>,
+    _lock: ProcessEnvGuard,
 }
 
 impl AgentEnvLock {
     /// Pins [`USER_DATA_DIR_ENV`] to `<home>/.tracedecay` while holding
     /// [`PROCESS_ENV_LOCK`].
     pub fn pin(home: impl AsRef<Path>) -> Self {
-        let lock = PROCESS_ENV_LOCK.blocking_lock();
+        let lock = lock_process_env_blocking();
         let pin = EnvVarGuard::set(USER_DATA_DIR_ENV, home.as_ref().join(".tracedecay"));
         Self {
             _pin: pin,
@@ -489,7 +553,7 @@ pub fn canonicalize_test_dir(path: &Path) -> PathBuf {
             path.display()
         )
     });
-    path.canonicalize().unwrap_or_else(|err| {
+    canonical_existing_identity(path).unwrap_or_else(|err| {
         panic!(
             "failed to canonicalize test directory '{}': {err}",
             path.display()
@@ -517,7 +581,7 @@ pub fn canonicalize_test_db_path(path: &Path) -> PathBuf {
 }
 
 pub fn canonical_existing_path(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+    canonical_existing_identity(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn tempdir_or_panic() -> TempDir {
@@ -663,11 +727,15 @@ pub fn http_agent_with_timeout(timeout: Duration) -> ureq::Agent {
 /// panic while the child is still running, `Drop` force-stops and reaps it.
 pub struct TestChildProcess {
     child: Child,
-    stderr_reader: Option<std::thread::JoinHandle<std::collections::VecDeque<u8>>>,
-    stderr_tail: std::collections::VecDeque<u8>,
+    /// Whether this child has been waited on. A reaped pid belongs to the
+    /// kernel again, so it must never be used to address a process group.
+    reaped: bool,
+    /// Path of a Unix socket this child published. Released after the process
+    /// group is reaped so a descendant that still holds the listen descriptor
+    /// cannot keep the path accepting.
+    #[cfg(unix)]
+    release_socket: Option<PathBuf>,
 }
-
-const DAEMON_STDERR_TAIL_BYTES: usize = 16 * 1024;
 
 /// Daemon-specific name retained for test fixtures that keep a daemon alive.
 pub type DaemonProcess = TestChildProcess;
@@ -676,8 +744,48 @@ impl TestChildProcess {
     pub fn new(child: Child) -> Self {
         Self {
             child,
-            stderr_reader: None,
-            stderr_tail: std::collections::VecDeque::new(),
+            reaped: false,
+            #[cfg(unix)]
+            release_socket: None,
+        }
+    }
+
+    /// Unlink the socket this child published once it has been reaped.
+    ///
+    /// `process_group(0)` makes the child a group leader. Stopping only that
+    /// pid leaves descendants that still hold the listen socket. Group-kill
+    /// closes those descriptors; unlinking the path is what makes a later
+    /// `connect` fail even if the kernel has not finished the last close.
+    ///
+    /// Recording claims the path: a restart journey reassigns its handle
+    /// (`daemon = spawn(..)`), so the successor is already publishing when
+    /// the predecessor is dropped, and only the current publisher may unlink.
+    /// File identity is not enough for that - the successor's socket routinely
+    /// lands on the inode the predecessor's shutdown just freed.
+    #[cfg(unix)]
+    pub fn release_socket_on_stop(&mut self, path: PathBuf) {
+        claim_published_socket(&path, self.child.id());
+        self.release_socket = Some(path);
+    }
+
+    #[cfg(unix)]
+    fn release_recorded_socket(&mut self) {
+        let Some(path) = self.release_socket.take() else {
+            return;
+        };
+        if !release_published_socket_claim(&path, self.child.id()) {
+            // A successor publishes here now; its socket is not ours to unlink.
+            return;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                panic!(
+                    "failed to release daemon socket '{}': {error}",
+                    path.display()
+                )
+            }
         }
     }
 
@@ -690,7 +798,9 @@ impl TestChildProcess {
     }
 
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        let status = self.child.try_wait()?;
+        self.reaped |= status.is_some();
+        Ok(status)
     }
 
     pub fn wait_for_exit(&mut self, timeout: Duration) -> std::io::Result<Option<ExitStatus>> {
@@ -766,101 +876,67 @@ impl TestChildProcess {
     /// Force-stops the daemon and reaps its process before returning.
     ///
     /// `Child::kill` maps to `SIGKILL` on Unix and the platform termination
-    /// primitive elsewhere, keeping fault-injection tests portable.
+    /// primitive elsewhere, keeping fault-injection tests portable. On Unix
+    /// the child's process group is signaled first, then the published socket
+    /// path is unlinked.
     pub fn kill_and_wait(&mut self) -> std::io::Result<ExitStatus> {
-        let status = terminate_and_reap(&mut self.child)?;
-        if let Some(reader) = self.stderr_reader.take() {
-            self.stderr_tail = reader
-                .join()
-                .map_err(|_| std::io::Error::other("daemon stderr reader panicked"))?;
-        }
-        Ok(status)
+        let status = terminate_and_reap(&mut self.child, !self.reaped);
+        self.reaped = true;
+        #[cfg(unix)]
+        self.release_recorded_socket();
+        status
     }
 
     fn drain_stderr(&mut self) {
         let Some(mut stderr) = self.child.stderr.take() else {
             return;
         };
-        self.stderr_reader = Some(std::thread::spawn(move || {
-            use std::io::Write;
-            let mut log = std::env::var_os("TRACEDECAY_TEST_DAEMON_LOG").and_then(|path| {
-                std::fs::OpenOptions::new()
+        std::thread::spawn(move || {
+            if let Some(path) = std::env::var_os("TRACEDECAY_TEST_DAEMON_LOG")
+                && let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(path)
-                    .ok()
-            });
-            let mut tail = std::collections::VecDeque::with_capacity(DAEMON_STDERR_TAIL_BYTES);
-            let mut buffer = [0; 4096];
-            loop {
-                let count = match stderr.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => count,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                };
-                let excess = (tail.len() + count).saturating_sub(DAEMON_STDERR_TAIL_BYTES);
-                tail.drain(..excess);
-                tail.extend(&buffer[..count]);
-                // A failed optional log must never stop draining the child pipe.
-                if let Some(file) = &mut log
-                    && file.write_all(&buffer[..count]).is_err()
-                {
-                    log = None;
-                }
+            {
+                let _ = std::io::copy(&mut stderr, &mut file);
+                return;
             }
-            tail
-        }));
-    }
-
-    pub fn wait_for_daemon_ready(
-        &mut self,
-        mut ready: impl FnMut() -> bool,
-        authority_path: &Path,
-    ) -> Result<(), String> {
-        // Drain before the first readiness probe: startup output can fill a pipe.
-        self.drain_stderr();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let reason = loop {
-            if ready() {
-                return Ok(());
-            }
-            match self.try_wait() {
-                Ok(Some(status)) => {
-                    break format!(
-                        "tracedecay daemon exited before accepting connections: {status}"
-                    );
-                }
-                Err(error) => break format!("daemon status should be readable: {error}"),
-                Ok(None) => {}
-            }
-            if Instant::now() >= deadline {
-                break format!(
-                    "timed out waiting for daemon authority at {}",
-                    authority_path.display()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        };
-        // Stop/reap first, then join to include the final stderr bytes on both
-        // early exit and timeout. The owner also joins on normal fixture drop.
-        let cleanup = self.kill_and_wait();
-        let stderr = self.stderr_tail.make_contiguous();
-        Err(format!(
-            "{reason}; stderr tail: {}; cleanup: {cleanup:?}",
-            String::from_utf8_lossy(stderr).trim()
-        ))
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        });
     }
 }
 
 impl Drop for TestChildProcess {
     fn drop(&mut self) {
-        let _ = self.kill_and_wait();
+        let _ = terminate_and_reap(&mut self.child, !self.reaped);
+        self.reaped = true;
+        #[cfg(unix)]
+        self.release_recorded_socket();
     }
 }
 
-/// PID-directed stop: survives `process_group(0)` / `setsid` detachment.
-fn terminate_and_reap(child: &mut Child) -> std::io::Result<ExitStatus> {
+/// Stop a child that was detached with `process_group(0)`.
+///
+/// The child is the leader of its own group. `SIGKILL` of that pid alone
+/// leaves descendants in the group. Those descendants keep any descriptor they
+/// inherited, including a listen socket, so the path stays connectable after
+/// `wait` returns. Signaling the group first closes those descriptors; the
+/// leader kill still covers a child whose `setpgid` has not run yet.
+///
+/// `signal_group` must be false once this child has been waited on: a reaped
+/// pid is the kernel's to reissue, so negating it could address a process
+/// group this harness never created.
+fn terminate_and_reap(child: &mut Child, signal_group: bool) -> std::io::Result<ExitStatus> {
+    // Signal the group before reaping. A leader that has already exited still
+    // names the group while it is an unreaped zombie; returning on `try_wait`
+    // first would leave descendants holding the listen socket.
+    #[cfg(unix)]
+    if signal_group {
+        signal_child_process_group(child.id());
+    }
+    #[cfg(not(unix))]
+    let _ = signal_group;
+
     if let Ok(Some(status)) = child.try_wait() {
         return Ok(status);
     }
@@ -875,23 +951,65 @@ fn terminate_and_reap(child: &mut Child) -> std::io::Result<ExitStatus> {
     child.wait()
 }
 
-/// Detach a test child from the test process group.
+/// The child pid currently publishing each recorded socket path.
+#[cfg(unix)]
+static PUBLISHED_SOCKETS: Mutex<Vec<(PathBuf, u32)>> = Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn claim_published_socket(path: &Path, pid: u32) {
+    let mut claims = PUBLISHED_SOCKETS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    claims.retain(|(claimed, _)| claimed != path);
+    claims.push((path.to_path_buf(), pid));
+}
+
+/// True when `pid` is still the publisher of `path`, dropping the claim.
+#[cfg(unix)]
+fn release_published_socket_claim(path: &Path, pid: u32) -> bool {
+    let mut claims = PUBLISHED_SOCKETS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let Some(index) = claims
+        .iter()
+        .position(|(claimed, owner)| claimed == path && *owner == pid)
+    else {
+        return false;
+    };
+    claims.swap_remove(index);
+    true
+}
+
+#[cfg(unix)]
+fn signal_child_process_group(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid == 0 {
+        return;
+    }
+    // SAFETY: `pid` is the spawned child's id. Negating it addresses the
+    // process group `process_group(0)` created with that pid as leader.
+    // `ESRCH` is ignored: the child may not be a group leader, and the pid
+    // kill in `terminate_and_reap` still stops it.
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+}
+
+/// Detach a test child from the test process group, bound to the test's life.
 ///
 /// Nextest (and other harness timeouts) signal the test's process group.
 /// Spawned `tracedecay daemon run` children inherit that group unless they
 /// call `setpgid`, so a group SIGTERM becomes a clean daemon exit (status 0
 /// via `run_foreground_unix`) mid-test. `TestChildProcess::kill_and_wait` and
 /// `Drop` still target the PID, so the harness reaps the daemon when the
-/// test ends.
-fn detach_from_test_process_group(command: &mut Command) {
+/// test ends; [`die_with_test_process`] covers a test process that is killed
+/// before any `Drop` runs.
+fn bind_to_test_process(command: &mut Command) {
     #[cfg(unix)]
     {
         command.process_group(0);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = command;
-    }
+    die_with_test_process(command);
 }
 
 pub fn apply_tracedecay_home_env(command: &mut Command, home: &Path) {
@@ -908,8 +1026,13 @@ pub fn apply_tracedecay_home_env(command: &mut Command, home: &Path) {
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env(USER_DATA_DIR_ENV, home.join(".tracedecay"))
         .env(GLOBAL_DB_ENV, home.join(".tracedecay/global.db"))
-        .env_remove(tracedecay_daemon_protocol::SOCKET_ENV);
-    detach_from_test_process_group(command);
+        // Same hermeticity as the in-process guard: a child must never inherit
+        // a socket that reaches a daemon running under another profile.
+        .env(
+            tracedecay_daemon_protocol::SOCKET_ENV,
+            home.join(".tracedecay/daemon.sock"),
+        );
+    bind_to_test_process(command);
 }
 
 /// Resolve a `tracedecay-search-eval` package binary that used to live under
@@ -943,45 +1066,24 @@ pub fn search_eval_bin(name: &str) -> PathBuf {
     binary
 }
 
-pub(crate) fn select_tracedecay_bin(
-    explicit: Option<OsString>,
-    cargo_provided: Option<OsString>,
-) -> Option<PathBuf> {
-    explicit
-        .filter(|path| !path.is_empty())
-        .or_else(|| cargo_provided.filter(|path| !path.is_empty()))
-        .map(PathBuf::from)
-        .map(|binary| {
-            if binary.is_file() {
-                binary.canonicalize().unwrap_or_else(|error| {
-                    panic!(
-                        "failed to canonicalize selected tracedecay binary at {}: {error}",
-                        binary.display()
-                    )
-                })
-            } else {
-                binary
-            }
-        })
-}
-
 pub fn tracedecay_bin() -> PathBuf {
-    let binary = select_tracedecay_bin(
-        std::env::var_os("TRACEDECAY_TEST_BIN"),
-        option_env!("CARGO_BIN_EXE_tracedecay").map(OsString::from),
-    )
-    .unwrap_or_else(|| {
-        panic!(
-            "Cargo did not provide CARGO_BIN_EXE_tracedecay for this integration test; set TRACEDECAY_TEST_BIN to the tracedecay CLI built from this checkout (for example, run `cargo build -p tracedecay-cli --bin tracedecay` and set TRACEDECAY_TEST_BIN to target/debug/tracedecay)"
-        )
-    });
+    let binary = std::env::var_os("TRACEDECAY_TEST_BIN")
+        .map(PathBuf::from)
+        .or_else(|| option_env!("CARGO_BIN_EXE_tracedecay").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            let test_executable =
+                std::env::current_exe().expect("test executable path should resolve");
+            let profile_dir = test_executable
+                .parent()
+                .and_then(Path::parent)
+                .expect("integration test should run from a Cargo profile directory");
+            profile_dir.join(format!("tracedecay{}", std::env::consts::EXE_SUFFIX))
+        });
     assert!(
         binary.is_file(),
         "CLI binary not built: {} is not a file; build it with `cargo build -p tracedecay-cli --bin tracedecay` or set TRACEDECAY_TEST_BIN",
         binary.display()
     );
-    harness_binary::refuse_foreign_test_bin(&binary, &harness_binary::test_build_tree())
-        .unwrap_or_else(|refusal| panic!("{refusal}"));
 
     let output = Command::new(&binary)
         .arg("--version")
@@ -999,7 +1101,10 @@ pub fn tracedecay_bin() -> PathBuf {
     // this test process only ever registers the fixture product runtime. The
     // released version is the strongest in-process comparison left, so pin
     // the release and accept any build-metadata suffix.
-    let expected_release = format!("tracedecay {}", tracedecay::version::PACKAGE_VERSION);
+    let expected_release = format!(
+        "tracedecay {}",
+        tracedecay_project::version::PACKAGE_VERSION
+    );
     assert!(
         actual == expected_release || actual.starts_with(&format!("{expected_release}+")),
         "{} reported `{actual}`, not release {expected_release}; rebuild it with `cargo build -p tracedecay-cli --bin tracedecay` or set TRACEDECAY_TEST_BIN",
@@ -1132,20 +1237,7 @@ pub fn git_program() -> std::ffi::OsString {
 
 #[cfg(unix)]
 pub fn daemon_socket_path(home: &Path) -> PathBuf {
-    let profile_root = canonical_existing_path(home).join(".tracedecay");
-    let profile_scoped = profile_root.join("daemon.sock");
-    if tracedecay_daemon_protocol::unix_socket_path_within_limit(&profile_scoped) {
-        return profile_scoped;
-    }
-
-    // Keep this test resolver identical to the production fallback in
-    // `daemon::service`: daemon spawn, readiness checks, and clients must all
-    // name the same endpoint even when the profile path exceeds `sockaddr_un`.
-    let digest = Sha256::digest(profile_root.as_os_str().as_bytes());
-    PathBuf::from(format!(
-        "/tmp/tracedecay-{}/daemon.sock",
-        hex::encode(&digest[..8])
-    ))
+    canonical_existing_path(home).join(".tracedecay/daemon.sock")
 }
 
 pub fn daemon_authority_path(profile_root: &Path) -> PathBuf {
@@ -1195,6 +1287,13 @@ pub fn spawn_tracedecay_daemon_with(
     spawn_tracedecay_daemon_process(&home, &binary, configure)
 }
 
+/// How long a replacement daemon waits for a stopped predecessor's endpoint to
+/// stop accepting before reporting it as still live.
+///
+/// Generous on purpose: the wait only costs time when a predecessor is
+/// genuinely still reachable, and a real leak still fails rather than hangs.
+const PREDECESSOR_DAEMON_VACATE_TIMEOUT: Duration = Duration::from_secs(10);
+
 fn spawn_tracedecay_daemon_process(
     home: &Path,
     binary: &Path,
@@ -1217,47 +1316,97 @@ fn spawn_tracedecay_daemon_process(
             })
             .is_some_and(|address| TcpStream::connect(address).is_ok())
     };
-    #[cfg(unix)]
-    assert!(
-        std::os::unix::net::UnixStream::connect(&socket_path).is_err(),
-        "refusing to replace a live test daemon at {}",
-        socket_path.display()
-    );
-    #[cfg(not(unix))]
-    assert!(
-        !portable_daemon_connectable(),
-        "refusing to replace a live test daemon recorded at {}",
-        authority_path.display()
+    // Stopping a predecessor daemon is asynchronous with respect to its
+    // endpoint: `kill` plus `wait` reaps the PID the harness spawned, but the
+    // kernel keeps the listening socket alive while *any* duplicate of that
+    // descriptor survives, including one a subprocess inherited across `fork`
+    // and still holds because it has not reached its own `exec` yet. Asserting
+    // instantaneously therefore reports an ordinary teardown tail as a live
+    // daemon, which is what `init_project_fixture` journeys (spawn, init, drop,
+    // spawn again) hit on a loaded runner. Wait a bounded time for the endpoint
+    // to stop accepting; a daemon that keeps accepting still fails with the
+    // same refusal. The group signal in `terminate_and_reap` is what makes the
+    // endpoint go quiet; this wait only covers the kernel's leftover.
+    poll_until(
+        Instant::now() + PREDECESSOR_DAEMON_VACATE_TIMEOUT,
+        Duration::from_millis(25),
+        || {
+            #[cfg(unix)]
+            let live = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
+            #[cfg(not(unix))]
+            let live = portable_daemon_connectable();
+            (!live).then_some(())
+        },
+        || {
+            #[cfg(unix)]
+            {
+                format!(
+                    "refusing to replace a live test daemon at {}",
+                    socket_path.display()
+                )
+            }
+            #[cfg(not(unix))]
+            {
+                format!(
+                    "refusing to replace a live test daemon recorded at {}",
+                    authority_path.display()
+                )
+            }
+        },
     );
 
     let mut command = Command::new(binary);
     apply_tracedecay_home_env(&mut command, home);
-    command.args(["daemon", "run"]);
-    #[cfg(unix)]
-    command.args(["--socket"]).arg(&socket_path);
     command
+        .args(["daemon", "run"])
         .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
         .current_dir(home)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     configure(&mut command);
-    detach_from_test_process_group(&mut command);
+    bind_to_test_process(&mut command);
     let child = command.spawn().expect("tracedecay daemon should start");
     let mut daemon = DaemonProcess::new(child);
+    #[cfg(unix)]
+    daemon.release_socket_on_stop(socket_path.clone());
 
-    daemon
-        .wait_for_daemon_ready(
-            || {
-                #[cfg(unix)]
-                let ready = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
-                #[cfg(not(unix))]
-                let ready = portable_daemon_connectable();
-                ready
-            },
-            &authority_path,
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    poll_until(
+        deadline,
+        Duration::from_millis(25),
+        || {
+            #[cfg(unix)]
+            let ready = std::os::unix::net::UnixStream::connect(&socket_path).is_ok();
+            #[cfg(not(unix))]
+            let ready = portable_daemon_connectable();
+            if ready {
+                return Some(());
+            }
+            if let Some(status) = daemon
+                .child
+                .try_wait()
+                .expect("daemon status should be readable")
+            {
+                let mut stderr = String::new();
+                if let Some(mut child_stderr) = daemon.child.stderr.take() {
+                    let _ = child_stderr.read_to_string(&mut stderr);
+                }
+                panic!(
+                    "tracedecay daemon exited before accepting connections: {status}; stderr: {}",
+                    stderr.trim()
+                );
+            }
+            None
+        },
+        || {
+            format!(
+                "timed out waiting for daemon authority at {}",
+                authority_path.display()
+            )
+        },
+    );
+    daemon.drain_stderr();
     daemon
 }
 
@@ -1353,7 +1502,7 @@ pub fn poll_until<T>(
 pub async fn wait_for_dashboard(agent: &ureq::Agent, base_url: &str) {
     let probe = format!("{base_url}/api/capabilities");
     // Poll until the server both accepts the connection AND returns a real
-    // HTTP response (2xx). A bare connect success is not enough — the server
+    // HTTP response (2xx). A bare connect success is not enough, the server
     // can accept then drop the socket during startup ("Peer disconnected").
     for _ in 0..160 {
         let probe_agent = agent.clone();
@@ -1593,7 +1742,7 @@ pub async fn open_lcm_db(tmp: &TempDir) -> LcmTestRuntime {
 
 /// Writes an empty registered-global-schema store at `db_path` from the cached
 /// per-process template, so later opens (fixture seeding, dashboard server
-/// startup) find an existing DB and skip the full schema creation — a large
+/// startup) find an existing DB and skip the full schema creation, a large
 /// fixed cost on Windows. The first call in a process pays one real schema
 /// creation to build the template; every further store is a file copy.
 pub async fn write_empty_global_db_schema(db_path: &Path) {
@@ -1646,7 +1795,7 @@ async fn seed_database_from_template(db_path: &Path, bytes: &[u8], label: &str) 
 }
 
 /// Opens a fresh graph-schema [`Database`] at `db_path` from a cached
-/// per-process template, skipping the full `create_schema` DDL run — a large
+/// per-process template, skipping the full `create_schema` DDL run, a large
 /// fixed cost on Windows when a suite creates one store per test. The first
 /// call in a process pays one real `Database::initialize` to build the
 /// template; every further store is a file copy plus `Database::open`.

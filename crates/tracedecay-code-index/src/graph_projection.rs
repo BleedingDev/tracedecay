@@ -3,9 +3,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
 #[cfg(any(feature = "test-helpers", feature = "eval-helpers"))]
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,8 +20,8 @@ use tracedecay_graph_db::{
     GraphCancellation, GraphConflictContextV1, GraphDbError, GraphEntity, GraphEntityId,
     GraphEntityRef, GraphGenerationId, GraphGenerationManifest, GraphIdempotencyKey, GraphLabel,
     GraphNamespace, GraphProjectionId, GraphProjectionIdentity, GraphProjectorRevision,
-    GraphProperty, GraphPropertyName, GraphTraversalDirection, SourceGeneration, TraversalRequest,
-    VerifiedGraphSnapshot,
+    GraphProperty, GraphPropertyName, GraphServingEnginePin, GraphTraversalDirection,
+    SourceGeneration, TraversalRequest, VerifiedGraphSnapshot,
 };
 #[cfg(any(feature = "test-helpers", feature = "eval-helpers"))]
 use tracedecay_graph_db::{GraphWatermark, NeverCancelled};
@@ -35,17 +36,20 @@ pub use self::builder::build_published_code_graph_manifest_checked;
 use self::builder::{ProductionCodeGraphInputs, build_projection};
 use self::interactive::InteractiveCatalogCache;
 pub use self::interactive::{
-    CodeGraphDegreeRankingV1, CodeGraphEdgeKindCountsV1, CodeGraphImpactBatchV1,
-    CodeGraphImpactedSymbolV1, CodeGraphInteractiveReader, CodeGraphPathSearchV1,
-    CodeGraphSemanticEdgeV1, CodeGraphSymbolDegreesV1, CodeGraphSymbolPageV1,
-    CodeGraphSymbolPredicate, CodeGraphSymbolSummaryV1, INTERACTIVE_CATALOG_ARTIFACT_NAME,
-    write_interactive_catalog_artifact,
+    CodeGraphCatalogReleaseV1, CodeGraphCensusV1, CodeGraphDegreeRankingV1,
+    CodeGraphEdgeKindCountsV1, CodeGraphFileDependenciesV1, CodeGraphFileSymbolCountV1,
+    CodeGraphImpactBatchV1, CodeGraphImpactedSymbolV1, CodeGraphInteractiveReader,
+    CodeGraphPathSearchV1, CodeGraphRankedSymbolV1, CodeGraphReadCostMeter, CodeGraphRelationKeyV1,
+    CodeGraphRelationKeysV1, CodeGraphSemanticEdgeV1, CodeGraphSymbolDegreesV1,
+    CodeGraphSymbolPageV1, CodeGraphSymbolPredicate, CodeGraphSymbolRefV1,
+    CodeGraphSymbolSearchPageV1, CodeGraphSymbolSummaryV1,
 };
 use self::schema::{
     SYMBOL_LABEL, SYMBOL_RECORD_PROPERTY, deserialize_property, has_label, record_property,
     serialize, stable_identity,
 };
 use self::traversal::{FrontierPath, admit_frontier_path, best_frontier_path, compare_paths};
+use crate::chunks::CodeIndexUnresolvedReferenceV1;
 use crate::lineage::LineageSymbolRecordV1;
 
 #[cfg(any(feature = "test-helpers", feature = "eval-helpers"))]
@@ -57,7 +61,6 @@ const PROJECTION_NODE_COUNT_PROPERTY: &str = "projection-node-count";
 const EDGE_RECORD_PROPERTY: &str = "edge-record";
 const EDGE_LABEL: &str = "CodeRelationEvidence";
 const FILE_SYMBOL_EDGE_KIND: &str = "CodeFileContainsSymbol";
-const SOURCE_EDGE_KIND: &str = "CodeRelationSource";
 const TARGET_EDGE_KIND: &str = "CodeRelationTarget";
 /// Names the shape of the rows this projector emits for one sealed code
 /// generation; the graph generation id is derived from it, so a revision
@@ -65,7 +68,72 @@ const TARGET_EDGE_KIND: &str = "CodeRelationTarget";
 /// than mixing row shapes under one identity. v6 stopped projecting one
 /// `CodeChunk` entity and one `CodeChunkDescribesSymbol` relation per chunk
 /// and stores record payloads as JSON strings instead of byte properties.
-pub const CODE_GRAPH_PROJECTOR_REVISION: &str = "code-graph-projector.v6";
+/// v7 carries unresolved receiver-call limitations on each source symbol. v8
+/// widens those limitations to bare TypeScript calls whose import the seal
+/// could not bind to project code. v9 names each source relation for its edge
+/// kind, so adjacency filters kinds without decoding the edge.
+pub const CODE_GRAPH_PROJECTOR_REVISION: &str = "code-graph-projector.v9";
+
+/// Every semantic edge kind, at its [`relation_edge_kind_index`].
+const RELATION_EDGE_KINDS: [RelationEdgeKindV1; 9] = [
+    RelationEdgeKindV1::Calls,
+    RelationEdgeKindV1::Uses,
+    RelationEdgeKindV1::TypeOf,
+    RelationEdgeKindV1::Contains,
+    RelationEdgeKindV1::Implements,
+    RelationEdgeKindV1::Extends,
+    RelationEdgeKindV1::Annotates,
+    RelationEdgeKindV1::Returns,
+    RelationEdgeKindV1::Receives,
+];
+
+/// Adding an edge kind fails this exhaustive match until the kind is listed
+/// in [`RELATION_EDGE_KINDS`] at the index given here.
+const fn relation_edge_kind_index(kind: RelationEdgeKindV1) -> usize {
+    match kind {
+        RelationEdgeKindV1::Calls => 0,
+        RelationEdgeKindV1::Uses => 1,
+        RelationEdgeKindV1::TypeOf => 2,
+        RelationEdgeKindV1::Contains => 3,
+        RelationEdgeKindV1::Implements => 4,
+        RelationEdgeKindV1::Extends => 5,
+        RelationEdgeKindV1::Annotates => 6,
+        RelationEdgeKindV1::Returns => 7,
+        RelationEdgeKindV1::Receives => 8,
+    }
+}
+
+const _: () = {
+    let mut index = 0;
+    while index < RELATION_EDGE_KINDS.len() {
+        assert!(relation_edge_kind_index(RELATION_EDGE_KINDS[index]) == index);
+        index += 1;
+    }
+};
+
+/// The kind of the relation from an edge's source symbol to its edge entity:
+/// one per edge kind, so a fan-out names the kinds it admits.
+fn source_edge_kind(kind: RelationEdgeKindV1) -> &'static str {
+    match kind {
+        RelationEdgeKindV1::Calls => "CodeRelationSource.calls",
+        RelationEdgeKindV1::Uses => "CodeRelationSource.uses",
+        RelationEdgeKindV1::TypeOf => "CodeRelationSource.type_of",
+        RelationEdgeKindV1::Contains => "CodeRelationSource.contains",
+        RelationEdgeKindV1::Implements => "CodeRelationSource.implements",
+        RelationEdgeKindV1::Extends => "CodeRelationSource.extends",
+        RelationEdgeKindV1::Annotates => "CodeRelationSource.annotates",
+        RelationEdgeKindV1::Returns => "CodeRelationSource.returns",
+        RelationEdgeKindV1::Receives => "CodeRelationSource.receives",
+    }
+}
+
+/// The edge kind a source relation kind names, or `None` for any other
+/// relation.
+fn source_edge_kind_edge(relation_kind: &str) -> Option<RelationEdgeKindV1> {
+    RELATION_EDGE_KINDS
+        .into_iter()
+        .find(|kind| source_edge_kind(*kind) == relation_kind)
+}
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CodeGraphProjectionError {
@@ -165,10 +233,12 @@ pub struct CodeGraphSymbolBindingV1 {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SymbolRecordV1 {
     occurrence: SymbolOccurrenceId,
     binding: Option<CodeGraphSymbolBindingV1>,
     metadata: Option<LineageSymbolRecordV1>,
+    unresolved_calls: Vec<CodeIndexUnresolvedReferenceV1>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -203,6 +273,29 @@ pub struct CodeGraphProjectionStore {
     /// The state lock is never held across the projection scan, so
     /// occurrence-seeded reads remain independent while catalog warming runs.
     interactive_catalog: Arc<InteractiveCatalogCache>,
+    /// Keeps this generation's graph engine resident once
+    /// [`Self::warm_serving_engine`] opened it, until
+    /// [`Self::release_serving_engine`] gives it back.
+    serving_engine: Arc<Mutex<Option<GraphServingEnginePin>>>,
+    /// Set once the engine was released; the next read that finds it cold
+    /// re-warms it in the background instead of waiting on activation, which
+    /// already ran for this generation.
+    released: Arc<AtomicBool>,
+    rewarming: Arc<AtomicBool>,
+    /// Why the last background re-warm failed, answered to readers until a
+    /// later re-warm succeeds.
+    rewarm_failure: Arc<Mutex<Option<String>>>,
+}
+
+/// Outcome of [`CodeGraphProjectionStore::release_serving_engine`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeGraphEngineReleaseV1 {
+    /// The engine was closed; it had reported `bytes` while resident.
+    Released { bytes: Option<u64> },
+    /// A reader holds the engine; it stays pinned and serving.
+    Busy,
+    /// No engine was pinned.
+    NotPinned,
 }
 
 impl fmt::Debug for CodeGraphProjectionStore {
@@ -231,7 +324,128 @@ impl CodeGraphProjectionStore {
             projection,
             generation,
             interactive_catalog: Arc::new(InteractiveCatalogCache::new()),
+            serving_engine: Arc::new(Mutex::new(None)),
+            released: Arc::new(AtomicBool::new(false)),
+            rewarming: Arc::new(AtomicBool::new(false)),
+            rewarm_failure: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Opens this generation's graph engine once and keeps it resident until
+    /// it is released. Corpus-sized on a cold engine, so background
+    /// activation calls it before the store serves; readers never pay it.
+    #[hotpath::measure(label = "code_graph.store.warm_serving_engine")]
+    pub fn warm_serving_engine(&self) -> Result<(), CodeGraphProjectionError> {
+        let mut pin = self
+            .serving_engine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if pin.is_none() {
+            *pin = Some(self.snapshot.pin_serving_engine()?);
+        }
+        Ok(())
+    }
+
+    /// Bytes the pinned engine reports holding, or `None` when none is pinned.
+    pub fn serving_engine_bytes(&self) -> Result<Option<u64>, CodeGraphProjectionError> {
+        let pinned = self
+            .serving_engine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some();
+        if !pinned {
+            return Ok(None);
+        }
+        Ok(self.snapshot.resident_serving_engine_bytes()?)
+    }
+
+    /// Bytes the interactive catalog holds, or `None` when none is ready.
+    pub fn interactive_catalog_bytes(&self) -> Option<u64> {
+        self.interactive_catalog.ready_bytes()
+    }
+
+    /// Drop a ready interactive catalog; the next catalog read rebuilds it
+    /// from the durable projection.
+    pub fn release_interactive_catalog(&self) -> CodeGraphCatalogReleaseV1 {
+        self.interactive_catalog.release()
+    }
+
+    /// Unpin the engine and close it if no reader holds it. The durable
+    /// graph and its verified head stay; the next read re-warms the engine in
+    /// the background and answers the typed warming state meanwhile.
+    pub fn release_serving_engine(
+        &self,
+    ) -> Result<CodeGraphEngineReleaseV1, CodeGraphProjectionError> {
+        let mut slot = self
+            .serving_engine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(pin) = slot.take() else {
+            return Ok(CodeGraphEngineReleaseV1::NotPinned);
+        };
+        let bytes = self.snapshot.resident_serving_engine_bytes()?;
+        drop(pin);
+        if self.snapshot.release_serving_engine_when_idle()? {
+            self.released.store(true, AtomicOrdering::Release);
+            return Ok(CodeGraphEngineReleaseV1::Released { bytes });
+        }
+        // Still open under a reader, so re-pinning costs no open.
+        *slot = Some(self.snapshot.pin_serving_engine()?);
+        Ok(CodeGraphEngineReleaseV1::Busy)
+    }
+
+    /// Readers are latency bounded: a cold engine is warmed in background
+    /// activation, so a read that arrives first gets the typed warming
+    /// answer instead of waiting on the open.
+    fn require_resident_engine(&self) -> Result<(), CodeGraphProjectionError> {
+        if self.snapshot.serving_engine_resident()? {
+            return Ok(());
+        }
+        if !self.released.load(AtomicOrdering::Acquire) {
+            return Err(CodeGraphProjectionError::Unavailable(
+                "code graph engine is warming in the background".to_owned(),
+            ));
+        }
+        let failure = self
+            .rewarm_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.rewarm_in_background();
+        Err(CodeGraphProjectionError::Unavailable(match failure {
+            Some(failure) => format!("code graph engine re-warm failed and is retrying: {failure}"),
+            None => "code graph engine was released and is re-warming in the background".to_owned(),
+        }))
+    }
+
+    fn rewarm_in_background(&self) {
+        if self.rewarming.swap(true, AtomicOrdering::AcqRel) {
+            return;
+        }
+        let store = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("code-graph-rewarm".to_owned())
+            .spawn(move || {
+                let failure = store
+                    .warm_serving_engine()
+                    .err()
+                    .map(|error| error.to_string());
+                if failure.is_none() {
+                    store.released.store(false, AtomicOrdering::Release);
+                }
+                *store
+                    .rewarm_failure
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = failure;
+                store.rewarming.store(false, AtomicOrdering::Release);
+            });
+        if let Err(error) = spawned {
+            *self
+                .rewarm_failure
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(error.to_string());
+            self.rewarming.store(false, AtomicOrdering::Release);
+        }
     }
 
     pub fn evidence_reader(
@@ -263,6 +477,7 @@ impl CodeGraphProjectionStore {
             .validate()
             .map_err(|error| CodeGraphProjectionError::Contract(error.to_string()))?;
         validate_reader_metadata(repository_id.as_ref(), &freshness)?;
+        self.require_resident_engine()?;
         let snapshot = Arc::clone(&self.snapshot);
         let current =
             read_current_generation(&snapshot, &self.projection, Arc::clone(&cancellation))?;
@@ -307,6 +522,7 @@ impl CodeGraphProjectionStore {
         generation
             .validate()
             .map_err(|error| CodeGraphProjectionError::Contract(error.to_string()))?;
+        self.require_resident_engine()?;
         let snapshot = Arc::clone(&self.snapshot);
         let current =
             read_current_generation(&snapshot, &self.projection, Arc::clone(&cancellation))?;
@@ -394,7 +610,7 @@ impl InMemoryCodeGraphProjectionBuilder {
     /// symbol index, so the interactive reader can resolve qualified names and
     /// kinds. [`Self::publish_with_cancellation`] publishes edges and chunks
     /// alone, which leaves every symbol without metadata and therefore
-    /// unresolvable by name — the shape integration fixtures need.
+    /// unresolvable by name, the shape integration fixtures need.
     #[cfg(feature = "test-helpers")]
     pub fn publish_indexed_with_cancellation(
         &self,
@@ -431,6 +647,7 @@ impl InMemoryCodeGraphProjectionBuilder {
                 files,
                 symbols,
                 imports: &[],
+                unresolved_calls: &[],
             }),
             &revision,
             &check,
@@ -478,25 +695,12 @@ impl InMemoryCodeGraphProjectionBuilder {
         freshness: SourceFreshness,
         cancellation: &CancellationSignal,
     ) -> Result<CodeGraphEvidenceReader, CodeGraphProjectionError> {
-        let snapshot = self
-            .snapshot
-            .read()
-            .map_err(|_| {
-                CodeGraphProjectionError::Unavailable(
-                    "code graph verified snapshot lock is poisoned".to_owned(),
-                )
-            })?
-            .clone()
-            .ok_or_else(|| {
-                CodeGraphProjectionError::Unavailable(
-                    "code graph generation is not published".to_owned(),
-                )
-            })?;
-        CodeGraphProjectionStore::from_verified_snapshot(
-            snapshot.as_ref().clone(),
-            generation.clone(),
-        )?
-        .evidence_reader(generation, repository_id, freshness, cancellation)
+        self.verified_store(generation)?.evidence_reader(
+            generation,
+            repository_id,
+            freshness,
+            cancellation,
+        )
     }
 }
 
@@ -626,28 +830,6 @@ pub fn code_graph_projection_identity(
     namespace: GraphNamespace,
 ) -> Result<GraphProjectionIdentity, CodeGraphProjectionError> {
     Ok(GraphProjectionIdentity::new(namespace, projection()?))
-}
-
-/// The code-graph generation's manifest identity — the metadata half a
-/// sealed-read-bundle binding digest hashes — reconstructed without touching
-/// any bulk row. Every field is a pure function of the namespace, the sealed
-/// code generation, and the projector revision, exactly as
-/// [`build_code_graph_manifest_checked`] would set them.
-pub fn code_graph_manifest_identity(
-    namespace: GraphNamespace,
-    generation: &CodeGenerationId,
-    projector_revision: &GraphProjectorRevision,
-) -> Result<tracedecay_graph_db::GraphGenerationManifestIdentity, CodeGraphProjectionError> {
-    Ok(tracedecay_graph_db::GraphGenerationManifestIdentity::new(
-        code_graph_projection_identity(namespace)?,
-        code_graph_generation_id(generation, projector_revision)?,
-        source_generation(generation)?,
-        tracedecay_graph_db::GraphWatermark::new(stable_identity(
-            "watermark",
-            generation.as_str(),
-        ))?,
-        vec![],
-    ))
 }
 
 pub fn build_code_graph_manifest(
@@ -901,6 +1083,27 @@ fn validate_symbol_record(record: &SymbolRecordV1) -> Result<(), CodeGraphProjec
     if let Some(metadata) = &record.metadata {
         builder::validate_symbol_metadata(metadata, &record.occurrence)?;
     }
+    for reference in &record.unresolved_calls {
+        reference
+            .validate()
+            .map_err(|error| CodeGraphProjectionError::Corrupt(error.to_string()))?;
+        if reference.from_occurrence != record.occurrence
+            || reference.kind != RelationEdgeKindV1::Calls
+        {
+            return Err(CodeGraphProjectionError::Corrupt(
+                "unresolved call does not belong to its source symbol".to_owned(),
+            ));
+        }
+    }
+    if record
+        .unresolved_calls
+        .windows(2)
+        .any(|pair| pair[0] >= pair[1])
+    {
+        return Err(CodeGraphProjectionError::Corrupt(
+            "unresolved receiver calls are not canonically ordered".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -944,7 +1147,30 @@ fn load_symbol_record(
     occurrence: &SymbolOccurrenceId,
     cancellation: Arc<dyn GraphCancellation>,
 ) -> Result<Option<SymbolRecordV1>, CodeGraphProjectionError> {
-    let identity = symbol_entity_id(occurrence)?;
+    let record = load_symbol_entity_record(
+        snapshot,
+        projection,
+        &symbol_entity_id(occurrence)?,
+        cancellation,
+    )?;
+    if record
+        .as_ref()
+        .is_some_and(|record| record.occurrence != *occurrence)
+    {
+        return Err(CodeGraphProjectionError::Corrupt(
+            "code graph symbol identity does not match its payload".to_owned(),
+        ));
+    }
+    Ok(record)
+}
+
+/// Loads the symbol record stored under one symbol entity identity.
+fn load_symbol_entity_record(
+    snapshot: &VerifiedGraphSnapshot,
+    projection: &GraphProjectionIdentity,
+    identity: &GraphEntityId,
+    cancellation: Arc<dyn GraphCancellation>,
+) -> Result<Option<SymbolRecordV1>, CodeGraphProjectionError> {
     let reference = GraphEntityRef::new(projection.clone(), identity.clone());
     let Some(entity) = snapshot.entity(&reference, cancellation)? else {
         return Ok(None);
@@ -956,7 +1182,7 @@ fn load_symbol_record(
     }
     let record: SymbolRecordV1 = deserialize_property(&entity, SYMBOL_RECORD_PROPERTY)?;
     validate_symbol_record(&record)?;
-    if record.occurrence != *occurrence || symbol_entity_id(&record.occurrence)? != identity {
+    if symbol_entity_id(&record.occurrence)? != *identity {
         return Err(CodeGraphProjectionError::Corrupt(
             "code graph symbol identity does not match its payload".to_owned(),
         ));

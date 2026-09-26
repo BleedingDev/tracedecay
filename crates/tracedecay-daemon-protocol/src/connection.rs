@@ -47,7 +47,7 @@ pub trait DaemonLivenessProbe: Send + Sync {
 #[derive(Clone)]
 pub struct DaemonConnection {
     pub endpoint: DaemonEndpoint,
-    pub auth_token: Option<String>,
+    pub auth_token: String,
     /// The daemon version advertised by the authority record that named this
     /// endpoint. Lets transport failures name version skew instead of hiding
     /// it behind a raw io error.
@@ -56,7 +56,7 @@ pub struct DaemonConnection {
 }
 
 impl DaemonConnection {
-    pub fn new(endpoint: DaemonEndpoint, auth_token: Option<String>) -> Self {
+    pub fn new(endpoint: DaemonEndpoint, auth_token: String) -> Self {
         Self {
             endpoint,
             auth_token,
@@ -75,10 +75,6 @@ impl DaemonConnection {
     pub fn with_daemon_version(mut self, daemon_version: impl Into<String>) -> Self {
         self.daemon_version = Some(daemon_version.into());
         self
-    }
-
-    pub fn unauthenticated_for_test(endpoint: DaemonEndpoint) -> Self {
-        Self::new(endpoint, None)
     }
 }
 
@@ -142,7 +138,7 @@ pub fn daemon_response_stalled(elapsed: Duration) -> TraceDecayError {
         DAEMON_RESPONSE_STALLED,
         true,
         format!(
-            "daemon did not answer after {}s; stalled or saturated — run `tracedecay daemon status`",
+            "daemon did not answer after {}s; stalled or saturated. Run `tracedecay daemon status`",
             elapsed.as_secs()
         ),
     )
@@ -159,7 +155,7 @@ pub fn daemon_response_stalled_during(
         DAEMON_RESPONSE_STALLED,
         true,
         format!(
-            "daemon did not answer after {}s ({stage} stage of '{request_label}'); stalled or saturated — run `tracedecay daemon status`",
+            "daemon did not answer after {}s ({stage} stage of '{request_label}'); stalled or saturated. Run `tracedecay daemon status`",
             elapsed.as_secs()
         ),
     )
@@ -176,15 +172,21 @@ pub async fn ensure_daemon_connection_live(
     Ok(())
 }
 
-#[hotpath::measure(label = "daemon_protocol.client.response.wait", future = true)]
-pub async fn next_daemon_response_line<R>(
+/// Reads the next daemon frame, polling `ensure_live` whenever the read is
+/// still pending.
+///
+/// The reader stays held across polls. `read_mcp_line` is dropped when the
+/// poll wins `select!`; the accumulator lives on the line reader.
+pub async fn poll_daemon_response_line<R, F, Fut>(
     reader: &mut R,
-    connection: &DaemonConnection,
     request_label: &str,
     liveness_poll_interval: Duration,
+    mut ensure_live: F,
 ) -> Result<Option<String>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
 {
     let mut line_reader = BoundedLineReader::new(reader);
     loop {
@@ -203,10 +205,46 @@ where
                 };
             }
             () = tokio::time::sleep(liveness_poll_interval) => {
-                ensure_daemon_connection_live(connection, request_label).await?;
+                ensure_live().await?;
             }
         }
     }
+}
+
+#[hotpath::measure(label = "daemon_protocol.client.response.wait", future = true)]
+pub async fn next_daemon_response_line<R>(
+    reader: &mut R,
+    connection: &DaemonConnection,
+    request_label: &str,
+    liveness_poll_interval: Duration,
+) -> Result<Option<String>>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    poll_daemon_response_line(reader, request_label, liveness_poll_interval, || {
+        ensure_daemon_connection_live(connection, request_label)
+    })
+    .await
+}
+
+/// Writes the auth preface and the handshake line.
+///
+/// Callers that already hold a [`DaemonConnection`] use
+/// [`write_daemon_preamble`]. The composition-root client uses this directly
+/// because its connection type is the authority record, not the protocol
+/// connection.
+pub async fn write_daemon_handshake_preamble(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    auth_token: &str,
+    handshake: &DaemonHandshake,
+) -> Result<()> {
+    writer
+        .write_all(DaemonAuthPreface::new(auth_token).to_line()?.as_bytes())
+        .await?;
+    writer.write_all(b"\n").await?;
+    writer.write_all(handshake.to_line()?.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
 }
 
 #[hotpath::measure(label = "daemon_protocol.client.preamble", future = true)]
@@ -215,15 +253,7 @@ pub async fn write_daemon_preamble(
     connection: &DaemonConnection,
     handshake: &DaemonHandshake,
 ) -> Result<()> {
-    if let Some(token) = connection.auth_token.as_deref() {
-        writer
-            .write_all(DaemonAuthPreface::new(token).to_line()?.as_bytes())
-            .await?;
-        writer.write_all(b"\n").await?;
-    }
-    writer.write_all(handshake.to_line()?.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    Ok(())
+    write_daemon_handshake_preamble(writer, &connection.auth_token, handshake).await
 }
 
 pub fn is_transient_daemon_connect_error(kind: std::io::ErrorKind) -> bool {
@@ -241,9 +271,9 @@ pub fn is_saturated_daemon_connect_error(kind: std::io::ErrorKind) -> bool {
 
 pub fn daemon_connect_failure_advice(kind: std::io::ErrorKind) -> &'static str {
     if is_saturated_daemon_connect_error(kind) {
-        "The daemon is up but not accepting connections — likely overloaded. Retry shortly, or check `tracedecay daemon status`."
+        "The daemon is up but not accepting connections, likely overloaded. Retry shortly, or check `tracedecay daemon status`."
     } else {
-        "The daemon may be restarting (e.g. after `tracedecay update`) — retry shortly, or check `tracedecay daemon status`."
+        "The daemon may be restarting (e.g. after `tracedecay update`). Retry shortly, or check `tracedecay daemon status`."
     }
 }
 

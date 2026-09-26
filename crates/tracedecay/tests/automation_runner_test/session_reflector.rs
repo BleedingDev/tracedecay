@@ -46,7 +46,7 @@ impl AutomationSessionRetrieval for StructuralBudgetRefusalRetrieval {
 #[cfg(feature = "test-transport")]
 use std::sync::atomic::Ordering;
 #[cfg(feature = "test-transport")]
-use tracedecay_automation_runtime::ports::session_evidence::{LcmGrepSort, LcmScope};
+use tracedecay_lcm::{LcmGrepSort, LcmScope};
 #[cfg(feature = "test-transport")]
 use tracedecay_store::{ProjectMemoryFactSearchKindV1, ProjectMemoryFactSearchQuery};
 
@@ -262,23 +262,26 @@ async fn project_runners_keep_distinct_budget_stages_in_terminal_reports_and_led
 
     assert_eq!(reflector_backend.calls(), 0);
     assert_eq!(skill_backend.calls(), 0);
-    assert_eq!(
-        reflector.report["reason"],
-        json!("session_evidence_budget_exhausted_request_candidate_bytes")
-    );
-    assert_eq!(
-        reflector.ledger_record.error.as_deref(),
-        Some("session_evidence_budget_exhausted_request_candidate_bytes")
-    );
-    assert_eq!(
-        skill.report["reason"],
-        json!("session_evidence_budget_exhausted_execution_work_exhausted")
-    );
-    assert_eq!(
-        skill.ledger_record.error.as_deref(),
-        Some("session_evidence_budget_exhausted_execution_work_exhausted")
-    );
-    assert_ne!(reflector.ledger_record.error, skill.ledger_record.error);
+    for (run, report, stage) in [
+        (
+            &reflector.ledger_record,
+            &reflector.report,
+            tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::RequestCandidateBytes,
+        ),
+        (
+            &skill.ledger_record,
+            &skill.report,
+            tracedecay_contracts::retrieval::SessionRetrievalBudgetStageV1::ExecutionWorkExhausted,
+        ),
+    ] {
+        assert_eq!(report["reason"], json!("session_evidence_budget_exhausted"));
+        assert_eq!(
+            run.error.as_deref(),
+            Some("session_evidence_budget_exhausted")
+        );
+        assert_eq!(run.fallback_status, None);
+        assert_eq!(run.session_evidence_budget_stage, Some(stage));
+    }
     assert!(
         load_run_records(&cg.store_layout().dashboard_root, 10)
             .await
@@ -427,7 +430,7 @@ async fn project_reflector_and_skill_writer_terminal_evidence_matrix_has_zero_wr
     );
     assert_eq!(
         skill.ledger_record.error.as_deref(),
-        Some("no_skill_writer_evidence")
+        Some("no_session_evidence")
     );
     assert!(
         load_run_records(&cg.store_layout().dashboard_root, 10)
@@ -1410,6 +1413,10 @@ impl AgentTaskBackend for NoSummaryReplayBackend {
             output_tokens: Some(20),
         })
     }
+
+    fn executable(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 #[cfg(feature = "test-transport")]
@@ -1672,7 +1679,7 @@ async fn session_reflector_runner_records_noop_fallback_when_backend_run_task_fa
     .unwrap();
 
     // The backend failure is transient, but this test pins the noop-fallback
-    // record, not retry semantics (covered by backend.rs retry tests) —
+    // record, not retry semantics (covered by backend.rs retry tests),
     // timeout_secs: 1 short-circuits the backoff so the test stays fast.
     assert_eq!(backend.calls(), 1);
     assert_noop_fallback_record(

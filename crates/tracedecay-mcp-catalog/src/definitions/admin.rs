@@ -33,6 +33,16 @@ pub(super) fn def_status() -> ToolDefinition {
                     "type": "boolean",
                     "default": false,
                     "description": "Git staleness object. Default false."
+                },
+                "wait_for": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["state", "timeout_ms"],
+                    "description": "Hold the status read until the code index reaches `state` (`fresh`: status `current`; `ready`: also native graph serving; `graph_ready`: a published generation's native graph serves, whatever the freshness), for at most `timeout_ms`. The payload's `wait` reports `reached`, `timed_out` with `last_state`, or `unavailable` with `reason`.",
+                    "properties": {
+                        "state": { "type": "string", "enum": ["fresh", "ready", "graph_ready"] },
+                        "timeout_ms": { "type": "integer", "minimum": 0 }
+                    }
                 }
             }
         }),
@@ -114,7 +124,7 @@ pub(super) fn def_runtime() -> ToolDefinition {
     def(
         "tracedecay_runtime",
         "Runtime Snapshot",
-        "Capture a process + database telemetry snapshot for the running tracedecay MCP server: PID, resident memory, virtual size, sustained CPU% (sampled over ~200ms), thread count, system memory, DB / WAL / SHM file sizes, journal mode, and the DB-to-source byte ratio. Use this when triaging unexpected CPU or RAM consumption (issue #80). Set authority_audit=true only for exhaustive Doctor-style observation-authority validation. Single call — output is a JSON object.",
+        "Capture a process + database telemetry snapshot for the running tracedecay MCP server: PID, resident memory, virtual size, sustained CPU% (sampled over ~200ms), thread count, system memory, DB / WAL / SHM file sizes, journal mode, and the DB-to-source byte ratio. Use this when triaging unexpected CPU or RAM consumption (issue #80). Set authority_audit=true only for exhaustive Doctor-style observation-authority validation. Single call, output is a JSON object.",
         json!({
             "type": "object",
             "properties": {

@@ -29,6 +29,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracedecay_daemon_protocol::{ConnectionLocalRequestSequence, FramePoll};
+use tracedecay_runtime_core::path_safety::plain_host_path;
 
 use super::broker::{CodeDiagnostic, DiagnosticSeverity};
 use super::error::{
@@ -434,7 +435,7 @@ impl StdioLspClient {
         )
         .await;
         // A server that dies immediately can fail the initialize *request*
-        // write (broken pipe — on Windows this races the spawn under load)
+        // write (broken pipe, on Windows this races the spawn under load)
         // just as easily as the initialize *response* wait. Route both
         // failures through the same stderr-enriched classification so the
         // crash reason (e.g. a toolchain's "unknown binary" complaint) is
@@ -495,7 +496,7 @@ impl StdioLspClient {
     /// The analyzer answers only for documents in its own view. Diagnostics
     /// already open theirs (`collect_document_diagnostics`), but the semantic
     /// lane forwarded the bare request, so a document the diagnostics sweep had
-    /// not happened to open yet came back `-32603 file not found` — surfaced to
+    /// not happened to open yet came back `-32603 file not found`, surfaced to
     /// the client as `providerUnavailable` for `documentSymbol`/`hover` on a
     /// file it had just opened. Both lanes share one client and one
     /// `document_versions` ledger, so this never re-opens what the other lane
@@ -1335,7 +1336,9 @@ fn lsp_initialization_options(command: &str) -> Value {
 /// percent-encoding. Handles POSIX paths, Windows drive paths (`C:/…`), and UNC
 /// (`//server/share`) prefixes. Shared with the Kiro installer.
 pub fn file_uri_from_path_text(path: &str) -> String {
-    let normalized = path.replace('\\', "/");
+    let normalized = plain_host_path(Path::new(path))
+        .to_string_lossy()
+        .replace('\\', "/");
     let encoded = percent_encode_file_uri_path(&normalized);
     if normalized.starts_with("//") {
         format!("file:{encoded}")
@@ -1411,16 +1414,8 @@ fn code_diagnostic(
         // resolved later via `DiagnosticBroker::resolve_enclosing_nodes`,
         // which has access to the indexed nodes for the file.
         enclosing_node: None,
-        updated_at: now_unix(),
+        updated_at: tracedecay_runtime_core::tracedecay::saturating_unix_secs(),
     }
-}
-
-fn now_unix() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
-        })
 }
 
 fn code_to_string(value: NumberOrString) -> String {
@@ -1515,6 +1510,11 @@ mod tests {
         assert_eq!(
             file_uri_from_path_text("/tmp/100% real.rs"),
             "file:///tmp/100%25%20real.rs"
+        );
+        assert_eq!(
+            file_uri_from_path_text(r"\\?\D:\repo\src\main.rs"),
+            "file:///D:/repo/src/main.rs",
+            "a canonicalized Windows path must not become a `?` URL host"
         );
     }
 

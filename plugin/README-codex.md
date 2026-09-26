@@ -8,7 +8,7 @@ Codex.
 
 - **MCP server** (`.mcp.json`): the `tracedecay` stdio server exposing the code
   graph, search, call-graph, impact, memory, and session-recall tools.
-- **Skills** (`skills/`): one skill per common workflow — searching for code,
+- **Skills** (`skills/`): one skill per common workflow, searching for code,
   reading code cheaply, mapping architecture, impact analysis, reviewing diffs,
   recalling project memory and session context, and more. Codex auto-discovers
   each `SKILL.md` by its `name`/`description` frontmatter and loads the body
@@ -26,8 +26,8 @@ The source `hooks/hooks-codex.json` is an empty seed for repo-local bundles.
 Global Codex installs populate `hooks/hooks.json` from the managed hook table
 at install time.
 
-Codex skips newly installed or changed command hooks until they are trusted —
-run `/hooks` in Codex to review and trust the tracedecay hooks.
+Codex skips newly installed or changed command hooks until they are trusted.
+Run `/hooks` in Codex to review and trust the tracedecay hooks.
 
 Every MCP tool is also available from the shell as `tracedecay tool <name>`
 (`tracedecay tool` lists tools; `tracedecay tool <name> --help` shows
@@ -45,10 +45,13 @@ For literal strings, regexes, and config keys inside indexed code, use
 
 Before running `cargo check`/`tsc`/`clippy` in the shell, or when shell output
 shows compile errors, the injected steering routes the moment to tracedecay
-diagnostics: paste captured output into `tracedecay_diagnose`, or run
-`tracedecay_diagnostics` for fresh structured errors mapped to the enclosing
-symbols and callers. The bundled `fixing-build-and-type-errors` skill covers
-this workflow.
+diagnostics: paste captured output into `tracedecay_diagnose`, or read the
+published diagnostics with `tracedecay_diagnostics`, mapped to the enclosing
+symbols and callers. A TypeScript project with its own `node_modules/.bin/tsc`
+is checked by the daemon automatically after each complete index generation;
+other toolchains publish through `tracedecay_diagnose`, and a read with no
+publication is a typed problem naming the next step. The bundled
+`fixing-build-and-type-errors` skill covers this workflow.
 
 `PostCompact` is an admission-only request. The daemon schedules compaction
 against its canonical session data and owns model execution, retries, and

@@ -2,12 +2,12 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_lcm::{
     LcmCompressionRequest, LcmGrepRequest, LcmGrepSort, LcmLifecycleUpdate, LcmLoadSessionRequest,
     LcmMaintenanceDebt, LcmPreflightRequest, LcmScope, LcmSessionBoundaryRequest, LcmSourceRef,
     LcmStorageKind, LcmSummarizerMode, LcmSummaryNodeDraft, MAX_DERIVED_SNIPPET_CHARS,
 };
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
 
@@ -186,7 +186,7 @@ fn with_authoritative_timestamps(mut messages: Vec<Value>) -> Vec<Value> {
 }
 
 /// Ingests host-active messages through the daemon compression path without
-/// creating summary nodes — the production replacement for the retired
+/// creating summary nodes, the production replacement for the retired
 /// ingesting preflight (preflight is a read-only decision surface now).
 async fn ingest_active_messages(
     db: &LcmTestRuntime,

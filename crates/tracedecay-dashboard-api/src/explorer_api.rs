@@ -26,14 +26,16 @@ use super::lcm_api::{
     DashboardLcmCanonicalMessageV1, DashboardLcmCanonicalPageV1, DashboardLcmCanonicalStatsV1,
     DashboardLcmCanonicalSummaryV1, DashboardLcmReadOutcomeV1, DashboardLcmReadRequestV1,
     DashboardLcmReadStateV1, LcmMessageV1, LcmSummaryNodeV1, LcmTokenCountProvenanceV1,
+    message_tool_use_id,
 };
 use super::read_model::{
     DashboardCoverageV1, DashboardDomainStateV1, DashboardEnvelopeV1, DashboardFreshnessV1,
     DashboardLegalActionKindV1, DashboardLegalActionRefV1, now_micros, scope_from_state,
 };
+use super::util::json_error;
 use super::{DashboardHttpRequestControlV1, DashboardState, RequestControl, graph_service};
 use crate::request_identity::{GlobalOpaqueIdentityKind, mint_global_opaque_id};
-use tracedecay_session_memory::context::CancellationToken;
+use tracedecay_runtime_core::cancellation::CancellationToken;
 
 const SOURCE_IDS: [ExplorerSourceIdV1; 3] = [
     ExplorerSourceIdV1::CodeGraph,
@@ -269,27 +271,19 @@ fn new_run_id() -> Option<String> {
 }
 
 fn bad_request(message: impl Into<String>) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({"detail": message.into()})),
-    )
-        .into_response()
+    json_error(StatusCode::BAD_REQUEST, message).into_response()
 }
 
 fn not_found(run_id: &str) -> Response {
-    (
+    json_error(
         StatusCode::NOT_FOUND,
-        Json(json!({"detail": format!("explorer query run not found: {run_id}")})),
+        format!("explorer query run not found: {run_id}"),
     )
-        .into_response()
+    .into_response()
 }
 
 fn internal_error(message: impl Into<String>) -> Response {
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({"detail": message.into()})),
-    )
-        .into_response()
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, message).into_response()
 }
 
 fn validate_query(request: &mut ExplorerQueryRequestV1) -> Result<(), &'static str> {
@@ -423,11 +417,11 @@ pub async fn create_query(
                 return bad_request(message);
             }
             let Some(owner) = run_owner(&state) else {
-                return (
+                return json_error(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"detail": "exact registered project scope is unavailable"})),
+                    "exact registered project scope is unavailable",
                 )
-                    .into_response();
+                .into_response();
             };
             let Some(run_id) = new_run_id() else {
                 return internal_error("could not allocate explorer query run identity");
@@ -491,11 +485,11 @@ pub async fn cancel_query(
     };
     let mut run = stored.run.write().await;
     if run.state != ExplorerRunStateV1::Pending {
-        return (
+        return json_error(
             StatusCode::CONFLICT,
-            Json(json!({"detail": format!("explorer query run is already terminal: {run_id}")})),
+            format!("explorer query run is already terminal: {run_id}"),
         )
-            .into_response();
+        .into_response();
     }
     stored.cancellation.cancel();
     mark_cancelled(&mut run);
@@ -678,12 +672,11 @@ async fn code_source(
         }
     };
     let payload = read.payload;
-    let Ok(total) = u64::try_from(payload.total) else {
-        return ExplorerSourceProgressV1::error(
-            ExplorerSourceIdV1::CodeGraph,
-            "code_graph_contract_invalid",
-            "code graph search returned a negative total",
-        );
+    let total = payload.total;
+    let omission_reasons = if payload.has_more && total.is_none() {
+        vec!["query page limit".to_owned()]
+    } else {
+        Vec::new()
     };
     let rows = match payload
         .results
@@ -704,10 +697,10 @@ async fn code_source(
         ExplorerSourceIdV1::CodeGraph,
         request,
         rows,
-        Some(total),
+        total,
         json!({"query": request.query}),
         "symbols",
-        Vec::new(),
+        omission_reasons,
     );
     source.freshness = "fresh";
     source.watermark = Some(read.generation);
@@ -1276,6 +1269,7 @@ fn explorer_lcm_message(message: DashboardLcmCanonicalMessageV1) -> LcmMessageV1
         message_id: message.message_id,
         ordinal: Some(message.ordinal),
         storage_kind: Some("canonical_temporal".to_owned()),
+        tool_use_id: message_tool_use_id(message.metadata_json.as_deref()),
         metadata_json: message.metadata_json,
         tool_name: message.tool_names,
         pinned: None,

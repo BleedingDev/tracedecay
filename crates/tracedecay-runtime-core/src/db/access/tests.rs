@@ -1,108 +1,5 @@
 use super::*;
 
-fn sqlite_fixture(path: &Path, marker: &str) -> u64 {
-    let connection = rusqlite::Connection::open(path).unwrap();
-    connection
-        .execute_batch(&format!(
-            "PRAGMA journal_mode=DELETE;
-             CREATE TABLE marker (value TEXT NOT NULL);
-             INSERT INTO marker VALUES ('{marker}');"
-        ))
-        .unwrap();
-    drop(connection);
-    crate::db::sqlite_generation_identity(path).unwrap()
-}
-
-fn sqlite_marker(path: &Path) -> String {
-    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap()
-        .query_row("SELECT value FROM marker", (), |row| row.get(0))
-        .unwrap()
-}
-
-#[test]
-fn restored_sqlite_publication_retains_exact_rollback() {
-    let temp = tempfile::tempdir().unwrap();
-    let destination = temp.path().join("project.db");
-    let staging = temp.path().join("restore.staging");
-    let rollback = temp.path().join("restore.rollback");
-    let destination_identity = sqlite_fixture(&destination, "old");
-    let staging_identity = sqlite_fixture(&staging, "new");
-
-    DatabaseAuthority::replace_sqlite_with_rollback_atomically(
-        &staging,
-        &destination,
-        &rollback,
-        destination_identity,
-        staging_identity,
-    )
-    .unwrap();
-
-    assert_eq!(sqlite_marker(&destination), "new");
-    assert_eq!(sqlite_marker(&rollback), "old");
-    assert_eq!(
-        crate::db::sqlite_generation_identity(&destination).unwrap(),
-        staging_identity
-    );
-    assert_eq!(
-        crate::db::sqlite_generation_identity(&rollback).unwrap(),
-        destination_identity
-    );
-    assert!(!staging.exists());
-}
-
-#[test]
-fn restored_sqlite_publication_rejects_changed_destination_identity() {
-    let temp = tempfile::tempdir().unwrap();
-    let destination = temp.path().join("project.db");
-    let staging = temp.path().join("restore.staging");
-    let rollback = temp.path().join("restore.rollback");
-    let stale_destination_identity = sqlite_fixture(&destination, "old");
-    let staging_identity = sqlite_fixture(&staging, "new");
-    let changed_destination = temp.path().join("changed.db");
-    sqlite_fixture(&changed_destination, "changed");
-    std::fs::rename(&changed_destination, &destination).unwrap();
-
-    let error = DatabaseAuthority::replace_sqlite_with_rollback_atomically(
-        &staging,
-        &destination,
-        &rollback,
-        stale_destination_identity,
-        staging_identity,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("identity changed"));
-    assert_eq!(sqlite_marker(&destination), "changed");
-    assert_eq!(sqlite_marker(&staging), "new");
-    assert!(!rollback.exists());
-}
-
-#[test]
-fn restored_sqlite_publication_never_overwrites_existing_rollback() {
-    let temp = tempfile::tempdir().unwrap();
-    let destination = temp.path().join("project.db");
-    let staging = temp.path().join("restore.staging");
-    let rollback = temp.path().join("restore.rollback");
-    let destination_identity = sqlite_fixture(&destination, "old");
-    let staging_identity = sqlite_fixture(&staging, "new");
-    sqlite_fixture(&rollback, "retained");
-
-    let error = DatabaseAuthority::replace_sqlite_with_rollback_atomically(
-        &staging,
-        &destination,
-        &rollback,
-        destination_identity,
-        staging_identity,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("already exists"));
-    assert_eq!(sqlite_marker(&destination), "old");
-    assert_eq!(sqlite_marker(&staging), "new");
-    assert_eq!(sqlite_marker(&rollback), "retained");
-}
-
 #[test]
 fn symlink_aliases_share_one_database_identity() {
     let temp = tempfile::tempdir().unwrap();
@@ -127,7 +24,7 @@ fn profile_project_databases_share_the_profile_scope() {
     let temp = tempfile::tempdir().unwrap();
     let profile = temp.path().join("profile");
     let first = profile.join("projects/first/graph.db");
-    let second = profile.join("projects/second/branches/main.db");
+    let second = profile.join("projects/second/tracedecay.db");
     std::fs::create_dir_all(first.parent().unwrap()).unwrap();
     std::fs::create_dir_all(second.parent().unwrap()).unwrap();
 
@@ -271,21 +168,6 @@ fn writer_owner_intent_is_bounded_and_single_line() {
     let owner = writer_owner("token", &intent);
     assert!(!owner.intent.contains('\n'));
     assert!(owner.intent.len() <= 256);
-}
-
-#[test]
-fn fallback_scope_is_unambiguous_only_with_one_profile_owner() {
-    assert_eq!(fallback_scoped_runtime_role(0, 0).unwrap(), None);
-    assert_eq!(
-        fallback_scoped_runtime_role(1, 0).unwrap(),
-        Some(DatabaseAuthorityRole::Maintenance)
-    );
-    assert_eq!(
-        fallback_scoped_runtime_role(0, 1).unwrap(),
-        Some(DatabaseAuthorityRole::Daemon)
-    );
-    assert!(fallback_scoped_runtime_role(1, 1).is_err());
-    assert!(fallback_scoped_runtime_role(2, 0).is_err());
 }
 
 /// Reproduces the macOS `/var` -> `/private/var` scope-key shape on any unix

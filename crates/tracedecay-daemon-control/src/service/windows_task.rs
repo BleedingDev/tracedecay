@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use tracedecay_domain::errors::{Result, TraceDecayError};
 
-use super::{DaemonServiceSpec, DaemonServiceState, ServiceNamespace};
+use super::{DaemonServiceSpec, DaemonServiceState, ServiceNamespace, xml_escape, xml_unescape};
 
 #[cfg(any(windows, test))]
 const TASK_NAME_PREFIX: &str = "TraceDecay Daemon";
@@ -473,29 +473,14 @@ impl DaemonControlApi for NativeDaemonControl {
     }
 }
 
-pub(super) fn task_name() -> Result<String> {
-    let namespace = ServiceNamespace::current()?;
-    task_name_for(&namespace)
-}
-
 pub(super) fn task_name_for(namespace: &ServiceNamespace) -> Result<String> {
     Ok(TaskIdentity::current_for_namespace(namespace)?.task_name)
-}
-
-pub(super) fn task_path() -> Result<PathBuf> {
-    let namespace = ServiceNamespace::current()?;
-    task_path_for(&namespace)
 }
 
 pub(super) fn task_path_for(namespace: &ServiceNamespace) -> Result<PathBuf> {
     Ok(PathBuf::from(
         TaskIdentity::current_for_namespace(namespace)?.task_path,
     ))
-}
-
-pub(super) fn render_task_xml(spec: &DaemonServiceSpec) -> Result<String> {
-    let namespace = ServiceNamespace::current()?;
-    render_task_xml_for_namespace(spec, &namespace)
 }
 
 pub(super) fn render_task_xml_for_namespace(
@@ -518,6 +503,7 @@ pub(super) fn render_task_xml_for_namespace(
     )
 }
 
+#[cfg(test)]
 fn render_task_xml_for(spec: &DaemonServiceSpec, identity: &TaskIdentity) -> Result<String> {
     let profile_root = super::service_data_dir(spec)?;
     let global_db = super::service_global_db_path(spec, &profile_root)?;
@@ -690,6 +676,7 @@ fn validate_task_command_text(command: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn profile_root_from_task_xml(xml: &str) -> Option<PathBuf> {
     let arguments = xml_element_text(xml, "Arguments")?;
     let arguments = xml_unescape(arguments);
@@ -754,10 +741,6 @@ fn validate_task_namespace_metadata(xml: &str, namespace: &ServiceNamespace) -> 
 
 pub(super) fn task_environment_value_from_xml(xml: &str, name: &str) -> Result<Option<String>> {
     task_metadata_value_result(xml, name)
-}
-
-pub(super) fn global_db_from_task_xml(xml: &str) -> Option<PathBuf> {
-    task_metadata_value(xml, "TRACEDECAY_GLOBAL_DB").map(PathBuf::from)
 }
 
 pub(super) fn socket_path_from_task_xml(xml: &str) -> Option<PathBuf> {
@@ -1182,45 +1165,20 @@ fn secure_path_error(operation: &str, path: &Path, error: std::io::Error) -> Tra
     }
 }
 
-pub(super) fn task_exists() -> Result<bool> {
-    let namespace = ServiceNamespace::current()?;
-    task_exists_for(&namespace)
-}
-
 pub(super) fn task_exists_for(namespace: &ServiceNamespace) -> Result<bool> {
     with_platform_api_for(namespace, |api| Ok(api.snapshot()?.is_some()))
-}
-
-pub(super) fn service_state() -> Result<DaemonServiceState> {
-    let namespace = ServiceNamespace::current()?;
-    service_state_for(&namespace)
 }
 
 pub(super) fn service_state_for(namespace: &ServiceNamespace) -> Result<DaemonServiceState> {
     with_platform_api_for(namespace, |api| Ok(state_from_snapshot(api.snapshot()?)))
 }
 
-pub(super) fn register_task_xml(xml: &str) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    register_task_xml_for(&namespace, xml)
-}
-
 pub(super) fn register_task_xml_for(namespace: &ServiceNamespace, xml: &str) -> Result<()> {
     with_platform_api_for(namespace, |api| register_task_xml_with(api, xml))
 }
 
-pub(super) fn registered_task_xml() -> Result<Option<String>> {
-    let namespace = ServiceNamespace::current()?;
-    registered_task_xml_for(&namespace)
-}
-
 pub(super) fn registered_task_xml_for(namespace: &ServiceNamespace) -> Result<Option<String>> {
     with_platform_api_for(namespace, |api| api.registered_xml())
-}
-
-pub(super) fn apply_state(state: DaemonServiceState, expected_version: &str) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    apply_state_for(&namespace, state, expected_version)
 }
 
 pub(super) fn apply_state_for(
@@ -1244,11 +1202,6 @@ pub(super) fn apply_state_for(
     }
 }
 
-pub(super) fn start(expected_version: &str) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    start_for(&namespace, expected_version)
-}
-
 pub(super) fn start_for(namespace: &ServiceNamespace, expected_version: &str) -> Result<()> {
     #[cfg(any(windows, test))]
     {
@@ -1261,11 +1214,6 @@ pub(super) fn start_for(namespace: &ServiceNamespace, expected_version: &str) ->
     }
 }
 
-pub(super) fn stop(expected_version: &str) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    stop_for(&namespace, expected_version)
-}
-
 pub(super) fn stop_for(namespace: &ServiceNamespace, expected_version: &str) -> Result<()> {
     #[cfg(any(windows, test))]
     {
@@ -1276,11 +1224,6 @@ pub(super) fn stop_for(namespace: &ServiceNamespace, expected_version: &str) -> 
         let _ = (namespace, expected_version);
         control_api_unavailable()
     }
-}
-
-pub(super) fn deactivate(expected_version: &str) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    deactivate_for(&namespace, expected_version)
 }
 
 pub(super) fn deactivate_for(namespace: &ServiceNamespace, expected_version: &str) -> Result<()> {
@@ -1297,18 +1240,8 @@ pub(super) fn deactivate_for(namespace: &ServiceNamespace, expected_version: &st
     }
 }
 
-pub(super) fn delete() -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    delete_for(&namespace)
-}
-
 pub(super) fn delete_for(namespace: &ServiceNamespace) -> Result<()> {
     with_platform_api_for(namespace, delete_with)
-}
-
-pub(super) fn rollback_new_registration() -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    rollback_new_registration_for(&namespace)
 }
 
 pub(super) fn rollback_new_registration_for(namespace: &ServiceNamespace) -> Result<()> {
@@ -2219,30 +2152,6 @@ fn missing_task(operation: &str) -> TraceDecayError {
     }
 }
 
-fn xml_escape(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        match character {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&apos;"),
-            _ => escaped.push(character),
-        }
-    }
-    escaped
-}
-
-fn xml_unescape(value: &str) -> String {
-    value
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-}
-
 fn xml_element_text<'a>(xml: &'a str, element: &str) -> Option<&'a str> {
     let opening = format!("<{element}>");
     let closing = format!("</{element}>");
@@ -2450,13 +2359,6 @@ fn windows_argument_tokens(arguments: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-fn with_platform_api<T>(
-    operation: impl FnOnce(&mut dyn TaskSchedulerApi) -> Result<T>,
-) -> Result<T> {
-    let namespace = ServiceNamespace::current()?;
-    with_platform_api_for(&namespace, operation)
-}
-
 fn with_platform_api_for<T>(
     namespace: &ServiceNamespace,
     operation: impl FnOnce(&mut dyn TaskSchedulerApi) -> Result<T>,
@@ -2492,15 +2394,6 @@ fn with_platform_api_for_package<T>(
         TaskIdentity::for_package_user_sid_in_namespace(package_id, &user_sid, &namespace)?;
     let mut api = native::NativeTaskScheduler::connect_for(identity)?;
     operation(&mut api)
-}
-
-#[cfg(any(windows, test))]
-fn with_platform_control_api<T>(
-    expected_version: &str,
-    operation: impl FnOnce(&mut dyn TaskSchedulerApi, &mut dyn DaemonControlApi) -> Result<T>,
-) -> Result<T> {
-    let namespace = ServiceNamespace::current()?;
-    with_platform_control_api_for(&namespace, expected_version, operation)
 }
 
 #[cfg(any(windows, test))]

@@ -1,17 +1,24 @@
-//! `tracedecay_hotspots` — churn-weighted complexity ranking.
+//! `tracedecay_hotspots`, churn-weighted complexity ranking.
+
+use std::sync::LazyLock;
+
+use tracedecay_code_extraction::LanguageRegistry;
+use tracedecay_contracts::retrieval::{HotspotV1, HotspotsResultV1, HotspotsSurfaceRequestV1};
 
 use super::*;
 
+/// Manifest keys (`package.json`, `Cargo.toml`) are indexed for module
+/// resolution; they have no call edges and are not code hotspots.
+static EXTRACTORS: LazyLock<LanguageRegistry> = LazyLock::new(LanguageRegistry::new);
+
 #[hotpath::measure(future = true, label = "mcp.analysis.hotspots.total")]
-pub async fn handle_hotspots(
+pub(super) async fn compute_hotspots(
     graph: &tracedecay_graph_query::VerifiedGraphQuery,
     args: Value,
     scope_prefix: Option<&str>,
-) -> Result<ToolResult> {
-    let limit = args
-        .get("limit")
-        .and_then(serde_json::Value::as_u64)
-        .map_or(10, |v| v.min(100) as usize);
+) -> Result<GraphToolCompletionV1> {
+    let request: HotspotsSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_hotspots")?;
+    let limit = request.limit.map_or(10, |v| v.min(100) as usize);
     require_positive_limit(limit, "tracedecay_hotspots")?;
 
     let (mut symbols, edges) = hotpath::measure_block!("mcp.analysis.hotspots.graph", {
@@ -23,9 +30,10 @@ pub async fn handle_hotspots(
         let mut incoming = HashMap::<SymbolOccurrenceId, u64>::new();
         let mut outgoing = HashMap::<SymbolOccurrenceId, u64>::new();
         for edge in edges {
-            *outgoing.entry(edge.edge.from_occurrence).or_default() += 1;
-            *incoming.entry(edge.edge.to_occurrence).or_default() += 1;
+            *outgoing.entry(edge.from_occurrence).or_default() += 1;
+            *incoming.entry(edge.to_occurrence).or_default() += 1;
         }
+        symbols.retain(|symbol| !EXTRACTORS.is_configuration_file(&symbol.path));
         symbols.sort_by(|left, right| {
             let left_total = incoming
                 .get(&left.occurrence)
@@ -44,39 +52,29 @@ pub async fn handle_hotspots(
         symbols.truncate(limit);
         (symbols, incoming, outgoing)
     });
-    let (output, touched) = hotpath::measure_block!("mcp.analysis.hotspots.assemble", {
-        let mut items: Vec<Value> = Vec::new();
-        let mut touched: Vec<String> = Vec::new();
-        for symbol in symbols {
+    let hotspots: Vec<HotspotV1> = symbols
+        .into_iter()
+        .map(|symbol| {
             let incoming = incoming.get(&symbol.occurrence).copied().unwrap_or(0);
             let outgoing = outgoing.get(&symbol.occurrence).copied().unwrap_or(0);
-            touched.push(symbol.path.clone());
-            items.push(json!({
-                "id": symbol.occurrence.as_str(),
-                "name": symbol.metadata.simple_name,
-                "kind": symbol.metadata.kind,
-                "file": symbol.path,
-                "line": user_line(symbol.metadata.start_line),
-                "incoming": incoming,
-                "outgoing": outgoing,
-                "total": incoming + outgoing,
-            }));
-        }
-        (
-            json!({
-                "hotspot_count": items.len(),
-                "hotspots": items,
-            }),
-            touched,
-        )
-    });
-
-    let touched_files = unique_file_paths(touched.iter().map(std::string::String::as_str));
-
-    Ok(generic_tool_result(
-        Some(graph.project_root()?),
-        &args,
-        &output,
+            HotspotV1 {
+                id: symbol.occurrence.as_str().to_owned(),
+                name: symbol.metadata.simple_name,
+                kind: symbol.metadata.kind,
+                file: symbol.path,
+                line: user_line(symbol.metadata.start_line),
+                incoming,
+                outgoing,
+                total: incoming + outgoing,
+            }
+        })
+        .collect();
+    let touched_files = unique_file_paths(hotspots.iter().map(|hotspot| hotspot.file.as_str()));
+    Ok(graph_tool_completion(
+        GraphToolResultV1::Hotspots(HotspotsResultV1 {
+            hotspot_count: hotspots.len() as u64,
+            hotspots,
+        }),
         touched_files,
     ))
 }

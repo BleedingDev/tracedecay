@@ -2,7 +2,7 @@
 //!
 //! The one Doctor use case composes findings from several owning authorities.
 //! Each authority is reached through a narrow, transport-neutral *source port*
-//! defined here — the same seam pattern as
+//! defined here: the same seam pattern as
 //! [`StoreSizeTelemetryPort`](crate::storage::StoreSizeTelemetryPort): the trait
 //! and its typed read model live in this crate, and the implementation is owned
 //! by the runtime/host/configuration component that actually reads the source.
@@ -43,6 +43,7 @@ use tracedecay_domain::{
 
 use crate::RequestContext;
 use crate::error::ApplicationContractError;
+use crate::storage::findings::truncate_at_char_boundary;
 
 use super::types::{
     DoctorCoverageCompletenessV1, DoctorCoverageStatementV1, DoctorEvidenceRefV1,
@@ -77,26 +78,14 @@ fn source_finding(
 fn bounded_statement(statement: &str) -> String {
     const STATEMENT_LIMIT_BYTES: usize = 512;
     const TRUNCATION_MARK: &str = "…";
-    let sanitized = statement
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .collect::<String>();
+    let sanitized = tracedecay_domain::fold_control_characters(statement);
     let sanitized = sanitized.trim();
     if sanitized.len() <= STATEMENT_LIMIT_BYTES {
         return sanitized.to_owned();
     }
     let budget = STATEMENT_LIMIT_BYTES - TRUNCATION_MARK.len();
-    let mut cut = budget;
-    while cut > 0 && !sanitized.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{TRUNCATION_MARK}", sanitized[..cut].trim_end())
+    let cut = tracedecay_domain::utf8_prefix_at_or_before(sanitized, budget);
+    format!("{}{TRUNCATION_MARK}", cut.trim_end())
 }
 
 /// Build an honest non-healthy finding for an unobservable source read.
@@ -362,7 +351,6 @@ pub enum RemoteOperationalReadV1 {
         pending_spool_items: u64,
         quarantined_spool_items: u64,
         replay_coverage_complete: bool,
-        backup_verified: bool,
         failover_in_progress: bool,
         recovery_required: bool,
         coverage: DoctorCoverageCompletenessV1,
@@ -411,7 +399,6 @@ fn remote_operational_finding(
             authority,
             quarantined_spool_items,
             replay_coverage_complete,
-            backup_verified,
             failover_in_progress,
             recovery_required,
             coverage,
@@ -427,7 +414,6 @@ fn remote_operational_finding(
             listener: RemoteListenerReadV1::Serving,
             authority: RemoteAuthorityReadV1::Available,
             replay_coverage_complete: true,
-            backup_verified: true,
             failover_in_progress: false,
             coverage,
             ..
@@ -435,14 +421,14 @@ fn remote_operational_finding(
             family,
             "remote.operational.ready",
             *coverage,
-            "remote HTTPS listener, authority, spool, replay, and backup are ready",
+            "remote HTTPS listener, authority, spool, and replay are ready",
         ),
         RemoteOperationalReadV1::Observed { coverage, .. } => source_finding(
             family,
             DoctorEvidenceStateV1::Degraded,
             "remote.operational.partial",
             *coverage,
-            "remote HTTPS listener, authority, spool, replay, or backup is incomplete",
+            "remote HTTPS listener, authority, spool, or replay is incomplete",
         ),
         RemoteOperationalReadV1::Unconfigured => unobservable_finding(
             family,
@@ -1168,6 +1154,107 @@ pub enum LanguageServerStateV1 {
     Crashed,
 }
 
+/// Live state of one analyzer the daemon resolved for the current project.
+///
+/// `LanguageServerStateV1` is the aggregate the finding is graded on; this is
+/// the per-analyzer evidence behind it, so an operator learns *which*
+/// executable is missing and how to install it, resolved by the daemon
+/// process (the only PATH that matters, since the daemon spawns analyzers)
+/// rather than by whichever shell ran the CLI.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LanguageServerAnalyzerV1 {
+    /// Adapter language (`typescript`, `rust`, …).
+    pub language: String,
+    /// The configured executable, after any operator command override.
+    pub command: String,
+    pub state: LanguageServerAnalyzerStateV1,
+    /// Whether the daemon process finds `command` on its own PATH. For an
+    /// active analyzer `state` is the finer verdict (a rustup proxy whose
+    /// toolchain lacks the component is found yet `Unavailable`); for an
+    /// inactive one this is the only availability evidence.
+    pub executable_found: bool,
+    /// The first install command the adapter advertises, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<String>,
+    /// The owner's last recorded error for this analyzer, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// State of one analyzer as the daemon owner holds it.
+///
+/// `Inactive` is the one state the aggregate never takes: the language has no
+/// files in the project, so Doctor does not grade it, but `lsp servers` still
+/// lists it from this same read so both surfaces share one authority.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum LanguageServerAnalyzerStateV1 {
+    Ready,
+    Available,
+    Refreshing,
+    Disabled,
+    Unavailable,
+    Crashed,
+    Inactive,
+}
+
+impl LanguageServerAnalyzerStateV1 {
+    /// The aggregate this analyzer contributes to, or `None` for an inactive
+    /// language that the aggregate must not grade.
+    #[must_use]
+    pub const fn aggregate(self) -> Option<LanguageServerStateV1> {
+        match self {
+            Self::Ready => Some(LanguageServerStateV1::Ready),
+            Self::Available => Some(LanguageServerStateV1::Available),
+            Self::Refreshing => Some(LanguageServerStateV1::Refreshing),
+            Self::Disabled => Some(LanguageServerStateV1::Disabled),
+            Self::Unavailable => Some(LanguageServerStateV1::Unavailable),
+            Self::Crashed => Some(LanguageServerStateV1::Crashed),
+            Self::Inactive => None,
+        }
+    }
+}
+
+impl LanguageServerReadV1 {
+    /// Grade the daemon owner's resolved analyzers. Inactive languages are
+    /// carried but never graded; with no active analyzer the read is `Absent`.
+    /// Severity order: crashed, unavailable, disabled, refreshing, then ready
+    /// only when every active analyzer is ready, otherwise available.
+    #[must_use]
+    pub fn observed(analyzers: Vec<LanguageServerAnalyzerV1>) -> Self {
+        let active: Vec<LanguageServerStateV1> = analyzers
+            .iter()
+            .filter_map(|analyzer| analyzer.state.aggregate())
+            .collect();
+        if active.is_empty() {
+            return Self::Absent { analyzers };
+        }
+        let state = [
+            LanguageServerStateV1::Crashed,
+            LanguageServerStateV1::Unavailable,
+            LanguageServerStateV1::Disabled,
+            LanguageServerStateV1::Refreshing,
+        ]
+        .into_iter()
+        .find(|state| active.contains(state))
+        .unwrap_or(
+            if active
+                .iter()
+                .all(|state| *state == LanguageServerStateV1::Ready)
+            {
+                LanguageServerStateV1::Ready
+            } else {
+                LanguageServerStateV1::Available
+            },
+        );
+        Self::Observed {
+            state,
+            coverage: DoctorCoverageCompletenessV1::Complete,
+            analyzers,
+        }
+    }
+}
+
 /// One live read from the daemon language-server/analyzer owner.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case", tag = "kind")]
@@ -1176,11 +1263,19 @@ pub enum LanguageServerReadV1 {
     Observed {
         state: LanguageServerStateV1,
         coverage: DoctorCoverageCompletenessV1,
+        /// Every analyzer the owner resolved, active or not; the aggregate
+        /// `state` covers the active ones only.
+        #[serde(default)]
+        analyzers: Vec<LanguageServerAnalyzerV1>,
     },
     /// Language-server inspection is unsupported on this build/platform.
     Unsupported,
-    /// No project-active analyzer is configured.
-    Absent,
+    /// No project-active analyzer is configured. The owner's inactive
+    /// analyzers are still carried so `lsp servers` can list them.
+    Absent {
+        #[serde(default)]
+        analyzers: Vec<LanguageServerAnalyzerV1>,
+    },
     /// Authorization to inspect analyzer state was denied.
     Denied,
     /// Analyzer state could not be determined.
@@ -1194,7 +1289,11 @@ pub fn language_server_finding(
 ) -> Result<DoctorFindingV1, ApplicationContractError> {
     let family = DoctorFindingFamilyV1::LanguageServer;
     match read {
-        LanguageServerReadV1::Observed { state, coverage } => match state {
+        LanguageServerReadV1::Observed {
+            state,
+            coverage,
+            analyzers,
+        } => match state {
             LanguageServerStateV1::Ready => clean_finding(
                 family,
                 "language-server.analyzer.ready",
@@ -1220,21 +1319,30 @@ pub fn language_server_finding(
                 DoctorEvidenceStateV1::Degraded,
                 "language-server.analyzer.disabled",
                 *coverage,
-                "at least one project analyzer is disabled",
+                &bounded_statement(&format!(
+                    "project analyzer disabled: {}",
+                    degraded_analyzers_statement(analyzers, *state)
+                )),
             ),
             LanguageServerStateV1::Unavailable => source_finding(
                 family,
                 DoctorEvidenceStateV1::Degraded,
                 "language-server.analyzer.unavailable",
                 *coverage,
-                "at least one project analyzer executable is unavailable",
+                &bounded_statement(&format!(
+                    "project analyzer executable not found on the daemon PATH: {}",
+                    degraded_analyzers_statement(analyzers, *state)
+                )),
             ),
             LanguageServerStateV1::Crashed => source_finding(
                 family,
                 DoctorEvidenceStateV1::Degraded,
                 "language-server.analyzer.crashed",
                 *coverage,
-                "at least one project analyzer process crashed",
+                &bounded_statement(&format!(
+                    "project analyzer process crashed: {}",
+                    degraded_analyzers_statement(analyzers, *state)
+                )),
             ),
         },
         LanguageServerReadV1::Unsupported => unobservable_finding(
@@ -1243,7 +1351,7 @@ pub fn language_server_finding(
             "language-server.unsupported",
             "language-server inspection unsupported on this platform",
         ),
-        LanguageServerReadV1::Absent => unobservable_finding(
+        LanguageServerReadV1::Absent { .. } => unobservable_finding(
             family,
             DoctorEvidenceStateV1::Absent,
             "language-server.absent",
@@ -1261,6 +1369,36 @@ pub fn language_server_finding(
             "language-server.unknown",
             "language-server analyzer state undetermined",
         ),
+    }
+}
+
+/// Name every active analyzer in `state`, with its executable and install
+/// step, so a degraded finding is actionable. A read whose aggregate says
+/// `state` but lists no such analyzer is reported as exactly that gap rather
+/// than as a healthy-looking empty list.
+fn degraded_analyzers_statement(
+    analyzers: &[LanguageServerAnalyzerV1],
+    state: LanguageServerStateV1,
+) -> String {
+    let named: Vec<String> = analyzers
+        .iter()
+        .filter(|analyzer| analyzer.state.aggregate() == Some(state))
+        .map(|analyzer| {
+            let mut entry = format!("{} ({}", analyzer.language, analyzer.command);
+            if let Some(install) = &analyzer.install {
+                entry.push_str(&format!("; install: {install}"));
+            }
+            if let Some(detail) = &analyzer.detail {
+                entry.push_str(&format!("; {detail}"));
+            }
+            entry.push(')');
+            entry
+        })
+        .collect();
+    if named.is_empty() {
+        "analyzer identity not reported by the daemon owner".to_owned()
+    } else {
+        named.join(", ")
     }
 }
 
@@ -1367,6 +1505,135 @@ pub fn observability_finding(
     }
 }
 
+/// One retained owner as the resident-memory inventory reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResidentMemoryOwnerReadV1 {
+    /// Owner kind label, one of the inventory's shed-order kinds.
+    pub kind: String,
+    pub project_id: String,
+    pub worktree_id: String,
+    pub generation_id: String,
+    /// Measured bytes, or `None` for an owner that cannot size itself.
+    pub bytes: Option<u64>,
+    pub idle_seconds: u64,
+    /// Pressure will not release this owner while it serves inside its
+    /// idle window.
+    pub protected: bool,
+}
+
+/// Retained daemon memory as the resident-memory inventory reports it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ResidentMemoryReadV1 {
+    Observed {
+        /// Last sampled process RSS, `None` before the first sample.
+        resident_bytes: Option<u64>,
+        limit_bytes: u64,
+        high_watermark_bytes: u64,
+        over_budget: bool,
+        retained_bytes: u64,
+        owners: Vec<ResidentMemoryOwnerReadV1>,
+    },
+    /// The process keeps no inventory (not a daemon).
+    Unobserved,
+}
+
+const MIB: u64 = 1024 * 1024;
+
+/// Map the inventory into its `Memory` findings: one for the process against
+/// its limit, then one per retained owner.
+#[hotpath::measure(label = "application.doctor_sources.resident_memory")]
+pub fn resident_memory_findings(
+    read: &ResidentMemoryReadV1,
+) -> Result<Vec<DoctorFindingV1>, ApplicationContractError> {
+    let family = DoctorFindingFamilyV1::Memory;
+    let ResidentMemoryReadV1::Observed {
+        resident_bytes,
+        limit_bytes,
+        high_watermark_bytes,
+        over_budget,
+        retained_bytes,
+        owners,
+    } = read
+    else {
+        return Ok(vec![unobservable_finding(
+            family,
+            DoctorEvidenceStateV1::Unknown,
+            "memory.inventory.unobserved",
+            "this process keeps no resident-memory inventory",
+        )?]);
+    };
+    let unmeasured = owners.iter().filter(|owner| owner.bytes.is_none()).count();
+    let resident = resident_bytes.map_or_else(
+        || "unsampled".to_owned(),
+        |bytes| format!("{} MiB", bytes / MIB),
+    );
+    let summary = format!(
+        "resident {resident} of a {} MiB limit (pressure line {} MiB); {} owners retain {} MiB measured, {unmeasured} unmeasured",
+        limit_bytes / MIB,
+        high_watermark_bytes / MIB,
+        owners.len(),
+        retained_bytes / MIB,
+    );
+    let mut findings = vec![if *over_budget {
+        source_finding(
+            family,
+            DoctorEvidenceStateV1::Degraded,
+            "memory.process.over-budget",
+            DoctorCoverageCompletenessV1::Complete,
+            &summary,
+        )?
+    } else {
+        clean_finding(
+            family,
+            "memory.process.nominal",
+            if unmeasured == 0 {
+                DoctorCoverageCompletenessV1::Complete
+            } else {
+                DoctorCoverageCompletenessV1::Partial
+            },
+            &summary,
+        )?
+    }];
+    for owner in owners {
+        let bytes = owner.bytes.map_or_else(
+            || "unmeasured bytes".to_owned(),
+            |bytes| format!("{} MiB", bytes / MIB),
+        );
+        let statement = format!(
+            "{} of worktree {} holds {bytes}, idle {} s{}",
+            owner.kind,
+            owner.worktree_id,
+            owner.idle_seconds,
+            if owner.protected { ", serving" } else { "" },
+        );
+        findings.push(match owner.bytes {
+            Some(_) => clean_finding(
+                family,
+                "memory.owner.measured",
+                DoctorCoverageCompletenessV1::Complete,
+                &truncate_at_char_boundary(&statement, 512),
+            )?,
+            None => source_finding(
+                family,
+                DoctorEvidenceStateV1::Partial,
+                "memory.owner.unmeasured",
+                DoctorCoverageCompletenessV1::Partial,
+                &truncate_at_char_boundary(&statement, 512),
+            )?,
+        });
+    }
+    Ok(findings)
+}
+
+/// Narrow source port for the resident-memory inventory.
+pub trait ResidentMemoryDoctorPort: Send + Sync {
+    fn resident_memory<'a>(
+        &'a self,
+        context: &'a RequestContext,
+    ) -> DoctorSourceFuture<'a, ResidentMemoryReadV1>;
+}
+
 /// Count of durably refused source records for one provider and coverage
 /// reason, read from the observation authority's cursor-advance ledger.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1385,7 +1652,7 @@ pub struct IngestRefusalCountV1 {
 /// Deterministic refusals advance coverage with a durable typed reason so the
 /// stream converges instead of re-reporting the same records; the plans treat
 /// those refusals as visible typed outcomes, never silent drops. This read
-/// surfaces the recorded counts truthfully — re-admission of a deterministic
+/// surfaces the recorded counts truthfully. Re-admission of a deterministic
 /// refusal would deterministically fail again, so Doctor reports rather than
 /// retries.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1466,10 +1733,15 @@ pub fn ingest_refusal_finding(
             if ordered.len() > MAX_LISTED_PAIRS {
                 breakdown.push(format!("+{} more", ordered.len() - MAX_LISTED_PAIRS));
             }
+            // The cursor-advance ledger keeps only the rows that still support
+            // a source's current frontier, so this counts sources whose newest
+            // covered record was refused, not every refusal ever recorded; the
+            // count is bounded by sources × scopes and cannot grow unbounded.
             let statement = format!(
-                "durable ingest coverage advanced past {total} refused source records ({}); \
-                 refusals are deterministic typed outcomes recorded in the cursor-advance \
-                 ledger, not silently dropped data",
+                "durable ingest coverage rests on {total} refused source records ({}): each is \
+                 the newest covered record of one transcript source and was skipped, not \
+                 silently dropped; the daemon log names each one (WARN `admission refused`, \
+                 fields reason/cause/offset)",
                 breakdown.join(", ")
             );
             source_finding(
@@ -1477,7 +1749,7 @@ pub fn ingest_refusal_finding(
                 DoctorEvidenceStateV1::Degraded,
                 "observability.ingest-coverage.durably-refused",
                 DoctorCoverageCompletenessV1::Complete,
-                &statement,
+                &bounded_statement(&statement),
             )
         }
         IngestRefusalCensusReadV1::Unknown => unobservable_finding(
@@ -1588,6 +1860,69 @@ pub trait StorageDoctorPort: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_findings_report_the_process_and_each_owner_in_mib() {
+        let owner = |kind: &str, bytes: Option<u64>, protected: bool| ResidentMemoryOwnerReadV1 {
+            kind: kind.to_owned(),
+            project_id: "project.fixture".to_owned(),
+            worktree_id: "worktree.fixture".to_owned(),
+            generation_id: "generation.fixture".to_owned(),
+            bytes,
+            idle_seconds: 42,
+            protected,
+        };
+        let read = ResidentMemoryReadV1::Observed {
+            resident_bytes: Some(3 * 1024 * MIB),
+            limit_bytes: 6 * 1024 * MIB,
+            high_watermark_bytes: 5 * 1024 * MIB,
+            over_budget: false,
+            retained_bytes: 300 * MIB,
+            owners: vec![
+                owner("decoded_generation", Some(300 * MIB), true),
+                owner("graph_engine", None, false),
+            ],
+        };
+
+        let findings = resident_memory_findings(&read).expect("memory findings");
+
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| (
+                    finding.state(),
+                    finding.coverage().statement().to_owned()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    DoctorEvidenceStateV1::Partial,
+                    "resident 3072 MiB of a 6144 MiB limit (pressure line 5120 MiB); 2 owners retain 300 MiB measured, 1 unmeasured".to_owned()
+                ),
+                (
+                    DoctorEvidenceStateV1::HealthyCompleteCoverage,
+                    "decoded_generation of worktree worktree.fixture holds 300 MiB, idle 42 s, serving".to_owned()
+                ),
+                (
+                    DoctorEvidenceStateV1::Partial,
+                    "graph_engine of worktree worktree.fixture holds unmeasured bytes, idle 42 s".to_owned()
+                ),
+            ]
+        );
+
+        let over = ResidentMemoryReadV1::Observed {
+            resident_bytes: Some(5 * 1024 * MIB + 1),
+            limit_bytes: 6 * 1024 * MIB,
+            high_watermark_bytes: 5 * 1024 * MIB,
+            over_budget: true,
+            retained_bytes: 0,
+            owners: Vec::new(),
+        };
+        assert_eq!(
+            resident_memory_findings(&over).expect("memory findings")[0].state(),
+            DoctorEvidenceStateV1::Degraded
+        );
+    }
 
     #[test]
     fn configuration_in_sync_complete_is_healthy() {
@@ -1729,10 +2064,89 @@ mod tests {
         let finding = language_server_finding(&LanguageServerReadV1::Observed {
             state: LanguageServerStateV1::Refreshing,
             coverage: DoctorCoverageCompletenessV1::Complete,
+            analyzers: Vec::new(),
         })
         .expect("finding");
         assert_eq!(finding.family(), DoctorFindingFamilyV1::LanguageServer);
         assert_eq!(finding.state(), DoctorEvidenceStateV1::Partial);
+    }
+
+    #[test]
+    fn language_server_unavailable_names_each_missing_analyzer_and_install_step() {
+        let analyzer = |language: &str, command: &str, state, install: Option<&str>| {
+            LanguageServerAnalyzerV1 {
+                language: language.to_owned(),
+                command: command.to_owned(),
+                state,
+                executable_found: state != LanguageServerAnalyzerStateV1::Unavailable,
+                install: install.map(str::to_owned),
+                detail: None,
+            }
+        };
+        let read = LanguageServerReadV1::observed(vec![
+            analyzer(
+                "rust",
+                "rust-analyzer",
+                LanguageServerAnalyzerStateV1::Ready,
+                None,
+            ),
+            analyzer(
+                "typescript",
+                "typescript-language-server",
+                LanguageServerAnalyzerStateV1::Unavailable,
+                Some("npm install -g typescript typescript-language-server"),
+            ),
+            analyzer(
+                "python",
+                "pyright-langserver",
+                LanguageServerAnalyzerStateV1::Unavailable,
+                Some("npm install -g pyright"),
+            ),
+            analyzer(
+                "go",
+                "gopls",
+                LanguageServerAnalyzerStateV1::Inactive,
+                Some("go install golang.org/x/tools/gopls@latest"),
+            ),
+        ]);
+        let finding = language_server_finding(&read).expect("finding");
+        assert_eq!(finding.state(), DoctorEvidenceStateV1::Degraded);
+        assert_eq!(
+            finding.coverage().statement(),
+            "project analyzer executable not found on the daemon PATH: \
+             typescript (typescript-language-server; install: npm install -g typescript typescript-language-server), \
+             python (pyright-langserver; install: npm install -g pyright)"
+        );
+    }
+
+    #[test]
+    fn language_server_degraded_without_analyzer_identity_says_so() {
+        let finding = language_server_finding(&LanguageServerReadV1::Observed {
+            state: LanguageServerStateV1::Crashed,
+            coverage: DoctorCoverageCompletenessV1::Complete,
+            analyzers: Vec::new(),
+        })
+        .expect("finding");
+        assert_eq!(
+            finding.coverage().statement(),
+            "project analyzer process crashed: analyzer identity not reported by the daemon owner"
+        );
+    }
+
+    #[test]
+    fn language_server_observed_grades_only_active_analyzers() {
+        let inactive_only = LanguageServerReadV1::observed(vec![LanguageServerAnalyzerV1 {
+            language: "go".to_owned(),
+            command: "gopls".to_owned(),
+            state: LanguageServerAnalyzerStateV1::Inactive,
+            executable_found: false,
+            install: None,
+            detail: None,
+        }]);
+        assert!(matches!(
+            inactive_only,
+            LanguageServerReadV1::Absent { analyzers } if analyzers.len() == 1
+        ));
     }
 
     #[test]

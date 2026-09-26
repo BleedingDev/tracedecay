@@ -8,7 +8,7 @@ use tokio::time::{Duration, timeout};
 
 /// Watcher knobs the git-metadata watcher needs from resolved sync config.
 ///
-/// Root maps `tracedecay::config::SyncConfig` into this type at construction.
+/// Root maps `tracedecay_configuration::SyncConfig` into this type at construction.
 /// The usecases `SyncConfig` is a different, smaller PR-autotrack type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitWatchSyncConfigV1 {
@@ -60,19 +60,6 @@ impl Default for GitWatchMaintenanceWakeV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ApplicationCatalogSnapshotErrorV1 {
-    pub message: String,
-}
-
-impl ApplicationCatalogSnapshotErrorV1 {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
 /// Connection-admission lease the scheduler parks behind on blocking work.
 pub trait AdmissionParkLeaseV1: Send + Sync {
     fn release(&self) -> bool;
@@ -86,8 +73,8 @@ tokio::task_local! {
 /// How long a park may keep its admission permit before surrendering it.
 ///
 /// A request that finishes inside this grace never touches the semaphore.
-/// Only a request that is genuinely parked — waiting on a project open, on the
-/// writer gate, or on a single-flight generation decode — gives its slot back.
+/// Only a request that is genuinely parked, waiting on a project open, on the
+/// writer gate, or on a single-flight generation decode, gives its slot back.
 pub const ADMISSION_PARK_GRACE: Duration = Duration::from_millis(50);
 
 /// Park a future without holding a connection admission slot across a long wait.

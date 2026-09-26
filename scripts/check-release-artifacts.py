@@ -723,6 +723,42 @@ def verify_sidecar_archives(
             )
 
 
+def require_whole_targets(
+    targets: list[dict[str, str]],
+    binaries: set[str],
+    mcpbs: set[str],
+    binary_name: dict[str, str],
+    mcpb_name: dict[str, str],
+) -> list[str]:
+    """Partial coverage: every present target is whole, nothing is foreign.
+
+    A publish job that lost one build target still ships the others; the
+    recovery planner rebuilds only what is missing. What it must never ship
+    is half a target (an archive without its MCPB or the reverse) or a file
+    the manifest does not name.
+    """
+    extra = sorted(binaries - set(binary_name.values())) + sorted(
+        mcpbs - set(mcpb_name.values())
+    )
+    if extra:
+        raise SystemExit("unexpected release artifacts: " + ", ".join(extra))
+    missing = []
+    for target in targets:
+        has_binary = binary_name[target["name"]] in binaries
+        has_mcpb = mcpb_name[target["name"]] in mcpbs
+        if has_binary != has_mcpb:
+            raise SystemExit(
+                f"release target {target['name']} is half built: "
+                f"archive={'present' if has_binary else 'missing'}, "
+                f"mcpb={'present' if has_mcpb else 'missing'}"
+            )
+        if not has_binary:
+            missing.append(target["name"])
+    if len(missing) == len(targets):
+        raise SystemExit("no release target is complete; nothing to publish")
+    return missing
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -735,41 +771,61 @@ def main() -> int:
     parser.add_argument("--worker-manifest", type=Path)
     parser.add_argument("--model-acquisition-manifest", type=Path)
     parser.add_argument("--model-revision-receipt", type=Path)
+    parser.add_argument(
+        "--allow-missing-targets",
+        action="store_true",
+        help="accept a subset of targets as long as each present target is whole",
+    )
     arguments = parser.parse_args()
     targets = target_matrix(arguments.manifest, arguments.worker_platforms)
-    binary_prefix = "tracedecay-beta" if arguments.profile == "beta" else "tracedecay"
-
-    require_exact(
-        "binary",
-        files(arguments.binaries),
-        {
-            f"{binary_prefix}-{arguments.tag}-{target['name']}.{target['archive']}"
-            for target in targets
-        },
-    )
+    prefix = "tracedecay-beta" if arguments.profile == "beta" else "tracedecay"
+    binary_name = {
+        target["name"]: f"{prefix}-{arguments.tag}-{target['name']}.{target['archive']}"
+        for target in targets
+    }
+    mcpb_name = {
+        target["name"]: f"{prefix}-{arguments.tag}-{target['name']}.mcpb"
+        for target in targets
+    }
     if arguments.mcpbs is None:
         raise SystemExit("release validation requires an MCPB directory")
-    mcpb_prefix = "tracedecay-beta" if arguments.profile == "beta" else "tracedecay"
-    require_exact(
-        "MCPB",
-        files(arguments.mcpbs),
-        {
-            f"{mcpb_prefix}-{arguments.tag}-{target['name']}.mcpb"
-            for target in targets
-        },
-    )
-    expected_sidecars = {
+    binaries = files(arguments.binaries)
+    mcpbs = files(arguments.mcpbs)
+
+    missing: list[str] = []
+    if arguments.allow_missing_targets:
+        missing = require_whole_targets(targets, binaries, mcpbs, binary_name, mcpb_name)
+    else:
+        require_exact("binary", binaries, set(binary_name.values()))
+        require_exact("MCPB", mcpbs, set(mcpb_name.values()))
+
+    # NCM sidecars are validated for every target that is actually shipping.
+    # Argument validity is judged against the full manifest so a partial
+    # publish that lost the sidecar target does not reject its own inputs.
+    present_targets = [target for target in targets if target["name"] not in missing]
+    declared_sidecars = {
         asset
         for target in targets
+        for asset in sidecar_assets(target, arguments.tag, arguments.profile)
+    }
+    expected_sidecars = {
+        asset
+        for target in present_targets
         for asset in sidecar_assets(target, arguments.tag, arguments.profile)
     }
     if expected_sidecars and arguments.sidecars is None:
         raise SystemExit("release validation requires an NCM sidecar directory")
     if expected_sidecars and arguments.worker_manifest is None:
         raise SystemExit("release validation requires a trusted worker manifest")
-    expected_model_manifests = {
+    declared_model_manifests = {
         target.get("sidecar", {}).get("model_manifest")
         for target in targets
+        if isinstance(target.get("sidecar"), dict)
+        and target["sidecar"].get("model_manifest")
+    }
+    expected_model_manifests = {
+        target.get("sidecar", {}).get("model_manifest")
+        for target in present_targets
         if isinstance(target.get("sidecar"), dict)
         and target["sidecar"].get("model_manifest")
     }
@@ -777,19 +833,22 @@ def main() -> int:
         raise SystemExit("release validation requires a trusted model acquisition manifest")
     if expected_model_manifests and arguments.model_revision_receipt is None:
         raise SystemExit("release validation requires the canonical model revision receipt")
-    if arguments.model_acquisition_manifest is not None and not expected_model_manifests:
+    if arguments.model_acquisition_manifest is not None and not declared_model_manifests:
         raise SystemExit(
             "a model acquisition manifest is only valid when sidecar metadata expects one"
         )
-    if arguments.model_revision_receipt is not None and not expected_model_manifests:
+    if arguments.model_revision_receipt is not None and not declared_model_manifests:
         raise SystemExit(
             "a model revision receipt is only valid when sidecar model metadata is expected"
         )
-    if not expected_sidecars and arguments.worker_manifest is not None:
+    if not declared_sidecars and arguments.worker_manifest is not None:
         raise SystemExit("a worker manifest is only valid when sidecar assets are expected")
     if arguments.sidecars is not None:
+        # Nothing foreign ships: a sidecar whose target is missing from a
+        # partial publish is as unexpected as any other stray file.
         actual_sidecars = files(arguments.sidecars)
         require_exact("NCM sidecar", actual_sidecars, expected_sidecars)
+    if arguments.sidecars is not None and (expected_sidecars or not missing):
         if arguments.worker_manifest is None:
             raise SystemExit("release validation requires a trusted worker manifest")
         verify_sidecar_checksums(
@@ -799,11 +858,18 @@ def main() -> int:
         verify_sidecar_archives(
             arguments.sidecars,
             {asset for asset in expected_sidecars if not asset.endswith(".sha256")},
-            targets,
+            present_targets,
             arguments.worker_manifest,
             arguments.model_acquisition_manifest,
             arguments.model_revision_receipt,
         )
+
+    if missing:
+        print(
+            "release artifact coverage is partial; missing targets: "
+            + ", ".join(missing)
+        )
+        return 0
     print("release artifact coverage matches target manifest")
     return 0
 

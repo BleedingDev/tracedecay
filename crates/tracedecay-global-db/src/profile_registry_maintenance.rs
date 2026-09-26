@@ -10,8 +10,6 @@ use std::path::{Component, Path, PathBuf};
 use crate::{
     ProjectRegistryContext, RegisteredGlobalDb, RegisteredGlobalDbLeaseV1,
     registry_maintenance::ForgetRegistryProjectRows, registry_maintenance::RegistryGcReport,
-    registry_maintenance::RegistryOrphanRelinkApplyReport,
-    registry_maintenance::RegistryOrphanRelinkReport,
     registry_maintenance::forget_registry_project,
 };
 
@@ -141,7 +139,7 @@ impl ProfileRegistryMaintenanceRuntime {
         profile_root: &Path,
     ) -> tracedecay_domain::errors::Result<tracedecay_runtime_core::storage::ProjectStorageLocation>
     {
-        let location = tracedecay_runtime_core::storage::classify_project_storage(project_root);
+        let location = tracedecay_runtime_core::storage::classify_project_storage(project_root)?;
         if location.status != tracedecay_runtime_core::storage::ProjectStorageStatus::Stale {
             return Ok(location);
         }
@@ -155,10 +153,6 @@ impl ProfileRegistryMaintenanceRuntime {
         Ok(store
             .classify_storage(project_root, profile_root)
             .unwrap_or(location))
-    }
-
-    pub fn canonical_project_key(project_root: &Path) -> String {
-        RegisteredGlobalDb::canonical_project_key(project_root)
     }
 
     #[hotpath::measure(label = "daemon.profile_registry.retire_paths", future = true)]
@@ -244,18 +238,6 @@ impl ProfileRegistryMaintenanceRuntime {
             kept_store_dirs,
             rows,
         })
-    }
-
-    #[hotpath::measure(label = "daemon.profile_registry.apply_orphan_relink", future = true)]
-    pub async fn apply_orphan_relink(
-        &self,
-        report: &RegistryOrphanRelinkReport,
-    ) -> std::result::Result<RegistryOrphanRelinkApplyReport, Vec<String>> {
-        crate::registry_maintenance::apply_registry_orphan_relink_report(
-            self.profile_database.as_ref(),
-            report,
-        )
-        .await
     }
 
     #[hotpath::measure(label = "daemon.profile_registry.gc", future = true)]

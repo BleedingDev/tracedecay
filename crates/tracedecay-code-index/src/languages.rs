@@ -59,7 +59,7 @@ pub(crate) fn canonical_language_id(language_name: &str) -> String {
 ///
 /// Markdown qualifies: a heading owns its whole section, and nested headings
 /// are stable child spans. That is what keeps a chunk from splitting mid
-/// section — an oversized section splits at its sub-heading boundaries via
+/// section, an oversized section splits at its sub-heading boundaries via
 /// `structural_segments` instead of at an arbitrary byte window, and a section
 /// that fits the budget stays one chunk.
 fn has_stable_member_spans(language: &str) -> bool {
@@ -207,14 +207,39 @@ impl StaticLanguageRegistry {
             // struct-literal initialisers (never method calls or constructor-like
             // names), records restricted `pub` re-export scopes separately
             // from unrestricted exports, and resolves inherent impl methods across files of
-            // the owning type. Pinning these behaviors forces older file
-            // artifacts to be re-extracted.
-            let extractor_revision = if language == "rust" {
-                8
-            } else if matches!(language.as_str(), "typescript" | "protobuf" | "sql") {
-                4
-            } else {
-                3
+            // the owning type. Every language moved one revision when clone-body
+            // eligibility gained its token bound and again when it gained the
+            // pre-tokenization byte bound: one multi-megabyte literal is only
+            // a few tokens but still cannot fit a text-artifact page. Rust v11
+            // stopped emitting the bare method name of a dotted call, so an
+            // unrelated same-file callable sharing that name is no longer a
+            // caller, and types `self` through the enclosing impl or trait.
+            // Rust v12 resolves a receiver whose type is a type parameter with
+            // one trait bound to `Trait::method`, so that call now has a
+            // callee. Only re-extraction removes the poisoned record. Rust v13
+            // retains unresolved receiver-call evidence at the parser's member
+            // token; re-extracting Rust does not perturb other languages' rows.
+            // TypeScript v7 records `export … from` forwarding as public
+            // import evidence and retains explicitly imported ubiquitous names
+            // as cross-file candidates, so barrels and workspace packages bind.
+            // TypeScript v8 records same-module `export { a as b }` clauses as
+            // forwarding evidence, and its per-file pass no longer binds calls
+            // to test titles or to declarations outside the scope that shadows
+            // an import. TypeScript v9 records `export default <name>` the same
+            // way and retains member calls on imported names, so default and
+            // namespace imports bind.
+            // The C-comment docstring languages moved one revision when a
+            // docstring stopped absorbing trailing or blank-line-detached
+            // comments and `///` lost its stray `/`; QBasic dialects moved when
+            // CONST names stopped losing their text before an underscore.
+            let extractor_revision = match language.as_str() {
+                "rust" => 13,
+                "typescript" => 9,
+                "protobuf" => 7,
+                "sql" => 6,
+                "c" | "cpp" | "metal" | "objc" | "go" | "glsl" | "pascal" | "qbasic"
+                | "quickbasic" => 6,
+                _ => 5,
             };
             let descriptor = LanguageDescriptorV1 {
                 language: LanguageId::new(language.clone())
@@ -405,8 +430,6 @@ mod tests {
     #[test]
     fn descriptor_lookups_are_canonical_and_deterministic() {
         let registry = StaticLanguageRegistry::new();
-        let again = StaticLanguageRegistry::new();
-        assert_eq!(registry.registry_revision(), again.registry_revision());
 
         let rust = registry
             .descriptor(&language("rust"))
@@ -415,7 +438,7 @@ mod tests {
         assert!(rust.stable_member_spans);
         assert!(rust.capabilities.extraction);
         assert_eq!(rust.root_markers, vec!["Cargo.toml".to_owned()]);
-        assert_eq!(rust.extractor_revision.as_str(), "extractor.rust.v8");
+        assert_eq!(rust.extractor_revision.as_str(), "extractor.rust.v13");
 
         assert_eq!(
             registry
@@ -438,8 +461,11 @@ mod tests {
         assert!(registry.descriptor(&language("cobol-nope")).is_none());
         assert!(registry.descriptor_for_extension("nope").is_none());
         assert_eq!(
-            registry.descriptor_revision(&language("rust")),
-            Some(rust.descriptor_revision.clone())
+            registry
+                .descriptor_revision(&language("rust"))
+                .as_ref()
+                .map(|revision| revision.as_str()),
+            Some("descriptor.rust.v1")
         );
 
         // Canonical language-identity order.
@@ -451,6 +477,74 @@ mod tests {
         let mut sorted = ids.clone();
         sorted.sort_unstable();
         assert_eq!(ids, sorted);
+    }
+
+    #[test]
+    #[cfg(feature = "full")]
+    fn full_tier_registers_every_compiled_extractor_language() {
+        let registry = StaticLanguageRegistry::new();
+        let ids: Vec<&str> = registry
+            .descriptors()
+            .iter()
+            .map(|d| d.language.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "astro",
+                "bash",
+                "batch",
+                "c",
+                "clojure",
+                "cobol",
+                "cpp",
+                "csharp",
+                "dart",
+                "dockerfile",
+                "elixir",
+                "erlang",
+                "fortran",
+                "fsharp",
+                "glsl",
+                "go",
+                "gwbasic",
+                "haskell",
+                "hlsl",
+                "java",
+                "json",
+                "julia",
+                "kotlin",
+                "lean",
+                "lua",
+                "markdown",
+                "metal",
+                "msbasic2",
+                "nix",
+                "objc",
+                "ocaml",
+                "pascal",
+                "perl",
+                "php",
+                "powershell",
+                "protobuf",
+                "python",
+                "qbasic",
+                "quickbasic",
+                "quint",
+                "r",
+                "ruby",
+                "rust",
+                "scala",
+                "sql",
+                "svelte",
+                "swift",
+                "toml",
+                "typescript",
+                "vbnet",
+                "wgsl",
+                "zig",
+            ]
+        );
     }
 
     #[test]

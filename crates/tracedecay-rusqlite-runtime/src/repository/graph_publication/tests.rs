@@ -232,9 +232,7 @@ fn control_and_probe(
     )
 }
 
-fn digest(byte: char) -> String {
-    format!("sha256:{}", byte.to_string().repeat(64))
-}
+use tracedecay_domain::test_fixtures::repeated_sha256_text as digest;
 
 fn projection(name: &str) -> GraphProjectionIdentityV1 {
     projection_for_project("project.fixture", name)
@@ -491,7 +489,7 @@ fn replay_append_requires_the_atomic_commit_gate() {
 
     assert_eq!(
         fixture.storage().append_replay(&publication, &context),
-        Err(GraphPublicationStoreErrorV1::Infrastructure)
+        Err(GraphPublicationStoreErrorV1::CommitRefused)
     );
     assert_eq!(fixture.replay_count(), 0);
 }

@@ -5,10 +5,13 @@
 //! Unix broker, the portable broker, and the in-process test harness.
 
 use super::*;
+use tracedecay_agent_hosts::agents::context_scout::owner::unregister_registered_context_scout_owner;
+use tracedecay_agent_hosts::hooks::hook_project_id_for_layout;
 use tracedecay_code_index_runtime::code_index_scheduler;
 use tracedecay_daemon_identity::profile_identity;
 use tracedecay_daemon_service::daemon_owned_project_source_access_at;
 use tracedecay_runtime_core::logging::log_daemon_event;
+use tracedecay_runtime_core::path_safety::same_canonical_path;
 use tracedecay_session_runtime::session_sync::DaemonSessionSyncConfig;
 use tracedecay_session_runtime::session_temporal_refresh_scheduler::{
     ProfileSessionHistoricalIngestor, ProjectSessionHistoricalIngestor,
@@ -30,60 +33,6 @@ pub(super) use ncm_observer::NcmWorkerOwnerSlot;
 pub(in crate::daemon) use runtime::ProductionProjectCompositionRuntime;
 use runtime::bind_verified_project_graph_runtime;
 use session_database_admission::{join_independent_session_opens, log_session_database_admission};
-
-/// Commit points in the full publication transaction. The test-only failure
-/// injector can stop immediately after any one of these points and assert
-/// that the candidate never becomes reachable and that retrying starts clean.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(super) enum ProjectOpenFailurePhase {
-    SessionDatabases = 1,
-    ObservabilityMounted = 2,
-    ProviderMount = 3,
-    McpConstructed = 4,
-    SessionHoldersMounted = 5,
-    GitTransactions = 6,
-    IndependentOwners = 7,
-    DependentOwners = 8,
-    ProviderActivated = 9,
-    RuntimeReady = 10,
-    RegistryPublished = 11,
-    HttpMounted = 12,
-}
-
-#[cfg(test)]
-static PROJECT_OPEN_FAILURE_AFTER_PHASE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
-#[cfg(test)]
-static PROJECT_OPEN_REACHED_PHASE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
-#[cfg(test)]
-static PROJECT_OPEN_PHASE_CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
-
-/// Arm a deterministic full-publication failure for the next matching phase.
-/// This is intentionally process-local and test-only: production behavior has
-/// no injected branch and every phase checkpoint compiles to a no-op.
-#[cfg(test)]
-pub(super) fn fail_project_open_after(phase: ProjectOpenFailurePhase) {
-    PROJECT_OPEN_REACHED_PHASE.store(0, Ordering::Release);
-    PROJECT_OPEN_FAILURE_AFTER_PHASE.store(phase as u8, Ordering::Release);
-}
-
-#[cfg(test)]
-pub(super) fn clear_project_open_failure() {
-    PROJECT_OPEN_FAILURE_AFTER_PHASE.store(0, Ordering::Release);
-    PROJECT_OPEN_REACHED_PHASE.store(0, Ordering::Release);
-}
-
-#[cfg(test)]
-pub(super) async fn wait_for_project_open_phase(phase: ProjectOpenFailurePhase) {
-    loop {
-        if PROJECT_OPEN_REACHED_PHASE.load(Ordering::Acquire) == phase as u8 {
-            return;
-        }
-        PROJECT_OPEN_PHASE_CHANGED.notified().await;
-    }
-}
 
 /// Independent provider participation resolved from the pinned project
 /// configuration. The daemon owns the decision; the service crate only
@@ -173,9 +122,12 @@ fn project_server_has_in_flight_response(server: &Arc<crate::mcp::McpServer>) ->
 }
 
 #[hotpath::measure(label = "daemon.project.compose.release_idle", future = true)]
-#[expect(
-    clippy::too_many_lines,
-    reason = "Idle-server release is one cache-evict-and-shutdown before the next project open."
+#[cfg_attr(
+    not(feature = "hotpath"),
+    expect(
+        clippy::too_many_lines,
+        reason = "Idle-server release is one cache-evict-and-shutdown before the next project open."
+    )
 )]
 async fn release_one_idle_project_server_before_open(
     store_administration: &StoreAdministration,
@@ -348,13 +300,24 @@ async fn release_one_idle_project_server_before_open(
     Ok(capacity_admission)
 }
 
-#[cfg(test)]
-pub(super) fn daemon_transcript_source_home(profile_root: &Path) -> Option<PathBuf> {
+/// The one home a composed daemon reads host transcripts from.
+///
+/// Both readers resolve it here: the composition pins it onto the session
+/// refresh schedulers that own the background sweep, and the MCP server scopes
+/// every tool dispatch to it so a hook-triggered ingest cannot resolve a
+/// different one.
+///
+/// Gated exactly like the `production_harness` module that owns the isolated
+/// layout: an integration test links this crate without `cfg(test)`, so a
+/// `cfg(test)`-only pin left `mcp_suite` compositions sweeping the developer's
+/// real `$HOME` transcripts.
+#[cfg(any(test, feature = "test-transport"))]
+pub(crate) fn daemon_transcript_source_home(profile_root: &Path) -> Option<PathBuf> {
     profile_root.parent().map(Path::to_path_buf)
 }
 
-#[cfg(not(test))]
-pub(super) fn daemon_transcript_source_home(_profile_root: &Path) -> Option<PathBuf> {
+#[cfg(not(any(test, feature = "test-transport")))]
+pub(crate) fn daemon_transcript_source_home(_profile_root: &Path) -> Option<PathBuf> {
     tracedecay_sessions::runtime::home_dir()
 }
 
@@ -514,123 +477,85 @@ async fn production_project_server_inner(
         GraphOpen::Cached(composition) => return Ok(composition),
         GraphOpen::Opened(opened) => opened,
     };
-    let (core_candidate, core) = Box::pin(inputs.compose_core_server(&opened)).await?;
-    let CoreRouteBinding {
-        mut resolved,
-        inserted,
-    } = Box::pin(inputs.bind_core_route(
-        admitted.route,
-        &opened.key,
-        core_candidate,
-        &core.route_registered,
-    ))
-    .await?;
-    if inserted {
-        let http_route_attempt = if inputs.http_application_registry.is_active() {
-            if let Some(project_id) = opened.key.owner.project_id.as_deref() {
-                inputs
-                    .http_application_registry
-                    .block_project_route(project_id)
-                    .await
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let activation = match Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await
-        {
-            Ok(mut activation) => {
-                activation.http_route_attempt = http_route_attempt;
-                activation
-            }
-            Err(error) => {
-                // Core activation can fail after installing a source-edit
-                // owner or beginning a runtime publication. Feed even a
-                // partially built activation through the same exact-owner
-                // rollback so a pending route never survives the error.
-                let empty_activation = CoreRouteActivation {
-                    publication_attempt: None,
-                    core_source_edit_mutation: None,
-                    http_route_attempt,
-                };
-                let Err(error) = Box::pin(inputs.settle_failed_full_upgrade(
-                    &opened,
-                    &core,
-                    &empty_activation,
-                    &resolved,
-                    None,
-                    FailedUpgradeRouteDisposition::RetireAttempt,
-                    error,
-                ))
-                .await
-                else {
-                    unreachable!("failed project-open settlement cannot succeed");
-                };
-                return Err(error);
-            }
-        };
-        let upgrade = match Box::pin(inputs.construct_full_server(&opened, &core)).await {
-            Ok(mut full) => {
-                let phase_failure = inputs
-                    .phase_checkpoint(ProjectOpenFailurePhase::ProviderMount)
-                    .and_then(|()| {
-                        inputs.phase_checkpoint(ProjectOpenFailurePhase::McpConstructed)
-                    });
-                match phase_failure {
-                    Ok(()) => {
+    let composed = async {
+        let (core_candidate, core) = Box::pin(inputs.compose_core_server(&opened)).await?;
+        let CoreRouteBinding {
+            mut resolved,
+            inserted,
+        } = Box::pin(inputs.bind_core_route(
+            admitted.route,
+            &opened.key,
+            core_candidate,
+            &core.route_registered,
+        ))
+        .await?;
+        if inserted {
+            let activation =
+                Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await?;
+            let upgrade =
+                match Box::pin(inputs.construct_full_server(&opened, &core, &resolved)).await {
+                    Ok(PublishedFullServer {
+                        server,
+                        session_db,
+                        #[cfg(feature = "memory-provider-host")]
+                        provider_full_mount,
+                    }) => {
                         match Box::pin(inputs.finish_full_server(
                             &opened,
                             &core,
                             &activation,
                             &resolved,
-                            &mut full,
+                            &server,
+                            session_db,
+                            #[cfg(feature = "memory-provider-host")]
+                            &provider_full_mount,
                         ))
                         .await
                         {
-                            Ok(()) => Ok(Arc::clone(&full.server)),
-                            // Keep the complete transaction alive until the
-                            // failure funnel has retired every owner it
-                            // mounted. In particular, dropping the provider
-                            // bundle alone does not stop an already-started
-                            // observation worker.
+                            Ok(()) => Ok(server),
                             Err(error) => {
-                                let disposition = failed_upgrade_route_disposition(&error);
-                                Err((error, Some(full), disposition))
+                                // Dropping the provider bundle alone does not
+                                // stop an already-started observation worker.
+                                #[cfg(feature = "memory-provider-host")]
+                                shutdown_failed_provider_full_mount(
+                                    &provider_full_mount,
+                                    canonical_project_path,
+                                )
+                                .await;
+                                Err((error, Some(server)))
                             }
                         }
                     }
-                    Err(error) => Err((
+                    Err(error) => Err((error, None)),
+                };
+            match upgrade {
+                Ok(full_server) => resolved = full_server,
+                Err((error, published_full_server)) => {
+                    Box::pin(inputs.settle_failed_full_upgrade(
+                        &opened,
+                        &core,
+                        &activation,
+                        &resolved,
+                        published_full_server,
                         error,
-                        Some(full),
-                        FailedUpgradeRouteDisposition::RetainAdmittedCore,
-                    )),
+                    ))
+                    .await?;
                 }
             }
-            Err(error) => {
-                let disposition = failed_upgrade_route_disposition(&error);
-                Err((error, None, disposition))
-            }
-        };
-        match upgrade {
-            Ok(full_server) => resolved = full_server,
-            Err((error, published_full_server, disposition)) => {
-                Box::pin(inputs.settle_failed_full_upgrade(
-                    &opened,
-                    &core,
-                    &activation,
-                    &resolved,
-                    published_full_server,
-                    disposition,
-                    error,
-                ))
-                .await?;
-            }
+        } else {
+            drop(admitted.foreground_project_open);
+            core.route_registered.store(false, Ordering::Release);
         }
-    } else {
-        drop(admitted.foreground_project_open);
-        core.route_registered.store(false, Ordering::Release);
+        Ok((resolved, inserted))
     }
+    .await;
+    let (resolved, inserted) = match composed {
+        Ok(composed) => composed,
+        Err(error) => {
+            inputs.retire_failed_open_scout_owner(&opened.cg).await;
+            return Err(error);
+        }
+    };
     Ok(ProductionProjectComposition {
         #[cfg(unix)]
         key: opened.key,
@@ -645,7 +570,7 @@ async fn production_project_server_inner(
 /// is checked out on the *same* branch as its primary.
 ///
 /// `ProjectServerKey` is root-bound so distinct linked worktrees keep exact
-/// root-bound servers over one shared `StoreOwnerKey` — a worktree on another
+/// root-bound servers over one shared `StoreOwnerKey`, a worktree on another
 /// branch (or detached) serves a different generation and must not be answered
 /// from the primary's graph. A worktree on the same branch serves the same
 /// branch content from the same store owner and the same graph database, so a
@@ -713,7 +638,7 @@ enum GraphOpen {
 
 /// The opened graph and the route-wide choices resolved from its configuration.
 struct OpenedProjectGraph {
-    cg: Arc<crate::project::TraceDecay>,
+    cg: Arc<tracedecay_project::project::TraceDecay>,
     key: ProjectServerKey,
     runtime_configuration: tracedecay_configuration::config::PinnedRuntimeConfiguration,
     project_database_is_read_only: bool,
@@ -726,6 +651,8 @@ struct ProjectRoutePorts {
     code_index: ProjectCodeIndexAuthorities,
     dashboard_code_index_freshness_reader:
         tracedecay_contracts::code_index_freshness::CodeIndexFreshnessReader,
+    code_index_readiness_waiter:
+        tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaiter,
     dashboard_feedback_status_reader: tracedecay_dashboard_api::feedback_api::FeedbackStatusReader,
     dashboard_pr_autotrack_reader: tracedecay_dashboard_api::PrAutoTrackManagedSummaryReader,
     diagnostic_broker: Arc<tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>>,
@@ -767,8 +694,12 @@ impl ComposedCoreServer {
     fn publish_route_ports(
         &self,
         context: crate::mcp::server::McpServerConstructionContext,
-        cg: &Arc<crate::project::TraceDecay>,
+        cg: &Arc<tracedecay_project::project::TraceDecay>,
         invocation: &DaemonInvocationState,
+        #[cfg_attr(
+            not(feature = "memory-provider-host"),
+            expect(unused_variables, reason = "Only the provider host exposes cognitive recall.")
+        )]
         expose_cognitive_recall: bool,
     ) -> crate::mcp::server::McpServerConstructionContext {
         let ports = &self.ports;
@@ -777,6 +708,7 @@ impl ComposedCoreServer {
             .with_dashboard_code_index_freshness_reader(Arc::clone(
                 &ports.dashboard_code_index_freshness_reader,
             ))
+            .with_code_index_readiness_waiter(Arc::clone(&ports.code_index_readiness_waiter))
             .with_dashboard_feedback_status_reader(Arc::clone(
                 &ports.dashboard_feedback_status_reader,
             ))
@@ -819,10 +751,10 @@ impl ComposedCoreServer {
         {
             context =
                 context.with_memory_provider_host_mount(Arc::clone(&self.memory_provider_host));
-            if expose_cognitive_recall {
-                if let Some(recall) = self.memory_provider_host.cognitive_recall_mount() {
-                    context = context.with_cognitive_recall_mount(recall);
-                }
+            if expose_cognitive_recall
+                && let Some(recall) = self.memory_provider_host.cognitive_recall_mount()
+            {
+                context = context.with_cognitive_recall_mount(recall);
             }
         }
         if let Some(reconciler) = ports.automation_scheduler_reconciler.as_ref() {
@@ -849,9 +781,6 @@ struct CoreRouteActivation {
     /// The core's preview-only source-edit lane; `None` for a read-only database.
     core_source_edit_mutation:
         Option<Arc<tracedecay_daemon_service::project_owner_registration::SourceEditMutationGate>>,
-    /// Identity of the HTTP publication fence installed for this attempt.
-    /// Rollback must use this token so a newer replacement route survives.
-    http_route_attempt: Option<http_application::ProjectHttpRouteAttempt>,
 }
 
 /// Both session databases this route serves, admitted together.
@@ -860,43 +789,22 @@ struct AdmittedSessionDatabases {
     user_session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
 }
 
-/// The full server candidate and every retained mount created while it is
-/// being prepared. It remains private until `finish_full_server` commits the
-/// owner-registry cutover.
+/// The full server after it replaced the core in the owner registry, with the
+/// project session database its dependent owners still have to mount.
 struct PublishedFullServer {
     server: Arc<crate::mcp::McpServer>,
     session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
-    session_holder_database_paths: Vec<PathBuf>,
     #[cfg(feature = "memory-provider-host")]
     provider_full_mount:
         Arc<tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FailedUpgradeRouteDisposition {
-    RetainAdmittedCore,
-    RetireAttempt,
-}
-
-struct FailedProjectOpenSettlement {
-    publication_is_current: bool,
-    publication_attempt_present: bool,
-    retain_core: bool,
-}
-
+#[cfg(feature = "memory-provider-host")]
 const PROVIDER_FULL_UPGRADE_UNAVAILABLE_REASON: &str = "provider_full_upgrade_unavailable";
 
+#[cfg(feature = "memory-provider-host")]
 fn provider_full_upgrade_unavailable(detail: impl Into<String>) -> TraceDecayError {
     TraceDecayError::project_route(PROVIDER_FULL_UPGRADE_UNAVAILABLE_REASON, true, detail)
-}
-
-fn failed_upgrade_route_disposition(error: &TraceDecayError) -> FailedUpgradeRouteDisposition {
-    match error.project_route_context() {
-        Some((PROVIDER_FULL_UPGRADE_UNAVAILABLE_REASON, _, _)) => {
-            FailedUpgradeRouteDisposition::RetainAdmittedCore
-        }
-        _ => FailedUpgradeRouteDisposition::RetireAttempt,
-    }
 }
 
 impl ProjectOpenInputs<'_> {
@@ -904,20 +812,24 @@ impl ProjectOpenInputs<'_> {
         log_project_open_phase(self.canonical_project_path, phase, detail, since);
     }
 
-    #[inline]
-    fn phase_checkpoint(&self, phase: ProjectOpenFailurePhase) -> Result<()> {
-        #[cfg(test)]
-        {
-            PROJECT_OPEN_REACHED_PHASE.store(phase as u8, Ordering::Release);
-            PROJECT_OPEN_PHASE_CHANGED.notify_waiters();
-            if PROJECT_OPEN_FAILURE_AFTER_PHASE.load(Ordering::Acquire) == phase as u8 {
-                PROJECT_OPEN_FAILURE_AFTER_PHASE.store(0, Ordering::Release);
-                return Err(TraceDecayError::Config {
-                    message: format!("injected project-open failure after {phase:?}"),
-                });
-            }
+    /// Opening the graph started the process-global Context Scout owner, which
+    /// holds that graph's `Database`. A failed open leaves no server to retire
+    /// it, and while registered its lease keeps the store runtime from ever
+    /// closing, so its WAL is never truncated. An owner that another published
+    /// server over the same database still serves stays registered.
+    async fn retire_failed_open_scout_owner(&self, cg: &tracedecay_project::project::TraceDecay) {
+        let graph_db_path = cg.db().canonical_database_path();
+        let served = self
+            .store_administration
+            .project_servers()
+            .lock()
+            .await
+            .servers
+            .keys()
+            .any(|key| same_canonical_path(&key.owner.graph_db_path, graph_db_path));
+        if !served && let Some(project_id) = hook_project_id_for_layout(cg.hook_store_layout()) {
+            unregister_registered_context_scout_owner(project_id, graph_db_path);
         }
-        Ok(())
     }
 
     /// Route admission: registry enrollment, the published-server cache, the
@@ -946,7 +858,11 @@ impl ProjectOpenInputs<'_> {
             )));
         }
 
-        let gate = project_open_gate(self.project_open_gates, &route).await;
+        // Discovery runs before the per-route gate and the process-wide
+        // capacity gate. A hung walk must refuse this project, not hold either
+        // lock while it sits in `open()`.
+        ensure_checkout_topology_before_admission(self.canonical_project_path).await?;
+        let gate = project_open_gate(self.project_open_gates, &route).await?;
         let singleflight = tokio::select! {
             biased;
             () = self.cancellation.cancelled() => return Err(project_open_cancellation_error()),
@@ -1007,6 +923,18 @@ impl ProjectOpenInputs<'_> {
             )
             .await?,
         );
+        let opened = self.admit_opened_graph(route, Arc::clone(&cg)).await;
+        if opened.is_err() {
+            self.retire_failed_open_scout_owner(&cg).await;
+        }
+        opened
+    }
+
+    async fn admit_opened_graph(
+        &self,
+        route: &ProjectRouteKey,
+        cg: Arc<tracedecay_project::project::TraceDecay>,
+    ) -> Result<GraphOpen> {
         let mut key = ProjectServerKey::from_open_project(&cg, self.handshake)?;
         if let Some(shared_root) = shared_primary_checkout_root(self.canonical_project_path) {
             key.project_root = shared_root;
@@ -1061,9 +989,12 @@ impl ProjectOpenInputs<'_> {
     /// Build every route-owned port and construct the core (graph, search,
     /// diagnostics) server candidate. Nothing is published yet.
     #[hotpath::measure(label = "daemon.project.compose.core", future = true)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Core server composition wires one project's ports into a single McpServer."
+    #[cfg_attr(
+        not(feature = "hotpath"),
+        expect(
+            clippy::too_many_lines,
+            reason = "Core server composition wires one project's ports into a single McpServer."
+        )
     )]
     async fn compose_core_server(
         &self,
@@ -1256,6 +1187,9 @@ impl ProjectOpenInputs<'_> {
                 dashboard_code_index_freshness_reader: project_dashboard_freshness_reader(
                     self.invocation.code_index_schedulers.clone(),
                 ),
+                code_index_readiness_waiter: project_readiness_waiter(
+                    self.invocation.code_index_schedulers.clone(),
+                ),
                 dashboard_feedback_status_reader:
                     tracedecay_dashboard_api::feedback_api::feedback_status_reader(
                         self.invocation.feedback_runtime_registrar(),
@@ -1405,15 +1339,23 @@ impl ProjectOpenInputs<'_> {
                 .await?,
             )
         };
-        // The source-edit owner is the core's only runtime component, so its
-        // registration is what creates the registry slot this publication
-        // attempt fences. A read-only database registers none.
+        // Graph reads are served from the core onward, read-only or not; the
+        // full server re-registers as their owner once it is swapped in.
+        resolved
+            .register_graph_tool_owner(
+                self.canonical_project_path,
+                core.ports.code_index.scope.clone(),
+            )
+            .await?;
+        // The source-edit and graph-tool owners are the core's runtime
+        // components, so their registration creates the registry slot this
+        // publication attempt fences.
         let publication_attempt = self
             .invocation
             .service
             .project_runtimes
             .begin_publication(self.canonical_project_path);
-        if publication_attempt.is_none() && core_source_edit_mutation.is_some() {
+        if publication_attempt.is_none() {
             return Err(TraceDecayError::Config {
                 message: "project runtime disappeared before its publication began".to_owned(),
             });
@@ -1434,7 +1376,6 @@ impl ProjectOpenInputs<'_> {
         Ok(CoreRouteActivation {
             publication_attempt,
             core_source_edit_mutation,
-            http_route_attempt: None,
         })
     }
 
@@ -1443,7 +1384,7 @@ impl ProjectOpenInputs<'_> {
     #[hotpath::measure(label = "daemon.project.compose.admit_sessions", future = true)]
     async fn admit_session_databases(
         &self,
-        cg: &Arc<crate::project::TraceDecay>,
+        cg: &Arc<tracedecay_project::project::TraceDecay>,
         project_id: &tracedecay_domain::ProjectId,
         project_database_is_read_only: bool,
     ) -> Result<AdmittedSessionDatabases> {
@@ -1491,25 +1432,26 @@ impl ProjectOpenInputs<'_> {
     }
 
     /// Construct the full server over the admitted session databases and
-    /// runtime owners. The owner-registry cutover is deliberately deferred to
-    /// `finish_full_server`, after every required owner and publication fence
-    /// has succeeded.
+    /// runtime owners, then swap it in for the core.
     ///
-    /// The core remains the route's published server while this private
-    /// candidate is assembled. Every error therefore returns through the
-    /// caller's transaction funnel; the candidate has no registry or HTTP
-    /// reachability until `finish_full_server` commits it. Retired relational
-    /// graph repair is deliberately absent; the bounded code-index activation
-    /// owns background indexing.
+    /// The core is reachable from here on, so every step leaves this function
+    /// with an error instead of returning behind a published route: the
+    /// caller's funnel owns retiring the owner. Retired relational graph repair
+    /// is deliberately absent; the bounded code-index activation owns
+    /// background indexing.
     #[hotpath::measure(label = "daemon.project.compose.construct_full", future = true)]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "Full server construction is one owner-and-port assembly for a published project route."
+    #[cfg_attr(
+        not(feature = "hotpath"),
+        expect(
+            clippy::too_many_lines,
+            reason = "Full server construction is one owner-and-port assembly for a published project route."
+        )
     )]
     async fn construct_full_server(
         &self,
         opened: &OpenedProjectGraph,
         core: &ComposedCoreServer,
+        resolved: &Arc<crate::mcp::McpServer>,
     ) -> Result<PublishedFullServer> {
         let OpenedProjectGraph {
             cg,
@@ -1535,7 +1477,13 @@ impl ProjectOpenInputs<'_> {
                 *project_database_is_read_only,
             )
             .await?;
-        self.phase_checkpoint(ProjectOpenFailurePhase::SessionDatabases)?;
+        self.invocation
+            .service
+            .mount_session_holder_databases([
+                core.registered_profile_db.clone(),
+                user_session_db.clone(),
+            ])
+            .await;
         let delivery_access = daemon_owned_project_source_access_at(
             &code_index.scope,
             self.canonical_project_path,
@@ -1553,7 +1501,6 @@ impl ProjectOpenInputs<'_> {
             &delivery_access,
         )
         .await?;
-        self.phase_checkpoint(ProjectOpenFailurePhase::ObservabilityMounted)?;
         let host_admission_broker = Some(
             self.store_administration
                 .host_admission_broker(&session_db)
@@ -1612,7 +1559,6 @@ impl ProjectOpenInputs<'_> {
                 project_id: code_index.project_id.clone(),
                 profile_root: core.profile_identity.profile_root().to_path_buf(),
                 project_root: self.canonical_project_path.to_path_buf(),
-                scope: code_index.scope.clone(),
                 transcript_source_home: core.transcript_source_home.clone(),
                 project_sessions: session_db.clone(),
                 user_sessions: user_session_db.clone(),
@@ -1689,10 +1635,6 @@ impl ProjectOpenInputs<'_> {
             );
         let (delivery_settlement_authority, delivery_settlement_recorder) =
             project_delivery_settlement_ports(self.invocation, self.canonical_project_path).await?;
-        let profile_session_refresh = self
-            .store_administration
-            .profile_session_refresh_service(&user_session_db)
-            .await;
         let full_context = core
             .publish_route_ports(
                 crate::mcp::server::McpServerConstructionContext::daemon_owned(
@@ -1710,7 +1652,6 @@ impl ProjectOpenInputs<'_> {
                         background_cpu,
                         project_session_refresh_wake,
                         user_session_refresh_wake,
-                        profile_session_refresh,
                         session_sync_service,
                         database_owner_reconciler: Arc::clone(&core.database_owner_reconciler),
                         project_routes: self.store_administration.project_routes(),
@@ -1733,21 +1674,6 @@ impl ProjectOpenInputs<'_> {
             .with_remote_operational_status(remote_operational_status)
             .with_dashboard_doctor_report_reader(doctor_report_reader)
             .with_startup_catch_up_enabled(self.runtime.startup_catch_up());
-        let session_retrieval = full_context
-            .project_session_application_retrieval_service(&code_index.scope)
-            .await?;
-        project_open_owners::register_project_open_core_read_owners(
-            self.invocation,
-            self.canonical_project_path,
-            code_index.project_id.as_str(),
-            Arc::clone(cg),
-            Arc::clone(&code_index.graph_projection_read_port),
-            Arc::clone(&code_index.ignored_dependency_admission),
-            session_db.clone(),
-            session_retrieval,
-        )
-        .await?;
-        self.log_phase("core_read_owners_registered", None, self.started);
         #[cfg(feature = "memory-provider-host")]
         let provider_full_mount =
             tracedecay_daemon_service::retained_owner::mount_project_memory_provider_full(
@@ -1819,18 +1745,17 @@ impl ProjectOpenInputs<'_> {
                 )));
             }
         }
-        if full_candidate
-            .install_generation_census_reader(Arc::clone(&code_index.generation_census_reader))
-            .is_err()
-        {
-            #[cfg(feature = "memory-provider-host")]
+        let census_installed = full_candidate
+            .install_generation_census_reader(Arc::clone(&code_index.generation_census_reader));
+        #[cfg(feature = "memory-provider-host")]
+        if census_installed.is_err() {
             shutdown_failed_provider_full_mount(&provider_full_mount, self.canonical_project_path)
                 .await;
             full_candidate.shutdown().await;
-            return Err(TraceDecayError::Config {
-                message: "full MCP generation census authority was already installed".to_owned(),
-            });
         }
+        census_installed.map_err(|_| TraceDecayError::Config {
+            message: "full MCP generation census authority was already installed".to_owned(),
+        })?;
         self.log_phase("mcp_full_constructed", None, full_construction_started);
         if *core.current_key.lock().await != *key {
             #[cfg(feature = "memory-provider-host")]
@@ -1841,18 +1766,34 @@ impl ProjectOpenInputs<'_> {
                 message: "project changed branch during full capability admission".to_owned(),
             });
         }
+        let upgraded = self
+            .store_administration
+            .project_servers()
+            .lock()
+            .await
+            .replace_ready_if(key, Arc::clone(&full_candidate), |current| {
+                Arc::ptr_eq(current, resolved)
+            });
+        if !upgraded {
+            #[cfg(feature = "memory-provider-host")]
+            shutdown_failed_provider_full_mount(&provider_full_mount, self.canonical_project_path)
+                .await;
+            full_candidate.shutdown().await;
+            return Err(TraceDecayError::Config {
+                message: "project server changed during session capability upgrade".to_owned(),
+            });
+        }
         Ok(PublishedFullServer {
             server: full_candidate,
             session_db,
-            session_holder_database_paths: Vec::new(),
             #[cfg(feature = "memory-provider-host")]
             provider_full_mount,
         })
     }
 
     /// Mount the full server's dependent owners: the source-edit lane, Git
-    /// index transactions, and the production owners. The HTTP route is a
-    /// publication surface and is committed only after the MCP owner swap.
+    /// index transactions, the production owners, the owners that depend on
+    /// them, and the HTTP application router.
     ///
     /// The widest project-open phase: the two owner registrations it awaits
     /// are the largest leaves of the open (each ~20 KB, ~80 KB when
@@ -1863,7 +1804,7 @@ impl ProjectOpenInputs<'_> {
         &self,
         opened: &OpenedProjectGraph,
         core: &ComposedCoreServer,
-        full_server: &Arc<crate::mcp::McpServer>,
+        full_server: &crate::mcp::McpServer,
         session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
         core_source_edit_mutation: Option<
             Arc<tracedecay_daemon_service::project_owner_registration::SourceEditMutationGate>,
@@ -1871,6 +1812,12 @@ impl ProjectOpenInputs<'_> {
     ) -> Result<()> {
         let full_setup_started = Instant::now();
         project_open_cancellation_checkpoint(self.cancellation)?;
+        full_server
+            .register_graph_tool_owner(
+                self.canonical_project_path,
+                core.ports.code_index.scope.clone(),
+            )
+            .await?;
         // The shared invocation registry admits one source-edit owner per
         // project root. Core publication already registered it; the full
         // upgrade reuses that owner and marks its mutation gate ready after
@@ -1894,7 +1841,6 @@ impl ProjectOpenInputs<'_> {
         )
         .await?;
         self.log_phase("git_transactions_ready", None, full_setup_started);
-        self.phase_checkpoint(ProjectOpenFailurePhase::GitTransactions)?;
         let dependent_owners = if opened.project_database_is_read_only {
             None
         } else {
@@ -1914,7 +1860,6 @@ impl ProjectOpenInputs<'_> {
             )
             .await?;
             self.log_phase("independent_owners_registered", None, full_setup_started);
-            self.phase_checkpoint(ProjectOpenFailurePhase::IndependentOwners)?;
             Some(state)
         };
         project_open_cancellation_checkpoint(self.cancellation)?;
@@ -1927,14 +1872,20 @@ impl ProjectOpenInputs<'_> {
             )
             .await?;
             self.log_phase("production_owners_registered", None, full_setup_started);
+            mount_http_application_router(
+                self.http_application_registry,
+                &core.project_id,
+                self.canonical_project_path,
+            )
+            .await?;
+            self.log_phase("http_application_mounted", None, full_setup_started);
         }
-        self.phase_checkpoint(ProjectOpenFailurePhase::DependentOwners)?;
         Ok(())
     }
 
-    /// Mount full owners, then atomically commit runtime, MCP-registry, and
-    /// HTTP reachability. The displaced core is retired only after that commit
-    /// succeeds.
+    /// The full server is live in the registry: mount its dependent owners,
+    /// commit the runtime publication, drain and retire the displaced core,
+    /// and start code indexing.
     #[hotpath::measure(label = "daemon.project.compose.publish_full", future = true)]
     async fn finish_full_server(
         &self,
@@ -1942,162 +1893,89 @@ impl ProjectOpenInputs<'_> {
         core: &ComposedCoreServer,
         activation: &CoreRouteActivation,
         resolved: &Arc<crate::mcp::McpServer>,
-        full: &mut PublishedFullServer,
+        full_server: &Arc<crate::mcp::McpServer>,
+        session_db: tracedecay_global_db::RegisteredGlobalDbLeaseV1,
+        #[cfg(feature = "memory-provider-host")] provider_full_mount: &Arc<
+            tracedecay_daemon_service::retained_owner::ProjectMemoryProviderFullMountV1,
+        >,
     ) -> Result<()> {
-        // Keep the core in the registry while this whole block runs. A full
-        // candidate is only dispatchable after every owner mount, deferred
-        // provider activation, and the runtime publication fence succeeds.
-        let mut registry_published = false;
-        let result = async {
-            self.log_phase("session_capabilities_prepared", None, self.started);
-            #[cfg(feature = "memory-provider-host")]
-            full.provider_full_mount
-                .activate_after_publication(full.session_db.observation_store(), self.cancellation)
-                .await
-                .map_err(|error| {
-                    provider_full_upgrade_unavailable(format!(
-                        "memory provider activation is unavailable: {error}"
-                    ))
-                })?;
-            self.phase_checkpoint(ProjectOpenFailurePhase::ProviderActivated)
-                .map_err(|error| {
-                    provider_full_upgrade_unavailable(format!(
-                        "memory provider activation did not complete: {error}"
-                    ))
-                })?;
-            full.session_holder_database_paths = self
+        self.log_phase("session_capabilities_published", None, self.started);
+        #[cfg(feature = "memory-provider-host")]
+        provider_full_mount
+            .activate_after_publication(session_db.observation_store(), self.cancellation)
+            .await
+            .map_err(|error| {
+                provider_full_upgrade_unavailable(format!(
+                    "memory provider activation is unavailable: {error}"
+                ))
+            })?;
+        Box::pin(self.mount_full_server_owners(
+            opened,
+            core,
+            full_server.as_ref(),
+            session_db,
+            activation.core_source_edit_mutation.clone(),
+        ))
+        .await?;
+        if *core.current_key.lock().await != opened.key {
+            return Err(TraceDecayError::Config {
+                message: "project changed branch during full capability admission".to_owned(),
+            });
+        }
+        if let Some(attempt) = &activation.publication_attempt
+            && !self
                 .invocation
                 .service
-                .mount_session_holder_databases([
-                    core.registered_profile_db.clone(),
-                    full.session_db.clone(),
-                ])
-                .await;
-            self.phase_checkpoint(ProjectOpenFailurePhase::SessionHoldersMounted)?;
-            Box::pin(self.mount_full_server_owners(
-                opened,
-                core,
-                &full.server,
-                full.session_db.clone(),
-                activation.core_source_edit_mutation.clone(),
-            ))
-            .await?;
-            if *core.current_key.lock().await != opened.key {
-                return Err(TraceDecayError::Config {
-                    message: "project changed branch during full capability admission".to_owned(),
-                });
-            }
-            if let Some(attempt) = &activation.publication_attempt
-                && !self
-                    .invocation
-                    .service
-                    .project_runtimes
-                    .mark_publication_ready(attempt)
-            {
-                return Err(TraceDecayError::Config {
-                    message: "project runtime publication attempt was superseded".to_owned(),
-                });
-            }
-            self.phase_checkpoint(ProjectOpenFailurePhase::RuntimeReady)?;
-            // This is the single visibility transition for the full server.
-            // Until it succeeds, all registry lookups continue to resolve the
-            // core and the full candidate has no dispatch path.
-            let upgraded = self
-                .store_administration
-                .project_servers()
-                .lock()
-                .await
-                .replace_ready_if(&opened.key, Arc::clone(&full.server), |current| {
-                    Arc::ptr_eq(current, resolved)
-                });
-            if !upgraded {
-                return Err(TraceDecayError::Config {
-                    message: "project server changed during session capability upgrade".to_owned(),
-                });
-            }
-            registry_published = true;
-            self.phase_checkpoint(ProjectOpenFailurePhase::RegistryPublished)?;
-            // HTTP is a separate cache and therefore gets its route only after
-            // the MCP cutover. Any failure below is rolled back to the core and
-            // removed from the HTTP registry by the transaction funnel.
-            mount_http_application_router(
-                self.http_application_registry,
-                &core.project_id,
-                self.canonical_project_path,
-                activation.http_route_attempt.as_ref(),
-            )
-            .await?;
-            self.log_phase("http_application_mounted", None, self.started);
-            self.phase_checkpoint(ProjectOpenFailurePhase::HttpMounted)?;
-            resolved.revoke_project_server_responses_after_drain().await;
-            schedule_project_server_retirement(
-                self.store_administration,
-                opened.key.owner.clone(),
-                vec![Arc::clone(resolved)],
-                None,
-            )
-            .await;
-            full.server.publish_doctor_report();
-            let code_index_status = match core.code_index_activation.automatic_admission() {
-                code_index_scheduler::CodeIndexAutomaticAdmissionV1::Admitted => {
-                    if core.code_index_activation.activate() {
-                        "warming"
-                    } else {
-                        "unavailable"
-                    }
-                }
-                code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled => {
-                    log_daemon_event(
-                        "code_index_activation_skipped",
-                        &[
-                            ("project", self.canonical_project_path.display().to_string()),
-                            ("reason", "linked_worktree_disabled".to_owned()),
-                        ],
-                    );
-                    "linked_worktree_disabled"
-                }
-            };
-            self.log_phase(
-                "full_published",
-                Some(("code_index", code_index_status.to_owned())),
-                self.started,
-            );
-            Ok(())
+                .project_runtimes
+                .mark_publication_ready(attempt)
+        {
+            return Err(TraceDecayError::Config {
+                message: "project runtime publication attempt was superseded".to_owned(),
+            });
         }
+        // The registry cutover prevents new core leases. Existing core
+        // requests may finish while dependent owners warm, then the displaced
+        // server is drained without closing the shared graph.
+        resolved.revoke_project_server_responses_after_drain().await;
+        schedule_project_server_retirement(
+            self.store_administration,
+            opened.key.owner.clone(),
+            vec![Arc::clone(resolved)],
+            None,
+        )
         .await;
-        if result.is_err() {
-            // Restore the core before returning to the common failure funnel;
-            // this makes the candidate unreachable even when a later mount
-            // fails after the registry swap.
-            if let Some(attempt) = activation.http_route_attempt.as_ref() {
-                self.http_application_registry
-                    .remove_project_route_if(attempt)
-                    .await;
-            }
-            if registry_published {
-                let restored = self
-                    .store_administration
-                    .project_servers()
-                    .lock()
-                    .await
-                    .swap_ready_if(&opened.key, Arc::clone(resolved), |current| {
-                        Arc::ptr_eq(current, &full.server)
-                    });
-                if restored.is_none() {
-                    tracing::warn!(
-                        project = %self.canonical_project_path.display(),
-                        "full project publication rollback found a different registry owner"
-                    );
+        full_server.publish_doctor_report();
+        let code_index_status = match core.code_index_activation.automatic_admission() {
+            code_index_scheduler::CodeIndexAutomaticAdmissionV1::Admitted => {
+                if core.code_index_activation.activate() {
+                    "warming"
+                } else {
+                    "unavailable"
                 }
             }
-        }
-        result
+            code_index_scheduler::CodeIndexAutomaticAdmissionV1::LinkedWorktreeDisabled => {
+                log_daemon_event(
+                    "code_index_activation_skipped",
+                    &[
+                        ("project", self.canonical_project_path.display().to_string()),
+                        ("reason", "linked_worktree_disabled".to_owned()),
+                    ],
+                );
+                "linked_worktree_disabled"
+            }
+        };
+        self.log_phase(
+            "full_published",
+            Some(("code_index", code_index_status.to_owned())),
+            self.started,
+        );
+        Ok(())
     }
 
-    /// Unwind a failed full publication as one transaction. Provider-only
-    /// failures may retain the already-admitted core after every full-only
-    /// owner has been retired. Admission, owner-mount, cancellation, rekey, and
-    /// replacement failures retire the complete attempt.
+    /// A failed upgrade either degrades the route to the still-published core
+    /// (logging the failure and retiring the full server if it had gone live)
+    /// or, when the core cannot be reclaimed, retires every server this
+    /// attempt published and fails the open.
     #[hotpath::measure(label = "daemon.project.compose.settle_failed_upgrade", future = true)]
     async fn settle_failed_full_upgrade(
         &self,
@@ -2105,65 +1983,62 @@ impl ProjectOpenInputs<'_> {
         core: &ComposedCoreServer,
         activation: &CoreRouteActivation,
         resolved: &Arc<crate::mcp::McpServer>,
-        published_full_server: Option<PublishedFullServer>,
-        disposition: FailedUpgradeRouteDisposition,
+        published_full_server: Option<Arc<crate::mcp::McpServer>>,
         error: TraceDecayError,
     ) -> Result<()> {
         let failed_key = core.current_key.lock().await.clone();
-        let retain_core = disposition == FailedUpgradeRouteDisposition::RetainAdmittedCore
-            && !self.cancellation.is_cancelled()
-            && failed_key == opened.key
-            && self
-                .store_administration
-                .project_servers()
-                .lock()
-                .await
-                .get_ready(&failed_key)
-                .is_some_and(|current| Arc::ptr_eq(current, resolved));
+        let retain_core = !self.cancellation.is_cancelled() && failed_key == opened.key;
+        let (core_retained, failed_full_server) = if retain_core {
+            reclaim_core_after_failed_upgrade(
+                self.store_administration,
+                &opened.key,
+                resolved,
+                published_full_server.as_ref(),
+            )
+            .await
+        } else {
+            (false, None)
+        };
+        // The retained core owns preview-only source editing and never
+        // receives the full server's Git mutation authority. Once the upgrade
+        // fails, its mutation lane must become terminal rather than remaining
+        // in a warming state forever.
         if let Some(mutation) = &activation.core_source_edit_mutation {
             mutation.mark_failed();
         }
-        // The runtime publication identity is the immutable CAS token for
-        // this attempt. A rekeyed/replaced project must retain its newer
-        // publication while this failed attempt is being unwound.
-        let publication_is_current =
-            activation
-                .publication_attempt
-                .as_ref()
-                .is_some_and(|attempt| {
-                    self.invocation
-                        .service
-                        .project_runtimes
-                        .mark_publication_failed(attempt)
-                });
-        let core_retained = retire_failed_project_open_owner(
-            self.store_administration,
-            self.invocation,
-            self.http_application_registry,
-            self.canonical_project_path,
-            opened,
-            &failed_key,
-            resolved,
-            published_full_server,
-            activation.http_route_attempt.as_ref(),
-            &core.route_registered,
-            FailedProjectOpenSettlement {
-                publication_is_current,
-                publication_attempt_present: activation.publication_attempt.is_some(),
-                retain_core,
-            },
-        )
-        .await;
         if core_retained {
+            if let Some(attempt) = &activation.publication_attempt {
+                self.invocation
+                    .service
+                    .project_runtimes
+                    .mark_publication_failed(attempt);
+            }
+            if let Some(failed_full_server) = failed_full_server {
+                failed_full_server.revoke_project_server_responses();
+                schedule_project_server_retirement(
+                    self.store_administration,
+                    opened.key.owner.clone(),
+                    vec![failed_full_server],
+                    None,
+                )
+                .await;
+            }
             self.log_phase(
                 "full_upgrade_degraded",
                 Some(("error", error.to_string())),
                 self.started,
             );
-            Ok(())
-        } else {
-            Err(error)
+            return Ok(());
         }
+        retire_failed_project_open_owner(
+            self.store_administration,
+            &failed_key,
+            resolved,
+            published_full_server.is_some(),
+            &core.route_registered,
+        )
+        .await;
+        Err(error)
     }
 }
 
@@ -2209,11 +2084,11 @@ struct ProjectCodeIndexAuthorities {
     generation_census_reader: tracedecay_runtime_core::runtime_telemetry::GenerationCensusReader,
     graph_read_admission_port: crate::mcp::server::CodeGraphReadAdmissionPort,
     search_authority: tracedecay_query::code_search::CodeIndexSearchAuthorityV1,
-    search_executor: crate::mcp::server::CodeIndexSearchExecutor,
-    similar_executor: crate::mcp::server::CodeIndexSimilarExecutor,
-    redundancy_executor: crate::mcp::server::CodeIndexRedundancyExecutor,
-    branch_diff_executor: crate::mcp::server::CodeIndexBranchDiffExecutor,
-    semantic_admin_executor: crate::mcp::server::SemanticAdminExecutorV1,
+    search_executor: tracedecay_query::code_search::CodeIndexSearchExecutor,
+    similar_executor: tracedecay_query::code_search::CodeIndexSimilarExecutor,
+    redundancy_executor: tracedecay_query::code_search::CodeIndexRedundancyExecutor,
+    branch_diff_executor: tracedecay_query::code_search::CodeIndexBranchDiffExecutor,
+    semantic_admin_executor: tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1,
 }
 
 /// Resolve the project's search identity and bind every code-index read port to
@@ -2221,7 +2096,7 @@ struct ProjectCodeIndexAuthorities {
 /// not the handshake path, so a relocated store still binds its own scope.
 fn project_code_index_authorities(
     invocation: &DaemonInvocationState,
-    cg: &Arc<crate::project::TraceDecay>,
+    cg: &Arc<tracedecay_project::project::TraceDecay>,
     canonical_project_path: &Path,
     authoritative_project_id: &str,
     profile_identity: &profile_identity::LocalProfileIdentityAuthorityV1,
@@ -2326,7 +2201,7 @@ fn project_code_index_authorities(
 fn project_semantic_admin_executor(
     schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
     scope: tracedecay_contracts::ResolvedScope,
-) -> crate::mcp::server::SemanticAdminExecutorV1 {
+) -> tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1 {
     Arc::new(move |request, deadline, cancellation| {
         let schedulers = schedulers.clone();
         let scope = scope.clone();
@@ -2549,6 +2424,20 @@ fn project_dashboard_freshness_reader(
     reader
 }
 
+/// `tracedecay_status` `wait_for` over this route's code-index schedulers.
+fn project_readiness_waiter(
+    schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
+) -> tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaiter {
+    Arc::new(move |project_root, target, budget| {
+        let schedulers = schedulers.clone();
+        Box::pin(async move {
+            schedulers
+                .wait_for_readiness(&project_root, target, budget)
+                .await
+        })
+    })
+}
+
 fn project_dashboard_pr_autotrack_reader()
 -> tracedecay_dashboard_api::PrAutoTrackManagedSummaryReader {
     Arc::new(|store_root| {
@@ -2572,7 +2461,7 @@ fn project_dashboard_pr_autotrack_reader()
 /// never fatal: telemetry must not fail an otherwise healthy project open.
 fn register_route_store_telemetry(
     sampling: &tracedecay_maintenance::telemetry::StoreTelemetrySamplingRegistry,
-    cg: &Arc<crate::project::TraceDecay>,
+    cg: &Arc<tracedecay_project::project::TraceDecay>,
     scope: &tracedecay_contracts::ResolvedScope,
     session_databases: [&tracedecay_global_db::RegisteredGlobalDb; 3],
 ) {
@@ -2652,235 +2541,66 @@ async fn shutdown_failed_provider_full_mount(
     }
 }
 
-/// Retire every resource this failed open attempt published. The owner
-/// registry, HTTP cache, invocation runtime, refresh schedulers, provider
-/// workers, and database leases all have independent retention, so rollback
-/// must visit each one explicitly.
+/// Put the published core back in front of a failed full upgrade. Returns
+/// whether the core is the live server again, plus the displaced full server
+/// when one had already been published.
+async fn reclaim_core_after_failed_upgrade(
+    store_administration: &StoreAdministration,
+    key: &ProjectServerKey,
+    resolved: &Arc<crate::mcp::McpServer>,
+    published_full_candidate: Option<&Arc<crate::mcp::McpServer>>,
+) -> (bool, Option<Arc<crate::mcp::McpServer>>) {
+    let mut servers = store_administration.project_servers().lock().await;
+    match published_full_candidate {
+        Some(failed_full_server) => {
+            let displaced = servers.swap_ready_if(key, Arc::clone(resolved), |current| {
+                Arc::ptr_eq(current, failed_full_server)
+            });
+            (displaced.is_some(), displaced)
+        }
+        None => (
+            servers
+                .get_ready(key)
+                .is_some_and(|current| Arc::ptr_eq(current, resolved)),
+            None,
+        ),
+    }
+}
+
+/// Retire every server this failed open attempt published, including the core
+/// itself when session capabilities had already gone live.
 #[hotpath::measure(label = "daemon.project.compose.retire_failed", future = true)]
 async fn retire_failed_project_open_owner(
     store_administration: &StoreAdministration,
-    invocation: &DaemonInvocationState,
-    http_application_registry: &http_application::DaemonHttpApplicationRegistry,
-    canonical_project_path: &Path,
-    opened: &OpenedProjectGraph,
     failed_key: &ProjectServerKey,
     resolved: &Arc<crate::mcp::McpServer>,
-    published_full_server: Option<PublishedFullServer>,
-    http_route_attempt: Option<&http_application::ProjectHttpRouteAttempt>,
+    session_capabilities_published: bool,
     route_registered: &Arc<AtomicBool>,
-    settlement: FailedProjectOpenSettlement,
-) -> bool {
-    let FailedProjectOpenSettlement {
-        publication_is_current,
-        publication_attempt_present,
-        retain_core,
-    } = settlement;
-    let retain_core = retain_core && (publication_is_current || !publication_attempt_present);
-    let full_server = published_full_server
-        .as_ref()
-        .map(|full| Arc::clone(&full.server));
-    let session_holder_database_paths = published_full_server
-        .as_ref()
-        .map(|full| full.session_holder_database_paths.clone())
-        .unwrap_or_default();
-    let (owns_registry, removed) = {
-        let mut servers = store_administration.project_servers().lock().await;
-        if retain_core {
-            (
-                servers
-                    .get_ready(failed_key)
-                    .is_some_and(|server| Arc::ptr_eq(server, resolved)),
-                Vec::new(),
-            )
-        } else {
-            let removed = servers
-                .remove_if(failed_key, |server| {
-                    Arc::ptr_eq(server, resolved)
-                        || full_server
-                            .as_ref()
-                            .is_some_and(|full| Arc::ptr_eq(server, full))
-                })
-                .into_iter()
-                .collect::<Vec<_>>();
-            (!removed.is_empty(), removed)
-        }
-    };
-    // Registry removal is the attempt's owner-registry CAS. If a newer
-    // generation already replaced this key, leave its route and shared owner
-    // state untouched. The immutable runtime token below gives the same CAS
-    // guarantee for publication state.
-    let owns_attempt = owns_registry && (publication_is_current || !publication_attempt_present);
-    let core_retained = retain_core && owns_registry;
-    if owns_registry && !core_retained {
-        route_registered.store(false, Ordering::Release);
-    }
-    if let Some(attempt) = http_route_attempt
-        && owns_registry
+) {
+    let mut removed = store_administration
+        .project_servers()
+        .lock()
+        .await
+        .remove_owner(&failed_key.owner);
+    if session_capabilities_published && removed.iter().all(|server| !Arc::ptr_eq(server, resolved))
     {
-        http_application_registry
-            .remove_project_route_if(attempt)
-            .await;
+        removed.push(Arc::clone(resolved));
     }
     for server in &removed {
         server.revoke_project_server_responses();
     }
-    let full_is_removed = full_server
-        .as_ref()
-        .is_some_and(|full| removed.iter().any(|server| Arc::ptr_eq(server, full)));
-    if owns_attempt && !core_retained {
-        store_administration
-            .session_temporal_refresh_schedulers()
-            .retire_project(&failed_key.owner)
-            .await;
-    }
-    if !removed.is_empty() {
-        super::project_server_lifecycle::retire_project_servers(
-            removed,
-            Some(Arc::clone(route_registered)),
-        )
-        .await;
-    }
-
-    // A full candidate is deliberately retained through this function even
-    // when it never entered the registry. Shut down its provider journeys and
-    // server task graph before the last Arc drops.
-    if let Some(full) = published_full_server {
-        #[cfg(feature = "memory-provider-host")]
-        shutdown_failed_provider_full_mount(&full.provider_full_mount, canonical_project_path)
-            .await;
-        if !full_is_removed {
-            full.server.revoke_project_server_responses();
-            full.server.shutdown().await;
-        }
-    }
-    // Eligible provider failures happen before any full-only invocation owner
-    // is mounted. The core route therefore keeps its core read owners and the
-    // session authorities they were built from; only the private full MCP and
-    // provider candidate above require retirement.
-    if core_retained {
-        return true;
-    }
-
-    let project_sessions_path = failed_key
-        .owner
-        .store_root
-        .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
-    let project_id = failed_key
-        .owner
-        .project_id
-        .clone()
-        .and_then(|project_id| tracedecay_domain::ProjectId::new(project_id).ok());
-    if project_id.is_none() {
-        tracing::warn!(
-            project = %canonical_project_path.display(),
-            "failed project-open owner omitted its authoritative project identity"
-        );
-    }
-    let identity = store_administration.profile_identity().ok().cloned();
-    if identity.is_none() {
-        tracing::warn!(
-            project = %canonical_project_path.display(),
-            "failed project-open owner profile identity was unavailable during rollback"
-        );
-    }
-
-    // Keep the final holder-lease release below unconditional. A malformed
-    // identity or a profile lookup failure must not turn rollback into an
-    // early return that strands the session stores mounted by this attempt.
-    if owns_attempt && let Some(project_id) = project_id.as_ref() {
-        if let Some(identity) = identity.as_ref() {
-            let mut project_roots = std::collections::BTreeSet::new();
-            project_roots.insert(canonical_project_path.to_path_buf());
-            project_roots.insert(failed_key.project_root.clone());
-            match invocation
-                .quiesce_project_runtime_owners(identity.profile_id(), project_id, &project_roots)
-                .await
-            {
-                Ok(quiescence) => {
-                    // Failed project publication is retryable. Dropping the
-                    // reopenable quiescence lease after the owner drain
-                    // releases the root fence; terminal retirement would make
-                    // the next open fail before it could rebuild the owners.
-                    drop(quiescence);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        project = %canonical_project_path.display(),
-                        %error,
-                        "failed project-open invocation owners did not quiesce cleanly"
-                    );
-                }
-            }
-        }
-        if let Err(error) = store_administration
-            .git_index_transaction_services()
-            .retire_project_database(project_id, &project_sessions_path)
-            .await
-        {
-            tracing::warn!(
-                project = %canonical_project_path.display(),
-                %error,
-                "failed project-open Git transaction owner did not retire cleanly"
-            );
-        }
-        if let Err(error) = store_administration
-            .native_integration_services()
-            .retire_project_database(project_id, &project_sessions_path)
-            .await
-        {
-            tracing::warn!(
-                project = %canonical_project_path.display(),
-                %error,
-                "failed project-open Native integration owner did not retire cleanly"
-            );
-        }
-        if let Some(identity) = identity.as_ref()
-            && let Err(error) = store_administration
-                .session_sync_service()
-                .retire_project(identity.profile_id(), project_id)
-                .await
-        {
-            tracing::warn!(
-                project = %canonical_project_path.display(),
-                %error,
-                "failed project-open session sync owner did not retire cleanly"
-            );
-        }
-        super::branch_admin::retire_registered_context_scout_owner(
-            project_id,
-            &failed_key.owner.graph_db_path,
-        );
-    }
-    if owns_attempt {
-        super::hook_v2_replay_consumer::shutdown_hook_v2_replay_consumer(
-            &opened.cg.hook_store_layout().data_root,
-        )
-        .await;
-    }
-    let telemetry_sampling = store_administration.store_telemetry_sampling();
-    if owns_attempt {
-        telemetry_sampling.release_retained_handle(&project_sessions_path);
-        if !core_retained {
-            telemetry_sampling.release_retained_handle(&failed_key.owner.graph_db_path);
-        }
-    }
-    if owns_attempt
-        && let Some(project_id) = project_id.as_ref()
-        && let Ok(runtime_registry) = store_administration.session_runtime_registry().await
-    {
-        let _ = runtime_registry
-            .retire_project_session_relation_graph(project_id)
-            .await;
-        let _ = runtime_registry
-            .retire_project_memory_graph(project_id)
-            .await;
-        runtime_registry
-            .drop_project_runtime_caches(project_id)
-            .await;
-    }
-    invocation
-        .service
-        .unmount_session_holder_databases(session_holder_database_paths)
-        .await;
-    core_retained
+    debug_assert!(
+        !removed.is_empty(),
+        "failed core upgrade must retire its published owner"
+    );
+    // Request execution may itself need the owner writer held by this open
+    // attempt. The tracked retirement starts draining after the caller returns
+    // and releases that writer.
+    super::project_server_lifecycle::retire_evicted_project_owner(
+        store_administration,
+        failed_key.owner.clone(),
+        removed,
+        Some(Arc::clone(route_registered)),
+    )
+    .await;
 }

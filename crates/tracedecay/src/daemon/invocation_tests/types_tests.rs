@@ -115,7 +115,7 @@ async fn hook_orchestration_backpressures_without_waiting() {
     // A distinct hook event at a distinct work address is real new work, so it
     // must contend for the single permit rather than join or supersede the
     // admitted boundary. Address identity is the envelope's project, repository,
-    // worktree, and protected session — not the event id or scout lifecycle.
+    // worktree, and protected session, not the event id or scout lifecycle.
     let mut other_envelope = hook_envelope(HookEventV2::SavedEdit {
         file_id: [8; 16],
         changed_range_count: 1,
@@ -510,8 +510,8 @@ async fn retryable_hook_work_does_not_acknowledge_the_durable_admission() {
 
 /// The durable-replay half of the retryable contract: after a cycle fails
 /// retryably and settles, the spool consumer re-admits the exact same
-/// envelope. The orchestrator must run a fresh cycle for it — not treat the
-/// settled failure as still in flight — and only the genuinely successful
+/// envelope. The orchestrator must run a fresh cycle for it, not treat the
+/// settled failure as still in flight, and only the genuinely successful
 /// cycle may fire the acknowledgement that clears the pending hook work.
 #[tokio::test]
 async fn replayed_admission_after_retryable_failure_completes_a_fresh_cycle() {
@@ -1043,17 +1043,18 @@ async fn feedback_admission_conflicts_construct_zero_losing_producers() {
     let _pin = tracedecay_runtime_core::config::PinnedUserDataDir::new();
     let project = tempfile::tempdir().expect("project root");
     let project_id = ProjectId::new("project.feedback.atomic-publication").expect("project id");
-    let host = crate::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
-        tracedecay_runtime_core::storage::default_profile_root().expect("profile root"),
-        project.path(),
-        project_id.clone(),
-    )
-    .await
-    .expect("registered project runtime");
+    let host =
+        tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+            tracedecay_runtime_core::storage::default_profile_root().expect("profile root"),
+            project.path(),
+            project_id.clone(),
+        )
+        .await
+        .expect("registered project runtime");
     let graph = host
         .initialize_project_graph_for_test(
             project.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("initialized project graph");
@@ -1096,6 +1097,7 @@ async fn feedback_admission_conflicts_construct_zero_losing_producers() {
         open_feedback_runtime(
             database.clone(),
             project.path(),
+            project.path().join("response-handles"),
             scope.clone(),
             access.clone(),
         )
@@ -1168,6 +1170,7 @@ async fn feedback_admission_conflicts_construct_zero_losing_producers() {
             .open_and_register(
                 database.clone(),
                 project.path().to_path_buf(),
+                project.path().join("response-handles"),
                 scope.clone(),
                 access.clone(),
                 Arc::new(DaemonCallableCodeAuthorizationSource::production(
@@ -1255,6 +1258,7 @@ async fn feedback_admission_conflicts_construct_zero_losing_producers() {
             .open_and_register(
                 publisher_database,
                 publisher_root.clone(),
+                publisher_root.join("response-handles"),
                 publisher_scope.clone(),
                 publisher_access,
                 Arc::new(DaemonCallableCodeAuthorizationSource::production(

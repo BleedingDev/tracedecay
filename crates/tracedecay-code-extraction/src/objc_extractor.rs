@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use tree_sitter::{Node as TsNode, Tree};
 
-use crate::common::{clean_c_doc_comment, docstring_from_preceding_comments, local_node_id};
+use crate::common::{clean_c_comment, docstring_from_preceding_comments, local_node_id};
 use crate::complexity::{OBJC_COMPLEXITY, count_complexity};
 use crate::traversal::{find_descendant_by_kind, find_direct_child_by_kind};
 use crate::types::{
@@ -52,8 +52,7 @@ impl<'s> ExtractionState<'s> {
     ///
     /// The file root is pushed onto `node_stack` as the first frame when
     /// extraction begins, so iterating the stack already yields the file
-    /// path as the leading segment — prepending `self.file_path` here was
-    /// a leftover that duplicated the prefix (`<file>::<file>::Type::method`).
+    /// path as the leading segment.
     fn qualified_prefix(&self) -> String {
         self.node_stack
             .iter()
@@ -69,10 +68,6 @@ impl<'s> ExtractionState<'s> {
 
     /// Gets the text of a tree-sitter node from the source.
     fn node_text(&self, node: TsNode<'_>) -> &'s str {
-        node.utf8_text(self.source).unwrap_or("<invalid utf8>")
-    }
-
-    fn node_str(&self, node: TsNode<'_>) -> &'s str {
         node.utf8_text(self.source).unwrap_or("<invalid utf8>")
     }
 
@@ -329,7 +324,7 @@ impl ObjcExtractor {
                     .to_string()
             })
             .or_else(|| {
-                let text = state.node_str(node);
+                let text = state.node_text(node);
                 text.find('{').map(|pos| text[..pos].trim().to_string())
             });
         let qualified_name = format!("{}::{}", state.qualified_prefix(), enum_name);
@@ -1035,7 +1030,7 @@ impl ObjcExtractor {
     /// Extract docstring for an `implementation_definition` by looking at preceding
     /// sibling comments within the `class_implementation`.
     fn extract_impl_method_docstring(state: &ExtractionState, node: TsNode<'_>) -> Option<String> {
-        docstring_from_preceding_comments(state.source, node, clean_c_doc_comment)
+        docstring_from_preceding_comments(state.source, node, clean_c_comment)
     }
 
     /// Extract a method definition (has a body).
@@ -1340,7 +1335,7 @@ impl ObjcExtractor {
                 .trim()
                 .to_string();
         }
-        let text = state.node_str(node);
+        let text = state.node_text(node);
         if let Some(brace_pos) = text.find('{') {
             text[..brace_pos].trim().to_string()
         } else {
@@ -1350,7 +1345,7 @@ impl ObjcExtractor {
 
     /// Extract docstrings from preceding comment nodes.
     fn extract_docstring(state: &ExtractionState, node: TsNode<'_>) -> Option<String> {
-        docstring_from_preceding_comments(state.source, node, clean_c_doc_comment)
+        docstring_from_preceding_comments(state.source, node, clean_c_comment)
     }
 
     /// Extract first line of text as a signature.

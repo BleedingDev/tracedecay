@@ -4,11 +4,9 @@
 //! writer has flushed successfully. The daemon settles files through the
 //! project delivery authority and removes them only after that durable CAS.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-use crate::lock_admission::{LockAdmissionError, lock_until};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,8 +15,10 @@ use tracedecay_domain::{
     canonical_json_bytes, canonical_sha256, sha256_hex_suffix,
 };
 use tracedecay_private_fs::framed_log::{
-    DirectorySyncPolicy, atomic_write, read_bounded, sync_directory, validate_regular_or_missing,
+    DirectorySyncPolicy, atomic_write, is_owned_temporary_name, read_bounded,
+    remove_abandoned_temporaries, sync_directory, validate_regular_or_missing,
 };
+use tracedecay_private_fs::{FileLease, LockAdmissionError, lock_until};
 
 pub(crate) const MAX_PENDING_RECEIPTS: usize = 1_024;
 const MAX_RECEIPT_BYTES: usize = 4 * 1024;
@@ -117,15 +117,7 @@ pub enum HookDeliverySpoolError {
 #[derive(Debug)]
 pub struct HookDeliveryReceiptSpoolV1 {
     root: PathBuf,
-    _lock: File,
-}
-
-impl Drop for HookDeliveryReceiptSpoolV1 {
-    fn drop(&mut self) {
-        if let Err(error) = self._lock.unlock() {
-            tracing::warn!(error = %error, "hook delivery receipt spool lock could not be released");
-        }
-    }
+    _lock: FileLease,
 }
 
 impl HookDeliveryReceiptSpoolV1 {
@@ -171,7 +163,7 @@ impl HookDeliveryReceiptSpoolV1 {
             Some(wait_budget) => {
                 lock_until(&lock, Instant::now() + wait_budget).map_err(|error| match error {
                     LockAdmissionError::TimedOut => HookDeliverySpoolError::AdmissionTimedOut,
-                    LockAdmissionError::Io => HookDeliverySpoolError::Io,
+                    LockAdmissionError::Io(_) => HookDeliverySpoolError::Io,
                 })?;
             }
             None => {
@@ -186,7 +178,14 @@ impl HookDeliveryReceiptSpoolV1 {
                 )?;
             }
         }
-        let spool = Self { root, _lock: lock };
+        let spool = Self {
+            root,
+            _lock: FileLease::held(lock, "hooks.delivery.writer"),
+        };
+        // The lock is held now, so every staging temporary still in the root
+        // was abandoned by a killed publisher rather than owned by a live one.
+        remove_abandoned_temporaries(&spool.root, DIRECTORY_POLICY)
+            .map_err(|_| HookDeliverySpoolError::Io)?;
         spool.receipt_paths()?;
         Ok(spool)
     }
@@ -329,7 +328,7 @@ impl HookDeliveryReceiptSpoolV1 {
                 .file_name()
                 .into_string()
                 .map_err(|_| HookDeliverySpoolError::UnsafePath)?;
-            if name == LOCK_FILE {
+            if name == LOCK_FILE || is_owned_temporary_name(&name) {
                 continue;
             }
             if !valid_receipt_name(&name)
@@ -358,7 +357,10 @@ impl HookDeliveryReceiptSpoolV1 {
     }
 }
 
-pub fn hook_delivery_receipt_spool_root(data_root: &Path, host: crate::HookHostV1) -> PathBuf {
+pub fn hook_delivery_receipt_spool_root(
+    data_root: &Path,
+    host: tracedecay_domain::NativeHostIdentityV1,
+) -> PathBuf {
     data_root.join("hook-delivery-spool").join(host.hook_key())
 }
 

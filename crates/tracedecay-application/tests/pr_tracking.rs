@@ -50,6 +50,64 @@ fn managed_pr_state_round_trips_through_application_owner() {
 }
 
 #[test]
+fn undecodable_managed_pr_entries_are_scoped_refusals_that_save_state_resets() {
+    let store = tempfile::tempdir().expect("store root");
+    let current = ManagedPr {
+        pr: 7,
+        head_branch: "feature-7".to_owned(),
+        head_sha: "sha-7".to_owned(),
+        worktree: store.path().join("pr-worktrees/pr-7"),
+        tracking_ref: "refs/tracedecay/pr/7".to_owned(),
+    };
+    let entry_without = |field: &str| {
+        let mut entry = serde_json::to_value(&current).expect("encode entry");
+        entry.as_object_mut().expect("entry object").remove(field);
+        entry
+    };
+    std::fs::write(
+        store.path().join("pr-autotrack.json"),
+        serde_json::json!({
+            "managed": {
+                "tracedecay/autotrack/pr/7": current,
+                "tracedecay/autotrack/pr/8": entry_without("head_sha"),
+                "tracedecay/autotrack/pr/9": entry_without("tracking_ref"),
+            }
+        })
+        .to_string(),
+    )
+    .expect("write mixed state");
+
+    let state = load_state(store.path()).expect("stale entries do not fail the file");
+    assert_eq!(
+        state.managed.into_iter().collect::<Vec<_>>(),
+        vec![("tracedecay/autotrack/pr/7".to_owned(), current.clone())]
+    );
+    assert_eq!(
+        state
+            .stale
+            .iter()
+            .map(|stale| (stale.label.as_str(), stale.detail.split(" at ").next()))
+            .collect::<Vec<_>>(),
+        vec![
+            (
+                "tracedecay/autotrack/pr/8",
+                Some("missing field `head_sha`")
+            ),
+            (
+                "tracedecay/autotrack/pr/9",
+                Some("missing field `tracking_ref`")
+            ),
+        ]
+    );
+    assert_eq!(managed_summary(store.path()).expect("summary")[0].pr, 7);
+
+    save_state(store.path(), &load_state(store.path()).expect("reload")).expect("reset");
+    let reset = load_state(store.path()).expect("load reset state");
+    assert!(reset.stale.is_empty());
+    assert_eq!(reset.managed["tracedecay/autotrack/pr/7"], current);
+}
+
+#[test]
 fn manual_branch_artifacts_hash_the_branch_name_not_the_raw_path() {
     let store = tempfile::tempdir().expect("store root");
     let slashed = tracedecay_application::pr_tracking::ManualBranchArtifactsV1::for_branch(
@@ -70,32 +128,34 @@ fn manual_branch_artifacts_hash_the_branch_name_not_the_raw_path() {
     );
 }
 
-#[test]
-fn manual_branch_lifecycle_lease_is_exclusive_per_branch() {
-    let store = tempfile::tempdir().expect("store root");
-    let first = tracedecay_application::pr_tracking::try_acquire_manual_branch_lifecycle(
-        store.path(),
-        "feature/exclusive",
-    )
-    .expect("first lease");
-    let contended = tracedecay_application::pr_tracking::try_acquire_manual_branch_lifecycle(
-        store.path(),
-        "feature/exclusive",
-    );
+/// The daemon owns each exact branch lifecycle: a second caller for the same
+/// branch queues until the first releases it instead of being refused, while
+/// another branch is admitted at once.
+#[tokio::test]
+async fn manual_branch_lifecycle_queues_same_branch_callers() {
+    use tracedecay_application::pr_tracking::acquire_manual_branch_lifecycle;
 
-    assert!(first.matches_branch("feature/exclusive"));
-    assert!(matches!(
-        contended,
-        Err(
-            tracedecay_application::pr_tracking::ManualBranchActivationError::LifecycleContended { .. }
-        )
-    ));
+    let store = tempfile::tempdir().expect("store root");
+    let first = acquire_manual_branch_lifecycle(store.path(), "feature/exclusive")
+        .await
+        .expect("first lease");
+    let other = acquire_manual_branch_lifecycle(store.path(), "feature/other")
+        .await
+        .expect("independent branch lease");
+
+    let second = acquire_manual_branch_lifecycle(store.path(), "feature/exclusive");
+    tokio::pin!(second);
+    let queued = tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+        .await
+        .is_err();
     drop(first);
-    tracedecay_application::pr_tracking::try_acquire_manual_branch_lifecycle(
-        store.path(),
-        "feature/exclusive",
-    )
-    .expect("lease after drop");
+    let second = second
+        .await
+        .map(|lease| lease.matches_branch("feature/exclusive"));
+
+    assert!(queued, "a same-branch caller must wait for the owner");
+    assert_eq!(second, Ok(true));
+    assert!(other.matches_branch("feature/other"));
 }
 
 #[test]

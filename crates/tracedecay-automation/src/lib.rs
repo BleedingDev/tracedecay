@@ -17,7 +17,6 @@ pub mod evidence_budget;
 pub mod managed_skill_format;
 mod managed_skill_model;
 mod managed_skill_validation;
-mod ports;
 pub mod run_labels;
 pub mod skill_frontmatter;
 pub mod text;
@@ -29,7 +28,6 @@ pub mod managed_skills {
         ManagedSkillMaterializationScope, ManagedSkillMetadata, ManagedSkillProvenance,
         ManagedSkillSource, ManagedSkillState, ManagedSkillUpdate, ManagedSupportFile,
         SkillInstallTarget, current_metadata_timestamp, default_managed_skill_targets,
-        legacy_managed_skill_routing_description,
     };
     pub use crate::managed_skill_validation::{
         validate_managed_skill, validate_managed_skill_update, validate_managed_support_files,
@@ -38,7 +36,6 @@ pub mod managed_skills {
 }
 
 pub use error::{AutomationError, Result};
-pub use ports::AutomationRunRecord;
 
 pub(crate) fn config_error(message: impl Into<String>) -> AutomationError {
     AutomationError::config(message)

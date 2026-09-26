@@ -25,6 +25,8 @@ use tracedecay_daemon_protocol::RequestedOutputFormat;
 use tracedecay_daemon_service::application_surface::{
     execute_application_surface, resolve_application_surface_dispatch,
 };
+#[cfg(unix)]
+use tracedecay_daemon_service::logging::recent_watcher_events;
 use tracedecay_runtime_core::text::format_token_count;
 
 /// Opens an isolated daemon-registered profile database so Doctor tests can
@@ -83,7 +85,7 @@ impl DoctorTestRuntime {
 }
 
 /// Sync cloud probes admitted by the CLI binary. Doctor never opens ureq
-/// itself — the composition root cannot depend on the CLI crate.
+/// itself, the composition root cannot depend on the CLI crate.
 #[derive(Clone, Copy)]
 pub struct AdmittedDoctorNetworkProbes {
     pub fetch_worldwide_total: fn() -> Option<u64>,
@@ -93,17 +95,21 @@ pub struct AdmittedDoctorNetworkProbes {
 /// Runs a comprehensive health check of the tracedecay installation.
 #[hotpath::measure(label = "doctor.run", future = true)]
 pub async fn run_doctor(
+    profile_root: &std::path::Path,
     network: AdmittedDoctorNetworkProbes,
 ) -> tracedecay_domain::errors::Result<()> {
     let _lifecycle_lease =
-        match tracedecay_runtime_core::lifecycle_lease::acquire_shared_or_inherited("doctor") {
+        match tracedecay_runtime_core::lifecycle_lease::acquire_shared_or_inherited(
+            profile_root,
+            "doctor",
+        ) {
             Ok(lease) => lease,
             Err(error) => {
                 eprintln!("tracedecay doctor could not start: {error}");
                 return Err(error);
             }
         };
-    let build_version = crate::version::build_version()?;
+    let build_version = tracedecay_project::version::build_version()?;
     let mut dc = DoctorCounters::new();
 
     eprintln!("\n\x1b[1mtracedecay doctor v{build_version}\x1b[0m\n");
@@ -114,6 +120,7 @@ pub async fn run_doctor(
     eprintln!("\n\x1b[1mCurrent project\x1b[0m");
     let project_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     check_inert_project_config(&mut dc, &project_path);
+    check_pr_autotrack_state(&mut dc, &project_path);
     let daemon_status = daemon_project_status(&project_path).await;
     let storage_health = match daemon_status.as_ref() {
         Ok(None) => {
@@ -138,14 +145,7 @@ pub async fn run_doctor(
                 }
             }
         }
-        Err(error) => {
-            report_daemon_diagnostics_unavailable(
-                &mut dc,
-                fallback_database_path(&project_path).as_deref(),
-                error,
-            );
-            DatabaseHealth::unknown("canonical_doctor_report_unavailable")
-        }
+        Err(error) => classify_daemon_status_error(&mut dc, &project_path, error),
     };
     check_watcher(&mut dc);
     let upload_enabled = configured_upload_enabled(&project_path).await;
@@ -155,7 +155,7 @@ pub async fn run_doctor(
     if let Some(ref home) = agents::home_dir() {
         // Host integration health is read-only: every `healthcheck` only reads
         // the host's own on-disk registration and reports findings. Doctor
-        // never repairs them — remediation stays with `tracedecay install`.
+        // never repairs them, remediation stays with `tracedecay install`.
         let hctx = HealthcheckContext {
             home: home.clone(),
             project_path: project_path.clone(),
@@ -171,10 +171,10 @@ pub async fn run_doctor(
                 // The host itself is on this machine but carries no tracedecay
                 // integration. Silence here read as "nothing to say", which
                 // hid exactly the hosts an operator most likely wants wired
-                // up — warn uniformly, like the deferred-lifecycle hosts do.
+                // up, warn uniformly, like the deferred-lifecycle hosts do.
                 eprintln!("\n\x1b[1m{} integration\x1b[0m", agent.name());
                 dc.warn(&format!(
-                    "{} detected ({}) but tracedecay is not integrated — run `tracedecay install --agent {}`",
+                    "{} detected ({}) but tracedecay is not integrated, run `tracedecay install --agent {}`",
                     agent.name(),
                     surface.display(),
                     agent.id()
@@ -390,8 +390,8 @@ fn database_health_from_storage_runtime_findings<'a>(
 
 /// Gates the doctor exit code.
 ///
-/// Only an observed storage *failure* is fatal. `DatabaseHealth::Unknown` — a
-/// diagnostic that could not run — is reported to the user but never laundered
+/// Only an observed storage *failure* is fatal. `DatabaseHealth::Unknown`, a
+/// diagnostic that could not run, is reported to the user but never laundered
 /// into a healthy verdict nor turned into a hard failure.
 fn doctor_result(
     dc: &DoctorCounters,
@@ -442,6 +442,28 @@ async fn daemon_project_status(
             None => tokio::time::sleep(RUNTIME_TELEMETRY_POLL).await,
         }
     }
+}
+
+/// The daemon owner's per-analyzer language-server read for the project at
+/// `project_path`: the same read Doctor grades, resolved on the daemon's PATH.
+/// `Ok(None)` is the warming state where the daemon answered but has not
+/// published this project's telemetry yet.
+pub async fn daemon_language_server_read(
+    project_path: &Path,
+) -> tracedecay_domain::errors::Result<Option<tracedecay_contracts::doctor::LanguageServerReadV1>> {
+    let Some(status) = daemon_project_status(project_path).await? else {
+        return Ok(None);
+    };
+    let read = status
+        .pointer("/doctor_report/language_servers")
+        .ok_or_else(|| tracedecay_domain::errors::TraceDecayError::Config {
+            message: "daemon runtime response omitted the language-server read".to_string(),
+        })?;
+    serde_json::from_value(read.clone())
+        .map(Some)
+        .map_err(|error| tracedecay_domain::errors::TraceDecayError::Config {
+            message: format!("daemon language-server read violated its wire contract: {error}"),
+        })
 }
 
 fn daemon_doctor_runtime_args() -> serde_json::Value {
@@ -534,6 +556,71 @@ impl DatabaseHealth {
     }
 }
 
+/// Warming and discovery-blocked refusals are not lost database authority.
+///
+/// The closed-connection / WAL recovery text belongs to a daemon that
+/// disappeared while owning the store. A profile that is still warming, or a
+/// repository walk blocked on one path, is a retryable state.
+fn classify_daemon_status_error(
+    dc: &mut DoctorCounters,
+    project_path: &Path,
+    error: &tracedecay_domain::errors::TraceDecayError,
+) -> DatabaseHealth {
+    if let Some(message) = daemon_warming_doctor_message(project_path, error) {
+        dc.warn(&message);
+        return DatabaseHealth::unknown("daemon_warming");
+    }
+    if crate::daemon::error_is_project_not_enrolled(error) {
+        report_project_not_enrolled(dc, project_path);
+        return DatabaseHealth::unknown("project_not_enrolled");
+    }
+    report_daemon_diagnostics_unavailable(
+        dc,
+        fallback_database_path(project_path).as_deref(),
+        error,
+    );
+    DatabaseHealth::unknown("canonical_doctor_report_unavailable")
+}
+
+fn daemon_warming_doctor_message(
+    project_path: &Path,
+    error: &tracedecay_domain::errors::TraceDecayError,
+) -> Option<String> {
+    if crate::daemon::error_is_repository_discovery_deferred(error) {
+        return Some(format!(
+            "daemon is still warming: repository discovery blocked on {}",
+            repository_discovery_block_path(error, project_path)
+        ));
+    }
+    if crate::daemon::error_is_project_warming(error) {
+        return Some("daemon is still warming: profile runtime is warming".to_owned());
+    }
+    None
+}
+
+fn repository_discovery_block_path(
+    error: &tracedecay_domain::errors::TraceDecayError,
+    project_path: &Path,
+) -> String {
+    let Some((_, _, detail)) = error.project_route_context() else {
+        return project_path.display().to_string();
+    };
+    detail
+        .split("repository discovery blocked on ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| project_path.display().to_string(), str::to_owned)
+}
+
+fn report_project_not_enrolled(dc: &mut DoctorCounters, project_path: &Path) {
+    dc.warn(&format!(
+        "Current project is not enrolled in this profile ({}). Run `tracedecay init` to enroll it.",
+        project_path.display()
+    ));
+}
+
 fn report_daemon_diagnostics_unavailable(
     dc: &mut DoctorCounters,
     db_path: Option<&Path>,
@@ -554,14 +641,10 @@ fn report_daemon_diagnostics_unavailable(
 }
 
 fn fallback_database_path(project_path: &Path) -> Option<PathBuf> {
-    if let Ok(Some(layout)) =
-        tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(project_path)
-    {
-        return Some(layout.graph_db_path);
-    }
-    let data_root = crate::config::get_tracedecay_dir(project_path);
-    let db_path = data_root.join(crate::config::db_filename(&data_root));
-    db_path.is_file().then_some(db_path)
+    tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(project_path)
+        .ok()
+        .flatten()
+        .map(|layout| layout.graph_db_path)
 }
 
 fn database_recovery_guidance(db_path: &Path) -> String {
@@ -571,7 +654,6 @@ fn database_recovery_guidance(db_path: &Path) -> String {
     let mut graph_dirty = db_path.as_os_str().to_os_string();
     graph_dirty.push(".dirty");
     let graph_dirty = PathBuf::from(graph_dirty);
-    let legacy_dirty = data_root.join("dirty");
     let sessions_path = data_root.join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
 
     format!(
@@ -581,16 +663,14 @@ fn database_recovery_guidance(db_path: &Path) -> String {
          WAL: {}\n\
          SHM: {}\n\
          graph dirty sentinel: {}\n\
-         legacy dirty sentinel (if present): {}\n\
          `sessions.db` is separate and must not be removed: {}\n\
          Facts are stored in the graph database; automatic default-store rebuild is intentionally blocked because it cannot preserve them generically.\n\
-         Do not run `tracedecay init`, `tracedecay sync --force`, or `tracedecay wipe` until that recovery set is safely copied.\n\
+         Do not run `tracedecay init`, `tracedecay sync`, or `tracedecay wipe` until that recovery set is safely copied.\n\
          Report the preserved set at https://github.com/ScriptedAlchemy/tracedecay/issues for offline recovery.",
         db_path.display(),
         wal_path.display(),
         shm_path.display(),
         graph_dirty.display(),
-        legacy_dirty.display(),
         sessions_path.display(),
     )
 }
@@ -602,7 +682,7 @@ fn print_database_recovery_guidance(dc: &DoctorCounters, db_path: &Path) {
 }
 
 /// Diagnose the managed user-service unit, then prove a running unit by
-/// initialize — not by `systemctl is-active` or a connectable socket.
+/// initialize, not by `systemctl is-active` or a connectable socket.
 ///
 /// A stopped or disabled unit is visible without treating it as permission to
 /// activate the service; it may be an intentional operator hold.
@@ -697,19 +777,19 @@ fn check_binary(dc: &mut DoctorCounters, build_version: &str) {
 /// from the daemon log (systemd journal on Linux, launchd err-log on macOS). It
 /// reports whether an explicitly enabled project watcher is active or using
 /// bounded scheduler reconciliation. Absent telemetry is reported as info, not
-/// a failure — activation comes from each project's pinned configuration.
+/// a failure, activation comes from each project's pinned configuration.
 #[hotpath::measure(label = "doctor.check.watcher")]
 fn check_watcher(dc: &mut DoctorCounters) {
     eprintln!("\n\x1b[1mWatcher\x1b[0m");
 
     if !tracedecay_daemon_control::daemon_reachable() {
-        dc.info("Daemon not running — watcher inactive; sync happens on hook/read events");
+        dc.info("Daemon not running, watcher inactive; sync happens on hook/read events");
         return;
     }
 
     #[cfg(unix)]
     {
-        let events = crate::daemon::recent_watcher_events(2000);
+        let events = recent_watcher_events(2000);
         if events.is_empty() {
             dc.info("Daemon running; no recent watcher telemetry in the log yet");
             return;
@@ -724,7 +804,7 @@ fn check_watcher(dc: &mut DoctorCounters) {
                     degraded += 1;
                     dc.warn(&format!(
                         "{project}: degraded (bounded scheduler-reconciliation fallback){}",
-                        ev.detail.map(|d| format!(" — {d}")).unwrap_or_default()
+                        ev.detail.map(|d| format!(", {d}")).unwrap_or_default()
                     ));
                 }
                 "git_watch_restart" => {
@@ -756,11 +836,12 @@ const DOMAIN_SYMBOL_RULES_FILENAME: &str = "domain-symbols.toml";
 ///
 /// `docs/DOMAIN-EXTRACTORS.md` documents `.tracedecay/domain-symbols.toml` as a
 /// design rather than a shipped feature: no extractor parses it. Without this
-/// check, authoring one is a silent no-op — no error, no warning, and no domain
-/// nodes — so Doctor is where the author finds out. `None` (the normal case)
+/// check, authoring one is a silent no-op, no error, no warning, and no domain
+/// nodes, so Doctor is where the author finds out. `None` (the normal case)
 /// keeps Doctor silent about a file that is not there.
 fn domain_symbol_rules_warning(project_path: &Path) -> Option<String> {
-    let rules = crate::config::get_tracedecay_dir(project_path).join(DOMAIN_SYMBOL_RULES_FILENAME);
+    let rules = tracedecay_runtime_core::config::get_tracedecay_dir(project_path)
+        .join(DOMAIN_SYMBOL_RULES_FILENAME);
     rules.is_file().then(|| {
         format!(
             "Domain symbol extraction is unavailable: no extractor reads {}, \
@@ -775,6 +856,42 @@ fn domain_symbol_rules_warning(project_path: &Path) -> Option<String> {
 fn check_inert_project_config(dc: &mut DoctorCounters, project_path: &Path) {
     if let Some(warning) = domain_symbol_rules_warning(project_path) {
         dc.warn(&warning);
+    }
+}
+
+/// Warnings name entries PR reconciliation will reset; the error names a
+/// state file that blocks reconciliation outright.
+fn pr_autotrack_state_findings(data_root: &Path) -> std::result::Result<Vec<String>, String> {
+    match tracedecay_application::pr_tracking::load_state(data_root) {
+        Ok(state) => Ok(state
+            .stale
+            .iter()
+            .map(|stale| {
+                format!(
+                    "{stale}; PR auto-tracking reconciliation drops this entry and re-tracks the PR if it is still open"
+                )
+            })
+            .collect()),
+        Err(error) => Err(format!(
+            "PR auto-tracking state {} is unreadable ({error}); reconciliation stays blocked until that file is removed, after which open PRs are re-tracked",
+            tracedecay_application::pr_tracking::state_path(data_root).display()
+        )),
+    }
+}
+
+fn check_pr_autotrack_state(dc: &mut DoctorCounters, project_path: &Path) {
+    let Ok(Some(layout)) =
+        tracedecay_runtime_core::storage::resolve_enrolled_layout_for_current_profile(project_path)
+    else {
+        return;
+    };
+    match pr_autotrack_state_findings(&layout.data_root) {
+        Ok(warnings) => {
+            for warning in warnings {
+                dc.warn(&warning);
+            }
+        }
+        Err(failure) => dc.fail(&failure),
     }
 }
 
@@ -819,7 +936,7 @@ async fn configured_upload_enabled(project_path: &Path) -> tracedecay_domain::er
     let envelope =
         result.result.map_err(
             |problem| tracedecay_domain::errors::TraceDecayError::Config {
-                message: format!("{}: {}", problem.problem.code, problem.problem.message),
+                message: problem.problem.summary(),
             },
         )?;
     let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
@@ -878,7 +995,6 @@ fn check_external_tools(dc: &mut DoctorCounters) {
     let diagnostics = tracedecay_mcp::ast_grep_diagnostics_json();
     let installed = json_bool(&diagnostics, "installed");
     let rewrite_available = json_bool(&diagnostics, "rewrite_available");
-    let outline_available = json_bool(&diagnostics, "outline_available");
     let version = diagnostics
         .get("version")
         .and_then(serde_json::Value::as_str)
@@ -888,18 +1004,12 @@ fn check_external_tools(dc: &mut DoctorCounters) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("ast-grep status unavailable");
 
-    if outline_available {
-        dc.pass(&format!(
-            "ast-grep {version}: rewrite and outline support available"
-        ));
+    if rewrite_available {
+        dc.pass(&format!("ast-grep {version}: rewrite support available"));
         return;
     }
 
-    if rewrite_available {
-        dc.warn(&format!(
-            "ast-grep {version}: rewrite support available, but outline support is missing"
-        ));
-    } else if installed {
+    if installed {
         dc.warn(&format!(
             "ast-grep {version}: optional ast-grep-backed tools are unavailable"
         ));
@@ -907,7 +1017,7 @@ fn check_external_tools(dc: &mut DoctorCounters) {
         dc.warn("ast-grep not found on PATH; optional ast-grep-backed tools are hidden");
     }
     dc.info(message);
-    dc.info("Install or update ast-grep to >= 0.44, then rerun `tracedecay install` or `tracedecay update-plugin` if your agent integration caches tool metadata.");
+    dc.info("Install or update ast-grep, then rerun `tracedecay install` or `tracedecay update-plugin` if your agent integration caches tool metadata.");
 }
 
 fn json_bool(value: &serde_json::Value, key: &str) -> bool {

@@ -68,14 +68,14 @@ impl SessionTemporalRefreshPassReport {
 ///
 /// Every mounted project scheduler plus the profile scheduler owns one worker
 /// task, so a daemon serving N registered projects would otherwise run N + 1
-/// historical catch-up passes concurrently at startup — each pass is bounded,
+/// historical catch-up passes concurrently at startup, each pass is bounded,
 /// but the aggregate grew with the number of projects (the 11.6 GB catch-up
 /// incident). Daemon readiness never waits on this admission: catch-up is
 /// background work, and a worker that cannot acquire a permit defers its
 /// history pass as typed retryable state while projection serving continues.
 ///
 /// Two rather than one for the same reason as the code-index reconcile bound:
-/// a pass is not pure CPU — discovery, store writes, and projection drains are
+/// a pass is not pure CPU, discovery, store writes, and projection drains are
 /// I/O and lock phases that overlap a second pass's parsing at negligible
 /// cost, while race-to-idle finishes each backlog sooner than interleaving
 /// all of them.
@@ -142,7 +142,7 @@ pub struct SessionTemporalRefreshSchedulerRegistry {
     shutdown_guard: tokio::sync::Mutex<()>,
     project_lifecycle: tokio::sync::Mutex<()>,
     retired_project_owners: std::sync::Mutex<HashSet<StoreOwnerKey>>,
-    codex_discovery: Arc<tracedecay_sessions::runtime::codex::CodexDiscoveryHub>,
+    codex_discovery: Arc<tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub>,
     /// The process background CPU authority mounted by
     /// [`Self::configure_codex_preparation_resources`]; retained so historical
     /// ingest compositions built through this registry inject the same
@@ -163,7 +163,7 @@ impl Default for SessionTemporalRefreshSchedulerRegistry {
             project_lifecycle: tokio::sync::Mutex::new(()),
             retired_project_owners: std::sync::Mutex::new(HashSet::new()),
             codex_discovery: Arc::new(
-                tracedecay_sessions::runtime::codex::CodexDiscoveryHub::default(),
+                tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub::default(),
             ),
             background_cpu: std::sync::OnceLock::new(),
             historical_ingest_admission: Arc::new(tokio::sync::Semaphore::new(
@@ -176,31 +176,18 @@ impl Default for SessionTemporalRefreshSchedulerRegistry {
 impl Drop for SessionTemporalRefreshSchedulerRegistry {
     fn drop(&mut self) {
         self.shutting_down.store(true, Ordering::Release);
-        if let Ok(project) = self.project.try_lock() {
-            for entry in project.values() {
-                if let Some(history) = entry
-                    .history
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                {
-                    history.cancel();
-                }
-                entry.state.cancel();
+        let project = self.project.get_mut().values();
+        let profile = self.profile.get_mut().values();
+        for entry in project.chain(profile) {
+            if let Some(history) = entry
+                .history
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                history.cancel();
             }
-        }
-        if let Ok(profile) = self.profile.try_lock() {
-            for entry in profile.values() {
-                if let Some(history) = entry
-                    .history
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .as_ref()
-                {
-                    history.cancel();
-                }
-                entry.state.cancel();
-            }
+            entry.state.cancel();
         }
     }
 }
@@ -245,7 +232,9 @@ impl SessionTemporalRefreshSchedulerRegistry {
         self.background_cpu.get().map(Arc::clone)
     }
 
-    pub fn codex_discovery(&self) -> Arc<tracedecay_sessions::runtime::codex::CodexDiscoveryHub> {
+    pub fn codex_discovery(
+        &self,
+    ) -> Arc<tracedecay_sessions::runtime::hosts::codex::CodexDiscoveryHub> {
         Arc::clone(&self.codex_discovery)
     }
 
@@ -568,18 +557,6 @@ impl SessionTemporalRefreshSchedulerRegistry {
         if let Some(entry) = self.project.lock().await.remove(owner) {
             entry.shutdown().await;
         }
-    }
-
-    #[hotpath::skip]
-    pub async fn owns_project_database_paths(
-        &self,
-        database_paths: &HashSet<std::path::PathBuf>,
-    ) -> bool {
-        self.project
-            .lock()
-            .await
-            .keys()
-            .any(|owner| database_paths.contains(&owner.graph_db_path))
     }
 
     #[hotpath::skip]

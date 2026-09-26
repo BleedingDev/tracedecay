@@ -15,12 +15,12 @@ mod worktrees;
 pub use worktrees::{
     ManualBranchActivation, ManualBranchActivationError, ManualBranchArtifactOwnershipV1,
     ManualBranchArtifactsV1, ManualBranchLifecycleLeaseV1, PrCleanupArtifact, PrCleanupError,
-    PrCleanupReceipt, ReconcileReport, cleanup_owned_worktree, cleanup_owned_worktree_off_runtime,
-    cleanup_pr_worktree, cleanup_pr_worktree_off_runtime, manual_branch_artifact_ownership,
-    manual_branch_artifact_ownership_off_runtime, manual_branch_artifacts_match,
-    manual_branch_artifacts_match_off_runtime, manual_branch_source_owns_artifacts,
-    prepare_manual_branch_worktree, prepare_pr_worktree, resolve_branch_head,
-    try_acquire_manual_branch_lifecycle,
+    PrCleanupReceipt, ReconcileReport, acquire_manual_branch_lifecycle, cleanup_owned_worktree,
+    cleanup_owned_worktree_off_runtime, cleanup_pr_worktree, cleanup_pr_worktree_off_runtime,
+    manual_branch_artifact_ownership, manual_branch_artifact_ownership_off_runtime,
+    manual_branch_artifacts_match, manual_branch_artifacts_match_off_runtime,
+    manual_branch_source_owns_artifacts, prepare_manual_branch_worktree, prepare_pr_worktree,
+    resolve_branch_head,
 };
 
 const STATE_FILENAME: &str = "pr-autotrack.json";
@@ -102,17 +102,35 @@ pub struct PrDiscovery {
 pub struct ManagedPr {
     pub pr: u64,
     pub head_branch: String,
-    #[serde(default)]
     pub head_sha: String,
     pub worktree: PathBuf,
     pub tracking_ref: String,
 }
 
 /// Durable managed-PR state keyed by collision-proof synthetic branch label.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PrAutotrackState {
-    #[serde(default)]
     pub managed: BTreeMap<String, ManagedPr>,
+    /// Persisted entries whose shape this build refuses to decode. They are
+    /// never serialized, so the next [`save_state`] is their reset.
+    #[serde(skip)]
+    pub stale: Vec<StaleManagedPr>,
+}
+
+/// A persisted managed-PR entry refused because its shape does not decode as
+/// [`ManagedPr`] (for example a retired shape that omits `head_sha`). The
+/// refusal is scoped to this entry; every other entry still loads.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("PR auto-tracking entry '{label}' has an undecodable shape: {detail}")]
+pub struct StaleManagedPr {
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Deserialize)]
+struct PersistedPrAutotrackState {
+    #[serde(default)]
+    managed: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -138,7 +156,20 @@ pub fn load_state(data_root: &Path) -> std::result::Result<PrAutotrackState, Tra
         }
         Err(error) => return Err(error.into()),
     };
-    Ok(serde_json::from_str(&content)?)
+    let persisted: PersistedPrAutotrackState = serde_json::from_str(&content)?;
+    let mut state = PrAutotrackState::default();
+    for (label, entry) in persisted.managed {
+        match serde_json::from_value(entry) {
+            Ok(managed) => {
+                state.managed.insert(label, managed);
+            }
+            Err(error) => state.stale.push(StaleManagedPr {
+                label,
+                detail: error.to_string(),
+            }),
+        }
+    }
+    Ok(state)
 }
 
 pub fn save_state(data_root: &Path, state: &PrAutotrackState) -> std::io::Result<()> {
@@ -168,7 +199,7 @@ pub fn managed_summary(
     Ok(summaries)
 }
 
-fn state_path(data_root: &Path) -> PathBuf {
+pub fn state_path(data_root: &Path) -> PathBuf {
     data_root.join(STATE_FILENAME)
 }
 
@@ -187,8 +218,8 @@ struct GhPr {
 
 /// Builds the `git` invocation these PR commands run in `repo_root`.
 ///
-/// The arguments carry resolved paths — the worktree `git worktree add`/`remove`
-/// operate on descends from a canonicalized data root — and Git for Windows
+/// The arguments carry resolved paths, the worktree `git worktree add`/`remove`
+/// operate on descends from a canonicalized data root, and Git for Windows
 /// rewrites a `\\?\` path *argument* to `//?/D:/...` and then fails with
 /// "could not create leading directories". `plain_git_args` spells those
 /// plainly for the child process, exactly as `bounded_git_output` does; every
@@ -584,20 +615,5 @@ mod tests {
         ]"#;
         assert!(parse_gh_pr_list(json, 2).expect("partial list").partial);
         assert!(!parse_gh_pr_list(json, 3).expect("complete list").partial);
-    }
-
-    #[test]
-    fn legacy_state_without_head_sha_remains_refreshable() {
-        let store = tempfile::tempdir().expect("store root");
-        std::fs::write(
-            state_path(store.path()),
-            r#"{"managed":{"pr/8":{"pr":8,"head_branch":"legacy","worktree":"pr-worktrees/pr-8","tracking_ref":"refs/tracedecay/pr/8"}}}"#,
-        )
-        .expect("legacy state");
-
-        assert_eq!(
-            load_state(store.path()).expect("load legacy state").managed["pr/8"].head_sha,
-            ""
-        );
     }
 }

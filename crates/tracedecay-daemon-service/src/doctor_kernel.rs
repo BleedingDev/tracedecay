@@ -5,28 +5,29 @@
 //! module gathers live daemon signals, maps daemon-owned types into kernel
 //! reads, and wires those reads into the composer. Truthfulness is preserved
 //! end to end: a signal that cannot be consulted maps to the kernel's typed
-//! `Unsupported`/`Absent`/`Denied`/`Unknown` read — never a fabricated healthy
-//! result — and partial coverage carries its real reason.
+//! `Unsupported`/`Absent`/`Denied`/`Unknown` read, never a fabricated healthy
+//! result, and partial coverage carries its real reason.
 //!
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
 use tracedecay_code_index_runtime::code_index_scheduler::identity::repository_id_for;
+use tracedecay_configuration::config::PinnedRuntimeConfiguration;
 use tracedecay_contracts::doctor::{
     AdvisoryFeedbackDoctorPort, AdvisoryFeedbackReadV1, CodeIndexMountDoctorPort,
     CodeIndexMountReadV1, CodeIndexMountStateV1, ConfigurationAuthorityDoctorPort,
     ConfigurationAuthorityReadV1, ConfigurationDriftV1, DaemonRuntimeHealthSignalV1,
     DoctorCoverageCompletenessV1, DoctorKernelInputsV1, DoctorReportComposerV1, DoctorReportV1,
     DoctorSourceFuture, DoctorStorageFamilyReadV1, HostConformanceV1, HostIntegrationDoctorPort,
-    HostIntegrationReadV1, IngestRefusalCensusReadV1, LanguageServerDoctorPort,
-    LanguageServerReadV1, LanguageServerStateV1, ObservabilityDoctorPort, ObservabilityReadV1,
-    ObservabilityStateV1, OperationalAuditDoctorPort, OperationalAuditReadV1,
-    ProfileAuthorityReadV1, RemoteOperationalReadV1, RuntimeHealthDoctorPort, RuntimeHealthReadV1,
-    StorageDoctorPort, advisory_feedback_read_from_publication, merge_storage_reads,
-    runtime_health_read, storage_family_read,
+    HostIntegrationReadV1, IngestRefusalCensusReadV1, LanguageServerAnalyzerStateV1,
+    LanguageServerAnalyzerV1, LanguageServerDoctorPort, LanguageServerReadV1,
+    ObservabilityDoctorPort, ObservabilityReadV1, ObservabilityStateV1, OperationalAuditDoctorPort,
+    OperationalAuditReadV1, ProfileAuthorityReadV1, RemoteOperationalReadV1,
+    ResidentMemoryDoctorPort, ResidentMemoryOwnerReadV1, ResidentMemoryReadV1,
+    RuntimeHealthDoctorPort, RuntimeHealthReadV1, StorageDoctorPort,
+    advisory_feedback_read_from_publication, merge_storage_reads, runtime_health_read,
+    storage_family_read,
 };
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
 use tracedecay_contracts::storage::SchemaConvergenceFindingV1;
@@ -36,10 +37,10 @@ use tracedecay_contracts::{
 };
 use tracedecay_domain::CodeGenerationId;
 use tracedecay_global_db::{GlobalDbNativeIntegrationStore, RegisteredGlobalDb};
-use tracedecay_project::config::DaemonRuntimeConfiguration;
 
 use crate::DaemonFeedbackRuntimeRegistrar;
 use tracedecay_maintenance::telemetry::GuardedStoreTelemetryPort;
+use tracedecay_session_temporal_store::SessionTemporalAccess;
 
 const DOCTOR_REPORT_CAPABILITY: &str = "capability.application.doctor.report";
 const DOCTOR_REPORT_USE_CASE: &str = "use-case.application.doctor.report";
@@ -51,12 +52,12 @@ const DOCTOR_CONTEXT_HORIZON_MICROS: i64 = 30_000_000;
 ///
 /// A pinned snapshot resolves in-sync (the cache invariant guarantees the pinned
 /// configuration equals the value derived from its resolved snapshot, so within
-/// the cache there is no unobserved drift). A cold cache — the fail-closed
-/// accessor's `Err` — is a typed [`ConfigurationAuthorityReadV1::Absent`], never
+/// the cache there is no unobserved drift). A cold cache, the fail-closed
+/// accessor's `Err`, is a typed [`ConfigurationAuthorityReadV1::Absent`], never
 /// a fabricated healthy result.
 #[must_use]
 pub fn configuration_read_from_pin<E>(
-    resolved: &Result<DaemonRuntimeConfiguration, E>,
+    resolved: &Result<PinnedRuntimeConfiguration, E>,
 ) -> ConfigurationAuthorityReadV1 {
     match resolved {
         Ok(_) => ConfigurationAuthorityReadV1::Resolved {
@@ -74,7 +75,7 @@ pub fn configuration_read_from_pin<E>(
 /// ([`tracedecay_global_db::schema_stages::validate_observation_authority_connection`]):
 /// read-only, so Doctor observes the invariant without owning any repair of it.
 /// `true` means the audit ran and every invariant held; `false` means it ran and
-/// an invariant failed. "Could not run" is not representable here — the caller
+/// an invariant failed. "Could not run" is not representable here, the caller
 /// owns that distinction.
 async fn observation_authority_audit_passed(
     snapshot: &impl tracedecay_runtime_core::db::engine::QueryExecutor,
@@ -123,10 +124,10 @@ fn host_integration_read_from_report(
     }) {
         HostConformanceV1::ProtocolDrift
     } else if report.components.iter().any(|component| {
-        // `Drifted`, `OrphanedRegistration`, and `ActivationDeferred` are
-        // repairable conformance, not protocol drift: the component's ownership
-        // is intact and either the ordinary reinstall or the host's own
-        // activation converges it, so none may escalate to `ProtocolDrift`.
+        // `Drifted`, `OrphanedRegistration`, `ActivationDeferred`, and
+        // `ReinstallRequired` are repairable conformance, not protocol drift:
+        // an ordinary or adopting install, or the host's own activation,
+        // converges each, so none may escalate to `ProtocolDrift`.
         matches!(
             component.state,
             HostBundleComponentDoctorStateV1::Repairable
@@ -134,6 +135,7 @@ fn host_integration_read_from_report(
                 | HostBundleComponentDoctorStateV1::Drifted
                 | HostBundleComponentDoctorStateV1::OrphanedRegistration
                 | HostBundleComponentDoctorStateV1::ActivationDeferred
+                | HostBundleComponentDoctorStateV1::ReinstallRequired
         )
     }) {
         HostConformanceV1::Drifted
@@ -190,13 +192,13 @@ pub async fn code_index_read_from_registry(
 
 /// Report the shards whose historical schema convergence has not completed.
 ///
-/// Convergence carries the migrations whose cost scales with store size — a
-/// full index rebuild, a whole-table rewrite — so on a large store it runs for
+/// Convergence carries the migrations whose cost scales with store size, a
+/// full index rebuild, a whole-table rewrite, so on a large store it runs for
 /// minutes after the daemon is already serving. That is deliberate: it runs
 /// after the fail-closed admission checks and outside any caller's write
 /// lease, so it blocks neither admission nor retrieval. What it must not do is
-/// stay invisible. A shard still pending or running reads as `Stale` — the
-/// store is behind its current schema but readable — and one whose migration
+/// stay invisible. A shard still pending or running reads as `Stale`, the
+/// store is behind its current schema but readable, and one whose migration
 /// failed reads as `Degraded`, carrying the failure the convergence task
 /// recorded. An empty set is absent rather than a healthy claim, since a
 /// daemon with no mounted shard has converged nothing.
@@ -251,42 +253,50 @@ pub struct SchemaConvergenceDoctorReadV1 {
 
 // === Language server/analyzer (LanguageServer family) ========================
 
-/// Map the daemon diagnostic broker's project-active engine statuses.
+/// Map the daemon diagnostic broker's resolved engine statuses into the Doctor
+/// read. Every adapter is carried so `lsp servers` can list the daemon's view;
+/// grading of inactive languages is refused by the contract itself.
 #[must_use]
-pub fn language_server_read_from_engine_states(
-    states: impl IntoIterator<Item = tracedecay_lsp::analyzer::broker::EngineState>,
+pub fn language_server_read_from_engine_statuses(
+    statuses: impl IntoIterator<Item = tracedecay_lsp::analyzer::broker::ResolvedEngineStatus>,
 ) -> LanguageServerReadV1 {
     use tracedecay_lsp::analyzer::broker::EngineState;
 
-    let states = states.into_iter().collect::<Vec<_>>();
-    if states.is_empty() {
-        return LanguageServerReadV1::Absent;
-    }
-    let state = if states.contains(&EngineState::Crashed) {
-        LanguageServerStateV1::Crashed
-    } else if states.contains(&EngineState::Unavailable) {
-        LanguageServerStateV1::Unavailable
-    } else if states.contains(&EngineState::Disabled) {
-        LanguageServerStateV1::Disabled
-    } else if states.contains(&EngineState::Refreshing) {
-        LanguageServerStateV1::Refreshing
-    } else if states.iter().all(|state| *state == EngineState::Ready) {
-        LanguageServerStateV1::Ready
-    } else {
-        LanguageServerStateV1::Available
-    };
-    LanguageServerReadV1::Observed {
-        state,
-        coverage: DoctorCoverageCompletenessV1::Complete,
-    }
+    LanguageServerReadV1::observed(
+        statuses
+            .into_iter()
+            .map(|resolved| LanguageServerAnalyzerV1 {
+                state: match (resolved.active, resolved.status.state) {
+                    (false, _) | (true, EngineState::Inactive) => {
+                        LanguageServerAnalyzerStateV1::Inactive
+                    }
+                    (true, EngineState::Ready) => LanguageServerAnalyzerStateV1::Ready,
+                    (true, EngineState::Available) => LanguageServerAnalyzerStateV1::Available,
+                    (true, EngineState::Refreshing) => LanguageServerAnalyzerStateV1::Refreshing,
+                    (true, EngineState::Disabled) => LanguageServerAnalyzerStateV1::Disabled,
+                    (true, EngineState::Unavailable) => LanguageServerAnalyzerStateV1::Unavailable,
+                    (true, EngineState::Crashed) => LanguageServerAnalyzerStateV1::Crashed,
+                },
+                executable_found: resolved.executable_found,
+                language: resolved.status.language,
+                command: resolved.status.command,
+                install: resolved
+                    .status
+                    .install_options
+                    .first()
+                    .map(|option| option.command.clone()),
+                detail: resolved.status.last_error,
+            })
+            .collect(),
+    )
 }
 
-/// Read live project-active analyzer state from the daemon diagnostic owner.
+/// Read live analyzer state from the daemon diagnostic owner.
 pub async fn language_server_read_from_broker(
     broker: &tokio::sync::Mutex<tracedecay_lsp::analyzer::broker::DiagnosticBroker>,
 ) -> LanguageServerReadV1 {
-    let statuses = broker.lock().await.project_engine_statuses();
-    language_server_read_from_engine_states(statuses.into_iter().map(|status| status.state))
+    let statuses = broker.lock().await.resolved_engine_statuses();
+    language_server_read_from_engine_statuses(statuses)
 }
 
 // === Canonical Plan-26 observations (Observability family) ===================
@@ -354,8 +364,8 @@ struct CollectedStoreTelemetryV1 {
 const MAX_SYNCHRONOUS_TABLE_GROWTH_STORE_BYTES: u64 = 64 * 1024 * 1024;
 /// Entry ceiling for the code-index generation census.
 ///
-/// The census is metadata-only — a `stat` and a bounded manifest prefix per
-/// generation — so its cost scales with the number of directory entries, not
+/// The census is metadata-only, a `stat` and a bounded manifest prefix per
+/// generation, so its cost scales with the number of directory entries, not
 /// with their size. Gating it on bytes instead (the previous
 /// `MAX_SYNCHRONOUS_EXHAUSTIVE_SCAN_BYTES` budget) compared a 64 MiB ceiling
 /// against generation files that are routinely ~1 GiB each, so the gate failed
@@ -729,6 +739,56 @@ struct KernelDoctorSources<'a> {
     inputs: &'a DoctorKernelInputsV1,
 }
 
+/// The daemon's resident-memory inventory as the Doctor read: every
+/// project's owners from the one report whose per-project rows
+/// `tracedecay_status` renders, so the two never disagree.
+fn resident_memory_read() -> ResidentMemoryReadV1 {
+    use tracedecay_runtime_core::resident_memory::{
+        ResidentMemoryPressureStateV1, process_resident_memory_pressure_v1,
+        process_resident_owners_v1,
+    };
+    let pressure = process_resident_memory_pressure_v1();
+    let (resident_bytes, over_budget) = match pressure.state() {
+        ResidentMemoryPressureStateV1::Unobserved => (None, false),
+        ResidentMemoryPressureStateV1::Nominal { observed_bytes, .. } => {
+            (Some(observed_bytes), false)
+        }
+        ResidentMemoryPressureStateV1::OverBudget { observed_bytes, .. } => {
+            (Some(observed_bytes), true)
+        }
+    };
+    let report = process_resident_owners_v1().report(std::time::Instant::now());
+    ResidentMemoryReadV1::Observed {
+        resident_bytes,
+        limit_bytes: pressure.limit_bytes(),
+        high_watermark_bytes: pressure.high_watermark_bytes(),
+        over_budget,
+        retained_bytes: report.measured_bytes,
+        owners: report
+            .owners
+            .into_iter()
+            .map(|row| ResidentMemoryOwnerReadV1 {
+                kind: row.kind.as_str().to_owned(),
+                project_id: row.scope.project_id.as_str().to_owned(),
+                worktree_id: row.scope.worktree_id.as_str().to_owned(),
+                generation_id: row.generation_id.as_str().to_owned(),
+                bytes: row.bytes.measured(),
+                idle_seconds: row.idle_for.as_secs(),
+                protected: row.protected,
+            })
+            .collect(),
+    }
+}
+
+impl ResidentMemoryDoctorPort for KernelDoctorSources<'_> {
+    fn resident_memory<'b>(
+        &'b self,
+        _context: &'b RequestContext,
+    ) -> DoctorSourceFuture<'b, ResidentMemoryReadV1> {
+        Box::pin(async move { resident_memory_read() })
+    }
+}
+
 impl ConfigurationAuthorityDoctorPort for KernelDoctorSources<'_> {
     fn configuration_health<'b>(
         &'b self,
@@ -850,6 +910,7 @@ pub async fn compose_doctor_report(
         .with_code_index(&sources)
         .with_observability(&sources)
         .with_storage(&sources)
+        .with_memory(&sources)
         .compose(context)
         .await
 }
@@ -1007,6 +1068,7 @@ pub fn production_doctor_report_reader(
                         })
                 })
             });
+            let project_temporal = SessionTemporalAccess::new(&*project_sessions);
             let (
                 quick_check,
                 authority_audit_ok,
@@ -1028,7 +1090,7 @@ pub fn production_doctor_report_reader(
                         tokio::join!(
                     graph.quick_check_report(),
                     observation_authority_audit_ok(registry.as_ref()),
-                    project_sessions.session_temporal_doctor_health(),
+                    project_temporal.session_temporal_doctor_health(),
                     profile_storage_reads,
                     collect_over_budget_store_findings(&context, &telemetry_ports, &retention),
                     tracedecay_maintenance::retention::diagnostics::collect_session_retention_findings(
@@ -1110,7 +1172,7 @@ pub fn production_doctor_report_reader(
                     // The exhaustive invariant pass
                     // (`validate_observation_authority_connection`) observed just
                     // above, never a boolean re-derived from schema and write-scope
-                    // currency — that is a different question and is already
+                    // currency, that is a different question and is already
                     // reported through `startup_converged`. `None` here means the
                     // audit genuinely could not run and drops runtime coverage to
                     // partial, exactly as the coverage split intends.
@@ -1137,7 +1199,8 @@ pub fn production_doctor_report_reader(
             Ok(
                 tracedecay_dashboard_api::AdmittedDoctorReportV1::new(report)
                     .with_table_growth_evidence(store_telemetry.table_growth_evidence)
-                    .with_schema_convergences(schema_convergence.findings),
+                    .with_schema_convergences(schema_convergence.findings)
+                    .with_language_servers(inputs.language_server),
             )
         })
     })
@@ -1188,12 +1251,7 @@ pub fn doctor_report_request_context(
 }
 
 fn now_secs() -> i64 {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_secs()),
-    )
-    .unwrap_or(i64::MAX)
+    tracedecay_runtime_core::tracedecay::saturating_unix_secs()
 }
 
 #[cfg(test)]

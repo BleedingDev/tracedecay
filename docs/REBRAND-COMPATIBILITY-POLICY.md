@@ -34,7 +34,7 @@ the final product shape.
    benchmark outputs, and TraceDecay-era narrative may keep old names when the name
    is part of the historical record.
 
-## Category A — retained indefinitely without migration
+## Category A, retained indefinitely without migration
 
 These surfaces remain valid indefinitely. New code must continue to understand them
 because removing them would hide existing data, break old installs, or erase useful
@@ -66,7 +66,7 @@ before deleting anything.
 
 ### A4. Historical docs, changelog entries, benchmark outputs, and old daemon cleanup docs
 
-Historical wording in `CHANGELOG.md`, `docs/TRACEDECAY-WHATSNEW.md`, old plans/specs,
+Historical wording in `CHANGELOG.md`, retained old plans/specs,
 benchmark reports, and daemon-removal instructions should remain unless it is
 factually wrong. These references should be labeled as historical when helpful, not
 mechanically rewritten.
@@ -77,7 +77,7 @@ The existing counter endpoint name may remain `tracedecay-counter` while the ser
 continues to be best-effort and documented. A future endpoint rename is allowed only
 when the replacement worker is deployed and continuity/failure behavior is preserved.
 
-## Category B — automatically migrated or cleaned up
+## Category B, automatically migrated or cleaned up
 
 These surfaces are accepted as old installed state, but installers, refreshers, or
 uninstallers should rewrite or remove generated legacy artifacts so the post-rebrand
@@ -132,7 +132,7 @@ actionable compatibility notes where behavior exists. When behavior changes, doc
 must be updated in the same change. Historical docs remain Category A instead of
 being migrated.
 
-## Category C — accepted as fallback but warning-producing
+## Category C, accepted as fallback but warning-producing
 
 These surfaces are still honored, but the new spelling is canonical. Runtime code or
 installer/reporting code should warn once per process or once per operation when the
@@ -198,7 +198,7 @@ guarantee.
 Docs may warn that external taps/buckets can lag behind the rename and still expose a
 legacy package name. This is a user-support warning, not a new canonical install path.
 
-## Category D — reject, fail, or do not silently accept
+## Category D, reject, fail, or do not silently accept
 
 These surfaces should not be accepted silently because doing so creates downgrade,
 data-loss, or supply-chain risk.
@@ -230,7 +230,7 @@ Installers and uninstallers must not delete unknown user-authored files merely
 because they live under an old path. Generated files can be migrated or
 removed; unrecognized files require preservation or explicit user confirmation.
 
-## Category E — externally constrained names that must not change yet
+## Category E, externally constrained names that must not change yet
 
 These names are not compatibility shims owned by TraceDecay. They are external
 upstream identifiers or ecosystem state that the project cannot safely rename by
@@ -293,7 +293,6 @@ Every audited surface maps to exactly one policy category below.
 | Homebrew/Scoop legacy package note | C | Keep as support warning while external packages lag; not canonical install path. |
 | Primary user docs mentioning fallback behavior | B | Keep aligned with runtime behavior; canonical examples use TraceDecay names. |
 | Design docs mentioning path/env/plugin fallback | B | Keep aligned with runtime behavior or mark as compatibility target. |
-| `docs/TRACEDECAY-WHATSNEW.md` historical narrative | A | Preserve as history. |
 | Historical plans/specs with TraceDecay names | A | Preserve as history unless factually wrong. |
 | Benchmark reports with TraceDecay tool/path names | A | Preserve measured historical names. |
 | Changelog historical TraceDecay references | A | Preserve history; summarize rename in current entries only. |

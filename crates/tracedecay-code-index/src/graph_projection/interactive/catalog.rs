@@ -1,10 +1,12 @@
 //! Bounded construction of the generation-pinned interactive catalog.
 
+use std::borrow::{Borrow, Cow};
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use tracedecay_domain::SanitizedCodeFileV1;
+use serde::Deserialize;
+use tracedecay_domain::{RelationEdgeKindV1, SanitizedCodeFileV1, SymbolOccurrenceId};
 use tracedecay_graph_db::{
     GraphCancellation, GraphEntity, GraphEntityId, GraphProjectionIdentity,
     GraphProjectionReadRequest, GraphRelation, MAX_VERIFIED_GENERATION_RELATIONS,
@@ -17,9 +19,10 @@ use super::super::schema::{
     file_import_relation_id, has_label, import_entity_id,
 };
 use super::super::{
-    CodeGraphProjectionError, SymbolRecordV1, symbol_entity_id, validate_symbol_record,
+    CodeGraphProjectionError, EDGE_LABEL, EDGE_RECORD_PROPERTY, SymbolRecordV1, TARGET_EDGE_KIND,
+    source_edge_kind_edge, symbol_entity_id, validate_symbol_record,
 };
-use super::models::{CatalogSymbol, InteractiveCatalog};
+use super::models::{CatalogSymbol, CodeGraphFileDependenciesV1, InteractiveCatalog};
 use crate::chunks::CodeIndexImportEvidenceV1;
 
 const CATALOG_SCAN_PAGE_ITEMS: usize = 1_024;
@@ -92,8 +95,23 @@ struct CatalogScan {
     catalog: InteractiveCatalog,
     imports_by_entity: BTreeMap<GraphEntityId, CodeIndexImportEvidenceV1>,
     import_links: BTreeMap<GraphEntityId, GraphRelation>,
+    degrees: SymbolDegreeCounts<GraphEntityId>,
+    /// `calls`/`uses` edge endpoints, folded into file dependencies once
+    /// every symbol's file is known.
+    dependency_edges: Vec<(SymbolOccurrenceId, SymbolOccurrenceId)>,
     scanned_entities: usize,
     scanned_relations: usize,
+}
+
+/// The fields of an edge record the file dependency fold reads, borrowed so
+/// edges of other kinds allocate nothing.
+#[derive(Deserialize)]
+struct DependencyEdgeRecord<'entity> {
+    #[serde(borrow)]
+    from_occurrence: Cow<'entity, str>,
+    #[serde(borrow)]
+    to_occurrence: Cow<'entity, str>,
+    kind: RelationEdgeKindV1,
 }
 
 impl CatalogScan {
@@ -102,6 +120,8 @@ impl CatalogScan {
             catalog: InteractiveCatalog::empty(),
             imports_by_entity: BTreeMap::new(),
             import_links: BTreeMap::new(),
+            degrees: SymbolDegreeCounts::default(),
+            dependency_edges: Vec::new(),
             scanned_entities: 0,
             scanned_relations: 0,
         }
@@ -143,6 +163,22 @@ impl CatalogScan {
         }
         if has_label(entity, IMPORT_LABEL) {
             self.record_import(entity)?;
+        }
+        if has_label(entity, EDGE_LABEL) {
+            let edge: DependencyEdgeRecord = deserialize_property(entity, EDGE_RECORD_PROPERTY)?;
+            if matches!(
+                edge.kind,
+                RelationEdgeKindV1::Calls | RelationEdgeKindV1::Uses
+            ) {
+                let endpoint = |occurrence: Cow<'_, str>| {
+                    SymbolOccurrenceId::new(occurrence.into_owned())
+                        .map_err(|error| CodeGraphProjectionError::Corrupt(error.to_string()))
+                };
+                self.dependency_edges.push((
+                    endpoint(edge.from_occurrence)?,
+                    endpoint(edge.to_occurrence)?,
+                ));
+            }
         }
         Ok(())
     }
@@ -200,6 +236,9 @@ impl CatalogScan {
             CatalogSymbol {
                 binding: record.binding,
                 metadata: record.metadata,
+                unresolved_calls: record.unresolved_calls,
+                outgoing: 0,
+                incoming: 0,
             },
         );
         Ok(())
@@ -238,10 +277,14 @@ impl CatalogScan {
         for relation in relations {
             check_cancelled(cancellation)?;
             self.count_relation()?;
-            if relation.kind.as_str() != FILE_IMPORT_EDGE_KIND {
-                continue;
+            match relation.kind.as_str() {
+                FILE_IMPORT_EDGE_KIND => self.record_import_link(relation.clone())?,
+                TARGET_EDGE_KIND => self.degrees.record_incoming(relation.to.clone()),
+                kind if source_edge_kind_edge(kind).is_some() => {
+                    self.degrees.record_outgoing(relation.from.clone());
+                }
+                _ => {}
             }
-            self.record_import_link(relation.clone())?;
         }
         Ok(())
     }
@@ -336,9 +379,100 @@ impl CatalogScan {
             ));
         }
 
+        for (occurrence, symbol) in &mut self.catalog.symbols {
+            (symbol.outgoing, symbol.incoming) = self.degrees.take(&symbol_entity_id(occurrence)?);
+        }
+        self.degrees.require_drained()?;
+        self.catalog.file_dependencies = file_dependencies(&self.catalog, &self.dependency_edges);
+
         self.catalog.imports = self.imports_by_entity.into_values().collect();
         self.catalog.imports.sort_by(canonical_import_order);
+        self.catalog.finalize();
         Ok(self.catalog)
+    }
+}
+
+fn file_dependencies(
+    catalog: &InteractiveCatalog,
+    edges: &[(SymbolOccurrenceId, SymbolOccurrenceId)],
+) -> CodeGraphFileDependenciesV1 {
+    let logical_path = |occurrence: &SymbolOccurrenceId| {
+        catalog
+            .symbols
+            .get(occurrence)?
+            .binding
+            .as_ref()?
+            .logical_path
+            .as_deref()
+    };
+    let mut folded: HashMap<&str, HashSet<&str>> = catalog
+        .files
+        .values()
+        .map(|file| (file.logical_path.as_str(), HashSet::new()))
+        .collect();
+    for (from, to) in edges {
+        if let (Some(source), Some(target)) = (logical_path(from), logical_path(to))
+            && source != target
+        {
+            folded.entry(source).or_default().insert(target);
+        }
+    }
+    let adjacency = folded
+        .into_iter()
+        .map(|(source, targets)| {
+            (
+                source.to_owned(),
+                targets.into_iter().map(str::to_owned).collect(),
+            )
+        })
+        .collect();
+    CodeGraphFileDependenciesV1 {
+        adjacency: Arc::new(adjacency),
+        dependency_edges: edges.len() as u64,
+    }
+}
+
+/// Per-symbol semantic degree tallied from source (`CodeRelationSource.*`) and
+/// `CodeRelationTarget` relations while the rows stream past, keyed by the
+/// symbol's entity identity.
+pub(super) struct SymbolDegreeCounts<K> {
+    counts: BTreeMap<K, (u64, u64)>,
+}
+
+impl<K> Default for SymbolDegreeCounts<K> {
+    fn default() -> Self {
+        Self {
+            counts: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Ord> SymbolDegreeCounts<K> {
+    pub(super) fn record_outgoing(&mut self, symbol: K) {
+        self.counts.entry(symbol).or_default().0 += 1;
+    }
+
+    pub(super) fn record_incoming(&mut self, symbol: K) {
+        self.counts.entry(symbol).or_default().1 += 1;
+    }
+
+    pub(super) fn take<Q>(&mut self, symbol: &Q) -> (u64, u64)
+    where
+        K: Borrow<Q>,
+        Q: Ord + ?Sized,
+    {
+        self.counts.remove(symbol).unwrap_or_default()
+    }
+
+    /// Every tallied endpoint must have been claimed by a symbol entity.
+    pub(super) fn require_drained(&self) -> Result<(), CodeGraphProjectionError> {
+        if self.counts.is_empty() {
+            Ok(())
+        } else {
+            Err(CodeGraphProjectionError::Corrupt(
+                "code graph relation endpoint is not a symbol entity".to_owned(),
+            ))
+        }
     }
 }
 

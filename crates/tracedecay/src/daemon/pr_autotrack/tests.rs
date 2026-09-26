@@ -25,17 +25,12 @@ async fn reconcile_preserves_closed_pr_when_scheduler_retirement_is_unavailable(
     let repo_root = tempfile::tempdir().unwrap(); // not a git repo; git ops no-op
 
     let mut meta = BranchMeta::new("main");
-    meta.add_branch("pr/5", "branches/pr_5.db", "main");
-    std::fs::create_dir_all(data_root.path().join("branches")).unwrap();
-    drop(
-        rusqlite::Connection::open(data_root.path().join("branches/pr_5.db"))
-            .expect("empty branch database"),
-    );
+    meta.add_branch("tracedecay/autotrack/pr/5", "main");
     save_branch_meta(data_root.path(), &meta).unwrap();
 
     let mut state = PrAutotrackState::default();
     state.managed.insert(
-        "pr/5".to_string(),
+        "tracedecay/autotrack/pr/5".to_string(),
         ManagedPr {
             pr: 5,
             head_branch: "feature-5".to_string(),
@@ -86,11 +81,10 @@ async fn reconcile_preserves_closed_pr_when_scheduler_retirement_is_unavailable(
         load_state(data_root.path())
             .expect("load managed PR state")
             .managed
-            .contains_key("pr/5")
+            .contains_key("tracedecay/autotrack/pr/5")
     );
     let reloaded = load_branch_meta(data_root.path()).unwrap();
-    assert!(reloaded.is_tracked("pr/5"));
-    assert!(data_root.path().join("branches/pr_5.db").exists());
+    assert!(reloaded.is_tracked("tracedecay/autotrack/pr/5"));
 }
 
 #[tokio::test]
@@ -235,6 +229,69 @@ async fn reconcile_refuses_malformed_state_before_branch_mutation() {
 }
 
 #[tokio::test]
+async fn reconcile_resets_entry_without_head_sha_and_preserves_other_entries() {
+    let data_root = tempfile::tempdir().expect("data root");
+    let repo_root = tempfile::tempdir().expect("repository root");
+    let current = ManagedPr {
+        pr: 3,
+        head_branch: "feature-3".to_owned(),
+        head_sha: "sha-3".to_owned(),
+        worktree: data_root.path().join("pr-worktrees/pr-3"),
+        tracking_ref: "refs/tracedecay/pr/3".to_owned(),
+    };
+    let state_path = data_root.path().join("pr-autotrack.json");
+    std::fs::write(
+        &state_path,
+        serde_json::json!({
+            "managed": {
+                "tracedecay/autotrack/pr/3": current,
+                "tracedecay/autotrack/pr/5": {
+                    "pr": 5,
+                    "head_branch": "feature-5",
+                    "worktree": data_root.path().join("pr-worktrees/pr-5"),
+                    "tracking_ref": "refs/tracedecay/pr/5"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write state without head_sha");
+    let discovery = PrDiscovery {
+        open: vec![DiscoveredPr {
+            number: 3,
+            head_branch: "feature-3".to_owned(),
+            head_sha: "sha-3".to_owned(),
+        }],
+        ..PrDiscovery::default()
+    };
+    let daemon_administration = StoreAdministration::default();
+
+    let report = reconcile_project_with_administration(
+        repo_root.path(),
+        data_root.path(),
+        &discovery,
+        10,
+        PrStoreAdministration::state_only(&daemon_administration),
+    )
+    .await
+    .expect("an entry without head_sha must not block reconciliation");
+
+    assert_eq!(report.failures, Vec::<(String, String)>::new());
+    assert!(report.tracked.is_empty() && report.untracked.is_empty());
+    assert_eq!(report.reset_stale.len(), 1);
+    assert_eq!(report.reset_stale[0].label, "tracedecay/autotrack/pr/5");
+    assert!(report.reset_stale[0].detail.contains("head_sha"));
+    let persisted: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read state"))
+            .expect("persisted state is JSON");
+    assert_eq!(
+        persisted["managed"],
+        serde_json::json!({ "tracedecay/autotrack/pr/3": current }),
+        "the reset drops only the stale entry"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_does_not_prepare_new_pr_without_scheduler_activation() {
     let data_root = tempfile::tempdir().unwrap();
     let repo_root = tempfile::tempdir().unwrap();
@@ -309,9 +366,9 @@ async fn reconcile_activates_discovered_pr_head_when_scheduler_is_injected() {
     git(repo.path(), &["branch", "-q", "-D", "feature-11"]);
 
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("open project graph"),
@@ -441,14 +498,12 @@ async fn partial_discovery_suppresses_removals() {
     let repo_root = tempfile::tempdir().unwrap();
 
     let mut meta = BranchMeta::new("main");
-    meta.add_branch("pr/5", "branches/pr_5.db", "main");
-    std::fs::create_dir_all(data_root.path().join("branches")).unwrap();
-    std::fs::write(data_root.path().join("branches/pr_5.db"), b"db").unwrap();
+    meta.add_branch("tracedecay/autotrack/pr/5", "main");
     save_branch_meta(data_root.path(), &meta).unwrap();
 
     let mut state = PrAutotrackState::default();
     state.managed.insert(
-        "pr/5".to_string(),
+        "tracedecay/autotrack/pr/5".to_string(),
         ManagedPr {
             pr: 5,
             head_branch: "feature-5".to_string(),
@@ -460,7 +515,7 @@ async fn partial_discovery_suppresses_removals() {
     save_state(data_root.path(), &state).unwrap();
 
     // Empty BUT partial discovery: PR 5 is absent only because the listing was
-    // truncated, not because it closed — it must NOT be untracked.
+    // truncated, not because it closed, it must NOT be untracked.
     let discovery = PrDiscovery {
         partial: true,
         ..Default::default()
@@ -485,15 +540,14 @@ async fn partial_discovery_suppresses_removals() {
         load_state(data_root.path())
             .expect("load managed PR state")
             .managed
-            .contains_key("pr/5"),
+            .contains_key("tracedecay/autotrack/pr/5"),
         "managed entry survives a partial discovery"
     );
     assert!(
         load_branch_meta(data_root.path())
             .unwrap()
-            .is_tracked("pr/5")
+            .is_tracked("tracedecay/autotrack/pr/5")
     );
-    assert!(data_root.path().join("branches/pr_5.db").exists());
 }
 
 fn init_manual_branch_repo(repo: &Path, branch: &str) {
@@ -536,9 +590,9 @@ async fn manual_branch_activates_when_scheduler_is_injected() {
     init_manual_branch_repo(repo.path(), "feature-manual");
 
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("open project graph"),
@@ -595,9 +649,9 @@ async fn retained_linked_worktree_honors_parent_native_graph_refusal() {
     let linked = linked_parent.path().join("linked");
     init_manual_branch_repo(repo.path(), "feature-retained-refusal");
 
-    let graph = crate::project::TraceDecay::open_with_options_for_test(
+    let graph = tracedecay_project::project::TraceDecay::open_with_options_for_test(
         repo.path(),
-        crate::project::TraceDecayOpenOptions::default(),
+        tracedecay_project::project::TraceDecayOpenOptions::default(),
     )
     .await
     .expect("open writable parent graph");
@@ -653,9 +707,9 @@ async fn retained_linked_worktree_honors_parent_native_graph_refusal() {
     graph.close();
 
     let graph = Arc::new(
-        crate::project::TraceDecay::open_read_only_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_read_only_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("reopen parent graph from persisted configuration"),
@@ -748,9 +802,9 @@ async fn manual_branch_identity_keeps_slashed_and_underscored_names_disjoint() {
     git(repo.path(), &["checkout", "-q", "main"]);
 
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .unwrap(),
@@ -798,9 +852,9 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
     let repo = tempfile::tempdir().unwrap();
     init_manual_branch_repo(repo.path(), "feature/advance");
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .unwrap(),
@@ -850,10 +904,11 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
     let staged_repo = repo.path().to_path_buf();
     let (staged_sender, staged_receiver) = tokio::sync::oneshot::channel();
     let owner = tokio::spawn(async move {
-        let lifecycle = try_acquire_manual_branch_lifecycle(
+        let lifecycle = acquire_manual_branch_lifecycle(
             &staged_graph.store_layout().data_root,
             "feature/advance",
         )
+        .await
         .unwrap();
         let staged = activate_manual_branch_head_with_lifecycle(
             &staged_repo,
@@ -897,7 +952,9 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
         schedulers.clone(),
         "feature/advance".to_owned(),
         data_root.clone(),
-        try_acquire_manual_branch_lifecycle(&data_root, "feature/advance").unwrap(),
+        acquire_manual_branch_lifecycle(&data_root, "feature/advance")
+            .await
+            .unwrap(),
         tracedecay_runtime_core::cancellation::CancellationToken::new(),
     )
     .await
@@ -923,7 +980,9 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
         schedulers.clone(),
         "feature/advance".to_owned(),
         data_root.clone(),
-        try_acquire_manual_branch_lifecycle(&data_root, "feature/advance").unwrap(),
+        acquire_manual_branch_lifecycle(&data_root, "feature/advance")
+            .await
+            .unwrap(),
         tracedecay_runtime_core::cancellation::CancellationToken::new(),
     )
     .await
@@ -963,46 +1022,54 @@ async fn manual_branch_stages_new_head_without_replacing_published_worktree() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn manual_branch_activation_refuses_exact_lifecycle_contention_before_mutating_git() {
+async fn manual_branch_activation_queues_behind_the_exact_lifecycle_before_mutating_git() {
     use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
 
     let repo = tempfile::tempdir().unwrap();
     init_manual_branch_repo(repo.path(), "feature/contended");
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .unwrap(),
     );
     let lifecycle =
-        try_acquire_manual_branch_lifecycle(&graph.store_layout().data_root, "feature/contended")
+        acquire_manual_branch_lifecycle(&graph.store_layout().data_root, "feature/contended")
+            .await
             .expect("first lifecycle owner");
     let schedulers = CodeIndexSchedulerRegistryV1::new(2);
-
-    let error =
-        activate_manual_branch_head(repo.path(), &graph, Some(&schedulers), "feature/contended")
-            .await
-            .expect_err("concurrent exact branch activation must be rejected");
-
-    assert!(matches!(
-        &error,
-        ManualBranchActivationError::LifecycleContended { .. }
-    ));
-    assert!(
+    let tracking_refs = || {
         git_output(
             repo.path(),
             &[
                 "for-each-ref",
                 "--format=%(refname)",
-                "refs/tracedecay/branch"
-            ]
+                "refs/tracedecay/branch",
+            ],
         )
         .trim()
-        .is_empty()
-    );
+        .to_owned()
+    };
+
+    let activation =
+        activate_manual_branch_head(repo.path(), &graph, Some(&schedulers), "feature/contended");
+    tokio::pin!(activation);
+    let queued = tokio::time::timeout(Duration::from_millis(200), &mut activation)
+        .await
+        .is_err();
+    let refs_while_queued = tracking_refs();
     drop(lifecycle);
+    let activated = activation.await.map(|activation| activation.branch);
+
+    assert!(
+        queued,
+        "same-branch activation must wait for the lifecycle owner"
+    );
+    assert_eq!(refs_while_queued, "");
+    assert_eq!(activated, Ok("feature/contended".to_owned()));
+    assert_ne!(tracking_refs(), "");
     schedulers.shutdown().await;
 }
 
@@ -1013,16 +1080,17 @@ async fn failed_manual_branch_sealing_retires_the_exact_mount_worktree_and_track
     let repo = tempfile::tempdir().unwrap();
     init_manual_branch_repo(repo.path(), "feature/failure-cleanup");
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .unwrap(),
     );
     let data_root = graph.store_layout().data_root.clone();
     let schedulers = CodeIndexSchedulerRegistryV1::new(2);
-    let lifecycle = try_acquire_manual_branch_lifecycle(&data_root, "feature/failure-cleanup")
+    let lifecycle = acquire_manual_branch_lifecycle(&data_root, "feature/failure-cleanup")
+        .await
         .expect("lifecycle owner");
     let activation = activate_manual_branch_head_with_lifecycle(
         repo.path(),
@@ -1075,9 +1143,9 @@ async fn manual_branch_fails_closed_without_scheduler_before_git_or_state_mutati
     init_manual_branch_repo(repo.path(), "feature-denied");
 
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("open project graph"),
@@ -1115,9 +1183,9 @@ async fn manual_branch_missing_ref_is_typed_failure() {
     init_manual_branch_repo(repo.path(), "feature-present");
 
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("open project graph"),
@@ -1167,9 +1235,9 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
     let branch = "feature/stalled-exact-read";
     init_manual_branch_repo(repo.path(), branch);
     let graph = Arc::new(
-        crate::project::TraceDecay::open_with_options_for_test(
+        tracedecay_project::project::TraceDecay::open_with_options_for_test(
             repo.path(),
-            crate::project::TraceDecayOpenOptions::default(),
+            tracedecay_project::project::TraceDecayOpenOptions::default(),
         )
         .await
         .expect("open project graph"),
@@ -1232,7 +1300,8 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
     let owner_branch = branch.to_owned();
     let requester = tokio::spawn(async move {
         let owner = tokio::spawn(async move {
-            let lifecycle = try_acquire_manual_branch_lifecycle(&owner_data_root, &owner_branch)
+            let lifecycle = acquire_manual_branch_lifecycle(&owner_data_root, &owner_branch)
+                .await
                 .expect("activation owner acquires the exact lifecycle");
             let control = PrCommandControl::with_timeout(Duration::from_millis(300));
             let outcome = activate_manual_branch_with_administration(
@@ -1309,7 +1378,8 @@ async fn cancelled_activation_keeps_its_lifecycle_owner_bounded_during_stalled_e
             .is_none_or(|metadata| !metadata.branches.contains_key(branch)),
         "activation alone must not leak sealed branch provenance"
     );
-    let lifecycle = try_acquire_manual_branch_lifecycle(&data_root, branch)
+    let lifecycle = acquire_manual_branch_lifecycle(&data_root, branch)
+        .await
         .expect("completed owner releases the exact lifecycle lease");
     cleanup_manual_branch_activation(
         repo.path(),
@@ -1368,6 +1438,7 @@ fn dashboard_managed_summary_reader_matches_canonical_state() {
                 },
             ),
         ]),
+        ..PrAutotrackState::default()
     };
     save_state(data_root.path(), &state).expect("write pr-autotrack state");
 

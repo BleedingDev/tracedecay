@@ -55,15 +55,26 @@ use tracedecay_runtime_core::cancellation::CancellationToken;
 /// Human-facing detail fragment for a still-warming project/profile owner.
 ///
 /// Protocol control flow must key on [`PROJECT_WARMING_REASON_CODE`] (or the
-/// sibling deferred/revoked codes below), never on this English prose.
+/// sibling deferred, capacity, and revoked codes below), never on this English
+/// prose.
 pub(crate) const PROJECT_WARMING_RETRY_HINT: &str =
     "is warming in the background; retry the same tool shortly";
 /// Typed reason a project/profile/owner open has not finished yet.
 pub const PROJECT_WARMING_REASON_CODE: &str = "project_warming";
 /// Typed reason a repository-identity probe deferred past its budget.
-pub const REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE: &str = "repository_discovery_deferred";
+pub use tracedecay_runtime_core::git_discovery::REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE;
 /// Typed reason a retained project server was retired mid-response.
 pub const PROJECT_SERVER_RESPONSE_REVOKED_REASON_CODE: &str = "project_server_response_revoked";
+/// Typed reason the in-flight project-open task table is full.
+pub const PROJECT_OPEN_TASK_CAPACITY_REASON_CODE: &str = "project_open_task_capacity_reached";
+/// Typed reason the cached project-server table is full.
+pub const PROJECT_SERVER_CAPACITY_REASON_CODE: &str = "project_server_capacity_reached";
+/// Typed reason a handshake route names a directory the authenticated profile
+/// has not enrolled (no `tracedecay init`, no registry row, no durable store).
+/// It is a client state, not a daemon failure: `initialize` and `tools/list`
+/// still answer, and every `tools/call` re-derives this refusal until
+/// enrollment succeeds.
+pub const PROJECT_NOT_ENROLLED_REASON_CODE: &str = "project_not_enrolled";
 #[cfg(unix)]
 const TOOL_LIST_CHANGED_METHOD: &str = "notifications/tools/list_changed";
 #[cfg(unix)]
@@ -72,6 +83,18 @@ const MAX_CACHED_PROJECT_SERVERS: usize = 8;
 const MAX_TRACKED_PROJECT_OPEN_TASKS: usize = MAX_CACHED_PROJECT_SERVERS;
 const MAX_CACHED_PROJECT_OPEN_FAILURES: usize = 64;
 const PROJECT_OPEN_REQUEST_DEADLINE: Duration = Duration::from_millis(500);
+
+/// Instant a foreground request stops waiting for an open it has already claimed.
+///
+/// Measured from the claim, not from connection arrival. Route enrollment and
+/// git discovery have their own bounds. Charging them to this deadline made a
+/// restart's first request answer warming for a store whose open had already
+/// recorded `reset_required`: the connection spent the budget before it joined
+/// the watch, so the publication wait returned immediately and never read the
+/// refusal.
+fn project_open_publication_deadline(claimed_at: tokio::time::Instant) -> tokio::time::Instant {
+    claimed_at + PROJECT_OPEN_REQUEST_DEADLINE
+}
 /// One budget for every blocking repository probe a route resolution runs.
 ///
 /// Route resolution reads the repository's topology, enrollment marker, and
@@ -128,25 +151,6 @@ impl AuthenticatedFirstRequest {
 pub(crate) const PROJECT_OPEN_RETRY_GRACE: Duration = Duration::from_secs(15);
 pub(crate) const PROJECT_OPEN_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Daemon error messages for a saturated project-open queue. Both clear on
-/// their own as in-flight opens finish, so they are retryable for the same
-/// reason [`PROJECT_WARMING_REASON_CODE`] is.
-const PROJECT_OPEN_CAPACITY_MESSAGES: [&str; 2] = [
-    "daemon project open task capacity reached",
-    "daemon project server capacity reached",
-];
-/// Typed `error.data.kind` values for the same two capacity states.
-const PROJECT_OPEN_CAPACITY_ERROR_KINDS: [&str; 2] = [
-    "project_open_task_capacity_reached",
-    "project_server_capacity_reached",
-];
-/// Message fragments emitted when a daemon request misses its read deadline.
-const DAEMON_READ_DEADLINE_MESSAGES: [&str; 3] = [
-    "before deadline",
-    "deadline already elapsed",
-    "did not answer after",
-];
-
 /// True when a daemon error is the typed project/profile/owner warming refusal.
 pub(crate) fn error_is_project_warming(error: &TraceDecayError) -> bool {
     matches!(
@@ -155,53 +159,65 @@ pub(crate) fn error_is_project_warming(error: &TraceDecayError) -> bool {
     )
 }
 
+/// True when repository discovery deferred or blocked this route.
+pub(crate) fn error_is_repository_discovery_deferred(error: &TraceDecayError) -> bool {
+    matches!(
+        error.project_route_context(),
+        Some((REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE, _, _))
+    )
+}
+
+/// True when route admission refused the handshake path as not enrolled.
+pub(crate) fn error_is_project_not_enrolled(error: &TraceDecayError) -> bool {
+    matches!(
+        error.project_route_context(),
+        Some((PROJECT_NOT_ENROLLED_REASON_CODE, false, _))
+    )
+}
+
+fn project_open_retryable_reason(reason_code: &str) -> bool {
+    matches!(
+        reason_code,
+        PROJECT_WARMING_REASON_CODE
+            | REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE
+            | PROJECT_OPEN_TASK_CAPACITY_REASON_CODE
+            | PROJECT_SERVER_CAPACITY_REASON_CODE
+    )
+}
+
+fn project_open_capacity_limit(reason_code: &str) -> Option<usize> {
+    match reason_code {
+        PROJECT_OPEN_TASK_CAPACITY_REASON_CODE => Some(MAX_TRACKED_PROJECT_OPEN_TASKS),
+        PROJECT_SERVER_CAPACITY_REASON_CODE => Some(MAX_CACHED_PROJECT_SERVERS),
+        _ => None,
+    }
+}
+
 /// True when a daemon error describes a project open that has not finished
 /// yet: typed warming, deferred repository discovery, or a saturated open
-/// queue (still named in the `Config` message until those producers migrate).
+/// queue. Capacity clears as in-flight opens finish, so it is retryable for
+/// the same reason [`PROJECT_WARMING_REASON_CODE`] is. Classification keys on
+/// the reason code, never on English detail.
 pub(crate) fn error_is_project_open_retryable(error: &TraceDecayError) -> bool {
-    error_is_project_warming(error)
-        || matches!(
-            error.project_route_context(),
-            Some((REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE, true, _))
-        )
-        || matches!(
-            error,
-            TraceDecayError::Config { message }
-                if PROJECT_OPEN_CAPACITY_MESSAGES
-                    .iter()
-                    .any(|capacity| message.contains(*capacity))
-        )
+    error
+        .project_route_context()
+        .is_some_and(|(reason, retryable, _)| retryable && project_open_retryable_reason(reason))
 }
 
 /// Response-side form of [`error_is_project_open_retryable`] for clients that
-/// still hold the JSON-RPC `error` member. Warming/deferred key on
-/// `data.reason_code`; capacity states also carry a typed `data.kind`.
+/// still hold the JSON-RPC `error` member. Every retryable open refusal,
+/// including capacity, carries `data.reason_code`.
 pub(crate) fn json_rpc_error_is_project_open_retryable(error: &serde_json::Value) -> bool {
     error
         .pointer("/data/reason_code")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|reason| {
-            reason == PROJECT_WARMING_REASON_CODE
-                || reason == REPOSITORY_DISCOVERY_DEFERRED_REASON_CODE
-        })
-        || error
-            .pointer("/data/kind")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|kind| PROJECT_OPEN_CAPACITY_ERROR_KINDS.contains(&kind))
-        || error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|message| {
-                PROJECT_OPEN_CAPACITY_MESSAGES
-                    .iter()
-                    .any(|capacity| message.contains(*capacity))
-            })
+        .is_some_and(project_open_retryable_reason)
 }
 
 /// True when a one-shot tool-call transport error should be retried by a
 /// journey (or any client riding out a transient open/retirement).
 ///
-/// Keys only on typed reason codes — never on English detail prose.
+/// Keys only on typed reason codes, never on English detail prose.
 pub fn tool_call_transport_error_is_retryable(error: &TraceDecayError) -> bool {
     matches!(
         error.project_route_context(),
@@ -212,20 +228,15 @@ pub fn tool_call_transport_error_is_retryable(error: &TraceDecayError) -> bool {
     )
 }
 
-/// True when a daemon error message reports a missed read deadline.
-pub fn error_message_is_read_deadline(message: &str) -> bool {
-    DAEMON_READ_DEADLINE_MESSAGES
-        .iter()
-        .any(|deadline| message.contains(deadline))
-}
-
-/// True when a daemon client missed its read deadline, including the typed
-/// `daemon_response_stalled` reason code.
+/// True when a daemon client missed its read deadline.
+///
+/// Keys only on [`tracedecay_daemon_protocol::DAEMON_RESPONSE_STALLED`]. English
+/// detail, including the stalled wait phrase, is not a second classifier.
 pub fn error_is_read_deadline(error: &TraceDecayError) -> bool {
     matches!(
         error.project_route_context(),
         Some((tracedecay_daemon_protocol::DAEMON_RESPONSE_STALLED, _, _))
-    ) || error_message_is_read_deadline(&error.to_string())
+    )
 }
 
 mod bootstrap;
@@ -252,13 +263,13 @@ mod connection_serving;
 pub use connection_serving::rmcp_benchmark;
 #[cfg(unix)]
 use connection_serving::serve_authenticated_socket_client_with_class;
-#[cfg(all(unix, test))]
-use connection_serving::serve_socket_client;
 #[cfg(not(unix))]
 use connection_serving::serve_windows_broker_client_with_class_and_invocation;
+#[cfg(any(test, feature = "test-transport"))]
+pub(crate) use connection_serving::{RoutedRmcpReplay, serve_routed_rmcp_connection};
 #[cfg(test)]
 use connection_serving::{
-    await_project_owner_or_disconnect, serve_routed_rmcp_connection, serve_windows_broker_client,
+    await_project_owner_or_disconnect, serve_windows_broker_client,
     serve_windows_broker_client_with_class,
 };
 mod core_admission;
@@ -268,10 +279,6 @@ use engine::DaemonEngine;
 use engine::{
     ensure_context_scout_owner_before_advertising,
     ensure_git_index_transactions_for_mutation_owners,
-};
-pub(crate) use tracedecay_daemon_service::automation_observation::{
-    project_run_observation_producer as project_automation_observation_producer,
-    record_project_run as record_project_automation_run,
 };
 mod core_client;
 mod core_doctor;
@@ -298,17 +305,6 @@ pub(crate) use core_doctor::*;
 pub use core_handshake::*;
 pub use core_hooks::*;
 pub use core_proxy::*;
-// Daemon process lifecycle and logging live in `tracedecay-daemon-service`;
-// the root's engine, bootstrap, and connection serving still read them by
-// these names until they move.
-#[cfg(unix)]
-pub(crate) use tracedecay_daemon_service::logging::recent_watcher_events;
-pub(crate) use tracedecay_daemon_service::logging::unavailable_error;
-#[cfg(feature = "hotpath")]
-pub use tracedecay_daemon_service::shutdown::install_hotpath_shutdown_finalizer;
-pub(crate) use tracedecay_daemon_service::shutdown::{
-    DAEMON_CLIENT_DRAIN_DEADLINE, DAEMON_TASK_ABORT_DEADLINE, DaemonLifecycle, ShutdownStatus,
-};
 mod github_credential_lifecycle;
 mod graph_resolution;
 use graph_resolution::retained_project_server_resolver;
@@ -356,15 +352,15 @@ mod store_maintenance;
 pub use production_harness::ProductionProjectCompositionHarnessV1;
 #[cfg(all(unix, feature = "test-transport"))]
 pub use production_harness::capture_exact_git_snapshot_for_test;
+mod profile_retained;
 mod projectless;
 mod remote_deletion;
 #[cfg(test)]
 use projectless::projectless_tools_call_response;
-use projectless::{
-    projectless_tool_call, projectless_user_session_request, serve_projectless_client,
-};
+use projectless::{projectless_first_request, projectless_tool_call, serve_projectless_client};
 mod project_composition;
 mod project_delivery_mount;
+pub(crate) use project_composition::daemon_transcript_source_home;
 use project_composition::{ProductionProjectCompositionRuntime, production_project_server};
 mod project_open_admission;
 #[cfg(test)]
@@ -385,7 +381,8 @@ mod project_open_handshake;
 #[cfg(test)]
 use project_open_handshake::is_missing_index_error;
 use project_open_handshake::{
-    open_project_for_handshake, project_open_error_response, write_project_open_error,
+    initialize_project_open_error, open_project_for_handshake, project_open_error_response,
+    write_project_open_error,
 };
 mod project_open_orchestration;
 mod project_routing;
@@ -411,11 +408,11 @@ use project_routing::portable_database_owner_reconciler;
 use project_routing::{CatalogRefreshClientKey, maintenance_transition_gate};
 use project_routing::{
     bind_authenticated_profile_identity, bounded_repository_probe,
-    cached_or_bind_ready_project_server, prefer_recorded_open_failure,
-    project_open_cancellation_checkpoint, project_open_cancellation_error,
-    project_open_capacity_gate, project_open_gate, project_open_task_capacity_error,
-    project_open_tasks, project_route_for_handshake, project_server_capacity_error,
-    project_warming_error, resolved_project_server_key,
+    cached_or_bind_ready_project_server, ensure_checkout_topology_before_admission,
+    prefer_recorded_open_failure, project_open_cancellation_checkpoint,
+    project_open_cancellation_error, project_open_capacity_gate, project_open_gate,
+    project_open_task_capacity_error, project_open_tasks, project_route_for_handshake,
+    project_server_capacity_error, project_warming_error, resolved_project_server_key,
 };
 #[cfg(test)]
 use project_server_lifecycle::replay_user_profile_host_admission_for_identity;

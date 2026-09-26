@@ -66,7 +66,7 @@ function feedReading(sync: ProjectionSync): {
  * The bottom status strip (NAVIGATION.md "Persistent regions" 6): a 32px
  * strip separating Link, Feed, Source, Query and Registry authority. Each is
  * its own labelled cell with its own reading; none vouches for another.
- * `Link live` says the `/api/events` socket is open — not that data is
+ * `Link live` says the `/api/events` socket is open, not that data is
  * synced, not that any activity was accepted, not that anything is healthy.
  */
 export function StatusStrip({ queryActivity }: { queryActivity?: ReactNode } = {}) {
@@ -99,7 +99,7 @@ export function StatusStrip({ queryActivity }: { queryActivity?: ReactNode } = {
          *
          * They used to be two elements with the live region around the word
          * alone, so a reader listening to the strip was told "stale" and never
-         * told why — the sentence that says a refresh was rejected sat outside
+         * told why, the sentence that says a refresh was rejected sat outside
          * the announcement, updating silently beside it. Both change at the
          * same moment and only mean anything together, so they are announced
          * together.
@@ -113,7 +113,7 @@ export function StatusStrip({ queryActivity }: { queryActivity?: ReactNode } = {
           {feed.detail !== null && (
             // The state is carried by the word, not the swatch; the reason is
             // the one thing a reader needs to know that the word cannot hold.
-            <span className="td-value min-w-0 truncate text-3xs normal-case text-text-muted">
+            <span className="td-value min-w-0 truncate text-xs normal-case text-text-muted">
               {feed.detail}
             </span>
           )}
@@ -128,7 +128,7 @@ export function StatusStrip({ queryActivity }: { queryActivity?: ReactNode } = {
 
 /**
  * The registers the mounted workspace publishes about the authorities it is
- * reading — the Code workspace's graph read, index freshness and pinned
+ * reading, the Code workspace's graph read, index freshness and pinned
  * selection, for instance. Numbered on from the shell's own four so the strip
  * stays one status word, and gone the moment the workspace unmounts.
  */
@@ -153,14 +153,14 @@ function WorkspaceRegisters() {
             data-state={register.state}
             className="flex min-w-0 items-center gap-1.5"
           >
-            <span className="td-value max-w-56 truncate text-2xs">{register.value}</span>
+            <span className="td-value max-w-56 truncate text-xs">{register.value}</span>
             {/* The qualifier yields first: with the shell's own four cells and
               * three workspace registers, a 1440px strip has room for every
               * state word or every detail, not both. The word carries the
               * state; the detail returns from `2xl` and stays on the title. */}
             {register.detail ? (
               <span
-                className="td-value min-w-0 max-w-64 truncate text-3xs text-text-muted max-2xl:hidden"
+                className="td-value min-w-0 max-w-64 truncate text-xs text-text-muted max-2xl:hidden"
                 title={register.detail}
               >
                 {register.detail}
@@ -179,7 +179,7 @@ function WorkspaceRegisters() {
  * one.
  *
  *   LIVE      the event stream is up; plates follow the daemon.
- *   CAPTURED  the stream is down but resolved reads are still on screen —
+ *   CAPTURED  the stream is down but resolved reads are still on screen,
  *             fixtures, or the last answers before the link dropped. Stamped
  *             in the alert register because it is exactly the state a reader
  *             must not mistake for live.
@@ -213,7 +213,7 @@ export function SourceProvenance() {
   );
 }
 
-/** Whether any read model on screen has resolved with data — the difference
+/** Whether any read model on screen has resolved with data, the difference
  * between CAPTURED (plates hold a real read) and NO SOURCE (empty frames). */
 function useAnyResolvedRead(): boolean {
   const client = useQueryClient();
@@ -241,11 +241,11 @@ export function QueryActivityStatus() {
   if (activeQuery !== undefined) {
     return (
       <Cell icon={Search} label="Query">
-        <span className="td-value max-w-64 truncate text-2xs" role="status">
+        <span className="td-value max-w-64 truncate text-xs" role="status">
           {activeQuery.label}
         </span>
         {queryActivities.length > 1 ? (
-          <span className="td-value text-3xs text-text-muted">
+          <span className="td-value text-xs text-text-muted">
             +{queryActivities.length - 1}
           </span>
         ) : null}
@@ -269,7 +269,7 @@ export function QueryActivityStatus() {
 
   return lastCancellation === null ? null : (
     <Cell icon={Search} label="Query">
-      <span className="td-value max-w-72 truncate text-2xs" role="status">
+      <span className="td-value max-w-72 truncate text-xs" role="status">
         cancelled · {lastCancellation.label}
       </span>
     </Cell>
@@ -281,7 +281,7 @@ export function QueryActivityStatus() {
  * depends on for scope and the command palette.
  *
  * Distinct from Link and Feed: the socket can be live and the projection
- * synced while the registry — the authority that says which projects exist —
+ * synced while the registry, the authority that says which projects exist,
  * is missing, unopenable, or refusing this caller. It is also distinct from
  * the scope register's per-project reconciliation, which asks about one id;
  * this asks whether the registry can be read at all. The typed-state
@@ -387,7 +387,7 @@ export function RegistryAuthorityStatus() {
       >
         <span className="td-value text-2xs uppercase">{registry.value}</span>
         {registry.detail !== null && (
-          <span className="td-value min-w-0 truncate text-3xs normal-case text-text-muted">
+          <span className="td-value min-w-0 truncate text-xs normal-case text-text-muted">
             {registry.detail}
           </span>
         )}

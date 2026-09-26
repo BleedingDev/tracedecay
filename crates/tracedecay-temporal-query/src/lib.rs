@@ -1,11 +1,13 @@
 pub mod candidates;
 pub mod context;
 pub mod cursor;
+pub mod execution;
 pub mod hydration;
-pub mod ports;
+pub mod paging;
 pub mod ranking;
 pub mod resolution;
 mod retriever;
+pub mod snapshot;
 
 pub use retriever::{hydrate_temporal_candidate_export, hydrate_temporal_candidate_selection};
 
@@ -25,14 +27,14 @@ use self::context::{
     CompactContext, ContextBudget, ContextError, TemporalContextFrames, VersionedTokenEstimator,
 };
 use self::cursor::{
-    CursorError, CursorPosition, StableSortKey, encode_cursor_position, verify_cursor_position,
+    CursorError, CursorPosition, SessionCursorAuthenticator, StableSortKey, encode_cursor_position,
+    verify_cursor_position,
 };
+use self::execution::{ExecutionLimits, TemporalPortError};
 use self::hydration::{HydrationBatch, HydrationError, TemporalHydrationPort};
-use self::ports::{
-    CandidateReadState, ExecutionLimits, PageKey, PageLimits, PageStatus,
-    SessionCursorAuthenticator, TemporalExecutionSnapshot, TemporalPortError, TemporalReadPort,
-    TemporalRecord, TemporalRecordBatch, TemporalRecordReadState, TemporalRetrievalScope,
-    pull_candidate_page, pull_temporal_record_page,
+use self::paging::{
+    CandidateReadState, PageKey, PageLimits, PageStatus, TemporalReadPort, TemporalRecord,
+    TemporalRecordBatch, TemporalRecordReadState, pull_candidate_page, pull_temporal_record_page,
 };
 use self::ranking::{
     DiversityLimits, RankedCandidate, RankingCandidate, RankingError, rank_candidates,
@@ -45,6 +47,7 @@ use self::resolution::summary::{
 use self::resolution::types::{
     ResolutionLineageEdge, ResolutionLineageEdgeKind, ResolvedOccurrence, TemporalResolution,
 };
+use self::snapshot::{TemporalExecutionSnapshot, TemporalRetrievalScope};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TemporalKernelRequest {
@@ -250,7 +253,7 @@ pub struct TemporalCandidateExport {
     resolution: TemporalResolution,
     summaries: Vec<SessionSummaryRecordV1>,
     summary_eligibility: SummaryLineageEligibility,
-    strict_population: Option<ports::TemporalCandidatePopulationCount>,
+    strict_population: Option<snapshot::TemporalCandidatePopulationCount>,
 }
 
 impl TemporalCandidateExport {
@@ -318,11 +321,11 @@ pub async fn execute_temporal_kernel(
 ///
 /// The window is the unit a cursor can rank inside: scores are cohort-relative,
 /// so a ranked position is only meaningful against the same window. Filling the
-/// window while storage still holds rows is a continuation — the returned key
-/// is where the next window starts — not exhausted coverage.
+/// window while storage still holds rows is a continuation, the returned key
+/// is where the next window starts, not exhausted coverage.
 ///
-/// An empty query is a scope browse — the authorized scope's records in
-/// temporal order — never a zero-clause (structurally empty) plan. Text queries
+/// An empty query is a scope browse, the authorized scope's records in
+/// temporal order, never a zero-clause (structurally empty) plan. Text queries
 /// rank through the lexical/phrase/entity channels instead.
 async fn read_candidate_window(
     read_port: &impl TemporalReadPort,
@@ -426,7 +429,7 @@ pub async fn execute_temporal_candidate_export(
         .unwrap_or_default();
     let strict_population = snapshot
         .prepared_candidate_cohort()
-        .and_then(ports::TemporalPreparedCandidateCohort::strict_population);
+        .and_then(snapshot::TemporalPreparedCandidateCohort::strict_population);
     let (candidates, next_window_keyset) = match snapshot.prepared_candidate_cohort() {
         Some(prepared) => (prepared.candidates().to_vec(), None),
         None => read_candidate_window(read_port, &snapshot, request, limits, &resume).await?,
@@ -547,7 +550,7 @@ pub async fn execute_temporal_candidate_export(
     // A derived-evidence group anchor names a span/burst container, never a
     // retrievable payload: no hydration authority resolves a group, so ranking
     // one as a standalone row can only spend a result slot and a diversity
-    // slot, then report an unresolvable omission — evicting real messages from
+    // slot, then report an unresolvable omission, evicting real messages from
     // the page it was supposed to enrich. Groups contribute their bounds to the
     // record read and their evidence to rank fusion; they never become results.
     let visible_candidates = all_candidates
@@ -625,7 +628,7 @@ fn evaluate_summaries_for_scope(
     source_states: &BTreeMap<RetrievalAnchorId, SummarySourceState>,
     scope: &TemporalRetrievalScope,
     mode: tracedecay_domain::TemporalModeV1,
-    control: &ports::ExecutionControl,
+    control: &execution::ExecutionControl,
 ) -> Result<SummaryLineageEligibility, TemporalPortError> {
     match scope {
         TemporalRetrievalScope::Session(session_id) => {
@@ -816,7 +819,7 @@ fn temporal_context_frames(
     // Ranked summaries carry their own provenance: each summary anchor
     // supports-derives from its source anchors. Surfacing that as Supports
     // lineage keeps summary describes traceable without a stored assertion
-    // row per source. Only summaries actually returned contribute edges —
+    // row per source. Only summaries actually returned contribute edges,
     // merely-eligible summaries must not pollute unrelated results' lineage.
     for summary in summaries {
         if !ranked_anchors.contains(summary.summary_anchor_id())
@@ -879,7 +882,7 @@ fn increment_hydration_coverage(coverage: &mut TemporalCoverageCountsV1, state: 
         | HydrationStateV1::RetentionExpired => CoverageClass::Redacted,
         HydrationStateV1::RetainedButUnavailable
         | HydrationStateV1::Locked
-        | HydrationStateV1::UnverifiableLegacy => CoverageClass::Unknown,
+        | HydrationStateV1::Unverifiable => CoverageClass::Unknown,
         HydrationStateV1::Available => return,
     };
     increment_coverage(coverage, class);
@@ -1022,11 +1025,12 @@ mod scope_tests {
         SummarySourceHorizonV1, TemporalModeV1, TemporalValidityV1, UtcMicros,
     };
 
+    use super::execution::ExecutionControl;
     use super::hydration::HydrationBatch;
-    use super::ports::{ExecutionControl, TemporalRetrievalScope};
     use super::resolution::summary::{
         SummaryLineageEligibility, SummaryLineageRejection, SummaryOmission, SummarySourceState,
     };
+    use super::snapshot::TemporalRetrievalScope;
     use super::{evaluate_summaries_for_scope, public_summary_omissions, temporal_context_frames};
 
     fn anchor(value: &str) -> RetrievalAnchorId {

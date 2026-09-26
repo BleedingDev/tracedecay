@@ -1,0 +1,39 @@
+packages:
+  - dashboard
+  - sdks/typescript
+  - plugin/cursor-native-extension
+  # pnpm's Cargo inventory walks every directory not pruned by a negated
+  # pattern and treats each Cargo.toml it finds as a workspace to install.
+  # Test fixtures, eval corpora, mockups, vendored crates, and local git
+  # worktrees are not install targets. Worktree checkouts
+  # (`.worktrees`, `.codex-worktrees`, `.claude-worktrees`, and
+  # `.claude/worktrees`) sit inside the repo and carry their own Cargo.toml.
+  - "!crates/*/tests/fixtures/**"
+  - "!evals/**"
+  - "!mockups/**"
+  - "!tests/fixtures/**"
+  - "!vendor/**"
+  - "!.worktrees/**"
+  - "!.codex-worktrees/**"
+  - "!.claude-worktrees/**"
+  - "!.claude/worktrees/**"
+
+allowBuilds:
+  esbuild: true
+  core-js: false
+  msw: false
+
+overrides:
+  esbuild: ^0.28.1
+
+# `pnpm run` refuses to execute against npm packages that no longer match
+# pnpm-lock.yaml. It does not check Cargo.lock. The CLI build script relies on
+# this instead of installing from inside a Cargo build, which would rewrite
+# the Cargo sources it compiles.
+verifyDepsBeforeRun: error
+
+# Installs the crates of the root and sdks/codegen Cargo workspaces into
+# `.pnpm/crates` and writes the source replacement in each `.cargo/config.toml`,
+# so `cargo` builds offline against sources from pnpm's store.
+cargo:
+  enabled: true

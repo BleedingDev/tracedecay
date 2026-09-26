@@ -20,8 +20,9 @@ use tracedecay_domain::{
 
 use super::ports::{
     CodeCandidateBindingV1, LaneBoundEvidence, LaneEvidenceRejections, LexicalPostingReadPort,
-    RetrievalExecutionControl, RetrievalPortError, candidate_checkpoint_prefix, checkpoint_digest,
-    contract_error, lane_bound_evidence, lane_candidate_cap,
+    RETRIEVAL_CANDIDATE_BATCH_SIZE, RetrievalExecutionControl, RetrievalPortError,
+    candidate_checkpoint_prefix, checkpoint_digest, contract_error, lane_bound_evidence,
+    lane_candidate_cap, retrieval_checkpoint,
 };
 
 mod projection;
@@ -50,21 +51,15 @@ pub use self::projection::{
     CodeLexicalArtifactBuildProgressV1, CodeLexicalArtifactBuilderV1, CodeLexicalArtifactErrorV1,
     CodeLexicalArtifactFinalizationPhaseV1, CodeLexicalArtifactFinalizationStepV1,
     CodeLexicalArtifactOccurrenceV1, CodeLexicalArtifactReaderV1,
-    CodeLexicalArtifactSectionDigestV1, CodeLexicalArtifactWriterRevisionV1,
-    CodeLexicalCloneIndexCensusV1, CodeLexicalCloneSuccessorV1,
-    CodeLexicalImportMembershipWitnessV1, CodeLexicalProjectionMetadataV1,
-    MAX_CLONE_EXACT_PAGE_MEMBERS_V1, MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1,
-    PreparedCodeLexicalArtifactBatchV1, PreparedCodeLexicalArtifactPageV1,
-    VerifiedCodeLexicalArtifactV1, code_lexical_artifact_build_memory_budget_for,
-};
-#[cfg(feature = "search-eval")]
-pub use self::projection::{
-    CodeExactProjectionAdapterV1, CodeLexicalProjectionAdapterV1, CodeLexicalProjectionBuildStepV1,
-    CodeLexicalProjectionBuildV1, LEXICAL_PROJECTION_BUILD_DEADLINE_MICROS_V1,
-    lexical_projection_build_deadline_micros,
+    CodeLexicalArtifactSectionDigestV1, CodeLexicalCloneIndexCensusV1, CodeLexicalCloneRouteV1,
+    CodeLexicalProjectionMetadataV1, MAX_CLONE_EXACT_PAGE_MEMBERS_V1,
+    MAX_CLONE_FINGERPRINT_PAGE_BODIES_V1, PreparedCodeLexicalArtifactBatchV1,
+    PreparedCodeLexicalArtifactPageV1, VerifiedCodeLexicalArtifactV1,
+    code_lexical_artifact_build_memory_budget_for, code_lexical_artifact_content_key,
 };
 pub use self::routes::{
-    LexicalAliasV1, LexicalAlternativeReasonV1, LexicalAnchorV1, LexicalRouteErrorV1,
+    LEXICAL_ANCHOR_MATCH_SCORE_MICROS_V1, LexicalAliasV1, LexicalAlternativeReasonV1,
+    LexicalAnchorOutcomeV1, LexicalAnchorReceiptV1, LexicalAnchorV1, LexicalRouteErrorV1,
     LexicalRouteKindV1, LexicalRouteMatchV1, LexicalRouteOutcomeV1, LexicalRoutePlanV1,
     LexicalRouteReceiptV1, LexicalRouteV1, LexicalRoutingV1, MAX_LEXICAL_ALIAS_BYTES_V1,
     MAX_LEXICAL_ALIASES_V1, MAX_LEXICAL_ANCHOR_BYTES_V1, MAX_LEXICAL_ANCHORS_V1,
@@ -95,7 +90,7 @@ pub const MAX_LEXICAL_QUERY_TERM_BYTES_V1: usize = 512;
 
 /// Summed document-frequency budget for lexical term-source admission. Every
 /// candidate is decoded from its row and scored, so the union of the request's
-/// term sources — not the winner cap — decides the lane's transient allocation
+/// term sources, not the winner cap, decides the lane's transient allocation
 /// and wall time: unbounded, a natural-language task whose terms include
 /// common words hydrated ~74k rows of a 472k-chunk corpus per read (~0.95 GB
 /// decoded, 5.7 s) and missed the context deadline. Term sources are admitted
@@ -333,28 +328,13 @@ pub struct LexicalLaneRequest<'a> {
     pub score_domain: ScoreDomainId,
     pub budget: RetrievalBudget,
     /// The live request authority the lane consults between bounded units of
-    /// row work ([`lexical_checkpoint`]). The candidate-source bound keeps one
-    /// request's hydration finite, but a caller that has already settled —
-    /// cancelled, past its deadline, or revoked — must not keep the shared
+    /// row work. The candidate-source bound keeps one
+    /// request's hydration finite, but a caller that has already settled,
+    /// cancelled, past its deadline, or revoked, must not keep the shared
     /// search execution permit occupied while the remaining rows decode and
     /// score. Cancellation unwinds the scan with
     /// [`RetrievalPortError::Cancelled`] instead of an empty or partial batch.
     pub control: &'a dyn RetrievalExecutionControl,
-}
-
-/// The lexical lane's cooperative cancellation checkpoint.
-///
-/// Called before each candidate row is decoded and scored, and between the
-/// scan's phases, so cancellation performs at most one further row visit
-/// after the signal. An uncancelled request never observes it, which keeps
-/// candidate order, evidence, and coverage identical to an unchecked scan.
-pub(crate) fn lexical_checkpoint(
-    control: &dyn RetrievalExecutionControl,
-) -> Result<(), RetrievalPortError> {
-    if control.is_cancelled() {
-        return Err(RetrievalPortError::Cancelled);
-    }
-    Ok(())
 }
 
 /// Per-occurrence lexical-lane evidence with its field score breakdown.
@@ -592,7 +572,10 @@ where
         let mut admitted: Vec<(CompactCandidate, LexicalLaneEvidence, FixedPointScore)> =
             Vec::with_capacity(batch.candidates.len());
         let mut excluded = 0_u64;
-        for candidate in &batch.candidates {
+        for (ordinal, candidate) in batch.candidates.iter().enumerate() {
+            if ordinal.is_multiple_of(RETRIEVAL_CANDIDATE_BATCH_SIZE) {
+                retrieval_checkpoint(request.control)?;
+            }
             let evidence = lane_bound_evidence(
                 batch,
                 candidate,
@@ -647,6 +630,9 @@ where
         let mut candidates = Vec::with_capacity(admitted.len());
         let mut evidence_by_occurrence = BTreeMap::new();
         for (ordinal, (mut candidate, evidence, raw_score)) in admitted.into_iter().enumerate() {
+            if ordinal.is_multiple_of(RETRIEVAL_CANDIDATE_BATCH_SIZE) {
+                retrieval_checkpoint(request.control)?;
+            }
             candidate.ordinal_rank = ordinal as u32;
             candidate.raw_score = raw_score;
             evidence_by_occurrence.insert(candidate.source_occurrence_id.clone(), evidence);
@@ -660,6 +646,7 @@ where
         let eligible = batch.coverage.eligible.max(seen).saturating_sub(excluded);
         let capped = batch.coverage.capped.saturating_add(truncated as u64);
         let exhausted = truncated == 0 && batch.coverage.capped == 0;
+        retrieval_checkpoint(request.control)?;
         let checkpoint_digest = lexical_checkpoint_digest(&request.generation, &candidates)?;
         let rebuilt = RetrieverBatch {
             candidates,
@@ -692,7 +679,7 @@ where
         request: &LexicalLaneRequest<'_>,
     ) -> Result<RetrieverOutcome<RetrieverBatch<LexicalLaneEvidence>>, RetrievalPortError> {
         request.validate()?;
-        lexical_checkpoint(request.control)?;
+        retrieval_checkpoint(request.control)?;
         let outcome = match self.postings.read_lexical_postings(request) {
             Ok(outcome) => outcome,
             // A missing lexical authority rejects the request as a typed

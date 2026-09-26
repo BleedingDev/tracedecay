@@ -29,7 +29,8 @@ use super::project_composition::{
 use super::project_server_lifecycle::{detach_project_servers, shutdown_detached_project_servers};
 use super::*;
 #[cfg(unix)]
-use tracedecay_application::pr_tracking::try_acquire_manual_branch_lifecycle;
+use tracedecay_application::pr_tracking::acquire_manual_branch_lifecycle;
+use tracedecay_code_index_runtime::CodeIndexSchedulerRegistryV1;
 #[cfg(all(unix, feature = "test-transport"))]
 use tracedecay_code_index_runtime::git_transactions;
 use tracedecay_daemon_identity::profile_identity;
@@ -408,10 +409,7 @@ async fn install_production_composition_profile_workers(
                     profile_identity.profile_id(),
                 )
                 .await?;
-            store_administration.install_remote_recovery_project_lifecycle(
-                invocation.clone(),
-                Arc::clone(project_open_gates),
-            )?;
+            store_administration.install_remote_recovery_project_lifecycle()?;
             install_http_application_cold_resolver(
                 http_application_registry,
                 store_administration.clone(),
@@ -479,7 +477,7 @@ async fn mount_one_production_composition_project(
         allow_initialize_root_routing: false,
         tool_list_changed_capable: false,
         catalog_version: String::new(),
-        moved_store_adoption: crate::project::MovedStoreAdoption::Never,
+        moved_store_adoption: tracedecay_project::project::MovedStoreAdoption::Never,
     };
     let (canonical_project_path, _) = project_route_for_handshake(&handshake)?;
     let composition = stores
@@ -563,7 +561,7 @@ impl ProductionProjectCompositionHarnessV1 {
     ///
     /// The composition pins its transcript source home to its own isolated
     /// layout rather than reading the ambient process `HOME`, so a journey
-    /// that seeds a real transcript must write it here — a transcript written
+    /// that seeds a real transcript must write it here, a transcript written
     /// under `$HOME` is invisible to the composition and the session lane
     /// stays empty forever.
     pub fn transcript_source_home(isolation_root: impl AsRef<Path>) -> Option<PathBuf> {
@@ -574,7 +572,8 @@ impl ProductionProjectCompositionHarnessV1 {
         isolation_root: impl AsRef<Path>,
         project_roots: impl IntoIterator<Item = PathBuf>,
     ) -> ProductionHarnessOpenFuture {
-        let live_profile_root = crate::config::user_data_dir().filter(|path| path.exists());
+        let live_profile_root =
+            tracedecay_runtime_core::config::user_data_dir().filter(|path| path.exists());
         Self::open_with_live_profile_root(
             isolation_root.as_ref().to_path_buf(),
             project_roots.into_iter().collect(),
@@ -614,7 +613,8 @@ impl ProductionProjectCompositionHarnessV1 {
         isolation_root: impl AsRef<Path>,
         project_roots: impl IntoIterator<Item = PathBuf>,
     ) -> ProductionHarnessOpenFuture {
-        let live_profile_root = crate::config::user_data_dir().filter(|path| path.exists());
+        let live_profile_root =
+            tracedecay_runtime_core::config::user_data_dir().filter(|path| path.exists());
         Self::open_with_live_profile_root(
             isolation_root.as_ref().to_path_buf(),
             project_roots.into_iter().collect(),
@@ -632,7 +632,8 @@ impl ProductionProjectCompositionHarnessV1 {
         project_roots: impl IntoIterator<Item = PathBuf>,
         scope_prefix: impl Into<String>,
     ) -> ProductionHarnessOpenFuture {
-        let live_profile_root = crate::config::user_data_dir().filter(|path| path.exists());
+        let live_profile_root =
+            tracedecay_runtime_core::config::user_data_dir().filter(|path| path.exists());
         Self::open_with_live_profile_root(
             isolation_root.as_ref().to_path_buf(),
             project_roots.into_iter().collect(),
@@ -667,7 +668,7 @@ impl ProductionProjectCompositionHarnessV1 {
             // product-runtime registration, so the canonical fixture is this
             // composition's provider; without it daemon bootstrap and version
             // reporting answer the typed missing-provider state.
-            crate::product_runtime::register_fixture_product_runtime();
+            tracedecay_project::product_runtime::register_fixture_product_runtime();
             let isolated = isolate_production_composition_roots(
                 isolation_root,
                 project_roots,
@@ -798,7 +799,7 @@ impl ProductionProjectCompositionHarnessV1 {
     }
 
     /// Sums the retained profile's settled savings-ledger rows, optionally
-    /// scoped to one project path — the production accounting authority the
+    /// scoped to one project path, the production accounting authority the
     /// MCP analytics journeys assert against.
     #[hotpath::measure(label = "daemon.harness.sum_profile_savings", future = true)]
     pub async fn sum_profile_savings(
@@ -848,13 +849,14 @@ impl ProductionProjectCompositionHarnessV1 {
 
     pub fn server(&self, project_root: impl AsRef<Path>) -> Result<Arc<crate::mcp::McpServer>> {
         let canonical_project_path =
-            std::fs::canonicalize(project_root.as_ref()).map_err(|error| {
-                TraceDecayError::Config {
-                    message: format!(
-                        "failed to canonicalize production-composition project '{}': {error}",
-                        project_root.as_ref().display()
-                    ),
-                }
+            tracedecay_runtime_core::path_safety::canonical_existing_identity(
+                project_root.as_ref(),
+            )
+            .map_err(|error| TraceDecayError::Config {
+                message: format!(
+                    "failed to canonicalize production-composition project '{}': {error}",
+                    project_root.as_ref().display()
+                ),
             })?;
         self.resources
             .as_ref()
@@ -971,14 +973,9 @@ impl ProductionProjectCompositionHarnessV1 {
         administration
             .run_manual_branch_publication(|cancellation| async move {
                 let _lifecycle =
-                    try_acquire_manual_branch_lifecycle(&graph.store_layout().data_root, &branch)
-                        .map_err(|error| {
-                        TraceDecayError::project_route(
-                            error.reason_code(),
-                            error.retryable(),
-                            error.detail(),
-                        )
-                    })?;
+                    acquire_manual_branch_lifecycle(&graph.store_layout().data_root, &branch)
+                        .await
+                        .map_err(super::branch_add::lifecycle_route_error)?;
                 super::branch_add::branch_publication_context(&graph)?
                     .track_exact_worktree_branch(
                         &schedulers,
@@ -1033,6 +1030,47 @@ impl ProductionProjectCompositionHarnessV1 {
     }
 }
 
+/// Liveness floor for the readiness probe above.
+///
+/// Every seat install and every source revalidation that keeps an unchanged
+/// generation seated signals the serving watch, so the common case wakes on
+/// the publication itself. This bound only covers the terminal answers that
+/// install no seat — a route that has not mounted yet, and a verified source
+/// that publishes no generation at all.
+const CODE_INDEX_READINESS_BACKSTOP: Duration = Duration::from_millis(100);
+
+/// Park until the mounted route seats a generation, or until the backstop.
+///
+/// The probe this paces canonicalizes the root, takes the scheduler registry's
+/// mounted mutex several times, offloads a Git-metadata freshness capture to
+/// the blocking pool, and emits a decline event. Re-running it on a fixed
+/// millisecond cadence spends that on the same cores as the reconcile it is
+/// waiting for, so the wait is driven by the serving watch instead.
+async fn await_serving_generation_change(
+    schedulers: &CodeIndexSchedulerRegistryV1,
+    project_root: &Path,
+    serving_changed: &mut Option<tokio::sync::watch::Receiver<()>>,
+) {
+    if serving_changed.is_none() {
+        *serving_changed = schedulers
+            .subscribe_serving_generation_changes(project_root)
+            .await;
+    }
+    let Some(changed) = serving_changed.as_mut() else {
+        tokio::time::sleep(CODE_INDEX_READINESS_BACKSTOP).await;
+        return;
+    };
+    match timeout(CODE_INDEX_READINESS_BACKSTOP, changed.changed()).await {
+        Ok(Ok(())) | Err(_) => {}
+        // The route retired its watch. Drop it and let the next probe report
+        // whatever typed state replaced the mount.
+        Ok(Err(_)) => {
+            *serving_changed = None;
+            tokio::time::sleep(CODE_INDEX_READINESS_BACKSTOP).await;
+        }
+    }
+}
+
 #[hotpath::measure(label = "daemon.harness.wait_code_index", future = true)]
 async fn wait_for_production_composition_code_index(
     invocation: &DaemonInvocationState,
@@ -1051,6 +1089,12 @@ async fn wait_for_production_composition_code_index(
         return Ok(());
     }
     let wait_started = Instant::now();
+    // Subscribe before the first probe so a seat installed between the probe
+    // and the wait still wakes this loop.
+    let mut serving_changed = invocation
+        .code_index_schedulers
+        .subscribe_serving_generation_changes(project_root)
+        .await;
     let publication = timeout(Duration::from_secs(20), async {
         loop {
             // Scope-aware readiness is the authenticated demand boundary that
@@ -1101,7 +1145,12 @@ async fn wait_for_production_composition_code_index(
             {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            await_serving_generation_change(
+                &invocation.code_index_schedulers,
+                project_root,
+                &mut serving_changed,
+            )
+            .await;
         }
     })
     .await;
@@ -1572,28 +1621,30 @@ mod code_index_activation_test {
         let owner_cancellation = cancellation.clone();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let owner = tokio::spawn(async move {
-            let _lease =
-                try_acquire_manual_branch_lifecycle(&data_root, "main").expect("lifecycle owner");
+            let _lease = acquire_manual_branch_lifecycle(&data_root, "main")
+                .await
+                .expect("lifecycle owner");
             ready_tx.send(()).expect("publish owner readiness");
             owner_cancellation.cancelled().await;
         });
         ready_rx.await.expect("lifecycle owner started");
 
-        let error = harness
-            .track_worktree_branch(&project, &project, "main")
-            .await
-            .expect_err("harness publication must not bypass the lifecycle owner");
-        assert!(
-            error.to_string().contains("lifecycle is already active"),
-            "{error}"
-        );
+        {
+            let publication = harness.track_worktree_branch(&project, &project, "main");
+            tokio::pin!(publication);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(200), &mut publication)
+                    .await
+                    .is_err(),
+                "harness publication must queue behind the lifecycle owner, not bypass it"
+            );
 
-        cancellation.cancel();
-        owner.await.expect("cancelled lifecycle owner");
-        harness
-            .track_worktree_branch(&project, &project, "main")
-            .await
-            .expect("publication proceeds after lifecycle owner cancellation");
+            cancellation.cancel();
+            owner.await.expect("cancelled lifecycle owner");
+            publication
+                .await
+                .expect("queued publication proceeds once the lifecycle owner releases");
+        }
         harness.shutdown().await;
     }
 }
@@ -1608,10 +1659,19 @@ mod journey_test_support;
 mod delivery_read_gate_journey_test;
 
 #[cfg(test)]
+mod advisory_cycle_language_journey_test;
+
+#[cfg(test)]
 mod generation_retention_test;
 
 #[cfg(test)]
 mod configuration_idempotency_journey_test;
+
+#[cfg(test)]
+mod configuration_protected_preview_journey_test;
+
+#[cfg(test)]
+mod configuration_set_behavior_test;
 
 #[cfg(test)]
 mod read_only_project_open_journey_test;

@@ -35,6 +35,7 @@ pub struct LcmStatusV1 {
     pub payload: LcmPayloadStatusV1,
     pub payload_gc: LcmPayloadGcStatusV1,
     pub lifecycle: LcmLifecycleStatusV1,
+    pub summary_convergence: LcmSummaryConvergenceStatusV1,
     pub redaction: LcmRedactionStatusV1,
 }
 
@@ -147,12 +148,42 @@ pub struct LcmLifecycleStatusV1 {
     pub last_finalized_frontier_store_id: Option<i64>,
 }
 
+/// Retained-session summary convergence queue: disjoint per-state session
+/// counts and the reasons parked or failed sessions record.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LcmSummaryConvergenceStatusV1 {
+    pub pending_session_count: i64,
+    pub retryable_session_count: i64,
+    pub current_session_count: i64,
+    pub unavailable_session_count: i64,
+    pub permanent_session_count: i64,
+    pub reasons: Vec<LcmSummaryConvergenceReasonV1>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LcmSummaryConvergenceReasonV1 {
+    pub state: LcmSummaryConvergenceStateV1,
+    pub reason: String,
+    pub session_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LcmSummaryConvergenceStateV1 {
+    Pending,
+    Retryable,
+    Current,
+    Unavailable,
+    Permanent,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct LcmRedactionStatusV1 {
     pub enabled: bool,
     pub lossy_records: i64,
-    pub legacy_truncated_count: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -237,7 +268,7 @@ pub enum LcmDoctorProjectionStateV1 {
 
 /// The temporal projection's serving state at diagnosis time. A store whose
 /// schema is healthy can still have nothing to serve while history is being
-/// re-derived (for example after a scoped observation reset); this is where
+/// re-derived (for example on a fresh profile); this is where
 /// that state is named instead of being read as absent data.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -299,8 +330,6 @@ pub struct LcmMessageV1 {
     pub content_hash: Option<String>,
     pub storage_kind: LcmStorageKindV1,
     pub payload_ref: Option<String>,
-    pub legacy_source: bool,
-    pub legacy_truncated: bool,
     pub metadata_json: Option<String>,
 }
 
@@ -443,8 +472,6 @@ pub struct LcmRawMessageV1 {
     pub content_hash: String,
     pub storage_kind: LcmStorageKindV1,
     pub payload_ref: Option<String>,
-    pub legacy_source: bool,
-    pub legacy_truncated: bool,
     pub metadata_json: Option<String>,
 }
 
@@ -461,8 +488,6 @@ pub struct LcmRawMessageMetadataV1 {
     pub content_hash: String,
     pub storage_kind: LcmStorageKindV1,
     pub payload_ref: Option<String>,
-    pub legacy_source: bool,
-    pub legacy_truncated: bool,
     pub metadata_json: Option<String>,
 }
 
@@ -504,8 +529,6 @@ pub struct LcmExpansionV1 {
     pub payload_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_current_session: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub externalized_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_pagination: Option<LcmSourcePaginationV1>,
 }

@@ -25,7 +25,6 @@ fn run_hydration_render_workload() -> usize {
         summary_sources: Vec::new(),
         payload_ref: None,
         from_current_session: None,
-        externalized_note: None,
         source_pagination: None,
     };
 
@@ -51,7 +50,7 @@ mod unguarded {
     fn workload_is_a_no_op_for_profiling() {
         let report = Path::new(env!("CARGO_TARGET_TMPDIR")).join("temporal-store-hotpath-off.json");
         let _ = std::fs::remove_file(&report);
-        // SAFETY: single-threaded with respect to readers — the feature-off
+        // SAFETY: single-threaded with respect to readers, the feature-off
         // build contains no hotpath runtime and nothing else in this test
         // binary reads these variables.
         unsafe {

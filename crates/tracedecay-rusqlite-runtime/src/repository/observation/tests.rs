@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 use serde_json::json;
 use tracedecay_domain::{
-    AnchorDurabilityClass, AnchorSourceGenerationV2, CanonicalObservationEnvelopeV1,
+    AnchorDurabilityClass, AnchorSourceGeneration, CanonicalObservationEnvelopeV1,
     CanonicalObservationEvidenceV1, CanonicalObservationFactV1, CanonicalObservationRelationsV1,
     ComponentVersion, CoverageReportV1, EvidenceAvailabilityV1, EvidenceClass, FactOwnerV1,
     GenerationBoundRepositoryProvenanceV1, ObservationId, ObservationIdentityMaterialV1,
@@ -10,7 +10,7 @@ use tracedecay_domain::{
     PayloadAccessState, PayloadReferenceV1, PrivacyDomainBoundLocatorDigest, ProjectId,
     ProjectionGenerationId, ProviderId, ProviderUsageContractDimensionV1, RefId,
     RepositoryEvidenceV1, RepositoryId, RepositoryProvenanceV1, RepositoryRemoteIdentityV1,
-    RetentionClass, RetrievalAnchorRecordV2, RetrievalAnchorRecordV2Parts, RetrievalAnchorTargetV2,
+    RetentionClass, RetrievalAnchorRecord, RetrievalAnchorRecordParts, RetrievalAnchorTarget,
     SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1,
     SensitivityV1, SessionId, UtcMicros, VectorWatermark,
 };
@@ -21,7 +21,7 @@ use tracedecay_store::{
     ObservationCursorAdvance, ObservationReadOperationV1, ObservationReadResultV1,
     ObservationWrite, RetrievalAnchorDispositionRecordV1, SESSION_MESSAGE_PROJECTOR_VERSION,
     StorageRuntimeErrorV1, build_observation_resolution_authorization_v1,
-    build_observation_retrieval_anchor_v2,
+    build_observation_retrieval_anchor,
 };
 
 use crate::operation::StorageOperationError;
@@ -125,7 +125,7 @@ fn anchored_at(write: ObservationWrite, ingested_at: UtcMicros) -> AnchoredObser
     let authorization =
         build_observation_resolution_authorization_v1(write.observation(), "runtime.fixture.v1")
             .unwrap();
-    let anchor = build_observation_retrieval_anchor_v2(
+    let anchor = build_observation_retrieval_anchor(
         write.observation(),
         projection_generation.clone(),
         ingested_at,
@@ -235,8 +235,8 @@ fn repository_write_for(
         Some(write.observation().observation_id().clone()),
     )
     .unwrap();
-    let anchor = RetrievalAnchorRecordV2::new(RetrievalAnchorRecordV2Parts {
-        target: RetrievalAnchorTargetV2::RepositoryCapture {
+    let anchor = RetrievalAnchorRecord::new(RetrievalAnchorRecordParts {
+        target: RetrievalAnchorTarget::RepositoryCapture {
             repository_id: binding.capture().repository_id().clone(),
             capture_id: binding.capture_id().clone(),
             receipt: write.observation().receipt().receipt().clone(),
@@ -246,9 +246,7 @@ fn repository_write_for(
         occurred_at: None,
         ingested_at: UtcMicros(clock),
         evidence_class,
-        source_generation: AnchorSourceGenerationV2::RepositoryCapture(
-            binding.capture_id().clone(),
-        ),
+        source_generation: AnchorSourceGeneration::RepositoryCapture(binding.capture_id().clone()),
         projection_generation: write.projection_generation().clone(),
         projection_watermark: VectorWatermark::default(),
         coverage: CoverageReportV1::default(),
@@ -621,6 +619,20 @@ fn execute_cursor_advance(
     Ok(())
 }
 
+fn source_cursor_json(connection: &Connection) -> String {
+    connection
+        .query_row("SELECT cursor_json FROM source_cursors", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+}
+
+fn restore_source_cursor(connection: &Connection, cursor_json: &str) {
+    connection
+        .execute("UPDATE source_cursors SET cursor_json = ?1", [cursor_json])
+        .unwrap();
+}
+
 #[test]
 fn anchored_write_persists_all_authority_rows_atomically() {
     let mut connection = connection();
@@ -752,7 +764,7 @@ fn replay_with_different_anchor_fails_without_mutating_authority_rows() {
     let authorization =
         build_observation_resolution_authorization_v1(write.observation(), "runtime.fixture.v1")
             .unwrap();
-    let conflicting_anchor = build_observation_retrieval_anchor_v2(
+    let conflicting_anchor = build_observation_retrieval_anchor(
         write.observation(),
         conflicting_generation.clone(),
         UtcMicros(1),
@@ -881,10 +893,11 @@ fn identity_collision_fails_without_advancing_the_source_cursor() {
 }
 
 #[test]
-fn source_cursor_advance_replays_exactly_and_reports_ledger_disagreement() {
+fn source_cursor_advance_keeps_the_first_owner_once_the_frontier_is_reached() {
     let mut connection = connection();
     let write = anchored_observation_write("fixture", "receipt.fixture");
     execute(&mut connection, &write).unwrap();
+    let owned_frontier = source_cursor_json(&connection);
     let advance = ObservationCursorAdvance::for_ordering(
         write.observation().source().clone(),
         write.observation().scope().clone(),
@@ -917,9 +930,30 @@ fn source_cursor_advance_replays_exactly_and_reports_ledger_disagreement() {
         ObservationCoverageReason::OutOfScope,
     )
     .unwrap();
+    execute_cursor_advance(&mut connection, &conflicting).unwrap();
+    assert_eq!(
+        connection
+            .query_row("SELECT reason FROM source_cursor_advances", [], |row| {
+                row.get::<_, String>(0)
+            },)
+            .unwrap(),
+        ObservationCoverageReason::BlankFrame.as_str()
+    );
+    assert_eq!(
+        connection
+            .query_row("SELECT COUNT(*) FROM source_cursor_advances", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
+    );
+
+    // The disagreement stays a write-time failure: the cursor has not
+    // reached the proposed frontier, so this advance would move it.
+    restore_source_cursor(&connection, &owned_frontier);
     let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
     let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
-        panic!("expected structured immutable ledger disagreement");
+        panic!("expected structured immutable ledger disagreement, got {error:?}");
     };
     assert_eq!(disagreement.source(), write.observation().source());
     assert_eq!(disagreement.scope(), write.observation().scope());
@@ -942,11 +976,69 @@ fn source_cursor_advance_replays_exactly_and_reports_ledger_disagreement() {
     ));
 }
 
+fn advance_ledger_ends(connection: &Connection) -> Vec<i64> {
+    let mut statement = connection
+        .prepare(
+            "SELECT json_extract(coverage_json, '$.range.end')
+             FROM source_cursor_advances ORDER BY 1",
+        )
+        .unwrap();
+    statement
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+#[test]
+fn cursor_commits_keep_only_the_advance_supporting_the_frontier() {
+    let mut connection = connection();
+    let write = anchored_observation_write("fixture", "receipt.fixture");
+    execute(&mut connection, &write).unwrap();
+    let identity = write.observation().identity();
+    let mut cursor = write.next_cursor().clone();
+    for end in 2_u64..=6 {
+        let advance = ObservationCursorAdvance::for_ordering(
+            write.observation().source().clone(),
+            write.observation().scope().clone(),
+            identity.generation(),
+            identity.ordering_domain(),
+            Some(cursor.clone()),
+            ObservationSourceRangeV1::new(end - 1, end).unwrap(),
+            ObservationCoverageReason::OutOfScope,
+        )
+        .unwrap();
+        execute_cursor_advance(&mut connection, &advance).unwrap();
+        cursor = advance.next_cursor().clone();
+        assert_eq!(
+            advance_ledger_ends(&connection),
+            vec![i64::try_from(end).unwrap()]
+        );
+    }
+    assert_eq!(cursor.position(), 6);
+
+    let next = anchored(observation_write_for_record(
+        "next",
+        "receipt.next",
+        1,
+        6,
+        7,
+        Some(cursor),
+        "record.next",
+    ));
+    execute(&mut connection, &next).unwrap();
+    assert!(
+        advance_ledger_ends(&connection).is_empty(),
+        "an observation past the frontier settles the last advance"
+    );
+}
+
 #[test]
 fn canonical_cursor_advance_receipt_remains_typed_after_authority_lookup() {
     let mut connection = connection();
     let write = anchored_observation_write("fixture", "receipt.fixture");
     execute(&mut connection, &write).unwrap();
+    let observation_cursor = source_cursor_json(&connection);
     let advance = ObservationCursorAdvance::for_ordering_with_sanitization_receipt(
         write.observation().source().clone(),
         write.observation().scope().clone(),
@@ -972,9 +1064,26 @@ fn canonical_cursor_advance_receipt_remains_typed_after_authority_lookup() {
     )
     .unwrap();
 
+    execute_cursor_advance(&mut connection, &conflicting).unwrap();
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT reason, receipt_id FROM source_cursor_advances",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap(),
+        (
+            ObservationCoverageReason::DuplicateObservation
+                .as_str()
+                .to_owned(),
+            "receipt.fixture".to_owned(),
+        )
+    );
+    restore_source_cursor(&connection, &observation_cursor);
     let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
     let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
-        panic!("expected structured immutable ledger disagreement");
+        panic!("expected structured immutable ledger disagreement, got {error:?}");
     };
     assert!(matches!(
         disagreement.stored().receipt_id(),
@@ -993,6 +1102,7 @@ fn corrupt_cursor_advance_ledger_values_are_opaque_and_content_free() {
     let mut connection = connection();
     let write = anchored_observation_write("fixture", "receipt.fixture");
     execute(&mut connection, &write).unwrap();
+    let observation_cursor = source_cursor_json(&connection);
     let advance = ObservationCursorAdvance::for_ordering(
         write.observation().source().clone(),
         write.observation().scope().clone(),
@@ -1022,10 +1132,11 @@ fn corrupt_cursor_advance_ledger_values_are_opaque_and_content_free() {
         ObservationCoverageReason::OutOfScope,
     )
     .unwrap();
+    restore_source_cursor(&connection, &observation_cursor);
 
     let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
     let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
-        panic!("expected structured immutable ledger disagreement");
+        panic!("expected structured immutable ledger disagreement, got {error:?}");
     };
     assert!(matches!(
         disagreement.stored().reason(),
@@ -1055,6 +1166,7 @@ fn short_corrupt_ledger_receipt_stays_opaque_across_runtime_boundary() {
     let mut connection = connection();
     let write = anchored_observation_write("fixture", "receipt.fixture");
     execute(&mut connection, &write).unwrap();
+    let observation_cursor = source_cursor_json(&connection);
     let advance = ObservationCursorAdvance::for_ordering(
         write.observation().source().clone(),
         write.observation().scope().clone(),
@@ -1085,10 +1197,11 @@ fn short_corrupt_ledger_receipt_stays_opaque_across_runtime_boundary() {
         ObservationCoverageReason::OutOfScope,
     )
     .unwrap();
+    restore_source_cursor(&connection, &observation_cursor);
 
     let error = execute_cursor_advance(&mut connection, &conflicting).unwrap_err();
     let StorageOperationError::CursorAdvanceLedgerDisagreement { disagreement } = error else {
-        panic!("expected structured immutable ledger disagreement");
+        panic!("expected structured immutable ledger disagreement, got {error:?}");
     };
     assert!(matches!(
         disagreement.stored().receipt_id(),

@@ -5,8 +5,8 @@
 //! 1. A deterministic content refusal covers past the frame with a durable
 //!    typed reason (`ObservationIdentityCollision` for that exact refusal,
 //!    otherwise `AdmissionRefused`) so the stream converges.
-//! 2. Everything else — store commit/read-back failures, unbound authorities,
-//!    retryable races — is a typed [`TranscriptIngestError::HostAdmission`]
+//! 2. Everything else, store commit/read-back failures, unbound authorities,
+//!    retryable races, is a typed [`TranscriptIngestError::HostAdmission`]
 //!    block: the frontier does not advance and no coverage is written over a
 //!    record whose durable fate is unknown.
 //!
@@ -27,11 +27,11 @@ use tracedecay_domain::{
     ObservationSourceIdentityV1, ProjectId, ProviderId, RetentionClass, SessionId,
 };
 use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
+use tracedecay_store::ParseOffset;
 use tracedecay_store::observation::{
     CursorAdvanceOutcome, ObservationCoverageReason, ObservationCursorAdvance,
     ObservationIdentityCollisionDispositionV1,
 };
-use tracedecay_store::{ObservationBatchFallbackCause, ParseOffset};
 
 use crate::admission::test_support::MemoryHostAdmission;
 use crate::admission::{
@@ -40,7 +40,7 @@ use crate::admission::{
 use crate::observation::{
     CaptureObservationOutcome, CaptureObservationRequest, ObservationCancellation,
 };
-use crate::runtime::codex::{
+use crate::runtime::hosts::codex::{
     try_admit_codex_jsonl_observations_for_profile_with_admission,
     try_admit_codex_jsonl_observations_for_project_with_admission,
 };
@@ -59,6 +59,13 @@ struct SeamSpyAdmission {
     capture_calls: AtomicU64,
     capture_collision_dispositions: Mutex<Vec<ObservationIdentityCollisionDispositionV1>>,
     cover_past_advances: Mutex<Vec<ObservationCursorAdvance>>,
+    /// Commit the next capture through the shared store and then report the
+    /// cursor CAS as lost, the way a live hook ingest wins the race a sweep
+    /// was still trying to write.
+    peer_wins_next_cursor_cas: AtomicBool,
+    /// Commit only the first batched frame, then report the window CAS lost.
+    /// The durable cursor then covers a prefix, not the window's last frame.
+    peer_covers_batch_prefix: AtomicBool,
 }
 
 #[tokio::test]
@@ -651,6 +658,18 @@ impl SeamSpyAdmission {
         *self.scripted_capture_error.lock().unwrap() = Some(outcome);
     }
 
+    fn script_peer_wins_next_cursor_cas(&self) {
+        self.peer_wins_next_cursor_cas.store(true, Ordering::SeqCst);
+    }
+
+    fn script_peer_covers_batch_prefix(&self) {
+        self.peer_covers_batch_prefix.store(true, Ordering::SeqCst);
+    }
+
+    fn peer_won_cursor_cas(&self) -> bool {
+        self.peer_wins_next_cursor_cas.swap(false, Ordering::SeqCst)
+    }
+
     fn script_batch_error(&self, outcome: HostAdmissionOutcome) {
         *self.scripted_batch_error.lock().unwrap() = Some(outcome);
     }
@@ -683,6 +702,12 @@ impl HostAdmission for SeamSpyAdmission {
                 .lock()
                 .unwrap()
                 .push(request.identity_collision_disposition());
+            if self.peer_won_cursor_cas() {
+                let _ = self.inner.capture_observation(request).await;
+                return Err(HostAdmissionOutcome::retained_backpressured(
+                    "cursor_conflict",
+                ));
+            }
             if let Some(outcome) = self.scripted_capture_error_once.lock().unwrap().take() {
                 return Err(outcome);
             }
@@ -703,6 +728,20 @@ impl HostAdmission for SeamSpyAdmission {
                     .iter()
                     .map(CaptureObservationRequest::identity_collision_disposition),
             );
+            if self.peer_won_cursor_cas() {
+                let _ = self.inner.capture_observations(requests).await;
+                return Err(HostAdmissionOutcome::retained_backpressured(
+                    "cursor_conflict",
+                ));
+            }
+            if self.peer_covers_batch_prefix.swap(false, Ordering::SeqCst) {
+                if let Some(first) = requests.into_iter().next() {
+                    let _ = self.inner.capture_observation(first).await;
+                }
+                return Err(HostAdmissionOutcome::retained_backpressured(
+                    "cursor_conflict",
+                ));
+            }
             if let Some(outcome) = self.scripted_batch_error.lock().unwrap().take() {
                 return Err(outcome);
             }
@@ -821,7 +860,7 @@ fn rollout_fixture() -> (tempfile::TempDir, PathBuf, u64) {
 }
 
 async fn stored_cursor(spy: &SeamSpyAdmission) -> Option<ObservationSourceCursorV1> {
-    let source = crate::runtime::codex::codex_observation_source_v2(SESSION_ID).unwrap();
+    let source = crate::runtime::hosts::codex::codex_observation_source_v2(SESSION_ID).unwrap();
     spy.get_source_cursor(&source, &ObservationScopeV1::Profile)
         .await
         .unwrap()
@@ -898,6 +937,116 @@ async fn retryable_admission_failures_keep_their_own_verdict() {
     assert!(stored_cursor(&spy).await.is_none());
 }
 
+/// Live hook ingest and the catch-up sweep own the same `(source, scope)`
+/// cursor, so one of them loses the store's compare-and-swap. When the winner
+/// already covered the range the loser was writing, the loser's work is
+/// durable and the pass is a no-op, not a failed source: reporting it as a
+/// failure produced a "Cursor transcript catch-up failed" WARN roughly every
+/// ten seconds on a live daemon for work that was already committed.
+#[tokio::test]
+async fn cursor_cas_lost_to_a_peer_that_covered_the_range_is_a_no_op() {
+    let (_temp, path, len) = rollout_fixture();
+    let spy = SeamSpyAdmission::default();
+    spy.script_peer_wins_next_cursor_cas();
+
+    let stats =
+        try_admit_codex_jsonl_observations_for_profile_with_admission(&path, None, &[], &spy, None)
+            .await
+            .expect("a CAS the peer already covered must not fail the source pass");
+
+    assert_eq!(
+        stored_cursor(&spy).await.map(|cursor| cursor.position()),
+        Some(len),
+        "the pass must adopt the winner's frontier"
+    );
+    assert!(
+        !spy.inner.observations().is_empty(),
+        "the peer's commit is the durable record this pass stopped duplicating"
+    );
+    assert_eq!(
+        stats.frames_accepted, 0,
+        "the loser accepts nothing of its own"
+    );
+    assert!(
+        stats.frames_skipped > 0,
+        "the covered frames are counted as skipped, not lost"
+    );
+}
+
+/// The same lost CAS with nothing behind it stays a typed retryable block:
+/// adopting a frontier the winner never reached would skip real records.
+#[tokio::test]
+async fn cursor_cas_lost_without_peer_coverage_stays_a_typed_block() {
+    let (_temp, path, _len) = rollout_fixture();
+    let spy = SeamSpyAdmission::default();
+    spy.script_capture_error(HostAdmissionOutcome::retained_backpressured(
+        "cursor_conflict",
+    ));
+
+    let error =
+        try_admit_codex_jsonl_observations_for_profile_with_admission(&path, None, &[], &spy, None)
+            .await
+            .expect_err("an uncovered race must surface for another pass");
+
+    assert!(matches!(
+        error,
+        TranscriptIngestError::HostAdmission {
+            reason: "cursor_conflict",
+            retryable: true,
+            ..
+        }
+    ));
+    assert!(stored_cursor(&spy).await.is_none());
+}
+
+/// A window CAS that the peer only partly won used to fail the source. The
+/// prefix is already durable; the tail has to be replayed one frame at a time.
+#[tokio::test]
+async fn cursor_cas_lost_on_a_partially_covered_window_replays_the_tail() {
+    super::install_test_shared_jsonl_preparation_authority();
+    let temp = tempfile::tempdir().unwrap();
+    let cwd = temp.path().join("workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let path = temp.path().join("rollout.jsonl");
+    write_rollout(&path, &cwd);
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "user_message",
+                "message": "tail that the peer did not cover"
+            }
+        })
+    )
+    .unwrap();
+    let len = std::fs::metadata(&path).unwrap().len();
+    let spy = SeamSpyAdmission::default();
+    spy.script_peer_covers_batch_prefix();
+
+    let stats =
+        try_admit_codex_jsonl_observations_for_profile_with_admission(&path, None, &[], &spy, None)
+            .await
+            .expect("a prefix-covered window must replay its uncovered tail");
+
+    assert_eq!(
+        stored_cursor(&spy).await.map(|cursor| cursor.position()),
+        Some(len),
+        "the replay must adopt the prefix and commit through the tail"
+    );
+    assert!(
+        spy.inner.observations().len() >= 2,
+        "the covered prefix and the uncovered tail must both stay durable, got {} observations and stats {stats:?}",
+        spy.inner.observations().len()
+    );
+}
+
 #[tokio::test]
 async fn eligible_identity_collision_retries_once_with_normalizer_fallback() {
     super::install_test_shared_jsonl_preparation_authority();
@@ -906,8 +1055,8 @@ async fn eligible_identity_collision_retries_once_with_normalizer_fallback() {
     let bytes = b"{\"role\":\"user\",\"content\":\"repeated\"}\n";
     std::fs::write(&path, bytes).unwrap();
     let spy = SeamSpyAdmission::default();
-    spy.script_batch_error(HostAdmissionOutcome::batch_requires_scalar_fallback(
-        ObservationBatchFallbackCause::IntraBatchIdentityCollision,
+    spy.script_batch_error(HostAdmissionOutcome::deterministic_content_refusal(
+        "observation_identity_collision",
     ));
     spy.script_capture_error_once(HostAdmissionOutcome::deterministic_content_refusal(
         "observation_identity_collision",
@@ -1024,8 +1173,8 @@ async fn exhausted_identity_collision_retry_uses_its_exact_terminal_coverage_rea
     let bytes = b"{\"role\":\"user\",\"content\":\"repeated\"}\n";
     std::fs::write(&path, bytes).unwrap();
     let spy = SeamSpyAdmission::default();
-    spy.script_batch_error(HostAdmissionOutcome::batch_requires_scalar_fallback(
-        ObservationBatchFallbackCause::IntraBatchIdentityCollision,
+    spy.script_batch_error(HostAdmissionOutcome::deterministic_content_refusal(
+        "observation_identity_collision",
     ));
     spy.script_capture_error(HostAdmissionOutcome::deterministic_content_refusal(
         "observation_identity_collision",
@@ -1175,10 +1324,15 @@ async fn content_refusals_cover_past_so_the_stream_converges() {
 
 #[tokio::test]
 async fn codex_session_meta_prefix_is_decoded_once_across_consumers() {
+    // The shared metadata cache retains entries up to
+    // `shared_jsonl_preparation_capacity()`, so this test only observes the
+    // shared decode once the preparation authority is installed: without it the
+    // capacity is the degraded fallback of one entry.
+    super::install_test_shared_jsonl_preparation_authority();
     let (_temp, path, _) = rollout_fixture();
     let first = SeamSpyAdmission::default();
     let second = SeamSpyAdmission::default();
-    let before = crate::runtime::codex::session_meta_read_count_for_test(&path);
+    let before = crate::runtime::hosts::codex::session_meta_read_count_for_test(&path);
 
     try_admit_codex_jsonl_observations_for_profile_with_admission(&path, None, &[], &first, None)
         .await
@@ -1188,7 +1342,7 @@ async fn codex_session_meta_prefix_is_decoded_once_across_consumers() {
         .expect("second profile consumer");
 
     assert_eq!(
-        crate::runtime::codex::session_meta_read_count_for_test(&path) - before,
+        crate::runtime::hosts::codex::session_meta_read_count_for_test(&path) - before,
         1,
         "canonical path+native identity must share one bounded prefix decode"
     );
@@ -1228,8 +1382,8 @@ async fn batch_refusal_reuses_pre_context_switch_frames() {
     let contents = lines.join("\n") + "\n";
     std::fs::write(&path, contents).unwrap();
     let spy = SeamSpyAdmission::default();
-    spy.script_batch_error(HostAdmissionOutcome::batch_requires_scalar_fallback(
-        ObservationBatchFallbackCause::IntraBatchIdentityCollision,
+    spy.script_batch_error(HostAdmissionOutcome::deterministic_content_refusal(
+        "observation_identity_collision",
     ));
     spy.script_capture_error(HostAdmissionOutcome::deterministic_content_refusal(
         "observation_identity_collision",
@@ -1380,7 +1534,7 @@ async fn out_of_scope_frames_are_rejected_before_the_decode() {
     assert_eq!(progress.frames_decoded, 1);
     // The coverage reason proves the decode was skipped; this proves the seam
     // *reports* it. `session_meta` names itself, so it is still decoded before
-    // it is judged — only the two frames that cannot move the cwd are refused
+    // it is judged, only the two frames that cannot move the cwd are refused
     // from the gate, and the split has to say so or a change that moves the
     // verdict earlier is invisible to production telemetry.
     assert_eq!(

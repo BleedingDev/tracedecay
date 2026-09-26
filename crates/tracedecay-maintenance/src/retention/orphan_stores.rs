@@ -8,13 +8,13 @@
 //! silently strands the prior store on disk. Registry GC removes the
 //! stale *registry row* but never the on-disk store *data*, so the payload
 //! accumulates invisibly (measured at ~41 GB in one observed profile). This
-//! module makes those stores a typed finding — carrying age and size — and
+//! module makes those stores a typed finding, carrying age and size, and
 //! collects them under an owner-visible retention window.
 //!
 //! The contract is "re-link or explicitly retire, never orphan silently": a
 //! store whose registry roots are gone but whose manifest points at a
-//! *different, currently-live* root is classified [`StoreDisposition::Relinkable`]
-//! and is never collected here — an applied sweep atomically transfers its
+//! *different, currently-live* root is classified `StoreDisposition::Relinkable`
+//! and is never collected here, an applied sweep atomically transfers its
 //! registry identity to that exact live project. Only stores with no live root
 //! at all are eligible for collection, and only once older than the retention
 //! window.
@@ -23,22 +23,20 @@ use std::path::{Path, PathBuf};
 
 use tracedecay_global_db::registry_maintenance::{RootLivenessV1, probe_root};
 
+mod collection;
 mod fence;
 mod pages;
-mod quarantine;
 mod unregistered_page;
 pub use fence::{
     StoreContentEntry, StoreContentEntryKind, StoreContentFence, StoreContentInventory,
     StoreDirectoryFence, StoreFileIdentity, StoreRootIdentity,
 };
-#[cfg(test)]
-pub(crate) use quarantine::read_pending_quarantine_receipts;
 pub use unregistered_page::UnregisteredSweepCompletionV1;
+pub(super) use unregistered_page::read_project_directory_page;
 pub use unregistered_page::{
     DEFAULT_UNREGISTERED_STORE_PAGE_LIMIT, UnregisteredStoreSweepReport,
     UnregisteredStoreSweepRequestV1, sweep_unregistered_store_page,
 };
-pub(super) use unregistered_page::{ProjectDirectoryWorkV1, read_project_directory_page};
 
 /// One profile-sharded store observed on disk, paired with the registry
 /// identity that points at it. This is the pure input to classification so the
@@ -80,12 +78,12 @@ pub struct StoreCensusEntry {
     /// prior store's eligibility merely by copying its payload mtimes.
     pub expected_data_root_fence: StoreDirectoryFence,
     /// Complete no-follow child content/identity fence. Collection rechecks it
-    /// only after atomically moving the store into a same-parent quarantine.
+    /// on the opened store directory immediately before deleting it.
     pub expected_content_fence: StoreContentFence,
     pub expected_manifest_bytes: Option<Vec<u8>>,
-    /// Registered graph-scope database paths, relative to `data_root`. Scopes
-    /// may sit at custom relative paths, so the durable-data check cannot infer
-    /// them from the main graph alone.
+    /// Registered graph-scope database paths, relative to the profile root as
+    /// store registration records them. Scopes may sit at custom paths, so the
+    /// durable-data check cannot infer them from the main graph alone.
     pub graph_scope_relpaths: Vec<PathBuf>,
 }
 
@@ -134,9 +132,9 @@ pub struct OrphanStoreFinding {
     pub expected_data_root_fence: StoreDirectoryFence,
     pub expected_content_fence: StoreContentFence,
     pub expected_manifest_bytes: Option<Vec<u8>>,
-    /// Registered graph-scope database paths, relative to `data_root`; carried
-    /// through so the durable-data check covers every scope, not just the main
-    /// graph.
+    /// Registered graph-scope database paths, relative to the profile root;
+    /// carried through so the durable-data check covers every registered
+    /// graph-scope database.
     pub graph_scope_relpaths: Vec<PathBuf>,
 }
 
@@ -180,7 +178,7 @@ fn classify_one(entry: &StoreCensusEntry) -> StoreDisposition {
         };
     }
     // Registry identity is dead. If the manifest still names a live root the
-    // repository moved rather than vanished — re-link instead of collecting.
+    // repository moved rather than vanished, re-link instead of collecting.
     if let Some(manifest_root) = entry.manifest_root.as_deref()
         && manifest_root != entry.canonical_root
         && entry.display_root.as_deref() != Some(manifest_root)
@@ -228,29 +226,20 @@ pub fn classify_stores(census: &[StoreCensusEntry], now: i64) -> Vec<OrphanStore
 /// The partitioned collection decision over a set of findings.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CollectionPlan {
-    /// Orphaned and older than the retention window — collect these.
+    /// Orphaned and older than the retention window, collect these.
     pub collect: Vec<OrphanStoreFinding>,
-    /// Orphaned but still inside the retention window — kept for now, surfaced.
+    /// Orphaned but still inside the retention window, kept for now, surfaced.
     pub retained_immature: Vec<OrphanStoreFinding>,
-    /// Re-linkable (moved repository) — never collected; an applied sweep
+    /// Re-linkable (moved repository), never collected; an applied sweep
     /// transfers these to the exact registered live project identity.
     pub relink: Vec<OrphanStoreFinding>,
-    /// Liveness could not be proven either way — never collected, surfaced so
+    /// Liveness could not be proven either way, never collected, surfaced so
     /// an owner can resolve the inspection failure instead of losing the store.
     pub unverifiable: Vec<OrphanStoreFinding>,
 }
 
-impl CollectionPlan {
-    /// Total bytes that collecting [`Self::collect`] would reclaim.
-    pub fn collectable_bytes(&self) -> u64 {
-        self.collect
-            .iter()
-            .fold(0u64, |acc, f| acc.saturating_add(f.size_bytes))
-    }
-}
-
 /// Partition findings under a retention window. Live stores are dropped from
-/// the plan entirely — they are never a retention concern. Pure.
+/// the plan entirely, they are never a retention concern. Pure.
 pub fn plan_collection(findings: Vec<OrphanStoreFinding>, retention_secs: i64) -> CollectionPlan {
     let mut plan = CollectionPlan::default();
     for finding in findings {
@@ -279,27 +268,11 @@ pub struct CollectedStore {
     pub size_bytes: u64,
 }
 
-/// The exact filesystem mutation that failed during orphan-store retirement.
+/// The exact filesystem mutation that failed while deleting an orphan store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionMutationOperation {
-    ReserveQuarantineName,
-    PublishQuarantineJournal,
-    PublishQuarantineRenameMarker,
-    RenameLiveLeafToQuarantine,
-    RestoreLiveLeafFromQuarantine,
-    ProbeRecoveryJournal,
-    ValidateRestoredStoreIdentity,
-    ClearRecoveryJournal,
-    MarkRetirementCommitted,
     RecursiveRemove,
     ParentSync,
-}
-
-/// Whether a mutation failure is a known external-owner deferral.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CollectionMutationFailureClassification {
-    RetryableDeferred,
-    NonRetryable,
 }
 
 /// Structured evidence for a failed orphan-store filesystem mutation.
@@ -308,47 +281,18 @@ pub struct CollectionMutationFailure {
     pub operation: CollectionMutationOperation,
     pub raw_os_error: Option<i32>,
     pub target_path: PathBuf,
-    pub expected_root_identity: Option<StoreRootIdentity>,
-    pub classification: CollectionMutationFailureClassification,
 }
 
 impl CollectionMutationFailure {
-    pub fn retryable(&self) -> bool {
-        self.classification == CollectionMutationFailureClassification::RetryableDeferred
-    }
-
     pub(crate) fn from_io_error(
         operation: CollectionMutationOperation,
         target_path: PathBuf,
-        expected_root_identity: Option<StoreRootIdentity>,
         error: &std::io::Error,
     ) -> Self {
-        let raw_os_error = error.raw_os_error();
-        let classification = if cfg!(windows) && matches!(raw_os_error, Some(5 | 32 | 33)) {
-            CollectionMutationFailureClassification::RetryableDeferred
-        } else {
-            CollectionMutationFailureClassification::NonRetryable
-        };
         Self {
             operation,
-            raw_os_error,
+            raw_os_error: error.raw_os_error(),
             target_path,
-            expected_root_identity,
-            classification,
-        }
-    }
-
-    pub(crate) fn without_native_error(
-        operation: CollectionMutationOperation,
-        target_path: PathBuf,
-        expected_root_identity: Option<StoreRootIdentity>,
-    ) -> Self {
-        Self {
-            operation,
-            raw_os_error: None,
-            target_path,
-            expected_root_identity,
-            classification: CollectionMutationFailureClassification::NonRetryable,
         }
     }
 }
@@ -368,8 +312,8 @@ pub enum CollectionFailureKind {
     PayloadChanged,
     /// The store's graph database carries rows in a durable per-project memory
     /// table (or the check could not prove otherwise). Never collected, even
-    /// when every other eligibility check passed — see
-    /// [`DurableMemoryCheck`]/[`check_durable_memory_rows`].
+    /// when every other eligibility check passed, see
+    /// `DurableMemoryCheck`/`check_durable_memory_rows`.
     DurableDataProtected,
 }
 
@@ -379,36 +323,11 @@ pub struct CollectionFailure {
     pub kind: CollectionFailureKind,
 }
 
-/// A truthful recovery receipt for a store moved to the retention quarantine.
-/// A failed post-move proof never becomes an invisible failure: either the
-/// original name was restored, or the moved bytes remain at the named sibling
-/// for a later reconciliation pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CollectionRecoveryAction {
-    Restored,
-    RetainedForRecovery,
-    /// Registry retirement committed, but the irreversible delete has not yet
-    /// been durably confirmed. A journal-backed retry owns this state.
-    DeleteUnconfirmed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectionRecoveryReceipt {
-    pub store_id: String,
-    pub original_path: PathBuf,
-    pub quarantine_path: PathBuf,
-    /// The path that currently owns the bytes (or, after a remove/sync
-    /// ambiguity, the exact path whose deletion remains unconfirmed).
-    pub actual_path: PathBuf,
-    pub action: CollectionRecoveryAction,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CollectionOutcome {
     pub collected: Vec<CollectedStore>,
     pub reclaimed_bytes: u64,
     pub errors: Vec<CollectionFailure>,
-    pub recovery_receipts: Vec<CollectionRecoveryReceipt>,
     /// A bounded pass may have completed only a prefix of its plan. This is
     /// never reported as a successful empty collection.
     pub completion: CollectionCompletionV1,
@@ -422,6 +341,13 @@ pub enum CollectionCompletionV1 {
     DeadlineExceeded,
 }
 
+pub use collection::execute_registered_collection;
+pub(crate) use collection::{CollectionControl, execute_unregistered_collection_controlled};
+#[cfg(test)]
+pub(crate) use collection::{
+    execute_registered_collection_controlled, execute_unregistered_collection,
+    unbounded_collection_control,
+};
 pub use pages::{
     OrphanSweepReport, StoreCensusPageV1, UnregisteredCollectionPlan, UnregisteredStoreFinding,
     build_store_census, build_store_census_page, plan_unregistered_collection,
@@ -432,13 +358,6 @@ pub(crate) use pages::{census_unregistered_project_dirs, sweep_orphan_stores};
 pub(crate) use pages::{
     dir_size_bytes, dir_size_bytes_controlled, manifest_names_abandoned_root,
     newest_mtime_secs_controlled,
-};
-pub use quarantine::execute_registered_collection;
-pub(crate) use quarantine::{CollectionControl, execute_unregistered_collection_controlled};
-#[cfg(test)]
-pub(crate) use quarantine::{
-    execute_registered_collection_controlled, execute_unregistered_collection,
-    unbounded_collection_control,
 };
 
 #[cfg(test)]

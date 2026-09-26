@@ -1,11 +1,13 @@
 //! Stdio MCP proxy: forwards host traffic to the daemon over the broker
 //! transport, tracking initialize-route and tool-catalog metadata.
 
+use std::borrow::Cow;
 #[cfg(unix)]
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
@@ -20,13 +22,12 @@ use super::{
 #[cfg(unix)]
 use super::{binary_version, connect_with_restart_grace};
 #[cfg(unix)]
-use tracedecay_daemon_identity::connection_for_socket_path;
-#[cfg(unix)]
 use tracedecay_daemon_protocol::{DAEMON_TOOL_RESPONSE_GRACE, version_skew_action};
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_mcp::JsonRpcRequest;
 #[cfg(not(unix))]
 use tracedecay_mcp::McpTransport;
+use tracedecay_mcp::server::attach_stateless_request_context;
 use tracedecay_mcp::transport::StdioTransport;
 #[cfg(unix)]
 use tracedecay_mcp::transport::{McpDuplexTransport, McpTransportReader, McpTransportWriter};
@@ -129,8 +130,7 @@ pub(crate) async fn should_proxy_serve_to_daemon_with(
     if installed_service_socket != Some(socket_path) {
         return false;
     }
-    let connection = connection_for_socket_path(socket_path);
-    connect_with_restart_grace(&connection, grace, poll_interval)
+    connect_with_restart_grace(socket_path, grace, poll_interval)
         .await
         .is_ok()
 }
@@ -160,8 +160,13 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
     let (mut reader, mut writer) = transport.split();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     let (eof_tx, mut eof_rx) = tokio::sync::watch::channel(false);
+    // Keep a Sender alive for the whole proxy lifetime. `read_host` only
+    // marks EOF; if it owned the sole Sender, dropping it on host close would
+    // make later `eof.changed()` calls fail as "monitor closed" and abort
+    // before the in-flight daemon response could be drained to the host.
+    let eof_signal = eof_tx.clone();
 
-    let read_host = async {
+    let read_host = async move {
         loop {
             match reader.read_line().await {
                 Ok(Some(line)) => {
@@ -170,7 +175,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
                     }
                 }
                 Ok(None) => {
-                    let _ = eof_tx.send(true);
+                    let _ = eof_signal.send(true);
                     return Ok(());
                 }
                 Err(error) => return Err(error.into()),
@@ -186,7 +191,9 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
         &mut writer,
         drain_bound,
     );
-    tokio::try_join!(read_host, proxy)?;
+    let result = tokio::try_join!(read_host, proxy);
+    drop(eof_tx);
+    result?;
     Ok(())
 }
 
@@ -194,14 +201,14 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
 /// request it has already been handed.
 ///
 /// This is *not* a timeout invented here: it is the daemon's own published
-/// dispatch ceiling for that exact request — "nothing may run unbounded", per
+/// dispatch ceiling for that exact request, "nothing may run unbounded", per
 /// [`tool_dispatch_ceiling`](tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling)
-/// — plus
+///, plus
 /// [`DAEMON_TOOL_RESPONSE_GRACE`](tracedecay_daemon_protocol::DAEMON_TOOL_RESPONSE_GRACE), the grace
 /// this crate already keeps reading for beyond a request deadline. A daemon
 /// honouring its own contract always answers first, so the bound cannot cut
 /// short correct work, including a slow `tools/call` from a batch client. Only a
-/// daemon that has already blown its own ceiling reaches it — and by then the
+/// daemon that has already blown its own ceiling reaches it, and by then the
 /// client that would have received the answer is gone.
 ///
 /// A line that is not a `tools/call` (initialize, tools/list, resources/*) has
@@ -209,16 +216,26 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
 /// ([`tool_dispatch_ceiling`](tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling)
 /// with an empty name), not a named catalog tool's possibly shorter deadline.
 struct DaemonProxyRequest<'a> {
-    raw: &'a str,
+    raw: Cow<'a, str>,
     parsed: Option<JsonRpcRequest>,
 }
 
 impl<'a> DaemonProxyRequest<'a> {
+    /// Every host request after `initialize` travels on its own daemon
+    /// connection, so it carries this proxy's SEP-2575 per-request context
+    /// instead of an `initialize` session.
     fn new(raw: &'a str) -> Self {
-        Self {
-            raw,
-            parsed: JsonRpcRequest::decode(raw.trim()).ok(),
-        }
+        let mut parsed = JsonRpcRequest::decode(raw.trim()).ok();
+        let attached = parsed
+            .as_mut()
+            .is_some_and(attach_stateless_request_context);
+        let raw = match parsed.as_ref() {
+            Some(request) if attached => {
+                serde_json::to_string(request).map_or(Cow::Borrowed(raw), Cow::Owned)
+            }
+            _ => Cow::Borrowed(raw),
+        };
+        Self { raw, parsed }
     }
 }
 
@@ -253,7 +270,7 @@ fn request_tool_name(request: Option<&JsonRpcRequest>) -> Option<String> {
 /// The wait itself is still required: a batch client (`echo request |
 /// tracedecay serve`) closes stdin the instant it finishes writing, and its
 /// response must still be produced. What must not survive is an *ownerless*
-/// `tracedecay serve` waiting forever on a daemon that never answers — that is
+/// `tracedecay serve` waiting forever on a daemon that never answers, that is
 /// how a disconnected session turns into a long-lived orphan holding its fds
 /// and daemon connection.
 #[cfg(unix)]
@@ -445,12 +462,12 @@ pub(crate) async fn resolve_daemon_initialize_route(
     registry: Option<&tracedecay_global_db::RegisteredGlobalDb>,
 ) -> tracedecay_domain::errors::Result<Option<InitializeRouteMetadata>> {
     let roots = crate::mcp::server::initialize_root_paths(params);
-    // One parent discovery budget for the whole initialize request — not N×
+    // One parent discovery budget for the whole initialize request, not N×
     // REPOSITORY_DISCOVERY_DEADLINE across roots / registry then fallback loops.
     let discovery_deadline = repository_discovery_parent_deadline();
     if let Some(registry) = registry {
         for root in &roots {
-            let mut candidate = root.canonicalize().unwrap_or_else(|_| root.clone());
+            let mut candidate = canonical_existing_identity(root).unwrap_or_else(|_| root.clone());
             loop {
                 if registry
                     .project_registry_context_by_alias(&candidate)
@@ -497,11 +514,11 @@ pub(crate) async fn resolve_daemon_initialize_route(
             reason,
         ) = &repository_identity
         {
-            // Deferred is uncertainty, not a decided root — never fall through
+            // Deferred is uncertainty, not a decided root, never fall through
             // to discover_project_root / Resolved admission.
             return Err(repository_discovery_deferred(&root, *reason));
         }
-        if let Some(project_path) = crate::config::discover_project_root(&root) {
+        if let Some(project_path) = tracedecay_runtime_core::config::discover_project_root(&root) {
             return Ok(Some(InitializeRouteMetadata {
                 project_path,
                 allow_init: false,
@@ -512,16 +529,17 @@ pub(crate) async fn resolve_daemon_initialize_route(
                 identity,
             ) => {
                 // An initialize route has no retained configuration authority.
-                // Never revive legacy-file fallback here — but a fresh repo with
+                // Never revive legacy-file fallback here, but a fresh repo with
                 // no published snapshot follows the schema default (auto-init
                 // enabled), not fail-closed: treating a missing snapshot as
                 // "disabled" contradicted the config default and left explicit
                 // initialize-roots repos unable to open at all.
-                let allow_init = crate::config::cached_sync_config(&identity.worktree_root)
-                    .map_or_else(
-                        |_| tracedecay_configuration::SyncConfig::default().auto_init,
-                        |config| config.auto_init,
-                    );
+                let allow_init =
+                    tracedecay_project::config::cached_sync_config(&identity.worktree_root)
+                        .map_or_else(
+                            |_| tracedecay_configuration::SyncConfig::default().auto_init,
+                            |config| config.auto_init,
+                        );
                 return Ok(Some(InitializeRouteMetadata {
                     project_path: identity.worktree_root,
                     allow_init,
@@ -561,10 +579,10 @@ pub(super) async fn bounded_repository_identity(
 /// warming project open. Spawn and probe failures are terminal because retrying
 /// them until the caller's budget expires only hides the actionable error.
 ///
-/// A deferral names when to come back and, when one is still running, that a
-/// resolution is in progress — the difference between "this root is being
-/// resolved" and "this root is unresolved", which is what a client staring at
-/// a repeated deferral cannot otherwise tell.
+/// A deferral names the checkout whose walk is blocked and when to come back.
+/// The in-flight identity slot is optional: a probe can be parked in `open()`
+/// without that slot, and the refusal still has to name the path so status
+/// and doctor can tell this project from every other one.
 pub(super) fn repository_discovery_deferred(
     path: &Path,
     reason: tracedecay_runtime_core::git_discovery::GitDiscoveryUnknown,
@@ -575,12 +593,13 @@ pub(super) fn repository_discovery_deferred(
     );
     let progress = if deferred {
         let retry_after_ms = super::REPOSITORY_DISCOVERY_DEADLINE.as_millis();
+        let blocked = format!("repository discovery blocked on {}", path.display());
         match tracedecay_runtime_core::git_discovery::identity_resolution_elapsed(path) {
             Some(elapsed) => format!(
-                "; resolution in progress for {:.1}s and publishing its result, retry after {retry_after_ms}ms",
+                "; {blocked} for {:.1}s; retry after {retry_after_ms}ms",
                 elapsed.as_secs_f64()
             ),
-            None => format!("; retry after {retry_after_ms}ms"),
+            None => format!("; {blocked}; retry after {retry_after_ms}ms"),
         }
     } else {
         String::new()
@@ -611,11 +630,16 @@ async fn write_proxy_request_result(
         Ok(responses) => {
             let metadata =
                 proxy_initialize_metadata_for_request(request.parsed.as_ref(), &responses);
-            if let Some(warning) = daemon_version_skew_warning_for_request(
-                request.parsed.as_ref(),
-                &responses,
-                binary_version()?,
-            ) {
+            // Skew is a warning. A process with no registered product runtime
+            // has no version to compare, and that must not drop the response
+            // the daemon already produced.
+            if let Ok(version) = binary_version()
+                && let Some(warning) = daemon_version_skew_warning_for_request(
+                    request.parsed.as_ref(),
+                    &responses,
+                    version,
+                )
+            {
                 log_daemon_event("core_proxy_warning", &[("warning", warning)]);
             }
             for response in responses {
@@ -897,12 +921,12 @@ fn daemon_version_skew_warning_for_request(
     client_version: &str,
 ) -> Option<String> {
     let daemon_version = proxy_initialize_metadata_for_request(request, responses).daemon_version?;
-    if daemon_version == client_version {
+    if tracedecay_daemon_protocol::versions_name_same_build(&daemon_version, client_version) {
         return None;
     }
     let action = version_skew_action(&daemon_version, client_version);
     Some(format!(
-        "TraceDecay daemon is version {daemon_version} but this client is {client_version} — \
+        "TraceDecay daemon is version {daemon_version} but this client is {client_version}, \
          {action}"
     ))
 }
@@ -975,6 +999,7 @@ mod tests {
                     "code": -32603,
                     "message": "daemon project open task capacity reached",
                     "data": {
+                        "reason_code": "project_open_task_capacity_reached",
                         "kind": "project_open_task_capacity_reached",
                         "retryable": true,
                         "capacity": 8
@@ -988,6 +1013,7 @@ mod tests {
                     "code": -32603,
                     "message": "daemon project server capacity reached",
                     "data": {
+                        "reason_code": "project_server_capacity_reached",
                         "kind": "project_server_capacity_reached",
                         "retryable": true,
                         "capacity": 8
@@ -1014,10 +1040,27 @@ mod tests {
             }
         })
         .to_string()]));
+        assert!(
+            !responses_are_project_open_retryable(&[json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "error": {
+                    "code": -32603,
+                    "message": "daemon project server capacity reached",
+                    "data": {
+                        "kind": "project_server_capacity_reached",
+                        "retryable": true,
+                        "capacity": 8
+                    }
+                }
+            })
+            .to_string()]),
+            "capacity prose and kind without reason_code must not decide proxy retry"
+        );
     }
 
     /// The post-disconnect drain must never cut short work the daemon is still
-    /// entitled to be doing — a batch client closes stdin immediately, so every
+    /// entitled to be doing, a batch client closes stdin immediately, so every
     /// one of its requests drains under this bound.
     #[cfg(unix)]
     #[test]
@@ -1052,8 +1095,8 @@ mod tests {
 
         // Unnamed methods resolve the unnamed-tool default
         // (`tool_dispatch_ceiling("")`), not a named catalog tool such as
-        // `tracedecay_context`. The drain must outlive that resolved ceiling —
-        // the longest bound that actually applies to this request — rather
+        // `tracedecay_context`. The drain must outlive that resolved ceiling,
+        // the longest bound that actually applies to this request, rather
         // than a hardcoded catalog value.
         assert_eq!(request_tool_name(non_tool.parsed.as_ref()), None);
         let unnamed_ceiling = tracedecay_mcp::tools::dispatch_ceiling::tool_dispatch_ceiling("");

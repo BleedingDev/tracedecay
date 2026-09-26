@@ -1,3 +1,4 @@
+import { Crosshair, Database, Waypoints } from 'lucide-react';
 import { describe, expect, it } from 'vitest';
 
 import type {
@@ -39,7 +40,6 @@ describe('the graph register', () => {
     const overview = {
       totals: { nodes: 48_612, edges: 1, files: 1 },
       nodes_by_kind: [],
-      edges_by_kind: [],
       files_by_language: [],
       largest_files: [],
       path: '',
@@ -79,7 +79,7 @@ describe('the index register', () => {
     parked: null,
   } as unknown as CodeIndexFreshnessPayloadV1['worktrees'][number];
 
-  it('leads with the scheduler’s staleness word and the sealed clock', () => {
+  it('leads with the scheduler\'s staleness word and the sealed clock', () => {
     expect(
       indexRegister(false, {
         outcome: 'envelope',
@@ -104,7 +104,7 @@ describe('the index register', () => {
     expect(register.detail).toBe('no sealed generation · +1 more worktree');
   });
 
-  it('carries the route’s own note when no worktree is mounted', () => {
+  it('carries the route\'s own note when no worktree is mounted', () => {
     expect(
       indexRegister(false, {
         outcome: 'envelope',
@@ -128,6 +128,8 @@ describe('the selection register', () => {
     });
     // Each register carries its own glyph so the strip never falls back to a
     // link icon for a graph, an index, or a selection.
-    expect(selectionRegister(null).icon).toBeTypeOf('object');
+    expect(selectionRegister(null).icon).toBe(Crosshair);
+    expect(graphRegister(true, undefined).icon).toBe(Waypoints);
+    expect(indexRegister(true, undefined).icon).toBe(Database);
   });
 });

@@ -3,7 +3,7 @@
 
 use tempfile::TempDir;
 use tracedecay_global_db::ParseOffset;
-use tracedecay_sessions::runtime::codex::CodexSource;
+use tracedecay_sessions::runtime::hosts::codex::CodexSource;
 
 use crate::codex::{write_codex_rollout, write_codex_rollout_with_goal_context, write_jsonl};
 use crate::restart_atomicity::{open_project_session_db, try_ingest_source};
@@ -299,8 +299,8 @@ async fn codex_response_item_tool_events_are_cataloged_compactly() {
     // success stay null rather than being guessed.
     assert_eq!(metadata["exit_code"], serde_json::Value::Null);
     assert_eq!(metadata["success"], serde_json::Value::Null);
-    // The full output body (and its failure line) is never stored — only the
-    // parsed fields — so heavy tool output does not bloat the index.
+    // The full output body (and its failure line) is never stored, only the
+    // parsed fields, so heavy tool output does not bloat the index.
     assert!(!call.text.contains("error: exact failure line"));
     assert!(
         !call

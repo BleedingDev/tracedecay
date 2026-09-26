@@ -1,14 +1,17 @@
 //! Exact Git ownership and managed worktree preparation/retirement.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
-use fs2::FileExt;
 use tracedecay_domain::canonical_text::sha256_hex;
+use tracedecay_private_fs::{FileLease, LockAdmissionError, lock_until};
 use tracedecay_runtime_core::branch::BranchAddOutcome;
 
 use super::{
-    PrCommandControlV1, PrGitCommandError, pr_label, pr_tracking_ref, run_git_with_control,
-    successful_git_with_control,
+    PrCommandControlV1, PrGitCommandError, StaleManagedPr, pr_label, pr_tracking_ref,
+    run_git_with_control, successful_git_with_control,
 };
 
 const CODE_INDEX_SCHEDULER_UNAVAILABLE: &str = "code_index_scheduler_unavailable";
@@ -35,6 +38,9 @@ pub struct ReconcileReport {
     pub capped: bool,
     pub removals_suppressed: bool,
     pub failures: Vec<(String, String)>,
+    /// Undecodable persisted entries dropped from state; their leftover
+    /// artifacts go through the orphan sweep or a fresh track.
+    pub reset_stale: Vec<StaleManagedPr>,
 }
 
 /// The exact Git and filesystem artifacts owned by one manually activated
@@ -80,7 +86,7 @@ impl ManualBranchArtifactsV1 {
     /// lease is taken before the branch identity is resolved, so a typed
     /// pre-mutation refusal (missing ref, unavailable Git authority) must not
     /// leave the worktree root behind as evidence of an activation that never
-    /// happened — and nothing enumerating branch worktrees has to filter a
+    /// happened, and nothing enumerating branch worktrees has to filter a
     /// non-worktree entry out.
     fn lifecycle_lock_path(&self, data_root: &Path) -> PathBuf {
         data_root
@@ -89,13 +95,13 @@ impl ManualBranchArtifactsV1 {
     }
 }
 
-/// Non-blocking exact-branch lifecycle gate. It deliberately spans activation,
-/// worktree replacement, scheduler mount, and metadata sealing; a concurrent
-/// caller receives a typed retryable contention rather than observing a
+/// Exact-branch lifecycle lease. It deliberately spans activation, worktree
+/// replacement, scheduler mount, and metadata sealing, so no caller observes a
 /// partially replaced branch route.
 pub struct ManualBranchLifecycleLeaseV1 {
     branch: String,
-    _lock: std::fs::File,
+    _lock: FileLease,
+    _queued: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl ManualBranchLifecycleLeaseV1 {
@@ -104,12 +110,44 @@ impl ManualBranchLifecycleLeaseV1 {
     }
 }
 
-pub fn try_acquire_manual_branch_lifecycle(
+/// Same-branch lifecycle callers queue this long before the operation fails
+/// with typed, retryable [`ManualBranchActivationError::LifecycleContended`].
+const MANUAL_BRANCH_LIFECYCLE_ADMISSION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// The daemon's single owner per exact branch lifecycle lock.
+// ponytail: entries are never evicted; one empty mutex per branch lifecycle
+// this process has touched, bounded by the branches it administers.
+fn manual_branch_lifecycle_owner(lock_path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static OWNERS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut owners = OWNERS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    Arc::clone(owners.entry(lock_path.to_path_buf()).or_default())
+}
+
+/// Acquires the exact-branch lifecycle. The daemon owns branch lifecycles:
+/// same-branch callers queue on its in-process owner, and the lock file
+/// fences any other process. Both waits share one admission deadline.
+pub async fn acquire_manual_branch_lifecycle(
     data_root: &Path,
     branch: &str,
 ) -> std::result::Result<ManualBranchLifecycleLeaseV1, ManualBranchActivationError> {
+    let deadline = Instant::now() + MANUAL_BRANCH_LIFECYCLE_ADMISSION_DEADLINE;
     let artifacts = ManualBranchArtifactsV1::for_branch(data_root, branch);
     let lock_path = artifacts.lifecycle_lock_path(data_root);
+    let contended = || {
+        ManualBranchActivationError::lifecycle_contended(format!(
+            "branch '{branch}' lifecycle at '{}' stayed busy past its admission deadline; retry",
+            lock_path.display()
+        ))
+    };
+    let queued = tokio::time::timeout_at(
+        deadline.into(),
+        manual_branch_lifecycle_owner(&lock_path).lock_owned(),
+    )
+    .await
+    .map_err(|_| contended())?;
     let lock_directory = lock_path.parent().ok_or_else(|| {
         ManualBranchActivationError::activation_failed(format!(
             "manual branch lifecycle lock '{}' has no parent",
@@ -132,15 +170,26 @@ pub fn try_acquire_manual_branch_lifecycle(
                 lock_path.display()
             ))
         })?;
-    lock.try_lock_exclusive().map_err(|error| {
-        ManualBranchActivationError::lifecycle_contended(format!(
-            "branch '{branch}' lifecycle is already active at '{}': {error}",
-            lock_path.display()
-        ))
-    })?;
+    let lock = tokio::task::spawn_blocking(move || lock_until(&lock, deadline).map(|()| lock))
+        .await
+        .map_err(|error| {
+            ManualBranchActivationError::activation_failed(format!(
+                "manual branch lifecycle admission task failed: {error}"
+            ))
+        })?
+        .map_err(|error| match error {
+            LockAdmissionError::TimedOut => contended(),
+            LockAdmissionError::Io(error) => {
+                ManualBranchActivationError::activation_failed(format!(
+                    "cannot lock manual branch lifecycle '{}': {error}",
+                    lock_path.display()
+                ))
+            }
+        })?;
     Ok(ManualBranchLifecycleLeaseV1 {
         branch: branch.to_owned(),
-        _lock: lock,
+        _lock: FileLease::held(lock, "pr_tracking.manual_branch_lifecycle"),
+        _queued: queued,
     })
 }
 
@@ -776,7 +825,6 @@ pub fn cleanup_pr_worktree(
     data_root: &Path,
     pr: u64,
     expected_head: &str,
-    remove_synthetic_branch: bool,
     command_control: &PrCommandControlV1,
 ) -> std::result::Result<PrCleanupReceipt, PrCleanupError> {
     let worktree = data_root.join("pr-worktrees").join(format!("pr-{pr}"));
@@ -784,14 +832,11 @@ pub fn cleanup_pr_worktree(
     let label = pr_label(pr);
     let branch_ref = format!("refs/heads/{label}");
     let artifacts = || {
-        let mut artifacts = vec![
+        vec![
             PrCleanupArtifact::Worktree(worktree.clone()),
             PrCleanupArtifact::TrackingRef(tracking_ref.clone()),
-        ];
-        if remove_synthetic_branch {
-            artifacts.push(PrCleanupArtifact::Branch(branch_ref.clone()));
-        }
-        artifacts
+            PrCleanupArtifact::Branch(branch_ref.clone()),
+        ]
     };
     if command_control.is_cancelled() {
         return Err(PrCleanupError::Remaining(artifacts()));
@@ -813,9 +858,7 @@ pub fn cleanup_pr_worktree(
         }
     })?;
     if let Some(owned_head) = owned_head {
-        if remove_synthetic_branch
-            && ref_points_to(repo_root, &branch_ref, &owned_head, command_control)?
-        {
+        if ref_points_to(repo_root, &branch_ref, &owned_head, command_control)? {
             successful_git_with_control(repo_root, &["branch", "-D", &label], command_control)
                 .map_err(|source| PrCleanupError::Command {
                     artifact: PrCleanupArtifact::Branch(branch_ref.clone()),
@@ -838,7 +881,7 @@ pub fn cleanup_pr_worktree(
     let remaining = remaining_pr_artifacts(
         repo_root,
         &worktree,
-        remove_synthetic_branch.then_some(branch_ref.as_str()),
+        &branch_ref,
         &tracking_ref,
         &verification_control,
     )?;
@@ -896,7 +939,7 @@ fn cleanup_artifact_for_ref(reference: &str) -> PrCleanupArtifact {
 fn remaining_pr_artifacts(
     repo_root: &Path,
     worktree: &Path,
-    branch_ref: Option<&str>,
+    branch_ref: &str,
     tracking_ref: &str,
     command_control: &PrCommandControlV1,
 ) -> std::result::Result<Vec<PrCleanupArtifact>, PrCleanupError> {
@@ -925,9 +968,7 @@ fn remaining_pr_artifacts(
     {
         remaining.push(PrCleanupArtifact::Worktree(worktree.to_owned()));
     }
-    if let Some(branch_ref) = branch_ref
-        && ref_sha(repo_root, branch_ref, command_control)?.is_some()
-    {
+    if ref_sha(repo_root, branch_ref, command_control)?.is_some() {
         remaining.push(PrCleanupArtifact::Branch(branch_ref.to_owned()));
     }
     if ref_sha(repo_root, tracking_ref, command_control)?.is_some() {
@@ -1052,21 +1093,13 @@ pub async fn cleanup_pr_worktree_off_runtime(
     data_root: &Path,
     pr: u64,
     expected_head: &str,
-    remove_synthetic_branch: bool,
     command_control: PrCommandControlV1,
 ) -> std::result::Result<PrCleanupReceipt, PrCleanupError> {
     let repo_root = repo_root.to_path_buf();
     let data_root = data_root.to_path_buf();
     let expected_head = expected_head.to_owned();
     tokio::task::spawn_blocking(move || {
-        cleanup_pr_worktree(
-            &repo_root,
-            &data_root,
-            pr,
-            &expected_head,
-            remove_synthetic_branch,
-            &command_control,
-        )
+        cleanup_pr_worktree(&repo_root, &data_root, pr, &expected_head, &command_control)
     })
     .await
     .map_err(|error| PrCleanupError::Join(error.to_string()))?

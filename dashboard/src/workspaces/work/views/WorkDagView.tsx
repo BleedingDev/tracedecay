@@ -6,10 +6,11 @@ import type { WorkGraphReading } from '../workGraphModel.ts';
 import type { WorkProductView } from '../workProductView.ts';
 import { type WorkDagReading, workDagReading } from '../workViewsModel.ts';
 import { WorkDagBoard } from './WorkDagBoard.tsx';
+import type { WorkDagFieldView } from './dagField.ts';
 import { ChannelLedger, EmptyReading } from './WorkViewChannel.tsx';
 
 /**
- * DAG / critical path — the task dependency board over the declared graph.
+ * DAG / critical path, the task dependency board over the declared graph.
  *
  * Strata are the longest path over the Tarjan condensation, the same discipline
  * the Code workspace layers imports with: a task sits one stratum below the
@@ -31,11 +32,13 @@ export function WorkDagView({
   graph,
   selected,
   onSelect,
+  view = 'graph',
 }: {
   snapshot: WorkProductView;
   graph: WorkGraphReading;
   selected: string | null;
   onSelect: (taskId: string) => void;
+  view?: WorkDagFieldView;
 }) {
   const reading = useMemo(
     () => workDagReading(snapshot.projections, graph),
@@ -44,9 +47,9 @@ export function WorkDagView({
   const coverage = coverageReading(snapshot.coverage);
 
   return (
-    <div className="flex min-w-0 flex-col gap-3" data-work-view="dag">
+    <div className="flex min-w-0 flex-col gap-3" data-work-view={view === 'graph' ? 'dag' : 'matrix'}>
       <Panel
-        legend="Task dependency graph"
+        legend={view === 'graph' ? 'Task dependency graph' : 'Dependency structure matrix'}
         actions={
           <>
             <StateChip kind={coverage.state} detail={coverage.detail} />
@@ -62,6 +65,7 @@ export function WorkDagView({
           reading={reading}
           selected={selected}
           onSelect={onSelect}
+          view={view}
         />
       </Panel>
 
@@ -180,7 +184,7 @@ function GatingEdges({ reading }: { reading: WorkDagReading }) {
         <p className="text-3xs leading-snug text-text-muted">{gating.detail}</p>
       ) : gating.value.length === 0 ? (
         <EmptyReading>
-          The work-product graph declares no gating edge at all. Nobody wrote one down — this is
+          The work-product graph declares no gating edge at all. Nobody wrote one down, this is
           the authority answering the question, not the question going unasked.
         </EmptyReading>
       ) : (
@@ -227,8 +231,8 @@ function ClimbAndCycles({
         <div className="flex min-w-0 flex-col gap-2">
           <p className="text-3xs leading-snug text-text-muted">
             These edges join tasks that already depend on each other, so the condensation
-            holds them in one stratum. That is an observation about the plan — a cycle the
-            task graph declares — and not an error in this drawing.
+            holds them in one stratum. That is an observation about the plan, a cycle the
+            task graph declares, and not an error in this drawing.
           </p>
           <ul className="flex min-w-0 flex-col gap-1">
             {climbs.map((edge) => (

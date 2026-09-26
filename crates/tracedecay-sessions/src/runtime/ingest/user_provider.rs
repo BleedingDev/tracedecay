@@ -11,7 +11,8 @@ use crate::runtime::source::{
 };
 use crate::runtime::store_port::TranscriptIngestStore;
 use crate::runtime::{
-    SessionProvider, claude_observation, cline_like, hermes, kimi, kiro, opencode, vibe,
+    SessionProvider, hosts::claude_observation, hosts::cline_like, hosts::hermes, hosts::kimi,
+    hosts::kiro, hosts::opencode, hosts::pi, hosts::vibe,
 };
 
 use super::failure::{
@@ -105,7 +106,8 @@ pub(super) struct UserProviderUnit<'a, S> {
     pub(super) candidate: SessionProvider,
     pub(super) max_new_bytes: u64,
     pub(super) cancellation: &'a ObservationCancellation,
-    pub(super) codex_discovery: Option<(&'a crate::runtime::codex::CodexDiscoveryHub, &'a str)>,
+    pub(super) codex_discovery:
+        Option<(&'a crate::runtime::hosts::codex::CodexDiscoveryHub, &'a str)>,
 }
 
 impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
@@ -126,6 +128,7 @@ impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
                 UserProviderRunResult::provider(self.run_cline_like().await)
             }
             SessionProvider::Vibe => UserProviderRunResult::provider(self.run_vibe().await),
+            SessionProvider::Pi => UserProviderRunResult::provider(self.run_pi().await),
         }
     }
 
@@ -415,6 +418,67 @@ impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
         }
     }
 
+    #[hotpath::measure(label = "sessions.ingest.user.pi", future = true)]
+    async fn run_pi(self) -> ProviderRunOutcome {
+        let Some(source) = pi::PiSource::new() else {
+            return ProviderRunOutcome::bounded(TranscriptIngestStats::default(), 0, false);
+        };
+        let source = source.for_user_scope(self.roots.to_vec());
+        match pi::capture_pi_observations(
+            self.facade,
+            &source,
+            self.profile_root,
+            ObservationScopeV1::Profile,
+            Some(self.max_new_bytes),
+            self.cancellation,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let mut run = ProviderRunOutcome::bounded(
+                    TranscriptIngestStats::default(),
+                    outcome.bytes_consumed,
+                    outcome.deferred,
+                );
+                if outcome.discovery_failures > 0 {
+                    run.add_failure(TranscriptCatchUpFailure::source_discovery_partial("pi"));
+                }
+                run
+            }
+            Err(error) => {
+                if let Some(cancelled) = cancelled_provider_outcome(&error) {
+                    return cancelled;
+                }
+                let mut run = ProviderRunOutcome::failed(
+                    warn_transcript_catch_up_failure(
+                        "pi",
+                        "observation",
+                        &error,
+                        "user Pi observation catch-up failed",
+                    ),
+                    self.max_new_bytes,
+                );
+                if let Err(coverage_error) = persist_host_provider_coverage(
+                    self.facade,
+                    &ObservationScopeV1::Profile,
+                    "pi",
+                    HostProviderCoverage::Unavailable,
+                    1,
+                )
+                .await
+                {
+                    run.add_failure(warn_transcript_catch_up_failure(
+                        "pi",
+                        "coverage",
+                        &coverage_error,
+                        "user Pi coverage persistence failed",
+                    ));
+                }
+                run
+            }
+        }
+    }
+
     #[hotpath::measure(label = "sessions.ingest.user.opencode", future = true)]
     async fn run_opencode(self) -> ProviderRunOutcome {
         let Some(source) = opencode::OpenCodeSource::new_for_user(self.roots.to_vec()) else {
@@ -564,7 +628,7 @@ impl<S: TranscriptIngestStore> UserProviderUnit<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use crate::runtime::claude_observation::{
+    use crate::runtime::hosts::claude_observation::{
         ClaudeObservationIngestError, ClaudeObservationIngestStats,
     };
     use crate::runtime::shared::TranscriptIngestStats;

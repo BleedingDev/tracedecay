@@ -165,7 +165,7 @@ pub async fn handle_branch_list(ctx: &McpToolContext<'_>, args: Value) -> Result
                 })
             );
             Ok(generic_tool_result(
-                Some(ctx.project_root()),
+                Some(&ctx.store_layout().response_handle_root),
                 &args,
                 &result,
                 vec![],
@@ -174,7 +174,7 @@ pub async fn handle_branch_list(ctx: &McpToolContext<'_>, args: Value) -> Result
         Err(error) => {
             let (reason, retryable) = branch_read_reason(&error);
             Ok(generic_tool_result(
-                Some(ctx.project_root()),
+                Some(&ctx.store_layout().response_handle_root),
                 &args,
                 &json!({
                     "status": "unavailable",
@@ -198,7 +198,7 @@ fn branch_reference_unavailable(
 ) -> ToolResult {
     let (reason, retryable) = branch_read_reason(error);
     generic_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         args,
         &json!({
             "status": "unavailable",
@@ -223,7 +223,7 @@ fn branch_search_unavailable(
 ) -> ToolResult {
     let (reason, retryable) = branch_unavailable_wire(unavailable.reason);
     generic_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         args,
         &json!({
             "status": "unavailable",
@@ -415,7 +415,7 @@ pub async fn handle_branch_search(ctx: &McpToolContext<'_>, args: Value) -> Resu
                 })
                 .collect::<Vec<_>>();
             Ok(generic_tool_result(
-                Some(ctx.project_root()),
+                Some(&ctx.store_layout().response_handle_root),
                 &args,
                 &hotpath::measure_block!(
                     "mcp.git.branch_search.assemble",
@@ -449,7 +449,7 @@ fn branch_diff_unavailable(
 ) -> ToolResult {
     let (reason, retryable) = branch_unavailable_wire(unavailable.reason);
     generic_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         args,
         &json!({
             "status": "unavailable",
@@ -557,7 +557,7 @@ pub async fn handle_branch_diff(ctx: &McpToolContext<'_>, args: Value) -> Result
         .filter(|head| !head.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| TraceDecayError::Config {
-            message: "cannot determine head branch — specify it explicitly".to_string(),
+            message: "cannot determine head branch. Specify it explicitly".to_string(),
         })?;
     let limit = args
         .get("limit")
@@ -670,7 +670,7 @@ pub async fn handle_branch_diff(ctx: &McpToolContext<'_>, args: Value) -> Result
                 .collect::<Vec<_>>();
             let touched = unique_file_paths(completed.changes.iter().flat_map(branch_change_files));
             Ok(generic_tool_result(
-                Some(ctx.project_root()),
+                Some(&ctx.store_layout().response_handle_root),
                 &args,
                 &hotpath::measure_block!(
                     "mcp.git.branch_diff.assemble",
@@ -705,7 +705,7 @@ pub async fn handle_branch_diff(ctx: &McpToolContext<'_>, args: Value) -> Result
                 .collect::<Vec<_>>();
             let touched = unique_file_paths(partial.changes.iter().flat_map(branch_change_files));
             Ok(generic_tool_result(
-                Some(ctx.project_root()),
+                Some(&ctx.store_layout().response_handle_root),
                 &args,
                 &hotpath::measure_block!(
                     "mcp.git.branch_diff.assemble",

@@ -13,6 +13,7 @@ use crate::response_handles::{
     store_response_handle,
 };
 use tracedecay_daemon_protocol::{RequestedOutputFormat, requested_output_format};
+use tracedecay_domain::errors::TraceDecayError;
 use tracedecay_mcp_catalog::MAX_RESPONSE_CHARS;
 use tracedecay_runtime_core::text::utf8_prefix_at_or_before;
 use tracedecay_runtime_core::tracedecay::current_timestamp;
@@ -53,16 +54,21 @@ pub fn wants_json(args: &Value) -> bool {
     parse_format(args) == RequestedOutputFormat::Json
 }
 
-pub fn finalize<F>(project_root: Option<&Path>, args: &Value, value: &Value, md: F) -> String
+pub fn finalize<F>(
+    response_handle_root: Option<&Path>,
+    args: &Value,
+    value: &Value,
+    md: F,
+) -> String
 where
     F: FnOnce() -> String,
 {
-    finalize_with_format(project_root, parse_format(args), value, md)
+    finalize_with_format(response_handle_root, parse_format(args), value, md)
 }
 
 #[hotpath::measure(label = "mcp.server.response.render")]
 pub fn finalize_with_format<F>(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     format: RequestedOutputFormat,
     value: &Value,
     md: F,
@@ -73,38 +79,39 @@ where
     match format {
         RequestedOutputFormat::Json => {
             let json = value.to_string();
-            truncated_json_envelope_with_handle(project_root, &json)
+            truncated_json_envelope_with_handle(response_handle_root, &json)
         }
         RequestedOutputFormat::Markdown => {
             let text = md();
             if text.is_empty() {
                 return text;
             }
-            truncated_markdown_with_handle(project_root, &text)
+            truncated_markdown_with_handle(response_handle_root, &text)
         }
     }
 }
 
-/// Wraps oversized JSON text in a valid preview envelope. With a project root,
+/// Wraps oversized JSON text in a valid preview envelope. With a handle root,
 /// stores the full original locally and includes a retrieval handle.
 ///
 /// If local handle storage is unavailable or fails, the envelope still carries
 /// a preview but also includes explicit recovery metadata so clients can tell
 /// why no handle was emitted and what to retry.
-pub fn truncated_json_envelope_with_handle(project_root: Option<&Path>, formatted: &str) -> String {
+pub fn truncated_json_envelope_with_handle(
+    response_handle_root: Option<&Path>,
+    formatted: &str,
+) -> String {
     if formatted.len() <= MAX_RESPONSE_CHARS {
         return formatted.to_string();
     }
     let started = std::time::Instant::now();
     let now = current_timestamp();
-    let handle = prepare_truncated_response_handle(project_root, formatted);
+    let handle = prepare_truncated_response_handle(response_handle_root, formatted);
     let original_chars = formatted.chars().count();
     let mut end = formatted.len().min(MAX_RESPONSE_CHARS.saturating_sub(1024));
     loop {
-        while end > 0 && !formatted.is_char_boundary(end) {
-            end -= 1;
-        }
-        let preview = &formatted[..end];
+        let preview = utf8_prefix_at_or_before(formatted, end);
+        end = preview.len();
         let mut envelope = serde_json::json!({
             "truncated": true,
             "original_chars": original_chars,
@@ -149,7 +156,7 @@ pub fn truncated_json_envelope_with_handle(project_root: Option<&Path>, formatte
                 // failed/absent handle means the preview is all that survives.
                 handle.record.is_some(),
                 now,
-                truncation_handle_status(project_root, &handle),
+                truncation_handle_status(response_handle_root, &handle),
                 started.elapsed(),
             );
             return text;
@@ -159,7 +166,7 @@ pub fn truncated_json_envelope_with_handle(project_root: Option<&Path>, formatte
 }
 
 pub fn markdown_preview_with_handle(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     full_text: &str,
     preview: &str,
 ) -> String {
@@ -167,17 +174,17 @@ pub fn markdown_preview_with_handle(
         return full_text.to_string();
     }
     if full_text == preview {
-        return truncated_markdown_with_handle(project_root, full_text);
+        return truncated_markdown_with_handle(response_handle_root, full_text);
     }
-    markdown_preview_truncation_with_handle(project_root, full_text, preview)
+    markdown_preview_truncation_with_handle(response_handle_root, full_text, preview)
 }
 
-fn truncated_markdown_with_handle(project_root: Option<&Path>, text: &str) -> String {
+fn truncated_markdown_with_handle(response_handle_root: Option<&Path>, text: &str) -> String {
     if text.len() <= MAX_RESPONSE_CHARS {
         return text.to_string();
     }
     render_markdown_truncation_with_handle(
-        project_root,
+        response_handle_root,
         text,
         text.len(),
         |end| markdown_truncation_preview(text, end),
@@ -192,12 +199,12 @@ fn truncated_markdown_with_handle(project_root: Option<&Path>, text: &str) -> St
 }
 
 fn markdown_preview_truncation_with_handle(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     full_text: &str,
     preview: &str,
 ) -> String {
     render_markdown_truncation_with_handle(
-        project_root,
+        response_handle_root,
         full_text,
         preview.len(),
         |end| {
@@ -218,7 +225,7 @@ fn markdown_preview_truncation_with_handle(
 }
 
 fn render_markdown_truncation_with_handle(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     full_text: &str,
     mut end: usize,
     mut preview_for_end: impl FnMut(usize) -> String,
@@ -226,7 +233,7 @@ fn render_markdown_truncation_with_handle(
 ) -> String {
     let started = std::time::Instant::now();
     let now = current_timestamp();
-    let handle = prepare_truncated_response_handle(project_root, full_text);
+    let handle = prepare_truncated_response_handle(response_handle_root, full_text);
     end = end.min(MAX_RESPONSE_CHARS.saturating_sub(MARKDOWN_TRUNCATION_RESERVED_CHARS));
     loop {
         let preview = preview_for_end(end);
@@ -237,7 +244,7 @@ fn render_markdown_truncation_with_handle(
                 rendered.len(),
                 handle.record.is_some(),
                 now,
-                truncation_handle_status(project_root, &handle),
+                truncation_handle_status(response_handle_root, &handle),
                 started.elapsed(),
             );
             return rendered;
@@ -342,12 +349,12 @@ struct TruncatedResponseHandle {
 }
 
 fn truncation_handle_status(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     handle: &TruncatedResponseHandle,
 ) -> &'static str {
     if handle.record.is_some() {
         "stored"
-    } else if project_root.is_none() {
+    } else if response_handle_root.is_none() {
         "no_project_root"
     } else {
         "store_failed"
@@ -374,11 +381,30 @@ fn run_blocking_handle_store<T>(work: impl FnOnce() -> T) -> T {
     }
 }
 
+/// The adapter records the full typed error in internal telemetry. Public
+/// output must not disclose project-local filesystem paths.
+fn handle_store_failure_status(error: &TraceDecayError) -> Value {
+    if matches!(error, TraceDecayError::SyncLock { .. }) {
+        return serde_json::json!({
+            "reason_code": "handle_store_busy",
+            "message": "The local response-handle cache stayed busy with other writers past its admission deadline, so no retrieval handle is available.",
+            "retryable": true,
+            "retry_instruction": "Re-run the original MCP tool to regenerate the full response and a fresh handle."
+        });
+    }
+    serde_json::json!({
+        "reason_code": "handle_store_failed",
+        "message": "The full response could not be cached locally, so no retrieval handle is available.",
+        "retryable": true,
+        "retry_instruction": "Fix the local project cache path or filesystem error, then re-run the original MCP tool to regenerate the full response and a fresh handle."
+    })
+}
+
 fn prepare_truncated_response_handle(
-    project_root: Option<&Path>,
+    response_handle_root: Option<&Path>,
     text: &str,
 ) -> TruncatedResponseHandle {
-    if let Some(root) = project_root {
+    if let Some(root) = response_handle_root {
         match hotpath::measure_block!(
             "mcp.server.response.handle_store",
             run_blocking_handle_store(|| store_response_handle(root, text, current_timestamp()))
@@ -387,16 +413,9 @@ fn prepare_truncated_response_handle(
                 record: Some(record),
                 unavailable: None,
             },
-            // The adapter records the full typed error in internal telemetry.
-            // Public output must not disclose project-local filesystem paths.
-            Err(_) => TruncatedResponseHandle {
+            Err(error) => TruncatedResponseHandle {
                 record: None,
-                unavailable: Some(serde_json::json!({
-                    "reason_code": "handle_store_failed",
-                    "message": "The full response could not be cached locally, so no retrieval handle is available.",
-                    "retryable": true,
-                    "retry_instruction": "Fix the local project cache path or filesystem error, then re-run the original MCP tool to regenerate the full response and a fresh handle."
-                })),
+                unavailable: Some(handle_store_failure_status(&error)),
             },
         }
     } else {
@@ -631,8 +650,8 @@ pub fn risky_patterns_md(value: &Value) -> String {
 
 /// Dedicated markdown renderer for `tracedecay_unmounted_files`.
 ///
-/// An empty answer here is a real and welcome verdict — "every source file is
-/// reachable" — so it is spelled out rather than left as the generic renderer's
+/// An empty answer here is a real and welcome verdict, "every source file is
+/// reachable", so it is spelled out rather than left as the generic renderer's
 /// silence. The per-ecosystem section is not decoration: "unmounted" means
 /// something stronger for cargo than for a bundler, and a language nobody
 /// modelled must say so out loud rather than let a clean report imply coverage
@@ -732,7 +751,7 @@ fn render_ecosystem(md: &mut Md, ecosystem: &Value) {
     let number = |key: &str| ecosystem.get(key).and_then(Value::as_u64).unwrap_or(0);
     let findings = number("unmounted_file_count");
     md.bullet(&format!(
-        "**{name}** — {status} · {} package(s) · {} entry point(s) · {} file(s) scanned · {findings} unmounted",
+        "**{name}**, {status} · {} package(s) · {} entry point(s) · {} file(s) scanned · {findings} unmounted",
         number("package_count"),
         number("entry_point_count"),
         number("scanned_file_count"),

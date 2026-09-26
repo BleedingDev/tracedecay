@@ -3,13 +3,21 @@
 use std::path::Path;
 
 use serde_json::{Value, json};
+use tracedecay_application::advisory::github_runtime::github_source_status_v1;
 use tracedecay_application::tracedecay::BranchDiagnostics;
 use tracedecay_contracts::code_index_freshness::{
-    CodeIndexFreshnessCoverageV1, CodeIndexStalenessStateV1,
+    CodeIndexFreshnessCoverageV1, CodeIndexReadinessWaitOutcomeV1, CodeIndexReadinessWaitReadV1,
+    CodeIndexReadinessWaitV1, CodeIndexStalenessStateV1,
 };
 use tracedecay_contracts::storage::{SchemaConvergenceFindingV1, SchemaConvergenceStateV1};
-use tracedecay_domain::errors::Result;
+use tracedecay_domain::ProjectId;
+use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_global_db::{RegisteredGlobalDb, SessionIngestHealth};
+use tracedecay_runtime_core::resident_memory::{
+    RESIDENT_OWNER_SHED_ORDER_V1, ResidentMemoryPressureStateV1, ResidentMemoryPressureV1,
+    ResidentOwnerKindV1, ResidentOwnersV1, process_resident_memory_pressure_v1,
+    process_resident_owners_v1, sampled_memory_pressure_some_avg10_v1,
+};
 use tracedecay_runtime_core::runtime_telemetry::GenerationCensusSnapshot;
 use tracedecay_runtime_core::storage::{StorageMode, StoreKind};
 
@@ -18,6 +26,45 @@ use crate::{McpToolContext, ToolResult, generic_tool_result, rendered_tool_resul
 
 fn display_path(path: &Path) -> String {
     path.display().to_string()
+}
+
+/// The `wait_for` argument, when present.
+pub fn status_readiness_wait(args: &Value) -> Result<Option<CodeIndexReadinessWaitV1>> {
+    match args.get("wait_for") {
+        None | Some(Value::Null) => Ok(None),
+        Some(wait_for) => serde_json::from_value(wait_for.clone())
+            .map(Some)
+            .map_err(|error| TraceDecayError::Config {
+                message: format!(
+                    "tracedecay_status wait_for must be {{\"state\": \"fresh\"|\"ready\"|\"graph_ready\", \"timeout_ms\": <u64>}}: {error}"
+                ),
+            }),
+    }
+}
+
+/// Project what a readiness wait observed onto the caller-facing outcome.
+/// `last_state` is the `code_index_freshness.status` label of the last
+/// reading, or `not_mounted` when no scheduler was mounted for the root.
+#[must_use]
+pub fn readiness_wait_outcome(
+    read: CodeIndexReadinessWaitReadV1,
+) -> CodeIndexReadinessWaitOutcomeV1 {
+    match read {
+        CodeIndexReadinessWaitReadV1::Reached => CodeIndexReadinessWaitOutcomeV1::Reached,
+        CodeIndexReadinessWaitReadV1::TimedOut { last } => {
+            CodeIndexReadinessWaitOutcomeV1::TimedOut {
+                last_state: last
+                    .as_ref()
+                    .map_or("not_mounted", |freshness| {
+                        code_index_freshness_projection(freshness).0
+                    })
+                    .to_owned(),
+            }
+        }
+        CodeIndexReadinessWaitReadV1::Unreachable { reason } => {
+            CodeIndexReadinessWaitOutcomeV1::Unavailable { reason }
+        }
+    }
 }
 
 fn status_arg_flag(args: &Value, key: &str, default: bool) -> bool {
@@ -48,7 +95,7 @@ fn schema_convergence_status(findings: &[SchemaConvergenceFindingV1]) -> Value {
 /// sealed-generation census the retrieval lanes enforce.
 ///
 /// `serving_branch` is store provenance, but readers take it as a serving
-/// claim — on a fresh daemon it named a branch seconds into enrollment while
+/// claim, on a fresh daemon it named a branch seconds into enrollment while
 /// every retrieval lane truthfully refused `generation_rebuilding`. Status
 /// must report the same serving truth the lanes enforce: the branch claim is
 /// gated on a sealed complete generation existing, and the typed
@@ -147,18 +194,19 @@ fn ready_serving_source(
 }
 
 fn attach_compact_branch_summary(
-    branch_diagnostics: &BranchDiagnostics,
+    open_active_branch: Option<&str>,
+    serving_branch: Option<&str>,
     output: &mut Value,
     retrieval_serving: &CodeIndexRetrievalServingV1,
 ) {
     // Both status shapes consume the serving identity reconciled with the
     // ready generation source below.
     // Do not alias open/active into current/live: those are distinct under drift.
-    if let Some(active) = branch_diagnostics.open_active_branch.as_deref() {
+    if let Some(active) = open_active_branch {
         output["active_branch"] = json!(active);
     }
     let branch_servable = retrieval_serving.attach(output);
-    if branch_servable && let Some(serving) = branch_diagnostics.serving_branch.as_deref() {
+    if branch_servable && let Some(serving) = serving_branch {
         output["serving_branch"] = json!(serving);
     }
 }
@@ -209,6 +257,70 @@ fn attach_full_branch_status(
 /// authority for the `graph_statistics` field: this route serializes it and
 /// `tracedecay status` deserializes the same Rust type, so the two sides
 /// cannot drift.
+/// The daemon's resident memory as one project sees it: process RSS against
+/// the admission ceiling and pressure line, the daemon-wide retained totals,
+/// and this project's retained owners with their bytes, idle time, and
+/// whether pressure may shed them. Other projects' owners belong to the
+/// daemon-wide Doctor inventory, never to a project read.
+fn project_memory_value(project_id: &ProjectId) -> Value {
+    memory_value(
+        process_resident_memory_pressure_v1(),
+        process_resident_owners_v1(),
+        sampled_memory_pressure_some_avg10_v1(),
+        std::time::Instant::now(),
+        project_id,
+    )
+}
+
+fn memory_value(
+    pressure: &ResidentMemoryPressureV1,
+    owners: &ResidentOwnersV1,
+    psi_some_avg10: Option<f64>,
+    now: std::time::Instant,
+    project_id: &ProjectId,
+) -> Value {
+    let (state, resident_bytes) = match pressure.state() {
+        ResidentMemoryPressureStateV1::Unobserved => ("unobserved", None),
+        ResidentMemoryPressureStateV1::Nominal { observed_bytes, .. } => {
+            ("nominal", Some(observed_bytes))
+        }
+        ResidentMemoryPressureStateV1::OverBudget { observed_bytes, .. } => {
+            ("over_budget", Some(observed_bytes))
+        }
+    };
+    let report = owners.report(now);
+    let rows = report
+        .owners
+        .iter()
+        .filter(|row| row.scope.project_id == *project_id)
+        .map(|row| {
+            json!({
+                "project_id": row.scope.project_id.as_str(),
+                "worktree_id": row.scope.worktree_id.as_str(),
+                "kind": row.kind.as_str(),
+                "generation_id": row.generation_id.as_str(),
+                "bytes": row.bytes.measured(),
+                "measured": row.bytes.measured().is_some(),
+                "idle_seconds": row.idle_for.as_secs(),
+                "protected": row.protected,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": state,
+        "resident_bytes": resident_bytes,
+        "limit_bytes": pressure.limit_bytes(),
+        "high_watermark_bytes": pressure.high_watermark_bytes(),
+        "low_watermark_bytes": pressure.low_watermark_bytes(),
+        "psi_some_avg10": psi_some_avg10,
+        "idle_window_seconds": report.idle_window.as_secs(),
+        "shed_order": RESIDENT_OWNER_SHED_ORDER_V1.map(ResidentOwnerKindV1::as_str),
+        "retained_bytes": report.measured_bytes,
+        "unmeasured_owners": report.unmeasured_owners,
+        "owners": rows,
+    })
+}
+
 pub fn graph_statistics_value(census: Option<&GenerationCensusSnapshot>) -> Result<Value> {
     let census = census.cloned().unwrap_or(
         GenerationCensusSnapshot::Unavailable {
@@ -225,6 +337,7 @@ pub async fn handle_status(
     args: Value,
     server_stats: Option<Value>,
     scope_prefix: Option<&str>,
+    wait: Option<CodeIndexReadinessWaitOutcomeV1>,
 ) -> Result<ToolResult> {
     if status_arg_flag(&args, "admission_only", false) {
         let mut output = json!({
@@ -238,7 +351,7 @@ pub async fn handle_status(
             output["scope_prefix"] = json!(prefix);
         }
         return Ok(generic_tool_result(
-            Some(ctx.project_root()),
+            Some(&ctx.store_layout().response_handle_root),
             &args,
             &output,
             vec![],
@@ -258,6 +371,7 @@ pub async fn handle_status(
     let mut output = json!({
         "project_root": ctx.project_root(),
         "graph_statistics": graph_statistics,
+        "memory": project_memory_value(&ctx.admitted_scope().project_id),
     });
     output["schema_convergence"] = schema_convergence_status(
         &ctx.store_runtime()
@@ -328,12 +442,19 @@ pub async fn handle_status(
         ),
     };
     let ready_serving_source = ready_serving_source(freshness_payload.as_ref());
-    let branch_diagnostics = ctx.branch_diagnostics_for_serving_source(
+    let (source_reference, source_revision, source_is_current) = (
         ready_serving_source.map(|source| source.reference),
         ready_serving_source.and_then(|source| source.revision),
         ready_serving_source.is_some_and(|source| source.current_source_verified),
     );
     output["code_index_freshness"] = code_index_freshness;
+    output["github_source"] = match github_source_status_v1(ctx.project_root()) {
+        Some(source) => serde_json::to_value(&source)?,
+        None => json!({
+            "state": "not_observed",
+            "reason": "the checkout has no GitHub origin, or its advisory owner has not mounted in this daemon",
+        }),
+    };
     if include_storage_health {
         let mut storage_health = serde_json::to_value(
             hotpath::future!(
@@ -355,9 +476,24 @@ pub async fn handle_status(
     }
 
     if include_branch_diagnostics {
+        let branch_diagnostics = ctx.branch_diagnostics_for_serving_source(
+            source_reference,
+            source_revision,
+            source_is_current,
+        );
         attach_full_branch_status(&branch_diagnostics, &mut output, &retrieval_serving);
     } else {
-        attach_compact_branch_summary(&branch_diagnostics, &mut output, &retrieval_serving);
+        let (open_active_branch, serving_branch) = ctx.serving_branch_identity_for_serving_source(
+            source_reference,
+            source_revision,
+            source_is_current,
+        );
+        attach_compact_branch_summary(
+            open_active_branch.as_deref(),
+            serving_branch.as_deref(),
+            &mut output,
+            &retrieval_serving,
+        );
     }
 
     // Session-transcript ingest health (recall trust): last ingest time and
@@ -430,9 +566,12 @@ pub async fn handle_status(
     if let Some(prefix) = scope_prefix {
         output["scope_prefix"] = json!(prefix);
     }
+    if let Some(wait) = wait {
+        output["wait"] = serde_json::to_value(wait)?;
+    }
 
     Ok(rendered_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         &args,
         &output,
         vec![],
@@ -445,15 +584,13 @@ pub async fn handle_status(
 ///
 /// Only the first is retryable-by-waiting: a `warming` read converges on its
 /// own, while a `parked` read names a deterministic contract violation the
-/// background worker re-checks every wake but can never fix by waiting — so
+/// background worker re-checks every wake but can never fix by waiting, so
 /// the warning carries the exact reason and remediation instead of a
 /// wait-longer message.
 fn code_index_freshness_projection(
     freshness: &tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1,
 ) -> (&'static str, Option<String>) {
-    let authoritative = freshness.latest_generation_id.is_some()
-        && freshness.coverage == CodeIndexFreshnessCoverageV1::Complete
-        && freshness.staleness_state == Some(CodeIndexStalenessStateV1::Fresh);
+    let authoritative = freshness.is_authoritative();
     if let Some(parked) = freshness.parked.as_ref() {
         let warning = format!(
             "code-index background convergence is parked: {}; {}",
@@ -615,6 +752,13 @@ fn render_status_md(value: &Value) -> String {
                     } else {
                         md.field(k, &format!("{{{} field(s)}}", o.len()));
                     }
+                    if k == "memory"
+                        && let Some(owners) = o.get("owners").and_then(Value::as_array)
+                    {
+                        for owner in owners {
+                            md.bullet(&owner.to_string());
+                        }
+                    }
                     if k == "schema_convergence"
                         && let Some(findings) = o.get("findings").and_then(Value::as_array)
                     {
@@ -655,7 +799,6 @@ fn active_project_context(
             "class": store_kind_name(&layout.store_kind),
             "mode": storage_mode_name(&layout.storage_mode),
             "data_root": display_path(&layout.data_root),
-            "config_path": display_path(&layout.config_path),
             "graph_db_path": display_path(graph_db_path),
             "graph_db_exists": graph_db_path.exists(),
             "graph_db_size_bytes": graph_db_path.metadata().map_or(0, |metadata| metadata.len()),
@@ -684,7 +827,6 @@ fn active_project_context(
 
 fn storage_mode_name(mode: &StorageMode) -> &'static str {
     match mode {
-        StorageMode::ProjectLocal => "project_local",
         StorageMode::ProfileSharded => "profile_sharded",
     }
 }
@@ -711,7 +853,7 @@ pub async fn handle_active_project(
     );
     let output = active_project_context(ctx, &branch, server_stats, scope_prefix);
     Ok(generic_tool_result(
-        Some(ctx.project_root()),
+        Some(&ctx.store_layout().response_handle_root),
         args,
         &output,
         vec![],
@@ -729,8 +871,9 @@ mod tests {
     };
 
     use super::{
-        code_index_freshness_projection, graph_statistics_value, historical_session_catch_up_state,
-        render_status_md, schema_convergence_status,
+        CodeIndexReadinessWaitReadV1, CodeIndexReadinessWaitV1, code_index_freshness_projection,
+        graph_statistics_value, historical_session_catch_up_state, readiness_wait_outcome,
+        render_status_md, schema_convergence_status, status_readiness_wait,
     };
     use tracedecay_contracts::code_index_freshness::{
         CodeIndexFreshnessCoverageV1, CodeIndexStalenessStateV1,
@@ -739,6 +882,99 @@ mod tests {
         SchemaConvergenceFindingV1, SchemaConvergenceProgressV1, SchemaConvergenceStageV1,
         SchemaConvergenceStateV1,
     };
+
+    struct HeldDecode;
+
+    impl tracedecay_runtime_core::resident_memory::ResidentOwnerV1 for HeldDecode {
+        fn sample(
+            &self,
+        ) -> Option<tracedecay_runtime_core::resident_memory::ResidentOwnerSampleV1> {
+            Some(
+                tracedecay_runtime_core::resident_memory::ResidentOwnerSampleV1 {
+                    generation_id: tracedecay_domain::CodeGenerationId::new("generation.fixture")
+                        .expect("generation id"),
+                    bytes: tracedecay_runtime_core::resident_memory::ResidentOwnerBytesV1::Measured(
+                        4_096,
+                    ),
+                    last_used: std::time::Instant::now(),
+                    serving: true,
+                },
+            )
+        }
+
+        fn release(&self) -> tracedecay_runtime_core::resident_memory::ResidentOwnerReleaseV1 {
+            tracedecay_runtime_core::resident_memory::ResidentOwnerReleaseV1::Busy
+        }
+    }
+
+    #[test]
+    fn status_memory_reports_the_projects_own_owners_and_daemon_totals() {
+        use std::sync::Arc;
+        use tracedecay_runtime_core::resident_memory::{
+            ResidentMemoryPressureV1, ResidentOwnerKindV1, ResidentOwnerScopeV1, ResidentOwnerV1,
+            ResidentOwnersV1,
+        };
+        let pressure =
+            ResidentMemoryPressureV1::new(std::num::NonZeroU64::new(10_000).expect("limit"));
+        pressure.publish_observed_resident_bytes(6_000);
+        let owners = Arc::new(ResidentOwnersV1::new(std::time::Duration::from_mins(10)));
+        let owner: Arc<dyn ResidentOwnerV1> = Arc::new(HeldDecode);
+        let project = tracedecay_domain::ProjectId::new("project.fixture").expect("project id");
+        let _registrations = [
+            (project.clone(), "worktree.fixture"),
+            (
+                tracedecay_domain::ProjectId::new("project.other").expect("project id"),
+                "worktree.other",
+            ),
+        ]
+        .map(|(project_id, worktree)| {
+            owners
+                .register(
+                    ResidentOwnerScopeV1 {
+                        project_id,
+                        worktree_id: tracedecay_domain::WorktreeId::new(worktree)
+                            .expect("worktree id"),
+                    },
+                    ResidentOwnerKindV1::DecodedGeneration,
+                    Arc::downgrade(&owner),
+                )
+                .expect("register")
+        });
+
+        let memory = super::memory_value(
+            &pressure,
+            &owners,
+            Some(1.5),
+            std::time::Instant::now(),
+            &project,
+        );
+
+        assert_eq!(
+            memory,
+            serde_json::json!({
+                "status": "nominal",
+                "resident_bytes": 6_000,
+                "limit_bytes": 10_000,
+                "high_watermark_bytes": 9_000,
+                "low_watermark_bytes": 7_500,
+                "psi_some_avg10": 1.5,
+                "idle_window_seconds": 600,
+                "shed_order": ["superseded_generation", "graph_catalog", "decoded_generation", "graph_engine"],
+                "retained_bytes": 8_192,
+                "unmeasured_owners": 0,
+                "owners": [{
+                    "project_id": "project.fixture",
+                    "worktree_id": "worktree.fixture",
+                    "kind": "decoded_generation",
+                    "generation_id": "generation.fixture",
+                    "bytes": 4_096,
+                    "measured": true,
+                    "idle_seconds": 0,
+                    "protected": true,
+                }],
+            })
+        );
+    }
 
     #[test]
     fn status_markdown_exposes_nested_status_without_expanding_other_objects() {
@@ -825,6 +1061,85 @@ mod tests {
         let decoded: GenerationCensusSnapshot =
             serde_json::from_value(value).expect("CLI decodes observed census");
         assert_eq!(decoded, observed);
+    }
+
+    #[test]
+    fn a_timed_out_wait_names_the_last_status_label() {
+        let seated_graph_pending =
+            tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
+                worktree_root: "/project".to_owned(),
+                latest_generation_id: Some("generation.fixture".to_owned()),
+                staleness_state: Some(CodeIndexStalenessStateV1::Fresh),
+                coverage: CodeIndexFreshnessCoverageV1::Complete,
+                code_graph_serving: Some(
+                    tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Pending,
+                ),
+                ..Default::default()
+            };
+        let rebuilding = tracedecay_contracts::code_index_freshness::CodeIndexWorktreeFreshnessV1 {
+            worktree_root: "/project".to_owned(),
+            staleness_state: Some(CodeIndexStalenessStateV1::Indexing),
+            coverage: CodeIndexFreshnessCoverageV1::PartialRefreshInProgress,
+            ..Default::default()
+        };
+        for (last, expected) in [
+            (Some(Box::new(seated_graph_pending)), "current"),
+            (Some(Box::new(rebuilding)), "warming"),
+            (None, "not_mounted"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(readiness_wait_outcome(
+                    CodeIndexReadinessWaitReadV1::TimedOut { last }
+                ))
+                .expect("outcome serializes"),
+                serde_json::json!({ "outcome": "timed_out", "last_state": expected })
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(readiness_wait_outcome(
+                CodeIndexReadinessWaitReadV1::Reached
+            ))
+            .expect("outcome serializes"),
+            serde_json::json!({ "outcome": "reached" })
+        );
+    }
+
+    #[test]
+    fn wait_for_rejects_an_unknown_state() {
+        let refused = status_readiness_wait(
+            &serde_json::json!({ "wait_for": { "state": "sealed", "timeout_ms": 5 } }),
+        )
+        .expect_err("unknown state is refused");
+        assert!(
+            refused.to_string().contains("wait_for must be"),
+            "{refused}"
+        );
+        assert_eq!(
+            status_readiness_wait(
+                &serde_json::json!({ "wait_for": { "state": "ready", "timeout_ms": 5 } })
+            )
+            .expect("valid wait"),
+            Some(CodeIndexReadinessWaitV1 {
+                state:
+                    tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::Ready,
+                timeout_ms: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn wait_for_accepts_graph_ready() {
+        assert_eq!(
+            status_readiness_wait(
+                &serde_json::json!({ "wait_for": { "state": "graph_ready", "timeout_ms": 5 } })
+            )
+            .expect("graph_ready is a wait state"),
+            Some(CodeIndexReadinessWaitV1 {
+                state:
+                    tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::GraphReady,
+                timeout_ms: 5,
+            })
+        );
     }
 
     #[test]

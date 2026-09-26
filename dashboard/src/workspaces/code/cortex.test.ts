@@ -49,7 +49,7 @@ function node(over: Partial<GraphNodeV1> & { id: string }): GraphNodeV1 {
 }
 
 describe('the register strip', () => {
-  it('reads modules as the index’s module kind, and names the absence otherwise', () => {
+  it('reads modules as the index\'s module kind, and names the absence otherwise', () => {
     expect(
       moduleReading([
         { kind: 'function', count: 40 },
@@ -81,7 +81,7 @@ describe('the register strip', () => {
     });
   });
 
-  it('lays out seven cells in the plate’s order and names the renderer’s real rule', () => {
+  it('lays out seven cells in the plate\'s order and names the renderer\'s real rule', () => {
     const cells = cortexRegister({
       totals: { nodes: 12_873, edges: 41_206, files: 642 },
       nodes_by_kind: [{ kind: 'module', count: 393 }],
@@ -96,9 +96,13 @@ describe('the register strip', () => {
       'rank',
     ]);
     expect(cells[0]?.reading).toMatchObject({ value: '12,873', note: '12,873 symbols indexed' });
-    // The field is force-settled and sized by degree; the register must not
-    // promise eigenvector rank the renderer does not compute.
-    expect(cells[5]?.reading).toMatchObject({ value: 'force-directed' });
+    // The field packs directories and sizes by degree; the register must not
+    // promise a force layout or an eigenvector rank the renderer does not run.
+    expect(cells[5]?.reading).toEqual({
+      kind: 'measured',
+      value: 'module-packed',
+      note: 'directories packed by shared relations',
+    });
     expect(cells[6]?.reading).toMatchObject({ value: 'degree' });
   });
 });
@@ -178,13 +182,10 @@ describe('strata for a file', () => {
       { path: 'src/storage/store.rs', depth: 2, scc_size: 1, chain: [] },
     ],
     scan: {
-      budget_ms: 250,
       cache_scope: 'sealed_generation',
       cache_state: 'warm',
       dependency_edges_examined: 100,
       files_examined: 2,
-      max_dependency_edges: 50_000,
-      max_files: 10_000,
     },
   };
 
@@ -196,29 +197,20 @@ describe('strata for a file', () => {
       idealDepth: 5,
       directory: 'src/storage',
       sccSize: 3,
-      capped: false,
     });
   });
 
-  it('falls back to the directory’s depths, then names the absence', () => {
+  it('falls back to the directory\'s depths, then names the absence', () => {
     expect(strataForPath(measurement, 'src/storage/other.rs')).toEqual({
       kind: 'directory_only',
       directory: 'src/storage',
       depths: [2, 3],
-      capped: false,
     });
     expect(strataForPath(measurement, 'dashboard/src/x.tsx')).toEqual({
       kind: 'not_in_scan',
       filesLaidOut: 2,
-      capped: false,
     });
     expect(strataForPath(measurement, null)).toEqual({ kind: 'no_path' });
-  });
-
-  it('flags a budget-capped scan so a depth reads as a floor', () => {
-    const capped = { ...measurement, scan: { ...measurement.scan, files_examined: 10_000 } };
-    expect(strataForPath(capped, 'src/storage/store.rs')).toMatchObject({ capped: true });
-    expect(strataForPath(capped, 'nowhere.rs')).toMatchObject({ kind: 'not_in_scan', capped: true });
   });
 });
 
@@ -235,7 +227,7 @@ describe('diagnostics in a file', () => {
     ],
   } as unknown as DiagnosticsSnapshot;
 
-  it('matches the broker’s absolute or relative path to the index path', () => {
+  it('matches the broker\'s absolute or relative path to the index path', () => {
     const file = diagnosticsForFile(snapshot, 'src/a.rs');
     expect(file?.rows.length).toBe(2);
     expect(file?.errors).toBe(1);

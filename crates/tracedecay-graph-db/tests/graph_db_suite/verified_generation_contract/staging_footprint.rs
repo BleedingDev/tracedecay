@@ -256,7 +256,7 @@ fn stage_rows_before_publish(
 }
 
 /// Publishes one already-journaled replay, exactly as
-/// [`publish_sealed`] does but with no in-hand manifest — the inline arm the
+/// [`publish_sealed`] does but with no in-hand manifest, the inline arm the
 /// memory graph uses.
 fn publish_journaled(
     registered: &RegisteredGraph,
@@ -529,13 +529,13 @@ fn staging_holds_rows_for_at_most_active_and_in_flight_generations() {
 /// memory graph's inline head and the one serving code generation, so every
 /// other sealed code scope has no lease here. Release used to answer
 /// `NoVerifiedLease` for all of them and log nothing, so the shared staging
-/// container kept every scope's rows — 8.6 GB on disk, 20+ GB of heap on the
+/// container kept every scope's rows, 8.6 GB on disk, 20+ GB of heap on the
 /// next open, with the release queue backed up for a day (#799).
 ///
 /// Fails if the lease-independent authority is removed (release answers
 /// `Retained` again), if a fail-closed check is skipped, if a released
 /// generation stops being serveable from its sealed store, or if the
-/// inline-head generation — which has no sealed artifact — is released.
+/// inline-head generation, which has no sealed artifact, is released.
 #[test]
 fn sealed_generations_release_staging_rows_without_a_resident_lease() {
     let temp = TempDir::new().unwrap();
@@ -649,7 +649,7 @@ fn sealed_generations_release_staging_rows_without_a_resident_lease() {
     );
 
     // The memory graph with no sealed artifact installed: staging holds the
-    // only copy of its rows, so no authority — lease or artifact — may
+    // only copy of its rows, so no authority, lease or artifact, may
     // release them. Fails if the lease-independent arm ever releases rows
     // that nothing else can reconstruct.
     database
@@ -796,7 +796,7 @@ fn retained_sealed_generations_hold_at_most_one_resident_engine() {
 
         let (retained, resident) = database.sealed_generation_engine_census();
         // Fails if a published generation stops being retained as a sealed
-        // reader — the identity every later read and release resolves through.
+        // reader, the identity every later read and release resolves through.
         assert_eq!(
             retained,
             published.len(),
@@ -837,7 +837,7 @@ fn retained_sealed_generations_hold_at_most_one_resident_engine() {
     let (retained, resident) = database.sealed_generation_engine_census();
     assert_eq!(retained, 4);
     // Fails if installing a generation stops sweeping the readers that a
-    // prior pass materialized — the case that leaves N whole graphs resident.
+    // prior pass materialized, the case that leaves N whole graphs resident.
     assert!(
         resident <= 1,
         "installing a generation must step every other idle sealed reader down; \
@@ -959,6 +959,103 @@ fn release_sweep_retries_idle_sealed_reader_hibernation() {
         "the next bounded sweep must retry the now-idle reader"
     );
     assert_snapshot_reads(&commit.snapshot, &identity, "retry-idle");
+}
+
+/// A serving owner pins its generation's engine, and latency-bounded readers
+/// keep being told it is resident: neither the bounded release sweep nor a
+/// peer generation's install may step it down for the next read to reopen.
+///
+/// Fails if any hibernation path ignores a live serving pin (the snapshot
+/// reports a cold engine between reads), or if a dropped pin stops returning
+/// the reader to ordinary idle hibernation.
+#[test]
+fn a_pinned_serving_generation_opens_once_across_sweeps_and_peer_installs() {
+    let temp = TempDir::new().unwrap();
+    let registered = RegisteredGraph::new_mounted(temp.path()).unwrap();
+    let mut authority = RelationalAuthority::default();
+    let identity = projection("code:pinned-serving", "code");
+    let manifest = rich_manifest(identity.clone(), "pinned-g1", "pinned");
+    let replay = stage_sealed_manifest(
+        &mut authority,
+        &registered.binding,
+        &manifest,
+        "publish:pinned-g1",
+        None,
+        '6',
+    );
+    stage_rows_before_publish(&registered, temp.path(), &manifest);
+    let commit = publish_sealed(&registered, temp.path(), &mut authority, &replay, &manifest);
+    release_sealed_head(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &replay.publication.key.projection,
+    );
+    assert_eq!(
+        commit.snapshot.serving_engine_resident(),
+        Ok(false),
+        "an unpinned idle reader is stepped down by the sweep"
+    );
+
+    let pin = commit.snapshot.pin_serving_engine().unwrap();
+    assert_eq!(
+        commit.snapshot.serving_engine_resident(),
+        Ok(true),
+        "taking the pin opens the sealed engine"
+    );
+    for _ in 0..3 {
+        assert_snapshot_reads(&commit.snapshot, &identity, "pinned");
+        release_sealed_head(
+            &registered,
+            temp.path(),
+            &mut authority,
+            &replay.publication.key.projection,
+        );
+        assert_eq!(
+            commit.snapshot.serving_engine_resident(),
+            Ok(true),
+            "a release sweep must not hibernate a pinned serving engine"
+        );
+    }
+
+    let peer_identity = projection("code:pinned-peer", "code");
+    let peer_manifest = rich_manifest(peer_identity.clone(), "pinned-peer-g1", "peer");
+    let peer_replay = stage_sealed_manifest(
+        &mut authority,
+        &registered.binding,
+        &peer_manifest,
+        "publish:pinned-peer-g1",
+        None,
+        '7',
+    );
+    let peer = publish_sealed(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &peer_replay,
+        &peer_manifest,
+    );
+    assert_eq!(
+        commit.snapshot.serving_engine_resident(),
+        Ok(true),
+        "installing a peer generation must not step a pinned serving engine down"
+    );
+    assert_snapshot_reads(&commit.snapshot, &identity, "pinned");
+
+    drop(pin);
+    release_sealed_head(
+        &registered,
+        temp.path(),
+        &mut authority,
+        &replay.publication.key.projection,
+    );
+    assert_eq!(
+        commit.snapshot.serving_engine_resident(),
+        Ok(false),
+        "once its pin drops, the reader returns to idle hibernation"
+    );
+    assert_snapshot_reads(&commit.snapshot, &identity, "pinned");
+    assert_snapshot_reads(&peer.snapshot, &peer_identity, "peer");
 }
 
 /// A remount of a generation with no staging rows must adopt the sealed store
@@ -1083,7 +1180,7 @@ fn sealed_artifact_containers(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 /// remount must all leave its container byte-identical. Grafeo's close-time
 /// checkpoint elision excludes the layered store a compacted artifact opens
 /// as, so a write-capable reopen re-serialized the whole container on every
-/// close — a 3.2 GB artifact doubled to 6.4 GB after one reopen in the
+/// close, a 3.2 GB artifact doubled to 6.4 GB after one reopen in the
 /// dogfood journey. Fails if any reopen path opens the artifact write-capable.
 #[test]
 fn sealed_artifact_container_is_byte_identical_across_reopens() {
@@ -1341,7 +1438,7 @@ fn corrupt_sealed_containers(root: &Path) -> usize {
 /// container. With no staging rows (the direct-seal shape) recovery has
 /// nothing to serve from, so the canonical serialized activation path
 /// republishes the same head with the hydrated manifest and rebuilds the
-/// artifact from it — without staging a row.
+/// artifact from it, without staging a row.
 ///
 /// `staged_rows_retained` runs the legacy shape instead: the rows the
 /// artifact was derived from are still in the staging database, so recovery

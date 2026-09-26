@@ -19,7 +19,7 @@ use tracedecay_domain::{
 };
 
 use super::chunks::{ChunkingFailureV1, CodeFileChunksV1, symbol_occurrence_id};
-use super::generations::{FileExtractionActionV1, GenerationIncrementPlanV1};
+use super::generations::{FileExtractionActionV1, GenerationIncrementPlanV1, placeholder_digest};
 use super::lineage::{
     GenerationSymbolIndexV1, LineageResolutionErrorV1, LineageSymbolRecordV1,
     SymbolLineageCandidateV1, SymbolLineageResolver,
@@ -494,10 +494,7 @@ pub fn plan_chunk_increment(
         reused_count,
         reused_digest,
     };
-    changes.manifest_digest = changes.compute_digest().map_err(|error| {
-        ChunkIncrementErrorV1::NonCanonical(crate::noncanonical::noncanonical_from_domain(error))
-    })?;
-    changes.validate().map_err(|error| {
+    changes.seal().map_err(|error| {
         ChunkIncrementErrorV1::NonCanonical(crate::noncanonical::noncanonical_from_domain(error))
     })?;
     Ok(changes)
@@ -608,10 +605,7 @@ pub(crate) fn plan_chunk_increment_arc_shared(
         reused_count,
         reused_digest,
     };
-    changes.manifest_digest = changes.compute_digest().map_err(|error| {
-        ChunkIncrementErrorV1::NonCanonical(crate::noncanonical::noncanonical_from_domain(error))
-    })?;
-    changes.validate().map_err(|error| {
+    changes.seal().map_err(|error| {
         ChunkIncrementErrorV1::NonCanonical(crate::noncanonical::noncanonical_from_domain(error))
     })?;
     Ok(changes)
@@ -657,11 +651,6 @@ fn map_lineage_error(error: LineageResolutionErrorV1) -> ChunkIncrementErrorV1 {
             error.to_string(),
         ),
     )
-}
-
-fn placeholder_digest() -> ManifestDigest {
-    ManifestDigest::new(format!("sha256:{}", "0".repeat(64)))
-        .expect("a zeroed sha256 digest is canonical")
 }
 
 #[cfg(test)]

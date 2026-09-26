@@ -33,7 +33,7 @@ fn test_call_root_callee<'s>(state: &ExtractionState<'s>, call: TsNode<'_>) -> O
     loop {
         match callee.kind() {
             "identifier" => return Some(state.node_text(callee)),
-            // `describe.only`, `it.each`, `test.skip` — recurse into the
+            // `describe.only`, `it.each`, `test.skip`. Recurse into the
             // object side of the member access. Curried calls like
             // `test.each([...])(...)` are their own `call_expression`, so we
             // descend into that callee the same way.
@@ -49,6 +49,19 @@ fn test_call_root_callee<'s>(state: &ExtractionState<'s>, call: TsNode<'_>) -> O
 /// call (`describe`, `it`, `test`, …) based on its root callee.
 pub(super) fn is_test_framework_call(state: &ExtractionState<'_>, call: TsNode<'_>) -> bool {
     test_call_root_callee(state, call).is_some_and(|root| TEST_CALLEES.contains(&root))
+}
+
+/// Whether a `Function` node's signature is the one [`visit_test_call`] writes:
+/// the first source line of a call rooted at a test-framework callee
+/// (`describe("fn", …`, `it.each(…`). Such a node is named by its title
+/// string, not by a declaration, so it must never be a name-resolution target:
+/// `fn()` inside `describe("fn", …)` calls the real `fn`.
+pub fn is_test_framework_call_signature(signature: &str) -> bool {
+    let root_end = signature
+        .find(|character: char| !(character.is_alphanumeric() || matches!(character, '_' | '$')))
+        .unwrap_or(signature.len());
+    let (root, rest) = signature.split_at(root_end);
+    TEST_CALLEES.contains(&root) && (rest.starts_with('(') || rest.starts_with('.'))
 }
 
 /// Find the title argument (first string / template) of a test call's
@@ -217,7 +230,7 @@ pub(super) fn visit_test_call(state: &mut ExtractionState<'_>, call: TsNode<'_>)
 /// Whether a statement is a named function declaration whose body owns its
 /// own call sites. `extract_call_sites` only skips nested arrow/function
 /// *children*, so a top-level `function_declaration` statement would have
-/// its body walked and double-attributed to the enclosing test — guard it.
+/// its body walked and double-attributed to the enclosing test. Guard it.
 /// Arrow/function-expression assignments (`const f = () => {}`) are already
 /// skipped by `extract_call_sites` and need no guard here.
 fn defines_own_callable(stmt: TsNode<'_>) -> bool {
@@ -242,7 +255,7 @@ fn visit_test_body(state: &mut ExtractionState<'_>, body: TsNode<'_>, test_id: &
             && let Some(call) = find_direct_child_by_kind(stmt, "call_expression")
             && is_test_framework_call(state, call)
         {
-            // Nested describe/it — recurse as its own test node.
+            // Nested describe/it. Recurse as its own test node.
             visit_test_call(state, call);
             handled = true;
         }

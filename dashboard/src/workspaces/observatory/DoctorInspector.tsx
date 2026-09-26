@@ -45,7 +45,7 @@ export function DoctorInspector() {
       <div className="flex flex-wrap items-center gap-2 px-4 pt-4">
         <Activity aria-hidden size={14} className="text-accent" />
         <h2 className="text-sm font-semibold tracking-tight">Doctor diagnosis</h2>
-        <span className="text-2xs text-text-muted">
+        <span className="text-body text-text-muted">
           canonical evidence and typed diagnostics
         </span>
       </div>
@@ -63,8 +63,8 @@ export function DoctorInspector() {
 /**
  * What this scope means for acting on the diagnosis.
  *
- * The Doctor route is read-only by design — corrective actions stay with the
- * owning daemon — so there is no control here to disable. But a reader on a
+ * The Doctor route is read-only by design, corrective actions stay with the
+ * owning daemon, so there is no control here to disable. But a reader on a
  * non-active project scope still needs to know that everything on this page is
  * an observation of a project the gateway will not let them change, and how to
  * reach the scope that would. A writable scope renders nothing: a sentence
@@ -78,12 +78,12 @@ function ScopeWritabilityNote() {
   return (
     <p
       data-scope-writability={writability.state}
-      className="min-w-0 px-4 pt-1.5 text-2xs leading-relaxed text-text-secondary"
+      className="min-w-0 px-4 pt-1.5 text-body leading-relaxed text-text-secondary"
     >
       {scopeWriteSentence(writability, {
         writable: (target) => `Writes apply to ${target}.`,
         refused: (reason) =>
-          `This diagnosis is read-only here — corrective actions stay with the owning daemon. ${reason}`,
+          `This diagnosis is read-only here, corrective actions stay with the owning daemon. ${reason}`,
       })}
     </p>
   );
@@ -126,7 +126,7 @@ function DoctorFindings({
           ))}
         </OverviewGrid>
       )}
-      <p className="border-t border-edge-subtle px-4 py-2 text-2xs text-text-muted">
+      <p className="border-t border-edge-subtle px-4 py-2 text-body text-text-muted">
         {envelope.payload.note}
       </p>
     </>
@@ -150,7 +150,7 @@ export function SchemaConvergencePanel({
           <li
             key={`${finding.store}:${finding.stage}:${index}`}
             data-convergence-state={finding.state}
-            className="text-2xs text-text-secondary"
+            className="text-body text-text-secondary"
           >
             <span className="font-medium text-text-primary">
               {convergenceStateLabel(finding.state)}
@@ -234,7 +234,7 @@ function consultationState(
     // An unreachable source is a source-level refusal, not a lost dashboard.
     case 'unavailable':
       return 'unavailable';
-    // Observed degradations of the source itself — a stronger claim than
+    // Observed degradations of the source itself, a stronger claim than
     // "could not be determined", and rendered as the fault it is.
     case 'reset_required':
     case 'corrupt':
@@ -277,7 +277,7 @@ function EvidenceBadge({ state }: { state: DoctorEvidenceStateV1 }) {
   const Icon = EVIDENCE_ICON[state];
   return (
     <span
-      className="relative inline-flex w-fit items-center gap-1.5 border border-edge-subtle bg-surface-2 py-[3px] pl-2.5 pr-2 text-2xs font-medium"
+      className="relative inline-flex w-fit items-center gap-1.5 border border-edge-subtle bg-surface-2 py-[3px] pl-2.5 pr-2 text-body font-medium"
       data-evidence-state={state}
     >
       <span
@@ -302,7 +302,7 @@ function FindingEvidence({ entry }: { entry: DoctorReportEntryV1 }) {
             // Indexed like the entry cards above: references are
             // server-authored rows, not unique identities.
             key={`${evidence.family}:${evidence.reference}:${index}`}
-            className="flex items-start gap-1.5 text-2xs text-text-secondary"
+            className="flex items-start gap-1.5 text-body text-text-secondary"
           >
             <FileSearch aria-hidden size={11} className="mt-0.5 shrink-0 text-text-muted" />
             <span className="font-mono">{evidence.reference}</span>

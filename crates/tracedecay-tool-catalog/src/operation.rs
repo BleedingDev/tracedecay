@@ -1,14 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-macro_rules! count_operations {
-    () => {
-        0usize
-    };
-    ($head:ident $(, $tail:ident)*) => {
-        1usize + count_operations!($($tail),*)
-    };
-}
-
 macro_rules! application_surface_operations {
     (
         $(
@@ -29,11 +20,11 @@ macro_rules! application_surface_operations {
         }
 
         impl ApplicationSurfaceOperation {
-            pub const ALL: [Self; count_operations!($($variant),+)] = [
+            pub const ALL: [Self; [$(stringify!($variant)),+].len()] = [
                 $(Self::$variant,)+
             ];
 
-            pub const MCP_TOOL_NAMES: [&'static str; count_operations!($($variant),+)] = [
+            pub const MCP_TOOL_NAMES: [&'static str; [$(stringify!($variant)),+].len()] = [
                 $(
                     application_surface_operations!(
                         @mcp_tool_name $catalog_name $(, $mcp_name)?
@@ -70,8 +61,9 @@ macro_rules! application_surface_operations {
 
             /// MCP/CLI spelling for this canonical operation.
             ///
-            /// The diagnostics read keeps its established public tool spelling;
-            /// its catalog and HTTP/SDK identity remain `diagnostics_read`.
+            /// Diagnostics and the code-graph navigation reads keep their
+            /// established short public tool spellings; their catalog and
+            /// HTTP/SDK identities keep the canonical name.
             pub const fn mcp_operation_name(self) -> &'static str {
                 match self {
                     $(
@@ -150,11 +142,11 @@ application_surface_operations! {
     CodeExactOccurrence => "code_exact_occurrence";
     CodePhraseSearch => "code_phrase_search";
     CodeSymbolSearch => "code_symbol_search";
-    CodeSignatureSearch => "code_signature_search";
-    CodeImplementations => "code_implementations";
-    CodeTypeHierarchy => "code_type_hierarchy";
-    CodeCallers => "code_callers";
-    CodeCallees => "code_callees";
+    CodeSignatureSearch => "code_signature_search", mcp: "signature_search";
+    CodeImplementations => "code_implementations", mcp: "implementations";
+    CodeTypeHierarchy => "code_type_hierarchy", mcp: "type_hierarchy";
+    CodeCallers => "code_callers", mcp: "callers";
+    CodeCallees => "code_callees", mcp: "callees";
     CodeFacets => "code_facets";
     CodeTimeline => "code_timeline";
     CodeDeclaration => "code_declaration";
@@ -168,6 +160,38 @@ application_surface_operations! {
     SourceBody => "source_body";
     SourceOutline => "source_outline";
     ModuleApi => "module_api";
+    Context => "context";
+    Node => "node";
+    Impact => "impact";
+    Similar => "similar";
+    Redundancy => "redundancy";
+    RenamePreview => "rename_preview";
+    PortStatus => "port_status";
+    PortOrder => "port_order";
+    Todos => "todos";
+    TestMap => "test_map";
+    TestRisk => "test_risk";
+    Gini => "gini";
+    DependencyDepth => "dependency_depth";
+    Health => "health";
+    Dsm => "dsm";
+    Diagnose => "diagnose";
+    DeadCode => "dead_code";
+    Circular => "circular";
+    Hotspots => "hotspots";
+    UnmountedFiles => "unmounted_files";
+    Rank => "rank";
+    Largest => "largest";
+    Coupling => "coupling";
+    InheritanceDepth => "inheritance_depth";
+    Distribution => "distribution";
+    Recursion => "recursion";
+    Complexity => "complexity";
+    DocCoverage => "doc_coverage";
+    GodClass => "god_class";
+    UnsafePatterns => "unsafe_patterns";
+    Constructors => "constructors";
+    FieldSites => "field_sites";
     HealthRead => "health_read";
     HealthDelta => "health_delta";
     StorageStatus => "storage_status";
@@ -195,6 +219,86 @@ application_surface_operations! {
     ContextScoutClaim => "context_scout_claim";
     ContextScoutDelivery => "context_scout_delivery";
     ContextScoutFeedback => "context_scout_feedback";
+    StrReplace => "str_replace";
+    MultiStrReplace => "multi_str_replace";
+    InsertAt => "insert_at";
+    AstGrepRewrite => "ast_grep_rewrite";
+    ReplaceSymbol => "replace_symbol";
+    InsertAtSymbol => "insert_at_symbol";
+    MoveSymbol => "move_symbol";
+    RenameSymbol => "rename_symbol";
+    SourceEditReconcile => "source_edit_reconcile";
+    SourceEditRollback => "source_edit_rollback";
+    FactStoreCurate => "fact_store_curate";
+    FactStoreAdd => "fact_store_add";
+    FactStoreSearch => "fact_store_search";
+    FactStoreProbe => "fact_store_probe";
+    FactStoreRelated => "fact_store_related";
+    FactStoreReason => "fact_store_reason";
+    FactStoreContradict => "fact_store_contradict";
+    FactStoreGet => "fact_store_get";
+    FactStoreUpdate => "fact_store_update";
+    FactStoreRemove => "fact_store_remove";
+    FactStoreSupersede => "fact_store_supersede";
+    FactStoreList => "fact_store_list";
+    FactFeedback => "fact_feedback";
+    MemoryStatus => "memory_status";
+    SessionRefreshStatus => "session_refresh_status";
+    SessionRefreshCancel => "session_refresh_cancel";
+    SessionRefreshBegin => "session_refresh_begin";
+    MessageSearch => "message_search";
+    SessionsFor => "sessions_for";
+    Workflows => "workflows";
+    LcmStatus => "lcm_status";
+    LcmDoctor => "lcm_doctor";
+    LcmLoadSession => "lcm_load_session";
+    LcmGrep => "lcm_grep";
+    LcmDescribe => "lcm_describe";
+    LcmExpand => "lcm_expand";
+    LcmExpandQuery => "lcm_expand_query";
+}
+
+impl ApplicationSurfaceOperation {
+    /// Graph-backed reads and reports answered by the project's graph-tool
+    /// owner with their typed catalog result in `ApplicationOutcome::Result`.
+    pub const GRAPH_TOOL_OPERATIONS: &[Self] = &[
+        Self::Context,
+        Self::Node,
+        Self::Impact,
+        Self::Similar,
+        Self::Redundancy,
+        Self::RenamePreview,
+        Self::PortStatus,
+        Self::PortOrder,
+        Self::Todos,
+        Self::TestMap,
+        Self::TestRisk,
+        Self::Gini,
+        Self::DependencyDepth,
+        Self::Health,
+        Self::Dsm,
+        Self::Diagnose,
+        Self::DeadCode,
+        Self::Circular,
+        Self::Hotspots,
+        Self::UnmountedFiles,
+        Self::Rank,
+        Self::Largest,
+        Self::Coupling,
+        Self::InheritanceDepth,
+        Self::Distribution,
+        Self::Recursion,
+        Self::Complexity,
+        Self::DocCoverage,
+        Self::GodClass,
+        Self::UnsafePatterns,
+        Self::Constructors,
+        Self::FieldSites,
+    ];
+
+    pub fn is_graph_tool(self) -> bool {
+        Self::GRAPH_TOOL_OPERATIONS.contains(&self)
+    }
 }
 
 #[cfg(test)]
@@ -272,6 +376,18 @@ mod tests {
         assert_eq!(
             ApplicationSurfaceOperation::from_tool_name("tracedecay_diagnostics_read"),
             None
+        );
+        assert_eq!(
+            ApplicationSurfaceOperation::from_tool_name("tracedecay_callers"),
+            Some(ApplicationSurfaceOperation::CodeCallers)
+        );
+        assert_eq!(
+            ApplicationSurfaceOperation::from_tool_name("tracedecay_code_callers"),
+            None
+        );
+        assert_eq!(
+            ApplicationSurfaceOperation::CodeCallers.as_str(),
+            "code_callers"
         );
         assert_eq!(
             ApplicationSurfaceOperation::from_tool_name("tracedecay_not_an_operation"),

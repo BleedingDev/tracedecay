@@ -25,7 +25,7 @@ interface CommandPaletteRow {
  * The DOM id of one option row, by position.
  *
  * Positional rather than derived from the entry, because a project entry's id
- * carries its `canonical_root` — a filesystem path, which routinely contains
+ * carries its `canonical_root`, a filesystem path, which routinely contains
  * spaces and may contain quotes or `#`. Interpolated into an `id`, that
  * produced an attribute HTML forbids whitespace in, and
  * `aria-activedescendant` is an IDREF: a screen reader could not resolve the
@@ -58,7 +58,7 @@ export function CommandPalette({
   // project rows (workspace navigation never depends on it).
   // The shared registry read, so opening the palette on a surface that already
   // listed the registry costs nothing, and so a registry change invalidates this
-  // too — it used to have a private key that no event named.
+  // too, it used to have a private key that no event named.
   const projects = useProjectRegistry({ enabled: open });
 
   const entries = useMemo<CommandPaletteRow[]>(() => {
@@ -86,7 +86,7 @@ export function CommandPalette({
                 // `active_project_id` the gateway accepts writes on, so the
                 // pick starts from that answer instead of `unresolved`. It is
                 // read through the shared authority rather than compared here,
-                // so a row that omits the field stays unresolved — the daemon
+                // so a row that omits the field stays unresolved, the daemon
                 // marks it optional, and absent is not "no".
                 selectProject(
                   project.project_id,
@@ -123,8 +123,8 @@ export function CommandPalette({
    *
    * `active` is only reset by a query change or a reopen, and the list has a
    * second input: the registry read behind the project rows. A listing that
-   * shrinks — a refetch returning fewer projects, or an `ok` result becoming a
-   * failure, which drops every project row at once — leaves the stored index
+   * shrinks, a refetch returning fewer projects, or an `ok` result becoming a
+   * failure, which drops every project row at once, leaves the stored index
    * past the end. That row does not exist, so `aria-activedescendant` referred
    * to nothing and Enter fired nothing: a palette that looked navigable and was
    * inert. Clamped on read rather than corrected in an effect, so there is no
@@ -135,7 +135,7 @@ export function CommandPalette({
 
   const listRef = useRef<HTMLUListElement>(null);
   useEffect(() => {
-    // The list scrolls at `max-h-72` — about eight rows — and the project rows
+    // The list scrolls at `max-h-72`, about eight rows, and the project rows
     // sit after every workspace, so on a real registry the keyboard selection
     // left the viewport almost immediately and moved something the reader could
     // not see. `nearest` keeps the list still when the row is already visible.
@@ -187,7 +187,7 @@ export function CommandPalette({
               value={query}
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Go to workspace or project…"
-              className="min-h-[var(--touch-target-min)] w-full bg-transparent text-sm outline-none placeholder:text-text-muted"
+              className="min-h-[var(--touch-target-min)] w-full bg-transparent text-body outline-none placeholder:text-text-muted"
               role="combobox"
               aria-expanded="true"
               aria-controls="td-palette-list"
@@ -204,7 +204,7 @@ export function CommandPalette({
             className="td-well max-h-72 overflow-auto"
           >
             {filtered.length === 0 ? (
-              <li className="px-3 py-6 text-center text-sm text-text-muted">No matches</li>
+              <li className="px-3 py-6 text-center text-body text-text-muted">No matches</li>
             ) : (
               filtered.map((entry, i) => (
                 <li
@@ -217,7 +217,7 @@ export function CommandPalette({
                   className={cn(
                     // The same selection grammar as the rail: a cyan position
                     // bar in the gutter and the raised face, never a glow.
-                    'relative flex min-h-[var(--touch-target-min)] cursor-pointer items-center gap-2.5 border-b border-edge-subtle pl-3.5 pr-2.5 text-sm',
+                    'relative flex min-h-[var(--touch-target-min)] cursor-pointer items-center gap-2.5 border-b border-edge-subtle pl-3.5 pr-2.5 text-body',
                     i === activeIndex
                       ? 'td-raised text-text-primary before:absolute before:inset-y-0 before:left-0 before:w-[3px] before:bg-accent'
                       : 'text-text-secondary',
@@ -235,7 +235,7 @@ export function CommandPalette({
                     {entry.channel ?? ''}
                   </code>
                   <span className="min-w-0 flex-1 truncate">{entry.label}</span>
-                  <span className="flex shrink-0 items-center gap-2 text-2xs text-text-muted">
+                  <span className="flex shrink-0 items-center gap-2 text-sm text-text-muted">
                     {entry.hint}
                     {i === activeIndex ? <CornerDownLeft aria-hidden size={11} /> : null}
                   </span>

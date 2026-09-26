@@ -4,10 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracedecay_domain::{
     CalibrationProfileId, CodeGenerationId, CodeSourceCursorBindingV1, ComponentRevision,
-    EphemeralSanitizedQueryViewV1, GitOidV1, PrincipalId, PublicRetrieverStatus, QueryMac,
-    QueryNormalizationRevision, RefId, RepositoryId, RetrievalCursorKeyId, RetrievalFailure,
-    RetrieverBatch, RetrieverCoverage, RetrieverKind, RetrieverOutcome, SanitizerRevision,
-    ScoreDomainCalibrationV1, ScoreDomainId, TemporalModeV1,
+    EphemeralSanitizedQueryViewV1, FixedPointScore, GitOidV1, PrincipalId, PublicRetrieverStatus,
+    QueryMac, QueryNormalizationRevision, RefId, RepositoryId, RetrievalCursorKeyId,
+    RetrievalFailure, RetrieverBatch, RetrieverCoverage, RetrieverKind, RetrieverOutcome,
+    SanitizerRevision, ScoreDomainCalibrationV1, ScoreDomainId, TemporalModeV1,
 };
 
 use super::{batch, candidate, composition_lanes, id, no_caps, profile, request};
@@ -80,12 +80,19 @@ fn fallback_cursor_serves_disjoint_canonical_pages() {
     };
 
     let first = authority
-        .compose(&request, &query, lanes(), 1, None)
+        .compose(&request, &query, lanes(), &BTreeMap::new(), 1, None)
         .expect("first page");
     let cursor = first.fallback.cursor.clone().expect("continuation");
     assert_eq!(cursor.next_ordinal, 1);
     let second = authority
-        .compose(&request, &query, lanes(), 1, Some(&cursor))
+        .compose(
+            &request,
+            &query,
+            lanes(),
+            &BTreeMap::new(),
+            1,
+            Some(&cursor),
+        )
         .expect("second page");
     assert_eq!(
         second
@@ -275,7 +282,14 @@ fn federated_authority_composes_every_lane_without_fallback_projection() {
     assert!(authorized.page.ranked_candidates.is_empty());
     assert!(authorized.page.cursor.is_none());
     assert_eq!(
-        authority.compose(&request, &query_view(), empty_foreground_lanes(), 8, None,),
+        authority.compose(
+            &request,
+            &query_view(),
+            empty_foreground_lanes(),
+            &BTreeMap::new(),
+            8,
+            None,
+        ),
         Err(QueryAuthorityErrorV1::AuthorityModeMismatch)
     );
 }
@@ -301,6 +315,119 @@ fn task_session_selection_uses_the_accepted_federated_profile_without_fake_lanes
         authority.task_session_score_domain().expect("score domain"),
         id::<ScoreDomainId>("score.task_session.v1"),
     );
+}
+
+#[test]
+fn core_fallback_authority_ranks_task_session_without_changing_search_lanes() {
+    let authority = authority();
+    let request = request();
+    let outcome = RetrieverOutcome::Complete(RetrieverBatch::<TaskSessionLaneEvidenceV1> {
+        candidates: Vec::new(),
+        evidence_by_occurrence: BTreeMap::new(),
+        coverage: RetrieverCoverage::default(),
+        continuation: None,
+    });
+
+    let selected = authority
+        .select_task_session(&request, &query_view(), outcome, 8, None)
+        .expect("core fallback authority ranks the TaskSession lane");
+    assert!(selected.ranked_candidates().is_empty());
+    assert_eq!(
+        authority.task_session_score_domain().expect("score domain"),
+        id::<ScoreDomainId>(crate::retrieval::QUERY_TASK_SESSION_SCORE_DOMAIN_V1),
+    );
+    authority
+        .compose(
+            &request,
+            &query_view(),
+            empty_foreground_lanes(),
+            &BTreeMap::new(),
+            8,
+            None,
+        )
+        .expect("search lanes stay the checked-in fallback set");
+}
+
+/// TaskSession raw scores are temporal ranking's encoded `tier * 1_000_000 +
+/// within_tier` values, not a `[0, 1_000_000]` feature. A calibration capped
+/// at one tier span saturates every ranked anchor to the same calibrated
+/// feature, flattening utility and handing the order to the source-validity
+/// tie-break.
+#[test]
+fn core_fallback_task_session_calibration_spans_the_temporal_score_range() {
+    let profile = authority()
+        .task_session_ranking_profile()
+        .expect("core fallback projects a TaskSession ranking profile");
+    let calibration = profile
+        .score_domain_calibrations
+        .get(&id::<ScoreDomainId>(
+            crate::retrieval::QUERY_TASK_SESSION_SCORE_DOMAIN_V1,
+        ))
+        .expect("projected TaskSession score domain calibration");
+
+    let corroborating = calibration
+        .calibrate(FixedPointScore(0))
+        .expect("corroborating occurrence exports zero");
+    let approximate = calibration
+        .calibrate(FixedPointScore(1_100_000))
+        .expect("approximate tier");
+    let exact_message = calibration
+        .calibrate(FixedPointScore(3_500_000))
+        .expect("exact-message tier");
+
+    assert_eq!(corroborating, 0);
+    assert!(
+        approximate < exact_message,
+        "distinct temporal tiers must not collapse onto one calibrated feature: \
+         {approximate} vs {exact_message}"
+    );
+    assert!(
+        exact_message < 1_000_000,
+        "the encoded ceiling must stay inside the calibration range: {exact_message}"
+    );
+}
+
+/// A ranked TaskSession anchor names the policy that ordered it, and under the
+/// core authority that policy is the checked-in fallback, not a search lane.
+///
+/// This is the consumer's only signal that the order came from the fallback:
+/// `WorkTaskSessionRankContributionV1` publishes the score domain and
+/// calibration profile per anchor, and a projection that reused a search
+/// lane's identity would report the fallback ranking as that lane's.
+#[test]
+fn core_fallback_task_session_ranking_names_its_own_policy() {
+    let profile = authority()
+        .task_session_ranking_profile()
+        .expect("core fallback projects a TaskSession ranking profile");
+    let score_domain = id::<ScoreDomainId>(crate::retrieval::QUERY_TASK_SESSION_SCORE_DOMAIN_V1);
+    let calibration =
+        id::<CalibrationProfileId>(crate::retrieval::QUERY_TASK_SESSION_CALIBRATION_V1);
+
+    assert_eq!(
+        profile.calibrations.get(&RetrieverKind::TaskSession),
+        Some(&calibration),
+        "the ranked contribution must name the fallback calibration profile"
+    );
+    assert_eq!(
+        profile
+            .score_domain_calibrations
+            .get(&score_domain)
+            .map(|domain| &domain.calibration_profile_id),
+        Some(&calibration),
+        "the fallback score domain must resolve to the fallback calibration"
+    );
+    for search_lane in [
+        crate::retrieval::QUERY_EXACT_SCORE_DOMAIN_V1,
+        crate::retrieval::QUERY_LEXICAL_SCORE_DOMAIN_V1,
+        crate::retrieval::QUERY_GRAPH_SCORE_DOMAIN_V1,
+    ] {
+        assert!(
+            !profile
+                .score_domain_calibrations
+                .contains_key(&id::<ScoreDomainId>(search_lane)),
+            "a TaskSession ranking must not be reported under the {search_lane} search lane"
+        );
+    }
 }
 
 #[test]
@@ -459,7 +586,14 @@ fn query_cursor_ttl_uses_wall_clock_instead_of_snapshot_time() {
         .expect("system time")
         .as_micros() as i64;
     let current = authority()
-        .compose(&request, &query, paged_foreground_lanes(), 1, None)
+        .compose(
+            &request,
+            &query,
+            paged_foreground_lanes(),
+            &BTreeMap::new(),
+            1,
+            None,
+        )
         .expect("compose current cursor")
         .fallback
         .cursor
@@ -509,6 +643,7 @@ fn query_cursor_ttl_uses_wall_clock_instead_of_snapshot_time() {
             &request,
             &query,
             paged_foreground_lanes(),
+            &BTreeMap::new(),
             1,
             Some(&expired)
         ),
@@ -524,7 +659,14 @@ fn exact_code_source_binding_is_authenticated_with_the_query_cursor() {
     let request = request();
     let query = query_view();
     let mut cursor = authority
-        .compose(&request, &query, paged_foreground_lanes(), 1, None)
+        .compose(
+            &request,
+            &query,
+            paged_foreground_lanes(),
+            &BTreeMap::new(),
+            1,
+            None,
+        )
         .expect("compose first page")
         .fallback
         .cursor
@@ -573,10 +715,24 @@ fn authenticated_foreground_fallback_is_byte_stable_and_lane_bounded() {
     let request = request();
     let query = query_view();
     let first = authority
-        .compose(&request, &query, empty_foreground_lanes(), 8, None)
+        .compose(
+            &request,
+            &query,
+            empty_foreground_lanes(),
+            &BTreeMap::new(),
+            8,
+            None,
+        )
         .expect("compose");
     let second = authority
-        .compose(&request, &query, empty_foreground_lanes(), 8, None)
+        .compose(
+            &request,
+            &query,
+            empty_foreground_lanes(),
+            &BTreeMap::new(),
+            8,
+            None,
+        )
         .expect("repeat compose");
 
     assert_eq!(first, second);

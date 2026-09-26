@@ -31,7 +31,7 @@ use super::{
 
 mod stack_network;
 #[cfg(test)]
-mod test_support;
+pub(super) mod test_support;
 
 pub const GITHUB_REVIEW_THREADS_QUERY_V1: &str = r"
 query TraceDecayGitHubReviewThreads(
@@ -624,6 +624,10 @@ impl GitHubReadOnlyCredentialV1 {
             GitHubReadOnlyCredentialKindV1::Anonymous => 0,
             GitHubReadOnlyCredentialKindV1::VerifiedPrivate { generation, .. } => *generation,
         }
+    }
+
+    pub fn is_anonymous(&self) -> bool {
+        matches!(self.kind, GitHubReadOnlyCredentialKindV1::Anonymous)
     }
 
     pub fn permits(&self, permission: GitHubReadPermissionV1) -> bool {
@@ -2745,6 +2749,7 @@ mod tests {
                 outcome: GitHubReviewIngressProviderOutcomeV1::Complete,
                 coverage: GitHubReviewCoverageV1::Complete,
                 items: Vec::new(),
+                quarantined: Vec::new(),
                 pull_request: None,
                 fetched_at: UtcMicros(10),
             },

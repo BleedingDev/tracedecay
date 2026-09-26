@@ -92,10 +92,10 @@ impl Drop for MaintenancePhaseInstrumentation {
 /// starts promptly; it never moves the due deadline, so a burst of git-watch
 /// events cannot turn the daily cadence into a busy loop.
 /// [`Self::request_due`] is for an event that just made retention work
-/// collectable — a sealed code generation superseding its predecessor — and
+/// collectable, a sealed code generation superseding its predecessor, and
 /// pulls the next tick forward to at most one retry delay away. Requests
 /// inside that window coalesce into one tick. Before this, every publication
-/// left its predecessor's sealed artifact, read bundle, and segments on disk
+/// left its predecessor's sealed artifact and segments on disk
 /// until the daily tick.
 #[derive(Default)]
 pub struct MaintenanceWake {
@@ -125,7 +125,7 @@ impl MaintenanceWake {
 
 /// Park on cancel / wake / cadence, then run the next admitted tick.
 pub async fn run_maintenance_loop<F, Fut>(
-    cancellation: &tracedecay_session_memory::context::CancellationToken,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
     wake: &MaintenanceWake,
     interval: Duration,
     mut run_tick: F,

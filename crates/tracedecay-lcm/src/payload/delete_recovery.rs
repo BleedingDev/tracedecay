@@ -6,7 +6,8 @@ use super::filesystem_authority::{
     ensure_contained, existing_payload_dir_opt, inspect_payload_file_for_delete,
     read_payload_file_for_verify, remove_verified_payload_file, verify_payload_file_authority,
 };
-use super::{LcmError, gc, load_payload_metadata, util, validate_payload_ref};
+use super::{LcmError, gc, load_payload_metadata, validate_payload_ref};
+use tracedecay_domain::canonical_text::sha256_hex;
 #[cfg(test)]
 use tracedecay_runtime_core::db::engine::{Connection, TransactionBehavior};
 use tracedecay_runtime_core::db::engine::{Executor, Value as SqlValue, params};
@@ -57,7 +58,7 @@ pub enum CommittedPayloadRemoval {
 /// * `tombstone_residual_placeholders` rewrites a bracket placeholder only when
 ///   [`gc::tombstone_placeholder_in_text`] finds that placeholder's `ref=` equal
 ///   to the ref being deleted, and `extract_payload_refs_from_text` yields at
-///   most one ref per bracket — so tombstoning `Y` cannot drop a reference to
+///   most one ref per bracket, so tombstoning `Y` cannot drop a reference to
 ///   any `X != Y`.
 /// * The `payload_ref` column is only nulled on rows whose column already equals
 ///   the ref being deleted.
@@ -191,7 +192,7 @@ pub(super) async fn prepare_external_payload_delete_in_transaction_with_cache(
 ) -> Result<PreparedPayloadDelete, LcmError> {
     validate_payload_ref(payload_ref)?;
     // The DB-side cleanup below must still run for a store whose payload
-    // directory is gone — the file simply counts as already removed.
+    // directory is gone, the file simply counts as already removed.
     let dir = existing_payload_dir_opt(storage_root)?;
     let path = match dir.as_deref() {
         Some(dir) => {
@@ -345,7 +346,7 @@ where
     };
     let quarantine_name = format!(
         ".tracedecay-pending-delete-{}",
-        util::sha256_hex(payload_ref.as_bytes())
+        sha256_hex(payload_ref.as_bytes())
     );
     let quarantine = dir.join(&quarantine_name);
     ensure_contained(&dir, &quarantine)?;
@@ -438,7 +439,7 @@ pub fn payload_file_fingerprint(
     };
     let text = std::str::from_utf8(&content).map_err(|_| LcmError::PayloadIntegrityMismatch)?;
     Ok((
-        util::sha256_hex(&content),
+        sha256_hex(&content),
         content.len() as u64,
         text.chars().count() as u64,
     ))
@@ -451,14 +452,15 @@ async fn tombstone_residual_placeholders(
     // `payload_ref = ?` is the indexable arm and covers every row whose stored
     // ref must be cleared. The `LIKE` arm is only reachable for text that embeds
     // a placeholder, which no index can answer; narrowing it from a bare
-    // `%ref%` to `%live-prefix%ref%` keeps the arm exact — a rewrite only ever
+    // `%ref%` to `%live-prefix%ref%` keeps the arm exact, a rewrite only ever
     // changes a bracket that starts with a live prefix and carries `ref=<ref>`
-    // after it — while dropping inline bodies and already-tombstoned rows that
+    // after it, while dropping inline bodies and already-tombstoned rows that
     // the bare pattern dragged back for no change.
     let like_patterns = gc::live_prefix_ref_like_patterns(payload_ref);
     let like_sql = gc::placeholder_text_like_sql(like_patterns.len());
     let sql = format!(
-        "SELECT store_id, storage_kind, payload_ref, content, snippet_text, index_text, metadata_json
+        "SELECT store_id, storage_kind, payload_ref, content, snippet_text, index_text, metadata_json,
+                placeholder_text
          FROM lcm_raw_messages
          WHERE payload_ref = ? OR {like_sql}"
     );
@@ -482,14 +484,15 @@ async fn tombstone_residual_placeholders(
             }
             tombstoned
         });
-        let new_snippet = gc::tombstone_placeholder_in_text(&snippet_text, payload_ref);
-        if new_snippet != snippet_text {
+        if gc::tombstone_placeholder_in_text(&snippet_text, payload_ref) != snippet_text {
             changed += 1;
         }
-        let new_index = gc::tombstone_placeholder_in_text(&index_text, payload_ref);
-        if new_index != index_text {
+        if gc::tombstone_placeholder_in_text(&index_text, payload_ref) != index_text {
             changed += 1;
         }
+        let placeholder_text: Option<String> = row.get(7)?;
+        let new_placeholder =
+            placeholder_text.map(|text| gc::tombstone_placeholder_in_text(&text, payload_ref));
         let new_metadata = metadata_json.map(|text| {
             let tombstoned = gc::tombstone_placeholder_in_text(&text, payload_ref);
             if tombstoned != text {
@@ -509,8 +512,7 @@ async fn tombstone_residual_placeholders(
                 store_id,
                 clear_raw_ref,
                 new_content,
-                new_snippet,
-                new_index,
+                new_placeholder,
                 new_metadata,
                 changed,
             ));
@@ -518,19 +520,16 @@ async fn tombstone_residual_placeholders(
     }
 
     let mut changed_total = 0usize;
-    for (store_id, clear_raw_ref, content, snippet_text, index_text, metadata_json, changed) in
-        updates
-    {
+    for (store_id, clear_raw_ref, content, placeholder_text, metadata_json, changed) in updates {
         if clear_raw_ref {
             conn.execute(
                 "UPDATE lcm_raw_messages
-                 SET storage_kind = 'inline', payload_ref = NULL, content = ?2, snippet_text = ?3, index_text = ?4, metadata_json = ?5
+                 SET storage_kind = 'inline', payload_ref = NULL, content = ?2, placeholder_text = ?3, metadata_json = ?4
                  WHERE store_id = ?1",
                 params![
                     store_id,
                     content.as_deref(),
-                    snippet_text,
-                    index_text,
+                    placeholder_text.as_deref(),
                     metadata_json.as_deref()
                 ],
             )
@@ -538,13 +537,12 @@ async fn tombstone_residual_placeholders(
         } else {
             conn.execute(
                 "UPDATE lcm_raw_messages
-                 SET content = ?2, snippet_text = ?3, index_text = ?4, metadata_json = ?5
+                 SET content = ?2, placeholder_text = ?3, metadata_json = ?4
                  WHERE store_id = ?1",
                 params![
                     store_id,
                     content.as_deref(),
-                    snippet_text,
-                    index_text,
+                    placeholder_text.as_deref(),
                     metadata_json.as_deref()
                 ],
             )

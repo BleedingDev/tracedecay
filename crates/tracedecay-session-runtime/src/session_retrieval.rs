@@ -34,11 +34,13 @@ use tracedecay_session_temporal_store::{
 };
 use tracedecay_sessions::runtime::SessionMessageSearchResult;
 use tracedecay_temporal_query::context::{ContextError, TokenPolicy, VersionedTokenEstimator};
+use tracedecay_temporal_query::execution::ExecutionLimits;
+use tracedecay_temporal_query::execution::TemporalPortError;
 use tracedecay_temporal_query::hydration::HydrationError;
-use tracedecay_temporal_query::ports::{
-    ExecutionLimits, TemporalCandidatePopulationCount, TemporalExecutionSnapshot, TemporalPortError,
-};
 use tracedecay_temporal_query::ranking::RankedCandidate;
+use tracedecay_temporal_query::snapshot::{
+    TemporalCandidatePopulationCount, TemporalExecutionSnapshot,
+};
 use tracedecay_temporal_query::{
     TemporalHydratedResult, TemporalKernelError, TemporalKernelResult,
 };
@@ -106,6 +108,7 @@ pub use contract::{
     SessionRetrievalServiceOutcome, SessionRetrievalStoreScope, SessionRetrievalUnavailable,
     SessionRetrievalUnavailableReason, SessionTemporalMetadataView, SessionTemporalWatermarksView,
 };
+pub(crate) use contract::{temporal_message_type, temporal_session_scope};
 pub use primitive::DaemonSessionLookupPrimitiveV1;
 
 /// Serving identity of the store the daemon currently serves, extracted

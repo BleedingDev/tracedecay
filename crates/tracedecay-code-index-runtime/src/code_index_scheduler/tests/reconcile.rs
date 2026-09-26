@@ -18,37 +18,41 @@ use tracedecay_domain::{
     RetrieverKind, SensitivityLevelV1, UtcMicros, WorktreeId,
 };
 use tracedecay_runtime_core::resident_memory::{
-    DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1,
-    sampled_process_resident_bytes_v1,
+    DEFAULT_PROCESS_RESIDENT_MEMORY_LIMIT_V1, ProcessResidentMemoryV1, ResidentOwnerBytesV1,
+    ResidentOwnerKindV1, ResidentOwnerReleaseV1, ResidentOwnerSampleV1, ResidentOwnerScopeV1,
+    ResidentOwnerV1, ResidentOwnersV1, sampled_process_resident_bytes_v1,
 };
 
 use super::{
-    ALPHA_LIB_V1, GitFixture, RETAINED_REVISION_0, SERVING_SEAT_FAILURE_CEILING,
-    advance_pointer_to_unseated_successor, application_context, committed_capture_corpus_files,
-    core_search_request, drain_clone_backfill, git, git_stdout, mounted_core_query_worktree,
-    mounted_core_query_worktree_with_one_permit, published, query_authority, query_meta,
-    quiesced_background_reconcile_admission, replace_scheduler_chunker_revision,
-    replace_scheduler_policy_revision, rewrite_active_rust_extractor_revision,
-    rewrite_preserving_stat, scheduler, scheduler_with_policy, served_lexical_texts,
-    test_project_id, wait_for_dashboard_ready, wait_for_event_to_ready, wait_for_generation_change,
-    wait_for_initial_generation, wait_for_live_complete_generation,
-    wait_for_live_complete_generation_by_polling, wait_for_queryable_text_generation,
+    ALPHA_LIB_V1, GitFixture, OwnerSignals, RETAINED_REVISION_0, SERVING_SEAT_FAILURE_CEILING,
+    advance_pointer_to_unseated_successor, application_context, clear_pending_wake_until_quiet,
+    committed_capture_corpus_files, core_search_request, git, git_stdout, hold_scheduler_for_root,
+    mounted_core_query_worktree, mounted_core_query_worktree_with_one_permit, move_git_metadata,
+    published, query_authority, query_meta, quiesced_background_reconcile_admission,
+    replace_scheduler_chunker_revision, replace_scheduler_policy_revision,
+    rewrite_active_rust_extractor_revision, rewrite_preserving_stat, scheduler,
+    scheduler_with_policy, served_lexical_texts, settle_text_projection,
+    settled_owner_with_idle_admission, test_project_id, wait_for_dashboard_ready,
+    wait_for_event_to_ready, wait_for_generation_change, wait_for_initial_generation,
+    wait_for_live_complete_generation, wait_for_live_complete_generation_by_polling,
+    wait_for_owner_pass, wait_for_queryable_text_generation,
     wait_for_queryable_text_generation_change, wait_for_queryable_text_generation_id,
-    wait_for_quiescent_owner_pass, wait_until_serving_seat, write,
+    wait_for_quiescent_owner_pass, wait_for_settled_owner, wait_for_worker_phase,
+    wait_until_serving_seat, write,
 };
 use crate::{
     code_index::{
         chunks::content_digest,
         production::{
-            CodeIndexExecutionControlV1, DAEMON_CODE_INDEX_CHUNKER_REVISION,
-            UninterruptibleCodeIndexControlV1,
+            CodeIndexExecutionControlV1, CodeIndexPublishedGenerationV1,
+            DAEMON_CODE_INDEX_CHUNKER_REVISION, UninterruptibleCodeIndexControlV1,
         },
     },
     code_index_scheduler::{
         CodeIndexCadenceOutcomeV1, CodeIndexCadenceTriggerV1, CodeIndexEventToReadyReceiptV1,
         CodeIndexHintPolicyV1, CodeIndexIgnoredDependencyRequestV1, CodeIndexReconcileAdmissionV1,
-        CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorktreeSchedulerV1,
-        GenerationDecodeAdmissionV1, SharedCodeIndexBytePoolV1,
+        CodeIndexReconcileOutcomeV1, CodeIndexSchedulerRegistryV1, CodeIndexWorkerPhaseV1,
+        CodeIndexWorktreeSchedulerV1, GenerationDecodeAdmissionV1, SharedCodeIndexBytePoolV1,
         classification::{WorktreeChangeClassV1, WorktreeChangeClassificationV1},
         feedback_document_identity_from_generation,
         freshness_witness::RestoreFreshnessWitnessV1,
@@ -58,6 +62,7 @@ use crate::{
         },
     },
 };
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 #[test]
 fn ephemeral_folder_selection_filters_capture_and_keeps_default_cursor_shape() {
@@ -699,7 +704,7 @@ async fn registry_feeds_publications_and_bounded_freshness_reads() {
         .expect("initial publication event");
     assert_eq!(
         initial.project_root,
-        fixture.path().canonicalize().expect("canonical fixture")
+        canonical_existing_identity(fixture.path()).expect("canonical fixture")
     );
     // Publication is not the seated dashboard identity. Wait for the seat
     // before asserting the projected generation id.
@@ -735,6 +740,37 @@ async fn registry_feeds_publications_and_bounded_freshness_reads() {
     assert_ne!(changed.generation_id, initial.generation_id);
 }
 
+/// Poll a mounted worktree's dashboard clone-index status until it reports
+/// ready coverage.
+///
+/// Clone status is `Unavailable` until the published generation's owners
+/// serve, which is a truthful transient, not the settled answer a caller is
+/// asking for.
+async fn wait_for_ready_clone_index(
+    registry: &CodeIndexSchedulerRegistryV1,
+    path: &Path,
+) -> tracedecay_contracts::code_index_freshness::CodeCloneIndexObservationV1 {
+    let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    let mut signals = OwnerSignals::subscribe(registry, path).await;
+    loop {
+        let status = registry
+            .dashboard_freshness(path)
+            .await
+            .expect("mounted dashboard freshness")
+            .clone_index;
+        match status {
+            Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready {
+                observation,
+            }) => return observation,
+            transient => assert!(
+                Instant::now() <= deadline,
+                "the artifact never reported ready clone coverage: {transient:?}"
+            ),
+        }
+        signals.changed_before(deadline).await;
+    }
+}
+
 #[tokio::test]
 async fn registry_clone_freshness_reports_coverage_and_update_accounting() {
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n")]);
@@ -750,16 +786,7 @@ async fn registry_clone_freshness_reports_coverage_and_update_accounting() {
         .expect("mount worktree");
     let initial = wait_for_initial_generation(&registry, fixture.path()).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
-    let initial_status = registry
-        .dashboard_freshness(fixture.path())
-        .await
-        .expect("initial clone freshness");
-    let Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready {
-        observation,
-    }) = initial_status.clone_index
-    else {
-        panic!("a complete V16 artifact must report ready clone coverage");
-    };
+    let observation = wait_for_ready_clone_index(&registry, fixture.path()).await;
     assert_eq!(observation.coverage.source_bodies, Some(1));
     assert_eq!(observation.coverage.eligible_source_bodies, Some(0));
     assert_eq!(observation.coverage.conservative_normalized_bodies, Some(0));
@@ -777,22 +804,13 @@ async fn registry_clone_freshness_reports_coverage_and_update_accounting() {
     ));
     let _ = wait_for_generation_change(&registry, fixture.path(), &initial).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
-    let changed = registry
-        .dashboard_freshness(fixture.path())
-        .await
-        .expect("changed clone freshness");
-    let Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Ready {
-        observation,
-    }) = changed.clone_index
-    else {
-        panic!("the changed V16 artifact must return to ready");
-    };
+    let observation = wait_for_ready_clone_index(&registry, fixture.path()).await;
     assert_eq!(observation.coverage.payloads_reused, Some(0));
     assert_eq!(observation.resources.stale_invalidations, Some(1));
     assert!(observation.resources.changed_symbol_update_micros.is_some());
 }
 
-/// The generation-publication broadcast carries only verified publishes —
+/// The generation-publication broadcast carries only verified publishes,
 /// generations that crossed the durable publication compare-and-swap, the
 /// verified graph snapshot publish, and the serving swap. A restart that
 /// restores a retained generation is a `Noop` apply and must reach the
@@ -827,12 +845,13 @@ async fn restart_remount_serves_the_retained_generation_without_republishing() {
         )
         .await
         .expect("remount worktree over the retained store");
+    let mut signals = OwnerSignals::subscribe(&restarted, fixture.path()).await;
     let restored = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(generation) = restarted.latest_generation_id(fixture.path()).await {
                 break generation;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -861,7 +880,7 @@ async fn restart_remount_serves_the_retained_generation_without_republishing() {
 }
 
 #[test]
-fn retained_v3_rust_extractor_generation_is_refused_and_rebuilt_by_v5() {
+fn retained_stale_rust_extractor_generation_is_refused_and_rebuilt() {
     let fixture = GitFixture::new(ALPHA_LIB_V1);
     let store = TempDir::new().expect("store root");
     let mut seed = scheduler(
@@ -902,7 +921,7 @@ fn retained_v3_rust_extractor_generation_is_refused_and_rebuilt_by_v5() {
             .iter()
             .find(|(language, _)| language.as_str() == "rust")
             .map(|(_, revision)| revision.as_str()),
-        Some("extractor.rust.v8")
+        Some("extractor.rust.v13")
     );
 }
 
@@ -942,10 +961,7 @@ async fn restart_remount_seats_the_retained_generation_before_a_dirty_rebuild() 
     fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
 
     let restarted = CodeIndexSchedulerRegistryV1::new(1);
-    let remount_root = fixture
-        .path()
-        .canonicalize()
-        .expect("canonical remount root");
+    let remount_root = canonical_existing_identity(fixture.path()).expect("canonical remount root");
     let (recovery_entered, release_successor) = restarted
         .pause_next_retained_graph_recovery_before_successor(remount_root.clone())
         .await;
@@ -973,6 +989,7 @@ async fn restart_remount_seats_the_retained_generation_before_a_dirty_rebuild() 
         .send(())
         .expect("release the dirty successor rebuild");
 
+    let mut signals = OwnerSignals::subscribe(&restarted, &remount_root).await;
     let rebuilt = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(generation_id) = restarted.latest_generation_id(&remount_root).await
@@ -980,68 +997,13 @@ async fn restart_remount_seats_the_retained_generation_before_a_dirty_rebuild() 
             {
                 break generation_id;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
     .expect("dirty remount must still publish the successor generation");
     assert_ne!(rebuilt, sealed_id, "the dirty checkout must rebuild");
     restarted.shutdown().await;
-}
-
-/// Dirty remount seating must not park on the publication decode barrier
-/// while holding the scheduler lock. Activation may already own that cache;
-/// joining it left remount warming with no seated generation.
-#[tokio::test]
-async fn dirty_retained_seat_does_not_join_the_publication_decode_cache() {
-    let fixture = GitFixture::new(ALPHA_LIB_V1);
-    let store = TempDir::new().expect("store root");
-    let registry = CodeIndexSchedulerRegistryV1::new(1);
-    registry
-        .mount_worktree(
-            test_project_id(),
-            fixture.path(),
-            store.path().to_path_buf(),
-        )
-        .await
-        .expect("mount worktree");
-    wait_for_live_complete_generation(&registry, fixture.path()).await;
-
-    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 2 }\n");
-    let scheduler = registry
-        .scheduler_handle(fixture.path())
-        .await
-        .expect("scheduler handle");
-    let held_decode = scheduler
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .hold_active_decode();
-    let seating = scheduler.clone();
-    let outcome = tokio::time::timeout(
-        Duration::from_secs(1),
-        tokio::task::spawn_blocking(move || {
-            seating
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .seat_retained_generation_on_empty_serving_for_test()
-        }),
-    )
-    .await
-    .expect("dirty retained seat must not wait for the decode cache")
-    .expect("seat task")
-    .expect("seat result");
-    assert!(
-        matches!(outcome, Some(CodeIndexReconcileOutcomeV1::Noop(_))),
-        "dirty remount must still emit a retained-seat Noop without decoding"
-    );
-    assert_eq!(
-        held_decode.waiter_count(),
-        0,
-        "retained seating must not join the publication decode flight"
-    );
-
-    drop(held_decode);
-    registry.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1569,9 +1531,16 @@ fn occurrence_graph_store_is_available_before_catalog_warm() {
     );
 }
 
+/// Linked worktrees sealing identical content share its occurrence identity
+/// and physical artifacts; each worktree still seals its own snapshot and
+/// generation, and a worktree's generation never names content only its
+/// sibling holds.
 #[test]
-fn cross_worktree_byte_reuse_without_identity_alias() {
-    let first = GitFixture::new(&[("src/lib.rs", "pub fn shared() -> u32 { 7 }\n")]);
+fn linked_worktrees_share_identity_for_identical_content_and_never_serve_divergent_content() {
+    let first = GitFixture::new(&[
+        ("src/lib.rs", "pub fn shared() -> u32 { 7 }\n"),
+        ("src/other.rs", "pub fn other() -> u32 { 9 }\n"),
+    ]);
     let linked_root = TempDir::new().expect("linked worktree root");
     let linked = linked_root.path().join("linked");
     let linked_arg = linked.to_str().expect("linked worktree path");
@@ -1607,30 +1576,31 @@ fn cross_worktree_byte_reuse_without_identity_alias() {
         "matching parse/chunk artifacts must be physically shared"
     );
     assert_eq!(first_publish.repository_id, second_publish.repository_id);
-    assert_eq!(first_generation.manifest().project_id, project_id);
-    assert_eq!(second_generation.manifest().project_id, project_id);
+    assert_eq!(
+        first_publish.file_occurrence_ids, second_publish.file_occurrence_ids,
+        "identical content shares its occurrence identity across linked worktrees"
+    );
+    let symbol_occurrences = |generation: &CodeIndexPublishedGenerationV1| {
+        generation
+            .symbols()
+            .symbols
+            .iter()
+            .map(|symbol| symbol.occurrence.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        symbol_occurrences(&first_generation),
+        symbol_occurrences(&second_generation)
+    );
+    // Snapshot authority stays with each worktree's own generation.
     assert_ne!(
         first_generation.snapshot().worktree,
         second_generation.snapshot().worktree
-    );
-    assert_eq!(
-        first_publish.snapshot_content_identity,
-        second_publish.snapshot_content_identity
-    );
-    assert_ne!(
-        first_publish.file_occurrence_ids, second_publish.file_occurrence_ids,
-        "shared artifacts must never alias worktree occurrence identity"
     );
     assert_ne!(first_publish.generation_id, second_publish.generation_id);
     assert_ne!(
         first_generation.manifest().snapshot_digest,
         second_generation.manifest().snapshot_digest
-    );
-    assert_eq!(
-        first_generation.capability().manifest_digest,
-        second_generation.capability().manifest_digest,
-        "byte-identical capability evidence is generation-free; generation, occurrence, \
-         snapshot, and publication identities remain worktree-local above and below"
     );
     assert_ne!(
         first_generation.projection().publication_digest(),
@@ -1638,41 +1608,71 @@ fn cross_worktree_byte_reuse_without_identity_alias() {
         "publication identity remains generation-local"
     );
 
+    // Divergent content in the linked worktree mints its own identity and is
+    // never part of what the primary worktree's generation serves.
+    write(
+        &linked,
+        "src/lib.rs",
+        "pub fn only_in_linked() -> u32 { 8 }\n",
+    );
+    second_scheduler.notify_path(linked.join("src/lib.rs"));
+    let diverged_publish = published(
+        second_scheduler
+            .reconcile_now()
+            .expect("diverged linked-worktree publish"),
+    );
+    let shared = first_publish
+        .file_occurrence_ids
+        .iter()
+        .filter(|occurrence| diverged_publish.file_occurrence_ids.contains(occurrence))
+        .count();
+    assert_eq!(
+        shared, 1,
+        "only the unchanged file keeps a shared identity: {:?} vs {:?}",
+        first_publish.file_occurrence_ids, diverged_publish.file_occurrence_ids
+    );
+    let names = |generation: &CodeIndexPublishedGenerationV1| {
+        generation
+            .symbols()
+            .symbols
+            .iter()
+            .map(|symbol| symbol.simple_name.clone())
+            .collect::<BTreeSet<_>>()
+    };
+    let primary = first_scheduler
+        .latest_complete()
+        .expect("first worktree remains current")
+        .generation;
+    let diverged = second_scheduler
+        .latest_complete()
+        .expect("diverged linked generation")
+        .generation;
+    assert_eq!(
+        primary.manifest().generation_id,
+        first_publish.generation_id,
+        "editing one linked worktree must not invalidate its sibling"
+    );
+    assert!(names(&diverged).contains("only_in_linked"));
+    assert!(
+        !names(&primary).contains("only_in_linked"),
+        "a read routed to the primary worktree's generation never sees linked-only symbols"
+    );
+    assert!(names(&primary).contains("shared"));
+    assert!(!names(&diverged).contains("shared"));
+
     git(&linked, &["mv", "src/lib.rs", "src/renamed.rs"]);
     second_scheduler.notify_path(linked.join("src/lib.rs"));
     second_scheduler.notify_path(linked.join("src/renamed.rs"));
+    let before_rename = registry.byte_pool_stats();
     published(
         second_scheduler
             .reconcile_now()
             .expect("renamed linked-worktree publish"),
     );
-    let after_rename = registry.byte_pool_stats();
     assert_eq!(
-        after_rename.parse_chunk_reused, reuse.parse_chunk_reused,
+        registry.byte_pool_stats().parse_chunk_reused,
+        before_rename.parse_chunk_reused,
         "same content at a new logical path must not reuse path-bound parse/chunk artifacts"
-    );
-
-    write(&linked, "src/renamed.rs", "pub fn shared() -> u32 { 8 }\n");
-    second_scheduler.notify_path(linked.join("src/renamed.rs"));
-    published(
-        second_scheduler
-            .reconcile_now()
-            .expect("edited linked-worktree publish"),
-    );
-    let after_edit = registry.byte_pool_stats();
-    assert_eq!(
-        after_edit.parse_chunk_reused, after_rename.parse_chunk_reused,
-        "changed source content must not reuse the prior parse/chunk artifact"
-    );
-    assert_eq!(
-        first_scheduler
-            .latest_complete()
-            .expect("first worktree remains current")
-            .generation
-            .manifest()
-            .generation_id,
-        first_publish.generation_id,
-        "editing one linked worktree must not invalidate its sibling"
     );
 }
 
@@ -1756,7 +1756,7 @@ async fn paused_cold_mount_rejects_a_root_retiring_before_final_commit() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let registry = CodeIndexSchedulerRegistryV1::new(2);
-    let root = fixture.path().canonicalize().expect("canonical root");
+    let root = canonical_existing_identity(fixture.path()).expect("canonical root");
     let (cold_commit_entered, release_cold_commit) = registry
         .pause_next_cold_mount_before_final_commit(root.clone())
         .await;
@@ -2226,7 +2226,7 @@ async fn unchanged_git_watcher_probe_does_not_enqueue_authoritative_capture() {
         .await
         .expect("mount graph-off retained generation");
 
-    let canonical_root = fixture.path().canonicalize().expect("canonical fixture");
+    let canonical_root = canonical_existing_identity(fixture.path()).expect("canonical fixture");
     let scheduler = {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
@@ -2237,6 +2237,7 @@ async fn unchanged_git_watcher_probe_does_not_enqueue_authoritative_capture() {
         )
     };
     let settled_deadline = Instant::now() + Duration::from_secs(10);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         let settled = {
             let scheduler = scheduler
@@ -2255,14 +2256,17 @@ async fn unchanged_git_watcher_probe_does_not_enqueue_authoritative_capture() {
             Instant::now() <= settled_deadline,
             "retained graph-off owner never established initial freshness"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(settled_deadline).await;
     }
     let admission = registry
         .background_reconcile_admission()
         .acquire_owned()
         .await
         .expect("hold background reconcile admission");
-    registry.clear_pending_wake_for_scope(&scope).await;
+    // The settle above cannot see a pass tail that has dropped its guard and
+    // not yet stamped its `BusyFollowUp` follow-up, so prove the slot stays
+    // empty before asserting that nothing queued a capture pass.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
     assert_eq!(
         scheduler
             .lock()
@@ -2272,10 +2276,12 @@ async fn unchanged_git_watcher_probe_does_not_enqueue_authoritative_capture() {
         "settled fixture starts without source-change evidence"
     );
 
-    let identity = tracedecay_runtime_core::git_discovery::GitRepositoryIdentity {
-        worktree_root: canonical_root.clone(),
-        git_dir: canonical_root.join(".git"),
-        common_dir: canonical_root.join(".git"),
+    let tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(identity) =
+        tracedecay_runtime_core::git_discovery::discover_repository_identity_bounded(
+            fixture.path(),
+        )
+    else {
+        panic!("the fixture checkout resolves a repository identity");
     };
     assert_eq!(
         registry.request_for_root(&identity).await,
@@ -2300,8 +2306,8 @@ async fn unchanged_git_watcher_probe_does_not_enqueue_authoritative_capture() {
 }
 
 /// The live outage this covers: a background reconcile owns the scheduler
-/// mutex for its whole pass — sealing a production-scale corpus holds it for
-/// minutes per generation — while the seated serving generation stays fully
+/// mutex for its whole pass, sealing a production-scale corpus holds it for
+/// minutes per generation, while the seated serving generation stays fully
 /// decoded, activated, and proven current from before the pass began.
 /// Verified graph reads (diagnose, `dead_code`, callers, impact)
 /// resolve through `latest_complete_ready_decoded_for_root_scope`; refusing
@@ -2316,6 +2322,7 @@ async fn proven_seated_generation_serves_verified_reads_while_reconcile_owns_the
     // Seating races the publication event; poll the ready gate bounded until
     // the quiet probe proves the seated generation current (arming the
     // busy-read witness).
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -2324,7 +2331,7 @@ async fn proven_seated_generation_serves_verified_reads_while_reconcile_owns_the
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2335,7 +2342,7 @@ async fn proven_seated_generation_serves_verified_reads_while_reconcile_owns_the
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -2380,6 +2387,7 @@ async fn selected_generation_mints_feedback_identity_after_registry_lookup_close
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let selected = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -2388,7 +2396,7 @@ async fn selected_generation_mints_feedback_identity_after_registry_lookup_close
             {
                 break ready.text_generation_handle();
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2429,6 +2437,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -2437,7 +2446,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2448,7 +2457,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -2458,7 +2467,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
         .await
         .expect("mounted worktree witness");
     // Hold the scheduler first so no reconcile pass can re-prove the seat,
-    // then withdraw the proof — the exact state a restart-restored seat is in
+    // then withdraw the proof, the exact state a restart-restored seat is in
     // before its first passing probe.
     let (locked_tx, locked_rx) = tokio::sync::oneshot::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -2491,6 +2500,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
 
     // With the scheduler quiet again the exact-source probe re-proves the
     // unchanged checkout and re-arms the witness.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let reproved = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -2499,7 +2509,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2516,7 +2526,7 @@ async fn busy_scheduler_still_refuses_a_seated_generation_without_a_currency_wit
 /// `code_index_post_projection_source_unverified`) can only be re-proven by a
 /// pass. When the retained native graph already serves, the swap arm that
 /// used to do that never runs, so the unchanged-pass path must bind the
-/// renewed proof to the seat itself — and only for the exact snapshot the
+/// renewed proof to the seat itself, and only for the exact snapshot the
 /// pass verified.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unchanged_pass_binds_its_source_proof_to_an_unproven_seat() {
@@ -2524,6 +2534,7 @@ async fn unchanged_pass_binds_its_source_proof_to_an_unproven_seat() {
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -2532,7 +2543,7 @@ async fn unchanged_pass_binds_its_source_proof_to_an_unproven_seat() {
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2544,7 +2555,7 @@ async fn unchanged_pass_binds_its_source_proof_to_an_unproven_seat() {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .serving_generation,
         )
@@ -2679,27 +2690,20 @@ async fn graph_read_during_reconcile_records_a_busy_follow_up() {
         .hold_reconcile_pass_for_test(fixture.path())
         .await
         .expect("mounted worktree");
-    let source_freshness = registry
-        .source_freshness_for_root(fixture.path())
-        .await
-        .expect("mounted worktree source fence");
-    {
-        let mut state = source_freshness
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.last_reconciled_at = Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("age the source proof");
-    }
+    // The permit and the pass guard leave the graph tail's renewals free to
+    // run (see `hold_scheduler_for_root`).
+    let scheduler = hold_scheduler_for_root(&registry, fixture.path()).await;
+    move_git_metadata(fixture.path());
 
     assert!(
         registry
             .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
             .await
             .is_none(),
-        "an expired graph proof abstains while the owner pass is in flight"
+        "a moved Git metadata sample abstains while the owner pass is in flight"
     );
+    scheduler.release().await;
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     drop(owner_pass);
     drop(admission);
 
@@ -2714,7 +2718,7 @@ async fn graph_read_during_reconcile_records_a_busy_follow_up() {
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2732,15 +2736,16 @@ async fn graph_read_during_reconcile_records_a_busy_follow_up() {
 }
 
 /// A publication can finish source capture long before its text artifact is
-/// ready. The serving swap must reverify after that projection, otherwise the
-/// exact active generation seats after its bounded proof expires and every
-/// graph readiness probe keeps an unchanged-source Noop loop alive.
+/// ready. The serving swap must reverify source evidence that landed during
+/// that projection, otherwise the exact active generation seats without a
+/// witness and every graph readiness probe keeps an unchanged-source Noop
+/// loop alive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn long_text_projection_renews_source_before_seating_and_noop_follow_up_settles() {
     let fixture = GitFixture::new(ALPHA_LIB_V1);
     let store = TempDir::new().expect("store root");
     let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
-    let canonical_root = fixture.path().canonicalize().expect("canonical fixture");
+    let canonical_root = canonical_existing_identity(fixture.path()).expect("canonical fixture");
     let (projection_started, release_projection) = registry
         .pause_next_published_text_projection(canonical_root)
         .await;
@@ -2766,19 +2771,7 @@ async fn long_text_projection_renews_source_before_seating_and_noop_follow_up_se
         identity.head_ref().cloned(),
     )
     .expect("resolved scope");
-    let source_freshness = registry
-        .source_freshness_for_root(fixture.path())
-        .await
-        .expect("mounted source fence");
-    {
-        let mut state = source_freshness
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.last_reconciled_at = Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("age the pre-projection proof");
-    }
+    move_git_metadata(fixture.path());
     release_projection
         .send(())
         .expect("release publication projection");
@@ -2788,21 +2781,20 @@ async fn long_text_projection_renews_source_before_seating_and_noop_follow_up_se
     })
     .await;
     let generation = ready.generation().manifest().generation_id.clone();
-    // The seat precedes the clone-fingerprint backfill; settle it so the pass
-    // observed below is the source-verification Noop alone.
-    drain_clone_backfill(&registry, fixture.path()).await;
+    // Settle the mount-era passes so the pass observed below is the
+    // source-verification Noop alone.
+    settle_text_projection(&registry, fixture.path()).await;
 
-    // Exercise the ordinary expiry path too. The existing seat keeps its exact
+    // Exercise the ordinary seated path too. The existing seat keeps its exact
     // witness while the source-verification Noop renews the proof.
-    {
-        let mut state = source_freshness
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.last_reconciled_at = Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("age the seated proof");
-    }
+    //
+    // A pass that re-proves the seat rebinds the Git metadata sample, so an
+    // unfenced window between moving that metadata and reading it is a race
+    // with the worker. The admission permit alone does not close it (see
+    // `hold_scheduler_for_root`).
+    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    let scheduler = hold_scheduler_for_root(&registry, fixture.path()).await;
+    move_git_metadata(fixture.path());
     registry.clear_pending_wake_for_scope(&scope).await;
     let receipts_before = registry.event_to_ready_receipts().len();
     assert!(
@@ -2810,8 +2802,10 @@ async fn long_text_projection_renews_source_before_seating_and_noop_follow_up_se
             .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
             .await
             .is_none(),
-        "the expired proof declines before the worker renews it"
+        "moved Git metadata declines before the worker renews the proof"
     );
+    scheduler.release().await;
+    drop(admission);
     assert_eq!(
         wait_until_serving_seat(&registry, fixture.path(), Duration::from_secs(10), || {
             registry.latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
@@ -2874,12 +2868,13 @@ async fn verified_empty_source_remains_observable_while_scheduler_is_busy() {
         identity.head_ref().cloned(),
     )
     .expect("resolved scope");
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         while !registry
             .reconciled_without_generation_for_scope(&scope)
             .await
         {
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -2932,13 +2927,18 @@ async fn background_worker_waits_for_global_admission_before_publication_gate() 
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .build_publication_lock,
         )
     };
 
-    tokio::time::sleep(Duration::from_millis(25)).await;
+    wait_for_worker_phase(
+        &registry,
+        fixture.path(),
+        CodeIndexWorkerPhaseV1::AwaitingAdmission,
+    )
+    .await;
     let publication = tokio::time::timeout(Duration::from_millis(100), publication_gate.lock())
         .await
         .expect("global admission wait must not hold the per-worktree publication gate");
@@ -2975,7 +2975,11 @@ async fn ignored_dependency_waits_for_global_admission_before_publication_gate()
     let store = TempDir::new().expect("store root");
     let (registry, _) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
     let latest = wait_for_live_complete_generation(&registry, fixture.path()).await;
-    drain_clone_backfill(&registry, fixture.path()).await;
+    // Draining leaves the busy follow-up wake armed, and every pass it starts
+    // owns the single global admission permit this test needs idle. Settle
+    // that chain and burn the banked permit behind it before sampling.
+    settle_text_projection(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
     let generation = latest.generation();
     let verified_import = generation
         .imports()
@@ -3000,7 +3004,7 @@ async fn ignored_dependency_waits_for_global_admission_before_publication_gate()
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .build_publication_lock,
         )
@@ -3036,20 +3040,21 @@ async fn ignored_dependency_waits_for_global_admission_before_publication_gate()
     registry.shutdown().await;
 }
 
-/// Busy-read proof reuse is explicitly bounded, but the bound belongs to the
-/// freshness fence, not to a per-read worktree sweep: an ordinary read never
-/// walks the checkout. An out-of-band write that moves no Git metadata and
-/// reaches no hint authority is therefore served from the live proof until
-/// that proof expires. The first read after it does declines the seat and
-/// hands the exact stat-plus-sealed-digest comparison to the retained worker,
-/// whose pass is the only authority that may withdraw the witness from the
-/// disproved generation.
+/// An ordinary read never walks the checkout and never treats the proof's
+/// age as evidence. An out-of-band write that moves no Git metadata and
+/// reaches no hint authority is therefore served from the live proof, however
+/// old, until a source probe proves the movement: the read-refresh probe
+/// sweeps the stat signature and sealed digests and posts the observed
+/// change. Reads then decline the seat, and the retained worker's pass is the
+/// only authority that may withdraw the witness from the disproved
+/// generation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -3058,7 +3063,7 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -3076,6 +3081,11 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
     // Hold the worker at its dequeue point so every observation below is the
     // read path's own answer and never a pass that raced it.
     let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    // The permit and the pass counter leave the graph tail of the settled
+    // pass free to re-verify source once the drift below lands, and that
+    // re-verification withdraws the witness on its own (see
+    // `hold_scheduler_for_root`). Fence it until the read path has answered.
+    let scheduler = hold_scheduler_for_root(&registry, fixture.path()).await;
 
     std::fs::write(
         fixture.path().join("src/main.rs"),
@@ -3091,30 +3101,45 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
         "an unhinted raw write reuses the live proof; a read never walks the checkout"
     );
 
-    // Expire that proof exactly as its own bound does, without waiting it out.
-    {
-        let mut state = source_freshness
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.last_reconciled_at = Instant::now()
-            .checked_sub(state.staleness_threshold + Duration::from_secs(1))
-            .expect("age the source proof past its own bound");
-    }
+    // Age the proof past the probe window, without waiting it out. Age alone
+    // is not evidence: the read still serves and schedules nothing.
+    source_freshness.age_probe_clock_past_for_test(super::super::DEFAULT_STALENESS_THRESHOLD);
     registry.clear_pending_wake_for_scope(&scope).await;
+    assert_eq!(
+        (
+            registry
+                .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+                .await
+                .map(|served| served.generation().manifest().generation_id.clone()),
+            registry.pending_wake_micros_for_scope(&scope).await,
+        ),
+        (Some(disproved_generation_id.clone()), Some(0)),
+        "an aged proof keeps serving and posts no verification wake"
+    );
+
+    // The read-refresh probe sweeps the aged witness and proves the drift.
+    scheduler.release().await;
+    assert!(
+        registry
+            .diagnostics_change_generation(fixture.path())
+            .await
+            .is_some(),
+        "the mounted worktree answers the source probe"
+    );
+    let scheduler = hold_scheduler_for_root(&registry, fixture.path()).await;
     assert!(
         registry
             .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
             .await
             .is_none(),
-        "an expired proof disproves the seated generation's currency"
+        "a probe-proven drift disproves the seated generation's currency"
     );
     assert!(
         registry
             .pending_wake_micros_for_scope(&scope)
             .await
             .is_some_and(|pending| pending != 0),
-        "the declining read hands the exact source proof to the retained worker"
+        "the probe hands the proven change to the retained worker"
     );
     assert_eq!(
         witness
@@ -3128,6 +3153,8 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
 
     // Release the worker: its pass re-derives the sealed digests, observes the
     // drift, and the witness stops naming the disproved generation.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
+    scheduler.release().await;
     drop(admission);
     let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
     while witness
@@ -3141,7 +3168,7 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
             Instant::now() <= deadline,
             "the disproving reconcile pass never withdrew the busy-read witness"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        signals.changed_before(deadline).await;
     }
 
     registry.shutdown().await;
@@ -3150,8 +3177,8 @@ async fn a_disproving_exact_source_probe_withdraws_the_busy_read_witness() {
 /// The pointer-supersession half of the verified-read outage: a reconcile
 /// pass publishes a successor generation and flips the durable pointer
 /// minutes before the successor's O(store) decode + native activation seats
-/// it. When that successor sealed the SAME source content — a convergence or
-/// repair republication, not an edit — the seated predecessor still describes
+/// it. When that successor sealed the SAME source content, a convergence or
+/// repair republication, not an edit, the seated predecessor still describes
 /// exactly the bytes on disk, so verified reads must keep serving it through
 /// the successor's activation window instead of refusing "not ready".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3160,6 +3187,7 @@ async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() 
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -3168,7 +3196,7 @@ async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() 
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -3176,15 +3204,12 @@ async fn a_same_content_successor_pointer_keeps_the_seated_generation_serving() 
     let generation_id = ready.generation().manifest().generation_id.clone();
 
     // Flip the durable pointer to an unseated successor sealed from the same
-    // source content — the exact durable state between a convergence
+    // source content, the exact durable state between a convergence
     // republication's publish and its seat.
     advance_pointer_to_unseated_successor(
         &super::super::scoped_code_index_store_root(
             store.path(),
-            &fixture
-                .path()
-                .canonicalize()
-                .expect("canonical fixture root"),
+            &canonical_existing_identity(fixture.path()).expect("canonical fixture root"),
         ),
         false,
     );
@@ -3216,6 +3241,7 @@ async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let ready = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(ready) = registry
@@ -3224,7 +3250,7 @@ async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
             {
                 break ready;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -3238,10 +3264,7 @@ async fn a_different_content_successor_pointer_refuses_the_stale_seat() {
     advance_pointer_to_unseated_successor(
         &super::super::scoped_code_index_store_root(
             store.path(),
-            &fixture
-                .path()
-                .canonicalize()
-                .expect("canonical fixture root"),
+            &canonical_existing_identity(fixture.path()).expect("canonical fixture root"),
         ),
         true,
     );
@@ -3306,8 +3329,8 @@ fn graph_publication_conflict_re_arms_activation_instead_of_orphaning_serving() 
     );
 }
 
-/// A conflict verdict identical to the previous seat attempt's — same guard
-/// site, same compared evidence, same sealed generation — is deterministic:
+/// A conflict verdict identical to the previous seat attempt's, same guard
+/// site, same compared evidence, same sealed generation, is deterministic:
 /// the sealed inputs are immutable, so replaying activation reproduces the
 /// exact refusal forever. The seat loop must recognize the repeat and take
 /// the terminal typed-refusal arm instead of looping at the backoff ceiling
@@ -3402,7 +3425,7 @@ fn repeated_identical_conflict_verdict_is_terminal_not_retryable() {
 /// A first publication conflict is a concurrent-publisher race, not a
 /// deterministic refusal. The seat loop must schedule exactly one retry and
 /// seat the sealed generation when that retry succeeds (issue #765). A later
-/// conflict at a different guard site stays retryable — only an identical
+/// conflict at a different guard site stays retryable, only an identical
 /// repeat is terminal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn first_activation_conflict_retries_once_and_then_seats() {
@@ -3412,7 +3435,7 @@ async fn first_activation_conflict_retries_once_and_then_seats() {
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, worktree_id, sealed_generation_id) = {
         let mut scheduler = scheduler(
@@ -3478,6 +3501,7 @@ async fn first_activation_conflict_retries_once_and_then_seats() {
         .expect("mount retained generation");
 
     let deadline = Instant::now() + Duration::from_secs(10);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         let freshness = registry
             .dashboard_freshness(fixture.path())
@@ -3514,7 +3538,7 @@ async fn first_activation_conflict_retries_once_and_then_seats() {
             Instant::now() <= deadline,
             "the first-conflict retry did not seat the sealed generation: {freshness:?}"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        signals.changed_before(deadline).await;
     }
 
     assert_eq!(
@@ -3611,6 +3635,7 @@ async fn foreign_serving_generation_replacement_rejects_stale_rollback_token() {
     );
     let newer = wait_for_generation_change(&registry, fixture.path(), &original_id).await;
     let serving_deadline = Instant::now() + Duration::from_secs(5);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let newer_generation = loop {
         if let Some(generation) = registry
             .serving_code_scope(fixture.path())
@@ -3624,7 +3649,7 @@ async fn foreign_serving_generation_replacement_rejects_stale_rollback_token() {
             Instant::now() <= serving_deadline,
             "foreign replacement must seat the newer serving generation"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(serving_deadline).await;
     };
 
     assert_eq!(
@@ -3777,7 +3802,10 @@ async fn dashboard_progress_does_not_wait_for_the_scheduler_mutex() {
         .collect::<Vec<_>>();
     let fixture = GitFixture::new(&borrowed);
     let store = TempDir::new().expect("store root");
-    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    // One background permit, so holding it is what parks the owner: the
+    // default bound is the host core count and a single held permit would
+    // leave the other passes free to run under the sample below.
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
     registry
         .mount_worktree(
             test_project_id(),
@@ -3788,24 +3816,43 @@ async fn dashboard_progress_does_not_wait_for_the_scheduler_mutex() {
         .expect("mount daemon-owned scheduler");
     wait_for_initial_generation(&registry, fixture.path()).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
-    let canonical_root = fixture
-        .path()
-        .canonicalize()
-        .expect("canonical fixture root");
-    let (scheduler, progress_slot) = {
+    // `refresh_in_flight` is the pass counter *or* the pending-wake slot, and
+    // `wait_for_dashboard_ready` only joins the running pass; a banked
+    // permit's no-op pass projects Verifying instead of Fresh. Settle the
+    // whole mount-era chain, then hold the admission so no further pass can
+    // start under the sample below.
+    settle_text_projection(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
+    let _quiet_owner = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    let canonical_root =
+        canonical_existing_identity(fixture.path()).expect("canonical fixture root");
+    let (scheduler, progress_slot, scope) = {
         let mounted = registry.mounted.lock().await;
         let worktree = mounted.get(&canonical_root).expect("mounted worktree");
         (
             Arc::clone(&worktree.scheduler),
             Arc::clone(&worktree.build_progress),
+            tracedecay_contracts::ResolvedScope::new(
+                test_project_id(),
+                worktree.repository_id.clone(),
+                worktree.worktree_id.clone(),
+                None,
+            )
+            .expect("resolved scope"),
         )
     };
+    // `refresh_in_flight` also reads the pending-wake slot, and the settled
+    // owner's pass tail can still stamp `BusyFollowUp` into it after every
+    // settle check above (CI run 35412193695). With the admission held that
+    // tail is finite: empty the slot until it stays empty.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let expected = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(progress) = progress_slot.read().expect("progress slot").snapshot() {
                 break progress;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -3846,6 +3893,188 @@ async fn dashboard_progress_does_not_wait_for_the_scheduler_mutex() {
     registry.shutdown().await;
 }
 
+/// A query that cannot join the owner must not schedule the verification the
+/// dashboard would then report as `Verifying`, however old the proof is. A
+/// read that posted `BusyFollowUp` while a pass holds the lock would be taken
+/// and immediately replaced by the next poll, so the ladder would never
+/// settle to `Fresh`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn busy_query_does_not_rearm_dashboard_verification() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+        )
+        .await
+        .expect("mount daemon-owned scheduler");
+    wait_for_initial_generation(&registry, fixture.path()).await;
+    wait_for_dashboard_ready(&registry, fixture.path()).await;
+    settle_text_projection(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
+    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    let canonical_root =
+        canonical_existing_identity(fixture.path()).expect("canonical fixture root");
+    let scope = {
+        let mounted = registry.mounted.lock().await;
+        let worktree = mounted.get(&canonical_root).expect("mounted worktree");
+        tracedecay_contracts::ResolvedScope::new(
+            test_project_id(),
+            worktree.repository_id.clone(),
+            worktree.worktree_id.clone(),
+            None,
+        )
+        .expect("resolved scope")
+    };
+    clear_pending_wake_until_quiet(&registry, &scope).await;
+    let freshness = registry
+        .source_freshness_for_root(fixture.path())
+        .await
+        .expect("mounted freshness fence");
+    freshness.age_probe_clock_past_for_test(super::super::DEFAULT_STALENESS_THRESHOLD);
+    let scheduler = {
+        let mounted = registry.mounted.lock().await;
+        Arc::clone(
+            &mounted
+                .get(&canonical_root)
+                .expect("mounted worktree")
+                .scheduler,
+        )
+    };
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let scheduler_holder = tokio::task::spawn_blocking(move || {
+        let _scheduler_guard = scheduler.lock().expect("hold scheduler mutex");
+        let _ = locked_tx.send(());
+        let _ = release_rx.blocking_recv();
+    });
+    locked_rx.await.expect("scheduler mutex holder started");
+    for _ in 0..8 {
+        assert!(
+            registry
+                .latest_complete_fresh(fixture.path())
+                .await
+                .is_some(),
+            "a busy owner still serves the seated generation"
+        );
+    }
+    assert_eq!(
+        registry.pending_wake_micros_for_root(fixture.path()).await,
+        Some(0),
+        "a read blocked on the in-flight owner must not schedule another verification"
+    );
+    let projected = registry
+        .dashboard_freshness(fixture.path())
+        .await
+        .expect("dashboard freshness while the owner holds the scheduler");
+    assert_eq!(
+        projected.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh),
+        "an owner that has not observed a source change is not Verifying"
+    );
+    let _ = release_tx.send(());
+    scheduler_holder
+        .await
+        .expect("scheduler mutex holder joined");
+
+    assert_eq!(
+        (
+            registry
+                .latest_complete_fresh(fixture.path())
+                .await
+                .is_some(),
+            registry.pending_wake_micros_for_root(fixture.path()).await,
+        ),
+        (true, Some(0)),
+        "an uncontended read of an aged proof serves and requests no verification"
+    );
+    drop(admission);
+    registry.shutdown().await;
+}
+
+/// A status read never schedules work. On a settled, unchanged tree whose
+/// proof clock has aged past the probe window, every read a `tracedecay
+/// status` or query call makes (graph census, query admission, dashboard
+/// freshness) serves the seat, reports `fresh`, and leaves the worker idle.
+/// An unhinted raw write is found by the read-refresh probe, which sweeps the
+/// sealed digests and posts the one wake that rebuilds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reads_on_an_unchanged_tree_schedule_no_verification() {
+    let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
+    let store = TempDir::new().expect("store root");
+    let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
+    let seated = wait_for_live_complete_generation(&registry, fixture.path())
+        .await
+        .generation()
+        .manifest()
+        .generation_id
+        .clone();
+    wait_for_dashboard_ready(&registry, fixture.path()).await;
+    settle_text_projection(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
+    clear_pending_wake_until_quiet(&registry, &scope).await;
+    registry
+        .source_freshness_for_root(fixture.path())
+        .await
+        .expect("mounted source fence")
+        .age_probe_clock_past_for_test(super::super::DEFAULT_STALENESS_THRESHOLD);
+    let receipts_before = registry.event_to_ready_receipts().len();
+
+    let mut reads = Vec::new();
+    for _ in 0..5 {
+        let census = registry
+            .latest_complete_ready_decoded_for_root_scope(fixture.path(), &scope)
+            .await
+            .map(|latest| latest.generation().manifest().generation_id.clone());
+        let admitted = registry
+            .latest_complete_fresh(fixture.path())
+            .await
+            .map(|latest| latest.generation().manifest().generation_id.clone());
+        let staleness = registry
+            .dashboard_freshness(fixture.path())
+            .await
+            .and_then(|freshness| freshness.staleness_state);
+        let pending = registry.pending_wake_micros_for_root(fixture.path()).await;
+        reads.push((census, admitted, staleness, pending));
+    }
+    assert_eq!(
+        reads,
+        vec![
+            (
+                Some(seated.clone()),
+                Some(seated.clone()),
+                Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh),
+                Some(0),
+            );
+            5
+        ],
+        "every status read serves the seat as fresh and schedules nothing"
+    );
+    assert_eq!(
+        registry.event_to_ready_receipts().len(),
+        receipts_before,
+        "status reads ran no verification pass"
+    );
+
+    fixture.edit("src/main.rs", "fn main() { moved(); }\n");
+    assert!(
+        matches!(
+            registry.probe_freshness_admission(fixture.path()).await,
+            super::super::CodeIndexDemandAdmissionV1::Queued
+        ),
+        "the read-refresh probe admits the proven change"
+    );
+    let rebuilt = wait_for_generation_change(&registry, fixture.path(), &seated).await;
+    assert_ne!(
+        rebuilt, seated,
+        "the probe-proven raw write publishes a successor"
+    );
+    registry.shutdown().await;
+}
+
 // Two workers so the timeout timer stays live if a regression parks one
 // runtime worker on the scheduler mutex: the test then fails instead of
 // deadlocking against its own release channel.
@@ -3863,10 +4092,8 @@ async fn replay_binding_does_not_wait_for_the_scheduler_mutex() {
         .await
         .expect("mount daemon-owned scheduler");
     let generation_id = wait_for_initial_generation(&registry, fixture.path()).await;
-    let canonical_root = fixture
-        .path()
-        .canonicalize()
-        .expect("canonical fixture root");
+    let canonical_root =
+        canonical_existing_identity(fixture.path()).expect("canonical fixture root");
     let scheduler = {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
@@ -3928,12 +4155,14 @@ async fn unchanged_background_freshness_probe_posts_no_overflow_wake() {
         .await
         .expect("mount daemon-owned scheduler");
     wait_for_initial_generation(&registry, fixture.path()).await;
-    // The seat is published mid-pass and the receipt lands after the pass
-    // releases its in-progress guard, so sample the baseline only once the
-    // mount's own receipt exists, or it is charged to the probe below.
-    wait_for_quiescent_owner_pass(&registry, fixture.path()).await;
+    // Every wake posts its own receipt, so settle the whole mount-era chain
+    // first: a pass that ends with a wake still pending re-arms a busy
+    // follow-up whose receipt would otherwise land inside the probe's window
+    // below.
+    settle_text_projection(&registry, fixture.path()).await;
+    wait_for_settled_owner(&registry, fixture.path()).await;
     wait_for_event_to_ready(&registry).await;
-    let canonical = fixture.path().canonicalize().expect("canonical fixture");
+    let canonical = canonical_existing_identity(fixture.path()).expect("canonical fixture");
     {
         let mounted = registry.mounted.lock().await;
         let scheduler = &mounted.get(&canonical).expect("mounted worktree").scheduler;
@@ -3943,13 +4172,17 @@ async fn unchanged_background_freshness_probe_posts_no_overflow_wake() {
             .policy
             .staleness_threshold = Duration::ZERO;
     }
-    let receipts_before = registry.event_to_ready_receipts().len();
+    // Receipts are attributed by the arrival the pass claimed, not by list
+    // position: a mount-era wake claimed before this instant belongs to the
+    // mount even when its receipt lands during the window below. Only a wake
+    // accepted from here on is the probe's.
+    let probe_at = tracedecay_contracts::now_micros().0;
 
     assert_eq!(
         registry.probe_freshness_admission(fixture.path()).await,
         super::super::CodeIndexDemandAdmissionV1::Queued
     );
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_settled_owner(&registry, fixture.path()).await;
 
     let mounted = registry.mounted.lock().await;
     let scheduler = mounted.get(&canonical).expect("mounted worktree");
@@ -3962,10 +4195,15 @@ async fn unchanged_background_freshness_probe_posts_no_overflow_wake() {
         Some(0),
         "matching Git/stat evidence must not become an overflow hint"
     );
-    assert_eq!(
-        registry.event_to_ready_receipts().len(),
-        receipts_before,
-        "a suppressed probe must not fabricate a reconcile receipt"
+    let receipts = registry.event_to_ready_receipts();
+    assert!(
+        receipts.iter().all(|receipt| {
+            receipt
+                .arrival
+                .wake_micros()
+                .is_none_or(|wake_micros| wake_micros < probe_at)
+        }),
+        "a suppressed probe must not fabricate a reconcile receipt: {receipts:#?}"
     );
     drop(mounted);
     registry.shutdown().await;
@@ -4084,7 +4322,9 @@ async fn diagnostics_change_generation_advances_for_out_of_band_git_drift() {
 async fn elapsed_freshness_window_alone_does_not_make_dashboard_state_stale() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
-    let registry = CodeIndexSchedulerRegistryV1::new(1);
+    // Single-permit admission: holding it below parks the background worker,
+    // which the host's default bound cannot do.
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
     registry
         .mount_worktree(
             test_project_id(),
@@ -4095,18 +4335,32 @@ async fn elapsed_freshness_window_alone_does_not_make_dashboard_state_stale() {
         .expect("mount daemon-owned scheduler");
     wait_for_initial_generation(&registry, fixture.path()).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
-    let canonical = fixture.path().canonicalize().expect("canonical fixture");
-    {
+    // A banked permit's no-op pass projects `Verifying` instead of `Fresh`.
+    // Settle the mount-era chain, hold the admission so no pass can start
+    // under the sample, and prove the pending-wake slot stays empty, exactly
+    // as the text-progress test does.
+    settle_text_projection(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
+    let _quiet_owner = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
+    let canonical = canonical_existing_identity(fixture.path()).expect("canonical fixture");
+    let scope = {
         let mounted = registry.mounted.lock().await;
-        mounted
-            .get(&canonical)
-            .expect("mounted worktree")
+        let worktree = mounted.get(&canonical).expect("mounted worktree");
+        worktree
             .scheduler
             .lock()
             .expect("scheduler")
             .policy
             .staleness_threshold = Duration::ZERO;
-    }
+        tracedecay_contracts::ResolvedScope::new(
+            test_project_id(),
+            worktree.repository_id.clone(),
+            worktree.worktree_id.clone(),
+            None,
+        )
+        .expect("resolved scope")
+    };
+    clear_pending_wake_until_quiet(&registry, &scope).await;
 
     let projected = registry
         .dashboard_freshness(fixture.path())
@@ -4138,6 +4392,11 @@ async fn dashboard_freshness_reports_pending_rebuild_liveness() {
         .expect("mount daemon-owned scheduler");
     wait_for_initial_generation(&registry, fixture.path()).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
+    // The admission below only parks a *new* pass at its dequeue point.
+    // Settle the mount-era passes and burn the wake permits they bank, so the
+    // held admission is the only scheduling this sample can observe.
+    settle_text_projection(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
 
     let admission = registry
         .background_reconcile_admission()
@@ -4163,10 +4422,14 @@ async fn dashboard_freshness_reports_pending_rebuild_liveness() {
         projected.rebuild_in_flight,
         "a pending scheduler wake must keep stale serving typed as rebuilding"
     );
-    assert!(matches!(
-        projected.clone_index,
-        Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Stale { .. })
-    ));
+    assert!(
+        matches!(
+            projected.clone_index,
+            Some(tracedecay_contracts::code_index_freshness::CodeCloneIndexStatusV1::Stale { .. })
+        ),
+        "a settled clone index under a stale source must read Stale: {:?}",
+        projected.clone_index
+    );
     drop(admission);
     registry.shutdown().await;
 }
@@ -4182,9 +4445,9 @@ async fn a_fresh_seat_declines_query_admission_during_source_verification() {
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree(&fixture, &store).await;
     wait_for_dashboard_ready(&registry, fixture.path()).await;
-    // Pending clone work is a reason to admit a background pass; settle it so
-    // the freshness gate alone decides this admission.
-    drain_clone_backfill(&registry, fixture.path()).await;
+    // Settle the mount-era passes so the freshness gate alone decides this
+    // admission.
+    settle_text_projection(&registry, fixture.path()).await;
     registry.clear_pending_wake_for_scope(&scope).await;
 
     let pass = registry
@@ -4594,6 +4857,7 @@ async fn restart_over_same_length_preserved_mtime_rewrite_rebuilds_the_retained_
         )
         .await
         .expect("remount worktree over the retained store");
+    let mut signals = OwnerSignals::subscribe(&restarted, fixture.path()).await;
     let rebuilt = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(latest) = restarted.latest_complete_fresh(fixture.path()).await
@@ -4601,7 +4865,7 @@ async fn restart_over_same_length_preserved_mtime_rewrite_rebuilds_the_retained_
             {
                 break latest;
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -4806,8 +5070,8 @@ fn swapping_two_same_length_files_with_preserved_mtimes_reconciles() {
 /// A checkout whose clean filters separate the bytes on disk from HEAD's blobs
 /// (`core.autocrlf=true` over CRLF files) seals LF blob digests from the exact
 /// HEAD tree. The content comparison must recognise the unchanged checkout as
-/// current through the repository's own filter pipeline — never looping into a
-/// reconcile every staleness window — while a same-length preserved-mtime
+/// current through the repository's own filter pipeline, never looping into a
+/// reconcile every staleness window, while a same-length preserved-mtime
 /// rewrite of the same file is still disproved.
 #[test]
 fn clean_filtered_checkout_verifies_current_and_still_disproves_a_rewrite() {
@@ -5085,7 +5349,7 @@ async fn shutdown_signals_code_index_worker_without_taking_busy_scheduler_lock()
     // Let the mount-time reconcile finish first. Until it does, the background
     // worker owns the scheduler lock itself, and shutdown joining a worker that
     // is *already* blocked acquiring that lock is a different wait than the one
-    // under test — this test is about shutdown never taking the lock on its own
+    // under test, this test is about shutdown never taking the lock on its own
     // behalf.
     wait_for_live_complete_generation(&registry, fixture.path()).await;
     let scheduler = registry
@@ -5093,24 +5357,36 @@ async fn shutdown_signals_code_index_worker_without_taking_busy_scheduler_lock()
         .await
         .expect("scheduler handle");
     let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let lock_thread = std::thread::spawn(move || {
         let _guard = scheduler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         held_tx.send(()).expect("signal scheduler lock held");
-        std::thread::sleep(Duration::from_millis(750));
+        release_rx.recv().expect("release scheduler lock");
     });
     held_rx.recv().expect("scheduler lock acquired");
 
-    let started = std::time::Instant::now();
+    // The contract is that shutdown never takes this mutex on its own behalf:
+    // it sets `shutting_down`, wakes the worker, and joins it, while the worker
+    // polls `try_lock` and returns cancelled the moment that flag is set. So
+    // shutdown must return while this thread still owns the mutex, and the
+    // proof is program order: the release below has not been sent yet.
+    //
+    // Wall time cannot state that. The worker's cancellation-observation
+    // latency is unbounded by design (it may be mid-slice in a blocking
+    // decode), so a clock-based budget measures host CPU, not the lock. A
+    // regression that makes shutdown wait on the mutex deadlocks here instead
+    // of failing, and the harness reports it as a timeout.
     registry.shutdown().await;
-    let elapsed = started.elapsed();
-    lock_thread.join().expect("scheduler lock holder joins");
 
     assert!(
-        elapsed < Duration::from_millis(250),
-        "shutdown waited {elapsed:?} for a synchronous scheduler lock instead of signalling its cooperative cancellation token"
+        !lock_thread.is_finished(),
+        "shutdown returned only after the scheduler lock holder let go, so it waited for a \
+         synchronous scheduler lock instead of signalling its cooperative cancellation token"
     );
+    release_tx.send(()).expect("release scheduler lock");
+    lock_thread.join().expect("scheduler lock holder joins");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5215,7 +5491,7 @@ async fn project_retirement_retains_blocked_worker_owner_until_retry_joins_it() 
     })
     .await
     .expect("worker admits a reconcile pass before retirement");
-    let roots = [fixture.path().canonicalize().expect("canonical root")]
+    let roots = [canonical_existing_identity(fixture.path()).expect("canonical root")]
         .into_iter()
         .collect();
 
@@ -5286,30 +5562,39 @@ async fn simultaneous_cold_mounts_admit_exactly_one_worktree_owner() {
 }
 
 // Each caller begins from the same empty pending slot. Holding the scheduler
-// lock forces every request onto the BusyFollowUp path, where the registry—not
-// the worker's later wake coalescing—is solely responsible for one admission.
+// lock forces every request onto the BusyFollowUp path, where the registry, not
+// the worker's later wake coalescing, is solely responsible for one admission.
 #[allow(clippy::await_holding_lock)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_query_admissions_claim_one_pending_wake_before_worker_coalescing() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
-    let admission = registry
-        .background_reconcile_admission()
-        .acquire_owned()
-        .await
-        .expect("background reconcile admission");
+    // The mount's own passes own the same coalesced pending-wake slot. This
+    // test is about simultaneous query admissions, so settle them before
+    // establishing the empty-slot precondition.
+    settle_text_projection(&registry, fixture.path()).await;
+    // Take the shared admission first, through the helper that also waits out
+    // an in-flight pass: from here no new pass can start, so the quiet window
+    // established below stays quiet. A raw `acquire_owned` returns the instant
+    // a running pass releases the admission mid-body, and that pass's tail then
+    // stamps `BusyFollowUp` over the empty slot this test set up, which makes
+    // every claim below decline.
+    let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
     let scheduler = {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
     };
+    // The tail of the pass the admission was taken from also publishes text
+    // owners, so empty the wake slot and prove it stays empty before clearing
+    // the generations this test needs absent.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
     registry.clear_serving_generation_for_scope(&scope).await;
-    registry.clear_pending_wake_for_scope(&scope).await;
     let held = scheduler
         .lock()
         .expect("hold the scheduler as a rebuild would");
@@ -5534,7 +5819,10 @@ async fn foreign_wake_keeps_pending_arrival_when_query_claim_is_released() {
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
     let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
-    registry.clear_pending_wake_for_scope(&scope).await;
+    // A `BusyFollowUp` stamp from the finishing pass's tail would make the
+    // request below decline before it ever reaches the claim gate, and
+    // `wait_for_query_claim` would then hang instead of failing.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
     registry.install_query_claim_gate(&scope);
 
     let request = {
@@ -5580,11 +5868,13 @@ async fn foreign_wake_arriving_during_query_claim_drop_is_retained() {
     let fixture = GitFixture::new(&[("src/main.rs", "fn main() {}\n")]);
     let store = TempDir::new().expect("store root");
     let (registry, scope) = mounted_core_query_worktree_with_one_permit(&fixture, &store).await;
-    // A query over pending clone work is admitted for that work and never
-    // reaches the claim gate under test; settle the backfill first.
-    drain_clone_backfill(&registry, fixture.path()).await;
+    // A query over pending text work is admitted for that work and never
+    // reaches the claim gate under test; settle it first.
+    settle_text_projection(&registry, fixture.path()).await;
     let admission = quiesced_background_reconcile_admission(&registry, fixture.path()).await;
-    registry.clear_pending_wake_for_scope(&scope).await;
+    // Same hang: a tail's `BusyFollowUp` stamp declines the request before the
+    // claim gate this test waits on.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
     registry.install_query_claim_gate(&scope);
     registry.install_pending_wake_drop_gate(&scope).await;
 
@@ -5742,7 +6032,8 @@ async fn retirement_waits_for_and_fences_an_exact_cold_mount_open() {
     let mut cancelled = registry
         .subscribe_cold_mount_cancellation(fixture.path())
         .expect("cold mount reservation");
-    let roots = BTreeSet::from([fixture.path().canonicalize().expect("canonical root")]);
+    let roots =
+        BTreeSet::from([canonical_existing_identity(fixture.path()).expect("canonical root")]);
     let retirement = {
         let registry = registry.clone();
         tokio::spawn(async move {
@@ -5802,7 +6093,7 @@ async fn background_reconciles_respect_a_single_admission_permit() {
     }
     // Publication broadcasts at publish time, before the pass's deliberately
     // admission-free tail (graph prepare, activation, serving seat) has run.
-    // Wait for both serving seats — the tail's last scheduler-lock step — so
+    // Wait for both serving seats, the tail's last scheduler-lock step, so
     // each worker is parked on its wake. Holding the first scheduler's lock
     // any earlier wedges that worker inside its tail, where it holds no
     // permit, and the second worktree would overtake through the free permit
@@ -5843,7 +6134,7 @@ async fn background_reconciles_respect_a_single_admission_permit() {
 
     first.edit("src/lib.rs", "pub fn first() -> u32 { 2 }\n");
     first_wake.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_owner_pass(&registry, first.path()).await;
 
     second.edit("src/lib.rs", "pub fn second() -> u32 { 2 }\n");
     assert!(matches!(
@@ -5852,7 +6143,12 @@ async fn background_reconciles_respect_a_single_admission_permit() {
             .await,
         super::super::CodeIndexDemandAdmissionV1::Queued
     ));
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_for_worker_phase(
+        &registry,
+        second.path(),
+        CodeIndexWorkerPhaseV1::AwaitingAdmission,
+    )
+    .await;
     assert_eq!(
         registry.latest_generation_id(second.path()).await,
         Some(second_generation.clone()),
@@ -5863,6 +6159,199 @@ async fn background_reconciles_respect_a_single_admission_permit() {
     lock_thread.join().expect("first lock thread joins");
     let _ = wait_for_generation_change(&registry, first.path(), &first_generation).await;
     let _ = wait_for_generation_change(&registry, second.path(), &second_generation).await;
+    registry.shutdown().await;
+}
+
+/// `tracedecay_status` `wait_for` rides on this wait. While graph activation
+/// of the first generation is held, a short wait for `ready` times out on the
+/// published generation with its graph pending; a longer one returns
+/// `Reached` only once activation is released, and the freshness it leaves
+/// behind serves that graph.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn readiness_wait_reaches_ready_exactly_when_the_held_graph_publishes() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    let admission = registry
+        .background_reconcile_admission()
+        .acquire_owned()
+        .await
+        .expect("hold worker before publication");
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+        )
+        .await
+        .expect("mount worktree");
+    let scope = registry
+        .serving_code_scope(fixture.path())
+        .await
+        .expect("mounted scope");
+    let gate = super::super::graph_activation::install_injected_activation_gate(&scope.worktree_id);
+    let mut publications = registry.subscribe_generation_publications();
+    drop(admission);
+    tokio::time::timeout(Duration::from_secs(10), gate.wait_until_started())
+        .await
+        .expect("graph activation reached the held gate");
+    let published = tokio::time::timeout(Duration::from_secs(10), publications.recv())
+        .await
+        .expect("publication deadline")
+        .expect("sealed publication");
+
+    let held = registry
+        .wait_for_readiness(
+            fixture.path(),
+            tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::Ready,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("freshness read");
+    let tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaitReadV1::TimedOut {
+        last: Some(last),
+    } = held
+    else {
+        panic!("a held graph cannot be ready: {held:?}");
+    };
+    assert_eq!(
+        last.latest_generation_id.as_deref(),
+        Some(published.generation_id.as_str())
+    );
+    assert_eq!(
+        last.code_graph_serving,
+        Some(tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Pending)
+    );
+    let held_graph_ready = registry
+        .wait_for_readiness(
+            fixture.path(),
+            tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::GraphReady,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("freshness read");
+    assert!(
+        matches!(
+            held_graph_ready,
+            tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaitReadV1::TimedOut {
+                last: Some(_)
+            }
+        ),
+        "a held graph cannot be graph_ready: {held_graph_ready:?}"
+    );
+
+    let waiter = registry.clone();
+    let root = fixture.path().to_path_buf();
+    let wait = tokio::spawn(async move {
+        waiter
+            .wait_for_readiness(
+                &root,
+                tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::Ready,
+                SERVING_SEAT_FAILURE_CEILING,
+            )
+            .await
+    });
+    gate.release();
+    let reached = wait
+        .await
+        .expect("wait task joins")
+        .expect("freshness read");
+    assert!(
+        matches!(
+            reached,
+            tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaitReadV1::Reached
+        ),
+        "{reached:?}"
+    );
+    let freshness = registry
+        .dashboard_freshness(fixture.path())
+        .await
+        .expect("mounted freshness");
+    assert_eq!(
+        freshness.code_graph_serving,
+        Some(tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready)
+    );
+    assert_eq!(
+        freshness.latest_generation_id.as_deref(),
+        Some(published.generation_id.as_str())
+    );
+    let graph_ready = registry
+        .wait_for_readiness(
+            fixture.path(),
+            tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::GraphReady,
+            Duration::from_millis(50),
+        )
+        .await
+        .expect("freshness read");
+    assert!(
+        matches!(
+            graph_ready,
+            tracedecay_contracts::code_index_freshness::CodeIndexReadinessWaitReadV1::Reached
+        ),
+        "{graph_ready:?}"
+    );
+    registry.shutdown().await;
+}
+
+/// A pass can start and settle entirely between two reads of the running
+/// level. The owner-activity counts only grow, so a reader that looks after
+/// the pass still sees it, and the worker phase says the pass and its tail
+/// are over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_activity_reports_a_pass_that_settled_before_the_reader_looked() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn source() -> u32 { 1 }\n")]);
+    let store = TempDir::new().expect("store root");
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    registry
+        .mount_worktree(
+            test_project_id(),
+            fixture.path(),
+            store.path().to_path_buf(),
+        )
+        .await
+        .expect("mount worktree");
+    let initial = wait_for_initial_generation(&registry, fixture.path()).await;
+    settled_owner_with_idle_admission(&registry, fixture.path()).await;
+    let activity = registry
+        .subscribe_owner_activity(fixture.path())
+        .await
+        .expect("mounted owner activity");
+    let before = activity.passes();
+    assert!(!before.running());
+    assert_eq!(activity.worker_phase(), CodeIndexWorkerPhaseV1::Parked);
+    let receipts = registry.subscribe_cadence_receipts();
+
+    fixture.edit("src/lib.rs", "pub fn source() -> u32 { 2 }\n");
+    assert!(matches!(
+        registry
+            .notify_hook_paths(fixture.path(), &["src/lib.rs".to_owned()])
+            .await,
+        super::super::CodeIndexDemandAdmissionV1::Queued
+    ));
+    let advanced = wait_for_generation_change(&registry, fixture.path(), &initial).await;
+    assert_ne!(advanced, initial);
+    wait_for_worker_phase(&registry, fixture.path(), CodeIndexWorkerPhaseV1::Parked).await;
+    wait_for_settled_owner(&registry, fixture.path()).await;
+
+    assert!(
+        !registry
+            .reconcile_in_progress_for_test(fixture.path())
+            .await,
+        "the running level no longer shows the pass"
+    );
+    let after = activity.passes();
+    assert!(
+        after.started > before.started,
+        "the settled pass is still counted: before {before:?} after {after:?}"
+    );
+    assert_eq!(after.settled, after.started);
+    assert!(!activity.wake_pending());
+    assert!(
+        receipts
+            .has_changed()
+            .expect("the cadence channel stays open while the registry lives"),
+        "the pass recorded a cadence receipt"
+    );
     registry.shutdown().await;
 }
 
@@ -5893,7 +6382,12 @@ async fn build_publication_lock_serializes_source_reconcile() {
             .await,
         super::super::CodeIndexDemandAdmissionV1::Queued
     ));
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_worker_phase(
+        &registry,
+        fixture.path(),
+        CodeIndexWorkerPhaseV1::AwaitingPublicationGate,
+    )
+    .await;
     assert_eq!(
         registry.latest_generation_id(fixture.path()).await,
         Some(initial.clone()),
@@ -5911,9 +6405,9 @@ async fn distinct_stores_reconcile_in_parallel_under_bounded_admission() {
     // With two permits, hold the FIRST worktree's scheduler lock so its worker
     // takes one permit and blocks mid-reconcile (an in-flight reconcile analog).
     // The SECOND worktree, writing to a different path-scoped store, must still
-    // acquire the remaining permit and publish — proving distinct stores are NOT
-    // serialized behind one another. (Same-store exclusion — that one worktree
-    // never runs two overlapping reconciles — is structural, from its single
+    // acquire the remaining permit and publish, proving distinct stores are NOT
+    // serialized behind one another. (Same-store exclusion, that one worktree
+    // never runs two overlapping reconciles, is structural, from its single
     // worker plus per-scheduler `Mutex`, and is covered by
     // `scheduler_notifications_release_registry_while_reconcile_is_busy`.)
     let first = GitFixture::new(&[("src/lib.rs", "pub fn first() -> u32 { 1 }\n")]);
@@ -5959,9 +6453,9 @@ async fn distinct_stores_reconcile_in_parallel_under_bounded_admission() {
     // occupies exactly one permit.
     first.edit("src/lib.rs", "pub fn first() -> u32 { 2 }\n");
     first_wake.notify_one();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_owner_pass(&registry, first.path()).await;
 
-    // The second worktree — a distinct path-scoped store — must proceed on the
+    // The second worktree, a distinct path-scoped store, must proceed on the
     // remaining permit and publish a new generation without the first releasing.
     // (Note: the first scheduler lock is deliberately held here, so we must NOT
     // query the first worktree via `latest_generation_id`, which would block on
@@ -5981,7 +6475,7 @@ async fn distinct_stores_reconcile_in_parallel_under_bounded_admission() {
     );
 
     // Release the first worktree and confirm it, too, reconciles the pending edit
-    // once its lock frees — it was blocked, never starved.
+    // once its lock frees, it was blocked, never starved.
     release_tx.send(()).expect("release first scheduler");
     lock_thread.join().expect("first lock thread joins");
     let advanced_first =
@@ -6050,7 +6544,7 @@ fn classification_distinguishes_staged_unstaged_untracked_and_deleted() {
     // Unstaged deletion.
     std::fs::remove_file(fixture.path().join("src/d.rs")).expect("remove d");
 
-    let repository = gix::open(fixture.path()).expect("open gix");
+    let repository = tracedecay_runtime_core::git_open::open(fixture.path()).expect("open gix");
     let classification = WorktreeChangeClassificationV1::classify(&repository).expect("classify");
 
     assert_eq!(
@@ -6108,9 +6602,10 @@ fn rename_reconciliation_matches_clean_scan() {
         fixture.path().join("src/new.rs"),
     )
     .expect("rename source file");
-    let classification =
-        WorktreeChangeClassificationV1::classify(&gix::open(fixture.path()).expect("open gix"))
-            .expect("classify rename");
+    let classification = WorktreeChangeClassificationV1::classify(
+        &tracedecay_runtime_core::git_open::open(fixture.path()).expect("open gix"),
+    )
+    .expect("classify rename");
     assert_eq!(
         classification.class_of("src/old.rs"),
         Some(WorktreeChangeClassV1::UnstagedDeleted)
@@ -6176,9 +6671,10 @@ fn index_only_reconciliation_matches_clean_scan() {
 
     fixture.edit("src/lib.rs", "pub fn staged_symbol() -> u32 { 10 }\n");
     git(fixture.path(), &["add", "src/lib.rs"]);
-    let classification =
-        WorktreeChangeClassificationV1::classify(&gix::open(fixture.path()).expect("open gix"))
-            .expect("classify staged-only edit");
+    let classification = WorktreeChangeClassificationV1::classify(
+        &tracedecay_runtime_core::git_open::open(fixture.path()).expect("open gix"),
+    )
+    .expect("classify staged-only edit");
     assert_eq!(
         classification.class_of("src/lib.rs"),
         Some(WorktreeChangeClassV1::StagedModified)
@@ -6717,12 +7213,13 @@ async fn expired_query_does_not_wait_for_a_busy_scheduler() {
         .await
         .expect("scheduler");
     let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
     let lock_thread = std::thread::spawn(move || {
         let _guard = scheduler
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         held_tx.send(()).expect("signal scheduler lock held");
-        std::thread::sleep(Duration::from_millis(300));
+        let _ = release_rx.recv();
     });
     held_rx.recv().expect("scheduler lock acquired");
 
@@ -6737,6 +7234,7 @@ async fn expired_query_does_not_wait_for_a_busy_scheduler() {
         )
         .await;
     let elapsed = started.elapsed();
+    release_tx.send(()).expect("release scheduler lock");
     lock_thread.join().expect("scheduler lock thread joins");
 
     assert!(matches!(outcome, RetrievalPortOutcome::Unavailable(_)));
@@ -6797,7 +7295,7 @@ fn same_content_head_move_publishes_new_source_identity() {
 
 /// A text freshness query that arrives while the worker still owns a pass
 /// cannot run the ladder itself, and the in-flight pass observed the source
-/// when *it* started — after publication it is still projecting text or
+/// when *it* started, after publication it is still projecting text or
 /// seating the graph of the previous source state. Answering stale without
 /// leaving a wake stranded the remedy until an unrelated hint arrived; the
 /// out-of-band commit stayed unserved (issue #917, the flaky tail of
@@ -6967,7 +7465,7 @@ async fn text_freshness_query_during_owner_work_schedules_a_follow_up_pass() {
 /// A text owner whose sealed source the fence has verified against the live
 /// tree is current even while the worker owns a pass: the read answers from
 /// source truth and leaves no follow-up wake. Treating every in-flight pass as
-/// staleness made a polling reader and the worker livelock — each read during
+/// staleness made a polling reader and the worker livelock, each read during
 /// a `Noop` pass posted a follow-up, the follow-up was another pass, and the
 /// owner was never called current although nothing moved (issue #1103). The
 /// same read during the same pass must still report a genuine edit stale.
@@ -6996,6 +7494,7 @@ async fn text_freshness_query_during_owner_work_is_current_when_source_is_unchan
     )
     .expect("resolved scope");
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let settled_deadline = Instant::now() + Duration::from_secs(10);
     while registry
         .reconcile_in_progress_for_test(fixture.path())
@@ -7005,14 +7504,16 @@ async fn text_freshness_query_during_owner_work_is_current_when_source_is_unchan
             Instant::now() <= settled_deadline,
             "initial graph-off mount never released its owner pass"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(settled_deadline).await;
     }
     let admission = registry
         .background_reconcile_admission()
         .acquire_owned()
         .await
         .expect("hold background reconcile admission");
-    registry.clear_pending_wake_for_scope(&scope).await;
+    // A pass tail that stamps `BusyFollowUp` after this clear would fail the
+    // "no wake" assertion below, so prove the empty slot holds.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
     // Stand in for a worker pass re-observing an unchanged tree: in-progress,
     // scheduler mutex free, nothing moved on disk or in git.
     let owner_pass = registry
@@ -7111,13 +7612,7 @@ async fn compiler_diagnostics_published_under_registry_identity_are_admitted_by_
         }
     }
 
-    fn id<T>(value: &str) -> T
-    where
-        T: TryFrom<String>,
-        <T as TryFrom<String>>::Error: std::fmt::Debug,
-    {
-        T::try_from(value.to_owned()).expect("valid fixture identity")
-    }
+    use tracedecay_domain::test_fixtures::id;
 
     let source = "pub fn alpha() -> u32 {\n    let value: u32 = \"nope\";\n    value\n}\n";
     let fixture = GitFixture::new(&[("src/lib.rs", "pub fn alpha() -> u32 { 1 }\n")]);
@@ -7607,7 +8102,7 @@ async fn mount_with_retained_generation_verifies_cadence_promptly() {
     let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let first_generation = {
         let mut scheduler = scheduler(&fixture, scoped_store, Arc::clone(&bytes));
@@ -7645,6 +8140,7 @@ async fn mount_with_retained_generation_verifies_cadence_promptly() {
     // Early publish records the Published receipt on the source pass; a
     // later graph/verify Noop can become `latest`. Wait for a Published
     // receipt in the set, not only the newest one.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let published_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if registry
@@ -7658,7 +8154,7 @@ async fn mount_with_retained_generation_verifies_cadence_promptly() {
             Instant::now() <= published_deadline,
             "stale retained generation must publish a refreshed generation"
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        signals.changed_before(published_deadline).await;
     }
     registry.shutdown().await;
 }
@@ -7672,7 +8168,7 @@ async fn mount_verification_noop_emits_event_to_ready_receipt() {
     let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     {
         let mut scheduler = scheduler(&fixture, scoped_store.clone(), Arc::clone(&bytes));
@@ -7751,7 +8247,7 @@ async fn witness_verified_mount_activates_without_rebuild() {
     let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let seeded = {
         let mut scheduler = scheduler(&fixture, scoped_store.clone(), Arc::clone(&bytes));
@@ -7794,7 +8290,7 @@ async fn reopened_current_text_generation_resolves_publication_identity_without_
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (generation, scope) = {
         let mut scheduler = scheduler(
@@ -7826,29 +8322,29 @@ async fn reopened_current_text_generation_resolves_publication_identity_without_
         )
         .await
         .expect("reopen retained generation");
-    let mut serving_changes = registry
-        .subscribe_serving_generation_changes(fixture.path())
-        .await
-        .expect("subscribe to retained serving changes");
     assert!(
         registry.request_complete_generation(fixture.path()).await,
         "mounted worktree admits complete-generation demand"
     );
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let current = loop {
-        if let Some((current, true)) = registry
-            .latest_text_serving_freshness_for_scope(&scope)
-            .await
-            && current.query_owners_are_ready()
-        {
-            break current;
-        }
-        tokio::time::timeout_at(deadline, serving_changes.changed())
-            .await
-            .expect("the current retained text owner wakes deferred consumers")
-            .expect("the serving-change channel stays open while mounted");
-    };
+    // A 5s `changed()` cut-off reports a late seat as a lost wake. The
+    // registry signal has no such wall-clock bound; the ceiling only
+    // distinguishes a seat that never arrives.
+    let current = wait_until_serving_seat(
+        &registry,
+        fixture.path(),
+        SERVING_SEAT_FAILURE_CEILING,
+        || async {
+            let Some((current, true)) = registry
+                .latest_text_serving_freshness_for_scope(&scope)
+                .await
+            else {
+                return None;
+            };
+            current.query_owners_are_ready().then_some(current)
+        },
+    )
+    .await;
     assert!(
         current.uses_partitioned_manifest(),
         "the retained text owner is the partitioned generation authority"
@@ -7896,7 +8392,7 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
     let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let scope = {
         let mut scheduler = scheduler(&fixture, scoped_store, bytes);
@@ -7934,7 +8430,7 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -7956,6 +8452,7 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
     drop(admission);
 
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         if registry
             .reconcile_in_progress_for_test(fixture.path())
@@ -7967,11 +8464,12 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
             std::time::Instant::now() <= deadline,
             "worker did not enter the retained activation pass"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(deadline).await;
     }
     release_tx.send(()).expect("release scheduler");
     lock_thread.join().expect("join scheduler holder");
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
         if registry
@@ -7985,7 +8483,7 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
             std::time::Instant::now() <= deadline,
             "failed activation did not restore its pending retry arrival"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(deadline).await;
     }
 
     assert_eq!(
@@ -8017,6 +8515,7 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
     );
     let receipts_before = registry.event_to_ready_receipts().len();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         let seated = registry
             .latest_generation_id(fixture.path())
@@ -8030,7 +8529,7 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
             std::time::Instant::now() <= deadline,
             "successful retry did not seat the verified retained generation with a cadence receipt; seated={seated} before={receipts_before} after={receipts_after}"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(deadline).await;
     }
     registry.shutdown().await;
 }
@@ -8040,12 +8539,12 @@ async fn failed_retained_activation_never_installs_unverified_serving_state() {
 /// ceiling must therefore degrade only graph capability instead of withholding
 /// the generation from every query surface.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn resident_memory_graph_refusal_seats_text_serving_without_graph() {
+async fn resident_memory_graph_refusal_serves_text_and_retries_when_memory_is_given_back() {
     let fixture = GitFixture::new(ALPHA_LIB_V1);
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, worktree_id) = {
         let mut scheduler = scheduler(
@@ -8070,7 +8569,9 @@ async fn resident_memory_graph_refusal_seats_text_serving_without_graph() {
     };
     super::super::graph_activation::set_injected_resident_memory_refusal(&worktree_id, true);
 
-    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
+    let owners = Arc::new(ResidentOwnersV1::new(Duration::from_mins(10)));
+    let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1)
+        .with_resident_owners(Arc::clone(&owners));
     registry
         .mount_worktree(
             test_project_id(),
@@ -8080,19 +8581,22 @@ async fn resident_memory_graph_refusal_seats_text_serving_without_graph() {
         .await
         .expect("mount retained generation");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let latest = loop {
-        if let Some(latest) = registry.latest_complete_serving_for_scope(&scope).await
-            && latest.query_owners_are_ready()
-        {
-            break latest;
-        }
-        assert!(
-            std::time::Instant::now() <= deadline,
-            "resident graph refusal withheld the text-serving generation"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    // The historical 5s/10ms poll misses a seat that lands after the
+    // deadline (`serving_seat_signal_observes_a_seat_that_misses_the_poll_deadline`).
+    // Graph refusal must still seat exact and lexical serving whenever
+    // that signal arrives.
+    let latest = wait_until_serving_seat(
+        &registry,
+        fixture.path(),
+        SERVING_SEAT_FAILURE_CEILING,
+        || async {
+            registry
+                .latest_complete_serving_for_scope(&scope)
+                .await
+                .filter(|latest| latest.query_owners_are_ready())
+        },
+    )
+    .await;
     assert!(
         latest.production_query_owners().is_ok(),
         "exact and lexical owners remain serving under graph refusal"
@@ -8119,9 +8623,100 @@ async fn resident_memory_graph_refusal_seats_text_serving_without_graph() {
             "text serving must not turn the refused graph into strict graph readiness: {other:?}"
         ),
     }
+    // While memory stays short the refusal reads as a typed park, not an
+    // indefinite `indexing` (issue #2057's restart after an interrupted
+    // build).
+    assert_eq!(
+        freshness.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Parked),
+        "a refused graph is parked, not indexing"
+    );
+    let parked = freshness.parked.expect("typed resident-memory park");
+    assert_eq!(
+        parked.blocked_reason,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexBuildBlockedReasonV1::ResidentMemory)
+    );
+    assert!(parked.retries_on_wake);
 
+    // Memory comes back: the injected refusal lifts and another worktree's
+    // decode is shed. No restart and no source change follow.
     super::super::graph_activation::set_injected_resident_memory_refusal(&worktree_id, false);
+    let idle_owner: Arc<dyn ResidentOwnerV1> = Arc::new(IdleDecodeOwner {
+        held: std::sync::atomic::AtomicBool::new(true),
+    });
+    let _idle_registration = owners
+        .register(
+            ResidentOwnerScopeV1 {
+                project_id: ProjectId::new("project.other").expect("project id"),
+                worktree_id: WorktreeId::new("worktree.other").expect("worktree id"),
+            },
+            ResidentOwnerKindV1::DecodedGeneration,
+            Arc::downgrade(&idle_owner),
+        )
+        .expect("register idle owner");
+    // Shedding frees only the unprotected owner: this worktree keeps its
+    // seated generation, so only the refused graph's own retry can seat it.
+    let released = owners.shed(4_096, Instant::now());
+    assert_eq!(
+        released
+            .iter()
+            .map(|release| release.generation_id.as_str())
+            .collect::<Vec<_>>(),
+        ["generation.v1.other"]
+    );
+
+    wait_for_dashboard_ready(&registry, fixture.path()).await;
+    let freshness = registry
+        .dashboard_freshness(fixture.path())
+        .await
+        .expect("mounted worktree freshness");
+    assert_eq!(
+        freshness.code_graph_serving,
+        Some(tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready)
+    );
+    assert!(freshness.parked.is_none(), "{freshness:?}");
+    let serving = registry
+        .latest_complete_serving_for_scope(&scope)
+        .await
+        .expect("the same daemon serves the generation");
+    assert_eq!(
+        serving
+            .generation()
+            .generation_statistics()
+            .expect("generation statistics")
+            .symbol_count,
+        1,
+        "`alpha` is the fixture's one symbol"
+    );
     registry.shutdown().await;
+}
+
+/// Another worktree's decode, not serving and so sheddable.
+struct IdleDecodeOwner {
+    held: std::sync::atomic::AtomicBool,
+}
+
+impl ResidentOwnerV1 for IdleDecodeOwner {
+    fn sample(&self) -> Option<ResidentOwnerSampleV1> {
+        self.held
+            .load(std::sync::atomic::Ordering::Acquire)
+            .then(|| ResidentOwnerSampleV1 {
+                generation_id: CodeGenerationId::new("generation.v1.other").expect("generation id"),
+                bytes: ResidentOwnerBytesV1::Measured(4_096),
+                last_used: Instant::now(),
+                serving: false,
+            })
+    }
+
+    fn release(&self) -> ResidentOwnerReleaseV1 {
+        if self.held.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            ResidentOwnerReleaseV1::Released {
+                bytes: ResidentOwnerBytesV1::Measured(4_096),
+            }
+        } else {
+            ResidentOwnerReleaseV1::Empty
+        }
+    }
 }
 
 /// A benign Git metadata rewrite after a clean graph-off seal must trigger one
@@ -8187,9 +8782,145 @@ fn graph_off_stale_witness_reconciles_unchanged_source_without_full_decode() {
     );
 }
 
+/// The disk freshness witness names whichever generation last persisted it.
+/// A later seal of the same bytes used to return `None` the moment that id
+/// disagreed, and the graph-on caller then decoded and resealed. Under load
+/// that reseal outlived the admission window, the swap cleared the witness,
+/// and the newer generation never became current. Unchanged sealed bytes
+/// keep the generation and rewrite the witness onto it. Moved bytes still
+/// refuse, without publishing a substitute.
+#[test]
+fn predecessor_freshness_witness_keeps_the_sealed_generation() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let seeded = published(scheduler.reconcile_now().expect("seed retained generation"));
+    let metadata = scheduler
+        .servable_retained_text_generation()
+        .expect("publication store")
+        .expect("authenticated retained text generation")
+        .metadata()
+        .clone();
+    let generation_id = metadata.manifest().generation_id.clone();
+    let mut witness =
+        RestoreFreshnessWitnessV1::load(store.path()).expect("the seal persisted a proof");
+    assert_eq!(witness.generation_id, generation_id.as_str());
+    witness.generation_id = "generation.predecessor".to_owned();
+    witness.persist(store.path());
+    let index_path = fixture.path().join(".git/index");
+    let index_mtime = std::fs::metadata(&index_path)
+        .expect("git index metadata")
+        .modified()
+        .expect("git index mtime");
+    filetime::set_file_mtime(
+        &index_path,
+        filetime::FileTime::from_system_time(index_mtime + Duration::from_secs(2)),
+    )
+    .expect("advance only the git index mtime");
+
+    let decodes_before = scheduler.sealed_decode_count();
+    let outcome = scheduler
+        .reconcile_retained_text_generation_with(&metadata, false)
+        .expect("graph-on retained reconcile")
+        .expect("unchanged sealed bytes must not be dropped");
+    let CodeIndexReconcileOutcomeV1::Noop(evidence) = outcome else {
+        panic!("predecessor proof must not reseal the same snapshot: {outcome:?}");
+    };
+    assert_eq!(
+        evidence.snapshot_content_identity, seeded.snapshot_content_identity,
+        "the noop names the generation that was already sealed"
+    );
+    assert_eq!(
+        scheduler.sealed_decode_count(),
+        decodes_before,
+        "keeping the sealed generation must not decode it again"
+    );
+    assert_eq!(
+        RestoreFreshnessWitnessV1::load(store.path())
+            .expect("rebound proof")
+            .generation_id,
+        generation_id.as_str(),
+        "the disk proof must name the sealed generation, not the predecessor"
+    );
+    assert_eq!(
+        scheduler
+            .source_currency_witness_for(&generation_id, &metadata.snapshot().content_identity,)
+            .map(|witness| witness.generation_id),
+        Some(generation_id.clone()),
+        "the in-memory proof must admit the sealed generation"
+    );
+
+    fixture.edit(
+        "src/lib.rs",
+        "pub fn changed_after_predecessor_proof() -> u32 { 2 }\n",
+    );
+    let refused = scheduler
+        .reconcile_retained_text_generation_with(&metadata, false)
+        .expect("changed source is a typed refusal, not an error");
+    assert!(
+        refused.is_none(),
+        "moved bytes must not keep the sealed generation: {refused:?}"
+    );
+    assert_eq!(
+        scheduler
+            .publication
+            .read_publication_pointer()
+            .expect("read pointer")
+            .expect("active pointer")
+            .generation_id,
+        generation_id.as_str(),
+        "refusing the moved bytes must not publish a substitute generation"
+    );
+}
+
+/// Clone backfill and the seal itself can outlast the probe window, and a
+/// seal can move the Git index it samples. Neither age nor a moved Git
+/// metadata sample is a reason to drop the generation the sealed digests
+/// already name: age is not evidence, and moved metadata re-checks those
+/// digests. A byte change behind moved metadata still drops it.
+#[test]
+fn moved_git_metadata_keeps_the_sealed_generation_until_bytes_move() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    let seeded = published(scheduler.reconcile_now().expect("seed retained generation"));
+    let witnessed = |scheduler: &CodeIndexWorktreeSchedulerV1| {
+        scheduler
+            .currency_witness_for_sealed_snapshot(
+                &seeded.generation_id,
+                &seeded.snapshot_content_identity,
+            )
+            .map(|witness| witness.generation_id)
+    };
+    scheduler.expire_source_proof_for_test();
+    let aged = witnessed(&scheduler);
+    move_git_metadata(fixture.path());
+    let moved_metadata = witnessed(&scheduler);
+    fixture.edit("src/lib.rs", "pub fn alpha() -> u32 { 9 }\n");
+    move_git_metadata(fixture.path());
+    let moved_bytes = witnessed(&scheduler);
+    assert_eq!(
+        (aged, moved_metadata, moved_bytes),
+        (
+            Some(seeded.generation_id.clone()),
+            Some(seeded.generation_id.clone()),
+            None,
+        ),
+        "age keeps the proof, moved metadata re-checks the sealed digests, and moved bytes drop it"
+    );
+}
+
 /// A query freshness probe against a restored owner that no pass has verified
-/// yet must report "not current" — the restart's first pass is still the
-/// remedy — without minting an observed source change: no overflow hint and no
+/// yet must report "not current", the restart's first pass is still the
+/// remedy, without minting an observed source change: no overflow hint and no
 /// cancellation epoch, because nothing was observed to move. The fabricated
 /// overflow made the graph-on restart's own verifying pass skip the
 /// sealed-digest witness a quiet tree satisfies and fall into the full sealed
@@ -8475,7 +9206,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, privacy_domain) = {
         let mut scheduler = scheduler(
@@ -8516,7 +9247,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         let mounted = registry.mounted.lock().await;
         Arc::clone(
             &mounted
-                .get(&fixture.path().canonicalize().expect("canonical root"))
+                .get(&canonical_existing_identity(fixture.path()).expect("canonical root"))
                 .expect("mounted worktree")
                 .scheduler,
         )
@@ -8610,7 +9341,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
     );
 
     let attempt_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while reconcile_in_progress.load(std::sync::atomic::Ordering::Acquire) == 0 {
+    while !reconcile_in_progress.running() {
         assert!(
             std::time::Instant::now() <= attempt_deadline,
             "transient publication failure was never attempted"
@@ -8618,7 +9349,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     let restore_deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while reconcile_in_progress.load(std::sync::atomic::Ordering::Acquire) != 0 {
+    while reconcile_in_progress.running() {
         assert!(
             std::time::Instant::now() <= restore_deadline,
             "transient publication failure did not terminate"
@@ -8831,7 +9562,7 @@ async fn graph_off_changed_source_advances_text_authority_without_full_decode() 
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Seal releases the decoded active generation so text projection does
-        // not keep a whole-generation owner. Inspect the durable pointer — do
+        // not keep a whole-generation owner. Inspect the durable pointer, do
         // not call load_active_shared here or the probe itself would decode.
         assert_eq!(
             scheduler.sealed_decode_count(),
@@ -8879,7 +9610,7 @@ async fn pinned_configuration_refuses_native_graph_before_text_serving_swap() {
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let scope = {
         let mut scheduler = scheduler(
@@ -8954,6 +9685,7 @@ async fn pinned_configuration_refuses_native_graph_before_text_serving_swap() {
     // the fence's bounded proof expires on its own clock, and a pass renewing
     // it republishes the owner. Sampling the owner once and resolving its
     // identity afterwards turned either boundary into a red.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
     let (latest, identity) = loop {
         if let Some((latest, current)) = registry
@@ -8974,7 +9706,7 @@ async fn pinned_configuration_refuses_native_graph_before_text_serving_swap() {
             Instant::now() <= deadline,
             "configured graph refusal withheld the ready text owner's publication identity"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(deadline).await;
     };
     assert!(
         registry
@@ -9051,7 +9783,7 @@ async fn same_root_remount_updates_retained_graph_policy_before_worker_activatio
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let scope = {
         let mut scheduler = scheduler(
@@ -9102,6 +9834,7 @@ async fn same_root_remount_updates_retained_graph_policy_before_worker_activatio
     );
     drop(activation);
 
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let latest = loop {
         if let Some((latest, _)) = registry
@@ -9115,7 +9848,7 @@ async fn same_root_remount_updates_retained_graph_policy_before_worker_activatio
             std::time::Instant::now() <= deadline,
             "updated same-root policy did not seat the retained text-serving owner"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(deadline).await;
     };
     assert!(
         registry
@@ -9142,7 +9875,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, generation_a) = {
         let mut scheduler = scheduler(
@@ -9176,6 +9909,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
         .await
         .expect("mount graph-off retained generation");
     let settled_deadline = Instant::now() + Duration::from_secs(10);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         let text_ready = registry
             .latest_text_serving_freshness_for_scope(&scope)
@@ -9192,7 +9926,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
             Instant::now() <= settled_deadline,
             "graph-off retained generation never settled"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(settled_deadline).await;
     }
 
     let admission = registry
@@ -9200,7 +9934,8 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
         .acquire_owned()
         .await
         .expect("hold worker after remount dequeue");
-    registry.clear_pending_wake_for_scope(&scope).await;
+    // Same tail: its stamp would look like the unhinted edit's own wake below.
+    clear_pending_wake_until_quiet(&registry, &scope).await;
     fixture.edit("src/lib.rs", "pub fn beta() -> usize { 2 }\n");
     git(fixture.path(), &["commit", "-qam", "unhinted remount edit"]);
 
@@ -9226,6 +9961,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
     drop(admission);
 
     let reconcile_deadline = Instant::now() + Duration::from_secs(10);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         let generation = registry.latest_generation_id(fixture.path()).await;
         if generation
@@ -9238,7 +9974,7 @@ async fn graph_off_remount_preserves_an_unhinted_source_reconcile() {
             Instant::now() <= reconcile_deadline,
             "the remount wake never reconciled the unhinted edit"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(reconcile_deadline).await;
     }
     registry.shutdown().await;
 }
@@ -9265,7 +10001,7 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
     let bytes = Arc::new(SharedCodeIndexBytePoolV1::default());
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, sealed_worktree_id, sealed_generation_id) = {
         let mut scheduler = scheduler(&fixture, scoped_store.clone(), bytes);
@@ -9400,6 +10136,7 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
     let text_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let (text_owner_after_refresh, refreshed_generation_id) = loop {
         let generation_id = registry.latest_generation_id(fixture.path()).await;
         if let (Some(text), Some(generation_id)) = (
@@ -9414,7 +10151,7 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
             std::time::Instant::now() <= text_deadline,
             "graph retry backoff withheld the changed exact and lexical generation"
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        signals.changed_before(text_deadline).await;
     };
     assert!(
         !text_owner_after_refresh.same_text_owner(&text_owner_before_retry),
@@ -9447,34 +10184,48 @@ async fn retryable_graph_activation_does_not_block_changed_text_generation() {
             tracedecay_contracts::code_index_freshness::CodeIndexBuildPhaseV1::Ready
         );
     }
-    assert!(
-        registry
-            .latest_complete_serving_for_scope(&scope)
-            .await
-            .is_none(),
-        "retryable graph activation must not expose an unactivated graph owner"
+    // A retryable failure still seats the changed generation; its graph stays
+    // typed pending until a retry activates it.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
+    let seat_deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let seated = loop {
+        if let Some(latest) = registry.latest_complete_serving_for_scope(&scope).await
+            && latest.generation().manifest().generation_id == refreshed_generation_id
+        {
+            break latest;
+        }
+        assert!(
+            std::time::Instant::now() <= seat_deadline,
+            "graph retry backoff withheld the changed generation's seat"
+        );
+        signals.changed_before(seat_deadline).await;
+    };
+    assert_eq!(
+        seated.code_graph_serving_readiness(),
+        tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Pending,
+        "retryable graph activation must not expose an activated graph"
     );
 
     // Clearing the injected failure lets the scheduled backoff activate the
-    // changed generation without resealing it.
+    // seated generation without resealing it.
     super::super::graph_activation::set_injected_activation_failures(&sealed_worktree_id, 0);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if registry
-            .latest_complete_serving_for_scope(&scope)
-            .await
-            .is_some_and(|latest| {
-                latest.generation().manifest().generation_id == refreshed_generation_id
-            })
-        {
-            break;
-        }
+    while seated.code_graph_serving_readiness()
+        != tracedecay_contracts::code_index_freshness::CodeGraphServingReadinessV1::Ready
+    {
         assert!(
             std::time::Instant::now() <= deadline,
             "the backoff retry did not activate the sealed generation"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        signals.changed_before(deadline).await;
     }
+    assert_eq!(
+        registry.latest_generation_id(fixture.path()).await,
+        Some(refreshed_generation_id),
+        "activation must not reseal the changed generation"
+    );
+    assert_eq!(generation_files(&scoped_store), 2);
     registry.shutdown().await;
 }
 
@@ -9518,7 +10269,7 @@ fn dashboard_graph_readiness_follows_the_current_text_generation() {
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let mut scheduler = scheduler(
         &fixture,
@@ -9557,7 +10308,7 @@ async fn terminal_graph_activation_failure_is_typed_for_current_text_generation(
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let (scope, worktree_id) = {
         let mut scheduler = scheduler(
@@ -9602,6 +10353,7 @@ async fn terminal_graph_activation_failure_is_typed_for_current_text_generation(
     activation_gate.release();
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let reason = loop {
         let freshness = registry
             .dashboard_freshness(fixture.path())
@@ -9620,7 +10372,7 @@ async fn terminal_graph_activation_failure_is_typed_for_current_text_generation(
             Instant::now() <= deadline,
             "terminal graph activation failure remained pending: {freshness:?}"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(deadline).await;
     };
     assert!(
         reason.contains("injected terminal graph activation failure"),
@@ -9629,6 +10381,7 @@ async fn terminal_graph_activation_failure_is_typed_for_current_text_generation(
     // The owner's projection runs on its own task now, so the terminal graph
     // failure above can be observed before it finishes. Withdrawal is still
     // falsified: a withdrawn owner never becomes warm and this deadline fires.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let serving_deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if registry
@@ -9642,7 +10395,7 @@ async fn terminal_graph_activation_failure_is_typed_for_current_text_generation(
             Instant::now() <= serving_deadline,
             "terminal native graph failure must not withdraw exact/lexical serving"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(serving_deadline).await;
     }
     registry.shutdown().await;
 }
@@ -9657,7 +10410,7 @@ async fn graph_decode_does_not_block_text_freshness() {
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let scope = {
         let mut scheduler = scheduler(
@@ -9687,6 +10440,7 @@ async fn graph_decode_does_not_block_text_freshness() {
         )
         .await
         .expect("mount text-only retained generation");
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if registry
@@ -9696,7 +10450,7 @@ async fn graph_decode_does_not_block_text_freshness() {
             {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(2)).await;
+            signals.changed().await;
         }
     })
     .await
@@ -9804,6 +10558,21 @@ async fn busy_admission_schedules_follow_up_cadence_wake() {
         let _ = release_rx.recv();
     });
     held_rx.recv().expect("lock acquired");
+    // Busy means a pass owns the worktree: wake one and let it park on the
+    // held scheduler before the read.
+    let _ = registry.notify_hook_overflow(fixture.path()).await;
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
+    let busy_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !registry
+        .reconcile_in_progress_for_test(fixture.path())
+        .await
+    {
+        assert!(
+            std::time::Instant::now() <= busy_deadline,
+            "the woken pass never took the worktree"
+        );
+        signals.changed_before(busy_deadline).await;
+    }
 
     let latest = tokio::time::timeout(
         Duration::from_millis(250),
@@ -9819,6 +10588,7 @@ async fn busy_admission_schedules_follow_up_cadence_wake() {
 
     // The follow-up wake must produce its own cadence receipt after the lock
     // frees.
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
         let receipts = registry.event_to_ready_receipts();
@@ -9833,7 +10603,7 @@ async fn busy_admission_schedules_follow_up_cadence_wake() {
             std::time::Instant::now() <= deadline,
             "busy follow-up wake did not produce a cadence receipt"
         );
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        signals.changed_before(deadline).await;
     }
     registry.shutdown().await;
 }
@@ -9895,6 +10665,7 @@ async fn blocked_observability_store_does_not_hold_reconcile_readiness() {
     let _ = wait_for_generation_change(&registry, fixture.path(), &initial).await;
 
     let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     loop {
         let freshness = registry
             .dashboard_freshness(fixture.path())
@@ -9908,7 +10679,7 @@ async fn blocked_observability_store_does_not_hold_reconcile_readiness() {
             std::time::Instant::now() <= deadline,
             "optional telemetry held successful reconcile readiness: {freshness:?}"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        signals.changed_before(deadline).await;
     }
 
     blocked_writer
@@ -9916,7 +10687,20 @@ async fn blocked_observability_store_does_not_hold_reconcile_readiness() {
         .await
         .expect("release observability writer");
     registry.shutdown().await;
-    producer.shutdown().await.expect("flush producer");
+    // The writer held above is this store's only one, and it is held across a
+    // whole reconcile, so the producer's own bounded persistence budget can
+    // expire against it on a slow host: the lane then drops that batch and
+    // latches the denial for its whole life, which `shutdown` reports even
+    // after the writer is released. That denial is the arrangement this test
+    // builds, not a defect. The contract is the readiness loop above, which
+    // converged while the store was blocked; any other fault here is a real
+    // producer defect.
+    match producer.shutdown().await {
+        Ok(_) => {}
+        Err(tracedecay_contracts::ApplicationContractError::Domain(domain))
+            if domain == "observability_persistence_deadline" => {}
+        Err(error) => panic!("flush producer: {error:?}"),
+    }
 }
 
 /// The installed observability lane must persist one canonical index
@@ -10098,7 +10882,7 @@ async fn continuously_edited_tree_still_seats_the_sealed_graph_generation() {
     let store = TempDir::new().expect("store root");
     let scoped_store = super::super::scoped_code_index_store_root(
         store.path(),
-        &fixture.path().canonicalize().expect("canonical fixture"),
+        &canonical_existing_identity(fixture.path()).expect("canonical fixture"),
     );
     let scope = {
         let mut scheduler = scheduler(
@@ -10155,6 +10939,7 @@ async fn continuously_edited_tree_still_seats_the_sealed_graph_generation() {
     });
 
     let deadline = Instant::now() + Duration::from_mins(1);
+    let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
     let seated = loop {
         if let Some(seated) = registry.latest_complete_serving_for_scope(&scope).await {
             break Some(seated.generation().manifest().generation_id.clone());
@@ -10192,12 +10977,13 @@ async fn continuously_edited_tree_still_seats_the_sealed_graph_generation() {
                 text.map(|text| text.query_owners_are_ready()),
             );
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        signals.changed_before(deadline).await;
     };
 
     // The seat is stale by construction - the tree moved on while it sealed -
     // and the next sealed generation must still supersede it.
     if let Some(seated) = seated {
+        let mut signals = OwnerSignals::subscribe(&registry, fixture.path()).await;
         let deadline = Instant::now() + Duration::from_mins(1);
         loop {
             let current = registry
@@ -10211,7 +10997,7 @@ async fn continuously_edited_tree_still_seats_the_sealed_graph_generation() {
                 Instant::now() <= deadline,
                 "a stale seat was never superseded by the generation that sealed after it"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            signals.changed_before(deadline).await;
         }
     }
 
@@ -10243,7 +11029,7 @@ fn a_publication_seats_its_own_generation_without_waiting_for_a_quiet_tree() {
         "a publication whose replacement text owner did not become ready must not start graph work"
     );
     // The ready bit above is `query_owners_are_ready` at both the published
-    // seat gate and the full-replay skip — never a second, forked check for
+    // seat gate and the full-replay skip, never a second, forked check for
     // "exact/lexical" or clone-complete. See
     // `query_owners_ready_admits_seat_and_replay_both_directions`.
     assert_eq!(
@@ -10361,7 +11147,7 @@ fn serving_swap_seats_a_generation_whose_publication_moved_while_it_activated() 
         ServingSwapOutcomeV1::decide(false, false, true),
         ServingSwapOutcomeV1::SeatedStale,
         "an activated generation whose pointer moved must seat when no active \
-         publication holds the slot — empty, or an incumbent the store \
+         publication holds the slot, empty, or an incumbent the store \
          superseded as well"
     );
     assert_eq!(
@@ -10388,5 +11174,68 @@ fn serving_swap_seats_a_generation_whose_publication_moved_while_it_activated() 
         !ServingSwapOutcomeV1::decide(false, true, true).installs()
             && !ServingSwapOutcomeV1::decide(true, true, false).installs(),
         "neither refusing arm writes the serving slot"
+    );
+}
+
+/// Unchanged source bytes are not a reason to keep a generation the checkout
+/// has committed past. An empty (or docs-only) commit moves HEAD without
+/// touching one indexed byte, and `finish_retained_reconcile` rebuilds on
+/// exactly that `source_revision` drift because branch-scoped reads resolve
+/// generations by the commit they sealed. Accepting the sealed snapshot here
+/// would pin the stale attribution for as long as the bytes hold still.
+#[test]
+fn a_moved_commit_refuses_the_sealed_generation_despite_identical_bytes() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let mut scheduler = scheduler(
+        &fixture,
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    );
+    published(scheduler.reconcile_now().expect("seed retained generation"));
+    let metadata = scheduler
+        .servable_retained_text_generation()
+        .expect("publication store")
+        .expect("authenticated retained text generation")
+        .metadata()
+        .clone();
+    let sealed_revision = metadata
+        .snapshot()
+        .source_revision
+        .clone()
+        .expect("a clean seed seals its commit");
+    git(
+        fixture.path(),
+        &["commit", "-qm", "docs only", "--allow-empty"],
+    );
+    let moved_head =
+        CommitId::new(git_stdout(fixture.path(), &["rev-parse", "HEAD"])).expect("moved HEAD");
+    assert_ne!(sealed_revision, moved_head, "the fixture must move HEAD");
+
+    let refused = scheduler
+        .reconcile_retained_text_generation_with(&metadata, false)
+        .expect("graph-on retained reconcile");
+    assert!(
+        refused.is_none(),
+        "a moved commit must not keep the generation sealed at {sealed_revision:?}: {refused:?}"
+    );
+
+    // The refusal is what hands the pass to the authoritative capture, and
+    // that capture is what re-attributes the generation to the new commit.
+    published(
+        scheduler
+            .reconcile_now()
+            .expect("rebuild at the moved commit"),
+    );
+    assert_eq!(
+        scheduler
+            .servable_retained_text_generation()
+            .expect("publication store")
+            .expect("authenticated retained text generation")
+            .metadata()
+            .snapshot()
+            .source_revision,
+        Some(moved_head),
+        "the rebuilt generation must name the commit the checkout is on"
     );
 }

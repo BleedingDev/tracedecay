@@ -84,6 +84,13 @@ pub enum ProjectionSkipReason {
     SanitizationRefused,
 }
 
+/// Retry deadline that parks one projection queue row permanently.
+///
+/// A genuine session-output collision records its error on that row and sets
+/// this deadline. Queue-head selection and restart re-arm ignore the row, so
+/// the projector advances and the same collision is not retried every pass.
+pub const PROJECTION_TERMINAL_RETRY_MICROS: i64 = i64::MAX;
+
 impl ProjectionSkipReason {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -172,10 +179,11 @@ impl ObservationProjection {
     /// The deterministic `output_digest` is a pure function of the projector
     /// version, ordinal, session, and message, so it is derived lazily on first
     /// use (see [`SessionMessageProjection::output_digest`]) instead of on
-    /// every derivation. Read paths that only need the projected records —
-    /// temporal hydration, occurrence materialization, parent resolution —
+    /// every derivation. Read paths that only need the projected records
     /// therefore never pay the canonical-JSON plus SHA-256 cost, while write
-    /// paths that persist the digest observe byte-identical values.
+    /// paths that persist the digest observe byte-identical values. That
+    /// covers temporal hydration, occurrence materialization, and parent
+    /// resolution.
     fn message_projection(
         provenance: ProjectionProvenance,
         session: SessionRecord,
@@ -434,9 +442,6 @@ fn workflow_fact_output_digest(
         .clone())
 }
 
-pub type ClaudeObservationProjection = ObservationProjection;
-pub type ClaudeSessionMessageProjection = SessionMessageProjection;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionCheckpoint {
     last_sequence: u64,
@@ -588,6 +593,12 @@ pub enum ProjectionStoreError {
         provider: String,
         message_id: String,
     },
+    #[error("projection session output collided at {provider}/{session_id}: {field} differs")]
+    SessionOutputCollision {
+        provider: String,
+        session_id: String,
+        field: &'static str,
+    },
     #[error("projection provenance collided with an existing output")]
     ProvenanceCollision,
     #[error("projection rebuild frontier {frontier} is past committed sequence {committed}")]
@@ -661,7 +672,7 @@ pub struct ProjectionBatchItem {
 pub struct ProjectionDrainBatch {
     /// Items in authoritative sequence order.
     pub items: Vec<ProjectionBatchItem>,
-    /// Whether queued work remains after this window — either ready items
+    /// Whether queued work remains after this window, either ready items
     /// past the window budget or a retry-deferred queue head.
     pub has_more: bool,
 }

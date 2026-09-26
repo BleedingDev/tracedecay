@@ -12,8 +12,8 @@
 //! Every field is **required**: a hook that reaches this module in production
 //! needs all of them, so there is no partial handle and no per-capability
 //! default. Because the handle is a parameter rather than a slot, a hook path
-//! cannot run without one — the compiler, not a runtime probe, is the
-//! composition check — and two fixtures can hold two different handles in the
+//! cannot run without one, the compiler, not a runtime probe, is the
+//! composition check, and two fixtures can hold two different handles in the
 //! same process without a first-registration-wins race.
 //!
 //! Two former slots are gone rather than moved. The memory-injection gate and
@@ -137,8 +137,7 @@ mod test_runtime {
     /// registered identity authority; this crate's tests seed the markers
     /// directly, so the fixture reads them.
     fn initialized(project_root: &Path) -> bool {
-        tracedecay_runtime_core::config::has_project_database(project_root)
-            || tracedecay_runtime_core::storage::has_repository_identity_marker(project_root)
+        tracedecay_runtime_core::storage::has_repository_identity_marker(project_root)
     }
 
     fn layout(_: &Path) -> Pin<Box<dyn Future<Output = Result<StoreLayout>> + Send + '_>> {

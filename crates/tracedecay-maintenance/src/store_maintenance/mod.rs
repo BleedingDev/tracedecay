@@ -2,7 +2,7 @@
 //! maintenance owner.
 //!
 //! Every operation that opens or garbage-collects a store lives here so its
-//! [`StoreAdministration`] lifetime is kept separate from the watcher state
+//! `StoreAdministration` lifetime is kept separate from the watcher state
 //! machine. The git watcher itself never opens or mutates a store: it routes
 //! exact-frontier freshness requests to the code-index scheduler and wakes the
 //! maintenance owner.
@@ -12,7 +12,6 @@ use std::path::Path;
 use crate::lease::ProjectStoreMaintenanceLeaseV1;
 use crate::telemetry::StoreTelemetrySamplingRegistry;
 use tracedecay_code_index_runtime::code_index_scheduler::CodeIndexSchedulerRegistryV1;
-use tracedecay_contracts::storage::compaction::CompactionThresholdConfig;
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 mod graph_replay;
@@ -20,11 +19,12 @@ use graph_replay::{defer_graph_replay_pool_busy, log_code_generation_retention_d
 
 /// Outcome of one bounded code-generation retention pass.
 ///
-/// `MoreWork` reports bounded progress with a remaining backlog — another
-/// collectable superseded generation, or unconsumed graph-replay release
-/// evidence — so the maintenance owner keeps the short cadence until the
-/// store converges instead of parking multi-GiB debris behind the full
-/// maintenance interval.
+/// `MoreWork` reports bounded progress with a remaining backlog, another
+/// collectable superseded generation, superseded bytes a transient holder
+/// (serving seat, in-flight text replacement) is about to release, or
+/// unconsumed graph-replay release evidence, so the maintenance owner keeps
+/// the short cadence until the store converges instead of parking multi-GiB
+/// debris behind the full maintenance interval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodeGenerationRetentionOutcomeV1 {
     Complete,
@@ -57,7 +57,7 @@ pub async fn run_code_generation_retention(
     lease: &ProjectStoreMaintenanceLeaseV1,
     schedulers: &CodeIndexSchedulerRegistryV1,
     observations: &StoreTelemetrySamplingRegistry,
-    cancellation: &tracedecay_session_memory::context::CancellationToken,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
 ) -> CodeGenerationRetentionOutcomeV1 {
     use tracedecay_code_index_retention::code_index_generations::{
         CodeGenerationRetentionErrorV1, CodeGenerationRetentionModeV1,
@@ -77,7 +77,7 @@ pub async fn run_code_generation_retention(
     // *without* an active pointer is different: it is crash debris from a
     // publish that never reached its pointer write (an OOM-killed rebuild is
     // the ordinary cause), and the planner collects it as a typed unpublished
-    // store — before this, such orphaned partial generations were unreachable
+    // store, before this, such orphaned partial generations were unreachable
     // by every retention pass while their worktree root stayed live.
     if !store_root.is_dir() {
         return CodeGenerationRetentionOutcomeV1::Complete;
@@ -90,14 +90,15 @@ pub async fn run_code_generation_retention(
         .graph_db()
         .database_path()
         .with_extension("graph-replay");
-    let mut protected_sources = serving_generation_pins(schedulers, &layout.project_root).await;
+    let serving_pins = serving_generation_pins(schedulers, &layout.project_root).await;
+    let mut protected_sources = serving_pins.clone();
     // Native previews bind retained-only candidate generations between
     // preflight and terminal apply. Their durable commitments are liveness
     // roots; omitting them lets an ordinary maintenance tick collect the exact
     // evidence apply must reopen. The bindings are keyed by repository, which
     // is a pure function of the checkout's git common dir: a project whose
-    // worktree is not mounted in this daemon — the inactive project with the
-    // largest backlog — still resolves it, so retention neither collects blind
+    // worktree is not mounted in this daemon, the inactive project with the
+    // largest backlog, still resolves it, so retention neither collects blind
     // nor fails every tick. Only a root that cannot yield an identity at all
     // stays fail-closed.
     let repository_id = match schedulers.serving_code_scope(&layout.project_root).await {
@@ -131,8 +132,8 @@ pub async fn run_code_generation_retention(
     // that as `graph_replay_release_failed error=DeadlineExceeded` on every
     // tick), and the collection executor would then contend for the same
     // lock while holding the daemon writer gate. One non-blocking probe
-    // defers the pass for this tick instead — before the multi-GiB
-    // full-digest planning below is paid — and the executor's own checked
+    // defers the pass for this tick instead, before the multi-GiB
+    // full-digest planning below is paid, and the executor's own checked
     // acquire returns `GraphReplayPoolBusy` if a publisher wins the
     // probe-to-execute window, so the writer gate is never pinned on a
     // blocking flock. Both paths arm the same bounded release backoff.
@@ -194,7 +195,7 @@ pub async fn run_code_generation_retention(
     };
     // A failed, deferred, or retained replay reconcile keeps its durable
     // release evidence for a later graph-available pass. Deleting newly
-    // planned files stays safe — retention hard-links each retired generation
+    // planned files stays safe, retention hard-links each retired generation
     // into the replay pool before its release event becomes durable, so the
     // graph can always finish its retirement later. The pass therefore keeps
     // collecting instead of letting sealed generations and their multi-GiB
@@ -227,10 +228,15 @@ pub async fn run_code_generation_retention(
             false
         }
     };
+    // A superseded generation still named by the serving or text slot, or a
+    // text replacement still building, is released by a seat or descriptor
+    // publication that does not wake maintenance. Without the short cadence
+    // its bytes wait for the next full interval (a day by default).
+    let awaits_transient_release = plan.awaits_transient_release(&serving_pins);
     if !plan.has_collectable_work() {
         return if replay_reconcile_failed {
             CodeGenerationRetentionOutcomeV1::Failed
-        } else if release_backlog_remains {
+        } else if release_backlog_remains || awaits_transient_release {
             CodeGenerationRetentionOutcomeV1::MoreWork
         } else {
             CodeGenerationRetentionOutcomeV1::Complete
@@ -301,7 +307,7 @@ pub async fn run_code_generation_retention(
                 );
             }
             // The just-collected generation queued fresh release evidence;
-            // offer it to the graph immediately — but only when this tick's
+            // offer it to the graph immediately, but only when this tick's
             // earlier reconcile was actually served. A deferred or failed
             // runtime must not be probed twice in one tick.
             let mut release_reconcile_failed = replay_reconcile_failed;
@@ -328,6 +334,7 @@ pub async fn run_code_generation_retention(
             if release_reconcile_failed {
                 CodeGenerationRetentionOutcomeV1::Failed
             } else if release_backlog_remains
+                || awaits_transient_release
                 || report.generation_segment_batch_exhausted
                 || !report.deleted_generations.is_empty()
                 || !report.deleted_text_artifacts.is_empty()
@@ -398,83 +405,4 @@ async fn serving_generation_pins(
         pins.insert(text.metadata().manifest().generation_id.clone());
     }
     pins
-}
-
-/// Runs bounded incremental-vacuum compaction over every tracked branch
-/// database other than the one `cg` currently has mounted (the maintenance
-/// owner compacts that store through its live-runtime authority). Best-effort
-/// and independent per file: a busy or failing branch database never blocks
-/// the rest, but keeps the maintenance cadence retry-eligible — see
-/// `src/retention/branch_compaction.rs` for the compaction policy itself.
-#[hotpath::measure(label = "daemon.git.maintenance.branch_compaction")]
-pub fn run_branch_compaction(
-    lease: &ProjectStoreMaintenanceLeaseV1,
-    config: &CompactionThresholdConfig,
-) -> bool {
-    let layout = lease.store_layout();
-    let Some(meta) = tracedecay_runtime_core::branch_meta::load_branch_meta(&layout.data_root)
-    else {
-        return true;
-    };
-    let active_db_path = layout.graph_db_path.clone();
-    let candidates = crate::retention::branch_compaction::select_branch_db_candidates(
-        &layout.data_root,
-        &meta,
-        &active_db_path,
-    );
-    if candidates.is_empty() {
-        return true;
-    }
-    let report = crate::retention::branch_compaction::compact_branch_databases(&candidates, config);
-    if report.policy_invalid {
-        // Never silent: an out-of-range threshold disables the pass entirely
-        // and would otherwise be indistinguishable from "nothing to compact".
-        log_daemon_event(
-            "retention_degraded",
-            &[
-                ("pass", "branch_compaction".to_string()),
-                ("failure", "invalid_compaction_policy".to_string()),
-                (
-                    "free_page_ratio_threshold",
-                    config.free_page_ratio_threshold.to_string(),
-                ),
-            ],
-        );
-        return false;
-    }
-    if report.compacted.is_empty() && report.skipped.is_empty() {
-        return true;
-    }
-    let freed_pages: u64 = report
-        .compacted
-        .iter()
-        .map(|outcome| outcome.freed_pages)
-        .sum();
-    let unreclaimable = report
-        .skipped
-        .iter()
-        .filter(|skip| {
-            skip.reason
-                == crate::retention::branch_compaction::BranchCompactionSkipReason::IncrementalVacuumUnavailable
-        })
-        .count();
-    log_daemon_event(
-        "retention_branch_compaction",
-        &[
-            ("project", lease.project_root().display().to_string()),
-            ("compacted", report.compacted.len().to_string()),
-            ("freed_pages", freed_pages.to_string()),
-            ("skipped", report.skipped.len().to_string()),
-            // Branch databases predating `auto_vacuum = INCREMENTAL`: their
-            // free pages need a full VACUUM this pass deliberately avoids.
-            ("unreclaimable", unreclaimable.to_string()),
-        ],
-    );
-    branch_compaction_succeeded(&report)
-}
-
-pub fn branch_compaction_succeeded(
-    report: &crate::retention::branch_compaction::BranchCompactionReport,
-) -> bool {
-    !report.policy_invalid && report.skipped.is_empty()
 }

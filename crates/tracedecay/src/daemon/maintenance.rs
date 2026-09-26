@@ -16,6 +16,7 @@ use tracedecay_maintenance::tick::{
 };
 
 use super::branch_admin::StoreAdministration;
+use tracedecay_daemon_service::shutdown::DAEMON_TASK_ABORT_DEADLINE;
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 const MAINTENANCE_STORE_PAGE_LIMIT: usize = 8;
@@ -25,7 +26,7 @@ async fn join_abandoned_maintenance_task(task: Option<JoinHandle<()>>, owner: &'
         return;
     };
     task.abort();
-    match tokio::time::timeout(super::DAEMON_TASK_ABORT_DEADLINE, task).await {
+    match tokio::time::timeout(DAEMON_TASK_ABORT_DEADLINE, task).await {
         Ok(Ok(()) | Err(_)) => {}
         Err(_) => {
             log_daemon_event(
@@ -132,6 +133,7 @@ async fn run_registered_store_retention(
         ),
         Ok(_) => {}
     }
+    log_payload_gc_outcome(&report.payload_gc);
     let mut succeeded = report.succeeded();
     if let Some(compaction) = &config.compaction {
         let outcome = tracedecay_maintenance::retention::live_compaction::compact_registered_store(
@@ -141,6 +143,33 @@ async fn run_registered_store_retention(
         succeeded &= record_live_compaction_outcome("mounted_sessions", outcome);
     }
     succeeded
+}
+
+fn log_payload_gc_outcome(
+    outcome: &Result<
+        tracedecay_lcm::LcmGcReport,
+        tracedecay_maintenance::retention::registered_store::RegisteredStoreRetentionErrorV1,
+    >,
+) {
+    match outcome {
+        Ok(gc) if gc.totals.files > 0 || !gc.errors.is_empty() => log_daemon_event(
+            "retention_lcm_payload_gc",
+            &[
+                ("store", "mounted_sessions".to_owned()),
+                ("reaped_files", gc.totals.files.to_string()),
+                ("bytes_reclaimed", gc.totals.bytes.to_string()),
+                ("errors", gc.errors.len().to_string()),
+            ],
+        ),
+        Err(error) => log_daemon_event(
+            "retention_degraded",
+            &[
+                ("pass", "lcm_payload_gc".to_owned()),
+                ("failure", error.diagnostic().to_owned()),
+            ],
+        ),
+        Ok(_) => {}
+    }
 }
 
 #[hotpath::measure(
@@ -226,12 +255,11 @@ pub(super) struct MaintenanceMetricsV1 {
     pub(super) last_outcome: Option<MaintenanceStoreOutcomeV1>,
 }
 
-/// Grace windows for the daily branch-store GC pass, taken from the pinned
+/// Grace window for the daily branch-store GC pass, taken from the pinned
 /// sync configuration at daemon startup.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct BranchStoreGcCadenceV1 {
     pub(super) branch_gc_days: u64,
-    pub(super) orphan_db_gc_days: u64,
 }
 
 /// Interval between branch-store GC passes across mounted projects.
@@ -239,7 +267,7 @@ const BRANCH_STORE_GC_PERIOD: Duration = Duration::from_hours(24);
 
 #[derive(Clone)]
 pub(super) struct MaintenanceCoordinator {
-    cancellation: tracedecay_session_memory::context::CancellationToken,
+    cancellation: tracedecay_runtime_core::cancellation::CancellationToken,
     background_cpu: Option<Arc<tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1>>,
     wake: Arc<MaintenanceWake>,
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
@@ -262,7 +290,7 @@ pub(super) struct MaintenanceCoordinator {
 impl Default for MaintenanceCoordinator {
     fn default() -> Self {
         Self {
-            cancellation: tracedecay_session_memory::context::CancellationToken::new(),
+            cancellation: tracedecay_runtime_core::cancellation::CancellationToken::new(),
             background_cpu: None,
             wake: Arc::new(MaintenanceWake::default()),
             task: Arc::new(Mutex::new(None)),
@@ -282,7 +310,7 @@ impl Default for MaintenanceCoordinator {
 /// store stays alive for the duration of the writer-held critical section.
 enum MaintenanceStoreWork {
     Session(tracedecay_global_db::RegisteredGlobalDbLeaseV1),
-    Graph(Arc<crate::project::TraceDecay>),
+    Graph(Arc<tracedecay_project::project::TraceDecay>),
 }
 
 impl MaintenanceStoreWork {
@@ -295,7 +323,7 @@ impl MaintenanceStoreWork {
 }
 
 pub(crate) fn project_store_maintenance_lease(
-    graph: &crate::project::TraceDecay,
+    graph: &tracedecay_project::project::TraceDecay,
 ) -> ProjectStoreMaintenanceLeaseV1 {
     ProjectStoreMaintenanceLeaseV1::new(
         graph.project_root().to_path_buf(),
@@ -326,6 +354,15 @@ impl MaintenanceCoordinator {
         // sampled on its own short cadence regardless of whether retention
         // maintenance runs: the retention tick is hours apart, and a cold
         // index climbs from nothing to the admission watermark in minutes.
+        if let Err(error) =
+            tracedecay_runtime_core::resident_memory::install_process_resident_owners_pressure_reclaimer_v1()
+        {
+            tracing::error!(
+                event = "resident_owners_pressure_reclaimer_unavailable",
+                error = %error,
+                "could not bind retained owners to the resident-memory pressure cell"
+            );
+        }
         if let Err(error) =
             tracedecay_runtime_core::resident_memory::install_process_allocator_pressure_reclaimer_v1()
         {
@@ -421,7 +458,7 @@ impl MaintenanceCoordinator {
         self.cancel();
         // Cancel stops the next pass; an in-flight tick only notices between
         // stores. Abort the tasks so shutdown does not wait for retention or
-        // RSS sampling to finish — those are abandonable maintenance, not
+        // RSS sampling to finish, those are abandonable maintenance, not
         // durability. The abort deadline is the join backstop if a tick is
         // stuck in blocking work.
         join_abandoned_maintenance_task(self.task.lock().await.take(), "retention_tick").await;
@@ -442,7 +479,10 @@ impl MaintenanceCoordinator {
         run_resident_memory_sampler_loop(
             &self.cancellation,
             RESIDENT_MEMORY_SAMPLE_INTERVAL_V1,
-            Arc::new(move || record_process_resident_memory_gauge(&log)),
+            Arc::new(move || {
+                record_process_resident_memory_gauge(&log);
+                sweep_resident_owners();
+            }),
         )
         .await;
     }
@@ -481,9 +521,12 @@ impl MaintenanceCoordinator {
         clippy::too_many_arguments,
         reason = "A tick borrows independently owned stores and policy while retaining the continuation cursor."
     )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "A maintenance tick is one ordered pass over session, graph, and retention owners."
+    #[cfg_attr(
+        not(feature = "hotpath"),
+        expect(
+            clippy::too_many_lines,
+            reason = "A maintenance tick is one ordered pass over session, graph, and retention owners."
+        )
     )]
     async fn run_tick(
         &self,
@@ -681,7 +724,6 @@ impl MaintenanceCoordinator {
                         profile_root,
                         profile_database,
                         retention.orphan_store_gc_days,
-                        retention.incident_debris_retention_days,
                         &self.cancellation,
                     )
                 })
@@ -710,7 +752,7 @@ impl MaintenanceCoordinator {
 
         // Branch-store GC: the watcher owns no store authorities, while this
         // owner already holds the administration coordinator. Daily cadence,
-        // retry-eligible — the stamp advances only when every mounted project's
+        // retry-eligible, the stamp advances only when every mounted project's
         // pass succeeded.
         if continuation.is_none() && !self.cancellation.is_cancelled() {
             let gc_due = self
@@ -729,7 +771,6 @@ impl MaintenanceCoordinator {
                         administration,
                         code_index_schedulers,
                         branch_gc.branch_gc_days,
-                        branch_gc.orphan_db_gc_days,
                         graph,
                     )
                     .await;
@@ -835,8 +876,33 @@ fn record_process_resident_memory_gauge(log: &std::sync::Mutex<ResidentMemoryLog
                 low_watermark_bytes = pressure.low_watermark_bytes(),
                 "measured process RSS fell back under the admission low watermark"
             );
+            tracedecay_runtime_core::resident_memory::process_resident_owners_v1().note_headroom();
         }
         _ => {}
+    }
+}
+
+/// Scope end and memory stalls both free retained owners: a worktree idle
+/// past its window gives its state back, and kernel-reported stalls above
+/// [`RESIDENT_MEMORY_PSI_SOME_AVG10_SHED_PERCENT_V1`] shed one tier even
+/// while RSS sits under the watermark.
+///
+/// [`RESIDENT_MEMORY_PSI_SOME_AVG10_SHED_PERCENT_V1`]: tracedecay_runtime_core::resident_memory::RESIDENT_MEMORY_PSI_SOME_AVG10_SHED_PERCENT_V1
+fn sweep_resident_owners() {
+    use tracedecay_runtime_core::resident_memory::{
+        RESIDENT_MEMORY_PSI_SOME_AVG10_SHED_PERCENT_V1, log_resident_owner_release_v1,
+        process_resident_owners_v1, sampled_memory_pressure_some_avg10_v1,
+    };
+    let owners = process_resident_owners_v1();
+    let now = std::time::Instant::now();
+    let mut released = owners.release_idle(now);
+    if sampled_memory_pressure_some_avg10_v1()
+        .is_some_and(|stalled| stalled >= RESIDENT_MEMORY_PSI_SOME_AVG10_SHED_PERCENT_V1)
+    {
+        released.extend(owners.shed_one_tier(now));
+    }
+    for release in &released {
+        log_resident_owner_release_v1(release);
     }
 }
 
@@ -846,7 +912,7 @@ fn record_process_resident_memory_gauge(_log: &std::sync::Mutex<ResidentMemoryLo
 type ResidentMemorySampleV1 = Arc<dyn Fn() + Send + Sync + 'static>;
 
 async fn run_resident_memory_sampler_loop(
-    cancellation: &tracedecay_session_memory::context::CancellationToken,
+    cancellation: &tracedecay_runtime_core::cancellation::CancellationToken,
     interval: Duration,
     sample: ResidentMemorySampleV1,
 ) {
@@ -888,6 +954,8 @@ struct ResidentMemoryLogStateV1 {
 }
 
 /// A change in the logged resident-memory verdict.
+// Only the Linux resident-memory sampler (and tests) observe transitions.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ResidentMemoryLogTransitionV1 {
     EnteredOverBudget,
@@ -895,6 +963,7 @@ enum ResidentMemoryLogTransitionV1 {
 }
 
 impl ResidentMemoryLogStateV1 {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     /// Record one verdict and return the transition it made, if any: a
     /// sustained state is logged once, when it starts and when it ends.
     fn observe(&mut self, over_budget: bool) -> Option<ResidentMemoryLogTransitionV1> {
@@ -914,7 +983,6 @@ pub(super) fn retention_maintenance_enabled(
     retention.session_lcm.enabled
         || retention.observation.enabled
         || retention.orphan_store_gc_days.is_some()
-        || retention.incident_debris_retention_days.is_some()
         || retention.compaction.is_some()
 }
 
@@ -1146,7 +1214,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn repeated_wakes_do_not_move_the_maintenance_due_deadline() {
         let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
         let wake = Arc::new(MaintenanceWake::default());
         let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let baseline = maintenance_futures_active();
@@ -1208,7 +1276,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn due_request_pulls_the_next_tick_forward_without_busy_looping() {
         let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
         let wake = Arc::new(MaintenanceWake::default());
         let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let task_cancellation = cancellation.clone();
@@ -1279,7 +1347,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn progress_continuation_reenters_only_the_owning_phase() {
         let _lifecycle_isolation = MAINTENANCE_LOOP_LIFECYCLE.lock().await;
-        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
         let wake = Arc::new(MaintenanceWake::default());
         let phases = Arc::new(std::sync::Mutex::new(Vec::new()));
         let task_cancellation = cancellation.clone();
@@ -1337,7 +1405,7 @@ mod tests {
     fn store_window_round_robin_reaches_every_store_and_never_starves() {
         // With more stores than the budget, feeding each tick's cursor into the
         // next must cover every store within ceil(count / budget) ticks while
-        // no tick exceeds the budget — nothing reclaimable is skipped forever.
+        // no tick exceeds the budget, nothing reclaimable is skipped forever.
         for &(count, budget) in &[(7usize, 3usize), (50, 8), (17, 5), (8, 8), (1, 8)] {
             let keys = store_keys(count);
             let ticks = count.div_ceil(budget);
@@ -1452,24 +1520,11 @@ mod tests {
     }
 
     #[test]
-    fn debris_retention_enables_maintenance_without_orphan_gc() {
-        let mut retention = tracedecay_configuration::RetentionConfig::default();
-        retention.session_lcm.enabled = false;
-        retention.observation.enabled = false;
-        retention.orphan_store_gc_days = None;
-        retention.incident_debris_retention_days = Some(30);
-        retention.compaction = None;
-
-        assert!(super::retention_maintenance_enabled(&retention));
-    }
-
-    #[test]
     fn soft_budget_alone_never_enables_destructive_maintenance() {
         let mut retention = tracedecay_configuration::RetentionConfig::default();
         retention.session_lcm.enabled = false;
         retention.observation.enabled = false;
         retention.orphan_store_gc_days = None;
-        retention.incident_debris_retention_days = None;
         retention.compaction = None;
         retention
             .store_soft_budgets_bytes
@@ -1506,7 +1561,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn blocked_resident_memory_reclaimer_never_stalls_runtime_or_sampler_cancellation() {
-        let cancellation = tracedecay_session_memory::context::CancellationToken::new();
+        let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
         let started = Arc::new(Notify::new());
         let calls = Arc::new(AtomicUsize::new(0));
         let release = Arc::new((StdMutex::new(false), Condvar::new()));

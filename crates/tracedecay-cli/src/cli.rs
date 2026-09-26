@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum, builder::PossibleValuesParser};
+use tracedecay_contracts::retained_surfaces::{MessageRelationshipScopeV1, MessageTypeFilterV1};
 
 pub use crate::ncm_cmd::NcmAction;
 
@@ -12,8 +13,8 @@ mod package_hook;
 mod work;
 mod workflow;
 pub use automation::{
-    AutomationAction, AutomationConfigAction, AutomationConfigScope, AutomationFactsAction,
-    AutomationRunAction, AutomationRunsAction, AutomationSkillsAction,
+    AutomationAction, AutomationConfigAction, AutomationFactsAction, AutomationRunsAction,
+    AutomationSkillsAction,
 };
 use help::*;
 pub use package_hook::{PackageHookAction, ScoopPackageHookAction};
@@ -76,18 +77,6 @@ pub enum HostBundleComponentArg {
     OperatorMcp,
 }
 
-/// Serving implementation selected by the explicit V1-to-V2 replacement.
-///
-/// The replacement coordinator records this choice in its durable journal so
-/// recovery cannot resume a Native cutover as NCM (or the reverse). Native is
-/// the default because it is the in-process provider shipped in every CLI
-/// build; NCM requires its independently attested worker and model bundle.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum ReplacementProviderArg {
-    Native,
-    Ncm,
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HostBundleCliOptions {
     pub component: Option<HostBundleComponentArg>,
@@ -127,72 +116,33 @@ pub enum FeedbackRollbackAction {
     },
 }
 
-#[derive(Clone, Debug, Subcommand)]
-pub enum HostBundleAction {
-    /// List every host whose component-set lifecycle journal is awaiting recovery
-    Status,
-    /// Roll an interrupted host component transaction back to its pre-transaction state
-    ///
-    /// Recovery converges automatically when a second writer left the deployed
-    /// bytes equal to the pre-transaction backup or to the transaction's own
-    /// cataloged output. Genuinely foreign bytes stay fail-closed; pass
-    /// `--quarantine` to set the journal aside (backups are preserved) and
-    /// unblock the host.
-    Recover {
-        /// Recover only this agent's host journal (default: every pending host)
-        #[arg(long, value_parser = agent_value_parser())]
-        agent: Option<String>,
-        /// Set aside a journal that convergent recovery cannot resolve
-        #[arg(long)]
-        quarantine: bool,
-    },
-    /// Snapshot one installed component's managed artifact files.
-    ///
-    /// Requires the global `--yes` confirmation. The backup writer refuses an
-    /// unconfirmed receipt even though deployed files are not overwritten.
-    ArtifactBackup {
-        /// Agent whose selected component owns the managed artifacts
-        #[arg(long, value_parser = agent_value_parser())]
-        agent: String,
-    },
-    /// Restore managed artifact files without changing host registration
-    ArtifactRestore {
-        /// Agent whose selected component owns the managed artifacts
-        #[arg(long, value_parser = agent_value_parser())]
-        agent: String,
-        /// Lowercase 32-character hexadecimal artifact-backup receipt id
-        #[arg(long)]
-        backup_id: String,
-    },
-}
-
 /// Code intelligence for Rust codebases.
 #[derive(Parser)]
 #[command(
     name = "tracedecay",
-    about = "Code intelligence for 34 languages — semantic graph queries instead of file reads",
+    about = "Code intelligence for 34 languages, semantic graph queries instead of file reads",
     after_help = TOP_LEVEL_AFTER_HELP,
     version = crate::product_runtime::PRODUCT_BUILD_VERSION
 )]
 pub struct Cli {
-    /// Select one compiled first-party host component; without it, lifecycle commands apply
-    /// the host's canonical component set atomically
+    /// Select one compiled first-party host component; without it, lifecycle commands run
+    /// the same receipt-backed lifecycle over the host's whole canonical component set
     #[arg(long, global = true, value_enum)]
     pub component: Option<HostBundleComponentArg>,
     /// Verify and print the exact signed lifecycle plan without mutating.
-    /// Valid only alongside the agent-lifecycle commands; dispatch enforces the
-    /// `--component` pairing so this global flag never demands `--component`
-    /// from unrelated subcommands (e.g. `branch gc`, `storage report`).
+    /// Valid only alongside the agent-lifecycle commands; dispatch enforces
+    /// that scope so this global flag never leaks onto unrelated subcommands
+    /// (e.g. `branch gc`, `storage report`).
     #[arg(long, global = true, conflicts_with = "yes")]
     pub dry_run: bool,
-    /// Confirm a first-party component mutation, or a `wipe`. Scope is enforced
+    /// Confirm a host lifecycle mutation, or a `wipe`. Scope is enforced
     /// in dispatch, not by a global clap `requires`, so it does not leak onto
     /// other commands.
     #[arg(long, global = true)]
     pub yes: bool,
-    /// Additionally confirm taking ownership of an existing file that no
-    /// TraceDecay receipt records. Required alongside `--yes` for
-    /// `reinstall --component`; the previous bytes are always backed up first,
+    /// Confirm taking ownership of an existing file that no
+    /// TraceDecay receipt records. Required alongside `--yes` for install,
+    /// update-plugin, or reinstall; the previous bytes are replaced and not kept,
     /// and a file another owner claims is refused regardless of this flag.
     #[arg(long, global = true)]
     pub adopt: bool,
@@ -211,7 +161,7 @@ pub enum Commands {
         /// Project path, as an explicit flag. Equivalent to the positional
         /// PATH argument above; accepted for consistency with `-p`/`--path`
         /// on other project-scoped commands (e.g. `dashboard`, `gitignore`,
-        /// `bench`). Conflicts with the positional PATH — pass one or the
+        /// `bench`). Conflicts with the positional PATH, pass one or the
         /// other, not both.
         #[arg(
             short = 'p',
@@ -242,9 +192,6 @@ pub enum Commands {
     Sync {
         /// Project path (default: current directory)
         path: Option<String>,
-        /// Compatibility flag that queues the same authoritative reconciliation
-        #[arg(short, long)]
-        force: bool,
         /// Folders to skip during indexing (can be repeated)
         #[arg(long = "skip-folder", num_args = 1..)]
         skip_folders: Vec<String>,
@@ -275,11 +222,8 @@ pub enum Commands {
         /// Show only the header (version, tokens, sync times)
         #[arg(short, long)]
         short: bool,
-        /// Show the node-kind distribution from the verified graph generation
-        #[arg(short, long)]
-        details: bool,
         /// Capture a runtime telemetry snapshot (PID, RSS, CPU%, DB / WAL
-        /// sizes) — useful when reporting unexpected resource use (#80).
+        /// sizes), useful when reporting unexpected resource use (#80).
         #[arg(long)]
         runtime: bool,
     },
@@ -378,16 +322,12 @@ pub enum Commands {
         #[arg(long, value_parser = agent_value_parser(), requires = "local")]
         agent: Option<String>,
     },
-    /// Refresh generated plugin code/assets for detected installs without
-    /// touching agent config files.
+    /// Update every installed agent's component set to this binary
     ///
-    /// Rewrites only tracedecay-generated artifacts — the Hermes plugin
-    /// (.py files, schemas.json, dashboard page) for the user integration,
-    /// the Cursor plugin bundle, the Codex plugin bundle/cache, and the Kiro
-    /// managed agent — re-baking the current binary path and version. Config
-    /// files (Hermes config.yaml, mcp.json, settings,
-    /// prompt rules) are left byte-for-byte intact; use `tracedecay reinstall`
-    /// to refresh those.
+    /// Runs the receipt-backed update lifecycle over each tracked agent's
+    /// canonical component set (or the one `--component` names), re-baking
+    /// the current binary path and version into its artifacts and host
+    /// registration.
     #[command(name = "update-plugin", after_help = UPDATE_PLUGIN_AFTER_HELP)]
     UpdatePlugin {
         /// Update one project-local integration in the current directory
@@ -420,16 +360,6 @@ pub enum Commands {
     FeedbackRollback {
         #[command(subcommand)]
         action: FeedbackRollbackAction,
-    },
-    /// Inspect or recover an interrupted first-party host component transaction
-    #[command(
-        name = "host-bundle",
-        long_about = HOST_BUNDLE_LONG_ABOUT,
-        after_help = HOST_BUNDLE_AFTER_HELP
-    )]
-    HostBundle {
-        #[command(subcommand)]
-        action: HostBundleAction,
     },
     /// PreToolUse hook handler (called by Claude Code, not by users directly)
     #[command(name = "hook-pre-tool-use", hide = true)]
@@ -521,6 +451,12 @@ pub enum Commands {
     /// OpenCode direct tool.execute.after Hook V2 handler.
     #[command(name = "hook-opencode-tool-after", hide = true)]
     HookOpenCodeToolAfter,
+    /// Pi extension lifecycle (`session_start`, `agent_end`) Hook V2 handler.
+    #[command(name = "hook-pi-event", hide = true)]
+    HookPiEvent,
+    /// Factory Droid lifecycle (`SessionStart`, `Stop`) Hook V2 handler.
+    #[command(name = "hook-droid-event", hide = true)]
+    HookDroidEvent,
     /// Serve the local dashboard UI (holographic memory + LCM + code graph explorers)
     #[command(long_about = DASHBOARD_LONG_ABOUT, after_help = DASHBOARD_AFTER_HELP)]
     Dashboard {
@@ -560,7 +496,7 @@ pub enum Commands {
     /// Downloads and installs the newest release. When a new binary was
     /// installed, also refreshes generated plugins, configured agent
     /// integrations, and the daemon service. When already up to date it stops
-    /// there — use `tracedecay update` to refresh regardless.
+    /// there, use `tracedecay update` to refresh regardless.
     #[command(after_help = UPGRADE_AFTER_HELP)]
     Upgrade {
         /// Skip refreshing already-configured agent integrations
@@ -571,7 +507,7 @@ pub enum Commands {
     ///
     /// Upgrades the binary first when a newer release exists, then always
     /// refreshes generated plugins, configured agent integrations, and the
-    /// daemon service — even when the binary was already current.
+    /// daemon service, even when the binary was already current.
     #[command(after_help = UPDATE_AFTER_HELP)]
     Update {
         /// Skip refreshing already-configured agent integrations
@@ -661,9 +597,6 @@ pub enum Commands {
         /// Group by model
         #[arg(long)]
         by_model: bool,
-        /// Group by task category
-        #[arg(long)]
-        by_task: bool,
         /// Export format: csv or json
         #[arg(long)]
         export: Option<String>,
@@ -749,7 +682,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: AutomationAction,
     },
-    /// Inspect and preserve exact-final profile storage
+    /// Inspect exact-final profile storage
     #[command(long_about = STORAGE_LONG_ABOUT, after_help = STORAGE_AFTER_HELP)]
     Storage {
         #[command(subcommand)]
@@ -890,16 +823,6 @@ pub enum RemoteAction {
         #[command(flatten)]
         authority: RemoteAuthorityArgs,
     },
-    /// Create a verified Remote Brain backup
-    Backup {
-        #[command(flatten)]
-        authority: RemoteAuthorityArgs,
-    },
-    /// Restore a verified backup into isolated staging
-    Restore {
-        #[command(flatten)]
-        authority: RemoteAuthorityArgs,
-    },
     /// Fail over to a standby under a higher installed fence
     Failover {
         #[command(flatten)]
@@ -930,12 +853,6 @@ impl From<RemoteAction> for crate::remote_command::RemoteCommand {
             RemoteAction::Replay { authority } => Self::Replay {
                 args: authority.into(),
             },
-            RemoteAction::Backup { authority } => Self::Backup {
-                args: authority.into(),
-            },
-            RemoteAction::Restore { authority } => Self::Restore {
-                args: authority.into(),
-            },
             RemoteAction::Failover { authority } => Self::Failover {
                 args: authority.into(),
             },
@@ -945,7 +862,7 @@ impl From<RemoteAction> for crate::remote_command::RemoteCommand {
 
 #[derive(Subcommand)]
 pub enum LspAction {
-    /// List supported language servers, availability, and install hints
+    /// List the project's analyzers as the daemon resolved them, with install hints
     Servers {
         /// Output as JSON
         #[arg(long)]
@@ -1029,9 +946,6 @@ pub enum AnalyticsAction {
         /// Skip the hook-JSONL import pass before summarizing
         #[arg(long)]
         no_sync: bool,
-        /// Keep compatibility with JSON-capable diagnostics commands.
-        #[arg(long)]
-        json: bool,
     },
     /// Import hook_analytics.jsonl rows into the durable analytics_events table
     Sync,
@@ -1134,10 +1048,18 @@ pub(crate) struct SessionsSearchArgs {
     #[arg(long)]
     pub(crate) provider: Option<String>,
     /// Relationship scope: all, parents_only, or subagents_only
-    #[arg(long, default_value = "all", value_parser = ["all", "parents_only", "subagents_only"])]
+    #[arg(
+        long,
+        default_value = "all",
+        value_parser = PossibleValuesParser::new(MessageRelationshipScopeV1::WIRE)
+    )]
     pub(crate) scope: String,
     /// Semantic message type: all, direct_user, or tool_result
-    #[arg(long, default_value = "all", value_parser = ["all", "direct_user", "tool_result"])]
+    #[arg(
+        long,
+        default_value = "all",
+        value_parser = PossibleValuesParser::new(MessageTypeFilterV1::WIRE)
+    )]
     pub(crate) message_type: String,
     /// Only child sessions belonging to this parent session
     #[arg(long)]
@@ -1146,10 +1068,10 @@ pub(crate) struct SessionsSearchArgs {
     #[arg(long, default_value_t = 10)]
     pub(crate) limit: usize,
     /// Inclusive minimum message timestamp. Accepts Unix seconds, RFC3339, YYYY-MM-DD, or relative time like "last hour"
-    #[arg(long, alias = "time-from", alias = "start-time")]
+    #[arg(long)]
     pub(crate) since: Option<String>,
     /// Inclusive maximum message timestamp. Accepts Unix seconds, RFC3339, YYYY-MM-DD, or relative time like "last hour"
-    #[arg(long, alias = "time-to", alias = "end-time")]
+    #[arg(long)]
     pub(crate) until: Option<String>,
     /// Registered project id whose session store should be searched
     #[arg(long)]
@@ -1406,69 +1328,6 @@ pub enum ProfileStorageAction {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
-    },
-    /// Create a complete checksummed profile backup under a quiesced exclusive lease.
-    #[command(name = "backup")]
-    BackupProfile {
-        /// Backup parent outside the TraceDecay profile.
-        #[arg(long)]
-        to: String,
-        /// Stable backup directory name.
-        #[arg(long = "backup-id")]
-        backup_id: String,
-    },
-    /// Restore and verify a complete backup in an isolated destination.
-    #[command(name = "rehearse-backup")]
-    RehearseProfileBackup {
-        /// Complete backup directory containing `backup-manifest.json`.
-        #[arg(long)]
-        backup: String,
-        /// New isolated restore directory.
-        #[arg(long)]
-        restore: String,
-    },
-    /// Replace a V1 profile through the shipped first-party V1-to-V2 cutover.
-    /// Requires the global `--yes` confirmation.
-    #[command(name = "replace-v1", visible_alias = "migrate-v1")]
-    ReplaceV1 {
-        /// Existing profile root to replace (defaults to the resolved profile).
-        #[arg(long = "profile-root")]
-        profile_root: Option<String>,
-        /// Backup parent outside the profile.
-        #[arg(long = "backup-to", alias = "backup-parent")]
-        backup_to: String,
-        /// Stable external backup directory name.
-        #[arg(long = "backup-id")]
-        backup_id: String,
-        /// Provider that serves the published V2 profile.
-        #[arg(long, value_enum, default_value = "native")]
-        provider: ReplacementProviderArg,
-        /// Optional legacy worker path retained for compatibility. The
-        /// shipped first-party worker runs in this binary when omitted.
-        #[arg(long)]
-        worker: Option<String>,
-        /// Maximum seconds allowed for each worker phase.
-        #[arg(long, default_value_t = 1800)]
-        timeout_seconds: u64,
-        /// Output the cutover receipt as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Reset exactly one refused authority so the next open recreates it at
-    /// the canonical schema. Applies only to a store whose open failed with
-    /// the typed ResetRequired state naming that authority; healthy
-    /// authorities are refused and nothing else in the store is touched.
-    /// Requires the global `--yes` confirmation and an exclusive maintenance
-    /// lease (the daemon cannot open a refused store, so recovery runs
-    /// offline).
-    #[command(name = "reset-authority")]
-    ResetAuthority {
-        /// Authority named by the ResetRequired state ("observations").
-        authority: String,
-        /// Sessions store carrying the refused authority (defaults to the
-        /// profile-scope user sessions store).
-        #[arg(long = "db")]
-        db: Option<String>,
     },
     /// Reset a project graph store whose open failed with the typed
     /// ResetRequired state (an incompatible schema this binary cannot upgrade

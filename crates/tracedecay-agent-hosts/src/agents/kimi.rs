@@ -2,10 +2,12 @@
 //!
 //! Kimi Code currently exposes plugin lifecycle only through its interactive
 //! `/plugins` host API. `TraceDecay` stages its first-party bundle under its
-//! own profile, while registration in `plugins/installed.json` remains owned by Kimi's
+//! own profile through the receipt-backed component transaction, while
+//! registration in `plugins/installed.json` remains owned by Kimi's
 //! interactive host flow. Until Kimi ships a documented non-interactive
-//! mutation API, global install/update/uninstall return an explicit
-//! remediation instead of mutating the current registration. Project-local `--local`
+//! mutation API, global install/update commit only that staged source and
+//! return the `/plugins install` remediation, and uninstall refuses while the
+//! registration stands. Project-local `--local`
 //! installs write
 //! `<project>/.kimi-code/mcp.json` plus prompt rules in `<project>/AGENTS.md`.
 //! Global installs register MCP in Kimi's user-level `mcp.json`; unlike plugin
@@ -15,8 +17,8 @@
 //!
 //! **Deferral re-verified 2026-08-08 under the CLI-first policy.** `kimi
 //! --help` was probed directly: its command set is
-//! `export, provider, acp, web, server, login, doctor, vis, migrate, upgrade`
-//! — there is no `mcp` subcommand and no plugin subcommand of any kind. The
+//! `export, provider, acp, web, server, login, doctor, vis, migrate, upgrade`,
+//! there is no `mcp` subcommand and no plugin subcommand of any kind. The
 //! documented way to add, edit, or delete a server is the in-TUI
 //! `/mcp-config`. So there is nothing to adopt, and the deferral above is the
 //! honest lifecycle rather than a preference. See
@@ -30,9 +32,9 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::{
     AgentIntegration, DeferredUserAction, DoctorCounters, HealthcheckContext, InstallContext,
-    JsonConfigDialect, McpUninstallPolicy, NonInteractiveInstallOutcome, UpdatePluginOutcome,
-    host_home_override, install_mcp_server_entry, load_json_file, load_json_file_strict,
-    mcp_config_has_tracedecay, safe_write_text_file, uninstall_mcp_server_entry,
+    JsonConfigDialect, McpUninstallPolicy, NonInteractiveInstallOutcome, host_home_override,
+    install_mcp_server_entry, load_json_file, load_json_file_strict, mcp_config_has_tracedecay,
+    uninstall_mcp_server_entry,
 };
 
 use super::prompt_rules::{PROMPT_RULE_MARKER, PromptRulesOptions};
@@ -73,25 +75,14 @@ impl AgentIntegration for KimiIntegration {
         )? {
             return Ok(NonInteractiveInstallOutcome::Ready);
         }
+        // The component transaction deploys the staged source; Kimi's own
+        // `/plugins install` must then copy it into the managed registry.
         Ok(NonInteractiveInstallOutcome::DeferredUserAction(
-            kimi_official_lifecycle_unavailable("install", None),
+            kimi_official_lifecycle_unavailable(
+                "install",
+                Some(&kimi_staged_plugin_dir(&ctx.home)),
+            ),
         ))
-    }
-
-    fn prepare_non_interactive_install(
-        &self,
-        ctx: &InstallContext,
-    ) -> Result<NonInteractiveInstallOutcome> {
-        let deferred = stage_kimi_install_action(ctx)?;
-        if kimi_plugin_is_natively_active(
-            &ctx.home,
-            &kimi_code_home(&ctx.home),
-            &ctx.tracedecay_bin,
-        )? {
-            Ok(NonInteractiveInstallOutcome::Ready)
-        } else {
-            Ok(NonInteractiveInstallOutcome::DeferredUserAction(deferred))
-        }
     }
 
     fn interactive_removal_guidance(&self) -> Option<String> {
@@ -149,7 +140,7 @@ impl AgentIntegration for KimiIntegration {
     fn deactivate_project_host_component_registration(
         &self,
         _components: &[super::host_bundle::HostComponentV1],
-        ctx: &InstallContext,
+        _ctx: &InstallContext,
         project_path: &Path,
     ) -> Result<()> {
         let mcp_path = project_path.join(".kimi-code/mcp.json");
@@ -164,7 +155,6 @@ impl AgentIntegration for KimiIntegration {
         )?;
         let agents_md = project_path.join("AGENTS.md");
         super::remove_managed_skill_prompt_index(
-            &ctx.home,
             &agents_md,
             tracedecay_automation_runtime::automation::skill_targets::SkillInstallTarget::Kimi,
         )?;
@@ -172,17 +162,18 @@ impl AgentIntegration for KimiIntegration {
         Ok(())
     }
 
-    fn update_plugin(&self, ctx: &InstallContext) -> Result<UpdatePluginOutcome> {
-        let code_home = kimi_code_home(&ctx.home);
-        if !installed_json_has_tracedecay(&code_home) {
-            return Ok(UpdatePluginOutcome::NotInstalled);
-        }
-        stage_kimi_install_action(ctx).map(UpdatePluginOutcome::DeferredUserAction)
-    }
-
     fn healthcheck(&self, dc: &mut DoctorCounters, ctx: &HealthcheckContext) {
         eprintln!("\n\x1b[1mKimi CLI integration\x1b[0m");
         doctor_check_plugin(dc, &ctx.home, &kimi_code_home(&ctx.home));
+        // Kimi exports only a project index: `export_managed_skills_local`
+        // writes `AGENTS.md` while the user-scope export stays the no-op
+        // default, so that one file is this host's whole index set.
+        super::doctor_check_managed_skill_prompt_indexes(
+            dc,
+            &ctx.home,
+            &[ctx.project_path.join("AGENTS.md")],
+            tracedecay_automation_runtime::automation::skill_targets::SkillInstallTarget::Kimi,
+        );
     }
 
     fn reports_absence_to_doctor(&self) -> bool {
@@ -493,27 +484,6 @@ pub(crate) fn rendered_plugin_files(tracedecay_bin: &str) -> Result<Vec<(&'stati
         .collect()
 }
 
-#[hotpath::measure(label = "hosts.agent.kimi.plugin_deploy")]
-fn deploy_kimi_plugin_to(managed_dir: &Path, tracedecay_bin: &str) -> Result<PathBuf> {
-    for (relative, rendered) in rendered_plugin_files(tracedecay_bin)? {
-        safe_write_text_file(&managed_dir.join(relative), &rendered, None)?;
-    }
-    eprintln!(
-        "\x1b[32m✔\x1b[0m Installed Kimi Code CLI plugin at {}",
-        managed_dir.display()
-    );
-    Ok(managed_dir.to_path_buf())
-}
-
-fn stage_kimi_install_action(ctx: &InstallContext) -> Result<DeferredUserAction> {
-    let staged_dir = kimi_staged_plugin_dir(&ctx.home);
-    deploy_kimi_plugin_to(&staged_dir, &ctx.tracedecay_bin)?;
-    Ok(kimi_official_lifecycle_unavailable(
-        "install",
-        Some(&staged_dir),
-    ))
-}
-
 fn deferred_user_action_error(action: DeferredUserAction) -> TraceDecayError {
     TraceDecayError::Config {
         message: action.remediation,
@@ -534,8 +504,19 @@ fn kimi_official_lifecycle_unavailable(
              TraceDecay made no current plugin registration changes. Open Kimi Code and run \
              `{command}`, then re-run repair to verify registration"
         ),
-        staged_paths: staged_dir.into_iter().map(Path::to_path_buf).collect(),
+        command,
     }
+}
+
+/// Doctor's line for a staged source Kimi Code has not yet installed, so the
+/// operator step stays visible until Kimi's own manager records it.
+fn pending_plugins_install_notice(home: &Path) -> String {
+    let action =
+        kimi_official_lifecycle_unavailable("install", Some(&kimi_staged_plugin_dir(home)));
+    format!(
+        "pending operator action: open Kimi Code and run `{}`, then re-run doctor",
+        action.command
+    )
 }
 
 fn render_kimi_hook_commands(raw: &str, tracedecay_bin: &str) -> Result<String> {
@@ -606,8 +587,15 @@ fn uninstall_prompt_rules(agents_md: &Path) -> Result<()> {
 fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path, kimi_code_home: &Path) {
     let installed_path = kimi_installed_json_path(kimi_code_home);
     if !installed_json_has_tracedecay(kimi_code_home) {
+        if kimi_staged_plugin_dir(home)
+            .join(KIMI_PLUGIN_MANIFEST_RELATIVE)
+            .is_file()
+        {
+            dc.warn(&pending_plugins_install_notice(home));
+            return;
+        }
         dc.warn(&format!(
-            "no tracedecay entry in {} — run `tracedecay install --agent kimi` if you use Kimi Code CLI",
+            "no tracedecay entry in {}, run `tracedecay install --agent kimi` if you use Kimi Code CLI",
             installed_path.display()
         ));
         return;
@@ -619,9 +607,10 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path, kimi_code_home: &Pa
 
     match kimi_managed_bundle_matches_staged(home, kimi_code_home) {
         Ok(true) => dc.pass("Kimi Code CLI managed plugin matches its staged source"),
-        Ok(false) => dc.fail(
-            "Kimi Code CLI managed plugin is stale — run the staged `/plugins install` action",
-        ),
+        Ok(false) => dc.fail(&format!(
+            "Kimi Code CLI managed plugin is stale; {}",
+            pending_plugins_install_notice(home)
+        )),
         Err(error) => dc.fail(&format!(
             "could not verify Kimi Code CLI managed plugin: {error}"
         )),
@@ -650,7 +639,7 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path, kimi_code_home: &Pa
         }
     } else {
         dc.fail(&format!(
-            "Kimi Code CLI plugin manifest missing or invalid at {} — run `tracedecay install --agent kimi`",
+            "Kimi Code CLI plugin manifest missing or invalid at {}, run `tracedecay install --agent kimi`",
             manifest_path.display()
         ));
     }
@@ -659,6 +648,13 @@ fn doctor_check_plugin(dc: &mut DoctorCounters, home: &Path, kimi_code_home: &Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deploy_kimi_plugin_to(dir: &Path, tracedecay_bin: &str) -> Result<PathBuf> {
+        for (relative, rendered) in rendered_plugin_files(tracedecay_bin)? {
+            super::super::safe_write_text_file(&dir.join(relative), &rendered)?;
+        }
+        Ok(dir.to_path_buf())
+    }
 
     #[test]
     fn native_activation_waits_for_manager_to_copy_refreshed_staged_bundle() {
@@ -689,14 +685,13 @@ mod tests {
         let ctx = InstallContext {
             home: home.path().to_path_buf(),
             tracedecay_bin: "/new/tracedecay".to_string(),
-            tool_permissions: Vec::new(),
             project_root: None,
             dashboard: false,
         };
 
         assert!(matches!(
             KimiIntegration
-                .prepare_non_interactive_install(&ctx)
+                .preflight_non_interactive_install(&ctx)
                 .unwrap(),
             NonInteractiveInstallOutcome::DeferredUserAction(_)
         ));
@@ -712,10 +707,19 @@ mod tests {
             super::super::host_bundle::HostBundleRegistrationStateV1::Repairable
         );
 
+        // The component transaction refreshes the staged source; Kimi's
+        // manager then copies it into its managed root.
+        deploy_kimi_plugin_to(&staged_source, &ctx.tracedecay_bin).unwrap();
+        assert!(matches!(
+            KimiIntegration
+                .preflight_non_interactive_install(&ctx)
+                .unwrap(),
+            NonInteractiveInstallOutcome::DeferredUserAction(_)
+        ));
         deploy_kimi_plugin_to(&managed_root, &ctx.tracedecay_bin).unwrap();
         assert_eq!(
             KimiIntegration
-                .prepare_non_interactive_install(&ctx)
+                .preflight_non_interactive_install(&ctx)
                 .unwrap(),
             NonInteractiveInstallOutcome::Ready
         );
@@ -794,7 +798,6 @@ mod tests {
         };
 
         let home = tempfile::tempdir().unwrap();
-        let lifecycle = tempfile::tempdir().unwrap();
         let code_home = home.path().join(".kimi-code");
         let staged_source = kimi_staged_plugin_dir(home.path());
         let managed_root = kimi_managed_plugin_dir(&code_home);
@@ -829,7 +832,6 @@ mod tests {
         let install = InstallContext {
             home: home.path().to_path_buf(),
             tracedecay_bin: tracedecay_bin.to_string(),
-            tool_permissions: Vec::new(),
             project_root: None,
             dashboard: false,
         };
@@ -863,7 +865,6 @@ mod tests {
         let mut registration = crate::agents::host_component_registration::CatalogHostComponentRegistrationAuthority::new_with_tracedecay_bin(
             "kimi",
             home.path(),
-            lifecycle.path(),
             HostBundleLifecycleOpV1::Install,
             tracedecay_bin.to_string(),
         )
@@ -910,7 +911,6 @@ mod tests {
         let mut uninstall = crate::agents::host_component_registration::CatalogHostComponentRegistrationAuthority::new_with_tracedecay_bin(
             "kimi",
             home.path(),
-            lifecycle.path(),
             HostBundleLifecycleOpV1::Uninstall,
             tracedecay_bin.to_string(),
         )

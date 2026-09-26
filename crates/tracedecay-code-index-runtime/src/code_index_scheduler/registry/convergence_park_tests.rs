@@ -5,15 +5,15 @@
 //! The pinned defect: a code-text-artifacts root that violates the
 //! owner-privacy contract (for example a 0775 directory created by an older
 //! binary) failed every text-projection pass with a background WARN and
-//! nothing else — `status` reported "warming"/"indexing" forever while the
+//! nothing else, `status` reported "warming"/"indexing" forever while the
 //! wake cadence silently retried a violation that can never fix itself. The
 //! socket-directory variant of the same contract refuses fast and typed at
 //! daemon bootstrap; background convergence must be just as truthful.
 //!
-//! Green means: an owned legacy mode self-heals (with the store converging to
-//! owner-private and serving), and an unhealable violation surfaces as a typed
-//! `parked` freshness state whose reason names the violation — while removing
-//! the violation lets the ordinary wake cadence resume without a remount.
+//! Green means: every violation, including a permissive mode, surfaces as a
+//! typed `parked` freshness state whose reason names the violation and is
+//! never rewritten in place, while removing the violation lets the ordinary
+//! wake cadence resume without a remount.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -23,11 +23,16 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tracedecay_code_index_retention::code_index_generations::{
-    code_text_artifacts_root, scoped_code_index_store_root,
+    code_text_artifact_staging_root, scoped_code_index_store_root,
 };
 
-use super::super::graph_activation::install_injected_activation_gate;
+use super::super::graph_activation::{
+    injected_activation_attempt_count, install_injected_activation_gate,
+    set_injected_activation_failures,
+};
+use super::super::tests::OwnerSignals;
 use super::CodeIndexSchedulerRegistryV1;
+use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 
 /// Ceiling on how long a test waits for the worker to reach the asserted
 /// state. Nothing is asserted about elapsed time; this only stops a hung
@@ -37,11 +42,16 @@ const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(30);
 /// Poll spacing while waiting on the freshness projection.
 const POLL_SPACING: Duration = Duration::from_millis(50);
 
+/// More injected activation failures than any bounded test window can drain,
+/// so a seat observed under this injection is never a pass that simply
+/// outlasted the injection and activated for real.
+const UNDRAINABLE_ACTIVATION_FAILURES: usize = 10_000;
+
 struct Fixture {
     _root: TempDir,
     project: std::path::PathBuf,
     /// The exact durable text-artifacts root of the mounted worktree's scoped
-    /// store — the directory the owner-privacy contract governs.
+    /// store, the directory the owner-privacy contract governs.
     artifacts_root: std::path::PathBuf,
     registry: CodeIndexSchedulerRegistryV1,
 }
@@ -81,10 +91,11 @@ impl Fixture {
         // is the one `poison` plants on the artifacts root itself.
         let store = root.path().join("store");
         tracedecay_private_fs::create_private_directory(&store).expect("create store root");
-        let canonical_project = project.canonicalize().expect("canonical project root");
+        let canonical_project =
+            canonical_existing_identity(&project).expect("canonical project root");
         let scoped = scoped_code_index_store_root(&store, &canonical_project);
         tracedecay_private_fs::create_private_directory(&scoped).expect("create scoped root");
-        let artifacts_root = code_text_artifacts_root(&scoped);
+        let artifacts_root = code_text_artifact_staging_root(&scoped);
         poison(&artifacts_root);
 
         let registry = CodeIndexSchedulerRegistryV1::with_background_reconcile_permits(1, 1);
@@ -116,7 +127,7 @@ impl Fixture {
     /// One wake that carries no new input, exactly like the periodic cadence
     /// traffic a live daemon produces over an unchanged checkout.
     async fn wake_without_new_input(&self) {
-        let canonical = self.project.canonicalize().expect("canonical project");
+        let canonical = canonical_existing_identity(&self.project).expect("canonical project");
         let mounted = self.registry.mounted.lock().await;
         if let Some(worktree) = mounted.get(&canonical) {
             worktree.wake.notify_one();
@@ -147,16 +158,36 @@ impl Fixture {
         }
         last
     }
+
+    /// Poll the real serving slot until something is seated, waking the
+    /// worker between observations exactly as the periodic cadence does.
+    async fn wait_for_seated_generation(
+        &self,
+    ) -> Option<std::sync::Arc<super::super::CodeIndexPublishedGenerationV1>> {
+        let deadline = tokio::time::Instant::now() + CONVERGENCE_DEADLINE;
+        loop {
+            let seated = self
+                .registry
+                .serving_code_scope(&self.project)
+                .await
+                .and_then(|scope| scope.serving_generation);
+            if seated.is_some() || tokio::time::Instant::now() >= deadline {
+                return seated;
+            }
+            self.wake_without_new_input().await;
+            tokio::time::sleep(POLL_SPACING).await;
+        }
+    }
 }
 
-/// An owned legacy artifacts root with a permissive mode is exactly the state
-/// older binaries left behind. Ownership is provable, so the worker heals it
-/// to owner-private in place and serving converges — no operator chmod, no
-/// parked state, no indefinite warming.
+/// A permissive artifacts root violates the owner-privacy contract; the
+/// worker never re-permissions it. It parks typed, leaves the mode exactly as
+/// found, and resumes on the ordinary wake cadence once the operator restores
+/// owner-only access.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_legacy_permissive_text_artifacts_root_self_heals_and_serves() {
+async fn a_permissive_text_artifacts_root_parks_typed_without_rewriting_its_mode() {
     let fixture = Fixture::mount_with_poisoned_artifacts_root(
-        "project.text-artifacts-root-self-heal",
+        "project.text-artifacts-root-permissive",
         |artifacts_root| {
             fs::create_dir_all(artifacts_root).expect("create artifacts root");
             fs::set_permissions(artifacts_root, fs::Permissions::from_mode(0o775))
@@ -165,47 +196,62 @@ async fn a_legacy_permissive_text_artifacts_root_self_heals_and_serves() {
     )
     .await;
 
-    let observed = fixture
+    let parked = fixture
+        .wait_for_freshness(|freshness| freshness.parked.is_some())
+        .await
+        .expect("freshness projection for the mounted worktree");
+    assert_eq!(
+        parked.staleness_state,
+        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Parked),
+        "a permissive root must park instead of serving: {parked:?}"
+    );
+    let park = parked.parked.as_ref().expect("typed parked state");
+    assert!(
+        park.reason.contains("code text artifacts root") && park.reason.contains("mode 775"),
+        "the parked reason must name the violated contract and observed mode: {}",
+        park.reason
+    );
+    let mode = |root: &Path| {
+        fs::metadata(root)
+            .expect("artifacts root metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(
+        mode(&fixture.artifacts_root),
+        0o775,
+        "the worker must not rewrite a root it did not create"
+    );
+
+    fs::set_permissions(&fixture.artifacts_root, fs::Permissions::from_mode(0o700))
+        .expect("operator restores owner-only access");
+    let recovered = fixture
         .wait_for_freshness(|freshness| {
-            freshness.staleness_state
-                == Some(
-                    tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh,
-                )
+            freshness.parked.is_none()
+                && freshness.staleness_state
+                    == Some(
+                        tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh,
+                    )
         })
         .await
         .expect("freshness projection for the mounted worktree");
-
-    assert_eq!(
-        observed.staleness_state,
-        Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Fresh),
-        "the healed store must converge to serving instead of warming forever: {observed:?}"
-    );
     assert!(
-        observed.parked.is_none(),
-        "a healed root must not stay parked: {:?}",
-        observed.parked
-    );
-    let mode = fs::metadata(&fixture.artifacts_root)
-        .expect("artifacts root metadata")
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(
-        mode, 0o700,
-        "self-heal must tighten the legacy root to owner-private"
+        recovered.parked.is_none(),
+        "the park must clear once the operator fixes the mode: {recovered:?}"
     );
 
     fixture.registry.shutdown().await;
 }
 
-/// A violation ownership cannot prove away — here a foreign regular file
-/// squatting on the artifacts-root path — must park typed: the freshness
+/// A foreign regular file squatting on the artifacts-root path must park
+/// typed: the freshness
 /// projection names the exact violation and remediation instead of reporting
 /// "indexing" (surfaced as "warming") forever. Removing the violation lets
 /// the ordinary wake cadence resume without a remount, proving parked is
 /// visible-but-recoverable rather than permanently dead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unhealable_text_artifacts_root_parks_typed_and_recovers_when_fixed() {
+async fn a_squatted_text_artifacts_root_parks_typed_and_recovers_when_fixed() {
     let fixture = Fixture::mount_with_poisoned_artifacts_root(
         "project.text-artifacts-root-typed-park",
         |artifacts_root| {
@@ -282,7 +328,7 @@ async fn an_unhealable_text_artifacts_root_parks_typed_and_recovers_when_fixed()
 /// consumers of the sealed generation. Starting graph work while text is
 /// parked can hold the source text needs, cross the process RSS watermark,
 /// and then prevent text from reacquiring its reservation indefinitely. A
-/// text owner parked on an unhealable artifacts root makes the required
+/// text owner parked on an invalid artifacts root makes the required
 /// ordering observable: fresh graph activation must not start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_graph_activation_waits_while_the_published_text_owner_is_parked() {
@@ -308,7 +354,7 @@ async fn fresh_graph_activation_waits_while_the_published_text_owner_is_parked()
     assert_eq!(
         parked.staleness_state,
         Some(tracedecay_contracts::code_index_freshness::CodeIndexStalenessStateV1::Parked),
-        "the text owner must park on the unhealable root: {parked:?}"
+        "the text owner must park on the invalid root: {parked:?}"
     );
 
     assert!(
@@ -340,20 +386,13 @@ async fn fresh_graph_activation_waits_while_the_published_text_owner_is_parked()
     fixture.registry.shutdown().await;
 }
 
-/// The published pass waits for the owners the seat needs — exact and
-/// lexical — and nothing more. The clone-fingerprint successor that follows
-/// the admission artifact re-decodes the whole sealed source into a second
-/// artifact; on the 772-file lifecycle fixture that pass alone held graph
-/// activation back by ~27 s (#1103). Fresh graph activation must start while
-/// that successor is still pending, and the successor must still finish on a
-/// later pass.
+/// A publication's graph activation overlaps its own text projection once
+/// that projection has opened its build: text readiness never waits on graph
+/// activation, and the serving swap still waits for both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fresh_graph_activation_starts_while_the_clone_successor_is_pending() {
-    let (fixture, admission) = Fixture::mount_with_poisoned_artifacts_root_held(
-        "project.graph-before-clone-successor",
-        |_| {},
-    )
-    .await;
+async fn fresh_graph_activation_never_delays_the_published_text_owner() {
+    let (fixture, admission) =
+        Fixture::mount_with_poisoned_artifacts_root_held("project.graph-beside-text", |_| {}).await;
     let scope = fixture
         .registry
         .serving_code_scope(&fixture.project)
@@ -364,8 +403,8 @@ async fn fresh_graph_activation_starts_while_the_clone_successor_is_pending() {
 
     tokio::time::timeout(CONVERGENCE_DEADLINE, gate.wait_until_started())
         .await
-        .expect("fresh graph activation starts once exact and lexical owners are ready");
-    let canonical = fixture.project.canonicalize().expect("canonical project");
+        .expect("fresh graph activation starts beside the opened text projection");
+    let canonical = canonical_existing_identity(&fixture.project).expect("canonical project");
     let text = {
         let mounted = fixture.registry.mounted.lock().await;
         mounted
@@ -377,28 +416,75 @@ async fn fresh_graph_activation_starts_while_the_clone_successor_is_pending() {
             .clone()
     }
     .expect("the publication installed its text owner before activation");
+    let mut signals = OwnerSignals::subscribe(&fixture.registry, &fixture.project).await;
+    tokio::time::timeout(CONVERGENCE_DEADLINE, async {
+        while !text.query_owners_are_ready() {
+            signals.changed().await;
+        }
+    })
+    .await
+    .expect("the text owner finishes while graph activation is held");
     assert!(
-        text.query_owners_are_ready(),
-        "graph activation must not start before exact and lexical owners are ready"
+        fixture
+            .registry
+            .serving_code_scope(&fixture.project)
+            .await
+            .expect("mounted scope")
+            .serving_generation
+            .is_none(),
+        "the seat waits for the held graph activation"
     );
-    assert!(
-        text.text_projection_needs_work(),
-        "the clone-fingerprint successor must still be pending when activation starts"
-    );
+    let mut signals = OwnerSignals::subscribe(&fixture.registry, &fixture.project).await;
     gate.release();
+    tokio::time::timeout(CONVERGENCE_DEADLINE, async {
+        while fixture
+            .registry
+            .serving_code_scope(&fixture.project)
+            .await
+            .expect("mounted scope")
+            .serving_generation
+            .is_none()
+        {
+            signals.changed().await;
+        }
+    })
+    .await
+    .expect("the publication seats once graph activation and text are done");
+    fixture.registry.shutdown().await;
+}
 
-    let deadline = tokio::time::Instant::now() + CONVERGENCE_DEADLINE;
-    while text.text_projection_needs_work() {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the clone successor must finish on a follow-up pass after the seat"
-        );
-        fixture.wake_without_new_input().await;
-        tokio::time::sleep(POLL_SPACING).await;
-    }
+/// Exact and lexical serving does not depend on native graph. A retryable
+/// activation failure used to replace the whole prepared triple with
+/// `Ok((Err, None, None))`, which failed the serving swap's own guard, so the
+/// sealed generation never reached the slot and search kept the predecessor
+/// for the entire activation backoff. Under an activation that keeps failing
+/// retryably, that is starvation: no pass ever seats.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_seats_while_graph_activation_keeps_failing_retryably() {
+    let (fixture, admission) =
+        Fixture::mount_with_poisoned_artifacts_root_held("project.seat-through-retry", |_| {})
+            .await;
+    let scope = fixture
+        .registry
+        .serving_code_scope(&fixture.project)
+        .await
+        .expect("mounted scope");
+    // Injected deadline failures are the retryable class, and they carry no
+    // conflict verdict, so every attempt takes the retry arm rather than
+    // falling through to the terminal one that already keeps the seat.
+    set_injected_activation_failures(&scope.worktree_id, UNDRAINABLE_ACTIVATION_FAILURES);
+    drop(admission);
+
+    let seated = fixture.wait_for_seated_generation().await;
+    let attempts = injected_activation_attempt_count(&scope.worktree_id);
     assert!(
-        text.query_owners_are_ready(),
-        "finishing the successor must keep exact and lexical owners ready"
+        attempts > 0,
+        "the fixture must observe a real graph activation attempt, otherwise the seat proves nothing"
+    );
+    assert!(
+        seated.is_some(),
+        "the sealed generation must take the serving seat while graph activation retries \
+         (activation attempts: {attempts})"
     );
     fixture.registry.shutdown().await;
 }

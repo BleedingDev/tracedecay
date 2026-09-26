@@ -3,10 +3,11 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use serde::Deserialize;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::util::{JsonError, http_detail, internal_error};
+use super::util::{JsonError, internal_error, json_error};
 use super::{
     DashboardManagedSkillCommandOutcomeV1, DashboardManagedSkillCommandV1, DashboardState,
     automation_authority_error_response, exact_automation_authority,
@@ -17,8 +18,7 @@ use tracedecay_automation_runtime::automation::managed_skills::{
     load_managed_skill, managed_skill_dir, managed_skill_root,
 };
 use tracedecay_automation_runtime::automation::skill_usage::{
-    skill_improvement_recommendations, stale_skill_recommendations, summarize_skill_usage,
-    summarize_skill_usage_for,
+    skill_improvement_recommendations, stale_skill_recommendations, summarize_skill_usage_for,
 };
 use tracedecay_automation_runtime::automation::skill_writer::ManagedSkillDeploymentReceipt;
 use tracedecay_runtime_core::tracedecay::current_timestamp;
@@ -52,32 +52,25 @@ pub struct ManagedSkillUpdateRequest {
     update: ManagedSkillUpdate,
 }
 
+/// `GET /api/automation/skills`.
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct AutomationSkillsPayloadV1 {
+    skills: Vec<ManagedSkill>,
+    count: usize,
+}
+
 #[hotpath::measure(label = "dashboard_api.skills.list", future = true)]
-pub async fn list(State(state): State<DashboardState>) -> ApiResult {
+pub async fn list(
+    State(state): State<DashboardState>,
+) -> std::result::Result<Json<AutomationSkillsPayloadV1>, JsonError> {
     let profile_root = profile_root(&state)?;
     let skills = list_managed_skills(profile_root)
         .await
         .map_err(|err| internal_error(&err))?;
-    let skill_metadata = skills
-        .iter()
-        .map(|skill| skill.metadata.clone())
-        .collect::<Vec<_>>();
-    let usage_summaries = summarize_skill_usage(profile_root, &skills)
-        .await
-        .map_err(|err| internal_error(&err))?;
-    let stale_recommendations =
-        stale_skill_recommendations(&usage_summaries, current_timestamp(), 60 * 60 * 24 * 90);
-    let improvement_recommendations = skill_improvement_recommendations(&usage_summaries);
-    Ok(Json(json!({
-        "profile_root": profile_root.display().to_string(),
-        "skills_root": managed_skill_root(profile_root).display().to_string(),
-        "count": skills.len(),
-        "skills": skills,
-        "skill_metadata": skill_metadata,
-        "usage_summaries": usage_summaries,
-        "stale_recommendations": stale_recommendations,
-        "improvement_recommendations": improvement_recommendations,
-    })))
+    Ok(Json(AutomationSkillsPayloadV1 {
+        count: skills.len(),
+        skills,
+    }))
 }
 
 #[hotpath::measure(label = "dashboard_api.skills.view", future = true)]
@@ -86,7 +79,7 @@ pub async fn view(State(state): State<DashboardState>, Path(id): Path<String>) -
     let skill = load_managed_skill(profile_root, &id)
         .await
         .map_err(|err| not_found_or_internal(&err))?;
-    skill_payload(profile_root, skill).await
+    skill_payload_with_deployment(profile_root, skill, None).await
 }
 
 #[hotpath::measure(label = "dashboard_api.skills.create", future = true)]
@@ -164,10 +157,6 @@ async fn execute_skill_command(
     skill_payload_with_deployment(authority.profile_root(), skill, Some(deployment)).await
 }
 
-async fn skill_payload(profile_root: &std::path::Path, skill: ManagedSkill) -> ApiResult {
-    skill_payload_with_deployment(profile_root, skill, None).await
-}
-
 async fn skill_payload_with_deployment(
     profile_root: &std::path::Path,
     skill: ManagedSkill,
@@ -215,10 +204,6 @@ fn profile_root(state: &DashboardState) -> std::result::Result<&std::path::Path,
     Ok(automation_authority(state)?.profile_root())
 }
 
-fn bad_request(err: &impl ToString) -> JsonError {
-    (StatusCode::BAD_REQUEST, Json(http_detail(&err.to_string())))
-}
-
 fn bad_request_or_internal(err: &impl ToString) -> JsonError {
     client_error_or_internal(err, false, true)
 }
@@ -234,20 +219,16 @@ fn client_error_or_internal(
 ) -> JsonError {
     let message = err.to_string();
     if allow_not_found && is_not_found(&message) {
-        not_found(&message)
+        json_error(StatusCode::NOT_FOUND, message)
     } else if allow_bad_request && is_bad_request(&message) {
-        bad_request(&message)
+        json_error(StatusCode::BAD_REQUEST, message)
     } else {
-        internal_error(&message)
+        internal_error(message)
     }
 }
 
 fn is_not_found(message: &str) -> bool {
     message.contains("No such file") || message.contains("not found")
-}
-
-fn not_found(message: &str) -> JsonError {
-    (StatusCode::NOT_FOUND, Json(http_detail(message)))
 }
 
 fn is_bad_request(message: &str) -> bool {

@@ -21,12 +21,15 @@ use crate::retrieval::PageRequest;
 pub enum InvocationTarget {
     CurrentProject,
     Resolved(ResolvedScope),
+    /// The authenticated profile's own memory, session, and LCM stores. Only
+    /// retained operations resolve against it; no project is opened.
+    Profile,
 }
 
 impl InvocationTarget {
     pub fn resolved(&self) -> Option<&ResolvedScope> {
         match self {
-            Self::CurrentProject => None,
+            Self::CurrentProject | Self::Profile => None,
             Self::Resolved(scope) => Some(scope),
         }
     }
@@ -246,26 +249,8 @@ impl ApplicationRequest {
     }
 
     #[hotpath::skip]
-    pub const fn is_stream(&self) -> bool {
-        matches!(self, Self::OperationEvents { .. })
-    }
-
-    #[hotpath::skip]
     pub const fn is_cancellation(&self) -> bool {
         matches!(self, Self::OperationCancel { .. })
-    }
-
-    pub fn feedback_observation_parts(&self) -> Option<(&ManifestDigest, UtcMicros, &Value)> {
-        match self {
-            Self::FeedbackObservation {
-                configuration_digest,
-                observed_at,
-                event,
-            } => Some((configuration_digest, *observed_at, event)),
-            Self::Surface { .. } | Self::OperationEvents { .. } | Self::OperationCancel { .. } => {
-                None
-            }
-        }
     }
 }
 
@@ -300,7 +285,7 @@ impl ApplicationInvocation {
 /// Invocation failure. Bare variants describe failures raised before the
 /// daemon produced an authoritative answer; once the daemon has answered with
 /// a typed [`ApplicationProblem`], that problem IS the failure and must reach
-/// the caller intact — `SafeDiagnostic` is already the sanctioned disclosure
+/// the caller intact, `SafeDiagnostic` is already the sanctioned disclosure
 /// surface, so carrying it here discloses nothing new.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InvocationError {

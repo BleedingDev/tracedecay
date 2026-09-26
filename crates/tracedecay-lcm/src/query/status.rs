@@ -4,6 +4,8 @@ use tracedecay_runtime_core::db::engine::{Value, params_from_iter};
 
 use super::scope::LcmScopeSql;
 use super::*;
+use crate::summary_convergence::LcmSummaryConvergenceQueueState;
+use crate::types::LcmSummaryConvergenceReasonCount;
 
 const STORE_STATUS_PAGE_SIZE: i64 = 512;
 const STORE_STATUS_TOKEN_SCAN_MAX_BYTES: i64 = 1024 * 1024;
@@ -11,7 +13,7 @@ const STORE_STATUS_TOKEN_SCAN_MAX_BYTES: i64 = 1024 * 1024;
 /// Message bodies summed for the replay token estimate in one status call.
 ///
 /// The estimate needs each message's text, so an unbounded scan reads the whole
-/// raw store — gigabytes on a long-lived profile — and the request is
+/// raw store, gigabytes on a long-lived profile, and the request is
 /// interrupted before it can answer. Past this many rows the status reports a
 /// typed partial estimate with a resume cursor instead.
 const STORE_STATUS_TOKEN_SCAN_BUDGET: i64 = 20_000;
@@ -33,19 +35,18 @@ impl StatusQueryWork {
 }
 
 struct StatusCounts {
-    provider_count: i64,
     raw_message_count: i64,
     summary_node_count: i64,
     maintenance_debt_count: i64,
     lifecycle_state_count: i64,
     frontier_count: i64,
-    legacy_truncated_count: i64,
     lossy_ingest_records: i64,
     summary_pending_count: i64,
     summary_retryable_count: i64,
     summary_current_count: i64,
     summary_unavailable_count: i64,
     summary_permanent_count: i64,
+    summary_reasons: Vec<LcmSummaryConvergenceReasonCount>,
 }
 
 pub(super) async fn status_for_provider(
@@ -80,9 +81,7 @@ async fn status_for_provider_with_work(
     work: &mut StatusQueryWork,
 ) -> Result<LcmStatus, LcmError> {
     work.record_query();
-    let schema_version = schema::schema_version(conn)
-        .await
-        .unwrap_or(LCM_SCHEMA_VERSION);
+    let schema_version = schema::schema_version(conn).await?;
     work.record_query();
     let counts = status_counts(conn, provider, session_id).await?;
     work.record_payload_health();
@@ -147,15 +146,9 @@ async fn aggregate_provider_status_with_work(
 ) -> Result<(LcmStatus, StatusQueryWork), LcmError> {
     let mut work = StatusQueryWork::default();
     work.record_query();
-    let schema_version = schema::schema_version(conn)
-        .await
-        .unwrap_or(LCM_SCHEMA_VERSION);
+    let schema_version = schema::schema_version(conn).await?;
     work.record_query();
     let counts = status_counts(conn, "all", session_id).await?;
-    if counts.provider_count == 0 {
-        return Ok((empty_status(schema_version, gc_config), work));
-    }
-
     work.record_payload_health();
     let payload_health = if deep {
         payload_health_detail(conn, storage_root, "all", session_id, true, 20, gc_config).await?
@@ -180,7 +173,7 @@ async fn aggregate_provider_status_with_work(
 
 /// One-statement status count rollup.
 ///
-/// Every `lcm_raw_messages` term here must be answerable from an index —
+/// Every `lcm_raw_messages` term here must be answerable from an index,
 /// never the body-bearing table records. The plain counts cover through
 /// `idx_lcm_raw_session_order` when scoped, and through SQLite's bare
 /// `COUNT(*)` b-tree count when unbounded. The redaction counts' predicates
@@ -197,20 +190,15 @@ fn status_counts_query(provider: &str, session_id: Option<&str>) -> (String, Vec
     let lifecycle_where = lifecycle.where_clause();
     let lifecycle_and = lifecycle.and_clause();
     let debt_where = debt.where_clause();
+    let visible = schema::SUMMARY_VISIBLE_SQL;
     let sql = format!(
         "SELECT
-             CASE WHEN
-                 EXISTS (SELECT 1 FROM lcm_raw_messages {content_where})
-                 OR EXISTS (SELECT 1 FROM lcm_summary_nodes {content_where})
-                 OR EXISTS (SELECT 1 FROM lcm_external_payloads {content_where})
-                 OR EXISTS (SELECT 1 FROM lcm_lifecycle_state {lifecycle_where})
-             THEN 1 ELSE 0 END,
              (SELECT COUNT(*)
                 FROM lcm_raw_messages
                 {content_where}),
              (SELECT COUNT(*)
-                FROM lcm_summary_nodes
-                {content_where}),
+                FROM session_summary_nodes n
+               WHERE {visible}{content_and}),
              (SELECT COUNT(*)
                 FROM lcm_maintenance_debt d
                 JOIN lcm_lifecycle_state s
@@ -223,9 +211,6 @@ fn status_counts_query(provider: &str, session_id: Option<&str>) -> (String, Vec
              (SELECT COUNT(*)
                 FROM lcm_lifecycle_state
                WHERE current_frontier_store_id IS NOT NULL{lifecycle_and}),
-             (SELECT COUNT(*)
-                FROM lcm_raw_messages
-               WHERE legacy_truncated != 0{content_and}),
              (SELECT COUNT(*)
                 FROM lcm_raw_messages
                WHERE metadata_json IS NOT NULL
@@ -246,14 +231,19 @@ fn status_counts_query(provider: &str, session_id: Option<&str>) -> (String, Vec
                WHERE state = 'unavailable'{content_and}),
              (SELECT COUNT(*)
                 FROM lcm_summary_convergence_queue
-               WHERE state = 'permanent'{content_and})"
+               WHERE state = 'permanent'{content_and}),
+             (SELECT json_group_array(json_array(state, failure_code, session_count))
+                FROM (SELECT state, failure_code, COUNT(*) AS session_count
+                        FROM lcm_summary_convergence_queue
+                       WHERE failure_code IS NOT NULL{content_and}
+                       GROUP BY state, failure_code))"
     );
-    // Bound in the placeholders' textual order: the four EXISTS probes, the
-    // raw/summary counts, the debt join, both lifecycle counts, two redaction
-    // counts, and five disjoint summary-convergence states.
-    let scopes_in_sql_order: [&LcmScopeSql; 16] = [
-        &content, &content, &content, &lifecycle, &content, &content, &debt, &lifecycle,
-        &lifecycle, &content, &content, &content, &content, &content, &content, &content,
+    // Bound in the placeholders' textual order: the raw/summary counts, the
+    // debt join, both lifecycle counts, the lossy ingest count, five disjoint
+    // summary-convergence states, and their recorded reasons.
+    let scopes_in_sql_order: [&LcmScopeSql; 12] = [
+        &content, &content, &debt, &lifecycle, &lifecycle, &content, &content, &content, &content,
+        &content, &content, &content,
     ];
     let mut values = Vec::new();
     for scope in scopes_in_sql_order {
@@ -275,20 +265,39 @@ async fn status_counts(
         .await?
         .ok_or_else(|| LcmError::Db("status count query returned no rows".to_string()))?;
     Ok(StatusCounts {
-        provider_count: row.get(0)?,
-        raw_message_count: row.get(1)?,
-        summary_node_count: row.get(2)?,
-        maintenance_debt_count: row.get(3)?,
-        lifecycle_state_count: row.get(4)?,
-        frontier_count: row.get(5)?,
-        legacy_truncated_count: row.get(6)?,
-        lossy_ingest_records: row.get(7)?,
-        summary_pending_count: row.get(8)?,
-        summary_retryable_count: row.get(9)?,
-        summary_current_count: row.get(10)?,
-        summary_unavailable_count: row.get(11)?,
-        summary_permanent_count: row.get(12)?,
+        raw_message_count: row.get(0)?,
+        summary_node_count: row.get(1)?,
+        maintenance_debt_count: row.get(2)?,
+        lifecycle_state_count: row.get(3)?,
+        frontier_count: row.get(4)?,
+        lossy_ingest_records: row.get(5)?,
+        summary_pending_count: row.get(6)?,
+        summary_retryable_count: row.get(7)?,
+        summary_current_count: row.get(8)?,
+        summary_unavailable_count: row.get(9)?,
+        summary_permanent_count: row.get(10)?,
+        summary_reasons: summary_convergence_reasons(&row.get::<String>(11)?)?,
     })
+}
+
+fn summary_convergence_reasons(
+    encoded: &str,
+) -> Result<Vec<LcmSummaryConvergenceReasonCount>, LcmError> {
+    let groups: Vec<(String, String, i64)> = serde_json::from_str(encoded).map_err(|error| {
+        LcmError::Db(format!("decode LCM summary convergence reasons: {error}"))
+    })?;
+    let mut reasons = groups
+        .into_iter()
+        .map(|(state, reason, session_count)| {
+            Ok(LcmSummaryConvergenceReasonCount {
+                state: LcmSummaryConvergenceQueueState::parse(&state)?,
+                reason,
+                session_count,
+            })
+        })
+        .collect::<Result<Vec<_>, LcmError>>()?;
+    reasons.sort_by(|left, right| (left.state, &left.reason).cmp(&(right.state, &right.reason)));
+    Ok(reasons)
 }
 
 fn status_from_parts(
@@ -299,7 +308,7 @@ fn status_from_parts(
     payload_health: PayloadHealthDetail,
     lifecycle_metadata: LcmLifecycleMetadata,
 ) -> LcmStatus {
-    let lossy_records = counts.legacy_truncated_count + counts.lossy_ingest_records;
+    let lossy_records = counts.lossy_ingest_records;
     LcmStatus {
         schema_version,
         raw_message_count: counts.raw_message_count,
@@ -332,11 +341,11 @@ fn status_from_parts(
             current_session_count: counts.summary_current_count,
             unavailable_session_count: counts.summary_unavailable_count,
             permanent_session_count: counts.summary_permanent_count,
+            reasons: counts.summary_reasons,
         },
         redaction: LcmRedactionStatus {
             enabled: lossy_records > 0,
             lossy_records,
-            legacy_truncated_count: counts.legacy_truncated_count,
         },
     }
 }
@@ -390,8 +399,22 @@ fn merge_lcm_status(target: &mut LcmStatus, source: LcmStatus) {
         source.summary_convergence.unavailable_session_count;
     target.summary_convergence.permanent_session_count +=
         source.summary_convergence.permanent_session_count;
+    for reason in source.summary_convergence.reasons {
+        match target
+            .summary_convergence
+            .reasons
+            .iter_mut()
+            .find(|existing| existing.state == reason.state && existing.reason == reason.reason)
+        {
+            Some(existing) => existing.session_count += reason.session_count,
+            None => target.summary_convergence.reasons.push(reason),
+        }
+    }
+    target
+        .summary_convergence
+        .reasons
+        .sort_by(|left, right| (left.state, &left.reason).cmp(&(right.state, &right.reason)));
     target.redaction.lossy_records += source.redaction.lossy_records;
-    target.redaction.legacy_truncated_count += source.redaction.legacy_truncated_count;
 }
 
 #[cfg(test)]
@@ -561,13 +584,12 @@ pub(super) fn empty_status(schema_version: i64, gc_config: &LcmGcConfig) -> LcmS
         redaction: LcmRedactionStatus {
             enabled: false,
             lossy_records: 0,
-            legacy_truncated_count: 0,
         },
     }
 }
 
 /// Store size and token estimate for one provider/session scope, using the
-/// same bounded scan the status query reports — the single token-estimate
+/// same bounded scan the status query reports, the single token-estimate
 /// authority for every surface that presents a session's size.
 pub async fn store_status(
     conn: &(impl QueryExecutor + ?Sized),
@@ -757,17 +779,19 @@ async fn store_message_count(
     Ok(row.get(0)?)
 }
 
-/// DAG depth rollup, covered by `idx_lcm_summary_nodes_depth_tokens` so the
-/// aggregate never reads `summary_text` records.
+/// DAG depth rollup over visible summaries, scoped through
+/// `idx_session_summary_nodes_depth_tokens` so the aggregate never reads
+/// `summary_text` records.
 fn dag_status_query(provider: &str, session_id: Option<&str>) -> (String, Vec<Value>) {
-    let scope = LcmScopeSql::new("provider", "session_id", provider, session_id);
+    let scope = LcmScopeSql::new("n.provider", "n.session_id", provider, session_id);
     let sql = format!(
-        "SELECT depth, COUNT(*), SUM(summary_token_count), SUM(source_token_count)
-         FROM lcm_summary_nodes
-         {scope}
-         GROUP BY depth
-         ORDER BY depth",
-        scope = scope.where_clause()
+        "SELECT n.depth, COUNT(*), SUM(n.summary_token_count), SUM(n.source_token_count)
+         FROM session_summary_nodes n
+         WHERE {visible}{scope}
+         GROUP BY n.depth
+         ORDER BY n.depth",
+        visible = schema::SUMMARY_VISIBLE_SQL,
+        scope = scope.and_clause(),
     );
     (sql, scope.into_values())
 }
@@ -908,22 +932,6 @@ mod tests {
                  transcript_path TEXT,
                  metadata_json TEXT,
                  PRIMARY KEY(provider, session_id)
-             );
-             CREATE TABLE session_messages (
-                 provider TEXT NOT NULL,
-                 message_id TEXT NOT NULL,
-                 session_id TEXT NOT NULL,
-                 role TEXT NOT NULL,
-                 timestamp INTEGER,
-                 ordinal INTEGER NOT NULL,
-                 text TEXT NOT NULL,
-                 kind TEXT,
-                 model TEXT,
-                 tool_names TEXT,
-                 source_path TEXT,
-                 source_offset INTEGER,
-                 metadata_json TEXT,
-                 PRIMARY KEY(provider, message_id)
              );",
         )
         .await
@@ -932,6 +940,201 @@ mod tests {
             .await
             .expect("create LCM schema");
         (directory, conn)
+    }
+
+    const MISSING_SCHEMA_VERSION: LcmError = LcmError::ProfileResetRequired {
+        found_version: None,
+        required_version: schema::LCM_SCHEMA_VERSION,
+    };
+
+    async fn corrupt_schema_version(conn: &Connection) {
+        conn.execute(
+            "UPDATE session_schema_migrations SET version = 'unreadable' WHERE name = 'lcm'",
+            (),
+        )
+        .await
+        .expect("corrupt LCM schema version");
+    }
+
+    async fn drop_schema_version(conn: &Connection) {
+        conn.execute(
+            "DELETE FROM session_schema_migrations WHERE name = 'lcm'",
+            (),
+        )
+        .await
+        .expect("drop LCM schema version");
+    }
+
+    #[tokio::test]
+    async fn provider_status_reports_the_schema_version_read_failure() {
+        let (_database_dir, conn) = test_lcm_connection().await;
+        let storage = TempDir::new().expect("storage tempdir");
+        seed_provider(&conn, 0).await;
+        let gc_config = LcmGcConfig::default();
+        let read = || {
+            status_for_provider(
+                &*conn,
+                storage.path(),
+                "provider-00",
+                None,
+                false,
+                &gc_config,
+            )
+        };
+        assert_eq!(
+            read().await.expect("current status").schema_version,
+            schema::LCM_SCHEMA_VERSION
+        );
+
+        corrupt_schema_version(&conn).await;
+        let unreadable = read()
+            .await
+            .expect_err("unreadable version is not a status");
+        assert!(matches!(unreadable, LcmError::Db(_)), "{unreadable:?}");
+        drop_schema_version(&conn).await;
+        assert_eq!(
+            read().await.expect_err("missing version is not a status"),
+            MISSING_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn aggregate_status_reports_the_schema_version_read_failure() {
+        let (_database_dir, conn) = test_lcm_connection().await;
+        let storage = TempDir::new().expect("storage tempdir");
+        seed_provider(&conn, 0).await;
+        let gc_config = LcmGcConfig::default();
+        let read = || aggregate_provider_status(&*conn, storage.path(), None, false, &gc_config);
+        assert_eq!(
+            read().await.expect("current status").schema_version,
+            schema::LCM_SCHEMA_VERSION
+        );
+
+        corrupt_schema_version(&conn).await;
+        let unreadable = read()
+            .await
+            .expect_err("unreadable version is not a status");
+        assert!(matches!(unreadable, LcmError::Db(_)), "{unreadable:?}");
+        drop_schema_version(&conn).await;
+        assert_eq!(
+            read().await.expect_err("missing version is not a status"),
+            MISSING_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn status_reports_an_unreadable_schema_version_instead_of_the_compiled_one() {
+        let (_database_dir, conn) = test_lcm_connection().await;
+        let storage = TempDir::new().expect("storage tempdir");
+        let gc_config = LcmGcConfig::default();
+        conn.execute(
+            "UPDATE session_schema_migrations SET version = 'unreadable' WHERE name = 'lcm'",
+            (),
+        )
+        .await
+        .expect("corrupt LCM schema version");
+        for provider in ["all", "cursor"] {
+            let error =
+                super::super::status(&*conn, storage.path(), provider, None, false, &gc_config)
+                    .await
+                    .expect_err("an unreadable schema version must not become a status");
+            assert!(matches!(error, LcmError::Db(_)), "{provider}: {error:?}");
+        }
+
+        conn.execute(
+            "DELETE FROM session_schema_migrations WHERE name = 'lcm'",
+            (),
+        )
+        .await
+        .expect("drop LCM schema version");
+        let error = super::super::status(&*conn, storage.path(), "all", None, false, &gc_config)
+            .await
+            .expect_err("a missing schema version must not become a status");
+        assert_eq!(
+            error,
+            LcmError::ProfileResetRequired {
+                found_version: None,
+                required_version: schema::LCM_SCHEMA_VERSION,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn status_groups_parked_and_failed_sessions_by_recorded_reason() {
+        let (_database_dir, conn) = test_lcm_connection().await;
+        let storage = TempDir::new().expect("storage tempdir");
+        for (session_id, state, reason) in [
+            ("parked-a", "unavailable", Some("cursor_agent_unconfigured")),
+            ("parked-b", "unavailable", Some("cursor_agent_unconfigured")),
+            ("parked-c", "unavailable", Some("cursor_agent_unavailable")),
+            ("failed-a", "permanent", Some("payload_integrity_mismatch")),
+            ("retry-a", "retryable", Some("storage_unavailable")),
+            ("queued-a", "pending", None),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (provider, session_id, project_key, project_path)
+                 VALUES ('cursor', ?1, 'project', '/tmp/project')",
+                params![session_id],
+            )
+            .await
+            .expect("insert session");
+            conn.execute(
+                "INSERT INTO lcm_summary_convergence_queue (
+                     provider, session_id, newest_raw_store_id, state, failure_code
+                 ) VALUES ('cursor', ?1, 1, ?2, ?3)",
+                params![session_id, state, reason],
+            )
+            .await
+            .expect("insert queue row");
+        }
+
+        let status = super::super::status(
+            &*conn,
+            storage.path(),
+            "cursor",
+            None,
+            false,
+            &LcmGcConfig::default(),
+        )
+        .await
+        .expect("load status");
+        let reason = |state, reason: &str, session_count| LcmSummaryConvergenceReasonCount {
+            state,
+            reason: reason.to_string(),
+            session_count,
+        };
+        assert_eq!(
+            status.summary_convergence,
+            LcmSummaryConvergenceStatus {
+                pending_session_count: 1,
+                retryable_session_count: 1,
+                current_session_count: 0,
+                unavailable_session_count: 3,
+                permanent_session_count: 1,
+                reasons: vec![
+                    reason(
+                        LcmSummaryConvergenceQueueState::Retryable,
+                        "storage_unavailable",
+                        1
+                    ),
+                    reason(
+                        LcmSummaryConvergenceQueueState::Unavailable,
+                        "cursor_agent_unavailable",
+                        1
+                    ),
+                    reason(
+                        LcmSummaryConvergenceQueueState::Unavailable,
+                        "cursor_agent_unconfigured",
+                        2
+                    ),
+                    reason(
+                        LcmSummaryConvergenceQueueState::Permanent,
+                        "payload_integrity_mismatch",
+                        1
+                    ),
+                ],
+            }
+        );
     }
 
     async fn seed_provider(conn: &Connection, index: usize) {
@@ -951,17 +1154,15 @@ mod tests {
         conn.execute(
             "INSERT INTO lcm_raw_messages (
                  provider, message_id, session_id, role, ordinal, timestamp,
-                 content, content_hash, storage_kind, payload_ref, snippet_text,
-                 index_text, legacy_source, legacy_truncated, metadata_json
+                 content, content_hash, storage_kind, payload_ref, metadata_json
              )
-             VALUES (?1, ?2, ?3, 'assistant', 1, 1, ?4, ?5, 'inline', NULL, ?4, ?4, 0, ?6, ?7)",
+             VALUES (?1, ?2, ?3, 'assistant', 1, 1, ?4, ?5, 'inline', NULL, ?6)",
             params![
                 provider.clone(),
                 message_id,
                 session_id.clone(),
                 format!("provider {index} message"),
                 format!("hash-{index:02}"),
-                i64::from(index.is_multiple_of(2)),
                 if index.is_multiple_of(3) {
                     Some(r#"{"ingest_protection":{"lossy":true}}"#.to_string())
                 } else {
@@ -972,13 +1173,13 @@ mod tests {
         .await
         .expect("insert raw message");
         conn.execute(
-            "INSERT INTO lcm_summary_nodes (
-                 node_id, provider, conversation_id, session_id, depth,
+            "INSERT INTO session_summary_nodes (
+                 summary_id, provider, conversation_id, session_id, depth,
                  summary_text, summary_hash, summary_token_count, source_token_count
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                node_id,
+                node_id.clone(),
                 provider.clone(),
                 conversation_id.clone(),
                 session_id.clone(),
@@ -991,6 +1192,8 @@ mod tests {
         )
         .await
         .expect("insert summary node");
+        crate::test_support::seed_active_generation(conn, &session_id).await;
+        crate::test_support::mark_summary_available(conn, &session_id, &node_id).await;
         conn.execute(
             "INSERT INTO lcm_lifecycle_state (
                  provider, conversation_id, current_session_id,
@@ -1027,7 +1230,7 @@ mod tests {
         let gc_config = LcmGcConfig::default();
         let schema_version = schema::schema_version(conn)
             .await
-            .unwrap_or(LCM_SCHEMA_VERSION);
+            .expect("read LCM schema version");
         let mut aggregate = empty_status(schema_version, &gc_config);
         for provider in providers {
             let status = status_for_provider(conn, storage_root, provider, None, deep, &gc_config)
@@ -1157,13 +1360,11 @@ mod tests {
              )
              INSERT INTO lcm_raw_messages (
                  provider, message_id, session_id, role, ordinal, timestamp,
-                 content, content_hash, storage_kind, payload_ref, snippet_text,
-                 index_text, legacy_source, legacy_truncated, metadata_json
+                 content, content_hash, storage_kind, payload_ref, metadata_json
              )
              SELECT 'cursor', printf('message-%05d', value), 'session-paged-status',
                     'assistant', value, value, 'one token',
-                    printf('hash-%05d', value), 'inline', NULL, 'one token',
-                    'one token', 0, 0, NULL
+                    printf('hash-%05d', value), 'inline', NULL, NULL
              FROM fixture",
             (),
         )
@@ -1196,11 +1397,10 @@ mod tests {
             conn.execute(
                 "INSERT INTO lcm_raw_messages (
                     provider, message_id, session_id, role, ordinal, timestamp,
-                    content, content_hash, storage_kind, payload_ref, snippet_text,
-                    index_text, legacy_source, legacy_truncated, metadata_json
+                    content, content_hash, storage_kind, payload_ref, metadata_json
                  ) VALUES (
                     'cursor', ?1, 'session-byte-budget', 'assistant', ?2, ?2,
-                    ?3, ?4, 'inline', NULL, ?3, ?3, 0, 0, NULL
+                    ?3, ?4, 'inline', NULL, NULL
                  )",
                 params![
                     format!("byte-budget-message-{ordinal}"),
@@ -1245,13 +1445,11 @@ mod tests {
                  )
                  INSERT INTO lcm_raw_messages (
                      provider, message_id, session_id, role, ordinal, timestamp,
-                     content, content_hash, storage_kind, payload_ref, snippet_text,
-                     index_text, legacy_source, legacy_truncated, metadata_json
+                     content, content_hash, storage_kind, payload_ref, metadata_json
                  )
                  SELECT 'cursor', printf('message-%05d', value), ?1,
                         'assistant', value, value, 'one token',
-                        printf('hash-%05d', value), 'inline', NULL, 'one token',
-                        'one token', 0, 0, NULL
+                        printf('hash-%05d', value), 'inline', NULL, NULL
                  FROM fixture"
             ),
             params![session_id],
@@ -1262,7 +1460,7 @@ mod tests {
 
     /// The token estimate must not stream the whole raw store. Past the scan
     /// budget the status reports the exact message count with a typed partial
-    /// estimate and a resume cursor — never a truncated total presented as the
+    /// estimate and a resume cursor, never a truncated total presented as the
     /// whole store.
     #[tokio::test]
     async fn store_status_reports_a_partial_token_estimate_beyond_the_scan_budget() {
@@ -1379,14 +1577,12 @@ mod tests {
                  )
                  INSERT INTO lcm_raw_messages (
                      provider, message_id, session_id, role, ordinal, timestamp,
-                     content, content_hash, storage_kind, payload_ref, snippet_text,
-                     index_text, legacy_source, legacy_truncated, metadata_json
+                     content, content_hash, storage_kind, payload_ref, metadata_json
                  )
                  SELECT 'cursor', printf('message-%05d', value), 'session-paged-payloads',
                         'assistant', value, value, 'one token',
                         printf('hash-%05d', value), 'external',
-                        printf('payload-%05d', value), 'one token',
-                        'one token', 0, 0, NULL
+                        printf('payload-%05d', value), NULL
                  FROM fixture"
             ),
             (),
@@ -1451,7 +1647,7 @@ mod tests {
         for line in plan {
             for table in [
                 "lcm_raw_messages",
-                "lcm_summary_nodes",
+                "session_summary_nodes",
                 "lcm_external_payloads",
             ] {
                 if line.contains(table) && line.contains("SCAN") && !line.contains("INDEX") {
@@ -1471,7 +1667,7 @@ mod tests {
 
     /// The status probe must answer from indexes. A tautology-filtered scan
     /// over a body-bearing LCM table re-reads the whole store's message
-    /// content per probe — issue #767 measured 10.65 s daemon-side for one
+    /// content per probe, issue #767 measured 10.65 s daemon-side for one
     /// 1706-byte row on a 7.5 GB profile store. This holds the plan-shape
     /// contract between the rendered status SQL and
     /// [`schema::LCM_STATUS_PERFORMANCE_INDEX_SQL`].
@@ -1510,13 +1706,12 @@ mod tests {
         for (provider, session_id) in scopes {
             let (sql, values) = status_counts_query(provider, session_id);
             let counts_plan = status_plan_lines(&conn, &sql, values).await;
-            for partial_index in ["idx_lcm_raw_legacy_truncated", "idx_lcm_raw_lossy_ingest"] {
-                assert!(
-                    counts_plan.iter().any(|line| line.contains(partial_index)),
-                    "status counts no longer substitute {partial_index} for {provider:?}/{session_id:?}; plan:\n{}",
-                    counts_plan.join("\n")
-                );
-            }
+            let partial_index = "idx_lcm_raw_lossy_ingest";
+            assert!(
+                counts_plan.iter().any(|line| line.contains(partial_index)),
+                "status counts no longer substitute {partial_index} for {provider:?}/{session_id:?}; plan:\n{}",
+                counts_plan.join("\n")
+            );
         }
     }
 
@@ -1544,8 +1739,7 @@ mod tests {
                      )
                      INSERT INTO lcm_raw_messages (
                          provider, message_id, session_id, role, ordinal, timestamp,
-                         content, content_hash, storage_kind, payload_ref, snippet_text,
-                         index_text, legacy_source, legacy_truncated, metadata_json
+                         content, content_hash, storage_kind, payload_ref, metadata_json
                      )
                      SELECT CASE WHEN (1 + (value % 200)) % 4 = 0 THEN 'claude' ELSE 'cursor' END,
                             printf('message-%09d', value),
@@ -1554,9 +1748,6 @@ mod tests {
                             value, value,
                             hex(randomblob(1536)),
                             printf('hash-%09d', value), 'inline', NULL,
-                            'snippet', 'index text',
-                            0,
-                            CASE WHEN value % 9000 = 0 THEN 1 ELSE 0 END,
                             CASE
                                 WHEN value % 7 = 0 THEN NULL
                                 WHEN value % 5000 = 0 THEN
@@ -1579,8 +1770,8 @@ mod tests {
                 "WITH RECURSIVE fixture(value) AS (
                      SELECT 1 UNION ALL SELECT value + 1 FROM fixture WHERE value < {summaries}
                  )
-                 INSERT INTO lcm_summary_nodes (
-                     node_id, provider, conversation_id, session_id, depth,
+                 INSERT INTO session_summary_nodes (
+                     summary_id, provider, conversation_id, session_id, depth,
                      summary_text, summary_hash, summary_token_count, source_token_count
                  )
                  SELECT printf('node-%09d', value),
@@ -1598,6 +1789,16 @@ mod tests {
         )
         .await
         .expect("seed summary nodes");
+        conn.execute_batch(
+            "INSERT INTO session_temporal_generations(session_id, generation, state)
+             SELECT DISTINCT session_id, 1, 'active' FROM session_summary_nodes;
+             INSERT INTO session_summary_availability(
+                 session_id, generation, summary_id, availability
+             )
+             SELECT session_id, 1, summary_id, 'available' FROM session_summary_nodes;",
+        )
+        .await
+        .expect("seed summary availability");
         conn.execute(
             &format!(
                 "WITH RECURSIVE fixture(value) AS (
@@ -1648,7 +1849,7 @@ mod tests {
     /// Times `runs` shallow all-provider status calls, printing each run and
     /// returning p50/p95 over the successful samples. A run that the engine
     /// interrupts (read deadline) is reported as its own truthful outcome
-    /// instead of aborting the harness — that outcome is exactly the
+    /// instead of aborting the harness, that outcome is exactly the
     /// production overrun being measured.
     async fn timed_aggregate_status(
         conn: &Connection,
@@ -1727,13 +1928,9 @@ mod tests {
                  (SELECT COUNT(*) FROM lcm_raw_messages
                    WHERE (?1 = 'all' OR provider = ?1)
                      AND (?2 IS NULL OR session_id = ?2)),
-                 (SELECT COUNT(*) FROM lcm_summary_nodes
+                 (SELECT COUNT(*) FROM session_summary_nodes
                    WHERE (?1 = 'all' OR provider = ?1)
                      AND (?2 IS NULL OR session_id = ?2)),
-                 (SELECT COUNT(*) FROM lcm_raw_messages
-                   WHERE (?1 = 'all' OR provider = ?1)
-                     AND (?2 IS NULL OR session_id = ?2)
-                     AND legacy_truncated != 0),
                  (SELECT COUNT(*) FROM lcm_raw_messages
                    WHERE (?1 = 'all' OR provider = ?1)
                      AND (?2 IS NULL OR session_id = ?2)
@@ -1786,9 +1983,7 @@ mod tests {
         }
 
         conn.execute_batch(
-            "DROP INDEX IF EXISTS idx_lcm_raw_legacy_truncated;
-             DROP INDEX IF EXISTS idx_lcm_raw_lossy_ingest;
-             DROP INDEX IF EXISTS idx_lcm_summary_nodes_depth_tokens;
+            "DROP INDEX IF EXISTS idx_lcm_raw_lossy_ingest;
              DROP INDEX IF EXISTS idx_lcm_external_payloads_owner_bytes;
              CREATE INDEX idx_lcm_external_payloads_owner
                  ON lcm_external_payloads(provider, session_id);",

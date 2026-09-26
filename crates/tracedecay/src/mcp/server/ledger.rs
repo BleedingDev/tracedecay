@@ -6,9 +6,54 @@ use tracedecay_global_db::RegisteredGlobalDb;
 /// Upper bound for [`McpServer::ledger_writes_settled`]. Savings-ledger writes
 /// are fire-and-forget `SQLite` appends that finish in well under a second on a
 /// healthy machine, so 10 s is generous headroom; the point is that the wait
-/// is *finite* — a wedged recorder task can never hang the caller (tests,
+/// is *finite*, a wedged recorder task can never hang the caller (tests,
 /// shutdown drains) indefinitely as the previous unbounded loop allowed.
 const LEDGER_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_SPAN_IDENTIFIER_BYTES: usize = 256;
+
+fn bounded_span_identifier(value: Option<&str>) -> Option<String> {
+    value
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= MAX_SPAN_IDENTIFIER_BYTES
+                && !value.chars().any(char::is_control)
+        })
+        .map(str::to_string)
+}
+
+fn derive_hook_span_git_context(
+    cwd: &Path,
+    project_root: PathBuf,
+    active_project_root: &Path,
+) -> Option<(String, Option<String>)> {
+    let deadline = tracedecay_runtime_core::cancellation::MonotonicDeadline::at(
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+    );
+    let cancellation = tracedecay_runtime_core::cancellation::CancellationToken::new();
+    let worktree_raw =
+        match tracedecay_runtime_core::git_discovery::discover_repository_identity_with_control(
+            cwd,
+            deadline,
+            &cancellation,
+        ) {
+            tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Resolved(
+                identity,
+            ) => identity.worktree_root,
+            tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::NotRepository => {
+                project_root
+            }
+            tracedecay_runtime_core::git_discovery::GitRepositoryIdentityOutcome::Unknown(_) => {
+                return None;
+            }
+        };
+    let worktree_raw =
+        hook_events::authorize_add_branch_at_root(&worktree_raw, active_project_root).ok()?;
+    let worktree = git_correlation::normalize_worktree(&worktree_raw.to_string_lossy());
+    let branch = bounded_span_identifier(
+        tracedecay_runtime_core::branch::current_branch(&worktree_raw).as_deref(),
+    );
+    Some((worktree, branch))
+}
 
 fn configuration_authority_unavailable(detail: impl std::fmt::Display) -> TraceDecayError {
     TraceDecayError::Config {
@@ -47,8 +92,8 @@ fn upload_enabled_from_desired_configuration(
 /// *silent*: each recorder independently checked both handles and returned
 /// early, so a fixture that forgot to mount a database failed later as a
 /// missing row in an assertion far from the construction that caused it.
-/// Naming the state makes the absence observable at construction — see
-/// [`McpServer::ledger_sink_is_mounted`] — and collapses three copies of
+/// Naming the state makes the absence observable at construction, see
+/// [`McpServer::ledger_sink_is_mounted`], and collapses three copies of
 /// the same fallback into one resolution.
 pub(crate) enum LedgerSink {
     Mounted(tracedecay_global_db::RegisteredGlobalDbLeaseV1),
@@ -107,7 +152,7 @@ impl McpServer {
 
     /// Estimates the raw-file token cost ("before") for the given file
     /// paths from the cached file-token map (indexed file bytes / 4).
-    /// Pure lookup — persists nothing.
+    /// Pure lookup, persists nothing.
     #[hotpath::measure(label = "mcp.ledger.estimate_raw_tokens")]
     pub(crate) fn estimate_raw_file_tokens(&self, file_paths: &[String]) -> u64 {
         if file_paths.is_empty() {
@@ -194,7 +239,7 @@ impl McpServer {
     }
 
     /// Resolves once every savings-ledger write spawned so far has
-    /// completed (immediately when none are pending — including when global
+    /// completed (immediately when none are pending, including when global
     /// accounting is disabled and no writes are ever spawned).
     ///
     /// Test-only observability for the fire-and-forget ledger recorder:
@@ -202,9 +247,9 @@ impl McpServer {
     /// non-blocking, while tests can await durability deterministically
     /// instead of polling the DB against a wall-clock deadline.
     ///
-    /// Bounded by [`LEDGER_SETTLE_TIMEOUT`] so a spawned write that wedges
+    /// Bounded by `LEDGER_SETTLE_TIMEOUT` so a spawned write that wedges
     /// (a stuck DB handle, a task that never resolves) can never hang the
-    /// caller forever — the earlier unbounded loop made a wedged write
+    /// caller forever, the earlier unbounded loop made a wedged write
     /// manifest as an un-observable, indefinitely-hung integration test.
     #[hotpath::skip]
     pub async fn ledger_writes_settled(&self) {
@@ -268,10 +313,7 @@ impl McpServer {
     /// never await configuration or cloud I/O and shutdown still drains it.
     #[hotpath::measure(label = "mcp.ledger.flush_worldwide")]
     pub(crate) fn maybe_flush_worldwide(self: &Arc<Self>) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let now = tracedecay_runtime_core::tracedecay::current_timestamp();
         let last = self.last_flush_at.load(Ordering::Relaxed);
         if now - last < 30 {
             return;
@@ -357,13 +399,14 @@ impl McpServer {
             response_tokens: 0,
             net_saved_tokens: 0,
             duration_us,
-            timestamp: crate::project::current_timestamp(),
+            timestamp: tracedecay_runtime_core::tracedecay::current_timestamp(),
             request_id,
             arguments,
             internal_analytics: None,
             client_name: connection_client_name,
             mcp_instance_id: connection_instance_id,
             failure_reason: Some(&failure_reason),
+            cost: None,
         });
         self.spawn_observed_ledger_write(async move {
             if let Err(e) = gdb.append_analytics_event(&event).await {
@@ -374,7 +417,7 @@ impl McpServer {
 
     /// Best-effort hook-route analytics after authoritative admission commit.
     ///
-    /// Insert failures are logged only — they never alter
+    /// Insert failures are logged only, they never alter
     /// [`HostAdmissionOutcome`]. The durable admission sequence is carried as
     /// the event idempotency identity, so identical but distinct admissions
     /// remain distinct analytics rows.
@@ -390,7 +433,7 @@ impl McpServer {
             project_root,
             event,
             current_branch,
-            crate::project::current_timestamp(),
+            tracedecay_runtime_core::tracedecay::current_timestamp(),
             admission_seq,
         ) else {
             return;
@@ -414,7 +457,7 @@ impl McpServer {
     /// project, this folds one [`SpanObservation`] into that project's
     /// `sessions.db` span table (see [`tracedecay_sessions::runtime::git_correlation`]).
     /// Mid-session branch/worktree switches are handled by the span table
-    /// itself — the observation always carries the *current* branch.
+    /// itself, the observation always carries the *current* branch.
     ///
     /// This analytics side write is intentionally fail-open: any resolution
     /// or DB error is dropped. Graph snapshots, git derivation, debounce, and
@@ -431,22 +474,11 @@ impl McpServer {
         event: &hook_events::HookEvent,
         selected: &crate::mcp::project_route::ResolvedProjectRoute,
     ) {
-        const MAX_SPAN_IDENTIFIER_BYTES: usize = 256;
-
         let Some(route) = event.route.as_ref() else {
             return;
         };
 
-        let bounded_identifier = |value: Option<&str>| {
-            value
-                .filter(|value| {
-                    !value.is_empty()
-                        && value.len() <= MAX_SPAN_IDENTIFIER_BYTES
-                        && !value.chars().any(char::is_control)
-                })
-                .map(str::to_string)
-        };
-        let Some(session_id) = bounded_identifier(route.session_id.as_deref())
+        let Some(session_id) = bounded_span_identifier(route.session_id.as_deref())
             .and_then(|value| tracedecay_privacy::protect_sensitive_structural_id(&value).ok())
         else {
             return;
@@ -461,9 +493,9 @@ impl McpServer {
         let Some(db) = self.project_session_db.clone() else {
             return;
         };
-        let thread_id = bounded_identifier(route.thread_id.as_deref())
+        let thread_id = bounded_span_identifier(route.thread_id.as_deref())
             .and_then(|value| tracedecay_privacy::protect_sensitive_structural_id(&value).ok());
-        let ts = crate::project::current_timestamp();
+        let ts = tracedecay_runtime_core::tracedecay::current_timestamp();
         // Session-only pre-debounce: the full key needs branch/worktree, which
         // cost gix/git discovery. A burst for one session almost always shares
         // those, so reject here before paying for derivation. Mid-session
@@ -498,16 +530,7 @@ impl McpServer {
             // spawn git, so it runs on the blocking pool, off the
             // notification hot path.
             let derived = tokio::task::spawn_blocking(move || {
-                let worktree_raw = tracedecay_runtime_core::worktree::git_worktree_root(&cwd)
-                    .unwrap_or(project_root);
-                let worktree_raw =
-                    hook_events::authorize_add_branch_at_root(&worktree_raw, &active_project_root)
-                        .ok()?;
-                let worktree = git_correlation::normalize_worktree(&worktree_raw.to_string_lossy());
-                let branch = bounded_identifier(
-                    tracedecay_runtime_core::branch::current_branch(&worktree_raw).as_deref(),
-                );
-                Some((worktree, branch))
+                derive_hook_span_git_context(&cwd, project_root, &active_project_root)
             })
             .await;
             let Ok(Some((worktree, branch))) = derived else {
@@ -568,10 +591,7 @@ fn persist_worldwide_delta(delta: u64, upload_enabled: bool) -> bool {
         && tracedecay_dashboard_api::cloud::flush_pending(config.pending_upload).is_some()
     {
         config.pending_upload = 0;
-        config.last_upload_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        config.last_upload_at = tracedecay_runtime_core::tracedecay::current_timestamp();
     }
     match config.save() {
         Ok(()) => true,
@@ -599,9 +619,9 @@ mod tests {
     use super::*;
 
     fn desired_configuration() -> ConfigurationSnapshotV1 {
-        let registry =
-            crate::config::registry::ConfigurationRegistry::core().expect("configuration registry");
-        crate::config::resolver::resolve_configuration(&registry, &[])
+        let registry = tracedecay_project::config::registry::ConfigurationRegistry::core()
+            .expect("configuration registry");
+        tracedecay_project::config::resolver::resolve_configuration(&registry, &[])
             .expect("default desired configuration")
             .snapshot
     }
@@ -676,7 +696,7 @@ mod tests {
 
     #[test]
     fn disabled_upload_records_each_delta_once_after_durable_save() {
-        let _profile = crate::config::PinnedUserDataDir::new();
+        let _profile = tracedecay_project::config::PinnedUserDataDir::new();
         let mut config = tracedecay_session_memory::user_config::UserConfig::load();
         config.pending_upload = 0;
         config.save().expect("initialize isolated user config");
