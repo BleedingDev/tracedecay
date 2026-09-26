@@ -66,9 +66,6 @@ pub const INDEX_EXTRACT_DOCSTRINGS_SETTING_KEY: &str = "index.extract_docstrings
 pub const INDEX_TRACK_CALL_SITES_SETTING_KEY: &str = "index.track_call_sites.v1";
 pub const INDEX_GIT_IGNORE_SETTING_KEY: &str = "index.git_ignore.v1";
 pub const INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY: &str = "index.native_graph_activation.v1";
-/// Final-V2 project semantic runtime configuration. The v1 key shipped with
-/// beta.37's accepted-profile shape and is intentionally not reinterpreted.
-pub const SEMANTIC_RUNTIME_SETTING_KEY_V2: &str = "semantic.runtime.v2";
 pub const MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY: &str = "memory.provider_native_enabled.v1";
 pub const MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY: &str = "memory.provider_ncm_observer.v1";
 pub const MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY: &str = "memory.provider_recall_routing.v1";
@@ -117,7 +114,6 @@ pub const CONFIGURATION_SETTING_KEYS_V1: &[&str] = &[
     INDEX_TRACK_CALL_SITES_SETTING_KEY,
     INDEX_GIT_IGNORE_SETTING_KEY,
     INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-    SEMANTIC_RUNTIME_SETTING_KEY_V2,
     MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
     MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
     MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,

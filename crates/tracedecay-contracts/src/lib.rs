@@ -23,7 +23,6 @@ mod capability_manifest;
 pub mod catalog_composition;
 pub mod clock;
 pub mod code_index_freshness;
-pub mod code_index_reconcile;
 pub mod configuration;
 pub mod context;
 pub mod context_scout;
@@ -59,7 +58,6 @@ pub mod retained_receipts;
 pub mod retained_surfaces;
 pub mod retrieval;
 pub mod sdk_catalog;
-pub mod semantic_activation;
 pub mod session_sync;
 mod session_temporal_refresh;
 pub mod settings_preview;
@@ -121,9 +119,6 @@ pub use advisory::{
 };
 pub use authorization::AuthorizationRequest;
 pub use clock::{ClockError, now_micros, try_now_micros};
-pub use code_index_reconcile::{
-    CodeIndexReconcileOptionsErrorV1, CodeIndexReconcileOptionsV1, CodeIndexReconcileRequestV1,
-};
 pub use configuration::{
     ActivationDriftV1, ComponentConfigurationState, ConfigurationAuditPage,
     ConfigurationAuditRequestV1, ConfigurationBatchRequestV1, ConfigurationDirectMutationRequestV1,
@@ -359,12 +354,11 @@ pub use retained_receipts::{
     session_refresh_effect_outcome,
 };
 pub use retained_surfaces::{
-    ProviderControlRequestV1, ProviderControlResultV1, RetainedLcmExecutionPortV1,
-    RetainedLcmRequestV1, RetainedMemoryExecutionPortV1, RetainedMemoryRequestV1,
-    RetainedProviderControlExecutionPortV1, RetainedSessionExecutionPortV1,
-    RetainedSessionRequestV1, RetainedSurfaceExecutionContextV1, RetainedSurfaceExecutionErrorV1,
-    RetainedSurfaceExecutionFutureV1, RetainedSurfaceOperation, RetainedSurfacePortsV1,
-    RetainedSurfaceServiceV1, retained_surface_application_operation,
+    RetainedLcmExecutionPortV1, RetainedLcmRequestV1, RetainedMemoryExecutionPortV1,
+    RetainedMemoryRequestV1, RetainedProviderControlExecutionPortV1,
+    RetainedSessionExecutionPortV1, RetainedSessionRequestV1, RetainedSurfaceExecutionContextV1,
+    RetainedSurfaceExecutionErrorV1, RetainedSurfaceExecutionFutureV1, RetainedSurfaceOperation,
+    RetainedSurfacePortsV1, RetainedSurfaceServiceV1, retained_surface_application_operation,
     retained_surface_catalog_contribution, retained_surface_execution_problem,
     retained_surface_handler_descriptors, retained_surface_operation_is_effect,
     retained_surface_outcome_matches_terminal, retained_surface_problem_matches_terminal,
@@ -397,15 +391,6 @@ pub use retrieval::{
 pub use sdk_catalog::{
     application_http_executable_binding_registry, application_http_route_path,
     sdk_executable_binding_registry,
-};
-pub use semantic_activation::{
-    SemanticActivationAuthorityReceiptV1, SemanticActivationAvailabilityV1,
-    SemanticActivationBindingV1, SemanticActivationContractErrorV1,
-    SemanticActivationCoordinationErrorV1, SemanticActivationCoordinationPort,
-    SemanticActivationJournalEntryV1, SemanticActivationJournalErrorV1,
-    SemanticActivationJournalPhaseV1, SemanticActivationJournalPortV1,
-    SemanticActivationOperationV1, SemanticActivationUnavailableReasonV1,
-    SemanticQualificationFailureV1, SemanticQualificationStateV1,
 };
 pub use session_temporal_refresh::{
     SessionTemporalRefreshWakeFuture, SessionTemporalRefreshWakePort,

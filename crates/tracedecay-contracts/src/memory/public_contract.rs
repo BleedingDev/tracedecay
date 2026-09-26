@@ -2,17 +2,13 @@
 //! memory operations and composite retrieval surfaces.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use schemars::JsonSchema;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 use tracedecay_domain::{
     FactAssertionId, FactEventId, FactId, LocatorDigest, ProjectId, ProvenanceId,
     RetrievalAnchorId, UtcMicros,
 };
-
-use crate::error::ApplicationContractError;
-use crate::identity::application_identifier;
 
 pub use tracedecay_domain::FactCategoryV1;
 
@@ -110,20 +106,13 @@ pub enum FactProjectionV1 {
     },
 }
 
-application_identifier!(
-    /// Authenticated continuation returned by ranked fact reads.
-    ///
-    /// The wire value is deliberately a bounded opaque identifier. Ordering
-    /// fields remain inside the authenticated cursor payload and are never
-    /// part of the request or result schema, so clients cannot manufacture a
-    /// position by copying a score, timestamp, or fact id.
-    FactSearchCursorV1 => ("fact search cursor", 4_096),
-    /// Authenticated continuation returned by deterministic fact-id reads.
-    ///
-    /// The wire value is deliberately a bounded opaque identifier. The fact
-    /// id remains inside the authenticated cursor payload.
-    FactListCursorV1 => ("fact list cursor", 4_096),
-);
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FactSearchCursorV1 {
+    pub score_millionths: u32,
+    pub updated_at: UtcMicros,
+    pub fact_id: FactId,
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

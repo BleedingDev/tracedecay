@@ -304,39 +304,6 @@ mod path_normalize_tests {
     }
 
     #[test]
-    fn which_tracedecay_does_not_fallback_to_cargo_target_without_valid_path_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let current_exe = dir
-            .path()
-            .join("checkout/target/debug")
-            .join(tracedecay_bin_name());
-        let cargo_target_dir = dir.path().join("checkout/target");
-        let path_dir = dir.path().join("empty/bin");
-        std::fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(&path_dir).unwrap();
-        std::fs::write(&current_exe, b"cargo target v2").unwrap();
-        let path_var = std::env::join_paths([&path_dir]).unwrap();
-
-        assert_eq!(
-            which_tracedecay_path_from(
-                Some(&current_exe),
-                Some(path_var.as_os_str()),
-                Some(&cargo_target_dir),
-            ),
-            None,
-            "a filtered Cargo target binary must not reappear as the final fallback"
-        );
-        assert!(
-            which_tracedecay_from(
-                Some(&current_exe),
-                Some(path_var.as_os_str()),
-                Some(&cargo_target_dir),
-            )
-            .is_none()
-        );
-    }
-
-    #[test]
     fn which_tracedecay_keeps_non_target_current_exe() {
         let dir = tempfile::tempdir().unwrap();
         let path_bin = dir.path().join("bin").join(tracedecay_bin_name());
@@ -352,43 +319,6 @@ mod path_normalize_tests {
             found,
             tracedecay_domain::forward_slash_text(&current_exe.to_string_lossy())
         );
-    }
-
-    #[test]
-    fn lifecycle_executable_prefers_current_binary_over_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let current_exe = dir.path().join("target/debug").join(tracedecay_bin_name());
-        let path_exe = dir.path().join("stable/bin").join(tracedecay_bin_name());
-        std::fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
-        std::fs::create_dir_all(path_exe.parent().unwrap()).unwrap();
-        std::fs::write(&current_exe, b"v2").unwrap();
-        std::fs::write(&path_exe, b"v1").unwrap();
-
-        let resolved = resolve_lifecycle_executable_from(&current_exe).unwrap();
-
-        assert_eq!(resolved, current_exe);
-    }
-
-    #[test]
-    fn lifecycle_executable_rejects_non_tracedecay_current_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let current_exe = dir.path().join("target/debug/other");
-        std::fs::create_dir_all(current_exe.parent().unwrap()).unwrap();
-        std::fs::write(&current_exe, b"not tracedecay").unwrap();
-
-        let error = resolve_lifecycle_executable_from(&current_exe).unwrap_err();
-
-        assert!(error.to_string().contains("not a tracedecay binary"));
-    }
-
-    #[test]
-    fn lifecycle_executable_rejects_missing_current_binary() {
-        let dir = tempfile::tempdir().unwrap();
-        let current_exe = dir.path().join("target/debug").join(tracedecay_bin_name());
-
-        let error = resolve_lifecycle_executable_from(&current_exe).unwrap_err();
-
-        assert!(error.to_string().contains("is unavailable"));
     }
 }
 

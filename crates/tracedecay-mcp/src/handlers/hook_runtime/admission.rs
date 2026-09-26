@@ -20,7 +20,6 @@ use super::envelope::{
     daemon_mint_hook_v2_envelope, hook_now, hook_v2_envelope, hook_v2_family_label,
     hook_v2_lifecycle_range, hook_v2_native_session_id, hook_v2_requires_producer_work,
 };
-use super::origin::{LiveOriginAdmissionV1, LiveOriginOutcomeV1, record_live_hook_origin};
 use super::required_project_db;
 use crate::handlers::SessionAuthorities;
 
@@ -96,37 +95,6 @@ type HookV2AdmissionLedgers = BTreeMap<std::path::PathBuf, tracedecay_hooks::Hoo
 fn hook_v2_admission_ledgers() -> &'static StdMutex<HookV2AdmissionLedgers> {
     static LEDGERS: OnceLock<StdMutex<HookV2AdmissionLedgers>> = OnceLock::new();
     LEDGERS.get_or_init(|| StdMutex::new(BTreeMap::new()))
-}
-
-pub(super) fn live_hook_origin_baseline(
-    data_root: &Path,
-    envelope: &tracedecay_hooks::HookEventEnvelopeV2,
-    now: UtcMicros,
-) -> Option<tracedecay_hooks::admission_ledger::HookLiveOriginBoundaryV1> {
-    hook_v2_admission_ledgers()
-        .try_lock()
-        .ok()?
-        .get(&(data_root.to_path_buf(), envelope.producer.hook_key()))?
-        .live_origin_baseline(envelope.protected_session_id, now)
-}
-
-pub(super) fn retain_live_hook_origin(
-    data_root: &Path,
-    envelope: &tracedecay_hooks::HookEventEnvelopeV2,
-    receipt: tracedecay_hooks::HookAdmissionLedgerReceiptV1,
-    observation: Option<tracedecay_hooks::admission_ledger::HookLiveOriginObservationV1>,
-    now: UtcMicros,
-) -> std::result::Result<
-    tracedecay_hooks::admission_ledger::HookLiveOriginOutcomeV1,
-    tracedecay_hooks::admission_ledger::HookAdmissionLedgerError,
-> {
-    let mut ledgers = hook_v2_admission_ledgers()
-        .try_lock()
-        .map_err(|_| tracedecay_hooks::admission_ledger::HookAdmissionLedgerError::Busy)?;
-    let ledger = ledgers
-        .get_mut(&(data_root.to_path_buf(), envelope.producer.hook_key()))
-        .ok_or(tracedecay_hooks::admission_ledger::HookAdmissionLedgerError::InvalidIdentity)?;
-    ledger.record_live_origin(envelope, receipt, observation, now)
 }
 
 fn hook_v2_pending_work_root(
@@ -424,8 +392,7 @@ pub async fn admit_hook_v2_envelope(
     native_session_id: Option<SessionId>,
     now: UtcMicros,
 ) -> HookV2AdmissionOutcomeV1 {
-    admit_hook_v2_envelope_with_lifecycle(cg, envelope, native_session_id, None, false, None, now)
-        .await
+    admit_hook_v2_envelope_with_lifecycle(cg, envelope, native_session_id, None, false, now).await
 }
 
 pub async fn admit_hook_v2_replayed_envelope_with_lifecycle(
@@ -447,7 +414,6 @@ pub async fn admit_hook_v2_replayed_envelope_with_lifecycle(
             background_cpu: Some(background_cpu),
         }),
         false,
-        None,
         now,
     )
     .await
@@ -463,7 +429,6 @@ async fn admit_hook_v2_envelope_with_lifecycle(
     native_session_id: Option<SessionId>,
     mount: Option<HookV2LifecycleMountV1<'_>>,
     host_response_available: bool,
-    live_origin: Option<LiveOriginAdmissionV1<'_>>,
     now: UtcMicros,
 ) -> HookV2AdmissionOutcomeV1 {
     Box::pin(admit_hook_v2_envelope_with_lifecycle_inner(
@@ -472,7 +437,6 @@ async fn admit_hook_v2_envelope_with_lifecycle(
         native_session_id,
         mount,
         host_response_available,
-        live_origin,
         now,
     ))
     .await
@@ -488,7 +452,6 @@ async fn admit_hook_v2_envelope_with_lifecycle_inner(
     native_session_id: Option<SessionId>,
     mount: Option<HookV2LifecycleMountV1<'_>>,
     host_response_available: bool,
-    live_origin: Option<LiveOriginAdmissionV1<'_>>,
     now: UtcMicros,
 ) -> HookV2AdmissionOutcomeV1 {
     let provider_envelope = envelope;
@@ -513,29 +476,6 @@ async fn admit_hook_v2_envelope_with_lifecycle_inner(
         | tracedecay_hooks::HookAdmissionDecisionV1::ExactDuplicate => {}
         tracedecay_hooks::HookAdmissionDecisionV1::Conflict => {
             return HookV2AdmissionOutcomeV1::Conflict;
-        }
-    }
-    if receipt.decision == tracedecay_hooks::HookAdmissionDecisionV1::Admitted
-        && let Some(live_origin) = live_origin
-    {
-        let outcome = record_live_hook_origin(
-            cg,
-            envelope,
-            native_session_id.as_ref(),
-            mount.as_ref().map(|mount| mount.project_sessions),
-            live_origin,
-            receipt,
-            now,
-        )
-        .await;
-        match outcome {
-            LiveOriginOutcomeV1::Recorded(outcome) => {
-                tracing::debug!(?outcome, "live hook transcript origin")
-            }
-            LiveOriginOutcomeV1::Ledger(error) => {
-                tracing::debug!(?error, "live hook origin ledger unavailable")
-            }
-            outcome => tracing::debug!(?outcome, "live hook transcript origin unavailable"),
         }
     }
     let requires_producer_work = hook_v2_requires_producer_work(envelope);
@@ -810,13 +750,11 @@ pub(super) async fn hook_v2_admit(
     action: &str,
     session_authorities: SessionAuthorities<'_>,
 ) -> Result<Value> {
-    let entered_at = std::time::Instant::now();
     let project_sessions = required_project_db(&session_authorities)?;
     let envelope = hook_v2_envelope(args, action)?;
     let now = hook_now();
     let native_session_id = hook_v2_native_session_id(args, &envelope);
     let native_lifecycle = hook_v2_native_context_scout_lifecycle(args, &envelope);
-    let native_start_locator = super::envelope::hook_v2_native_start_locator(args, &envelope);
     Ok(
         match admit_hook_v2_envelope_with_lifecycle(
             cg,
@@ -828,12 +766,6 @@ pub(super) async fn hook_v2_admit(
                 background_cpu: session_authorities.background_cpu.as_ref(),
             }),
             true,
-            Some(LiveOriginAdmissionV1 {
-                profile_identity: session_authorities.profile_identity.as_deref(),
-                background_cpu: session_authorities.background_cpu.as_ref(),
-                entered_at,
-                native_start_locator,
-            }),
             now,
         )
         .await

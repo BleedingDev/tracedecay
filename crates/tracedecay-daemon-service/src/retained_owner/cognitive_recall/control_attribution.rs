@@ -26,10 +26,10 @@ use super::{PROJECT_RECALL_BUDGETS, RecallAdmissionLedgerV1};
 const TRACE_PREFIX: &str = "recall-trace-v1:";
 const ITEM_PREFIX: &str = "recall-item-v1:";
 const MAX_SOURCES: usize = 64;
-pub(super) const MAX_ID_BYTES: usize = 1_024;
+const MAX_ID_BYTES: usize = 1_024;
 const MAX_SCOPE_BYTES: usize = 16_384;
 const MAX_SOURCES_BYTES: usize = 1_048_576;
-pub(super) const MAX_DECISION_BYTES: usize = 16_384;
+const MAX_DECISION_BYTES: usize = 16_384;
 const MAX_DETAIL_BYTES: usize = 16_384;
 const RETAINED_MEMORY_REF_PREFIX: &str = "recall-memory-ref-v1:";
 const RETAINED_SOURCE_LOCATOR_PREFIX: &str = "recall-source-locator-v1:";
@@ -212,9 +212,7 @@ struct PreparedItemV1 {
     candidate_id: String,
     binding: RetainedRecallControlBindingV1,
     original_sources_json: String,
-    /// Keyed integrity for the opaque binding. The legacy SHA column remains
-    /// in old ledgers for migration, but it cannot authorize a retained
-    /// target because it is not bound to the durable recall key.
+    /// Keyed integrity for the opaque binding, bound to the durable recall key.
     control_binding_mac: String,
 }
 
@@ -560,33 +558,6 @@ pub(crate) struct RetainedRecallControlSourceV1 {
     pub(crate) original_source: RecallSourceAttributionV1,
 }
 
-/// Startup-only additive migration. No data is inferred for historical rows.
-pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
-    for (table, column) in [
-        ("recall_explain_traces", "delivery_scope_json"),
-        ("recall_explain_traces", "scope_binding_mac"),
-        ("recall_explain_traces", "control_metadata_sha256"),
-        ("recall_explain_traces", "control_metadata_mac"),
-        ("recall_explain_traces", "trace_mac"),
-        ("recall_explain_trace_items", "stable_memory_ref"),
-        ("recall_explain_trace_items", "original_sources_json"),
-        ("recall_explain_trace_items", "control_binding_sha256"),
-        ("recall_explain_trace_items", "control_binding_mac"),
-        ("recall_explain_trace_items", "item_mac"),
-    ] {
-        let present: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
-            params![table, column],
-            |row| row.get(0),
-        )?;
-        if !present {
-            // Both identifiers are the fixed literals above, never caller data.
-            connection.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
-        }
-    }
-    Ok(())
-}
-
 impl RecallAdmissionLedgerV1 {
     /// Execute on the caller's existing blocking pool with its original control.
     pub(crate) fn read_retained_control_scope(
@@ -695,7 +666,7 @@ impl RecallAdmissionLedgerV1 {
 }
 
 /// Shares the existing scope query with the read-only test reader's transaction.
-pub(super) fn read_retained_control_scope_on_connection(
+fn read_retained_control_scope_on_connection(
     connection: &Connection,
     trace: &RecallControlTraceRefV1,
     control: &OperationControl,
@@ -1174,7 +1145,7 @@ fn decode_source(
     })
 }
 
-pub(super) fn optional_text(
+fn optional_text(
     row: &Row<'_>,
     column: usize,
     maximum: usize,
@@ -1190,7 +1161,7 @@ pub(super) fn optional_text(
         .transpose()
 }
 
-pub(super) fn required_text(row: &Row<'_>, column: usize, maximum: usize) -> Result<String> {
+fn required_text(row: &Row<'_>, column: usize, maximum: usize) -> Result<String> {
     optional_text(row, column, maximum)?.ok_or_else(|| invalid("missing retained field"))
 }
 
@@ -2593,7 +2564,6 @@ mod tests {
             ),
             Err(RecallAdmissionLedgerError::ConflictingTrace { .. })
         ));
-        initialize_schema(&ledger.connection.lock().unwrap()).unwrap();
         assert!(matches!(
             ledger.read_retained_control_source(
                 metadata.trace_ref(),

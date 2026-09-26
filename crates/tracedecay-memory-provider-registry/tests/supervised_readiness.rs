@@ -14,7 +14,7 @@ use tracedecay_memory_provider_api::{
     ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation,
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort,
 };
 mod isolation_fixture;
 
@@ -192,43 +192,7 @@ impl NativeMemoryApplicationPort for MountedNativePort {
         unexpected()
     }
 
-    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
-        unexpected()
-    }
-
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected()
     }
 }
@@ -696,43 +660,7 @@ impl NativeMemoryApplicationPort for HangingNativePort {
         unexpected()
     }
 
-    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
-        unexpected()
-    }
-
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected()
     }
 }

@@ -14,27 +14,20 @@ pub const CONFIGURATION_FORMAT_REVISION: i64 = 1;
 const FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:8ed9dff8077f0cd9a8c62588ef1fe1a7a1e9caed6a433a4fa0c4a57e65d63beb";
 /// Tip shape that retired semantic-retrieval state but still carried the
-/// accepted-profile tables. It is recognized so the caller receives a typed
-/// reset outcome without mutating the store.
+/// accepted-profile tables. Converges by dropping those accepted-profile
+/// tables only.
 const PRIOR_FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:14cfab8b33e57816605c7275e7f3140d6755c933a84239b1608dbdf653b56a1b";
 /// Campaign tip before #1303 residue deletion: credential-free but still
 /// carried the three semantic-retrieval tables (and accepted-profile tables).
-/// It is recognized so the caller receives a typed reset outcome without
-/// mutating the store.
+/// Converges by dropping all five semantic tables.
 const PRE_RESIDUE_FINAL_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:c79fac916ce535c2b90bd46af0fec9dcd80bdb85ae7e226879dd6eb765e6ca63";
 /// The configuration shape every release from v0.1.0-beta.25 through
 /// v0.1.0-beta.37 published. It includes the inert credential-reference table
 /// and the retired semantic-retrieval and accepted-profile tables.
-/// It is recognized so the caller receives a typed reset outcome without
-/// mutating the store.
 const RELEASED_CONFIGURATION_SCHEMA_DIGEST: &str =
     "sha256:99b8f5f5cebc584ab564181d8a67ee665031c20bbdf63b479c212d16a1c63746";
-/// Tables removed from the current canonical configuration shape. The
-/// beta.25-beta.37 binaries exposed these tables, and some released writers
-/// populated them. The migration can therefore remove only an empty table;
-/// any row must remain available for an explicit reset decision.
 const CONVERGE_RELEASED_CONFIGURATION_SQL: &str = "
 DROP TABLE configuration_credential_references;
 DROP TABLE configuration_semantic_retrieval_state_v1;
@@ -43,42 +36,17 @@ DROP TABLE configuration_semantic_retrieval_inventory_v1;
 DROP TABLE configuration_semantic_accepted_profiles_v1;
 DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
 ";
-
-const RELEASED_CONFIGURATION_RETIRED_TABLES: &[(&str, &str)] = &[
-    (
-        "configuration_credential_references",
-        "released configuration store holds credential references with no lossless migration",
-    ),
-    (
-        "configuration_semantic_retrieval_state_v1",
-        "released configuration store holds semantic retrieval state with no lossless migration",
-    ),
-    (
-        "configuration_semantic_retrieval_pending_v1",
-        "released configuration store holds pending semantic retrieval transitions with no lossless migration",
-    ),
-    (
-        "configuration_semantic_retrieval_inventory_v1",
-        "released configuration store holds semantic retrieval inventory with no lossless migration",
-    ),
-    (
-        "configuration_semantic_accepted_profiles_v1",
-        "released configuration store holds accepted semantic profiles with no lossless migration",
-    ),
-    (
-        "configuration_semantic_accepted_profile_receipt_key_v1",
-        "released configuration store holds an accepted profile receipt key with no lossless migration",
-    ),
-];
-
-// These are the two version markers persisted by the configuration store's
-// snapshot-entry codec. A released shape may only be converged when both
-// markers still describe the payload contract understood by current readers.
-const RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION: i64 = 1;
-const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION: i64 = 1;
-const RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION_REASON: &str =
-    "released configuration store holds a configuration entry with an unsupported schema revision";
-const RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION_REASON: &str = "released configuration store holds a configuration entry with an unsupported encoded payload version";
+const CONVERGE_PRIOR_FINAL_CONFIGURATION_SQL: &str = "
+DROP TABLE configuration_semantic_accepted_profiles_v1;
+DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
+";
+const CONVERGE_PRE_RESIDUE_FINAL_CONFIGURATION_SQL: &str = "
+DROP TABLE configuration_semantic_retrieval_state_v1;
+DROP TABLE configuration_semantic_retrieval_pending_v1;
+DROP TABLE configuration_semantic_retrieval_inventory_v1;
+DROP TABLE configuration_semantic_accepted_profiles_v1;
+DROP TABLE configuration_semantic_accepted_profile_receipt_key_v1;
+";
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigurationSchemaError {
@@ -451,30 +419,12 @@ BEGIN SELECT RAISE(ABORT, 'configuration component activation events are immutab
 enum ConfigurationShape {
     Absent,
     Final,
-    /// Recognized historical shape before accepted-profile table retirement.
+    /// Tip shape before accepted-profile table retirement.
     PriorFinal,
-    /// Recognized historical shape before #1303 semantic-retrieval residue deletion.
+    /// Tip shape before #1303 semantic-retrieval residue deletion.
     PreResidueFinal,
-    /// Recognized historical shape shipped by beta.25 through beta.37.
+    /// The exact shape shipped by beta.25 through beta.37.
     Released,
-}
-
-fn historical_shape_reset(shape: ConfigurationShape) -> ConfigurationSchemaError {
-    let reason = match shape {
-        ConfigurationShape::PriorFinal => {
-            "recognized prior-final configuration schema requires an explicit reset"
-        }
-        ConfigurationShape::PreResidueFinal => {
-            "recognized pre-residue configuration schema requires an explicit reset"
-        }
-        ConfigurationShape::Released => {
-            "recognized released configuration schema requires an explicit reset"
-        }
-        ConfigurationShape::Absent | ConfigurationShape::Final => {
-            "configuration schema is not a historical shape requiring reset"
-        }
-    };
-    ConfigurationSchemaError::ResetRequired { reason }
 }
 
 async fn validate_configuration_schema(
@@ -519,25 +469,17 @@ async fn validate_configuration_schema(
     Ok(shape)
 }
 
-/// Read-only admission: the exact final shape and an empty known
-/// beta.25-beta.37 shape are admissible. Released data without a lossless
-/// current-registry mapping is reset-required and untouched.
+/// Read-only admission: the final shape and convergeable prior shapes are
+/// admissible; the writer converges prior shapes on its next open.
 pub async fn admit_configuration_schema(
     connection: &impl QueryExecutor,
     fresh_store: Option<&FreshConfigurationStoreEvidence>,
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
-        ConfigurationShape::Final => Ok(()),
-        ConfigurationShape::Released => {
-            if let Some(reason) = released_configuration_data_reset_reason(connection).await? {
-                Err(ConfigurationSchemaError::ResetRequired { reason })
-            } else {
-                Ok(())
-            }
-        }
-        shape @ (ConfigurationShape::PriorFinal | ConfigurationShape::PreResidueFinal) => {
-            Err(historical_shape_reset(shape))
-        }
+        ConfigurationShape::Final
+        | ConfigurationShape::PriorFinal
+        | ConfigurationShape::PreResidueFinal
+        | ConfigurationShape::Released => Ok(()),
         ConfigurationShape::Absent if fresh_store.is_some() => Ok(()),
         ConfigurationShape::Absent => Err(ConfigurationSchemaError::ResetRequired {
             reason: "configuration schema is missing from a non-fresh registered store",
@@ -551,9 +493,14 @@ pub async fn ensure_configuration_schema(
 ) -> Result<(), ConfigurationSchemaError> {
     match validate_configuration_schema(connection).await? {
         ConfigurationShape::Final => return Ok(()),
-        ConfigurationShape::Released => return converge_released_configuration(connection).await,
-        shape @ (ConfigurationShape::PriorFinal | ConfigurationShape::PreResidueFinal) => {
-            return Err(historical_shape_reset(shape));
+        ConfigurationShape::PriorFinal => {
+            return converge_prior_final_configuration(connection).await;
+        }
+        ConfigurationShape::PreResidueFinal => {
+            return converge_pre_residue_final_configuration(connection).await;
+        }
+        ConfigurationShape::Released => {
+            return converge_released_configuration(connection).await;
         }
         ConfigurationShape::Absent => {}
     }
@@ -577,22 +524,23 @@ pub async fn ensure_configuration_schema(
     }
 }
 
-/// Converges the known beta.25-beta.37 shape to the current canonical shape.
-///
-/// Callers run this from the atomic registered-schema transaction. The
-/// released writers populated retired semantic and accepted-profile tables,
-/// and beta37 snapshots can retain setting entries from older registries. No
-/// current registry definition provides a lossless mapping for those values.
-/// Refuse before the first drop so a refused store remains byte-for-byte
-/// available for an explicit reset decision. Supported setting rows stay in
-/// place while the retired empty tables are removed.
+/// Converges a shipped store to the final shape. The credential table never
+/// had a writer, while semantic-retrieval rows have no remaining consumer.
 async fn converge_released_configuration(
     connection: &impl Executor,
 ) -> Result<(), ConfigurationSchemaError> {
-    if let Some(reason) = released_configuration_data_reset_reason(connection).await? {
-        return Err(ConfigurationSchemaError::ResetRequired { reason });
+    let mut rows = connection
+        .query(
+            "SELECT 1 FROM configuration_credential_references LIMIT 1",
+            (),
+        )
+        .await?;
+    if rows.next().await?.is_some() {
+        return Err(ConfigurationSchemaError::ResetRequired {
+            reason: "released configuration store holds credential references no shipped binary wrote",
+        });
     }
-
+    drop(rows);
     connection
         .execute_batch(CONVERGE_RELEASED_CONFIGURATION_SQL)
         .await?;
@@ -605,78 +553,36 @@ async fn converge_released_configuration(
     }
 }
 
-/// Inspect every retired data owner before any convergence DDL runs.
-///
-/// The table names are fixed internal constants, so formatting them into the
-/// read-only probes cannot introduce caller SQL. Keeping this check ahead of
-/// the batch is the important safety property: a store with any retired row
-/// is left physically unchanged for an explicit reset decision.
-async fn released_configuration_data_reset_reason(
-    connection: &impl QueryExecutor,
-) -> Result<Option<&'static str>, ConfigurationSchemaError> {
-    for &(table, reason) in RELEASED_CONFIGURATION_RETIRED_TABLES {
-        let sql = format!("SELECT 1 FROM {table} LIMIT 1");
-        let mut rows = connection.query(&sql, ()).await?;
-        if rows.next().await?.is_some() {
-            return Ok(Some(reason));
-        }
-    }
-
-    let mut rows = connection
-        .query(
-            "SELECT key
-             FROM configuration_entries
-             WHERE key IN ('query.default_collection.v1', 'semantic.runtime.v1')
-             LIMIT 1",
-            (),
-        )
+/// Converges a tip store that still carries retired accepted-profile tables.
+async fn converge_prior_final_configuration(
+    connection: &impl Executor,
+) -> Result<(), ConfigurationSchemaError> {
+    connection
+        .execute_batch(CONVERGE_PRIOR_FINAL_CONFIGURATION_SQL)
         .await?;
-    if rows.next().await?.is_some() {
-        return Ok(Some(
-            "released configuration store holds a retired setting entry with no lossless migration",
-        ));
+    if validate_configuration_schema(connection).await? == ConfigurationShape::Final {
+        Ok(())
+    } else {
+        Err(ConfigurationSchemaError::ResetRequired {
+            reason: "prior-final configuration store did not converge to the final shape",
+        })
     }
+}
 
-    let mut rows = connection
-        .query(
-            &format!(
-                "SELECT 1
-                 FROM configuration_entries
-                 WHERE schema_revision != {}
-                 LIMIT 1",
-                RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION,
-            ),
-            (),
-        )
+/// Converges a pre-#1303 tip store that still carries retrieval + accepted-profile tables.
+async fn converge_pre_residue_final_configuration(
+    connection: &impl Executor,
+) -> Result<(), ConfigurationSchemaError> {
+    connection
+        .execute_batch(CONVERGE_PRE_RESIDUE_FINAL_CONFIGURATION_SQL)
         .await?;
-    if rows.next().await?.is_some() {
-        return Ok(Some(RELEASED_CONFIGURATION_ENTRY_SCHEMA_REVISION_REASON));
+    if validate_configuration_schema(connection).await? == ConfigurationShape::Final {
+        Ok(())
+    } else {
+        Err(ConfigurationSchemaError::ResetRequired {
+            reason: "pre-residue-final configuration store did not converge to the final shape",
+        })
     }
-
-    let mut rows = connection
-        .query(
-            &format!(
-                "SELECT 1
-                 FROM configuration_entries
-                 WHERE CASE
-                     WHEN json_valid(typed_value) = 0 THEN 1
-                     WHEN COALESCE(json_type(typed_value, '$.schema_version'), '') != 'integer' THEN 1
-                     WHEN COALESCE(json_extract(typed_value, '$.schema_version'), -1) != {} THEN 1
-                     ELSE 0
-                 END = 1
-                 LIMIT 1",
-                RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION,
-            ),
-            (),
-        )
-        .await?;
-    if rows.next().await?.is_some() {
-        return Ok(Some(
-            RELEASED_CONFIGURATION_ENTRY_PAYLOAD_SCHEMA_VERSION_REASON,
-        ));
-    }
-
-    Ok(None)
 }
 
 #[cfg(test)]

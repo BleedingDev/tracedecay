@@ -496,12 +496,12 @@ impl DaemonInvocationService {
 
     /// Registers this project's one source-edit owner, or joins the incumbent.
     ///
-    /// Identity is the authenticated profile and authorized scope, exactly as
+    /// Identity is the authorized scope, exactly as
     /// [`DaemonRetainedRuntimeRegistrar::register`] keys the retained runtime.
     /// A linked worktree or a reopen of the same canonical root builds its own
-    /// owner object; that same-profile route aliases the incumbent instead of
-    /// being refused, while a foreign profile or scope is refused with a typed
-    /// error rather than replacing the incumbent.
+    /// owner object; that route aliases the incumbent instead of being refused,
+    /// while a foreign scope is refused with a typed error rather than
+    /// replacing the incumbent.
     #[hotpath::skip]
     pub async fn register_source_edit_owner(
         &self,
@@ -530,30 +530,6 @@ impl DaemonInvocationService {
     pub async fn registered_retained_request_context(
         &self,
         project_root: &Path,
-        profile_id: &UserProfileId,
-        request_id: RequestId,
-        deadline: Deadline,
-        cancellation: CancellationContext,
-        observed_at: UtcMicros,
-        operation: &ApplicationOperation,
-    ) -> Result<RequestContext, RegisteredRetainedRequestContextError> {
-        self.registered_retained_request_context_inner(
-            project_root,
-            profile_id,
-            request_id,
-            deadline,
-            cancellation,
-            observed_at,
-            operation,
-        )
-        .await
-    }
-
-    #[hotpath::skip]
-    async fn registered_retained_request_context_inner(
-        &self,
-        project_root: &Path,
-        expected_profile_id: &UserProfileId,
         request_id: RequestId,
         deadline: Deadline,
         cancellation: CancellationContext,
@@ -569,13 +545,6 @@ impl DaemonInvocationService {
                     message: "automation retained application authority is unavailable".to_owned(),
                 })
             })?;
-        if registered.profile_id() != expected_profile_id {
-            return Err(RegisteredRetainedRequestContextError::Runtime(
-                TraceDecayError::Config {
-                    message: "automation retained application authority is unavailable".to_owned(),
-                },
-            ));
-        }
         let effective_deadline = Deadline {
             expires_at: UtcMicros(deadline.expires_at.0.min(registered.grant.expires_at.0)),
         };
@@ -630,41 +599,10 @@ impl DaemonInvocationService {
     pub async fn mount_session_holder_databases(
         &self,
         databases: impl IntoIterator<Item = tracedecay_global_db::RegisteredGlobalDbLeaseV1>,
-    ) -> Vec<PathBuf> {
-        let mut mounted = self.session_holder_databases.lock().await;
-        let mut inserted = Vec::new();
-        for database in databases {
-            let database_path = database.db_path().to_path_buf();
-            if let std::collections::btree_map::Entry::Vacant(entry) =
-                mounted.entry(database_path.clone())
-            {
-                entry.insert(database);
-                inserted.push(database_path);
-            }
-        }
-        inserted
-    }
-
-    /// Remove session-holder leases that belonged to an aborted project-open
-    /// transaction. Project sessions are exact-root owned; profile/session
-    /// leases may be shared by later opens and are removed only when the
-    /// caller explicitly names their paths.
-    #[hotpath::skip]
-    pub async fn unmount_session_holder_databases(
-        &self,
-        database_paths: impl IntoIterator<Item = PathBuf>,
     ) {
         let mut mounted = self.session_holder_databases.lock().await;
-        for database_path in database_paths {
-            mounted.remove(&database_path);
+        for database in databases {
+            mounted.insert(database.db_path().to_path_buf(), database);
         }
-    }
-
-    /// Test-only census for the session-holder leases retained by project
-    /// publication. A failed open must return this to its pre-open count
-    /// before a retry can mount the same profile and project stores again.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn session_holder_database_count(&self) -> usize {
-        self.session_holder_databases.lock().await.len()
     }
 }

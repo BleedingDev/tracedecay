@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tracedecay_contracts::{CodeIndexReconcileOptionsV1, ResolvedScope};
+use tracedecay_contracts::ResolvedScope;
 
 use tracedecay_runtime_core::cancellation::{CancellationToken, MonotonicDeadline};
 use tracedecay_runtime_core::git_discovery::{
@@ -60,16 +60,12 @@ enum ActivationDemandV1 {
 pub struct CodeIndexActivationHookBatchV1 {
     pub paths: Vec<String>,
     pub overflow: bool,
-    /// One request-scoped reconcile policy, delivered after the route mounts.
-    /// It is consumed by the mounted scheduler and never persisted.
-    pub reconcile_options: Option<CodeIndexReconcileOptionsV1>,
 }
 
 #[derive(Default)]
 struct PendingHookPathsV1 {
     paths: BTreeSet<String>,
     overflow: bool,
-    reconcile_options: Option<CodeIndexReconcileOptionsV1>,
 }
 
 impl PendingHookPathsV1 {
@@ -90,7 +86,6 @@ impl PendingHookPathsV1 {
         CodeIndexActivationHookBatchV1 {
             paths: std::mem::take(&mut self.paths).into_iter().collect(),
             overflow: std::mem::take(&mut self.overflow),
-            reconcile_options: self.reconcile_options.take(),
         }
     }
 }
@@ -339,11 +334,7 @@ impl CodeIndexActivationV1 {
                         .set(f64::from(ACTIVATION_MOUNTED));
                     pending.take()
                 };
-                if route_is_live()
-                    && (!batch.paths.is_empty()
-                        || batch.overflow
-                        || batch.reconcile_options.is_some())
-                {
+                if route_is_live() && (!batch.paths.is_empty() || batch.overflow) {
                     let _ = hint_sink(batch).await;
                 }
                 tracing::info!(
@@ -433,7 +424,8 @@ impl CodeIndexActivationV1 {
         if let Some(verdict) = self.gate_demand(project_root, &demand).await {
             return verdict;
         }
-        let (rel_paths, overflow, reconcile_options) = match demand {
+        let overflow = !matches!(demand, CodeIndexDemandV1::HookPaths(_));
+        let rel_paths = match demand {
             CodeIndexDemandV1::HookPaths(rel_paths) => {
                 if rel_paths.is_empty() {
                     // Empty path batches are a no-op, not a queue seat.
@@ -441,14 +433,9 @@ impl CodeIndexActivationV1 {
                         CodeIndexDemandUnavailableV1::NoProvenChange,
                     );
                 }
-                (rel_paths, false, None)
+                rel_paths
             }
-            CodeIndexDemandV1::Reconcile | CodeIndexDemandV1::OperatorReconcile => {
-                (Vec::new(), true, None)
-            }
-            CodeIndexDemandV1::OperatorReconcileWithOptions(options) => {
-                (Vec::new(), false, Some(options))
-            }
+            CodeIndexDemandV1::Reconcile | CodeIndexDemandV1::OperatorReconcile => Vec::new(),
         };
         let direct = {
             let mut pending = self
@@ -458,15 +445,11 @@ impl CodeIndexActivationV1 {
             if self.state.load(Ordering::Acquire) == ACTIVATION_MOUNTED {
                 Some(CodeIndexActivationHookBatchV1 {
                     paths: rel_paths,
-                    reconcile_options,
                     overflow,
                 })
             } else {
                 pending.extend(rel_paths);
                 pending.overflow |= overflow;
-                if reconcile_options.is_some() {
-                    pending.reconcile_options = reconcile_options;
-                }
                 None
             }
         };
@@ -697,39 +680,6 @@ mod tests {
                 .count(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn explicit_folder_options_survive_cold_mount_and_are_delivered_once() {
-        let repository = repository();
-        let mount_attempts = Arc::new(AtomicUsize::new(0));
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let batches = Arc::new(Mutex::new(Vec::new()));
-        let activation = activation(
-            repository.path(),
-            Arc::clone(&mount_attempts),
-            Some(Arc::clone(&gate)),
-            Arc::clone(&batches),
-        );
-        let options =
-            CodeIndexReconcileOptionsV1::new(["vendor".to_owned()], ["dist/generated".to_owned()])
-                .expect("valid folder options");
-
-        assert_eq!(
-            activation
-                .admit(
-                    repository.path(),
-                    CodeIndexDemandV1::OperatorReconcileWithOptions(options.clone()),
-                )
-                .await,
-            CodeIndexDemandAdmissionV1::Queued
-        );
-        wait_until(|| mount_attempts.load(Ordering::SeqCst) == 1).await;
-        gate.notify_waiters();
-        wait_until(|| !batches.lock().expect("batches").is_empty()).await;
-        let batch = batches.lock().expect("batches").remove(0);
-        assert_eq!(batch.reconcile_options, Some(options));
-        assert!(!batch.overflow);
     }
 
     #[tokio::test]

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use serde_json::Value;
-use tracedecay_hooks::{DaemonHookEvent, HookAgent};
 
 use crate::ports::hook_runtime::HookRuntimeV1;
 
@@ -37,180 +36,6 @@ pub fn codex_additional_context_json(event_name: &str, additional_context: &str)
     super::additional_context_json(event_name, additional_context)
 }
 
-/// Codex `Stop` response: seal the live frontier before queuing transcript ingest.
-pub async fn hook_codex_stop(runtime: &HookRuntimeV1) -> i32 {
-    let started = Instant::now();
-    let event = read_hook_event!();
-    let parsed = serde_json::from_str::<Value>(&event).unwrap_or(Value::Null);
-    if codex_stop_session_id(&parsed).is_none() {
-        return 1;
-    }
-    let root = event_project_root_with_identity(runtime, &parsed).await;
-    let telemetry = record_hook_invoked_parsed(
-        runtime,
-        root.as_deref(),
-        HintAgent::Codex,
-        "Stop",
-        &event,
-        &parsed,
-    );
-    let (dispatched, queued) = super::dispatch::dispatch_for_scope_with_required_work(
-        runtime,
-        tracedecay_hooks::HookHostV1::Codex,
-        &event,
-        root.as_deref(),
-        Some(&telemetry),
-        started,
-        enqueue_codex_stop(runtime, &parsed, root.as_deref(), Some(&telemetry), started),
-    )
-    .await;
-    let guidance = dispatched.into_recorded_guidance(&telemetry).flatten();
-    let output = guidance.map_or_else(
-        || "{}".to_owned(),
-        |guidance| additional_context_json("Stop", &guidance),
-    );
-    let written = super::write_hook_output(
-        root.as_deref(),
-        tracedecay_hooks::HookHostV1::Codex,
-        &event,
-        &output,
-    )
-    .await;
-    i32::from(!written || !queued)
-}
-
-fn codex_stop_session_id(parsed: &Value) -> Option<&str> {
-    // Validate before dispatch; native decoders intentionally ignore identity fields.
-    let session_id = parsed.get("session_id").and_then(Value::as_str)?;
-    if parsed.get("hook_event_name").and_then(Value::as_str) != Some("Stop")
-        || session_id.trim().is_empty()
-        || session_id.chars().any(char::is_control)
-        || tracedecay_domain::SessionId::new(session_id.to_owned()).is_err()
-        || tracedecay_hooks::decode_native_hook_event(
-            tracedecay_hooks::HookHostV1::Codex,
-            parsed.to_string().as_bytes(),
-        )
-        .is_err()
-    {
-        return None;
-    }
-    Some(session_id)
-}
-
-async fn enqueue_codex_stop(
-    runtime: &HookRuntimeV1,
-    parsed: &Value,
-    project_root: Option<&Path>,
-    telemetry: Option<&super::analytics::HookTimingSpan>,
-    started: Instant,
-) -> bool {
-    let Some(session_id) = codex_stop_session_id(parsed) else {
-        return false;
-    };
-    let deadline = super::dispatch::native_lifecycle_deadline(started);
-    if Instant::now() >= deadline {
-        return false;
-    }
-    let mut arguments = serde_json::json!({ "action": "codex_stop", "session_id": session_id });
-    if let Some(project_root) = project_root {
-        // A binding check against the session's daemon-published route, never a new authority.
-        let Some(project_root) = project_root.to_str() else {
-            return false;
-        };
-        arguments["project_root"] = serde_json::json!(project_root);
-    }
-    // The action acknowledges retained cancellable work; it never waits for ingest.
-    let result = tokio::time::timeout_at(
-        deadline.into(),
-        super::daemon_hook_action(runtime, None, arguments, telemetry),
-    )
-    .await;
-    let queued = matches!(result, Ok(Ok(ref value)) if value.get("status").and_then(Value::as_str) == Some("accepted"));
-    if !queued {
-        tracing::warn!("Codex Stop daemon enqueue failed or exceeded the hook deadline");
-    }
-    queued
-}
-
-#[cfg(test)]
-#[test]
-fn native_codex_stop_enqueues_exact_identity_and_refuses_invalid_identity() {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let guard = super::TestDaemonHookActionGuard::install([serde_json::json!({"status":"accepted"}), serde_json::json!({"status":"accepted"})]);
-        let runtime = crate::ports::hook_runtime::crate_test_runtime();
-        let event = serde_json::json!({
-            "hook_event_name": "Stop", "session_id": "native-codex-session-123",
-            "turn_id": "turn-1", "cwd": "/workspace", "model": "codex",
-            "permission_mode": "default", "stop_hook_active": false,
-            "last_assistant_message": "finished"
-        });
-        assert!(enqueue_codex_stop(&runtime, &event, None, None, Instant::now()).await);
-        assert_eq!(guard.calls(), vec![(None, serde_json::json!({
-            "action": "codex_stop", "session_id": "native-codex-session-123", "format": "json"
-        }))]);
-        assert!(enqueue_codex_stop(&runtime, &event, Some(Path::new("/registered/worktree")), None, Instant::now()).await);
-        assert_eq!(guard.calls()[1], (None, serde_json::json!({
-            "action": "codex_stop", "session_id": "native-codex-session-123", "format": "json",
-            "project_root": "/registered/worktree"
-        })));
-        for invalid in [Value::Null, serde_json::json!(17), serde_json::json!(""), serde_json::json!(" ")] {
-            let mut rejected = event.clone();
-            rejected["session_id"] = invalid;
-            enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
-        }
-        let mut rejected = event.clone();
-        rejected.as_object_mut().unwrap().remove("session_id");
-        enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
-        let mut rejected = event;
-        rejected["hook_event_name"] = serde_json::json!("SessionStart");
-        enqueue_codex_stop(&runtime, &rejected, None, None, Instant::now()).await;
-        assert_eq!(guard.calls().len(), 2);
-    });
-}
-
-#[cfg(test)]
-#[tokio::test]
-async fn native_codex_stop_enqueue_uses_reserved_lifecycle_time_and_refuses_expiry() {
-    let guard = super::TestDaemonHookActionGuard::install([serde_json::json!({
-        "status": "accepted"
-    })]);
-    let runtime = crate::ports::hook_runtime::crate_test_runtime();
-    let event = serde_json::json!({
-        "hook_event_name": "Stop", "session_id": "session-stop-reserve",
-        "turn_id": "turn-one", "cwd": "/workspace", "model": "codex",
-        "permission_mode": "default", "stop_hook_active": false,
-        "last_assistant_message": "finished"
-    });
-    let started = Instant::now() - std::time::Duration::from_millis(900);
-    assert!(
-        tracedecay_hooks::HookSynchronousDeadlineV1::after_elapsed(super::analytics::elapsed_us(
-            started
-        ))
-        .is_none()
-    );
-    assert!(enqueue_codex_stop(&runtime, &event, None, None, started).await);
-    assert_eq!(guard.calls().len(), 1);
-    assert!(
-        !enqueue_codex_stop(
-            &runtime,
-            &event,
-            None,
-            None,
-            Instant::now() - std::time::Duration::from_secs(2),
-        )
-        .await
-    );
-    assert_eq!(
-        guard.calls().len(),
-        1,
-        "expired enqueue must not reach transport"
-    );
-}
-
 /// Codex `SessionStart` hook handler.
 #[hotpath::measure(future = true, label = "hosts.hooks.codex.session_start")]
 pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
@@ -237,15 +62,6 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
     .await
     .into_recorded_guidance(&hook_telemetry)
     .flatten();
-    if let Some(project_root) = root.as_deref() {
-        super::notify_hook_event_with_telemetry(
-            runtime,
-            project_root,
-            codex_session_start_route_event(&parsed, project_root),
-            &hook_telemetry,
-        )
-        .await;
-    }
     let output = guidance.map_or_else(
         || serde_json::json!({}).to_string(),
         |guidance| additional_context_json("SessionStart", &guidance),
@@ -263,11 +79,6 @@ pub async fn hook_codex_session_start(runtime: &HookRuntimeV1) -> i32 {
     0
 }
 
-fn codex_session_start_route_event(parsed: &Value, project_root: &Path) -> DaemonHookEvent {
-    DaemonHookEvent::session_start(HookAgent::Codex, project_root.to_path_buf()).with_route(Some(
-        super::hook_route_metadata_from_parsed(parsed, project_root),
-    ))
-}
 /// Codex `UserPromptSubmit` hook handler.
 ///
 /// Resets the local counter and injects steering context for the new turn.

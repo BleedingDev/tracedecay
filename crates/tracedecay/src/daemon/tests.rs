@@ -41,7 +41,6 @@ mod multi_root_journey;
 mod multi_root_scope_set_cas_mcp;
 mod ownership;
 mod profile_retained;
-mod projectless;
 mod remote_project_deletion;
 mod replay;
 mod restart_proxy;

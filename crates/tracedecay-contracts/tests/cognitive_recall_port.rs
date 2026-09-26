@@ -53,7 +53,7 @@ fn candidate(id: &str) -> CognitiveRecallCandidate {
 }
 
 #[test]
-fn legacy_request_json_and_constructor_remain_valid_without_options() {
+fn request_without_options_round_trips_without_optional_fields() {
     let request = request(scope("project.cognitive-recall"));
     let serialized = serde_json::to_value(&request).unwrap();
     assert!(serialized.get("temporal_query").is_none());

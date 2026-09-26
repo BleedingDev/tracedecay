@@ -24,7 +24,7 @@ use tracedecay_domain::configuration::{
     MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
     ProtectedChange, ProtectedChangePlan, ProtectedChangeSnapshotError,
     RETIRED_CORE_SETTING_KEYS_V1, RedactedConfigurationChangeV1, RollbackModeV1, RuleEffect,
-    SEMANTIC_RUNTIME_SETTING_KEY_V2, SOURCE_BINDINGS_SETTING_KEY,
+    SOURCE_BINDINGS_SETTING_KEY,
     SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY, ScopeControlOperationV1, SettingKey, SourceKindV1,
     USER_CODE_INDEX_WORKERS_SETTING_KEY, UserProfileId, WORK_TOPOLOGY_POLICY_SETTING_KEY,
 };
@@ -393,7 +393,6 @@ impl<'db> GlobalDbConfigurationControlStore<'db> {
                 MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
                 MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
                 MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-                SEMANTIC_RUNTIME_SETTING_KEY_V2,
                 SYNC_WATCH_LINKED_WORKTREES_SETTING_KEY,
             ]
             .into_iter()

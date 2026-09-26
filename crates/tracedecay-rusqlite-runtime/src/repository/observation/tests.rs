@@ -14,7 +14,6 @@ use tracedecay_domain::{
     SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1, SanitizerDispositionV1,
     SensitivityV1, SessionId, UtcMicros, VectorWatermark,
 };
-use tracedecay_store::observation::ObservationOriginV1;
 use tracedecay_store::{
     AnchorDispositionReasonClassV1, AnchorDispositionStateV1, AnchoredObservationWrite,
     CursorAdvanceLedgerReasonV1, CursorAdvanceLedgerReceiptIdV1, ObservationCoverageReason,
@@ -294,144 +293,6 @@ fn repository_capture_replay_preserves_first_receipt_and_refuses_changed_evidenc
     assert_eq!(read(&mut connection, &request).unwrap(), retained);
 }
 
-fn recorded_repository_write(clock: i64, authority_ref: &str) -> AnchoredObservationWrite {
-    let write = repository_write(clock, "refs/heads/main", EvidenceClass::Observed);
-    let attachment = write
-        .repository_provenance_attachment()
-        .clone()
-        .with_recorded_origin(
-            authority_ref.to_owned(),
-            write.observation().identity().clone(),
-        )
-        .unwrap();
-    write
-        .with_original_repository_provenance_attachment(attachment)
-        .unwrap()
-}
-
-#[test]
-fn recorded_origin_survives_reopen_and_replay_without_accepting_changed_proof() {
-    let directory = tempfile::TempDir::new().unwrap();
-    let path = directory.path().join("observations.sqlite3");
-    let first = recorded_repository_write(1, "live-event:original");
-    let request = ObservationReadOperationV1::Observation {
-        observation_id: first.observation().observation_id().clone(),
-    };
-    let mut connection = initialize_connection(Connection::open(&path).unwrap());
-    execute(&mut connection, &first).unwrap();
-    drop(connection);
-
-    let mut connection = Connection::open(&path).unwrap();
-    let point = read(&mut connection, &request).unwrap();
-    let ObservationReadResultV1::Observation(row) = &point else {
-        panic!("expected a point read");
-    };
-    assert_eq!(
-        &row.as_ref().as_ref().unwrap().repository_provenance,
-        first.repository_provenance_attachment()
-    );
-    let ObservationReadResultV1::Replay(rows) = read(
-        &mut connection,
-        &ObservationReadOperationV1::Replay {
-            after_sequence: 0,
-            limit: 10,
-        },
-    )
-    .unwrap() else {
-        panic!("expected replay rows");
-    };
-    assert_eq!(rows.len(), 1);
-    assert_eq!(
-        &rows[0].repository_provenance,
-        first.repository_provenance_attachment()
-    );
-
-    execute(
-        &mut connection,
-        &recorded_repository_write(2, "live-event:original"),
-    )
-    .expect("capture clock normalization must preserve the same retained proof");
-    assert!(
-        execute(
-            &mut connection,
-            &recorded_repository_write(3, "live-event:changed"),
-        )
-        .is_err(),
-        "capture clock normalization must not accept a different proof"
-    );
-    assert_eq!(read(&mut connection, &request).unwrap(), point);
-
-    let foreign_identity = observation_write_at("foreign", "receipt.foreign", 2, 0, 1, None)
-        .observation()
-        .identity()
-        .clone();
-    let tampered = ObservationOriginV1::Recorded {
-        authority_ref: "live-event:original".to_owned(),
-        source_identity: foreign_identity,
-    };
-    connection
-        .execute(
-            "UPDATE observation_repository_provenance SET origin_json = ?1",
-            [serde_json::to_string(&tampered).unwrap()],
-        )
-        .unwrap();
-    assert!(
-        read(&mut connection, &request).is_err(),
-        "a retained proof for another source generation must fail read validation"
-    );
-}
-
-#[test]
-fn null_legacy_origin_keeps_constructor_default_and_cannot_gain_a_proof_on_replay() {
-    for write in [
-        repository_write(1, "refs/heads/main", EvidenceClass::Observed),
-        anchored_observation_write("legacy unavailable", "receipt.legacy-unavailable"),
-    ] {
-        let mut connection = connection();
-        execute(&mut connection, &write).unwrap();
-        connection
-            .execute(
-                "UPDATE observation_repository_provenance SET origin_json = NULL",
-                [],
-            )
-            .unwrap();
-        let request = ObservationReadOperationV1::Observation {
-            observation_id: write.observation().observation_id().clone(),
-        };
-        let ObservationReadResultV1::Observation(row) = read(&mut connection, &request).unwrap()
-        else {
-            panic!("expected a legacy point read");
-        };
-        assert_eq!(
-            row.unwrap().repository_provenance.origin(),
-            write.repository_provenance_attachment().origin()
-        );
-        execute(&mut connection, &write).expect("unchanged legacy evidence can replay");
-        if write
-            .repository_provenance_attachment()
-            .provenance()
-            .is_some()
-        {
-            assert!(
-                execute(
-                    &mut connection,
-                    &recorded_repository_write(2, "live-event:new"),
-                )
-                .is_err(),
-                "a duplicate cannot invent recorded origin for an old row"
-            );
-        }
-        let origin: Option<String> = connection
-            .query_row(
-                "SELECT origin_json FROM observation_repository_provenance",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(origin.is_none());
-    }
-}
-
 #[test]
 fn repository_capture_is_persisted_once_and_hydrated_back_into_every_row() {
     let mut connection = connection();
@@ -497,10 +358,7 @@ fn repository_capture_is_persisted_once_and_hydrated_back_into_every_row() {
 }
 
 fn connection() -> Connection {
-    initialize_connection(Connection::open_in_memory().unwrap())
-}
-
-fn initialize_connection(connection: Connection) -> Connection {
+    let connection = Connection::open_in_memory().unwrap();
     connection
         .execute_batch(
             "CREATE TABLE sanitization_receipts (
@@ -561,8 +419,7 @@ fn initialize_connection(connection: Connection) -> Connection {
                     availability_json TEXT NOT NULL,
                     capture_json TEXT,
                     retrieval_anchor_id TEXT UNIQUE,
-                    owner_json TEXT,
-                    origin_json TEXT CHECK(origin_json IS NULL OR json_valid(origin_json))
+                    owner_json TEXT
                  );
                  CREATE TABLE observation_repository_captures (
                     capture_id TEXT PRIMARY KEY,
@@ -1612,91 +1469,4 @@ fn cline_stream_alias_refuses_changed_usage_or_wrong_native_stream() {
             .unwrap();
         assert_eq!(alias, old.retrieval_anchor_id().as_str());
     }
-}
-
-#[test]
-fn recent_sequence_window_is_empty_or_newest_bounded_rows_with_gaps() {
-    use tracedecay_store::ObservationRecentWindowV1;
-    let mut connection = connection();
-    assert_eq!(
-        read(
-            &mut connection,
-            &ObservationReadOperationV1::RecentWindow { limit: 2 }
-        )
-        .unwrap(),
-        ObservationReadResultV1::RecentWindow(None)
-    );
-    // The read must inspect sequence metadata only. These payload fields are
-    // deliberately not decodable observations; a later replay must validate them.
-    for sequence in [7_i64, 90, 300] {
-        connection.execute("INSERT INTO observations (sequence, observation_id, payload_digest, receipt_id, observation_json, committed_cursor_json) VALUES (?1, ?2, 'unread', 'unread', 'unread', 'unread')", rusqlite::params![sequence, format!("row.{sequence}")]).unwrap();
-    }
-    for (limit, first_sequence, has_older) in [
-        (1, 300, true),
-        (2, 90, true),
-        (3, 7, false),
-        (4096, 7, false),
-    ] {
-        assert_eq!(
-            read(
-                &mut connection,
-                &ObservationReadOperationV1::RecentWindow { limit }
-            )
-            .unwrap(),
-            ObservationReadResultV1::RecentWindow(Some(ObservationRecentWindowV1 {
-                first_sequence,
-                last_sequence: 300,
-                has_older
-            }))
-        );
-    }
-    for limit in [0, 4097, u16::MAX] {
-        assert!(
-            read(
-                &mut connection,
-                &ObservationReadOperationV1::RecentWindow { limit }
-            )
-            .is_err()
-        );
-    }
-    connection
-        .execute(
-            "UPDATE observations SET sequence = 0 WHERE sequence = 7",
-            [],
-        )
-        .unwrap();
-    assert!(
-        read(
-            &mut connection,
-            &ObservationReadOperationV1::RecentWindow { limit: 3 }
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn recent_sequence_window_reads_at_most_the_requested_newest_rows_plus_one() {
-    use tracedecay_store::ObservationRecentWindowV1;
-    let mut connection = connection();
-    connection.execute_batch("WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5000) INSERT INTO observations (sequence, observation_id, payload_digest, receipt_id, observation_json, committed_cursor_json) SELECT n, 'row.' || n, 'unread', 'unread', 'unread', 'unread' FROM seq;").unwrap();
-    // The invalid old row is beyond LIMIT 4097 and therefore cannot be read
-    // by this request. This catches widening the sequence lookup to all rows.
-    connection
-        .execute(
-            "UPDATE observations SET sequence = 0 WHERE sequence = 1",
-            [],
-        )
-        .unwrap();
-    assert_eq!(
-        read(
-            &mut connection,
-            &ObservationReadOperationV1::RecentWindow { limit: 4096 }
-        )
-        .unwrap(),
-        ObservationReadResultV1::RecentWindow(Some(ObservationRecentWindowV1 {
-            first_sequence: 905,
-            last_sequence: 5000,
-            has_older: true
-        }))
-    );
 }

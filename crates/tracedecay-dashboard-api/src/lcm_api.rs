@@ -26,8 +26,6 @@ pub enum DashboardLcmReadRequestV1 {
     Overview {
         query: String,
         limit: i64,
-        cursor: Option<String>,
-        provider: Option<String>,
     },
     Search {
         query: String,
@@ -35,7 +33,6 @@ pub enum DashboardLcmReadRequestV1 {
         cursor: Option<String>,
         role: Option<String>,
         source: Option<String>,
-        provider: Option<String>,
         session_id: Option<String>,
         since: Option<i64>,
         until: Option<i64>,
@@ -44,14 +41,11 @@ pub enum DashboardLcmReadRequestV1 {
         session_id: String,
         limit: i64,
         cursor: Option<String>,
-        provider: Option<String>,
     },
     Timeline {
         bucket: DashboardLcmTimelineBucketV1,
         session_id: Option<String>,
         limit: i64,
-        cursor: Option<String>,
-        provider: Option<String>,
     },
 }
 
@@ -113,7 +107,6 @@ pub struct DashboardLcmCanonicalMessageV1 {
 pub struct DashboardLcmCanonicalSummaryV1 {
     pub node_id: String,
     pub session_id: String,
-    pub provider: String,
     pub depth: i64,
     pub token_count: Option<i64>,
     pub source_token_count: Option<i64>,
@@ -181,7 +174,6 @@ pub(super) enum LcmTokenCountProvenanceV1 {
 pub(super) struct LcmMessageV1 {
     pub(super) store_id: Option<i64>,
     pub(super) session_id: String,
-    pub(super) provider: String,
     pub(super) role: Option<String>,
     pub(super) source: Option<String>,
     pub(super) timestamp: Option<i64>,
@@ -218,7 +210,6 @@ pub(super) fn message_tool_use_id(metadata_json: Option<&str>) -> Option<String>
 pub(super) struct LcmSummaryNodeV1 {
     pub(super) node_id: String,
     pub(super) session_id: String,
-    pub(super) provider: String,
     pub(super) depth: i64,
     pub(super) category: String,
     pub(super) source_type: String,
@@ -243,7 +234,6 @@ struct LcmRoleCountV1 {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 struct LcmSourceCountV1 {
     source: String,
-    provider: String,
     count: i64,
 }
 
@@ -277,7 +267,6 @@ struct LcmOverviewStatsV1 {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 struct LcmLatestSessionV1 {
     session_id: String,
-    provider: String,
     message_count: i64,
     last_store_id: Option<i64>,
     last_timestamp: Option<i64>,
@@ -300,10 +289,6 @@ pub struct LcmOverviewPayloadV1 {
     matches: LcmMatchesV1,
     query: String,
     limit: i64,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    next_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -322,8 +307,6 @@ struct LcmSearchTotalsV1 {
 struct LcmSearchFiltersV1 {
     role: Option<String>,
     source: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
     session_id: Option<String>,
     since: Option<f64>,
     until: Option<f64>,
@@ -350,7 +333,6 @@ pub(super) struct LcmSessionPayloadV1 {
     storage_scope: String,
     exists: bool,
     session_id: String,
-    provider: String,
     limit: i64,
     counts: LcmSessionCountsV1,
     messages: Vec<LcmMessageV1>,
@@ -388,10 +370,6 @@ pub(super) struct LcmTimelinePayloadV1 {
     exists: bool,
     bucket: String,
     session_id: Option<String>,
-    #[serde(default)]
-    provider: Option<String>,
-    #[serde(default)]
-    next_cursor: Option<String>,
     buckets: Vec<LcmTimelineBucketV1>,
     node_buckets: Vec<LcmTimelineNodeBucketV1>,
     undated: LcmTimelineUndatedV1,
@@ -419,9 +397,6 @@ pub struct OverviewParams {
     #[serde(default)]
     q: String,
     limit: Option<i64>,
-    cursor: Option<String>,
-    #[serde(default)]
-    provider: String,
 }
 
 /// GET /api/plugins/hermes-lcm/overview
@@ -441,8 +416,6 @@ pub async fn overview(
                 DashboardLcmReadRequestV1::Overview {
                     query: params.q,
                     limit: params.limit.unwrap_or(25).clamp(1, 200),
-                    cursor: params.cursor,
-                    provider: trimmed_nonempty(params.provider),
                 },
             )
             .await
@@ -462,8 +435,6 @@ pub struct SearchParams {
     role: String,
     #[serde(default)]
     source: String,
-    #[serde(default)]
-    provider: String,
     #[serde(default)]
     session_id: String,
     #[serde(default)]
@@ -497,7 +468,6 @@ pub async fn search(
                     cursor: params.cursor,
                     role: trimmed_nonempty(params.role),
                     source: trimmed_nonempty(params.source),
-                    provider: trimmed_nonempty(params.provider),
                     session_id: trimmed_nonempty(params.session_id),
                     since,
                     until,
@@ -514,8 +484,6 @@ pub async fn search(
 pub struct SessionParams {
     limit: Option<i64>,
     cursor: Option<String>,
-    #[serde(default)]
-    provider: String,
 }
 
 /// GET /api/plugins/hermes-lcm/session/{session_id}
@@ -534,7 +502,6 @@ pub async fn session(
                     session_id,
                     limit: params.limit.unwrap_or(100).clamp(1, 500),
                     cursor: params.cursor,
-                    provider: trimmed_nonempty(params.provider),
                 },
             )
             .await
@@ -550,9 +517,6 @@ pub struct TimelineParams {
     #[serde(default)]
     session_id: String,
     limit: Option<i64>,
-    cursor: Option<String>,
-    #[serde(default)]
-    provider: String,
 }
 
 /// GET /api/plugins/hermes-lcm/timeline
@@ -575,8 +539,6 @@ pub async fn timeline(
                     bucket,
                     session_id: trimmed_nonempty(params.session_id),
                     limit: params.limit.unwrap_or(400).clamp(1, 2_000),
-                    cursor: params.cursor,
-                    provider: trimmed_nonempty(params.provider),
                 },
             )
             .await
@@ -608,17 +570,6 @@ where
     match outcome {
         DashboardLcmReadOutcomeV1::Ready(page) => {
             let timeline_coverage = aggregates::timeline_view_coverage(&request, &page);
-            if timeline_coverage
-                .map(|(_, _, truncated)| truncated)
-                .unwrap_or(false)
-                && page.next_cursor.is_none()
-            {
-                return Json(DashboardEnvelopeV1::unavailable(
-                    scope_from_state(state),
-                    None,
-                    "lcm_timeline_bucket_limit_without_cursor",
-                ));
-            }
             let coverage = if aggregates::is_aggregate_request(&request) {
                 DashboardCoverageV1::complete(
                     aggregates::returned_count(&page),
@@ -655,13 +606,6 @@ where
             }
         }
         DashboardLcmReadOutcomeV1::Partial { page, omitted } => {
-            if aggregates::is_aggregate_request(&request) && page.next_cursor.is_none() {
-                return Json(DashboardEnvelopeV1::unavailable(
-                    scope_from_state(state),
-                    None,
-                    "lcm_aggregate_continuation_unavailable",
-                ));
-            }
             let examined = aggregates::returned_count(&page);
             let eligible = examined.saturating_add(omitted);
             match aggregates::render_canonical_payload(

@@ -32,7 +32,7 @@ use tracedecay_memory_provider_api::{
     ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation,
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort,
 };
 mod isolation_fixture;
 
@@ -947,43 +947,7 @@ impl NativeMemoryApplicationPort for MountedHostilePort {
         mounted_unexpected()
     }
 
-    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
-        mounted_unexpected()
-    }
-
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        mounted_unexpected()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         mounted_unexpected()
     }
 }

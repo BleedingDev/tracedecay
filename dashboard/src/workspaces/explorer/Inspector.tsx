@@ -47,8 +47,7 @@ export function HitInspector({
   const evidence = hitEvidence(hit);
   const age = compactRelativeAge(hit.stamp, Date.now() / 1000);
   const sessionId = sessionIdOf(hit);
-  const provider = providerOf(hit);
-  const session = useExplorerSessionContext(sessionId, provider, mode === 'selected');
+  const session = useExplorerSessionContext(sessionId, mode === 'selected');
   const identityKey = identityFieldOf(hit);
   return (
     <InspectorPanel
@@ -264,14 +263,6 @@ function CodePivot({ hit }: { hit: Hit }) {
       <ArrowUpRight aria-hidden size={11} />
     </Link>
   );
-}
-
-function providerOf(hit: Hit): string | undefined {
-  if (hit.lane !== "sessions") return undefined;
-  const raw = hit.raw["provider"] ?? hit.raw["source"];
-  if (typeof raw !== "string") return undefined;
-  const trimmed = raw.trim();
-  return trimmed === "" ? undefined : trimmed;
 }
 
 function SessionContextDetails({

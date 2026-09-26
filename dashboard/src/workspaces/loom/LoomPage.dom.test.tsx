@@ -59,7 +59,6 @@ const SESSIONS = {
 function chainMessage(over: Record<string, unknown>) {
   return {
     session_id: 'sess-open',
-    provider: 'cursor',
     role: null,
     content: null,
     snippet: null,
@@ -81,7 +80,6 @@ function chainMessage(over: Record<string, unknown>) {
 const CHAIN = {
   exists: true,
   session_id: 'sess-open',
-  provider: 'cursor',
   path: '/home/zack/.tracedecay/projects/project-loom/sessions.db',
   storage_scope: 'profile_sharded',
   limit: 200,
@@ -132,8 +130,6 @@ const TIMELINE = {
   exists: true,
   bucket: 'day',
   session_id: null,
-  provider: null,
-  next_cursor: null,
   buckets: [
     {
       bucket: '2026-07-23',
@@ -719,21 +715,10 @@ describe('LoomPage', () => {
 
   it('renders chain token provenance and keeps unknown counts unknown', async () => {
     renderLoom({ ...HAPPY, '/api/plugins/hermes-lcm/session/': { status: 200, body: readyEnvelope(CHAIN) } });
-    const fetchMock = vi.mocked(fetch);
     await userEvent.click(await screen.findByRole('button', { name: 'Select session Deliver Git primitive runtime' }));
     expect(await screen.findByText('~12 tokens · o200k approximate')).toBeTruthy();
     expect(screen.getByText('~20 tokens · o200k approximate')).toBeTruthy();
     expect(screen.getByText('tokens unknown')).toBeTruthy();
-    expect(
-      fetchMock.mock.calls.some((call) => {
-        const url = new URL(String(call[0]), 'http://daemon.test');
-        return (
-          url.pathname.endsWith('/session/sess-open') &&
-          url.searchParams.get('provider') === 'cursor' &&
-          url.searchParams.get('limit') === '200'
-        );
-      }),
-    ).toBe(true);
   });
 
   it('draws undated turns in recorded order and shares one reveal cursor across field, rows and URL', async () => {
@@ -829,20 +814,11 @@ describe('LoomPage', () => {
           next_cursor: 'opaque-next-page',
           summary_nodes: [
             {
-              category: 'checkpoint',
-              created_at: NOW - 100,
-              depth: 1,
-              expand_hint: 'open the canonical transcript page',
-              latest_at: null,
-              node_id: 'summary-raw-0',
-              recency: null,
-              session_id: 'sess-open',
-              provider: 'cursor',
-              snippet: 'compacted setup',
-              source_token_count: 30,
-              source_type: 'message',
-              summary: 'The setup was compacted.',
-              token_count: 8,
+              category: 'checkpoint', created_at: NOW - 100, depth: 1,
+              expand_hint: 'open the canonical transcript page', latest_at: null,
+              node_id: 'summary-raw-0', recency: null, session_id: 'sess-open',
+              snippet: 'compacted setup', source_token_count: 30, source_type: 'message',
+              summary: 'The setup was compacted.', token_count: 8,
             },
           ],
           messages: [

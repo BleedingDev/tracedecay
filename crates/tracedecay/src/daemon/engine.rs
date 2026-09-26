@@ -852,23 +852,7 @@ impl DaemonEngine {
                 Some(&self.project_open_attempts),
             ))
             .await?;
-            let full_maintenance_ready = if composition.inserted {
-                self.store_administration
-                    .project_servers()
-                    .lock()
-                    .await
-                    .servers
-                    .get(&composition.key)
-                    .is_some_and(|entry| {
-                        entry
-                            .publication
-                            .satisfies(ProjectServerRequirement::RegisteredHostIngest)
-                            && Arc::ptr_eq(&entry.server, &composition.server)
-                    })
-            } else {
-                false
-            };
-            if full_maintenance_ready {
+            if composition.inserted {
                 self.spawn_project_maintenance_activation(
                     composition.key.clone(),
                     composition.canonical_project_path.clone(),

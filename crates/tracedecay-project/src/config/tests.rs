@@ -2,117 +2,6 @@ use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
 
-#[test]
-fn memory_provider_recall_routing_defaults_to_no_active_provider_and_validates() {
-    use tracedecay_domain::configuration::{
-        MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
-        MemoryProviderRecallFallbackV1, MemoryProviderRecallRoutingV1,
-    };
-
-    let closed = MemoryProviderRecallRoutingV1::default();
-    assert_eq!(
-        closed.active_provider, None,
-        "no provider may answer recall unless the routing gate names it"
-    );
-    assert_eq!(closed.fallback, None);
-    assert_eq!(closed.degradation, None);
-
-    // An explicit pin round-trips.
-    let pinned = MemoryProviderRecallRoutingV1 {
-        active_provider: Some("tracedecay.native".to_owned()),
-        fallback: Some(MemoryProviderRecallFallbackV1 {
-            policy_id: "policy.memory-failover".to_owned(),
-            policy_revision: 7,
-            target_provider: "provider.other".to_owned(),
-        }),
-        degradation: Some(MemoryProviderRecallDegradationV1 {
-            policy_id: "policy.memory-degradation".to_owned(),
-            policy_revision: 4,
-            allowed_causes: vec![
-                MemoryProviderRecallDegradationCauseV1::Unavailable,
-                MemoryProviderRecallDegradationCauseV1::TimedOut,
-            ],
-        }),
-    };
-    pinned.validate().unwrap();
-    let parsed: MemoryProviderRecallRoutingV1 =
-        serde_json::from_str(&serde_json::to_string(&pinned).unwrap()).unwrap();
-    assert_eq!(parsed, pinned);
-
-    // Contradictory or incomplete gates fail closed.
-    let self_target = MemoryProviderRecallRoutingV1 {
-        active_provider: Some("tracedecay.native".to_owned()),
-        fallback: Some(MemoryProviderRecallFallbackV1 {
-            policy_id: "policy.memory-failover".to_owned(),
-            policy_revision: 7,
-            target_provider: "tracedecay.native".to_owned(),
-        }),
-        degradation: None,
-    };
-    assert!(self_target.validate().is_err());
-    let fallback_without_active = MemoryProviderRecallRoutingV1 {
-        active_provider: None,
-        fallback: Some(MemoryProviderRecallFallbackV1 {
-            policy_id: "policy.memory-failover".to_owned(),
-            policy_revision: 7,
-            target_provider: "provider.other".to_owned(),
-        }),
-        degradation: None,
-    };
-    assert!(fallback_without_active.validate().is_err());
-    let zero_revision = MemoryProviderRecallRoutingV1 {
-        active_provider: Some("tracedecay.native".to_owned()),
-        fallback: Some(MemoryProviderRecallFallbackV1 {
-            policy_id: "policy.memory-failover".to_owned(),
-            policy_revision: 0,
-            target_provider: "provider.other".to_owned(),
-        }),
-        degradation: None,
-    };
-    assert!(zero_revision.validate().is_err());
-
-    let valid_degradation = MemoryProviderRecallDegradationV1 {
-        policy_id: "policy.memory-degradation".to_owned(),
-        policy_revision: 4,
-        allowed_causes: vec![MemoryProviderRecallDegradationCauseV1::Unavailable],
-    };
-    let degradation_without_active = MemoryProviderRecallRoutingV1 {
-        active_provider: None,
-        fallback: None,
-        degradation: Some(valid_degradation.clone()),
-    };
-    assert!(degradation_without_active.validate().is_err());
-
-    for degradation in [
-        MemoryProviderRecallDegradationV1 {
-            policy_id: " ".to_owned(),
-            ..valid_degradation.clone()
-        },
-        MemoryProviderRecallDegradationV1 {
-            policy_revision: 0,
-            ..valid_degradation.clone()
-        },
-        MemoryProviderRecallDegradationV1 {
-            allowed_causes: Vec::new(),
-            ..valid_degradation.clone()
-        },
-        MemoryProviderRecallDegradationV1 {
-            allowed_causes: vec![
-                MemoryProviderRecallDegradationCauseV1::Unavailable,
-                MemoryProviderRecallDegradationCauseV1::Unavailable,
-            ],
-            ..valid_degradation
-        },
-    ] {
-        let routing = MemoryProviderRecallRoutingV1 {
-            active_provider: Some("tracedecay.native".to_owned()),
-            fallback: None,
-            degradation: Some(degradation),
-        };
-        assert!(routing.validate().is_err());
-    }
-}
-
 #[tokio::test]
 async fn discover_project_root_with_identity_does_not_open_registry_only_store() {
     let _profile = super::PinnedUserDataDir::new();
@@ -330,9 +219,8 @@ mod runtime_configuration_cutover {
         ConfigurationMutationGrantReceiptV1, ConfigurationMutationOperationV1,
         ConfigurationMutationSinkV1, ConfigurationRevisionId, ConfigurationValueV1,
         DIAGNOSTICS_PREWARM_SETTING_KEY, INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY,
-        MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, SOURCE_BINDINGS_SETTING_KEY,
-        SYNC_AUTO_WATCH_SETTING_KEY, ScopeSourceBinding, SettingKey, SourceBindingId,
-        SourceKindV1,
+        SOURCE_BINDINGS_SETTING_KEY, SYNC_AUTO_WATCH_SETTING_KEY, ScopeSourceBinding, SettingKey,
+        SourceBindingId, SourceKindV1,
     };
     use tracedecay_domain::{AccessPolicyDigest, ActorId, ProjectId, UtcMicros};
 
@@ -767,7 +655,7 @@ mod runtime_configuration_cutover {
     }
 
     #[tokio::test]
-    async fn existing_snapshot_converges_registered_additive_defaults_before_materialization() {
+    async fn existing_snapshot_converges_new_native_graph_default_before_materialization() {
         use tracedecay_runtime_core::db::engine::params;
 
         let _profile = crate::config::PinnedUserDataDir::new();
@@ -796,18 +684,12 @@ mod runtime_configuration_cutover {
         let database = runtime
             .registered_database_arc(tracedecay_sessions::admission::HostAdmissionScope::Project)
             .expect("bind registered project database");
-        let settings = [
-            SettingKey::new(INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY)
-                .expect("native graph setting key"),
-            SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY)
-                .expect("memory provider setting key"),
-        ];
+        let setting = SettingKey::new(INDEX_NATIVE_GRAPH_ACTIVATION_SETTING_KEY)
+            .expect("native graph setting key");
         let mut values = initial.snapshot().effective_values.clone();
         let mut provenance = initial.snapshot().provenance.clone();
-        for setting in &settings {
-            values.remove(setting);
-            provenance.remove(setting);
-        }
+        values.remove(&setting);
+        provenance.remove(&setting);
         let pre_key_snapshot =
             tracedecay_domain::configuration::ConfigurationSnapshotV1::new(values, provenance)
                 .expect("pre-key snapshot remains internally canonical");
@@ -824,15 +706,13 @@ mod runtime_configuration_cutover {
             .execute("DROP TRIGGER configuration_revisions_immutable_update", ())
             .await
             .expect("open immutable revision fixture seam");
-        for setting in &settings {
-            transaction
-                .execute(
-                    "DELETE FROM configuration_entries WHERE revision_id = ?1 AND key = ?2",
-                    params![initial.revision_id().as_str(), setting.as_str()],
-                )
-                .await
-                .expect("remove post-snapshot setting from fixture");
-        }
+        transaction
+            .execute(
+                "DELETE FROM configuration_entries WHERE revision_id = ?1 AND key = ?2",
+                params![initial.revision_id().as_str(), setting.as_str()],
+            )
+            .await
+            .expect("remove post-snapshot setting from fixture");
         transaction
             .execute(
                 "UPDATE configuration_revisions
@@ -875,14 +755,9 @@ mod runtime_configuration_cutover {
             .expect("registered default must converge before runtime materialization");
         assert_ne!(converged.revision_id(), initial.revision_id());
         assert!(converged.config().native_graph_activation);
-        assert!(!converged.config().memory_provider_native_enabled);
         assert_eq!(
-            converged.snapshot().effective_values.get(&settings[0]),
+            converged.snapshot().effective_values.get(&setting),
             Some(&ConfigurationValueV1::Boolean(true))
-        );
-        assert_eq!(
-            converged.snapshot().effective_values.get(&settings[1]),
-            Some(&ConfigurationValueV1::Boolean(false))
         );
         let reopened = runtime
             .ensure_runtime_configuration_for_test(root.path(), &layout)

@@ -130,7 +130,6 @@ function message(over: Partial<LcmMessageV1> = {}): LcmMessageV1 {
     metadata_json: null,
     ordinal: 0,
     pinned: null,
-    provider: 'claude',
     role: 'assistant',
     session_id: 'root',
     snippet: null,

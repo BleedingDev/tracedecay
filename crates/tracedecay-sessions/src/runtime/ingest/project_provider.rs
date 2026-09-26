@@ -278,7 +278,6 @@ impl<'a> ProjectProviderRun<'a> {
                 path,
                 self.project_root,
                 self.project_id.clone(),
-                None,
                 self.facade,
                 remaining,
                 self.cancellation,

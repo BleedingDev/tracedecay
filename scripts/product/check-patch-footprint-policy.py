@@ -190,7 +190,6 @@ TRACEDECAY_INTERNAL_DEPENDENCY_PATTERNS = frozenset(
         "tracedecay-rusqlite-runtime",
         "tracedecay-code-*",
         "tracedecay-*query*",
-        "tracedecay-semantic*",
         "rusqlite",
         "grafeo*",
         "libsql*",

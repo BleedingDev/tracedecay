@@ -405,26 +405,51 @@ async fn moved_project_alias_survives_runtime_restart_and_missing_symlink_tail()
     assert_eq!(old_project, current_project);
 }
 
-/// A fresh registry carries the read indexes; a store missing them is not the
-/// exact final shape and is refused by registered-schema admission instead of
-/// being migrated on reopen.
 #[tokio::test]
-async fn fresh_project_registry_indexes_cover_actual_read_shapes() {
-    let harness = RegisteredGlobalDbHarness::open("project-registry-read-indexes").await;
-    let plans = registry_query_plans(&harness.registered).await;
-    assert_plan_uses(&plans.recent, "idx_code_projects_last_seen_project");
-    assert_plan_uses(&plans.git_common_dir, "idx_code_projects_git_common_dir");
-    assert_plan_uses(
-        &plans.canonical_root,
-        "idx_code_projects_canonical_root_project",
-    );
+async fn project_registry_indexes_migrate_on_reopen_and_cover_actual_read_shapes() {
+    let harness = RegisteredGlobalDbHarness::open("project-registry-read-index-migration").await;
+    harness
+        .registered
+        .writer_connection()
+        .expect("registered writer")
+        .execute_batch(
+            "DROP INDEX IF EXISTS idx_code_projects_last_seen_project;
+             DROP INDEX IF EXISTS idx_code_projects_git_common_dir;
+             DROP INDEX IF EXISTS idx_code_projects_canonical_root_project;",
+        )
+        .await
+        .expect("remove project registry read indexes");
+
+    let pre = registry_query_plans(&harness.registered).await;
+    for (name, plan) in [
+        ("idx_code_projects_last_seen_project", &pre.recent),
+        ("idx_code_projects_git_common_dir", &pre.git_common_dir),
+        (
+            "idx_code_projects_canonical_root_project",
+            &pre.canonical_root,
+        ),
+    ] {
+        assert!(
+            plan.iter().all(|detail| !detail.contains(name)),
+            "pre-migration plan unexpectedly used {name}:\n{}",
+            plan.join("\n")
+        );
+    }
     assert!(
-        plans
-            .recent
+        pre.recent
             .iter()
-            .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
-        "recent-project query must be served in index order:\n{}",
-        plans.recent.join("\n")
+            .any(|detail| detail.contains("USE TEMP B-TREE FOR ORDER BY")),
+        "pre-migration recent-project query must expose its sorting regression:\n{}",
+        pre.recent.join("\n")
+    );
+
+    let harness = harness.restart().await;
+    let post = registry_query_plans(&harness.registered).await;
+    assert_plan_uses(&post.recent, "idx_code_projects_last_seen_project");
+    assert_plan_uses(&post.git_common_dir, "idx_code_projects_git_common_dir");
+    assert_plan_uses(
+        &post.canonical_root,
+        "idx_code_projects_canonical_root_project",
     );
 }
 

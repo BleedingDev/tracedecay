@@ -231,7 +231,7 @@ fn checked_in_native_fixture_without_complete_lifecycle_fails_closed() {
 }
 
 #[tokio::test]
-async fn protected_replay_locator_resolves_session_before_lifecycle_exists() {
+async fn protected_replay_locator_re_resolves_the_authoritative_native_lifecycle() {
     let temporary = TempDir::new().unwrap();
     let project_id = id::<ProjectId>("project.native.replay");
     let worktree_id = id::<WorktreeId>("worktree.native.replay");
@@ -240,16 +240,8 @@ async fn protected_replay_locator_resolves_session_before_lifecycle_exists() {
         .registered_database_arc(HostAdmissionScope::Project)
         .unwrap();
     sessions
-        .writer_connection()
-        .unwrap()
-        .execute(
-            "INSERT INTO sessions (provider, session_id, project_key, project_path)
-             VALUES ('codex', 'session.native.codex', ?1, ?2)",
-            tracedecay_runtime_core::db::engine::params![
-                project_id.as_str(),
-                temporary.path().join("project").display().to_string()
-            ],
-        )
+        .observation_store()
+        .persist_observation(durable_native_observation(&project_id))
         .await
         .unwrap();
     let hook_project_id = [211; 16];

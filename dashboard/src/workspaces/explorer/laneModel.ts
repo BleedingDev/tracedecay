@@ -243,13 +243,12 @@ function hitsForLane(
   lane: SourceLaneId,
   rows: readonly Record<string, unknown>[],
   terms: readonly string[],
-  scopeIdentity?: string,
 ): Hit[] {
   switch (lane) {
     case 'code':
       return codeHits(rows, terms);
     case 'sessions':
-      return sessionHits(rows, terms, scopeIdentity);
+      return sessionHits(rows, terms);
     case 'knowledge':
       return knowledgeHits(rows, terms);
     default: {
@@ -285,7 +284,6 @@ export function laneFromSourceProgress(
   lane: SourceLaneId,
   source: ExplorerSourceProgressV1,
   terms: readonly string[],
-  scopeIdentity?: string,
 ): ExplorerLaneReadModel {
   if (source.source_id !== LANE_SOURCE_ID[lane]) {
     // The record is addressed to another source, so it says nothing about this
@@ -314,7 +312,7 @@ export function laneFromSourceProgress(
           watermark: source.watermark,
         };
       }
-      const hits = hitsForLane(lane, narrowPageRows(page), terms, scopeIdentity);
+      const hits = hitsForLane(lane, narrowPageRows(page), terms);
       return {
         state: 'ready',
         lane,
@@ -328,8 +326,7 @@ export function laneFromSourceProgress(
     }
     case 'partial': {
       const page = source.page;
-      const hits =
-        page === null ? [] : hitsForLane(lane, narrowPageRows(page), terms, scopeIdentity);
+      const hits = page === null ? [] : hitsForLane(lane, narrowPageRows(page), terms);
       return {
         state: 'partial',
         lane,
@@ -428,7 +425,6 @@ export function searchLane(
   result: EnvelopeResult<ExplorerQueryRunV1> | undefined,
   submittedQuery: string,
   terms: readonly string[],
-  scopeIdentity?: string,
 ): ExplorerLaneReadModel {
   if (result === undefined) return { state: 'pending', lane, phase: null };
   if (result.outcome === 'transport') {
@@ -437,7 +433,7 @@ export function searchLane(
   const run = result.envelope.payload;
   if (run.request.query !== submittedQuery) return { state: 'pending', lane, phase: null };
   const source = run.sources.find((candidate) => candidate.source_id === LANE_SOURCE_ID[lane]);
-  if (source !== undefined) return laneFromSourceProgress(lane, source, terms, scopeIdentity);
+  if (source !== undefined) return laneFromSourceProgress(lane, source, terms);
   // The coordinator has finished and never named this source. Leaving the lane
   // on `pending` would show a spinner for a read that will never arrive.
   return runIsTerminal(run.state)
@@ -458,23 +454,14 @@ export function browseLane<T>(
   isPending: boolean,
   rowsOf: (data: T) => readonly Record<string, unknown>[],
   terms: readonly string[],
-  scopeIdentity?: string,
 ): ExplorerLaneReadModel {
   if (isPending) return { state: 'pending', lane, phase: null };
   if (result === undefined) return { state: 'unanswered', lane };
   if (result.outcome === 'transport') {
     return laneFromTransport(lane, result.state, result.detail ?? null);
   }
-  if (result.envelope.domain_state === 'partial') {
-    return {
-      state: 'unavailable',
-      lane,
-      errorCode: 'explorer_resume_cursor_unavailable',
-      detail: 'the overview is truncated without an Explorer resume cursor',
-    };
-  }
   const rows = rowsOf(result.envelope.payload);
-  const hits = hitsForLane(lane, rows, terms, scopeIdentity);
+  const hits = hitsForLane(lane, rows, terms);
   // The overview carries no per-source freshness; the envelope's own
   // freshness reading is the daemon's statement about this read.
   const freshness = result.envelope.freshness;

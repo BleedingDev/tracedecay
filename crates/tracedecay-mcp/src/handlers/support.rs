@@ -20,7 +20,7 @@ pub fn retrieval_cursor(args: &Value) -> Result<Option<tracedecay_domain::Retrie
     let Some(encoded) = args.get("cursor").and_then(Value::as_str) else {
         return Ok(None);
     };
-    if encoded.len() > tracedecay_domain::RETRIEVAL_CURSOR_MAX_ENVELOPE_BYTES {
+    if encoded.len() > 4_096 {
         return Err(TraceDecayError::Config {
             message: "cursor exceeds its bounded authenticated envelope".to_owned(),
         });

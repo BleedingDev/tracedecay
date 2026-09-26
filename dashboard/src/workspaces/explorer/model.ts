@@ -201,7 +201,6 @@ function symbolHits(
 export function sessionHits(
   rows: readonly Record<string, unknown>[],
   terms: readonly string[],
-  scopeIdentity?: string,
 ): Hit[] {
   let messageRank = 0;
   let summaryRank = 0;
@@ -232,28 +231,14 @@ export function sessionHits(
                 : 'store_id';
     const role = str(row, 'role') ?? (summary ? 'summary' : undefined);
     const source = str(row, 'source');
-    const explicitProvider = str(row, 'provider');
-    const provider = explicitProvider ?? source;
-    const providerField = explicitProvider ? 'provider' : source ? 'source' : undefined;
-    const projectScope = str(row, 'project_id') ?? str(row, 'project');
-    const profileScope = str(row, 'profile_id') ?? str(row, 'profile');
-    const rowIdentity = messageId ?? nodeId ?? storeId ?? index;
+    const provider = source ?? str(row, 'provider');
+    const providerField = source ? 'source' : provider ? 'provider' : undefined;
     const timestamp = num(row, 'timestamp');
     const latestAt = num(row, 'latest_at');
     const stamp = timestamp ?? latestAt;
     const stampField = timestamp != null ? 'timestamp' : latestAt != null ? 'latest_at' : undefined;
     const hit: Hit = {
-      // A transcript identity is owned by its project/profile and provider.
-      // Keeping all three dimensions in the UI key prevents a same-named
-      // session/message from one scope or provider replacing another row.
-      key: `sessions:${JSON.stringify([
-        scopeIdentity ?? null,
-        projectScope ?? null,
-        profileScope ?? null,
-        provider ?? null,
-        session ?? null,
-        rowIdentity,
-      ])}`,
+      key: `sessions:${messageId ?? nodeId ?? storeId ?? index}`,
       lane: 'sessions',
       rank,
       orderLabel: isSummary ? 'summary-node matches' : 'message matches',

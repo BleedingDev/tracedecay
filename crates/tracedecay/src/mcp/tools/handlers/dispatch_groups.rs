@@ -333,7 +333,6 @@ fn dispatch_admin_tools_inner<'a>(
                     args,
                     options.global_db.map(RegisteredGlobalDbLeaseV1::as_ref),
                     options.automation_scheduler_reconciler,
-                    options.semantic_admin_executor,
                     deadline,
                     cancellation,
                 )

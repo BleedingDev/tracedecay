@@ -209,25 +209,9 @@ async fn create_schema_transaction(conn: &(impl Executor + Sync)) -> Result<()> 
             message: format!("failed to create runtime writer ledger: {e}"),
             operation: "create_schema".to_string(),
         })?;
-    install_vector_authority_schema(conn, "create_schema").await?;
     final_shape::require_exact_final_shape(conn).await?;
     set_version(conn, SCHEMA_VERSION).await?;
     Ok(())
-}
-
-/// Installs the immutable vector-generation authority tables that back the
-/// dense semantic lane. Fresh stores are created with them; there is no
-/// in-place install for an existing store.
-async fn install_vector_authority_schema(
-    conn: &(impl Executor + Sync),
-    operation: &str,
-) -> Result<()> {
-    conn.execute_batch(tracedecay_rusqlite_runtime::repository::VECTOR_AUTHORITY_SCHEMA_V1)
-        .await
-        .map_err(|error| TraceDecayError::Database {
-            message: format!("failed to create vector-authority schema: {error}"),
-            operation: operation.to_owned(),
-        })
 }
 
 /// Runs a `SELECT 1 ... LIMIT 1`-shaped probe against `sqlite_master` and

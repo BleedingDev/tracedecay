@@ -54,14 +54,6 @@ impl McpServer {
             }
             None => None,
         };
-        // Route metadata is not a tool argument. Routing above and the
-        // advisory recall lane below both bind on the caller identity a host
-        // publishes in `_meta`, while the semantic request schemas decode
-        // strictly and reject any field they do not declare. Keep the identity
-        // view those lanes bind on, and hand the handler only its declared
-        // business arguments.
-        let route_identity_arguments =
-            crate::mcp::project_route::take_route_only_metadata(tool_name, &mut handler_arguments);
         if tracedecay_automation::analytics::is_skill_view_tool(tool_name)
             && let Some(request_id) = json_rpc_request_id_string(id)
             && let Some(map) = handler_arguments.as_object_mut()
@@ -98,7 +90,6 @@ impl McpServer {
             .transpose()?;
         Ok(RoutedToolCall {
             arguments: handler_arguments,
-            route_identity_arguments,
             selected_project,
             selected_server,
         })
@@ -142,7 +133,6 @@ impl McpServer {
                 cg.as_ref(),
                 tool_name,
                 routed.arguments,
-                routed.route_identity_arguments,
                 routed.selected_project.as_ref(),
                 None,
                 application_invocation_executor,
@@ -232,7 +222,6 @@ impl McpServer {
                 &cg,
                 tool_name,
                 routed.arguments,
-                routed.route_identity_arguments,
                 routed.selected_project.as_ref(),
                 server_stats,
                 application_invocation_executor,
@@ -263,10 +252,6 @@ impl McpServer {
         cg: &TraceDecay,
         tool_name: &str,
         handler_arguments: Value,
-        // The caller's routing/advisory identity view when route-only
-        // metadata was stripped out of `handler_arguments`; `None` when the
-        // handler arguments already carry that identity.
-        route_identity_arguments: Option<Value>,
         resolved_project_route: Option<&crate::mcp::project_route::ResolvedProjectRoute>,
         server_stats: Option<Value>,
         application_invocation_executor: Option<
@@ -277,9 +262,6 @@ impl McpServer {
         application_deadline: Option<tracedecay_contracts::Deadline>,
         application_cancellation: Option<tracedecay_contracts::CancellationSignal>,
     ) -> Result<ToolResult> {
-        // Only the advisory recall lane consults the preserved identity view.
-        #[cfg(not(feature = "memory-provider-host"))]
-        let _ = &route_identity_arguments;
         let engine_identity = cg.db_path();
         let read_flight = tool_allows_identical_read_coalescing(tool_name, |tool_name| {
             tracedecay_mcp::tools::binding::mcp_dispatch_contract(tool_name)
@@ -297,21 +279,13 @@ impl McpServer {
             .session_sync_service
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
-        // Advisory admission reads the arguments before they move; the
-        // recall itself runs only after the handler answered.
+        // Advisory admission reads the arguments before they move; the recall
+        // itself runs only after the authoritative handler answered.
         #[cfg(feature = "memory-provider-host")]
         let advisory_call =
             tracedecay_daemon_service::retained_owner::project_advisory_context_call(
                 tool_name,
-                // The lane binds to the exact caller session the host routed this
-                // call under, which lives in the preserved identity view whenever
-                // route-only metadata carried it out of the handler arguments.
-                route_identity_arguments
-                    .as_ref()
-                    .unwrap_or(&handler_arguments),
-                // An ordinary agent call carries no session id in its arguments,
-                // so the lane binds to the connection this request identity was
-                // minted on instead of skipping the call.
+                &handler_arguments,
                 application_request_id.as_ref(),
                 application_deadline.as_ref(),
                 application_cancellation.as_ref(),
@@ -370,7 +344,6 @@ impl McpServer {
                 code_index_similar_executor: self.code_index_similar_executor.clone(),
                 code_index_redundancy_executor: self.code_index_redundancy_executor.clone(),
                 code_index_branch_diff_executor: self.code_index_branch_diff_executor.clone(),
-                semantic_admin_executor: self.semantic_admin_executor.clone(),
                 code_index_search_authority: self.code_index_search_authority.clone(),
                 admitted_project_scope: self.admitted_project_scope.clone(),
                 code_graph_projection_read_port: self.code_graph_projection_read_port.clone(),
@@ -429,39 +402,29 @@ impl McpServer {
         } else {
             dispatch.await
         };
-        // The authoritative handler keeps its whole deadline, so a blocking
-        // provider can never starve, delay or displace code truth, and a lane
-        // that fails leaves the canonical result exactly as produced. Running
-        // here also keeps a coalesced read free of this caller's candidates.
-        #[cfg(feature = "memory-provider-host")]
-        let advisory_routing_mount = self.advisory_routing_mount();
+        // The handler keeps its whole deadline and a failed lane leaves the
+        // canonical result exactly as produced; running after the read flight
+        // keeps a coalesced read free of this caller's provider candidates.
         #[cfg(feature = "memory-provider-host")]
         let dispatched = match (dispatched, advisory_call) {
-            (Ok(result), Some(call)) => Ok(
-                match tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
-                    self.cognitive_recall_port_for_session(call.canonical_session_id()),
-                    advisory_routing_mount.as_deref(),
-                    call,
-                    result.context_memory_contribution(),
-                )
-                .await
+            (Ok(mut result), Some(call)) => {
+                let advisory_routing_mount = self.advisory_routing_mount();
+                let advisory =
+                    tracedecay_daemon_service::retained_owner::project_advisory_memory_context_for_call(
+                        self.cognitive_recall_port_for_session(call.canonical_session_id()),
+                        advisory_routing_mount.as_deref(),
+                        call,
+                        result.context_memory_contribution(),
+                    )
+                    .await;
+                if let Some(advisory) = advisory
+                    && let Some(slot) = result.value.pointer_mut("/content/0/text")
+                    && let Some(text) = slot.as_str()
                 {
-                    Some(advisory) => {
-                        let mut result = result;
-                        if let Some(text) = result
-                            .value
-                            .pointer("/content/0/text")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                            && let Some(slot) = result.value.pointer_mut("/content/0/text")
-                        {
-                            *slot = Value::String(advisory.appended_text(&text));
-                        }
-                        result
-                    }
-                    None => result,
-                },
-            ),
+                    *slot = Value::String(advisory.appended_text(text));
+                }
+                Ok(result)
+            }
             (dispatched, _) => dispatched,
         };
         dispatched

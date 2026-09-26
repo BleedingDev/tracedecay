@@ -104,12 +104,12 @@ export function TranscriptSearchResults({ read, submitted, selection, onSelect }
 }
 
 function hitSelection(hit: LcmMessageV1): SessionSelection {
-  return { provider: hit.provider, sessionId: hit.session_id };
+  return { provider: hit.source, sessionId: hit.session_id };
 }
 
 function hitKey(hit: LcmMessageV1, index: number): string {
   if (hit.store_id != null) return `store:${hit.store_id}`;
-  return `${hit.provider}:${hit.session_id}:${hit.message_id}:${index}`;
+  return `${hit.source ?? ''}:${hit.session_id}:${hit.message_id}:${index}`;
 }
 
 function SearchHit({
@@ -124,7 +124,7 @@ function SearchHit({
   const snippet = hit.snippet ?? hit.content;
   return (
     <DataRow selected={selected} onSelect={onSelect} align="start" height={56}>
-      <span className="td-legend w-14 shrink-0 truncate max-md:hidden">{hit.provider}</span>
+      <span className="td-legend w-14 shrink-0 truncate max-md:hidden">{hit.source ?? 'provider unrecorded'}</span>
       <span className="td-legend w-14 shrink-0 border border-edge-subtle px-1 py-1 text-center">
         {hit.role ?? 'role unrecorded'}
       </span>

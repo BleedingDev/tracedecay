@@ -226,7 +226,7 @@ function CompactionLinks({
         node == null ? (
           <StateChip key={`missing-${index}`} kind="partial" detail="linked boundary is outside this loaded transcript page" />
         ) : (
-          <div key={JSON.stringify([node.provider, node.node_id])} className="flex flex-col border border-edge-subtle px-2 py-1 text-3xs">
+          <div key={node.node_id} className="flex flex-col border border-edge-subtle px-2 py-1 text-3xs">
             <span className="text-text-secondary">{node.category} · depth {node.depth}</span>
             <span className="text-text-muted">created {formatStamp(node.created_at)} · {node.source_type}</span>
           </div>

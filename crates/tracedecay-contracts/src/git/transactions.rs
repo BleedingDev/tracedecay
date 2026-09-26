@@ -593,9 +593,7 @@ pub(super) fn scope_reference_matches_snapshot(
 
 const fn expected_operation_termination(termination: EffectTermination) -> OperationTermination {
     match termination {
-        EffectTermination::Completed | EffectTermination::NoChange => {
-            OperationTermination::Completed
-        }
+        EffectTermination::Completed => OperationTermination::Completed,
         EffectTermination::Cancelled => OperationTermination::Cancelled,
         EffectTermination::TimedOut => OperationTermination::TimedOut,
         EffectTermination::Failed => OperationTermination::Failed,

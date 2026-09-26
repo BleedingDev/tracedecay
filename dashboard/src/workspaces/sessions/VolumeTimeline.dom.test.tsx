@@ -47,9 +47,7 @@ function payload(overrides: Partial<LcmTimelinePayloadV1> = {}): LcmTimelinePayl
     },
     exists: true,
     node_buckets: [],
-    next_cursor: null,
     path: '/tmp/lcm.sqlite',
-    provider: null,
     session_id: null,
     storage_scope: 'project',
     undated: {

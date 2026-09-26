@@ -1921,19 +1921,24 @@ fn checkout_observation_candidate(
 }
 
 #[test]
-fn checkout_observations_cross_sessions_only_under_native_registration()
+fn checkout_observations_cross_sessions_only_under_a_checkout_binding()
 -> Result<(), Box<dyn Error>> {
     let origin = admitted_scope();
     let mut request = origin.clone();
     request.agent_session_id = "session-next".to_owned();
     request.resolved_scope_digest = STALE_SCOPE_DIGEST.to_owned();
     let candidate = checkout_observation_candidate(&origin);
-    let native = RecallScopeBindingsV1::from_wire(
+    // TraceDecay Native declares owner bindings only: its facts and message
+    // search hits are project- or profile-wide, never one checkout's.
+    let declared = RecallScopeBindingsV1::from_wire(
         tracedecay_memory_provider_native::NATIVE_RECALL_SCOPE_BINDINGS
             .iter()
             .copied(),
     )?;
-    assert_eq!(native, authorized_native());
+    assert!(!declared.authorizes(ScopeBinding::CheckoutObservations));
+    assert!(declared.authorizes(ScopeBinding::ProjectFacts));
+    assert!(declared.authorizes(ScopeBinding::ProfileFacts));
+    let native = authorized_native();
     let admitted = admit_recall_candidates(
         &request,
         "request-next",

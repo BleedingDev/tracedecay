@@ -7,7 +7,6 @@
 //! terminal park became "retryable scheduler unavailable" and a watcher-policy
 //! refusal became "accepted".
 
-use tracedecay_contracts::CodeIndexReconcileOptionsV1;
 use tracedecay_contracts::code_index_freshness::CodeIndexConvergenceParkedV1;
 
 /// Who is asking, which is the only thing that changes whether a refusal is a
@@ -23,10 +22,6 @@ pub enum CodeIndexDemandV1 {
     /// A whole-worktree reconciliation an operator named (`tracedecay init`,
     /// `tracedecay sync`). Not subject to the watcher policy.
     OperatorReconcile,
-    /// An operator-named reconciliation with one validated, request-scoped
-    /// folder selection. The selection is consumed by one scheduler pass and
-    /// never changes durable project configuration.
-    OperatorReconcileWithOptions(CodeIndexReconcileOptionsV1),
 }
 
 impl CodeIndexDemandV1 {

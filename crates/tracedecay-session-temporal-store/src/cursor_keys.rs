@@ -4,7 +4,6 @@ mod tests;
 use std::fmt;
 
 use thiserror::Error;
-use tracedecay_contracts::memory::{FACT_CURSOR_TTL_MICROS_V2, FactCursorKeyringV1};
 use tracedecay_contracts::now_micros;
 use tracedecay_domain::{
     PrivacyDomainId, RetrievalCursorKeyId, SessionCursorKeyIdV1, SessionCursorVersionV1,
@@ -45,8 +44,6 @@ pub enum SessionTemporalCursorKeyProviderError {
     InvalidKeyMaterial,
     #[error("cursor authentication key cannot authorize retrieval cursors")]
     InvalidRetrievalKey,
-    #[error("cursor authentication key cannot authorize fact cursors")]
-    InvalidFactCursorKey,
     #[error("failed to provision the active cursor authentication key")]
     Provision {
         #[source]
@@ -361,52 +358,6 @@ impl SessionTemporalCursorKeyProvider {
                     material.to_vec(),
                 )
                 .map_err(|_| SessionTemporalCursorKeyProviderError::InvalidRetrievalKey)?;
-        }
-        Ok(keyring)
-    }
-
-    /// Build the profile-bound fact cursor keyring from the persisted session
-    /// key rows. The derivation context separates fact cursors from query
-    /// cursors while keeping the same durable rotation and retention policy.
-    /// No process-local fallback is possible: every material comes from an
-    /// authenticator loaded from the session temporal database.
-    pub fn fact_cursor_keyring(
-        &self,
-        profile_binding: [u8; 32],
-    ) -> Result<FactCursorKeyringV1, SessionTemporalCursorKeyProviderError> {
-        let derivation_context =
-            canonical_sha256(&("tracedecay.fact-cursor-key.v2", profile_binding))
-                .map_err(|_| SessionTemporalCursorKeyProviderError::InvalidFactCursorKey)?;
-        let active_authenticator = self
-            .authenticators
-            .iter()
-            .find(|(key, _)| key == &self.active_key)
-            .ok_or_else(
-                || SessionTemporalCursorKeyProviderError::ActiveKeyUnavailable {
-                    expected: self.active_key.clone(),
-                },
-            )?;
-        let active_material = active_authenticator
-            .1
-            .derive_key_material(&self.active_key, derivation_context.as_str().as_bytes())
-            .map_err(|_| SessionTemporalCursorKeyProviderError::InvalidFactCursorKey)?;
-        let mut keyring = FactCursorKeyringV1::new(
-            profile_binding,
-            u64::from(self.active_key.version.value()),
-            active_material.as_slice(),
-            FACT_CURSOR_TTL_MICROS_V2,
-        )
-        .map_err(|_| SessionTemporalCursorKeyProviderError::InvalidFactCursorKey)?;
-        for (key, authenticator) in &self.authenticators {
-            if key == &self.active_key {
-                continue;
-            }
-            let material = authenticator
-                .derive_key_material(key, derivation_context.as_str().as_bytes())
-                .map_err(|_| SessionTemporalCursorKeyProviderError::InvalidFactCursorKey)?;
-            keyring
-                .retain(u64::from(key.version.value()), material.as_slice())
-                .map_err(|_| SessionTemporalCursorKeyProviderError::InvalidFactCursorKey)?;
         }
         Ok(keyring)
     }

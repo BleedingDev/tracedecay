@@ -290,6 +290,7 @@ function mixedRoutes(): Record<string, () => unknown> {
       ),
   };
 }
+
 function coverage(
   completeness: 'complete' | 'partial' | 'unknown',
   examined: number | null,
@@ -439,3 +440,4 @@ function freshnessPayload() {
     ],
   };
 }
+

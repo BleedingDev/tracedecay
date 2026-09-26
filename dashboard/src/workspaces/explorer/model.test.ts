@@ -73,7 +73,7 @@ describe('sessionHits', () => {
 
     expect(hits).toHaveLength(2);
     expect(hits[0]).toMatchObject({
-      key: 'sessions:[null,null,null,"cursor","s1","m1"]',
+      key: 'sessions:m1',
       rank: 1,
       orderLabel: 'message matches',
       facet: 'assistant',
@@ -83,7 +83,7 @@ describe('sessionHits', () => {
       stampField: 'timestamp',
     });
     expect(hits[1]).toMatchObject({
-      key: 'sessions:[null,null,null,null,"s2","sum1"]',
+      key: 'sessions:sum1',
       rank: 1,
       orderLabel: 'summary-node matches',
       facet: 'summary',
@@ -93,68 +93,6 @@ describe('sessionHits', () => {
       titleField: 'summary',
       stampField: 'latest_at',
     });
-  });
-
-  it('keeps equal message identities separate when providers differ', () => {
-    const hits = sessionHits(
-      [
-        { message_id: 'shared', session_id: 'session.shared', provider: 'claude', content: 'one' },
-        { message_id: 'shared', session_id: 'session.shared', provider: 'codex', content: 'two' },
-      ],
-      [],
-    );
-
-    expect(hits.map((hit) => hit.key)).toEqual([
-      'sessions:[null,null,null,"claude","session.shared","shared"]',
-      'sessions:[null,null,null,"codex","session.shared","shared"]',
-    ]);
-    expect(hits.map((hit) => hit.context)).toEqual([
-      'claude · session.shared',
-      'codex · session.shared',
-    ]);
-  });
-
-  it('keeps equal session and message identities separate across project profiles', () => {
-    const hits = sessionHits(
-      [
-        {
-          project_id: 'project.alpha',
-          profile_id: 'profile.alpha',
-          provider: 'claude',
-          session_id: 'session.shared',
-          message_id: 'message.shared',
-          content: 'alpha',
-        },
-        {
-          project_id: 'project.beta',
-          profile_id: 'profile.beta',
-          provider: 'codex',
-          session_id: 'session.shared',
-          message_id: 'message.shared',
-          content: 'beta',
-        },
-      ],
-      [],
-    );
-
-    expect(hits.map((hit) => hit.key)).toEqual([
-      'sessions:[null,"project.alpha","profile.alpha","claude","session.shared","message.shared"]',
-      'sessions:[null,"project.beta","profile.beta","codex","session.shared","message.shared"]',
-    ]);
-  });
-
-  it('keeps the route scope in the key when rows omit project metadata', () => {
-    const row = {
-      provider: 'claude',
-      session_id: 'session.shared',
-      message_id: 'message.shared',
-      content: 'same row shape',
-    };
-
-    const [alpha] = sessionHits([row], [], 'project:project.alpha');
-    const [beta] = sessionHits([row], [], 'project:project.beta');
-
-    expect(alpha?.key).not.toBe(beta?.key);
   });
 });
 

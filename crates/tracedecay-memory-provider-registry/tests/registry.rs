@@ -11,32 +11,26 @@ use tracedecay_memory_provider_api::contract::{
 use tracedecay_memory_provider_api::{
     CancellationToken, CanonicalPayload, CommittedEffectEvidence, FallbackDirective,
     HandshakeRequest, HandshakeRequestParts, HandshakeResponse, OperationControl, OwnedExactScope,
-    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PayloadSanitizationReceipt,
-    PayloadSanitizationReceiptParts, PinnedFallbackPolicy, ProviderCall, ProviderCallParts,
-    ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
-    observation_extensions_digest,
+    OwnedOpaqueExtension, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy, ProviderCall,
+    ProviderCallParts, ProviderDescriptor, ProviderLimits, ProviderOperation, ProviderReply,
+    TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort, NativeObservation,
+    NATIVE_PROVIDER_ID, NativeAdapterError, NativeMemoryApplicationPort,
 };
 use tracedecay_memory_provider_registry::{
-    EnabledProviderMode, FabricConfig, FabricError, NativeProviderActivation, ObserverReceipt,
+    EnabledProviderMode, FabricConfig, FabricError, NativeProviderActivation,
     ProjectMemoryProviderComposition, ProviderCapabilityAvailability, ProviderMode,
     ProviderReadiness, ReadinessTargetError, RegistryError, is_mountable_active_provider,
 };
 
 const ZERO_SHA: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 const ONE_SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-const TWO_SHA: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const REGISTRY_PAYLOAD_SHA: &str =
     "2bc217171d7030f82de2853ea3e4914b803d3504a3409433d62bf426a613d7ee";
 const OPAQUE_PAYLOAD_SHA: &str = "a4ebe309c7d7eaf1b08aec54feea5668a4b10a564770d162dbd7a131990d0de8";
-const OBSERVATION_PAYLOAD_SHA: &str =
-    "44ac27354a32cf05157b61fa2267cdca7ec3e1cace0222a16ac1f22d602b5219";
 const RESOLVED_SCOPE_DIGEST: &str =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
-const OBSERVATION_PAYLOAD: &[u8] = br#"{"canonical_payload":{"commit":{"fixture":true},"fact":{"fixture":true},"kind":"settled_native_fact_write"},"observation_kind":"native.fact_promoted.v1","payload_contract":"tracedecay.memory.observation.native-fact-promotion.v1"}"#;
-
 struct MockNativePort {
     descriptor: ProviderDescriptor,
     descriptor_calls: AtomicUsize,
@@ -65,43 +59,7 @@ impl NativeMemoryApplicationPort for MockNativePort {
         unexpected_provider_contact()
     }
 
-    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected_provider_contact()
     }
 }
@@ -118,7 +76,6 @@ struct EvidenceNativePort {
     application_fallback: FallbackDirective,
     handshake_calls: AtomicUsize,
     health_calls: AtomicUsize,
-    observe_calls: AtomicUsize,
 }
 
 impl EvidenceNativePort {
@@ -132,7 +89,6 @@ impl EvidenceNativePort {
             application_fallback: FallbackDirective::forbidden(),
             handshake_calls: AtomicUsize::new(0),
             health_calls: AtomicUsize::new(0),
-            observe_calls: AtomicUsize::new(0),
         }
     }
 
@@ -175,34 +131,6 @@ impl EvidenceNativePort {
             state_generation: call.expected_state_generation,
         }
     }
-
-    fn committed_observation_reply(&self, call: &ProviderCall) -> ProviderReply {
-        let state_generation = call.expected_state_generation.saturating_add(1);
-        ProviderReply {
-            terminal: TerminalRecord::new(
-                call.operation,
-                call.provider_id.clone(),
-                TerminalCode::Success,
-                CommittedEffectEvidence::committed(
-                    call.expected_state_generation,
-                    state_generation,
-                    vec!["observation:item-1".to_owned()],
-                    ONE_SHA,
-                    TWO_SHA,
-                )
-                .expect("committed observation evidence"),
-                FallbackDirective::forbidden(),
-                call.operation_id.clone(),
-                call.exact_scope.exact_scope_sha256(),
-                None,
-            )
-            .expect("committed observation terminal"),
-            payload: Some(call.payload.clone()),
-            warnings: vec!["observation accepted".to_owned()],
-            extensions: call.extensions.clone(),
-            state_generation,
-        }
-    }
 }
 
 impl NativeMemoryApplicationPort for EvidenceNativePort {
@@ -243,44 +171,7 @@ impl NativeMemoryApplicationPort for EvidenceNativePort {
         self.unavailable_reply(call)
     }
 
-    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-        self.observe_calls.fetch_add(1, Ordering::Relaxed);
-        self.committed_observation_reply(observation.call())
-    }
-
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected_provider_contact()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected_provider_contact()
     }
 }
@@ -376,10 +267,7 @@ fn call_after_handshake(
         ProviderOperation::Replay => "tracedecay.memory.provider.replay.v1",
     };
 
-    let (payload_bytes, payload_sha256) = match operation {
-        ProviderOperation::Observe => (OBSERVATION_PAYLOAD.to_vec(), OBSERVATION_PAYLOAD_SHA),
-        _ => (br#"{"registry":true}"#.to_vec(), REGISTRY_PAYLOAD_SHA),
-    };
+    let (payload_bytes, payload_sha256) = (br#"{"registry":true}"#.to_vec(), REGISTRY_PAYLOAD_SHA);
 
     ProviderCall::new(ProviderCallParts {
         operation,
@@ -414,35 +302,7 @@ fn call_after_handshake(
             .expect("optional extension"),
         ],
     })
-    .map(admitted)
     .expect("provider call")
-}
-
-/// Sanitizer revision this harness stands in for. The real revision is derived
-/// by `tracedecay-memory-hygiene` from the canonical policy document.
-const TEST_SANITIZER_REVISION: &str = "tracedecay.memory.observation.hygiene.v1+registry-test";
-
-/// Attaches the receipt the admitted hygiene pipeline mints for a payload it
-/// read and left byte-identical. Observation dispatch fails closed without one.
-fn admitted(call: ProviderCall) -> ProviderCall {
-    if call.operation != ProviderOperation::Observe {
-        return call;
-    }
-    // The receipt binds the sanitized payload *and* the exact opaque
-    // extensions dispatched with it; a receipt over the empty extension set
-    // would be rejected as unbound for the optional extension this fixture
-    // carries.
-    let extensions_digest =
-        observation_extensions_digest(&call.extensions).expect("observation extensions digest");
-    let receipt = PayloadSanitizationReceipt::new(
-        PayloadSanitizationReceiptParts::accepted_unmodified_with_extensions(
-            TEST_SANITIZER_REVISION,
-            call.payload.sha256.clone(),
-            extensions_digest,
-        ),
-    )
-    .expect("accepted sanitization receipt");
-    call.with_sanitization(receipt)
 }
 
 fn handshake() -> HandshakeRequest {
@@ -453,7 +313,6 @@ fn handshake() -> HandshakeRequest {
         request_id: "registry-handshake".to_owned(),
         required_capabilities: vec![
             OwnedVersionedId::new("provider.health.v1").expect("health capability"),
-            OwnedVersionedId::new("observation.accept.v1").expect("observation capability"),
             OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
         ],
         host_limits: limits(),
@@ -848,71 +707,6 @@ fn handshake_route_sanitizes_wrong_terminal_operation_and_provider() -> Result<(
 }
 
 #[test]
-fn observer_route_strips_output_but_preserves_structured_effect_evidence()
--> Result<(), Box<dyn Error>> {
-    let port = Arc::new(EvidenceNativePort::new());
-    let composition =
-        ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
-            fabric_config: config(1, 2),
-            port: port.clone(),
-            registration_revision: 31,
-            mode: EnabledProviderMode::Observer,
-        })?;
-    let registry = composition.registry().expect("enabled registry");
-    let handshake_response = registry.handshake(&handshake())?;
-    let call = call_after_handshake(ProviderOperation::Observe, &handshake_response);
-
-    assert_eq!(
-        registry.invoke_active(&call),
-        Err(FabricError::ProviderObserverOnly(
-            NATIVE_PROVIDER_ID.to_owned()
-        ))
-    );
-    assert_eq!(port.observe_calls.load(Ordering::Relaxed), 0);
-
-    let receipt = registry.deliver_observation(&call)?;
-
-    let ObserverReceipt {
-        provider_id,
-        registration_revision,
-        terminal,
-    } = receipt;
-    assert_eq!(terminal.diagnostic_id(), None);
-    assert_eq!(terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(port.observe_calls.load(Ordering::Relaxed), 1);
-    assert_eq!(provider_id.as_str(), NATIVE_PROVIDER_ID);
-    assert_eq!(registration_revision, 31);
-    assert_eq!(terminal.operation_id(), call.operation_id);
-    assert_eq!(terminal.operation(), ProviderOperation::Observe);
-    assert_eq!(terminal.provider_id().as_str(), NATIVE_PROVIDER_ID);
-    assert_eq!(
-        terminal.exact_scope_sha256(),
-        call.exact_scope.exact_scope_sha256()
-    );
-    let effect = terminal.committed_effect();
-    assert_eq!(effect.state(), CommittedEffectState::Committed);
-    assert_eq!(effect.committed_boundary(), None);
-    assert_eq!(effect.state_generation_before(), Some(5));
-    assert_eq!(effect.state_generation_after(), Some(6));
-    assert_eq!(
-        effect.committed_item_refs(),
-        &["observation:item-1".to_owned()]
-    );
-    assert_eq!(effect.uncommitted_item_refs(), &[] as &[String]);
-    assert_eq!(effect.provider_receipt_sha256(), Some(ONE_SHA));
-    assert_eq!(effect.reconciliation_action(), None);
-    assert_eq!(effect.verification_sha256(), Some(TWO_SHA));
-    assert_eq!(
-        terminal.fallback().eligibility(),
-        FallbackEligibility::Forbidden
-    );
-    assert_eq!(terminal.fallback().source_provider_id(), None);
-    assert_eq!(terminal.fallback().policy(), None);
-    assert_eq!(terminal.fallback().reason(), None);
-    Ok(())
-}
-
-#[test]
 fn readiness_target_derives_only_from_validated_handshake_evidence() -> Result<(), Box<dyn Error>> {
     let port = Arc::new(EvidenceNativePort::new());
     let composition =
@@ -952,7 +746,6 @@ fn readiness_target_rejects_stale_registration_revision() -> Result<(), Box<dyn 
         request_id: "registry-handshake-stale-revision".to_owned(),
         required_capabilities: vec![
             OwnedVersionedId::new("provider.health.v1").expect("health capability"),
-            OwnedVersionedId::new("observation.accept.v1").expect("observation capability"),
             OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
         ],
         host_limits: limits(),

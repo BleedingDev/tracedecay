@@ -415,11 +415,7 @@ pub fn result_paths(search: &Value) -> Vec<&str> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|result| {
-            result["display"]["path"]
-                .as_str()
-                .or_else(|| result["file"].as_str())
-        })
+        .filter_map(|result| result["display"]["path"].as_str())
         .collect()
 }
 

@@ -26,14 +26,8 @@ struct PreparedToolCall {
     arguments: Value,
     analytics_arguments: Value,
     analytics_session_id: Option<String>,
-    hook_v2_session_route: Option<HookV2SessionRouteCandidate>,
     /// The deadline the caller declared on the request, when it declared one.
     caller_deadline: Option<tracedecay_contracts::Deadline>,
-}
-
-struct HookV2SessionRouteCandidate {
-    native_session_id: String,
-    protected_session_id: String,
 }
 
 struct DispatchedToolCall {
@@ -45,15 +39,7 @@ struct DispatchedToolCall {
 }
 
 struct RoutedToolCall {
-    /// The handler's declared business arguments: the caller's arguments with
-    /// route-only metadata removed, so a strictly decoded request schema sees
-    /// only fields it declares.
     arguments: Value,
-    /// The routing/advisory identity view of this call — the sanitized
-    /// arguments as they arrived, before route-only metadata was stripped.
-    /// `None` when nothing identity-bearing was stripped, in which case
-    /// [`Self::arguments`] is already that view.
-    route_identity_arguments: Option<Value>,
     selected_project: Option<crate::mcp::project_route::ResolvedProjectRoute>,
     selected_server: Option<Arc<McpServer>>,
 }
@@ -120,60 +106,6 @@ fn analytics_arguments_snapshot(tool_name: &str, arguments: &Value) -> Value {
         }
     }
     Value::Object(snapshot)
-}
-
-fn hook_v2_session_route_candidate(
-    tool_name: &str,
-    arguments: &Value,
-) -> Option<HookV2SessionRouteCandidate> {
-    if tool_name != "tracedecay_hook_runtime"
-        || arguments.get("action").and_then(Value::as_str) != Some("hook_v2_admit")
-    {
-        return None;
-    }
-    let envelope: tracedecay_hooks::HookEventEnvelopeV2 =
-        serde_json::from_value(arguments.get("envelope")?.clone()).ok()?;
-    if !matches!(
-        envelope.event,
-        tracedecay_hooks::HookEventV2::SessionBoundary {
-            boundary: tracedecay_hooks::HookBoundaryV1::Start
-        }
-    ) {
-        return None;
-    }
-    let native_session_id = arguments
-        .get("native_session_id")?
-        .as_str()
-        .filter(|session_id| !session_id.is_empty())?;
-    if tracedecay_agent_hosts::hooks::protected_native_session_id(native_session_id)
-        != envelope.protected_session_id
-    {
-        return None;
-    }
-    let protected_session_id =
-        tracedecay_privacy::protect_sensitive_structural_id(native_session_id).ok()?;
-    Some(HookV2SessionRouteCandidate {
-        native_session_id: native_session_id.to_owned(),
-        protected_session_id,
-    })
-}
-
-fn hook_v2_admission_publishes_session_route(result: &ToolResult) -> bool {
-    result
-        .value
-        .get("content")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
-        .any(|payload| {
-            payload.get("action").and_then(Value::as_str) == Some("hook_v2_admit")
-                && matches!(
-                    payload.get("status").and_then(Value::as_str),
-                    Some("accepted" | "exact_duplicate")
-                )
-        })
 }
 
 /// Locks a server-side `std::sync::Mutex`, recovering from poisoning.
@@ -402,13 +334,7 @@ impl McpServer {
                 &mut connection.route_cache,
             ))
             .await;
-            // Ordinary JSON-RPC notifications remain response-free. The shipped
-            // host notifier sends a request id and waits for this acknowledgement
-            // so it cannot close the socket while daemon profile/project binding
-            // is still racing peer disconnect, before the private route is stored.
-            return request
-                .cloned_id()
-                .map(|id| JsonRpcResponse::success(id, json!({ "processed": true })));
+            return None;
         }
         if matches!(method, McpMethod::Cancelled) {
             self.record_request_accounting(method_name, false);
@@ -889,14 +815,12 @@ impl McpServer {
         if crate::mcp::project_route::protect_tool_structural_ids(&mut arguments).is_err() {
             return Err(invalid_params("invalid structural identifier"));
         }
-        let hook_v2_session_route = hook_v2_session_route_candidate(&tool_name, &arguments);
 
         Ok(PreparedToolCall {
             analytics_arguments: analytics_arguments_snapshot(&tool_name, &arguments),
             analytics_session_id: mcp_analytics_session_id(&arguments),
             tool_name,
             arguments,
-            hook_v2_session_route,
             caller_deadline,
         })
     }
@@ -1262,7 +1186,6 @@ impl McpServer {
         tool_name: String,
         analytics_arguments: Value,
         analytics_session_id: Option<String>,
-        hook_v2_session_route: Option<HookV2SessionRouteCandidate>,
         dispatch: DispatchedToolCall,
         connection_server: &Self,
     ) -> JsonRpcResponse {
@@ -1280,25 +1203,6 @@ impl McpServer {
 
         match outcome {
             Ok(mut result) => {
-                if let Some(route) = hook_v2_session_route
-                    && hook_v2_admission_publishes_session_route(&result)
-                    && let Err(error) = self
-                        .publish_hook_v2_session_route(cg.project_root(), &route.native_session_id)
-                        .await
-                {
-                    self.record_mcp_tool_error_analytics(McpToolErrorAnalyticsRequest {
-                        project_root: cg.project_root(),
-                        session_id: Some(route.protected_session_id),
-                        tool_name: &tool_name,
-                        request_id: &request_id,
-                        arguments: &analytics_arguments,
-                        duration_us: elapsed_us,
-                        error: &error,
-                        connection_client_name,
-                        connection_instance_id,
-                    });
-                    return tool_error_response(id, &tool_name, &error);
-                }
                 Self::attach_tool_timing(&mut result, elapsed_us);
                 mark_semantic_tool_error(&mut result);
                 if !tool_result_has_semantic_error(&result)
@@ -1529,7 +1433,6 @@ impl McpServer {
             arguments,
             analytics_arguments,
             analytics_session_id,
-            hook_v2_session_route,
             caller_deadline,
         } = match Self::prepare_tool_call(&id, params) {
             Ok(call) => call,
@@ -1750,7 +1653,6 @@ impl McpServer {
                 tool_name.clone(),
                 analytics_arguments,
                 analytics_session_id,
-                hook_v2_session_route,
                 dispatch,
                 self,
             )

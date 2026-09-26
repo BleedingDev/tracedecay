@@ -36,7 +36,6 @@ pub(super) fn install_http_application_cold_resolver(
     invocation: DaemonInvocationState,
     project_open_gates: Arc<tokio::sync::Mutex<ProjectOpenGates>>,
 ) -> Result<()> {
-    let project_runtimes = invocation.service.project_runtimes.clone();
     registry.install_remote_deletion_runtime_owners(
         super::remote_deletion::RemoteDeletionRuntimeOwners {
             administration: store_administration.clone(),
@@ -46,7 +45,6 @@ pub(super) fn install_http_application_cold_resolver(
     )?;
     registry.install_resolver(move |project_id| {
         let store_administration = store_administration.clone();
-        let project_runtimes = project_runtimes.clone();
         hotpath::future!(
             async move {
                 let database = store_administration.registered_profile_database().await?;
@@ -91,15 +89,6 @@ pub(super) fn install_http_application_cold_resolver(
                         message: "daemon HTTP registered project root is not canonical".to_owned(),
                     });
                 }
-                // The cold resolver is an alternate reachability path around
-                // the MCP owner registry. Keep it behind the same publication
-                // fence so a warming or failed full upgrade cannot be reached
-                // through HTTP while its owners are still being assembled.
-                if project_runtimes.publication_state(&canonical_root)
-                    != Some(tracedecay_daemon_service::ProjectRuntimePublicationStateV1::Ready)
-                {
-                    return Ok(None);
-                }
                 build_http_application_router(project_id.as_str(), &canonical_root).map(Some)
             },
             label = "daemon.http.application.router_cold_resolve"
@@ -128,15 +117,10 @@ pub(super) async fn mount_http_application_router(
     registry: &http_application::DaemonHttpApplicationRegistry,
     project_id: &str,
     project_path: &Path,
-    attempt: Option<&http_application::ProjectHttpRouteAttempt>,
 ) -> Result<()> {
     if !registry.is_active() {
         return Ok(());
     }
     let router = build_http_application_router(project_id, project_path)?;
-    if let Some(attempt) = attempt {
-        registry.mount_for_attempt(attempt, router).await
-    } else {
-        registry.mount(project_id, router).await
-    }
+    registry.mount(project_id, router).await
 }

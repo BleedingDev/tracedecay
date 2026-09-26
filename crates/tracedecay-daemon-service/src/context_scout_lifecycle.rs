@@ -262,8 +262,7 @@ pub async fn lookup_registered_context_scout_lifecycle(
 /// Replay has only the privacy-preserving locator carried by the validated
 /// envelope. The authoritative project-session shard supplies the native
 /// identity again; no hook payload or workspace path becomes durable replay
-/// identity. SessionStart replay cannot require an existing observation or
-/// lifecycle because it is the event that establishes that lifecycle.
+/// identity.
 #[hotpath::measure(label = "daemon.context_scout.lifecycle_lookup_native", future = true)]
 pub async fn lookup_registered_context_scout_native_session(
     hook_project_id: [u8; 16],
@@ -273,14 +272,27 @@ pub async fn lookup_registered_context_scout_native_session(
     if protected_session_id == [0; 32] {
         return None;
     }
-    let (_, _, _, sessions) = resolve_authority(hook_project_id, hook_worktree_id)?;
-    {
+    let (profile_id, project_id, worktree_id, sessions) =
+        resolve_authority(hook_project_id, hook_worktree_id)?;
+    let session_id = {
         let snapshot = sessions.read_snapshot().await.ok()?;
         let mut rows = snapshot
             .query(
-                "SELECT DISTINCT session_id
-                 FROM sessions
-                 ORDER BY session_id",
+                "SELECT json_extract(
+                        observation_json,
+                        '$.identity.source.session_id'
+                    ) AS session_id
+                 FROM observations
+                 WHERE json_extract(
+                        observation_json,
+                        '$.__retention_released'
+                    ) IS NULL
+                   AND json_type(
+                        observation_json,
+                        '$.identity.source.session_id'
+                    ) = 'text'
+                 GROUP BY session_id
+                 ORDER BY MAX(sequence) DESC",
                 (),
             )
             .await
@@ -302,8 +314,18 @@ pub async fn lookup_registered_context_scout_native_session(
             }
             resolved = Some(candidate);
         }
-        resolved
-    }
+        resolved?
+    };
+    lookup_context_scout_lifecycle(
+        &profile_id,
+        &project_id,
+        &worktree_id,
+        &session_id,
+        &sessions,
+    )
+    .await
+    .is_resolved()
+    .then_some(session_id)
 }
 
 /// Why an exact lifecycle lookup resolved nothing.

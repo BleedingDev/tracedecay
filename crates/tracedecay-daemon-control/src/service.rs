@@ -10,7 +10,6 @@ use sha2::Digest;
 
 use tracedecay_domain::errors::{Result, TraceDecayError};
 use tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE;
-use tracedecay_runtime_core::config::{GLOBAL_DB_FILENAME, GLOBAL_DB_PATH_ENV, USER_DATA_DIR_ENV};
 
 use crate::{RemoteBrainTlsConfig, SOCKET_ENV};
 
@@ -45,146 +44,13 @@ use runner::{
     launchd_service_state,
 };
 use unit_file::{
-    read_service_unit_for, remove_service_unit_for, service_env_value_from_unit,
-    service_unit_exists, service_unit_exists_for, service_unit_path, socket_path_from_unit_text,
-    write_service_unit_for,
+    launchd_plist_env_value, read_service_unit, remove_service_unit, service_unit_exists,
+    service_unit_path, socket_path_from_unit_text, write_service_unit,
 };
 
-const DEFAULT_LAUNCHD_LABEL: &str = "com.tracedecay.daemon";
-const DEFAULT_LAUNCHD_PLIST_NAME: &str = "com.tracedecay.daemon.plist";
-/// Environment variable selecting an isolated managed-daemon namespace.
-///
-/// An unset variable retains the shipped `tracedecay.service`/
-/// `com.tracedecay.daemon` identity. When set, the value is a suffix only;
-/// the service managers receive names derived from the validated suffix, so a
-/// shadow V2 profile can coexist with the stable V1 service.
-pub const SERVICE_NAMESPACE_ENV: &str = "TRACEDECAY_SERVICE_NAMESPACE";
-const MAX_SERVICE_NAMESPACE_LEN: usize = 48;
+const LAUNCHD_LABEL: &str = "com.tracedecay.daemon";
+const LAUNCHD_PLIST_NAME: &str = "com.tracedecay.daemon.plist";
 static SERVICE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// The validated namespace used to derive every managed service identity.
-///
-/// The default value represents the shipped V1 service identity. A namespace
-/// is validated once when a [`ServiceRunner`] is created and then carried by
-/// that runner, so changing the process environment during a lifecycle
-/// operation cannot retarget a different service.
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ServiceNamespace(Option<String>);
-
-impl ServiceNamespace {
-    /// Resolves and validates [`SERVICE_NAMESPACE_ENV`].
-    pub fn current() -> Result<Self> {
-        let Some(value) = std::env::var_os(SERVICE_NAMESPACE_ENV) else {
-            return Ok(Self::stable());
-        };
-        if value.is_empty() {
-            return Err(TraceDecayError::Config {
-                message: format!("{SERVICE_NAMESPACE_ENV} must not be empty"),
-            });
-        }
-        let value = value.to_str().ok_or_else(|| TraceDecayError::Config {
-            message: format!("{SERVICE_NAMESPACE_ENV} must be valid Unicode"),
-        })?;
-        Self::from_suffix(value.to_owned())
-    }
-
-    /// Returns the stable V1 namespace, which has no service suffix.
-    pub const fn stable() -> Self {
-        Self(None)
-    }
-
-    /// Creates a namespace from a validated service suffix.
-    ///
-    /// This constructor is useful to retain a resolved namespace across a
-    /// lifecycle operation. The suffix uses the same validation as the
-    /// environment-selected namespace.
-    pub fn from_suffix(value: impl Into<String>) -> Result<Self> {
-        let value = value.into();
-        if value.is_empty() {
-            return Err(TraceDecayError::Config {
-                message: format!("{SERVICE_NAMESPACE_ENV} must not be empty"),
-            });
-        }
-        if value.len() > MAX_SERVICE_NAMESPACE_LEN
-            || value.chars().any(|character| {
-                !character.is_ascii_alphanumeric() && character != '-' && character != '_'
-            })
-            || !value
-                .chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_alphanumeric())
-            || !value
-                .chars()
-                .next_back()
-                .is_some_and(|character| character.is_ascii_alphanumeric())
-        {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "{SERVICE_NAMESPACE_ENV} must be a {MAX_SERVICE_NAMESPACE_LEN}-character maximum suffix containing only ASCII letters, digits, '-' or '_' and starting and ending with a letter or digit"
-                ),
-            });
-        }
-        Ok(Self(Some(value)))
-    }
-
-    /// Returns the suffix, or `None` for the stable V1 identity.
-    pub fn suffix(&self) -> Option<&str> {
-        self.0.as_deref()
-    }
-
-    /// Returns the systemd unit name for this namespace.
-    pub fn service_name(&self) -> String {
-        self.suffix().map_or_else(
-            || crate::SERVICE_NAME.to_owned(),
-            |suffix| format!("tracedecay-{suffix}.service"),
-        )
-    }
-
-    /// Returns the launchd label for this namespace.
-    pub fn launchd_label(&self) -> String {
-        self.suffix().map_or_else(
-            || DEFAULT_LAUNCHD_LABEL.to_owned(),
-            |suffix| format!("{DEFAULT_LAUNCHD_LABEL}.{suffix}"),
-        )
-    }
-
-    /// Returns the launchd plist filename for this namespace.
-    pub fn launchd_plist_name(&self) -> String {
-        self.suffix().map_or_else(
-            || DEFAULT_LAUNCHD_PLIST_NAME.to_owned(),
-            |suffix| format!("{DEFAULT_LAUNCHD_LABEL}.{suffix}.plist"),
-        )
-    }
-}
-
-/// Resolves the namespace selected for managed service operations.
-pub fn service_namespace() -> Result<ServiceNamespace> {
-    ServiceNamespace::current()
-}
-
-/// Returns the validated suffix selected for the managed service.
-pub(super) fn service_namespace_suffix() -> Result<Option<String>> {
-    Ok(ServiceNamespace::current()?.suffix().map(ToOwned::to_owned))
-}
-
-pub(super) fn service_name_for(namespace: &ServiceNamespace) -> String {
-    namespace.service_name()
-}
-
-#[cfg(test)]
-pub(super) fn service_name() -> Result<String> {
-    Ok(ServiceNamespace::current()?.service_name())
-}
-
-#[cfg(test)]
-pub(super) fn launchd_label() -> Result<String> {
-    Ok(ServiceNamespace::current()?.launchd_label())
-}
-
-#[cfg(test)]
-pub(super) fn launchd_plist_name() -> Result<String> {
-    Ok(ServiceNamespace::current()?.launchd_plist_name())
-}
 
 // Cached project owners retain SQLite families and coordination locks. The
 // platform default of 256 descriptors is too small for multi-worktree use.
@@ -240,7 +106,6 @@ pub struct DaemonServiceSpec {
     pub tracedecay_bin: PathBuf,
     pub socket_path: PathBuf,
     pub data_dir_override: Option<PathBuf>,
-    pub global_db_override: Option<PathBuf>,
     pub remote_tls: Option<RemoteBrainTlsConfig>,
     pub memory: DaemonServiceMemoryLimitsV1,
 }
@@ -429,24 +294,6 @@ impl QuiescedDaemonLifecycle {
     pub fn finish_after_update(self) -> Result<()> {
         let target = self.previous_state.expected_after_update();
         self.finish_with_state(target)
-    }
-
-    /// Refreshes the installed service while retaining this guard's resolved
-    /// namespace and captured lifecycle state. Callers performing a restart
-    /// after acquiring this guard must use this method so a concurrent change
-    /// to [`SERVICE_NAMESPACE_ENV`] cannot redirect the refresh to another
-    /// service unit.
-    pub fn refresh_installed_service_under_lease_with_state(
-        &self,
-        spec: &DaemonServiceSpec,
-        expected_version: &str,
-    ) -> Result<Option<PathBuf>> {
-        refresh_installed_service_with_state_and_runner(
-            &self.runner,
-            spec,
-            Some(self.previous_state),
-            expected_version,
-        )
     }
 
     /// Adopts a maintenance action's [`MaintenanceWindowOutcome`], returning
@@ -685,21 +532,7 @@ fn installed_service_unit_present() -> Result<bool> {
 
 impl DaemonServiceSpec {
     pub fn render_systemd_user_unit(&self) -> Result<String> {
-        let namespace = ServiceNamespace::current()?;
-        self.render_systemd_user_unit_for(&namespace)
-    }
-
-    pub(super) fn render_systemd_user_unit_for(
-        &self,
-        _namespace: &ServiceNamespace,
-    ) -> Result<String> {
         validate_managed_remote_tls(self.remote_tls.as_ref())?;
-        let tracedecay_bin = managed_service_path_text("daemon executable", &self.tracedecay_bin)?;
-        let socket_path = managed_service_path_text("daemon socket", &self.socket_path)?;
-        let data_dir_path = service_data_dir(self)?;
-        let data_dir = managed_service_path_text("daemon data directory", &data_dir_path)?;
-        let global_db = service_global_db_path(self, &data_dir_path)?;
-        let global_db = managed_service_path_text("daemon global database", &global_db)?;
         let service_path = daemon_service_path_env(&self.tracedecay_bin);
         let remote_arguments = match self.remote_tls.as_ref() {
             Some(config) => format!(
@@ -728,8 +561,6 @@ impl DaemonServiceSpec {
              [Service]\n\
              Type=simple\n\
              Environment=\"PATH={}\"\n\
-             Environment=\"{}={}\"\n\
-             Environment=\"{}={}\"\n\
              ExecStart={} daemon run --socket {}{}\n\
              # Restart=always (not on-failure): come back after OOM SIGKILL,\n\
              # crash, or a clean-but-unexpected exit. A looping daemon is\n\
@@ -749,12 +580,8 @@ impl DaemonServiceSpec {
              [Install]\n\
              WantedBy=default.target\n",
             systemd_escape_env_value(&service_path),
-            USER_DATA_DIR_ENV,
-            systemd_escape_env_value(data_dir),
-            GLOBAL_DB_PATH_ENV,
-            systemd_escape_env_value(global_db),
-            systemd_quote_exec_argument_if_needed(tracedecay_bin),
-            systemd_quote_exec_argument_if_needed(socket_path),
+            systemd_quote_exec_argument_if_needed(&self.tracedecay_bin.display().to_string()),
+            systemd_quote_exec_argument_if_needed(&self.socket_path.display().to_string()),
             remote_arguments,
             DAEMON_RESTART_SEC,
             DAEMON_STOP_TIMEOUT_SECS,
@@ -772,28 +599,27 @@ impl DaemonServiceSpec {
     /// one previous generation as `daemon.err.log.1`, so the managed log holds
     /// at most about twice that bound on disk.
     pub fn render_launchd_plist(&self) -> Result<String> {
-        let namespace = ServiceNamespace::current()?;
-        self.render_launchd_plist_for(&namespace)
-    }
-
-    pub(super) fn render_launchd_plist_for(&self, namespace: &ServiceNamespace) -> Result<String> {
         validate_managed_remote_tls(self.remote_tls.as_ref())?;
-        let tracedecay_bin = managed_service_path_text("daemon executable", &self.tracedecay_bin)?;
-        let socket_path = managed_service_path_text("daemon socket", &self.socket_path)?;
+        if !self.tracedecay_bin.is_absolute() {
+            return Err(TraceDecayError::Config {
+                message: format!(
+                    "launchd daemon service requires an absolute tracedecay binary path, got '{}'",
+                    self.tracedecay_bin.display()
+                ),
+            });
+        }
 
         let home = home_for_service_env()?;
-        let data_dir = service_data_dir(self)?;
-        let data_dir_text = managed_service_path_text("daemon data directory", &data_dir)?;
-        let global_db = service_global_db_path(self, &data_dir)?;
-        let global_db_text = managed_service_path_text("daemon global database", &global_db)?;
-        let env_entries = vec![
+        let data_dir = match &self.data_dir_override {
+            Some(dir) => dir.clone(),
+            None => tracedecay_data_dir()?,
+        };
+        let mut env_entries = vec![
             (
                 "PATH".to_string(),
                 daemon_service_path_env(&self.tracedecay_bin),
             ),
             ("HOME".to_string(), home.display().to_string()),
-            (USER_DATA_DIR_ENV.to_string(), data_dir_text.to_owned()),
-            (GLOBAL_DB_PATH_ENV.to_string(), global_db_text.to_owned()),
             // launchd enforces no memory ceiling, so the budget systemd
             // hands the kernel goes to the daemon's own resident-memory
             // authority: admission refuses growth and sheds caches at it.
@@ -803,6 +629,12 @@ impl DaemonServiceSpec {
                 self.memory.max_bytes.to_string(),
             ),
         ];
+        if let Some(data_dir_override) = &self.data_dir_override {
+            env_entries.push((
+                tracedecay_runtime_core::config::USER_DATA_DIR_ENV.to_string(),
+                data_dir_override.display().to_string(),
+            ));
+        }
 
         let mut environment = String::new();
         for (key, value) in env_entries {
@@ -887,70 +719,22 @@ impl DaemonServiceSpec {
                <string>{stderr}</string>\n\
              </dict>\n\
              </plist>\n",
-            label = xml_escape(&namespace.launchd_label()),
-            bin = xml_escape(tracedecay_bin),
-            socket = xml_escape(socket_path),
+            label = xml_escape(LAUNCHD_LABEL),
+            bin = xml_escape(&self.tracedecay_bin.display().to_string()),
+            socket = xml_escape(&self.socket_path.display().to_string()),
             open_file_limit = DAEMON_OPEN_FILE_LIMIT,
             stdout = xml_escape(&data_dir.join("daemon.out.log").display().to_string()),
             stderr = xml_escape(&data_dir.join("daemon.err.log").display().to_string()),
         ))
     }
 
-    #[cfg(test)]
     fn render_unit(&self) -> Result<String> {
-        let namespace = ServiceNamespace::current()?;
-        self.render_unit_for(&namespace)
-    }
-
-    pub(super) fn render_unit_for(&self, namespace: &ServiceNamespace) -> Result<String> {
         match ServicePlatform::current()? {
-            ServicePlatform::Systemd => self.render_systemd_user_unit_for(namespace),
-            ServicePlatform::Launchd => self.render_launchd_plist_for(namespace),
-            ServicePlatform::WindowsTask => {
-                windows_task::render_task_xml_for_namespace(self, namespace)
-            }
+            ServicePlatform::Systemd => self.render_systemd_user_unit(),
+            ServicePlatform::Launchd => self.render_launchd_plist(),
+            ServicePlatform::WindowsTask => windows_task::render_task_xml(self),
         }
     }
-}
-
-fn service_data_dir(spec: &DaemonServiceSpec) -> Result<PathBuf> {
-    spec.data_dir_override
-        .clone()
-        .map_or_else(tracedecay_data_dir, Ok)
-}
-
-fn service_global_db_path(spec: &DaemonServiceSpec, data_dir: &Path) -> Result<PathBuf> {
-    if let Some(path) = &spec.global_db_override {
-        return Ok(path.clone());
-    }
-    if tracedecay_runtime_core::config::global_db_path_is_overridden() {
-        return tracedecay_runtime_core::config::global_db_path().ok_or_else(|| {
-            TraceDecayError::Config {
-                message: "could not determine TraceDecay global database path".to_string(),
-            }
-        });
-    }
-    Ok(data_dir.join(GLOBAL_DB_FILENAME))
-}
-
-fn managed_service_path_text<'a>(description: &str, path: &'a Path) -> Result<&'a str> {
-    if !path.is_absolute() {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "managed {description} path must be absolute, got '{}'",
-                path.display()
-            ),
-        });
-    }
-    let path_text = path.to_str().ok_or_else(|| TraceDecayError::Config {
-        message: format!("managed {description} path must be valid Unicode"),
-    })?;
-    if path_text.chars().any(char::is_control) {
-        return Err(TraceDecayError::Config {
-            message: format!("managed {description} path contains a control character"),
-        });
-    }
-    Ok(path_text)
 }
 
 pub(super) fn validate_managed_remote_tls(remote_tls: Option<&RemoteBrainTlsConfig>) -> Result<()> {
@@ -1170,16 +954,12 @@ pub fn service_spec_with_remote_tls(
     socket: Option<String>,
     remote_tls: Option<RemoteBrainTlsConfig>,
 ) -> Result<DaemonServiceSpec> {
-    service_namespace_suffix()?;
     let tracedecay_bin = tracedecay_bin.into();
     validate_managed_remote_tls(remote_tls.as_ref())?;
     Ok(DaemonServiceSpec {
         tracedecay_bin,
         socket_path: socket_path_or_default(socket)?,
-        data_dir_override: std::env::var_os(USER_DATA_DIR_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from),
-        global_db_override: std::env::var_os(GLOBAL_DB_PATH_ENV)
+        data_dir_override: std::env::var_os(tracedecay_runtime_core::config::USER_DATA_DIR_ENV)
             .filter(|value| !value.is_empty())
             .map(PathBuf::from),
         remote_tls,
@@ -1211,191 +991,13 @@ pub fn install_service(
     expected_version: &str,
 ) -> Result<PathBuf> {
     let guard = QuiescedDaemonLifecycle::acquire("daemon service install", expected_version)?;
-    let operation_result =
-        install_service_under_lease_with_runner(&guard.runner, spec, false, expected_version);
+    let operation_result = install_service_under_lease(spec, false, expected_version);
     let restore_result = if start {
         guard.finish_with_state(DaemonServiceState::RunningEnabled)
     } else {
         guard.finish()
     };
     combine_operation_and_restore("daemon service install", operation_result, restore_result)
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ServiceProfileIdentity {
-    data_dir: PathBuf,
-    global_db: PathBuf,
-    socket_path: PathBuf,
-}
-
-fn service_profile_identity(spec: &DaemonServiceSpec) -> Result<ServiceProfileIdentity> {
-    let data_dir = service_data_dir(spec)?;
-    let global_db = service_global_db_path(spec, &data_dir)?;
-    if matches!(
-        ServicePlatform::current()?,
-        ServicePlatform::Systemd | ServicePlatform::Launchd
-    ) {
-        managed_service_path_text("daemon data directory", &data_dir)?;
-        managed_service_path_text("daemon global database", &global_db)?;
-        managed_service_path_text("daemon socket", &spec.socket_path)?;
-    }
-    Ok(ServiceProfileIdentity {
-        data_dir,
-        global_db,
-        socket_path: spec.socket_path.clone(),
-    })
-}
-
-/// Refuses to replace a service unit that belongs to a different profile.
-///
-/// The unit filename/label is the namespace boundary. A stale or manually
-/// colliding unit must be proven to carry the same profile and socket before
-/// an install is allowed to rewrite it; otherwise a V2 install could silently
-/// stop owning V1's daemon.
-#[cfg(test)]
-fn validate_service_install_target(spec: &DaemonServiceSpec) -> Result<()> {
-    let namespace = ServiceNamespace::current()?;
-    validate_service_install_target_for(spec, &namespace)
-}
-
-fn validate_service_install_target_for(
-    spec: &DaemonServiceSpec,
-    namespace: &ServiceNamespace,
-) -> Result<()> {
-    if matches!(ServicePlatform::current()?, ServicePlatform::WindowsTask) {
-        return Ok(());
-    }
-    let service_path = unit_file::service_unit_path_for(namespace)?;
-    if !unit_file::service_unit_exists_for(&service_path, namespace)? {
-        return Ok(());
-    }
-    let requested = service_profile_identity(spec)?;
-    let unit = unit_file::read_service_unit_for(&service_path, namespace)?;
-    if matches!(ServicePlatform::current()?, ServicePlatform::Launchd) {
-        let expected_label = namespace.launchd_label();
-        if unit_file::launchd_plist_label(&unit).as_deref() != Some(expected_label.as_str()) {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "cannot verify the existing launchd daemon service '{}': its label does not match '{}'; refusing to overwrite a possible colliding profile",
-                    service_path.display(),
-                    expected_label,
-                ),
-            });
-        }
-    }
-    let persisted_data_dir = service_env_value_from_unit(&unit, USER_DATA_DIR_ENV)?;
-    let persisted_global_db = service_env_value_from_unit(&unit, GLOBAL_DB_PATH_ENV)?;
-    if namespace.suffix().is_some()
-        && (persisted_data_dir.is_none() || persisted_global_db.is_none())
-    {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "cannot verify the existing namespaced daemon service '{}': it does not persist both {USER_DATA_DIR_ENV} and {GLOBAL_DB_PATH_ENV}; refusing to overwrite a possible colliding profile",
-                service_path.display()
-            ),
-        });
-    }
-    let existing = ServiceProfileIdentity {
-        data_dir: persisted_data_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(|| requested.data_dir.clone()),
-        global_db: persisted_global_db
-            .map(PathBuf::from)
-            .unwrap_or_else(|| requested.data_dir.join(GLOBAL_DB_FILENAME)),
-        socket_path: socket_path_from_unit_text(&unit).ok_or_else(|| {
-            TraceDecayError::Config {
-                message: format!(
-                    "cannot verify the existing daemon service '{}': its socket is missing or malformed; refusing to overwrite a possible colliding profile",
-                    service_path.display()
-                ),
-            }
-        })?,
-    };
-    let same_profile =
-        existing.data_dir == requested.data_dir && existing.global_db == requested.global_db;
-    let same_socket = existing.socket_path == requested.socket_path;
-    if !same_profile || !same_socket {
-        let name = namespace.service_name();
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "daemon service name '{name}' at '{}' belongs to another profile (data '{}', global '{}', socket '{}'); refusing to overwrite it",
-                service_path.display(),
-                existing.data_dir.display(),
-                existing.global_db.display(),
-                existing.socket_path.display(),
-            ),
-        });
-    }
-    Ok(())
-}
-
-pub(super) fn validate_service_identity_before_control(
-    service_path: &Path,
-    unit: &str,
-    namespace: &ServiceNamespace,
-) -> Result<()> {
-    let platform = ServicePlatform::current()?;
-    if matches!(platform, ServicePlatform::WindowsTask) {
-        let (data_dir, global_db, socket_path) =
-            windows_task::task_paths_from_xml(unit, namespace)?;
-        managed_service_path_text("daemon data directory", &data_dir)?;
-        managed_service_path_text("daemon global database", &global_db)?;
-        managed_service_path_text("daemon socket", &socket_path)?;
-        return Ok(());
-    }
-    if matches!(platform, ServicePlatform::Launchd) {
-        let expected_label = namespace.launchd_label();
-        if unit_file::launchd_plist_label(unit).as_deref() != Some(expected_label.as_str()) {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "cannot verify the existing launchd daemon service \"{}\": its label does not match \"{expected_label}\"; refusing to control a possible colliding profile",
-                    service_path.display()
-                ),
-            });
-        }
-    }
-    let persisted_data_dir = service_env_value_from_unit(unit, USER_DATA_DIR_ENV)?;
-    let persisted_global_db = service_env_value_from_unit(unit, GLOBAL_DB_PATH_ENV)?;
-    if namespace.suffix().is_some()
-        && (persisted_data_dir.is_none() || persisted_global_db.is_none())
-    {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "cannot verify the existing namespaced daemon service \"{}\": it does not persist both {USER_DATA_DIR_ENV} and {GLOBAL_DB_PATH_ENV}; refusing to control a possible colliding profile",
-                service_path.display()
-            ),
-        });
-    }
-    if let Some(data_dir) = persisted_data_dir {
-        managed_service_path_text("daemon data directory", Path::new(&data_dir))?;
-    }
-    if let Some(global_db) = persisted_global_db {
-        managed_service_path_text("daemon global database", Path::new(&global_db))?;
-    }
-    let persisted_socket = socket_path_from_unit_text(unit).ok_or_else(|| {
-        TraceDecayError::Config {
-            message: format!(
-                "cannot verify the existing daemon service \"{}\": its socket is missing or malformed; refusing to control a possible colliding profile",
-                service_path.display()
-            ),
-        }
-    })?;
-    managed_service_path_text("daemon socket", &persisted_socket)?;
-    Ok(())
-}
-
-fn persisted_service_socket_path(
-    service_path: &Path,
-    unit: &str,
-    namespace: &ServiceNamespace,
-) -> Result<PathBuf> {
-    validate_service_identity_before_control(service_path, unit, namespace)?;
-    socket_path_from_unit_text(unit).ok_or_else(|| TraceDecayError::Config {
-        message: format!(
-            "cannot determine the socket for installed daemon service \"{}\": its persisted socket is missing or malformed",
-            service_path.display()
-        ),
-    })
 }
 
 /// Install the managed service unit while the caller already holds the
@@ -1409,31 +1011,20 @@ pub fn install_service_under_lease(
     expected_version: &str,
 ) -> Result<PathBuf> {
     let runner = ServiceRunner::current()?;
-    install_service_under_lease_with_runner(&runner, spec, start, expected_version)
-}
-
-fn install_service_under_lease_with_runner(
-    runner: &ServiceRunner,
-    spec: &DaemonServiceSpec,
-    start: bool,
-    expected_version: &str,
-) -> Result<PathBuf> {
     #[cfg(windows)]
-    let new_windows_task =
-        windows_task::service_state_for(runner.namespace())? == DaemonServiceState::Missing;
+    let new_windows_task = windows_task::service_state()? == DaemonServiceState::Missing;
     #[cfg(not(windows))]
     let new_windows_task = false;
     let operation_result = (|| {
         #[cfg(windows)]
-        let materialized_spec = if matches!(runner, ServiceRunner::WindowsTask { .. }) {
+        let materialized_spec = if matches!(runner, ServiceRunner::WindowsTask) {
             windows_task::materialize_service_spec_after_quiescence(spec)?
         } else {
             spec.clone()
         };
         #[cfg(not(windows))]
         let materialized_spec = spec.clone();
-        validate_service_install_target_for(&materialized_spec, runner.namespace())?;
-        let service_path = write_service_unit_for(&materialized_spec, runner.namespace())?;
+        let service_path = write_service_unit(&materialized_spec)?;
         runner.install(
             &service_path,
             start,
@@ -1443,7 +1034,7 @@ fn install_service_under_lease_with_runner(
         Ok(service_path)
     })();
     if operation_result.is_err() && new_windows_task {
-        let rollback_result = windows_task::rollback_new_registration_for(runner.namespace());
+        let rollback_result = windows_task::rollback_new_registration();
         return combine_operation_and_restore(
             "install new Windows daemon task",
             operation_result,
@@ -1463,7 +1054,7 @@ fn refresh_service_with_runner(
     if matches!(runner, ServiceRunner::Systemd { .. })
         && previous_state == DaemonServiceState::Masked
     {
-        let service_path = runner.service_path()?;
+        let service_path = service_unit_path()?;
         if std::fs::read_link(&service_path).is_ok_and(|target| target == Path::new("/dev/null")) {
             return Err(TraceDecayError::Config {
                 message: format!(
@@ -1474,14 +1065,14 @@ fn refresh_service_with_runner(
         }
     }
     #[cfg(windows)]
-    let materialized_spec = if matches!(runner, ServiceRunner::WindowsTask { .. }) {
+    let materialized_spec = if matches!(runner, ServiceRunner::WindowsTask) {
         windows_task::materialize_service_spec_after_quiescence(spec)?
     } else {
         spec.clone()
     };
     #[cfg(not(windows))]
     let materialized_spec = spec.clone();
-    let service_path = write_service_unit_for(&materialized_spec, runner.namespace())?;
+    let service_path = write_service_unit(&materialized_spec)?;
     runner.refresh(
         &service_path,
         &materialized_spec.socket_path,
@@ -1498,28 +1089,6 @@ pub fn refresh_installed_service_under_lease_with_state(
     expected_version: &str,
 ) -> Result<Option<PathBuf>> {
     refresh_installed_service_with_state(spec, Some(previous_state), expected_version)
-}
-
-/// Refreshes an installed service using a namespace resolved by the caller.
-///
-/// Update and restart orchestration that acquires a lifecycle guard before
-/// doing other work should resolve [`ServiceNamespace`] before entering that
-/// work and pass it here. This keeps the refresh on the same unit as the
-/// guard even if process environment variables change in between.
-#[doc(hidden)]
-pub fn refresh_installed_service_under_lease_with_state_for_namespace(
-    spec: &DaemonServiceSpec,
-    previous_state: DaemonServiceState,
-    expected_version: &str,
-    namespace: &ServiceNamespace,
-) -> Result<Option<PathBuf>> {
-    let runner = ServiceRunner::for_namespace(namespace.clone())?;
-    refresh_installed_service_with_state_and_runner(
-        &runner,
-        spec,
-        Some(previous_state),
-        expected_version,
-    )
 }
 
 fn refresh_installed_service_with_state(
@@ -1544,48 +1113,25 @@ fn refresh_installed_service_with_state_and_runner(
     if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         return Ok(None);
     }
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         return Ok(None);
     }
-    if matches!(runner, ServiceRunner::Systemd { .. })
-        && std::fs::read_link(&service_path).is_ok_and(|target| target == Path::new("/dev/null"))
-    {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "TraceDecay daemon service '{}' is persistently masked; preserved the /dev/null mask and skipped rewriting it",
-                service_path.display()
-            ),
-        });
-    }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    validate_service_identity_before_control(&service_path, &unit, runner.namespace())?;
+    let unit = read_service_unit(&service_path)?;
     let mut refreshed_spec = spec.clone();
     refreshed_spec.remote_tls = unit_file::remote_tls_from_unit_text(&unit)?;
-    if matches!(
-        runner,
-        ServiceRunner::Launchd { .. } | ServiceRunner::Systemd { .. }
-    ) {
-        // The installed unit is the source of truth for profile paths; the
-        // refreshing shell may not have the overrides set (or may be pointed
-        // at a different profile while a shadow service is being refreshed).
-        refreshed_spec.data_dir_override = service_env_value_from_unit(&unit, USER_DATA_DIR_ENV)?
-            .map(PathBuf::from)
-            .or(refreshed_spec.data_dir_override);
-        refreshed_spec.global_db_override = service_env_value_from_unit(&unit, GLOBAL_DB_PATH_ENV)?
-            .map(PathBuf::from)
-            .or(refreshed_spec.global_db_override);
-    } else if matches!(runner, ServiceRunner::WindowsTask { .. }) {
-        let (data_dir, global_db, socket_path) =
-            windows_task::task_paths_from_xml(&unit, runner.namespace())?;
-        refreshed_spec.data_dir_override = Some(data_dir);
-        refreshed_spec.global_db_override = Some(global_db);
-        refreshed_spec.socket_path = socket_path;
+    if matches!(runner, ServiceRunner::Launchd { .. }) {
+        // The installed plist is the source of truth for the daemon's data
+        // directory; the refreshing shell may not have the override set.
+        refreshed_spec.data_dir_override =
+            launchd_plist_env_value(&unit, tracedecay_runtime_core::config::USER_DATA_DIR_ENV)
+                .map(PathBuf::from);
+    } else if matches!(runner, ServiceRunner::WindowsTask) {
+        refreshed_spec.data_dir_override = windows_task::profile_root_from_task_xml(&unit);
     }
     if let Some(socket_path) = socket_path_from_unit_text(&unit) {
         refreshed_spec.socket_path = socket_path;
     }
-    validate_service_install_target_for(&refreshed_spec, runner.namespace())?;
     let previous_state = match previous_state {
         Some(state) => state,
         None => runner.service_state(&refreshed_spec.socket_path)?,
@@ -1611,8 +1157,8 @@ fn quiesce_installed_service_before_lease_with_runner(
     if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         return Ok(DaemonServiceState::Missing);
     }
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         let socket_path = default_socket_path()?;
         let socket_state = daemon_socket_state(&socket_path);
         if !socket_state.is_proven_quiesced() {
@@ -1625,8 +1171,8 @@ fn quiesce_installed_service_before_lease_with_runner(
         }
         return Ok(DaemonServiceState::Missing);
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
     let state = runner.service_state(&socket_path)?;
     if !state.is_running() {
         let socket_state = daemon_socket_state(&socket_path);
@@ -1658,8 +1204,8 @@ fn verify_installed_service_quiesced_under_lease_with_runner(
     if !cfg!(any(target_os = "linux", target_os = "macos", windows)) {
         return Ok(DaemonServiceState::Missing);
     }
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         let socket_path = default_socket_path()?;
         let socket_state = daemon_socket_state(&socket_path);
         if !socket_state.is_proven_quiesced() {
@@ -1672,8 +1218,8 @@ fn verify_installed_service_quiesced_under_lease_with_runner(
         }
         return Ok(DaemonServiceState::Missing);
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
     let state = runner.service_state(&socket_path)?;
     let socket_state = daemon_socket_state(&socket_path);
     if state.is_running() || !socket_state.is_proven_quiesced() {
@@ -1718,8 +1264,8 @@ fn restore_installed_service_after_update_with_runner(
     {
         return Ok(());
     }
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         return Err(TraceDecayError::Config {
             message: format!(
                 "cannot restore TraceDecay daemon state: service unit '{}' is missing",
@@ -1727,8 +1273,8 @@ fn restore_installed_service_after_update_with_runner(
             ),
         });
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
     runner.restore_after_update(
         &service_path,
         &socket_path,
@@ -1753,47 +1299,35 @@ fn restore_installed_service_after_failed_acquire_with_runner(
 }
 
 pub fn uninstall_service(stop: bool, expected_version: &str) -> Result<PathBuf> {
-    let runner = ServiceRunner::current()?;
     if !stop {
-        let service_path = runner.service_path()?;
-        if service_unit_exists_for(&service_path, runner.namespace())? {
-            let unit = read_service_unit_for(&service_path, runner.namespace())?;
-            let socket_path =
-                persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
-            if runner.service_state(&socket_path)?.is_running() {
-                return Err(TraceDecayError::Config {
-                    message: "cannot uninstall the daemon service with --no-stop while the managed daemon is running; stop it first or omit --no-stop".to_string(),
-                });
-            }
+        let state = installed_service_state()?;
+        if state.is_running() {
+            return Err(TraceDecayError::Config {
+                message: "cannot uninstall the daemon service with --no-stop while the managed daemon is running; stop it first or omit --no-stop".to_string(),
+            });
         }
         let _lifecycle_lease =
             tracedecay_runtime_core::lifecycle_lease::acquire_exclusive_for_profile(
                 &tracedecay_data_dir()?,
                 "daemon service uninstall --no-stop",
             )?;
-        verify_installed_service_quiesced_under_lease_with_runner(&runner)?;
-        return uninstall_service_under_lease(&runner, false, expected_version);
+        verify_installed_service_quiesced_under_lease()?;
+        return uninstall_service_under_lease(false, expected_version);
     }
-    let guard = QuiescedDaemonLifecycle::acquire_with_runner_and_timeout(
-        "daemon service uninstall",
-        expected_version,
-        runner,
-        QUIESCED_LEASE_RELEASE_TIMEOUT,
-    )?;
-    let operation_result = uninstall_service_under_lease(&guard.runner, true, expected_version);
+    let guard = QuiescedDaemonLifecycle::acquire("daemon service uninstall", expected_version)?;
+    let operation_result = uninstall_service_under_lease(true, expected_version);
     guard.finish_without_restore();
     operation_result
 }
 
 pub fn installed_service_state() -> Result<DaemonServiceState> {
-    let runner = ServiceRunner::current()?;
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         return Ok(DaemonServiceState::Missing);
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
-    runner.service_state(&socket_path)
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
+    ServiceRunner::current()?.service_state(&socket_path)
 }
 
 /// Observe whether the managed unit's process completed initialize.
@@ -1801,16 +1335,15 @@ pub fn installed_service_state() -> Result<DaemonServiceState> {
 /// `Running` from systemd or a connectable socket is not this proof. A missing
 /// or stopped unit is [`DaemonProcessProofV1::Unproven`] without a probe.
 pub fn installed_service_process_proof(expected_version: &str) -> Result<DaemonProcessProofV1> {
-    let runner = ServiceRunner::current()?;
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         return Ok(DaemonProcessProofV1::Unproven {
             detail: "no managed TraceDecay daemon service is installed".to_owned(),
         });
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
-    let state = runner.service_state(&socket_path)?;
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
+    let state = ServiceRunner::current()?.service_state(&socket_path)?;
     if !state.is_running() {
         return Ok(DaemonProcessProofV1::Unproven {
             detail: "managed daemon unit is not running".to_owned(),
@@ -1821,18 +1354,18 @@ pub fn installed_service_process_proof(expected_version: &str) -> Result<DaemonP
 
 #[hotpath::measure(label = "daemon.service.start")]
 pub fn start_service(expected_version: &str) -> Result<()> {
-    let runner = ServiceRunner::current()?;
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         return Err(TraceDecayError::Config {
             message: "no TraceDecay daemon service is installed".to_string(),
         });
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
+    let runner = ServiceRunner::current()?;
     let pre_start_state = runner.service_state(&socket_path)?;
     runner.start(&service_path, &socket_path, expected_version)?;
-    if matches!(runner, ServiceRunner::WindowsTask { .. }) {
+    if matches!(runner, ServiceRunner::WindowsTask) {
         // `windows_task::start` already polls authenticated readiness
         // internally; a second wait would double the start path.
         return Ok(());
@@ -1859,24 +1392,12 @@ pub fn start_service(expected_version: &str) -> Result<()> {
 
 #[hotpath::measure(label = "daemon.service.stop")]
 pub fn stop_service(expected_version: &str) -> Result<()> {
-    let runner = ServiceRunner::current()?;
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    if matches!(installed_service_state()?, DaemonServiceState::Missing) {
         return Err(TraceDecayError::Config {
             message: "no TraceDecay daemon service is installed".to_string(),
         });
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
-    if matches!(
-        runner.service_state(&socket_path)?,
-        DaemonServiceState::Missing
-    ) {
-        return Err(TraceDecayError::Config {
-            message: "no TraceDecay daemon service is installed".to_string(),
-        });
-    }
-    runner.stop(expected_version)
+    ServiceRunner::current()?.stop(expected_version)
 }
 
 /// Waits for a strict maintenance command to observe the exact managed-service
@@ -1968,8 +1489,8 @@ fn installed_service_status_snapshot(
     DaemonProtocolState,
 )> {
     const READINESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-    let service_path = runner.service_path()?;
-    if !service_unit_exists_for(&service_path, runner.namespace())? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         let socket_path = default_socket_path()?;
         let socket_state = daemon_socket_state(&socket_path);
         return Ok((
@@ -1979,20 +1500,15 @@ fn installed_service_status_snapshot(
             DaemonProtocolState::NotRequired,
         ));
     }
-    let unit = read_service_unit_for(&service_path, runner.namespace())?;
-    let socket_path = persisted_service_socket_path(&service_path, &unit, runner.namespace())?;
+    let unit = read_service_unit(&service_path)?;
+    let socket_path = socket_path_from_unit_text(&unit).unwrap_or(default_socket_path()?);
     // launchd's liveness is a socket connect, so the authenticated readiness
     // probe doubles as that observation instead of the daemon seeing an extra
     // bare connection ahead of it.
-    if let ServiceRunner::Launchd {
-        launchctl,
-        id,
-        namespace,
-    } = runner
-    {
+    if let ServiceRunner::Launchd { launchctl, id } = runner {
         let (socket_state, protocol_state) =
             daemon_readiness_probe(&socket_path, expected_version, READINESS_TIMEOUT);
-        let actual = launchd_service_state(launchctl, id, namespace, socket_state)?;
+        let actual = launchd_service_state(launchctl, id, socket_state)?;
         let protocol_state = if actual.is_running() {
             protocol_state
         } else {
@@ -2046,14 +1562,11 @@ fn combine_operation_and_restore<T>(
 }
 
 #[hotpath::measure(label = "daemon.service.uninstall")]
-fn uninstall_service_under_lease(
-    runner: &ServiceRunner,
-    stop: bool,
-    expected_version: &str,
-) -> Result<PathBuf> {
-    let service_path = runner.service_path()?;
+fn uninstall_service_under_lease(stop: bool, expected_version: &str) -> Result<PathBuf> {
+    let runner = ServiceRunner::current()?;
+    let service_path = service_unit_path()?;
     runner.before_uninstall(stop, expected_version)?;
-    remove_service_unit_for(&service_path, runner.namespace())?;
+    remove_service_unit(&service_path)?;
     runner.after_uninstall(stop);
     Ok(service_path)
 }
@@ -2069,15 +1582,11 @@ pub fn service_status(socket_path: &Path, expected_version: &str) -> String {
             .unwrap_or_else(|| socket_path.to_path_buf())
     };
     let (socket_state, process) = probe::observe_daemon_process(&transport_path, expected_version);
+    let service = service_unit_path().map_or_else(
+        |e| format!("unavailable: {e}"),
+        |path| path.display().to_string(),
+    );
     let runner = ServiceRunner::current();
-    let service = runner
-        .as_ref()
-        .map_err(ToString::to_string)
-        .and_then(|runner| runner.service_path().map_err(|error| error.to_string()))
-        .map_or_else(
-            |error| format!("unavailable: {error}"),
-            |path| path.display().to_string(),
-        );
     let service_manager = match runner
         .as_ref()
         .map(|runner| runner.observe_service_state(&transport_path))

@@ -102,7 +102,7 @@ export function SessionInspector({
         {provider != null ? (
           <LoomPivot provider={provider} sessionId={selection.sessionId} />
         ) : null}
-        <SessionTranscript sessionId={selection.sessionId} provider={provider} />
+        <SessionTranscript sessionId={selection.sessionId} />
         <RelationsSection identity={identity} />
       </div>
     </InspectorPanel>
@@ -362,32 +362,14 @@ function LoomPivot({ provider, sessionId }: { provider: string; sessionId: strin
  * Transcript, one server page at a time
  * ------------------------------------------------------------------------ */
 
-export function SessionTranscript({
-  sessionId,
-  provider,
-}: {
-  sessionId: string;
-  provider?: string | null;
-}) {
+export function SessionTranscript({ sessionId }: { sessionId: string }) {
   // The cache token comes from the authority, never a second construction of
   // it here, `scopeKey` is what every scoped read keys by.
   const scopeCacheKey = useScope((state) => scopeKey(state.scope));
-  return (
-    <SessionTranscriptPage
-      key={`${scopeCacheKey}:${provider ?? ''}:${sessionId}`}
-      sessionId={sessionId}
-      provider={provider}
-    />
-  );
+  return <SessionTranscriptPage key={`${scopeCacheKey}:${sessionId}`} sessionId={sessionId} />;
 }
 
-function SessionTranscriptPage({
-  sessionId,
-  provider,
-}: {
-  sessionId: string;
-  provider?: string | null;
-}) {
+function SessionTranscriptPage({ sessionId }: { sessionId: string }) {
   /** The current cursor is the top entry; the rest lets Previous replay the
    * exact opaque cursor the server issued for the preceding page. */
   const [cursorStack, setCursorStack] = useState<string[]>([]);
@@ -401,10 +383,8 @@ function SessionTranscriptPage({
    */
   const [pageRequest, setPageRequest] = useState(0);
   const session = useEnvelope(
-    ['lcm', 'session', provider ?? null, sessionId, cursor],
+    ['lcm', 'session', sessionId, cursor],
     `/api/plugins/hermes-lcm/session/${encodeURIComponent(sessionId)}?limit=${PAGE_SIZE}${
-      provider == null || provider === '' ? '' : `&provider=${encodeURIComponent(provider)}`
-    }${
       cursor == null ? '' : `&cursor=${encodeURIComponent(cursor)}`
     }`,
     LcmSessionPayloadV1Schema,
@@ -585,7 +565,7 @@ function CompactionBoundaries({ payload }: { payload: LcmSessionPayloadV1 }) {
           className="flex max-h-64 flex-col overflow-auto border border-edge-subtle"
         >
           {nodes.map((node) => (
-            <SummaryNodeRow key={JSON.stringify([node.provider, node.node_id])} node={node} />
+            <SummaryNodeRow key={node.node_id} node={node} />
           ))}
         </ol>
       )}
@@ -714,7 +694,7 @@ function RawMessages({
           className="flex max-h-96 flex-col overflow-auto border border-edge-subtle"
         >
           {messages.map((message) => (
-            <MessageRow key={JSON.stringify([message.provider, message.message_id])} message={message} />
+            <MessageRow key={message.message_id} message={message} />
           ))}
         </ol>
       )}

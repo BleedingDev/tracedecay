@@ -590,28 +590,6 @@ impl CompositionKernel {
             policy,
             &[RetrieverKind::ExactLiteral, RetrieverKind::Lexical],
             anchor_tiers,
-            &[],
-        )
-    }
-
-    /// Compose an optional semantic lane alongside the already admitted
-    /// fallback lanes. The fallback candidates are retained by the caller as
-    /// the byte-authoritative subpayload; this method only produces the
-    /// semantic composition view. The current diversity stage is
-    /// deterministic, so its result remains reproducible from the supplied
-    /// lane inputs and profile.
-    pub(crate) fn compose_preserving_cap_incumbents(
-        &self,
-        input: &FusionStageInput,
-        policy: &tracedecay_domain::DiversityPolicy,
-        incumbents: &[RankedCandidate],
-    ) -> Result<CompositionOutputV1, FusionStageError> {
-        self.compose_required(
-            input,
-            policy,
-            &[RetrieverKind::ExactLiteral, RetrieverKind::Lexical],
-            &BTreeMap::new(),
-            incumbents,
         )
     }
 
@@ -624,7 +602,7 @@ impl CompositionKernel {
         policy: &tracedecay_domain::DiversityPolicy,
         lane: RetrieverKind,
     ) -> Result<CompositionOutputV1, FusionStageError> {
-        self.compose_required(input, policy, &[lane], &BTreeMap::new(), &[])
+        self.compose_required(input, policy, &[lane], &BTreeMap::new())
     }
 
     #[hotpath::measure(label = "query.fusion")]
@@ -634,7 +612,6 @@ impl CompositionKernel {
         policy: &tracedecay_domain::DiversityPolicy,
         required_lanes: &[RetrieverKind],
         anchor_tiers: &BTreeMap<RetrievalAnchorId, u32>,
-        cap_incumbents: &[RankedCandidate],
     ) -> Result<CompositionOutputV1, FusionStageError> {
         let admitted = admitted_lanes(input, required_lanes)?;
         let (compact, dedupe_decisions) = self
@@ -653,7 +630,7 @@ impl CompositionKernel {
             .map_err(|error| FusionStageError::Contract(error.to_string()))?;
         let (ranked_candidates, diversity_decisions) = self
             .diversity
-            .apply_caps_preserving(policy, deduped, cap_incumbents)
+            .apply_caps(policy, deduped)
             .map_err(map_diversity_error)?;
         let comparator_records = ranked_comparator_records(&ranked_candidates, comparator_records)?;
 
@@ -778,37 +755,6 @@ impl CompositionKernel {
             ranked_candidates,
             cursor,
         })
-    }
-
-    /// Build a signed continuation for an already composed frozen candidate
-    /// set at an arbitrary ordinal. Semantic execution uses this to attach
-    /// its own authenticated continuation to the query cursor after the
-    /// optional lane has been admitted.
-    pub(crate) fn cursor(
-        &self,
-        request: &RetrievalRequest,
-        query_view: &EphemeralSanitizedQueryViewV1,
-        keyring: &RetrievalCursorKeyringV1,
-        output: &CompositionOutputV1,
-        next_ordinal: usize,
-    ) -> Result<RetrievalCursor, RetrievalError> {
-        if next_ordinal > output.ranked_candidates.len() {
-            return Err(RetrievalError::CursorSetMismatch);
-        }
-        let query_digest = keyring
-            .digest_active_query(request, query_view)
-            .map_err(|error| RetrievalError::InvalidRequest(error.to_string()))?;
-        build_cursor(
-            request,
-            output,
-            query_digest,
-            request.snapshot.compute_digest()?,
-            digest_candidate_set(&output.ranked_candidates)?,
-            self.ranking_revision.clone(),
-            u32::try_from(next_ordinal).map_err(|_| RetrievalError::CursorSetMismatch)?,
-            current_utc_micros()?,
-            keyring,
-        )
     }
 }
 
@@ -1339,7 +1285,6 @@ fn build_cursor(
             ranking_revision.as_str().to_owned(),
         )?,
         next_ordinal,
-        semantic: None,
         code_source: None,
         expiry: keyring.expiry_from(now)?,
         signature: QueryMac::new(format!("hmac-sha256:{}", "0".repeat(64)))?,
@@ -1365,8 +1310,6 @@ struct CursorAuthenticatedPayload<'a> {
     ranking_revision: &'a tracedecay_domain::RankingRevision,
     next_ordinal: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    semantic: &'a Option<tracedecay_domain::SemanticRetrievalContinuationV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     code_source: &'a Option<tracedecay_domain::CodeSourceCursorBindingV1>,
     expiry: UtcMicros,
 }
@@ -1387,7 +1330,6 @@ fn cursor_authenticated_bytes(cursor: &RetrievalCursor) -> Result<Vec<u8>, Retri
         lane_checkpoints: &cursor.lane_checkpoints,
         ranking_revision: &cursor.ranking_revision,
         next_ordinal: cursor.next_ordinal,
-        semantic: &cursor.semantic,
         code_source: &cursor.code_source,
         expiry: cursor.expiry,
     })

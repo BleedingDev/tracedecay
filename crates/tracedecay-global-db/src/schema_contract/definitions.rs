@@ -409,7 +409,6 @@ pub(super) const TABLES: &[Table] = &[
             column("capture_json", "TEXT", false, None, 0),
             column("retrieval_anchor_id", "TEXT", false, None, 0),
             column("owner_json", "TEXT", false, None, 0),
-            column("origin_json", "TEXT", false, None, 0),
         ],
         [
             foreign_key(

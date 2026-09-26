@@ -8,9 +8,7 @@ use super::super::git_correlation::{
     CommitSessionRecord, DEFAULT_SPAN_MERGE_GAP_SECS, GitEvidenceBatch, GitEvidenceWriter,
     SpanObservation,
 };
-use super::super::registered_db::{
-    SessionExec, SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn,
-};
+use super::super::registered_db::{SessionRegisteredDb, SessionStoreAccess, SessionWriteTxn};
 use super::super::shared::{durable_project_path_key, path_identity_key};
 use super::codex_goal_reconciliation::find_preceding_codex_goal_response;
 use super::types::{TranscriptBatch, TranscriptPersistenceError};
@@ -98,7 +96,6 @@ pub async fn get_parse_offset(
 ) -> Result<Option<ParseOffset>, TranscriptPersistenceError> {
     let path = path_identity_key(path);
     let path = path.as_str();
-    let encoding = ParseOffsetEncoding::for_path(path);
     match conn
         .query(
             "SELECT byte_offset, mtime, file_id FROM parse_offsets WHERE file_path = ?1",
@@ -114,8 +111,8 @@ pub async fn get_parse_offset(
                 return Ok(None);
             };
             Ok(Some(ParseOffset {
-                byte_offset: encoding.decode(&row, 0, "decode transcript byte offset")?,
-                mtime: encoding.decode(&row, 1, "decode transcript mtime")?,
+                byte_offset: decode_u64_bits(&row, 0, "decode transcript byte offset")?,
+                mtime: decode_u64_bits(&row, 1, "decode transcript mtime")?,
                 file_id: decode_u64_bits(&row, 2, "decode transcript file id")?,
             }))
         }
@@ -136,8 +133,8 @@ pub async fn get_parse_offset(
                 return Ok(None);
             };
             Ok(Some(ParseOffset {
-                byte_offset: encoding.decode(&row, 0, "decode transcript byte offset")?,
-                mtime: encoding.decode(&row, 1, "decode transcript mtime")?,
+                byte_offset: decode_u64_bits(&row, 0, "decode transcript byte offset")?,
+                mtime: decode_u64_bits(&row, 1, "decode transcript mtime")?,
                 file_id: 0,
             }))
         }
@@ -157,68 +154,14 @@ fn sqlite_missing_column(error: &tracedecay_runtime_core::db::engine::Error, col
     }
 }
 
-/// Reserved Codex corpus epochs and OpenCode generation/rewrite frontiers
-/// carry full-width digests or sentinels. Preserve their unsigned bit patterns;
-/// ordinary cursors keep checked signed storage and reject negative corruption.
-#[derive(Clone, Copy)]
-enum ParseOffsetEncoding {
-    TranscriptCursor,
-    CodexCorpusEpoch,
-    OpenCodeFrontier,
-}
-
-impl ParseOffsetEncoding {
-    fn for_path(path: &str) -> Self {
-        match path {
-            crate::runtime::source::CODEX_HISTORY_EPOCH_KEY
-            | crate::runtime::ingest::USER_INGEST_CODEX_HISTORY_EPOCH_KEY => Self::CodexCorpusEpoch,
-            "host-frontier://opencode/content-generation/v1"
-            | "host-frontier://opencode/rewrite-rowid/v1" => Self::OpenCodeFrontier,
-            _ => Self::TranscriptCursor,
-        }
-    }
-
-    fn decode(
-        self,
-        row: &Row,
-        index: i32,
-        operation: &'static str,
-    ) -> Result<u64, TranscriptPersistenceError> {
-        match self {
-            Self::TranscriptCursor => decode_u64(row, index, operation),
-            Self::CodexCorpusEpoch | Self::OpenCodeFrontier => {
-                decode_u64_bits(row, index, operation)
-            }
-        }
-    }
-
-    fn encode(
-        self,
-        value: u64,
-        operation: &'static str,
-    ) -> Result<i64, TranscriptPersistenceError> {
-        match self {
-            Self::TranscriptCursor => encode_i64(value, operation),
-            Self::CodexCorpusEpoch | Self::OpenCodeFrontier => Ok(encode_u64_bits(value)),
-        }
-    }
-}
-
-fn decode_u64(
-    row: &Row,
-    index: i32,
-    operation: &'static str,
-) -> Result<u64, TranscriptPersistenceError> {
-    let value = row
-        .get::<i64>(index)
-        .map_err(|error| TranscriptPersistenceError::storage(operation, error))?;
-    u64::try_from(value).map_err(|error| TranscriptPersistenceError::storage(operation, error))
-}
-
-fn encode_i64(value: u64, operation: &'static str) -> Result<i64, TranscriptPersistenceError> {
-    i64::try_from(value).map_err(|error| TranscriptPersistenceError::storage(operation, error))
-}
-
+/// Every `parse_offsets` numeric column carries the full `u64` domain of its
+/// `ParseOffset` field through SQLite's signed 64-bit INTEGER as a two's
+/// complement bit-cast. Transcript byte positions never leave the
+/// non-negative half, but the same three columns are the durable authority
+/// for versioned host frontiers whose fields are digests and sentinels (the
+/// Codex corpus epoch packs a 128-bit digest into `byte_offset`/`mtime`, the
+/// OpenCode rewrite frontier uses `u64::MAX`), so a range-checked encode
+/// refused to persist them and left every history pass retrying forever.
 fn decode_u64_bits(
     row: &Row,
     index: i32,
@@ -261,7 +204,6 @@ pub async fn set_parse_offset(
     offset: ParseOffset,
 ) -> Result<(), TranscriptPersistenceError> {
     let path = path_identity_key(path);
-    let encoding = ParseOffsetEncoding::for_path(&path);
     conn.execute(
         "INSERT INTO parse_offsets (file_path, byte_offset, mtime, file_id)
          VALUES (?1, ?2, ?3, ?4)
@@ -271,8 +213,8 @@ pub async fn set_parse_offset(
             file_id = excluded.file_id",
         params![
             path,
-            encoding.encode(offset.byte_offset, "encode transcript byte offset")?,
-            encoding.encode(offset.mtime, "encode transcript mtime")?,
+            encode_u64_bits(offset.byte_offset),
+            encode_u64_bits(offset.mtime),
             encode_u64_bits(offset.file_id)
         ],
     )
@@ -289,69 +231,6 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
         self.begin_write_transaction()
             .await
             .map_err(|error| TranscriptPersistenceError::storage("begin transcript batch", error))
-    }
-
-    /// Registers a locator for a newly admitted live SessionStart without
-    /// granting transcript-history authority or replacing observed metadata.
-    ///
-    /// The caller supplies the admitted project's canonical path and verifies
-    /// its binding to this shard's project identity. The registered-store port
-    /// exposes the shard identity, but has no project-root registry lookup.
-    /// Existing provider project keys remain opaque and byte-exact.
-    #[hotpath::skip]
-    pub async fn register_live_session_locator(
-        &self,
-        provider: &str,
-        session_id: &str,
-        project_path: &str,
-        transcript_path: &str,
-    ) -> Result<bool, TranscriptPersistenceError> {
-        if !matches!(
-            &self.registered_binding().shard_id.scope,
-            StoreShardScopeV1::ProjectSessions { .. }
-        ) {
-            return Err(TranscriptPersistenceError::storage(
-                "register live session locator",
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "live session locator requires ProjectSessions authority",
-                ),
-            ));
-        }
-        let canonical_project_path = durable_project_path_key(project_path);
-        let transaction = self.begin_transcript_transaction().await?;
-        // The conflict predicate and NULL-only fill share the writer lease
-        // with insertion, so competing sources cannot replace the winner.
-        let changed = SessionExec::execute(
-            &transaction,
-            "INSERT INTO sessions
-                     (provider, session_id, project_key, project_path, title, started_at,
-                      ended_at, transcript_path, metadata_json, parent_session_id,
-                      is_subagent, agent_id, parent_tool_use_id)
-                 VALUES (?1, ?2, ?3, ?3, NULL, NULL, NULL, ?4, NULL, NULL, 0, NULL, NULL)
-                 ON CONFLICT(provider, session_id) DO UPDATE SET
-                    transcript_path = COALESCE(sessions.transcript_path, excluded.transcript_path)
-                 WHERE sessions.project_path = excluded.project_path
-                   AND (sessions.transcript_path IS NULL
-                        OR sessions.transcript_path = excluded.transcript_path)",
-            params![
-                provider,
-                session_id,
-                canonical_project_path,
-                transcript_path
-            ],
-        )
-        .await
-        .map_err(|error| {
-            TranscriptPersistenceError::storage("register live session locator", error)
-        })?;
-        if changed == 0 {
-            return Ok(false);
-        }
-        transaction.commit().await.map_err(|error| {
-            TranscriptPersistenceError::storage("commit live session locator", error)
-        })?;
-        Ok(true)
     }
 
     #[hotpath::skip]
@@ -828,10 +707,6 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
         offset: ParseOffset,
     ) -> Result<(), String> {
         let path = path_identity_key(path);
-        let encoding = ParseOffsetEncoding::for_path(&path);
-        if matches!(encoding, ParseOffsetEncoding::CodexCorpusEpoch) {
-            return Err("Codex corpus epochs require exact compare-and-set".to_owned());
-        }
         conn.execute(
             "INSERT INTO parse_offsets (file_path, byte_offset, mtime, file_id)
                  VALUES (?1, ?2, ?3, ?4)
@@ -845,12 +720,8 @@ impl<D: SessionRegisteredDb + Sync> SessionStoreAccess<'_, D> {
                         AND excluded.byte_offset >= parse_offsets.byte_offset)",
             params![
                 path,
-                encoding
-                    .encode(offset.byte_offset, "encode transcript byte offset")
-                    .map_err(|error| error.to_string())?,
-                encoding
-                    .encode(offset.mtime, "encode transcript mtime")
-                    .map_err(|error| error.to_string())?,
+                encode_u64_bits(offset.byte_offset),
+                encode_u64_bits(offset.mtime),
                 encode_u64_bits(offset.file_id)
             ],
         )
@@ -904,34 +775,6 @@ mod tests {
             encode_u64_bits((i64::MAX as u64) + 1) < 0,
             "the upper half maps onto the negative INTEGER range instead of failing"
         );
-    }
-
-    #[test]
-    fn reserved_frontiers_preserve_bits_without_relaxing_ordinary_cursors() {
-        for path in [
-            crate::runtime::source::CODEX_HISTORY_EPOCH_KEY,
-            crate::runtime::ingest::USER_INGEST_CODEX_HISTORY_EPOCH_KEY,
-            "host-frontier://opencode/content-generation/v1",
-            "host-frontier://opencode/rewrite-rowid/v1",
-        ] {
-            let encoding = super::ParseOffsetEncoding::for_path(path);
-            for value in [0, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
-                assert_eq!(
-                    decode_u64_bits_value(
-                        encoding.encode(value, "test reserved frontier").unwrap()
-                    ),
-                    value,
-                    "reserved frontier {path}"
-                );
-            }
-        }
-        let cursor = super::ParseOffsetEncoding::for_path("/project/transcript.jsonl");
-        assert_eq!(
-            cursor.encode(i64::MAX as u64, "test cursor").unwrap(),
-            i64::MAX
-        );
-        assert!(cursor.encode((i64::MAX as u64) + 1, "test cursor").is_err());
-        assert!(cursor.encode(u64::MAX, "test cursor").is_err());
     }
 
     #[test]

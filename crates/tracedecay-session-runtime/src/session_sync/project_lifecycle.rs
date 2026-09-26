@@ -9,7 +9,6 @@ use tracedecay_contracts::{
     CancellationSignal, Deadline, IdempotencyKey, OperationTermination, RequestId, now_micros,
 };
 use tracedecay_domain::{BrainId, ProjectId, UserProfileId, UtcMicros};
-use tracedecay_runtime_core::background_cpu::ProcessBackgroundCpuV1;
 use tracedecay_store::{StoreShardScopeV1, VerifiedStoreLocatorV1};
 
 use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
@@ -28,20 +27,10 @@ pub struct SessionSyncProjectContext {
     pub(super) profile_id: UserProfileId,
     pub(super) project_id: ProjectId,
     pub(super) project_root: PathBuf,
-    /// The authoritative project-open scope, propagated verbatim from
-    /// `DaemonSessionSyncConfig`. Never re-derived from `project_root`.
-    pub(super) scope: tracedecay_contracts::ResolvedScope,
-    pub(super) transcript_source_home: Option<PathBuf>,
     pub(super) project_sessions: RwLock<Option<RegisteredGlobalDbLeaseV1>>,
     project_sessions_locator: VerifiedStoreLocatorV1,
     pub(super) user_sessions: RegisteredGlobalDbLeaseV1,
     pub registry: RegisteredGlobalDbLeaseV1,
-    pub(super) background_cpu: Arc<ProcessBackgroundCpuV1>,
-    pub(super) original_provenance_resolver: Option<
-        Arc<
-            dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1,
-        >,
-    >,
     pub(super) project_refresh:
         crate::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
     pub(super) user_refresh: crate::session_temporal_refresh_scheduler::SessionTemporalRefreshWake,
@@ -300,17 +289,6 @@ impl DaemonSessionSyncService {
         &self,
         config: DaemonSessionSyncConfig,
     ) -> tracedecay_domain::errors::Result<()> {
-        self.register_project_with_original_provenance(config, None)
-            .await
-    }
-
-    /// Registers the same existing project worker with its root-owned original
-    /// event reader. The reader never advances a canonical source cursor.
-    pub async fn register_project_with_original_provenance(
-        &self,
-        config: DaemonSessionSyncConfig,
-        original_provenance_resolver: Option<Arc<dyn tracedecay_sessions::repository_provenance::OriginalObservationProvenanceResolverV1>>,
-    ) -> tracedecay_domain::errors::Result<()> {
         let scope = SessionSyncScopeV1::new(config.project_id.clone(), config.profile_id.clone());
         let project_gate = self.project_gate(&scope);
         let project = project_gate.lock().await;
@@ -321,14 +299,10 @@ impl DaemonSessionSyncService {
             profile_id: config.profile_id,
             project_id: config.project_id,
             project_root: config.project_root,
-            scope: config.scope,
-            transcript_source_home: config.transcript_source_home,
             project_sessions: RwLock::new(None),
             project_sessions_locator,
             user_sessions: config.user_sessions,
             registry: config.registry,
-            background_cpu: config.background_cpu,
-            original_provenance_resolver,
             project_refresh: config.project_refresh,
             user_refresh: config.user_refresh,
         });

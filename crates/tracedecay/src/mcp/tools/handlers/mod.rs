@@ -348,8 +348,6 @@ pub struct ToolCallRegistryOptions<'a> {
         Option<tracedecay_query::code_search::CodeIndexRedundancyExecutor>,
     pub(crate) code_index_branch_diff_executor:
         Option<tracedecay_query::code_search::CodeIndexBranchDiffExecutor>,
-    pub(crate) semantic_admin_executor:
-        Option<tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1>,
     pub(crate) code_index_search_authority:
         Option<tracedecay_query::code_search::CodeIndexSearchAuthorityV1>,
     /// The checkout the serving route was admitted for. Every scoped authority
@@ -421,7 +419,6 @@ impl Default for ToolCallRegistryOptions<'_> {
             code_index_similar_executor: None,
             code_index_redundancy_executor: None,
             code_index_branch_diff_executor: None,
-            semantic_admin_executor: None,
             code_index_search_authority: None,
             admitted_project_scope: None,
             code_graph_projection_read_port: None,

@@ -151,7 +151,6 @@ fn search_request(
     CodeIndexSearchRequestV1 {
         project_root: project_root.to_path_buf(),
         query: "alpha".to_owned(),
-        semantic_mode: None,
         source_revision: None,
         source_tree: None,
         source_reference: None,

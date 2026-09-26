@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::sync::Arc;
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 
 #[cfg(unix)]
@@ -21,16 +21,14 @@ use tracing_subscriber::fmt::MakeWriter;
 use super::runner::ServiceRunner;
 use super::{
     DaemonServiceMemoryLimitsV1, DaemonServiceSpec, DaemonServiceState, QuiescedDaemonLifecycle,
-    RestoreSettlement, SERVICE_NAMESPACE_ENV, ServiceNamespace,
+    RestoreSettlement,
 };
 use tracedecay_daemon_protocol::SOCKET_ENV;
 use tracedecay_runtime_core::config::{
-    GLOBAL_DB_PATH_ENV, USER_DATA_DIR_ENV, lock_user_data_dir_test_env, user_data_dir,
+    USER_DATA_DIR_ENV, lock_user_data_dir_test_env, user_data_dir,
 };
 
 pub(super) const TEST_BUILD_VERSION: &str = "0.1.0-test+service-probe";
-#[cfg(unix)]
-static SERVICE_NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn refresh_in_quiesced_window(
     runner: ServiceRunner,
@@ -94,9 +92,7 @@ fn released_windows_replacement_lease_is_reacquired_shared_before_restore() {
         previous_state: DaemonServiceState::RunningEnabled,
         lifecycle_lease: None,
         expected_version: TEST_BUILD_VERSION.to_owned(),
-        runner: ServiceRunner::WindowsTask {
-            namespace: ServiceNamespace::stable(),
-        },
+        runner: ServiceRunner::WindowsTask,
         settlement: RestoreSettlement::Owed,
     };
 
@@ -983,7 +979,6 @@ fn running_service_snapshot_uses_one_authenticated_connection() {
         tracedecay_bin: PathBuf::from("/old/tracedecay"),
         socket_path: socket_path.clone(),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     }
@@ -1048,7 +1043,6 @@ fn systemd_unit_declares_memory_high_max_and_swap_cap() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(128 << 30),
     };
@@ -1083,7 +1077,6 @@ fn launchd_plist_hands_the_memory_budget_to_the_daemon_authority() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: profile.path().join("daemon.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(16 << 30),
     };
@@ -1105,7 +1098,6 @@ fn systemd_unit_quotes_exec_start_paths_that_systemd_would_misparse() {
         tracedecay_bin: PathBuf::from("/opt/trace decay/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/trace decay%50.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -1130,7 +1122,6 @@ fn systemd_unit_does_not_cap_malloc_arenas() {
         tracedecay_bin: PathBuf::from("/usr/local/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -1141,24 +1132,16 @@ fn systemd_unit_does_not_cap_malloc_arenas() {
         .lines()
         .filter_map(|line| line.strip_prefix("Environment="))
         .collect();
-    assert!(
-        environment
-            .iter()
-            .all(|entry| !entry.contains("MALLOC_ARENA_MAX")),
-        "a malloc arena cap serialized the index workers, got:\n{unit}"
-    );
     assert_eq!(
         environment.len(),
-        3,
-        "the daemon's environment is PATH plus the persisted profile paths and nothing else, got:\n{unit}"
+        1,
+        "the daemon's environment is PATH and nothing else; a malloc arena cap serialized the index workers, got:\n{unit}"
     );
     assert!(
         environment[0].starts_with("\"PATH=") && environment[0].contains("/usr/local/bin"),
-        "the first environment entry is a PATH that reaches the daemon binary, got: {}",
+        "the one environment entry is a PATH that reaches the daemon binary, got: {}",
         environment[0]
     );
-    assert!(environment[1].starts_with(&format!("\"{USER_DATA_DIR_ENV}=")));
-    assert!(environment[2].starts_with(&format!("\"{GLOBAL_DB_PATH_ENV}=")));
 }
 
 #[test]
@@ -1287,7 +1270,6 @@ fn render_launchd_plist_escapes_xml_and_parser_unescapes_socket_path() {
         tracedecay_bin: PathBuf::from("/opt/trace&decay/bin/tracedecay"),
         socket_path: socket_path.clone(),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -1327,7 +1309,6 @@ fn launchd_plist_env_value_round_trips_data_dir_override() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: profile.path().join("daemon.sock"),
         data_dir_override: Some(profile.path().to_path_buf()),
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -1341,411 +1322,6 @@ fn launchd_plist_env_value_round_trips_data_dir_override() {
     assert_eq!(
         super::unit_file::launchd_plist_env_value(&plist, "MISSING_VAR"),
         None
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn service_namespace_derives_distinct_validated_names_and_paths() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("service namespace fixture");
-    let config_home = dir.path().join("config");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&config_home).expect("config home");
-    std::fs::create_dir_all(&home).expect("home");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-v2");
-    assert_eq!(
-        super::service_name().expect("namespaced systemd name"),
-        "tracedecay-shadow-v2.service"
-    );
-    assert_eq!(
-        super::launchd_label().expect("namespaced launchd label"),
-        "com.tracedecay.daemon.shadow-v2"
-    );
-    assert_eq!(
-        super::launchd_plist_name().expect("namespaced launchd plist"),
-        "com.tracedecay.daemon.shadow-v2.plist"
-    );
-    let namespaced_path = super::unit_file::service_unit_path().expect("namespaced service path");
-    #[cfg(target_os = "linux")]
-    assert_eq!(
-        namespaced_path,
-        config_home
-            .join("systemd/user")
-            .join("tracedecay-shadow-v2.service")
-    );
-    #[cfg(target_os = "macos")]
-    assert_eq!(
-        namespaced_path,
-        home.join("Library/LaunchAgents/com.tracedecay.daemon.shadow-v2.plist")
-    );
-
-    drop(_namespace_guard);
-    assert_eq!(
-        super::service_name().expect("stable systemd name"),
-        crate::SERVICE_NAME
-    );
-    assert_eq!(
-        super::launchd_label().expect("stable launchd label"),
-        "com.tracedecay.daemon"
-    );
-    assert_eq!(
-        super::launchd_plist_name().expect("stable launchd plist"),
-        "com.tracedecay.daemon.plist"
-    );
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn invalid_service_namespace_fails_closed_before_path_resolution() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    for value in [
-        "",
-        "-leading",
-        "trailing-",
-        "contains.dot",
-        "contains/slash",
-        "contains space",
-        "contains$expansion",
-    ] {
-        let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, value);
-        let error = super::service_name().expect_err("invalid namespace must fail closed");
-        assert!(
-            error.to_string().contains(SERVICE_NAMESPACE_ENV),
-            "error should identify the invalid namespace variable: {error}"
-        );
-        drop(_namespace_guard);
-    }
-
-    let too_long = "a".repeat(49);
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, &too_long);
-    assert!(super::unit_file::service_unit_path().is_err());
-}
-
-#[test]
-fn typed_service_namespace_constructor_validates_identity_names() {
-    let stable = super::ServiceNamespace::stable();
-    assert_eq!(stable.suffix(), None);
-    assert_eq!(stable.service_name(), crate::SERVICE_NAME);
-    assert_eq!(stable.launchd_label(), "com.tracedecay.daemon");
-    let shadow =
-        super::ServiceNamespace::from_suffix("shadow-v2").expect("valid typed service namespace");
-    assert_eq!(shadow.suffix(), Some("shadow-v2"));
-    assert_eq!(shadow.service_name(), "tracedecay-shadow-v2.service");
-    assert_eq!(shadow.launchd_label(), "com.tracedecay.daemon.shadow-v2");
-    assert_eq!(
-        shadow.launchd_plist_name(),
-        "com.tracedecay.daemon.shadow-v2.plist"
-    );
-    for value in ["", "-leading", "trailing-", "has.dot", "has space"] {
-        assert!(
-            super::ServiceNamespace::from_suffix(value).is_err(),
-            "invalid service namespace {value} must fail closed"
-        );
-    }
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn systemd_service_unit_persists_namespace_profile_and_exact_invocation() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("systemd service fixture");
-    let profile = dir.path().join("shadow profile");
-    let global_db = dir.path().join("shadow global.db");
-    let socket = dir.path().join("shadow socket.sock");
-    let executable = dir.path().join("shadow bin/tracedecay");
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-v2");
-    let spec = DaemonServiceSpec {
-        tracedecay_bin: executable.clone(),
-        socket_path: socket.clone(),
-        data_dir_override: Some(profile.clone()),
-        global_db_override: Some(global_db.clone()),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-
-    let unit = spec
-        .render_systemd_user_unit()
-        .expect("render namespaced systemd unit");
-    assert!(unit.contains(&format!(
-        "Environment=\"{USER_DATA_DIR_ENV}={}\"",
-        profile.display()
-    )));
-    assert!(unit.contains(&format!(
-        "Environment=\"{GLOBAL_DB_PATH_ENV}={}\"",
-        global_db.display()
-    )));
-    assert!(unit.contains(&format!(
-        "ExecStart=\"{}\" daemon run --socket \"{}\"",
-        executable.display(),
-        socket.display()
-    )));
-    assert_eq!(
-        super::unit_file::service_env_value_from_unit(&unit, USER_DATA_DIR_ENV)
-            .expect("read persisted data dir"),
-        Some(profile.display().to_string())
-    );
-    assert_eq!(
-        super::unit_file::service_env_value_from_unit(&unit, GLOBAL_DB_PATH_ENV)
-            .expect("read persisted global db"),
-        Some(global_db.display().to_string())
-    );
-    assert_eq!(
-        super::unit_file::socket_path_from_unit_text(&unit),
-        Some(socket)
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn systemd_environment_parser_preserves_literal_dollar_signs() {
-    let unit = "[Service]\nEnvironment=\"TRACEDECAY_DATA_DIR=/tmp/with$$dollars\"\nEnvironment=\"TRACEDECAY_GLOBAL_DB=/tmp/with$dollar.db\"\n";
-
-    assert_eq!(
-        super::unit_file::service_env_value_from_unit(&unit, USER_DATA_DIR_ENV)
-            .expect("read literal-dollar data dir"),
-        Some("/tmp/with$$dollars".to_string())
-    );
-    assert_eq!(
-        super::unit_file::service_env_value_from_unit(&unit, GLOBAL_DB_PATH_ENV)
-            .expect("read literal-dollar global db"),
-        Some("/tmp/with$dollar.db".to_string())
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn launchd_service_plist_persists_namespace_profile_and_exact_invocation() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("launchd service fixture");
-    let home = dir.path().join("home");
-    let profile = dir.path().join("shadow profile");
-    let global_db = dir.path().join("shadow global.db");
-    let socket = dir.path().join("shadow socket.sock");
-    let executable = dir.path().join("shadow bin/tracedecay");
-    std::fs::create_dir_all(&home).expect("home");
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-v2");
-    let spec = DaemonServiceSpec {
-        tracedecay_bin: executable.clone(),
-        socket_path: socket.clone(),
-        data_dir_override: Some(profile.clone()),
-        global_db_override: Some(global_db.clone()),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-
-    let plist = spec
-        .render_launchd_plist()
-        .expect("render namespaced launchd plist");
-    assert_eq!(
-        super::unit_file::launchd_plist_label(&plist),
-        Some("com.tracedecay.daemon.shadow-v2".to_string())
-    );
-    assert!(plist.contains(&format!(
-        "<key>{USER_DATA_DIR_ENV}</key>\n    <string>{}</string>",
-        profile.display()
-    )));
-    assert!(plist.contains(&format!(
-        "<key>{GLOBAL_DB_PATH_ENV}</key>\n    <string>{}</string>",
-        global_db.display()
-    )));
-    assert!(plist.contains(&format!(
-        "<string>{}</string>",
-        super::xml_escape(&executable.display().to_string())
-    )));
-    assert_eq!(
-        super::unit_file::launchd_plist_env_value(&plist, USER_DATA_DIR_ENV),
-        Some(profile.display().to_string())
-    );
-    assert_eq!(
-        super::unit_file::launchd_plist_env_value(&plist, GLOBAL_DB_PATH_ENV),
-        Some(global_db.display().to_string())
-    );
-    assert_eq!(
-        super::unit_file::socket_path_from_launchd_plist(&plist),
-        Some(socket)
-    );
-}
-
-#[cfg(target_os = "linux")]
-fn render_current_service_unit(spec: &DaemonServiceSpec) -> String {
-    spec.render_systemd_user_unit()
-        .expect("render systemd service unit")
-}
-
-#[cfg(target_os = "macos")]
-fn render_current_service_unit(spec: &DaemonServiceSpec) -> String {
-    spec.render_launchd_plist().expect("render launchd plist")
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn stable_v1_and_namespaced_v2_service_units_are_isolated() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("service isolation fixture");
-    let config_home = dir.path().join("config");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&config_home).expect("config home");
-    std::fs::create_dir_all(&home).expect("home");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-
-    let v1_profile = dir.path().join("profile-v1");
-    let v1_global = dir.path().join("global-v1.db");
-    let v1_socket = dir.path().join("socket-v1.sock");
-    let v2_profile = dir.path().join("profile-v2");
-    let v2_global = dir.path().join("global-v2.db");
-    let v2_socket = dir.path().join("socket-v2.sock");
-    let v1_spec = DaemonServiceSpec {
-        tracedecay_bin: PathBuf::from("/opt/tracedecay/v1/bin/tracedecay"),
-        socket_path: v1_socket.clone(),
-        data_dir_override: Some(v1_profile.clone()),
-        global_db_override: Some(v1_global.clone()),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-    let v2_spec = DaemonServiceSpec {
-        tracedecay_bin: PathBuf::from("/opt/tracedecay/v2/bin/tracedecay"),
-        socket_path: v2_socket.clone(),
-        data_dir_override: Some(v2_profile.clone()),
-        global_db_override: Some(v2_global.clone()),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-
-    let (v1_path, v1_unit) = {
-        let _namespace_guard = EnvVarGuard::unset(SERVICE_NAMESPACE_ENV);
-        let path = super::unit_file::service_unit_path().expect("stable V1 service path");
-        let unit = render_current_service_unit(&v1_spec);
-        super::unit_file::atomic_replace_service_unit_with(&path, &unit, &mut |_| Ok(()))
-            .expect("write stable V1 service unit");
-        (path, unit)
-    };
-    let (v2_path, v2_unit) = {
-        let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-v2");
-        let path = super::unit_file::service_unit_path().expect("namespaced V2 service path");
-        let unit = render_current_service_unit(&v2_spec);
-        super::unit_file::atomic_replace_service_unit_with(&path, &unit, &mut |_| Ok(()))
-            .expect("write namespaced V2 service unit");
-        (path, unit)
-    };
-
-    assert_ne!(
-        v1_path, v2_path,
-        "V1 and V2 must select distinct service paths"
-    );
-    assert!(
-        v1_path.is_file(),
-        "stable V1 service unit must remain present"
-    );
-    assert!(
-        v2_path.is_file(),
-        "namespaced V2 service unit must be present"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&v1_path).expect("read stable V1 service unit"),
-        v1_unit
-    );
-    assert_eq!(
-        std::fs::read_to_string(&v2_path).expect("read namespaced V2 service unit"),
-        v2_unit
-    );
-    assert!(v1_unit.contains(&v1_profile.display().to_string()));
-    assert!(v1_unit.contains(&v1_global.display().to_string()));
-    assert!(v1_unit.contains(&v1_socket.display().to_string()));
-    assert!(v2_unit.contains(&v2_profile.display().to_string()));
-    assert!(v2_unit.contains(&v2_global.display().to_string()));
-    assert!(v2_unit.contains(&v2_socket.display().to_string()));
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn colliding_existing_service_profile_is_rejected_without_rewrite() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("service collision fixture");
-    let config_home = dir.path().join("config");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&config_home).expect("config home");
-    std::fs::create_dir_all(&home).expect("home");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-v2");
-
-    #[cfg(target_os = "linux")]
-    let _program_path_guard = {
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).expect("systemd fixture bin");
-        let systemctl = bin.join("systemctl");
-        std::fs::write(&systemctl, "#!/bin/sh\nexit 0\n").expect("fake systemctl");
-        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
-            .expect("fake systemctl permissions");
-        tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(&bin)
-    };
-    #[cfg(target_os = "macos")]
-    let _program_path_guard = {
-        let bin = dir.path().join("bin");
-        std::fs::create_dir_all(&bin).expect("launchd fixture bin");
-        for (name, body) in [
-            ("launchctl", "#!/bin/sh\nexit 0\n"),
-            ("id", "#!/bin/sh\nprintf '501\\n'\n"),
-        ] {
-            let program = bin.join(name);
-            std::fs::write(&program, body).expect("fake launchd program");
-            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
-                .expect("fake launchd program permissions");
-        }
-        tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(&bin)
-    };
-
-    let first = DaemonServiceSpec {
-        tracedecay_bin: PathBuf::from("/opt/tracedecay/v2/bin/tracedecay"),
-        socket_path: dir.path().join("socket-first.sock"),
-        data_dir_override: Some(dir.path().join("profile-first")),
-        global_db_override: Some(dir.path().join("global-first.db")),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-    let second = DaemonServiceSpec {
-        tracedecay_bin: PathBuf::from("/opt/tracedecay/v2/bin/tracedecay"),
-        socket_path: dir.path().join("socket-second.sock"),
-        data_dir_override: Some(dir.path().join("profile-second")),
-        global_db_override: Some(dir.path().join("global-second.db")),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-    let service_path = super::unit_file::service_unit_path().expect("collision service path");
-    let original = render_current_service_unit(&first);
-    super::unit_file::atomic_replace_service_unit_with(&service_path, &original, &mut |_| Ok(()))
-        .expect("write colliding service unit");
-
-    let error = super::validate_service_install_target(&second)
-        .expect_err("a service path owned by another profile must fail closed");
-    assert!(error.to_string().contains("refusing to overwrite"));
-    assert_eq!(
-        std::fs::read_to_string(service_path).expect("read unchanged colliding service"),
-        original
     );
 }
 
@@ -1877,10 +1453,6 @@ fn launchd_disabled_output_matches_only_the_tracedecay_label() {
     ));
     assert!(!super::runner::launchd_disabled_output_contains_label(
         "disabled services = {\n\t\"com.example.other\" => true\n}",
-        "com.tracedecay.daemon"
-    ));
-    assert!(!super::runner::launchd_disabled_output_contains_label(
-        "disabled services = {\n\t\"com.tracedecay.daemon.shadow\" => true\n}",
         "com.tracedecay.daemon"
     ));
 }
@@ -2036,38 +1608,6 @@ fn atomic_service_write_sets_permissions_and_orders_durability_steps() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn service_runner_freezes_namespace_for_the_lifecycle() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("namespace runner fixture");
-    let fake_bin = dir.path().join("bin");
-    let config_home = dir.path().join("config");
-    std::fs::create_dir_all(&fake_bin).expect("fake bin");
-    std::fs::create_dir_all(&config_home).expect("config home");
-    let systemctl = fake_bin.join("systemctl");
-    std::fs::write(&systemctl, "#!/bin/sh\nexit 0\n").expect("fake systemctl");
-    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
-        .expect("systemctl permissions");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _path_guard = tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(&fake_bin);
-    let _first_namespace = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-one");
-    let runner = ServiceRunner::systemd(&systemctl).expect("frozen systemd runner");
-    drop(_first_namespace);
-    let _second_namespace = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-two");
-
-    assert_eq!(runner.namespace().suffix(), Some("shadow-one"));
-    assert!(
-        runner
-            .service_path()
-            .expect("frozen service path")
-            .ends_with("tracedecay-shadow-one.service")
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
 fn refresh_installed_service_skips_missing_unit() {
     let _env_lock = lock_user_data_dir_test_env();
     let dir = TempDir::new().expect("temp dir");
@@ -2089,7 +1629,6 @@ fn refresh_installed_service_skips_missing_unit() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -2099,182 +1638,6 @@ fn refresh_installed_service_skips_missing_unit() {
 
     assert_eq!(outcome, None);
     assert!(!service_path.exists());
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn public_install_and_no_stop_uninstall_are_scoped_to_the_selected_namespace() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("lifecycle fixture");
-    let config_home = dir.path().join("config");
-    let fake_bin = dir.path().join("bin");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&fake_bin).expect("fake bin");
-    std::fs::create_dir_all(&home).expect("home");
-    let systemctl = fake_bin.join("systemctl");
-    std::fs::write(
-        &systemctl,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TRACEDECAY_SYSTEMCTL_LOG\"\n[ \"$2\" = is-enabled ] && echo disabled\n[ \"$2\" = is-active ] && exit 3\nexit 0\n",
-    )
-    .expect("fake systemctl");
-    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
-        .expect("systemctl permissions");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _path_guard = tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(&fake_bin);
-    let _data_guard = EnvVarGuard::set(USER_DATA_DIR_ENV, dir.path().join("profile-v2"));
-    let _log_guard = EnvVarGuard::set("TRACEDECAY_SYSTEMCTL_LOG", dir.path().join("systemctl.log"));
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-v2");
-    let stable_path = config_home.join("systemd/user").join(crate::SERVICE_NAME);
-    std::fs::create_dir_all(stable_path.parent().expect("stable service parent"))
-        .expect("stable service directory");
-    let stable_unit = "[Service]\nEnvironment=\"TRACEDECAY_DATA_DIR=/profiles/v1\"\nEnvironment=\"TRACEDECAY_GLOBAL_DB=/profiles/v1/global.db\"\nExecStart=/opt/tracedecay/v1 daemon run --socket /profiles/v1/daemon.sock\n";
-    std::fs::write(&stable_path, stable_unit).expect("stable V1 service unit");
-
-    let profile = dir.path().join("profile-v2");
-    let global_db = dir.path().join("global-v2.db");
-    let socket = dir.path().join("socket-v2.sock");
-    let spec = DaemonServiceSpec {
-        tracedecay_bin: PathBuf::from("/opt/tracedecay/v2/tracedecay"),
-        socket_path: socket.clone(),
-        data_dir_override: Some(profile.clone()),
-        global_db_override: Some(global_db.clone()),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-    let namespaced_path = super::install_service(&spec, false, TEST_BUILD_VERSION)
-        .expect("install namespaced V2 service");
-    assert_eq!(
-        namespaced_path,
-        config_home
-            .join("systemd/user")
-            .join("tracedecay-shadow-v2.service")
-    );
-    assert!(namespaced_path.is_file(), "V2 unit should be installed");
-    assert!(stable_path.is_file(), "V1 unit should remain installed");
-    let namespaced_unit = std::fs::read_to_string(&namespaced_path).expect("V2 unit");
-    assert!(namespaced_unit.contains(&profile.display().to_string()));
-    assert!(namespaced_unit.contains(&global_db.display().to_string()));
-    assert!(namespaced_unit.contains(&socket.display().to_string()));
-
-    let removed_path = super::uninstall_service(false, TEST_BUILD_VERSION)
-        .expect("no-stop uninstall namespaced V2 service");
-    assert_eq!(removed_path, namespaced_path);
-    assert!(!namespaced_path.exists(), "V2 unit should be removed");
-    assert!(stable_path.is_file(), "V1 unit must not be removed");
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn public_stop_uses_the_installed_service_identity() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("stop fixture");
-    let config_home = dir.path().join("config");
-    let fake_bin = dir.path().join("bin");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&fake_bin).expect("fake bin");
-    std::fs::create_dir_all(&home).expect("home");
-    let systemctl = fake_bin.join("systemctl");
-    let log = dir.path().join("systemctl.log");
-    std::fs::write(
-        &systemctl,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TRACEDECAY_SYSTEMCTL_LOG\"\n[ \"$2\" = is-enabled ] && echo enabled\nexit 0\n",
-    )
-    .expect("fake systemctl");
-    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
-        .expect("systemctl permissions");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _path_guard = tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(&fake_bin);
-    let _data_guard = EnvVarGuard::set(USER_DATA_DIR_ENV, dir.path().join("profile"));
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-stop");
-    let service_path = config_home
-        .join("systemd/user")
-        .join("tracedecay-shadow-stop.service");
-    std::fs::create_dir_all(service_path.parent().expect("service parent"))
-        .expect("service directory");
-    let socket = dir.path().join("installed.sock");
-    std::fs::write(
-        &service_path,
-        format!(
-            "[Service]\nEnvironment=\"{USER_DATA_DIR_ENV}={}\"\nEnvironment=\"{GLOBAL_DB_PATH_ENV}={}\"\nExecStart=/opt/tracedecay daemon run --socket {}\n",
-            dir.path().join("installed-profile").display(),
-            dir.path().join("installed-global.db").display(),
-            socket.display()
-        ),
-    )
-    .expect("installed service unit");
-
-    super::stop_service(TEST_BUILD_VERSION).expect("stop installed service");
-
-    let commands = std::fs::read_to_string(log).expect("systemctl log");
-    assert!(
-        systemctl_log_contains_sequence(&commands, &["--user stop tracedecay-shadow-stop.service"]),
-        "stop should target the selected namespace, got:\n{commands}"
-    );
-}
-
-#[cfg(target_os = "linux")]
-#[test]
-fn namespaced_refresh_restarts_only_the_selected_service_unit() {
-    let _env_lock = lock_user_data_dir_test_env();
-    let _namespace_test_lock = SERVICE_NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = TempDir::new().expect("restart fixture");
-    let config_home = dir.path().join("config");
-    let fake_bin = dir.path().join("bin");
-    let home = dir.path().join("home");
-    std::fs::create_dir_all(&fake_bin).expect("fake bin");
-    std::fs::create_dir_all(&home).expect("home");
-    let systemctl = fake_bin.join("systemctl");
-    let log = dir.path().join("systemctl.log");
-    std::fs::write(
-        &systemctl,
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TRACEDECAY_SYSTEMCTL_LOG\"\nexit 0\n",
-    )
-    .expect("fake systemctl");
-    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755))
-        .expect("systemctl permissions");
-    let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
-    let _home_guard = EnvVarGuard::set("HOME", &home);
-    let _path_guard = tracedecay_runtime_core::config::HostProgramSearchPathGuard::set(&fake_bin);
-    let _namespace_guard = EnvVarGuard::set(SERVICE_NAMESPACE_ENV, "shadow-restart");
-    let runner = ServiceRunner::systemd(&systemctl).expect("namespaced runner");
-    let spec = DaemonServiceSpec {
-        tracedecay_bin: PathBuf::from("/opt/tracedecay/restart/tracedecay"),
-        socket_path: dir.path().join("restart.sock"),
-        data_dir_override: Some(dir.path().join("restart-profile")),
-        global_db_override: Some(dir.path().join("restart-global.db")),
-        remote_tls: None,
-        memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
-    };
-
-    let service_path = super::refresh_service_with_runner(
-        &runner,
-        &spec,
-        DaemonServiceState::RunningEnabled,
-        TEST_BUILD_VERSION,
-    )
-    .expect("refresh namespaced service");
-    assert!(service_path.ends_with("tracedecay-shadow-restart.service"));
-    let commands = std::fs::read_to_string(log).expect("systemctl log");
-    assert!(
-        systemctl_log_contains_sequence(
-            &commands,
-            &[
-                "--user daemon-reload",
-                "--user restart tracedecay-shadow-restart.service",
-            ]
-        ),
-        "restart should target the selected namespace, got:\n{commands}"
-    );
 }
 
 #[cfg(target_os = "linux")]
@@ -2324,8 +1687,6 @@ fn refresh_installed_service_preserves_existing_socket_path() {
     let _config_guard = EnvVarGuard::set("XDG_CONFIG_HOME", &config_home);
     let _home_guard = EnvVarGuard::set("HOME", &home);
     let _data_guard = EnvVarGuard::set(USER_DATA_DIR_ENV, dir.path().join("profile"));
-    let persisted_data_dir = dir.path().join("installed-profile");
-    let persisted_global_db = dir.path().join("installed-global.db");
     let _log_guard = EnvVarGuard::set("TRACEDECAY_SYSTEMCTL_LOG", &log);
     let _stopped_guard = EnvVarGuard::set("TRACEDECAY_SYSTEMCTL_STOPPED", &stopped);
 
@@ -2339,11 +1700,7 @@ fn refresh_installed_service_preserves_existing_socket_path() {
              Description=TraceDecay daemon\n\
              \n\
              [Service]\n\
-             Environment=\"{USER_DATA_DIR_ENV}={}\"\n\
-             Environment=\"{GLOBAL_DB_PATH_ENV}={}\"\n\
              ExecStart=/old/tracedecay daemon run --socket {} --remote-listen 192.0.2.10:7443 --remote-tls-cert \"/etc/trace decay/server.pem\" --remote-tls-key \"/etc/trace decay/server-key.pem\"\n",
-            persisted_data_dir.display(),
-            persisted_global_db.display(),
             custom_socket.display()
         ),
     )
@@ -2353,7 +1710,6 @@ fn refresh_installed_service_preserves_existing_socket_path() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -2387,14 +1743,6 @@ fn refresh_installed_service_preserves_existing_socket_path() {
     assert!(unit.contains(&format!(
         "ExecStart=/opt/tracedecay/bin/tracedecay daemon run --socket {}",
         custom_socket.display()
-    )));
-    assert!(unit.contains(&format!(
-        "Environment=\"{USER_DATA_DIR_ENV}={}\"",
-        persisted_data_dir.display()
-    )));
-    assert!(unit.contains(&format!(
-        "Environment=\"{GLOBAL_DB_PATH_ENV}={}\"",
-        persisted_global_db.display()
     )));
     assert!(!unit.contains("/run/user/1000/tracedecay.sock"));
     assert!(unit.contains("--remote-listen \"192.0.2.10:7443\""));
@@ -2584,7 +1932,6 @@ fn no_start_install_then_refresh_and_restore_has_no_activation_commands() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: PathBuf::from("/custom/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -2954,7 +2301,6 @@ fn refresh_installed_service_preserves_stopped_state() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };
@@ -3012,7 +2358,6 @@ fn refresh_preserves_persistent_systemd_mask_symlink() {
         tracedecay_bin: PathBuf::from("/opt/tracedecay/bin/tracedecay"),
         socket_path: PathBuf::from("/run/user/1000/tracedecay.sock"),
         data_dir_override: None,
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     };

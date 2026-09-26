@@ -373,7 +373,6 @@ pub async fn handle_branch_search(ctx: &McpToolContext<'_>, args: Value) -> Resu
         executor(tracedecay_query::code_search::CodeIndexSearchRequestV1 {
             project_root: source_root,
             query,
-            semantic_mode: None,
             source_revision: Some(revision.commit.clone()),
             source_tree: Some(revision.tree.clone()),
             source_reference: Some(source_reference),

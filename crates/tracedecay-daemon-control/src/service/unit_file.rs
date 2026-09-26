@@ -7,7 +7,7 @@ use tracedecay_domain::errors::{Result, TraceDecayError};
 
 use super::runner::ServicePlatform;
 use super::{
-    DaemonServiceSpec, SERVICE_TEMP_SEQUENCE, ServiceNamespace, home_for_service_env,
+    DaemonServiceSpec, LAUNCHD_PLIST_NAME, SERVICE_TEMP_SEQUENCE, home_for_service_env,
     windows_task, xml_escape, xml_unescape,
 };
 
@@ -115,14 +115,11 @@ pub(super) fn atomic_replace_service_unit_with(
     replacement_result
 }
 
-pub(super) fn write_service_unit_for(
-    spec: &DaemonServiceSpec,
-    namespace: &ServiceNamespace,
-) -> Result<PathBuf> {
-    let service_path = service_unit_path_for(namespace)?;
-    let unit = spec.render_unit_for(namespace)?;
+pub(super) fn write_service_unit(spec: &DaemonServiceSpec) -> Result<PathBuf> {
+    let service_path = service_unit_path()?;
+    let unit = spec.render_unit()?;
     match ServicePlatform::current()? {
-        ServicePlatform::WindowsTask => windows_task::register_task_xml_for(namespace, &unit)?,
+        ServicePlatform::WindowsTask => windows_task::register_task_xml(&unit)?,
         ServicePlatform::Systemd | ServicePlatform::Launchd => {
             atomic_replace_service_unit_with(&service_path, &unit, &mut |_| Ok(()))?;
         }
@@ -131,31 +128,22 @@ pub(super) fn write_service_unit_for(
 }
 
 pub fn installed_service_socket_path() -> Result<Option<PathBuf>> {
-    let namespace = ServiceNamespace::current()?;
-    installed_service_socket_path_for(&namespace)
-}
-
-pub(super) fn installed_service_socket_path_for(
-    namespace: &ServiceNamespace,
-) -> Result<Option<PathBuf>> {
-    let service_path = service_unit_path_for(namespace)?;
-    if !service_unit_exists_for(&service_path, namespace)? {
+    let service_path = service_unit_path()?;
+    if !service_unit_exists(&service_path)? {
         return Ok(None);
     }
-    let unit = read_service_unit_for(&service_path, namespace)?;
-    super::validate_service_identity_before_control(&service_path, &unit, namespace)?;
-    Ok(socket_path_from_unit_text(&unit))
+    Ok(socket_path_from_unit_text(&read_service_unit(
+        &service_path,
+    )?))
 }
 
-pub(super) fn read_service_unit_for(
-    service_path: &Path,
-    namespace: &ServiceNamespace,
-) -> Result<String> {
+pub(super) fn read_service_unit(service_path: &Path) -> Result<String> {
     match ServicePlatform::current()? {
-        ServicePlatform::WindowsTask => windows_task::registered_task_xml_for(namespace)?
-            .ok_or_else(|| TraceDecayError::Config {
+        ServicePlatform::WindowsTask => {
+            windows_task::registered_task_xml()?.ok_or_else(|| TraceDecayError::Config {
                 message: format!("daemon task '{}' is not registered", service_path.display()),
-            }),
+            })
+        }
         ServicePlatform::Systemd | ServicePlatform::Launchd => {
             std::fs::read_to_string(service_path).map_err(|e| TraceDecayError::Config {
                 message: format!("failed to read service '{}': {e}", service_path.display()),
@@ -165,27 +153,16 @@ pub(super) fn read_service_unit_for(
 }
 
 pub(super) fn service_unit_exists(service_path: &Path) -> Result<bool> {
-    let namespace = ServiceNamespace::current()?;
-    service_unit_exists_for(service_path, &namespace)
-}
-
-pub(super) fn service_unit_exists_for(
-    service_path: &Path,
-    namespace: &ServiceNamespace,
-) -> Result<bool> {
     match ServicePlatform::current()? {
-        ServicePlatform::WindowsTask => windows_task::task_exists_for(namespace),
+        ServicePlatform::WindowsTask => windows_task::task_exists(),
         ServicePlatform::Systemd | ServicePlatform::Launchd => Ok(service_path.exists()),
     }
 }
 
 #[hotpath::measure(label = "daemon.service.unit.remove")]
-pub(super) fn remove_service_unit_for(
-    service_path: &Path,
-    namespace: &ServiceNamespace,
-) -> Result<()> {
+pub(super) fn remove_service_unit(service_path: &Path) -> Result<()> {
     match ServicePlatform::current()? {
-        ServicePlatform::WindowsTask => windows_task::delete_for(namespace),
+        ServicePlatform::WindowsTask => windows_task::delete(),
         ServicePlatform::Systemd | ServicePlatform::Launchd => {
             match std::fs::remove_file(service_path) {
                 Ok(()) => Ok(()),
@@ -286,17 +263,9 @@ pub(super) fn set_unique_argument<T>(
 }
 
 fn systemd_exec_tokens(exec_start: &str) -> Result<Vec<String>> {
-    systemd_tokens(exec_start, true)
-}
-
-fn systemd_environment_tokens(environment: &str) -> Result<Vec<String>> {
-    systemd_tokens(environment, false)
-}
-
-fn systemd_tokens(value: &str, decode_dollar: bool) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut token = String::new();
-    let mut chars = value.chars().peekable();
+    let mut chars = exec_start.chars().peekable();
     let mut quoted = false;
     while let Some(ch) = chars.next() {
         match ch {
@@ -316,7 +285,7 @@ fn systemd_tokens(value: &str, decode_dollar: bool) -> Result<Vec<String>> {
             }
             ch if ch.is_whitespace() && !quoted => {
                 if !token.is_empty() {
-                    tokens.push(decode_systemd_token(&token, decode_dollar));
+                    tokens.push(token.replace("%%", "%").replace("$$", "$"));
                     token = String::new();
                 }
             }
@@ -329,25 +298,17 @@ fn systemd_tokens(value: &str, decode_dollar: bool) -> Result<Vec<String>> {
         });
     }
     if !token.is_empty() {
-        tokens.push(decode_systemd_token(&token, decode_dollar));
+        tokens.push(token.replace("%%", "%").replace("$$", "$"));
     }
     Ok(tokens)
-}
-
-fn decode_systemd_token(token: &str, decode_dollar: bool) -> String {
-    let token = token.replace("%%", "%");
-    if decode_dollar {
-        token.replace("$$", "$")
-    } else {
-        token
-    }
 }
 
 /// Reads the `--socket` argument back from an `ExecStart=` line with the same
 /// quote-aware tokenizer the renderer's escaping targets, so quoted paths
 /// (whitespace, `%%`, `$$`) round-trip exactly. A line the tokenizer rejects
-/// yields `None`; lifecycle callers treat a missing or malformed persisted
-/// socket as an identity error before controlling the service.
+/// yields `None`, callers fall back to the default socket path, and the
+/// refresh journey surfaces the typed parse error through
+/// [`remote_tls_from_service_unit`] on the same line.
 pub(super) fn socket_path_from_service_unit(unit: &str) -> Option<PathBuf> {
     unit.lines()
         .filter_map(|line| line.trim().strip_prefix("ExecStart="))
@@ -420,76 +381,6 @@ pub(super) fn launchd_plist_env_value(plist: &str, name: &str) -> Option<String>
         .next()
 }
 
-pub(super) fn launchd_plist_label(plist: &str) -> Option<String> {
-    if plist.matches("<key>Label</key>").count() != 1 {
-        return None;
-    }
-    let label_key = plist.find("<key>Label</key>")? + "<key>Label</key>".len();
-    plist_string_values(&plist[label_key..]).into_iter().next()
-}
-
-/// Reads one persisted environment value from a generated service unit.
-///
-/// Systemd stores generated values as quote-aware `Environment=` assignments;
-/// launchd stores the same values in its XML environment dictionary. Keeping
-/// the parser here lets refresh use the installed unit as the source of truth
-/// without exposing platform-specific parsing to the lifecycle code.
-pub(super) fn service_env_value_from_unit(unit: &str, name: &str) -> Result<Option<String>> {
-    match ServicePlatform::current()? {
-        ServicePlatform::Systemd => systemd_env_value(unit, name),
-        ServicePlatform::Launchd => launchd_env_value(unit, name),
-        ServicePlatform::WindowsTask => windows_task::task_environment_value_from_xml(unit, name),
-    }
-}
-
-fn launchd_env_value(plist: &str, name: &str) -> Result<Option<String>> {
-    let key_tag = format!("<key>{}</key>", xml_escape(name));
-    let env_start = plist.find("<key>EnvironmentVariables</key>");
-    if let Some(env_start) = env_start {
-        let after_env = &plist[env_start..];
-        if let Some(dict_start) = after_env.find("<dict>") {
-            let after_dict_start = &after_env[dict_start + "<dict>".len()..];
-            if let Some(dict_end) = after_dict_start.find("</dict>") {
-                let dict_text = &after_dict_start[..dict_end];
-                if dict_text.matches(&key_tag).count() > 1 {
-                    return Err(TraceDecayError::Config {
-                        message: format!(
-                            "installed launchd daemon service repeats persisted environment variable {name}"
-                        ),
-                    });
-                }
-            }
-        }
-    }
-    Ok(launchd_plist_env_value(plist, name))
-}
-
-fn systemd_env_value(unit: &str, name: &str) -> Result<Option<String>> {
-    let mut value = None;
-    for assignments in unit
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("Environment="))
-    {
-        for assignment in systemd_environment_tokens(assignments)? {
-            let Some((assignment_name, assignment_value)) = assignment.split_once('=') else {
-                continue;
-            };
-            if assignment_name != name {
-                continue;
-            }
-            if value.is_some() {
-                return Err(TraceDecayError::Config {
-                    message: format!(
-                        "installed daemon service repeats persisted environment variable {name}"
-                    ),
-                });
-            }
-            value = Some(assignment_value.to_owned());
-        }
-    }
-    Ok(value)
-}
-
 fn plist_string_values(text: &str) -> Vec<String> {
     let mut values = Vec::new();
     let mut remaining = text;
@@ -509,7 +400,8 @@ pub(super) fn socket_path_from_unit_text(unit: &str) -> Option<PathBuf> {
     match ServicePlatform::current().ok()? {
         ServicePlatform::Systemd => socket_path_from_service_unit(unit),
         ServicePlatform::Launchd => socket_path_from_launchd_plist(unit),
-        ServicePlatform::WindowsTask => windows_task::socket_path_from_task_xml(unit),
+        ServicePlatform::WindowsTask => windows_task::profile_root_from_task_xml(unit)
+            .map(|profile_root| profile_root.join("daemon.sock")),
     }
 }
 
@@ -522,29 +414,24 @@ pub(super) fn remote_tls_from_unit_text(unit: &str) -> Result<Option<crate::Remo
 }
 
 pub(super) fn service_unit_path() -> Result<PathBuf> {
-    let namespace = ServiceNamespace::current()?;
-    service_unit_path_for(&namespace)
-}
-
-pub(super) fn service_unit_path_for(namespace: &ServiceNamespace) -> Result<PathBuf> {
     match ServicePlatform::current()? {
-        ServicePlatform::Systemd => systemd_user_service_path(&namespace.service_name()),
-        ServicePlatform::Launchd => launchd_user_service_path(&namespace.launchd_plist_name()),
-        ServicePlatform::WindowsTask => windows_task::task_path_for(namespace),
+        ServicePlatform::Systemd => systemd_user_service_path(),
+        ServicePlatform::Launchd => launchd_user_service_path(),
+        ServicePlatform::WindowsTask => windows_task::task_path(),
     }
 }
 
-fn systemd_user_service_path(service_name: &str) -> Result<PathBuf> {
+fn systemd_user_service_path() -> Result<PathBuf> {
     let config_home = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".config")))
         .ok_or_else(|| TraceDecayError::Config {
             message: "could not determine XDG config directory".to_string(),
         })?;
-    Ok(config_home.join("systemd/user").join(service_name))
+    Ok(config_home.join("systemd/user").join(crate::SERVICE_NAME))
 }
 
-fn launchd_user_service_path(plist_name: &str) -> Result<PathBuf> {
+fn launchd_user_service_path() -> Result<PathBuf> {
     let home = home_for_service_env()?;
-    Ok(home.join("Library/LaunchAgents").join(plist_name))
+    Ok(home.join("Library/LaunchAgents").join(LAUNCHD_PLIST_NAME))
 }

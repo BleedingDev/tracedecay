@@ -4,29 +4,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tracedecay_domain::errors::{Result, TraceDecayError};
-use tracedecay_runtime_core::config::USER_DATA_DIR_ENV;
 
 use super::probe::{DaemonSocketState, daemon_socket_state};
-use super::unit_file::service_env_value_from_unit;
-use super::{
-    DaemonServiceState, ServiceNamespace, service_name_for, tracedecay_data_dir, windows_task,
-};
+use super::{DaemonServiceState, LAUNCHD_LABEL, tracedecay_data_dir, windows_task};
 
 /// All variants exist on every platform so that dispatch stays exhaustive.
 #[derive(Clone, Debug)]
 pub(super) enum ServiceRunner {
-    Systemd {
-        systemctl: PathBuf,
-        namespace: ServiceNamespace,
-    },
-    Launchd {
-        launchctl: PathBuf,
-        id: PathBuf,
-        namespace: ServiceNamespace,
-    },
-    WindowsTask {
-        namespace: ServiceNamespace,
-    },
+    Systemd { systemctl: PathBuf },
+    Launchd { launchctl: PathBuf, id: PathBuf },
+    WindowsTask,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,22 +39,14 @@ impl ServicePlatform {
 
 impl ServiceRunner {
     pub(super) fn current() -> Result<Self> {
-        let namespace = ServiceNamespace::current()?;
-        Self::for_namespace(namespace)
-    }
-
-    pub(super) fn for_namespace(namespace: ServiceNamespace) -> Result<Self> {
         let path_var = tracedecay_runtime_core::config::host_program_search_path();
         match ServicePlatform::current()? {
-            ServicePlatform::Systemd => Self::systemd_with_namespace(
-                require_service_program_on_path(
-                    "systemctl",
-                    "systemd user service management",
-                    path_var.as_deref(),
-                )?,
-                namespace,
-            ),
-            ServicePlatform::Launchd => Self::launchd_with_namespace(
+            ServicePlatform::Systemd => Self::systemd(require_service_program_on_path(
+                "systemctl",
+                "systemd user service management",
+                path_var.as_deref(),
+            )?),
+            ServicePlatform::Launchd => Self::launchd(
                 require_service_program_on_path(
                     "launchctl",
                     "launchd agent management",
@@ -78,41 +57,22 @@ impl ServiceRunner {
                     "launchd user-domain resolution",
                     path_var.as_deref(),
                 )?,
-                namespace,
             ),
-            ServicePlatform::WindowsTask => Ok(Self::WindowsTask { namespace }),
+            ServicePlatform::WindowsTask => Ok(Self::WindowsTask),
         }
     }
 
     pub(super) fn systemd(systemctl: impl AsRef<Path>) -> Result<Self> {
-        let namespace = ServiceNamespace::current()?;
-        Self::systemd_with_namespace(systemctl, namespace)
-    }
-
-    fn systemd_with_namespace(
-        systemctl: impl AsRef<Path>,
-        namespace: ServiceNamespace,
-    ) -> Result<Self> {
         Ok(Self::Systemd {
             systemctl: required_service_program(
                 "systemctl",
                 "systemd user service management",
                 systemctl.as_ref(),
             )?,
-            namespace,
         })
     }
 
     pub(super) fn launchd(launchctl: impl AsRef<Path>, id: impl AsRef<Path>) -> Result<Self> {
-        let namespace = ServiceNamespace::current()?;
-        Self::launchd_with_namespace(launchctl, id, namespace)
-    }
-
-    fn launchd_with_namespace(
-        launchctl: impl AsRef<Path>,
-        id: impl AsRef<Path>,
-        namespace: ServiceNamespace,
-    ) -> Result<Self> {
         Ok(Self::Launchd {
             launchctl: required_service_program(
                 "launchctl",
@@ -120,20 +80,7 @@ impl ServiceRunner {
                 launchctl.as_ref(),
             )?,
             id: required_service_program("id", "launchd user-domain resolution", id.as_ref())?,
-            namespace,
         })
-    }
-
-    pub(super) fn namespace(&self) -> &ServiceNamespace {
-        match self {
-            Self::Systemd { namespace, .. }
-            | Self::Launchd { namespace, .. }
-            | Self::WindowsTask { namespace } => namespace,
-        }
-    }
-
-    pub(super) fn service_path(&self) -> Result<PathBuf> {
-        super::unit_file::service_unit_path_for(self.namespace())
     }
 
     #[hotpath::measure(label = "daemon.service.runner.install")]
@@ -145,23 +92,16 @@ impl ServiceRunner {
         expected_version: &str,
     ) -> Result<()> {
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
-                let service_name = service_name_for(namespace);
-                for arguments in systemd_install_command_plan(start, &service_name) {
+            Self::Systemd { systemctl } => {
+                for arguments in systemd_install_command_plan(start) {
                     run_systemctl(systemctl, &arguments)?;
                 }
                 Ok(())
             }
-            Self::Launchd {
-                launchctl,
-                id,
-                namespace,
-            } => launchd_install(launchctl, id, namespace, service_path, start, socket_path),
-            Self::WindowsTask { namespace } => windows_task::apply_state_for(
-                namespace,
+            Self::Launchd { launchctl, id } => {
+                launchd_install(launchctl, id, service_path, start, socket_path)
+            }
+            Self::WindowsTask => windows_task::apply_state(
                 if start {
                     DaemonServiceState::RunningEnabled
                 } else {
@@ -181,35 +121,22 @@ impl ServiceRunner {
         expected_version: &str,
     ) -> Result<()> {
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
-                let service_name = service_name_for(namespace);
+            Self::Systemd { systemctl } => {
                 run_systemctl(systemctl, &["daemon-reload"])?;
                 if previous_state.is_running() {
-                    run_systemctl(systemctl, &["restart", &service_name])?;
+                    run_systemctl(systemctl, &["restart", crate::SERVICE_NAME])?;
                 }
                 Ok(())
             }
-            Self::Launchd {
-                launchctl,
-                id,
-                namespace,
-            } if previous_state.is_running() => {
-                launchd_refresh(launchctl, id, namespace, service_path, socket_path)?;
+            Self::Launchd { launchctl, id } if previous_state.is_running() => {
+                launchd_refresh(launchctl, id, service_path, socket_path)?;
                 if !previous_state.is_enabled() {
-                    run_launchctl(
-                        launchctl,
-                        &["disable", &launchd_service_target(id, namespace)?],
-                    )?;
+                    run_launchctl(launchctl, &["disable", &launchd_service_target(id)?])?;
                 }
                 Ok(())
             }
             Self::Launchd { .. } => Ok(()),
-            Self::WindowsTask { namespace } => {
-                windows_task::apply_state_for(namespace, previous_state, expected_version)
-            }
+            Self::WindowsTask => windows_task::apply_state(previous_state, expected_version),
         }
     }
 
@@ -225,22 +152,14 @@ impl ServiceRunner {
         socket_path: &Path,
     ) -> std::result::Result<DaemonServiceState, ServiceStateError> {
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
-                let service_name = service_name_for(namespace);
-                let activity = systemctl_unit_query(systemctl, "is-active", &service_name)?;
+            Self::Systemd { systemctl } => {
+                let activity = systemctl_unit_query(systemctl, "is-active")?;
                 let running = match activity.as_str() {
                     "active" | "reloading" | "refreshing" => true,
                     "inactive" | "failed" | "activating" | "deactivating" | "maintenance" => false,
-                    _ => {
-                        return Err(
-                            systemctl_unknown_state("is-active", &service_name, &activity).into(),
-                        );
-                    }
+                    _ => return Err(systemctl_unknown_state("is-active", &activity).into()),
                 };
-                let enablement = systemctl_unit_query(systemctl, "is-enabled", &service_name)?;
+                let enablement = systemctl_unit_query(systemctl, "is-enabled")?;
                 if enablement.starts_with("masked") {
                     Ok(DaemonServiceState::Masked)
                 } else if running && enablement.starts_with("enabled") {
@@ -253,42 +172,27 @@ impl ServiceRunner {
                     Ok(DaemonServiceState::StoppedDisabled)
                 }
             }
-            Self::Launchd {
+            Self::Launchd { launchctl, id } => Ok(launchd_service_state(
                 launchctl,
                 id,
-                namespace,
-            } => Ok(launchd_service_state(
-                launchctl,
-                id,
-                namespace,
                 daemon_socket_state(socket_path),
             )?),
-            Self::WindowsTask { namespace } => Ok(windows_task::service_state_for(namespace)?),
+            Self::WindowsTask => Ok(windows_task::service_state()?),
         }
     }
 
     #[hotpath::measure(label = "daemon.service.runner.before_uninstall")]
     pub(super) fn before_uninstall(&self, stop: bool, expected_version: &str) -> Result<()> {
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
+            Self::Systemd { systemctl } => {
                 if stop {
-                    let service_name = service_name_for(namespace);
-                    let _ = run_systemctl(systemctl, &["disable", "--now", &service_name]);
+                    let _ = run_systemctl(systemctl, &["disable", "--now", crate::SERVICE_NAME]);
                 }
                 Ok(())
             }
-            Self::Launchd {
-                launchctl,
-                id,
-                namespace,
-            } => launchd_before_uninstall(launchctl, id, namespace, stop),
-            Self::WindowsTask { namespace } if stop => {
-                windows_task::deactivate_for(namespace, expected_version)
-            }
-            Self::WindowsTask { .. } => Ok(()),
+            Self::Launchd { launchctl, id } => launchd_before_uninstall(launchctl, id, stop),
+            Self::WindowsTask if stop => windows_task::deactivate(expected_version),
+            Self::WindowsTask => Ok(()),
         }
     }
 
@@ -300,51 +204,32 @@ impl ServiceRunner {
         expected_version: &str,
     ) -> Result<()> {
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
-                let service_name = service_name_for(namespace);
-                for arguments in systemd_start_command_plan(&service_name) {
+            Self::Systemd { systemctl } => {
+                for arguments in systemd_start_command_plan() {
                     run_systemctl(systemctl, &arguments)?;
                 }
                 Ok(())
             }
-            Self::Launchd {
-                launchctl,
-                id,
-                namespace,
-            } => {
-                let target = launchd_service_target(id, namespace)?;
+            Self::Launchd { launchctl, id } => {
+                let target = launchd_service_target(id)?;
                 launchd_start_preserving_enablement(
                     launchctl,
                     id,
-                    namespace,
                     &target,
                     service_path,
                     socket_path,
                 )
             }
-            Self::WindowsTask { namespace } => windows_task::start_for(namespace, expected_version),
+            Self::WindowsTask => windows_task::start(expected_version),
         }
     }
 
     #[hotpath::measure(label = "daemon.service.runner.stop")]
     pub(super) fn stop(&self, expected_version: &str) -> Result<()> {
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
-                let service_name = service_name_for(namespace);
-                run_systemctl(systemctl, &["stop", &service_name])
-            }
-            Self::Launchd {
-                launchctl,
-                id,
-                namespace,
-            } => launchd_stop(launchctl, id, namespace),
-            Self::WindowsTask { namespace } => windows_task::stop_for(namespace, expected_version),
+            Self::Systemd { systemctl } => run_systemctl(systemctl, &["stop", crate::SERVICE_NAME]),
+            Self::Launchd { launchctl, id } => launchd_stop(launchctl, id),
+            Self::WindowsTask => windows_task::stop(expected_version),
         }
     }
 
@@ -363,18 +248,14 @@ impl ServiceRunner {
             return Ok(());
         }
         match self {
-            Self::Systemd {
-                systemctl,
-                namespace,
-            } => {
-                let service_name = service_name_for(namespace);
+            Self::Systemd { systemctl } => {
                 run_systemctl(systemctl, &["daemon-reload"])?;
                 if previous_state.is_enabled() {
-                    run_systemctl(systemctl, &["enable", &service_name])?;
+                    run_systemctl(systemctl, &["enable", crate::SERVICE_NAME])?;
                 } else {
-                    run_systemctl(systemctl, &["disable", &service_name])?;
+                    run_systemctl(systemctl, &["disable", crate::SERVICE_NAME])?;
                 }
-                run_systemctl(systemctl, &["start", &service_name])?;
+                run_systemctl(systemctl, &["start", crate::SERVICE_NAME])?;
                 // `systemctl start` reports the fork, not a serving daemon.
                 // Restore success must mean an authenticated daemon at the
                 // expected version answering from the installed unit's socket.
@@ -384,17 +265,10 @@ impl ServiceRunner {
                     expected_version,
                 )
             }
-            Self::Launchd {
-                launchctl,
-                id,
-                namespace,
-            } => {
-                launchd_refresh(launchctl, id, namespace, service_path, socket_path)?;
+            Self::Launchd { launchctl, id } => {
+                launchd_refresh(launchctl, id, service_path, socket_path)?;
                 if !previous_state.is_enabled() {
-                    run_launchctl(
-                        launchctl,
-                        &["disable", &launchd_service_target(id, namespace)?],
-                    )?;
+                    run_launchctl(launchctl, &["disable", &launchd_service_target(id)?])?;
                 }
                 // `launchd_refresh` proves only that the socket accepts a
                 // connection; hold launchd restores to the same authenticated
@@ -407,47 +281,31 @@ impl ServiceRunner {
             }
             // `windows_task::apply_state` already polls authenticated
             // readiness internally; a second wait would double the restore.
-            Self::WindowsTask { namespace } => {
-                windows_task::apply_state_for(namespace, previous_state, expected_version)
-            }
+            Self::WindowsTask => windows_task::apply_state(previous_state, expected_version),
         }
     }
 
     pub(super) fn after_uninstall(&self, stop: bool) {
         match self {
-            Self::Systemd { systemctl, .. } => {
+            Self::Systemd { systemctl } => {
                 if stop {
                     let _ = run_systemctl(systemctl, &["daemon-reload"]);
                 }
             }
-            Self::Launchd { .. } | Self::WindowsTask { .. } => {}
+            Self::Launchd { .. } | Self::WindowsTask => {}
         }
     }
 
     pub(super) fn log_hint(&self) -> String {
         match self {
-            Self::Systemd { namespace, .. } => {
-                format!("journalctl --user -u {} -f", service_name_for(namespace))
+            Self::Systemd { .. } => {
+                format!("journalctl --user -u {} -f", crate::SERVICE_NAME)
             }
-            Self::Launchd { .. } => {
-                let persisted_data_dir = self
-                    .service_path()
-                    .ok()
-                    .and_then(|path| std::fs::read_to_string(path).ok())
-                    .and_then(|unit| {
-                        service_env_value_from_unit(&unit, USER_DATA_DIR_ENV)
-                            .ok()
-                            .flatten()
-                    })
-                    .map(PathBuf::from);
-                persisted_data_dir
-                    .or_else(|| tracedecay_data_dir().ok())
-                    .map_or_else(
-                        || "tail -f <tracedecay-data-dir>/daemon.err.log".to_string(),
-                        |dir| format!("tail -f \"{}\"", dir.join("daemon.err.log").display()),
-                    )
-            }
-            Self::WindowsTask { .. } => {
+            Self::Launchd { .. } => tracedecay_runtime_core::config::user_data_dir().map_or_else(
+                || "tail -f <tracedecay-data-dir>/daemon.err.log".to_string(),
+                |dir| format!("tail -f \"{}\"", dir.join("daemon.err.log").display()),
+            ),
+            Self::WindowsTask => {
                 "Event Viewer: Applications and Services Logs/Microsoft/Windows/TaskScheduler/Operational"
                     .to_string()
             }
@@ -457,10 +315,10 @@ impl ServiceRunner {
     pub(super) fn service_detail_hint(&self) -> Option<String> {
         match self {
             Self::Systemd { .. } => None,
-            Self::Launchd { id, namespace, .. } => launchd_service_target(id, namespace)
+            Self::Launchd { id, .. } => launchd_service_target(id)
                 .ok()
                 .map(|target| format!("launchctl print {target}")),
-            Self::WindowsTask { namespace } => windows_task::task_name_for(namespace)
+            Self::WindowsTask => windows_task::task_name()
                 .ok()
                 .map(|name| format!("Get-ScheduledTask -TaskName '{name}'")),
         }
@@ -652,10 +510,9 @@ impl From<ServiceStateError> for TraceDecayError {
 fn systemctl_unit_query(
     systemctl: &Path,
     verb: &str,
-    service_name: &str,
 ) -> std::result::Result<String, ServiceStateError> {
     let output = Command::new(systemctl)
-        .args(["--user", verb, service_name])
+        .args(["--user", verb, crate::SERVICE_NAME])
         .output()
         .map_err(|error| {
             service_program_spawn_error("systemctl", "systemd service state", &error)
@@ -665,7 +522,8 @@ fn systemctl_unit_query(
         return Err(ServiceStateError::ManagerUnreachable(
             ServiceManagerUnreachable {
                 query: format!(
-                    "systemctl --user {verb} {service_name} reported no unit state ({}): {}",
+                    "systemctl --user {verb} {} reported no unit state ({}): {}",
+                    crate::SERVICE_NAME,
                     output.status,
                     String::from_utf8_lossy(&output.stderr).trim()
                 ),
@@ -675,10 +533,11 @@ fn systemctl_unit_query(
     Ok(state)
 }
 
-fn systemctl_unknown_state(verb: &str, service_name: &str, state: &str) -> TraceDecayError {
+fn systemctl_unknown_state(verb: &str, state: &str) -> TraceDecayError {
     TraceDecayError::Config {
         message: format!(
-            "systemctl --user {verb} {service_name} reported unrecognized unit state `{state}`"
+            "systemctl --user {verb} {} reported unrecognized unit state `{state}`",
+            crate::SERVICE_NAME
         ),
     }
 }
@@ -772,10 +631,10 @@ pub(super) fn retry_transient_bootstrap(
 /// (re)written the unit file, so systemd must re-read it even when the unit is
 /// not started now (`--no-start`); without the reload a later `start` launches
 /// whatever stale definition systemd last loaded.
-pub(super) fn systemd_install_command_plan(start: bool, service_name: &str) -> Vec<Vec<&str>> {
+pub(super) fn systemd_install_command_plan(start: bool) -> Vec<Vec<&'static str>> {
     let mut plan = vec![vec!["daemon-reload"]];
     if start {
-        plan.push(vec!["enable", "--now", service_name]);
+        plan.push(vec!["enable", "--now", crate::SERVICE_NAME]);
     }
     plan
 }
@@ -783,8 +642,8 @@ pub(super) fn systemd_install_command_plan(start: bool, service_name: &str) -> V
 /// Commands that start the installed unit. A `start` can follow a unit
 /// rewrite that never went through install on this boot, so reload first;
 /// the reload is idempotent when the unit on disk is unchanged.
-pub(super) fn systemd_start_command_plan(service_name: &str) -> Vec<Vec<&str>> {
-    vec![vec!["daemon-reload"], vec!["start", service_name]]
+pub(super) fn systemd_start_command_plan() -> Vec<Vec<&'static str>> {
+    vec![vec!["daemon-reload"], vec!["start", crate::SERVICE_NAME]]
 }
 
 /// Commands that (re)start the launchd agent. Booting the service out first
@@ -865,12 +724,8 @@ fn launchd_domain(id: &Path) -> Result<String> {
     Ok(format!("gui/{uid}"))
 }
 
-fn launchd_service_target(id: &Path, namespace: &ServiceNamespace) -> Result<String> {
-    Ok(format!(
-        "{}/{}",
-        launchd_domain(id)?,
-        namespace.launchd_label()
-    ))
+fn launchd_service_target(id: &Path) -> Result<String> {
+    Ok(format!("{}/{}", launchd_domain(id)?, LAUNCHD_LABEL))
 }
 
 /// launchd has no liveness query of its own: the agent is running when its
@@ -878,11 +733,10 @@ fn launchd_service_target(id: &Path, namespace: &ServiceNamespace) -> Result<Str
 pub(super) fn launchd_service_state(
     launchctl: &Path,
     id: &Path,
-    namespace: &ServiceNamespace,
     socket_state: DaemonSocketState,
 ) -> Result<DaemonServiceState> {
     let running = matches!(socket_state, DaemonSocketState::Connectable);
-    let enabled = !launchd_service_is_disabled(launchctl, id, namespace)?;
+    let enabled = !launchd_service_is_disabled(launchctl, id)?;
     Ok(match (running, enabled) {
         (true, true) => DaemonServiceState::RunningEnabled,
         (true, false) => DaemonServiceState::RunningDisabled,
@@ -891,12 +745,7 @@ pub(super) fn launchd_service_state(
     })
 }
 
-fn launchd_service_is_disabled(
-    launchctl: &Path,
-    id: &Path,
-    namespace: &ServiceNamespace,
-) -> Result<bool> {
-    let label = namespace.launchd_label();
+fn launchd_service_is_disabled(launchctl: &Path, id: &Path) -> Result<bool> {
     let domain = launchd_domain(id)?;
     let output = Command::new(launchctl)
         .args(["print-disabled", &domain])
@@ -906,29 +755,21 @@ fn launchd_service_is_disabled(
         })?;
     Ok(launchd_disabled_output_contains_label(
         &String::from_utf8_lossy(&output.stdout),
-        &label,
+        LAUNCHD_LABEL,
     ))
 }
 
 pub(super) fn launchd_disabled_output_contains_label(output: &str, label: &str) -> bool {
     output.lines().any(|line| {
-        line.split_once("=>").is_some_and(|(key, value)| {
-            key.trim().trim_matches('"') == label && value.trim().starts_with("true")
-        })
+        line.contains(label)
+            && line
+                .split_once("=>")
+                .is_some_and(|(_, value)| value.trim().starts_with("true"))
     })
 }
 
-fn ensure_launchd_runtime_dirs(service_path: &Path) -> Result<()> {
-    let unit = std::fs::read_to_string(service_path).map_err(|error| TraceDecayError::Config {
-        message: format!(
-            "failed to read launchd daemon service '{}' before creating runtime directories: {error}",
-            service_path.display()
-        ),
-    })?;
-    let data_dir = match service_env_value_from_unit(&unit, USER_DATA_DIR_ENV)? {
-        Some(path) => PathBuf::from(path),
-        None => tracedecay_data_dir()?,
-    };
+fn ensure_launchd_runtime_dirs() -> Result<()> {
+    let data_dir = tracedecay_data_dir()?;
     std::fs::create_dir_all(&data_dir).map_err(|e| TraceDecayError::Config {
         message: format!(
             "failed to create daemon data directory '{}': {e}",
@@ -940,44 +781,41 @@ fn ensure_launchd_runtime_dirs(service_path: &Path) -> Result<()> {
 fn launchd_install(
     launchctl: &Path,
     id: &Path,
-    namespace: &ServiceNamespace,
     service_path: &Path,
     start: bool,
     socket_path: &Path,
 ) -> Result<()> {
-    ensure_launchd_runtime_dirs(service_path)?;
-    let target = launchd_service_target(id, namespace)?;
+    ensure_launchd_runtime_dirs()?;
+    let target = launchd_service_target(id)?;
     if !start {
         // launchd bootstraps every plist in ~/Library/LaunchAgents at login,
         // so persist a disabled state to keep --no-start meaning "do not run".
         run_launchctl(launchctl, &["disable", &target])?;
         return Ok(());
     }
-    launchd_start(launchctl, id, namespace, &target, service_path, socket_path)
+    launchd_start(launchctl, id, &target, service_path, socket_path)
 }
 
 fn launchd_refresh(
     launchctl: &Path,
     id: &Path,
-    namespace: &ServiceNamespace,
     service_path: &Path,
     socket_path: &Path,
 ) -> Result<()> {
-    ensure_launchd_runtime_dirs(service_path)?;
-    let target = launchd_service_target(id, namespace)?;
-    launchd_start(launchctl, id, namespace, &target, service_path, socket_path)
+    ensure_launchd_runtime_dirs()?;
+    let target = launchd_service_target(id)?;
+    launchd_start(launchctl, id, &target, service_path, socket_path)
 }
 
 fn launchd_start_preserving_enablement(
     launchctl: &Path,
     id: &Path,
-    namespace: &ServiceNamespace,
     target: &str,
     service_path: &Path,
     socket_path: &Path,
 ) -> Result<()> {
-    let was_disabled = launchd_service_is_disabled(launchctl, id, namespace)?;
-    let start_result = launchd_start(launchctl, id, namespace, target, service_path, socket_path);
+    let was_disabled = launchd_service_is_disabled(launchctl, id)?;
+    let start_result = launchd_start(launchctl, id, target, service_path, socket_path);
     if !was_disabled {
         return start_result;
     }
@@ -996,7 +834,6 @@ fn launchd_start_preserving_enablement(
 fn launchd_start(
     launchctl: &Path,
     id: &Path,
-    _namespace: &ServiceNamespace,
     target: &str,
     service_path: &Path,
     socket_path: &Path,
@@ -1009,21 +846,16 @@ fn launchd_start(
     verify_launchd_started(launchctl, target, socket_path)
 }
 
-fn launchd_before_uninstall(
-    launchctl: &Path,
-    id: &Path,
-    namespace: &ServiceNamespace,
-    stop: bool,
-) -> Result<()> {
+fn launchd_before_uninstall(launchctl: &Path, id: &Path, stop: bool) -> Result<()> {
     if !stop {
         return Ok(());
     }
-    let target = launchd_service_target(id, namespace)?;
+    let target = launchd_service_target(id)?;
     run_launchd_commands(launchctl, &launchd_uninstall_command_plan(&target))
 }
 
-fn launchd_stop(launchctl: &Path, id: &Path, namespace: &ServiceNamespace) -> Result<()> {
-    let target = launchd_service_target(id, namespace)?;
+fn launchd_stop(launchctl: &Path, id: &Path) -> Result<()> {
+    let target = launchd_service_target(id)?;
     run_launchctl_allow_not_loaded(launchctl, &["bootout", &target])
 }
 

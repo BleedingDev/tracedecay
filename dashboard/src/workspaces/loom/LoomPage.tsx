@@ -181,14 +181,12 @@ function TemporalBody({
     const row = rows.find(
       (session) => JSON.stringify([session.provider || 'unknown', session.session_id]) === selectedId,
     );
-    return row
-      ? { id: selectedId!, sessionId: row.session_id, provider: row.provider }
-      : null;
+    return row ? { id: selectedId!, sessionId: row.session_id } : null;
   }, [rows, selectedId]);
 
   const chain = useEnvelope(
     ['loom', 'chain', selectedLane?.id ?? 'none'],
-    `/api/plugins/hermes-lcm/session/${encodeURIComponent(selectedLane?.sessionId ?? '')}?provider=${encodeURIComponent(selectedLane?.provider ?? '')}&limit=200`,
+    `/api/plugins/hermes-lcm/session/${encodeURIComponent(selectedLane?.sessionId ?? '')}?limit=200`,
     LcmSessionPayloadV1Schema,
     { enabled: selectedLane != null },
   );

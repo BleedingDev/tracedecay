@@ -1,5 +1,4 @@
-//! Seeded crash and restart fuzzing of the **mounted** observation journey
-//! (`tdmem-5lc`).
+//! Seeded crash and restart fuzzing of the **mounted** observation journey.
 //!
 //! # What is under test, and why it is this mount
 //!
@@ -23,7 +22,7 @@
 //! inside the composition, exactly as the daemon does. The journey itself is
 //! untouched, and no `#[cfg(test)]` seam is compiled into it.
 //!
-//! | boundary the bead names | where this driver stands | what the parent proves after the kill |
+//! | boundary | where this driver stands | what the parent proves after the kill |
 //! | --- | --- | --- |
 //! | canonical commit → journal write | the store parks on the pass that would serve the target | the canonical log holds it and the journal has no row for it |
 //! | journal write → dispatch | the provider parks inside the **delivery preflight handshake**, which the host performs before it builds the observation call | the journal row is durable and this life's provider-entry log never named the row's key |
@@ -40,13 +39,13 @@
 //! existed; the observer proves host ownership of the seam; the parent then
 //! verifies that no acknowledging receipt crossed it before the kill.
 //!
-//! The last row is the honest form of the bead's "after receipt before
-//! watermark advance": the host writes the receipt and the acknowledged
-//! watermark in **one** transaction ([`advance_watermark_for`] runs inside the
-//! receipt's own transaction), so there is no instant between them to stand
-//! in. The journal observer therefore runs after commit and parks only once the
-//! target has both an acknowledging receipt and a contiguous watermark. A life
-//! killed there leaves both durable.
+//! The last row covers "after receipt before watermark advance": the host
+//! writes the receipt and the acknowledged watermark in **one** transaction
+//! ([`advance_watermark_for`] runs inside the receipt's own transaction), so
+//! there is no instant between them to stand in. The journal observer
+//! therefore runs after commit and parks only once the target has both an
+//! acknowledging receipt and a contiguous watermark. A life killed there leaves
+//! both durable.
 //!
 //! # No sleeps, and no marker polling
 //!
@@ -84,26 +83,26 @@ use super::*;
 
 /// Carries one child life's whole assignment. Present exactly when this
 /// process *is* a child life.
-const CHILD_LIFE_ENV: &str = "TDMEM_5LC_MOUNTED_CHILD_LIFE";
+const CHILD_LIFE_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_CHILD_LIFE";
 
 /// Carries only a socket path for the attach-without-arrival cleanup child.
-const NON_ARRIVING_CHILD_ENV: &str = "TDMEM_5LC_MOUNTED_NON_ARRIVING_CHILD";
+const NON_ARRIVING_CHILD_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_NON_ARRIVING_CHILD";
 
 /// Raises or lowers the developer tier's seed window. Lowering it to `1`
 /// together with [`BASE_SEED_ENV`] reproduces exactly one failure.
-const SEEDS_ENV: &str = "TDMEM_5LC_MOUNTED_SEEDS";
+const SEEDS_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_SEEDS";
 
 /// Raises or lowers the soak tier's seed window.
-const SOAK_SEEDS_ENV: &str = "TDMEM_5LC_SOAK_SEEDS";
+const SOAK_SEEDS_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_SOAK_SEEDS";
 
 /// How many seeds the soak tier keeps in flight at once.
-const SOAK_LANES_ENV: &str = "TDMEM_5LC_SOAK_LANES";
+const SOAK_LANES_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_SOAK_LANES";
 
 /// The soak tier's wall-clock ceiling, in seconds.
-const SOAK_BUDGET_ENV: &str = "TDMEM_5LC_SOAK_BUDGET_SECONDS";
+const SOAK_BUDGET_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_SOAK_BUDGET_SECONDS";
 
 /// Moves the start of the seed window, for reproducing one seed.
-const BASE_SEED_ENV: &str = "TDMEM_5LC_MOUNTED_BASE_SEED";
+const BASE_SEED_ENV: &str = "TRACEDECAY_OBSERVATION_CRASH_FUZZ_BASE_SEED";
 
 /// Seeds the developer tier covers.
 ///
@@ -111,19 +110,12 @@ const BASE_SEED_ENV: &str = "TDMEM_5LC_MOUNTED_BASE_SEED";
 /// is a full mounted journey in a fresh process: a project database, a SQLite
 /// journal, a readiness handshake and a live replay task. That costs about a
 /// second per life, so this window is the largest one that keeps a bare
-/// `cargo test` honest for a developer. It is *not* the gate: the soak tier
-/// below runs [`SOAK_SEEDS`] seeds against the same mounted path and is the
-/// command the convergence map registers.
+/// `cargo test` honest for a developer. The soak tier below runs
+/// [`SOAK_SEEDS`] seeds against the same mounted path.
 const DEFAULT_SEEDS: u64 = 32;
 
-/// Seeds the soak tier covers. The bead asks for hundreds against the real
-/// mounted path, and this is that number.
+/// Seeds the soak tier covers against the real mounted path.
 const SOAK_SEEDS: u64 = 200;
-
-/// The floor the registered gate is asserted to have, checked at compile time
-/// so lowering [`SOAK_SEEDS`] cannot quietly turn the soak tier into a short
-/// one.
-const _: () = assert!(SOAK_SEEDS >= 200);
 
 /// Seeds the soak tier keeps in flight when the machine does not say otherwise.
 const SOAK_LANES: usize = 6;
@@ -136,7 +128,7 @@ const SOAK_BUDGET: Duration = Duration::from_secs(1_800);
 /// Where the seed windows start. Fixed forever: moving it would silently
 /// retire the coverage these tiers are asserted to have. The soak window is a
 /// superset of the developer window, so a developer failure is always inside
-/// the gate too.
+/// the soak window too.
 const BASE_SEED: u64 = 0x0000_5FC1_0000_0001;
 
 /// Seeds that must always run, whatever the budget is. A seed lands here when
@@ -178,7 +170,7 @@ const SIGKILL: i32 = 9;
 /// test binary with `--exact` on it, so a rename that missed this constant
 /// fails loudly with "child never attached" rather than silently running
 /// nothing.
-const CHILD_TEST_PATH: &str = "daemon::retained_owner::observation_journey::tests::\
+const CHILD_TEST_PATH: &str = "retained_owner::observation_journey::tests::\
 crash_restart_fuzz::mounted_crash_child_process_entrypoint";
 
 /// States a row may never be left in once the journey has converged.
@@ -376,19 +368,6 @@ impl FuzzCanonicalPortV1 {
 }
 
 impl ObservationAdmissionPort for FuzzCanonicalPortV1 {
-    async fn recent_admitted_observation_window(
-        &self,
-        request: tracedecay_store::ObservationRecentWindowRequest,
-    ) -> Result<Option<tracedecay_store::ObservationRecentWindowV1>, ObservationStoreError> {
-        let window = recent_record_window(&self.records, request)?;
-        self.hooks.check_verified(
-            HookPointV1::BeforeJournalWrite,
-            |target| window.as_ref().map(|window| window.first_sequence) == Some(target),
-            |target| !self.journalled(target),
-        );
-        Ok(window)
-    }
-
     async fn read_admitted_observation(
         &self,
         observation_id: &CanonicalObservationIdV1,
@@ -579,145 +558,7 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
         Self::unexpected()
     }
 
-    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-        let call = observation.call();
-        let sequence = self.position_of(call);
-        let key = call
-            .idempotency_key
-            .clone()
-            .expect("an observation call carries an idempotency key");
-
-        // Durable, fsync'd, and taken under the same gate the
-        // never-entered boundary seals: after this line no life can claim the
-        // provider was not asked about this row, and before it no entry can
-        // slip past a seal that has already been taken.
-        self.hooks.record_entry(&self.entries, &key);
-
-        // The row is leased, the provider has been entered, and it has not
-        // touched its ledger.
-        self.hooks
-            .check(HookPointV1::AtProviderEntry, |target| sequence == target);
-
-        if self.refused.contains(&sequence) {
-            return ProviderReply {
-                terminal: TerminalRecord::new(
-                    ProviderOperation::Observe,
-                    call.provider_id.clone(),
-                    TerminalCode::ContractViolation,
-                    CommittedEffectEvidence::none(Some(call.expected_state_generation)),
-                    FallbackDirective::forbidden(),
-                    call.operation_id.clone(),
-                    call.exact_scope.exact_scope_sha256(),
-                    Some("observation-refused-by-contract".to_owned()),
-                )
-                .expect("refusal terminal"),
-                payload: None,
-                warnings: Vec::new(),
-                extensions: call.extensions.clone(),
-                state_generation: call.expected_state_generation,
-            };
-        }
-
-        if self.ledger.holds(&key) {
-            // The provider recognises its own key. This is the path a
-            // redelivery after a lost answer must take, and the only reason
-            // redelivery is safe at all.
-            return ProviderReply {
-                terminal: TerminalRecord::new(
-                    ProviderOperation::Observe,
-                    call.provider_id.clone(),
-                    TerminalCode::Success,
-                    CommittedEffectEvidence::duplicate(
-                        call.expected_state_generation,
-                        key.clone(),
-                        call.operation_id.clone(),
-                        PROVIDER_RECEIPT,
-                    )
-                    .expect("duplicate evidence"),
-                    FallbackDirective::forbidden(),
-                    call.operation_id.clone(),
-                    call.exact_scope.exact_scope_sha256(),
-                    None,
-                )
-                .expect("duplicate terminal"),
-                payload: Some(call.payload.clone()),
-                warnings: Vec::new(),
-                extensions: call.extensions.clone(),
-                state_generation: call.expected_state_generation,
-            };
-        }
-
-        self.ledger.commit(&key);
-        // The effect is durable and the answer does not exist yet.
-        self.hooks
-            .check(HookPointV1::AfterEffectBeforeAnswer, |target| {
-                sequence == target
-            });
-
-        let reply = ProviderReply {
-            terminal: TerminalRecord::new(
-                ProviderOperation::Observe,
-                call.provider_id.clone(),
-                TerminalCode::Success,
-                CommittedEffectEvidence::committed(
-                    call.expected_state_generation,
-                    call.expected_state_generation,
-                    vec![format!("observation:{sequence}")],
-                    PROVIDER_RECEIPT,
-                    EFFECT_DIGEST,
-                )
-                .expect("committed effect"),
-                FallbackDirective::forbidden(),
-                call.operation_id.clone(),
-                call.exact_scope.exact_scope_sha256(),
-                None,
-            )
-            .expect("observation terminal"),
-            payload: Some(call.payload.clone()),
-            warnings: Vec::new(),
-            extensions: call.extensions.clone(),
-            state_generation: call.expected_state_generation,
-        };
-        // The answer above is complete. The provider records that fact, then
-        // returns normally. The host-owned journal observer takes the crash
-        // boundary later, at entry to `record_attempt`.
-        self.hooks.seal_answer(sequence, &self.answers, &key);
-        reply
-    }
-
     fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         Self::unexpected()
     }
 }
@@ -1192,7 +1033,7 @@ impl ArrivalSocketV1 {
             .get_or_init(|| AtomicU32::new(0))
             .fetch_add(1, Ordering::Relaxed);
         let path =
-            std::env::temp_dir().join(format!("tdmem5lcm-{}-{ordinal}.sock", std::process::id()));
+            std::env::temp_dir().join(format!("tdobsfuzz-{}-{ordinal}.sock", std::process::id()));
         let _ = fs::remove_file(&path);
         let listener = UnixListener::bind(&path).expect("arrival socket");
         Self { path, listener }
@@ -1477,7 +1318,7 @@ fn await_arrival_with_bounds(
     };
     let (signals, arrivals) = mpsc::channel::<Result<ChildSignalV1, String>>();
     let waiter = match std::thread::Builder::new()
-        .name("tdmem-5lc-mounted-arrival".to_owned())
+        .name("observation-crash-fuzz-arrival".to_owned())
         .spawn(move || {
             (|| -> Result<(), String> {
                 let (mut stream, _) = listener.accept().map_err(|error| {
@@ -2200,7 +2041,7 @@ impl FuzzCoverageV1 {
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "tdmem-5lc {tier}: {seeds} seeds, {} process kills, {} multi-life seeds, {} refusal \
+            "observation crash fuzz {tier}: {seeds} seeds, {} process kills, {} multi-life seeds, {} refusal \
              seeds; kills per boundary: {boundaries}",
             self.kills, self.multi_life_seeds, self.refusal_seeds
         )
@@ -2326,12 +2167,11 @@ fn window(base: u64, budget: u64) -> Vec<u64> {
         .collect()
 }
 
-/// Acceptance (`tdmem-5lc`), developer tier: a short window of randomized crash
-/// plans against the **mounted** journey holds every invariant.
+/// Developer tier: a short window of randomized crash plans against the
+/// **mounted** journey holds every invariant.
 ///
 /// This tier exists so a bare `cargo test` on this file is honest and fast. The
-/// gate the convergence map registers is the soak tier below, which runs the
-/// same seeds and hundreds more.
+/// soak tier below runs the same seeds and hundreds more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn seeded_crash_restart_fuzzing_holds_every_invariant_on_the_mounted_journey() {
     let base = base_seed();
@@ -2350,15 +2190,11 @@ async fn seeded_crash_restart_fuzzing_holds_every_invariant_on_the_mounted_journ
     assert_window_is_not_vacuous(&total, count);
 }
 
-/// Acceptance (`tdmem-5lc`), soak tier: **two hundred** deterministic seeds of
-/// randomized crash plans against the mounted journey, inside a bounded wall
-/// budget.
+/// Soak tier: [`SOAK_SEEDS`] deterministic seeds of randomized crash plans
+/// against the mounted journey, inside a bounded wall budget.
 ///
-/// This is the tier the bead's "run N seeds (hundreds)" names and the one
-/// `product/upstream/convergence-map.json` registers as the repeatable mounted
-/// verification. It is `#[ignore]`d so that a developer's `cargo test` runs the
-/// short tier, and the registered command runs exactly this one with
-/// `--ignored`.
+/// It is `#[ignore]`d so that a developer's `cargo test` runs the short tier;
+/// run it by name with `--ignored`.
 ///
 /// Seeds are independent journeys over their own temporary directories, so the
 /// window runs [`SOAK_LANES`] of them at a time. The budget is enforced while
@@ -2367,7 +2203,7 @@ async fn seeded_crash_restart_fuzzing_holds_every_invariant_on_the_mounted_journ
 /// silently shrink into a shorter one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "soak tier: hundreds of seeds and thousands of process kills; run it by name"]
-async fn mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_seeds() {
+async fn mounted_crash_restart_soak_holds_every_invariant_across_the_soak_window() {
     let seeds = window(base_seed(), env_u64(SOAK_SEEDS_ENV, SOAK_SEEDS));
     let planned = seeds.len();
     let lanes = usize::try_from(env_u64(
@@ -2463,11 +2299,5 @@ async fn mounted_crash_restart_soak_holds_every_invariant_across_two_hundred_see
         finished, planned,
         "the soak window finished {finished} of {planned} seeds"
     );
-    if std::env::var(SOAK_SEEDS_ENV).is_err() {
-        assert!(
-            planned >= 200,
-            "the soak window ran {planned} seeds, which is not the hundreds this tier is for"
-        );
-    }
     assert_window_is_not_vacuous(&total, finished);
 }

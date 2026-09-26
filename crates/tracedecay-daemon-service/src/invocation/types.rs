@@ -369,10 +369,6 @@ impl BoundedHookOrchestratorV1 {
                 Some(HookOrchestrationWorkOutcomeV1::Completed) => true,
                 Some(HookOrchestrationWorkOutcomeV1::RetryableFailure) => false,
                 None => {
-                    // The supersede join above already reaped this future while
-                    // holding the permit, so it is settled or was preempted by
-                    // owner retirement. Never poll it again here: a completed
-                    // `async fn` panics on resume.
                     drop(work_future);
                     operation
                         .superseded
@@ -734,25 +730,18 @@ impl RegisteredWorkRuntime {
     }
 }
 
-/// One profile's retained application runtime, shared by every route that
-/// answers to the same profile-scoped store authority.
+/// One project's retained application runtime, shared by every route that
+/// answers to the same store authority.
 ///
 /// A linked worktree of the same project, and a reopen of a route whose ports
 /// were rebuilt, join this runtime instead of registering a second one. It is
 /// released with the whole root (`retire_roots`), never per route.
 #[derive(Clone)]
 pub struct RegisteredRetainedRuntime {
-    pub(super) profile_id: UserProfileId,
     pub(super) scope: ResolvedScope,
     pub(super) actor: ActorId,
     pub(super) grant: CapabilityGrantSnapshot,
     pub(super) ports: Arc<tracedecay_contracts::retained_surfaces::RetainedSurfacePortsV1<'static>>,
-}
-
-impl RegisteredRetainedRuntime {
-    pub(super) fn profile_id(&self) -> &UserProfileId {
-        &self.profile_id
-    }
 }
 
 pub struct RegisteredFeedbackRuntime {
@@ -1049,22 +1038,8 @@ impl LspLeaseTaskRegistry {
         matches.then(|| state.tasks.remove(session_id)).flatten()
     }
 
-    /// Closes admission and retires every registered lease task inside the
-    /// caller's absolute `deadline`.
-    ///
-    /// Cancellation is signalled to every captured task before the first join,
-    /// so one task that outlives its own join cannot keep its successors
-    /// running uncancelled. A task still unfinished at the deadline is aborted
-    /// rather than dropped: dropping a `JoinHandle` only detaches the task,
-    /// which would let lease work continue after a shutdown that already
-    /// reported itself unclean. Abort is cooperative: a task blocking inside
-    /// its own poll still runs to its next suspension point, possibly after
-    /// this call returns, but it can never resume past that point.
     #[hotpath::skip]
-    pub async fn shutdown(
-        &self,
-        deadline: tokio::time::Instant,
-    ) -> Result<(), DaemonInvocationProblem> {
+    pub async fn shutdown(&self) -> Result<(), DaemonInvocationProblem> {
         let tasks = {
             let mut state = match self.state.lock() {
                 Ok(state) => state,
@@ -1073,17 +1048,10 @@ impl LspLeaseTaskRegistry {
             state.accepting = false;
             std::mem::take(&mut state.tasks)
         };
-        for task in tasks.values() {
-            task.cancellation.cancel();
-        }
         let mut outcome = Ok(());
-        for mut task in tasks.into_values() {
-            if !matches!(
-                tokio::time::timeout_at(deadline, &mut task.handle).await,
-                Ok(Ok(()))
-            ) {
-                task.handle.abort();
-                outcome = Err(DaemonInvocationProblem::Unavailable);
+        for task in tasks.into_values() {
+            if let Err(problem) = task.stop().await {
+                outcome = Err(problem);
             }
         }
         outcome

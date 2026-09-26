@@ -375,9 +375,8 @@ pub(super) fn persist_repository_provenance(
     }
     connection.execute(
         "INSERT INTO observation_repository_provenance (
-            observation_id, availability_json, capture_json, retrieval_anchor_id, owner_json,
-            origin_json
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            observation_id, availability_json, capture_json, retrieval_anchor_id, owner_json
+         ) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             observation_id,
             slim.availability_json,
@@ -389,7 +388,6 @@ pub(super) fn persist_repository_provenance(
                 .anchor()
                 .map(|anchor| encode(anchor.owner()))
                 .transpose()?,
-            encode(attachment.origin())?,
         ],
     )?;
     Ok(())
@@ -417,8 +415,7 @@ pub(super) fn verify_observation_authority(
         .query_row(
             &format!(
                 "SELECT {REPOSITORY_PROVENANCE_HYDRATED_COLUMNS},
-                        repository.retrieval_anchor_id, repository.owner_json,
-                        repository.origin_json
+                        repository.retrieval_anchor_id, repository.owner_json
                  FROM observation_repository_provenance AS repository
                  {REPOSITORY_PROVENANCE_CAPTURE_JOIN}
                  WHERE repository.observation_id = ?1"
@@ -430,30 +427,10 @@ pub(super) fn verify_observation_authority(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()?;
-    let Some((_, capture, _, _, origin_json)) = stored.as_ref() else {
-        return Err(invalid("observation repository provenance collision"));
-    };
-    let retained_origin = origin_json
-        .clone()
-        .map(decode::<tracedecay_store::observation::ObservationOriginV1>)
-        .transpose()?
-        .unwrap_or_else(|| {
-            if capture.is_some() {
-                tracedecay_store::observation::ObservationOriginV1::IngestionOnly
-            } else {
-                tracedecay_store::observation::ObservationOriginV1::Unavailable
-            }
-        });
-    // Capture-clock normalization below must never normalize a changed live
-    // receipt or promote a legacy row to recorded origin on duplicate replay.
-    if &retained_origin != attachment.origin() {
-        return Err(invalid("observation original provenance collision"));
-    }
     let expected = (
         encode(attachment.availability())?,
         attachment.provenance().map(encode).transpose()?,
@@ -467,21 +444,20 @@ pub(super) fn verify_observation_authority(
     );
     // The hydrated columns are SQLite-minified, so the documents are compared,
     // not their bytes.
-    let matches_expected =
-        stored
-            .as_ref()
-            .is_some_and(|(availability, capture, anchor, owner, _origin)| {
-                same_json(availability, &expected.0)
-                    && match (capture, &expected.1) {
-                        (Some(stored), Some(expected)) => same_json(stored, expected),
-                        (None, None) => true,
-                        _ => false,
-                    }
-                    && *anchor == expected.2
-                    && *owner == expected.3
-            });
+    let matches_expected = stored
+        .as_ref()
+        .is_some_and(|(availability, capture, anchor, owner)| {
+            same_json(availability, &expected.0)
+                && match (capture, &expected.1) {
+                    (Some(stored), Some(expected)) => same_json(stored, expected),
+                    (None, None) => true,
+                    _ => false,
+                }
+                && *anchor == expected.2
+                && *owner == expected.3
+        });
     if !matches_expected {
-        let Some((availability, capture, anchor_id, owner, _origin_json)) = stored else {
+        let Some((availability, capture, anchor_id, owner)) = stored else {
             return Err(invalid(
                 "observation repository provenance collision: no retained provenance row",
             ));

@@ -127,7 +127,6 @@ const OBSERVATION_AUTHORITY_SCHEMA_SQL: &str =
             capture_json TEXT CHECK(capture_json IS NULL OR json_valid(capture_json)),
             retrieval_anchor_id TEXT UNIQUE,
             owner_json TEXT CHECK(owner_json IS NULL OR json_valid(owner_json)),
-            origin_json TEXT CHECK(origin_json IS NULL OR json_valid(origin_json)),
             CHECK((capture_json IS NULL) = (retrieval_anchor_id IS NULL)),
             CHECK((owner_json IS NULL) = (retrieval_anchor_id IS NULL)),
             FOREIGN KEY(observation_id) REFERENCES observations(observation_id),
@@ -206,17 +205,6 @@ pub async fn ensure_observation_schema(
     conn.execute_batch(OBSERVATION_AUTHORITY_SCHEMA_SQL)
         .await
         .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
-    super::super::ensure_table_columns(
-        conn,
-        "observation_repository_provenance",
-        &[(
-            "origin_json",
-            "ALTER TABLE observation_repository_provenance ADD COLUMN origin_json TEXT \
-             CHECK(origin_json IS NULL OR json_valid(origin_json))",
-        )],
-    )
-    .await
-    .map_err(|error| global_db_operation_error(OBSERVATION_SCHEMA_OPERATION, error))?;
     if !table_preexisted {
         conn.execute(
             "INSERT OR IGNORE INTO global_schema_migrations(migration) VALUES (?1)",

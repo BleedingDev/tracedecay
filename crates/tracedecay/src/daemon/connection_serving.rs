@@ -4,7 +4,6 @@
 //! portable broker path. Each entry point owns framing, project-owner routing,
 //! and connection teardown for exactly one client.
 
-use super::projectless::projectless_registered_project_reader_server;
 use super::*;
 use tracedecay_daemon_protocol::DaemonInvocationPayload;
 use tracedecay_daemon_service::ProfileHostAdmissionBootstrapStatus;
@@ -677,20 +676,10 @@ fn settle_daemon_work_delivery(
         if let Err(error) =
             offer_daemon_work_delivery(recorder, Some(attempt.clone()), outcome, drop_reason)
         {
-            retain_first_error(&mut result, error);
+            result = Err(error);
         }
     }
     result
-}
-
-/// Retain the earliest error in a multi-stage settlement. A later fan-out
-/// attempt can fail while cleaning up after the original refusal, but replacing
-/// the original error would make the terminal stage appear to be the cause of
-/// the transport/setup failure.
-fn retain_first_error<E>(result: &mut std::result::Result<(), E>, error: E) {
-    if result.is_ok() {
-        *result = Err(error);
-    }
 }
 
 async fn write_daemon_delivery_ack_response(
@@ -1542,24 +1531,7 @@ fn serve_broker_socket_client_inner(
                             }
                         }
                     } else {
-                        match projectless_registered_project_reader_server(
-                            first_request.raw(),
-                            &handshake.client_identity,
-                            &engine.store_administration,
-                        ) {
-                            Ok(Some(server)) => Ok(Some((Some(server), VecDeque::new()))),
-                            Ok(None) => Ok(Some((None, VecDeque::new()))),
-                            Err(error) => {
-                                write_project_open_error(
-                                    &mut transport,
-                                    &first_request,
-                                    &handshake.client_instance_id,
-                                    &error,
-                                )
-                                .await?;
-                                Ok(None)
-                            }
-                        }
+                        Ok::<_, TraceDecayError>(Some((None, VecDeque::new())))
                     }
                 })
                 .await?;
@@ -2134,17 +2106,5 @@ mod delivery_ack_tests {
             classify_daemon_delivery_ack_wait(DaemonDeliveryAckWait::Cancelled),
             Err(tracedecay_domain::DeliveryDropReasonV1::Cancelled)
         );
-    }
-
-    #[test]
-    fn settlement_preserves_the_first_causal_error() {
-        let mut result = Err("setup");
-        super::retain_first_error(&mut result, "cleanup");
-        assert_eq!(result, Err("setup"));
-
-        let mut result = Ok(());
-        super::retain_first_error(&mut result, "first");
-        super::retain_first_error(&mut result, "later");
-        assert_eq!(result, Err("first"));
     }
 }

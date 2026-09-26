@@ -41,19 +41,6 @@ impl DeterministicDiversity {
         policy: &DiversityPolicy,
         candidates: Vec<FusedCandidate>,
     ) -> Result<(Vec<RankedCandidate>, Vec<DiversityDecisionV1>), DiversityStageError> {
-        self.apply_caps_preserving(policy, candidates, &[])
-    }
-
-    /// Apply diversity caps while reserving slots already granted by the
-    /// canonical fallback composition. An optional semantic lane may reorder
-    /// or add candidates, but it cannot displace an incumbent fallback result
-    /// from a bounded diversity slot.
-    pub(crate) fn apply_caps_preserving(
-        &self,
-        policy: &DiversityPolicy,
-        candidates: Vec<FusedCandidate>,
-        incumbents: &[RankedCandidate],
-    ) -> Result<(Vec<RankedCandidate>, Vec<DiversityDecisionV1>), DiversityStageError> {
         let candidate_count = candidates.len();
         let enabled = [
             policy.per_source_namespace,
@@ -72,7 +59,7 @@ impl DeterministicDiversity {
         // Absent caps are a no-op over candidate data: the fused order is the
         // final order, and no key or counter is ever derived.
         let (admitted, decisions) = if enabled {
-            cap_candidates(policy, candidates, incumbents)
+            cap_candidates(policy, candidates)
         } else {
             (candidates, Vec::new())
         };
@@ -97,31 +84,8 @@ impl DeterministicDiversity {
 fn cap_candidates(
     policy: &DiversityPolicy,
     candidates: Vec<FusedCandidate>,
-    incumbents: &[RankedCandidate],
 ) -> (Vec<FusedCandidate>, Vec<DiversityDecisionV1>) {
     let mut counters = CapCounters::default();
-    // Reserve slots for fallback candidates that remain in the fused set.
-    // Their semantic contribution may change the score, but the optional lane
-    // must not make a previously admitted fallback result disappear solely due
-    // to a newly applied cap.
-    let incumbent_ids = incumbents
-        .iter()
-        .map(|ranked| {
-            (
-                ranked.candidate.anchor_id.clone(),
-                ranked.candidate.logical_evidence_id.clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    for candidate in &candidates {
-        if incumbent_ids.contains(&(
-            candidate.anchor_id.clone(),
-            candidate.logical_evidence_id.clone(),
-        )) && !is_protected(candidate)
-        {
-            counters.admit(&CandidateCapKeys::derive(policy, candidate));
-        }
-    }
     let mut admitted = Vec::with_capacity(candidates.len());
     let mut decisions = Vec::new();
     for candidate in candidates {
@@ -136,13 +100,6 @@ fn cap_candidates(
         let dimensions = counters.reached_caps(policy, &keys);
         if dimensions.is_empty() {
             counters.admit(&keys);
-            admitted.push(candidate);
-            continue;
-        }
-        if incumbent_ids.contains(&(
-            candidate.anchor_id.clone(),
-            candidate.logical_evidence_id.clone(),
-        )) {
             admitted.push(candidate);
             continue;
         }

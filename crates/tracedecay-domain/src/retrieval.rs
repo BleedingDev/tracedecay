@@ -13,14 +13,8 @@ use thiserror::Error;
 use crate::canonical_text::{
     CANONICAL_TEXT_MAX_BYTES, is_canonical_text_within, validated_string_newtype,
 };
-use crate::code_intelligence::{
-    CodeGenerationId, EmbeddingExecutionProviderV1, ProjectionKeyV1, ProjectionKindV1,
-    SemanticSearchIndexKeyV1, SemanticSearchIndexKindV1, VectorGenerationIdV1,
-};
-use crate::research::id::{
-    ManifestDigest, PrivacyDomainId, ProjectId, RefId, RepositoryId, RetrievalAnchorId, WorktreeId,
-    digest_id,
-};
+use crate::code_intelligence::CodeGenerationId;
+use crate::research::id::{ManifestDigest, PrivacyDomainId, RetrievalAnchorId, digest_id};
 use crate::research::time::UtcMicros;
 use crate::research::watermark::VectorWatermark;
 use crate::research::{DomainError, SessionId, canonical_sha256};
@@ -72,7 +66,6 @@ validated_string_newtype!(
     CalibrationProfileId,
     FusionProfileId,
     DiversityPolicyId,
-    RerankPolicyId,
     ComponentRevision,
     ExactAdmissionRuleRevision,
     AuthorizationRevision,
@@ -221,7 +214,6 @@ pub enum RetrievalContractError {
 pub enum RetrieverKind {
     ExactLiteral,
     Lexical,
-    Semantic,
     Graph,
     Temporal,
     TaskSession,
@@ -229,10 +221,9 @@ pub enum RetrieverKind {
 }
 
 impl RetrieverKind {
-    pub const ALL_LANES: [Self; 7] = [
+    pub const ALL_LANES: [Self; 6] = [
         Self::ExactLiteral,
         Self::Lexical,
-        Self::Semantic,
         Self::Graph,
         Self::Temporal,
         Self::TaskSession,
@@ -246,7 +237,6 @@ impl RetrieverKind {
         match self {
             Self::ExactLiteral => "exact_literal",
             Self::Lexical => "lexical",
-            Self::Semantic => "semantic",
             Self::Graph => "graph",
             Self::Temporal => "temporal",
             Self::TaskSession => "task_session",
@@ -415,58 +405,9 @@ impl RetrievalScope {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SingleRootScopeV1 {
-    pub repository: RepositoryId,
-    pub worktree: Option<WorktreeId>,
-    pub reference: Option<RefId>,
-}
-
-/// Canonical source scope carried by a semantic request and its continuation.
-///
-/// `RetrievalScope` remains the shared fallback scope and deliberately keeps
-/// its historical wire shape. Semantic serving needs the full resolved
-/// project/repository/worktree/reference tuple so a request cannot be
-/// detached from the source identity selected by the application layer.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticSourceScopeV1 {
-    pub project_id: ProjectId,
-    pub repository_id: RepositoryId,
-    pub worktree_id: WorktreeId,
-    pub reference: Option<RefId>,
-}
-
-#[derive(Serialize)]
-struct SemanticSourceScopeDigestInput<'a> {
-    domain: &'static str,
-    scope: &'a SemanticSourceScopeV1,
-}
-
-impl SemanticSourceScopeV1 {
-    pub fn validate(&self) -> Result<(), RetrievalContractError> {
-        self.project_id.validate()?;
-        self.repository_id.validate()?;
-        self.worktree_id.validate()?;
-        if let Some(reference) = &self.reference {
-            reference.validate()?;
-        }
-        Ok(())
-    }
-
-    pub fn compute_digest(&self) -> Result<CandidateSetDigest, RetrievalContractError> {
-        self.validate()?;
-        let digest = canonical_sha256(&SemanticSourceScopeDigestInput {
-            domain: "tracedecay.semantic-source-scope.v1",
-            scope: self,
-        })
-        .map_err(|error| RetrievalContractError::CanonicalSerialization(error.to_string()))?;
-        CandidateSetDigest::new(digest.as_str())
-    }
-
-    pub fn matches_retrieval_scope(&self, scope: &RetrievalScope) -> bool {
-        scope.root.repository == self.repository_id
-            && scope.root.worktree.as_ref() == Some(&self.worktree_id)
-            && scope.root.reference == self.reference
-    }
+    pub repository: crate::research::id::RepositoryId,
+    pub worktree: Option<crate::research::id::WorktreeId>,
+    pub reference: Option<crate::research::id::RefId>,
 }
 
 /// Frozen execution snapshot: watermarks, index generations, and authorization
@@ -524,24 +465,6 @@ impl RetrievalBudget {
     }
 }
 
-/// Project a caller-owned deadline into a canonical retrieval budget.
-///
-/// A caller deadline is an upper bound on every lane's configured budget. The
-/// projection is pure so the application/scheduler can apply the same rule to
-/// both the exact fallback and the opt-in semantic request before either lane
-/// starts. `None` means that the caller supplied no additional bound.
-pub fn project_caller_deadline(
-    mut budget: RetrievalBudget,
-    caller_deadline_micros: Option<u64>,
-) -> RetrievalBudget {
-    budget.deadline_micros = match (budget.deadline_micros, caller_deadline_micros) {
-        (Some(configured), Some(caller)) => Some(configured.min(caller)),
-        (None, Some(caller)) => Some(caller),
-        (configured, None) => configured,
-    };
-    budget
-}
-
 /// Observed budget consumption, sealed server-side.
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -551,15 +474,6 @@ pub struct RetrievalBudgetUsage {
     pub hydrated_results: u64,
     pub hydration_bytes: u64,
     pub elapsed_micros: u64,
-}
-
-/// Public, sanitized budget usage for an optional stage. It carries no lane
-/// identifying counts or timing detail that could distinguish denied evidence.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SanitizedBudgetUsage {
-    pub elapsed_micros: u64,
-    pub truncated: bool,
 }
 
 /// Typed lane failure. Denial is never surfaced as a distinct public state.
@@ -1067,7 +981,6 @@ pub enum RankingDecisionKind {
     ContradictionPreservation,
     DiversityCap,
     ComparatorProvenance,
-    RerankAdmission,
     Fallback,
 }
 
@@ -1086,11 +999,6 @@ pub struct FusionProfile {
     pub minimum_calibrated_feature_micros: BTreeMap<RetrieverKind, u32>,
     pub weights_micros: BTreeMap<RetrieverKind, u32>,
     pub diversity_policy_id: DiversityPolicyId,
-    /// Optional rerank authority bound to the same evaluated profile. The
-    /// semantic execution authority validates this identity before mounting
-    /// an optional rerank stage; fallback-only profiles keep it absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rerank_policy_id: Option<RerankPolicyId>,
     pub retrieval_budget: RetrievalBudget,
 }
 
@@ -1111,33 +1019,6 @@ pub struct DiversityPolicy {
     pub per_evidence_role: Option<u32>,
 }
 
-/// Optional bounded rerank contract. Exact tiers bypass the reranker; every
-/// incomplete or invalid rerank result restores the exact pre-rerank order.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct RerankPolicy {
-    pub policy_id: RerankPolicyId,
-    pub evaluation_result_anchor: RetrievalAnchorId,
-    pub max_candidates: u32,
-    pub max_input_bytes: u64,
-    pub max_input_tokens: u64,
-    pub max_work_units: u64,
-    pub max_model_invocations: u32,
-    pub deadline_micros: Option<u64>,
-}
-
-/// Ephemeral authorized rerank view. Only source-local approved features may
-/// enter the optional stage; the view is never persisted or cached.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct AuthorizedRerankView {
-    pub anchor_id: RetrievalAnchorId,
-    pub snapshot_digest: CandidateSetDigest,
-    pub privacy_domain: PrivacyDomainId,
-    pub compatibility: FreshnessCompatibilityV1,
-    pub approved_features: Vec<u8>,
-}
-
 /// Per-anchor hydration receipt. Every contribution and hydration receipt
 /// keys back to one `OccurrenceProvenance`.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1149,158 +1030,6 @@ pub struct HydrationReceipt {
     pub bytes_hydrated: u64,
     pub authorized: bool,
     pub freshness: SourceFreshness,
-}
-
-/// Explicit opt-in to code-semantic retrieval. Omission keeps baseline search.
-#[derive(Clone, Copy, Debug, Deserialize, schemars::JsonSchema, PartialEq, Eq, Serialize)]
-pub enum SemanticQueryModeV1 {
-    #[serde(rename = "fallback")]
-    FallbackAllowed,
-    #[serde(rename = "strict")]
-    StrictSemantic,
-}
-
-/// Optional semantic continuation authenticated by the same query cursor
-/// key as the canonical fallback. All source, model, privacy, candidate-set,
-/// and ranking identities are frozen here so resume never recomputes a
-/// changed semantic result set.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SemanticRetrievalContinuationV1 {
-    pub mode: SemanticQueryModeV1,
-    pub profile_id: FusionProfileId,
-    pub profile_digest: ManifestDigest,
-    pub code_generation: CodeGenerationId,
-    pub vector_generation: VectorGenerationIdV1,
-    /// Full model identity, retained separately from the projection digest so
-    /// a continuation cannot be resumed against a different model artifact
-    /// that happens to claim a compatible projection schema.
-    pub model_artifact_digest: ManifestDigest,
-    pub execution_provider: EmbeddingExecutionProviderV1,
-    pub projection_key: ProjectionKeyV1,
-    pub search_index_key: SemanticSearchIndexKeyV1,
-    pub capability_manifest_digest: ManifestDigest,
-    pub privacy_domain: PrivacyDomainId,
-    pub privacy_key_epoch: u64,
-    pub source_scope: SemanticSourceScopeV1,
-    pub candidate_set_digest: CandidateSetDigest,
-    pub public_lane_statuses: BTreeMap<RetrieverKind, PublicRetrieverStatus>,
-    pub lane_checkpoints: Vec<RetrieverContinuation>,
-    pub ranking_revision: RankingRevision,
-    pub rerank: OptionalStagePublicStatus,
-    pub candidate_count: u32,
-    pub next_ordinal: u32,
-}
-
-impl SemanticRetrievalContinuationV1 {
-    pub fn validate(&self) -> Result<(), RetrievalContractError> {
-        self.profile_id.validate()?;
-        self.profile_digest.validate()?;
-        self.model_artifact_digest.validate()?;
-        self.capability_manifest_digest.validate()?;
-        self.privacy_domain.validate()?;
-        self.source_scope.validate()?;
-        if !self.execution_provider.is_cpu() {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic execution provider deferred in V2",
-            });
-        }
-        self.projection_key.profile_digest.validate()?;
-        if self.projection_key.kind != ProjectionKindV1::Embedding {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic projection kind",
-            });
-        }
-        self.vector_generation.as_digest().validate().map_err(|_| {
-            RetrievalContractError::InvalidCursorBinding {
-                field: "semantic vector generation",
-            }
-        })?;
-        self.search_index_key.validate().map_err(|_| {
-            RetrievalContractError::InvalidCursorBinding {
-                field: "semantic search index key",
-            }
-        })?;
-        if self.search_index_key.kind != SemanticSearchIndexKindV1::ExactFlat {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic search index kind deferred in V2",
-            });
-        }
-        self.code_generation.validate().map_err(|_| {
-            RetrievalContractError::InvalidCursorBinding {
-                field: "semantic source generation",
-            }
-        })?;
-        self.candidate_set_digest.validate()?;
-        self.ranking_revision.validate()?;
-        if !self
-            .public_lane_statuses
-            .contains_key(&RetrieverKind::Semantic)
-        {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic lane status",
-            });
-        }
-        if self
-            .lane_checkpoints
-            .iter()
-            .any(|checkpoint| !self.public_lane_statuses.contains_key(&checkpoint.lane))
-        {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic lane checkpoint without admitted lane status",
-            });
-        }
-        if self.next_ordinal > self.candidate_count {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic frozen candidate position",
-            });
-        }
-        Ok(())
-    }
-
-    /// Validate identities shared with the enclosing authenticated cursor.
-    ///
-    /// The outer cursor freezes the canonical fallback composition consumed
-    /// before semantic execution. The nested continuation freezes the distinct
-    /// augmented composition. Both values are covered by the same cursor MAC,
-    /// while only their query privacy, comparator, and fallback-lane evidence
-    /// are required to agree. Semantic source, order digest, and ordinal state
-    /// remain canonical inside the nested, MAC-covered continuation.
-    pub fn validate_for_cursor(
-        &self,
-        cursor: &RetrievalCursor,
-    ) -> Result<(), RetrievalContractError> {
-        self.validate()?;
-        if self.ranking_revision != cursor.ranking_revision
-            || self.privacy_domain != cursor.privacy_domain
-            || self.privacy_key_epoch != cursor.key_epoch
-        {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation shared identities",
-            });
-        }
-        if RetrieverKind::QUERY_FALLBACK_LANES.into_iter().any(|lane| {
-            self.public_lane_statuses.get(&lane) != cursor.public_lane_statuses.get(&lane)
-        }) {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation fallback lane statuses",
-            });
-        }
-        let semantic_fallback_checkpoints = self
-            .lane_checkpoints
-            .iter()
-            .filter(|checkpoint| checkpoint.lane.is_query_fallback_lane());
-        let cursor_fallback_checkpoints = cursor
-            .lane_checkpoints
-            .iter()
-            .filter(|checkpoint| checkpoint.lane.is_query_fallback_lane());
-        if !semantic_fallback_checkpoints.eq(cursor_fallback_checkpoints) {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation fallback lane checkpoints",
-            });
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1322,12 +1051,10 @@ impl CodeSourceCursorBindingV1 {
     }
 }
 
-pub const RETRIEVAL_CURSOR_MAX_ENVELOPE_BYTES: usize = 4_096;
-
 /// Authenticated retrieval cursor. Binds the query snapshot, profile ID,
 /// authorized freshness digest, authorization revision, ordered candidate
-/// set digest, sanitized lane statuses, and lane checkpoints; a recomposed
-/// continuation must match the bound set exactly or resume rejects it.
+/// set digest, sanitized lane statuses, and lane checkpoints; resume uses
+/// the bound set or rejects, it never recomputes.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct RetrievalCursor {
@@ -1345,10 +1072,6 @@ pub struct RetrievalCursor {
     pub ranking_revision: RankingRevision,
     /// First final ordinal in the next page of the frozen candidate set.
     pub next_ordinal: u32,
-    /// Optional semantic continuation. Its absence is intentionally omitted
-    /// from canonical bytes so a fallback-only cursor remains byte-identical.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic: Option<SemanticRetrievalContinuationV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_source: Option<CodeSourceCursorBindingV1>,
     pub expiry: UtcMicros,
@@ -1379,29 +1102,6 @@ impl RetrievalCursor {
                 field: "lane checkpoint without admitted lane status",
             });
         }
-        if let Some(semantic) = &self.semantic {
-            semantic.validate()?;
-            semantic.validate_for_cursor(self)?;
-            if let Some(source) = &self.code_source
-                && (semantic.code_generation != source.generation
-                    || semantic
-                        .source_scope
-                        .reference
-                        .as_ref()
-                        .is_some_and(|reference| reference != &source.reference))
-            {
-                return Err(RetrievalContractError::InvalidCursorBinding {
-                    field: "semantic continuation code source",
-                });
-            }
-        }
-        let encoded = serde_json::to_vec(self)
-            .map_err(|error| RetrievalContractError::CanonicalSerialization(error.to_string()))?;
-        if encoded.len() > RETRIEVAL_CURSOR_MAX_ENVELOPE_BYTES {
-            return Err(RetrievalContractError::InvalidCursorBinding {
-                field: "cursor exceeds its bounded authenticated envelope",
-            });
-        }
         Ok(())
     }
 }
@@ -1415,31 +1115,6 @@ pub enum PublicRetrieverStatus {
     Partial,
     Unavailable,
     Stale,
-}
-
-/// Public status of an optional stage. Denied and absent evidence coalesce
-/// through the same sanitized unavailable shape.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "status", content = "detail", rename_all = "snake_case")]
-pub enum OptionalStagePublicStatus {
-    NotRequested,
-    Complete,
-    Unavailable(SanitizedStageFailure),
-    Rejected(SanitizedStageFailure),
-    Cancelled,
-    BudgetExceeded(SanitizedBudgetUsage),
-}
-
-/// Sanitized optional-stage failure class. Internal details never cross the
-/// public retrieval cursor boundary.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum SanitizedStageFailure {
-    AuthorityUnavailable,
-    Incompatible,
-    Stale,
-    Invalid,
-    Internal,
 }
 
 /// The typed, independently hashed query fallback subpayload. Canonical-encoded
@@ -1695,7 +1370,7 @@ mod tests {
             .validate()
             .expect("query fallback lanes are admissible");
 
-        let lane = RetrieverKind::Semantic;
+        let lane = RetrieverKind::Temporal;
         let rejected = subpayload(&[lane]);
         assert_eq!(
             rejected.validate(),
@@ -1711,17 +1386,19 @@ mod tests {
             [
                 RetrieverKind::ExactLiteral,
                 RetrieverKind::Lexical,
-                RetrieverKind::Semantic,
                 RetrieverKind::Graph,
                 RetrieverKind::Temporal,
                 RetrieverKind::TaskSession,
                 RetrieverKind::Diagnostic,
             ],
         );
+        assert!(
+            serde_json::from_str::<RetrieverKind>("\"semantic\"").is_err(),
+            "the retired dense lane must not deserialize"
+        );
         for (wire, expected) in [
             ("exact_literal", RetrieverKind::ExactLiteral),
             ("lexical", RetrieverKind::Lexical),
-            ("semantic", RetrieverKind::Semantic),
             ("graph", RetrieverKind::Graph),
             ("temporal", RetrieverKind::Temporal),
             ("task_session", RetrieverKind::TaskSession),
@@ -1749,218 +1426,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_continuation_uses_canonical_vector_and_index_identity_types() {
-        let index_key = crate::code_intelligence::SemanticSearchIndexProfileV1::exact_flat_v1()
-            .and_then(|profile| profile.index_key())
-            .expect("canonical semantic index key");
-        let continuation = SemanticRetrievalContinuationV1 {
-            mode: SemanticQueryModeV1::FallbackAllowed,
-            profile_id: id("profile.semantic.cursor.v1"),
-            profile_digest: id(ZERO_DIGEST),
-            code_generation: id("generation.semantic.cursor.v1"),
-            vector_generation: VectorGenerationIdV1::new(id(ZERO_DIGEST)),
-            model_artifact_digest: id(ZERO_DIGEST),
-            execution_provider: EmbeddingExecutionProviderV1::Cpu,
-            projection_key: ProjectionKeyV1 {
-                kind: crate::code_intelligence::ProjectionKindV1::Embedding,
-                schema_revision: "projection.semantic.cursor.v1".to_owned(),
-                profile_digest: id(ZERO_DIGEST),
-            },
-            search_index_key: index_key,
-            capability_manifest_digest: id(ZERO_DIGEST),
-            privacy_domain: id("privacy.semantic.cursor.v1"),
-            privacy_key_epoch: 1,
-            source_scope: SemanticSourceScopeV1 {
-                project_id: id("project.semantic.cursor.v1"),
-                repository_id: id("repository.semantic.cursor.v1"),
-                worktree_id: id("worktree.semantic.cursor.v1"),
-                reference: Some(id("reference.semantic.cursor.v1")),
-            },
-            candidate_set_digest: id(ZERO_DIGEST),
-            public_lane_statuses: BTreeMap::from([(
-                RetrieverKind::Semantic,
-                PublicRetrieverStatus::Complete,
-            )]),
-            lane_checkpoints: Vec::new(),
-            ranking_revision: id("ranking.semantic.cursor.v1"),
-            rerank: OptionalStagePublicStatus::NotRequested,
-            candidate_count: 1,
-            next_ordinal: 0,
-        };
-        continuation
-            .validate()
-            .expect("semantic continuation identity validates");
-    }
-
-    fn semantic_cursor(semantic: SemanticRetrievalContinuationV1) -> RetrievalCursor {
-        RetrievalCursor {
-            key_id: id("cursor-key.semantic.v1"),
-            key_epoch: semantic.privacy_key_epoch,
-            privacy_domain: semantic.privacy_domain.clone(),
-            query_digest: QueryDigest::new(
-                semantic.privacy_domain.clone(),
-                semantic.privacy_key_epoch,
-                QueryMac::new(format!("hmac-sha256:{}", "1".repeat(64))).unwrap(),
-            ),
-            profile_id: semantic.profile_id.clone(),
-            snapshot_digest: id(ZERO_DIGEST),
-            freshness_digest: id(ZERO_DIGEST),
-            authorization_revision: id("authorization.semantic.v1"),
-            candidate_set_digest: semantic.candidate_set_digest.clone(),
-            public_lane_statuses: semantic.public_lane_statuses.clone(),
-            lane_checkpoints: semantic.lane_checkpoints.clone(),
-            ranking_revision: semantic.ranking_revision.clone(),
-            next_ordinal: semantic.next_ordinal,
-            semantic: Some(semantic),
-            code_source: None,
-            expiry: UtcMicros(1),
-            signature: QueryMac::new(format!("hmac-sha256:{}", "0".repeat(64))).unwrap(),
-        }
-    }
-
-    #[test]
-    fn semantic_cursor_binds_nested_identity_and_compositions() {
-        let index_key = crate::code_intelligence::SemanticSearchIndexProfileV1::exact_flat_v1()
-            .and_then(|profile| profile.index_key())
-            .expect("canonical semantic index key");
-        let continuation = SemanticRetrievalContinuationV1 {
-            mode: SemanticQueryModeV1::FallbackAllowed,
-            profile_id: id("profile.semantic.cursor.binding.v1"),
-            profile_digest: id(ZERO_DIGEST),
-            code_generation: id("generation.semantic.cursor.binding.v1"),
-            vector_generation: VectorGenerationIdV1::new(id(ZERO_DIGEST)),
-            model_artifact_digest: id(ZERO_DIGEST),
-            execution_provider: EmbeddingExecutionProviderV1::Cpu,
-            projection_key: ProjectionKeyV1 {
-                kind: crate::code_intelligence::ProjectionKindV1::Embedding,
-                schema_revision: "projection.semantic.cursor.binding.v1".to_owned(),
-                profile_digest: id(ZERO_DIGEST),
-            },
-            search_index_key: index_key,
-            capability_manifest_digest: id(ZERO_DIGEST),
-            privacy_domain: id("privacy.semantic.cursor.binding.v1"),
-            privacy_key_epoch: 3,
-            source_scope: SemanticSourceScopeV1 {
-                project_id: id("project.semantic.cursor.binding.v1"),
-                repository_id: id("repository.semantic.cursor.binding.v1"),
-                worktree_id: id("worktree.semantic.cursor.binding.v1"),
-                reference: None,
-            },
-            candidate_set_digest: id(ZERO_DIGEST),
-            public_lane_statuses: BTreeMap::from([(
-                RetrieverKind::Semantic,
-                PublicRetrieverStatus::Complete,
-            )]),
-            lane_checkpoints: Vec::new(),
-            ranking_revision: id("ranking.semantic.cursor.binding.v1"),
-            rerank: OptionalStagePublicStatus::NotRequested,
-            candidate_count: 1,
-            next_ordinal: 0,
-        };
-        let mut cursor = semantic_cursor(continuation.clone());
-        cursor.validate().expect("bound semantic cursor validates");
-
-        let mut dual_composition = cursor.clone();
-        dual_composition.profile_id = id("profile.fallback.cursor.binding.v1");
-        dual_composition.candidate_set_digest = id(&format!("sha256:{}", "2".repeat(64)));
-        dual_composition.public_lane_statuses = RetrieverKind::QUERY_FALLBACK_LANES
-            .into_iter()
-            .map(|lane| (lane, PublicRetrieverStatus::Complete))
-            .collect();
-        dual_composition.next_ordinal = 1;
-        let semantic = dual_composition
-            .semantic
-            .as_mut()
-            .expect("semantic continuation");
-        semantic.public_lane_statuses.extend(
-            RetrieverKind::QUERY_FALLBACK_LANES
-                .into_iter()
-                .map(|lane| (lane, PublicRetrieverStatus::Complete)),
-        );
-        semantic.candidate_count = 2;
-        semantic.next_ordinal = 2;
-        dual_composition
-            .validate()
-            .expect("fallback and augmented cursor state validate independently");
-
-        let semantic_generation = dual_composition
-            .semantic
-            .as_ref()
-            .expect("semantic continuation")
-            .code_generation
-            .clone();
-        dual_composition.code_source = Some(CodeSourceCursorBindingV1 {
-            reference: id("refs/heads/semantic-cursor"),
-            commit: crate::GitOidV1::new("1".repeat(40)).expect("commit"),
-            tree: crate::GitOidV1::new("2".repeat(40)).expect("tree"),
-            generation: semantic_generation,
-        });
-        dual_composition
-            .validate()
-            .expect("semantic and exact source generation agree");
-
-        let mut mismatched_source_generation = dual_composition.clone();
-        mismatched_source_generation
-            .code_source
-            .as_mut()
-            .expect("code source")
-            .generation = id("generation.semantic.cursor.binding.other");
-        assert!(matches!(
-            mismatched_source_generation.validate(),
-            Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation code source"
-            })
-        ));
-
-        let mut mismatched_source_reference = dual_composition.clone();
-        let semantic = mismatched_source_reference
-            .semantic
-            .as_mut()
-            .expect("semantic continuation");
-        semantic.source_scope.reference = Some(id("refs/heads/other"));
-        assert!(matches!(
-            mismatched_source_reference.validate(),
-            Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation code source"
-            })
-        ));
-
-        let mut mismatched_fallback_status = dual_composition.clone();
-        mismatched_fallback_status
-            .semantic
-            .as_mut()
-            .expect("semantic continuation")
-            .public_lane_statuses
-            .insert(RetrieverKind::Lexical, PublicRetrieverStatus::Partial);
-        assert!(matches!(
-            mismatched_fallback_status.validate(),
-            Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation fallback lane statuses"
-            })
-        ));
-
-        let mut mismatched_ranking = dual_composition;
-        mismatched_ranking
-            .semantic
-            .as_mut()
-            .expect("semantic continuation")
-            .ranking_revision = id("ranking.semantic.cursor.binding.v2");
-        assert!(matches!(
-            mismatched_ranking.validate(),
-            Err(RetrievalContractError::InvalidCursorBinding {
-                field: "semantic continuation shared identities"
-            })
-        ));
-
-        cursor
-            .semantic
-            .as_mut()
-            .expect("semantic continuation")
-            .next_ordinal = 2;
-        assert!(cursor.validate().is_err());
-    }
-
-    #[test]
     fn retriever_outcome_keeps_deadlines_distinct_from_cancellation() {
         let usage = RetrievalBudgetUsage {
             elapsed_micros: 10_000,
@@ -1973,36 +1438,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(timed_out).expect("serialize timeout")["outcome"],
             "timed_out",
-        );
-    }
-
-    #[test]
-    fn caller_deadline_is_an_upper_bound_on_the_canonical_budget() {
-        let budget = RetrievalBudget {
-            max_candidates_per_lane: 4,
-            max_fused_candidates: 4,
-            max_hydrated_results: 4,
-            max_hydration_bytes: 4_096,
-            deadline_micros: Some(500),
-        };
-        assert_eq!(
-            project_caller_deadline(budget, Some(100)).deadline_micros,
-            Some(100)
-        );
-        assert_eq!(
-            project_caller_deadline(budget, Some(1_000)).deadline_micros,
-            Some(500)
-        );
-        assert_eq!(
-            project_caller_deadline(
-                RetrievalBudget {
-                    deadline_micros: None,
-                    ..budget
-                },
-                Some(100),
-            )
-            .deadline_micros,
-            Some(100)
         );
     }
 
@@ -2030,13 +1465,13 @@ mod tests {
                 exact_class: ExactClass::Approximate,
                 utility_micros: 1,
                 contributions: vec![CandidateContribution {
-                    retriever: RetrieverKind::Semantic,
-                    retriever_revision: id("retriever.semantic.v1"),
-                    source_occurrence_id: id("occurrence.semantic"),
+                    retriever: RetrieverKind::Temporal,
+                    retriever_revision: id("retriever.temporal.v1"),
+                    source_occurrence_id: id("occurrence.temporal"),
                     ordinal_rank: 0,
                     raw_score: FixedPointScore(1),
-                    score_domain: id("score.semantic.v1"),
-                    calibration_profile_id: id("calibration.semantic.v1"),
+                    score_domain: id("score.temporal.v1"),
+                    calibration_profile_id: id("calibration.temporal.v1"),
                     calibrated_feature_micros: 1,
                     weight_micros: 1,
                     weighted_contribution_micros: 1,

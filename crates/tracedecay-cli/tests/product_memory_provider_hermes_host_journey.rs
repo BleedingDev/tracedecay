@@ -46,7 +46,6 @@ const OBSERVATION_KIND: &str = "session.message_committed.v1";
 const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 const NCM_PROVIDER_ID: &str = "ncm";
 const HERMES_CANONICAL_PROVIDER_ID: &str = "hermes";
-const HERMES_HISTORY_CONTROL_REASON: &str = "hook_origin_reader_no_hermes_mapping";
 const JOURNAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SETTLEMENT_BUDGET: Duration = Duration::from_secs(60);
 
@@ -153,12 +152,9 @@ impl HermesJourney {
         let log = fs::File::create(self.home.path().join("daemon.stderr.log")).expect("daemon log");
         let mut command = self.cli(&["daemon", "run"]);
         command
-            .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
-            .env(
-                "RUST_LOG",
-                "warn,tracedecay::mcp::tools::handlers::hook_runtime::admission=debug",
-            );
-        command.stdout(Stdio::null()).stderr(Stdio::from(log));
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(log));
         let mut daemon = command.spawn().expect("daemon starts");
         wait_for_authority(&mut daemon, &daemon_authority_path(&self.profile));
         self.daemon = Some(daemon);
@@ -423,7 +419,6 @@ impl HermesJourney {
             "the fixture must state that it exercised register(ctx) without stock Hermes"
         );
         assert_eq!(result["context_engine_callback"], "complete");
-        assert_hermes_history_control_gate(&result);
         result
     }
 
@@ -732,28 +727,6 @@ fn assert_fixture_replay(fixture: &Value) {
         .expect("fixture reports exact original message ids");
     assert_eq!(ids.len(), 2);
     assert!(ids.iter().all(Value::is_string));
-}
-
-/// Hermes' LCM admission names the canonical host provider `hermes`, while
-/// the current retained-owner history reader resolves only Claude/Codex host
-/// origins. Keep that capability boundary explicit in the live fixture: a
-/// missing source resolution is an unsupported provider-history control, not
-/// an empty history result that could be mistaken for a successful binding.
-fn assert_hermes_history_control_gate(fixture: &Value) {
-    assert_eq!(
-        fixture["canonical_provider_id"],
-        HERMES_CANONICAL_PROVIDER_ID
-    );
-    let control = fixture
-        .get("history_control")
-        .expect("Hermes fixture reports its history/control capability gate");
-    assert_eq!(control["capability"], "provider_history");
-    assert_eq!(
-        control["canonical_provider_id"],
-        HERMES_CANONICAL_PROVIDER_ID
-    );
-    assert_eq!(control["state"], "unsupported");
-    assert_eq!(control["source_resolution"], HERMES_HISTORY_CONTROL_REASON);
 }
 
 fn assert_settled_rows(rows: &[JournalInspectionRowV1], provider: ActiveProvider) {

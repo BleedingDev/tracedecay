@@ -26,8 +26,7 @@ use tracedecay_store::{
     DurabilityClassV1, FOREGROUND_BATCH_MAX_BYTES, IdempotencyIdentityV1,
     ObservationBatchPersistOutcome, ObservationCommitReceipt, ObservationPersistOutcome,
     ObservationProjectionStatus, ObservationProjectionStore, ObservationReadOperationV1,
-    ObservationReadResultV1, ObservationRecentWindowRequest, ObservationRecentWindowV1,
-    ObservationReplayRequest, ObservationStore, ObservationStoreError,
+    ObservationReadResultV1, ObservationReplayRequest, ObservationStore, ObservationStoreError,
     ObservationStoreResult, OperationPriorityV1, ProjectReadOperationV1, ProjectReadResultV1,
     ProjectionCheckpoint, ProjectionPersistOutcome, ProjectionPredecessorConvergence,
     ProjectionRebuildOutcome, ProjectionStoreResult, RepositoryOperationEnvelopeV1,
@@ -736,16 +735,6 @@ impl GlobalDbObservationStore {
                     retained.observation().receipt() == observation.receipt()
                 }));
         if existed_exact {
-            let incoming_origin = write.repository_provenance_attachment().origin();
-            if pending
-                .as_ref()
-                .is_some_and(|retained| &retained.origin != incoming_origin)
-                || existing.as_ref().is_some_and(|retained| {
-                    retained.repository_provenance_attachment().origin() != incoming_origin
-                })
-            {
-                return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
-            }
             if pending.is_some() {
                 return Ok(PreparedObservationPersist::DeferredExactDuplicate(
                     Box::new(write),
@@ -982,7 +971,6 @@ struct PendingObservationAuthority {
     payload_reference: PayloadReferenceV1,
     identity: ObservationIdentityMaterialV1,
     receipt: SanitizationReceiptV1,
-    origin: tracedecay_store::observation::ObservationOriginV1,
 }
 
 #[derive(Clone)]
@@ -1049,7 +1037,6 @@ impl ObservationBatchState {
                 payload_reference: write.observation().payload_reference().clone(),
                 identity: write.observation().identity().clone(),
                 receipt: write.observation().receipt().clone(),
-                origin: write.repository_provenance_attachment().origin().clone(),
             },
         );
         self.pending_receipts.insert(
@@ -1420,7 +1407,7 @@ fn observation_batch_row_projection() -> String {
                 EXISTS(
                     SELECT 1 FROM projection_queue
                     WHERE projection_queue.observation_id = observation.observation_id
-                ), repository.origin_json
+                )
          FROM observations AS observation
          LEFT JOIN observation_retrieval_anchors AS binding
            ON binding.observation_id = observation.observation_id
@@ -1556,18 +1543,8 @@ async fn read_stored_observations_from_snapshot(
                 "observation repository owner binding mismatch",
             ));
         }
-        let repository_origin = row
-            .get::<Option<String>>(11)
-            .map_err(|error| runtime_storage_error(operation, error))?
-            .map(|encoded| {
-                decode_json::<tracedecay_store::observation::ObservationOriginV1>(
-                    encoded, operation,
-                )
-            })
-            .transpose()?;
         let repository_provenance =
             RepositoryProvenanceAttachmentV1::new(repository_availability, repository_anchor)
-                .and_then(|attachment| attachment.with_retained_origin(repository_origin))
                 .map_err(|error| runtime_storage_error(operation, error))?;
         let projection_queued = row
             .get::<i64>(10)
@@ -1761,34 +1738,6 @@ impl ObservationStore for GlobalDbObservationStore {
         observation_id: &CanonicalObservationIdV1,
     ) -> ObservationStoreResult<Option<StoredObservation>> {
         read_runtime_stored_observation(&self.runtime, observation_id)
-    }
-
-    #[hotpath::skip]
-    async fn recent_observation_window(
-        &self,
-        request: ObservationRecentWindowRequest,
-    ) -> ObservationStoreResult<Option<ObservationRecentWindowV1>> {
-        let limit = u16::try_from(request.limit()).map_err(|_| {
-            runtime_storage_error(
-                "recent observation window",
-                "window limit exceeds runtime contract",
-            )
-        })?;
-        match dispatch_runtime_observation_read(
-            &self.runtime,
-            ObservationReadOperationV1::RecentWindow { limit },
-        )? {
-            ObservationReadResultV1::RecentWindow(window) => {
-                if let Some(window) = &window {
-                    window.validate()?;
-                }
-                Ok(window)
-            }
-            _ => Err(runtime_storage_error(
-                "recent observation window",
-                "runtime returned a mismatched observation read result",
-            )),
-        }
     }
 
     #[hotpath::skip]

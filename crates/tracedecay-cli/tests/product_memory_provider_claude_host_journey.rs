@@ -49,10 +49,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
-#[path = "product_memory_provider_claude_host_journey/comparison_fixture.rs"]
-mod comparison_fixture;
-
-#[cfg(unix)]
 #[path = "product_memory_provider_claude_host_journey/provider_control_journeys.rs"]
 mod provider_control_journeys;
 
@@ -210,7 +206,6 @@ struct ClaudeHostJourney {
     /// connection across a restart.
     journal: RefCell<Option<Arc<SqliteObservationJournal>>>,
     ncm_journal: RefCell<Option<Arc<SqliteObservationJournal>>>,
-    live_origin_diagnostics: RefCell<Vec<Value>>,
 }
 
 impl ClaudeHostJourney {
@@ -264,7 +259,6 @@ impl ClaudeHostJourney {
             bin_dir,
             journal: RefCell::new(None),
             ncm_journal: RefCell::new(None),
-            live_origin_diagnostics: RefCell::new(Vec::new()),
         }
     }
 
@@ -298,10 +292,7 @@ impl ClaudeHostJourney {
         let mut command = self.cli(&["daemon", "run"]);
         command
             .env("TRACEDECAY_TEST_HOST_HISTORY_RECALL_DIAGNOSTICS", "1")
-            .env(
-                "RUST_LOG",
-                "warn,tracedecay::mcp::tools::handlers::hook_runtime::admission=debug",
-            )
+            .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
         if self.active_provider.is_ncm() || self.ncm_observer {
@@ -439,12 +430,7 @@ impl ClaudeHostJourney {
     /// Invoked only while formatting a failed populated-recall assertion.
     /// Reads opt-in host counters, never ledger tables or raw log content.
     fn native_recall_failure_diagnostics(&self) -> Value {
-        let missing = || {
-            json!({
-                "availability":"no_readable_opt_in_diagnostics",
-                "live_origin_checkpoints": *self.live_origin_diagnostics.borrow(),
-            })
-        };
+        let missing = || json!({"availability":"no_readable_opt_in_diagnostics"});
         let Ok(mut log) = fs::File::open(self.home.path().join("daemon.stderr.log")) else {
             return missing();
         };
@@ -459,121 +445,13 @@ impl ClaudeHostJourney {
         if log.take(64 * 1024).read_to_end(&mut tail).is_err() {
             return missing();
         }
-        let text = String::from_utf8_lossy(&tail);
-        let summaries = text
+        let summaries = String::from_utf8_lossy(&tail)
             .lines()
             .rev()
             .filter_map(recall_diagnostic_summary)
             .take(12)
             .collect::<Vec<_>>();
-        let origin_outcomes = text
-            .lines()
-            .rev()
-            .filter_map(|line| {
-                let message = if line.contains("live hook origin ledger unavailable") {
-                    "ledger_unavailable"
-                } else if line.contains("live hook transcript origin unavailable") {
-                    "origin_unavailable"
-                } else if line.contains("live hook transcript origin") {
-                    "origin_recorded"
-                } else {
-                    return None;
-                };
-                let outcome = [
-                    "Baseline",
-                    "Checkpoint",
-                    "Sealed",
-                    "Unavailable",
-                    "Deadline",
-                    "Duplicate",
-                ]
-                .into_iter()
-                .find(|label| line.contains(label))
-                .unwrap_or("unclassified");
-                Some(json!({"message":message, "outcome":outcome}))
-            })
-            .take(16)
-            .collect::<Vec<_>>();
-        json!({"order":"newest_first", "events":summaries, "live_origin_outcomes":origin_outcomes,
-            "live_origin_checkpoints": *self.live_origin_diagnostics.borrow()})
-    }
-
-    /// Read only the existing bounded origin authority; retain no transcript text or paths.
-    fn record_live_origin_diagnostic(&self, command: &str, session_id: Option<&str>) {
-        use tracedecay_hooks::admission_ledger::{
-            read_hook_live_origin_boundaries, read_hook_live_origin_proofs,
-        };
-        if !matches!(
-            command,
-            "hook-claude-session-start"
-                | "hook-codex-session-start"
-                | "hook-stop"
-                | "hook-codex-stop"
-        ) {
-            return;
-        }
-        let Some(session_id) = session_id else {
-            return;
-        };
-        let host = if self.codex {
-            tracedecay_hooks::HookHostV1::Codex
-        } else {
-            tracedecay_hooks::HookHostV1::ClaudeCode
-        };
-        let expected_path = fs::canonicalize(self.transcript_path_for_session(session_id)).ok();
-        let expected_source_key = if self.codex {
-            tracedecay_sessions::runtime::codex::codex_observation_source_v2(session_id)
-                .ok()
-                .map(|source| source.source_key().as_str().to_owned())
-        } else {
-            tracedecay_sessions::runtime::claude::identify_claude_source(
-                &self.transcript_path_for_session(session_id),
-            )
-            .map(|source| source.source_id)
-        };
-        let boundary_summary =
-            |boundary: &tracedecay_hooks::admission_ledger::HookLiveOriginBoundaryV1| {
-                let observed = &boundary.observation;
-                json!({
-                    "session_matches": observed.source.session_id().as_str() == session_id,
-                    "path_matches": expected_path.as_ref() == Some(&observed.canonical_source_path),
-                    "source_key_matches": expected_source_key.as_deref() == Some(observed.source.source_key().as_str()),
-                    "start_order": boundary.start.admission.order, "checkpoint_order": boundary.admission.order,
-                    "generation": observed.checkpoint.generation, "file_identity": observed.checkpoint.file_identity,
-                    "start_eof": boundary.start.physical_eof, "frontier": observed.checkpoint.complete_frontier,
-                    "physical_eof": observed.physical_eof,
-                })
-            };
-        let summary = if let Some(path) = find_file(&self.profile, "admission-live-origins.json") {
-            let root = path.parent().expect("origin metadata parent");
-            let now = tracedecay_contracts::now_micros();
-            let boundaries = read_hook_live_origin_boundaries(root, host, now);
-            let proofs = read_hook_live_origin_proofs(root, host, now);
-            match (boundaries, proofs) {
-                (Ok(boundaries), Ok(proofs)) => json!({
-                    "command":command, "availability":"read", "ledger_host_matches":root.file_name().is_some_and(|name| name == host.hook_key()),
-                    "boundary_count":boundaries.len(), "proof_count":proofs.len(),
-                    "boundaries":boundaries.iter().take(4).map(&boundary_summary).collect::<Vec<_>>(),
-                    "proofs":proofs.iter().take(4).map(|proof| json!({
-                        "baseline":boundary_summary(&proof.baseline), "seal_order":proof.seal.order,
-                        "frame_count":proof.frames.len(), "frames":proof.frames.iter().take(4).map(|frame| json!({
-                            "start":frame.start, "end":frame.end, "resume_fingerprint":frame.resume_fingerprint,
-                        })).collect::<Vec<_>>(),
-                    })).collect::<Vec<_>>(),
-                }),
-                _ => json!({"command":command, "availability":"reader_refused"}),
-            }
-        } else {
-            json!({"command":command, "availability":"metadata_absent"})
-        };
-        let mut retained = self.live_origin_diagnostics.borrow_mut();
-        if retained.len() < 8
-            && serde_json::to_vec(&*retained).map_or(false, |bytes| {
-                bytes.len() + summary.to_string().len() < 12 * 1024
-            })
-        {
-            retained.push(summary);
-        }
+        json!({"order":"newest_first", "events":summaries})
     }
 
     fn stop_daemon(&mut self) {
@@ -814,11 +692,9 @@ impl ClaudeHostJourney {
             fs::canonicalize(&self.profile).expect("canonical isolated profile"),
             "status authority must name the isolated profile"
         );
-        let connection = DaemonConnection::new(
-            authority.endpoint.clone(),
-            Some(authority.auth_token.clone()),
-        )
-        .with_daemon_version(authority.version.clone());
+        let connection =
+            DaemonConnection::new(authority.endpoint.clone(), authority.auth_token.clone())
+                .with_daemon_version(authority.version.clone());
         let handshake = DaemonHandshake {
             project_path: Some(self.project.clone()),
             scope_prefix: None,
@@ -1169,7 +1045,6 @@ impl ClaudeHostJourney {
     /// Runs one shipped Claude lifecycle hook process, handing it the bytes
     /// Claude Code itself writes on stdin.
     fn run_hook(&self, subcommand: &str, payload: &Value) -> Output {
-        let session_id = payload["session_id"].as_str().map(str::to_owned);
         let payload = payload.to_string();
         let mut command = self.cli(&[subcommand]);
         command.stdin(Stdio::piped());
@@ -1182,9 +1057,7 @@ impl ClaudeHostJourney {
             .expect("hook stdin")
             .write_all(payload.as_bytes())
             .expect("hook payload delivery");
-        let output = child.wait_with_output().expect("hook completes");
-        self.record_live_origin_diagnostic(subcommand, session_id.as_deref());
-        output
+        child.wait_with_output().expect("hook completes")
     }
 
     /// Captures the first completed turn after the live SessionStart baseline.
@@ -2677,95 +2550,6 @@ fn assert_host_memory_journey_with_provider(
             &original.1,
         );
     }
-    record_demo_output(&journey, next_session, &original.1, &recalled.1);
-}
-
-/// Optional fixture artifacts are emitted only after the complete journey passes.
-fn record_demo_output(
-    journey: &ClaudeHostJourney,
-    next_session: &str,
-    source_result: &[u8],
-    destination_result: &[u8],
-) {
-    let Some(output) = std::env::var_os("TRACEDECAY_DEMO_OUTPUT_DIR") else {
-        return;
-    };
-    if journey.ncm_observer {
-        return;
-    }
-    let case = match (journey.codex, journey.active_provider) {
-        (false, ActiveProvider::Native) => "claude-native",
-        (true, ActiveProvider::Native) => "codex-native",
-        (false, ActiveProvider::RustNcm) => "claude-ncm-active",
-        (true, ActiveProvider::RustNcm) => "codex-ncm-active",
-    };
-    let output = PathBuf::from(output);
-    let allowed = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("checkout root")
-        .join("target/task-scratch");
-    assert!(
-        output.is_absolute(),
-        "demo output directory must be absolute"
-    );
-    let relative = output
-        .strip_prefix(&allowed)
-        .expect("demo output must be under target/task-scratch");
-    assert!(
-        relative
-            .components()
-            .all(|part| matches!(part, std::path::Component::Normal(_))),
-        "demo output path must not contain parent components"
-    );
-    for ancestor in output.ancestors() {
-        assert!(
-            !fs::symlink_metadata(ancestor)
-                .expect("pre-created demo output directory")
-                .file_type()
-                .is_symlink(),
-            "demo output path must not traverse symlinks"
-        );
-    }
-    assert!(
-        output
-            .canonicalize()
-            .expect("demo output directory")
-            .starts_with(allowed.canonicalize().expect("task-scratch directory")),
-        "demo output must remain inside target/task-scratch"
-    );
-    let artifacts = [
-        ("source-a.tool-result.json", source_result),
-        ("destination-b.tool-result.json", destination_result),
-    ];
-    for (_, bytes) in artifacts {
-        assert!(
-            bytes.len() <= 8 * 1024 * 1024,
-            "demo artifact exceeds 8 MiB"
-        );
-        serde_json::from_slice::<Value>(bytes).expect("demo artifact retains actual JSON");
-    }
-    let directory = output.join(case);
-    fs::create_dir(&directory).expect("fresh demo case directory; refusing overwrite");
-    for (name, bytes) in artifacts {
-        let mut file = fs::File::create_new(directory.join(name)).expect("fresh demo artifact");
-        file.write_all(bytes).expect("write actual response bytes");
-        file.sync_all().expect("sync actual response bytes");
-    }
-    let identity = json!({
-        "fixture_case": case,
-        "host": if journey.codex { "codex" } else { "claude" },
-        "provider_id": journey.active_provider.id(),
-        "ncm_observer": journey.ncm_observer,
-        "source_session_id": journey.session_id(),
-        "destination_session_id": next_session,
-        "assertions_passed": true,
-    });
-    let mut file =
-        fs::File::create_new(directory.join("identity.json")).expect("fresh demo identity");
-    file.write_all(&serde_json::to_vec_pretty(&identity).expect("fixture identity JSON"))
-        .expect("write fixture identity");
-    file.sync_all().expect("sync fixture identity");
 }
 
 /// Canonical fact feedback has its own public host authority. This separate
@@ -3451,56 +3235,6 @@ fn assert_recalled_session_messages(
         .collect::<Vec<_>>();
     identities.sort();
     (identities, result_bytes, trace_ref.to_owned())
-}
-
-#[test]
-fn recall_failure_diagnostics_keep_only_bounded_counter_metadata() {
-    let marker = "[tracedecay] event=host_history_recall_test_diagnostic ";
-    let line = format!(
-        "{marker}{}",
-        json!({"phase":"admission", "received":4, "admitted":0,
-        "denied":4, "degraded":true, "denial_reasons":{"unknown_validity":4},
-        "request_id":"private-request", "content":"private-content"})
-    );
-    let summary = recall_diagnostic_summary(&line).expect("bounded host counters");
-    assert_eq!(summary["received"], 4);
-    assert_eq!(summary["denial_reasons"]["unknown_validity"], 4);
-    assert!(!summary.to_string().contains("private"));
-    assert!(recall_diagnostic_summary("unrelated private daemon line").is_none());
-    assert!(recall_diagnostic_summary(&format!("{marker}{}", "x".repeat(4097))).is_none());
-}
-
-#[test]
-fn ncm_recall_diagnostic_parser_rejects_unbounded_fields() {
-    let line = format!(
-        "{NCM_RECALL_DIAGNOSTIC_EVENT}stage=worker request_digest={} \
-         state_generation=3 history_source_count=4 scanned_items=4 candidate_count=4 \
-         excluded_count=0 truncated_count=0 \
-         unknown_count=0 empty_content_count=0 score_tie_count=0 \
-         score_margin_below_epsilon_count=0 remaining_candidate_slots=0 \
-         remaining_content_bytes=0",
-        "a".repeat(64)
-    );
-    let parsed = parse_ncm_recall_diagnostic(&line).expect("bounded NCM diagnostic fields");
-    assert_eq!(parsed.history_source_count, 4);
-    assert_eq!(parsed.scanned_items, 4);
-    assert_eq!(parsed.candidate_count, 4);
-    assert!(parse_ncm_recall_diagnostic(&format!("{line} query=private")).is_none());
-    assert!(
-        parse_ncm_recall_diagnostic(&line.replace("stage=worker", "stage=worker worker_id=raw"))
-            .is_none()
-    );
-    for forbidden in [
-        "candidate_id=raw",
-        "source_sequence=7",
-        "content=private",
-        "grant_digest=raw",
-    ] {
-        assert!(
-            parse_ncm_recall_diagnostic(&format!("{line} {forbidden}")).is_none(),
-            "parser must reject raw diagnostic field {forbidden}"
-        );
-    }
 }
 
 /// Stage the installed pinned NCM model into one isolated state root.

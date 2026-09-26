@@ -101,7 +101,6 @@ token-counting = ["tracedecay/token-counting"]
 lite = ["tracedecay/lite"]
 medium = ["tracedecay/medium"]
 full = ["tracedecay/full"]
-semantic-fastembed = ["tracedecay/semantic-fastembed"]
 test-transport = ["tracedecay/test-transport"]
 lang-dart = ["tracedecay/lang-dart"]
 lang-pascal = ["tracedecay/lang-pascal"]
@@ -164,7 +163,6 @@ alloc-jemalloc = ["dep:tikv-jemallocator", "tikv-jemallocator/background_threads
 alloc-mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-tracedecay-semantic-contracts.workspace = true
 crossterm = "0.28"
 clap = { version = "4.6", features = ["derive"] }
 flate2 = "1"

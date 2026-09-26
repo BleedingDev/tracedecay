@@ -47,7 +47,6 @@ pub const SCHEMA: &str = tracedecay_store::GENERATION_DIAGNOSTICS_SCHEMA_DDL;
 // across a cutover. These aliases keep the SQL below readable.
 const STATE_CURRENT: &str = DIAGNOSTIC_STATE_CURRENT;
 const STATE_CLEARED: &str = DIAGNOSTIC_STATE_CLEARED;
-const GENERATION_PUBLICATIONS_TABLE: &str = "diagnostic_generation_publications";
 
 /// SQLite-backed store for durable generation-bound diagnostics.
 ///
@@ -231,11 +230,6 @@ impl<'a> DiagnosticsStore<'a> {
 
     /// Creates the diagnostics schema idempotently. Safe to call on every
     /// open; existing rows are never touched.
-    ///
-    /// This is the only place the publication ledger comes into existence, and
-    /// only a publisher calls it. That is what makes
-    /// [`Self::publication_ledger_initialized`] a statement about publication
-    /// history rather than about which authorities are mounted.
     pub async fn ensure_schema(&self) -> Result<()> {
         hotpath::future!(
             self.with_immediate_tx("diagnostics ensure_schema", |store| {
@@ -250,36 +244,6 @@ impl<'a> DiagnosticsStore<'a> {
             label = "usecases.diagnostics_store.ensure_schema"
         )
         .await
-    }
-
-    /// Whether the durable publication ledger has been created in this store.
-    ///
-    /// The ledger is installed lazily by [`Self::ensure_schema`] on a
-    /// publisher's first publication, so an absent ledger means exactly one
-    /// thing: no generation has ever been published into this project. It is
-    /// *not* evidence that a publishing authority is missing — the explicit
-    /// diagnostics publication path creates the ledger when it is invoked.
-    /// Callers must therefore treat an uninitialized ledger as a retryable
-    /// "nothing published yet" state, never as a terminal absence.
-    ///
-    /// This is a read-only probe: consumers never create the schema on a
-    /// publisher's behalf, because doing so would turn "nothing has been
-    /// published" into an apparent clean empty publication.
-    pub async fn publication_ledger_initialized(&self) -> Result<bool> {
-        let operation = "diagnostics publication_ledger_initialized";
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1 LIMIT 1",
-                params![GENERATION_PUBLICATIONS_TABLE],
-            )
-            .await
-            .map_err(|error| db_error(operation, error))?;
-        Ok(rows
-            .next()
-            .await
-            .map_err(|error| db_error(operation, error))?
-            .is_some())
     }
 
     /// The exact clean generation whose diagnostic snapshot is current.

@@ -354,16 +354,8 @@ impl DaemonInvocationService {
         Some((scope, ApplicationOutcome::Evidence(packet)))
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn expire_all(&self) -> bool {
-        self.expire_all_until(
-            tokio::time::Instant::now() + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE,
-        )
-        .await
-    }
-
     #[hotpath::measure(label = "daemon.service.lsp.expire_all", future = true)]
-    pub async fn expire_all_until(&self, deadline: tokio::time::Instant) -> bool {
+    pub async fn expire_all(&self) -> bool {
         let started = std::time::Instant::now();
         let step = |outcome: &str| {
             tracedecay_runtime_core::logging::log_daemon_event(
@@ -376,7 +368,7 @@ impl DaemonInvocationService {
             );
         };
         self.begin_shutdown().await;
-        let lease_shutdown = self.lsp_lease_tasks.shutdown(deadline).await;
+        let lease_shutdown = self.lsp_lease_tasks.shutdown().await;
         step("lsp_lease_tasks_joined");
         let work_attempts_clean = self.work_attempt_processes.shutdown().await;
         step("work_attempt_processes_joined");
@@ -384,7 +376,7 @@ impl DaemonInvocationService {
         self.authorized_lsp_workspaces.lock().await.clear();
         self.context_scout_registries.lock().await.clear();
         step("lsp_registries_cleared");
-        let project_runtimes_clean = self.project_runtimes.shut_down_all_until(deadline).await;
+        let project_runtimes_clean = self.project_runtimes.shut_down_all().await;
         step("project_runtimes_shut_down");
         self.session_holder_databases.lock().await.clear();
         // The operation-event authority is process-global, not owned by this

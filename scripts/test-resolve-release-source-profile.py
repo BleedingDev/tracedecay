@@ -21,7 +21,7 @@ class FixtureResult:
     github_output: str
 
 
-def run_fixture(manifest: str, target: str | None = None) -> FixtureResult:
+def run_fixture(manifest: str) -> FixtureResult:
     with tempfile.TemporaryDirectory() as temporary_directory:
         source = Path(temporary_directory)
         # The resolver reads the product package manifest, not the workspace
@@ -44,18 +44,15 @@ def run_fixture(manifest: str, target: str | None = None) -> FixtureResult:
             capture_output=True,
         )
         output = source / "github-output.txt"
-        command = [
-            sys.executable,
-            str(RESOLVER),
-            "--source",
-            str(source),
-            "--github-output",
-            str(output),
-        ]
-        if target is not None:
-            command.extend(["--target", target])
         completed = subprocess.run(
-            command,
+            [
+                sys.executable,
+                str(RESOLVER),
+                "--source",
+                str(source),
+                "--github-output",
+                str(output),
+            ],
             check=False,
             capture_output=True,
             text=True,
@@ -92,67 +89,6 @@ full = []
     ):
         raise SystemExit(
             f"unexpected production profile output: {production.github_output!r}"
-        )
-
-    # The verified NCM worker and pinned model ship only for arm64 macOS, so
-    # only that target adds the opt-in memory-provider host to the release.
-    provider_host_manifest = """[package]
-name = "tracedecay"
-version = "0.1.0"
-edition = "2024"
-
-[features]
-default = ["production"]
-production = ["token-counting", "lite", "full"]
-token-counting = []
-lite = []
-full = []
-memory-provider-host = []
-"""
-    for target, expected_features in (
-        ("aarch64-apple-darwin", "production,memory-provider-host"),
-        ("x86_64-unknown-linux-gnu", "production"),
-        ("x86_64-pc-windows-msvc", "production"),
-    ):
-        provider_host = run_fixture(provider_host_manifest, target)
-        if provider_host.returncode != 0:
-            raise SystemExit(provider_host.stderr)
-        if provider_host.github_output != (
-            "profile=production\n"
-            f"cargo_args=--no-default-features --features {expected_features}\n"
-            f"cargo_features={expected_features}\n"
-        ):
-            raise SystemExit(
-                f"unexpected {target} release profile output: "
-                f"{provider_host.github_output!r}"
-            )
-
-    # Older production tags predate the opt-in host; replaying one for the
-    # arm64 macOS target must keep the plain production profile.
-    historical_macos = run_fixture(
-        """[package]
-name = "tracedecay"
-version = "0.1.0"
-edition = "2024"
-
-[features]
-default = ["production"]
-production = ["token-counting", "lite", "full"]
-token-counting = []
-lite = []
-full = []
-""",
-        "aarch64-apple-darwin",
-    )
-    if historical_macos.returncode != 0:
-        raise SystemExit(historical_macos.stderr)
-    if historical_macos.github_output != (
-        "profile=production\n"
-        "cargo_args=--no-default-features --features production\n"
-        "cargo_features=production\n"
-    ):
-        raise SystemExit(
-            f"unexpected historical macOS profile output: {historical_macos.github_output!r}"
         )
 
     contaminated_production = run_fixture(

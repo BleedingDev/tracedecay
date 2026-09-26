@@ -12,17 +12,19 @@
 //! TraceDecay Native memory behind the provider-neutral runtime boundary.
 //!
 //! This crate is deliberately an adapter, not a second memory implementation.
-//! It owns no database, index, scoring, curation, privacy, graph, or persistence
-//! state. A future composition mount supplies the existing owner-bound Native
-//! application port. The adapter validates the stable Native provider identity,
-//! projects the port's descriptor to the capabilities it can map losslessly,
-//! preserves canonical call bytes and exact scope unchanged, and rejects
-//! unsupported operations locally before contacting Native operation authority.
+//! It owns no database, index, scoring, curation, privacy, graph, staging, or
+//! persistence state. The composition mount supplies the owner-bound Native
+//! application port, which answers from upstream TraceDecay authorities only:
+//! canonical facts through the owner-bound memory application and session
+//! history through the `tracedecay_message_search` kernel. The adapter
+//! validates the stable Native provider identity, projects the port's
+//! descriptor to the capabilities it can map losslessly, preserves canonical
+//! call bytes and exact scope unchanged, and rejects unsupported operations
+//! locally before contacting Native operation authority.
 //!
-//! Observation classification happens here — an admitted envelope is parsed
-//! into one typed [`NativeObservation`] variant — but the durable consequence
-//! of an accepted observation belongs entirely to the application port behind
-//! this boundary. Staging a session message opens no store in this crate.
+//! Native observes nothing. Upstream has exactly one capture authority (host
+//! admission, projection, and the raw LCM message store), so no observation
+//! kind is a Native capability.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -31,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tracedecay_memory_provider_api::contract::TerminalCode;
+use tracedecay_memory_provider_api::contract::{CommittedEffectState, TerminalCode};
 use tracedecay_memory_provider_api::{
     ApiError, HandshakeRequest, HandshakeResponse, MemoryProvider, OperationControl,
     OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderOperation, ProviderReply,
@@ -41,80 +43,34 @@ use tracedecay_memory_provider_api::{
 /// Stable logical provider identity for TraceDecay Native memory.
 pub const NATIVE_PROVIDER_ID: &str = "tracedecay.native";
 
-/// Capability IDs the generic Native adapter can currently map without
-/// fabricating a provider-local authority.
+/// Capability IDs the Native adapter maps losslessly onto upstream
+/// authorities: health, and recall over canonical facts and session history.
 ///
-/// The application port may expose additional typed Native routes, but those
-/// routes are not generic provider capabilities. In particular, the adapter
-/// does not advertise temporal recall, lifecycle controls, snapshots, replay,
-/// or canonical fact writes until each has an exact provider-local mapping.
-pub const NATIVE_PROVIDER_CAPABILITY_IDS: &[&str] = &[
-    "provider.health.v1",
-    "observation.accept.v1",
-    "recall.query.v1",
-];
+/// Native declares no observation, feedback, maintenance, inspection,
+/// correction, deletion, snapshot, or replay capability. Upstream owns one
+/// capture path and one curation path; a provider copy of either would be a
+/// shadow authority.
+pub const NATIVE_PROVIDER_CAPABILITY_IDS: &[&str] = &["provider.health.v1", "recall.query.v1"];
 
 /// Recall candidate scope bindings the host authorizes Native to attest, in
 /// the wire vocabulary of `tracedecay.memory.provider.recall.v1`
 /// `candidate_scope_binding.bindings`.
 ///
-/// Native facts attest their project/profile owner. Staged observations are
-/// stored under all seven exact origin fields, but may be recalled in another
-/// agent session on the same profile, project, repository, worktree and branch
-/// under `checkout_observations`. Candidate session and resolved-scope fields
-/// are empty; the immutable origin fields remain in provenance. The fully exact
-/// binding remains authorized and still compares all seven fields.
+/// Native produces exactly two kinds of candidate. Upstream facts are owned by
+/// the project (`project_facts`) or by the profile (`profile_facts`). Upstream
+/// `tracedecay_message_search` hits come from every session in the
+/// authorized project root, so they are project-wide as well and attest the
+/// same project binding with the checkout, session, and resolved-scope
+/// fields left empty. No candidate attests a single checkout.
 ///
 /// The registry records this declaration at registration and passes it to
 /// admission with the admitted call; a provider reply can never widen it.
-pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] = &[
-    "exact_coding_scope",
-    "checkout_observations",
-    "project_facts",
-    "profile_facts",
-];
+pub const NATIVE_RECALL_SCOPE_BINDINGS: &[&str] = &["project_facts", "profile_facts"];
 
-/// Provider-neutral contract carried by an admitted observation call.
-pub const OBSERVATION_CONTRACT_ID: &str = "tracedecay.memory.provider.observation.v1";
-
-/// Observation kind reserved for an explicitly authorized Native promotion
-/// event.
-pub const NATIVE_FACT_PROMOTION_OBSERVATION_KIND: &str = "native.fact_promoted.v1";
-
-/// Payload contract paired with [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`].
-pub const NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID: &str =
-    "tracedecay.memory.observation.native-fact-promotion.v1";
-
-/// The one host observation kind Native stages as provider-local advisory
-/// state, from `tracedecay.memory.provider.observation.v1`
-/// `observation_kinds`.
-///
-/// Accepting a kind is a capability commitment: every accepted kind needs its
-/// own candidate projection, retention behaviour, and containment tests. Only
-/// this kind and [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`] are accepted;
-/// every other contract-known kind stays on the unsupported path.
-pub const NATIVE_STAGED_SESSION_OBSERVATION_KIND: &str = "session.message_committed.v1";
-
-/// Payload contract paired with [`NATIVE_STAGED_SESSION_OBSERVATION_KIND`].
-pub const NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID: &str =
-    "tracedecay.memory.observation.session-message.v1";
-
-const OBSERVATION_ENVELOPE_FIELDS: [&str; 3] =
-    ["canonical_payload", "observation_kind", "payload_contract"];
-
-const HANDSHAKE_CONTRACT_ID: &str = "tracedecay.memory.provider.handshake.v1";
 const HEALTH_CONTRACT_ID: &str = "tracedecay.memory.provider.health.v1";
 const RECALL_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
 /// Canonical payload contract identity returned by a successful recall operation.
 pub const RECALL_RESULT_CONTRACT_ID: &str = "tracedecay.memory.recall.query.outcome.v1";
-const FEEDBACK_CONTRACT_ID: &str = "tracedecay.memory.provider.feedback.v1";
-const MAINTENANCE_CONTRACT_ID: &str = "tracedecay.memory.provider.maintenance.v1";
-const INSPECTION_CONTRACT_ID: &str = "tracedecay.memory.provider.inspection.v1";
-const CORRECTION_CONTRACT_ID: &str = "tracedecay.memory.provider.correction.v1";
-const DELETE_BY_SOURCE_CONTRACT_ID: &str = "tracedecay.memory.provider.deletion-by-source.v1";
-const SNAPSHOT_EXPORT_CONTRACT_ID: &str = "tracedecay.memory.provider.snapshot-export.v1";
-const SNAPSHOT_RESTORE_CONTRACT_ID: &str = "tracedecay.memory.provider.snapshot-restore.v1";
-const REPLAY_CONTRACT_ID: &str = "tracedecay.memory.provider.replay.v1";
 
 /// Construction failure before a Native adapter can be registered.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,179 +105,27 @@ impl fmt::Display for NativeAdapterError {
 
 impl Error for NativeAdapterError {}
 
-/// The parsed view of an admitted observation envelope.
+/// Narrow application boundary implemented by the TraceDecay Native memory
+/// composition.
 ///
-/// `call` is the original provider call, so its exact scope, request and
-/// operation identities, idempotency key, control token, and opaque extensions
-/// remain unchanged. The remaining fields are copied from the canonical JSON
-/// envelope without semantic rewriting: the adapter never re-sanitizes,
-/// reshapes, or re-derives what admission already sanitized and bound to a
-/// receipt.
-#[derive(Clone, Debug)]
-pub struct NativeObservationEnvelope<'call> {
-    /// The original admitted provider call.
-    pub call: &'call ProviderCall,
-    /// Exact `observation_kind` from the canonical envelope.
-    pub observation_kind: String,
-    /// Exact `payload_contract` from the canonical envelope.
-    pub payload_contract: String,
-    /// Parsed `canonical_payload` from the canonical envelope.
-    pub canonical_payload: Value,
-}
-
-/// One admitted observation envelope, classified into the exact Native
-/// consequence its kind authorizes.
-///
-/// The classification is the authorization: the adapter accepts exactly two
-/// kinds and the application port branches on this enum rather than
-/// re-reading `observation_kind`, so a kind can never acquire a consequence
-/// it was not admitted for. Every other kind is refused before dispatch.
-#[derive(Clone, Debug)]
-pub enum NativeObservation<'call> {
-    /// [`NATIVE_FACT_PROMOTION_OBSERVATION_KIND`]: an explicitly authorized
-    /// Native promotion event.
-    ///
-    /// Receiving this variant is verification-only and does not by itself
-    /// authorize a fact write; the port re-runs Native validation and owns
-    /// the durable receipt.
-    FactPromotion(NativeObservationEnvelope<'call>),
-    /// [`NATIVE_STAGED_SESSION_OBSERVATION_KIND`]: a canonically settled host
-    /// session message the port stages as provider-local advisory state.
-    ///
-    /// Staging writes no canonical Native fact. A staged row can become an
-    /// accepted fact only through the separate, explicitly authorized
-    /// promotion path.
-    StagedSession(NativeObservationEnvelope<'call>),
-}
-
-impl<'call> NativeObservation<'call> {
-    /// The canonical envelope carried by whichever variant this is.
-    #[must_use]
-    pub const fn envelope(&self) -> &NativeObservationEnvelope<'call> {
-        match self {
-            Self::FactPromotion(envelope) | Self::StagedSession(envelope) => envelope,
-        }
-    }
-
-    /// The original admitted provider call.
-    #[must_use]
-    pub const fn call(&self) -> &'call ProviderCall {
-        self.envelope().call
-    }
-
-    /// Exact `observation_kind` from the canonical envelope.
-    #[must_use]
-    pub fn observation_kind(&self) -> &str {
-        self.envelope().observation_kind.as_str()
-    }
-
-    /// Exact `payload_contract` from the canonical envelope.
-    #[must_use]
-    pub fn payload_contract(&self) -> &str {
-        self.envelope().payload_contract.as_str()
-    }
-
-    /// Parsed `canonical_payload` from the canonical envelope.
-    #[must_use]
-    pub const fn canonical_payload(&self) -> &Value {
-        &self.envelope().canonical_payload
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObservationParseError {
-    Malformed,
-    UnknownKind,
-    KindContractMismatch,
-    UnsupportedKind,
-}
-
-impl ObservationParseError {
-    const fn terminal_code(self) -> TerminalCode {
-        match self {
-            Self::UnsupportedKind => TerminalCode::CapabilityUnsupported,
-            Self::Malformed | Self::UnknownKind | Self::KindContractMismatch => {
-                TerminalCode::InvalidRequest
-            }
-        }
-    }
-
-    const fn diagnostic_id(self) -> &'static str {
-        match self {
-            Self::Malformed => "native.observation_envelope_invalid",
-            Self::UnknownKind => "native.observation_kind_unknown",
-            Self::KindContractMismatch => "native.observation_kind_contract_mismatch",
-            Self::UnsupportedKind => "native.observation_unsupported",
-        }
-    }
-}
-
-/// Narrow application boundary implemented by the existing TraceDecay Native
-/// memory composition in M3.
-///
-/// The port owns Native authority and therefore constructs all Native terminal
-/// records, provenance, receipts, and exact-scope digests after dispatch. The
-/// adapter constructs only typed pre-dispatch rejections, with unknown effect
-/// generation and no fallback authority, and never opens or mutates Native
-/// persistence.
+/// The port answers only from upstream authorities and constructs all Native
+/// terminal records and exact-scope digests after dispatch. The adapter
+/// constructs only typed pre-dispatch rejections, with no fallback authority,
+/// and never opens or mutates Native persistence.
 pub trait NativeMemoryApplicationPort: Send + Sync + 'static {
     /// Returns the current real Native descriptor and capability set.
     fn descriptor(&self) -> ProviderDescriptor;
 
-    /// Performs the existing read-only Native compatibility handshake.
+    /// Performs the read-only Native compatibility handshake.
     fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse;
 
     /// Executes mandatory Native health without changing state.
     fn health(&self, call: &ProviderCall) -> ProviderReply;
 
-    /// Handles one admitted Native observation under Native authority.
-    ///
-    /// The adapter parses and classifies the provider-neutral envelope before
-    /// this method is called, so the implementation branches on the
-    /// [`NativeObservation`] variant rather than on a kind string. The
-    /// trusted application implementation must preserve owner, provenance,
-    /// trust, temporal state, idempotency, and receipts.
-    ///
-    /// [`NativeObservation::FactPromotion`] is verification-only and must not
-    /// imply a fact write; a separate authorized operation owns any canonical
-    /// Native mutation. [`NativeObservation::StagedSession`] does have a
-    /// durable consequence, but only in the port's own provider-local staged
-    /// store, and it must be committed before a success terminal is returned.
-    /// Neither variant writes a canonical Native fact from this path, and the
-    /// adapter itself still opens no persistence of any kind.
-    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply;
-
-    /// Executes existing Native recall and preserves Native ordering, scores,
-    /// evidence, temporal state, and provenance in the canonical payload.
+    /// Executes Native recall: an upstream canonical fact read, or an
+    /// explicitly requested upstream message search. Upstream ordering,
+    /// scores, and continuation are preserved in the canonical payload.
     fn recall(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Records one typed Native feedback operation.
-    ///
-    /// This port method is intentionally broader than the current generic
-    /// adapter projection. The adapter does not invoke it until a lossless
-    /// provider-local mapping is declared.
-    fn feedback(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Runs one typed Native maintenance operation.
-    fn maintenance(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Performs one typed redacted Native inspection.
-    fn inspection(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Applies one typed Native correction.
-    fn correction(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Deletes Native memory admitted under one typed source identity.
-    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Exports one typed Native snapshot.
-    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Restores one typed Native snapshot.
-    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply;
-
-    /// Applies one typed deterministic Native replay.
-    fn replay(&self, call: &ProviderCall) -> ProviderReply;
 }
 
 /// Provider-neutral TraceDecay Native adapter over one existing application
@@ -549,7 +353,7 @@ impl NativeProvider {
             return false;
         }
 
-        if !valid_effect_for_operation(call, reply)
+        if !valid_effect_for_operation(reply)
             || !valid_effect_generations(call, reply)
             || reply
                 .terminal
@@ -562,7 +366,7 @@ impl NativeProvider {
         match reply.terminal.terminal_code() {
             TerminalCode::Success | TerminalCode::SuccessZeroResults | TerminalCode::Partial => {
                 reply.payload.as_ref().is_some_and(|payload| {
-                    payload.contract_id.as_str() == canonical_result_contract_id(call.operation)
+                    Some(payload.contract_id.as_str()) == canonical_result_contract_id(call.operation)
                         && serde_json::from_slice::<Value>(&payload.bytes)
                             .is_ok_and(|value| value.is_object())
                 })
@@ -626,90 +430,15 @@ impl NativeProvider {
     }
 
     fn validate_payload_contract(&self, call: &ProviderCall) -> Option<ProviderReply> {
-        if call.payload.contract_id.as_str() != canonical_payload_contract_id(call.operation) {
+        if Some(call.payload.contract_id.as_str()) != canonical_payload_contract_id(call.operation)
+        {
             return Some(self.reject(
                 call,
                 TerminalCode::InvalidRequest,
-                if call.operation == ProviderOperation::Observe {
-                    "native.observation_contract_invalid"
-                } else {
-                    "native.payload_contract_invalid"
-                },
+                "native.payload_contract_invalid",
             ));
         }
         None
-    }
-
-    fn parse_observation<'call>(
-        call: &'call ProviderCall,
-    ) -> Result<NativeObservation<'call>, ObservationParseError> {
-        let envelope = parse_canonical_observation(&call.payload.bytes)?;
-        let object = envelope
-            .as_object()
-            .ok_or(ObservationParseError::Malformed)?;
-        if object.len() != 3
-            || object
-                .keys()
-                .any(|key| !OBSERVATION_ENVELOPE_FIELDS.contains(&key.as_str()))
-        {
-            return Err(ObservationParseError::Malformed);
-        }
-        let observation_kind = object
-            .get("observation_kind")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or(ObservationParseError::Malformed)?
-            .to_owned();
-        let payload_contract = object
-            .get("payload_contract")
-            .and_then(Value::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or(ObservationParseError::Malformed)?
-            .to_owned();
-        let canonical_payload = object
-            .get("canonical_payload")
-            .filter(|value| value.as_object().is_some_and(|payload| !payload.is_empty()))
-            .cloned()
-            .ok_or(ObservationParseError::Malformed)?;
-
-        let expected_payload_contract = match observation_kind.as_str() {
-            NATIVE_STAGED_SESSION_OBSERVATION_KIND => NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
-            "tool.execution_settled.v1" => "tracedecay.memory.observation.tool-execution.v1",
-            "source.edit_settled.v1" => "tracedecay.memory.observation.source-edit.v1",
-            "test.execution_settled.v1" => "tracedecay.memory.observation.test-execution.v1",
-            "diagnostic.observed.v1" => "tracedecay.memory.observation.diagnostic.v1",
-            "git.evidence_observed.v1" => "tracedecay.memory.observation.git-evidence.v1",
-            NATIVE_FACT_PROMOTION_OBSERVATION_KIND => NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-            "feedback.outcome_settled.v1" => "tracedecay.memory.observation.feedback-outcome.v1",
-            "automation.outcome_settled.v1" => {
-                "tracedecay.memory.observation.automation-outcome.v1"
-            }
-            _ => return Err(ObservationParseError::UnknownKind),
-        };
-        if payload_contract != expected_payload_contract {
-            return Err(ObservationParseError::KindContractMismatch);
-        }
-        // Only the session message has a provider-local staged projection.
-        // Fact promotion remains verification-only. Structured common
-        // observations need a distinct Native authority and stay unsupported
-        // until that mapping is implemented.
-        let staged = match observation_kind.as_str() {
-            NATIVE_FACT_PROMOTION_OBSERVATION_KIND => false,
-            NATIVE_STAGED_SESSION_OBSERVATION_KIND => true,
-            _ => return Err(ObservationParseError::UnsupportedKind),
-        };
-        let envelope = NativeObservationEnvelope {
-            call,
-            observation_kind,
-            payload_contract,
-            canonical_payload,
-        };
-
-        Ok(if staged {
-            NativeObservation::StagedSession(envelope)
-        } else {
-            NativeObservation::FactPromotion(envelope)
-        })
     }
 
     fn reject_handshake(
@@ -883,16 +612,6 @@ impl MemoryProvider for NativeProvider {
         if let Some(rejection) = self.validate_payload_contract(call) {
             return rejection;
         }
-        let observation = if call.operation == ProviderOperation::Observe {
-            match Self::parse_observation(call) {
-                Ok(observation) => Some(observation),
-                Err(error) => {
-                    return self.reject(call, error.terminal_code(), error.diagnostic_id());
-                }
-            }
-        } else {
-            None
-        };
         let _dispatch = self
             .dispatch_lock
             .lock()
@@ -923,267 +642,29 @@ impl MemoryProvider for NativeProvider {
             ProviderOperation::Health => {
                 self.validated_application_reply(call, self.port.health(call))
             }
-            ProviderOperation::Observe => match observation {
-                Some(observation) => {
-                    self.validated_application_reply(call, self.port.observe(observation))
-                }
-                None => self.reject(
-                    call,
-                    TerminalCode::ContractViolation,
-                    "native.observation_dispatch_missing",
-                ),
-            },
             ProviderOperation::Recall => {
                 self.validated_application_reply(call, self.port.recall(call))
             }
-            ProviderOperation::Feedback => {
-                self.validated_application_reply(call, self.port.feedback(call))
-            }
-            ProviderOperation::Maintenance => {
-                self.validated_application_reply(call, self.port.maintenance(call))
-            }
-            ProviderOperation::Inspection => {
-                self.validated_application_reply(call, self.port.inspection(call))
-            }
-            ProviderOperation::Correction => {
-                self.validated_application_reply(call, self.port.correction(call))
-            }
-            ProviderOperation::DeleteBySource => {
-                self.validated_application_reply(call, self.port.delete_by_source(call))
-            }
-            ProviderOperation::SnapshotExport => {
-                self.validated_application_reply(call, self.port.snapshot_export(call))
-            }
-            ProviderOperation::SnapshotRestore => {
-                self.validated_application_reply(call, self.port.snapshot_restore(call))
-            }
-            ProviderOperation::Replay => {
-                self.validated_application_reply(call, self.port.replay(call))
-            }
-            ProviderOperation::Handshake => self.reject(
+            // The projected descriptor declares no other capability, so the
+            // capability gate above refuses every other operation first.
+            _ => self.reject(
                 call,
-                TerminalCode::InvalidRequest,
-                "native.operation_dispatch_unreachable",
+                TerminalCode::CapabilityUnsupported,
+                "native.capability_unsupported",
             ),
         }
     }
 }
 
-fn valid_effect_for_operation(call: &ProviderCall, reply: &ProviderReply) -> bool {
-    let state = reply.terminal.committed_effect().state();
-    if !call.operation.mutates_provider_state() {
-        return state == tracedecay_memory_provider_api::contract::CommittedEffectState::None;
-    }
-
-    match reply.terminal.terminal_code() {
-        TerminalCode::Success => matches!(
-            state,
-            tracedecay_memory_provider_api::contract::CommittedEffectState::None
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Committed
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Duplicate
-        ),
-        // A mutating operation may complete with no effect, a committed
-        // effect, or a duplicate acknowledgement under `success`, but these
-        // read/query terminals cannot stand in for that operation-specific
-        // settlement.
-        TerminalCode::SuccessZeroResults | TerminalCode::Partial => false,
-        TerminalCode::PartialEffect => {
-            state == tracedecay_memory_provider_api::contract::CommittedEffectState::Partial
-        }
-        TerminalCode::EffectUnknown => {
-            state == tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
-        }
-        TerminalCode::DeadlineExceeded | TerminalCode::Cancelled => matches!(
-            state,
-            tracedecay_memory_provider_api::contract::CommittedEffectState::None
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Partial
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
-        ),
-        TerminalCode::ProviderUnavailable => matches!(
-            state,
-            tracedecay_memory_provider_api::contract::CommittedEffectState::None
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
-        ),
-        TerminalCode::ContractViolation | TerminalCode::InternalFailure => matches!(
-            state,
-            tracedecay_memory_provider_api::contract::CommittedEffectState::None
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Partial
-                | tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown
-        ),
-        _ => state == tracedecay_memory_provider_api::contract::CommittedEffectState::None,
-    }
+/// Native operations are reads: no dispatched reply may claim an effect.
+fn valid_effect_for_operation(reply: &ProviderReply) -> bool {
+    reply.terminal.committed_effect().state() == CommittedEffectState::None
 }
 
 fn valid_effect_generations(call: &ProviderCall, reply: &ProviderReply) -> bool {
     let effect = reply.terminal.committed_effect();
-    if effect.state() == tracedecay_memory_provider_api::contract::CommittedEffectState::Unknown {
-        // Unknown evidence intentionally carries no generation claim. Its
-        // receipt and reconciliation action are the witness retained for
-        // later inspection, so requiring `Some` here would erase the only
-        // truthful effect state the provider can report after uncertainty.
-        return true;
-    }
     effect.state_generation_before() == Some(call.expected_state_generation)
         && effect.state_generation_after() == Some(reply.state_generation)
-}
-
-fn parse_canonical_observation(bytes: &[u8]) -> Result<Value, ObservationParseError> {
-    let envelope =
-        serde_json::from_slice::<Value>(bytes).map_err(|_| ObservationParseError::Malformed)?;
-    if json_has_duplicate_object_keys(bytes).map_err(|_| ObservationParseError::Malformed)? {
-        return Err(ObservationParseError::Malformed);
-    }
-    let canonical = serde_json::to_vec(&envelope).map_err(|_| ObservationParseError::Malformed)?;
-    if canonical.as_slice() != bytes || contains_floating_number(&envelope) {
-        return Err(ObservationParseError::Malformed);
-    }
-    Ok(envelope)
-}
-
-fn contains_floating_number(value: &Value) -> bool {
-    match value {
-        Value::Number(number) => number.as_i64().is_none() && number.as_u64().is_none(),
-        Value::Array(values) => values.iter().any(contains_floating_number),
-        Value::Object(values) => values.values().any(contains_floating_number),
-        Value::Null | Value::Bool(_) | Value::String(_) => false,
-    }
-}
-
-fn json_has_duplicate_object_keys(bytes: &[u8]) -> Result<bool, ()> {
-    let mut scanner = JsonKeyScanner {
-        bytes,
-        index: 0,
-        duplicated: false,
-    };
-    scanner.parse_value()?;
-    scanner.skip_whitespace();
-    if scanner.index != bytes.len() {
-        return Err(());
-    }
-    Ok(scanner.duplicated)
-}
-
-struct JsonKeyScanner<'bytes> {
-    bytes: &'bytes [u8],
-    index: usize,
-    duplicated: bool,
-}
-
-impl JsonKeyScanner<'_> {
-    fn parse_value(&mut self) -> Result<(), ()> {
-        self.skip_whitespace();
-        match self.bytes.get(self.index).copied() {
-            Some(b'{') => self.parse_object(),
-            Some(b'[') => self.parse_array(),
-            Some(b'"') => self.parse_string().map(|_| ()),
-            Some(b'-' | b'0'..=b'9' | b't' | b'f' | b'n') => self.parse_atom(),
-            _ => Err(()),
-        }
-    }
-
-    fn parse_object(&mut self) -> Result<(), ()> {
-        self.consume(b'{')?;
-        self.skip_whitespace();
-        if self.consume_if(b'}') {
-            return Ok(());
-        }
-
-        let mut keys = BTreeSet::new();
-        loop {
-            self.skip_whitespace();
-            let key_literal = self.parse_string()?;
-            let key = serde_json::from_slice::<String>(key_literal).map_err(|_| ())?;
-            if !keys.insert(key) {
-                self.duplicated = true;
-            }
-            self.skip_whitespace();
-            self.consume(b':')?;
-            self.parse_value()?;
-            self.skip_whitespace();
-            if self.consume_if(b'}') {
-                return Ok(());
-            }
-            self.consume(b',')?;
-        }
-    }
-
-    fn parse_array(&mut self) -> Result<(), ()> {
-        self.consume(b'[')?;
-        self.skip_whitespace();
-        if self.consume_if(b']') {
-            return Ok(());
-        }
-        loop {
-            self.parse_value()?;
-            self.skip_whitespace();
-            if self.consume_if(b']') {
-                return Ok(());
-            }
-            self.consume(b',')?;
-        }
-    }
-
-    fn parse_atom(&mut self) -> Result<(), ()> {
-        let start = self.index;
-        while let Some(byte) = self.bytes.get(self.index).copied() {
-            if matches!(
-                byte,
-                b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}' | b':'
-            ) {
-                break;
-            }
-            self.index = self.index.saturating_add(1);
-        }
-        (self.index > start).then_some(()).ok_or(())
-    }
-
-    fn parse_string(&mut self) -> Result<&[u8], ()> {
-        let start = self.index;
-        self.consume(b'"')?;
-        loop {
-            match self.bytes.get(self.index).copied() {
-                Some(b'"') => {
-                    self.index = self.index.saturating_add(1);
-                    return Ok(&self.bytes[start..self.index]);
-                }
-                Some(b'\\') => {
-                    self.index = self.index.saturating_add(2);
-                    if self.index > self.bytes.len() {
-                        return Err(());
-                    }
-                }
-                Some(byte) if byte < 0x20 => return Err(()),
-                Some(_) => self.index = self.index.saturating_add(1),
-                None => return Err(()),
-            }
-        }
-    }
-
-    fn skip_whitespace(&mut self) {
-        while matches!(
-            self.bytes.get(self.index),
-            Some(b' ' | b'\t' | b'\n' | b'\r')
-        ) {
-            self.index = self.index.saturating_add(1);
-        }
-    }
-
-    fn consume(&mut self, expected: u8) -> Result<(), ()> {
-        if self.consume_if(expected) {
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-
-    fn consume_if(&mut self, expected: u8) -> bool {
-        if self.bytes.get(self.index) == Some(&expected) {
-            self.index = self.index.saturating_add(1);
-            true
-        } else {
-            false
-        }
-    }
 }
 
 fn project_descriptor(mut descriptor: ProviderDescriptor) -> ProviderDescriptor {
@@ -1219,36 +700,18 @@ fn is_lowercase_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-const fn canonical_payload_contract_id(operation: ProviderOperation) -> &'static str {
+const fn canonical_payload_contract_id(operation: ProviderOperation) -> Option<&'static str> {
     match operation {
-        ProviderOperation::Handshake => HANDSHAKE_CONTRACT_ID,
-        ProviderOperation::Health => HEALTH_CONTRACT_ID,
-        ProviderOperation::Observe => OBSERVATION_CONTRACT_ID,
-        ProviderOperation::Recall => RECALL_CONTRACT_ID,
-        ProviderOperation::Feedback => FEEDBACK_CONTRACT_ID,
-        ProviderOperation::Maintenance => MAINTENANCE_CONTRACT_ID,
-        ProviderOperation::Inspection => INSPECTION_CONTRACT_ID,
-        ProviderOperation::Correction => CORRECTION_CONTRACT_ID,
-        ProviderOperation::DeleteBySource => DELETE_BY_SOURCE_CONTRACT_ID,
-        ProviderOperation::SnapshotExport => SNAPSHOT_EXPORT_CONTRACT_ID,
-        ProviderOperation::SnapshotRestore => SNAPSHOT_RESTORE_CONTRACT_ID,
-        ProviderOperation::Replay => REPLAY_CONTRACT_ID,
+        ProviderOperation::Health => Some(HEALTH_CONTRACT_ID),
+        ProviderOperation::Recall => Some(RECALL_CONTRACT_ID),
+        _ => None,
     }
 }
 
-const fn canonical_result_contract_id(operation: ProviderOperation) -> &'static str {
+const fn canonical_result_contract_id(operation: ProviderOperation) -> Option<&'static str> {
     match operation {
-        ProviderOperation::Handshake => HANDSHAKE_CONTRACT_ID,
-        ProviderOperation::Health => HEALTH_CONTRACT_ID,
-        ProviderOperation::Observe => OBSERVATION_CONTRACT_ID,
-        ProviderOperation::Recall => RECALL_RESULT_CONTRACT_ID,
-        ProviderOperation::Feedback => "tracedecay.memory.feedback.record.outcome.v1",
-        ProviderOperation::Maintenance => "tracedecay.memory.maintenance.run.outcome.v1",
-        ProviderOperation::Inspection => "tracedecay.memory.inspection.read.outcome.v1",
-        ProviderOperation::Correction => "tracedecay.memory.correction.apply.outcome.v1",
-        ProviderOperation::DeleteBySource => "tracedecay.memory.deletion.by_source.outcome.v1",
-        ProviderOperation::SnapshotExport => "tracedecay.memory.snapshot.export.outcome.v1",
-        ProviderOperation::SnapshotRestore => "tracedecay.memory.snapshot.restore.outcome.v1",
-        ProviderOperation::Replay => "tracedecay.memory.replay.apply.outcome.v1",
+        ProviderOperation::Health => Some(HEALTH_CONTRACT_ID),
+        ProviderOperation::Recall => Some(RECALL_RESULT_CONTRACT_ID),
+        _ => None,
     }
 }

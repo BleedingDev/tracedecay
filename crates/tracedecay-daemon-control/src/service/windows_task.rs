@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use tracedecay_domain::errors::{Result, TraceDecayError};
 
-use super::{DaemonServiceSpec, DaemonServiceState, ServiceNamespace, xml_escape, xml_unescape};
+use super::{DaemonServiceSpec, DaemonServiceState, xml_escape, xml_unescape};
 
 #[cfg(any(windows, test))]
 const TASK_NAME_PREFIX: &str = "TraceDecay Daemon";
@@ -86,7 +86,6 @@ struct TaskIdentity {
     #[cfg(any(windows, test))]
     package_id: WindowsPackageId,
     user_sid: String,
-    namespace: ServiceNamespace,
     task_name: String,
     task_path: String,
     #[cfg(any(windows, test))]
@@ -95,11 +94,6 @@ struct TaskIdentity {
 
 impl TaskIdentity {
     fn current() -> Result<Self> {
-        let namespace = ServiceNamespace::current()?;
-        Self::current_for_namespace(&namespace)
-    }
-
-    fn current_for_namespace(namespace: &ServiceNamespace) -> Result<Self> {
         #[cfg(windows)]
         {
             let package_id = std::env::current_exe()
@@ -110,11 +104,10 @@ impl TaskIdentity {
                 .map_err(|error| TraceDecayError::Config {
                     message: format!("could not determine current Windows user SID: {error}"),
                 })?;
-            Self::for_package_user_sid_in_namespace(package_id, &user_sid, namespace)
+            Self::for_package_user_sid(package_id, &user_sid)
         }
         #[cfg(not(windows))]
         {
-            let _ = namespace;
             Err(TraceDecayError::Config {
                 message: "Windows Task Scheduler identity is unavailable on this platform"
                     .to_string(),
@@ -129,15 +122,6 @@ impl TaskIdentity {
 
     #[cfg(any(windows, test))]
     fn for_package_user_sid(package_id: WindowsPackageId, user_sid: &str) -> Result<Self> {
-        Self::for_package_user_sid_in_namespace(package_id, user_sid, &ServiceNamespace::stable())
-    }
-
-    #[cfg(any(windows, test))]
-    fn for_package_user_sid_in_namespace(
-        package_id: WindowsPackageId,
-        user_sid: &str,
-        namespace: &ServiceNamespace,
-    ) -> Result<Self> {
         let mut components = user_sid.split('-');
         let valid = components.next() == Some("S")
             && components.clone().count() >= 2
@@ -149,14 +133,10 @@ impl TaskIdentity {
                 message: format!("current Windows user SID '{user_sid}' is not canonical"),
             });
         }
-        let task_name = namespace.suffix().map_or_else(
-            || format!("{} ({user_sid})", package_id.task_name_prefix()),
-            |suffix| format!("{} [{suffix}] ({user_sid})", package_id.task_name_prefix()),
-        );
+        let task_name = format!("{} ({user_sid})", package_id.task_name_prefix());
         Ok(Self {
             package_id,
             user_sid: user_sid.to_string(),
-            namespace: namespace.clone(),
             task_path: format!(r"\{task_name}"),
             task_name,
             sddl: format!("O:{user_sid}D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})"),
@@ -229,10 +209,6 @@ struct ScoopServiceState {
     task_xml: String,
     action: ScoopTaskAction,
     profile_root: PathBuf,
-    #[serde(default)]
-    global_db: Option<PathBuf>,
-    #[serde(default)]
-    socket_path: Option<PathBuf>,
     enabled: bool,
     running: bool,
 }
@@ -246,23 +222,15 @@ impl ScoopServiceState {
         task_xml: String,
         task_sddl: String,
     ) -> Result<Self> {
-        validate_task_namespace_metadata(&task_xml, &identity.namespace)?;
         if !task_definition_is_owned(&task_xml, &task_sddl, identity) {
             return Err(foreign_task(identity));
         }
-        let action = task_action_from_xml(&task_xml)
-            .ok_or_else(|| invalid_state("task XML has no exact executable action"))?;
+        let action = task_action_from_xml(&task_xml).ok_or_else(|| foreign_task(identity))?;
         if package_id_from_executable(&action.executable) != Some(package_id) {
-            return Err(invalid_state(
-                "task action executable does not match the selected Scoop package",
-            ));
+            return Err(foreign_task(identity));
         }
-        let (profile_root, global_db, socket_path) =
-            task_paths_from_xml(&task_xml, &identity.namespace).map_err(|error| {
-                TraceDecayError::Config {
-                    message: format!("invalid Scoop service task paths: {error}"),
-                }
-            })?;
+        let profile_root =
+            profile_root_from_task_xml(&task_xml).ok_or_else(|| foreign_task(identity))?;
         Ok(Self {
             schema: SCOOP_STATE_SCHEMA.to_string(),
             package_id,
@@ -273,8 +241,6 @@ impl ScoopServiceState {
             task_xml,
             action,
             profile_root,
-            global_db: Some(global_db),
-            socket_path: Some(socket_path),
             enabled: snapshot.enabled,
             running: snapshot.running,
         })
@@ -309,33 +275,12 @@ impl ScoopServiceState {
                 "task action does not match the snapshotted package action",
             ));
         }
-        let (profile_root, global_db, socket_path) =
-            task_paths_from_xml(&self.task_xml, &identity.namespace)
-                .map_err(|_| invalid_state("task profile metadata is malformed"))?;
-        if profile_root != self.profile_root {
+        if profile_root_from_task_xml(&self.task_xml).as_ref() != Some(&self.profile_root) {
             return Err(invalid_state(
                 "task profile does not match the snapshotted profile",
             ));
         }
-        if global_db != self.global_db_path() || socket_path != self.socket_path() {
-            return Err(invalid_state(
-                "task global database or socket does not match the snapshotted service identity",
-            ));
-        }
         Ok(())
-    }
-
-    fn global_db_path(&self) -> PathBuf {
-        self.global_db.clone().unwrap_or_else(|| {
-            self.profile_root
-                .join(tracedecay_runtime_core::config::GLOBAL_DB_FILENAME)
-        })
-    }
-
-    fn socket_path(&self) -> PathBuf {
-        self.socket_path
-            .clone()
-            .unwrap_or_else(|| self.profile_root.join("daemon.sock"))
     }
 
     #[hotpath::skip]
@@ -473,89 +418,36 @@ impl DaemonControlApi for NativeDaemonControl {
     }
 }
 
-pub(super) fn task_name_for(namespace: &ServiceNamespace) -> Result<String> {
-    Ok(TaskIdentity::current_for_namespace(namespace)?.task_name)
+pub(super) fn task_name() -> Result<String> {
+    Ok(TaskIdentity::current()?.task_name)
 }
 
-pub(super) fn task_path_for(namespace: &ServiceNamespace) -> Result<PathBuf> {
-    Ok(PathBuf::from(
-        TaskIdentity::current_for_namespace(namespace)?.task_path,
-    ))
+pub(super) fn task_path() -> Result<PathBuf> {
+    Ok(PathBuf::from(TaskIdentity::current()?.task_path))
 }
 
-pub(super) fn render_task_xml_for_namespace(
-    spec: &DaemonServiceSpec,
-    namespace: &ServiceNamespace,
-) -> Result<String> {
-    let profile_root = super::service_data_dir(spec)?;
-    let global_db = super::service_global_db_path(spec, &profile_root)?;
-    let socket_path = if spec.socket_path.is_absolute() {
-        spec.socket_path.clone()
-    } else {
-        profile_root.join("daemon.sock")
-    };
-    render_task_xml_for_paths(
-        spec,
-        &TaskIdentity::current_for_namespace(namespace)?,
-        profile_root,
-        global_db,
-        socket_path,
-    )
+pub(super) fn render_task_xml(spec: &DaemonServiceSpec) -> Result<String> {
+    render_task_xml_for(spec, &TaskIdentity::current()?)
 }
 
-#[cfg(test)]
 fn render_task_xml_for(spec: &DaemonServiceSpec, identity: &TaskIdentity) -> Result<String> {
-    let profile_root = super::service_data_dir(spec)?;
-    let global_db = super::service_global_db_path(spec, &profile_root)?;
-    let socket_path = if spec.socket_path.is_absolute() {
-        spec.socket_path.clone()
-    } else {
-        profile_root.join("daemon.sock")
-    };
-    render_task_xml_for_paths(spec, identity, profile_root, global_db, socket_path)
-}
-
-fn render_task_xml_for_paths(
-    spec: &DaemonServiceSpec,
-    identity: &TaskIdentity,
-    profile_root: PathBuf,
-    global_db: PathBuf,
-    socket_path: PathBuf,
-) -> Result<String> {
     validate_task_remote_tls(spec.remote_tls.as_ref())?;
+    let profile_root = match &spec.data_dir_override {
+        Some(profile_root) => profile_root.clone(),
+        None => super::tracedecay_data_dir()?,
+    };
     #[cfg(windows)]
     let profile_root = fully_qualified_windows_path(&profile_root, "daemon profile root")?;
-    #[cfg(windows)]
-    let global_db = fully_qualified_windows_path(&global_db, "daemon global database")?;
-    #[cfg(windows)]
-    let socket_path = fully_qualified_windows_path(&socket_path, "daemon socket")?;
     #[cfg(windows)]
     let executable_path = fully_qualified_windows_path(&spec.tracedecay_bin, "daemon executable")?;
     #[cfg(not(windows))]
     let executable_path = spec.tracedecay_bin.clone();
     let executable_text = windows_path_text(&executable_path, "daemon executable")?;
-    let profile_text = windows_path_text(&profile_root, "daemon profile root")?;
-    let global_text = windows_path_text(&global_db, "daemon global database")?;
-    let socket_text = windows_path_text(&socket_path, "daemon socket")?;
     validate_task_command_text(executable_text)?;
-    for (description, value) in [
-        ("daemon profile root", profile_text),
-        ("daemon global database", global_text),
-        ("daemon socket", socket_text),
-    ] {
-        if value.chars().any(char::is_control) {
-            return Err(TraceDecayError::Config {
-                message: format!(
-                    "Windows Task Scheduler {description} path contains a control character"
-                ),
-            });
-        }
-    }
     let executable = xml_escape(executable_text);
     let mut arguments = format!(
-        "daemon run --profile-root {} --socket {}",
-        quote_windows_argument(profile_text),
-        quote_windows_argument(socket_text),
+        "daemon run --profile-root {}",
+        quote_windows_argument(windows_path_text(&profile_root, "daemon profile root")?)
     );
     if let Some(remote_tls) = &spec.remote_tls {
         arguments.push_str(" --remote-listen ");
@@ -573,19 +465,12 @@ fn render_task_xml_for_paths(
     }
     let arguments = xml_escape(&arguments);
     let user_sid = xml_escape(&identity.user_sid);
-    let namespace = xml_escape(identity.namespace.suffix().unwrap_or("stable"));
-    let description = format!(
-        "TraceDecay daemon\nTRACEDECAY_NAMESPACE={namespace}\nTRACEDECAY_DATA_DIR={}\nTRACEDECAY_GLOBAL_DB={}\nTRACEDECAY_SOCKET={}",
-        xml_escape(profile_text),
-        xml_escape(global_text),
-        xml_escape(socket_text),
-    );
 
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
-    <Description>{description}</Description>
+    <Description>TraceDecay daemon</Description>
   </RegistrationInfo>
   <Triggers>
     <LogonTrigger>
@@ -676,7 +561,6 @@ fn validate_task_command_text(command: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
 pub(super) fn profile_root_from_task_xml(xml: &str) -> Option<PathBuf> {
     let arguments = xml_element_text(xml, "Arguments")?;
     let arguments = xml_unescape(arguments);
@@ -691,208 +575,6 @@ pub(super) fn profile_root_from_task_xml(xml: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn task_metadata_value(xml: &str, name: &str) -> Option<String> {
-    task_metadata_value_result(xml, name).ok().flatten()
-}
-
-fn task_metadata_value_result(xml: &str, name: &str) -> Result<Option<String>> {
-    let Some(description) = xml_element_text(xml, "Description") else {
-        return Ok(None);
-    };
-    let prefix = format!("{name}=");
-    let mut value = None;
-    for line in description.lines() {
-        let Some(assignment_value) = line.strip_prefix(&prefix).map(xml_unescape) else {
-            continue;
-        };
-        if value.is_some() {
-            return Err(TraceDecayError::Config {
-                message: format!("installed Windows daemon task repeats metadata {name}"),
-            });
-        }
-        value = Some(assignment_value);
-    }
-    Ok(value)
-}
-
-pub(super) fn task_namespace_from_xml(xml: &str) -> Option<String> {
-    task_metadata_value(xml, "TRACEDECAY_NAMESPACE")
-}
-
-fn validate_task_namespace_metadata(xml: &str, namespace: &ServiceNamespace) -> Result<()> {
-    let persisted = task_metadata_value_result(xml, "TRACEDECAY_NAMESPACE")?;
-    let expected = namespace.suffix().unwrap_or("stable");
-    let matches_namespace = if namespace.suffix().is_some() {
-        persisted.as_deref() == Some(expected)
-    } else {
-        persisted.is_none_or(|value| value == expected)
-    };
-    if !matches_namespace {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "installed Windows daemon task namespace metadata does not match selected service namespace '{expected}'"
-            ),
-        });
-    }
-    Ok(())
-}
-
-pub(super) fn task_environment_value_from_xml(xml: &str, name: &str) -> Result<Option<String>> {
-    task_metadata_value_result(xml, name)
-}
-
-pub(super) fn socket_path_from_task_xml(xml: &str) -> Option<PathBuf> {
-    task_metadata_value(xml, "TRACEDECAY_SOCKET")
-        .map(PathBuf::from)
-        .or_else(|| {
-            let arguments = xml_element_text(xml, "Arguments")?;
-            let arguments = xml_unescape(arguments);
-            let tokens = windows_argument_tokens(&arguments).ok()?;
-            let mut tokens = tokens.iter();
-            while let Some(token) = tokens.next() {
-                if token == "--socket" {
-                    return tokens.next().map(PathBuf::from);
-                }
-                if let Some(value) = token.strip_prefix("--socket=") {
-                    return Some(PathBuf::from(value));
-                }
-            }
-            None
-        })
-}
-
-pub(super) fn task_paths_from_xml(
-    xml: &str,
-    namespace: &ServiceNamespace,
-) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let profile_root = task_argument_path_from_xml(xml, "--profile-root")?.ok_or_else(|| {
-        TraceDecayError::Config {
-            message: "installed Windows daemon task has no profile root".to_string(),
-        }
-    })?;
-    let task_namespace = task_metadata_value_result(xml, "TRACEDECAY_NAMESPACE")?;
-    let persisted_profile =
-        task_metadata_value_result(xml, "TRACEDECAY_DATA_DIR")?.map(PathBuf::from);
-    let persisted_global =
-        task_metadata_value_result(xml, "TRACEDECAY_GLOBAL_DB")?.map(PathBuf::from);
-    let persisted_socket = task_metadata_value_result(xml, "TRACEDECAY_SOCKET")?.map(PathBuf::from);
-    let action_socket = task_argument_path_from_xml(xml, "--socket")?;
-    let has_metadata = task_namespace.is_some()
-        || persisted_profile.is_some()
-        || persisted_global.is_some()
-        || persisted_socket.is_some();
-    if namespace.suffix().is_some()
-        && (task_namespace.is_none()
-            || persisted_profile.is_none()
-            || persisted_global.is_none()
-            || persisted_socket.is_none())
-    {
-        return Err(TraceDecayError::Config {
-            message:
-                "installed namespaced Windows daemon task has no persisted service profile metadata"
-                    .to_string(),
-        });
-    }
-    if let Some(task_namespace) = task_namespace
-        && task_namespace != namespace.suffix().unwrap_or("stable")
-    {
-        return Err(TraceDecayError::Config {
-            message: "installed Windows daemon task namespace does not match the selected service namespace".to_string(),
-        });
-    }
-    if has_metadata
-        && (persisted_profile.is_none() || persisted_global.is_none() || persisted_socket.is_none())
-    {
-        return Err(TraceDecayError::Config {
-            message:
-                "installed Windows daemon task has incomplete persisted service profile metadata"
-                    .to_string(),
-        });
-    }
-    if let Some(persisted_profile) = persisted_profile.as_ref()
-        && !task_paths_match(persisted_profile, &profile_root)
-    {
-        return Err(TraceDecayError::Config {
-            message: "installed Windows daemon task profile metadata does not match --profile-root"
-                .to_string(),
-        });
-    }
-    if let (Some(persisted_socket), Some(action_socket)) =
-        (persisted_socket.as_ref(), action_socket.as_ref())
-        && !task_paths_match(persisted_socket, action_socket)
-    {
-        return Err(TraceDecayError::Config {
-            message: "installed Windows daemon task socket metadata does not match --socket"
-                .to_string(),
-        });
-    }
-    if persisted_socket.is_some() && action_socket.is_none() {
-        return Err(TraceDecayError::Config {
-            message: "installed Windows daemon task socket metadata has no --socket action"
-                .to_string(),
-        });
-    }
-    let global_db = persisted_global
-        .unwrap_or_else(|| profile_root.join(tracedecay_runtime_core::config::GLOBAL_DB_FILENAME));
-    let socket_path = persisted_socket
-        .or(action_socket)
-        .unwrap_or_else(|| profile_root.join("daemon.sock"));
-    #[cfg(windows)]
-    for (description, path) in [
-        ("daemon profile root", &profile_root),
-        ("daemon global database", &global_db),
-        ("daemon socket", &socket_path),
-    ] {
-        fully_qualified_windows_path(path, description)?;
-    }
-    Ok((profile_root, global_db, socket_path))
-}
-
-fn task_argument_path_from_xml(xml: &str, argument_name: &str) -> Result<Option<PathBuf>> {
-    let Some(arguments) = xml_element_text(xml, "Arguments") else {
-        return Ok(None);
-    };
-    let arguments = xml_unescape(arguments);
-    let tokens = windows_argument_tokens(&arguments)?;
-    let mut value = None;
-    let mut tokens = tokens.iter();
-    while let Some(token) = tokens.next() {
-        let candidate: Option<&str> = if token == argument_name {
-            Some(
-                tokens
-                    .next()
-                    .ok_or_else(|| TraceDecayError::Config {
-                        message: format!(
-                            "installed Windows daemon task is missing a value for {argument_name}"
-                        ),
-                    })?
-                    .as_str(),
-            )
-        } else {
-            token.strip_prefix(&format!("{argument_name}="))
-        };
-        let Some(candidate) = candidate else {
-            continue;
-        };
-        if value.is_some() {
-            return Err(TraceDecayError::Config {
-                message: format!("installed Windows daemon task repeats {argument_name}"),
-            });
-        }
-        value = Some(PathBuf::from(candidate));
-    }
-    Ok(value)
-}
-
-fn task_paths_match(left: &Path, right: &Path) -> bool {
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
 }
 
 pub(super) fn remote_tls_from_task_xml(xml: &str) -> Result<Option<crate::RemoteBrainTlsConfig>> {
@@ -1165,87 +847,75 @@ fn secure_path_error(operation: &str, path: &Path, error: std::io::Error) -> Tra
     }
 }
 
-pub(super) fn task_exists_for(namespace: &ServiceNamespace) -> Result<bool> {
-    with_platform_api_for(namespace, |api| Ok(api.snapshot()?.is_some()))
+pub(super) fn task_exists() -> Result<bool> {
+    with_platform_api(|api| Ok(api.snapshot()?.is_some()))
 }
 
-pub(super) fn service_state_for(namespace: &ServiceNamespace) -> Result<DaemonServiceState> {
-    with_platform_api_for(namespace, |api| Ok(state_from_snapshot(api.snapshot()?)))
+pub(super) fn service_state() -> Result<DaemonServiceState> {
+    with_platform_api(|api| Ok(state_from_snapshot(api.snapshot()?)))
 }
 
-pub(super) fn register_task_xml_for(namespace: &ServiceNamespace, xml: &str) -> Result<()> {
-    with_platform_api_for(namespace, |api| register_task_xml_with(api, xml))
+pub(super) fn register_task_xml(xml: &str) -> Result<()> {
+    with_platform_api(|api| register_task_xml_with(api, xml))
 }
 
-pub(super) fn registered_task_xml_for(namespace: &ServiceNamespace) -> Result<Option<String>> {
-    with_platform_api_for(namespace, |api| api.registered_xml())
+pub(super) fn registered_task_xml() -> Result<Option<String>> {
+    with_platform_api(|api| api.registered_xml())
 }
 
-pub(super) fn apply_state_for(
-    namespace: &ServiceNamespace,
-    state: DaemonServiceState,
-    expected_version: &str,
-) -> Result<()> {
+pub(super) fn apply_state(state: DaemonServiceState, expected_version: &str) -> Result<()> {
     #[cfg(any(windows, test))]
     {
         if state == DaemonServiceState::Missing {
-            return with_platform_api_for(namespace, delete_with);
+            return with_platform_api(delete_with);
         }
-        with_platform_control_api_for(namespace, expected_version, |api, control| {
+        with_platform_control_api(expected_version, |api, control| {
             apply_managed_state_with(api, control, state)
         })
     }
     #[cfg(not(any(windows, test)))]
     {
-        let _ = (namespace, state, expected_version);
+        let _ = (state, expected_version);
         control_api_unavailable()
     }
 }
 
-pub(super) fn start_for(namespace: &ServiceNamespace, expected_version: &str) -> Result<()> {
+pub(super) fn start(expected_version: &str) -> Result<()> {
     #[cfg(any(windows, test))]
     {
-        with_platform_control_api_for(namespace, expected_version, start_managed_with)
+        with_platform_control_api(expected_version, start_managed_with)
     }
     #[cfg(not(any(windows, test)))]
     {
-        let _ = (namespace, expected_version);
+        let _ = expected_version;
         control_api_unavailable()
     }
 }
 
-pub(super) fn stop_for(namespace: &ServiceNamespace, expected_version: &str) -> Result<()> {
+pub(super) fn stop(expected_version: &str) -> Result<()> {
     #[cfg(any(windows, test))]
     {
-        with_platform_control_api_for(namespace, expected_version, stop_managed_with)
+        with_platform_control_api(expected_version, stop_managed_with)
     }
     #[cfg(not(any(windows, test)))]
     {
-        let _ = (namespace, expected_version);
+        let _ = expected_version;
         control_api_unavailable()
     }
 }
 
-pub(super) fn deactivate_for(namespace: &ServiceNamespace, expected_version: &str) -> Result<()> {
+pub(super) fn deactivate(expected_version: &str) -> Result<()> {
     #[cfg(any(windows, test))]
     {
-        with_platform_control_api_for(namespace, expected_version, |api, control| {
+        with_platform_control_api(expected_version, |api, control| {
             apply_managed_state_with(api, control, DaemonServiceState::StoppedDisabled)
         })
     }
     #[cfg(not(any(windows, test)))]
     {
-        let _ = (namespace, expected_version);
+        let _ = expected_version;
         control_api_unavailable()
     }
-}
-
-pub(super) fn delete_for(namespace: &ServiceNamespace) -> Result<()> {
-    with_platform_api_for(namespace, delete_with)
-}
-
-pub(super) fn rollback_new_registration_for(namespace: &ServiceNamespace) -> Result<()> {
-    with_platform_api_for(namespace, |api| rollback_registration_with(api, None, None))
 }
 
 #[cfg(not(any(windows, test)))]
@@ -1253,6 +923,14 @@ fn control_api_unavailable<T>() -> Result<T> {
     Err(TraceDecayError::Config {
         message: "Windows Task Scheduler is unavailable on this platform".to_string(),
     })
+}
+
+pub(super) fn delete() -> Result<()> {
+    with_platform_api(delete_with)
+}
+
+pub(super) fn rollback_new_registration() -> Result<()> {
+    with_platform_api(|api| rollback_registration_with(api, None, None))
 }
 
 pub(super) fn prepare_scoop_package_service(
@@ -1334,7 +1012,7 @@ fn prepare_scoop_package_service_windows(
         write_scoop_state(state_file, &state)?;
 
         let mut control = NativeDaemonControl {
-            transport_hint: state.socket_path(),
+            transport_hint: state.profile_root.join("daemon.sock"),
             expected_version: expected_version.to_owned(),
             clock_origin: std::time::Instant::now(),
         };
@@ -1398,21 +1076,17 @@ fn restore_scoop_package_service_windows(
     let restored_xml = replace_task_action_executable(&state.task_xml, &layout.executable)?;
     let restored_action = task_action_from_xml(&restored_xml)
         .ok_or_else(|| invalid_state("restored task XML has no executable action"))?;
-    let (restored_profile, restored_global_db, restored_socket) =
-        task_paths_from_xml(&restored_xml, &identity.namespace)?;
     if restored_action.arguments != state.action.arguments
-        || restored_profile != state.profile_root
-        || restored_global_db != state.global_db_path()
-        || restored_socket != state.socket_path()
+        || profile_root_from_task_xml(&restored_xml).as_ref() != Some(&state.profile_root)
     {
         return Err(invalid_state(
-            "restored task action or service paths differ from the snapshot",
+            "restored task action or profile differs from the snapshot",
         ));
     }
 
     with_platform_api_for_package(package_id, |api| {
         let mut control = NativeDaemonControl {
-            transport_hint: state.socket_path(),
+            transport_hint: state.profile_root.join("daemon.sock"),
             expected_version: expected_version.to_owned(),
             clock_origin: std::time::Instant::now(),
         };
@@ -1467,7 +1141,7 @@ fn restore_scoop_package_service_windows(
             DaemonServiceState::StoppedDisabled
         };
         apply_state_with(api, stopped_state)?;
-        verify_restored_task(api, &state, &layout, &identity.namespace, stopped_state)?;
+        verify_restored_task(api, &state, &layout, stopped_state)?;
         drop(lifecycle_lease);
 
         if state.running {
@@ -1484,13 +1158,7 @@ fn restore_scoop_package_service_windows(
                 });
             }
         }
-        verify_restored_task(
-            api,
-            &state,
-            &layout,
-            &identity.namespace,
-            state.desired_state(),
-        )
+        verify_restored_task(api, &state, &layout, state.desired_state())
     })?;
 
     remove_scoop_state(state_file)
@@ -1501,7 +1169,6 @@ fn verify_restored_task(
     api: &mut dyn TaskSchedulerApi,
     state: &ScoopServiceState,
     layout: &ServiceRuntimeLayout,
-    namespace: &ServiceNamespace,
     expected_state: DaemonServiceState,
 ) -> Result<()> {
     let actual_state = state_from_snapshot(api.snapshot()?);
@@ -1520,18 +1187,14 @@ fn verify_restored_task(
         .ok_or_else(|| missing_task("verify Scoop restore ACL for"))?;
     let action = task_action_from_xml(&xml)
         .ok_or_else(|| invalid_state("restored task XML has no executable action"))?;
-    let (profile_root, global_db, socket_path) = task_paths_from_xml(&xml, namespace)?;
     if !windows_paths_equal(&action.executable, &layout.executable)?
         || action.arguments != state.action.arguments
-        || !windows_paths_equal(&profile_root, &state.profile_root)?
-        || !windows_paths_equal(&global_db, &state.global_db_path())?
-        || !windows_paths_equal(&socket_path, &state.socket_path())?
+        || profile_root_from_task_xml(&xml).as_ref() != Some(&state.profile_root)
         || sddl != state.task_sddl
     {
         return Err(TraceDecayError::Config {
-            message:
-                "restored Scoop service did not preserve its exact action, service paths, or SDDL"
-                    .to_string(),
+            message: "restored Scoop service did not preserve its exact action, profile, or SDDL"
+                .to_string(),
         });
     }
     Ok(())
@@ -1545,8 +1208,7 @@ fn current_package_identity(package_id: WindowsPackageId) -> Result<TaskIdentity
                 message: format!("could not determine current Windows user SID: {error}"),
             }
         })?;
-    let namespace = ServiceNamespace::current()?;
-    TaskIdentity::for_package_user_sid_in_namespace(package_id, &user_sid, &namespace)
+    TaskIdentity::for_package_user_sid(package_id, &user_sid)
 }
 
 #[cfg(windows)]
@@ -2218,13 +1880,8 @@ fn task_definition_is_owned(xml: &str, sddl: &str, identity: &TaskIdentity) -> b
     let principal_user = xml_section_text(xml, r#"Principal id="Author""#)
         .and_then(|section| xml_element_text(section, "UserId"))
         .map(xml_unescape);
-    let namespace_owned = identity.namespace.suffix().map_or_else(
-        || task_namespace_from_xml(xml).is_none_or(|value| value == "stable"),
-        |suffix| task_namespace_from_xml(xml).as_deref() == Some(suffix),
-    );
     trigger_user.as_deref() == Some(identity.user_sid.as_str())
         && principal_user.as_deref() == Some(identity.user_sid.as_str())
-        && namespace_owned
         && task_sddl_is_private(sddl, &identity.user_sid)
 }
 
@@ -2359,19 +2016,17 @@ fn windows_argument_tokens(arguments: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-fn with_platform_api_for<T>(
-    namespace: &ServiceNamespace,
+fn with_platform_api<T>(
     operation: impl FnOnce(&mut dyn TaskSchedulerApi) -> Result<T>,
 ) -> Result<T> {
     #[cfg(windows)]
     {
-        let identity = TaskIdentity::current_for_namespace(namespace)?;
-        let mut api = native::NativeTaskScheduler::connect_for(identity)?;
+        let mut api = native::NativeTaskScheduler::connect()?;
         operation(&mut api)
     }
     #[cfg(not(windows))]
     {
-        let _ = (namespace, operation);
+        let _ = operation;
         Err(TraceDecayError::Config {
             message: "Windows Task Scheduler is unavailable on this platform".to_string(),
         })
@@ -2389,28 +2044,30 @@ fn with_platform_api_for_package<T>(
                 message: format!("could not determine current Windows user SID: {error}"),
             }
         })?;
-    let namespace = ServiceNamespace::current()?;
-    let identity =
-        TaskIdentity::for_package_user_sid_in_namespace(package_id, &user_sid, &namespace)?;
+    let identity = TaskIdentity::for_package_user_sid(package_id, &user_sid)?;
     let mut api = native::NativeTaskScheduler::connect_for(identity)?;
     operation(&mut api)
 }
 
 #[cfg(any(windows, test))]
-fn with_platform_control_api_for<T>(
-    namespace: &ServiceNamespace,
+fn with_platform_control_api<T>(
     expected_version: &str,
     operation: impl FnOnce(&mut dyn TaskSchedulerApi, &mut dyn DaemonControlApi) -> Result<T>,
 ) -> Result<T> {
     #[cfg(windows)]
     {
-        with_platform_api_for(namespace, |api| {
+        with_platform_api(|api| {
             let xml = api
                 .registered_xml()?
                 .ok_or_else(|| missing_task("resolve profile for"))?;
-            let (_, _, socket_path) = task_paths_from_xml(&xml, namespace)?;
+            let profile_root =
+                profile_root_from_task_xml(&xml).ok_or_else(|| TraceDecayError::Config {
+                    message:
+                        "cannot manage TraceDecay daemon task: registered task has no profile root"
+                            .to_string(),
+                })?;
             let mut control = NativeDaemonControl {
-                transport_hint: socket_path,
+                transport_hint: profile_root.join("daemon.sock"),
                 expected_version: expected_version.to_owned(),
                 clock_origin: std::time::Instant::now(),
             };
@@ -2419,7 +2076,7 @@ fn with_platform_control_api_for<T>(
     }
     #[cfg(not(windows))]
     {
-        let _ = (namespace, expected_version, operation);
+        let _ = (expected_version, operation);
         Err(TraceDecayError::Config {
             message: "Windows Task Scheduler is unavailable on this platform".to_string(),
         })
@@ -2520,7 +2177,6 @@ mod native {
             let sddl = String::try_from(sddl).map_err(|error| TraceDecayError::Config {
                 message: format!("daemon task security descriptor is not valid UTF-16: {error}"),
             })?;
-            validate_task_namespace_metadata(&xml, &self.identity.namespace)?;
             if task_definition_is_owned(&xml, &sddl, &self.identity) {
                 return Ok(());
             }

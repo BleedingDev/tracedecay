@@ -20,7 +20,6 @@ mod ports;
 mod repository_read;
 mod scope_set;
 mod telemetry;
-mod vector_authority;
 
 pub use consistency::{
     CommitSequenceV1, ConsistencyModeV1, FrozenWatermarkCoverageV1, FrozenWatermarkVectorV1,
@@ -109,12 +108,4 @@ pub use scope_set::{
 };
 pub use telemetry::{
     MaintenanceTelemetryV1, ReaderLaneV1, RuntimeMaintenanceStateV1, WalPressureV1,
-};
-pub use vector_authority::{
-    BatchCommitDecisionV1, ContentDigest, DurableVectorAuthorityStoreV1,
-    PreparedVectorGenerationV1, ProjectedChunkVectorV1, ProjectionKeyV1,
-    PublishedVectorGenerationV1, VectorAuthorityError, VectorAuthorityRevisionV1,
-    VectorAuthorityStoreErrorV1, VectorGenerationAuthority, VectorGenerationBuildIdV1,
-    VectorGenerationIdV1, VectorGenerationPlanV1, VectorGenerationPublicationV1,
-    VectorProjectionCheckpointV1, prepare_vector,
 };

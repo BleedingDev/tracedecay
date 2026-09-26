@@ -1075,15 +1075,8 @@ impl DaemonInvocationState {
         self.code_index_schedulers.cancel();
     }
 
-    #[cfg(test)]
-    pub(super) async fn shutdown(&self) -> ShutdownStatus {
-        let now = tokio::time::Instant::now();
-        self.shutdown_until(now + tracedecay_runtime_core::DAEMON_SHUTDOWN_DEADLINE)
-            .await
-    }
-
     #[hotpath::measure(label = "daemon.invocation_state.shutdown", future = true)]
-    pub(super) async fn shutdown_until(&self, deadline: tokio::time::Instant) -> ShutdownStatus {
+    pub(super) async fn shutdown(&self) -> ShutdownStatus {
         let started = std::time::Instant::now();
         let step = |outcome: &str| {
             log_daemon_event(
@@ -1123,7 +1116,7 @@ impl DaemonInvocationState {
         }
         self.lsp_session_registry.lock().await.expire_at(u64::MAX);
         step("lsp_sessions_expired");
-        let expired = self.service.expire_all_until(deadline).await;
+        let expired = self.service.expire_all().await;
         step("invocation_service_expired");
         if !expired {
             hotpath::gauge!("daemon.invocation_state.shutdown_incomplete_total").inc(1_u64);

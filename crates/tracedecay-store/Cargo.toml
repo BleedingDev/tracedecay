@@ -16,7 +16,6 @@ sha2 = "0.11"
 thiserror = "2"
 tracedecay-domain = { path = "../tracedecay-domain" }
 tracedecay-temporal-query = { path = "../tracedecay-temporal-query" }
-tracedecay-vector-authority = { path = "../tracedecay-vector-authority" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tracedecay_observation_fault_harness)"] }

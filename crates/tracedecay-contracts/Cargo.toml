@@ -16,7 +16,6 @@ hotpath = ["hotpath/hotpath"]
 
 [dependencies]
 hotpath.workspace = true
-ring = "0.17.14"
 schemars.workspace = true
 getrandom = "0.2"
 hex = "0.4"

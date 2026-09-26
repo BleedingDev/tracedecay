@@ -1834,9 +1834,9 @@ fn original_record_ref(source: &RecallSourceAttributionV1) -> String {
     )
 }
 
-/// Typed attribution cannot replace a contradictory declared claim. Native
-/// observations name source keys and staged origins; NCM observations name
-/// canonical records. Facts retain their separate host record authority.
+/// Typed attribution cannot replace a contradictory declared claim.
+/// Observation-sourced candidates name source keys or canonical records;
+/// facts retain their separate host record authority.
 fn check_original_source_claims(
     candidate: &RecallCandidateV1,
     sources: &[RecallSourceAttributionV1],
@@ -1982,7 +1982,7 @@ const SESSION_OBSERVATION_MEMORY_CLASS: &str = "session_observation";
 ///
 /// Provider authorization is provider-wide, while session observations must
 /// retain all five checkout identities. They may use the fully exact binding
-/// or the Native-authorized checkout binding; project/profile fact bindings
+/// or the checkout binding; project/profile fact bindings
 /// would make checkout fields optional or forbidden and are never admissible
 /// for this class. Session and resolved-scope identity remain origin metadata
 /// when the candidate uses the checkout binding.

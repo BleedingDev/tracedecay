@@ -14,19 +14,10 @@ doctest = false
 # Cross-crate fixture surface for composition-root invocation tests:
 # `DaemonInvocationService::invoke`, publication gates, and test constructors.
 # Production code is never gated by this feature.
-test-helpers = [
-    "tracedecay-maintenance/test-helpers",
-    "tracedecay-memory-provider-ncm?/test-helpers",
-]
-test-transport = [
-    "test-helpers",
-    "tracedecay-memory-provider-ncm?/test-transport",
-]
-# The retained provider owner is compiled in this crate after the #707 owner
-# extraction. Keep the complete Native/NCM mount opt-in at the same boundary as
-# the source modules; the composition root forwards its public host feature
-# here. `test-helpers` remains independent so upstream-only builds do not pull
-# provider code or the NCM runtime.
+test-helpers = []
+# The pluggable memory-provider host (Native/NCM mount in `retained_owner`).
+# The composition root forwards its public host feature here; builds without
+# it pull no provider code or NCM runtime.
 memory-provider-host = [
     "dep:chrono",
     "dep:fs2",
@@ -62,7 +53,6 @@ tracedecay-session-runtime = { path = "../tracedecay-session-runtime" }
 axum = "0.8"
 chrono = { version = "0.4.45", default-features = false, features = ["std"], optional = true }
 fs2 = { version = "0.4", optional = true }
-futures-util = "0.3.33"
 getrandom = "0.2"
 hex = "0.4"
 hmac = { version = "0.13.0", features = ["zeroize"], optional = true }
@@ -121,8 +111,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 tracedecay-code-index-runtime = { path = "../tracedecay-code-index-runtime", default-features = false, features = ["test-helpers"] }
 tracedecay-global-db = { path = "../tracedecay-global-db", features = ["test-helpers"] }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core", features = ["test-helpers"] }
-# The Native baseline and mounted observation-journey tests share the
-# provider-neutral conformance fixtures and adversarial harness.
+# Provider-neutral conformance fixtures for the mounted provider journey tests.
 tracedecay-memory-conformance = { path = "../tracedecay-memory-conformance" }
 # The moved lifecycle/doctor tests open projects through the registered test
 # runtime and pin the profile data directory.

@@ -842,7 +842,6 @@ fn query_authority(privacy_domain: PrivacyDomainId) -> Arc<QueryAuthorityV1> {
         diversity_policy_id: id("diversity.code-index.fixture")
             .try_into()
             .expect("diversity id"),
-        rerank_policy_id: None,
         retrieval_budget: RetrievalBudget {
             max_candidates_per_lane: 32,
             max_fused_candidates: 32,

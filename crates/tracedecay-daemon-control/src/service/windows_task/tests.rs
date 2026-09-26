@@ -130,19 +130,10 @@ fn scoop_restore_rewrites_only_the_service_executable() {
     // byte-exactly. On Windows `render_task_xml_for` fully qualifies the
     // profile root, which spells it with the native separator; the Unix
     // arm renders the fixture text verbatim.
-    let expected_socket = if cfg!(windows) {
-        r#"C:\profiles\stable & exact\daemon.sock"#
-    } else {
-        r#"C:/profiles/stable & exact/daemon.sock"#
-    };
-    let expected_arguments = format!(
-        r#"daemon run --profile-root "{}" --socket "{expected_socket}""#,
-        if cfg!(windows) {
-            r#"C:\profiles\stable & exact"#
-        } else {
-            r#"C:/profiles/stable & exact"#
-        },
-    );
+    #[cfg(windows)]
+    let expected_arguments = r#"daemon run --profile-root "C:\profiles\stable & exact""#;
+    #[cfg(not(windows))]
+    let expected_arguments = r#"daemon run --profile-root "C:/profiles/stable & exact""#;
     assert_eq!(action.arguments, expected_arguments);
 }
 
@@ -376,7 +367,6 @@ fn spec(executable: impl Into<PathBuf>, profile_root: impl Into<PathBuf>) -> Dae
         tracedecay_bin: executable.into(),
         socket_path: PathBuf::from("ignored-by-windows-task"),
         data_dir_override: Some(profile_root.into()),
-        global_db_override: None,
         remote_tls: None,
         memory: DaemonServiceMemoryLimitsV1::for_physical_memory(64 << 30),
     }
@@ -561,19 +551,9 @@ fn task_xml_escapes_action_paths_and_declares_daemon_settings() {
     assert!(xml.contains(
         r"<Command>C:\Program Files\Trace&lt;&amp;&quot;&apos;Decay\tracedecay.exe</Command>"
     ));
-    let profile_root = profile_root_from_task_xml(&xml).expect("profile root");
-    let socket_path = profile_root.join("daemon.sock");
-    let arguments = xml_unescape(xml_element_text(&xml, "Arguments").expect("arguments"));
-    assert!(arguments.starts_with("daemon run --profile-root "));
-    assert!(arguments.contains(" --socket "));
-    assert_eq!(
-        task_paths_from_xml(&xml, &identity.namespace).expect("persisted task paths"),
-        (
-            profile_root.clone(),
-            profile_root.join("global.db"),
-            socket_path
-        )
-    );
+    assert!(xml.contains(
+        r"<Arguments>daemon run --profile-root &quot;C:\Users\Zack &amp; &lt;Trace&gt;\&quot;&apos;Decay&quot;</Arguments>"
+    ));
     assert!(xml.contains("<LogonTrigger>"));
     assert_eq!(
         xml.matches(&format!("<UserId>{TEST_SID}</UserId>")).count(),
@@ -586,136 +566,6 @@ fn task_xml_escapes_action_paths_and_declares_daemon_settings() {
     assert!(xml.contains("<Interval>PT1M</Interval>"));
     assert!(xml.contains("<Count>255</Count>"));
     assert!(xml.contains("<Enabled>true</Enabled>"));
-}
-
-#[test]
-fn namespaced_tasks_coexist_with_the_stable_task_and_preserve_paths() {
-    let stable_identity = TaskIdentity::for_package_user_sid(WindowsPackageId::Stable, TEST_SID)
-        .expect("stable identity");
-    let namespace = ServiceNamespace::from_suffix("shadow-v2").expect("shadow namespace");
-    let shadow_identity = TaskIdentity::for_package_user_sid_in_namespace(
-        WindowsPackageId::Stable,
-        TEST_SID,
-        &namespace,
-    )
-    .expect("shadow identity");
-    assert_ne!(stable_identity.task_name, shadow_identity.task_name);
-    assert_ne!(stable_identity.task_path, shadow_identity.task_path);
-
-    let stable_profile = if cfg!(windows) {
-        PathBuf::from(r#"C:\profiles\stable"#)
-    } else {
-        PathBuf::from("/profiles/stable")
-    };
-    let shadow_profile = if cfg!(windows) {
-        PathBuf::from(r#"C:\profiles\shadow"#)
-    } else {
-        PathBuf::from("/profiles/shadow")
-    };
-    let mut stable_spec = spec(
-        r#"C:\scoop\apps\tracedecay\5.0.0\tracedecay.exe"#,
-        stable_profile.clone(),
-    );
-    let stable_global = stable_profile.join("global.db");
-    stable_spec.global_db_override = Some(stable_global.clone());
-    let mut shadow_spec = spec(
-        r#"C:\scoop\apps\tracedecay\5.0.0\tracedecay.exe"#,
-        shadow_profile.clone(),
-    );
-    let shadow_global = shadow_profile.join("global.db");
-    shadow_spec.global_db_override = Some(shadow_global.clone());
-    let stable_xml = render_task_xml_for(&stable_spec, &stable_identity).expect("stable XML");
-    let shadow_xml = render_task_xml_for(&shadow_spec, &shadow_identity).expect("shadow XML");
-    let stable_socket = stable_profile.join("daemon.sock");
-    let shadow_socket = shadow_profile.join("daemon.sock");
-
-    assert!(stable_xml.contains("TRACEDECAY_NAMESPACE=stable"));
-    assert!(shadow_xml.contains("TRACEDECAY_NAMESPACE=shadow-v2"));
-    for (xml, profile, global_db, socket) in [
-        (&stable_xml, &stable_profile, &stable_global, &stable_socket),
-        (&shadow_xml, &shadow_profile, &shadow_global, &shadow_socket),
-    ] {
-        assert!(xml.contains(&format!(
-            "TRACEDECAY_DATA_DIR={}",
-            xml_escape(&profile.display().to_string())
-        )));
-        assert!(xml.contains(&format!(
-            "TRACEDECAY_GLOBAL_DB={}",
-            xml_escape(&global_db.display().to_string())
-        )));
-        assert!(xml.contains(&format!(
-            "TRACEDECAY_SOCKET={}",
-            xml_escape(&socket.display().to_string())
-        )));
-    }
-
-    assert_eq!(
-        task_paths_from_xml(&stable_xml, &stable_identity.namespace).expect("stable paths"),
-        (stable_profile, stable_global, stable_socket)
-    );
-    assert_eq!(
-        task_paths_from_xml(&shadow_xml, &shadow_identity.namespace).expect("shadow paths"),
-        (shadow_profile, shadow_global, shadow_socket)
-    );
-    assert!(task_definition_is_owned(
-        &stable_xml,
-        &stable_identity.sddl,
-        &stable_identity
-    ));
-    assert!(task_definition_is_owned(
-        &shadow_xml,
-        &shadow_identity.sddl,
-        &shadow_identity
-    ));
-    assert!(!task_definition_is_owned(
-        &shadow_xml,
-        &stable_identity.sddl,
-        &stable_identity
-    ));
-    assert!(!task_definition_is_owned(
-        &stable_xml,
-        &shadow_identity.sddl,
-        &shadow_identity
-    ));
-}
-
-#[test]
-fn mismatched_namespace_metadata_is_an_identity_error() {
-    let stable_identity = TaskIdentity::for_package_user_sid(WindowsPackageId::Stable, TEST_SID)
-        .expect("stable identity");
-    let shadow_namespace = ServiceNamespace::from_suffix("shadow-v2").expect("shadow namespace");
-    let shadow_identity = TaskIdentity::for_package_user_sid_in_namespace(
-        WindowsPackageId::Stable,
-        TEST_SID,
-        &shadow_namespace,
-    )
-    .expect("shadow identity");
-    let xml = render_task_xml_for(
-        &spec(
-            r#"C:\scoop\apps\tracedecay\5.0.0\tracedecay.exe"#,
-            r#"C:\profiles\stable"#,
-        ),
-        &stable_identity,
-    )
-    .expect("stable task XML");
-
-    let error = ScoopServiceState::capture(
-        WindowsPackageId::Stable,
-        &shadow_identity,
-        TaskSnapshot {
-            running: false,
-            enabled: false,
-        },
-        xml,
-        shadow_identity.sddl.clone(),
-    )
-    .expect_err("namespace mismatch must fail closed");
-    assert!(
-        !error
-            .to_string()
-            .contains("refusing to manage scheduled task")
-    );
-    assert!(error.to_string().contains("namespace"));
 }
 
 #[test]

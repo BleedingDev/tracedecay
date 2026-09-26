@@ -49,14 +49,8 @@ pub fn sync_directory(dir: &Path, policy: DirectorySyncPolicy) -> io::Result<()>
     }
     #[cfg(not(unix))]
     {
-        let _ = dir;
-        match policy {
-            DirectorySyncPolicy::Strict => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "strict directory synchronization is unsupported on this platform",
-            )),
-            DirectorySyncPolicy::TolerateUnsupported => Ok(()),
-        }
+        let _ = (dir, policy);
+        Ok(())
     }
 }
 
@@ -236,7 +230,7 @@ fn normalize_no_follow_error(error: io::Error) -> io::Error {
 /// Open a regular file for bounded caller-owned reads. Empty regular files
 /// are valid; final symlinks, reparse points, directories and FIFOs are not.
 /// The handle check follows the nonblocking, no-follow open, so replacing a
-/// pathname with a FIFO cannot park an origin-capture worker in `open`.
+/// pathname with a FIFO cannot park a reader in `open`.
 pub fn open_regular_read_no_follow(path: &Path) -> io::Result<File> {
     let file = open_no_follow(path)?;
     if !file.metadata()?.file_type().is_file() {
@@ -881,17 +875,6 @@ mod tests {
         DIRECTORY_SYNC_CALLS, DirectorySyncPolicy, append_durable, atomic_write_accelerator,
         atomic_write_prepared, open_regular_read_no_follow,
     };
-
-    #[cfg(not(unix))]
-    #[test]
-    fn strict_directory_sync_rejects_unsupported_platforms() {
-        let root = tempfile::tempdir().expect("directory sync fixture");
-        let error = super::sync_directory(root.path(), DirectorySyncPolicy::Strict)
-            .expect_err("strict sync cannot claim unsupported durability");
-        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-        super::sync_directory(root.path(), DirectorySyncPolicy::TolerateUnsupported)
-            .expect("unsupported directory sync remains tolerated");
-    }
 
     #[test]
     fn regular_read_opener_accepts_empty_files_and_rejects_directories() {

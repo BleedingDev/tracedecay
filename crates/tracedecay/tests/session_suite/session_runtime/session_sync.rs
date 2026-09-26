@@ -873,9 +873,6 @@ async fn cancel_in_alias_activation_gap_mirrors_primary_terminal_receipt() {
     // reads it from the profile identity authority.
     let brain_id = project_sessions.binding().shard_id.brain_id.clone();
     let profile_id = project_sessions.binding().shard_id.profile_id.clone();
-    let scope =
-        tracedecay_code_index_runtime::resolved_scope_for_project(&project_root, &project_id)
-            .unwrap();
     let service = DaemonSessionSyncService::default();
     service
         .register_project(DaemonSessionSyncConfig {
@@ -884,7 +881,6 @@ async fn cancel_in_alias_activation_gap_mirrors_primary_terminal_receipt() {
             project_id: project_id.clone(),
             profile_root: profile_root.path().to_path_buf(),
             project_root,
-            scope,
             transcript_source_home: None,
             project_sessions,
             user_sessions: profile_sessions.clone(),

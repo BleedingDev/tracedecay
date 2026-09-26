@@ -28,7 +28,6 @@ test-transport = []
 test-helpers = ["tracedecay-project/test-helpers"]
 
 [dependencies]
-tracedecay-semantic-contracts.workspace = true
 futures-util = "0.3.33"
 shell-words = "1.1"
 gix.workspace = true
@@ -69,7 +68,6 @@ tracedecay-maintenance = { path = "../tracedecay-maintenance" }
 tracedecay-mcp-catalog = { path = "../tracedecay-mcp-catalog" }
 tracedecay-privacy = { path = "../tracedecay-privacy" }
 tracedecay-project = { path = "../tracedecay-project" }
-tracedecay-private-fs = { path = "../tracedecay-private-fs" }
 tracedecay-query = { path = "../tracedecay-query" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core" }
 tracedecay-session-memory = { path = "../tracedecay-session-memory" }

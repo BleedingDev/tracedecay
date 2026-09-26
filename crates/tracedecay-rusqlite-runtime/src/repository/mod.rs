@@ -36,7 +36,6 @@ mod retained_exact_sql;
 mod retrieval_anchor;
 mod scope_set;
 mod support;
-mod vector_authority;
 
 use rusqlite::{Savepoint, Transaction};
 use tracedecay_store::RepositoryWritePayloadV1;
@@ -64,10 +63,6 @@ pub use retrieval_anchor::RetrievalAnchorExecutor;
 pub use scope_set::{
     AUTHORIZED_SCOPE_SET_SCHEMA_V1, AuthorizedScopeSetExecutor, AuthorizedScopeSetSqliteStorage,
     AuthorizedScopeSetStoreError,
-};
-pub use vector_authority::{
-    ProjectVectorAuthorityHandleV1, VECTOR_AUTHORITY_OBJECTS_V1, VECTOR_AUTHORITY_SCHEMA_V1,
-    VectorAuthoritySqliteStorage,
 };
 
 pub use tracedecay_store::{

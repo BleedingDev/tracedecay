@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tracedecay_hooks::DaemonHookEvent;
-use tracedecay_hooks::HookRouteMetadata;
 
 use crate::ports::hook_runtime::HookRuntimeV1;
 
@@ -35,7 +34,6 @@ mod steering;
 mod store_layout;
 pub mod tool_hints;
 pub use dispatch::NATIVE_HOOK_HOSTS;
-pub use dispatch::NativeSessionStartLocatorV1;
 pub use dispatch::native_capture_material;
 pub use dispatch::project_and_worktree_locators_for_scope as hook_scope_locators;
 pub use dispatch::project_id_for_layout as hook_project_id_for_layout;
@@ -52,8 +50,8 @@ pub use codex::{
     codex_additional_context_json, codex_apply_patch_rel_paths, codex_project_root_from_event,
     codex_subagent_start_log_line, codex_user_prompt_submit_context_for_event,
     codex_workspace_status_from_event, evaluate_codex_subagent_start, hook_codex_post_compact,
-    hook_codex_post_tool_use, hook_codex_session_start, hook_codex_stop,
-    hook_codex_user_prompt_submit, record_codex_subagent_start,
+    hook_codex_post_tool_use, hook_codex_session_start, hook_codex_user_prompt_submit,
+    record_codex_subagent_start,
 };
 pub use cursor::{
     CURSOR_CATCH_UP_INGEST_MAX_BYTES, cursor_project_root_from_event, cursor_session_start_json,
@@ -641,19 +639,6 @@ impl TranscriptIngestOutcome {
     pub(crate) fn should_schedule_user_review(&self) -> bool {
         !self.failed && !self.timed_out && self.user_scope && self.messages_upserted > 0
     }
-
-    /// Stable label for an ingest that did not complete, so a fail-open caller
-    /// can report what it lost instead of discarding this outcome. `None`
-    /// means the daemon answered; it does not mean anything was upserted.
-    pub(crate) fn failure_reason(&self) -> Option<&'static str> {
-        if self.failed {
-            Some("daemon_call_failed")
-        } else if self.timed_out {
-            Some("budget_exceeded")
-        } else {
-            None
-        }
-    }
 }
 
 enum IngestAttempt {
@@ -1048,36 +1033,6 @@ fn take_test_daemon_hook_action(
             message: "daemon hook test responder has no response".to_string(),
         }
     }))
-}
-
-/// Route identity for a hook event published from inside a registered
-/// project: the event's own cwd (or the project root), the Git worktree that
-/// contains it, and the current branch, so the daemon can bind the session to
-/// the exact checkout it ran in.
-pub(crate) fn hook_route_metadata_from_parsed(
-    parsed: &Value,
-    project_root: &Path,
-) -> HookRouteMetadata {
-    let cwd = event_cwd_from_parsed(parsed);
-    let route_root = cwd.as_deref().unwrap_or(project_root);
-    let worktree = tracedecay_runtime_core::worktree::git_worktree_root(route_root)
-        .unwrap_or_else(|| project_root.to_path_buf());
-    let branch = tracedecay_runtime_core::branch::current_branch(&worktree);
-    HookRouteMetadata {
-        session_id: hook_route_session_id(parsed),
-        thread_id: text_field(
-            parsed,
-            &[
-                "thread_id",
-                "threadId",
-                "conversation_thread_id",
-                "conversationThreadId",
-            ],
-        ),
-        cwd,
-        worktree: Some(worktree),
-        branch,
-    }
 }
 
 const HOOK_SESSION_ID_KEYS: &[&str] = &[

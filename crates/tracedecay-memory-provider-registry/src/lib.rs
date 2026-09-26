@@ -176,10 +176,8 @@ pub use tracedecay_memory_provider_api::{
     SourceAttribution, TemporalEligibility, TerminalRecord, WithheldReason,
 };
 pub use tracedecay_memory_provider_native::{
-    NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NATIVE_RECALL_SCOPE_BINDINGS, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
-    NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeAdapterError, NativeMemoryApplicationPort,
-    NativeObservation, NativeObservationEnvelope, NativeProvider, OBSERVATION_CONTRACT_ID,
+    NATIVE_PROVIDER_ID, NATIVE_RECALL_SCOPE_BINDINGS, NativeAdapterError,
+    NativeMemoryApplicationPort, NativeProvider,
 };
 
 /// Legacy Native-constructor kind retained for callers of the compatibility API.

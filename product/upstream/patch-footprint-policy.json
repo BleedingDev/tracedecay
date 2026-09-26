@@ -532,7 +532,6 @@
         "tracedecay-rusqlite-runtime",
         "tracedecay-code-*",
         "tracedecay-*query*",
-        "tracedecay-semantic*",
         "rusqlite",
         "grafeo*",
         "libsql*",
@@ -611,7 +610,6 @@
         "tracedecay-rusqlite-runtime",
         "tracedecay-code-*",
         "tracedecay-*query*",
-        "tracedecay-semantic*",
         "rusqlite",
         "grafeo*",
         "libsql*",
@@ -641,7 +639,6 @@
         "tracedecay-rusqlite-runtime",
         "tracedecay-code-*",
         "tracedecay-*query*",
-        "tracedecay-semantic*",
         "rusqlite",
         "grafeo*",
         "libsql*",
@@ -728,8 +725,7 @@
         "crates/tracedecay-code-index-runtime/**",
         "crates/tracedecay-code-index-retention/**",
         "crates/tracedecay-code-extraction/**",
-        "crates/tracedecay-query/**",
-        "crates/tracedecay-semantic/**"
+        "crates/tracedecay-query/**"
       ],
       "reason": "TraceDecay remains authority for current code and verified code projections; provider integration must consume ports rather than alter indexing semantics.",
       "required_exception_evidence": [

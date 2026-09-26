@@ -23,7 +23,6 @@ use tracedecay_code_index_retention::code_index_generations::{
     CodeIndexScopeStoreResetV1, DurablePublicationPointerV1, DurableSealedCodeGenerationIdentityV1,
 };
 use tracedecay_contracts::{
-    CodeIndexReconcileOptionsV1,
     code_index_freshness::{
         CodeIndexBuildPhaseV1, CodeIndexBuildProgressV1, CodeIndexGenerationRecoveryServingV1,
         CodeIndexGenerationRecoveryV1,
@@ -88,7 +87,6 @@ type ProductionOwner =
 pub(super) struct PendingHintsV1 {
     pub(super) paths: BTreeSet<PathBuf>,
     pub(super) overflow: bool,
-    pub(super) reconcile_options: Option<CodeIndexReconcileOptionsV1>,
     observed_source_change: bool,
 }
 
@@ -111,20 +109,12 @@ impl PendingHintsV1 {
         self.overflow = true;
     }
 
-    pub(super) fn set_explicit_reconcile_options(&mut self, options: CodeIndexReconcileOptionsV1) {
-        self.reconcile_options = Some(options);
-        self.overflow();
-    }
-
     pub(super) fn take(&mut self) -> Self {
         std::mem::take(self)
     }
 
     fn restore(&mut self, pending: Self) {
         self.observed_source_change |= pending.observed_source_change;
-        if self.reconcile_options.is_none() {
-            self.reconcile_options = pending.reconcile_options;
-        }
         if self.overflow {
             return;
         }
@@ -170,12 +160,6 @@ impl DrainedPendingHintsV1 {
         self.pending
             .as_ref()
             .is_some_and(|pending| pending.overflow)
-    }
-
-    fn options(&self) -> Option<&CodeIndexReconcileOptionsV1> {
-        self.pending
-            .as_ref()
-            .and_then(|pending| pending.reconcile_options.as_ref())
     }
 
     fn commit(mut self) {
@@ -786,10 +770,6 @@ pub struct CodeIndexWorktreeSchedulerV1 {
     pub(super) production_config: CodeIndexProductionConfigV1,
     pub(super) owner: ProductionOwner,
     pub(super) hints: Arc<Mutex<PendingHintsV1>>,
-    /// Request-scoped folder policy currently being consumed by one reconcile
-    /// pass. This is transient scheduler state, never part of the durable
-    /// production configuration or generation compatibility contract.
-    active_reconcile_options: Option<CodeIndexReconcileOptionsV1>,
     /// gix "unchanged" is relative to the index, while active rows may have
     /// been captured from dirty content, so the exact snapshot identity keeps
     /// those paths excluded from reuse after they are reverted.
@@ -1113,7 +1093,6 @@ impl CodeIndexWorktreeSchedulerV1 {
             production_config,
             owner,
             hints,
-            active_reconcile_options: None,
             active_snapshot_changed_paths: Mutex::new(None),
             wake,
             epoch,
@@ -1523,7 +1502,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 .hints
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if hints.overflow || !hints.paths.is_empty() || hints.reconcile_options.is_some() {
+            if hints.overflow || !hints.paths.is_empty() {
                 return Ok(None);
             }
         }
@@ -1686,7 +1665,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 .hints
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            hints.overflow || !hints.paths.is_empty() || hints.reconcile_options.is_some()
+            hints.overflow || !hints.paths.is_empty()
         } || configuration_changed;
         if dirty {
             self.request_background_reconcile();
@@ -1741,15 +1720,6 @@ impl CodeIndexWorktreeSchedulerV1 {
     pub fn republish_unpublished_retained_generation(
         &mut self,
     ) -> Result<Option<CodeIndexReconcileOutcomeV1>, CodeIndexSchedulerErrorV1> {
-        if self
-            .hints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .reconcile_options
-            .is_some()
-        {
-            return Ok(None);
-        }
         let Some(pointer) = self
             .publication
             .read_publication_pointer()
@@ -1927,15 +1897,6 @@ impl CodeIndexWorktreeSchedulerV1 {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err(cancelled_code_index_reconcile());
         }
-        if self
-            .hints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .reconcile_options
-            .is_some()
-        {
-            return Ok(None);
-        }
         if let Some(outcome) = self.republish_unpublished_retained_generation()? {
             return Ok(Some(outcome));
         }
@@ -1977,7 +1938,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 .hints
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            hints.overflow || !hints.paths.is_empty() || hints.reconcile_options.is_some()
+            hints.overflow || !hints.paths.is_empty()
         };
         // The witness proves a quiet tree only through the retained
         // generation's sealed file digests; its matching stat signature is
@@ -2542,15 +2503,6 @@ impl CodeIndexWorktreeSchedulerV1 {
             .map(|pointer| pointer.generation_id)
     }
 
-    /// Set the transient folder policy used by a direct capture in tests.
-    #[cfg(test)]
-    pub(super) fn set_active_reconcile_options_for_test(
-        &mut self,
-        options: Option<CodeIndexReconcileOptionsV1>,
-    ) {
-        self.active_reconcile_options = options;
-    }
-
     /// Install a deterministic reconcile fault for one mounted worktree so a
     /// test can drive the real background worker loop over a pass that panics
     /// or fails, and count the attempts the loop actually makes.
@@ -2687,25 +2639,6 @@ impl CodeIndexWorktreeSchedulerV1 {
                 Arc::clone(&self.epoch),
                 Arc::clone(&self.shutting_down),
             );
-            let drained_hints = {
-                let mut hints = self
-                    .hints
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (!control.is_cancelled())
-                    .then(|| DrainedPendingHintsV1::new(Arc::clone(&self.hints), hints.take()))
-            };
-            let Some(drained_hints) = drained_hints else {
-                if retry < MAX_SUPERSEDED_RECONCILE_RETRIES
-                    && !self.shutting_down.load(Ordering::Acquire)
-                {
-                    std::thread::sleep(SUPERSEDED_RECONCILE_RETRY_BACKOFF);
-                    continue;
-                }
-                return Err(cancelled_code_index_reconcile());
-            };
-            let reconcile_options = drained_hints.options().cloned();
-            self.active_reconcile_options = reconcile_options.clone();
             let mut captured = match capture(self, &control) {
                 Ok(captured) => captured,
                 Err(CodeIndexSchedulerErrorV1::Production(
@@ -2715,17 +2648,28 @@ impl CodeIndexWorktreeSchedulerV1 {
                 )) if retry < MAX_SUPERSEDED_RECONCILE_RETRIES
                     && !self.shutting_down.load(Ordering::Acquire) =>
                 {
-                    self.active_reconcile_options = None;
                     std::thread::sleep(SUPERSEDED_RECONCILE_RETRY_BACKOFF);
                     continue;
                 }
-                Err(error) => {
-                    self.active_reconcile_options = None;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             };
-            self.active_reconcile_options = None;
-            overflow_reconciled |= drained_hints.overflow();
+            let hints = {
+                let mut hints = self
+                    .hints
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (!control.is_cancelled()).then(|| hints.take())
+            };
+            let Some(hints) = hints else {
+                if retry < MAX_SUPERSEDED_RECONCILE_RETRIES
+                    && !self.shutting_down.load(Ordering::Acquire)
+                {
+                    std::thread::sleep(SUPERSEDED_RECONCILE_RETRY_BACKOFF);
+                    continue;
+                }
+                return Err(cancelled_code_index_reconcile());
+            };
+            overflow_reconciled |= hints.overflow;
             let active_generation = self
                 .publication
                 .load_active_shared()
@@ -2769,12 +2713,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 self._retained_snapshot_memory =
                     std::mem::take(&mut captured.retained_reservations);
                 self.latest_content_identity = Some(captured.snapshot.content_identity.clone());
-                if reconcile_options.is_some() {
-                    self.finish_ephemeral_reconcile();
-                } else {
-                    self.mark_reconciled(SourceContentManifestV1::for_snapshot(&captured.snapshot));
-                }
-                drained_hints.commit();
+                self.mark_reconciled(SourceContentManifestV1::for_snapshot(&captured.snapshot));
                 return Ok(CodeIndexReconcileOutcomeV1::Noop(CodeIndexNoopEvidenceV1 {
                     snapshot_content_identity: captured.snapshot.content_identity,
                     overflow_reconciled,
@@ -2810,11 +2749,8 @@ impl CodeIndexWorktreeSchedulerV1 {
                 tracing::warn!(
                     "code-index incremental build missing captured file bytes; retrying without active-generation reuse"
                 );
-                self.active_reconcile_options = reconcile_options.clone();
-                let fallback_capture =
-                    self.capture_authoritative_snapshot_without_active_generation_reuse(None);
-                self.active_reconcile_options = None;
-                captured = fallback_capture?;
+                captured =
+                    self.capture_authoritative_snapshot_without_active_generation_reuse(None)?;
                 snapshot_content_identity = captured.snapshot.content_identity.clone();
                 source_manifest = SourceContentManifestV1::for_snapshot(&captured.snapshot);
                 reextracted_files = captured.changed_paths.len();
@@ -2850,12 +2786,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                     self._retained_snapshot_memory =
                         std::mem::take(&mut captured.retained_reservations);
                     self.latest_content_identity = Some(snapshot_content_identity.clone());
-                    if reconcile_options.is_some() {
-                        self.finish_ephemeral_reconcile();
-                    } else {
-                        self.mark_reconciled(source_manifest);
-                    }
-                    drained_hints.commit();
+                    self.mark_reconciled(source_manifest);
                     return Ok(CodeIndexReconcileOutcomeV1::Noop(CodeIndexNoopEvidenceV1 {
                         snapshot_content_identity,
                         overflow_reconciled,
@@ -2874,11 +2805,7 @@ impl CodeIndexWorktreeSchedulerV1 {
             self.retained_snapshot_bytes = std::mem::take(&mut captured.retained_bytes);
             self._retained_snapshot_memory = std::mem::take(&mut captured.retained_reservations);
             self.latest_content_identity = Some(snapshot_content_identity);
-            if reconcile_options.is_some() {
-                self.finish_ephemeral_reconcile();
-            } else {
-                self.mark_reconciled(source_manifest);
-            }
+            self.mark_reconciled(source_manifest);
 
             let changes = &generation.projection().request().changes;
             let (clone_payloads_reused, clone_stale_invalidations, clone_body_changes_observed) =
@@ -2894,7 +2821,6 @@ impl CodeIndexWorktreeSchedulerV1 {
                 generation.edges(),
             ))
             .map_err(|error| CodeIndexSchedulerErrorV1::Identity(error.to_string()))?;
-            drained_hints.commit();
             return Ok(CodeIndexReconcileOutcomeV1::Published(
                 CodeIndexPublishEvidenceV1 {
                     generation_id: generation.manifest().generation_id.clone(),
@@ -2933,19 +2859,6 @@ impl CodeIndexWorktreeSchedulerV1 {
                 });
         self.mark_reconciled_state(metadata, source_witness);
         self.persist_freshness_witness();
-    }
-
-    /// End one request-scoped reconcile without allowing its reduced or
-    /// expanded snapshot to become the durable freshness cursor. Re-arm the
-    /// ordinary authoritative pass so the next generation returns to the
-    /// project configuration's default folder policy.
-    fn finish_ephemeral_reconcile(&mut self) {
-        self.active_reconcile_options = None;
-        *self
-            .active_snapshot_changed_paths
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.request_background_reconcile();
     }
 
     fn mark_reconciled_state(
@@ -3703,14 +3616,7 @@ impl CodeIndexWorktreeSchedulerV1 {
         progress: Option<&git_tree_capture::CaptureProgressV1>,
         explicitly_admitted: bool,
     ) -> Result<Option<CapturedCandidateV1>, CodeIndexSchedulerErrorV1> {
-        let explicitly_included = self
-            .active_reconcile_options
-            .as_ref()
-            .is_some_and(|options| options.includes_path(logical_path));
-        if !explicitly_admitted
-            && !explicitly_included
-            && crate::config::is_generated_path_segment(logical_path)
-        {
+        if !explicitly_admitted && crate::config::is_generated_path_segment(logical_path) {
             return Ok(None);
         }
         let absolute = self.project_root.join(logical_path);
@@ -3730,86 +3636,12 @@ impl CodeIndexWorktreeSchedulerV1 {
         self.capture_candidate_bytes_with_progress(registry, logical_path, &raw_bytes, progress)
     }
 
-    /// Add files beneath request-scoped include folders, including files Git
-    /// currently reports as ignored. The walk is bounded to the repository
-    /// root, does not follow symlinks, and never crosses TraceDecay's private
-    /// state directory.
-    fn extend_ephemeral_include_paths(
-        &self,
-        options: &CodeIndexReconcileOptionsV1,
-        candidate_paths: &mut BTreeSet<String>,
-        changed_paths: &mut BTreeSet<String>,
-    ) {
-        for folder in &options.include_folders {
-            let include_root = self.project_root.join(folder);
-            if std::fs::symlink_metadata(&include_root)
-                .is_ok_and(|metadata| metadata.file_type().is_file())
-            {
-                if let Some(logical_path) = include_root
-                    .strip_prefix(&self.project_root)
-                    .ok()
-                    .and_then(|path| path.to_str())
-                    .map(|path| path.replace('\\', "/"))
-                {
-                    if !logical_path.split('/').any(|component| component == ".git")
-                        && logical_path != crate::config::TRACEDECAY_DIR
-                        && !logical_path
-                            .strip_prefix(crate::config::TRACEDECAY_DIR)
-                            .is_some_and(|suffix| suffix.starts_with('/'))
-                    {
-                        candidate_paths.insert(logical_path.clone());
-                        changed_paths.insert(logical_path);
-                    }
-                }
-                continue;
-            }
-            if !std::fs::symlink_metadata(&include_root)
-                .is_ok_and(|metadata| metadata.file_type().is_dir())
-            {
-                continue;
-            }
-            let mut walk = walkdir::WalkDir::new(&include_root)
-                .follow_links(false)
-                .into_iter();
-            while let Some(entry) = walk.next() {
-                let Ok(entry) = entry else { continue };
-                if entry.file_type().is_dir()
-                    && (entry.file_name() == std::ffi::OsStr::new(".git")
-                        || entry.file_name() == std::ffi::OsStr::new(crate::config::TRACEDECAY_DIR))
-                {
-                    walk.skip_current_dir();
-                    continue;
-                }
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let Some(logical_path) = entry
-                    .path()
-                    .strip_prefix(&self.project_root)
-                    .ok()
-                    .and_then(|path| path.to_str())
-                    .map(|path| path.replace('\\', "/"))
-                else {
-                    continue;
-                };
-                if logical_path.split('/').any(|component| component == ".git") {
-                    continue;
-                }
-                candidate_paths.insert(logical_path.clone());
-                changed_paths.insert(logical_path);
-            }
-        }
-    }
-
     #[hotpath::measure(label = "code_index.capture.authoritative_snapshot")]
     pub(super) fn capture_authoritative_snapshot(
         &self,
         control: Option<&dyn CodeIndexExecutionControlV1>,
     ) -> Result<CapturedSnapshotV1, CodeIndexSchedulerErrorV1> {
-        self.capture_authoritative_snapshot_with_active_generation_reuse(
-            control,
-            self.active_reconcile_options.is_none(),
-        )
+        self.capture_authoritative_snapshot_with_active_generation_reuse(control, true)
     }
 
     pub(super) fn capture_authoritative_snapshot_without_active_generation_reuse(
@@ -3955,7 +3787,6 @@ impl CodeIndexWorktreeSchedulerV1 {
             }
         }
         let source_revision = (self.ignored_source_admissions.is_empty()
-            && self.active_reconcile_options.is_none()
             && classification.changes().is_empty())
         .then(|| self.identity.head_commit().cloned())
         .flatten();
@@ -3972,18 +3803,7 @@ impl CodeIndexWorktreeSchedulerV1 {
                 .iter()
                 .map(|admission| admission.logical_path.clone()),
         );
-        if let Some(options) = self.active_reconcile_options.as_ref() {
-            self.extend_ephemeral_include_paths(options, &mut candidate_paths, &mut changed_paths);
-            candidate_paths.retain(|path| !options.skips_path(path));
-            changed_paths.retain(|path| !options.skips_path(path));
-        }
         let dirty = if !self.ignored_source_admissions.is_empty() {
-            RepositoryDirtyStateV1::Dirty
-        } else if self.active_reconcile_options.is_some() {
-            // A request-scoped selection is intentionally not represented by
-            // the durable source cursor. Keep this generation dirty so a
-            // restart or the re-armed default pass cannot treat it as the
-            // ordinary clean project snapshot.
             RepositoryDirtyStateV1::Dirty
         } else if classification
             .changes()

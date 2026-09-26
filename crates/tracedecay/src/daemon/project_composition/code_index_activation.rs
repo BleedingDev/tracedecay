@@ -11,31 +11,6 @@ use tracedecay_code_index_runtime::code_index_scheduler::{
 use tracedecay_runtime_core::logging::log_daemon_event;
 use tracedecay_session_temporal_store::SessionTemporalAccess;
 
-const SEMANTIC_LEASE_NAMESPACE_DOMAIN: &[u8] =
-    b"tracedecay.semantic.project-runtime-lease-namespace.v1";
-
-fn semantic_lease_namespace(scope: &tracedecay_contracts::ResolvedScope) -> String {
-    let digest = tracedecay_domain::canonical_text::canonical_framed_sha256(
-        SEMANTIC_LEASE_NAMESPACE_DOMAIN,
-        &[
-            scope.project_id.as_str().as_bytes(),
-            scope.repository_id.as_str().as_bytes(),
-            scope.worktree_id.as_str().as_bytes(),
-        ],
-    );
-    format!("semantic.v1:{digest}")
-}
-
-fn observe_ready_artifact_change(
-    observed: &mut Option<String>,
-    event: &tracedecay_semantic_contracts::SemanticLifecycleVerifiedReadyEventV1,
-) -> bool {
-    let current = event.artifact_digest.clone();
-    let changed = current != *observed;
-    *observed = current;
-    changed && observed.is_some()
-}
-
 /// Inputs the deferred mount closure re-clones on every activation attempt.
 /// Bundled so the builder keeps one argument list instead of ten positional
 /// parameters.
@@ -44,9 +19,7 @@ pub(super) struct CodeIndexActivationMountInputs {
     pub(super) project_id: tracedecay_domain::ProjectId,
     pub(super) project_root: PathBuf,
     pub(super) store_root: PathBuf,
-    pub(super) profile_root: PathBuf,
     pub(super) native_graph_activation: bool,
-    pub(super) semantic_config: tracedecay_semantic_contracts::SemanticConfig,
     pub(super) scope: tracedecay_contracts::ResolvedScope,
     pub(super) route_registered: Arc<AtomicBool>,
     pub(super) cancellation: CancellationToken,
@@ -66,9 +39,7 @@ pub(super) fn code_index_activation_mount(
         project_id,
         project_root,
         store_root,
-        profile_root,
         native_graph_activation,
-        semantic_config,
         scope,
         route_registered,
         cancellation,
@@ -80,9 +51,7 @@ pub(super) fn code_index_activation_mount(
         let project_id = project_id.clone();
         let project_root = project_root.clone();
         let store_root = store_root.clone();
-        let profile_root = profile_root.clone();
         let native_graph_activation = native_graph_activation;
-        let semantic_config = semantic_config.clone();
         let scope = scope.clone();
         let route_registered = Arc::clone(&route_registered);
         let cancellation = cancellation.clone();
@@ -95,7 +64,6 @@ pub(super) fn code_index_activation_mount(
                 }
                 let query_project_id = project_id.clone();
                 let query_graph_runtime = Arc::clone(&graph_runtime);
-                let semantic_database = Arc::clone(&graph_publication_database);
                 // Order-sensitive: subscribing before the mount is what keeps the
                 // first generation publication observable by the waiter below.
                 let publications = invocation
@@ -104,7 +72,7 @@ pub(super) fn code_index_activation_mount(
                 let mount = invocation.mount_code_index(
                     project_id,
                     &project_root,
-                    store_root.clone(),
+                    store_root,
                     native_graph_activation,
                     graph_runtime,
                     graph_publication_database,
@@ -132,251 +100,12 @@ pub(super) fn code_index_activation_mount(
                     route_registered: Arc::clone(&route_registered),
                     cancellation: cancellation.clone(),
                 });
-                if semantic_config.enabled {
-                    spawn_semantic_runtime(SemanticRuntimeInputs {
-                        invocation,
-                        project_root,
-                        store_root,
-                        profile_root,
-                        config: semantic_config,
-                        scope,
-                        route_registered,
-                        cancellation,
-                        database: semantic_database,
-                    });
-                }
                 Ok(())
             },
             label = "daemon.project.activate.mount"
         ))
     });
     mount
-}
-
-struct SemanticRuntimeInputs {
-    invocation: DaemonInvocationState,
-    project_root: PathBuf,
-    store_root: PathBuf,
-    profile_root: PathBuf,
-    config: tracedecay_semantic_contracts::SemanticConfig,
-    scope: tracedecay_contracts::ResolvedScope,
-    route_registered: Arc<AtomicBool>,
-    cancellation: CancellationToken,
-    database: Arc<tracedecay_runtime_core::db::Database>,
-}
-
-/// Open and drive semantic projection behind the already-admitted code-index
-/// route. All filesystem restore, model acquisition, and projection work lives
-/// on this detached route-fenced task, so exact, lexical, and graph readiness
-/// never waits for semantic startup.
-fn spawn_semantic_runtime(mut inputs: SemanticRuntimeInputs) {
-    let process_memory = inputs
-        .invocation
-        .code_index_schedulers
-        .process_resident_memory()
-        .snapshot();
-    let resident_ceiling =
-        match tracedecay_semantic::embedding_parallelism::effective_resident_ceiling(
-            process_memory
-                .limit_bytes
-                .saturating_sub(process_memory.used_bytes),
-            inputs.config.resources,
-        ) {
-            Ok(resident_ceiling) => resident_ceiling,
-            Err(error) => {
-                tracing::warn!(
-                    event = "semantic_resident_ceiling",
-                    project_id = %inputs.scope.project_id,
-                    error = %error,
-                    "semantic runtime remained unavailable"
-                );
-                return;
-            }
-        };
-    inputs.config.resources.max_resident_bytes = Some(resident_ceiling.bytes);
-    tokio::spawn(hotpath::future!(
-        async move {
-            let SemanticRuntimeInputs {
-                invocation,
-                project_root,
-                store_root,
-                profile_root,
-                config,
-                scope,
-                route_registered,
-                cancellation,
-                database,
-            } = inputs;
-            let Some(mut serving_changes) = invocation
-                .code_index_schedulers
-                .subscribe_serving_generation_changes(&project_root)
-                .await
-            else {
-                return;
-            };
-            let runtime_cancellation = cancellation.child_token();
-            let lease_namespace = semantic_lease_namespace(&scope);
-            let open = tracedecay_application::semantic_runtime::ProjectSemanticRuntimeV1::open(
-                config,
-                store_root.join("semantic-lifecycle-v1"),
-                profile_root.join("semantic-model-artifacts-v1"),
-                &lease_namespace,
-                database,
-                runtime_cancellation,
-            );
-            let runtime = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return,
-                outcome = open => match outcome {
-                    Ok(runtime) => Arc::new(runtime),
-                    Err(error) => {
-                        tracing::warn!(
-                            event = "semantic_runtime_open",
-                            project_id = %scope.project_id,
-                            error = %error,
-                            "semantic runtime remained unavailable"
-                        );
-                        return;
-                    }
-                }
-            };
-            let mut model_ready = runtime.model_ready_events();
-            let mut observed_ready_artifact_digest = model_ready.borrow().artifact_digest.clone();
-            let mut semantic_commit_completions = runtime.schedule_commit_completions();
-            if let Err(error) = invocation
-                .code_index_schedulers
-                .mount_semantic_runtime(&project_root, &scope, Arc::clone(&runtime))
-                .await
-            {
-                tracing::warn!(
-                    event = "semantic_runtime_mount",
-                    project_id = %scope.project_id,
-                    error = %error,
-                    "semantic runtime could not acquire the project route"
-                );
-                let _ = runtime
-                    .shutdown(tokio::time::Instant::now() + DAEMON_TASK_ABORT_DEADLINE)
-                    .await;
-                return;
-            }
-            let _ = invocation
-                .code_index_schedulers
-                .request_complete_generation(&project_root)
-                .await;
-
-            let mut restore_pending = true;
-            let mut scheduled_generation = None;
-            loop {
-                if cancellation.is_cancelled() || !route_registered.load(Ordering::Acquire) {
-                    break;
-                }
-                if let Some(generation_id) = invocation
-                    .code_index_schedulers
-                    .latest_generation_id(&project_root)
-                    .await
-                    && scheduled_generation.as_ref() != Some(&generation_id)
-                {
-                    match invocation
-                        .code_index_schedulers
-                        .generation_for(&scope, &generation_id)
-                        .await
-                    {
-                        Ok(Some(latest)) => {
-                            let generation = latest.generation_handle();
-                            let restored = if restore_pending {
-                                restore_pending = false;
-                                match runtime.restore(Arc::clone(&generation)).await {
-                                    Ok(restored) => restored,
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            event = "semantic_runtime_restore",
-                                            project_id = %scope.project_id,
-                                            error = %error,
-                                            "semantic runtime restore did not produce a serving generation"
-                                        );
-                                        false
-                                    }
-                                }
-                            } else {
-                                false
-                            };
-                            let scheduled = if restored {
-                                true
-                            } else {
-                                match runtime.schedule_generation(generation).await {
-                                    Ok(scheduled) => scheduled,
-                                    Err(error) => {
-                                        tracing::warn!(
-                                            event = "semantic_projection_schedule",
-                                            project_id = %scope.project_id,
-                                            error = %error,
-                                            "semantic generation was not admitted"
-                                        );
-                                        false
-                                    }
-                                }
-                            };
-                            if scheduled {
-                                scheduled_generation = Some(generation_id);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(reason) => {
-                            tracing::warn!(
-                                event = "semantic_generation_resolve",
-                                project_id = %scope.project_id,
-                                reason = reason.as_str(),
-                                "semantic projection could not resolve the seated generation"
-                            );
-                        }
-                    }
-                }
-                tokio::select! {
-                    biased;
-                    () = cancellation.cancelled() => break,
-                    changed = serving_changes.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                    }
-                    changed = model_ready.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        let ready_event = model_ready.borrow().clone();
-                        if !observe_ready_artifact_change(
-                            &mut observed_ready_artifact_digest,
-                            &ready_event,
-                        ) {
-                            continue;
-                        }
-                        // Prefer the durable active generation after a cold
-                        // model acquisition. Only rebuild when there is no
-                        // restorable generation for the seated source.
-                        restore_pending = true;
-                        scheduled_generation = None;
-                    }
-                    changed = semantic_commit_completions.changed() => {
-                        if changed.is_err() {
-                            break;
-                        }
-                        // A newer source refused during the serialized commit
-                        // remains unscheduled and is retried at the loop head.
-                    }
-                }
-            }
-            if invocation
-                .code_index_schedulers
-                .unmount_semantic_runtime_if_current(&project_root, &scope, &runtime)
-                .await
-            {
-                let _ = runtime
-                    .shutdown(tokio::time::Instant::now() + DAEMON_TASK_ABORT_DEADLINE)
-                    .await;
-            }
-        },
-        label = "daemon.project.activate.semantic_runtime"
-    ));
 }
 
 /// Route-fenced inputs for the post-mount query-authority wait.
@@ -669,100 +398,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
     use tracedecay_runtime_core::path_safety::canonical_existing_identity;
-
-    fn semantic_scope(repository: &str, worktree: &str) -> tracedecay_contracts::ResolvedScope {
-        tracedecay_contracts::ResolvedScope::new(
-            tracedecay_domain::ProjectId::new("project.semantic-namespace").expect("project id"),
-            tracedecay_domain::RepositoryId::new(repository).expect("repository id"),
-            tracedecay_domain::WorktreeId::new(worktree).expect("worktree id"),
-            None,
-        )
-        .expect("resolved scope")
-    }
-
-    #[test]
-    fn semantic_lease_namespace_frames_slash_bearing_worktree_identity() {
-        let left = semantic_scope("repository/a", "worktree");
-        let right = semantic_scope("repository", "a/worktree");
-
-        assert_eq!(
-            format!(
-                "{}/{}",
-                left.repository_id.as_str(),
-                left.worktree_id.as_str()
-            ),
-            format!(
-                "{}/{}",
-                right.repository_id.as_str(),
-                right.worktree_id.as_str()
-            ),
-            "the legacy delimiter encoding must demonstrate the collision"
-        );
-        assert_ne!(
-            semantic_lease_namespace(&left),
-            semantic_lease_namespace(&right),
-            "canonical framing must keep linked-worktree heads isolated"
-        );
-    }
-
-    #[tokio::test]
-    async fn semantic_ready_watch_rearms_only_for_a_new_available_artifact() {
-        use tracedecay_semantic_contracts::SemanticLifecycleVerifiedReadyEventV1;
-
-        let initial = SemanticLifecycleVerifiedReadyEventV1 {
-            epoch: 1,
-            artifact_digest: Some("artifact-a".to_owned()),
-        };
-        let (events, mut receiver) = tokio::sync::watch::channel(initial.clone());
-        let mut observed = initial.artifact_digest;
-
-        events.send_replace(SemanticLifecycleVerifiedReadyEventV1 {
-            epoch: 2,
-            artifact_digest: Some("artifact-a".to_owned()),
-        });
-        receiver.changed().await.expect("same-artifact event");
-        assert!(!observe_ready_artifact_change(
-            &mut observed,
-            &receiver.borrow()
-        ));
-
-        events.send_replace(SemanticLifecycleVerifiedReadyEventV1 {
-            epoch: 3,
-            artifact_digest: None,
-        });
-        receiver.changed().await.expect("artifact loss event");
-        assert!(!observe_ready_artifact_change(
-            &mut observed,
-            &receiver.borrow()
-        ));
-
-        events.send_replace(SemanticLifecycleVerifiedReadyEventV1 {
-            epoch: 4,
-            artifact_digest: Some("artifact-a".to_owned()),
-        });
-        receiver
-            .changed()
-            .await
-            .expect("artifact reacquisition event");
-        assert!(observe_ready_artifact_change(
-            &mut observed,
-            &receiver.borrow()
-        ));
-
-        events.send_replace(SemanticLifecycleVerifiedReadyEventV1 {
-            epoch: 5,
-            artifact_digest: Some("artifact-b".to_owned()),
-        });
-        receiver.changed().await.expect("new-artifact event");
-        assert!(observe_ready_artifact_change(
-            &mut observed,
-            &receiver.borrow()
-        ));
-        assert!(!observe_ready_artifact_change(
-            &mut observed,
-            &receiver.borrow()
-        ));
-    }
 
     fn git(root: &Path, arguments: &[&str]) {
         let status = Command::new(

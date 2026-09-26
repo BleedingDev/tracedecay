@@ -211,27 +211,6 @@ impl HookProjectRouteCache {
         }
     }
 
-    /// Publishes the native session identity from an admitted Hook V2
-    /// SessionStart onto the same private-route cache used by legacy hook
-    /// events. The caller owns V2 envelope and project-scope validation; this
-    /// cache owns only the already-authorized structural route.
-    pub(crate) fn observe_session_workspace_route(
-        &mut self,
-        session_id: &str,
-        route: WorkspaceProjectRoute,
-    ) -> tracedecay_domain::errors::Result<()> {
-        let session_id =
-            tracedecay_privacy::protect_sensitive_structural_id(session_id).map_err(|_| {
-                tracedecay_domain::errors::TraceDecayError::project_route(
-                    "project_route_invalid_identity",
-                    false,
-                    "Hook V2 session identity could not be protected",
-                )
-            })?;
-        self.insert_session_workspace_route(session_id, route);
-        Ok(())
-    }
-
     #[hotpath::measure(label = "mcp.project_route.select_route")]
     pub(crate) fn workspace_route_for_arguments(
         &self,
@@ -372,22 +351,6 @@ impl SharedHookProjectRouteCache {
         Ok(())
     }
 
-    /// Atomically adds one admitted V2 session route without replacing routes
-    /// published concurrently by other hook connections.
-    #[hotpath::measure(label = "mcp.project_route.publish_session")]
-    pub(crate) fn publish_session_route(
-        &self,
-        session_id: &str,
-        route: WorkspaceProjectRoute,
-    ) -> tracedecay_domain::errors::Result<()> {
-        let mut state = self.inner.lock().map_err(|_| Self::unavailable("update"))?;
-        state
-            .cache
-            .observe_session_workspace_route(session_id, route)?;
-        state.generation += 1;
-        Ok(())
-    }
-
     /// Refresh `target` from the shared cache with one clone under the lock,
     /// skipped entirely while `target` already carries the current shared
     /// generation (route updates are rare relative to tool calls).
@@ -432,59 +395,6 @@ pub(crate) fn mcp_analytics_session_id(arguments: &Value) -> Option<String> {
 
 pub(crate) fn arguments_have_structural_route_identity(arguments: &Value) -> bool {
     mcp_route_thread_id(arguments).is_some() || mcp_analytics_session_id(arguments).is_some()
-}
-
-/// Top-level structural identity fields that are semantic input for a tool,
-/// rather than route-only host metadata.
-///
-/// Keep this explicit because those fields have two meanings: the router uses
-/// them to select a private project, while the listed handlers also consume
-/// them as business arguments. The catalog lockstep test below makes a newly
-/// declared top-level session/thread field fail loudly until it is classified.
-fn semantic_structural_identity_fields(tool_name: &str) -> &'static [&'static str] {
-    match tool_name {
-        "tracedecay_lcm_status"
-        | "tracedecay_lcm_load_session"
-        | "tracedecay_lcm_grep"
-        | "tracedecay_lcm_describe"
-        | "tracedecay_lcm_expand"
-        | "tracedecay_lcm_expand_query"
-        | "tracedecay_session_lookup"
-        | "tracedecay_workflows"
-        // The hook runtime consumes the caller's session as business input:
-        // transcript ingest, terminal receipts, and the Hermes callback all
-        // read it from the arguments after routing.
-        | "tracedecay_hook_runtime" => &["session_id"],
-        _ => &[],
-    }
-}
-
-/// Removes route-only metadata from handler `arguments`, answering the
-/// original routing/advisory identity view when one of its identity fields was
-/// removed.
-///
-/// `_meta` is always host metadata. Top-level snake/camel session and thread
-/// spellings are also route-only unless the called tool declares that exact
-/// spelling as semantic input. Routing and private-route authorization run
-/// before this function; analytics snapshots the original arguments even
-/// earlier. Strict semantic request decoders therefore receive only declared
-/// business fields without weakening either identity consumer.
-pub(crate) fn take_route_only_metadata(tool_name: &str, arguments: &mut Value) -> Option<Value> {
-    let carried_identity = arguments_have_structural_route_identity(arguments);
-    let preserved = carried_identity.then(|| arguments.clone());
-    let Some(map) = arguments.as_object_mut() else {
-        return None;
-    };
-    let semantic_fields = semantic_structural_identity_fields(tool_name);
-    let mut removed_identity = map
-        .remove("_meta")
-        .is_some_and(|value| arguments_have_structural_route_identity(&value));
-    for key in ["session_id", "sessionId", "thread_id", "threadId"] {
-        if !semantic_fields.contains(&key) {
-            removed_identity |= map.remove(key).is_some();
-        }
-    }
-    if removed_identity { preserved } else { None }
 }
 
 #[hotpath::measure(label = "mcp.project_route.protect_structural_ids")]
@@ -590,8 +500,7 @@ mod tests {
 
     use super::{
         HookProjectRouteCache, MAX_HOOK_ROUTE_CACHE_ENTRIES, SharedHookProjectRouteCache,
-        WorkspaceProjectRoute, mcp_analytics_session_id, project_route_identity_matches,
-        semantic_structural_identity_fields, take_route_only_metadata,
+        WorkspaceProjectRoute, project_route_identity_matches,
     };
     use crate::daemon::ProductionProjectCompositionHarnessV1;
     use crate::mcp::server::McpServer;
@@ -659,111 +568,6 @@ mod tests {
             _harness: harness,
             server,
             event,
-        }
-    }
-
-    /// A host that publishes the caller's session in the `_meta` envelope
-    /// routes the call and binds its advisory lane, but the semantic handler
-    /// must never see that envelope.
-    ///
-    /// Real defect this catches: `tracedecay_context` answering
-    /// `invalid arguments for tracedecay_context: unknown field "_meta"` for
-    /// every call a real Claude Code hook session routed.
-    #[test]
-    fn route_only_metadata_leaves_the_handler_arguments_and_survives_as_the_identity_view() {
-        let mut handler_arguments = json!({
-            "task": "cognitive recall ledger",
-            "include_memory": true,
-            "_meta": { "session_id": "session.hook.routed" }
-        });
-
-        let identity_view = take_route_only_metadata("tracedecay_context", &mut handler_arguments)
-            .expect("the stripped envelope carried the only caller identity");
-
-        assert_eq!(
-            handler_arguments,
-            json!({ "task": "cognitive recall ledger", "include_memory": true }),
-            "only route-only metadata may be stripped; declared arguments stay"
-        );
-        assert_eq!(
-            mcp_analytics_session_id(&identity_view).as_deref(),
-            Some("session.hook.routed"),
-            "the preserved view must still bind the exact caller session"
-        );
-        assert_eq!(
-            identity_view.get("task"),
-            Some(&json!("cognitive recall ledger")),
-            "the advisory lane reads its query from the preserved view too"
-        );
-    }
-
-    /// Top-level snake/camel spellings route a strict-schema tool but are not
-    /// business arguments of that tool, so none may reach its decoder.
-    #[test]
-    fn top_level_route_identity_is_stripped_from_a_strict_tool() {
-        let mut handler_arguments = json!({
-            "task": "cognitive recall ledger",
-            "session_id": "session.snake",
-            "sessionId": "session.camel",
-            "thread_id": "thread.snake",
-            "threadId": "thread.camel"
-        });
-
-        let identity_view = take_route_only_metadata("tracedecay_context", &mut handler_arguments)
-            .expect("top-level route identity must be preserved out of band");
-
-        assert_eq!(
-            handler_arguments,
-            json!({"task": "cognitive recall ledger"})
-        );
-        assert_eq!(
-            mcp_analytics_session_id(&identity_view).as_deref(),
-            Some("session.snake"),
-            "the original identity precedence remains unchanged"
-        );
-    }
-
-    /// A field the called tool actually declares stays semantic even though the
-    /// private router also uses it as structural identity. Undeclared aliases
-    /// and thread fields remain route-only.
-    #[test]
-    fn declared_structural_identity_stays_in_handler_arguments() {
-        let mut handler_arguments = json!({
-            "session_id": "session.semantic",
-            "sessionId": "session.route-only-alias",
-            "thread_id": "thread.route-only",
-            "limit": 5
-        });
-
-        let identity_view =
-            take_route_only_metadata("tracedecay_workflows", &mut handler_arguments)
-                .expect("route-only aliases were removed");
-
-        assert_eq!(
-            handler_arguments,
-            json!({"session_id": "session.semantic", "limit": 5}),
-            "the declared snake-case field must reach the workflow handler"
-        );
-        assert_eq!(
-            mcp_analytics_session_id(&identity_view).as_deref(),
-            Some("session.semantic")
-        );
-    }
-
-    #[test]
-    fn semantic_structural_identity_classification_matches_the_tool_catalog() {
-        let definitions = tracedecay_mcp::get_maximal_tool_definitions()
-            .expect("the deterministic maximal MCP catalog");
-        for definition in definitions {
-            for field in ["session_id", "sessionId", "thread_id", "threadId"] {
-                let declared = definition.input_schema["properties"].get(field).is_some();
-                assert_eq!(
-                    semantic_structural_identity_fields(&definition.name).contains(&field),
-                    declared,
-                    "{} field {field} must be classified with its input schema",
-                    definition.name
-                );
-            }
         }
     }
 

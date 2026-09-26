@@ -59,6 +59,7 @@ function Rows({ children, label }: { children: ReactNode; label: string }) {
     </div>
   );
 }
+
 function Row({
   label,
   value,
@@ -802,3 +803,4 @@ export function FindingsBody({
     </>
   );
 }
+

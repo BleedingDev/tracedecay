@@ -10,11 +10,6 @@ import sys
 import tomllib
 
 
-# The verified NCM worker and pinned model are distributed only for the arm64
-# macOS release; every other target ships the Native-only production profile.
-NCM_SUPPORTED_TARGET = "aarch64-apple-darwin"
-
-
 def expand_local_features(
     features: dict[str, list[str]], selected: list[str]
 ) -> set[str]:
@@ -76,14 +71,7 @@ def main() -> int:
         # so a release binary does not carry them and then try to switch them
         # off at runtime.
         cargo_features = "production"
-        # Older production tags predate the opt-in memory-provider host, so
-        # only add it when the replayed source actually declares the feature.
-        if (
-            arguments.target == NCM_SUPPORTED_TARGET
-            and "memory-provider-host" in features
-        ):
-            cargo_features = "production,memory-provider-host"
-        cargo_args = f"--no-default-features --features {cargo_features}"
+        cargo_args = "--no-default-features --features production"
     else:
         resolved_defaults = expand_local_features(features, defaults)
         if "test-transport" in resolved_defaults:

@@ -182,7 +182,6 @@ mod reconcile;
 mod reconcile_panic_guard;
 mod registry;
 mod residency;
-pub mod semantic_query_runtime;
 mod serving;
 
 // The registry surface lives in `registry.rs`; re-export it so its public path

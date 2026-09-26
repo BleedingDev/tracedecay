@@ -27,7 +27,7 @@ use tracedecay_memory_provider_api::{
     MemoryProvider, OwnedExactScope, OwnedProviderId, OwnedVersionedId, PinnedFallbackPolicy,
     ProviderCall, ProviderDescriptor, ProviderOperation, ProviderReply, TerminalRecord,
 };
-use tracedecay_memory_provider_native::{NativeMemoryApplicationPort, NativeObservation};
+use tracedecay_memory_provider_native::NativeMemoryApplicationPort;
 use tracedecay_memory_provider_registry::{
     ActiveRoutingPolicy, BudgetExclusionReason, CognitiveRecallPortError,
     CognitiveRecallPortInputsV1, DegradationCause, DegradationDeclinedReason, DegradationRule,
@@ -702,42 +702,6 @@ impl NativeMemoryApplicationPort for BlockingRecallPort {
     }
 
     fn health(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
-        unexpected()
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
         unexpected()
     }
 }
@@ -2351,42 +2315,6 @@ impl NativeMemoryApplicationPort for ProfileRecordingFixture {
 
     fn health(&self, call: &ProviderCall) -> ProviderReply {
         self.inner.health(call)
-    }
-
-    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-        self.inner.observe(observation)
-    }
-
-    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.feedback(call)
-    }
-
-    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.maintenance(call)
-    }
-
-    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.inspection(call)
-    }
-
-    fn correction(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.correction(call)
-    }
-
-    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.delete_by_source(call)
-    }
-
-    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.snapshot_export(call)
-    }
-
-    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.snapshot_restore(call)
-    }
-
-    fn replay(&self, call: &ProviderCall) -> ProviderReply {
-        self.inner.replay(call)
     }
 }
 

@@ -43,7 +43,6 @@ tracedecay-contracts = { path = "../tracedecay-contracts" }
 tracedecay-domain = { path = "../tracedecay-domain" }
 tracedecay-graph-db = { path = "../tracedecay-graph-db" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core" }
-tracedecay-semantic-contracts = { path = "../tracedecay-semantic-contracts" }
 tracedecay-rusqlite-runtime = { path = "../tracedecay-rusqlite-runtime" }
 tracedecay-session-temporal-store = { path = "../tracedecay-session-temporal-store" }
 tracedecay-lcm = { path = "../tracedecay-lcm" }

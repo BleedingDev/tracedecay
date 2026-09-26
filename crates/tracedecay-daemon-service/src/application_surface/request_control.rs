@@ -10,7 +10,6 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tracedecay_api::HttpApplicationControls;
 use tracedecay_contracts::request_identity::{GlobalRequestSurface, mint_global_request_id};
-use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, SdkRequestIdControlV1};
 use tracedecay_contracts::{
     APPLICATION_REQUEST_ID_HEADER, ApplicationRequestControlV1, CancellationSignal, Deadline,
     RequestId,
@@ -50,15 +49,10 @@ pub(super) fn supplied_request_id(
     ))
 }
 
-pub(super) fn supplied_request_id_operation(path: &str) -> Option<RetainedSurfaceOperation> {
-    let operation = path
-        .strip_prefix("/retained/")
-        .and_then(RetainedSurfaceOperation::from_operation_name)?;
-    matches!(
-        operation.sdk_operation_contract().request_id,
-        SdkRequestIdControlV1::Required
+pub(super) fn accepts_supplied_request_id(path: &str) -> bool {
+    path == tracedecay_api::retained_route_path(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::FactStoreCurate,
     )
-    .then_some(operation)
 }
 
 pub(super) struct ActiveHttpRequest {
@@ -123,8 +117,7 @@ pub(super) async fn application_http_context(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let request_id_operation = supplied_request_id_operation(request.uri().path());
-    if supplied_request_id.is_some() && request_id_operation.is_none() {
+    if supplied_request_id.is_some() && !accepts_supplied_request_id(request.uri().path()) {
         return invalid_http_request_control_response();
     }
     let request_id = match supplied_request_id {
@@ -167,10 +160,7 @@ pub(super) async fn application_http_context(
     ) {
         Ok(active) => active,
         Err(RequestControlError::ActiveCollision) => {
-            let Some(operation) = request_id_operation else {
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            };
-            return retained::active_request_conflict_response(operation, request_id);
+            return retained::active_request_conflict_response(request_id);
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
@@ -222,18 +212,8 @@ mod tests {
             supplied_request_id(&headers),
             Err(RequestControlError::DuplicateHeader)
         );
-        assert_eq!(
-            supplied_request_id_operation("/retained/fact_store_curate"),
-            Some(RetainedSurfaceOperation::FactStoreCurate)
-        );
-        assert_eq!(
-            supplied_request_id_operation("/retained/provider_feedback"),
-            Some(RetainedSurfaceOperation::ProviderFeedback)
-        );
-        assert_eq!(
-            supplied_request_id_operation("/retained/fact_store_add"),
-            None
-        );
+        assert!(accepts_supplied_request_id("/retained/fact_store_curate"));
+        assert!(!accepts_supplied_request_id("/retained/fact_store_add"));
     }
 
     #[test]

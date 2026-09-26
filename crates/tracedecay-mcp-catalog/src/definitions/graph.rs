@@ -22,12 +22,6 @@ const SEARCH_MAX_LEXICAL_PROXIMITY_TERMS: usize = 8;
 const SEARCH_MAX_LEXICAL_PROXIMITY_GAP: u32 = 8;
 
 pub(super) fn def_search() -> ToolDefinition {
-    let mut semantic_mode = json!(schemars::schema_for!(
-        tracedecay_contracts::retrieval::SemanticQueryModeV1
-    ));
-    semantic_mode["description"] = json!(
-        "Opt in to installed code-semantic search. fallback preserves baseline results when semantics is unavailable; strict requires a complete compatible semantic generation. Omit for exact/lexical/graph search. Never downloads or loads a model on the query path."
-    );
     def_always_load(
         "tracedecay_search",
         "Search Symbols",
@@ -45,9 +39,8 @@ pub(super) fn def_search() -> ToolDefinition {
                 },
                 "cursor": {
                     "type": "string",
-                    "description": "Authenticated opaque continuation returned as next_cursor. Repeat the same query, lexical options, and semantic mode with it."
+                    "description": "Authenticated opaque continuation returned as next_cursor. Repeat the same query and lexical options with it."
                 },
-                "semantic_mode": semantic_mode,
                 "lexical_anchors": {
                     "type": "array",
                     "items": { "type": "string" },
@@ -451,12 +444,9 @@ mod search_schema_tests {
     };
 
     #[test]
-    fn search_schema_exposes_explicit_semantic_modes_and_keeps_the_cursor() {
+    fn search_schema_has_no_semantic_mode_and_keeps_the_cursor() {
         let definition = def_search();
-        assert_eq!(
-            definition.input_schema["properties"]["semantic_mode"]["enum"],
-            serde_json::json!(["fallback", "strict"])
-        );
+        assert!(definition.input_schema["properties"]["semantic_mode"].is_null());
         assert_eq!(
             definition.input_schema["properties"]["cursor"]["type"],
             "string"

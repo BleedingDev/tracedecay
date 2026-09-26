@@ -110,11 +110,7 @@ impl DaemonSessionRuntimeRegistryV1 {
         // process mode is a construction-time fact, not a mutable runtime flag.
         let long_lived =
             super::LONG_LIVED_SESSION_MAINTENANCE.load(std::sync::atomic::Ordering::Relaxed);
-        // Keep the instrumented bootstrap layout behind one owned future.
-        // Callers retain the registry result, not its transitive startup stack.
-        let opening: std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self>> + Send>> =
-            Box::pin(Self::open_with_session_maintenance(identity, long_lived));
-        opening.await
+        Self::open_with_session_maintenance(identity, long_lived).await
     }
 
     /// Constructor with an explicit session-maintenance policy. Production

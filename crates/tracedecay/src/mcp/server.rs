@@ -280,8 +280,6 @@ pub(crate) type CodeIndexPublicationIdentityResolver = Arc<
         + 'static,
 >;
 
-pub(crate) use tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1;
-
 // Lock ordering: file_token_map -> method/resource/tool call counts (never nested)
 pub struct McpServer {
     /// The served code graph. Guarded so a mid-session `git checkout` can
@@ -399,8 +397,6 @@ pub struct McpServer {
     code_index_redundancy_executor: Option<CodeIndexRedundancyExecutor>,
     /// Daemon-owned exact sealed-generation branch comparison bridge.
     code_index_branch_diff_executor: Option<CodeIndexBranchDiffExecutor>,
-    /// Daemon-owned exact-scope semantic model lifecycle bridge.
-    semantic_admin_executor: Option<SemanticAdminExecutorV1>,
     code_graph_projection_read_port: Option<CodeGraphProjectionReadPort>,
     code_graph_read_admission_port: Option<CodeGraphReadAdmissionPort>,
     verified_graph_query_port:
@@ -861,7 +857,6 @@ impl McpServer {
             code_index_similar_executor,
             code_index_redundancy_executor,
             code_index_branch_diff_executor,
-            semantic_admin_executor,
             code_graph_projection_read_port,
             code_graph_read_admission_port,
             verified_graph_query_port,
@@ -1095,7 +1090,6 @@ impl McpServer {
             code_index_similar_executor,
             code_index_redundancy_executor,
             code_index_branch_diff_executor,
-            semantic_admin_executor,
             code_graph_projection_read_port,
             code_graph_read_admission_port,
             verified_graph_query_port,
@@ -1215,7 +1209,7 @@ impl McpServer {
     /// admission ledger before delivering a result. A server whose provider
     /// composition is disabled has no recall route, which is a typed state.
     #[cfg(feature = "memory-provider-host")]
-    pub fn cognitive_recall_port_for_session(
+    pub(crate) fn cognitive_recall_port_for_session(
         &self,
         canonical_session_id: &str,
     ) -> std::result::Result<
@@ -1247,13 +1241,6 @@ impl McpServer {
                 .as_ref()
                 .and_then(|host| host.cognitive_recall_mount())
         })
-    }
-
-    #[cfg(all(test, feature = "memory-provider-host"))]
-    pub(crate) fn memory_provider_host_mount_for_test(&self) -> &MemoryProviderHostMount {
-        self._memory_provider_host_mount
-            .as_ref()
-            .expect("production project server must retain its provider host mount")
     }
 
     #[hotpath::measure(label = "mcp.server.reconcile_automation", future = true)]
@@ -1553,8 +1540,6 @@ mod cancel_candidate_journey;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod work_evidence_mount_tests;
 
-#[cfg(all(test, feature = "memory-provider-host"))]
-mod cognitive_recall_journey_tests;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod lcm_claude_recall_tests;

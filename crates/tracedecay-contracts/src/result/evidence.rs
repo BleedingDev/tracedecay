@@ -3,7 +3,7 @@ use std::fmt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use tracedecay_domain::{
-    CodeGenerationId, ComponentVersion, ManifestDigest, RetrievalAnchorId, TemporalModeV1,
+    CodeGenerationId, ComponentVersion, FactId, ManifestDigest, RetrievalAnchorId, TemporalModeV1,
     UtcMicros,
 };
 use tracedecay_tool_catalog::{RetrieverId, SortContractId};
@@ -11,7 +11,7 @@ use tracedecay_tool_catalog::{RetrieverId, SortContractId};
 use crate::context::{CapabilityGrantId, DisclosureClass, RequestContext, ResolvedScope};
 use crate::error::ApplicationContractError;
 use crate::identity::application_identifier;
-use crate::memory::{FactListCursorV1, FactSearchCursorV1};
+use crate::memory::FactSearchCursorV1;
 
 use super::{CancellationObservation, OperationBudgetUsage, OperationReceipt, ResultContractRef};
 
@@ -27,16 +27,14 @@ application_identifier!(
 
 /// Exact continuation authority for the enclosing evidence page.
 ///
-/// General retrieval and retained fact operations carry authenticated opaque
-/// cursors. The fact-specific variants preserve the operation family for
-/// consumers while their values remain bounded strings with no ordering
-/// fields at the evidence boundary.
+/// General retrieval keeps its authenticated opaque cursor, while retained
+/// fact operations carry their canonical structural ordering cursor directly.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PageCursor {
     Opaque { cursor: OpaqueCursor },
     FactSearch { cursor: FactSearchCursorV1 },
-    FactList { cursor: FactListCursorV1 },
+    FactListAfter { fact_id: FactId },
 }
 
 impl PageCursor {
@@ -44,7 +42,7 @@ impl PageCursor {
     pub const fn as_opaque(&self) -> Option<&OpaqueCursor> {
         match self {
             Self::Opaque { cursor } => Some(cursor),
-            Self::FactSearch { .. } | Self::FactList { .. } => None,
+            Self::FactSearch { .. } | Self::FactListAfter { .. } => None,
         }
     }
 }
@@ -444,8 +442,8 @@ pub struct RetrieverContribution {
     pub elapsed_budget_class: BudgetClass,
 }
 
-/// Stable page state. Cursor bytes stay opaque until authorization is
-/// revalidated; fact-specific variants retain their operation family only.
+/// Stable page state. General cursor bytes stay opaque until authorization is
+/// revalidated; structural fact cursors retain their canonical ordering type.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PageState {

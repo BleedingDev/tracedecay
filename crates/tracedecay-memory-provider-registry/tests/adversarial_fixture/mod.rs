@@ -37,7 +37,7 @@ use tracedecay_memory_provider_api::{
     ProviderCall, ProviderDescriptor, ProviderLimits, ProviderReply,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation,
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort,
 };
 use tracedecay_memory_provider_registry::{
     ActiveRoutingPolicy, CognitiveRecallPortError, CognitiveRecallPortInputsV1, DegradationCause,
@@ -182,47 +182,7 @@ impl NativeMemoryApplicationPort for NativeShimV1 {
         tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
     }
 
-    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-        let call = match &observation {
-            NativeObservation::FactPromotion(envelope)
-            | NativeObservation::StagedSession(envelope) => envelope.call,
-        };
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn correction(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
-        tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
-    }
-
-    fn replay(&self, call: &ProviderCall) -> ProviderReply {
         tracedecay_memory_provider_api::MemoryProvider::invoke(self.inner.as_ref(), call)
     }
 }

@@ -142,17 +142,11 @@ pub use primitive_surface::{
     RedundancyResultV1, RedundancyScopeV1, RedundancySurfaceRequestV1, RenamePreviewNodeV1,
     RenamePreviewPrimitiveOutcomeV1, RenamePreviewPrimitiveRequestV1,
     RenamePreviewPrimitiveResultV1, RenamePreviewReferenceV1, RenamePreviewTextOnlyMatchV1,
-    SemanticQueryModeV1, SimilarAlignedDifferenceV1, SimilarAlignmentAnchorV1, SimilarAlignmentV1,
-    SimilarContainmentV1, SimilarCoverageV1, SimilarFamilyV1, SimilarMatchClassV1,
-    SimilarNearCoverageV1, SimilarNearMatchV1, SimilarNearPartialReasonV1, SimilarNearResultV1,
-    SimilarNearUnavailableReasonV1, SimilarOccurrenceV1, SimilarResultV1, SimilarSourceExtentV1,
-    SimilarSurfaceRequestV1, SimilarTargetV1, SimilarTokenSpanV1, TodoMarkerV1, TodosResultV1,
-    TodosSurfaceRequestV1,
+    SimilarCoverageV1, SimilarFamilyV1, SimilarMatchClassV1, SimilarOccurrenceV1, SimilarResultV1,
+    SimilarSurfaceRequestV1, SimilarTargetV1, TodoMarkerV1, TodosResultV1, TodosSurfaceRequestV1,
 };
-pub use primitive_surface::{
-    ContextMemoryContributionV1, ContextMemoryFactIdentityV1, ContextMemoryTemporalCoverageV1,
-    MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS,
-};
+// Non-serialized context sidecar read by the memory-provider host advisory lane.
+pub use primitive_surface::ContextMemoryContributionV1;
 pub use requests::{
     AffectedTestAttributionV1, AffectedTestsRequest, AffectedTestsResult, AnchorExpandRequest,
     AnchorExpandResult, CallChainPrimitiveRequest, CallChainPrimitiveResult,

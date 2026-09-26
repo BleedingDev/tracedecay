@@ -192,17 +192,6 @@ where
             })?;
 
     let lexical_routing = lexical_routing::routing_from_args(&args)?;
-    let semantic_mode = args
-        .get("semantic_mode")
-        .map(|value| {
-            serde_json::from_value::<tracedecay_contracts::retrieval::SemanticQueryModeV1>(
-                value.clone(),
-            )
-            .map_err(|error| TraceDecayError::Config {
-                message: format!("invalid semantic_mode: {error}"),
-            })
-        })
-        .transpose()?;
     let lazy_indexing_requested = dependency_hints::lazy_indexing_requested(&args);
     let cursor = retrieval_cursor(&args)?;
     let include_graph_node_ids = render::wants_json(&args);
@@ -219,7 +208,6 @@ where
     let search_request = tracedecay_query::code_search::CodeIndexSearchRequestV1 {
         project_root: ctx.project_root().to_path_buf(),
         query: query.to_owned(),
-        semantic_mode,
         source_revision: None,
         source_tree: None,
         source_reference: None,
@@ -827,7 +815,6 @@ where
         tracedecay_query::code_search::CodeIndexSearchRequestV1 {
             project_root: ctx.project_root().to_path_buf(),
             query: task.to_owned(),
-            semantic_mode: request.semantic_mode,
             source_revision: None,
             source_tree: None,
             source_reference: None,
@@ -2237,7 +2224,6 @@ mod tests {
             tracedecay_query::code_search::CodeIndexSearchRequestV1 {
                 project_root: std::path::PathBuf::from("/fixture"),
                 query: "fixture".to_owned(),
-                semantic_mode: None,
                 source_revision: None,
                 source_tree: None,
                 source_reference: None,
@@ -2270,7 +2256,6 @@ mod tests {
             tracedecay_query::code_search::CodeIndexSearchRequestV1 {
                 project_root: std::path::PathBuf::from("/fixture"),
                 query: "fixture".to_owned(),
-                semantic_mode: None,
                 source_revision: None,
                 source_tree: None,
                 source_reference: None,

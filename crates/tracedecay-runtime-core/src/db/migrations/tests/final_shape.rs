@@ -207,30 +207,6 @@ async fn runtime_writer_ledger_is_part_of_the_final_shape() {
     );
 }
 
-/// The vector-generation authority behind the dense semantic lane is part of
-/// the exact shape a fresh store is created with. A store missing any of its
-/// tables is refused unchanged rather than installed into.
-#[tokio::test]
-async fn vector_authority_schema_is_part_of_the_final_shape() {
-    let (_directory, path) = fresh_current_store().await;
-    for table in tracedecay_rusqlite_runtime::repository::VECTOR_AUTHORITY_OBJECTS_V1 {
-        assert!(
-            object_sql(&path, "table", table).is_some(),
-            "fresh store must carry {table}"
-        );
-    }
-    let before = store_snapshot(&path);
-    admit_existing(&path, "store carrying the vector authority must be admitted").await;
-    assert_eq!(
-        store_snapshot(&path),
-        before,
-        "vector-authority-carrying admission stays query-only"
-    );
-
-    tamper(&path, "DROP TABLE vector_authority_generation_blobs_v1;");
-    assert_reset_required_without_repair(&path, "store missing a vector-authority table").await;
-}
-
 #[tokio::test]
 async fn automation_run_receipt_indexes_are_required_final_shape() {
     let (_directory, path) = fresh_current_store().await;

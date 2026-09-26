@@ -33,7 +33,6 @@ pub(super) fn decode_repository_provenance_attachment(
     availability_json: &str,
     capture_json: Option<&str>,
     anchor_json: Option<&str>,
-    origin_json: Option<&str>,
     operation: &'static str,
 ) -> ObservationStoreResult<RepositoryProvenanceAttachmentV1> {
     let availability: EvidenceAvailabilityV1<GenerationBoundRepositoryProvenanceV1> =
@@ -44,18 +43,12 @@ pub(super) fn decode_repository_provenance_attachment(
     if availability.value() != capture.as_ref() {
         return Err(ObservationStoreError::RepositoryProvenanceBindingMismatch);
     }
-    let origin = origin_json
-        .map(|origin| {
-            decode::<tracedecay_store::observation::ObservationOriginV1>(origin, operation)
-        })
-        .transpose()?;
     RepositoryProvenanceAttachmentV1::new(
         availability,
         anchor_json
             .map(|anchor| decode::<RetrievalAnchorRecord>(anchor, operation))
             .transpose()?,
-    )?
-    .with_retained_origin(origin)
+    )
 }
 
 pub(super) fn decode_sequence(value: i64, operation: &'static str) -> ObservationStoreResult<u64> {

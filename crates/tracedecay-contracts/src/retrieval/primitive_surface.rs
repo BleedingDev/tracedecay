@@ -26,8 +26,6 @@ pub const MAX_REDUNDANCY_FAMILIES_V1: u32 = 100;
 pub const MAX_REDUNDANCY_PULL_REQUEST_PATHS_V1: usize = 256;
 pub const MAX_REDUNDANCY_WORK_V1: u32 = 10_000;
 
-pub use tracedecay_domain::SemanticQueryModeV1;
-
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextModeV1 {
@@ -49,8 +47,6 @@ impl ContextModeV1 {
 #[serde(deny_unknown_fields)]
 pub struct ContextSurfaceRequestV1 {
     pub task: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic_mode: Option<SemanticQueryModeV1>,
     pub max_nodes: Option<u32>,
     pub include_code: Option<bool>,
     pub max_code_blocks: Option<u32>,
@@ -467,9 +463,6 @@ pub struct PrimitiveSearchCoverageV1 {
     pub exact: PrimitiveLaneStatusV1,
     pub lexical: PrimitiveLaneStatusV1,
     pub graph: PrimitiveLaneStatusV1,
-    /// Absent when code-semantic retrieval was not requested.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub semantic: Option<PrimitiveLaneStatusV1>,
     pub recall: PrimitiveRecallV1,
 }
 
@@ -1182,7 +1175,6 @@ mod tests {
                 exact: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
                 lexical: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
                 graph: PrimitiveLaneStatusV1::Complete(PrimitiveLaneCompleteV1::Complete),
-                semantic: None,
                 recall: PrimitiveRecallV1::Full,
             },
             memory_matches: vec![],

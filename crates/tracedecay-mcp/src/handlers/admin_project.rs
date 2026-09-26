@@ -1,16 +1,10 @@
-use std::future::Future;
-use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use tracedecay_automation_runtime::automation::AutomationRunControl;
 use tracedecay_contracts::{CancellationSignal, Deadline, now_micros};
 use tracedecay_domain::ProvenanceId;
-use tracedecay_semantic_contracts::{
-    ModelArtifactManifestV1, SemanticModelLifecycleStatusV1, SemanticRuntimeStatusProjectionV1,
-};
 use tracedecay_store::{ProjectMemoryAutomaticFactReceiptV1, ProjectMemoryAutomaticFactStateV1};
 
 use tracedecay_domain::errors::{Result, TraceDecayError};
@@ -44,52 +38,7 @@ enum AdminProjectAction {
     AutomationReconcile {
         scope: tracedecay_dashboard_api::AutomationReconcileScope,
     },
-    SemanticStatus,
-    SemanticAcquire,
-    SemanticImport {
-        manifest: ModelArtifactManifestV1,
-        source: PathBuf,
-    },
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SemanticAdminRequestV1 {
-    Status,
-    Acquire,
-    Import {
-        manifest: ModelArtifactManifestV1,
-        source: PathBuf,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum SemanticAdminResponseV1 {
-    Status {
-        /// The runtime actually mounted for this route. `None` means the
-        /// configured state has not produced a mounted runtime yet (for
-        /// example, before the required daemon restart after enablement).
-        lifecycle: Option<SemanticModelLifecycleStatusV1>,
-        /// Index-generation scheduling and serving state observed from the
-        /// same mounted runtime as `lifecycle`.
-        runtime: Option<SemanticRuntimeStatusProjectionV1>,
-    },
-    Acquisition {
-        queued: bool,
-        lifecycle: SemanticModelLifecycleStatusV1,
-    },
-    Import {
-        lifecycle: SemanticModelLifecycleStatusV1,
-    },
-}
-
-pub type SemanticAdminFutureV1 =
-    Pin<Box<dyn Future<Output = Result<SemanticAdminResponseV1>> + Send>>;
-pub type SemanticAdminExecutorV1 = Arc<
-    dyn Fn(SemanticAdminRequestV1, Deadline, CancellationSignal) -> SemanticAdminFutureV1
-        + Send
-        + Sync,
->;
 
 fn project_memory_application<'a>(
     cg: &TraceDecay,
@@ -204,7 +153,6 @@ pub async fn handle_admin_project(
     automation_scheduler_reconciler: Option<
         tracedecay_dashboard_api::AutomationSchedulerReconciler,
     >,
-    semantic_admin: Option<SemanticAdminExecutorV1>,
     application_deadline: Deadline,
     application_cancellation: CancellationSignal,
 ) -> Result<ToolResult> {
@@ -338,58 +286,8 @@ pub async fn handle_admin_project(
                 })?;
             json!({ "receipt": automatic_fact_receipt_json(&receipt) })
         }
-        AdminProjectAction::SemanticStatus => {
-            execute_semantic_admin(
-                semantic_admin,
-                SemanticAdminRequestV1::Status,
-                application_deadline,
-                application_cancellation,
-            )
-            .await?
-        }
-        AdminProjectAction::SemanticAcquire => {
-            execute_semantic_admin(
-                semantic_admin,
-                SemanticAdminRequestV1::Acquire,
-                application_deadline,
-                application_cancellation,
-            )
-            .await?
-        }
-        AdminProjectAction::SemanticImport { manifest, source } => {
-            validate_semantic_import_source(&source)?;
-            execute_semantic_admin(
-                semantic_admin,
-                SemanticAdminRequestV1::Import { manifest, source },
-                application_deadline,
-                application_cancellation,
-            )
-            .await?
-        }
     };
     Ok(json_result(&value))
-}
-
-async fn execute_semantic_admin(
-    executor: Option<SemanticAdminExecutorV1>,
-    request: SemanticAdminRequestV1,
-    deadline: Deadline,
-    cancellation: CancellationSignal,
-) -> Result<Value> {
-    let executor = executor.ok_or_else(|| TraceDecayError::Config {
-        message: "semantic runtime is unavailable for this project".to_owned(),
-    })?;
-    let response = executor(request, deadline, cancellation).await?;
-    serde_json::to_value(response).map_err(TraceDecayError::from)
-}
-
-fn validate_semantic_import_source(source: &Path) -> Result<()> {
-    if !source.is_absolute() {
-        return Err(TraceDecayError::Config {
-            message: "semantic artifact source must be an absolute path".to_owned(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -494,7 +392,6 @@ mod tests {
                 }),
                 None,
                 None,
-                None,
                 deadline,
                 cancellation,
             )
@@ -516,7 +413,6 @@ mod tests {
             &handle_admin_project(
                 &cg,
                 json!({ "action": "automatic_fact_receipt_view", "id": apply_id }),
-                None,
                 None,
                 None,
                 deadline,
@@ -552,7 +448,7 @@ mod tests {
         ] {
             let (deadline, cancellation) = test_application_control();
             assert!(
-                handle_admin_project(&cg, action, None, None, None, deadline, cancellation,)
+                handle_admin_project(&cg, action, None, None, deadline, cancellation,)
                     .await
                     .is_err(),
                 "manual fact mutations must not be accepted"
@@ -659,68 +555,6 @@ mod tests {
                 scope: tracedecay_dashboard_api::AutomationReconcileScope::Project
             }
         ));
-        assert!(matches!(
-            serde_json::from_value::<AdminProjectAction>(json!({
-                "action": "semantic_status"
-            }))
-            .unwrap(),
-            AdminProjectAction::SemanticStatus
-        ));
-        assert!(matches!(
-            serde_json::from_value::<AdminProjectAction>(json!({
-                "action": "semantic_acquire"
-            }))
-            .unwrap(),
-            AdminProjectAction::SemanticAcquire
-        ));
-        assert!(
-            serde_json::from_value::<AdminProjectAction>(json!({
-                "action": "semantic_import",
-                "manifest": { "payload": {} },
-                "source": "/tmp/model"
-            }))
-            .is_err(),
-            "semantic import must decode through the canonical manifest contract"
-        );
-    }
-
-    #[tokio::test]
-    async fn semantic_admin_fails_closed_without_the_mounted_runtime_executor() {
-        let (deadline, cancellation) = test_application_control();
-        let error =
-            execute_semantic_admin(None, SemanticAdminRequestV1::Status, deadline, cancellation)
-                .await
-                .expect_err("missing mounted semantic runtime must fail");
-        assert!(
-            error
-                .to_string()
-                .contains("semantic runtime is unavailable")
-        );
-    }
-
-    #[test]
-    fn semantic_import_requires_an_absolute_source_before_executor_dispatch() {
-        let error = validate_semantic_import_source(Path::new("relative/model"))
-            .expect_err("relative semantic import source must be rejected");
-        assert!(error.to_string().contains("must be an absolute path"));
-        validate_semantic_import_source(&std::env::current_dir().expect("absolute current dir"))
-            .expect("absolute source reaches the daemon executor for canonicalization");
-    }
-
-    #[test]
-    fn semantic_status_serializes_unmounted_observations_explicitly() {
-        assert_eq!(
-            serde_json::to_value(SemanticAdminResponseV1::Status {
-                lifecycle: None,
-                runtime: None,
-            })
-            .unwrap(),
-            json!({
-                "outcome": "status",
-                "lifecycle": null,
-                "runtime": null,
-            })
-        );
     }
 
     #[test]

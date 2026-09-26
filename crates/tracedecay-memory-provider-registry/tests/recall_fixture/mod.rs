@@ -17,7 +17,7 @@ use tracedecay_memory_provider_api::{
     ProviderLimits, ProviderOperation, ProviderReply, TerminalRecord,
 };
 use tracedecay_memory_provider_native::{
-    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, NativeObservation,
+    NATIVE_PROVIDER_ID, NativeMemoryApplicationPort,
 };
 use tracedecay_memory_provider_registry::{
     AdmittedTemporalQuery, EnabledProviderMode, FabricConfig, NativeProviderActivation,
@@ -72,11 +72,9 @@ pub fn authorized_exact() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([ScopeBinding::ExactCodingScope])
 }
 
-/// The bindings the host records for the Native provider at registration,
-/// mirroring `NATIVE_RECALL_SCOPE_BINDINGS`.
-///
-/// Native attests owner-bound facts as `project_facts`/`profile_facts` and
-/// its provider-local staged session observations as `checkout_observations`.
+/// The complete binding vocabulary a host may authorize: exact, checkout,
+/// project, and profile bindings. Admission rules are exercised against it
+/// independently of any one provider's declaration.
 pub fn authorized_native() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([
         ScopeBinding::ExactCodingScope,
@@ -474,10 +472,6 @@ impl NativeMemoryApplicationPort for RecallFixturePort {
         unexpected()
     }
 
-    fn observe(&self, _observation: NativeObservation<'_>) -> ProviderReply {
-        unexpected()
-    }
-
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
         self.recall_calls.fetch_add(1, Ordering::Relaxed);
         let payload = if matches!(
@@ -518,38 +512,6 @@ impl NativeMemoryApplicationPort for RecallFixturePort {
             extensions: Vec::new(),
             state_generation: call.expected_state_generation,
         }
-    }
-
-    fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
-    }
-
-    fn replay(&self, _call: &ProviderCall) -> ProviderReply {
-        unexpected()
     }
 }
 

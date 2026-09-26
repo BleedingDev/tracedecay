@@ -44,8 +44,8 @@ use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionCon
 use tracedecay_store::observation::ObservationOriginV1;
 use tracedecay_store::{
     AnchorDispositionStateV1, ObservationAdmissionPort, ObservationRecentWindowRequest,
-    ObservationReplayRequest, RetrievalAnchorDispositionStore, RetrievalAnchorOwnerV1,
-    StoreShardIdV1, StoreShardScopeV1, StoredObservation,
+    ObservationReplayRequest, RetrievalAnchorDispositionStore, StoreShardIdV1, StoreShardScopeV1,
+    StoredObservation,
 };
 
 use super::cognitive_recall::control_attribution::{
@@ -2848,9 +2848,9 @@ where
             ingested_at_utc_nanos: checked_nanos(stored.retrieval_anchor().ingested_at().0)?,
             validity: RecordedValidity::default(),
         };
-        let owner = RetrievalAnchorOwnerV1::V2(FactOwnerV1::Project {
+        let owner = FactOwnerV1::Project {
             project_id: self.bridge.canonical_project.clone(),
-        });
+        };
         let current = bounded_read(
             control,
             self.dispositions

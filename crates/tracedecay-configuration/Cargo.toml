@@ -26,7 +26,6 @@ tracedecay-global-db = { path = "../tracedecay-global-db" }
 tracedecay-lcm = { path = "../tracedecay-lcm" }
 tracedecay-policy = { path = "../tracedecay-policy" }
 tracedecay-runtime-core = { path = "../tracedecay-runtime-core" }
-tracedecay-semantic-contracts.workspace = true
 tracedecay-session-memory = { path = "../tracedecay-session-memory" }
 
 [dev-dependencies]

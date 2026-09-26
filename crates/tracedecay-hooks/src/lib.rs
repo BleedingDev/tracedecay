@@ -23,8 +23,7 @@ pub use admission_ledger::{
     HookAdmissionLedgerV1,
 };
 pub use capture::{
-    NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1,
-    capture_native_event_with_delivery_writer, native_hook_delivery_settlement,
+    NativeHookCaptureOutcomeV1, NativeHookCaptureSourceV1, capture_native_event_for_replay,
 };
 pub use config::{
     HOOK_CONFIGURATION_SCHEMA_VERSION, HookConfigurationFileReaderV1,

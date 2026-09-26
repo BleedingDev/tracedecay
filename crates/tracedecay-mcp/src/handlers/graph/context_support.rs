@@ -1,17 +1,13 @@
 //! Rendering and memory enrichment support for the verified context handler.
 
 use std::fmt::Write as _;
-use std::future::Future;
 use std::sync::Arc;
 
-use tracedecay_contracts::memory::CognitiveRecallTemporalMode;
+use serde_json::Value;
 use tracedecay_contracts::retained_surfaces::{
     FactCategoryV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
 };
-use tracedecay_contracts::retrieval::{
-    ContextMemoryTemporalCoverageV1, ContextStageV1, ContextSurfaceRequestV1,
-    MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS,
-};
+use tracedecay_contracts::retrieval::ContextStageV1;
 use tracedecay_contracts::{
     CancellationSignal, ContextMemoryAnalyticsV1, Deadline, now_micros,
     retained_surface_execution_problem,
@@ -38,7 +34,7 @@ use tracedecay_session_memory::fact_store::{ProjectFactStore, ProjectMemoryDbHan
 use tracedecay_session_memory::memory::MemoryApplication;
 
 const CONTEXT_MEMORY_MATCH_LIMIT: usize = 3;
-const CONTEXT_MEMORY_MATCH_LIMIT_MAX: usize = MAX_CONTEXT_MEMORY_CONTRIBUTION_FACTS;
+const CONTEXT_MEMORY_MATCH_LIMIT_MAX: usize = 10;
 const CONTEXT_LANE_TRUNCATED_NOTE: &str =
     "\n... lane truncated; retrieve the full response handle for omitted details.\n";
 
@@ -114,11 +110,8 @@ pub(super) fn insert_context_memory_section(
     output: &mut String,
     memory_matches: &[FactSearchHitV1],
     memory_matches_error: Option<&str>,
-    temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
 ) {
-    let Some(section) =
-        context_memory_section(memory_matches, memory_matches_error, temporal_coverage)
-    else {
+    let Some(section) = context_memory_section(memory_matches, memory_matches_error) else {
         return;
     };
     if let Some(idx) = output.find(&format!("\n{CONTEXT_ENTRY_POINTS_HEADING}")) {
@@ -131,24 +124,8 @@ pub(super) fn insert_context_memory_section(
 pub(super) fn context_memory_section(
     memory_matches: &[FactSearchHitV1],
     memory_matches_error: Option<&str>,
-    temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
 ) -> Option<String> {
     let mut section = String::new();
-    if let Some(ContextMemoryTemporalCoverageV1::WithheldCurrentOnly { requested_mode }) =
-        temporal_coverage
-    {
-        let mode = match requested_mode {
-            CognitiveRecallTemporalMode::Current => "current",
-            CognitiveRecallTemporalMode::AsOf => "as_of",
-            CognitiveRecallTemporalMode::Interval => "interval",
-            CognitiveRecallTemporalMode::History => "history",
-        };
-        let _ = writeln!(
-            section,
-            "\n{CONTEXT_MEMORY_MATCHES_HEADING}\nWithheld: canonical fact search supports current state only; requested temporal mode={mode}."
-        );
-        return Some(section);
-    }
     if !memory_matches.is_empty() {
         section.push('\n');
         section.push_str(CONTEXT_MEMORY_MATCHES_HEADING);
@@ -194,33 +171,32 @@ pub(super) struct ContextMemoryOptions {
     include_memory: bool,
     limit: usize,
     min_trust: f64,
-    temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
 }
 
-pub(super) fn context_memory_options(request: &ContextSurfaceRequestV1) -> ContextMemoryOptions {
-    let include_memory = request.include_memory.unwrap_or(true);
-    let limit = request
-        .memory_limit
+pub(super) fn context_memory_options(args: &Value) -> ContextMemoryOptions {
+    let include_memory = args
+        .get("include_memory")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let limit = args
+        .get("memory_limit")
+        .and_then(Value::as_u64)
         .map_or(CONTEXT_MEMORY_MATCH_LIMIT, |value| value as usize)
         .clamp(1, CONTEXT_MEMORY_MATCH_LIMIT_MAX);
-    let min_trust = request.memory_min_trust.unwrap_or(0.5).clamp(0.0, 1.0);
-    let temporal_coverage = request.temporal_query.as_ref().and_then(|query| {
-        (include_memory && query.mode() != CognitiveRecallTemporalMode::Current).then_some(
-            ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
-                requested_mode: query.mode(),
-            },
-        )
-    });
+    let min_trust = args
+        .get("memory_min_trust")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
     ContextMemoryOptions {
         include_memory,
         limit,
         min_trust,
-        temporal_coverage,
     }
 }
 
 pub(super) fn context_memory_enabled(options: &ContextMemoryOptions) -> bool {
-    options.include_memory && options.temporal_coverage.is_none()
+    options.include_memory
 }
 
 pub(super) fn context_memory_read_control(
@@ -271,9 +247,7 @@ pub(super) fn context_memory_stage(
 ) -> ContextStageV1 {
     if !options.include_memory {
         ContextStageV1::NotRequested
-    } else if options.temporal_coverage.is_some() || memory_matches_error.is_some() {
-        // A non-current temporal policy withholds the current-only fact
-        // search: the stage's authority cannot answer that request.
+    } else if memory_matches_error.is_some() {
         ContextStageV1::Unavailable
     } else {
         ContextStageV1::ran(
@@ -292,41 +266,27 @@ pub(super) struct ContextMemoryMatches {
 pub(super) struct ContextMemoryOutcome {
     pub(super) hits: Vec<FactSearchHitV1>,
     pub(super) graph_coverage: Option<FactSearchGraphCoverageV1>,
-    pub(super) temporal_coverage: Option<ContextMemoryTemporalCoverageV1>,
     pub(super) error: Option<String>,
 }
 
 #[hotpath::measure(future = true, label = "mcp.graph.context_memory")]
-pub(super) async fn context_memory_outcome<'read, Read, ReadFuture>(
+pub(super) async fn context_memory_outcome(
+    ctx: &McpToolContext<'_>,
+    task: &str,
     options: &ContextMemoryOptions,
-    read_control: Option<&'read FactReadControl>,
-    read: Read,
-) -> ContextMemoryOutcome
-where
-    Read: FnOnce(&'read FactReadControl) -> ReadFuture,
-    ReadFuture: Future<Output = Result<ContextMemoryMatches>>,
-{
-    if let Some(temporal_coverage) = options.temporal_coverage {
+    read_control: Option<&FactReadControl>,
+) -> ContextMemoryOutcome {
+    let Some(read_control) = read_control else {
         return ContextMemoryOutcome {
             hits: Vec::new(),
             graph_coverage: None,
-            temporal_coverage: Some(temporal_coverage),
-            error: None,
-        };
-    }
-    let Some(read_control) = read_control.filter(|_| options.include_memory) else {
-        return ContextMemoryOutcome {
-            hits: Vec::new(),
-            graph_coverage: None,
-            temporal_coverage: None,
             error: None,
         };
     };
-    match read(read_control).await {
+    match context_memory_matches(ctx, task, options, read_control).await {
         Ok(matches) => ContextMemoryOutcome {
             hits: matches.hits,
             graph_coverage: Some(matches.graph_coverage),
-            temporal_coverage: None,
             error: None,
         },
         Err(error) => ContextMemoryOutcome {
@@ -334,7 +294,6 @@ where
             graph_coverage: Some(FactSearchGraphCoverageV1::Degraded {
                 reason: FactSearchGraphDegradationV1::Unavailable,
             }),
-            temporal_coverage: None,
             error: Some(error.to_string()),
         },
     }
@@ -351,7 +310,7 @@ fn context_memory_application<'a>(
     MemoryApplication::new(owner, store).map_err(memory_application_error)
 }
 
-pub(super) async fn context_memory_matches(
+async fn context_memory_matches(
     ctx: &McpToolContext<'_>,
     task: &str,
     options: &ContextMemoryOptions,
@@ -393,113 +352,4 @@ pub(super) async fn context_memory_matches(
         hits: mapped.hits,
         graph_coverage: mapped.graph_coverage,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use tracedecay_contracts::memory::CognitiveRecallTemporalQuery;
-    use tracedecay_domain::UtcMicros;
-
-    #[tokio::test]
-    async fn non_current_policy_never_invokes_current_fact_read() {
-        let reads = AtomicUsize::new(0);
-        let control = FactReadControl::new(Arc::new(|| false));
-        for query in [
-            CognitiveRecallTemporalQuery::current(UtcMicros(10))
-                .with_as_of(UtcMicros(5))
-                .expect("as-of"),
-            CognitiveRecallTemporalQuery::current(UtcMicros(10))
-                .with_interval(UtcMicros(3), UtcMicros(8))
-                .expect("interval"),
-            CognitiveRecallTemporalQuery::current(UtcMicros(10)).with_history(),
-        ] {
-            let request: ContextSurfaceRequestV1 =
-                serde_json::from_value(json!({"task": "history", "temporal_query": query}))
-                    .expect("context request");
-            request
-                .validate_memory_policy_at(UtcMicros(20))
-                .expect("admitted policy");
-            let options = context_memory_options(&request);
-            assert!(
-                context_memory_read_control(&options, None, None)
-                    .expect("withheld lane needs no read control")
-                    .is_none()
-            );
-            let outcome = context_memory_outcome(&options, Some(&control), |_| {
-                reads.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(ContextMemoryMatches {
-                    hits: Vec::new(),
-                    graph_coverage: FactSearchGraphCoverageV1::NotMounted,
-                }))
-            })
-            .await;
-            assert_eq!(reads.load(Ordering::SeqCst), 0);
-            assert!(outcome.hits.is_empty());
-            assert!(outcome.graph_coverage.is_none());
-            assert!(outcome.error.is_none());
-            assert_eq!(
-                outcome.temporal_coverage,
-                Some(ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {
-                    requested_mode: query.mode()
-                })
-            );
-            let section = context_memory_section(&[], None, outcome.temporal_coverage)
-                .expect("explicit withholding");
-            assert!(section.contains("current state only"));
-            assert!(section.contains("requested temporal mode="));
-        }
-    }
-
-    #[tokio::test]
-    async fn default_and_current_keep_fact_read_while_disabled_skips_it() {
-        let control = FactReadControl::new(Arc::new(|| false));
-        let reads = AtomicUsize::new(0);
-        for request in [
-            json!({"task": "default"}),
-            json!({"task": "current", "temporal_query": CognitiveRecallTemporalQuery::current(UtcMicros(10))}),
-        ] {
-            let request: ContextSurfaceRequestV1 =
-                serde_json::from_value(request).expect("context request");
-            let options = context_memory_options(&request);
-            let outcome = context_memory_outcome(&options, Some(&control), |_| {
-                reads.fetch_add(1, Ordering::SeqCst);
-                std::future::ready(Ok(ContextMemoryMatches {
-                    hits: Vec::new(),
-                    graph_coverage: FactSearchGraphCoverageV1::NotMounted,
-                }))
-            })
-            .await;
-            assert!(outcome.temporal_coverage.is_none());
-            assert_eq!(
-                outcome.graph_coverage,
-                Some(FactSearchGraphCoverageV1::NotMounted)
-            );
-        }
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-        let request: ContextSurfaceRequestV1 = serde_json::from_value(json!({
-            "task": "disabled", "include_memory": false,
-            "temporal_query": CognitiveRecallTemporalQuery::current(UtcMicros(10)).with_history()
-        }))
-        .expect("disabled request");
-        let options = context_memory_options(&request);
-        let read_control =
-            context_memory_read_control(&options, None, None).expect("disabled control");
-        assert!(read_control.is_none());
-        // Even a mistakenly supplied control cannot turn disabled memory into a read.
-        let outcome = context_memory_outcome(&options, Some(&control), |_| {
-            reads.fetch_add(1, Ordering::SeqCst);
-            std::future::ready(Ok(ContextMemoryMatches {
-                hits: Vec::new(),
-                graph_coverage: FactSearchGraphCoverageV1::NotMounted,
-            }))
-        })
-        .await;
-        assert_eq!(reads.load(Ordering::SeqCst), 2);
-        assert!(outcome.temporal_coverage.is_none());
-        assert!(outcome.graph_coverage.is_none());
-        assert!(context_memory_section(&[], None, None).is_none());
-    }
 }

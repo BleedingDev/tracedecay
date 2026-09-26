@@ -800,7 +800,6 @@ async fn session_source(
                 cursor: None,
                 role: None,
                 source: None,
-                provider: None,
                 session_id: None,
                 since: None,
                 until: None,
@@ -857,26 +856,6 @@ fn ready_source(
     omission_reasons: Vec<String>,
 ) -> ExplorerSourceProgressV1 {
     let completed = rows.len() as u64;
-    if !omission_reasons.is_empty() {
-        return ExplorerSourceProgressV1::unavailable(
-            source_id,
-            "explorer_resume_cursor_unavailable",
-            format!(
-                "{source_id:?} returned a truncated page without a signed, scope-bound resume cursor: {}",
-                omission_reasons.join("; ")
-            ),
-        );
-    }
-    if total.is_some_and(|eligible| completed < eligible) {
-        let eligible = total.expect("total is present when a source page is truncated");
-        return ExplorerSourceProgressV1::unavailable(
-            source_id,
-            "explorer_resume_cursor_unavailable",
-            format!(
-                "{source_id:?} returned {completed} of {eligible} {unit} without a signed, scope-bound resume cursor"
-            ),
-        );
-    }
     let coverage = total.map_or_else(
         || {
             let mut coverage = DashboardCoverageV1::unknown();
@@ -926,7 +905,6 @@ pub struct ReadContextParams {
     limit: Option<i64>,
     offset: Option<i64>,
     order: Option<String>,
-    provider: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -943,7 +921,6 @@ pub(super) struct ExplorerSessionCountsV1 {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub(super) struct ExplorerSessionSizeV1 {
     session_id: String,
-    provider: String,
     storage_scope: String,
     counts: ExplorerSessionCountsV1,
 }
@@ -951,7 +928,6 @@ pub(super) struct ExplorerSessionSizeV1 {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 pub(super) struct ExplorerReadContextV1 {
     session_id: String,
-    provider: String,
     storage_scope: String,
     limit: i64,
     offset: i64,
@@ -964,50 +940,19 @@ pub(super) struct ExplorerReadContextV1 {
     has_more_summary_nodes: bool,
 }
 
-fn required_session_provider(provider: Option<String>) -> Result<String, String> {
-    let Some(provider) = provider else {
-        return Err("lcm_session_provider_required".to_owned());
-    };
-    let provider = provider.trim();
-    if provider.is_empty() {
-        return Err("lcm_session_provider_required".to_owned());
-    }
-    Ok(provider.to_owned())
-}
-
 pub async fn session_size(
     State(state): State<DashboardState>,
     RequestControl(control): RequestControl,
     Path(session_id): Path<String>,
-    Query(params): Query<ReadContextParams>,
 ) -> Response {
     hotpath::future!(
         async move {
-            let provider = match required_session_provider(params.provider) {
-                Ok(provider) => provider,
-                Err(reason) => {
-                    return explorer_session_not_ready::<ExplorerSessionSizeV1>(
-                        &state,
-                        DashboardLcmReadStateV1::Unavailable,
-                        reason,
-                    );
-                }
-            };
-            let outcome =
-                read_session_page(&state, control, &session_id, &provider, 500, None).await;
+            let outcome = read_session_page(&state, control, &session_id, 500, None).await;
             match outcome {
                 DashboardLcmReadOutcomeV1::Ready(page) => {
-                    if page.has_more || page.next_cursor.is_some() {
-                        return explorer_session_not_ready::<ExplorerSessionSizeV1>(
-                            &state,
-                            DashboardLcmReadStateV1::Unavailable,
-                            "explorer_resume_cursor_unavailable".to_owned(),
-                        );
-                    }
                     let payload = ExplorerSessionSizeV1 {
                         session_id,
-                        provider,
-                        storage_scope: state.lcm_scope.clone(),
+                        storage_scope: "project".to_owned(),
                         counts: explorer_session_counts(&page.stats),
                     };
                     Json(DashboardEnvelopeV1::ready(
@@ -1017,12 +962,22 @@ pub async fn session_size(
                     ))
                     .into_response()
                 }
-                DashboardLcmReadOutcomeV1::Partial { .. } => {
-                    explorer_session_not_ready::<ExplorerSessionSizeV1>(
-                        &state,
-                        DashboardLcmReadStateV1::Unavailable,
-                        "explorer_resume_cursor_unavailable".to_owned(),
-                    )
+                DashboardLcmReadOutcomeV1::Partial { page, omitted } => {
+                    let examined = u64::try_from(page.messages.len()).unwrap_or(u64::MAX);
+                    let payload = ExplorerSessionSizeV1 {
+                        session_id,
+                        storage_scope: "project".to_owned(),
+                        counts: explorer_session_counts(&page.stats),
+                    };
+                    Json(DashboardEnvelopeV1::partial(
+                        scope_from_state(&state),
+                        examined.saturating_add(omitted),
+                        examined,
+                        "canonical hydrated records",
+                        vec!["lcm_temporal_read_incomplete".to_owned()],
+                        Some(payload),
+                    ))
+                    .into_response()
                 }
                 DashboardLcmReadOutcomeV1::NotReady {
                     state: read_state,
@@ -1045,16 +1000,6 @@ pub async fn read_context(
 ) -> Response {
     hotpath::future!(
         async move {
-            let provider = match required_session_provider(params.provider.clone()) {
-                Ok(provider) => provider,
-                Err(reason) => {
-                    return explorer_session_not_ready::<ExplorerReadContextV1>(
-                        &state,
-                        DashboardLcmReadStateV1::Unavailable,
-                        reason,
-                    );
-                }
-            };
             let limit = params.limit.unwrap_or(100).clamp(1, 500);
             let offset = params.offset.unwrap_or(0).max(0);
             let order = if params.order.as_deref() == Some("desc") {
@@ -1083,15 +1028,9 @@ pub async fn read_context(
             let mut omitted_total = 0_u64;
             let mut cursor: Option<String> = None;
             for _ in 0..READ_CONTEXT_FILL_PAGES {
-                let outcome = read_session_page(
-                    &state,
-                    control.clone(),
-                    &session_id,
-                    &provider,
-                    limit,
-                    cursor.take(),
-                )
-                .await;
+                let outcome =
+                    read_session_page(&state, control.clone(), &session_id, limit, cursor.take())
+                        .await;
                 let (mut page, page_partial, page_omitted) = match outcome {
                     DashboardLcmReadOutcomeV1::Ready(page) => (page, false, 0),
                     DashboardLcmReadOutcomeV1::Partial { page, omitted } => (page, true, omitted),
@@ -1129,8 +1068,7 @@ pub async fn read_context(
             let has_more = has_more_messages || has_more_summary_nodes;
             let payload = ExplorerReadContextV1 {
                 session_id,
-                provider,
-                storage_scope: state.lcm_scope.clone(),
+                storage_scope: "project".to_owned(),
                 limit,
                 offset,
                 order: order.to_owned(),
@@ -1144,12 +1082,16 @@ pub async fn read_context(
                 has_more_messages,
                 has_more_summary_nodes,
             };
-            if window_partial || omitted_total > 0 || cursor.is_some() || has_more {
-                explorer_session_not_ready::<ExplorerReadContextV1>(
-                    &state,
-                    DashboardLcmReadStateV1::Unavailable,
-                    "explorer_resume_cursor_unavailable".to_owned(),
-                )
+            if window_partial || has_more {
+                Json(DashboardEnvelopeV1::partial(
+                    scope_from_state(&state),
+                    examined.saturating_add(omitted_total),
+                    examined,
+                    "canonical hydrated records",
+                    vec!["lcm_temporal_read_incomplete".to_owned()],
+                    Some(payload),
+                ))
+                .into_response()
             } else {
                 Json(DashboardEnvelopeV1::ready(
                     scope_from_state(&state),
@@ -1168,7 +1110,6 @@ async fn read_session_page(
     state: &DashboardState,
     control: DashboardHttpRequestControlV1,
     session_id: &str,
-    provider: &str,
     limit: i64,
     cursor: Option<String>,
 ) -> DashboardLcmReadOutcomeV1 {
@@ -1186,7 +1127,6 @@ async fn read_session_page(
                 session_id: session_id.to_owned(),
                 limit,
                 cursor,
-                provider: Some(provider.to_owned()),
             },
         )
         .await
@@ -1199,27 +1139,6 @@ fn explorer_session_rows(
     read_incomplete: bool,
 ) -> ExplorerSourceProgressV1 {
     let has_more = page.has_more;
-    let has_cursor = page.next_cursor.is_some();
-    if has_more || has_cursor || read_incomplete || !omission_reasons.is_empty() {
-        let mut reasons = omission_reasons;
-        if has_more {
-            reasons.push("the temporal page has a continuation cursor".to_owned());
-        }
-        if has_cursor && !has_more {
-            reasons.push("the temporal page exposed a continuation cursor".to_owned());
-        }
-        if read_incomplete {
-            reasons.push("the temporal read reported omitted records".to_owned());
-        }
-        return ExplorerSourceProgressV1::unavailable(
-            ExplorerSourceIdV1::Sessions,
-            "explorer_resume_cursor_unavailable",
-            format!(
-                "session search returned a truncated page without a signed, scope-bound Explorer resume cursor: {}",
-                reasons.join("; ")
-            ),
-        );
-    }
     let rows = page
         .messages
         .into_iter()
@@ -1243,6 +1162,13 @@ fn explorer_session_rows(
                 "messages",
                 omission_reasons,
             );
+            // The temporal read itself reported omitted records: the rows are
+            // real but the answer is incomplete, which is a different outcome
+            // from a bounded page the source served completely.
+            if read_incomplete {
+                source.outcome = ExplorerSourceOutcomeV1::Partial;
+                source.error_code = Some("lcm_temporal_read_incomplete");
+            }
             source
         }
         Err(error) => ExplorerSourceProgressV1::error(
@@ -1258,7 +1184,6 @@ fn explorer_lcm_message(message: DashboardLcmCanonicalMessageV1) -> LcmMessageV1
         store_id: None,
         session_id: message.session_id,
         role: Some(message.role),
-        provider: message.provider.clone(),
         source: Some(message.provider),
         timestamp: message.timestamp,
         // The canonical temporal page carries no durable token accounting for
@@ -1282,7 +1207,6 @@ fn explorer_lcm_summary(summary: DashboardLcmCanonicalSummaryV1) -> LcmSummaryNo
     LcmSummaryNodeV1 {
         node_id: summary.node_id,
         session_id: summary.session_id,
-        provider: summary.provider,
         depth: summary.depth,
         category: "summary".to_owned(),
         source_type: "canonical_temporal".to_owned(),
@@ -1357,104 +1281,5 @@ const fn explorer_lcm_error_code(state: DashboardLcmReadStateV1) -> &'static str
         DashboardLcmReadStateV1::BudgetExhausted => "lcm_temporal_budget_exhausted",
         DashboardLcmReadStateV1::TimedOut => "lcm_temporal_read_timed_out",
         DashboardLcmReadStateV1::Cancelled => "lcm_temporal_read_cancelled",
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn request() -> ExplorerQueryRequestV1 {
-        ExplorerQueryRequestV1 {
-            query: "shared".to_owned(),
-            limit: 25,
-            offset: 0,
-        }
-    }
-
-    #[test]
-    fn explorer_source_truncation_fails_closed_without_a_resume_cursor() {
-        let source = ready_source(
-            ExplorerSourceIdV1::CodeGraph,
-            &request(),
-            vec![json!({"id": "one"})],
-            Some(2),
-            json!({"query": "shared"}),
-            "symbols",
-            Vec::new(),
-        );
-
-        assert_eq!(source.outcome, ExplorerSourceOutcomeV1::Unavailable);
-        assert_eq!(
-            source.error_code,
-            Some("explorer_resume_cursor_unavailable")
-        );
-        assert!(source.page.is_none());
-    }
-
-    #[test]
-    fn explorer_knowledge_omissions_fail_closed_without_a_resume_cursor() {
-        let source = ready_source(
-            ExplorerSourceIdV1::Knowledge,
-            &request(),
-            vec![json!({"fact_id": "one"})],
-            None,
-            json!({"authority": "canonical_project_memory_search"}),
-            "facts",
-            vec!["canonical fact search page is bounded".to_owned()],
-        );
-
-        assert_eq!(source.outcome, ExplorerSourceOutcomeV1::Unavailable);
-        assert_eq!(
-            source.error_code,
-            Some("explorer_resume_cursor_unavailable")
-        );
-        assert!(source.page.is_none());
-    }
-
-    #[test]
-    fn explorer_lcm_cap_fails_closed_without_a_public_resume_cursor() {
-        let source = explorer_session_rows(
-            &request(),
-            DashboardLcmCanonicalPageV1 {
-                messages: vec![DashboardLcmCanonicalMessageV1 {
-                    session_id: "session.shared".to_owned(),
-                    provider: "claude".to_owned(),
-                    role: "assistant".to_owned(),
-                    timestamp: Some(1),
-                    ordinal: 1,
-                    content: "one".to_owned(),
-                    message_id: "message.one".to_owned(),
-                    metadata_json: None,
-                    tool_names: None,
-                }],
-                summary_nodes: Vec::new(),
-                overview_matches: None,
-                stats: DashboardLcmCanonicalStatsV1::default(),
-                has_more: true,
-                next_cursor: Some("opaque-temporal-cursor".to_owned()),
-            },
-            Vec::new(),
-            false,
-        );
-
-        assert_eq!(source.outcome, ExplorerSourceOutcomeV1::Unavailable);
-        assert_eq!(
-            source.error_code,
-            Some("explorer_resume_cursor_unavailable")
-        );
-        assert!(source.page.is_none());
-    }
-
-    #[test]
-    fn explorer_session_provider_is_required_before_reading_page_one() {
-        assert_eq!(
-            required_session_provider(None),
-            Err("lcm_session_provider_required".to_owned())
-        );
-        assert_eq!(
-            required_session_provider(Some("  claude  ".to_owned())),
-            Ok("claude".to_owned())
-        );
     }
 }

@@ -27,7 +27,7 @@ pub use results::{
     ClosedUtcIntervalV1, CompactLineageEdgeV1, CorrelationIndexCountModeV1, CorrelationIndexV1,
     FactCommitDispositionV1, FactCommitOwnerV1, FactCommitReceiptV1, FactContradictionV1,
     FactFeedbackDetailsAvailabilityV1, FactFeedbackResultV1, FactFeedbackV1,
-    FactIdentitySourceResultV1, FactListCursorV1, FactPayloadAccessV1, FactProjectionV1,
+    FactIdentitySourceResultV1, FactPayloadAccessV1, FactProjectionV1,
     FactRetrievalTelemetryDegradationV1, FactRetrievalTelemetryV1, FactSearchCursorV1,
     FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1, FactSearchScoresV1,
     FactStatusV1, FactStoreAddCommitV1, FactStoreAddResultV1, FactStoreContradictResultV1,

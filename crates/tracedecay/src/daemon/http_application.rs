@@ -28,7 +28,6 @@ use tokio::task::JoinHandle;
 use tower::ServiceExt;
 use tracedecay_contracts::remote::auth::RemoteEnrollmentAdmissionEvidenceV1;
 use tracedecay_contracts::remote::status::RemoteOperationalStatusReadV1;
-use tracedecay_contracts::retained_surfaces::{RetainedSurfaceOperation, SdkRequestIdControlV1};
 use tracedecay_contracts::{
     APPLICATION_REQUEST_ID_HEADER, ApplicationProblem, RequestId, RetryDirective, SafeDiagnostic,
 };
@@ -53,7 +52,7 @@ type ProjectRouterResolverFuture =
 type ProjectRouterResolver =
     Arc<dyn Fn(ProjectId) -> ProjectRouterResolverFuture + Send + Sync + 'static>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum ProjectRouterResolutionError {
+enum ProjectRouterResolutionError {
     Saturated,
     TimedOut,
     Unavailable,
@@ -74,45 +73,27 @@ enum OuterApplicationRequestIdError {
     DisallowedOperation,
 }
 
-#[derive(Clone)]
-pub(super) struct ProjectHttpRouteAttempt {
-    project_id: String,
-    identity: Arc<()>,
-}
-
-#[derive(Clone)]
-struct ProjectRouterEntry {
-    router: Router,
-    attempt: Arc<()>,
-}
-
 #[derive(Default)]
 struct ProjectRouterCache {
-    routers: HashMap<String, ProjectRouterEntry>,
+    routers: HashMap<String, Router>,
     least_recently_used: VecDeque<String>,
-    blocked: HashMap<String, Arc<()>>,
 }
 
 impl ProjectRouterCache {
     fn get(&mut self, project_id: &str) -> Option<Router> {
-        let router = self.routers.get(project_id)?.router.clone();
+        let router = self.routers.get(project_id).cloned()?;
         self.touch(project_id);
         Some(router)
     }
 
     fn insert(&mut self, project_id: String, router: Router) {
-        self.insert_with_attempt(project_id, router, Arc::new(()));
-    }
-
-    fn insert_with_attempt(&mut self, project_id: String, router: Router, attempt: Arc<()>) {
         if !self.routers.contains_key(&project_id)
             && self.routers.len() >= MAX_HTTP_APPLICATION_PROJECT_ROUTERS
             && let Some(evicted) = self.least_recently_used.pop_front()
         {
             self.routers.remove(&evicted);
         }
-        self.routers
-            .insert(project_id.clone(), ProjectRouterEntry { router, attempt });
+        self.routers.insert(project_id.clone(), router);
         self.touch(&project_id);
     }
 
@@ -122,43 +103,15 @@ impl ProjectRouterCache {
         self.least_recently_used.push_back(project_id.to_owned());
     }
 
-    fn remove(&mut self, project_id: &str) -> bool {
-        let removed = self.routers.remove(project_id).is_some();
+    fn remove(&mut self, project_id: &str) {
+        self.routers.remove(project_id);
         self.least_recently_used
             .retain(|candidate| candidate != project_id);
-        removed
-    }
-
-    fn block(&mut self, project_id: &str) -> Arc<()> {
-        let identity = Arc::new(());
-        self.blocked
-            .insert(project_id.to_owned(), Arc::clone(&identity));
-        identity
-    }
-
-    fn is_blocked(&self, project_id: &str) -> bool {
-        self.blocked.contains_key(project_id)
-    }
-
-    fn unblock(&mut self, project_id: &str) {
-        self.blocked.remove(project_id);
-    }
-
-    fn remove_if_attempt(&mut self, project_id: &str, attempt: &Arc<()>) -> bool {
-        let owns_route = self
-            .routers
-            .get(project_id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.attempt, attempt));
-        if !owns_route {
-            return false;
-        }
-        self.remove(project_id)
     }
 
     fn clear(&mut self) {
         self.routers.clear();
         self.least_recently_used.clear();
-        self.blocked.clear();
     }
 }
 
@@ -207,42 +160,10 @@ impl DaemonHttpApplicationRegistry {
             ProjectId::new(project_id.to_owned()).map_err(|error| TraceDecayError::Config {
                 message: format!("daemon HTTP project identity is invalid: {error}"),
             })?;
-        let mut routers = self.routers.lock().await;
-        routers.unblock(project_id.as_str());
-        routers.insert(project_id.as_str().to_owned(), router);
-        Ok(())
-    }
-
-    /// Mount the route belonging to the same publication transaction that
-    /// fenced cold resolution. A stale failed attempt cannot replace a route
-    /// mounted by a newer generation.
-    #[hotpath::skip]
-    pub(super) async fn mount_for_attempt(
-        &self,
-        attempt: &ProjectHttpRouteAttempt,
-        router: Router,
-    ) -> Result<()> {
-        let project_id = ProjectId::new(attempt.project_id.clone()).map_err(|error| {
-            TraceDecayError::Config {
-                message: format!("daemon HTTP project identity is invalid: {error}"),
-            }
-        })?;
-        let mut routers = self.routers.lock().await;
-        let blocked = routers
-            .blocked
-            .get(project_id.as_str())
-            .is_some_and(|identity| Arc::ptr_eq(identity, &attempt.identity));
-        if !blocked {
-            return Err(TraceDecayError::Config {
-                message: "daemon HTTP project publication attempt was superseded".to_owned(),
-            });
-        }
-        routers.unblock(project_id.as_str());
-        routers.insert_with_attempt(
-            project_id.as_str().to_owned(),
-            router,
-            Arc::clone(&attempt.identity),
-        );
+        self.routers
+            .lock()
+            .await
+            .insert(project_id.as_str().to_owned(), router);
         Ok(())
     }
 
@@ -253,52 +174,6 @@ impl DaemonHttpApplicationRegistry {
     #[hotpath::skip]
     pub(super) async fn drain_project_routes_for_shutdown(&self) {
         self.routers.lock().await.clear();
-    }
-
-    /// Remove the exact project application route after an owner publication
-    /// fails. The route cache is independent from the MCP owner registry, so
-    /// rollback must clear it explicitly. The transaction block remains set
-    /// across removal so a cold resolver already in flight cannot repopulate
-    /// the failed route before a later successful mount lifts the fence.
-    #[hotpath::skip]
-    pub(super) async fn remove_project_route(&self, project_id: &str) -> bool {
-        let Ok(project_id) = ProjectId::new(project_id.to_owned()) else {
-            return false;
-        };
-        self.routers.lock().await.remove(project_id.as_str())
-    }
-
-    /// Remove only the HTTP route owned by this publication attempt. The
-    /// blocked fence intentionally remains until a matching successful mount
-    /// lifts it, preventing an in-flight cold resolver from repopulating a
-    /// failed attempt.
-    #[hotpath::skip]
-    pub(super) async fn remove_project_route_if(&self, attempt: &ProjectHttpRouteAttempt) -> bool {
-        let Ok(project_id) = ProjectId::new(attempt.project_id.clone()) else {
-            return false;
-        };
-        self.routers
-            .lock()
-            .await
-            .remove_if_attempt(project_id.as_str(), &attempt.identity)
-    }
-
-    /// Fence cold HTTP resolution while a project-open transaction is warming
-    /// or unwinding. In-flight resolvers re-check this fence before caching a
-    /// router, so a failed attempt cannot repopulate the route after removal.
-    #[hotpath::skip]
-    pub(super) async fn block_project_route(
-        &self,
-        project_id: &str,
-    ) -> Option<ProjectHttpRouteAttempt> {
-        if let Ok(project_id) = ProjectId::new(project_id.to_owned()) {
-            let identity = self.routers.lock().await.block(project_id.as_str());
-            return Some(ProjectHttpRouteAttempt {
-                project_id: project_id.as_str().to_owned(),
-                identity,
-            });
-        }
-        None
     }
 
     pub(super) fn install_resolver<F, Fut>(&self, resolver: F) -> Result<()>
@@ -388,21 +263,16 @@ impl DaemonHttpApplicationRegistry {
     }
 
     #[hotpath::skip]
-    pub(super) async fn resolve(
+    async fn resolve(
         &self,
         project_id: &str,
     ) -> std::result::Result<Option<Router>, ProjectRouterResolutionError> {
         let Ok(project_id) = ProjectId::new(project_id.to_owned()) else {
             return Ok(None);
         };
-        let mut routers = self.routers.lock().await;
-        if routers.is_blocked(project_id.as_str()) {
-            return Ok(None);
-        }
-        if let Some(router) = routers.get(project_id.as_str()) {
+        if let Some(router) = self.routers.lock().await.get(project_id.as_str()) {
             return Ok(Some(router));
         }
-        drop(routers);
         let resolver = {
             let slot = self
                 .resolver
@@ -431,12 +301,10 @@ impl DaemonHttpApplicationRegistry {
         let Some(router) = resolved else {
             return Ok(None);
         };
-        let mut routers = self.routers.lock().await;
-        if routers.is_blocked(project_id.as_str()) {
-            return Ok(None);
-        }
-        routers.unblock(project_id.as_str());
-        routers.insert(project_id.as_str().to_owned(), router.clone());
+        self.routers
+            .lock()
+            .await
+            .insert(project_id.as_str().to_owned(), router.clone());
         Ok(Some(router))
     }
 
@@ -673,14 +541,10 @@ fn outer_application_request_id(
     if values.next().is_some() {
         return Err(OuterApplicationRequestIdError::DuplicateHeader);
     }
-    let operation = tail
-        .strip_prefix("retained/")
-        .and_then(RetainedSurfaceOperation::from_operation_name)
-        .ok_or(OuterApplicationRequestIdError::DisallowedOperation)?;
-    if !matches!(
-        operation.sdk_operation_contract().request_id,
-        SdkRequestIdControlV1::Required
-    ) {
+    let curate_path = tracedecay_api::retained_route_path(
+        tracedecay_contracts::retained_surfaces::RetainedSurfaceOperation::FactStoreCurate,
+    );
+    if curate_path.strip_prefix('/') != Some(tail) {
         return Err(OuterApplicationRequestIdError::DisallowedOperation);
     }
     let value = value

@@ -950,7 +950,6 @@ async fn mount_rmcp_target(
     let project = fixture._temp.path().join(RMCP_TARGET_PROJECT.0);
     let handshake = DaemonHandshake {
         project_path: Some(project.clone()),
-        allow_init: true,
         client_identity: fixture.handshake.client_identity.clone(),
         client_instance_id: "rmcp-selected-target".to_owned(),
         ..test_handshake_defaults()

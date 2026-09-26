@@ -29,8 +29,6 @@
 //! for exactly one project-server lifetime.
 
 pub(crate) mod control_attribution;
-#[cfg(feature = "test-helpers")]
-pub mod test_context_evidence;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -198,9 +196,6 @@ pub enum CognitiveRecallMountError {
     /// The canonical session identity is not a usable identifier.
     #[error("canonical session identity is empty, untrimmed, or carries control characters")]
     SessionIdentityInvalid,
-    /// The host-private Native session binding could not be retained.
-    #[error("canonical Native session binding authority is unavailable")]
-    SessionBindingUnavailable,
     /// The admission ledger could not be opened or initialised.
     #[error("recall admission ledger at {path} could not be opened: {source}")]
     LedgerOpen {
@@ -229,7 +224,6 @@ impl CognitiveRecallMountError {
             Self::FullCompositionPending => "recall_mount_full_composition_pending",
             Self::ScopeDisagreement { .. } => "recall_mount_scope_disagreement",
             Self::SessionIdentityInvalid => "recall_mount_session_identity_invalid",
-            Self::SessionBindingUnavailable => "recall_mount_session_binding_unavailable",
             Self::LedgerOpen { .. } => "recall_mount_ledger_unopenable",
             Self::Port(error) => error.code(),
         }
@@ -461,6 +455,11 @@ impl RecallAdmissionLedgerV1 {
                      trace_sha256 TEXT NOT NULL,
                      token_summary_json TEXT,
                      recorded_at_utc_micros INTEGER NOT NULL,
+                     delivery_scope_json TEXT,
+                     scope_binding_mac TEXT,
+                     control_metadata_sha256 TEXT,
+                     control_metadata_mac TEXT,
+                     trace_mac TEXT,
                      PRIMARY KEY (exact_scope_sha256, trace_id)
                  ) STRICT;
                  CREATE INDEX IF NOT EXISTS recall_explain_traces_by_request
@@ -477,6 +476,10 @@ impl RecallAdmissionLedgerV1 {
                      provider_explanation_json TEXT NOT NULL,
                      section TEXT,
                      tokens INTEGER,
+                     stable_memory_ref TEXT,
+                     original_sources_json TEXT,
+                     control_binding_mac TEXT,
+                     item_mac TEXT,
                      PRIMARY KEY (exact_scope_sha256, trace_id, provider_rank),
                      FOREIGN KEY (exact_scope_sha256, trace_id)
                          REFERENCES recall_explain_traces (exact_scope_sha256, trace_id)
@@ -487,21 +490,6 @@ impl RecallAdmissionLedgerV1 {
                 path: path.clone(),
                 source,
             })?;
-        // Ledgers written before candidates named a scope binding hold rows
-        // whose candidates could only attest the full exact-scope shape, so
-        // the historical claim is exactly `exact_coding_scope`.
-        add_scope_binding_column_if_missing(&connection).map_err(|source| {
-            CognitiveRecallMountError::LedgerOpen {
-                path: path.clone(),
-                source,
-            }
-        })?;
-        control_attribution::initialize_schema(&connection).map_err(|source| {
-            CognitiveRecallMountError::LedgerOpen {
-                path: path.clone(),
-                source,
-            }
-        })?;
         Ok(Self {
             path,
             connection: Mutex::new(connection),
@@ -751,9 +739,9 @@ impl RecallAdmissionLedgerV1 {
             return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
         }
         // Keep the denormalized reason columns tied to the typed host
-        // decision. A legacy row can otherwise retain a raw provider detail
-        // beside a valid-looking decision JSON and reintroduce it through the
-        // explain renderer after an additive schema upgrade.
+        // decision. A row can otherwise retain a raw provider detail beside a
+        // valid-looking decision JSON and reintroduce it through the explain
+        // renderer.
         if trace.items.iter().any(|item| {
             item.host_reason_code != item.host_decision.code()
                 || item.host_reason_detail != item.host_decision.detail()
@@ -1081,11 +1069,10 @@ impl RecallAdmissionLedgerV1 {
             let provider_explanation: RecallExplainProviderExplanationV1 =
                 serde_json::from_str(&provider_explanation_json)
                     .map_err(RecallAdmissionLedgerError::Decode)?;
-            // Upgrade-time additive migrations leave old rows in place. A
-            // legacy row may have a perfectly valid historical digest while
-            // still carrying a provider-controlled candidate id (or a raw
-            // dedup target). Quarantine the whole trace before any caller can
-            // render those bytes.
+            // A row may have a valid digest while still carrying a
+            // provider-controlled candidate id (or a raw dedup target).
+            // Quarantine the whole trace before any caller can render those
+            // bytes.
             if control_attribution::validate_retained_trace_candidate_id(&candidate_id).is_err() {
                 return Err(RecallAdmissionLedgerError::InvalidControlMetadata);
             }
@@ -1223,9 +1210,8 @@ impl RecallAdmissionLedgerV1 {
                 &provider_id,
                 registration_revision,
             );
-            // Do not expose legacy trace references from an additive
-            // migration. The corresponding row remains available only to a
-            // future migration/quarantine job, never to this read surface.
+            // Do not expose a trace reference that is not bound to the
+            // durable recall key.
             if trace_id == expected_trace_id {
                 let wire = format!("recall-trace-v1:{exact_scope_sha256}:{trace_id}");
                 let Ok(reference) = control_attribution::RecallControlTraceRefV1::parse(&wire)
@@ -1282,12 +1268,10 @@ impl RecallAdmissionLedgerV1 {
             let provider_claimed_scope_binding =
                 tracedecay_memory_provider_registry::ScopeBinding::from_wire(&binding_wire);
             let reason = serde_json::from_str::<RecallDenialReason>(&reason_json).ok();
-            // A schema upgrade is additive, so a pre-keyed denial can remain
-            // in this table. Do not let the read helper turn its raw candidate
-            // id, stable ref, or provider detail back into a retained result.
-            // Valid rows are canonicalized and compared to the sanitized wire
-            // before they cross this read boundary; malformed/legacy rows are
-            // withheld and remain available only to an offline migration.
+            // Do not let the read helper turn a raw candidate id, stable ref,
+            // or provider detail back into a retained result. Valid rows are
+            // canonicalized and compared to the sanitized wire before they
+            // cross this read boundary; malformed or unkeyed rows are withheld.
             let provider_claimed_scope_sha256: Option<String> = row.get(4)?;
             let provider_claimed_temporal_state: String = row.get(5)?;
             let retained = match (reason, provider_claimed_scope_binding) {
@@ -1326,23 +1310,6 @@ impl RecallAdmissionLedgerV1 {
 /// Adds `provider_claimed_scope_binding` to a denial ledger created before
 /// candidates carried an explicit binding. Idempotent: a ledger that already
 /// has the column is left untouched.
-fn add_scope_binding_column_if_missing(connection: &Connection) -> Result<(), rusqlite::Error> {
-    let has_column = connection
-        .prepare("PRAGMA table_info(recall_admission_denials)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?
-        .iter()
-        .any(|name| name == "provider_claimed_scope_binding");
-    if has_column {
-        return Ok(());
-    }
-    connection.execute_batch(
-        "ALTER TABLE recall_admission_denials
-         ADD COLUMN provider_claimed_scope_binding TEXT NOT NULL DEFAULT 'exact_coding_scope';",
-    )?;
-    Ok(())
-}
-
 impl RecallExplainTraceSinkV1 for RecallAdmissionLedgerV1 {
     fn record_explain_trace(
         &self,
@@ -1382,7 +1349,6 @@ struct SessionExactScopeBindingV1 {
     profile_id: UserProfileId,
     scope: ResolvedScope,
     canonical_session_id: String,
-    native_session_binding: Option<super::native_authority::NativeSessionBindingV1>,
 }
 
 impl ExactScopeBinding for SessionExactScopeBindingV1 {
@@ -1443,10 +1409,8 @@ impl ExactScopeBinding for SessionExactScopeBindingV1 {
                 scope.scope_digest.as_str(),
             ));
         }
-        let provider_session_id = self.native_session_binding.as_ref().map_or_else(
-            || provider_agent_session_id(&self.profile_id, &self.scope, &self.canonical_session_id),
-            |binding| binding.provider_session_id().to_owned(),
-        );
+        let provider_session_id =
+            provider_agent_session_id(&self.profile_id, &self.scope, &self.canonical_session_id);
         OwnedExactScope::new(
             self.profile_id.as_str(),
             self.scope.project_id.as_str(),
@@ -1486,8 +1450,7 @@ impl ExactScopeBinding for SessionExactScopeBindingV1 {
 ///
 /// * Foreign provider code -- any identity the registry does not itself mount
 ///   and vouch for -- is **refused before contact**. Terminable isolation for
-///   that shape is a supervised provider process, which is bead `tdmem-0703`
-///   and ADR-0009, not a promise made here.
+///   that shape is a supervised provider process, not a promise made here.
 /// * Host-authored in-process code that hangs anyway is stopped being waited
 ///   for, has its capacity reclaimed so the route stays usable, and is counted
 ///   as a stranded worker under a finite per-provider ceiling.
@@ -1576,10 +1539,6 @@ pub(crate) struct CognitiveRecallMountInputsV1 {
     /// that stranded a worker under one session must stay refused under
     /// every other session too.
     pub(crate) invocation_boundary: Arc<ProviderInvocationBoundaryV1>,
-    /// Host-private Native session authority shared with the selected Native
-    /// application port when Native participates in this composition.
-    pub(crate) native_session_retrieval_mount:
-        Option<Arc<super::native_authority::NativeSessionRetrievalMountV1>>,
     /// Durable host secret used for all retained identity/source projections.
     pub(crate) locator_key: control_attribution::RecallLocatorKeyV1,
 }
@@ -1897,8 +1856,6 @@ pub struct ProjectCognitiveRecallMountV1 {
     routing: ActiveRoutingPolicy,
     host_limits: ProviderLimits,
     locator_key: control_attribution::RecallLocatorKeyV1,
-    native_session_retrieval_mount:
-        Option<Arc<super::native_authority::NativeSessionRetrievalMountV1>>,
     /// Composition-time binding only; provider selection stays in the registry.
     selected_history: OnceLock<SelectedProviderHistoryV1>,
 }
@@ -2264,31 +2221,12 @@ impl ProjectCognitiveRecallMountV1 {
         {
             return Err(CognitiveRecallMountError::SessionIdentityInvalid);
         }
-        let native_session_binding = match self.native_session_retrieval_mount.as_ref() {
-            Some(mount) => {
-                let canonical_session_id =
-                    tracedecay_domain::SessionId::new(canonical_session_id.to_owned())
-                        .map_err(|_| CognitiveRecallMountError::SessionIdentityInvalid)?;
-                let provider_session_id = provider_agent_session_id(
-                    &self.profile_id,
-                    &self.scope,
-                    canonical_session_id.as_str(),
-                );
-                Some(
-                    mount
-                        .bind_session(provider_session_id, canonical_session_id)
-                        .map_err(|_| CognitiveRecallMountError::SessionBindingUnavailable)?,
-                )
-            }
-            None => None,
-        };
         ProjectCognitiveRecallPortV1::mount(CognitiveRecallPortInputsV1 {
             composition: Arc::clone(&self.composition),
             scope_binding: Arc::new(SessionExactScopeBindingV1 {
                 profile_id: self.profile_id.clone(),
                 scope: self.scope.clone(),
                 canonical_session_id: canonical_session_id.to_owned(),
-                native_session_binding,
             }),
             invocation_boundary: Arc::clone(&self.invocation_boundary),
             admission_observer: Arc::clone(&self.ledger) as Arc<dyn RecallAdmissionObserver>,
@@ -2576,8 +2514,12 @@ pub(crate) fn advisory_context_call(
 
 /// Runs one admitted advisory call against a minted session port.
 ///
-/// A dormant composition and an observer-only routing gate are *no lane*
-/// (`None`), never an empty answer. Every other refusal is a typed
+/// A dormant composition, an observer-only routing gate, and a route that
+/// selects TraceDecay Native are *no lane* (`None`), never an empty answer.
+/// Native is upstream TraceDecay memory: its whole contribution to
+/// `tracedecay_context` is the canonical `memory_matches` section the context
+/// handler already rendered, so asking it again would add a second memory
+/// section that upstream context never has. Every other refusal is a typed
 /// `Unavailable`, attributed to the provider the mounted routing policy
 /// pinned, so a broken lane is visible -- and identified -- instead of
 /// looking empty.
@@ -2600,6 +2542,11 @@ pub(crate) async fn advisory_memory_context_for_call(
         return None;
     }
     let mount = mount?;
+    if mount.routing().active_provider().as_str()
+        == tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID
+    {
+        return None;
+    }
     // Every outcome below names the provider this project's routing policy
     // pinned, including the ones that never reach a provider at all.
     let routed_provider = mount.routing().active_provider();
@@ -3175,13 +3122,33 @@ async fn advisory_context_recall_with_retention(
         profile_id: mount.profile_id.clone(),
         scope: mount.scope.clone(),
         canonical_session_id: inputs.canonical_session_id.to_owned(),
-        native_session_binding: None,
     }
     .bind_exact_scope(&mount.scope)
     .ok();
     let mut control_bindings = BTreeMap::new();
     let mut candidates = Vec::with_capacity(result.candidates().len());
+    // The context handler already rendered these canonical facts as
+    // `memory_matches`; a provider candidate naming one of them is the same
+    // fact, not advisory memory, and is withheld rather than shown twice.
+    let memory_match_fact_ids = inputs
+        .context_memory_contribution
+        .map(|contribution| {
+            contribution
+                .facts()
+                .iter()
+                .map(|fact| fact.fact_id.as_str().to_owned())
+                .collect::<std::collections::BTreeSet<_>>()
+        })
+        .unwrap_or_default();
     for candidate in result.candidates() {
+        if duplicates_memory_match(candidate, &memory_match_fact_ids) {
+            host_withheld.push(RecallExplainHostWithholdingV1 {
+                candidate_id: candidate.candidate_id().to_owned(),
+                reason_code: "duplicate_of_memory_matches".to_owned(),
+                detail: None,
+            });
+            continue;
+        }
         let hydration_now = match try_now_micros() {
             Ok(now) => now,
             Err(error) => {
@@ -3352,6 +3319,27 @@ async fn advisory_context_recall_with_retention(
         candidates,
         explain,
     }
+}
+
+/// Whether a provider candidate names a canonical fact the context handler
+/// already returned in `memory_matches`, by its stable reference or by its
+/// claimed `record:` provenance.
+fn duplicates_memory_match(
+    candidate: &tracedecay_contracts::memory::CognitiveRecallCandidate,
+    memory_match_fact_ids: &std::collections::BTreeSet<String>,
+) -> bool {
+    if memory_match_fact_ids.is_empty() {
+        return false;
+    }
+    let names_match = |reference: &str| {
+        memory_match_fact_ids.contains(reference.strip_prefix("record:").unwrap_or(reference))
+    };
+    candidate.stable_reference().is_some_and(names_match)
+        || matches!(
+            candidate.provenance(),
+            tracedecay_contracts::memory::CognitiveRecallProvenance::Available { source }
+                if names_match(source)
+        )
 }
 
 /// Stable, provider-byte-free code for one provenance state.
@@ -3598,7 +3586,6 @@ pub(crate) fn mount_project_cognitive_recall(
         routing: inputs.routing,
         host_limits: inputs.host_limits,
         locator_key: inputs.locator_key,
-        native_session_retrieval_mount: inputs.native_session_retrieval_mount,
         selected_history: OnceLock::new(),
     }))
 }
@@ -5933,15 +5920,32 @@ mod tests {
     const MOUNTED_PROFILE: &str = "profile.cognitive-recall";
 
     /// The bindings the registry records for Native at registration, from the
-    /// adapter's own `NATIVE_RECALL_SCOPE_BINDINGS` declaration: owner-bound
-    /// facts plus the exact and checkout bindings for staged observations.
+    /// adapter's own `NATIVE_RECALL_SCOPE_BINDINGS` declaration: project- and
+    /// profile-owned candidates only.
     fn native_authorized_bindings() -> RecallScopeBindingsV1 {
-        RecallScopeBindingsV1::new([
-            ScopeBinding::ExactCodingScope,
-            ScopeBinding::CheckoutObservations,
-            ScopeBinding::ProjectFacts,
-            ScopeBinding::ProfileFacts,
-        ])
+        RecallScopeBindingsV1::new([ScopeBinding::ProjectFacts, ScopeBinding::ProfileFacts])
+    }
+
+    /// One project Native application port over the fixture graph, with the
+    /// canonical session mount left unbound.
+    fn native_port_for_test(
+        fixture: &StoreFixture,
+        worktree: &str,
+    ) -> Arc<super::super::native_provider::ProjectNativeMemoryApplicationPort> {
+        let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
+        Arc::new(
+            super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
+                graph_cell,
+                fixture.project_root.clone(),
+                Arc::new(
+                    super::super::native_authority::NativeSessionRetrievalMountV1::for_project(
+                        UserProfileId::new(MOUNTED_PROFILE).expect("profile id"),
+                        resolved_scope(&fixture.project_id, worktree),
+                    ),
+                ),
+            )
+            .expect("construct project Native application port"),
+        )
     }
 
     fn production_mount(
@@ -5950,58 +5954,6 @@ mod tests {
         worktree: &str,
     ) -> Arc<ProjectCognitiveRecallMountV1> {
         production_mount_with_evidence_host(fixture, mode, worktree, fixture)
-    }
-
-    /// The production mount plus a handle on the very Native port it routes
-    /// to, so a test can exercise the same canonical project authority the
-    /// mounted recall reads.
-    fn production_mount_with_native_port(
-        fixture: &StoreFixture,
-        worktree: &str,
-    ) -> (
-        Arc<ProjectCognitiveRecallMountV1>,
-        Arc<super::super::native_provider::ProjectNativeMemoryApplicationPort>,
-    ) {
-        let ledger_root = fixture.ledger_root.join(worktree);
-        std::fs::create_dir_all(&ledger_root).expect("ledger root for mount");
-        let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-        let port = Arc::new(
-            super::super::native_provider::ProjectNativeMemoryApplicationPort::new(
-                graph_cell,
-                fixture.project_root.clone(),
-            )
-            .expect("construct project Native application port"),
-        );
-        let invocation_boundary = host_provider_invocation_boundary(1);
-        let composition = Arc::new(
-            ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
-                fabric_config: FabricConfig {
-                    max_registered_providers: 1,
-                    max_in_flight: 1,
-                },
-                port: Arc::clone(&port)
-                    as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
-                registration_revision: 1,
-                mode: EnabledProviderMode::Active,
-            })
-            .expect("provider composition"),
-        );
-        let mount = mount_project_cognitive_recall(CognitiveRecallMountInputsV1 {
-            composition,
-            profile_id: UserProfileId::new(MOUNTED_PROFILE).expect("profile id"),
-            scope: resolved_scope(&fixture.project_id, worktree),
-            authoritative_project_id: fixture.project_id.clone(),
-            store_data_root: ledger_root,
-            canonical_project_path: fixture.project_root.clone(),
-            graph: Arc::clone(&fixture.graph),
-            routing: test_recall_routing(),
-            host_limits: super::super::native_provider::native_provider_limits(),
-            invocation_boundary: Arc::clone(&invocation_boundary),
-            native_session_retrieval_mount: None,
-            locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
-        })
-        .expect("mounted cognitive recall route");
-        (mount, port)
     }
 
     /// How a stalling provider's `recall` refuses to return.
@@ -6101,75 +6053,12 @@ mod tests {
             self.inner.health(call)
         }
 
-        fn observe(
-            &self,
-            observation: tracedecay_memory_provider_registry::NativeObservation<'_>,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.observe(observation)
-        }
-
         fn recall(
             &self,
             call: &tracedecay_memory_provider_registry::ProviderCall,
         ) -> tracedecay_memory_provider_registry::ProviderReply {
             self.stall.enter();
             self.inner.recall(call)
-        }
-
-        fn feedback(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.feedback(call)
-        }
-
-        fn maintenance(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.maintenance(call)
-        }
-
-        fn inspection(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.inspection(call)
-        }
-
-        fn correction(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.correction(call)
-        }
-
-        fn delete_by_source(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.delete_by_source(call)
-        }
-
-        fn snapshot_export(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.snapshot_export(call)
-        }
-
-        fn snapshot_restore(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.snapshot_restore(call)
-        }
-
-        fn replay(
-            &self,
-            call: &tracedecay_memory_provider_registry::ProviderCall,
-        ) -> tracedecay_memory_provider_registry::ProviderReply {
-            self.inner.replay(call)
         }
     }
 
@@ -6190,12 +6079,8 @@ mod tests {
     ) {
         let ledger_root = fixture.ledger_root.join(worktree);
         std::fs::create_dir_all(&ledger_root).expect("ledger root for mount");
-        let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-        let inner = super::super::native_provider::project_native_memory_application_port(
-            graph_cell,
-            fixture.project_root.clone(),
-        )
-        .expect("construct project Native application port");
+        let inner = native_port_for_test(fixture, worktree)
+            as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>;
         let invocation_boundary = host_provider_invocation_boundary(1);
         let composition = Arc::new(
             ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
@@ -6221,7 +6106,6 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
-            native_session_retrieval_mount: None,
             locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route");
@@ -6243,12 +6127,8 @@ mod tests {
     ) -> Arc<ProjectCognitiveRecallMountV1> {
         let ledger_root = fixture.ledger_root.join(worktree);
         std::fs::create_dir_all(&ledger_root).expect("ledger root for mount");
-        let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&fixture.graph)));
-        let port = super::super::native_provider::project_native_memory_application_port(
-            graph_cell,
-            fixture.project_root.clone(),
-        )
-        .expect("construct project Native application port");
+        let port = native_port_for_test(fixture, worktree)
+            as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>;
         let invocation_boundary = host_provider_invocation_boundary(1);
         let composition = Arc::new(
             ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
@@ -6273,7 +6153,6 @@ mod tests {
             routing: test_recall_routing(),
             host_limits: super::super::native_provider::native_provider_limits(),
             invocation_boundary: Arc::clone(&invocation_boundary),
-            native_session_retrieval_mount: None,
             locator_key: control_attribution::RecallLocatorKeyV1::for_test(),
         })
         .expect("mounted cognitive recall route")
@@ -7644,67 +7523,138 @@ mod tests {
         );
     }
 
-    /// An advisory lane whose deadline has already elapsed never contacts a
-    /// provider, and the canonical host answer is delivered unchanged with a
-    /// typed withheld lane.
+    /// With TraceDecay Native selected, `tracedecay_context` is exactly the
+    /// upstream answer: Native's contribution is the canonical
+    /// `memory_matches` section the context handler already rendered, so the
+    /// host never asks Native a second time and appends no advisory section.
+    /// Every admitted call shape -- ordinary, unbindable, past its deadline,
+    /// or still mounting -- yields the same *no lane* a disabled provider host
+    /// yields, and no provider is contacted.
     ///
-    /// Real defect this catches: advisory recall running before or instead of
-    /// the authoritative handler, so a provider that consumes the whole
-    /// deadline starves the canonical answer instead of simply losing its own
-    /// advisory slot.
+    /// Real defect this catches: selecting Native adding a second memory
+    /// section (or a typed "unavailable" line) to the context answer, which
+    /// makes the Native-selected output diverge from the provider-host-disabled
+    /// output byte for byte.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_elapsed_deadline_never_contacts_a_provider_and_never_costs_the_host_answer() {
+    async fn native_selected_context_equals_the_provider_host_disabled_answer() {
         let fixture = project_fixture().await;
         seed_fixture(&fixture).await;
         let mount = production_mount(&fixture, EnabledProviderMode::Active, MOUNTED_WORKTREE);
         let now = now_micros();
+        let live = Deadline::new(UtcMicros(now.0.saturating_add(60_000_000))).expect("deadline");
         let elapsed = Deadline::new(UtcMicros(now.0.saturating_sub(1))).expect("elapsed deadline");
-        let call = advisory_context_call(
+        let connection = RequestId::new("request.mcp.instancedd-c1.0123456789abcdef0123456789abcdef")
+            .expect("request identity");
+        let calls = [
+            (Some(&connection), &live, serde_json::json!({ "task": SEEDED_CONTENT })),
+            (None, &live, serde_json::json!({ "task": SEEDED_CONTENT })),
+            (
+                None,
+                &elapsed,
+                serde_json::json!({
+                    "task": SEEDED_CONTENT,
+                    "session_id": "session.cognitive-recall.elapsed",
+                }),
+            ),
+        ];
+        let host_answer = "## Code Context\nthe canonical answer body\n";
+        for (request_id, deadline, arguments) in calls {
+            let native_call = advisory_context_call(
+                ADVISORY_RECALL_CONTEXT_TOOL,
+                &arguments,
+                request_id,
+                Some(deadline),
+                Some(&live_signal()),
+            )
+            .expect("the context call is admitted");
+            let native = advisory_memory_context_for_call(
+                mount.port_for_session(native_call.canonical_session_id()),
+                Some(mount.as_ref()),
+                native_call,
+                None,
+            )
+            .await;
+            let disabled_call = advisory_context_call(
+                ADVISORY_RECALL_CONTEXT_TOOL,
+                &arguments,
+                request_id,
+                Some(deadline),
+                Some(&live_signal()),
+            )
+            .expect("the context call is admitted");
+            let disabled = advisory_memory_context_for_call(
+                Err(CognitiveRecallMountError::CompositionDisabled),
+                None,
+                disabled_call,
+                None,
+            )
+            .await;
+            assert!(native.is_none(), "Native selected must add no lane: {native:?}");
+            assert!(disabled.is_none(), "{disabled:?}");
+        }
+        let pending_call = advisory_context_call(
             ADVISORY_RECALL_CONTEXT_TOOL,
-            &serde_json::json!({
-                "task": "cognitive recall ledger",
-                "session_id": "session.cognitive-recall.elapsed",
-            }),
-            None,
-            Some(&elapsed),
+            &serde_json::json!({ "task": SEEDED_CONTENT }),
+            Some(&connection),
+            Some(&live),
             Some(&live_signal()),
         )
-        .expect("a context call with a session identity and a task is admitted");
-        let advisory = advisory_memory_context_for_call(
-            mount.port_for_session("session.cognitive-recall.elapsed"),
-            Some(mount.as_ref()),
-            call,
-            None,
-        )
-        .await
-        .expect("a mounted active route always yields a lane");
+        .expect("the context call is admitted");
         assert!(
-            matches!(
-                advisory,
-                AdvisoryMemoryContextV1::Unavailable {
-                    outcome: AdvisoryRecallUnavailableV1::DeadlineElapsed,
-                    ..
-                }
-            ),
-            "{advisory:?}"
+            advisory_memory_context_for_call(
+                Err(CognitiveRecallMountError::FullCompositionPending),
+                Some(mount.as_ref()),
+                pending_call,
+                None,
+            )
+            .await
+            .is_none()
         );
         assert_eq!(
             mount.ledger.report_count(),
             0,
-            "no provider may be contacted past the deadline"
+            "Native selected never contacts the provider for context assembly"
         );
+        // No lane means the tool layer appends nothing: the rendered answer is
+        // the host answer, exactly as with the provider host disabled.
+        let rendered = rendered_text_for_test(&tool_result_for_test(host_answer));
+        assert_eq!(rendered, host_answer);
+    }
 
-        let host_answer = "## Code Context\nthe canonical answer body\n";
-        let rendered = advisory.appended_to(TestToolResult::new(
-            serde_json::json!({ "content": [{ "type": "text", "text": host_answer }] }),
-            Vec::new(),
+    /// A provider candidate that names a canonical fact the context handler
+    /// already returned in `memory_matches` is the same fact, whether it
+    /// names it by stable reference or by `record:` provenance.
+    #[test]
+    fn a_candidate_naming_a_memory_match_is_recognized_as_a_duplicate() {
+        use tracedecay_contracts::memory::{CognitiveRecallCandidate, CognitiveRecallProvenance};
+
+        let matches = std::collections::BTreeSet::from(["fact.one".to_owned()]);
+        let by_reference = CognitiveRecallCandidate::new(
+            "candidate.reference",
+            "remembered",
+            CognitiveRecallProvenance::unavailable(),
+        )
+        .and_then(|candidate| candidate.with_stable_reference("record:fact.one"))
+        .expect("candidate");
+        let by_provenance = CognitiveRecallCandidate::new(
+            "candidate.provenance",
+            "remembered",
+            CognitiveRecallProvenance::available("record:fact.one").expect("provenance"),
+        )
+        .expect("candidate");
+        let unrelated = CognitiveRecallCandidate::new(
+            "candidate.unrelated",
+            "remembered",
+            CognitiveRecallProvenance::available("record:fact.two").expect("provenance"),
+        )
+        .expect("candidate");
+        assert!(duplicates_memory_match(&by_reference, &matches));
+        assert!(duplicates_memory_match(&by_provenance, &matches));
+        assert!(!duplicates_memory_match(&unrelated, &matches));
+        assert!(!duplicates_memory_match(
+            &by_reference,
+            &std::collections::BTreeSet::new()
         ));
-        let text = rendered.value["content"][0]["text"]
-            .as_str()
-            .expect("rendered text")
-            .to_owned();
-        assert!(text.starts_with(host_answer), "{text}");
-        assert!(text.contains("advisory_deadline_elapsed"), "{text}");
     }
 
     // -----------------------------------------------------------------
@@ -7853,61 +7803,6 @@ mod tests {
         );
     }
 
-    /// A mounted route that cannot bind the call to any session refuses by
-    /// identity, names the routed provider, and never contacts a provider.
-    ///
-    /// Real defect this catches: an unbindable recall quietly falling through
-    /// to some other session's memory, or to a host-invented session.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn an_unbindable_call_is_a_typed_refusal_that_names_the_routed_provider() {
-        let fixture = project_fixture().await;
-        seed_fixture(&fixture).await;
-        let mount = production_mount(&fixture, EnabledProviderMode::Active, MOUNTED_WORKTREE);
-        let call = advisory_context_call(
-            ADVISORY_RECALL_CONTEXT_TOOL,
-            &serde_json::json!({ "task": "cognitive recall ledger" }),
-            None,
-            Some(&Deadline::new(UtcMicros(now_micros().0.saturating_add(60_000_000))).unwrap()),
-            Some(&live_signal()),
-        )
-        .expect("the call is admitted so its refusal can be typed");
-        let advisory = advisory_memory_context_for_call(
-            mount.port_for_session(call.canonical_session_id()),
-            Some(mount.as_ref()),
-            call,
-            None,
-        )
-        .await
-        .expect("a mounted route always yields a lane");
-        assert!(
-            matches!(
-                advisory,
-                AdvisoryMemoryContextV1::Unavailable {
-                    outcome: AdvisoryRecallUnavailableV1::SessionBindingUnavailable,
-                    ..
-                }
-            ),
-            "{advisory:?}"
-        );
-        assert_eq!(advisory.provider_id(), NATIVE_PROVIDER_ID);
-        assert_eq!(
-            mount.ledger.report_count(),
-            0,
-            "an unbindable recall contacts no provider"
-        );
-        let text = rendered_text_for_test(&advisory.appended_to(tool_result_for_test(
-            "## Code Context\nthe canonical answer\n",
-        )));
-        assert!(
-            text.contains("advisory_session_binding_unavailable"),
-            "{text}"
-        );
-        assert!(
-            text.contains(NATIVE_PROVIDER_ID),
-            "the refusal names the configured provider: {text}"
-        );
-    }
-
     /// A dormant composition is *no lane*, not an unavailable one: nothing
     /// about a provider is rendered into the answer at all.
     ///
@@ -7939,57 +7834,6 @@ mod tests {
         );
     }
 
-    /// While project open still serves the early core route, a configured
-    /// provider is reported as mounting rather than silently absent, and no
-    /// provider is contacted before session retrieval is bound.
-    ///
-    /// Real defect this catches: the first context call after a daemon start
-    /// omitting the advisory lane entirely, indistinguishable from a project
-    /// with no provider configured.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_pending_full_composition_is_a_typed_lane_that_names_the_routed_provider() {
-        let fixture = project_fixture().await;
-        seed_fixture(&fixture).await;
-        let mount = production_mount(&fixture, EnabledProviderMode::Active, MOUNTED_WORKTREE);
-        let call = advisory_context_call(
-            ADVISORY_RECALL_CONTEXT_TOOL,
-            &serde_json::json!({ "task": "cognitive recall ledger" }),
-            Some(
-                &RequestId::new("request.mcp.instancecc-c1.0123456789abcdef0123456789abcdef")
-                    .unwrap(),
-            ),
-            Some(&Deadline::new(UtcMicros(now_micros().0.saturating_add(60_000_000))).unwrap()),
-            Some(&live_signal()),
-        )
-        .expect("the call is admitted");
-        let advisory = advisory_memory_context_for_call(
-            Err(CognitiveRecallMountError::FullCompositionPending),
-            Some(mount.as_ref()),
-            call,
-            None,
-        )
-        .await
-        .expect("a configured provider always yields a lane");
-        assert!(
-            matches!(
-                advisory,
-                AdvisoryMemoryContextV1::Unavailable {
-                    outcome: AdvisoryRecallUnavailableV1::MountRefused {
-                        mount_code: "recall_mount_full_composition_pending"
-                    },
-                    ..
-                }
-            ),
-            "{advisory:?}"
-        );
-        assert_eq!(advisory.provider_id(), NATIVE_PROVIDER_ID);
-        assert_eq!(
-            mount.ledger.report_count(),
-            0,
-            "a mounting provider is never contacted"
-        );
-    }
-
     /// A provider that ignores the deadline it was handed cannot hold the
     /// already-produced canonical answer open: the lane's own wall-clock
     /// slice terminates it as a typed outcome.
@@ -8010,26 +7854,23 @@ mod tests {
         // A short caller slice: the lane's own cap is the smaller of this and
         // `ADVISORY_RECALL_DEADLINE_BUDGET_MICROS`.
         let deadline = Deadline::new(UtcMicros(now.0.saturating_add(120_000))).expect("deadline");
-        let call = advisory_context_call(
-            ADVISORY_RECALL_CONTEXT_TOOL,
-            &serde_json::json!({ "task": "cognitive recall ledger" }),
-            Some(
-                &RequestId::new("request.mcp.instancebb-c1.0123456789abcdef0123456789abcdef")
-                    .unwrap(),
-            ),
-            Some(&deadline),
-            Some(&live_signal()),
-        )
-        .expect("an ordinary context call is admitted");
+        // The provider recall route itself is exercised here: context
+        // assembly never asks Native, so the lane entry would add no lane.
+        let session = "session.mcp.connection.instancebb-c1";
         let started = std::time::Instant::now();
-        let advisory = advisory_memory_context_for_call(
-            mount.port_for_session(call.canonical_session_id()),
-            Some(mount.as_ref()),
-            call,
-            None,
+        let advisory = advisory_context_recall(
+            &mount.port_for_session(session).expect("session port"),
+            mount.as_ref(),
+            AdvisoryRecallInputsV1 {
+                context_memory_contribution: None,
+                canonical_session_id: session,
+                query: "cognitive recall ledger",
+                maximum_candidates: ADVISORY_RECALL_MAXIMUM_CANDIDATES,
+                deadline,
+                cancellation: live_signal(),
+            },
         )
-        .await
-        .expect("a mounted route always yields a lane");
+        .await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -8051,7 +7892,7 @@ mod tests {
         // plus a fixed 250 ms grace, so every honest path is back inside half a
         // second. A ceiling of one second is therefore loose enough never to
         // flake and tight enough that waiting the 30-second stall out -- or
-        // anything close to it -- fails here (`tdmem-sz9` acceptance).
+        // anything close to it -- fails here.
         assert!(
             elapsed < std::time::Duration::from_secs(1),
             "the lane returned only after {elapsed:?}, so the stalled provider was still \
@@ -8083,8 +7924,9 @@ mod tests {
         // wait out the provider's 30-second stall, and neither does the suite.
     }
 
-    /// One ordinary advisory context call over a mounted route, under an
-    /// explicit deadline budget.
+    /// One provider recall over a mounted route, under an explicit deadline
+    /// budget. This drives the recall route directly: context assembly never
+    /// asks Native, so the lane entry would add no lane for this provider.
     async fn advisory_recall_for_test(
         mount: &ProjectCognitiveRecallMountV1,
         connection: &str,
@@ -8093,27 +7935,20 @@ mod tests {
         let now = now_micros();
         let deadline =
             Deadline::new(UtcMicros(now.0.saturating_add(budget_micros))).expect("deadline");
-        let call = advisory_context_call(
-            ADVISORY_RECALL_CONTEXT_TOOL,
-            &serde_json::json!({ "task": "cognitive recall ledger" }),
-            Some(
-                &RequestId::new(format!(
-                    "request.mcp.{connection}.0123456789abcdef0123456789abcdef"
-                ))
-                .expect("request identity"),
-            ),
-            Some(&deadline),
-            Some(&live_signal()),
-        )
-        .expect("an ordinary context call is admitted");
-        advisory_memory_context_for_call(
-            mount.port_for_session(call.canonical_session_id()),
-            Some(mount),
-            call,
-            None,
+        let session = format!("session.mcp.connection.{connection}");
+        advisory_context_recall(
+            &mount.port_for_session(&session).expect("session port"),
+            mount,
+            AdvisoryRecallInputsV1 {
+                context_memory_contribution: None,
+                canonical_session_id: &session,
+                query: "cognitive recall ledger",
+                maximum_candidates: ADVISORY_RECALL_MAXIMUM_CANDIDATES,
+                deadline,
+                cancellation: live_signal(),
+            },
         )
         .await
-        .expect("a mounted route always yields a lane")
     }
 
     /// Blocks the test -- not the host -- until `condition` holds.
@@ -9426,212 +9261,6 @@ mod history_recall_tests {
         assert_eq!(delivered.touched_files, host.touched_files);
         assert_eq!(sink.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(!delivered.value.to_string().contains("recall_trace"));
-    }
-
-    #[cfg(feature = "test-helpers")]
-    #[test]
-    fn readonly_context_evidence_binds_the_actual_wal_trace_and_original_control() {
-        use super::test_context_evidence::{
-            ContextEvidenceReadErrorV1, read_retained_context_trace_for_test,
-        };
-        let temporary = tempfile::tempdir().unwrap();
-        let path = temporary.path().join(LEDGER_FILE_NAME);
-        // Keep the real WAL writer open while the independent read-only helper runs.
-        let ledger = Arc::new(RecallAdmissionLedgerV1::open(path.clone()).unwrap());
-        let request_id = "recall.context.readonly.empty";
-        let (lane, scope) = empty_control_output_fixture(ledger.clone(), request_id);
-        let delivered = lane.appended_to(TestToolResult::new(
-            json!({"content": [{"type": "text", "text": "{\"answer\":\"actual host\"}"}]}),
-            Vec::new(),
-        ));
-        let payload: Value =
-            serde_json::from_str(delivered.value["content"][0]["text"].as_str().unwrap()).unwrap();
-        let reference = payload[ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"]["trace_ref"]
-            .as_str()
-            .unwrap();
-        let reference_ref = RecallControlTraceRefV1::parse(reference).unwrap();
-        let token = tracedecay_memory_provider_registry::CancellationToken::new();
-        let control = OperationControl::new(i64::MAX, 60_000, token.clone());
-        let read = |request, provider, revision, expected_scope: &OwnedExactScope| {
-            read_retained_context_trace_for_test(
-                temporary.path(),
-                reference,
-                request,
-                provider,
-                revision,
-                expected_scope,
-                &control,
-            )
-        };
-        let provider = tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID;
-        let before = [
-            std::fs::read(&path).unwrap(),
-            std::fs::read(path.with_extension("sqlite3-wal")).unwrap(),
-        ];
-        let trace = read(request_id, provider, 31, &scope).unwrap();
-        assert_eq!(trace.request_id, request_id);
-        assert_eq!(trace.requested_count, 0);
-        assert!(trace.items.is_empty());
-        assert_eq!(
-            trace,
-            ledger.explain_trace(&reference_ref).unwrap().unwrap().trace
-        );
-        assert!(matches!(
-            read("another-request", provider, 31, &scope),
-            Err(ContextEvidenceReadErrorV1::Invalid(_))
-        ));
-        assert!(matches!(
-            read(request_id, "provider.other", 31, &scope),
-            Err(ContextEvidenceReadErrorV1::Invalid(_))
-        ));
-        assert!(matches!(
-            read(request_id, provider, 32, &scope),
-            Err(ContextEvidenceReadErrorV1::Invalid(_))
-        ));
-        let mut other_scope = scope.clone();
-        other_scope.agent_session_id = "another-session".to_owned();
-        assert!(matches!(
-            read(request_id, provider, 31, &other_scope),
-            Err(ContextEvidenceReadErrorV1::Invalid(_))
-        ));
-        assert_eq!(
-            before,
-            [
-                std::fs::read(&path).unwrap(),
-                std::fs::read(path.with_extension("sqlite3-wal")).unwrap()
-            ],
-            "read-only helper must not write ledger or WAL bytes"
-        );
-        token.cancel();
-        assert!(matches!(
-            read(request_id, provider, 31, &scope),
-            Err(ContextEvidenceReadErrorV1::Stopped(_))
-        ));
-    }
-
-    #[cfg(feature = "test-helpers")]
-    #[test]
-    fn readonly_context_evidence_rejects_incomplete_overlarge_and_changed_rows() {
-        use super::test_context_evidence::{
-            ContextEvidenceReadErrorV1, read_retained_context_trace_for_test,
-        };
-        for mutation in [
-            "missing_row",
-            "count_overflow",
-            "row_overflow",
-            "oversize_field",
-            "changed_digest",
-        ] {
-            let temporary = tempfile::tempdir().unwrap();
-            let ledger = Arc::new(
-                RecallAdmissionLedgerV1::open(temporary.path().join(LEDGER_FILE_NAME)).unwrap(),
-            );
-            let request_id = format!("recall.context.readonly.{mutation}");
-            let (lane, scope, _) = control_output_fixture(ledger.clone(), &request_id);
-            let delivered = lane.appended_to(TestToolResult::new(
-                json!({"content": [{"type": "text", "text": "{\"answer\":\"actual host\"}"}]}),
-                Vec::new(),
-            ));
-            let payload: Value =
-                serde_json::from_str(delivered.value["content"][0]["text"].as_str().unwrap())
-                    .unwrap();
-            let reference = payload[ADVISORY_CONTEXT_PACK_JSON_KEY]["recall_trace"]["trace_ref"]
-                .as_str()
-                .unwrap();
-            let control = OperationControl::new(
-                i64::MAX,
-                60_000,
-                tracedecay_memory_provider_registry::CancellationToken::new(),
-            );
-            let read = || {
-                read_retained_context_trace_for_test(
-                    temporary.path(),
-                    reference,
-                    &request_id,
-                    tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID,
-                    31,
-                    &scope,
-                    &control,
-                )
-            };
-            assert!(read().is_ok());
-            match mutation {
-                "missing_row" => {
-                    ledger
-                        .connection()
-                        .execute(
-                            "DELETE FROM recall_explain_trace_items WHERE provider_rank=0",
-                            [],
-                        )
-                        .unwrap();
-                }
-                "count_overflow" => {
-                    ledger
-                        .connection()
-                        .execute("UPDATE recall_explain_traces SET requested_count=9", [])
-                        .unwrap();
-                }
-                "row_overflow" => {
-                    let connection = ledger.connection();
-                    connection
-                        .execute("UPDATE recall_explain_traces SET requested_count=8", [])
-                        .unwrap();
-                    for rank in 3..=8 {
-                        connection
-                            .execute(
-                                "INSERT INTO recall_explain_trace_items (
-                            exact_scope_sha256, trace_id, provider_rank, candidate_id, stage,
-                            host_reason_code, host_reason_detail, host_decision_json,
-                            provider_explanation_json, section, tokens)
-                            SELECT exact_scope_sha256, trace_id, ?1, candidate_id || ?1, stage,
-                                host_reason_code, host_reason_detail, host_decision_json,
-                                provider_explanation_json, section, tokens
-                            FROM recall_explain_trace_items WHERE provider_rank=0",
-                                params![rank],
-                            )
-                            .unwrap();
-                    }
-                }
-                "oversize_field" => {
-                    ledger.connection().execute("UPDATE recall_explain_trace_items SET candidate_id=?1 WHERE provider_rank=0", params!["x".repeat(1025)]).unwrap();
-                }
-                "changed_digest" => {
-                    ledger
-                        .connection()
-                        .execute("UPDATE recall_explain_traces SET degraded=1-degraded", [])
-                        .unwrap();
-                }
-                _ => unreachable!(),
-            }
-            assert!(
-                matches!(read(), Err(ContextEvidenceReadErrorV1::Invalid(_))),
-                "{mutation}"
-            );
-        }
-        let temporary = tempfile::tempdir().unwrap();
-        let sink = Arc::new(RefusingControlOutputSink(
-            std::sync::atomic::AtomicUsize::new(0),
-        ));
-        let (lane, scope) = empty_control_output_fixture(sink, "recall.context.missing");
-        let reference = lane.provisional_recall_trace().unwrap();
-        let control = OperationControl::new(
-            i64::MAX,
-            60_000,
-            tracedecay_memory_provider_registry::CancellationToken::new(),
-        );
-        assert!(
-            read_retained_context_trace_for_test(
-                temporary.path(),
-                &reference.trace_ref,
-                &reference.request_id,
-                tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID,
-                31,
-                &scope,
-                &control
-            )
-            .is_err()
-        );
-        assert!(!temporary.path().join(LEDGER_FILE_NAME).exists());
     }
 
     struct RefusingControlOutputSink(std::sync::atomic::AtomicUsize);

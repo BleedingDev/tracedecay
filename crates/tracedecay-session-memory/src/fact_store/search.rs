@@ -91,13 +91,14 @@ fn project_memory_search_scores(
     let trust = fact.trust().as_f64();
     let temporal_decay = project_memory_temporal_decay(fact.telemetry().updated_at(), now);
     let retrieval_count = fact.telemetry().retrieval_count();
-    // Cursor pages carry a ranking revision and must resume the same order
-    // after retrieval telemetry writes and process restarts. Telemetry is
-    // deliberately retained in `why`, but wall-clock decay and retrieval
-    // reinforcement are volatile inputs and therefore cannot participate in
-    // the canonical paged score. A future ranking change must bump the
-    // cursor revision in the contracts before changing this order.
-    let score = project_memory_combined_score(fts, jaccard, holographic, trust, 1.0, 0);
+    let score = project_memory_combined_score(
+        fts,
+        jaccard,
+        holographic,
+        trust,
+        temporal_decay,
+        retrieval_count,
+    );
     Ok((
         ProjectMemoryFactSearchScoresV1::new(
             project_memory_score_millionths(score),
@@ -136,11 +137,10 @@ fn rank_and_seek(
             .then_with(|| left.fact().fact_id().cmp(right.fact().fact_id()))
     });
     if let Some(after) = after {
-        // Resume from the cursor fact's position in this stable ranking when
-        // it is still eligible; its identity is the durable continuation
-        // anchor. Retrieval telemetry does not participate in this score or
-        // tie-break, so a telemetry write cannot move a candidate between
-        // pages.
+        // Search scores include wall-clock decay, so the score carried by a
+        // prior page can be stale even when the fact snapshot is unchanged.
+        // Resume from the cursor fact's position in this ranking when it is
+        // still eligible; its identity is the durable continuation anchor.
         let (after_score, after_updated_at) = ranked
             .iter()
             .find(|(hit, updated_at)| {
@@ -150,14 +150,7 @@ fn rank_and_seek(
                 (after.score_millionths(), after.updated_at()),
                 |(hit, updated_at)| (hit.score_millionths(), *updated_at),
             );
-        // A fact that was updated after the page was issued may no longer
-        // carry the same timestamp. Exclude the anchor by identity before
-        // applying the positional predicate so an update cannot duplicate it
-        // on the resumed page.
         ranked.retain(|(hit, updated_at)| {
-            if hit.fact().fact_id() == after.fact_id() {
-                return false;
-            }
             hit.score_millionths() < after_score
                 || (hit.score_millionths() == after_score
                     && (*updated_at < after_updated_at

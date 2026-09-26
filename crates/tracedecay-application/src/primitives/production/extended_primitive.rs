@@ -855,9 +855,6 @@ impl ExtendedPrimitivePort for TraceDecayExtendedPrimitivePortV1 {
                 };
                 match page.coverage {
                     DiagnosticQueryCoverage::Complete | DiagnosticQueryCoverage::Truncated => {}
-                    DiagnosticQueryCoverage::PublicationLedgerUninitialized => {
-                        return diagnostics_unavailable(finished_at, OmissionReason::Unavailable);
-                    }
                     DiagnosticQueryCoverage::StoreUnavailable { .. } => {
                         return diagnostics_unavailable(finished_at, OmissionReason::Unavailable);
                     }

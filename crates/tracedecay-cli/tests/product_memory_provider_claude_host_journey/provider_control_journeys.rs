@@ -19,13 +19,16 @@ use tracedecay_contracts::retained_surfaces::{
     ProviderControlResultV1, ProviderControlSourceSelectorV1, ProviderControlStateSelectorV1,
     ProviderControlTerminalV1, ProviderCorrectionRequestV1, ProviderDeleteBySourceRequestV1,
     ProviderFeedbackRequestV1, ProviderHealthRequestV1, ProviderMaintenanceRequestV1,
-    RetainedSurfaceResultV1,
+    RetainedSurfaceRequestV1, RetainedSurfaceResultV1, retained_surface_operation_is_effect,
 };
 use tracedecay_contracts::{
     ApplicationOutcome, CancellationSignal, Deadline, RequestId, now_micros,
 };
 use tracedecay_daemon_protocol::{
-    DaemonInvocationError, DaemonInvocationOutcome, DaemonInvocationResponse,
+    DaemonClientIdentity, DaemonConnection, DaemonHandshake, DaemonInvocationClient,
+    DaemonInvocationError, DaemonInvocationExecutor, DaemonInvocationOutcome,
+    DaemonInvocationRequest, DaemonInvocationResponse, InvocationCancellationPolicy,
+    MovedStoreAdoption,
 };
 use tracedecay_domain::UtcMicros;
 
@@ -214,17 +217,49 @@ fn invoke(
     let request_id = RequestId::new(request_id.to_owned()).expect("provider control request id");
     let cancellation = CancellationSignal::active(format!("{}.cancel", request_id.as_str()))
         .expect("provider control cancellation");
-    super::comparison_fixture::controlled_rpc::invoke_provider_control(
-        &authority,
-        &journey.project,
-        &journey.profile,
-        request_id,
-        request,
+    let policy = if retained_surface_operation_is_effect(request.operation()) {
+        InvocationCancellationPolicy::AuthoritativeEffect
+    } else {
+        InvocationCancellationPolicy::ReadOnly
+    };
+    let invocation = DaemonInvocationRequest::retained_application(
+        request_id.as_str(),
+        RetainedSurfaceRequestV1::ProviderControl(request),
         observed_at,
-        deadline,
-        cancellation,
-    )
-    .expect("create provider control RPC runtime")
+        deadline.clone(),
+        cancellation.context(),
+    );
+    let connection =
+        DaemonConnection::new(authority.endpoint.clone(), authority.auth_token.clone())
+            .with_daemon_version(authority.version.clone());
+    let handshake = DaemonHandshake {
+        project_path: Some(journey.project.clone()),
+        scope_prefix: None,
+        timings: false,
+        allow_init: false,
+        allow_initialize_root_routing: false,
+        client_identity: DaemonClientIdentity::new(
+            authority.profile_root.clone(),
+            journey.profile.join("global.db"),
+        ),
+        client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        client_instance_id: format!("host-provider-control-rpc-{}", std::process::id()),
+        tool_list_changed_capable: false,
+        catalog_version: String::new(),
+        moved_store_adoption: MovedStoreAdoption::Never,
+    };
+    let client = DaemonInvocationClient::new(connection, handshake);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("create provider control RPC runtime")
+        .block_on(DaemonInvocationExecutor::invoke_controlled(
+            &client,
+            invocation,
+            deadline,
+            cancellation,
+            policy,
+        ))
 }
 
 fn typed_result(response: &DaemonInvocationResponse) -> ProviderControlResultV1 {

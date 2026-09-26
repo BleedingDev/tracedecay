@@ -421,7 +421,6 @@ pub(crate) async fn register_dashboard_test_retained_runtime(
             .map_err(|error| TraceDecayError::Config {
                 message: format!("dashboard test retained grant is invalid: {error}"),
             })?;
-    let profile_id = cg.profile_database().binding().shard_id.profile_id.clone();
     let retained_ports = tracedecay_daemon_service::retained_owner::retained_surface_ports(
         tracedecay_daemon_service::retained_owner::ProductionRetainedAuthoritiesV1 {
             cg: Arc::new(tokio::sync::RwLock::new(Arc::clone(cg))),
@@ -443,7 +442,6 @@ pub(crate) async fn register_dashboard_test_retained_runtime(
     );
     DaemonRetainedRuntimeRegistrar::new(service)
         .register(
-            profile_id,
             project_root,
             scope,
             retained_access.requester,

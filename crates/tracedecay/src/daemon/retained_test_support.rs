@@ -83,18 +83,10 @@ impl tracedecay_daemon_protocol::DaemonInvocationExecutor for RetainedOwnerTestE
                     },
                 );
             }
-            let Some(profile_id) = self
-                .service
-                .retained_profile_id_for_test(&self.project_root)
-                .await
-            else {
-                return Err(tracedecay_daemon_protocol::DaemonInvocationError::Unavailable);
-            };
             Ok(self
                 .service
-                .invoke_with_cancellation_for_profile(
+                .invoke_with_cancellation(
                     &self.lsp_registry,
-                    &profile_id,
                     Some(&self.project_root),
                     None,
                     None,
@@ -156,12 +148,6 @@ pub(crate) async fn register_project_retained_owner_for_test(
 ) -> Result<()> {
     let graph = server.cg().await;
     let project_root = graph.project_root().canonicalize()?;
-    let profile_id = graph
-        .profile_database()
-        .binding()
-        .shard_id
-        .profile_id
-        .clone();
     let project_id = graph
         .store_layout()
         .identity
@@ -204,14 +190,7 @@ pub(crate) async fn register_project_retained_owner_for_test(
         access.configuration_digest.clone(),
     );
     DaemonRetainedRuntimeRegistrar::new(service)
-        .register(
-            profile_id,
-            project_root,
-            scope,
-            access.requester,
-            grant,
-            ports,
-        )
+        .register(project_root, scope, access.requester, grant, ports)
         .await
 }
 

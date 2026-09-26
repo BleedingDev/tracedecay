@@ -1,7 +1,7 @@
 # Deterministic coding-memory scenarios
 
-`coding-memory-scenarios.v1.json` is the provider-neutral corpus for
-`tdmem-0901`. It is a versioned, secret-free fixture: the runner supplies the
+`coding-memory-scenarios.v1.json` is the provider-neutral coding-memory
+corpus. It is a versioned, secret-free fixture: the runner supplies the
 provider under test, while the fixture, task, observations, code revisions,
 and adjudication remain unchanged for every provider.
 
@@ -39,15 +39,6 @@ Every scenario contains the same executable layers:
 5. `adjudication_rubric` — weighted checks whose weights sum to one; all
    safety-critical checks must pass for a scenario pass.
 
-The JSON schema is
-`coding-memory-scenarios.v1.schema.json`. The focused validator is
-`tests/product_tdmem_0901_scenario_corpus_test.py` and can be run without
-Cargo or model credentials:
-
-```sh
-python3 tests/product_tdmem_0901_scenario_corpus_test.py
-```
-
 The corpus intentionally does not name or require a concrete provider. The
 baseline runner in `crates/tracedecay-memory-conformance` runs the same
 scenarios against any provider or baseline by injecting the lane identity and
@@ -61,12 +52,11 @@ request a runner must issue: scope, objective, query, current-mode temporal
 query with a fixed `evaluation_time` at or after the scenario's latest
 observation, finite candidate budgets, empty exclusions, and the policy
 revision. Every catalog entry is referenced exactly once, so two runners
-cannot issue different recalls for the same step. Steps are typed shapes in
-the schema (`$defs.step` is a `oneOf` per action) and the Rust loader
+cannot issue different recalls for the same step. The Rust loader
 (`ScenarioCorpus::from_json_bytes`) rejects digest drift, unknown references,
 step-order faults, unbalanced rubric weights, and unknown terminal outcomes.
 
-## Baseline lanes (`tdmem-0902`)
+## Baseline lanes
 
 `BaselineRunner` executes one corpus under one host configuration through a
 typed `BaselineLane`:
@@ -78,10 +68,7 @@ typed `BaselineLane`:
 | `Provider(ProviderLane)` | `provider:<provider_id>` | Every step runs through one real `MemoryProvider`: per-scope handshake, observation envelopes, catalogued recalls, health, deletion by source, snapshot restore, replay, and cancellation preflight. |
 
 The first two lanes are runner behaviors, not provider look-alikes: they never
-construct a `MemoryProvider`. The real Native baseline is
-`crates/tracedecay/src/daemon/retained_owner/native_baseline_tests.rs`, which
-binds the production `NativeProvider` to the real project application port
-over a temporary store whose owner is the corpus project identity.
+construct a `MemoryProvider`.
 
 Every report carries a `BaselineRunIdentity`:
 
@@ -129,18 +116,11 @@ Run the provider-neutral lanes and the in-memory provider-lane fixture:
 cargo test -p tracedecay-memory-conformance --test baseline
 ```
 
-Run the real Native baseline (root crate, host feature):
-
-```sh
-cargo test -p tracedecay --features memory-provider-host native_baseline
-```
-
-## Metric catalog (`tdmem-0904`)
+## Metric catalog
 
 `coding-memory-metrics.v1.json` is the versioned, provider-neutral catalog of
 the quality, safety, cost, and latency metrics computed over runs of this
-corpus. Its schema is `coding-memory-metrics.v1.schema.json`; the stdlib gate
-is `tests/product_tdmem_0904_metric_catalog_test.py`. The catalog is compiled
+corpus. The catalog is compiled
 into `crates/tracedecay-memory-evaluation` (`include_str!`) and validated on
 load against the metrics the code computes (`MetricId::ALL`), so a metric
 cannot exist in one place without the other.
@@ -180,8 +160,7 @@ Honesty rules the evaluator enforces:
   labels in the pinned vocabulary. Label-based metrics carry `labeled`,
   `unlabeled`, and `indeterminate` counts; all-unresolved yields
   `indeterminate`, never `0.0`. The label vocabulary is pinned here until the
-  feedback capability (`tdmem-0802`) lands a typed enum, which must map onto
-  it.
+  provider feedback capability lands a typed enum, which must map onto it.
 * **Nothing is fabricated.** Latency percentiles use nearest rank over runner
   samples and are `indeterminate { reason: "no_samples" }` without them; token,
   curation, correction, and discovery values are `indeterminate` when
@@ -190,24 +169,20 @@ Honesty rules the evaluator enforces:
 * **Provider identity is metadata.** `ProviderRunIdentity` travels with the
   report but is not an input to any metric.
 
-**Caller status (honest):** nothing in production calls this crate yet. The
-tdmem-0902 baseline runner (`crates/tracedecay-memory-conformance`) produces a
+**Caller status:** nothing in production calls this crate yet. The
+baseline runner (`crates/tracedecay-memory-conformance`) produces a
 `BaselineRunOutput`; this crate consumes it through
 `MetricReport::from_baseline_run(&BaselineRunOutput, &BaselineAnnotations)`,
 which converts the conformance report (scope match, forgotten source keys,
 terminal codes, rubric verdicts, token estimates, timings) into run records.
-The runner does not call this crate. The intended consumer is the Native
-versus NCM differential runner (tdmem-0905, blocked by this bead). Today the
-only callers are this crate's integration tests
+The runner does not call this crate. Today the only callers are this crate's integration tests
 (`crates/tracedecay-memory-evaluation/tests/metrics.rs`), which drive the real
 `BaselineRunner` over the checked-in corpus for the `NoMemory` and
-`ExplicitDocumentation` lanes. The root-crate Native lane (`native_baseline`,
-above) is not yet evaluated by this crate. The runner records no labels,
+`ExplicitDocumentation` lanes. The runner records no labels,
 provenance states, or human measurements; those arrive as annotations and
 default to `missing` / unmeasured, so an unannotated lane is reported as
 unlabeled rather than scored. Stray annotations are typed errors.
 
 ```sh
-python3 tests/product_tdmem_0904_metric_catalog_test.py
 cargo test -p tracedecay-memory-evaluation
 ```

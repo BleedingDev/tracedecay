@@ -1,8 +1,8 @@
 //! Transport-neutral configuration control plane and runtime pin surfaces.
 //!
-//! Optional semantic runtime admission is represented by the canonical
-//! project-scoped `SemanticConfig`; artifact lifecycle and query execution stay
-//! behind their runtime owners.
+//! Retrieval-profile evaluation stays in `tracedecay-application::config::retrieval`
+//! because it is production-load-bearing on search-eval. This crate must not
+//! depend on `tracedecay-semantic` or `tracedecay-search-eval`.
 
 pub mod config;
 pub mod configuration;

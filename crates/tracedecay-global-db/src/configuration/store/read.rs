@@ -7,9 +7,8 @@ use super::codec::{
 use super::{
     ActorId, ChangePlanId, ConfigurationProtectedPlanRecordV1, ConfigurationRegistry,
     ConfigurationRevisionId, ConfigurationRevisionRecordV1, ConfigurationSnapshotV1,
-    ConfigurationStoreError, ConfigurationStoreResult, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-    QueryExecutor, Row, SettingKey, UtcMicros, invalid_store_data, params, unavailable_store,
+    ConfigurationStoreError, ConfigurationStoreResult, QueryExecutor, Row, SettingKey, UtcMicros,
+    invalid_store_data, params, unavailable_store,
 };
 fn decode_snapshot_entry(
     value: &str,
@@ -73,32 +72,7 @@ fn snapshot_from_entries(
             "stored configuration snapshot payload does not match revision metadata",
         ));
     }
-    validate_persisted_provider_configuration(&snapshot)?;
     Ok(snapshot)
-}
-
-/// Persisted project snapshots must satisfy the same provider composition
-/// boundary as newly resolved and mutated values. Profile worker snapshots do
-/// not carry provider keys, so they remain outside this project registry.
-fn validate_persisted_provider_configuration(
-    snapshot: &ConfigurationSnapshotV1,
-) -> ConfigurationStoreResult<()> {
-    let carries_provider_setting = snapshot.effective_values.keys().any(|key| {
-        matches!(
-            key.as_str(),
-            MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY
-                | MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY
-                | MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY
-        )
-    });
-    if !carries_provider_setting {
-        return Ok(());
-    }
-    let registry = ConfigurationRegistry::core()
-        .map_err(|error| invalid_store_data(format!("load configuration registry: {error}")))?;
-    registry
-        .validate_provider_configuration(&snapshot.effective_values)
-        .map_err(|error| invalid_store_data(format!("validate provider configuration: {error}")))
 }
 
 pub(super) fn validate_snapshot_registry_completeness(
@@ -131,13 +105,6 @@ pub(super) fn validate_snapshot_registry_completeness_with_registry(
         registry.validate_value(key, value).map_err(|error| {
             invalid_store_data(format!("validate configuration value: {error}"))
         })?;
-    }
-    if registry.has_provider_configuration() {
-        registry
-            .validate_provider_configuration(&snapshot.effective_values)
-            .map_err(|error| {
-                invalid_store_data(format!("validate provider configuration: {error}"))
-            })?;
     }
     Ok(())
 }
@@ -334,82 +301,4 @@ pub(super) async fn current_revision_id_from_executor(
         ));
     }
     Ok(revision_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::*;
-    use crate::configuration::registry::ConfigurationRegistry;
-    use crate::configuration::resolver::resolve_configuration;
-    use tracedecay_domain::canonical_json_bytes;
-    use tracedecay_domain::configuration::{
-        ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-        MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderRecallFallbackV1,
-        MemoryProviderRecallRoutingV1,
-    };
-
-    fn canonical_text<T: serde::Serialize>(value: &T) -> String {
-        String::from_utf8(canonical_json_bytes(value).unwrap()).unwrap()
-    }
-
-    fn encoded_entries(snapshot: &ConfigurationSnapshotV1) -> Vec<(String, i64, String)> {
-        let keys = snapshot
-            .effective_values
-            .keys()
-            .chain(snapshot.provenance.keys())
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        keys.into_iter()
-            .map(|key| {
-                let entry = StoredConfigurationSnapshotEntryV1 {
-                    schema_version: CONFIGURATION_SNAPSHOT_ENTRY_PAYLOAD_SCHEMA_VERSION,
-                    value: snapshot.effective_values.get(&key).cloned(),
-                    provenance: snapshot.provenance.get(&key).cloned().unwrap_or_default(),
-                };
-                (
-                    key.as_str().to_owned(),
-                    i64::from(CONFIGURATION_SNAPSHOT_ENTRY_PAYLOAD_SCHEMA_VERSION),
-                    serde_json::to_string(&entry).unwrap(),
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn digest_consistent_persisted_provider_fallback_is_rejected() {
-        let registry = ConfigurationRegistry::core().unwrap();
-        let resolved = resolve_configuration(&registry, &[]).unwrap().snapshot;
-        let mut effective_values = resolved.effective_values.clone();
-        let native_key = SettingKey::new(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY).unwrap();
-        let routing_key = SettingKey::new(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY).unwrap();
-        effective_values.insert(native_key, ConfigurationValueV1::Boolean(true));
-        effective_values.insert(
-            routing_key,
-            ConfigurationValueV1::Text(canonical_text(&MemoryProviderRecallRoutingV1 {
-                active_provider: Some("tracedecay.native".to_owned()),
-                fallback: Some(MemoryProviderRecallFallbackV1 {
-                    policy_id: "policy.recall.fallback".to_owned(),
-                    policy_revision: 1,
-                    target_provider: "ncm".to_owned(),
-                }),
-                ..Default::default()
-            })),
-        );
-        let invalid = ConfigurationSnapshotV1::new(effective_values, resolved.provenance).unwrap();
-
-        let result = snapshot_from_entries(
-            encoded_entries(&invalid),
-            invalid.snapshot_id.as_str(),
-            invalid.effective_behavior_digest.as_str(),
-            invalid.resolution_provenance_digest.as_str(),
-        );
-        assert!(matches!(
-            result,
-            Err(ConfigurationStoreError::InvalidData(message))
-                if message.contains("validate provider configuration")
-                    && message.contains("fallback memory provider Ncm is disabled")
-        ));
-    }
 }

@@ -1,375 +1,60 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-use std::collections::{BTreeMap, BTreeSet};
+//! Native is upstream TraceDecay memory inside the provider host. These tests
+//! prove it is observationally identical to the upstream tools it wraps:
+//! fact recall equals `tracedecay_fact_store_{search,probe,related,reason}`
+//! (same ids, order, and `score_millionths`), and session recall issues the
+//! exact `tracedecay_message_search` kernel query and carries its page
+//! verbatim.
+
+use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
-use tracedecay_contracts::ResolvedScope;
 use tracedecay_contracts::retained_surfaces::{
-    FactCommitDispositionV1, FactCommitOwnerV1, FactCommitReceiptV1, FactIdentitySourceResultV1,
-    FactProjectionV1, FactTelemetryV1, FactV1,
+    FactReadOptionsV1, FactSearchHitV1, FactStoreAddRequestV1, FactStoreProbeRequestV1,
+    FactStoreReasonRequestV1, FactStoreRelatedRequestV1, FactStoreSearchRequestV1,
+    MemoryScopeV1, MessageSearchRequestV1, RetainedSurfaceResultV1,
+};
+use tracedecay_contracts::{
+    ApplicationOperation, ApplicationOutcome, CancellationContext, CancellationSignal,
+    CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass, RequestContext,
+    RequestId, ResolvedScope, RetainedMemoryRequestV1, RetainedSessionExecutionPortV1,
+    RetainedSessionRequestV1, RetainedSurfaceExecutionContextV1, RetainedSurfaceOperation,
+    retained_surface_application_operation,
 };
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::{
-    CanonicalObservationIdV1, Confidence, FactAssertionId, FactCategoryV1, FactId,
-    FactIdentityMaterialV1, FactIdentitySourceV1, FactLineageEventKindV1, FactLineageEventV1,
-    FactOwnerV1, ProjectId, ProvenanceId, RefId, RepositoryId, RetrievalAnchorId, SessionId,
-    UserProfileId, UtcMicros, WorktreeId, derive_exact_observation_anchor_id,
+    ActorId, FactOwnerV1, ManifestDigest, ProjectId, RefId, RepositoryId, UserProfileId,
+    UtcMicros, WorktreeId,
 };
 use tracedecay_memory_provider_registry::{
-    CancellationToken, CanonicalPayload, CommittedEffectState, CurrentSourceDisposition,
-    GrantedHistorySource, HandshakeRequest, HistoryGrant, HistoryRelation,
-    NATIVE_FACT_PROMOTION_OBSERVATION_KIND, NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    NATIVE_PROVIDER_ID, NATIVE_STAGED_SESSION_OBSERVATION_KIND,
-    NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID, NativeMemoryApplicationPort, NativeObservation,
-    NativeObservationEnvelope, OBSERVATION_CONTRACT_ID, OperationControl, OriginScopeEvidence,
-    OriginalSourceIdentity, OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall,
-    ProviderCallParts, ProviderOperation, RecordedValidity, RestoreDispositionCheckpoint,
-    SourceAttribution, SourceDisposition, TerminalCode,
+    CancellationToken, CanonicalPayload, HandshakeRequest, MemoryProviderV1, NATIVE_PROVIDER_ID,
+    NativeProvider, OperationControl, OwnedExactScope, OwnedProviderId, OwnedVersionedId,
+    ProviderCall, ProviderCallParts, ProviderOperation, TerminalCode,
 };
-use tracedecay_session_memory::memory::{
-    ProjectMemoryFactAddRequest, ProjectMemoryFactAddRequestOutcome,
+use tracedecay_session_runtime::retained::{
+    DirectRetainedSessionPortV1, ProjectRetainedSessionAuthoritiesV1,
 };
-use tracedecay_store::{
-    FactReadControl, FactWriteControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
-    ProjectMemoryFactIdV1,
-};
+use tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalFutureV1;
+use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
+use tracedecay_store_runtime::retained_memory::DirectRetainedMemoryPortV1;
 
 use super::*;
 use tracedecay_project::project::{TraceDecay, TraceDecayOpenOptions};
 
 const SCOPE_DIGEST: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+const CONFIGURATION_DIGEST: &str =
+    "sha256:6161616161616161616161616161616161616161616161616161616161616161";
+const RECALL_PROFILE: &str = "profile.native-bridge-recall";
 
-fn project_parts(label: &str) -> (ProjectId, FactOwnerV1, FactCommitOwnerV1) {
-    let project_id =
-        ProjectId::new(format!("project.native-bridge-{label}")).expect("valid project identity");
-    (
-        project_id.clone(),
-        FactOwnerV1::Project {
-            project_id: project_id.clone(),
-        },
-        FactCommitOwnerV1::Project { project_id },
-    )
-}
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
 
-fn source_and_fact_id(owner: &FactOwnerV1, label: &str) -> (FactIdentitySourceV1, FactId) {
-    let source = FactIdentitySourceV1::Application {
-        operation_id: ProvenanceId::new(format!("operation.native-bridge-{label}"))
-            .expect("valid operation identity"),
-    };
-    let material = FactIdentityMaterialV1::new(owner.clone(), source.clone())
-        .expect("valid fact identity material");
-    let fact_id = FactId::derive(&material).expect("valid fact identity");
-    (source, fact_id)
-}
-
-fn event_for(
-    owner: &FactOwnerV1,
-    fact_id: &FactId,
-    assertion_id: &FactAssertionId,
-    occurred_at: i64,
-) -> FactLineageEventV1 {
-    FactLineageEventV1::new(
-        fact_id.clone(),
-        owner.clone(),
-        FactLineageEventKindV1::AssertionRecorded {
-            assertion_id: assertion_id.clone(),
-        },
-        UtcMicros(occurred_at),
-        None,
-    )
-    .expect("valid fact lineage event")
-}
-
-fn fact_for(
-    public_owner: &FactCommitOwnerV1,
-    fact_id: &FactId,
-    source: &FactIdentitySourceV1,
-    assertion_id: &FactAssertionId,
-    last_event: &FactLineageEventV1,
-    as_of: i64,
-) -> FactV1 {
-    let operation_id = match source {
-        FactIdentitySourceV1::Application { operation_id } => operation_id.clone(),
-        FactIdentitySourceV1::Evidence { .. } => unreachable!("test source is application-owned"),
-    };
-    FactV1 {
-        owner: public_owner.clone(),
-        fact_id: fact_id.clone(),
-        content: "Native bridge acceptance fact".to_owned(),
-        category: FactCategoryV1::Project,
-        tags: vec!["native".to_owned(), "bridge".to_owned()],
-        entities: vec!["TraceDecay".to_owned()],
-        trust_score_millionths: 876_543,
-        source: FactIdentitySourceResultV1::Application { operation_id },
-        source_label: Some("native bridge test".to_owned()),
-        active_assertion_id: assertion_id.clone(),
-        last_event_id: last_event.event_id().clone(),
-        projected_as_of: UtcMicros(as_of),
-        telemetry: FactTelemetryV1 {
-            retrieval_count: 7,
-            access_count: 5,
-            helpful_count: 3,
-            unhelpful_count: 1,
-            created_at: UtcMicros(1),
-            updated_at: UtcMicros(as_of),
-            last_retrieved_at: Some(UtcMicros(4)),
-            last_recalled_at: Some(UtcMicros(5)),
-            last_feedback_at: Some(UtcMicros(6)),
-        },
-        metadata: BTreeMap::from([("origin".to_owned(), json!("native"))]),
-    }
-}
-
-fn commit_for(
-    public_owner: &FactCommitOwnerV1,
-    fact_id: &FactId,
-    events: &[FactLineageEventV1],
-    assertion_id: &FactAssertionId,
-) -> FactCommitReceiptV1 {
-    FactCommitReceiptV1 {
-        disposition: FactCommitDispositionV1::Committed,
-        fact_id: fact_id.clone(),
-        owner: public_owner.clone(),
-        committed_event_ids: events
-            .iter()
-            .map(|event| event.event_id().clone())
-            .collect(),
-        last_event_id: events
-            .last()
-            .expect("receipt has a final event")
-            .event_id()
-            .clone(),
-        active_assertion_id: Some(assertion_id.clone()),
-    }
-}
-
-fn call_for(project_id: &str) -> ProviderCall {
-    let bytes = vec![1];
-    ProviderCall::new(ProviderCallParts {
-        operation: ProviderOperation::Observe,
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
-        registration_revision: 1,
-        ready_receipt_sha256: "a".repeat(64),
-        exact_scope: OwnedExactScope::new(
-            "profile.native-bridge-test",
-            project_id,
-            "repo.native-bridge-test",
-            "worktree.native-bridge-test",
-            "branch.native-bridge-test",
-            "agent.native-bridge-test",
-            SCOPE_DIGEST,
-        )
-        .expect("valid exact scope"),
-        request_id: "request.native-bridge-test".to_owned(),
-        operation_id: "operation.native-bridge-test".to_owned(),
-        expected_state_generation: 0,
-        idempotency_key: Some("idempotency.native-bridge-test".to_owned()),
-        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
-        payload: CanonicalPayload::new(
-            OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("valid observation contract"),
-            bytes.clone(),
-            sha256_hex(&bytes),
-        )
-        .expect("valid observation payload"),
-        required_capabilities: vec![
-            OwnedVersionedId::new(ProviderOperation::Observe.capability_id())
-                .expect("observe capability"),
-        ],
-        extensions: Vec::new(),
-    })
-    .expect("valid provider call")
-}
-
-fn valid_observation_call(project_id: &str, canonical_payload: &Value) -> ProviderCall {
-    let envelope = json!({
-        "canonical_payload": canonical_payload,
-        "observation_kind": NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
-        "payload_contract": NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID,
-    });
-    let envelope_bytes = serde_json::to_vec(&envelope).expect("observation envelope bytes");
-    ProviderCall::new(ProviderCallParts {
-        operation: ProviderOperation::Observe,
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
-        registration_revision: 1,
-        ready_receipt_sha256: "a".repeat(64),
-        exact_scope: OwnedExactScope::new(
-            "profile.native-bridge-store",
-            project_id,
-            "repo.native-bridge-store",
-            "worktree.native-bridge-store",
-            "branch.native-bridge-store",
-            "agent.native-bridge-store",
-            SCOPE_DIGEST,
-        )
-        .expect("valid exact scope"),
-        request_id: "request.native-bridge-store".to_owned(),
-        operation_id: "operation.native-bridge-store".to_owned(),
-        expected_state_generation: 0,
-        idempotency_key: Some("idempotency.native-bridge-store".to_owned()),
-        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
-        payload: CanonicalPayload::new(
-            OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("valid observation contract"),
-            envelope_bytes.clone(),
-            sha256_hex(&envelope_bytes),
-        )
-        .expect("valid observation payload"),
-        required_capabilities: vec![
-            OwnedVersionedId::new(ProviderOperation::Observe.capability_id())
-                .expect("observe capability"),
-        ],
-        extensions: Vec::new(),
-    })
-    .expect("valid provider call")
-}
-
-fn settled_fixture() -> (ProviderCall, SettledNativeFactWriteV1) {
-    let (project_id, owner, public_owner) = project_parts("settled");
-    let (source, fact_id) = source_and_fact_id(&owner, "settled");
-    let assertion_id =
-        FactAssertionId::new("assertion.native-bridge-settled").expect("valid assertion identity");
-    let event = event_for(&owner, &fact_id, &assertion_id, 2);
-    let fact = fact_for(&public_owner, &fact_id, &source, &assertion_id, &event, 2);
-    let commit = commit_for(
-        &public_owner,
-        &fact_id,
-        std::slice::from_ref(&event),
-        &assertion_id,
-    );
-    (
-        call_for(project_id.as_str()),
-        SettledNativeFactWriteV1 {
-            kind: "settled_native_fact_write".to_owned(),
-            fact,
-            commit,
-        },
-    )
-}
-
-fn ready_request() -> HandshakeRequest {
-    HandshakeRequest {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
-        registration_revision: 7,
-        exact_scope: OwnedExactScope::new(
-            "profile.native-bridge-ready",
-            "project.native-bridge-ready",
-            "repo.native-bridge-ready",
-            "worktree.native-bridge-ready",
-            "branch.native-bridge-ready",
-            "agent.native-bridge-ready",
-            SCOPE_DIGEST,
-        )
-        .expect("valid exact scope"),
-        request_id: "request.native-bridge-ready".to_owned(),
-        required_capabilities: BTreeSet::new(),
-        host_limits: native_descriptor().expect("descriptor").limits,
-        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
-        challenge_nonce: [7; 32],
-    }
-}
-
-fn history_fixture() -> (
-    FactOwnerV1,
-    FactV1,
-    FactCommitReceiptV1,
-    ProjectMemoryFactHistoryV1,
-) {
-    let (_project_id, owner, public_owner) = project_parts("history");
-    let (source, fact_id) = source_and_fact_id(&owner, "history");
-    let prefix_assertion =
-        FactAssertionId::new("assertion.native-bridge-prefix").expect("valid assertion");
-    let first_assertion =
-        FactAssertionId::new("assertion.native-bridge-first").expect("valid assertion");
-    let last_assertion =
-        FactAssertionId::new("assertion.native-bridge-last").expect("valid assertion");
-    let prefix = event_for(&owner, &fact_id, &prefix_assertion, 1);
-    let first = event_for(&owner, &fact_id, &first_assertion, 2);
-    let last = event_for(&owner, &fact_id, &last_assertion, 3);
-    let fact = fact_for(&public_owner, &fact_id, &source, &last_assertion, &last, 3);
-    let commit = commit_for(
-        &public_owner,
-        &fact_id,
-        &[first.clone(), last.clone()],
-        &last_assertion,
-    );
-    let history =
-        ProjectMemoryFactHistoryV1::new(owner.clone(), fact_id, vec![prefix, first, last], None)
-            .expect("valid project fact history");
-    (owner, fact, commit, history)
-}
-
-async fn read_store_snapshot(
-    graph: &TraceDecay,
-    owner: &FactOwnerV1,
-    fact_id: &FactId,
-) -> (FactProjectionV1, ProjectMemoryFactHistoryV1) {
-    let memory = graph
-        .project_memory_application()
-        .expect("project memory application");
-    let target = ProjectMemoryFactIdV1::new(owner.clone(), fact_id.clone())
-        .expect("owner-bound project fact target");
-    let read_control = FactReadControl::new(Arc::new(|| false));
-    let projection = memory
-        .get_project_memory_fact(target.clone(), &read_control)
-        .await
-        .expect("read project fact")
-        .expect("project fact exists");
-    let public = super::memory_mapping::projection(&projection).expect("public fact projection");
-    let history = memory
-        .get_project_memory_history(
-            ProjectMemoryFactHistoryQueryV1::new(target, None, MAX_NATIVE_FACT_LINEAGE)
-                .expect("fact history query"),
-            &read_control,
-        )
-        .await
-        .expect("read project fact history");
-    (public, history)
-}
-
-fn observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObservation<'_> {
-    NativeObservation::FactPromotion(NativeObservationEnvelope {
-        call,
-        observation_kind: NATIVE_FACT_PROMOTION_OBSERVATION_KIND.to_owned(),
-        payload_contract: NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID.to_owned(),
-        canonical_payload,
-    })
-}
-
-fn staged_observation_call(project_id: &str, canonical_payload: &Value) -> ProviderCall {
-    let mut call = valid_observation_call(project_id, canonical_payload);
-    let envelope = json!({
-        "canonical_payload": canonical_payload,
-        "observation_kind": NATIVE_STAGED_SESSION_OBSERVATION_KIND,
-        "payload_contract": NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
-    });
-    let bytes = serde_json::to_vec(&envelope).expect("staged observation envelope bytes");
-    call.payload = CanonicalPayload::new(
-        OwnedVersionedId::new(OBSERVATION_CONTRACT_ID).expect("observation contract"),
-        bytes.clone(),
-        sha256_hex(&bytes),
-    )
-    .expect("staged observation payload");
-    call
-}
-
-fn staged_observation_for(call: &ProviderCall, canonical_payload: Value) -> NativeObservation<'_> {
-    NativeObservation::StagedSession(NativeObservationEnvelope {
-        call,
-        observation_kind: NATIVE_STAGED_SESSION_OBSERVATION_KIND.to_owned(),
-        payload_contract: NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID.to_owned(),
-        canonical_payload,
-    })
-}
-
-async fn real_project_fixture() -> (
-    tempfile::TempDir,
-    PathBuf,
-    Arc<TraceDecay>,
-    FactOwnerV1,
-    ProjectId,
-) {
+async fn real_project_fixture() -> (tempfile::TempDir, PathBuf, Arc<TraceDecay>, ProjectId) {
     let temporary = tempfile::tempdir().expect("native recall fixture root");
     let project_root = temporary.path().join("project");
     let profile_root = temporary.path().join("profile");
@@ -393,52 +78,15 @@ async fn real_project_fixture() -> (
         .await
         .expect("initialize TraceDecay recall fixture"),
     );
-    let owner = graph.project_memory_owner().expect("project memory owner");
-    let FactOwnerV1::Project { project_id } = owner.clone() else {
+    let FactOwnerV1::Project { project_id } =
+        graph.project_memory_owner().expect("project memory owner")
+    else {
         panic!("recall fixture must have a project memory owner");
     };
-    (temporary, project_root, graph, owner, project_id)
-}
-
-async fn add_real_project_fact(graph: &TraceDecay, content: &str, source_label: &str) -> FactV1 {
-    let memory = graph
-        .project_memory_application()
-        .expect("project memory application");
-    let preflight = memory
-        .preflight_project_memory_fact_add(
-            ProjectMemoryFactAddRequest {
-                content: content.to_owned(),
-                category: FactCategoryV1::Project,
-                source_label: Some(source_label.to_owned()),
-                tags: vec!["native".to_owned(), "bridge".to_owned()],
-                entities: vec!["TraceDecay".to_owned()],
-                trust: Some(Confidence::new(0.91).expect("fact trust")),
-                metadata: json!({"fixture": source_label}),
-            },
-            None,
-        )
-        .expect("preflight project fact");
-    let outcome = memory
-        .add_preflighted_project_memory_fact(
-            preflight,
-            &FactWriteControl::new(Arc::new(|| false), Arc::new(|| true)),
-        )
-        .await
-        .expect("commit project fact");
-    let ProjectMemoryFactAddRequestOutcome::Applied(applied) = outcome else {
-        panic!("recall fixture fact must be applied");
-    };
-    let projection = super::memory_mapping::projection(applied.fact())
-        .expect("map stored recall fixture fact projection");
-    match projection {
-        FactProjectionV1::Available { fact } => fact.as_ref().clone(),
-        FactProjectionV1::Unavailable { .. } => {
-            panic!("recall fixture fact must remain available")
-        }
-        FactProjectionV1::Superseded { .. } => {
-            panic!("new recall fixture fact cannot already be superseded")
-        }
-    }
+    // Retained target admission compares the served root with the root it
+    // is asked for, so every read in these tests uses the graph's own root.
+    let served_root = graph.project_root().to_path_buf();
+    (temporary, served_root, graph, project_id)
 }
 
 fn recall_resolved_scope(project_id: &str) -> ResolvedScope {
@@ -454,7 +102,7 @@ fn recall_resolved_scope(project_id: &str) -> ResolvedScope {
 fn recall_scope_value(project_id: &str) -> Value {
     let scope = recall_resolved_scope(project_id);
     json!({
-        "profile_id": "profile.native-bridge-recall",
+        "profile_id": RECALL_PROFILE,
         "project_id": project_id,
         "repository_identity": "repo.native-bridge-recall",
         "worktree_identity": "worktree.native-bridge-recall",
@@ -464,15 +112,15 @@ fn recall_scope_value(project_id: &str) -> Value {
     })
 }
 
-fn recall_request_value(project_id: &str) -> Value {
+fn recall_request_value(project_id: &str, objective: &str, query: &str) -> Value {
     json!({
         "provider_id": NATIVE_PROVIDER_ID,
         "registration_revision": 1,
         "ready_receipt_digest": "a".repeat(64),
         "exact_scope_identity": recall_scope_value(project_id),
         "request_identity": "request.native-bridge-recall",
-        "objective": "search",
-        "query": "native bridge",
+        "objective": objective,
+        "query": query,
         "temporal_query": {
             "mode": "current",
             "evaluation_time": "2020-01-01T00:00:00Z",
@@ -511,15 +159,15 @@ fn recall_request_value(project_id: &str) -> Value {
     })
 }
 
-fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
-    let bytes = serde_json::to_vec(&request).expect("recall request bytes");
+fn valid_recall_call(project_id: &str, request: &Value) -> ProviderCall {
+    let bytes = serde_json::to_vec(request).expect("recall request bytes");
     ProviderCall::new(ProviderCallParts {
         operation: ProviderOperation::Recall,
         provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
         registration_revision: 1,
         ready_receipt_sha256: "a".repeat(64),
         exact_scope: OwnedExactScope::new(
-            "profile.native-bridge-recall",
+            RECALL_PROFILE,
             project_id,
             "repo.native-bridge-recall",
             "worktree.native-bridge-recall",
@@ -531,7 +179,7 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
         request_id: "request.native-bridge-recall".to_owned(),
         operation_id: "operation.native-bridge-recall".to_owned(),
         expected_state_generation: 0,
-        idempotency_key: Some("idempotency.native-bridge-recall".to_owned()),
+        idempotency_key: None,
         control: OperationControl::new(i64::MAX, 10_000, CancellationToken::new()),
         payload: CanonicalPayload::new(
             OwnedVersionedId::new(RECALL_REQUEST_CONTRACT_ID).expect("valid recall contract"),
@@ -548,7 +196,10 @@ fn valid_recall_call(project_id: &str, request: Value) -> ProviderCall {
 }
 
 fn valid_health_call(project_id: &str) -> ProviderCall {
-    let mut call = valid_recall_call(project_id, recall_request_value(project_id));
+    let mut call = valid_recall_call(
+        project_id,
+        &recall_request_value(project_id, "search", "native bridge"),
+    );
     let body = json!({
         "requested_checks": ["protocol", "state", "persistence"],
     });
@@ -565,6 +216,265 @@ fn valid_health_call(project_id: &str) -> ProviderCall {
     call
 }
 
+fn ready_request() -> HandshakeRequest {
+    HandshakeRequest {
+        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("valid provider id"),
+        registration_revision: 7,
+        exact_scope: OwnedExactScope::new(
+            "profile.native-bridge-ready",
+            "project.native-bridge-ready",
+            "repo.native-bridge-ready",
+            "worktree.native-bridge-ready",
+            "branch.native-bridge-ready",
+            "agent.native-bridge-ready",
+            SCOPE_DIGEST,
+        )
+        .expect("valid exact scope"),
+        request_id: "request.native-bridge-ready".to_owned(),
+        required_capabilities: BTreeSet::new(),
+        host_limits: native_descriptor().expect("descriptor").limits,
+        control: OperationControl::new(i64::MAX, 1_000, CancellationToken::new()),
+        challenge_nonce: [7; 32],
+    }
+}
+
+fn session_mount(project_id: &str) -> Arc<NativeSessionRetrievalMountV1> {
+    Arc::new(NativeSessionRetrievalMountV1::for_project(
+        UserProfileId::new(RECALL_PROFILE).expect("profile id"),
+        recall_resolved_scope(project_id),
+    ))
+}
+
+fn native_port(
+    graph: &Arc<TraceDecay>,
+    project_root: PathBuf,
+    project_id: &str,
+) -> Arc<ProjectNativeMemoryApplicationPort> {
+    Arc::new(
+        ProjectNativeMemoryApplicationPort::new(
+            Arc::new(tokio::sync::RwLock::new(Arc::clone(graph))),
+            project_root,
+            session_mount(project_id),
+        )
+        .expect("construct project Native application port"),
+    )
+}
+
+/// Runs one Native recall off the async runtime, exactly as the host
+/// invocation boundary runs a synchronous provider call.
+async fn native_recall(port: &Arc<ProjectNativeMemoryApplicationPort>, call: ProviderCall) -> Value {
+    let port = Arc::clone(port);
+    let reply = tokio::task::spawn_blocking(move || port.recall(&call))
+        .await
+        .expect("native recall worker");
+    assert!(
+        matches!(
+            reply.terminal.terminal_code(),
+            TerminalCode::Success | TerminalCode::SuccessZeroResults
+        ),
+        "{:?}",
+        reply.terminal
+    );
+    let payload = reply.payload.expect("recall payload");
+    assert_eq!(payload.contract_id.as_str(), RECALL_RESULT_CONTRACT_ID);
+    serde_json::from_slice(&payload.bytes).expect("recall payload JSON")
+}
+
+/// The upstream hits Native carried, in Native order.
+fn native_fact_hits(outcome: &Value) -> Vec<FactSearchHitV1> {
+    outcome["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|candidate| {
+            assert_eq!(candidate["memory_class"], json!(FACT_MEMORY_CLASS));
+            serde_json::from_value(candidate["provenance"]["fact_search_hit"].clone())
+                .expect("carried upstream fact search hit")
+        })
+        .collect()
+}
+
+fn ranking(hits: &[FactSearchHitV1]) -> Vec<(String, u32)> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.fact.fact_id.as_str().to_owned(),
+                hit.scores.score_millionths,
+            )
+        })
+        .collect()
+}
+
+fn retained_context(
+    project_id: &ProjectId,
+    operation: RetainedSurfaceOperation,
+    request_id: &str,
+) -> (RequestContext, CancellationSignal, ApplicationOperation) {
+    let scope = recall_resolved_scope(project_id.as_str());
+    let operation =
+        retained_surface_application_operation(operation).expect("retained application operation");
+    let cancellation_id = format!("cancel.{request_id}");
+    let grant = CapabilityGrantSnapshot::new(
+        CapabilityGrantId::new(format!("grant.{request_id}")).expect("grant id"),
+        1,
+        ManifestDigest::new(CONFIGURATION_DIGEST).expect("grant digest"),
+        ActorId::new("actor.native-parity").expect("actor id"),
+        UtcMicros(1),
+        UtcMicros(i64::MAX - 1),
+        scope.clone(),
+        BTreeSet::from([operation.capability_id().clone()]),
+        BTreeSet::from([operation.use_case_id().clone()]),
+        DisclosureClass::Evidence,
+    )
+    .expect("capability grant");
+    let context = RequestContext::new(
+        ActorId::new("actor.native-parity").expect("actor id"),
+        scope,
+        grant,
+        RequestId::new(request_id).expect("request id"),
+        Deadline::new(UtcMicros(i64::MAX - 1)).expect("deadline"),
+        CancellationContext::active(cancellation_id.clone()).expect("cancellation context"),
+    )
+    .expect("request context");
+    let signal = CancellationSignal::active(cancellation_id).expect("cancellation signal");
+    (context, signal, operation)
+}
+
+/// Executes one upstream retained memory tool call, the exact path every
+/// `tracedecay_fact_store_*` MCP, CLI and HTTP call takes.
+async fn upstream_memory(
+    graph: &Arc<TraceDecay>,
+    project_root: &std::path::Path,
+    project_id: &ProjectId,
+    operation: RetainedSurfaceOperation,
+    request: RetainedMemoryRequestV1<'_>,
+) -> ApplicationOutcome<RetainedSurfaceResultV1> {
+    let lock = tokio::sync::RwLock::new(Arc::clone(graph));
+    let authority = super::super::live_retained_memory_authority(&lock, project_id, project_root)
+        .await
+        .expect("retained memory authority");
+    let port = DirectRetainedMemoryPortV1::project(
+        authority,
+        ManifestDigest::new(CONFIGURATION_DIGEST).expect("configuration digest"),
+    );
+    let (context, signal, application_operation) =
+        retained_context(project_id, operation, "request.native-parity.upstream");
+    port.execute_request(
+        RetainedSurfaceExecutionContextV1 {
+            request_context: &context,
+            cancellation_signal: &signal,
+            operation: &application_operation,
+            observed_at: now_micros(),
+        },
+        request,
+    )
+    .await
+    .expect("upstream retained memory call")
+}
+
+fn upstream_hits(outcome: &ApplicationOutcome<RetainedSurfaceResultV1>) -> Vec<FactSearchHitV1> {
+    match outcome.payload().expect("upstream payload") {
+        RetainedSurfaceResultV1::FactStoreSearch(result) => result.hits.clone(),
+        RetainedSurfaceResultV1::FactStoreProbe(result) => result.hits.clone(),
+        RetainedSurfaceResultV1::FactStoreRelated(result) => result.hits.clone(),
+        RetainedSurfaceResultV1::FactStoreReason(result) => result.hits.clone(),
+        other => panic!("unexpected upstream result {other:?}"),
+    }
+}
+
+fn read_options(scope: MemoryScopeV1) -> FactReadOptionsV1 {
+    FactReadOptionsV1 {
+        memory_scope: Some(scope),
+        category: None,
+        min_trust: None,
+        limit: Some(8),
+        project_selector: None,
+    }
+}
+
+async fn add_fact(
+    graph: &Arc<TraceDecay>,
+    project_root: &std::path::Path,
+    project_id: &ProjectId,
+    scope: MemoryScopeV1,
+    content: &str,
+    entities: &[&str],
+) {
+    let request = FactStoreAddRequestV1 {
+        content: content.to_owned(),
+        memory_scope: Some(scope),
+        category: None,
+        tags: vec!["native".to_owned()],
+        entities: entities.iter().map(|entity| (*entity).to_owned()).collect(),
+        trust: Some(0.9),
+        source_label: Some("native-parity".to_owned()),
+        metadata: None,
+        project_selector: None,
+    };
+    upstream_memory(
+        graph,
+        project_root,
+        project_id,
+        RetainedSurfaceOperation::FactStoreAdd,
+        RetainedMemoryRequestV1::FactStoreAdd(&request),
+    )
+    .await;
+}
+
+async fn seed_project_facts(
+    graph: &Arc<TraceDecay>,
+    project_root: &std::path::Path,
+    project_id: &ProjectId,
+) {
+    for (content, entities) in [
+        (
+            "native bridge recall keeps upstream fact ranking",
+            &["TraceDecay", "Bridge"][..],
+        ),
+        (
+            "native bridge never rescales fact scores",
+            &["TraceDecay"][..],
+        ),
+        ("bridge recall reads project facts first", &["Bridge"][..]),
+        ("unrelated deployment note", &["Deploy"][..]),
+    ] {
+        add_fact(
+            graph,
+            project_root,
+            project_id,
+            MemoryScopeV1::Project,
+            content,
+            entities,
+        )
+        .await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Declaration
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_declares_only_health_and_recall() {
+    let (_temporary, project_root, graph, project_id) = real_project_fixture().await;
+    let port = native_port(&graph, project_root, project_id.as_str());
+    let provider = NativeProvider::new(port as Arc<dyn NativeMemoryApplicationPort>)
+        .expect("construct Native provider");
+    let descriptor = provider.descriptor();
+    let capabilities = descriptor
+        .capabilities
+        .iter()
+        .map(|capability| capability.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(capabilities, vec!["provider.health.v1", "recall.query.v1"]);
+    assert_eq!(descriptor.state_generation, 0);
+    assert_eq!(descriptor.state_schema_version, STATE_SCHEMA_VERSION);
+    assert_eq!(
+        tracedecay_memory_provider_registry::NATIVE_RECALL_SCOPE_BINDINGS,
+        &["project_facts", "profile_facts"]
+    );
+}
+
 #[test]
 fn ready_receipt_is_deterministic_and_nonce_bound() {
     let request = ready_request();
@@ -577,114 +487,10 @@ fn ready_receipt_is_deterministic_and_nonce_bound() {
     assert_ne!(first, ready_receipt(&changed, limits));
 }
 
-#[test]
-fn settled_fact_validation_accepts_exact_projection() {
-    let (call, payload) = settled_fixture();
-    assert!(validate_settled_native_fact(&call, &payload).is_ok());
-}
-
-#[test]
-fn settled_fact_validation_rejects_owner_fact_active_last_and_telemetry_mismatch() {
-    let (call, mut owner_mismatch) = settled_fixture();
-    owner_mismatch.commit.owner = FactCommitOwnerV1::Project {
-        project_id: ProjectId::new("project.native-bridge-foreign").expect("valid project"),
-    };
-    assert!(matches!(
-        validate_settled_native_fact(&call, &owner_mismatch),
-        Err(NativeReadFailure::ScopeUnavailable)
-    ));
-
-    let (call, mut fact_mismatch) = settled_fixture();
-    let (_project_id, owner, _public_owner) = project_parts("settled");
-    let (_source, other_fact_id) = source_and_fact_id(&owner, "other-fact");
-    fact_mismatch.commit.fact_id = other_fact_id;
-    assert!(matches!(
-        validate_settled_native_fact(&call, &fact_mismatch),
-        Err(NativeReadFailure::PromotionMismatch)
-    ));
-
-    let (call, mut active_mismatch) = settled_fixture();
-    active_mismatch.commit.active_assertion_id = Some(
-        FactAssertionId::new("assertion.native-bridge-other").expect("valid assertion identity"),
-    );
-    assert!(matches!(
-        validate_settled_native_fact(&call, &active_mismatch),
-        Err(NativeReadFailure::PromotionMismatch)
-    ));
-
-    let (call, mut last_event_mismatch) = settled_fixture();
-    let (_project_id, owner, _public_owner) = project_parts("settled");
-    let fact_id = last_event_mismatch.fact.fact_id.clone();
-    let other_assertion =
-        FactAssertionId::new("assertion.native-bridge-other-event").expect("valid assertion");
-    let other_event = event_for(&owner, &fact_id, &other_assertion, 3);
-    last_event_mismatch.commit.last_event_id = other_event.event_id().clone();
-    assert!(matches!(
-        validate_settled_native_fact(&call, &last_event_mismatch),
-        Err(NativeReadFailure::PromotionMismatch)
-    ));
-
-    let (call, mut telemetry_mismatch) = settled_fixture();
-    telemetry_mismatch.fact.telemetry.updated_at = UtcMicros(3);
-    assert!(matches!(
-        validate_settled_native_fact(&call, &telemetry_mismatch),
-        Err(NativeReadFailure::PromotionMismatch)
-    ));
-}
-
-#[test]
-fn receipt_matches_exact_authoritative_history_suffix() {
-    let (owner, fact, commit, history) = history_fixture();
-    assert!(receipt_matches_authoritative_history(
-        &history, &owner, &fact, &commit
-    ));
-}
-
-#[test]
-fn receipt_rejects_reordered_truncated_and_foreign_history_claims() {
-    let (owner, fact, commit, history) = history_fixture();
-
-    let mut reordered = commit.clone();
-    reordered.committed_event_ids.swap(0, 1);
-    assert!(!receipt_matches_authoritative_history(
-        &history, &owner, &fact, &reordered
-    ));
-
-    let mut truncated = commit.clone();
-    truncated.committed_event_ids.pop();
-    assert!(!receipt_matches_authoritative_history(
-        &history, &owner, &fact, &truncated
-    ));
-
-    let mut foreign = commit;
-    foreign.owner = FactCommitOwnerV1::Project {
-        project_id: ProjectId::new("project.native-bridge-foreign").expect("valid project"),
-    };
-    assert!(!receipt_matches_authoritative_history(
-        &history, &owner, &fact, &foreign
-    ));
-}
-
-#[test]
-fn control_preflight_reports_cancellation_and_deadline_without_contact() {
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
-    assert!(matches!(
-        control_failure(&OperationControl::new(i64::MAX, 1_000, cancellation)),
-        Err(NativeReadFailure::Cancelled)
-    ));
-    assert!(matches!(
-        control_failure(&OperationControl::new(0, 1_000, CancellationToken::new())),
-        Err(NativeReadFailure::DeadlineExceeded)
-    ));
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_health_payload_reports_operation_health_data() {
-    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
-    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
-        .expect("construct project Native application port");
+    let (_temporary, project_root, graph, project_id) = real_project_fixture().await;
+    let port = native_port(&graph, project_root, project_id.as_str());
     let call = valid_health_call(project_id.as_str());
 
     let reply = port.health(&call);
@@ -697,12 +503,13 @@ async fn native_health_payload_reports_operation_health_data() {
     assert_eq!(body["provider_instance_id"], json!(PROVIDER_INSTANCE_ID));
     assert_eq!(body["readiness"], json!("ready"));
     assert_eq!(
-        body["state_generation"],
-        json!(call.expected_state_generation)
-    );
-    assert_eq!(
-        body["scope_digest"],
-        json!(call.exact_scope.exact_scope_sha256())
+        body["capability_states"]
+            .as_array()
+            .expect("capability states")
+            .iter()
+            .map(|state| state["capability_id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("provider.health.v1"), json!("recall.query.v1")]
     );
     assert_eq!(
         body["effective_limits_digest"],
@@ -710,13 +517,21 @@ async fn native_health_payload_reports_operation_health_data() {
             native_descriptor().expect("descriptor").limits
         ))
     );
-    assert_eq!(body["backlog"], json!(0));
-    assert_eq!(body["recovery_state"], json!("ready"));
 }
 
 #[test]
 fn native_recall_failures_preserve_typed_terminal_states() {
     let cases = [
+        (
+            NativeReadFailure::RecallUnsupported,
+            TerminalCode::CapabilityUnsupported,
+            RECALL_UNSUPPORTED_DIAGNOSTIC,
+        ),
+        (
+            NativeReadFailure::RecallHistoryGrantUnsupported,
+            TerminalCode::CapabilityUnsupported,
+            RECALL_HISTORY_GRANT_DIAGNOSTIC,
+        ),
         (
             NativeReadFailure::RecallNotAuthorized,
             TerminalCode::Unauthorized,
@@ -733,9 +548,9 @@ fn native_recall_failures_preserve_typed_terminal_states() {
             RECALL_CURSOR_STALE_DIAGNOSTIC,
         ),
         (
-            NativeReadFailure::RecallBudgetExhausted,
+            NativeReadFailure::RecallCapacityExceeded,
             TerminalCode::CapacityExceeded,
-            RECALL_BUDGET_DIAGNOSTIC,
+            RECALL_CAPACITY_DIAGNOSTIC,
         ),
     ];
     for (failure, terminal_code, diagnostic_id) in cases {
@@ -743,454 +558,582 @@ fn native_recall_failures_preserve_typed_terminal_states() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane selection
+// ---------------------------------------------------------------------------
+
+fn parsed(request: &Value) -> NativeRecallRequestV1 {
+    let project_id = request["exact_scope_identity"]["project_id"]
+        .as_str()
+        .expect("project id")
+        .to_owned();
+    parse_native_recall_request(&valid_recall_call(&project_id, request))
+        .expect("valid recall request")
+}
+
 #[test]
-fn native_recall_scope_requires_live_same_session_binding_without_history_grant() {
-    let project_id = "project.native-same-session-scope";
-    let scope = recall_resolved_scope(project_id);
-    let mount = NativeSessionRetrievalMountV1::for_project(
-        UserProfileId::new("profile.native-bridge-recall").expect("profile id"),
-        scope,
-    );
-    let call = valid_recall_call(project_id, recall_request_value(project_id));
-
-    assert!(matches!(
-        native_recall_retrieval_scope(&mount, &call.exact_scope, false),
-        Err(NativeReadFailure::RecallNotAuthorized)
-    ));
-
-    let canonical_session_id =
-        SessionId::new("session.native-same-session-scope").expect("session id");
-    let binding = mount
-        .bind_session(
-            call.exact_scope.agent_session_id.clone(),
-            canonical_session_id.clone(),
-        )
-        .expect("bind canonical session");
-    let second_binding = mount
-        .bind_session(
-            call.exact_scope.agent_session_id.clone(),
-            canonical_session_id.clone(),
-        )
-        .expect("bind the same canonical session concurrently");
-    assert!(matches!(
-        mount.bind_session(
-            call.exact_scope.agent_session_id.clone(),
-            SessionId::new("session.native-collision").expect("different session id"),
+fn objectives_map_onto_upstream_fact_kinds_and_explicit_session_history() {
+    let project = "project.native-lanes";
+    for (objective, query, expected) in [
+        ("search", "bridge", NativeRecallLane::Facts(NativeFactRead::Search)),
+        ("probe", "TraceDecay", NativeRecallLane::Facts(NativeFactRead::Probe)),
+        (
+            "related",
+            "TraceDecay",
+            NativeRecallLane::Facts(NativeFactRead::Related),
         ),
-        Err(super::super::native_authority::NativeSessionBindingErrorV1::IdentityCollision)
-    ));
+        (
+            "reason",
+            "TraceDecay, Bridge",
+            NativeRecallLane::Facts(NativeFactRead::Reason {
+                entities: vec!["Bridge".to_owned(), "TraceDecay".to_owned()],
+            }),
+        ),
+        (
+            SESSION_HISTORY_OBJECTIVE,
+            "what did we decide",
+            NativeRecallLane::SessionHistory,
+        ),
+    ] {
+        let request = parsed(&recall_request_value(project, objective, query));
+        assert_eq!(NativeRecallLane::select(&request), Ok(expected), "{objective}");
+    }
+    let unknown = parsed(&recall_request_value(project, "summarize", "bridge"));
     assert_eq!(
-        native_recall_retrieval_scope(&mount, &call.exact_scope, false)
-            .expect("same-session scope"),
-        SessionRetrievalScope::Session(canonical_session_id.clone())
+        NativeRecallLane::select(&unknown),
+        Err(NativeReadFailure::RecallUnsupported)
     );
+    let duplicate_entities = parsed(&recall_request_value(project, "reason", "Bridge, Bridge"));
     assert_eq!(
-        native_recall_retrieval_scope(&mount, &call.exact_scope, true).expect("history scope"),
-        SessionRetrievalScope::AllSessionsInAuthorizedRoot
+        NativeRecallLane::select(&duplicate_entities),
+        Err(NativeReadFailure::RecallInvalidRequest)
     );
-
-    drop(binding);
-    assert_eq!(
-        native_recall_retrieval_scope(&mount, &call.exact_scope, false)
-            .expect("second holder preserves the same-session scope"),
-        SessionRetrievalScope::Session(canonical_session_id)
-    );
-    drop(second_binding);
-    assert!(matches!(
-        native_recall_retrieval_scope(&mount, &call.exact_scope, false),
-        Err(NativeReadFailure::RecallNotAuthorized)
-    ));
 }
 
 #[test]
-fn stale_session_projection_is_contract_valid_partial_recall() {
-    let project_id = "project.native-bridge-stale";
-    let call = valid_recall_call(project_id, recall_request_value(project_id));
-    let request = parse_native_recall_request(&call).expect("recall request");
-    let batch = NativeSessionRecallBatch {
-        candidates: Vec::new(),
-        temporal: tracedecay_session_runtime::session_retrieval::SessionTemporalMetadataView {
-            watermarks:
-                tracedecay_session_runtime::session_retrieval::SessionTemporalWatermarksView {
-                    generation: 7,
-                    ..Default::default()
-                },
-            cursor: Some("cursor.stale-test".to_owned()),
-            authorized_root: Some("/private/checkout".to_owned()),
-            ..Default::default()
-        },
-        status: NativeSessionRecallBatchStatus::Stale,
-        scanned_items: 0,
-        excluded_items: 0,
-        admitted_items: 0,
-        work_units: 0,
-        total_content_bytes: 0,
-        degraded: false,
-    };
-
-    let reply = build_native_session_recall_reply(&call, &request, &batch, None)
-        .expect("stale recall projection");
-
-    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Partial);
-    let payload = reply.payload.expect("stale recall payload");
-    assert_eq!(payload.contract_id.as_str(), RECALL_RESULT_CONTRACT_ID);
-    let body: Value = serde_json::from_slice(&payload.bytes).expect("stale recall JSON");
-    assert_eq!(body["coverage"]["state"], json!("partial"));
-    assert_eq!(body["coverage"]["truncated_items"], json!(1));
+fn only_current_state_recall_is_served_and_nothing_falls_back() {
+    let project = "project.native-temporal";
+    for objective in ["search", SESSION_HISTORY_OBJECTIVE] {
+        let mut as_of = recall_request_value(project, objective, "bridge");
+        as_of["temporal_query"]["mode"] = json!("as_of");
+        as_of["temporal_query"]["as_of"] = json!("2019-01-01T00:00:00Z");
+        let mut interval = recall_request_value(project, objective, "bridge");
+        interval["temporal_query"]["mode"] = json!("interval");
+        interval["temporal_query"]["interval_start"] = json!("2019-01-01T00:00:00Z");
+        interval["temporal_query"]["interval_end"] = json!("2019-06-01T00:00:00Z");
+        let mut history = recall_request_value(project, objective, "bridge");
+        history["temporal_query"]["mode"] = json!("history");
+        let mut superseded = recall_request_value(project, objective, "bridge");
+        superseded["temporal_query"]["include_superseded"] = json!(true);
+        for request in [as_of, interval, history, superseded] {
+            assert_eq!(
+                NativeRecallLane::select(&parsed(&request)),
+                Err(NativeReadFailure::RecallUnsupported),
+                "{request}"
+            );
+        }
+    }
+    // Facts expose no provider cursor; message search passes its own back.
+    let mut fact_cursor = recall_request_value(project, "search", "bridge");
+    fact_cursor["temporal_query"]["cursor"] = json!("cursor.opaque");
     assert_eq!(
-        body["coverage"]["reasons"],
-        json!(["session_projection_stale"])
+        NativeRecallLane::select(&parsed(&fact_cursor)),
+        Err(NativeReadFailure::RecallUnsupported)
     );
+    let mut session_cursor = recall_request_value(project, SESSION_HISTORY_OBJECTIVE, "bridge");
+    session_cursor["temporal_query"]["cursor"] = json!("cursor.opaque");
     assert_eq!(
-        body["terminal"],
-        json!({"terminal_code": "partial", "diagnostic_id": Value::Null})
-    );
-    assert_eq!(
-        body["coverage"]["canonical_temporal"]["watermarks"]["generation"],
-        json!(7)
-    );
-    assert_eq!(
-        body["coverage"]["canonical_temporal"]["cursor"],
-        json!("cursor.stale-test")
-    );
-    assert!(
-        body["coverage"]["canonical_temporal"]
-            .get("authorized_root")
-            .is_none()
-    );
-    assert!(
-        body["coverage"]["canonical_temporal"]
-            .get("source_coverage")
-            .is_none()
+        NativeRecallLane::select(&parsed(&session_cursor)),
+        Ok(NativeRecallLane::SessionHistory)
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_observe_verifies_real_store_without_writing() {
-    let temporary = tempfile::tempdir().expect("native bridge fixture root");
-    let project_root = temporary.path().join("project");
-    let profile_root = temporary.path().join("profile");
-    std::fs::create_dir_all(&project_root).expect("project root");
-    std::fs::create_dir_all(&profile_root).expect("profile root");
-    // The profile identity authority admits only a private root.
-    #[cfg(unix)]
-    std::fs::set_permissions(
-        &profile_root,
-        std::os::unix::fs::PermissionsExt::from_mode(0o700),
-    )
-    .expect("private profile root");
-    let graph = Arc::new(
-        TraceDecay::init_with_options(
-            &project_root,
-            TraceDecayOpenOptions {
-                global_db_path: Some(profile_root.join("global.db")),
-                profile_root: Some(profile_root),
-            },
-        )
-        .await
-        .expect("initialize TraceDecay project graph"),
-    );
-    let owner = graph.project_memory_owner().expect("project memory owner");
-    let FactOwnerV1::Project { project_id } = owner.clone() else {
-        panic!("project fixture must have a project memory owner");
-    };
-    let memory = graph
-        .project_memory_application()
-        .expect("project memory application");
-    let preflight = memory
-        .preflight_project_memory_fact_add(
-            ProjectMemoryFactAddRequest {
-                content: "Native bridge real-store verification fact".to_owned(),
-                category: FactCategoryV1::Project,
-                source_label: Some("native-bridge-real-store".to_owned()),
-                tags: vec!["native".to_owned(), "bridge".to_owned()],
-                entities: vec!["TraceDecay".to_owned()],
-                trust: Some(Confidence::new(0.91).expect("fact trust")),
-                metadata: json!({"fixture": "native-bridge-real-store"}),
-            },
-            None,
-        )
-        .expect("preflight project fact");
-    let outcome = memory
-        .add_preflighted_project_memory_fact(
-            preflight,
-            &FactWriteControl::new(Arc::new(|| false), Arc::new(|| true)),
-        )
-        .await
-        .expect("commit project fact");
-    let ProjectMemoryFactAddRequestOutcome::Applied(applied) = outcome else {
-        panic!("real-store fixture fact must be applied");
-    };
-    let expected_public =
-        super::memory_mapping::projection(applied.fact()).expect("map stored fact projection");
-    let expected_fact = match &expected_public {
-        FactProjectionV1::Available { fact } => fact.as_ref().clone(),
-        FactProjectionV1::Unavailable { .. } => {
-            panic!("real-store fixture fact must remain available")
-        }
-        FactProjectionV1::Superseded { .. } => {
-            panic!("new real-store fixture fact cannot already be superseded")
-        }
-    };
-    let expected_commit = super::memory_mapping::commit_receipt(
-        applied
-            .commit_receipt()
-            .expect("real-store add commit receipt"),
-        applied.commit_replayed(),
-    );
-    let fact_id = expected_fact.fact_id.clone();
-    drop(applied);
-    drop(memory);
-    let (before_public, before_history) = read_store_snapshot(&graph, &owner, &fact_id).await;
-    assert_eq!(before_public, expected_public);
-
-    let canonical_payload = json!({
-        "kind": "settled_native_fact_write",
-        "fact": expected_fact.clone(),
-        "commit": expected_commit.clone(),
-    });
-    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
-        .expect("construct project Native application port");
-    let call = valid_observation_call(project_id.as_str(), &canonical_payload);
-    let reply = port.observe(observation_for(&call, canonical_payload.clone()));
-    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-    assert_eq!(reply.payload, Some(call.payload.clone()));
-    assert_eq!(
-        reply.terminal.committed_effect().state(),
-        CommittedEffectState::None
-    );
-    assert_eq!(reply.state_generation, call.expected_state_generation);
-
-    let (after_public, after_history) = read_store_snapshot(&graph, &owner, &fact_id).await;
-    assert_eq!(after_public, expected_public);
-    assert_eq!(after_history, before_history);
-
-    let mut mismatched_payload = canonical_payload;
-    let fact_object = mismatched_payload
-        .get_mut("fact")
-        .and_then(Value::as_object_mut)
-        .expect("fact payload object");
-    fact_object.insert(
-        "trust_score_millionths".to_owned(),
-        json!(expected_fact.trust_score_millionths ^ 1),
-    );
-    let mismatch_call = valid_observation_call(project_id.as_str(), &mismatched_payload);
-    let mismatch_reply = port.observe(observation_for(&mismatch_call, mismatched_payload));
-    assert_eq!(
-        mismatch_reply.terminal.terminal_code(),
-        TerminalCode::ContractViolation
-    );
-    assert_eq!(
-        mismatch_reply.terminal.committed_effect().state(),
-        CommittedEffectState::None
-    );
-    assert_eq!(
-        mismatch_reply.state_generation,
-        mismatch_call.expected_state_generation
-    );
-    assert_eq!(mismatch_reply.payload, None);
-    let (final_public, final_history) = read_store_snapshot(&graph, &owner, &fact_id).await;
-    assert_eq!(final_public, expected_public);
-    assert_eq!(final_history, before_history);
+#[test]
+fn a_canonical_history_grant_is_refused_because_native_observes_nothing() {
+    let project = "project.native-history";
+    let mut request = recall_request_value(project, "search", "bridge");
+    request["history_grant"] = json!({"authorization_ref": "host-history.fixture"});
+    assert!(matches!(
+        parse_native_recall_request(&valid_recall_call(project, &request)),
+        Err(NativeReadFailure::RecallHistoryGrantUnsupported)
+    ));
 }
 
+// ---------------------------------------------------------------------------
+// Fact lane parity with the upstream fact tools
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_recall_requires_bound_canonical_session_authority() {
-    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
-    let _project_fact = add_real_project_fact(
-        &graph,
-        "Native bridge project fact must not satisfy session recall",
-        "native-bridge-recall-no-fallback",
+async fn native_fact_recall_equals_upstream_fact_store_reads() {
+    let (_temporary, project_root, graph, project_id) = real_project_fixture().await;
+    seed_project_facts(&graph, &project_root, &project_id).await;
+    let port = native_port(&graph, project_root.clone(), project_id.as_str());
+
+    // Probe, related and reason are pure reads upstream.
+    let probe = FactStoreProbeRequestV1 {
+        entity: "TraceDecay".to_owned(),
+        options: read_options(MemoryScopeV1::Project),
+        after: None,
+    };
+    let related = FactStoreRelatedRequestV1 {
+        entity: "TraceDecay".to_owned(),
+        options: read_options(MemoryScopeV1::Project),
+        after: None,
+    };
+    let reason = FactStoreReasonRequestV1 {
+        entities: vec!["Bridge".to_owned(), "TraceDecay".to_owned()],
+        options: read_options(MemoryScopeV1::Project),
+        after: None,
+    };
+    for (objective, query, operation, request) in [
+        (
+            "probe",
+            "TraceDecay",
+            RetainedSurfaceOperation::FactStoreProbe,
+            RetainedMemoryRequestV1::FactStoreProbe(&probe),
+        ),
+        (
+            "related",
+            "TraceDecay",
+            RetainedSurfaceOperation::FactStoreRelated,
+            RetainedMemoryRequestV1::FactStoreRelated(&related),
+        ),
+        (
+            "reason",
+            "TraceDecay, Bridge",
+            RetainedSurfaceOperation::FactStoreReason,
+            RetainedMemoryRequestV1::FactStoreReason(&reason),
+        ),
+    ] {
+        let native = native_recall(
+            &port,
+            valid_recall_call(
+                project_id.as_str(),
+                &recall_request_value(project_id.as_str(), objective, query),
+            ),
+        )
+        .await;
+        let upstream =
+            upstream_memory(&graph, &project_root, &project_id, operation, request).await;
+        assert_eq!(
+            ranking(&native_fact_hits(&native)),
+            ranking(&upstream_hits(&upstream)),
+            "{objective}"
+        );
+    }
+
+    // Native recall records no retrieval telemetry, so it runs before the
+    // explicit upstream search, which does.
+    let native = native_recall(
+        &port,
+        valid_recall_call(
+            project_id.as_str(),
+            &recall_request_value(project_id.as_str(), "search", "native bridge"),
+        ),
     )
     .await;
-
-    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
-        .expect("construct project Native application port");
-    let call = valid_recall_call(
-        project_id.as_str(),
-        recall_request_value(project_id.as_str()),
-    );
-    let reply = port.recall(&call);
-
-    assert_eq!(
-        reply.terminal.terminal_code(),
-        TerminalCode::ProviderUnavailable
-    );
-    assert_eq!(
-        reply.terminal.diagnostic_id(),
-        Some(PROVIDER_UNAVAILABLE_DIAGNOSTIC)
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state(),
-        CommittedEffectState::None
-    );
-    assert_eq!(reply.state_generation, call.expected_state_generation);
-    assert_eq!(reply.payload, None);
+    let search = FactStoreSearchRequestV1 {
+        query: "native bridge".to_owned(),
+        options: read_options(MemoryScopeV1::Project),
+        after: None,
+    };
+    let upstream = upstream_memory(
+        &graph,
+        &project_root,
+        &project_id,
+        RetainedSurfaceOperation::FactStoreSearch,
+        RetainedMemoryRequestV1::FactStoreSearch(&search),
+    )
+    .await;
+    let native_ranking = ranking(&native_fact_hits(&native));
+    assert!(!native_ranking.is_empty(), "{native}");
+    assert_eq!(native_ranking, ranking(&upstream_hits(&upstream)));
+    for candidate in native["candidates"].as_array().expect("candidates") {
+        let hit: FactSearchHitV1 =
+            serde_json::from_value(candidate["provenance"]["fact_search_hit"].clone())
+                .expect("carried hit");
+        assert_eq!(
+            candidate["native_score"]["components"]["score_millionths"],
+            json!(hit.scores.score_millionths),
+            "the upstream score is carried, never rescaled"
+        );
+        assert_eq!(candidate["exact_scope_identity"]["scope_binding"], json!("project_facts"));
+        assert_eq!(candidate["stable_memory_ref"], json!(hit.fact.fact_id.as_str()));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn native_canonical_session_replay_is_explicitly_non_required_without_staging_authority() {
-    let (_temporary, project_root, graph, _owner, project_id) = real_project_fixture().await;
-    let graph_cell = Arc::new(tokio::sync::RwLock::new(Arc::clone(&graph)));
-    let port = ProjectNativeMemoryApplicationPort::new(graph_cell, project_root)
-        .expect("construct project Native application port");
-    let canonical_payload = json!({
-        "provider_id": "claude",
-        "session_id": "session.native-replay",
-        "message_id": "message.native-replay",
-        "content": "already canonical",
-    });
-    let call = staged_observation_call(project_id.as_str(), &canonical_payload);
-    let reply = port.observe(staged_observation_for(&call, canonical_payload));
+async fn native_fact_recall_reads_project_then_profile_and_dedups_by_fact_then_content() {
+    let (_temporary, project_root, graph, project_id) = real_project_fixture().await;
+    add_fact(
+        &graph,
+        &project_root,
+        &project_id,
+        MemoryScopeV1::Project,
+        "shared bridge preference",
+        &["Bridge"],
+    )
+    .await;
+    // The same content in the profile owner is the same memory to recall.
+    add_fact(
+        &graph,
+        &project_root,
+        &project_id,
+        MemoryScopeV1::User,
+        "shared bridge preference",
+        &["Bridge"],
+    )
+    .await;
+    add_fact(
+        &graph,
+        &project_root,
+        &project_id,
+        MemoryScopeV1::User,
+        "profile bridge preference only",
+        &["Bridge"],
+    )
+    .await;
+    let port = native_port(&graph, project_root.clone(), project_id.as_str());
+    let native = native_recall(
+        &port,
+        valid_recall_call(
+            project_id.as_str(),
+            &recall_request_value(project_id.as_str(), "search", "bridge preference"),
+        ),
+    )
+    .await;
+    let bindings = native["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|candidate| {
+            (
+                candidate["exact_scope_identity"]["scope_binding"]
+                    .as_str()
+                    .expect("binding")
+                    .to_owned(),
+                candidate["content"].as_str().expect("content").to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bindings,
+        vec![
+            (
+                "project_facts".to_owned(),
+                "shared bridge preference".to_owned()
+            ),
+            (
+                "profile_facts".to_owned(),
+                "profile bridge preference only".to_owned()
+            ),
+        ]
+    );
+}
 
-    assert_eq!(
-        reply.terminal.terminal_code(),
-        TerminalCode::CapabilityUnsupported
-    );
-    assert_eq!(
-        reply.terminal.diagnostic_id(),
-        Some(STAGED_SESSION_UNSUPPORTED_DIAGNOSTIC)
-    );
-    assert_eq!(
-        reply.terminal.committed_effect().state(),
-        CommittedEffectState::None
-    );
-    assert_eq!(reply.payload, None);
-    assert_eq!(reply.state_generation, call.expected_state_generation);
+// ---------------------------------------------------------------------------
+// Session lane parity with upstream message search
+// ---------------------------------------------------------------------------
+
+/// A retrieval service that records every kernel query it receives and
+/// answers with one fixed kernel outcome.
+struct RecordingRetrievalV1 {
+    queries: Mutex<Vec<SessionTemporalQuery>>,
+    outcome: SessionRetrievalServiceOutcome,
+}
+
+impl SessionApplicationRetrievalPortV1 for RecordingRetrievalV1 {
+    fn retrieve_admitted<'a>(
+        &'a self,
+        _context: &'a RequestContext,
+        query: SessionTemporalQuery,
+    ) -> SessionApplicationRetrievalFutureV1<'a> {
+        self.queries.lock().expect("recorded queries").push(query);
+        let outcome = self.outcome.clone();
+        Box::pin(async move { outcome })
+    }
+}
+
+fn session_result(session_id: &str, message_id: &str, ordinal: i64, score: f64) -> SessionMessageSearchResult {
+    SessionMessageSearchResult {
+        session: SessionRecord {
+            provider: "claude".to_owned(),
+            session_id: session_id.to_owned(),
+            project_key: "project-key".to_owned(),
+            project_path: "/project".to_owned(),
+            title: None,
+            started_at: Some(1_700_000_000_000_000),
+            ended_at: None,
+            transcript_path: None,
+            metadata_json: None,
+            parent_session_id: None,
+            is_subagent: false,
+            agent_id: None,
+            parent_tool_use_id: None,
+        },
+        message: SessionMessageRecord {
+            provider: "claude".to_owned(),
+            message_id: message_id.to_owned(),
+            session_id: session_id.to_owned(),
+            role: "assistant".to_owned(),
+            timestamp: Some(1_700_000_000_000_000 + ordinal),
+            ordinal,
+            text: format!("message {message_id}"),
+            kind: None,
+            model: None,
+            tool_names: None,
+            source_path: None,
+            source_offset: None,
+            metadata_json: None,
+        },
+        score,
+    }
+}
+
+/// A partial kernel page whose order is deliberately not score order: the
+/// kernel's order is final and must survive the Native mapping unchanged.
+fn partial_page() -> SessionRetrievalServiceOutcome {
+    SessionRetrievalServiceOutcome::Partial {
+        page: SessionRetrievalPageView {
+            results: vec![
+                session_result("session.one", "message.b", 2, 0.25),
+                session_result("session.two", "message.a", 1, 0.75),
+            ],
+            temporal: SessionTemporalMetadataView {
+                cursor: Some("cursor.next-page".to_owned()),
+                ..SessionTemporalMetadataView::default()
+            },
+        },
+        freshness: SessionDataFreshness::Stored { generation_lag: 3 },
+        omitted: 2,
+    }
 }
 
 #[test]
-fn native_history_recall_binds_granted_source_through_canonical_observation_anchor() {
-    let project_id = "project.native-history-anchor";
-    let call = valid_recall_call(project_id, recall_request_value(project_id));
-    let request = parse_native_recall_request(&call).expect("valid recall request");
-    let source_scope = call.exact_scope.clone();
-    let source_project = ProjectId::new(source_scope.project_id.clone()).expect("source project");
-    let observation_id = CanonicalObservationIdV1::new("observation.native-history-anchor")
-        .expect("source observation id");
-    let observation_anchor = derive_exact_observation_anchor_id(
-        &tracedecay_domain::ObservationScopeV1::Project {
-            project_id: source_project,
-        },
-        &observation_id,
-    )
-    .expect("canonical observation anchor");
-    let source = SourceAttribution {
-        source: OriginalSourceIdentity {
-            canonical_provider_id: OwnedProviderId::new("claude").expect("source provider"),
-            canonical_session_id: "session.native-history-anchor".to_owned(),
-            source_key: "source.native-history-anchor".to_owned(),
-            stable_record_id: None,
-            observation_id: observation_id.as_str().to_owned(),
-            source_revision: Some("revision-1".to_owned()),
-            content_sha256: "a".repeat(64),
-        },
-        origin_scope: OriginScopeEvidence::Recorded {
-            scope: source_scope.clone(),
-            authority_ref: "host-original.native-history-anchor".to_owned(),
-        },
-        source_sequence: 1,
-        occurred_at_utc_nanos: None,
-        ingested_at_utc_nanos: 1,
-        validity: RecordedValidity::default(),
-    };
-    let grant = HistoryGrant {
-        authorization_ref: "host-grant.native-history-anchor".to_owned(),
-        policy_revision: request.policy_revision,
-        destination_scope: call.exact_scope.clone(),
-        relation: HistoryRelation::ExactScope,
-        sources: vec![GrantedHistorySource {
-            attribution: source,
-            current_disposition: CurrentSourceDisposition {
-                state: SourceDisposition::Available,
-                authority_ref: "host-disposition.native-history-anchor".to_owned(),
-                authority_revision: Some(1),
-                checked_at_utc_nanos: 1,
-            },
-        }],
-        disposition_checkpoint: RestoreDispositionCheckpoint {
-            exact_scope: call.exact_scope.clone(),
-            authority_ref: "host-checkpoint.native-history-anchor".to_owned(),
-            authority_revision: Some(1),
-            checked_at_utc_nanos: 1,
-        },
-    };
-    grant.validate_structure().expect("valid history grant");
-    let session_anchor =
-        RetrievalAnchorId::new("session:native-history-anchor#0-0").expect("session anchor");
-    let candidate = crate::retained_owner::native_session_recall::NativeSessionRecallCandidate {
-        candidate_id: "native-session:history-anchor".to_owned(),
-        stable_memory_ref: "native-session:history-anchor".to_owned(),
-        content: "history candidate".to_owned(),
-        content_sha256: sha256_hex(b"history candidate"),
-        score_millionths: 900_000,
-        session_anchor,
-        observation_anchor: observation_anchor.clone(),
-        source_anchor: observation_anchor.clone(),
-        provider: "claude".to_owned(),
-        session_id: "session.native-history-anchor".to_owned(),
-        message_id: "message.native-history-anchor".to_owned(),
-        ordinal: 0,
-        timestamp_micros: None,
-        role: "user".to_owned(),
-        kind: Some("message".to_owned()),
-        provenance: crate::retained_owner::native_session_recall::NativeSessionRecallProvenance {
-            session_anchor: RetrievalAnchorId::new("session:native-history-anchor#0-0")
-                .expect("provenance session anchor"),
-            observation_anchor: observation_anchor.clone(),
-            source_anchor: observation_anchor.clone(),
-            provider: "claude".to_owned(),
-            session_id: "session.native-history-anchor".to_owned(),
-            message_id: "message.native-history-anchor".to_owned(),
-            source_observation_id: None,
-        },
-        validity: crate::retained_owner::native_session_recall::NativeSessionRecallValidity {
-            observed_at_micros: None,
-            valid_from_micros: None,
-            valid_until_micros: None,
-            superseded_at_micros: None,
-            revoked_at_micros: None,
-            source_revision: None,
-            state: crate::retained_owner::native_session_recall::NativeSessionRecallValidityState::Current,
-        },
-        source_refs: vec![observation_anchor.as_str().to_owned()],
-        trace_refs: Vec::new(),
-        warnings: Vec::new(),
-    };
-
-    let original = native_history_source_attribution(&candidate, &grant, &request)
-        .expect("history source attribution")
-        .expect("canonical anchor should resolve to granted source");
-    let mut foreign_checkout_grant = grant.clone();
-    let OriginScopeEvidence::Recorded { scope, .. } =
-        &mut foreign_checkout_grant.sources[0].attribution.origin_scope
-    else {
-        panic!("history fixture must carry recorded origin scope");
-    };
-    scope.repository_identity = "repo.foreign-history-anchor".to_owned();
-    assert!(
-        native_history_source_attribution(&candidate, &foreign_checkout_grant, &request)
-            .expect("foreign source attribution")
-            .is_none(),
-        "same-project source from a different checkout must not pass anchor binding"
+fn session_history_maps_the_kernel_page_verbatim() {
+    let project = "project.native-session-page";
+    let request = parsed(&recall_request_value(
+        project,
+        SESSION_HISTORY_OBJECTIVE,
+        "what did we decide",
+    ));
+    let call = valid_recall_call(
+        project,
+        &recall_request_value(project, SESSION_HISTORY_OBJECTIVE, "what did we decide"),
     );
-    let projected = native_session_recall_candidate(&call, &candidate, Some(&original))
-        .expect("projected recall candidate");
+    let reply = session_history_reply(&call, &request, partial_page()).expect("mapped page");
+    assert_eq!(reply.terminal.terminal_code(), TerminalCode::Partial);
+    let outcome: Value =
+        serde_json::from_slice(&reply.payload.expect("payload").bytes).expect("outcome JSON");
+    let candidates = outcome["candidates"].as_array().expect("candidates");
     assert_eq!(
-        projected["provenance"]["observation_refs"],
-        json!(["observation.native-history-anchor"])
+        candidates
+            .iter()
+            .map(|candidate| (
+                candidate["provenance"]["message_search_hit"]["message"]["message_id"].clone(),
+                candidate["native_score"]["raw_value"].clone(),
+                candidate["memory_class"].clone(),
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (json!("message.b"), json!("0.250000"), json!(SESSION_MESSAGE_MEMORY_CLASS)),
+            (json!("message.a"), json!("0.750000"), json!(SESSION_MESSAGE_MEMORY_CLASS)),
+        ]
+    );
+    assert_eq!(outcome["coverage"]["next_cursor"], json!("cursor.next-page"));
+    assert_eq!(outcome["coverage"]["truncated_items"], json!(2));
+    assert_eq!(outcome["coverage"]["message_search_outcome"], json!("partial"));
+    assert_eq!(
+        outcome["coverage"]["freshness"],
+        json!({"state": "stored", "generation_lag": 3})
     );
     assert_eq!(
-        projected["source_refs"],
-        json!(["source.native-history-anchor"])
-    );
-    assert_eq!(
-        projected["provenance"]["original_sources"][0]["source"]["observation_id"],
-        "observation.native-history-anchor"
+        candidates[0]["provenance"]["origin_refs"],
+        json!(["session:session.one#2-2"])
     );
 }
 
-#[path = "native_common_tests.rs"]
-mod common_profile;
+#[test]
+fn session_history_refusals_keep_their_upstream_typed_meaning() {
+    let project = "project.native-session-refusals";
+    let request = parsed(&recall_request_value(
+        project,
+        SESSION_HISTORY_OBJECTIVE,
+        "what did we decide",
+    ));
+    let call = valid_recall_call(
+        project,
+        &recall_request_value(project, SESSION_HISTORY_OBJECTIVE, "what did we decide"),
+    );
+    for (outcome, failure) in [
+        (
+            SessionRetrievalServiceOutcome::Denied,
+            NativeReadFailure::RecallNotAuthorized,
+        ),
+        (
+            SessionRetrievalServiceOutcome::CursorStale,
+            NativeReadFailure::RecallCursorStale,
+        ),
+        (
+            SessionRetrievalServiceOutcome::TimedOut,
+            NativeReadFailure::DeadlineExceeded,
+        ),
+        (
+            SessionRetrievalServiceOutcome::Cancelled,
+            NativeReadFailure::Cancelled,
+        ),
+        (
+            SessionRetrievalServiceOutcome::Locked,
+            NativeReadFailure::ProviderUnavailable,
+        ),
+    ] {
+        assert_eq!(
+            session_history_reply(&call, &request, outcome).err(),
+            Some(failure)
+        );
+    }
+    let stale = session_history_reply(
+        &call,
+        &request,
+        SessionRetrievalServiceOutcome::Stale {
+            temporal: SessionTemporalMetadataView::default(),
+            freshness: SessionDataFreshness::Partial { generation_lag: 1 },
+        },
+    )
+    .expect("stale outcome is a partial answer");
+    assert_eq!(stale.terminal.terminal_code(), TerminalCode::Partial);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_session_recall_equals_upstream_message_search() {
+    use tracedecay_session_memory::context::{SessionRootId, SessionStoreId};
+    use tracedecay_session_runtime::StoreOwnerKey;
+    use tracedecay_session_runtime::session_temporal_refresh_scheduler::SessionTemporalRefreshSchedulerRegistry;
+    use tracedecay_sessions::admission::HostAdmissionScope;
+
+    let temporary = tempfile::tempdir().expect("session parity root");
+    let project_id = ProjectId::new("project.native-session-parity").expect("project id");
+    let project_root = temporary.path().join("project");
+    let runtime = tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
+        &temporary.path().join("profile"),
+        &project_root,
+        project_id.clone(),
+    )
+    .await
+    .expect("registered project runtime");
+    let database = runtime
+        .registered_database_arc(HostAdmissionScope::Project)
+        .expect("registered project database");
+    let graph_db_path = database.db_path().to_path_buf();
+    let store_root = graph_db_path
+        .parent()
+        .expect("registered database has a store root")
+        .to_path_buf();
+    let registry = SessionTemporalRefreshSchedulerRegistry::default();
+    let wake = registry
+        .ensure_project(
+            StoreOwnerKey {
+                profile_root: store_root.clone(),
+                global_db_path: graph_db_path.clone(),
+                project_id: Some(project_id.as_str().to_owned()),
+                store_root,
+                graph_db_path,
+            },
+            database.clone(),
+        )
+        .await;
+    let retrieval = Arc::new(RecordingRetrievalV1 {
+        queries: Mutex::new(Vec::new()),
+        outcome: partial_page(),
+    });
+    let upstream_port = DirectRetainedSessionPortV1::project(ProjectRetainedSessionAuthoritiesV1 {
+        project_root: project_root.clone(),
+        project_id: project_id.clone(),
+        profile_id: UserProfileId::new(RECALL_PROFILE).expect("profile id"),
+        session_store_id: SessionStoreId::new("store.native-session-parity").expect("store id"),
+        session_root_id: SessionRootId::new("root.native-session-parity").expect("root id"),
+        configuration_digest: ManifestDigest::new(CONFIGURATION_DIGEST).expect("digest"),
+        refresh: Arc::new(crate::session_refresh::DaemonSessionRefreshService::new(
+            database.clone(),
+            Arc::new(wake),
+            Some(project_id.as_str().to_owned()),
+        )),
+        retrieval: Arc::clone(&retrieval) as Arc<dyn SessionApplicationRetrievalPortV1>,
+        session_database: database.clone(),
+        workflow_index: Arc::new(crate::DaemonWorkflowIndexReadService::new(database.clone())),
+    });
+    let (context, signal, operation) = retained_context(
+        &project_id,
+        RetainedSurfaceOperation::MessageSearch,
+        "request.native-session-parity.upstream",
+    );
+    let message_search = MessageSearchRequestV1 {
+        query: Some("what did we decide".to_owned()),
+        limit: Some(8),
+        ..MessageSearchRequestV1::default()
+    };
+    let upstream = upstream_port
+        .execute_session(
+            RetainedSurfaceExecutionContextV1 {
+                request_context: &context,
+                cancellation_signal: &signal,
+                operation: &operation,
+                observed_at: now_micros(),
+            },
+            RetainedSessionRequestV1::MessageSearch(&message_search),
+        )
+        .await
+        .expect("upstream message search");
+    let RetainedSurfaceResultV1::MessageSearch(upstream) =
+        upstream.payload().expect("upstream payload").clone()
+    else {
+        panic!("unexpected upstream message search result");
+    };
+
+    let mount = session_mount(project_id.as_str());
+    mount
+        .bind(Arc::clone(&retrieval) as Arc<dyn SessionApplicationRetrievalPortV1>)
+        .expect("bind canonical session retrieval");
+    let request_value =
+        recall_request_value(project_id.as_str(), SESSION_HISTORY_OBJECTIVE, "what did we decide");
+    let call = valid_recall_call(project_id.as_str(), &request_value);
+    let request = parse_native_recall_request(&call).expect("native request");
+    let reply = recall_session_history(&mount, &call, &request)
+        .await
+        .expect("native session recall");
+    let native: Value =
+        serde_json::from_slice(&reply.payload.expect("payload").bytes).expect("native JSON");
+
+    let queries = retrieval.queries.lock().expect("recorded queries");
+    assert_eq!(queries.len(), 2);
+    assert_eq!(
+        queries[0], queries[1],
+        "Native must issue the exact upstream message-search kernel query"
+    );
+    let upstream_hits = upstream
+        .results
+        .expect("upstream hits")
+        .into_iter()
+        .map(|hit| (hit.message.message_id, hit.score))
+        .collect::<Vec<_>>();
+    let native_hits = native["candidates"]
+        .as_array()
+        .expect("candidates")
+        .iter()
+        .map(|candidate| {
+            let hit = &candidate["provenance"]["message_search_hit"];
+            (
+                hit["message"]["message_id"]
+                    .as_str()
+                    .expect("message id")
+                    .to_owned(),
+                hit["score"].as_f64().expect("score"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(native_hits, upstream_hits);
+    assert_eq!(
+        native["coverage"]["next_cursor"],
+        json!(upstream.temporal.expect("upstream temporal").next_cursor)
+    );
+}

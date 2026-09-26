@@ -136,24 +136,10 @@ fn explorer_session_routes_reuse_lcm_size_and_read_context_authority() {
         let fixture = start_dashboard_fixture(true).await;
         let agent = http_agent();
 
-        let (status, missing_provider) = get_json(
-            &agent,
-            &format!(
-                "{}/api/explorer/sessions/sess-dashboard-1/size",
-                fixture.base_url
-            ),
-        );
-        assert_eq!(status, 200);
-        assert_eq!(missing_provider["domain_state"], "unavailable");
-        assert_eq!(
-            missing_provider["coverage"]["omission_reasons"][0],
-            "lcm_session_provider_required"
-        );
-
         let (status, size) = get_json(
             &agent,
             &format!(
-                "{}/api/explorer/sessions/sess-dashboard-1/size?provider=cursor",
+                "{}/api/explorer/sessions/sess-dashboard-1/size",
                 fixture.base_url
             ),
         );
@@ -164,8 +150,6 @@ fn explorer_session_routes_reuse_lcm_size_and_read_context_authority() {
             "session size read must be ready: {size}"
         );
         assert_eq!(size["payload"]["session_id"], "sess-dashboard-1");
-        assert_eq!(size["payload"]["provider"], "cursor");
-        assert_eq!(size["payload"]["storage_scope"], "profile_sharded");
         assert_eq!(size["payload"]["counts"]["message_count"], 3);
         assert!(
             size["payload"]["counts"]["token_estimate_total"]
@@ -177,17 +161,23 @@ fn explorer_session_routes_reuse_lcm_size_and_read_context_authority() {
         let (status, context) = get_json(
             &agent,
             &format!(
-                "{}/api/explorer/sessions/sess-dashboard-1/read-context?limit=2&offset=0&order=asc&provider=cursor",
+                "{}/api/explorer/sessions/sess-dashboard-1/read-context?limit=2&offset=0&order=asc",
                 fixture.base_url
             ),
         );
         assert_eq!(status, 200, "read context should resolve: {context}");
-        assert_eq!(context["domain_state"], "unavailable");
-        assert!(context["payload"].is_null());
+        assert_eq!(context["domain_state"], "partial");
+        assert_eq!(context["payload"]["session_id"], "sess-dashboard-1");
         assert_eq!(
-            context["coverage"]["omission_reasons"][0],
-            "explorer_resume_cursor_unavailable",
-            "pagination without a public Explorer cursor must fail closed: {context}"
+            context["payload"]["messages"]
+                .as_array()
+                .map_or(0, Vec::len),
+            2
+        );
+        assert_eq!(context["payload"]["has_more_messages"], true);
+        assert_eq!(
+            context["coverage"]["completeness"], "partial",
+            "pagination must stay visible as partial coverage: {context}"
         );
     });
 }

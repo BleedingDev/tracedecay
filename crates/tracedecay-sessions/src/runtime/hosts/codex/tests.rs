@@ -180,14 +180,12 @@ mod goal_event_tests {
         let project = CodexObservationAdmission::Project {
             root: &project_root,
             project_id: project_id.clone(),
-            session_id: None,
         };
         let linked_root = temp.path().join("linked-worktree");
         std::fs::create_dir_all(&linked_root).unwrap();
         let linked = CodexObservationAdmission::Project {
             root: &linked_root,
             project_id,
-            session_id: None,
         };
         assert_eq!(project.scope(), linked.scope());
         assert!(project.scope_matcher().accepts(Some(&project_src)));
@@ -769,7 +767,6 @@ mod goal_event_tests {
             &transcript,
             &project,
             project_id.clone(),
-            None,
             &admission,
             u64::MAX,
             &cancellation,
@@ -786,7 +783,6 @@ mod goal_event_tests {
             &transcript,
             &project,
             project_id,
-            None,
             &admission,
             u64::MAX,
             &cancellation,

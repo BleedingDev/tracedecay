@@ -95,11 +95,6 @@ describe('SessionsPage index, selection and URL state', () => {
       const urls = fetchMock.mock.calls.map(([input]) => String(input));
       expect(urls.some((url) => url.includes('/api/loom/temporal?limit=50&offset=50'))).toBe(true);
       expect(urls.some((url) => url.includes('/timeline?bucket=hour&limit=2000'))).toBe(true);
-      expect(
-        urls.some((url) =>
-          url.includes('/session/sess-52?limit=100&provider=codex'),
-        ),
-      ).toBe(true);
     });
     expect(document.querySelector('[data-session-inspector-id]')?.textContent).toBe('sess-52');
     const identity = await screen.findByRole('region', { name: 'Identity' });
@@ -179,18 +174,11 @@ describe('SessionsPage index, selection and URL state', () => {
   });
 
   it('opens a transcript search hit in the inspector and returns to the same index page on clear', async () => {
-    const fetchMock = stubRoutes();
+    stubRoutes();
     renderPage('/sessions?sessionsPage=2');
     await screen.findAllByText('sess-26');
     const field = screen.getByRole('searchbox', { name: 'Search transcripts' });
     await userEvent.type(field, 'scheduler{enter}');
-    await waitFor(() => {
-      expect(
-        fetchMock.mock.calls.some(([input]) =>
-          String(input).includes('/hermes-lcm/search?q=scheduler&limit=50'),
-        ),
-      ).toBe(true);
-    });
     const hit = await screen.findByText('the scheduler was verified');
     await userEvent.click(hit.closest('button')!);
     await screen.findByText('Session provenance');
@@ -259,8 +247,6 @@ function timelinePayload() {
     exists: true,
     bucket: 'day',
     session_id: null,
-    provider: null,
-    next_cursor: null,
     buckets: [
       {
         bucket: '2026-08-04',
@@ -319,8 +305,6 @@ function overviewPayload() {
     matches: { messages: [], summary_nodes: [] },
     query: '',
     limit: 25,
-    provider: null,
-    next_cursor: null,
   };
 }
 
@@ -348,11 +332,10 @@ function indexPayload(url: URL) {
   };
 }
 
-function sessionPayload(sessionId: string, provider = 'claude') {
+function sessionPayload(sessionId: string) {
   return {
     exists: true,
     session_id: sessionId,
-    provider,
     path: 'daemon://session-temporal',
     storage_scope: 'project',
     limit: 100,
@@ -366,7 +349,6 @@ function sessionPayload(sessionId: string, provider = 'claude') {
         pinned: 0,
         role: 'assistant',
         session_id: sessionId,
-        provider,
         snippet: null,
         source: 'claude',
         storage_kind: null,
@@ -397,14 +379,7 @@ function searchPayload(query: string) {
     engine: 'canonical_temporal',
     engine_detail: { messages: 'canonical_hydration', summary_nodes: 'canonical_temporal_relations' },
     total: { messages: 1, summary_nodes: 0 },
-    filters: {
-      provider: null,
-      role: null,
-      source: null,
-      session_id: null,
-      since: null,
-      until: null,
-    },
+    filters: { role: null, source: null, session_id: null, since: null, until: null },
     matches: {
       messages: [{ ...sessionPayload('hit-session').messages[0], session_id: 'hit-session' }],
       summary_nodes: [],
@@ -423,9 +398,7 @@ function stubRoutes() {
     }
     if (path.includes('/hermes-lcm/session/')) {
       const id = decodeURIComponent(path.slice(path.lastIndexOf('/') + 1));
-      return jsonResponse(
-        fixtureEnvelope(sessionPayload(id, url.searchParams.get('provider') ?? 'claude')),
-      );
+      return jsonResponse(fixtureEnvelope(sessionPayload(id)));
     }
     if (path.endsWith('/loom/temporal')) return jsonResponse(fixtureEnvelope(indexPayload(url), 'partial'));
     return jsonResponse(TEMPORAL_RETRIEVAL_UNAVAILABLE);

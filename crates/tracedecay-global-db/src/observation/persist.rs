@@ -51,9 +51,6 @@ async fn read_observation_row(
     let repository_anchor_json = row
         .get::<Option<String>>(7)
         .map_err(|error| storage(operation, error))?;
-    let repository_origin_json = row
-        .get::<Option<String>>(8)
-        .map_err(|error| storage(operation, error))?;
     Ok(Some(
         ObservationCommitReceipt::new(
             sequence,
@@ -68,7 +65,6 @@ async fn read_observation_row(
                 &repository_availability_json,
                 repository_capture_json.as_deref(),
                 repository_anchor_json.as_deref(),
-                repository_origin_json.as_deref(),
                 operation,
             )?,
         )?,
@@ -85,7 +81,7 @@ pub(super) async fn read_by_observation_id(
             "SELECT observation.sequence, observation.observation_json,
                 observation.committed_cursor_json, anchor.anchor_json,
                 anchor.projection_generation, {REPOSITORY_PROVENANCE_HYDRATED_COLUMNS},
-                repository_anchor.anchor_json, repository.origin_json
+                repository_anchor.anchor_json
          FROM observations AS observation
          JOIN observation_retrieval_anchors AS binding
            ON binding.observation_id = observation.observation_id

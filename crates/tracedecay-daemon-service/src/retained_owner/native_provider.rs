@@ -1,16 +1,28 @@
 //! Project-owned Native application port.
 //!
-//! The provider-neutral Native adapter is synchronous, while the retained
-//! project and session authorities are asynchronous. This module keeps that
-//! seam narrow: one bounded actor owns a current-thread Tokio runtime and
-//! performs only the reads needed to verify an already-settled Native fact
-//! promotion or project a canonical session recall.
-//! No provider operation in this module writes Native memory.
-
-// This implementation is intentionally constructible before product
-// composition mounts it. Keep the dormant constructor/actor surface warning-
-// free until the composition owner wires the explicit activation path.
-#![allow(dead_code)]
+//! `tracedecay.native` is upstream TraceDecay memory inside the provider host.
+//! Native owns no store, schema, score domain, ranking, validity logic,
+//! staging, cursor format, or promotion path. Each recall is one call into one
+//! upstream authority plus a lossless envelope mapping:
+//!
+//! * **Fact lane** (objectives `search`, `probe`, `related`, `reason`): the
+//!   owner-bound [`MemoryApplication`] read for the project owner and then the
+//!   profile owner, with the query built by the same `memory_mapping`
+//!   helpers the `tracedecay_fact_store_*` tools use. Every hit is the
+//!   upstream `FactSearchHitV1` with its `score_millionths` unchanged.
+//!   Recall is a non-mutating provider operation, so it records no retrieval
+//!   telemetry, exactly like the `tracedecay_context` memory lane.
+//! * **Session lane** (objective `session_history`, explicit only): the
+//!   upstream `tracedecay_message_search` temporal query over the mounted
+//!   project session retrieval service. The kernel page (order, scores,
+//!   freshness, partial/stale outcome, cursor) is carried verbatim.
+//!
+//! Only current-state recall exists upstream for facts and message search, so
+//! `as_of`, `interval`, and `history` answer typed `capability_unsupported`.
+//!
+//! The provider API is synchronous while the upstream authorities are
+//! asynchronous. One bounded actor owns a current-thread runtime for that
+//! seam; every wait is bounded by the admitted operation control of the call.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -25,76 +37,68 @@ use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracedecay_contracts::retained_surfaces::{
-    FactCommitOwnerV1, FactCommitReceiptV1, FactProjectionV1, FactV1, MemoryScopeV1,
+    FactCommitOwnerV1, FactReadOptionsV1, FactSearchHitV1, FactStoreSearchRequestV1,
+    MemoryScopeV1,
 };
 use tracedecay_contracts::{
     CancellationSignal, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
     RequestContext, RequestId, RetainedSurfaceExecutionErrorV1, now_micros,
 };
 use tracedecay_domain::{
-    ActorId, CanonicalObservationIdV1, FactOwnerV1, ObservationScopeV1, ProjectId, RefId,
-    RepositoryId, RetrievalGrainV1, SessionId, TemporalModeV1, UtcMicros, WorktreeId,
-    canonical_sha256, derive_exact_observation_anchor_id,
+    ActorId, FactOwnerV1, RetrievalGrainV1, SessionId, TemporalModeV1, UtcMicros, canonical_sha256,
 };
 use tracedecay_memory_provider_registry::{
     ApiError, CanonicalPayload, CommittedEffectEvidence, FallbackDirective, HandshakeRequest,
-    HandshakeResponse, NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
-    NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID, NATIVE_PROVIDER_ID,
-    NATIVE_STAGED_SESSION_OBSERVATION_KIND, NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID,
-    NativeMemoryApplicationPort, NativeObservation, OBSERVATION_CONTRACT_ID, OperationControl,
-    OwnedExactScope, OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor,
-    ProviderLimits, ProviderOperation, ProviderReply, TerminalCode, TerminalRecord,
+    HandshakeResponse, NATIVE_PROVIDER_ID, NativeMemoryApplicationPort, OperationControl,
+    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderDescriptor, ProviderLimits,
+    ProviderOperation, ProviderReply, TerminalCode, TerminalRecord,
 };
-use tracedecay_store::{
-    FactReadControl, ProjectMemoryFactHistoryQueryV1, ProjectMemoryFactHistoryV1,
-    ProjectMemoryFactIdV1,
+use tracedecay_session_memory::fact_store::DatabaseFactStore;
+use tracedecay_session_memory::memory::MemoryApplication;
+use tracedecay_session_memory::session::{
+    SessionDataFreshness, SessionFreshnessPolicy, SessionRetrievalScope, SessionTemporalQuery,
 };
+use tracedecay_session_runtime::session_retrieval::{
+    APPLICATION_RETRIEVAL_MAX_BYTES, SessionApplicationRetrievalPortV1, SessionRetrievalPageView,
+    SessionRetrievalServiceOutcome, SessionTemporalMetadataView, admitted_execution_limits,
+};
+use tracedecay_sessions::runtime::SessionMessageSearchResult;
+use tracedecay_store::{FactReadControl, ProjectMemoryFactSearchKindV1};
+use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
 use tracedecay_temporal_query::context::ContextBudget;
 use tracedecay_temporal_query::ranking::DiversityLimits;
+use tracedecay_temporal_query::snapshot::{
+    TemporalCandidateFilterV1, TemporalMessageTypeFilterV1, TemporalSessionScopeFilterV1,
+};
 
 use super::memory_mapping;
 use super::native_authority::NativeSessionRetrievalMountV1;
-use super::native_session_recall::{
-    NativeSessionRecallBatch, NativeSessionRecallBatchStatus, NativeSessionRecallLimits,
-    NativeSessionRecallOptions, NativeSessionRecallTemporal, NativeSessionRecallUnavailable,
-    retrieve_native_session_recall_with_cancellation,
-};
 use super::open_project_retained_memory_target;
 use tracedecay_project::project::TraceDecay;
-use tracedecay_session_memory::fact_store::DatabaseFactStore;
-use tracedecay_session_memory::memory::MemoryApplication;
-use tracedecay_session_memory::session::{SessionRetrievalScope, SessionTemporalQuery};
-use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
 
-#[cfg(test)]
-#[path = "native_baseline_tests.rs"]
-mod baseline_tests;
 #[cfg(test)]
 #[path = "native_provider_tests.rs"]
 mod tests;
 
 pub(super) const IMPLEMENTATION_IDENTITY_SHA256: &str =
-    "7fe6923361d4caa6c213e0760d438c9f3b9bda60d4c1195812130bfe66c2fa16";
+    "27127197fad9c8694790cc0b4439e943414a42387a4df120dca21c00fff5fca0";
 pub(super) const STATE_SCHEMA_VERSION: &str = "native-application-port-v1";
 pub(crate) const PROVIDER_INSTANCE_ID: &str = "tracedecay.native.project";
 const STATE_NAMESPACE: &str = "tracedecay.native.project";
 const READY_RECEIPT_DOMAIN: &[u8] = b"tracedecay.native.application-ready.v1\0";
 const ACTOR_THREAD_NAME: &str = "tracedecay-native-memory-read";
 const ACTOR_POLL_MILLIS: u64 = 10;
-const NATIVE_OPERATION_MILLIS: u64 = 1_000;
 
-const INVALID_PAYLOAD_DIAGNOSTIC: &str = "native.fact_promotion_payload_invalid";
-const PROMOTION_MISMATCH_DIAGNOSTIC: &str = "native.fact_promotion_verification_mismatch";
-const SCOPE_UNAVAILABLE_DIAGNOSTIC: &str = "native.fact_promotion_scope_unavailable";
 const PROVIDER_UNAVAILABLE_DIAGNOSTIC: &str = "native.application_port_unavailable";
-const CANCELLED_DIAGNOSTIC: &str = "native.fact_promotion_cancelled";
-const DEADLINE_DIAGNOSTIC: &str = "native.fact_promotion_deadline_exceeded";
+const CANCELLED_DIAGNOSTIC: &str = "native.recall_cancelled";
+const DEADLINE_DIAGNOSTIC: &str = "native.recall_deadline_exceeded";
 const RECALL_INVALID_DIAGNOSTIC: &str = "native.recall_request_invalid";
 const RECALL_UNSUPPORTED_DIAGNOSTIC: &str = "native.recall_semantics_unsupported";
 const RECALL_SCOPE_MISMATCH_DIAGNOSTIC: &str = "native.recall_scope_mismatch";
 const RECALL_EXTENSION_DIAGNOSTIC: &str = "native.recall_extension_unsupported";
+const RECALL_HISTORY_GRANT_DIAGNOSTIC: &str = "native.recall_history_grant_unsupported";
 const RECALL_PROJECTION_DIAGNOSTIC: &str = "native.recall_projection_invalid";
-const RECALL_BUDGET_DIAGNOSTIC: &str = "native.recall_budget_exhausted";
+const RECALL_CAPACITY_DIAGNOSTIC: &str = "native.recall_capacity_exceeded";
 const RECALL_NOT_AUTHORIZED_DIAGNOSTIC: &str = "native.recall_not_authorized";
 const RECALL_RESET_DIAGNOSTIC: &str = "native.recall_reset_required";
 const RECALL_CURSOR_STALE_DIAGNOSTIC: &str = "native.recall_cursor_stale";
@@ -103,8 +107,28 @@ const RECALL_REQUEST_CONTRACT_ID: &str = "tracedecay.memory.provider.recall.v1";
 const RECALL_RESULT_CONTRACT_ID: &str = "tracedecay.memory.recall.query.outcome.v1";
 const HEALTH_INVALID_DIAGNOSTIC: &str = "native.health_request_invalid";
 const HEALTH_PROJECTION_DIAGNOSTIC: &str = "native.health_projection_invalid";
-const STAGED_SESSION_UNSUPPORTED_DIAGNOSTIC: &str = "native.staged_session_not_required";
-const NATIVE_RESPONSE_BYTES: u64 = 8_192;
+
+/// Capabilities the Native port declares. Native observes nothing: upstream
+/// has one capture authority (host admission, projection, `lcm_raw_messages`).
+const NATIVE_CAPABILITY_IDS: [&str; 2] = ["provider.health.v1", "recall.query.v1"];
+
+/// Objective selecting the explicit session-history lane.
+pub(crate) const SESSION_HISTORY_OBJECTIVE: &str = "session_history";
+
+/// Memory class of one upstream fact-search hit.
+pub(crate) const FACT_MEMORY_CLASS: &str = "fact";
+/// Memory class of one upstream message-search hit.
+pub(crate) const SESSION_MESSAGE_MEMORY_CLASS: &str = "session_message";
+
+/// Upstream fact-search score domain: `FactSearchScoresV1.score_millionths`.
+const FACT_SCORE_DOMAIN: &str = "tracedecay.memory.fact_search.score_millionths.v1";
+/// Upstream message-search score domain: the kernel's normalized score.
+const SESSION_SCORE_DOMAIN: &str = "tracedecay.session.message_search.score.v1";
+
+/// Upstream `tracedecay_message_search` anchor and filter identity.
+const MESSAGE_SEARCH_ROOT_SESSION_ID: &str = "session.message-search.root";
+const MESSAGE_SEARCH_FILTER_DOMAIN: &str = "tracedecay.daemon.retained.message-search.filter.v1";
+const MESSAGE_SEARCH_MAX_LIMIT: u64 = 50;
 
 /// Construction failures for the project-owned Native application port.
 #[derive(Debug)]
@@ -165,114 +189,35 @@ impl Error for NativeMemoryApplicationPortBuildError {
 pub(crate) struct ProjectNativeMemoryApplicationPort {
     descriptor: ProviderDescriptor,
     actor: NativeReadActor,
-    session_retrieval: Arc<NativeSessionRetrievalMountV1>,
 }
 
-/// Builds the project-owned Native application port behind the provider
-/// registry's neutral trait object.
-pub(crate) fn project_native_memory_application_port(
-    cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-    project_root: PathBuf,
-) -> Result<Arc<dyn NativeMemoryApplicationPort>, NativeMemoryApplicationPortBuildError> {
-    Ok(Arc::new(ProjectNativeMemoryApplicationPort::new(
-        cg,
-        project_root,
-    )?))
-}
-
-/// Builds a Native port with the late-bound canonical session authority that
-/// project composition installs after the session database is admitted.
-pub(crate) fn project_native_memory_application_port_with_session_retrieval(
-    cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-    project_root: PathBuf,
-    session_retrieval: Arc<NativeSessionRetrievalMountV1>,
-) -> Result<Arc<dyn NativeMemoryApplicationPort>, NativeMemoryApplicationPortBuildError> {
-    Ok(Arc::new(
-        ProjectNativeMemoryApplicationPort::new_with_session_retrieval(
-            cg,
-            project_root,
-            session_retrieval,
-        )?,
-    ))
-}
-
-/// Builds the Native port from an async composition context without retaining
-/// a provider-owned state root. Construction only starts the bounded read
-/// actor; all durable observation and recall state remains host canonical.
+/// Builds the Native port from an async composition context. Construction
+/// only starts the bounded read actor; every durable state remains upstream.
 pub(crate) async fn project_native_memory_application_port_off_runtime(
-    cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-    project_root: PathBuf,
-) -> Result<Arc<dyn NativeMemoryApplicationPort>, NativeMemoryApplicationPortBuildError> {
-    tokio::task::spawn_blocking(move || project_native_memory_application_port(cg, project_root))
-        .await
-        .map_err(|error| NativeMemoryApplicationPortBuildError::BlockingJoin(error.to_string()))?
-}
-
-/// Async composition variant retaining the host's canonical session mount.
-pub(crate) async fn project_native_memory_application_port_off_runtime_with_session_retrieval(
     cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: PathBuf,
     session_retrieval: Arc<NativeSessionRetrievalMountV1>,
 ) -> Result<Arc<dyn NativeMemoryApplicationPort>, NativeMemoryApplicationPortBuildError> {
     tokio::task::spawn_blocking(move || {
-        project_native_memory_application_port_with_session_retrieval(
-            cg,
-            project_root,
-            session_retrieval,
-        )
+        ProjectNativeMemoryApplicationPort::new(cg, project_root, session_retrieval)
+            .map(|port| Arc::new(port) as Arc<dyn NativeMemoryApplicationPort>)
     })
     .await
     .map_err(|error| NativeMemoryApplicationPortBuildError::BlockingJoin(error.to_string()))?
 }
 
 impl ProjectNativeMemoryApplicationPort {
-    /// Creates one bounded actor-backed port over the live project graph cell.
+    /// Creates one actor-backed Native port over the live project graph cell
+    /// and the late-bound canonical session retrieval mount.
     pub(crate) fn new(
-        cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-        project_root: PathBuf,
-    ) -> Result<Self, NativeMemoryApplicationPortBuildError> {
-        Self::new_with_session_retrieval(
-            cg,
-            project_root,
-            Arc::new(NativeSessionRetrievalMountV1::default()),
-        )
-    }
-
-    /// Creates one actor-backed Native port over a late-bound canonical
-    /// session retrieval mount.
-    pub(crate) fn new_with_session_retrieval(
         cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
         project_root: PathBuf,
         session_retrieval: Arc<NativeSessionRetrievalMountV1>,
     ) -> Result<Self, NativeMemoryApplicationPortBuildError> {
         let descriptor =
             native_descriptor().map_err(NativeMemoryApplicationPortBuildError::Descriptor)?;
-        let actor = NativeReadActor::new(cg, project_root, Arc::clone(&session_retrieval))?;
-        Ok(Self {
-            descriptor,
-            actor,
-            session_retrieval,
-        })
-    }
-
-    fn success_reply(&self, call: &ProviderCall) -> ProviderReply {
-        ProviderReply {
-            terminal: terminal_for_call(call, TerminalCode::Success, None),
-            payload: Some(call.payload.clone()),
-            warnings: Vec::new(),
-            extensions: call.extensions.clone(),
-            state_generation: call.expected_state_generation,
-        }
-    }
-
-    fn unavailable_reply(&self, call: &ProviderCall, diagnostic: &'static str) -> ProviderReply {
-        ProviderReply {
-            terminal: terminal_for_call(call, TerminalCode::ProviderUnavailable, Some(diagnostic)),
-            payload: None,
-            warnings: Vec::new(),
-            extensions: Vec::new(),
-            state_generation: call.expected_state_generation,
-        }
+        let actor = NativeReadActor::new(cg, project_root, session_retrieval)?;
+        Ok(Self { descriptor, actor })
     }
 
     fn handshake_failure(
@@ -301,21 +246,7 @@ impl ProjectNativeMemoryApplicationPort {
         }
     }
 
-    fn observe_invalid(&self, call: &ProviderCall) -> ProviderReply {
-        ProviderReply {
-            terminal: terminal_for_call(
-                call,
-                TerminalCode::InvalidRequest,
-                Some(INVALID_PAYLOAD_DIAGNOSTIC),
-            ),
-            payload: None,
-            warnings: Vec::new(),
-            extensions: Vec::new(),
-            state_generation: call.expected_state_generation,
-        }
-    }
-
-    fn observe_failure(&self, call: &ProviderCall, failure: NativeReadFailure) -> ProviderReply {
+    fn failure_reply(&self, call: &ProviderCall, failure: NativeReadFailure) -> ProviderReply {
         let (code, diagnostic) = failure.terminal();
         ProviderReply {
             terminal: terminal_for_call(call, code, Some(diagnostic)),
@@ -399,18 +330,18 @@ impl NativeMemoryApplicationPort for ProjectNativeMemoryApplicationPort {
 
     fn health(&self, call: &ProviderCall) -> ProviderReply {
         if let Err(failure) = control_failure(&call.control) {
-            return self.observe_failure(call, failure);
+            return self.failure_reply(call, failure);
         }
         if call.validate().is_err()
             || call.operation != ProviderOperation::Health
             || call.provider_id.as_str() != NATIVE_PROVIDER_ID
             || call.payload.contract_id.as_str() != HEALTH_CONTRACT_ID
         {
-            return self.observe_failure(call, NativeReadFailure::HealthInvalidRequest);
+            return self.failure_reply(call, NativeReadFailure::HealthInvalidRequest);
         }
         let payload = match native_health_payload(call, self.descriptor.limits) {
             Ok(payload) => payload,
-            Err(failure) => return self.observe_failure(call, failure),
+            Err(failure) => return self.failure_reply(call, failure),
         };
         ProviderReply {
             terminal: terminal_for_call(call, TerminalCode::Success, None),
@@ -421,110 +352,38 @@ impl NativeMemoryApplicationPort for ProjectNativeMemoryApplicationPort {
         }
     }
 
-    fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-        let call = observation.call();
-        if let Err(failure) = control_failure(&call.control) {
-            return self.observe_failure(call, failure);
-        }
-        if call.validate().is_err() || !observation_matches_call(&observation) {
-            return self.observe_invalid(call);
-        }
-        match observation {
-            // Fact promotion remains a separate, explicitly authorized
-            // consequence. It is the only observation kind that enters the
-            // Native fact verification actor.
-            NativeObservation::FactPromotion(_) => {
-                let payload = match parse_settled_native_fact(&observation) {
-                    Ok(payload) => payload,
-                    Err(failure) => return self.observe_failure(call, failure),
-                };
-                let outcome = self
-                    .actor
-                    .dispatch(call.clone(), payload.fact, payload.commit);
-                match outcome {
-                    NativeReadOutcome::Verified => self.success_reply(call),
-                    NativeReadOutcome::Failed(failure) => self.observe_failure(call, failure),
-                }
-            }
-            // Session messages are already admitted, sanitized, and projected
-            // by the host observation journey. Native has no durable staging
-            // row, journal, or provider receipt for them, so it must not ACK a
-            // stateless delivery as Applied. A typed capability refusal lets
-            // the host classify this canonical observation as non-required and
-            // settle the replay without manufacturing a Native-side effect.
-            NativeObservation::StagedSession(_) => {
-                self.observe_failure(call, NativeReadFailure::StagedSessionUnsupported)
-            }
-        }
-    }
-
     fn recall(&self, call: &ProviderCall) -> ProviderReply {
         if let Err(failure) = control_failure(&call.control) {
-            return self.observe_failure(call, failure);
+            return self.failure_reply(call, failure);
         }
         if call.validate().is_err()
             || call.operation != ProviderOperation::Recall
             || call.provider_id.as_str() != NATIVE_PROVIDER_ID
-            || !matches!(
-                call.payload.contract_id.as_str(),
-                RECALL_REQUEST_CONTRACT_ID | "tracedecay.memory.recall.query.request.v1"
-            )
+            || call.payload.contract_id.as_str() != RECALL_REQUEST_CONTRACT_ID
         {
-            return self.observe_failure(call, NativeReadFailure::RecallInvalidRequest);
+            return self.failure_reply(call, NativeReadFailure::RecallInvalidRequest);
         }
         let request = match parse_native_recall_request(call) {
             Ok(request) => request,
-            Err(failure) => return self.observe_failure(call, failure),
+            Err(failure) => return self.failure_reply(call, failure),
         };
-        match self.actor.dispatch_recall(call.clone(), request) {
-            NativeRecallOutcome::Reply(reply) => reply,
-            NativeRecallOutcome::Failed(failure) => self.observe_failure(call, failure),
+        let lane = match NativeRecallLane::select(&request) {
+            Ok(lane) => lane,
+            Err(failure) => return self.failure_reply(call, failure),
+        };
+        match self.actor.dispatch(call.clone(), request, lane) {
+            Ok(reply) => reply,
+            Err(failure) => self.failure_reply(call, failure),
         }
-    }
-
-    fn feedback(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.feedback_unimplemented")
-    }
-
-    fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.maintenance_unimplemented")
-    }
-
-    fn inspection(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.inspection_unimplemented")
-    }
-
-    fn correction(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.correction_unimplemented")
-    }
-
-    fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.delete_by_source_unimplemented")
-    }
-
-    fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.snapshot_export_unimplemented")
-    }
-
-    fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.snapshot_restore_unimplemented")
-    }
-
-    fn replay(&self, call: &ProviderCall) -> ProviderReply {
-        self.unavailable_reply(call, "native.replay_unimplemented")
     }
 }
 
 fn native_descriptor() -> Result<ProviderDescriptor, ApiError> {
     let provider_id = OwnedProviderId::new(NATIVE_PROVIDER_ID)?;
-    // `ProviderDescriptor` requires the mandatory recall capability. The
-    // Native implementation maps it to the host-admitted canonical session
-    // authority below; no optional capability is advertised here.
-    let capabilities = [
-        OwnedVersionedId::new("provider.health.v1")?,
-        OwnedVersionedId::new("observation.accept.v1")?,
-        OwnedVersionedId::new("recall.query.v1")?,
-    ];
+    let capabilities = NATIVE_CAPABILITY_IDS
+        .into_iter()
+        .map(OwnedVersionedId::new)
+        .collect::<Result<Vec<_>, _>>()?;
     ProviderDescriptor::new(
         provider_id,
         IMPLEMENTATION_IDENTITY_SHA256,
@@ -535,24 +394,19 @@ fn native_descriptor() -> Result<ProviderDescriptor, ApiError> {
     )
 }
 
-/// Copies the production declaration without constructing a provider or state.
-/// The limits remain declared ceilings until a caller matches actual health.
-#[cfg(feature = "test-helpers")]
-pub(crate) fn production_provider_declaration_for_test()
--> Result<(ProviderDescriptor, String, String), ApiError> {
-    let descriptor = native_descriptor()?;
-    let limits_digest = native_limits_digest(descriptor.limits);
-    Ok((descriptor, PROVIDER_INSTANCE_ID.to_owned(), limits_digest))
-}
-
+/// Declared Native ceilings. They are contract declarations negotiated at
+/// handshake; every actual wait is bounded by the admitted call control.
 pub(crate) fn native_provider_limits() -> ProviderLimits {
     ProviderLimits {
         request_bytes: 4_096,
-        response_bytes: 8_192,
+        // One upstream message-search page is bounded by the admitted
+        // application retrieval ceiling; the envelope around it stays well
+        // inside four times that ceiling.
+        response_bytes: APPLICATION_RETRIEVAL_MAX_BYTES * 4,
         observation_batch_items: 16,
-        recall_candidates: 32,
+        recall_candidates: MESSAGE_SEARCH_MAX_LIMIT,
         concurrent_operations: 4,
-        operation_millis: NATIVE_OPERATION_MILLIS,
+        operation_millis: 1_000,
         snapshot_bytes: 65_536,
         inspection_items: 64,
     }
@@ -623,7 +477,7 @@ fn ready_receipt(request: &HandshakeRequest, effective_limits: ProviderLimits) -
     digest.update(request.registration_revision.to_be_bytes());
     digest.update(request.exact_scope.exact_scope_sha256().as_bytes());
     digest.update(request.request_id.as_bytes());
-    digest.update(self_descriptor_identity());
+    digest.update(IMPLEMENTATION_IDENTITY_SHA256.as_bytes());
     digest.update(effective_limits.request_bytes.to_be_bytes());
     digest.update(effective_limits.response_bytes.to_be_bytes());
     digest.update(effective_limits.observation_batch_items.to_be_bytes());
@@ -633,10 +487,6 @@ fn ready_receipt(request: &HandshakeRequest, effective_limits: ProviderLimits) -
     digest.update(effective_limits.snapshot_bytes.to_be_bytes());
     digest.update(effective_limits.inspection_items.to_be_bytes());
     hex::encode(digest.finalize())
-}
-
-fn self_descriptor_identity() -> &'static [u8] {
-    IMPLEMENTATION_IDENTITY_SHA256.as_bytes()
 }
 
 /// Builds the operation-specific health result consumed by the provider
@@ -675,7 +525,7 @@ fn native_health_payload(
     ]))
     .map(|bytes| sha256_hex(&bytes))
     .map_err(|_| NativeReadFailure::HealthProjectionInvalid)?;
-    let capability_states = self_capability_ids()
+    let capability_states = NATIVE_CAPABILITY_IDS
         .into_iter()
         .map(|capability_id| {
             serde_json::json!({
@@ -712,14 +562,6 @@ fn native_health_payload(
     .map_err(|_| NativeReadFailure::HealthProjectionInvalid)
 }
 
-fn self_capability_ids() -> Vec<&'static str> {
-    vec![
-        "provider.health.v1",
-        "observation.accept.v1",
-        "recall.query.v1",
-    ]
-}
-
 fn native_limits_digest(limits: ProviderLimits) -> String {
     let mut digest = Sha256::new();
     for value in [
@@ -737,45 +579,9 @@ fn native_limits_digest(limits: ProviderLimits) -> String {
     hex::encode(digest.finalize())
 }
 
-fn observation_matches_call(observation: &NativeObservation<'_>) -> bool {
-    let call = observation.call();
-    if call.operation != ProviderOperation::Observe
-        || call.provider_id.as_str() != NATIVE_PROVIDER_ID
-        || call.payload.contract_id.as_str() != OBSERVATION_CONTRACT_ID
-        || !matches!(
-            (
-                observation.observation_kind(),
-                observation.payload_contract()
-            ),
-            (
-                NATIVE_FACT_PROMOTION_OBSERVATION_KIND,
-                NATIVE_FACT_PROMOTION_PAYLOAD_CONTRACT_ID
-            ) | (
-                NATIVE_STAGED_SESSION_OBSERVATION_KIND,
-                NATIVE_STAGED_SESSION_PAYLOAD_CONTRACT_ID
-            )
-        )
-    {
-        return false;
-    }
-    let Ok(envelope) = serde_json::from_slice::<Value>(&call.payload.bytes) else {
-        return false;
-    };
-    let Some(object) = envelope.as_object() else {
-        return false;
-    };
-    object.len() == 3
-        && object.get("observation_kind")
-            == Some(&Value::String(observation.observation_kind().to_owned()))
-        && object.get("payload_contract")
-            == Some(&Value::String(observation.payload_contract().to_owned()))
-        && object.get("canonical_payload") == Some(observation.canonical_payload())
-}
-
-/// The strict, provider-neutral request envelope understood by the Native
-/// application port.  The contract deliberately keeps this wire value
-/// provider-neutral; the Native mapping below only accepts the canonical
-/// session projection that the mounted host authority can prove.
+/// The strict, provider-neutral recall request envelope. Native reads the
+/// objective, query, temporal mode, cursor, and candidate budget; the host's
+/// admission owns exclusions and every per-candidate budget after the reply.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeRecallRequestV1 {
@@ -789,8 +595,8 @@ struct NativeRecallRequestV1 {
     temporal_query: NativeRecallTemporalQueryV1,
     budgets: NativeRecallBudgetsV1,
     exclusions: NativeRecallExclusionsV1,
-    /// The host-admitted history claim is carried through the provider call
-    /// so a canonical session projection cannot silently lose its grant.
+    /// Canonical history grants authorize observation-sourced candidates.
+    /// Native observes nothing, so a present grant is refused, never used.
     #[serde(default)]
     history_grant: Option<Value>,
     required_capabilities: Vec<String>,
@@ -820,9 +626,7 @@ struct NativeRecallTemporalQueryV1 {
     as_of: Value,
     interval_start: Value,
     interval_end: Value,
-    /// Opaque canonical-session continuation issued by the mounted authority.
-    /// Older callers omit this field; when present it is passed back to the
-    /// same authority rather than being treated as provider-local state.
+    /// Opaque upstream message-search continuation, passed back unchanged.
     #[serde(default)]
     cursor: Option<String>,
     include_superseded: bool,
@@ -863,6 +667,65 @@ struct NativeRecallExtensionV1 {
     payload_sha256: String,
 }
 
+/// One upstream read selected by the recall objective. The two lanes are
+/// never fused: a call answers facts or session messages, never a blend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NativeRecallLane {
+    /// Upstream fact read of one `ProjectMemoryFactSearchKindV1`.
+    Facts(NativeFactRead),
+    /// Upstream `tracedecay_message_search`.
+    SessionHistory,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NativeFactRead {
+    Search,
+    Probe,
+    Related,
+    Reason { entities: Vec<String> },
+}
+
+impl NativeRecallLane {
+    fn select(request: &NativeRecallRequestV1) -> Result<Self, NativeReadFailure> {
+        // Fact search and message search are current-state reads upstream.
+        // Every other mode is refused rather than served by a different read.
+        if request.temporal_query.mode != "current"
+            || request.temporal_query.include_superseded
+            || request.temporal_query.include_revoked
+        {
+            return Err(NativeReadFailure::RecallUnsupported);
+        }
+        let facts = |read| {
+            // Fact recall exposes no provider cursor; Native owns no cursor
+            // format that could span the project and profile owners.
+            if request.temporal_query.cursor.is_some() {
+                Err(NativeReadFailure::RecallUnsupported)
+            } else {
+                Ok(Self::Facts(read))
+            }
+        };
+        match request.objective.as_str() {
+            "search" => facts(NativeFactRead::Search),
+            "probe" => facts(NativeFactRead::Probe),
+            "related" => facts(NativeFactRead::Related),
+            "reason" => {
+                let entities = request
+                    .query
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entity| !entity.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let entities = memory_mapping::normalize_reason_entities(&entities)
+                    .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+                facts(NativeFactRead::Reason { entities })
+            }
+            SESSION_HISTORY_OBJECTIVE => Ok(Self::SessionHistory),
+            _ => Err(NativeReadFailure::RecallUnsupported),
+        }
+    }
+}
+
 fn parse_native_recall_request(
     call: &ProviderCall,
 ) -> Result<NativeRecallRequestV1, NativeReadFailure> {
@@ -881,6 +744,9 @@ fn parse_native_recall_request(
     if request.exact_scope_identity != native_recall_scope(call) {
         return Err(NativeReadFailure::RecallScopeMismatch);
     }
+    if request.history_grant.is_some() || call.history_grant().is_some() {
+        return Err(NativeReadFailure::RecallHistoryGrantUnsupported);
+    }
     validate_recall_text(&request.objective, 8_192)
         .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
     validate_recall_text(&request.query, 32_768)
@@ -888,7 +754,6 @@ fn parse_native_recall_request(
     validate_recall_temporal(&request.temporal_query)?;
     validate_recall_budgets(&request.budgets)?;
     validate_recall_exclusions(&request.exclusions)?;
-    validate_recall_history(call, &request)?;
     validate_recall_extensions(&request.extensions)?;
     validate_recall_control(call, &request.deadline, &request.cancellation)?;
     Ok(request)
@@ -917,6 +782,8 @@ fn validate_recall_text(value: &str, maximum_bytes: usize) -> Result<(), ()> {
     Ok(())
 }
 
+/// Validates the wire shape of every temporal mode. Supported semantics are
+/// decided separately by [`NativeRecallLane::select`].
 fn validate_recall_temporal(
     temporal: &NativeRecallTemporalQueryV1,
 ) -> Result<(), NativeReadFailure> {
@@ -935,7 +802,7 @@ fn validate_recall_temporal(
         validate_recall_text(cursor, 8_192).map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
     }
     match temporal.mode.as_str() {
-        "current" => {
+        "current" | "history" => {
             if !temporal.as_of.is_null()
                 || !temporal.interval_start.is_null()
                 || !temporal.interval_end.is_null()
@@ -973,14 +840,6 @@ fn validate_recall_temporal(
                 return Err(NativeReadFailure::RecallInvalidRequest);
             }
         }
-        "history" => {
-            if !temporal.as_of.is_null()
-                || !temporal.interval_start.is_null()
-                || !temporal.interval_end.is_null()
-            {
-                return Err(NativeReadFailure::RecallInvalidRequest);
-            }
-        }
         _ => return Err(NativeReadFailure::RecallInvalidRequest),
     }
     if !matches!(
@@ -988,32 +847,6 @@ fn validate_recall_temporal(
         "exclude" | "degrade" | "allow_with_warning"
     ) {
         return Err(NativeReadFailure::RecallInvalidRequest);
-    }
-    Ok(())
-}
-
-fn validate_recall_history(
-    call: &ProviderCall,
-    request: &NativeRecallRequestV1,
-) -> Result<(), NativeReadFailure> {
-    let Some(value) = request.history_grant.as_ref() else {
-        return if call.history_grant().is_some() {
-            Err(NativeReadFailure::RecallScopeMismatch)
-        } else {
-            Ok(())
-        };
-    };
-    let grant = super::provider_history::history_grant_from_json(value)
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    if grant.destination_scope != call.exact_scope
-        || grant.policy_revision != request.policy_revision
-    {
-        return Err(NativeReadFailure::RecallScopeMismatch);
-    }
-    if let Some(private) = call.history_grant()
-        && private != &grant
-    {
-        return Err(NativeReadFailure::RecallScopeMismatch);
     }
     Ok(())
 }
@@ -1160,15 +993,14 @@ fn validate_recall_budgets(budgets: &NativeRecallBudgetsV1) -> Result<(), Native
 fn validate_recall_exclusions(
     exclusions: &NativeRecallExclusionsV1,
 ) -> Result<(), NativeReadFailure> {
-    let groups = [
-        (&exclusions.stable_memory_refs, "stable_memory_refs"),
-        (&exclusions.candidate_ids, "candidate_ids"),
-        (&exclusions.source_refs, "source_refs"),
-        (&exclusions.trace_refs, "trace_refs"),
-        (&exclusions.observation_ids, "observation_ids"),
-        (&exclusions.content_sha256, "content_sha256"),
-    ];
-    for (values, _) in groups {
+    for values in [
+        &exclusions.stable_memory_refs,
+        &exclusions.candidate_ids,
+        &exclusions.source_refs,
+        &exclusions.trace_refs,
+        &exclusions.observation_ids,
+        &exclusions.content_sha256,
+    ] {
         if values.len() > 1_024 {
             return Err(NativeReadFailure::RecallInvalidRequest);
         }
@@ -1254,63 +1086,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SettledNativeFactWriteV1 {
-    kind: String,
-    fact: FactV1,
-    commit: FactCommitReceiptV1,
-}
-
-fn parse_settled_native_fact(
-    observation: &NativeObservation<'_>,
-) -> Result<SettledNativeFactWriteV1, NativeReadFailure> {
-    let payload =
-        serde_json::from_value::<SettledNativeFactWriteV1>(observation.canonical_payload().clone())
-            .map_err(|_| NativeReadFailure::InvalidPayload)?;
-    if payload.kind != "settled_native_fact_write" {
-        return Err(NativeReadFailure::InvalidPayload);
-    }
-    validate_settled_native_fact(observation.call(), &payload)?;
-    Ok(payload)
-}
-
-fn validate_settled_native_fact(
-    call: &ProviderCall,
-    payload: &SettledNativeFactWriteV1,
-) -> Result<(), NativeReadFailure> {
-    let project_id = ProjectId::new(call.exact_scope.project_id.clone())
-        .map_err(|_| NativeReadFailure::ScopeUnavailable)?;
-    let domain_owner = FactOwnerV1::Project {
-        project_id: project_id.clone(),
-    };
-    let public_owner = FactCommitOwnerV1::Project { project_id };
-    if payload.fact.owner != public_owner || payload.commit.owner != public_owner {
-        return Err(NativeReadFailure::ScopeUnavailable);
-    }
-    if payload.fact.fact_id.validate_owner(&domain_owner).is_err()
-        || payload.fact.fact_id != payload.commit.fact_id
-        || payload.commit.committed_event_ids.is_empty()
-        || payload.commit.committed_event_ids.last() != Some(&payload.commit.last_event_id)
-        || payload.commit.committed_event_ids.last() != Some(&payload.fact.last_event_id)
-        || payload.fact.last_event_id != payload.commit.last_event_id
-        || payload.commit.active_assertion_id.as_ref() != Some(&payload.fact.active_assertion_id)
-        || payload.fact.telemetry.updated_at != payload.fact.projected_as_of
-    {
-        return Err(NativeReadFailure::PromotionMismatch);
-    }
-    let mut event_ids = BTreeSet::new();
-    if payload
-        .commit
-        .committed_event_ids
-        .iter()
-        .any(|event_id| !event_ids.insert(event_id))
-    {
-        return Err(NativeReadFailure::PromotionMismatch);
-    }
-    Ok(())
-}
-
 fn control_failure(control: &OperationControl) -> Result<(), NativeReadFailure> {
     control.snapshot().map(|_| ()).map_err(|code| match code {
         TerminalCode::Cancelled => NativeReadFailure::Cancelled,
@@ -1319,23 +1094,20 @@ fn control_failure(control: &OperationControl) -> Result<(), NativeReadFailure> 
     })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeReadFailure {
-    InvalidPayload,
-    PromotionMismatch,
-    ScopeUnavailable,
     ProviderUnavailable,
     HealthInvalidRequest,
     HealthProjectionInvalid,
-    StagedSessionUnsupported,
     Cancelled,
     DeadlineExceeded,
     RecallInvalidRequest,
     RecallUnsupported,
     RecallScopeMismatch,
     RecallExtensionUnsupported,
+    RecallHistoryGrantUnsupported,
     RecallProjectionInvalid,
-    RecallBudgetExhausted,
+    RecallCapacityExceeded,
     RecallNotAuthorized,
     RecallResetRequired,
     RecallCursorStale,
@@ -1344,14 +1116,6 @@ enum NativeReadFailure {
 impl NativeReadFailure {
     fn terminal(self) -> (TerminalCode, &'static str) {
         match self {
-            Self::InvalidPayload => (TerminalCode::InvalidRequest, INVALID_PAYLOAD_DIAGNOSTIC),
-            Self::PromotionMismatch => (
-                TerminalCode::ContractViolation,
-                PROMOTION_MISMATCH_DIAGNOSTIC,
-            ),
-            Self::ScopeUnavailable => {
-                (TerminalCode::ScopeUnavailable, SCOPE_UNAVAILABLE_DIAGNOSTIC)
-            }
             Self::ProviderUnavailable => (
                 TerminalCode::ProviderUnavailable,
                 PROVIDER_UNAVAILABLE_DIAGNOSTIC,
@@ -1360,10 +1124,6 @@ impl NativeReadFailure {
             Self::HealthProjectionInvalid => (
                 TerminalCode::ContractViolation,
                 HEALTH_PROJECTION_DIAGNOSTIC,
-            ),
-            Self::StagedSessionUnsupported => (
-                TerminalCode::CapabilityUnsupported,
-                STAGED_SESSION_UNSUPPORTED_DIAGNOSTIC,
             ),
             Self::Cancelled => (TerminalCode::Cancelled, CANCELLED_DIAGNOSTIC),
             Self::DeadlineExceeded => (TerminalCode::DeadlineExceeded, DEADLINE_DIAGNOSTIC),
@@ -1380,12 +1140,16 @@ impl NativeReadFailure {
                 TerminalCode::CapabilityUnsupported,
                 RECALL_EXTENSION_DIAGNOSTIC,
             ),
+            Self::RecallHistoryGrantUnsupported => (
+                TerminalCode::CapabilityUnsupported,
+                RECALL_HISTORY_GRANT_DIAGNOSTIC,
+            ),
             Self::RecallProjectionInvalid => (
                 TerminalCode::ContractViolation,
                 RECALL_PROJECTION_DIAGNOSTIC,
             ),
-            Self::RecallBudgetExhausted => {
-                (TerminalCode::CapacityExceeded, RECALL_BUDGET_DIAGNOSTIC)
+            Self::RecallCapacityExceeded => {
+                (TerminalCode::CapacityExceeded, RECALL_CAPACITY_DIAGNOSTIC)
             }
             Self::RecallNotAuthorized => {
                 (TerminalCode::Unauthorized, RECALL_NOT_AUTHORIZED_DIAGNOSTIC)
@@ -1398,33 +1162,17 @@ impl NativeReadFailure {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum NativeReadOutcome {
-    Verified,
-    Failed(NativeReadFailure),
-}
+type NativeRecallOutcome = Result<ProviderReply, NativeReadFailure>;
 
-enum NativeRecallOutcome {
-    Reply(ProviderReply),
-    Failed(NativeReadFailure),
-}
-
-enum NativeReadCommand {
-    Verify {
-        call: ProviderCall,
-        fact: FactV1,
-        commit: FactCommitReceiptV1,
-        reply: SyncSender<NativeReadOutcome>,
-    },
-    Recall {
-        call: ProviderCall,
-        request: NativeRecallRequestV1,
-        reply: SyncSender<NativeRecallOutcome>,
-    },
+struct NativeRecallCommand {
+    call: ProviderCall,
+    request: NativeRecallRequestV1,
+    lane: NativeRecallLane,
+    reply: SyncSender<NativeRecallOutcome>,
 }
 
 struct NativeReadActor {
-    sender: Mutex<Option<SyncSender<NativeReadCommand>>>,
+    sender: Mutex<Option<SyncSender<NativeRecallCommand>>>,
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -1454,46 +1202,15 @@ impl NativeReadActor {
     fn dispatch(
         &self,
         call: ProviderCall,
-        fact: FactV1,
-        commit: FactCommitReceiptV1,
-    ) -> NativeReadOutcome {
-        let (reply, receiver) = mpsc::sync_channel(1);
-        let control = call.control.clone();
-        let command = NativeReadCommand::Verify {
-            call,
-            fact,
-            commit,
-            reply,
-        };
-        let sender = match self.sender.lock() {
-            Ok(sender) => sender.as_ref().cloned(),
-            Err(_) => None,
-        };
-        let Some(sender) = sender else {
-            return NativeReadOutcome::Failed(NativeReadFailure::ProviderUnavailable);
-        };
-        match sender.try_send(command) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                return NativeReadOutcome::Failed(NativeReadFailure::ProviderUnavailable);
-            }
-        }
-        match receive_actor_reply(&control, receiver) {
-            Ok(outcome) => outcome,
-            Err(failure) => NativeReadOutcome::Failed(failure),
-        }
-    }
-
-    fn dispatch_recall(
-        &self,
-        call: ProviderCall,
         request: NativeRecallRequestV1,
+        lane: NativeRecallLane,
     ) -> NativeRecallOutcome {
         let (reply, receiver) = mpsc::sync_channel(1);
         let control = call.control.clone();
-        let command = NativeReadCommand::Recall {
+        let command = NativeRecallCommand {
             call,
             request,
+            lane,
             reply,
         };
         let sender = match self.sender.lock() {
@@ -1501,37 +1218,30 @@ impl NativeReadActor {
             Err(_) => None,
         };
         let Some(sender) = sender else {
-            return NativeRecallOutcome::Failed(NativeReadFailure::ProviderUnavailable);
+            return Err(NativeReadFailure::ProviderUnavailable);
         };
         match sender.try_send(command) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                return NativeRecallOutcome::Failed(NativeReadFailure::ProviderUnavailable);
+                return Err(NativeReadFailure::ProviderUnavailable);
             }
         }
-        match receive_actor_reply(&control, receiver) {
-            Ok(outcome) => outcome,
-            Err(failure) => NativeRecallOutcome::Failed(failure),
-        }
+        receive_actor_reply(&control, receiver)?
     }
 }
 
+/// Waits for the actor under the admitted call control only.
 fn receive_actor_reply<T>(
     control: &OperationControl,
     receiver: mpsc::Receiver<T>,
 ) -> Result<T, NativeReadFailure> {
     loop {
-        let snapshot = match control.snapshot() {
-            Ok(snapshot) => snapshot,
-            Err(code) => {
-                return Err(match code {
-                    TerminalCode::Cancelled => NativeReadFailure::Cancelled,
-                    TerminalCode::DeadlineExceeded => NativeReadFailure::DeadlineExceeded,
-                    _ => NativeReadFailure::ProviderUnavailable,
-                });
-            }
-        };
-        let wait_millis = snapshot.remaining_millis.min(ACTOR_POLL_MILLIS).max(1);
+        let snapshot = control.snapshot().map_err(|code| match code {
+            TerminalCode::Cancelled => NativeReadFailure::Cancelled,
+            TerminalCode::DeadlineExceeded => NativeReadFailure::DeadlineExceeded,
+            _ => NativeReadFailure::ProviderUnavailable,
+        })?;
+        let wait_millis = snapshot.remaining_millis.clamp(1, ACTOR_POLL_MILLIS);
         match receiver.recv_timeout(Duration::from_millis(wait_millis)) {
             Ok(outcome) => return Ok(outcome),
             Err(RecvTimeoutError::Timeout) => {}
@@ -1560,334 +1270,691 @@ impl Drop for NativeReadActor {
 }
 
 fn native_read_actor_main(
-    receiver: mpsc::Receiver<NativeReadCommand>,
+    receiver: mpsc::Receiver<NativeRecallCommand>,
     cg: Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: PathBuf,
     runtime: tokio::runtime::Runtime,
     session_retrieval: Arc<NativeSessionRetrievalMountV1>,
 ) {
     while let Ok(command) = receiver.recv() {
-        match command {
-            NativeReadCommand::Verify {
-                call,
-                fact,
-                commit,
-                reply,
-            } => {
-                let outcome = verify_with_runtime(&runtime, &cg, &project_root, call, fact, commit);
-                let _ = reply.send(outcome);
-            }
-            NativeReadCommand::Recall {
-                call,
-                request,
-                reply,
-            } => {
-                let outcome = recall_with_runtime(
-                    &runtime,
-                    &cg,
-                    &project_root,
-                    &session_retrieval,
-                    call,
-                    request,
-                );
-                let _ = reply.send(outcome);
-            }
-        }
+        let NativeRecallCommand {
+            call,
+            request,
+            lane,
+            reply,
+        } = command;
+        let outcome = recall_with_runtime(
+            &runtime,
+            &cg,
+            &project_root,
+            &session_retrieval,
+            &call,
+            &request,
+            &lane,
+        );
+        let _ = reply.send(outcome);
     }
 }
 
+/// Runs one upstream read inside the admitted call deadline. No private
+/// timeout exists: the remaining budget of the call is the only bound.
 fn recall_with_runtime(
     runtime: &tokio::runtime::Runtime,
     cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
     project_root: &Path,
-    session_retrieval: &Arc<NativeSessionRetrievalMountV1>,
-    call: ProviderCall,
-    request: NativeRecallRequestV1,
+    session_retrieval: &NativeSessionRetrievalMountV1,
+    call: &ProviderCall,
+    request: &NativeRecallRequestV1,
+    lane: &NativeRecallLane,
 ) -> NativeRecallOutcome {
-    let snapshot = match call.control.snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(code) => {
-            return NativeRecallOutcome::Failed(match code {
-                TerminalCode::Cancelled => NativeReadFailure::Cancelled,
-                TerminalCode::DeadlineExceeded => NativeReadFailure::DeadlineExceeded,
-                _ => NativeReadFailure::ProviderUnavailable,
-            });
+    let snapshot = call.control.snapshot().map_err(|code| match code {
+        TerminalCode::Cancelled => NativeReadFailure::Cancelled,
+        TerminalCode::DeadlineExceeded => NativeReadFailure::DeadlineExceeded,
+        _ => NativeReadFailure::ProviderUnavailable,
+    })?;
+    let budget = Duration::from_millis(snapshot.remaining_millis);
+    runtime.block_on(async {
+        let read = async {
+            match lane {
+                NativeRecallLane::Facts(read) => {
+                    recall_facts(cg, project_root, call, request, read).await
+                }
+                NativeRecallLane::SessionHistory => {
+                    recall_session_history(session_retrieval, call, request).await
+                }
+            }
+        };
+        match tokio::time::timeout(budget, read).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(NativeReadFailure::DeadlineExceeded),
         }
-    };
-    let timeout_millis = snapshot.remaining_millis.min(NATIVE_OPERATION_MILLIS);
-    let session_retrieval = Arc::clone(session_retrieval);
-    match runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(timeout_millis),
-            recall_canonical_session(cg, project_root, &session_retrieval, &call, &request),
-        )
-        .await
-    }) {
-        Ok(outcome) => outcome,
-        Err(_) => NativeRecallOutcome::Failed(NativeReadFailure::DeadlineExceeded),
-    }
+    })
 }
 
-/// Reads the host-admitted session projection through the canonical application
-/// retrieval service. Native owns only this bounded response projection; it
-/// never opens a provider facts database for recall.
-async fn recall_canonical_session(
-    _cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-    _project_root: &Path,
+// ---------------------------------------------------------------------------
+// Fact lane
+// ---------------------------------------------------------------------------
+
+/// Fact owners in their fixed recall order: the project owner, then the
+/// profile owner. Each owner is one independent upstream read.
+const FACT_OWNER_ORDER: [MemoryScopeV1; 2] = [MemoryScopeV1::Project, MemoryScopeV1::User];
+
+/// Reads canonical facts through the owner-bound upstream application.
+///
+/// The project owner is read with the full candidate budget; the profile
+/// owner is read with whatever budget remains, so the concatenation never
+/// exceeds the admitted budget and no upstream hit is dropped or reordered.
+/// Hits are deduplicated by `fact_id` and then by content, keeping the first
+/// (project) occurrence, as the upstream Hermes recall does.
+async fn recall_facts(
+    cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
+    project_root: &Path,
+    call: &ProviderCall,
+    request: &NativeRecallRequestV1,
+    read: &NativeFactRead,
+) -> NativeRecallOutcome {
+    control_failure(&call.control)?;
+    let current = Arc::clone(&*cg.read().await);
+    let project_id = match current.project_memory_owner() {
+        Ok(FactOwnerV1::Project { project_id }) => project_id,
+        Ok(FactOwnerV1::Profile) | Err(_) => return Err(NativeReadFailure::ProviderUnavailable),
+    };
+    if project_id.as_str() != call.exact_scope.project_id {
+        return Err(NativeReadFailure::RecallScopeMismatch);
+    }
+    let budget = request
+        .budgets
+        .maximum_candidates
+        .min(native_provider_limits().recall_candidates);
+    let read_control = native_fact_read_control(&call.control);
+    let mut hits = Vec::<NativeFactHit>::new();
+    let mut scanned_items = 0_usize;
+    for scope in FACT_OWNER_ORDER {
+        let remaining = budget.saturating_sub(u64::try_from(hits.len()).unwrap_or(u64::MAX));
+        if remaining == 0 {
+            break;
+        }
+        let page = read_owner_facts(
+            &current,
+            project_root,
+            &project_id,
+            scope,
+            request,
+            read,
+            remaining,
+            &read_control,
+        )
+        .await?;
+        scanned_items = scanned_items.saturating_add(page.hits.len());
+        for hit in page.hits {
+            let duplicate = hits.iter().any(|existing| {
+                existing.hit.fact.fact_id == hit.fact.fact_id
+                    || existing.hit.fact.content == hit.fact.content
+            });
+            if !duplicate {
+                hits.push(NativeFactHit { scope, hit });
+            }
+        }
+        control_failure(&call.control)?;
+    }
+    let candidates = hits
+        .iter()
+        .map(|hit| fact_candidate(call, hit))
+        .collect::<Result<Vec<_>, _>>()?;
+    let coverage_state = if candidates.is_empty() {
+        "zero_results"
+    } else {
+        "complete"
+    };
+    let coverage = serde_json::json!({
+        "state": coverage_state,
+        "searched_scope_digest": call.exact_scope.exact_scope_sha256(),
+        "searched_temporal_digest": recall_temporal_digest(&request.temporal_query),
+        "scanned_items": scanned_items,
+        "matched_items": scanned_items,
+        "returned_items": candidates.len(),
+        "excluded_items": scanned_items.saturating_sub(candidates.len()),
+        "truncated_items": 0,
+        "next_cursor": Value::Null,
+        "reasons": [],
+    });
+    let ordering = serde_json::json!({
+        "provider_order": "upstream_fact_search_rank_per_owner_project_then_profile",
+        "score_domain_id": FACT_SCORE_DOMAIN,
+        "direction": "higher_is_better",
+        "tie_breaker": "upstream_fact_search_order",
+    });
+    let terminal_code = if candidates.is_empty() {
+        TerminalCode::SuccessZeroResults
+    } else {
+        TerminalCode::Success
+    };
+    recall_reply(call, request, candidates, coverage, ordering, terminal_code)
+}
+
+struct NativeFactHit {
+    scope: MemoryScopeV1,
+    hit: FactSearchHitV1,
+}
+
+/// One upstream owner read, built and mapped exactly as the matching
+/// `tracedecay_fact_store_*` tool builds and maps it.
+async fn read_owner_facts(
+    graph: &TraceDecay,
+    project_root: &Path,
+    project_id: &tracedecay_domain::ProjectId,
+    scope: MemoryScopeV1,
+    request: &NativeRecallRequestV1,
+    read: &NativeFactRead,
+    limit: u64,
+    read_control: &FactReadControl,
+) -> Result<memory_mapping::MappedSearchPageV1, NativeReadFailure> {
+    // Search and Related expand through the project memory graph and take
+    // the recording lease exactly as the retained fact tools do.
+    let access = match read {
+        NativeFactRead::Search | NativeFactRead::Related => MemoryTargetAccessV1::RecordRetrieval,
+        NativeFactRead::Probe | NativeFactRead::Reason { .. } => MemoryTargetAccessV1::Read,
+    };
+    let target = open_project_retained_memory_target(
+        graph,
+        project_root,
+        project_id,
+        Some(scope),
+        None,
+        access,
+    )
+    .await
+    .map_err(map_retained_error)?;
+    let owner = target.owner().clone();
+    let memory = MemoryApplication::new(owner.clone(), DatabaseFactStore::new(target.database()))
+        .map_err(|error| map_retained_error(memory_mapping::map_memory_error(error)))?;
+    let options = FactReadOptionsV1 {
+        memory_scope: Some(scope),
+        category: None,
+        min_trust: None,
+        limit: Some(limit),
+        project_selector: None,
+    };
+    let page = match read {
+        NativeFactRead::Search => {
+            let search_request = FactStoreSearchRequestV1 {
+                query: request.query.clone(),
+                options,
+                after: None,
+            };
+            let query = memory_mapping::PreparedFactSearch::new(owner, &search_request)
+                .map_err(map_retained_error)?
+                .into_query();
+            memory.search_project_memory_facts(query, read_control).await
+        }
+        NativeFactRead::Probe => {
+            let query = memory_mapping::search_query(
+                owner,
+                ProjectMemoryFactSearchKindV1::Probe,
+                Some(request.query.clone()),
+                &options,
+                None,
+            )
+            .map_err(map_retained_error)?;
+            memory.probe_project_memory_facts(query, read_control).await
+        }
+        NativeFactRead::Related => {
+            let query = memory_mapping::search_query(
+                owner,
+                ProjectMemoryFactSearchKindV1::Related {
+                    entity: request.query.clone(),
+                },
+                None,
+                &options,
+                None,
+            )
+            .map_err(map_retained_error)?;
+            memory.related_project_memory_facts(query, read_control).await
+        }
+        NativeFactRead::Reason { entities } => {
+            let query = memory_mapping::search_query(
+                owner,
+                ProjectMemoryFactSearchKindV1::Reason {
+                    entities: entities.clone(),
+                },
+                None,
+                &options,
+                None,
+            )
+            .map_err(map_retained_error)?;
+            memory.reason_project_memory_facts(query, read_control).await
+        }
+    }
+    .map_err(|error| map_retained_error(memory_mapping::map_memory_error(error)))?;
+    memory_mapping::search_page(&page).map_err(map_retained_error)
+}
+
+fn native_fact_read_control(control: &OperationControl) -> FactReadControl {
+    let control = control.clone();
+    FactReadControl::new(Arc::new(move || control.snapshot().is_err()))
+}
+
+/// Maps one upstream `FactSearchHitV1` into a provider candidate. The hit is
+/// carried unchanged; the native score is `score_millionths` written as the
+/// exact decimal it denotes.
+fn fact_candidate(call: &ProviderCall, fact_hit: &NativeFactHit) -> Result<Value, NativeReadFailure> {
+    let hit = &fact_hit.hit;
+    let fact = &hit.fact;
+    let fact_id = fact.fact_id.as_str();
+    let record_ref = format!("record:{fact_id}");
+    let exact_scope_identity = match (&fact.owner, fact_hit.scope) {
+        (FactCommitOwnerV1::Project { project_id }, MemoryScopeV1::Project)
+            if project_id.as_str() == call.exact_scope.project_id =>
+        {
+            owner_scope_value(call, "project_facts", true)
+        }
+        (FactCommitOwnerV1::Profile, MemoryScopeV1::User) => {
+            owner_scope_value(call, "profile_facts", false)
+        }
+        _ => return Err(NativeReadFailure::RecallProjectionInvalid),
+    };
+    let upstream_hit =
+        serde_json::to_value(hit).map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
+    // Candidate identities are request-scoped; the fact identity is the
+    // stable reference that survives across requests.
+    let candidate_id = format!("{}:fact:{fact_id}", call.request_id);
+    let observed_at =
+        tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros(
+            fact.projected_as_of.0,
+        );
+    Ok(serde_json::json!({
+        "candidate_id": candidate_id,
+        "stable_memory_ref": fact_id,
+        "content": fact.content,
+        "content_ref": Value::Null,
+        "content_sha256": sha256_hex(fact.content.as_bytes()),
+        "native_score": {
+            "score_domain_id": FACT_SCORE_DOMAIN,
+            "score_domain_version": 1,
+            "raw_value": millionths_decimal(u64::from(hit.scores.score_millionths)),
+            "direction": "higher_is_better",
+            "declared_minimum": "0.000000",
+            "declared_maximum": "1.000000",
+            "calibration_state": "uncalibrated",
+            "semantics": "upstream fact search score_millionths",
+            "components": {
+                "score_millionths": hit.scores.score_millionths,
+                "fts_score_millionths": hit.scores.fts_score_millionths,
+                "jaccard_score_millionths": hit.scores.jaccard_score_millionths,
+                "holographic_score_millionths": hit.scores.holographic_score_millionths,
+                "trust_score_millionths": hit.scores.trust_score_millionths,
+            },
+        },
+        "confidence": Value::Null,
+        "exact_scope_identity": exact_scope_identity,
+        "validity": {
+            "observed_at": observed_at,
+            "valid_from": Value::Null,
+            "valid_until": Value::Null,
+            "superseded_at": Value::Null,
+            "superseded_by": Value::Null,
+            "revoked_at": Value::Null,
+            "source_revision": fact.last_event_id.as_str(),
+            "temporal_state": "current",
+        },
+        "provenance": {
+            "state": "available",
+            "origin_refs": [record_ref],
+            "observation_refs": [],
+            "source_refs": [record_ref],
+            "transform_chain": [],
+            "provider_trace_refs": [],
+            "redaction_reason": Value::Null,
+            "fact_search_hit": upstream_hit,
+        },
+        "explanation": {
+            "summary": hit.why.as_deref().unwrap_or("upstream canonical fact search hit"),
+            "matched_features": [],
+            "activation_trace_refs": [],
+            "limitations": [],
+        },
+        "source_refs": [record_ref],
+        "trace_refs": [],
+        "sensitivity": "unknown",
+        "memory_class": FACT_MEMORY_CLASS,
+        "warnings": [],
+        "extensions": [],
+    }))
+}
+
+/// Owner-scoped identity: facts are project-wide (or profile-wide), so the
+/// checkout, session, and resolved-scope fields are never attested.
+fn owner_scope_value(call: &ProviderCall, binding: &str, project: bool) -> Value {
+    let project_id = if project {
+        call.exact_scope.project_id.as_str()
+    } else {
+        ""
+    };
+    serde_json::json!({
+        "scope_binding": binding,
+        "profile_id": call.exact_scope.profile_id,
+        "project_id": project_id,
+        "repository_identity": "",
+        "worktree_identity": "",
+        "branch_identity": "",
+        "agent_session_id": "",
+        "resolved_scope_digest": "",
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Session lane
+// ---------------------------------------------------------------------------
+
+/// The default `tracedecay_message_search` query, shaped exactly as the
+/// upstream retained session port shapes it: one logical message per hit,
+/// current mode, every session in the authorized project root, no summaries,
+/// default diversity, the admitted application byte ceiling with a
+/// `bytes / 4` token budget, stored data allowed, and admitted execution
+/// limits for the requested page size.
+fn message_search_query(
+    query: &str,
+    cursor: Option<String>,
+    limit: usize,
+) -> Result<SessionTemporalQuery, NativeReadFailure> {
+    let semantic_filter = TemporalCandidateFilterV1 {
+        project_key: None,
+        parent_session_id: None,
+        source: None,
+        include_summaries: false,
+        session_scope: TemporalSessionScopeFilterV1::All,
+        message_type: TemporalMessageTypeFilterV1::All,
+        roles: Vec::new(),
+        start_time: None,
+        end_time: None,
+        git_branch: None,
+        git_worktree: None,
+        git_commit: None,
+        workflow_run: None,
+        workflow_agent: None,
+        goals: false,
+    };
+    let filter_digest = canonical_sha256(&(MESSAGE_SEARCH_FILTER_DOMAIN, &semantic_filter))
+        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+    let session_id = SessionId::new(MESSAGE_SEARCH_ROOT_SESSION_ID)
+        .map_err(|_| NativeReadFailure::ProviderUnavailable)?;
+    SessionTemporalQuery::new(
+        session_id,
+        None,
+        query,
+        cursor,
+        TemporalModeV1::Current,
+        RetrievalGrainV1::LogicalMessage,
+        limit,
+        DiversityLimits::default(),
+        ContextBudget {
+            max_bytes: APPLICATION_RETRIEVAL_MAX_BYTES,
+            max_tokens: APPLICATION_RETRIEVAL_MAX_BYTES / 4,
+            estimator_version: "words-v1".to_owned(),
+        },
+    )
+    .map(|query| {
+        query
+            .with_retrieval_scope(SessionRetrievalScope::AllSessionsInAuthorizedRoot)
+            .with_freshness_policy(SessionFreshnessPolicy::AllowStored)
+            .with_compatibility_filter_digest(filter_digest.as_str().to_owned())
+            .with_semantic_filter(semantic_filter)
+            .with_execution_limits(admitted_execution_limits(limit))
+    })
+    .map_err(|_| NativeReadFailure::RecallInvalidRequest)
+}
+
+/// Reads session history through the upstream message-search kernel and maps
+/// its page verbatim. Reads never refresh or ingest.
+async fn recall_session_history(
     session_retrieval: &NativeSessionRetrievalMountV1,
     call: &ProviderCall,
     request: &NativeRecallRequestV1,
 ) -> NativeRecallOutcome {
-    if let Err(failure) = control_failure(&call.control) {
-        return NativeRecallOutcome::Failed(failure);
-    }
-    if !matches!(
-        request.objective.as_str(),
-        "search" | "probe" | "related" | "reason"
-    ) {
-        return NativeRecallOutcome::Failed(NativeReadFailure::RecallUnsupported);
-    }
-    let history_grant = match request
-        .history_grant
-        .as_ref()
-        .map(super::provider_history::history_grant_from_json)
-        .transpose()
+    control_failure(&call.control)?;
+    let scope = session_retrieval.host_scope();
+    if session_retrieval.host_profile_id().as_str() != call.exact_scope.profile_id
+        || scope.project_id.as_str() != call.exact_scope.project_id
     {
-        Ok(grant) => grant,
-        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
-    };
-    let retrieval_scope = match native_recall_retrieval_scope(
-        session_retrieval,
-        &call.exact_scope,
-        history_grant.is_some(),
-    ) {
-        Ok(scope) => scope,
-        Err(failure) => return NativeRecallOutcome::Failed(failure),
-    };
-
-    let (temporal_mode, native_temporal, evaluation_time_micros) =
-        match native_session_temporal(&request.temporal_query) {
-            Ok(value) => value,
-            Err(failure) => return NativeRecallOutcome::Failed(failure),
-        };
-    let limit = match usize::try_from(request.budgets.maximum_candidates.min(32)) {
-        Ok(limit) if limit > 0 => limit,
-        _ => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
-    };
-    let context_bytes = request.budgets.maximum_total_content_bytes;
-    let authority_binding_digest = match native_recall_authority_binding_digest(call) {
-        Ok(digest) => digest,
-        Err(failure) => return NativeRecallOutcome::Failed(failure),
-    };
-    let session_id = match SessionId::new(format!("native-recall.{authority_binding_digest}")) {
-        Ok(session_id) => session_id,
-        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
-    };
-    let query = match SessionTemporalQuery::new(
-        session_id,
-        None,
-        request.query.clone(),
-        request.temporal_query.cursor.clone(),
-        temporal_mode,
-        RetrievalGrainV1::Occurrence,
-        limit,
-        DiversityLimits::default(),
-        ContextBudget {
-            max_bytes: context_bytes,
-            max_tokens: context_bytes,
-            estimator_version: "words-v1".to_owned(),
-        },
-    ) {
-        Ok(query) => query
-            .with_retrieval_scope(retrieval_scope)
-            .with_execution_limits(
-                tracedecay_session_runtime::session_retrieval::admitted_execution_limits(limit),
-            ),
-        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
-    };
-    let options =
-        match native_session_recall_options(request, evaluation_time_micros, native_temporal) {
-            Ok(options) => options,
-            Err(failure) => return NativeRecallOutcome::Failed(failure),
-        };
-
-    let scope = match native_recall_scope_for_mount(session_retrieval, &call.exact_scope) {
-        Ok(scope) => scope,
-        Err(failure) => return NativeRecallOutcome::Failed(failure),
-    };
-    let cancellation = match CancellationSignal::active(format!(
-        "native-session-recall.{}",
-        sha256_hex(call.request_id.as_bytes())
-    )) {
-        Ok(signal) => signal,
-        Err(_) => return NativeRecallOutcome::Failed(NativeReadFailure::RecallInvalidRequest),
-    };
-    let context = match native_recall_context(call, &scope, &cancellation) {
-        Ok(context) => context,
-        Err(failure) => return NativeRecallOutcome::Failed(failure),
-    };
-    let _cancellation_bridge = NativeCancellationBridge::start(&call.control, &cancellation);
-    let batch = match retrieve_native_session_recall_with_cancellation(
-        session_retrieval,
-        &context,
-        &cancellation,
-        query,
-        &options,
-    )
-    .await
-    {
-        Ok(batch) => batch,
-        Err(error) => return NativeRecallOutcome::Failed(map_session_recall_error(error)),
-    };
-    if let Err(failure) = control_failure(&call.control) {
-        return NativeRecallOutcome::Failed(failure);
-    }
-    match build_native_session_recall_reply(call, request, &batch, history_grant.as_ref()) {
-        Ok(reply) => NativeRecallOutcome::Reply(reply),
-        Err(failure) => NativeRecallOutcome::Failed(failure),
-    }
-}
-
-fn native_recall_retrieval_scope(
-    session_retrieval: &NativeSessionRetrievalMountV1,
-    exact_scope: &OwnedExactScope,
-    history_authorized: bool,
-) -> Result<SessionRetrievalScope, NativeReadFailure> {
-    if history_authorized {
-        return Ok(SessionRetrievalScope::AllSessionsInAuthorizedRoot);
-    }
-    if session_retrieval.host_profile_id().is_some() {
-        return match session_retrieval.canonical_session_id(&exact_scope.agent_session_id) {
-            Ok(Some(session_id)) => Ok(SessionRetrievalScope::Session(session_id)),
-            Ok(None) => Err(NativeReadFailure::RecallNotAuthorized),
-            Err(_) => Err(NativeReadFailure::ProviderUnavailable),
-        };
-    }
-    // Direct test-only construction has no mounted project/session authority.
-    // Preserve its existing retrieval behavior; the unbound proxy still
-    // answers with service-not-configured.
-    Ok(SessionRetrievalScope::AllSessionsInAuthorizedRoot)
-}
-
-fn native_session_temporal(
-    temporal: &NativeRecallTemporalQueryV1,
-) -> Result<(TemporalModeV1, NativeSessionRecallTemporal, i64), NativeReadFailure> {
-    let evaluation_time_micros = parse_rfc3339_micros(&temporal.evaluation_time)
-        .ok_or(NativeReadFailure::RecallInvalidRequest)?;
-    match temporal.mode.as_str() {
-        "current" => Ok((
-            TemporalModeV1::Current,
-            NativeSessionRecallTemporal::Current,
-            evaluation_time_micros,
-        )),
-        "as_of" => {
-            let cutoff_micros = temporal
-                .as_of
-                .as_str()
-                .and_then(parse_rfc3339_micros)
-                .ok_or(NativeReadFailure::RecallInvalidRequest)?;
-            Ok((
-                TemporalModeV1::AsOf {
-                    cutoff: UtcMicros(cutoff_micros),
-                },
-                NativeSessionRecallTemporal::AsOf { cutoff_micros },
-                evaluation_time_micros,
-            ))
-        }
-        "interval" | "history" => Err(NativeReadFailure::RecallUnsupported),
-        _ => Err(NativeReadFailure::RecallInvalidRequest),
-    }
-}
-
-fn native_session_recall_options(
-    request: &NativeRecallRequestV1,
-    evaluation_time_micros: i64,
-    temporal: NativeSessionRecallTemporal,
-) -> Result<NativeSessionRecallOptions, NativeReadFailure> {
-    let unknown_validity_policy = match request.temporal_query.unknown_validity_policy.as_str() {
-        "exclude" => tracedecay_contracts::memory::CognitiveRecallUnknownValidityPolicy::Exclude,
-        "degrade" => tracedecay_contracts::memory::CognitiveRecallUnknownValidityPolicy::Degrade,
-        "allow_with_warning" => {
-            tracedecay_contracts::memory::CognitiveRecallUnknownValidityPolicy::AllowWithWarning
-        }
-        _ => return Err(NativeReadFailure::RecallInvalidRequest),
-    };
-    let maximum_candidates = usize::try_from(request.budgets.maximum_candidates.min(32))
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    let maximum_candidate_content_bytes =
-        usize::try_from(request.budgets.maximum_candidate_content_bytes)
-            .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    let maximum_total_content_bytes = usize::try_from(request.budgets.maximum_total_content_bytes)
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    Ok(NativeSessionRecallOptions {
-        temporal,
-        evaluation_time_micros: Some(evaluation_time_micros),
-        include_superseded: request.temporal_query.include_superseded,
-        include_revoked: request.temporal_query.include_revoked,
-        unknown_validity_policy,
-        exclusions: tracedecay_contracts::memory::CognitiveRecallExclusions {
-            stable_memory_refs: request.exclusions.stable_memory_refs.clone(),
-            candidate_ids: request.exclusions.candidate_ids.clone(),
-            source_refs: request.exclusions.source_refs.clone(),
-            trace_refs: request.exclusions.trace_refs.clone(),
-            observation_ids: request.exclusions.observation_ids.clone(),
-            content_sha256: request.exclusions.content_sha256.clone(),
-        },
-        limits: NativeSessionRecallLimits {
-            maximum_candidates,
-            maximum_candidate_content_bytes,
-            maximum_total_content_bytes,
-            maximum_work_units: 100_000,
-        },
-    })
-}
-
-fn native_recall_scope_for_mount(
-    session_retrieval: &NativeSessionRetrievalMountV1,
-    exact_scope: &OwnedExactScope,
-) -> Result<tracedecay_contracts::ResolvedScope, NativeReadFailure> {
-    exact_scope
-        .validate()
-        .map_err(|_| NativeReadFailure::RecallScopeMismatch)?;
-    if let (Some(profile_id), Some(scope)) = (
-        session_retrieval.host_profile_id(),
-        session_retrieval.host_scope(),
-    ) {
-        // Session storage is partitioned by checkout identity. A branch label
-        // and its resolved digest describe the generation that was observed,
-        // but they move when HEAD changes or a host is restarted on the same
-        // worktree. Keep the request's complete exact scope for provider
-        // admission while using the canonical checkout identity for the
-        // mounted session authority.
-        if profile_id.as_str() != exact_scope.profile_id
-            || scope.project_id.as_str() != exact_scope.project_id
-            || scope.repository_id.as_str() != exact_scope.repository_identity
-            || scope.worktree_id.as_str() != exact_scope.worktree_identity
-        {
-            return Err(NativeReadFailure::RecallScopeMismatch);
-        }
-        return Ok(scope.clone());
-    }
-
-    let project_id = ProjectId::new(exact_scope.project_id.clone())
-        .map_err(|_| NativeReadFailure::RecallScopeMismatch)?;
-    let repository_id = RepositoryId::new(exact_scope.repository_identity.clone())
-        .map_err(|_| NativeReadFailure::RecallScopeMismatch)?;
-    let worktree_id = WorktreeId::new(exact_scope.worktree_identity.clone())
-        .map_err(|_| NativeReadFailure::RecallScopeMismatch)?;
-    let reference = RefId::new(exact_scope.branch_identity.clone())
-        .map_err(|_| NativeReadFailure::RecallScopeMismatch)?;
-    let scope = tracedecay_contracts::ResolvedScope::new(
-        project_id,
-        repository_id,
-        worktree_id,
-        Some(reference),
-    )
-    .map_err(|_| NativeReadFailure::RecallScopeMismatch)?;
-    if scope.scope_digest.as_str() != exact_scope.resolved_scope_digest {
         return Err(NativeReadFailure::RecallScopeMismatch);
     }
-    Ok(scope)
+    let limit = usize::try_from(
+        request
+            .budgets
+            .maximum_candidates
+            .clamp(1, MESSAGE_SEARCH_MAX_LIMIT),
+    )
+    .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+    let query = message_search_query(&request.query, request.temporal_query.cursor.clone(), limit)?;
+    let cancellation = CancellationSignal::active(format!(
+        "native-session-recall.{}",
+        sha256_hex(call.request_id.as_bytes())
+    ))
+    .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+    let context = native_recall_context(call, scope, &cancellation)?;
+    let _cancellation_bridge = NativeCancellationBridge::start(&call.control, &cancellation);
+    let outcome = session_retrieval
+        .retrieve_admitted_with_cancellation(&context, &cancellation, query)
+        .await;
+    control_failure(&call.control)?;
+    session_history_reply(call, request, outcome)
+}
+
+/// Maps one kernel outcome verbatim. Page order, scores, anchors, freshness,
+/// omissions, and the cursor are the kernel's own; nothing is re-sorted,
+/// rescaled, filtered, or clipped here.
+fn session_history_reply(
+    call: &ProviderCall,
+    request: &NativeRecallRequestV1,
+    outcome: SessionRetrievalServiceOutcome,
+) -> NativeRecallOutcome {
+    let (state, results, temporal, freshness, omitted) = match outcome {
+        SessionRetrievalServiceOutcome::Complete { page, freshness } => {
+            let SessionRetrievalPageView { results, temporal } = page;
+            ("complete", results, Some(temporal), Some(freshness), 0)
+        }
+        SessionRetrievalServiceOutcome::CompleteZero {
+            temporal,
+            freshness,
+        } => (
+            "complete_zero",
+            Vec::new(),
+            Some(temporal),
+            Some(freshness),
+            0,
+        ),
+        SessionRetrievalServiceOutcome::Stale {
+            temporal,
+            freshness,
+        } => ("stale", Vec::new(), Some(temporal), Some(freshness), 0),
+        SessionRetrievalServiceOutcome::Partial {
+            page,
+            freshness,
+            omitted,
+        } => {
+            let SessionRetrievalPageView { results, temporal } = page;
+            ("partial", results, Some(temporal), Some(freshness), omitted)
+        }
+        SessionRetrievalServiceOutcome::Redacted => ("redacted", Vec::new(), None, None, 0),
+        SessionRetrievalServiceOutcome::Deleted => ("deleted", Vec::new(), None, None, 0),
+        SessionRetrievalServiceOutcome::WrongScope | SessionRetrievalServiceOutcome::Denied => {
+            return Err(NativeReadFailure::RecallNotAuthorized);
+        }
+        SessionRetrievalServiceOutcome::ResetRequired { .. } => {
+            return Err(NativeReadFailure::RecallResetRequired);
+        }
+        SessionRetrievalServiceOutcome::Locked
+        | SessionRetrievalServiceOutcome::Unavailable(_) => {
+            return Err(NativeReadFailure::ProviderUnavailable);
+        }
+        SessionRetrievalServiceOutcome::CursorStale => {
+            return Err(NativeReadFailure::RecallCursorStale);
+        }
+        SessionRetrievalServiceOutcome::CursorManifestLimitExceeded { .. }
+        | SessionRetrievalServiceOutcome::BudgetExhausted { .. } => {
+            return Err(NativeReadFailure::RecallCapacityExceeded);
+        }
+        SessionRetrievalServiceOutcome::TimedOut => {
+            return Err(NativeReadFailure::DeadlineExceeded);
+        }
+        SessionRetrievalServiceOutcome::Cancelled => return Err(NativeReadFailure::Cancelled),
+    };
+    let candidates = results
+        .iter()
+        .map(|result| session_message_candidate(call, result))
+        .collect::<Result<Vec<_>, _>>()?;
+    let partial = matches!(state, "partial" | "stale");
+    let next_cursor = temporal.as_ref().and_then(|temporal| temporal.cursor.clone());
+    let coverage_state = if partial {
+        "partial"
+    } else if candidates.is_empty() {
+        "zero_results"
+    } else {
+        "complete"
+    };
+    let reasons = if partial {
+        vec![format!("session_projection_{state}")]
+    } else {
+        Vec::new()
+    };
+    let freshness = freshness.map(freshness_value);
+    let session_temporal = temporal.as_ref().map(session_temporal_value);
+    let coverage = serde_json::json!({
+        "state": coverage_state,
+        "searched_scope_digest": call.exact_scope.exact_scope_sha256(),
+        "searched_temporal_digest": recall_temporal_digest(&request.temporal_query),
+        "scanned_items": candidates.len(),
+        "matched_items": candidates.len(),
+        "returned_items": candidates.len(),
+        "excluded_items": 0,
+        "truncated_items": omitted,
+        "next_cursor": next_cursor,
+        "reasons": reasons,
+        "message_search_outcome": state,
+        "freshness": freshness,
+        "session_temporal": session_temporal,
+    });
+    let ordering = serde_json::json!({
+        "provider_order": "upstream_message_search_page_order",
+        "score_domain_id": SESSION_SCORE_DOMAIN,
+        "direction": "higher_is_better",
+        "tie_breaker": "upstream_message_search_page_order",
+    });
+    let terminal_code = if partial {
+        TerminalCode::Partial
+    } else if candidates.is_empty() {
+        TerminalCode::SuccessZeroResults
+    } else {
+        TerminalCode::Success
+    };
+    recall_reply(call, request, candidates, coverage, ordering, terminal_code)
+}
+
+fn freshness_value(freshness: SessionDataFreshness) -> Value {
+    match freshness {
+        SessionDataFreshness::Fresh => serde_json::json!({"state": "fresh"}),
+        SessionDataFreshness::Stored { generation_lag } => {
+            serde_json::json!({"state": "stored", "generation_lag": generation_lag})
+        }
+        SessionDataFreshness::Partial { generation_lag } => {
+            serde_json::json!({"state": "partial", "generation_lag": generation_lag})
+        }
+    }
+}
+
+fn session_temporal_value(temporal: &SessionTemporalMetadataView) -> Value {
+    serde_json::to_value(temporal).unwrap_or(Value::Null)
+}
+
+/// Maps one upstream message-search hit. The kernel score is its normalized
+/// micro-score divided by one million, so writing it with six decimals is
+/// the exact value, not a rescaling.
+fn session_message_candidate(
+    call: &ProviderCall,
+    result: &SessionMessageSearchResult,
+) -> Result<Value, NativeReadFailure> {
+    if !result.score.is_finite() || result.score < 0.0 {
+        return Err(NativeReadFailure::RecallProjectionInvalid);
+    }
+    // The kernel publishes `normalized_score_micros / 1_000_000`, so this
+    // recovers the exact integer it ranked with.
+    let score_micros = (result.score * 1_000_000.0).round() as u64;
+    let message = &result.message;
+    let identity = sha256_hex(
+        serde_json::to_vec(&(
+            "tracedecay.native.session-message.v1",
+            &message.provider,
+            &message.session_id,
+            &message.message_id,
+        ))
+        .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?
+        .as_slice(),
+    );
+    let stable_memory_ref = format!("session-message:{identity}");
+    let candidate_id = format!("{}:{stable_memory_ref}", call.request_id);
+    let session_ref = u64::try_from(message.ordinal)
+        .ok()
+        .map(|ordinal| format!("session:{}#{ordinal}-{ordinal}", message.session_id));
+    let observed_at = message
+        .timestamp
+        .and_then(tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros);
+    let upstream_hit =
+        serde_json::to_value(result).map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
+    let session_refs = session_ref.into_iter().collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "candidate_id": candidate_id,
+        "stable_memory_ref": stable_memory_ref,
+        "content": message.text,
+        "content_ref": Value::Null,
+        "content_sha256": sha256_hex(message.text.as_bytes()),
+        "native_score": {
+            "score_domain_id": SESSION_SCORE_DOMAIN,
+            "score_domain_version": 1,
+            "raw_value": millionths_decimal(score_micros),
+            "direction": "higher_is_better",
+            "declared_minimum": "0.000000",
+            "declared_maximum": "1.000000",
+            "calibration_state": "uncalibrated",
+            "semantics": "upstream message search normalized relevance score",
+            "components": {
+                "normalized_score_micros": score_micros,
+            },
+        },
+        "confidence": Value::Null,
+        "exact_scope_identity": owner_scope_value(call, "project_facts", true),
+        "validity": {
+            "observed_at": observed_at,
+            "valid_from": Value::Null,
+            "valid_until": Value::Null,
+            "superseded_at": Value::Null,
+            "superseded_by": Value::Null,
+            "revoked_at": Value::Null,
+            "source_revision": Value::Null,
+            "temporal_state": "current",
+        },
+        "provenance": {
+            "state": "available",
+            "origin_refs": session_refs,
+            "observation_refs": [],
+            "source_refs": session_refs,
+            "transform_chain": [],
+            "provider_trace_refs": [],
+            "redaction_reason": Value::Null,
+            "message_search_hit": upstream_hit,
+        },
+        "explanation": {
+            "summary": "upstream message search hit",
+            "matched_features": [],
+            "activation_trace_refs": [],
+            "limitations": [],
+        },
+        "source_refs": session_refs,
+        "trace_refs": [],
+        "sensitivity": "unknown",
+        "memory_class": SESSION_MESSAGE_MEMORY_CLASS,
+        "warnings": [],
+        "extensions": [],
+    }))
 }
 
 fn native_recall_context(
@@ -1906,10 +1973,10 @@ fn native_recall_context(
         .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
     let use_case = tracedecay_tool_catalog::UseCaseId::new("memory.session-recall.v1")
         .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    let authority_binding_digest = native_recall_authority_binding_digest(call)?;
     let grant_digest = canonical_sha256(&(
-        "tracedecay.native.session-recall-grant.v2",
-        authority_binding_digest,
+        "tracedecay.native.session-recall-grant.v3",
+        call.exact_scope.exact_scope_sha256(),
+        call.request_id.as_str(),
     ))
     .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
     let grant = CapabilityGrantSnapshot::new(
@@ -1921,8 +1988,8 @@ fn native_recall_context(
         observed_at,
         expires_at,
         scope.clone(),
-        std::collections::BTreeSet::from([capability]),
-        std::collections::BTreeSet::from([use_case]),
+        BTreeSet::from([capability]),
+        BTreeSet::from([use_case]),
         DisclosureClass::Sensitive,
     )
     .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
@@ -1939,36 +2006,7 @@ fn native_recall_context(
     .map_err(|_| NativeReadFailure::RecallInvalidRequest)
 }
 
-/// Returns the stable binding for one canonical Native recall authority.
-///
-/// Provider request identities, deadlines, cancellation markers, and opaque
-/// cursors describe one dispatch attempt. They must not change the underlying
-/// session retrieval authority: a caller can present a valid continuation in
-/// a fresh request. The remaining canonical request bytes stay in the digest,
-/// including the exact scope, policy, exclusions, budgets, and host history
-/// grant, so a cursor cannot be replayed for a different source set.
-fn native_recall_authority_binding_digest(
-    call: &ProviderCall,
-) -> Result<String, NativeReadFailure> {
-    let mut request: Value = serde_json::from_slice(&call.payload.bytes)
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    let object = request
-        .as_object_mut()
-        .ok_or(NativeReadFailure::RecallInvalidRequest)?;
-    object.remove("request_identity");
-    object.remove("deadline");
-    object.remove("cancellation");
-    if let Some(temporal) = object
-        .get_mut("temporal_query")
-        .and_then(Value::as_object_mut)
-    {
-        temporal.insert("cursor".to_owned(), Value::Null);
-    }
-    let bytes = tracedecay_memory_hygiene::canonical_payload_bytes(&request)
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    Ok(sha256_hex(&bytes))
-}
-
+/// Forwards the provider call's cancellation token to the kernel's signal.
 struct NativeCancellationBridge {
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -1998,236 +2036,45 @@ impl Drop for NativeCancellationBridge {
     }
 }
 
-fn map_session_recall_error(
-    error: super::native_session_recall::NativeSessionRecallAdapterError,
-) -> NativeReadFailure {
-    use super::native_session_recall::NativeSessionRecallAdapterError;
-    match error {
-        NativeSessionRecallAdapterError::Unsupported(_) => NativeReadFailure::RecallUnsupported,
-        NativeSessionRecallAdapterError::InvalidLimits(_)
-        | NativeSessionRecallAdapterError::InvalidPage(_) => {
-            NativeReadFailure::RecallProjectionInvalid
-        }
-        NativeSessionRecallAdapterError::Unavailable(unavailable) => match unavailable {
-            NativeSessionRecallUnavailable::Cancelled => NativeReadFailure::Cancelled,
-            NativeSessionRecallUnavailable::TimedOut => NativeReadFailure::DeadlineExceeded,
-            NativeSessionRecallUnavailable::WrongScope => NativeReadFailure::RecallScopeMismatch,
-            NativeSessionRecallUnavailable::Denied => NativeReadFailure::RecallNotAuthorized,
-            NativeSessionRecallUnavailable::BudgetExhausted => {
-                NativeReadFailure::RecallBudgetExhausted
-            }
-            NativeSessionRecallUnavailable::Locked
-            | NativeSessionRecallUnavailable::Redacted
-            | NativeSessionRecallUnavailable::Deleted => NativeReadFailure::RecallNotAuthorized,
-            NativeSessionRecallUnavailable::ResetRequired(_) => {
-                NativeReadFailure::RecallResetRequired
-            }
-            NativeSessionRecallUnavailable::CursorStale => NativeReadFailure::RecallCursorStale,
-            NativeSessionRecallUnavailable::CursorManifestLimitExceeded => {
-                NativeReadFailure::RecallBudgetExhausted
-            }
-            NativeSessionRecallUnavailable::Retrieval(_) => NativeReadFailure::ProviderUnavailable,
-        },
-    }
-}
+// ---------------------------------------------------------------------------
+// Shared envelope
+// ---------------------------------------------------------------------------
 
-fn build_native_session_recall_reply(
+fn recall_reply(
     call: &ProviderCall,
     request: &NativeRecallRequestV1,
-    batch: &NativeSessionRecallBatch,
-    history_grant: Option<&tracedecay_memory_provider_registry::HistoryGrant>,
-) -> Result<ProviderReply, NativeReadFailure> {
-    // The application service's ordering includes internal anchors used by
-    // its SQL plan. Native's public contract names only score then candidate
-    // id, so establish that order again at the provider boundary.
-    let mut ordered_candidates = batch.candidates.clone();
-    ordered_candidates.sort_by(|left, right| {
-        right
-            .score_millionths
-            .cmp(&left.score_millionths)
-            .then_with(|| left.candidate_id.cmp(&right.candidate_id))
-    });
-    let mut candidates = Vec::with_capacity(ordered_candidates.len());
-    let matched_items = batch.admitted_items;
-    let mut excluded_items = batch.excluded_items;
-    let mut truncated_items = match batch.status {
-        NativeSessionRecallBatchStatus::Partial { omitted } => omitted,
-        NativeSessionRecallBatchStatus::Complete => 0,
-        NativeSessionRecallBatchStatus::Stale => 1,
-    };
-    let mut reasons = Vec::new();
-    if matches!(batch.status, NativeSessionRecallBatchStatus::Partial { .. }) {
-        reasons.push("session_projection_partial".to_owned());
-    }
-    if matches!(batch.status, NativeSessionRecallBatchStatus::Stale) {
-        reasons.push("session_projection_stale".to_owned());
-    }
-    if batch.degraded {
-        reasons.push("session_validity_degraded".to_owned());
-    }
-    if let Some(cursor) = batch.temporal.cursor.as_deref() {
-        validate_recall_text(cursor, 8_192)
-            .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-    }
-    if let Some(cursor) = batch.temporal.cursor.as_deref()
-        && !matches!(batch.status, NativeSessionRecallBatchStatus::Stale)
-    {
-        if request.temporal_query.cursor.as_deref() == Some(cursor) {
-            return Err(NativeReadFailure::RecallProjectionInvalid);
-        }
-        truncated_items = truncated_items.saturating_add(1);
-        reasons.push("continuation_available".to_owned());
-    }
-    let maximum_candidates = request.budgets.maximum_candidates.min(32);
-    let maximum_total_content_bytes = request.budgets.maximum_total_content_bytes;
-    let mut total_content_bytes = 0_u64;
-    let mut warning_count = 0_u64;
-    for candidate in &ordered_candidates {
-        if u64::try_from(candidates.len()).unwrap_or(u64::MAX) >= maximum_candidates {
-            excluded_items = excluded_items.saturating_add(1);
-            truncated_items = truncated_items.saturating_add(1);
-            if !reasons.iter().any(|reason| reason == "candidate_budget") {
-                reasons.push("candidate_budget".to_owned());
-            }
-            continue;
-        }
-        let original_source = match history_grant {
-            Some(grant) => match native_history_source_attribution(candidate, grant, request)? {
-                Some(source) => Some(source),
-                None => {
-                    excluded_items = excluded_items.saturating_add(1);
-                    truncated_items = truncated_items.saturating_add(1);
-                    if !reasons
-                        .iter()
-                        .any(|reason| reason == "source_history_not_granted")
-                    {
-                        reasons.push("source_history_not_granted".to_owned());
-                    }
-                    continue;
-                }
-            },
-            None => None,
-        };
-        if original_source
-            .as_ref()
-            .is_some_and(|source| native_history_source_excluded(candidate, source, request))
-        {
-            excluded_items = excluded_items.saturating_add(1);
-            continue;
-        }
-        if let Some(reason) = native_session_candidate_budget_reason(candidate, &request.budgets) {
-            excluded_items = excluded_items.saturating_add(1);
-            truncated_items = truncated_items.saturating_add(1);
-            if !reasons.iter().any(|existing| existing == reason) {
-                reasons.push(reason.to_owned());
-            }
-            continue;
-        }
-        let candidate_warning_count = u64::try_from(candidate.warnings.len()).unwrap_or(u64::MAX);
-        let Some(next_warning_count) = warning_count.checked_add(candidate_warning_count) else {
-            excluded_items = excluded_items.saturating_add(1);
-            truncated_items = truncated_items.saturating_add(1);
-            if !reasons.iter().any(|reason| reason == "warning_budget") {
-                reasons.push("warning_budget".to_owned());
-            }
-            continue;
-        };
-        if next_warning_count > request.budgets.maximum_warnings {
-            excluded_items = excluded_items.saturating_add(1);
-            truncated_items = truncated_items.saturating_add(1);
-            if !reasons.iter().any(|reason| reason == "warning_budget") {
-                reasons.push("warning_budget".to_owned());
-            }
-            continue;
-        }
-        let content_bytes = u64::try_from(candidate.content.len()).unwrap_or(u64::MAX);
-        let Some(next_total_content_bytes) = total_content_bytes.checked_add(content_bytes) else {
-            excluded_items = excluded_items.saturating_add(1);
-            truncated_items = truncated_items.saturating_add(1);
-            if !reasons
-                .iter()
-                .any(|reason| reason == "total_content_budget")
-            {
-                reasons.push("total_content_budget".to_owned());
-            }
-            continue;
-        };
-        if next_total_content_bytes > maximum_total_content_bytes {
-            excluded_items = excluded_items.saturating_add(1);
-            truncated_items = truncated_items.saturating_add(1);
-            if !reasons
-                .iter()
-                .any(|reason| reason == "total_content_budget")
-            {
-                reasons.push("total_content_budget".to_owned());
-            }
-            continue;
-        }
-        candidates.push(native_session_recall_candidate(
-            call,
-            candidate,
-            original_source.as_ref(),
-        )?);
-        total_content_bytes = next_total_content_bytes;
-        warning_count = next_warning_count;
-    }
-    let mut response = native_session_recall_response_value(
-        call,
-        request,
-        batch,
-        &candidates,
-        matched_items,
-        excluded_items,
-        truncated_items,
-        &reasons,
-    );
-    let (terminal_code, response_bytes) = loop {
-        let terminal_code = recall_terminal_code(
-            matched_items,
-            candidates.len(),
-            excluded_items,
-            truncated_items,
-            &reasons,
-        );
-        response["terminal"] = serde_json::json!({
+    candidates: Vec<Value>,
+    coverage: Value,
+    ordering: Value,
+    terminal_code: TerminalCode,
+) -> NativeRecallOutcome {
+    let response = serde_json::json!({
+        "provider_id": NATIVE_PROVIDER_ID,
+        "provider_instance_id": PROVIDER_INSTANCE_ID,
+        "registration_revision": request.registration_revision,
+        "ready_receipt_digest": request.ready_receipt_digest,
+        "request_identity": request.request_identity,
+        "exact_scope_identity": exact_scope_value(call),
+        "provider_state_generation": call.expected_state_generation,
+        "candidates": candidates,
+        "coverage": coverage,
+        "ordering": ordering,
+        "terminal": {
             "terminal_code": terminal_code.as_wire(),
             "diagnostic_id": Value::Null,
-        });
-        let response_bytes = serde_json::to_vec(&response)
-            .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
-        if u64::try_from(response_bytes.len()).unwrap_or(u64::MAX) <= NATIVE_RESPONSE_BYTES {
-            break (terminal_code, response_bytes);
-        }
-        if candidates.pop().is_none() {
-            return Err(NativeReadFailure::RecallBudgetExhausted);
-        }
-        excluded_items = excluded_items.saturating_add(1);
-        truncated_items = truncated_items.saturating_add(1);
-        if !reasons
-            .iter()
-            .any(|reason| reason == "response_byte_budget")
-        {
-            reasons.push("response_byte_budget".to_owned());
-        }
-        response = native_session_recall_response_value(
-            call,
-            request,
-            batch,
-            &candidates,
-            matched_items,
-            excluded_items,
-            truncated_items,
-            &reasons,
-        );
-    };
-    if u64::try_from(response_bytes.len()).unwrap_or(u64::MAX) > NATIVE_RESPONSE_BYTES {
-        return Err(NativeReadFailure::RecallBudgetExhausted);
+        },
+        "warnings": [],
+    });
+    let bytes =
+        serde_json::to_vec(&response).map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > native_provider_limits().response_bytes {
+        return Err(NativeReadFailure::RecallCapacityExceeded);
     }
     let payload = CanonicalPayload::new(
         OwnedVersionedId::new(RECALL_RESULT_CONTRACT_ID)
             .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?,
-        response_bytes.clone(),
-        sha256_hex(&response_bytes),
+        bytes.clone(),
+        sha256_hex(&bytes),
     )
     .map_err(|_| NativeReadFailure::RecallProjectionInvalid)?;
     Ok(ProviderReply {
@@ -2236,315 +2083,6 @@ fn build_native_session_recall_reply(
         warnings: Vec::new(),
         extensions: call.extensions.clone(),
         state_generation: call.expected_state_generation,
-    })
-}
-
-fn native_history_source_attribution(
-    candidate: &super::native_session_recall::NativeSessionRecallCandidate,
-    grant: &tracedecay_memory_provider_registry::HistoryGrant,
-    request: &NativeRecallRequestV1,
-) -> Result<Option<Value>, NativeReadFailure> {
-    // The hydrated SessionMessageRecord intentionally does not repeat the
-    // durable observation id. Its ranked occurrence anchor is nevertheless
-    // derived from that canonical id and owner by the session projection.
-    // Resolve that anchor against each host-granted source instead of trusting
-    // optional free-form metadata on the hydrated row.
-    for source in &grant.sources {
-        let source_identity = &source.attribution.source;
-        if candidate.provenance.provider != source_identity.canonical_provider_id.as_str()
-            || candidate.provenance.session_id != source_identity.canonical_session_id
-        {
-            continue;
-        }
-        if candidate
-            .provenance
-            .source_observation_id
-            .as_deref()
-            .is_some_and(|observation_id| observation_id != source_identity.observation_id)
-        {
-            continue;
-        }
-        // Source revisions are carried by the canonical envelope. Older
-        // hydrated projections may omit that nested field, but an explicit
-        // revision must still agree with the host grant.
-        if candidate
-            .validity
-            .source_revision
-            .as_deref()
-            .is_some_and(|revision| Some(revision) != source_identity.source_revision.as_deref())
-        {
-            continue;
-        }
-        let Ok(origin) = source.attribution.origin_scope.recorded_scope() else {
-            continue;
-        };
-        // A source observation is project scoped, but its recorded origin is
-        // still bound to the checkout that admitted that source session. A
-        // project-only comparison would let a fabricated grant from another
-        // repository/worktree reuse the same project observation anchor.
-        if origin.profile_id.as_str() != request.exact_scope_identity.profile_id
-            || origin.project_id.as_str() != request.exact_scope_identity.project_id
-            || origin.repository_identity != request.exact_scope_identity.repository_identity
-            || origin.worktree_identity != request.exact_scope_identity.worktree_identity
-            || origin.branch_identity != request.exact_scope_identity.branch_identity
-            || origin.resolved_scope_digest != request.exact_scope_identity.resolved_scope_digest
-        {
-            continue;
-        }
-        let Ok(project_id) = ProjectId::new(origin.project_id.clone()) else {
-            continue;
-        };
-        let owner = ObservationScopeV1::Project { project_id };
-        let Ok(observation_id) =
-            CanonicalObservationIdV1::new(source_identity.observation_id.clone())
-        else {
-            continue;
-        };
-        let Ok(expected_anchor) = derive_exact_observation_anchor_id(&owner, &observation_id)
-        else {
-            continue;
-        };
-        if candidate.observation_anchor != expected_anchor
-            || candidate.provenance.observation_anchor != candidate.observation_anchor
-            || candidate.provenance.source_anchor != candidate.source_anchor
-            || candidate.provenance.provider != candidate.provider
-            || candidate.provenance.session_id != candidate.session_id
-            || candidate.provenance.message_id != candidate.message_id
-        {
-            continue;
-        }
-        let admitted = match source.current_disposition.state {
-            tracedecay_memory_provider_registry::SourceDisposition::Available => true,
-            tracedecay_memory_provider_registry::SourceDisposition::Superseded => {
-                request.temporal_query.include_superseded
-            }
-            tracedecay_memory_provider_registry::SourceDisposition::Revoked => {
-                request.temporal_query.include_revoked
-            }
-            tracedecay_memory_provider_registry::SourceDisposition::Deleted
-            | tracedecay_memory_provider_registry::SourceDisposition::Redacted
-            | tracedecay_memory_provider_registry::SourceDisposition::Expired
-            | tracedecay_memory_provider_registry::SourceDisposition::Unknown => false,
-        };
-        if !admitted {
-            return Ok(None);
-        }
-        return super::provider_history::source_attribution_json(&source.attribution)
-            .map(Some)
-            .map_err(|_| NativeReadFailure::RecallProjectionInvalid);
-    }
-    Ok(None)
-}
-
-fn native_history_source_excluded(
-    candidate: &super::native_session_recall::NativeSessionRecallCandidate,
-    original_source: &Value,
-    request: &NativeRecallRequestV1,
-) -> bool {
-    let Some(source) = original_source.get("source").and_then(Value::as_object) else {
-        return true;
-    };
-    let Some(observation_id) = source.get("observation_id").and_then(Value::as_str) else {
-        return true;
-    };
-    let Some(source_key) = source.get("source_key").and_then(Value::as_str) else {
-        return true;
-    };
-    let stable_record_id = source.get("stable_record_id").and_then(Value::as_str);
-    let record_ref = format!("record:{}", stable_record_id.unwrap_or(observation_id));
-    let canonical_content_sha256 = source.get("content_sha256").and_then(Value::as_str);
-    request.exclusions.observation_ids.iter().any(|excluded| {
-        excluded == observation_id || excluded == candidate.observation_anchor.as_str()
-    }) || request.exclusions.source_refs.iter().any(|excluded| {
-        excluded == source_key
-            || excluded == &record_ref
-            || candidate
-                .source_refs
-                .iter()
-                .any(|reference| reference == excluded)
-    }) || request.exclusions.trace_refs.iter().any(|excluded| {
-        candidate
-            .trace_refs
-            .iter()
-            .any(|reference| reference == excluded)
-    }) || request
-        .exclusions
-        .candidate_ids
-        .iter()
-        .any(|excluded| excluded == &candidate.candidate_id)
-        || request
-            .exclusions
-            .stable_memory_refs
-            .iter()
-            .any(|excluded| excluded == &candidate.stable_memory_ref)
-        || request.exclusions.content_sha256.iter().any(|excluded| {
-            excluded == &candidate.content_sha256
-                || canonical_content_sha256.is_some_and(|digest| excluded == digest)
-        })
-}
-
-fn native_session_candidate_budget_reason(
-    candidate: &super::native_session_recall::NativeSessionRecallCandidate,
-    budgets: &NativeRecallBudgetsV1,
-) -> Option<&'static str> {
-    if u64::try_from(candidate.content.len()).unwrap_or(u64::MAX)
-        > budgets.maximum_candidate_content_bytes
-    {
-        return Some("candidate_content_budget");
-    }
-    if u64::try_from(candidate.source_refs.len()).unwrap_or(u64::MAX)
-        > budgets.maximum_source_refs_per_candidate
-    {
-        return Some("source_ref_budget");
-    }
-    if u64::try_from(candidate.trace_refs.len()).unwrap_or(u64::MAX)
-        > budgets.maximum_trace_refs_per_candidate
-    {
-        return Some("trace_ref_budget");
-    }
-    if u64::try_from(candidate.warnings.len()).unwrap_or(u64::MAX) > budgets.maximum_warnings {
-        return Some("warning_budget");
-    }
-    // Native currently emits no provider-local candidate extensions. Keep the
-    // check explicit so a future extension projection cannot silently bypass
-    // the admitted per-candidate ceiling.
-    let projected_extensions = 0_u64;
-    if projected_extensions > budgets.maximum_extensions_per_candidate {
-        return Some("extension_budget");
-    }
-    None
-}
-
-fn native_session_recall_candidate(
-    call: &ProviderCall,
-    candidate: &super::native_session_recall::NativeSessionRecallCandidate,
-    original_source: Option<&Value>,
-) -> Result<Value, NativeReadFailure> {
-    let observed_at = candidate
-        .validity
-        .observed_at_micros
-        .and_then(tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros);
-    let valid_from = candidate
-        .validity
-        .valid_from_micros
-        .and_then(tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros);
-    let valid_until = candidate
-        .validity
-        .valid_until_micros
-        .and_then(tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros);
-    let superseded_at = candidate
-        .validity
-        .superseded_at_micros
-        .and_then(tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros);
-    let revoked_at = candidate
-        .validity
-        .revoked_at_micros
-        .and_then(tracedecay_memory_provider_registry::recall_admission::rfc3339_utc_micros);
-    let mut observation_refs = candidate
-        .provenance
-        .source_observation_id
-        .as_ref()
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if let Some(observation_id) = original_source
-        .and_then(|source| source.pointer("/source/observation_id"))
-        .and_then(Value::as_str)
-        .filter(|observation_id| {
-            !observation_refs
-                .iter()
-                .any(|existing| existing == observation_id)
-        })
-    {
-        observation_refs.push(observation_id.to_owned());
-    }
-    // Once a history grant is attached, source references must name the
-    // granted canonical source identity. A retrieval anchor is useful local
-    // provenance, but it is not a source key and the host admission layer
-    // must reject it as an original-source claim.
-    let source_refs = original_source
-        .and_then(|source| source.pointer("/source/source_key"))
-        .and_then(Value::as_str)
-        .map(|source_key| vec![source_key.to_owned()])
-        .unwrap_or_else(|| candidate.source_refs.clone());
-    let mut provenance = serde_json::json!({
-        "state": "available",
-        "origin_refs": source_refs.clone(),
-        "observation_refs": observation_refs,
-        "source_refs": source_refs.clone(),
-        "transform_chain": [],
-        "provider_trace_refs": candidate.trace_refs,
-        "redaction_reason": Value::Null,
-        "session_anchor": candidate.session_anchor,
-        "observation_anchor": candidate.observation_anchor,
-        "source_anchor": candidate.source_anchor,
-        "provider": candidate.provider,
-        "session_id": candidate.session_id,
-        "message_id": candidate.message_id,
-        "ordinal": candidate.ordinal,
-        "role": candidate.role,
-        "kind": candidate.kind,
-    });
-    if let Some(original_source) = original_source {
-        provenance["original_sources"] = serde_json::json!([original_source]);
-    }
-    Ok(serde_json::json!({
-        "candidate_id": candidate.candidate_id,
-        "stable_memory_ref": candidate.stable_memory_ref,
-        "content": candidate.content,
-        "content_ref": Value::Null,
-        "content_sha256": candidate.content_sha256,
-        "native_score": {
-            "score_domain_id": super::native_session_recall::NATIVE_SESSION_RECALL_SCORE_DOMAIN,
-            "score_domain_version": 1,
-            "raw_value": native_score_decimal(candidate.score_millionths),
-            "direction": "higher_is_better",
-            "declared_minimum": "0.000000",
-            "declared_maximum": "1.000000",
-            "calibration_state": "provider_calibrated",
-            "semantics": "canonical session retrieval relevance score",
-            "components": {
-                "score_millionths": candidate.score_millionths,
-            },
-        },
-        "confidence": Value::Null,
-        "exact_scope_identity": checkout_observation_scope_value(call),
-        "validity": {
-            "observed_at": observed_at,
-            "valid_from": valid_from,
-            "valid_until": valid_until,
-            "superseded_at": superseded_at,
-            "superseded_by": Value::Null,
-            "revoked_at": revoked_at,
-            "source_revision": candidate.validity.source_revision,
-            "temporal_state": native_session_validity_state(candidate.validity.state),
-        },
-        "provenance": provenance,
-        "explanation": {
-            "summary": "canonical session message retrieved by the host-admitted Native route",
-            "matched_features": [],
-            "activation_trace_refs": candidate.trace_refs,
-            "limitations": candidate.warnings,
-        },
-        "source_refs": source_refs,
-        "trace_refs": candidate.trace_refs,
-        "sensitivity": "unknown",
-        "memory_class": super::native_session_recall::NATIVE_SESSION_RECALL_MEMORY_CLASS,
-        "warnings": candidate.warnings,
-        "extensions": [],
-    }))
-}
-
-fn checkout_observation_scope_value(call: &ProviderCall) -> Value {
-    serde_json::json!({
-        "scope_binding": "checkout_observations",
-        "profile_id": call.exact_scope.profile_id,
-        "project_id": call.exact_scope.project_id,
-        "repository_identity": call.exact_scope.repository_identity,
-        "worktree_identity": call.exact_scope.worktree_identity,
-        "branch_identity": call.exact_scope.branch_identity,
-        "agent_session_id": "",
-        "resolved_scope_digest": "",
     })
 }
 
@@ -2560,104 +2098,8 @@ fn exact_scope_value(call: &ProviderCall) -> Value {
     })
 }
 
-fn native_session_validity_state(
-    state: super::native_session_recall::NativeSessionRecallValidityState,
-) -> &'static str {
-    match state {
-        super::native_session_recall::NativeSessionRecallValidityState::Current => "current",
-        super::native_session_recall::NativeSessionRecallValidityState::Expired => "expired",
-        super::native_session_recall::NativeSessionRecallValidityState::Future => "future",
-        super::native_session_recall::NativeSessionRecallValidityState::Superseded => "superseded",
-        super::native_session_recall::NativeSessionRecallValidityState::Revoked => "revoked",
-        super::native_session_recall::NativeSessionRecallValidityState::Unknown => "unknown",
-    }
-}
-
-fn native_score_decimal(millionths: u64) -> String {
+fn millionths_decimal(millionths: u64) -> String {
     format!("{}.{:06}", millionths / 1_000_000, millionths % 1_000_000)
-}
-
-fn native_session_recall_response_value(
-    call: &ProviderCall,
-    request: &NativeRecallRequestV1,
-    batch: &NativeSessionRecallBatch,
-    candidates: &[Value],
-    matched_items: u64,
-    excluded_items: u64,
-    truncated_items: u64,
-    reasons: &[String],
-) -> Value {
-    let state = match batch.status {
-        // The provider contract has no `stale` coverage state. Preserve the
-        // typed freshness loss as a truthful partial result with an explicit
-        // reason rather than emitting a wire value the host cannot admit.
-        NativeSessionRecallBatchStatus::Stale => "partial",
-        NativeSessionRecallBatchStatus::Partial { .. } => "partial",
-        NativeSessionRecallBatchStatus::Complete
-            if batch.temporal.cursor.is_some()
-                || excluded_items > 0
-                || truncated_items > 0
-                || !reasons.is_empty() =>
-        {
-            "partial"
-        }
-        NativeSessionRecallBatchStatus::Complete if candidates.is_empty() => "zero_results",
-        NativeSessionRecallBatchStatus::Complete => "complete",
-    };
-    let next_cursor = (!matches!(batch.status, NativeSessionRecallBatchStatus::Stale))
-        .then(|| batch.temporal.cursor.clone())
-        .flatten();
-    serde_json::json!({
-        "provider_id": NATIVE_PROVIDER_ID,
-        "provider_instance_id": PROVIDER_INSTANCE_ID,
-        "registration_revision": request.registration_revision,
-        "ready_receipt_digest": request.ready_receipt_digest,
-        "request_identity": request.request_identity,
-        "exact_scope_identity": exact_scope_value(call),
-        "provider_state_generation": call.expected_state_generation,
-        "candidates": candidates,
-        "coverage": {
-            "state": state,
-            "searched_scope_digest": call.exact_scope.exact_scope_sha256(),
-            "searched_temporal_digest": recall_temporal_digest(&request.temporal_query),
-            "scanned_items": batch.scanned_items,
-            "matched_items": matched_items,
-            "returned_items": candidates.len(),
-            "excluded_items": excluded_items,
-            "truncated_items": truncated_items,
-            "next_cursor": next_cursor,
-            "reasons": reasons,
-            // The mounted session service also reports source coverage,
-            // hydration omissions, retrieval anchors, and its display root.
-            // Those values describe the whole checkout page, including rows
-            // removed below by the host history grant. Keep only aggregate
-            // temporal evidence and the opaque continuation; candidate-level
-            // source evidence is emitted after the grant check above.
-            "canonical_temporal": native_safe_temporal_metadata(&batch.temporal),
-            "history_grant_present": request.history_grant.is_some(),
-        },
-        "ordering": {
-            "provider_order": "deterministic_native_score_then_candidate_id_within_one_score_domain",
-            "score_domain_id": super::native_session_recall::NATIVE_SESSION_RECALL_SCORE_DOMAIN,
-            "direction": "higher_is_better",
-            "tie_breaker": "candidate_id_lexicographic_utf8",
-        },
-        "terminal": {
-            "terminal_code": "success",
-            "diagnostic_id": Value::Null,
-        },
-        "warnings": [],
-    })
-}
-
-fn native_safe_temporal_metadata(
-    temporal: &tracedecay_session_runtime::session_retrieval::SessionTemporalMetadataView,
-) -> Value {
-    serde_json::json!({
-        "watermarks": temporal.watermarks.clone(),
-        "coverage": temporal.coverage.clone(),
-        "cursor": temporal.cursor.clone(),
-    })
 }
 
 fn recall_temporal_digest(temporal: &NativeRecallTemporalQueryV1) -> String {
@@ -2677,224 +2119,26 @@ fn recall_temporal_digest(temporal: &NativeRecallTemporalQueryV1) -> String {
         .unwrap_or_default()
 }
 
-fn recall_terminal_code(
-    matched_items: u64,
-    returned_items: usize,
-    excluded_items: u64,
-    truncated_items: u64,
-    reasons: &[String],
-) -> TerminalCode {
-    if matched_items == 0 && returned_items == 0 && excluded_items == 0 && reasons.is_empty() {
-        TerminalCode::SuccessZeroResults
-    } else if excluded_items > 0 || truncated_items > 0 || !reasons.is_empty() {
-        TerminalCode::Partial
-    } else {
-        TerminalCode::Success
-    }
-}
-
-fn verify_with_runtime(
-    runtime: &tokio::runtime::Runtime,
-    cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-    project_root: &Path,
-    call: ProviderCall,
-    fact: FactV1,
-    commit: FactCommitReceiptV1,
-) -> NativeReadOutcome {
-    let snapshot = match call.control.snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(code) => {
-            return NativeReadOutcome::Failed(match code {
-                TerminalCode::Cancelled => NativeReadFailure::Cancelled,
-                TerminalCode::DeadlineExceeded => NativeReadFailure::DeadlineExceeded,
-                _ => NativeReadFailure::ProviderUnavailable,
-            });
-        }
-    };
-    let timeout_millis = snapshot.remaining_millis.min(NATIVE_OPERATION_MILLIS);
-    match runtime.block_on(async {
-        tokio::time::timeout(
-            Duration::from_millis(timeout_millis),
-            verify_current_fact(cg, project_root, &call, &fact, &commit),
-        )
-        .await
-    }) {
-        Ok(outcome) => outcome,
-        Err(_) => NativeReadOutcome::Failed(NativeReadFailure::DeadlineExceeded),
-    }
-}
-
-async fn verify_current_fact(
-    cg: &Arc<tokio::sync::RwLock<Arc<TraceDecay>>>,
-    project_root: &Path,
-    call: &ProviderCall,
-    expected_fact: &FactV1,
-    commit: &FactCommitReceiptV1,
-) -> NativeReadOutcome {
-    if let Err(failure) = control_failure(&call.control) {
-        return NativeReadOutcome::Failed(failure);
-    }
-    let project_id = match ProjectId::new(call.exact_scope.project_id.clone()) {
-        Ok(project_id) => project_id,
-        Err(_) => return NativeReadOutcome::Failed(NativeReadFailure::ScopeUnavailable),
-    };
-    let current = Arc::clone(&*cg.read().await);
-    if let Err(failure) = control_failure(&call.control) {
-        return NativeReadOutcome::Failed(failure);
-    }
-    let target = match open_project_retained_memory_target(
-        &current,
-        project_root,
-        &project_id,
-        Some(MemoryScopeV1::Project),
-        None,
-        MemoryTargetAccessV1::Read,
-    )
-    .await
-    {
-        Ok(target) => target,
-        Err(error) => return NativeReadOutcome::Failed(map_retained_error(error)),
-    };
-    let memory = match MemoryApplication::new(
-        target.owner().clone(),
-        DatabaseFactStore::new(target.database()),
-    ) {
-        Ok(memory) => memory,
-        Err(_) => return NativeReadOutcome::Failed(NativeReadFailure::ProviderUnavailable),
-    };
-    let fact_id =
-        match ProjectMemoryFactIdV1::new(target.owner().clone(), expected_fact.fact_id.clone()) {
-            Ok(fact_id) => fact_id,
-            Err(_) => return NativeReadOutcome::Failed(NativeReadFailure::PromotionMismatch),
-        };
-    let read_control = native_fact_read_control(&call.control);
-    let history_query = match ProjectMemoryFactHistoryQueryV1::new(
-        fact_id.clone(),
-        None,
-        MAX_NATIVE_FACT_LINEAGE,
-    ) {
-        Ok(query) => query,
-        Err(_) => return NativeReadOutcome::Failed(NativeReadFailure::ProviderUnavailable),
-    };
-    let history = match memory
-        .get_project_memory_history(history_query, &read_control)
-        .await
-    {
-        Ok(history) => history,
-        Err(error) => {
-            return NativeReadOutcome::Failed(map_retained_error(
-                memory_mapping::map_memory_error(error),
-            ));
-        }
-    };
-    if !receipt_matches_authoritative_history(&history, target.owner(), expected_fact, commit) {
-        return NativeReadOutcome::Failed(NativeReadFailure::PromotionMismatch);
-    }
-    let projection = match memory.get_project_memory_fact(fact_id, &read_control).await {
-        Ok(Some(projection)) => projection,
-        Ok(None) => return NativeReadOutcome::Failed(NativeReadFailure::PromotionMismatch),
-        Err(error) => {
-            return NativeReadOutcome::Failed(map_retained_error(
-                memory_mapping::map_memory_error(error),
-            ));
-        }
-    };
-    let public = match memory_mapping::projection(&projection) {
-        Ok(public) => public,
-        Err(error) => return NativeReadOutcome::Failed(map_retained_error(error)),
-    };
-    let FactProjectionV1::Available { fact } = public else {
-        return NativeReadOutcome::Failed(NativeReadFailure::PromotionMismatch);
-    };
-    if *fact == *expected_fact {
-        if let Err(failure) = control_failure(&call.control) {
-            return NativeReadOutcome::Failed(failure);
-        }
-        NativeReadOutcome::Verified
-    } else {
-        NativeReadOutcome::Failed(NativeReadFailure::PromotionMismatch)
-    }
-}
-
-const MAX_NATIVE_FACT_LINEAGE: usize = 1_000;
-
-fn receipt_matches_authoritative_history(
-    history: &ProjectMemoryFactHistoryV1,
-    authoritative_owner: &FactOwnerV1,
-    expected_fact: &FactV1,
-    expected_commit: &FactCommitReceiptV1,
-) -> bool {
-    if history.owner() != authoritative_owner
-        || !public_owner_matches(authoritative_owner, &expected_commit.owner)
-        || history.fact_id() != &expected_commit.fact_id
-        || expected_commit.committed_event_ids.is_empty()
-        || expected_commit.committed_event_ids.last() != Some(&expected_commit.last_event_id)
-        || expected_commit.committed_event_ids.last() != Some(&expected_fact.last_event_id)
-        || expected_commit.active_assertion_id.as_ref() != Some(&expected_fact.active_assertion_id)
-    {
-        return false;
-    }
-    let history_event_ids = history
-        .events()
-        .iter()
-        .map(|event| event.event_id())
-        .collect::<Vec<_>>();
-    let Some(start) = history_event_ids
-        .len()
-        .checked_sub(expected_commit.committed_event_ids.len())
-    else {
-        return false;
-    };
-    history_event_ids[start..]
-        .iter()
-        .copied()
-        .eq(expected_commit.committed_event_ids.iter())
-        && history
-            .events()
-            .last()
-            .is_some_and(|event| event.event_id() == &expected_fact.last_event_id)
-        && history.next_after().is_none()
-}
-
-fn public_owner_matches(
-    authoritative_owner: &FactOwnerV1,
-    public_owner: &FactCommitOwnerV1,
-) -> bool {
-    match (authoritative_owner, public_owner) {
-        (FactOwnerV1::Profile, FactCommitOwnerV1::Profile) => true,
-        (
-            FactOwnerV1::Project {
-                project_id: authoritative_project_id,
-            },
-            FactCommitOwnerV1::Project { project_id },
-        ) => authoritative_project_id == project_id,
-        _ => false,
-    }
-}
-
-fn native_fact_read_control(control: &OperationControl) -> FactReadControl {
-    let control = control.clone();
-    FactReadControl::new(Arc::new(move || control.snapshot().is_err()))
-}
-
 fn map_retained_error(error: RetainedSurfaceExecutionErrorV1) -> NativeReadFailure {
     match error {
         RetainedSurfaceExecutionErrorV1::Cancelled(_) => NativeReadFailure::Cancelled,
         RetainedSurfaceExecutionErrorV1::TimedOut(_) => NativeReadFailure::DeadlineExceeded,
         RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized => {
-            NativeReadFailure::ScopeUnavailable
+            NativeReadFailure::RecallNotAuthorized
         }
-        RetainedSurfaceExecutionErrorV1::Conflict => NativeReadFailure::PromotionMismatch,
-        RetainedSurfaceExecutionErrorV1::InvalidRequest => NativeReadFailure::InvalidPayload,
+        RetainedSurfaceExecutionErrorV1::InvalidRequest => NativeReadFailure::RecallInvalidRequest,
+        RetainedSurfaceExecutionErrorV1::ProfileResetRequired
+        | RetainedSurfaceExecutionErrorV1::ProjectResetRequired => {
+            NativeReadFailure::RecallResetRequired
+        }
+        RetainedSurfaceExecutionErrorV1::Saturated => NativeReadFailure::RecallCapacityExceeded,
         RetainedSurfaceExecutionErrorV1::ApplicationProblem(_)
         | RetainedSurfaceExecutionErrorV1::StructuralRefusal(_)
         | RetainedSurfaceExecutionErrorV1::PartialEffect { .. }
+        | RetainedSurfaceExecutionErrorV1::Conflict
         | RetainedSurfaceExecutionErrorV1::Stale
         | RetainedSurfaceExecutionErrorV1::Unsupported
-        | RetainedSurfaceExecutionErrorV1::Saturated
-        | RetainedSurfaceExecutionErrorV1::Unavailable { detail: _ }
-        | RetainedSurfaceExecutionErrorV1::ProfileResetRequired
-        | RetainedSurfaceExecutionErrorV1::ProjectResetRequired => {
+        | RetainedSurfaceExecutionErrorV1::Unavailable { detail: _ } => {
             NativeReadFailure::ProviderUnavailable
         }
     }

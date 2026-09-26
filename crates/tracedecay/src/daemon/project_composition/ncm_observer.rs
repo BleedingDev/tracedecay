@@ -287,27 +287,8 @@ impl ProviderLifecycleOwnerV1 for NcmLifecycleOwner {
     }
 }
 
-/// Builds one lazy registration over the existing NCM worker slot. Active mode
-/// is passed by validated composition; no Native advisory authority is required.
-pub(in crate::daemon) fn construct_ncm_registration(
-    owners: &NcmWorkerOwnerSlot,
-    profile_id: &UserProfileId,
-    worker_binary: PathBuf,
-    state_root: PathBuf,
-    registration_revision: u64,
-    mode: EnabledProviderMode,
-) -> Result<(ProviderRegistrationV1, ObservationProviderMountV1), NcmObserverConstructionError> {
-    construct_ncm_registration_with_authority(
-        owners,
-        profile_id,
-        worker_binary,
-        state_root,
-        registration_revision,
-        mode,
-        None,
-    )
-}
-
+/// Builds one lazy registration over the existing NCM worker slot. The mode is
+/// passed by validated composition; Native advisory authority is optional.
 pub(in crate::daemon) fn construct_ncm_registration_with_authority(
     owners: &NcmWorkerOwnerSlot,
     profile_id: &UserProfileId,
@@ -363,38 +344,6 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
     ))
 }
 
-/// Compatibility constructor for existing observer harnesses.
-#[cfg(test)]
-pub(in crate::daemon) fn construct_ncm_observer(
-    owners: &NcmWorkerOwnerSlot,
-    profile_id: &UserProfileId,
-    worker_binary: PathBuf,
-    state_root: PathBuf,
-    registration_revision: u64,
-) -> Result<
-    (
-        tracedecay_memory_provider_registry::ObserverProviderRegistration,
-        ObservationProviderMountV1,
-    ),
-    NcmObserverConstructionError,
-> {
-    let (registration, mount) = construct_ncm_registration(
-        owners,
-        profile_id,
-        worker_binary,
-        state_root,
-        registration_revision,
-        EnabledProviderMode::Observer,
-    )?;
-    Ok((
-        tracedecay_memory_provider_registry::ObserverProviderRegistration {
-            provider: registration.provider,
-            registration_revision,
-        },
-        mount,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Barrier;
@@ -402,6 +351,24 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+
+    fn construct_ncm_observer(
+        owners: &NcmWorkerOwnerSlot,
+        profile_id: &UserProfileId,
+        worker_binary: PathBuf,
+        state_root: PathBuf,
+    ) -> Result<ObservationProviderMountV1, NcmObserverConstructionError> {
+        construct_ncm_registration_with_authority(
+            owners,
+            profile_id,
+            worker_binary,
+            state_root,
+            1,
+            EnabledProviderMode::Observer,
+            None,
+        )
+        .map(|(_, mount)| mount)
+    }
 
     #[test]
     fn daemon_slot_reuses_one_strong_owner_and_refuses_conflicting_bindings() {
@@ -491,14 +458,12 @@ mod tests {
         let root = temp.path().join("state");
         let profile = UserProfileId::new("profile.unavailable-shared-ncm").unwrap();
         let slot = NcmWorkerOwnerSlot::default();
-        let (_, first) =
-            construct_ncm_observer(&slot, &profile, worker.clone(), root.clone(), 1).unwrap();
+        let first = construct_ncm_observer(&slot, &profile, worker.clone(), root.clone()).unwrap();
         assert!(first.provider_instance_id.is_none());
         assert!(first.instance_proof.is_some());
         let owner = slot.acquire(&profile, &worker, &root).unwrap();
         assert!(owner.worker_pid().is_none());
-        let (_, second) =
-            construct_ncm_observer(&slot, &profile, worker.clone(), root.clone(), 1).unwrap();
+        let second = construct_ncm_observer(&slot, &profile, worker.clone(), root.clone()).unwrap();
         assert!(second.provider_instance_id.is_none());
         assert!(Arc::ptr_eq(
             &owner,
@@ -510,7 +475,6 @@ mod tests {
                 &profile,
                 temp.path().join("replacement-worker"),
                 root,
-                1
             ),
             Err(NcmObserverConstructionError::OwnerBindingConflict {
                 field: "worker_binary"

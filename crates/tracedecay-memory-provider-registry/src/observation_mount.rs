@@ -9,7 +9,7 @@ use crate::{OwnedProviderId, ProviderLimits, TerminalCode};
 /// State namespace admission belongs to the registered provider boundary.
 #[derive(Clone, Debug)]
 pub enum ObservationStateNamespacePolicyV1 {
-    /// Native state is contained beneath its admitted identity prefix.
+    /// Provider state is contained beneath its admitted identity prefix.
     Prefix(String),
     /// The adapter validates the exact-scope namespace in its ready response.
     /// NCM uses its bare SHA-256 namespace under the worker's namespaces root.
@@ -46,8 +46,8 @@ pub struct ObservationProviderMountV1 {
     /// Optional bounded proof for a lazily constructed observer. The journey
     /// retries only explicit transient proof failures within its finite
     /// attempt and lifetime budget; permanent terminal failures make the
-    /// mount unavailable until recreation.
-    /// Native supplies its existing static proved instance instead.
+    /// mount unavailable until recreation. A provider with a static proved
+    /// instance supplies that instance instead.
     pub instance_proof: Option<Arc<dyn ObservationInstanceProofV1>>,
     /// Host handshake ceilings for this provider.
     pub host_limits: ProviderLimits,

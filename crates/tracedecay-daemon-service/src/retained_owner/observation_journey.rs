@@ -40,21 +40,13 @@
 //! same durable watermark while the project server is mounted; it only makes
 //! convergence faster and is never the thing that makes it correct.
 //!
-//! # What Native does with these observations today
+//! # Native never observes
 //!
-//! Native declares `observation.accept.v1`, and its adapter accepts exactly
-//! two kinds: its own `native.fact_promoted.v1`, and
-//! `session.message_committed.v1` paired with its declared payload contract.
-//! A session message reaches the project-owned Native application port, which
-//! durably commits it to the provider-local staged-observation store under the
-//! host-granted provider-state root *before* answering, so the row settles
-//! `Acknowledged` with committed effect evidence after a single attempt. A
-//! staged row is advisory provider state that becomes a recall candidate for
-//! the same checkout while retaining its exact origin scope; it is never a
-//! canonical fact, and promotion to a fact remains the separate explicit path. Every other contract-known kind
-//! still answers `capability_unsupported` with the diagnostic
-//! `native.observation_unsupported`, which this journey records as one typed,
-//! non-retried rejection.
+//! TraceDecay Native is upstream memory: facts through the owner-bound memory
+//! application and sessions through the message-search kernel, both already
+//! fed by the one upstream capture path. Native declares no observation
+//! capability, so production never mounts a Native journey; journeys exist
+//! only for providers that keep provider-local state, such as NCM.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -124,7 +116,7 @@ const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
 /// Directory name of the host-owned root every supervised provider's state is
 /// contained under, inside the canonical store layout. The host creates it and
 /// grants each admitted namespace a capability rooted beneath it; a provider
-/// never names a path outside it (`tdmem-1107`).
+/// never names a path outside it.
 pub(crate) const PROVIDER_STATE_DIR_NAME: &str = "provider-state";
 
 /// Domain separator for the product-owned binding from a canonical source
@@ -136,10 +128,9 @@ const AGENT_SESSION_BINDING_DOMAIN: &[u8] =
 /// identity apart from a raw host session id.
 const AGENT_SESSION_BINDING_PREFIX: &str = "tdmem-agent-session.v1.";
 
-/// The observation kind and inner payload contract this journey admits, taken
-/// from `product/observations/host-event-observation-policy.json` event class
-/// `host.session_message_committed.v1` and matched by the Native adapter's own
-/// kind/contract table.
+/// The observation kind and inner payload contract this journey admits for the
+/// host event class `host.session_message_committed.v1`, from the provider
+/// observation contract's kind/contract table.
 const SESSION_MESSAGE_OBSERVATION_KIND: &str = "session.message_committed.v1";
 const SESSION_MESSAGE_PAYLOAD_CONTRACT: &str = "tracedecay.memory.observation.session-message.v1";
 
@@ -561,7 +552,7 @@ pub(crate) enum ObservationShutdownFailureV1 {
 }
 
 // ---------------------------------------------------------------------------
-// Untrusted-memory gate for provider recall (tdmem-1105)
+// Untrusted-memory gate for provider recall
 //
 // Hygiene has two directions. Outbound, it keeps a credential from leaving the
 // host inside an observation. Inbound, a recall candidate is text a provider
@@ -2049,8 +2040,7 @@ impl RecoveryRefusalV1 {
 
 /// The restart-recovery gate every delivery attempt passes through.
 ///
-/// This is what makes `tdmem-0506` production code rather than a reusable
-/// type. The provider's own state schema and generation come from the *same*
+/// The provider's own state schema and generation come from the *same*
 /// validated handshake that produced the delivery address, so the journal never
 /// pairs an address from one incarnation with state evidence from another. A
 /// provider whose state schema moved, or whose generation went backwards
@@ -2574,12 +2564,10 @@ const ISOLATION_POLL_MILLIS: u64 = 5;
 /// matters most for observation delivery, whose caller is the journey's single
 /// dedicated delivery thread: without this, one panicking provider call ended
 /// that thread and the lane delivered nothing again for the life of the
-/// process (`tdmem-sz9`).
+/// process.
 ///
-/// This lives at the composition root because the provider registry is
-/// source-contracted to name no OS capability
-/// (`product/architecture/memory-dependency-policy.json`): the registry
-/// declares the boundary, the root supplies it (`tdmem-1107`).
+/// This lives at the composition root because the provider registry names no
+/// OS capability: the registry declares the boundary, the root supplies it.
 #[derive(Debug)]
 struct ThreadBoundedProviderCallV1 {
     /// Borrowed workers currently inside a provider call, whether or not
@@ -3027,8 +3015,7 @@ impl BoundedProviderCallV1 for ThreadBoundedProviderCallV1 {
 /// Mounts the project's provider lifecycle supervisor over the composed
 /// provider set.
 ///
-/// This is where `tdmem-0504`'s supervisor becomes production code rather
-/// than a reusable type: the journey obtains **every** readiness target from
+/// The journey obtains **every** readiness target from
 /// it, so restart bounding, exact-scope ownership, predecessor-death
 /// confirmation, adapter-panic containment, and fail-closed readiness
 /// validation are on the only path a provider observation can take.
@@ -5659,12 +5646,6 @@ mod journey_journal_inspection {
     }
 }
 
-/// The Claude Code host memory journey. It lives beside this mount because it
-/// asserts against the journal's own exact-scope binding and delivery states.
-#[cfg(all(test, feature = "memory-provider-host"))]
-#[path = "claude_host_journey_tests.rs"]
-mod claude_host_journey_tests;
-
 /// Whether a startup replay refusal is one a later pass can clear.
 ///
 /// The rule is fail-closed: a refusal counts as retryable only when the store
@@ -5899,8 +5880,7 @@ mod tests {
     };
     use tracedecay_memory_provider_registry::{
         CommittedEffectEvidence, EnabledProviderMode, FabricConfig, FallbackDirective,
-        HandshakeResponse, NativeMemoryApplicationPort, NativeObservation,
-        NativeProviderActivation, ProviderDescriptor, ProviderReply, TerminalRecord,
+        HandshakeResponse, NativeMemoryApplicationPort, NativeProviderActivation, ProviderDescriptor, ProviderReply, TerminalRecord,
     };
     use tracedecay_sessions::admission::HostAdmissionScope;
     use tracedecay_store::{
@@ -5919,7 +5899,7 @@ mod tests {
 
     mod control_dispatch;
 
-    /// Seeded crash and restart fuzzing of this mount (`tdmem-5lc`). It lives
+    /// Seeded crash and restart fuzzing of this mount. It lives
     /// beside the journey's own suite because it reuses these fixtures to
     /// build the very same mount, and kills it in a child process at every
     /// boundary between the host's canonical commit and the provider's durable
@@ -5930,7 +5910,7 @@ mod tests {
     mod real_ncm_observer;
 
     /// The host's bounded-execution boundary, judged on its own accounting
-    /// rather than through a journey (`tdmem-sz9`).
+    /// rather than through a journey.
     mod bounded_provider_call {
         //! What the boundary publishes about the workers it owns.
         //!
@@ -6407,12 +6387,12 @@ mod tests {
         }
     }
 
-    /// The adversarial provider harness against this mount (`tdmem-sz9`). It
+    /// The adversarial provider harness against this mount. It
     /// lives beside the journey's own suite because it judges the same journal
     /// rows, driven by a provider double that misbehaves on demand.
     mod adversarial_mounted_journey {
         //! The adversarial provider harness against the **mounted observation
-        //! journey** (`tdmem-sz9`).
+        //! journey**.
         //!
         //! The sibling suite in `tracedecay-memory-provider-registry` drives a
         //! misbehaving provider through the registry's own dispatch and recall ports.
@@ -6506,43 +6486,7 @@ mod tests {
                 MemoryProviderV1::invoke(self.inner.as_ref(), call)
             }
 
-            fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), observation.call())
-            }
-
             fn recall(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn feedback(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn maintenance(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn inspection(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn correction(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn delete_by_source(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn snapshot_export(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn snapshot_restore(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn replay(&self, call: &ProviderCall) -> ProviderReply {
                 MemoryProviderV1::invoke(self.inner.as_ref(), call)
             }
         }
@@ -6910,7 +6854,7 @@ mod tests {
         /// This is the host-owned half of "no worker was leaked". The double's
         /// in-flight counter says whether *provider* work is still running; this
         /// says whether the **host** still owns a thread for it, which is the count
-        /// the bead asks for and the only one that can grow without bound. An
+        /// that matters and the only one that can grow without bound. An
         /// episode that ends above its baseline left a worker behind.
         async fn wait_for_census(
             fixture: &AdversarialJourneyFixture,
@@ -8162,81 +8106,7 @@ mod tests {
             }
         }
 
-        fn observe(&self, observation: NativeObservation<'_>) -> ProviderReply {
-            self.observe_calls.fetch_add(1, Ordering::Relaxed);
-            if let Some(hook) = self.observe_hook.lock().unwrap().as_ref() {
-                hook();
-            }
-            let call = observation.call();
-            self.delivered.lock().unwrap().push(DeliveredObservation {
-                bytes: call.payload.bytes.clone(),
-                exact_scope: call.exact_scope.clone(),
-            });
-            // The generation this port declares is its descriptor's, and the
-            // descriptor is fixed for the incarnation — exactly like the real
-            // Native port. Reporting an advance here would be read back as a
-            // regression at the next handshake and refuse every later
-            // delivery, so the committed effect is non-regressing and
-            // unchanged, which the contract permits.
-            ProviderReply {
-                terminal: TerminalRecord::new(
-                    ProviderOperation::Observe,
-                    call.provider_id.clone(),
-                    TerminalCode::Success,
-                    CommittedEffectEvidence::committed(
-                        call.expected_state_generation,
-                        call.expected_state_generation,
-                        vec!["observation:journey-test".to_owned()],
-                        PROVIDER_RECEIPT,
-                        EFFECT_DIGEST,
-                    )
-                    .expect("committed effect"),
-                    FallbackDirective::forbidden(),
-                    call.operation_id.clone(),
-                    call.exact_scope.exact_scope_sha256(),
-                    None,
-                )
-                .expect("observation terminal"),
-                payload: Some(call.payload.clone()),
-                warnings: Vec::new(),
-                extensions: call.extensions.clone(),
-                state_generation: call.expected_state_generation,
-            }
-        }
-
         fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn feedback(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn maintenance(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn inspection(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn correction(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn delete_by_source(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn snapshot_export(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn snapshot_restore(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
-        }
-
-        fn replay(&self, _call: &ProviderCall) -> ProviderReply {
             Self::unexpected()
         }
     }
@@ -8735,14 +8605,14 @@ mod tests {
         (receipts, state)
     }
 
-    /// tdmem-0506, mounted. The generation a delivery call declares is the one
+    /// Mounted restart recovery. The generation a delivery call declares is the one
     /// restart recovery verified against this incarnation's own readiness
     /// evidence, and the gate's decision is written through the journey's real
     /// journal.
     ///
     /// The fabric refuses any call whose `expected_state_generation` is not the
-    /// ready incarnation's, so a hardcoded expectation — the defect this bead
-    /// exists to remove — never reaches a settlement at all.
+    /// ready incarnation's, so a hardcoded expectation never reaches a
+    /// settlement at all.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mounted_delivery_declares_the_state_generation_recovery_verified() {
         let temp = TempDir::new().expect("temporary journey root");
@@ -8903,7 +8773,7 @@ mod tests {
         );
     }
 
-    /// tdmem-0506, mounted. A durable recovery record naming a different
+    /// Mounted restart recovery. A durable recovery record naming a different
     /// implementation identity refuses delivery *before* the provider is
     /// called: no receipt, no settlement, the row still deliverable, and the
     /// refusal recorded once however many times the dispatcher retries it.
@@ -11485,7 +11355,7 @@ mod tests {
             .await;
     }
 
-    /// Acceptance (tdmem-5lc): a live replay pass that fails is recorded as a
+    /// A live replay pass that fails is recorded as a
     /// typed stall with its recoverability, and the stall is cleared by the
     /// pass that gets through.
     ///
@@ -11579,7 +11449,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
-    /// Acceptance (tdmem-5lc): a standing condition is reported once.
+    /// A standing condition is reported once.
     ///
     /// The slot is what keeps a permanent refusal from being re-reported at
     /// the backoff rate, so the property under test is exactly "is this new?":
@@ -11635,7 +11505,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------ //
-    // Blocking journal I/O never runs on a runtime worker (`tdmem-t4p`).  //
+    // Blocking journal I/O never runs on a runtime worker.               //
     // ------------------------------------------------------------------ //
 
     /// Holds this journal's write lock from a plain thread for a bounded

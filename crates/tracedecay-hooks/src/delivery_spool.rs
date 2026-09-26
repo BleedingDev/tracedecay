@@ -20,7 +20,7 @@ use tracedecay_private_fs::framed_log::{
 };
 use tracedecay_private_fs::{FileLease, LockAdmissionError, lock_until};
 
-pub(crate) const MAX_PENDING_RECEIPTS: usize = 1_024;
+const MAX_PENDING_RECEIPTS: usize = 1_024;
 const MAX_RECEIPT_BYTES: usize = 4 * 1024;
 const RECEIPT_SUFFIX: &str = ".delivery.v1.json";
 const LOCK_FILE: &str = "writer.v1.lock";
@@ -188,29 +188,6 @@ impl HookDeliveryReceiptSpoolV1 {
             .map_err(|_| HookDeliverySpoolError::Io)?;
         spool.receipt_paths()?;
         Ok(spool)
-    }
-
-    /// Checks capacity without publishing delivery evidence. The caller must
-    /// retain this writer lease through capture, output flush, and append.
-    pub fn admit_capacity(
-        &self,
-        receipt: &HookDeliverySourceReceiptV1,
-    ) -> Result<(), HookDeliverySpoolError> {
-        receipt.validate()?;
-        if let Some(bytes) = read_bounded(&self.receipt_path(receipt.receipt_id), MAX_RECEIPT_BYTES)
-            .map_err(map_read_error)?
-        {
-            return if decode_receipt(&bytes)?.same_identity(receipt) {
-                Ok(())
-            } else {
-                Err(HookDeliverySpoolError::Corrupt)
-            };
-        }
-        if self.receipt_paths()?.len() >= MAX_PENDING_RECEIPTS {
-            hotpath::gauge!("hooks.delivery.refused.full").inc(1);
-            return Err(HookDeliverySpoolError::Full);
-        }
-        Ok(())
     }
 
     #[hotpath::measure(label = "hooks.delivery.append")]

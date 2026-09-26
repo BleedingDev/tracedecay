@@ -25,7 +25,6 @@ mod monitor_test;
 #[path = "../../build-support/provision_host_cli_fixture.rs"]
 mod provision_host_cli_fixture;
 mod source_provenance_test;
-mod storage_replacement_test;
 mod sync_test;
 mod test_profile_isolation_test;
 #[cfg(unix)]

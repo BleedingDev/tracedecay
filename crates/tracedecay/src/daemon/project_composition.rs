@@ -724,7 +724,6 @@ impl ComposedCoreServer {
             .with_code_index_similar_executor(Arc::clone(&code_index.similar_executor))
             .with_code_index_redundancy_executor(Arc::clone(&code_index.redundancy_executor))
             .with_code_index_branch_diff_executor(Arc::clone(&code_index.branch_diff_executor))
-            .with_semantic_admin_executor(Arc::clone(&code_index.semantic_admin_executor))
             .with_code_graph_projection_read_port(Arc::clone(
                 &code_index.graph_projection_read_port,
             ))
@@ -1065,9 +1064,7 @@ impl ProjectOpenInputs<'_> {
             project_id: code_index.project_id.clone(),
             project_root: self.canonical_project_path.to_path_buf(),
             store_root: code_index_store_root.clone(),
-            profile_root: profile_identity.profile_root().to_path_buf(),
             native_graph_activation: runtime_configuration.config().native_graph_activation,
-            semantic_config: runtime_configuration.config().semantic.clone(),
             scope: code_index.scope.clone(),
             route_registered: Arc::clone(&route_registered),
             cancellation: route_cancellation.clone(),
@@ -2088,7 +2085,6 @@ struct ProjectCodeIndexAuthorities {
     similar_executor: tracedecay_query::code_search::CodeIndexSimilarExecutor,
     redundancy_executor: tracedecay_query::code_search::CodeIndexRedundancyExecutor,
     branch_diff_executor: tracedecay_query::code_search::CodeIndexBranchDiffExecutor,
-    semantic_admin_executor: tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1,
 }
 
 /// Resolve the project's search identity and bind every code-index read port to
@@ -2179,8 +2175,6 @@ fn project_code_index_authorities(
         read_admission_provider,
         tracedecay_code_index_runtime::mcp_admission::RegisteredProjectScopeResolverV1,
     );
-    let semantic_admin_executor =
-        project_semantic_admin_executor(invocation.code_index_schedulers.clone(), scope.clone());
     Ok(ProjectCodeIndexAuthorities {
         publication_identity,
         project_id,
@@ -2194,222 +2188,7 @@ fn project_code_index_authorities(
         similar_executor,
         redundancy_executor,
         branch_diff_executor,
-        semantic_admin_executor,
     })
-}
-
-fn project_semantic_admin_executor(
-    schedulers: code_index_scheduler::CodeIndexSchedulerRegistryV1,
-    scope: tracedecay_contracts::ResolvedScope,
-) -> tracedecay_mcp::handlers::admin_project::SemanticAdminExecutorV1 {
-    Arc::new(move |request, deadline, cancellation| {
-        let schedulers = schedulers.clone();
-        let scope = scope.clone();
-        Box::pin(async move {
-            ensure_semantic_admin_request_live(&deadline, &cancellation)?;
-            let runtime = schedulers.semantic_runtime_for_scope(&scope).await;
-            ensure_semantic_admin_request_live(&deadline, &cancellation)?;
-
-            use tracedecay_mcp::handlers::admin_project::{
-                SemanticAdminRequestV1, SemanticAdminResponseV1,
-            };
-            match request {
-                SemanticAdminRequestV1::Status => Ok(SemanticAdminResponseV1::Status {
-                    lifecycle: runtime.as_ref().map(|runtime| runtime.model_status()),
-                    runtime: runtime.as_ref().map(|runtime| runtime.status()),
-                }),
-                SemanticAdminRequestV1::Acquire => {
-                    let runtime = require_semantic_admin_runtime(runtime)?;
-                    begin_semantic_admin_effect(&deadline, &cancellation)?;
-                    let acquisition = runtime.acquire_model().map_err(|error| {
-                        semantic_admin_lifecycle_error("semantic_model_acquisition_failed", error)
-                    })?;
-                    Ok(SemanticAdminResponseV1::Acquisition {
-                        queued: acquisition.queued,
-                        lifecycle: acquisition.lifecycle,
-                    })
-                }
-                SemanticAdminRequestV1::Import { manifest, source } => {
-                    let runtime = require_semantic_admin_runtime(runtime)?;
-                    let now_unix = semantic_admin_now_unix()?;
-                    begin_semantic_admin_effect(&deadline, &cancellation)?;
-                    let imported = tokio::task::spawn_blocking(move || {
-                        let source = canonical_semantic_import_source(&source)?;
-                        runtime
-                            .import_model(&manifest, &source, now_unix)
-                            .map_err(|error| {
-                                semantic_admin_lifecycle_error(
-                                    "semantic_model_import_failed",
-                                    error,
-                                )
-                            })
-                    })
-                    .await
-                    .map_err(|_| {
-                        TraceDecayError::project_route(
-                            "semantic_model_import_task_failed",
-                            true,
-                            "semantic model import task failed while joining",
-                        )
-                    })??;
-                    Ok(SemanticAdminResponseV1::Import {
-                        lifecycle: imported,
-                    })
-                }
-            }
-        })
-    })
-}
-
-fn semantic_admin_lifecycle_error(
-    reason_code: &'static str,
-    error: tracedecay_application::semantic_runtime::ModelLifecycleErrorV1,
-) -> TraceDecayError {
-    use tracedecay_application::semantic_runtime::ModelLifecycleErrorV1;
-
-    if matches!(&error, ModelLifecycleErrorV1::Cancelled) {
-        return tracedecay_contracts::ApplicationProblem::cancelled_before_admission().into();
-    }
-    let retryable = semantic_admin_lifecycle_error_retryable(&error);
-    TraceDecayError::project_route(reason_code, retryable, error.to_string())
-}
-
-fn semantic_admin_lifecycle_error_retryable(
-    error: &tracedecay_application::semantic_runtime::ModelLifecycleErrorV1,
-) -> bool {
-    use tracedecay_application::semantic_runtime::{ArtifactImportErrorV1, ModelLifecycleErrorV1};
-
-    matches!(
-        error,
-        ModelLifecycleErrorV1::StoreUnavailable
-            | ModelLifecycleErrorV1::DownloadFailed
-            | ModelLifecycleErrorV1::DownloadFailedWithReason(_)
-            | ModelLifecycleErrorV1::WorkerJoinFailed
-            | ModelLifecycleErrorV1::ArtifactImport(
-                ArtifactImportErrorV1::StoreBusy
-                    | ArtifactImportErrorV1::SourceInterrupted
-                    | ArtifactImportErrorV1::StorageFailure
-            )
-    )
-}
-
-fn canonical_semantic_import_source(source: &Path) -> Result<PathBuf> {
-    if !source.is_absolute() {
-        return Err(TraceDecayError::Config {
-            message: "semantic artifact source must be an absolute path".to_owned(),
-        });
-    }
-    let source_metadata =
-        std::fs::symlink_metadata(source).map_err(|error| TraceDecayError::Config {
-            message: format!(
-                "cannot inspect semantic artifact source '{}': {error}",
-                source.display()
-            ),
-        })?;
-    if source_metadata.file_type().is_symlink() {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "semantic artifact source '{}' must not be a symbolic link",
-                source.display()
-            ),
-        });
-    }
-    let canonical = std::fs::canonicalize(source).map_err(|error| TraceDecayError::Config {
-        message: format!(
-            "cannot resolve semantic artifact source '{}': {error}",
-            source.display()
-        ),
-    })?;
-    if !canonical.is_dir() {
-        return Err(TraceDecayError::Config {
-            message: format!(
-                "semantic artifact source '{}' is not a directory",
-                canonical.display()
-            ),
-        });
-    }
-    Ok(canonical)
-}
-
-#[cfg(test)]
-mod semantic_admin_error_tests {
-    use super::semantic_admin_lifecycle_error_retryable;
-    use tracedecay_application::semantic_runtime::{ArtifactImportErrorV1, ModelLifecycleErrorV1};
-
-    #[test]
-    fn artifact_import_retryability_preserves_only_transient_failures() {
-        for error in [
-            ArtifactImportErrorV1::StoreBusy,
-            ArtifactImportErrorV1::SourceInterrupted,
-            ArtifactImportErrorV1::StorageFailure,
-        ] {
-            assert!(semantic_admin_lifecycle_error_retryable(
-                &ModelLifecycleErrorV1::ArtifactImport(error)
-            ));
-        }
-        for error in [
-            ArtifactImportErrorV1::DigestMismatch,
-            ArtifactImportErrorV1::LengthMismatch,
-            ArtifactImportErrorV1::UnsafePackageEntry,
-        ] {
-            assert!(!semantic_admin_lifecycle_error_retryable(
-                &ModelLifecycleErrorV1::ArtifactImport(error)
-            ));
-        }
-        assert!(!semantic_admin_lifecycle_error_retryable(
-            &ModelLifecycleErrorV1::AcquisitionUnavailable
-        ));
-    }
-}
-
-fn require_semantic_admin_runtime(
-    runtime: Option<Arc<tracedecay_application::semantic_runtime::ProjectSemanticRuntimeV1>>,
-) -> Result<Arc<tracedecay_application::semantic_runtime::ProjectSemanticRuntimeV1>> {
-    runtime.ok_or_else(|| {
-        TraceDecayError::project_route(
-            "semantic_runtime_unavailable",
-            true,
-            "semantic runtime is not mounted for this project checkout",
-        )
-    })
-}
-
-fn ensure_semantic_admin_request_live(
-    deadline: &tracedecay_contracts::Deadline,
-    cancellation: &tracedecay_contracts::CancellationSignal,
-) -> Result<()> {
-    if cancellation.is_cancelled() {
-        return Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission().into());
-    }
-    if deadline.is_elapsed_at(tracedecay_contracts::now_micros()) {
-        return Err(tracedecay_contracts::ApplicationProblem::timed_out_before_admission().into());
-    }
-    Ok(())
-}
-
-fn begin_semantic_admin_effect(
-    deadline: &tracedecay_contracts::Deadline,
-    cancellation: &tracedecay_contracts::CancellationSignal,
-) -> Result<()> {
-    ensure_semantic_admin_request_live(deadline, cancellation)?;
-    if !cancellation.try_begin_commit() {
-        return Err(tracedecay_contracts::ApplicationProblem::cancelled_before_admission().into());
-    }
-    Ok(())
-}
-
-fn semantic_admin_now_unix() -> Result<u64> {
-    let now = tracedecay_contracts::try_now_micros().map_err(|error| {
-        TraceDecayError::project_route("semantic_admin_clock_unavailable", true, error.to_string())
-    })?;
-    let micros = u64::try_from(now.0).map_err(|_| {
-        TraceDecayError::project_route(
-            "semantic_admin_clock_unavailable",
-            true,
-            "semantic admin clock is before the Unix epoch",
-        )
-    })?;
-    Ok(micros / 1_000_000)
 }
 
 /// Dashboard-facing freshness reader for this route's code-index schedulers.

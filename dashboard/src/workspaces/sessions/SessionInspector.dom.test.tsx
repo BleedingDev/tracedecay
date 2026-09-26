@@ -284,7 +284,6 @@ function message(content: string) {
     metadata_json: null,
     ordinal: null,
     pinned: 0,
-    provider: 'claude',
     role: 'assistant',
     session_id: 'claude:035c8f3c',
     snippet: null,
@@ -303,7 +302,6 @@ function sessionPage(over: Record<string, unknown> = {}) {
   return {
     exists: true,
     session_id: 'claude:035c8f3c',
-    provider: 'claude',
     path: 'daemon://session-temporal',
     storage_scope: 'project',
     limit: 100,

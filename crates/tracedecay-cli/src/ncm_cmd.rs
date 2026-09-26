@@ -5,7 +5,7 @@
 //! stays disabled until `install` or `update` is explicitly confirmed. Native
 //! participation and recall routing are deliberately read-only here.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -334,117 +334,6 @@ fn control_paths_for_profile(profile_root: &Path, create: bool) -> Result<Contro
         backup_root,
         journal,
     })
-}
-
-/// Resolve the currently configured, control-owned NCM worker for profile
-/// replacement without inventing a parallel install path.
-///
-/// Each project's newest canonical control receipt is its lifecycle authority:
-/// a later uninstall contributes no worker. The remaining configured bundles
-/// must still match the receipt's byte digests and the control-owned path
-/// shape. Profiles with distinct active worker generations require an explicit
-/// replacement override instead of choosing one by recency across projects.
-pub(crate) fn configured_ncm_worker_for_replacement(
-    profile_root: &Path,
-) -> Result<Option<PathBuf>> {
-    let paths = control_paths_for_profile(profile_root, false)?;
-    let entries = match fs::read_dir(&paths.root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(io_error("list NCM control receipts", &paths.root, error)),
-    };
-    let now = now_unix();
-    let mut latest_by_project = BTreeMap::<String, (u64, NcmReceiptArtifactIndex)>::new();
-    for entry in entries {
-        let path = entry
-            .map_err(|error| io_error("inspect NCM control receipt", &paths.root, error))?
-            .path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !name.starts_with(RECEIPT_FILE_PREFIX) || !name.ends_with(RECEIPT_FILE_SUFFIX) {
-            continue;
-        }
-        let Some(file) = (match read_regular_snapshot(&path, 1024 * 1024, "control receipt") {
-            Ok(file) => file,
-            Err(_) => continue,
-        }) else {
-            continue;
-        };
-        let Ok(receipt) = serde_json::from_slice::<NcmReceiptArtifactIndex>(&file.bytes) else {
-            continue;
-        };
-        if receipt.created_at_unix > now
-            || matches!(receipt.operation, NcmControlOperation::Recover)
-        {
-            continue;
-        }
-        match latest_by_project.get(&receipt.project_id) {
-            Some((created_at_unix, current)) if receipt.created_at_unix == *created_at_unix => {
-                if current != &receipt {
-                    return Err(config_error(format!(
-                        "NCM control receipts for project '{}' have conflicting lifecycle state at timestamp {}; set TRACEDECAY_NCM_WORKER to select the replacement worker explicitly",
-                        receipt.project_id, receipt.created_at_unix
-                    )));
-                }
-            }
-            Some((created_at_unix, _)) if receipt.created_at_unix < *created_at_unix => {}
-            _ => {
-                latest_by_project.insert(
-                    receipt.project_id.clone(),
-                    (receipt.created_at_unix, receipt),
-                );
-            }
-        }
-    }
-
-    let mut workers = BTreeSet::new();
-    for (_, receipt) in latest_by_project.into_values() {
-        if !matches!(
-            receipt.operation,
-            NcmControlOperation::Install | NcmControlOperation::Update
-        ) || receipt.outcome != "committed"
-        {
-            continue;
-        }
-        let (
-            Some(worker_path),
-            Some(worker_digest),
-            Some(manifest_digest),
-            Some(model_manifest_digest),
-        ) = (
-            receipt.worker_path,
-            receipt.worker_sha256,
-            receipt.manifest_sha256,
-            receipt.model_manifest_sha256,
-        )
-        else {
-            continue;
-        };
-        let Some(parent) = worker_path.parent() else {
-            continue;
-        };
-        let manifest_path = parent.join(WORKER_MANIFEST_NAME);
-        let model_manifest_path = parent.join(MODEL_ACQUISITION_MANIFEST_NAME);
-        if control_artifacts_are_safe(&paths, &worker_path, &manifest_path, &model_manifest_path)
-            && control_bundle_has_only_expected_entries(&worker_path)?
-            && bundle_digests_match(
-                &worker_path,
-                &worker_digest,
-                &manifest_digest,
-                &model_manifest_digest,
-            )
-        {
-            workers.insert(worker_path);
-        }
-    }
-    match workers.len() {
-        0 => Ok(None),
-        1 => Ok(workers.into_iter().next()),
-        _ => Err(config_error(
-            "multiple projects configure distinct verified NCM worker bundles; set TRACEDECAY_NCM_WORKER to select the replacement worker explicitly",
-        )),
-    }
 }
 
 async fn handle_status(scope: NcmScopeArgs, json: bool) -> Result<()> {
@@ -3427,7 +3316,7 @@ mod tests {
         NcmControlOperation, NcmControlReceiptV1, NcmJournalPhase, NcmScopeArgs,
         RECEIPT_FILE_PREFIX, RECEIPT_FILE_SUFFIX, TRUSTED_MODEL_ACQUISITION_MANIFEST,
         WORKER_MANIFEST_NAME, WORKER_NAME, before_observer_bundle_is_available,
-        cleanup_previous_control_worker, configured_ncm_worker_for_replacement,
+        cleanup_previous_control_worker,
         control_paths_for_profile, daemon_endpoint_is_reachable, daemon_profile_has_live_owner,
         latest_receipt, new_operation_id, now_unix, operation_id_for_identity, publish_worker,
         read_verified_model_acquisition_manifest, refuse_pending_journal,
@@ -3916,111 +3805,6 @@ mod tests {
             .expect("receipt scan")
             .expect("scoped receipt");
         assert!(latest.ends_with("control-receipt.c.v1.json"));
-    }
-
-    #[test]
-    fn replacement_worker_follows_current_receipt_and_ignores_flat_guess() {
-        let root = tempdir().expect("NCM replacement fixture root");
-        let profile_root = root.path().join("profile");
-        fs::create_dir_all(&profile_root).expect("profile root");
-        let paths = control_paths_for_profile(&profile_root, true).expect("control paths");
-        let source_worker = root.path().join("source-worker");
-        fs::write(&source_worker, b"worker bytes").expect("source worker");
-        let worker = paths
-            .worker_root
-            .join("install-operation")
-            .join(WORKER_NAME);
-        let worker_manifest = b"worker manifest";
-        publish_worker(
-            &worker,
-            worker_manifest,
-            TRUSTED_MODEL_ACQUISITION_MANIFEST,
-            &source_worker,
-        )
-        .expect("published control worker");
-
-        let flat_guess = paths.root.join(WORKER_NAME);
-        fs::write(&flat_guess, b"invented flat worker").expect("flat path fixture");
-        let now = now_unix();
-        write_receipt(
-            &paths,
-            &NcmControlReceiptV1 {
-                schema_version: CONTROL_SCHEMA_VERSION,
-                operation_id: "install-operation".to_owned(),
-                operation: NcmControlOperation::Install,
-                outcome: "committed",
-                profile_id: "profile.test".to_owned(),
-                project_id: "project.test".to_owned(),
-                worker_path: Some(worker.clone()),
-                state_root: Some(profile_root.join("ncm-state")),
-                worker_sha256: Some(sha256_hex(b"worker bytes")),
-                manifest_sha256: Some(sha256_hex(worker_manifest)),
-                model_manifest_sha256: Some(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST)),
-                model_state: "preserved",
-                native_state: "preserved",
-                recall_routing: "preserved",
-                configuration_receipt: None,
-                created_at_unix: now.saturating_sub(1),
-            },
-        )
-        .expect("install receipt");
-
-        assert_eq!(
-            configured_ncm_worker_for_replacement(&profile_root).expect("configured worker"),
-            Some(worker.clone())
-        );
-
-        write_receipt(
-            &paths,
-            &NcmControlReceiptV1 {
-                schema_version: CONTROL_SCHEMA_VERSION,
-                operation_id: "uninstall-operation".to_owned(),
-                operation: NcmControlOperation::Uninstall,
-                outcome: "committed",
-                profile_id: "profile.test".to_owned(),
-                project_id: "project.test".to_owned(),
-                worker_path: Some(worker.clone()),
-                state_root: Some(profile_root.join("ncm-state")),
-                worker_sha256: Some(sha256_hex(b"worker bytes")),
-                manifest_sha256: Some(sha256_hex(worker_manifest)),
-                model_manifest_sha256: Some(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST)),
-                model_state: "preserved",
-                native_state: "preserved",
-                recall_routing: "preserved",
-                configuration_receipt: None,
-                created_at_unix: now,
-            },
-        )
-        .expect("uninstall receipt");
-
-        assert_eq!(
-            configured_ncm_worker_for_replacement(&profile_root).expect("disabled worker"),
-            None
-        );
-
-        write_receipt(
-            &paths,
-            &NcmControlReceiptV1 {
-                schema_version: CONTROL_SCHEMA_VERSION,
-                operation_id: "same-second-install".to_owned(),
-                operation: NcmControlOperation::Install,
-                outcome: "committed",
-                profile_id: "profile.test".to_owned(),
-                project_id: "project.test".to_owned(),
-                worker_path: Some(worker),
-                state_root: Some(profile_root.join("ncm-state")),
-                worker_sha256: Some(sha256_hex(b"worker bytes")),
-                manifest_sha256: Some(sha256_hex(worker_manifest)),
-                model_manifest_sha256: Some(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST)),
-                model_state: "preserved",
-                native_state: "preserved",
-                recall_routing: "preserved",
-                configuration_receipt: None,
-                created_at_unix: now,
-            },
-        )
-        .expect("same-second install receipt");
-        assert!(configured_ncm_worker_for_replacement(&profile_root).is_err());
     }
 
     #[cfg(unix)]

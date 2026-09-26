@@ -164,11 +164,9 @@ verify_feature_wiring() {
   local code_index_packaged_manifest=$4
   local extraction_source_manifest=$5
   local extraction_packaged_manifest=$6
-  local semantic_source_manifest=$7
-  local semantic_packaged_manifest=$8
-  local cli_source_manifest=$9
-  local cli_packaged_manifest=${10}
-  local cargo_config=${11}
+  local cli_source_manifest=$7
+  local cli_packaged_manifest=$8
+  local cargo_config=$9
   # Manifest and layering rules only. Per-language `cargo check` isolation is
   # a source-graph property, not a packaging proof: it does not use the
   # just-built release binary, and on the extracted tree it serializes one
@@ -181,8 +179,6 @@ verify_feature_wiring() {
     --code-index-packaged "$code_index_packaged_manifest" \
     --extraction-source "$extraction_source_manifest" \
     --extraction-packaged "$extraction_packaged_manifest" \
-    --semantic-source "$semantic_source_manifest" \
-    --semantic-packaged "$semantic_packaged_manifest" \
     --cli-source "$cli_source_manifest" \
     --cli-packaged "$cli_packaged_manifest" \
     --cargo-config "$cargo_config" \
@@ -576,8 +572,7 @@ for required_package in \
   tracedecay-tool-catalog \
   tracedecay-code-index \
   tracedecay-code-index-runtime \
-  tracedecay-code-extraction \
-  tracedecay-semantic; do
+  tracedecay-code-extraction; do
   [[ -n ${package_dirs[$required_package]:-} ]] ||
     die "workspace package required by the distribution gate was not produced: $required_package"
 done
@@ -586,7 +581,6 @@ cli_package=${package_dirs[tracedecay-cli]}
 agent_hosts_package=${package_dirs[tracedecay-agent-hosts]}
 code_index_package=${package_dirs[tracedecay-code-index]}
 code_extraction_package=${package_dirs[tracedecay-code-extraction]}
-semantic_package=${package_dirs[tracedecay-semantic]}
 catalog_package=${package_dirs[tracedecay-tool-catalog]}
 contracts_package=${package_dirs[tracedecay-contracts]}
 
@@ -645,8 +639,6 @@ verify_feature_wiring \
   "$code_index_package/Cargo.toml" \
   "$repo/crates/tracedecay-code-extraction/Cargo.toml" \
   "$code_extraction_package/Cargo.toml" \
-  "$repo/crates/tracedecay-semantic/Cargo.toml" \
-  "$semantic_package/Cargo.toml" \
   "$repo/crates/tracedecay-cli/Cargo.toml" \
   "$cli_package/Cargo.toml" \
   "$patch_config"

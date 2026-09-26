@@ -57,7 +57,6 @@ mod ncm_cmd;
 mod product_runtime;
 mod project_cmd;
 mod remote_command;
-mod semantic_cmd;
 mod serve_cmd;
 mod sessions_cmd;
 mod status_cmd;
@@ -999,7 +998,6 @@ impl CommandFamily {
             | Commands::Projects { .. }
             | Commands::Branch { .. }
             | Commands::Memory { .. }
-            | Commands::Semantic { .. }
             | Commands::Storage { .. }
             | Commands::Wipe { .. }
             | Commands::List { .. } => Self::Project,
@@ -1281,9 +1279,6 @@ async fn dispatch_project_command(
         }
         Commands::Memory { action } => {
             dispatch_memory_command(action).await?;
-        }
-        Commands::Semantic { action } => {
-            semantic_cmd::handle_semantic_action(action).await?;
         }
         Commands::Storage { action } => {
             commands::handle_profile_storage_action(action, assume_yes).await?;
@@ -1973,8 +1968,7 @@ impl CommandStartupPolicy {
             | Commands::Projects { .. }
             | Commands::Daemon { .. }
             | Commands::Serve { .. }
-            | Commands::Ncm { .. }
-            | Commands::Semantic { .. } => Self::SkipAll,
+            | Commands::Ncm { .. } => Self::SkipAll,
             // Inspection-only commands retain ordinary startup maintenance but
             // do not need the unrelated agent-install health check.
             Commands::Status { .. }
