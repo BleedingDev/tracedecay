@@ -17,6 +17,8 @@ packages:
   - "!.codex-worktrees/**"
   - "!.claude-worktrees/**"
   - "!.claude/worktrees/**"
+  # Fork planning snapshots copy crate manifests; they are not workspaces.
+  - "!.codex/**"
 
 allowBuilds:
   esbuild: true

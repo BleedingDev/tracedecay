@@ -122,7 +122,7 @@ mod tests {
             let target = root.path().join(name);
             let lock_path = root.path().join(format!(".{name}.durable-directory.lock"));
             let held = open_lock_file(&lock_path, true).unwrap();
-            fs2::FileExt::lock_exclusive(&held).unwrap();
+            held.lock().unwrap();
             let worker_target = target.clone();
             let (completed, result) = std::sync::mpsc::channel();
             let worker = std::thread::spawn(move || {

@@ -514,7 +514,6 @@ fn family_request(
     CodeIndexSimilarRequestV1 {
         project_root: project_root.to_path_buf(),
         target: CodeIndexSimilarTargetV1::SymbolOccurrence(source.clone()),
-        source_extent: tracedecay_query::code_search::CodeIndexSimilarSourceExtentV1::WholeBody,
         match_classes: vec![
             tracedecay_code_index::clones::CloneNormalizationClassV1::Conservative,
             tracedecay_code_index::clones::CloneNormalizationClassV1::Rename,

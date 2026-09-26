@@ -36,8 +36,8 @@ use crate::{McpToolContext, ToolResult};
 
 use super::context_markdown::verified_plan_context;
 use super::context_support::{
-    ContextMemoryOutcome, context_memory_analytics, context_memory_matches, context_memory_options,
-    context_memory_outcome, context_memory_read_control, context_memory_stage,
+    ContextMemoryOutcome, context_memory_analytics, context_memory_options, context_memory_outcome,
+    context_memory_read_control, context_memory_stage,
 };
 use super::primitive_surface::{
     search_coverage as primitive_search_coverage, symbol_location as primitive_symbol_location,
@@ -781,15 +781,6 @@ where
     let deadline = ctx.deadline().cloned();
     let cancellation = ctx.cancellation().cloned();
     let request: ContextSurfaceRequestV1 = decode_primitive_request(&args, "tracedecay_context")?;
-    let memory_policy_admitted_at =
-        tracedecay_contracts::try_now_micros().map_err(|error| TraceDecayError::Config {
-            message: format!("context memory policy admission clock unavailable: {error}"),
-        })?;
-    request
-        .validate_memory_policy_at(memory_policy_admitted_at)
-        .map_err(|error| TraceDecayError::Config {
-            message: format!("invalid context memory policy: {error}"),
-        })?;
     let task = request.task.as_str();
     let mode = request.mode.unwrap_or(ContextModeV1::Explore);
     let max_nodes = request
@@ -804,7 +795,7 @@ where
         requested_anchors.clone(),
         request.prefer_symbol.unwrap_or(false),
     )?;
-    let memory_options = context_memory_options(&request);
+    let memory_options = context_memory_options(&args);
     let memory_read_control =
         context_memory_read_control(&memory_options, deadline.as_ref(), cancellation.as_ref())?;
     // Graph enrichment is optional unless the caller asks for source bodies.
@@ -826,11 +817,7 @@ where
             cancellation,
         },
     );
-    let memory = context_memory_outcome(
-        &memory_options,
-        memory_read_control.as_ref(),
-        |read_control| context_memory_matches(ctx, task, &memory_options, read_control),
-    );
+    let memory = context_memory_outcome(ctx, task, &memory_options, memory_read_control.as_ref());
     let search_and_graph = race_primary_search_with_graph(search, graph, false, None, include_code);
     let ((outcome, graph), memory_outcome) = tokio::join!(search_and_graph, memory);
     // Read after the search settles: the verdict must describe the scheduler
@@ -955,7 +942,6 @@ where
     let ContextMemoryOutcome {
         hits: memory_matches,
         graph_coverage: memory_graph_coverage,
-        temporal_coverage: memory_temporal_coverage,
         error: memory_matches_error,
     } = memory_outcome;
     let symbols = projection
@@ -1009,7 +995,7 @@ where
         coverage,
         memory_matches,
         memory_graph_coverage,
-        memory_temporal_coverage,
+        memory_temporal_coverage: None,
         memory_matches_error,
         verified_graph_evidence,
         plan,
@@ -2341,7 +2327,7 @@ mod tests {
         let content = format!("{}tail-marker", "long memory body ".repeat(100));
         let hit = context_memory_hit(&content);
 
-        let Some(section) = context_memory_section(&[hit], None, None) else {
+        let Some(section) = context_memory_section(&[hit], None) else {
             panic!("memory hit should render");
         };
 

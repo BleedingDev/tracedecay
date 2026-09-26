@@ -105,14 +105,12 @@ mod tests {
 
     #[test]
     fn provider_control_semantics_bind_generated_operation_source_and_terminal_effect() {
-        use crate::operations::{
-            ApplicationProviderFeedback, ApplicationProviderHealth, TypedOperation,
-        };
+        use crate::operations::{ProviderFeedback, ProviderHealth, TypedOperation};
         use tracedecay_contracts::RequestId;
         use tracedecay_contracts::retained_surfaces::ProviderControlResultV1;
 
         let source = json!({"trace_ref":"trace.retained.1","item_ref":"item.1","observation_id":"observation.1"});
-        let request: <ApplicationProviderFeedback as TypedOperation>::Request =
+        let request: <ProviderFeedback as TypedOperation>::Request =
             serde_json::from_value(json!({"source":source,"signal":"helpful","weight":"1","evidence_refs":[],"occurred_at":1})).expect("concrete SDK request body");
         let request = serde_json::to_value(request).expect("SDK serialized request");
         assert!(request.get("operation").is_none());
@@ -138,8 +136,8 @@ mod tests {
         });
         let matches = |result: &serde_json::Value| {
             response_matches(
-                ApplicationProviderFeedback::RESULT_SEMANTICS,
-                ApplicationProviderFeedback::OPERATION_ID,
+                ProviderFeedback::RESULT_SEMANTICS,
+                ProviderFeedback::OPERATION_ID,
                 expected_id.as_str(),
                 Some(&expected_id),
                 &request,
@@ -166,8 +164,8 @@ mod tests {
         );
         assert!(
             !response_matches(
-                ApplicationProviderFeedback::RESULT_SEMANTICS,
-                ApplicationProviderHealth::OPERATION_ID,
+                ProviderFeedback::RESULT_SEMANTICS,
+                ProviderHealth::OPERATION_ID,
                 expected_id.as_str(),
                 Some(&expected_id),
                 &request,
@@ -197,8 +195,8 @@ mod tests {
         );
         assert!(
             !response_matches(
-                ApplicationProviderFeedback::RESULT_SEMANTICS,
-                ApplicationProviderFeedback::OPERATION_ID,
+                ProviderFeedback::RESULT_SEMANTICS,
+                ProviderFeedback::OPERATION_ID,
                 "request.foreign",
                 Some(&expected_id),
                 &request,
@@ -208,7 +206,7 @@ mod tests {
         );
         assert!(
             !response_matches(
-                ApplicationProviderFeedback::RESULT_SEMANTICS,
+                ProviderFeedback::RESULT_SEMANTICS,
                 "operation.application.fact_store_curate",
                 expected_id.as_str(),
                 Some(&expected_id),

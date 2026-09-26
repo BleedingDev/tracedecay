@@ -309,16 +309,12 @@ pub(super) fn code_index_activation_hint_sink(
             if !paths.is_queued() {
                 return paths;
             }
-            let reconcile = if let Some(options) = batch.reconcile_options {
-                schedulers
-                    .notify_explicit_reconciliation(&project_root, options)
-                    .await
-            } else if batch.overflow {
+            let overflow = if batch.overflow {
                 schedulers.notify_hook_overflow(&project_root).await
             } else {
                 CodeIndexDemandAdmissionV1::Queued
             };
-            paths.strongest_refusal(reconcile)
+            paths.strongest_refusal(overflow)
         })
     });
     sink

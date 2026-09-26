@@ -563,7 +563,7 @@ fn provider_control_outcome_matches_request(
     let result = match outcome {
         ApplicationOutcome::Evidence(packet) => packet.payload.as_ref(),
         ApplicationOutcome::Effect(effect) => effect.payload.as_ref(),
-        ApplicationOutcome::Preview(_) => None,
+        ApplicationOutcome::Preview(_) | ApplicationOutcome::Result(_) => None,
     };
     matches!(result, Some(RetainedSurfaceResultV1::ProviderControl(result)) if result.validate_for(request).is_ok())
 }

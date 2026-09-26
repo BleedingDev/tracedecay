@@ -237,23 +237,3 @@ fn whitespace_framing_keeps_all_final_bytes_and_exact_token_counts() -> Result<(
     assert!(evaluate_host_retrieval(&MetricCatalog::embedded()?, &run).is_ok());
     Ok(())
 }
-
-#[test]
-fn heldout_catalog_binds_new_cases_without_changing_metric_definitions()
--> Result<(), Box<dyn Error>> {
-    let catalog = MetricCatalog::from_json_str(include_str!(
-        "../../../product/evaluation/host-comparison/metrics.v1.json"
-    ))?;
-    let original = MetricCatalog::embedded()?;
-    assert_eq!(catalog.scenario_ids().len(), 18);
-    assert_eq!(catalog.label_vocabulary, original.label_vocabulary);
-    assert_eq!(catalog.percentile_method, original.percentile_method);
-    for (mut actual, mut expected) in catalog.metrics.into_iter().zip(original.metrics) {
-        actual.applicable_scenarios = None;
-        expected.applicable_scenarios = None;
-        actual.rubric_check_bindings.clear();
-        expected.rubric_check_bindings.clear();
-        assert_eq!(actual, expected);
-    }
-    Ok(())
-}

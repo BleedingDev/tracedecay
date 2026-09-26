@@ -855,7 +855,7 @@ fn check_directory_creation_interrupt(
 fn acquire_directory_creation_lock(
     lock_path: &Path,
     interrupt: &mut Option<&mut dyn FnMut() -> io::Result<()>>,
-) -> io::Result<fs::File> {
+) -> io::Result<FileLease> {
     let Some(interrupt) = interrupt.as_deref_mut() else {
         return acquire_lock_file_blocking(lock_path, true);
     };
@@ -863,10 +863,11 @@ fn acquire_directory_creation_lock(
     let file = open_lock_file(lock_path, true)?;
     loop {
         interrupt()?;
-        match FileExt::try_lock_exclusive(&file) {
+        match file.try_lock().map_err(io::Error::from) {
             Ok(()) => {
+                let lease = FileLease::held(file, SIDECAR_LEASE_LABEL);
                 interrupt()?;
-                return Ok(file);
+                return Ok(lease);
             }
             Err(error) if crate::db::is_lock_contended(&error) => {
                 std::thread::sleep(std::time::Duration::from_millis(1));

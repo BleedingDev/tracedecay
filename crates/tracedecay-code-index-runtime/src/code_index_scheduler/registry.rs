@@ -3246,45 +3246,6 @@ impl CodeIndexSchedulerRegistryV1 {
         CodeIndexDemandAdmissionV1::Queued
     }
 
-    /// Queue one explicit, request-scoped folder policy on a mounted
-    /// worktree. The policy is consumed by the next authoritative scheduler
-    /// pass and is never written to the durable project configuration.
-    pub async fn notify_explicit_reconciliation(
-        &self,
-        project_root: &Path,
-        options: tracedecay_contracts::CodeIndexReconcileOptionsV1,
-    ) -> CodeIndexDemandAdmissionV1 {
-        let Ok(project_root) = project_root.canonicalize() else {
-            return CodeIndexDemandAdmissionV1::Unavailable(
-                CodeIndexDemandUnavailableV1::SchedulerUnmounted,
-            );
-        };
-        let (hints, wake, epoch, pending_wake) = {
-            let mounted = self.mounted.lock().await;
-            let Some(worktree) = mounted.get(&project_root) else {
-                return CodeIndexDemandAdmissionV1::Unavailable(
-                    CodeIndexDemandUnavailableV1::SchedulerUnmounted,
-                );
-            };
-            if let Some(parked) = Self::publication_authority_reset(worktree) {
-                return CodeIndexDemandAdmissionV1::Terminal(parked);
-            }
-            (
-                Arc::clone(&worktree.hints),
-                Arc::clone(&worktree.wake),
-                Arc::clone(&worktree.epoch),
-                Arc::clone(&worktree.pending_wake),
-            )
-        };
-        hints
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .set_explicit_reconcile_options(options);
-        DaemonCodeIndexControlV1::advance(&epoch);
-        Self::note_wake(&pending_wake, &wake, CodeIndexCadenceTriggerV1::Overflow);
-        CodeIndexDemandAdmissionV1::Queued
-    }
-
     /// Run the bounded Git/stat/content freshness ladder for an ordinary read
     /// without manufacturing an overflow. Only a proven source change posts a
     /// query admission wake; a source witness that still matches (stat

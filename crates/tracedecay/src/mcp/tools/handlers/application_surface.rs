@@ -397,7 +397,16 @@ pub fn retained_tool_target(
         | Op::LcmGrep
         | Op::LcmDescribe
         | Op::LcmExpand
-        | Op::LcmExpandQuery => false,
+        | Op::LcmExpandQuery
+        | Op::ProviderFeedback
+        | Op::ProviderCorrection
+        | Op::ProviderDeleteBySource
+        | Op::ProviderHealth
+        | Op::ProviderInspection
+        | Op::ProviderMaintenance
+        | Op::ProviderSnapshotExport
+        | Op::ProviderSnapshotRestore
+        | Op::ProviderReplay => false,
     };
     Ok(if profile {
         InvocationTarget::Profile
