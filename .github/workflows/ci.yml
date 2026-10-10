@@ -283,6 +283,11 @@ jobs:
         shell: bash
         run: bazel test --config=ci //...
 
+      - name: Summarize failed Bazel tests
+        if: failure()
+        shell: bash
+        run: python3 scripts/summarize-bazel-test-failures.py
+
       - name: Upload failed test diagnostics
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -461,6 +466,10 @@ jobs:
       - name: Build and test this shard
         run: bazel test --config=ci ${{ matrix.test_resources }} ${{ matrix.targets }}
 
+      - name: Summarize failed Bazel tests
+        if: failure()
+        run: python3 scripts/summarize-bazel-test-failures.py
+
       - name: Upload failed test diagnostics
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -521,6 +530,11 @@ jobs:
       - name: Build and test the workspace
         shell: bash
         run: bazel test --config=ci //...
+
+      - name: Summarize failed Bazel tests
+        if: failure()
+        shell: bash
+        run: python3 scripts/summarize-bazel-test-failures.py
 
       - name: Upload failed test diagnostics
         if: failure()

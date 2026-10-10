@@ -226,7 +226,8 @@ rust_test(
 
 rust_test(
     name = "mcp_suite",
-    size = "large",
+    size = "enormous",
+    env = {"TRACEDECAY_TEST_NOCAPTURE": "1"},
     srcs = glob(["tests/mcp_suite/**/*.rs"]) + glob(["tests/common/**/*.rs"]) + ["//tests:support_sources"],
     crate_root = "tests/mcp_suite/main.rs",
     edition = crate_edition(),

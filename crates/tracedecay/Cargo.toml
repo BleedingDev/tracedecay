@@ -67,7 +67,7 @@ include = [
 
 # Measured aggregate suites exceed the native five-minute medium limit.
 [package.metadata.bazel.test_sizes]
-mcp_suite = "large"
+mcp_suite = "enormous"
 unit_test = "large"
 
 [features]

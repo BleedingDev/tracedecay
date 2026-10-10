@@ -28,6 +28,12 @@ export PATH="{toolchain_path}:$PATH"
 # Names such as CARGO_BIN_EXE_<bin> may carry `-`, which no shell variable
 # can, so each assignment goes through env as its own argument: a runfiles
 # path with spaces stays one word.
+# rustc writes the trailing `failures:` section only at process end. A
+# TIMEOUT kills the suite first, so panic text never reaches test.log
+# unless each test prints as it runs.
+if [ "${{TRACEDECAY_TEST_NOCAPTURE:-}}" = "1" ]; then
+  set -- --nocapture "$@"
+fi
 exec env {runfiles_env} "$TEST_SRCDIR/$TEST_WORKSPACE/{binary}" "$@"
 """
 
@@ -61,7 +67,11 @@ if not exist "%TEST_BINARY%" (
   dir /s /b "%TEST_SRCDIR%" 1>&2
   exit /b 1
 )
-"%TEST_BINARY%" %*
+if "%TRACEDECAY_TEST_NOCAPTURE%"=="1" (
+  "%TEST_BINARY%" --nocapture %*
+) else (
+  "%TEST_BINARY%" %*
+)
 exit /b %ERRORLEVEL%
 """
 
@@ -195,10 +205,12 @@ def rust_test(name, tags = [], runfiles_env = {}, **kwargs):
         if attribute in kwargs
     }
     binary_name = name + "__binary"
+    extra_env = kwargs.pop("env", {})
     env = {
         "TRACEDECAY_DATA_DIR": "/dev/null",
         "TRACEDECAY_DISABLE_GLOBAL_DB": "1",
     }
+    env.update(extra_env)
     data = list(kwargs.pop("data", []))
     present = [native.package_relative_label(entry) for entry in data]
     for label in runfiles_env.values():
