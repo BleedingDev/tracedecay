@@ -30,11 +30,16 @@ use super::query::{
     retire_superseded_versions, storage, storage_message,
 };
 use super::rebuild::{
-    checkpoint_relation_rebuild_control, rebuild_candidate_session_relations,
-    validate_candidate_frontier,
+    apply_candidate_relation_projection, checkpoint_relation_rebuild_control,
+    rebuild_candidate_session_relations, reconstruct_candidate_session_relations,
+    record_relation_receipts_group, validate_candidate_frontier,
 };
 use super::relation_receipts::acknowledge_relation_receipt;
-use crate::handle::{SessionTemporalAccess, SessionTemporalRegisteredDb, SessionTemporalWriteTxn};
+use super::relations::SessionRelationProjection;
+use crate::handle::{
+    SessionTemporalAccess, SessionTemporalExec, SessionTemporalRegisteredDb,
+    SessionTemporalWriteTxn,
+};
 
 const BEGIN_REFRESH: &str = "begin or join session refresh";
 const PERSIST_REFRESH: &str = "persist session refresh progress";
@@ -176,6 +181,20 @@ pub enum SessionRefreshBeginPlanV1 {
     Begun,
     /// An equivalent operation already exists; the request attaches to it.
     Joined,
+}
+
+/// One session's begin and first projected batch inside a grouped begin
+/// commit (`commit_session_refresh_begin_batch_group`).
+#[derive(Debug)]
+pub struct SessionRefreshBeginBatchItemV1 {
+    /// The begin-or-join request this item replays.
+    pub request: SessionRefreshBeginOrJoinRequestV1,
+    /// Acceptance timestamp the planned recovery carried.
+    pub accepted_at: UtcMicros,
+    /// Progress the projected batch was validated against.
+    pub progress: SessionRefreshProgressV1,
+    /// The projected first batch to fold into the begin commit.
+    pub batch: SessionTemporalProjectionBatchV1,
 }
 
 /// Outcome of committing a refresh begin and its first projected batch in
@@ -803,34 +822,14 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                 .map_err(|error| storage(PERSIST_REFRESH, error))?;
             return Ok(SessionRefreshBeginBatchOutcomeV1::BeganOnly);
         }
-        let persisted = async {
-            require_progress_timestamp(&progress, authoritative_validation_time)?;
-            let receipt = persist_session_temporal_projection_batch_in_transaction(
-                &transaction,
-                &batch,
-                &execution_control,
-            )
-            .await?;
-            validate_next_progress(
-                &transaction,
-                &progress,
-                batch.generation(),
-                batch.batch_ordinal(),
-                batch.item_count(),
-            )
-            .await?;
-            validate_progress_binding(&binding, &progress)?;
-            insert_progress_and_binding(&transaction, &progress, &batch).await?;
-            touch_running_operation(
-                &transaction,
-                progress.session_id(),
-                progress.operation_id(),
-                progress.updated_at(),
-            )
-            .await?;
-            checkpoint_relation_rebuild_control(&execution_control)?;
-            Ok::<_, SessionStoreError>(receipt)
-        }
+        let persisted = persist_begin_batch_in_transaction(
+            &transaction,
+            &binding,
+            &progress,
+            &batch,
+            authoritative_validation_time,
+            &execution_control,
+        )
         .await;
         match persisted {
             Ok(receipt) => {
@@ -873,6 +872,52 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                 })
             }
         }
+    }
+
+    /// Commits the begin+first-batch fold for several independent session
+    /// refreshes inside one physical transaction. Each item runs under its
+    /// own savepoint: begin replays are `session_id`-scoped so no item can
+    /// observe another item's uncommitted rows, an item that fails to
+    /// persist rolls back to its savepoint (its durable begin is then
+    /// replayed alone, the same state a crash between the two commits left
+    /// behind), and every outcome is only handed back after the single
+    /// commit returns — no result is acknowledged before durability.
+    /// Cancellation or a transaction-level error aborts the whole group
+    /// before commit, which is exactly the state an interrupted pass
+    /// already relies on recovering from.
+    #[tracing::instrument(
+        name = "session_temporal.txn.begin_refresh_batch_group",
+        level = "trace",
+        skip_all
+    )]
+    pub async fn commit_session_refresh_begin_batch_group(
+        &self,
+        items: Vec<SessionRefreshBeginBatchItemV1>,
+        execution_control: ExecutionControl,
+    ) -> SessionStoreResult<Vec<SessionStoreResult<SessionRefreshBeginBatchOutcomeV1>>> {
+        let transaction = self
+            .begin_write_transaction()
+            .instrument(tracing::trace_span!("session_temporal.txn.begin"))
+            .await
+            .map_err(|error| storage(PERSIST_REFRESH, error))?;
+        let mut outcomes = Vec::with_capacity(items.len());
+        for (index, item) in items.into_iter().enumerate() {
+            outcomes.push(
+                commit_begin_batch_item_in_transaction(
+                    &transaction,
+                    index,
+                    item,
+                    &execution_control,
+                )
+                .await,
+            );
+        }
+        transaction
+            .commit()
+            .instrument(tracing::trace_span!("session_temporal.txn.commit"))
+            .await
+            .map_err(|error| storage(PERSIST_REFRESH, error))?;
+        Ok(outcomes)
     }
 
     pub async fn persist_session_refresh_projection_batch_result(
@@ -1168,90 +1213,232 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .instrument(tracing::trace_span!("session_temporal.txn.begin"))
             .await
             .map_err(|error| storage(COMPLETE_REFRESH, error))?;
-        if let Some(receipt) =
-            read_receipt(&transaction, request.session_id(), request.operation_id()).await?
-        {
-            require_exact_completion(&receipt, &request)?;
-            checkpoint_relation_rebuild_control(&execution_control)?;
-            transaction
-                .commit()
-                .instrument(tracing::trace_span!("session_temporal.txn.commit"))
-                .await
-                .map_err(|error| storage(COMPLETE_REFRESH, error))?;
-            return Ok(receipt);
-        }
-        let binding = require_running_binding(
+        let receipt = complete_session_refresh_in_transaction(
             &transaction,
-            request.session_id(),
-            request.operation_id(),
-            COMPLETE_REFRESH,
-        )
-        .await?;
-        // Terminal progress and the candidate frontier must hold at commit
-        // time, so they are proven inside the transaction that writes the
-        // finish rather than on the snapshot above.
-        let progress = require_exact_terminal_progress(
-            &transaction,
-            request.session_id(),
-            request.operation_id(),
-            request.frontier(),
-            request.coverage(),
-        )
-        .await?;
-        validate_candidate_frontier(
-            &transaction,
-            request.session_id().as_str(),
-            generation_i64(binding.generation, COMPLETE_REFRESH)?,
-            binding.target_frontier,
+            request,
             &relation_projection,
             &execution_control,
         )
-        .await?;
-        let mut request = request;
-        if request.source_coverage().is_none()
-            && let Some(source_coverage) = progress.source_coverage().cloned()
-        {
-            request = request.with_source_coverage(source_coverage);
+        .await;
+        match receipt {
+            Ok(receipt) => {
+                transaction
+                    .commit()
+                    .instrument(tracing::trace_span!("session_temporal.txn.commit"))
+                    .await
+                    .map_err(|error| storage(COMPLETE_REFRESH, error))?;
+                Ok(receipt)
+            }
+            Err(error) => {
+                transaction
+                    .rollback()
+                    .instrument(tracing::trace_span!("session_temporal.txn.rollback"))
+                    .await
+                    .map_err(|rollback| storage(COMPLETE_REFRESH, rollback))?;
+                Err(error)
+            }
         }
-        if request.frontier().committed_through() != binding.target_frontier {
-            return Err(SessionStoreError::InvalidStateTransition {
-                context: "refresh completion target coverage",
-            });
+    }
+
+    /// Commits several sessions' refresh completions in one physical
+    /// transaction. Each item runs under its own savepoint — the in-txn
+    /// proof chain is `session_id`-scoped so no item can observe another
+    /// item's uncommitted rows — and an item whose revalidation fails rolls
+    /// back to its savepoint while the rest of the group still commits,
+    /// exactly the durable states sequential commits would leave. Every
+    /// receipt is handed back only after the single commit returns, so no
+    /// completion is acknowledged before durability.
+    #[tracing::instrument(
+        name = "session_temporal.txn.complete_refresh_group",
+        level = "trace",
+        skip_all
+    )]
+    pub async fn complete_session_refresh_group(
+        &self,
+        items: Vec<(SessionRefreshCompletionRequestV1, SessionRelationProjection)>,
+        execution_control: ExecutionControl,
+    ) -> SessionStoreResult<Vec<SessionStoreResult<SessionRefreshReceiptV1>>> {
+        let transaction = self
+            .begin_write_transaction()
+            .instrument(tracing::trace_span!("session_temporal.txn.begin"))
+            .await
+            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
+        let mut receipts = Vec::with_capacity(items.len());
+        for (index, (request, relation_projection)) in items.into_iter().enumerate() {
+            let savepoint = format!("refresh_complete_item_{index}");
+            if let Err(error) = transaction
+                .execute(&format!("SAVEPOINT {savepoint}"), ())
+                .await
+                .map_err(|error| storage(COMPLETE_REFRESH, error))
+            {
+                receipts.push(Err(error));
+                continue;
+            }
+            let receipt = complete_session_refresh_in_transaction(
+                &transaction,
+                request,
+                &relation_projection,
+                &execution_control,
+            )
+            .await;
+            let outcome = match receipt {
+                Ok(receipt) => match transaction
+                    .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
+                    .await
+                {
+                    Ok(_) => Ok(receipt),
+                    Err(error) => Err(storage(COMPLETE_REFRESH, error)),
+                },
+                Err(item_error) => {
+                    let rollback = async {
+                        transaction
+                            .execute(&format!("ROLLBACK TO SAVEPOINT {savepoint}"), ())
+                            .await
+                            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
+                        transaction
+                            .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
+                            .await
+                            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
+                        Ok::<_, SessionStoreError>(())
+                    }
+                    .await;
+                    match rollback {
+                        Ok(()) => Err(item_error),
+                        Err(rollback_error) => Err(rollback_error),
+                    }
+                }
+            };
+            receipts.push(outcome);
         }
-        acknowledge_relation_receipt(&transaction, &relation_projection).await?;
-        let terminal_at = terminal_timestamp(&progress, COMPLETE_REFRESH)?;
-        activate_bound_generation(&transaction, request.session_id(), &binding, terminal_at)
-            .await?;
-        finish_operation(
-            &transaction,
-            request.session_id(),
-            request.operation_id(),
-            "complete",
-            None,
-            terminal_at,
-        )
-        .await?;
-        insert_terminal_receipt(
-            &transaction,
-            request.session_id(),
-            request.operation_id(),
-            "complete",
-            progress.frontier(),
-            progress.coverage(),
-            request
-                .source_coverage()
-                .or_else(|| progress.source_coverage()),
-            None,
-            terminal_at,
-        )
-        .await?;
-        checkpoint_relation_rebuild_control(&execution_control)?;
         transaction
             .commit()
             .instrument(tracing::trace_span!("session_temporal.txn.commit"))
             .await
             .map_err(|error| storage(COMPLETE_REFRESH, error))?;
-        Ok(SessionRefreshReceiptV1::completed(request, terminal_at))
+        Ok(receipts)
+    }
+
+    /// Stages one refresh completion for the grouped receipt/apply/
+    /// complete pipeline: proves the same snapshot preconditions as
+    /// `complete_session_refresh_result` and reconstructs the candidate
+    /// relation projection off the writer lane. The grouped receipt
+    /// commit, the per-session relation apply, the post-apply
+    /// `validate_staged_session_refresh_completion` scan, and the grouped
+    /// completion commit each re-prove what they commit against, so a
+    /// stage built on stale-but-committed state degrades the same way the
+    /// single-session path does.
+    pub async fn stage_session_refresh_completion(
+        &self,
+        request: SessionRefreshCompletionRequestV1,
+        execution_control: &ExecutionControl,
+    ) -> SessionStoreResult<SessionRefreshCompletionStage> {
+        checkpoint_relation_rebuild_control(execution_control)?;
+        let snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
+        if let Some(receipt) =
+            read_receipt(&snapshot, request.session_id(), request.operation_id()).await?
+        {
+            require_exact_completion(&receipt, &request)?;
+            checkpoint_relation_rebuild_control(execution_control)?;
+            return Ok(SessionRefreshCompletionStage::Durable(receipt));
+        }
+        let binding = require_running_binding(
+            &snapshot,
+            request.session_id(),
+            request.operation_id(),
+            COMPLETE_REFRESH,
+        )
+        .await?;
+        drop(snapshot);
+        if request.frontier().committed_through() != binding.target_frontier {
+            return Err(SessionStoreError::InvalidStateTransition {
+                context: "refresh completion target coverage",
+            });
+        }
+
+        let relation_projection = reconstruct_candidate_session_relations(
+            self.inner(),
+            request.session_id(),
+            binding.generation,
+            execution_control,
+            COMPLETE_REFRESH,
+        )
+        .await?;
+
+        Ok(SessionRefreshCompletionStage::Ready {
+            request,
+            relation_projection,
+            watermarks: binding.watermarks,
+        })
+    }
+
+    /// Records the pending relation receipts for several staged
+    /// completions in one physical commit — the same writes
+    /// `rebuild_candidate_session_relations` commits per session, folded
+    /// into one transaction with per-item savepoint isolation. Every
+    /// watermark is returned only after the commit returns.
+    pub async fn record_relation_receipts_group(
+        &self,
+        projections: &[SessionRelationProjection],
+        execution_control: &ExecutionControl,
+    ) -> SessionStoreResult<Vec<SessionStoreResult<tracedecay_graph_db::GraphWatermark>>> {
+        record_relation_receipts_group(
+            self.inner(),
+            projections,
+            execution_control,
+            COMPLETE_REFRESH,
+        )
+        .await
+    }
+
+    /// Applies one staged completion's reconstructed projection to the
+    /// native relation graph and verifies the loaded graph preserves the
+    /// canonical reconstruction — the per-session half of
+    /// `rebuild_candidate_session_relations`, run off the writer lane
+    /// after its receipt committed. `snapshot` must postdate the grouped
+    /// receipt commit.
+    pub async fn apply_candidate_relation_projection(
+        &self,
+        snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
+        projection: &SessionRelationProjection,
+        execution_control: &ExecutionControl,
+    ) -> SessionStoreResult<SessionRelationProjection> {
+        apply_candidate_relation_projection(
+            self.inner(),
+            snapshot,
+            projection,
+            execution_control,
+            COMPLETE_REFRESH,
+        )
+        .await
+    }
+
+    /// Runs the final-receipt scan for a staged completion after its
+    /// relation apply — the same validation snapshot the single-session
+    /// path opens between the rebuild and its finish transaction.
+    pub async fn validate_staged_session_refresh_completion(
+        &self,
+        session_id: &tracedecay_domain::SessionId,
+        generation: tracedecay_domain::SessionProjectionGenerationV1,
+        watermarks: &SessionFrozenWatermarksV1,
+        relation_projection: &SessionRelationProjection,
+        execution_control: &ExecutionControl,
+    ) -> SessionStoreResult<()> {
+        let validation_snapshot = self
+            .read_snapshot()
+            .await
+            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
+        validate_final_projection_receipt(
+            &validation_snapshot,
+            session_id,
+            generation,
+            watermarks,
+            relation_projection,
+            execution_control,
+        )
+        .await
     }
 
     #[tracing::instrument(name = "session_temporal.txn.fail_refresh", level = "trace", skip_all)]
@@ -3066,6 +3253,281 @@ fn decode_refresh_state(
             operation,
             "refresh operation state is invalid",
         )),
+    }
+}
+
+/// The batch-persist half of the begin+first-batch fold against an open
+/// write transaction. Shared by the single-item commit and the grouped
+/// commit so a grouped item is refused in the same order an independent
+/// commit would refuse it.
+async fn persist_begin_batch_in_transaction(
+    transaction: &impl SessionTemporalWriteTxn,
+    binding: &RefreshBinding,
+    progress: &SessionRefreshProgressV1,
+    batch: &SessionTemporalProjectionBatchV1,
+    authoritative_validation_time: UtcMicros,
+    execution_control: &ExecutionControl,
+) -> SessionStoreResult<SessionTemporalProjectionBatchReceiptV1> {
+    require_progress_timestamp(progress, authoritative_validation_time)?;
+    let receipt = persist_session_temporal_projection_batch_in_transaction(
+        transaction,
+        batch,
+        execution_control,
+    )
+    .await?;
+    validate_next_progress(
+        transaction,
+        progress,
+        batch.generation(),
+        batch.batch_ordinal(),
+        batch.item_count(),
+    )
+    .await?;
+    validate_progress_binding(binding, progress)?;
+    insert_progress_and_binding(transaction, progress, batch).await?;
+    touch_running_operation(
+        transaction,
+        progress.session_id(),
+        progress.operation_id(),
+        progress.updated_at(),
+    )
+    .await?;
+    checkpoint_relation_rebuild_control(execution_control)?;
+    Ok(receipt)
+}
+
+/// Result of staging a refresh completion for the grouped commit: the
+/// snapshot preconditions and the candidate rebuild are already proven, so
+/// only the commit-time proof chain and the finish writes remain.
+#[derive(Debug)]
+pub enum SessionRefreshCompletionStage {
+    /// A durable receipt already satisfies the request — no transaction is
+    /// needed at all.
+    Durable(SessionRefreshReceiptV1),
+    /// The candidate reconstruction is ready for the grouped receipt
+    /// commit, relation apply, and the grouped completion commit.
+    Ready {
+        /// The completion request to replay in the grouped commit.
+        request: SessionRefreshCompletionRequestV1,
+        /// The relation projection reconstructed for this session.
+        relation_projection: SessionRelationProjection,
+        /// The running binding's frozen watermarks, carried for the
+        /// post-apply final-receipt scan.
+        watermarks: SessionFrozenWatermarksV1,
+    },
+}
+
+/// The completion write half of `complete_session_refresh_result` against
+/// an open write transaction: re-proves the receipt, running binding,
+/// terminal progress, and candidate frontier at commit time, then writes
+/// the acknowledgement, generation activation, operation finish, and
+/// terminal receipt. Shared by the single-session commit and the grouped
+/// commit so both fail in the same order.
+async fn complete_session_refresh_in_transaction(
+    transaction: &impl SessionTemporalWriteTxn,
+    request: SessionRefreshCompletionRequestV1,
+    relation_projection: &SessionRelationProjection,
+    execution_control: &ExecutionControl,
+) -> SessionStoreResult<SessionRefreshReceiptV1> {
+    if let Some(receipt) =
+        read_receipt(transaction, request.session_id(), request.operation_id()).await?
+    {
+        require_exact_completion(&receipt, &request)?;
+        checkpoint_relation_rebuild_control(execution_control)?;
+        return Ok(receipt);
+    }
+    let binding = require_running_binding(
+        transaction,
+        request.session_id(),
+        request.operation_id(),
+        COMPLETE_REFRESH,
+    )
+    .await?;
+    // Terminal progress and the candidate frontier must hold at commit
+    // time, so they are proven inside the transaction that writes the
+    // finish rather than on a snapshot taken before it.
+    let progress = require_exact_terminal_progress(
+        transaction,
+        request.session_id(),
+        request.operation_id(),
+        request.frontier(),
+        request.coverage(),
+    )
+    .await?;
+    validate_candidate_frontier(
+        transaction,
+        request.session_id().as_str(),
+        generation_i64(binding.generation, COMPLETE_REFRESH)?,
+        binding.target_frontier,
+        relation_projection,
+        execution_control,
+    )
+    .await?;
+    let mut request = request;
+    if request.source_coverage().is_none()
+        && let Some(source_coverage) = progress.source_coverage().cloned()
+    {
+        request = request.with_source_coverage(source_coverage);
+    }
+    if request.frontier().committed_through() != binding.target_frontier {
+        return Err(SessionStoreError::InvalidStateTransition {
+            context: "refresh completion target coverage",
+        });
+    }
+    acknowledge_relation_receipt(transaction, relation_projection).await?;
+    let terminal_at = terminal_timestamp(&progress, COMPLETE_REFRESH)?;
+    activate_bound_generation(transaction, request.session_id(), &binding, terminal_at).await?;
+    finish_operation(
+        transaction,
+        request.session_id(),
+        request.operation_id(),
+        "complete",
+        None,
+        terminal_at,
+    )
+    .await?;
+    insert_terminal_receipt(
+        transaction,
+        request.session_id(),
+        request.operation_id(),
+        "complete",
+        progress.frontier(),
+        progress.coverage(),
+        request
+            .source_coverage()
+            .or_else(|| progress.source_coverage()),
+        None,
+        terminal_at,
+    )
+    .await?;
+    checkpoint_relation_rebuild_control(execution_control)?;
+    Ok(SessionRefreshReceiptV1::completed(request, terminal_at))
+}
+
+/// Rolls an isolated begin-batch item back to its savepoint and releases
+/// it, leaving the rest of the grouped transaction untouched.
+async fn rollback_begin_item_savepoint(
+    transaction: &impl SessionTemporalWriteTxn,
+    savepoint: &str,
+) -> SessionStoreResult<()> {
+    transaction
+        .execute(&format!("ROLLBACK TO SAVEPOINT {savepoint}"), ())
+        .await
+        .map_err(|error| storage(PERSIST_REFRESH, error))?;
+    transaction
+        .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
+        .await
+        .map_err(|error| storage(PERSIST_REFRESH, error))?;
+    Ok(())
+}
+
+/// One item inside a grouped begin commit: the replay and the batch persist
+/// run under `index`'s savepoint so the item's outcome is isolated while
+/// still landing in the group's single physical commit. The decision order
+/// mirrors `commit_session_refresh_begin_batch_result`: Joined leaves
+/// nothing behind, a diverged replay keeps only the begin rows, and a
+/// refused batch re-runs the begin alone — the durable state independent
+/// commits would have produced.
+async fn commit_begin_batch_item_in_transaction(
+    transaction: &impl SessionTemporalWriteTxn,
+    index: usize,
+    item: SessionRefreshBeginBatchItemV1,
+    execution_control: &ExecutionControl,
+) -> SessionStoreResult<SessionRefreshBeginBatchOutcomeV1> {
+    let savepoint = format!("refresh_begin_item_{index}");
+    let SessionRefreshBeginBatchItemV1 {
+        request,
+        accepted_at,
+        progress,
+        batch,
+    } = item;
+    validate_progress_batch_identity(&progress, &batch)?;
+    let authoritative_validation_time = now_micros(PERSIST_REFRESH)?;
+    transaction
+        .execute(&format!("SAVEPOINT {savepoint}"), ())
+        .await
+        .map_err(|error| storage(PERSIST_REFRESH, error))?;
+    let (operation_id, binding) =
+        match begin_session_refresh_in_transaction(transaction, request.clone(), accepted_at).await
+        {
+            Err(error) => {
+                rollback_begin_item_savepoint(transaction, &savepoint).await?;
+                return Err(error);
+            }
+            Ok(SessionRefreshBeginTxnOutcome::Joined { .. }) => {
+                rollback_begin_item_savepoint(transaction, &savepoint).await?;
+                return Ok(SessionRefreshBeginBatchOutcomeV1::Joined);
+            }
+            Ok(SessionRefreshBeginTxnOutcome::Started {
+                operation_id,
+                binding,
+                ..
+            }) => (operation_id, binding),
+        };
+    let diverged = operation_id != *progress.operation_id()
+        || validate_batch_binding(&binding, &batch).is_err()
+        || validate_progress_binding(&binding, &progress).is_err();
+    if diverged {
+        transaction
+            .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
+            .await
+            .map_err(|error| storage(PERSIST_REFRESH, error))?;
+        return Ok(SessionRefreshBeginBatchOutcomeV1::BeganOnly);
+    }
+    match persist_begin_batch_in_transaction(
+        transaction,
+        &binding,
+        &progress,
+        &batch,
+        authoritative_validation_time,
+        execution_control,
+    )
+    .await
+    {
+        Ok(receipt) => {
+            transaction
+                .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
+                .await
+                .map_err(|error| storage(PERSIST_REFRESH, error))?;
+            Ok(SessionRefreshBeginBatchOutcomeV1::Persisted {
+                progress: Box::new(progress),
+                receipt: Box::new(receipt),
+            })
+        }
+        Err(_) => {
+            rollback_begin_item_savepoint(transaction, &savepoint).await?;
+            // The refused batch rolled back alone; replay the begin so the
+            // group still commits the durable running operation the next
+            // pass retires — the same state a crash between the two
+            // commits leaves behind on the independent path.
+            let alone = format!("{savepoint}_alone");
+            transaction
+                .execute(&format!("SAVEPOINT {alone}"), ())
+                .await
+                .map_err(|error| storage(PERSIST_REFRESH, error))?;
+            let outcome =
+                begin_session_refresh_in_transaction(transaction, request, accepted_at).await;
+            match outcome {
+                Err(error) => {
+                    rollback_begin_item_savepoint(transaction, &alone).await?;
+                    Err(error)
+                }
+                Ok(SessionRefreshBeginTxnOutcome::Started { .. }) => {
+                    transaction
+                        .execute(&format!("RELEASE SAVEPOINT {alone}"), ())
+                        .await
+                        .map_err(|error| storage(PERSIST_REFRESH, error))?;
+                    Ok(SessionRefreshBeginBatchOutcomeV1::BeganOnly)
+                }
+                Ok(SessionRefreshBeginTxnOutcome::Joined { .. }) => {
+                    transaction
+                        .execute(&format!("RELEASE SAVEPOINT {alone}"), ())
+                        .await
+                        .map_err(|error| storage(PERSIST_REFRESH, error))?;
+                    Ok(SessionRefreshBeginBatchOutcomeV1::Joined)
+                }
+            }
+        }
     }
 }
 
