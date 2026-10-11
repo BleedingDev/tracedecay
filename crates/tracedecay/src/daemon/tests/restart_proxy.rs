@@ -1407,7 +1407,10 @@ async fn repeated_stub_calls_are_also_tracked_and_hinted() {
         }
     };
     let requests = vec![
-        (json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 1),
+        (
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+            1,
+        ),
         // The first stub call hydrates the tool and announces
         // notifications/tools/list_changed after its result.
         (
