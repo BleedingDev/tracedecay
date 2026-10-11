@@ -397,19 +397,24 @@ pub fn code_index_search_display_binding(
                 "code-chunk:{}:",
                 generation.manifest().generation_id.as_str()
             );
+            // A fused candidate orders occurrences by id, so a signature
+            // hit can precede the body piece that matched. Serve the body
+            // piece the lane matched; the first piece is only the
+            // fallback when no body chunk was named.
             let matched = candidate
                 .candidate
                 .occurrences
                 .iter()
                 .filter_map(|p| occurrence_chunk_id(p, &source_prefix))
-                .find_map(|chunk_id| {
+                .filter_map(|chunk_id| {
                     generation
                         .chunks()
                         .chunks()
                         .iter()
                         .find(|chunk| chunk.id.as_str() == chunk_id)
                 })
-                .map(AsRef::as_ref);
+                .map(AsRef::as_ref)
+                .find(|chunk| serves_symbol_body(chunk, &symbol.occurrence));
             let code_window = symbol_body_chunk(generation, &symbol.occurrence, matched)
                 .map(published_chunk_window);
             let display = code_index_symbol_display(symbol, display_paths, code_window)?;
@@ -533,25 +538,32 @@ pub fn code_index_text_search_display_binding(
     }
 
     let source_prefix = format!("code-chunk:{}:", manifest.generation_id.as_str());
-    let (provenance, chunk_id) = candidate
+    // A fused candidate orders occurrences by id, so a signature hit can
+    // precede the body piece that matched.
+    let hits: Vec<(&tracedecay_domain::OccurrenceProvenance, &str)> = candidate
         .candidate
         .occurrences
         .iter()
-        .find_map(|provenance| {
+        .filter_map(|provenance| {
             let chunk_id = occurrence_chunk_id(provenance, &source_prefix)?;
             (provenance.repository_id.as_ref() == Some(&request.scope.root.repository)
                 && provenance.source_namespace == provenance.freshness.source_namespace
                 && provenance.freshness.compatibility
                     == tracedecay_domain::FreshnessCompatibilityV1::Current
                 && provenance.source_namespace.as_str() == "ns.code.daemon")
-                .then_some((provenance.clone(), chunk_id))
+                .then_some((provenance, chunk_id))
         })
+        .collect();
+    let (provenance, chunk_id) = hits
+        .first()
+        .copied()
         .ok_or(HydrationUnavailableV1::Invalid)?;
     let chunk_id = tracedecay_domain::CodeSearchChunkId::new(chunk_id.to_owned())
         .map_err(|_| HydrationUnavailableV1::Invalid)?;
-    let occurrence = latest
+    let mut occurrence = latest
         .artifact_occurrence_by_chunk(&chunk_id)
         .map_err(|_| HydrationUnavailableV1::AuthorityUnavailable)?;
+    let mut provenance = provenance.clone();
     if occurrence.generation != manifest.generation_id
         || !snapshot.files.iter().any(|file| {
             file.file_occurrence_id == occurrence.file
@@ -571,6 +583,39 @@ pub fn code_index_text_search_display_binding(
             != Some(symbol)
         {
             return Err(HydrationUnavailableV1::Invalid);
+        }
+        // Serve the body piece the lane matched when one is named: a
+        // signature hit sorted first would otherwise hide it. Misses in
+        // the optional scan leave the signature's attested serve in
+        // place.
+        if occurrence.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolSignature {
+            for &(hit_provenance, hit_chunk_id) in hits.iter().skip(1) {
+                let Ok(candidate_id) =
+                    tracedecay_domain::CodeSearchChunkId::new(hit_chunk_id.to_owned())
+                else {
+                    continue;
+                };
+                let Ok(body) = latest.artifact_occurrence_by_chunk(&candidate_id) else {
+                    continue;
+                };
+                let serves = matches!(
+                    body.grain,
+                    tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
+                        | tracedecay_domain::CodeSearchChunkGrainV1::SymbolMember
+                ) && body.generation == manifest.generation_id
+                    && body.symbol == occurrence.symbol
+                    && snapshot.files.iter().any(|file| {
+                        file.file_occurrence_id == body.file
+                            && file.logical_path == body.logical_path
+                            && file.disposition
+                                == tracedecay_domain::SnapshotFileDispositionV1::Present
+                    });
+                if serves {
+                    occurrence = body;
+                    provenance = hit_provenance.clone();
+                    break;
+                }
+            }
         }
     } else if anchor.strip_prefix("code-chunk:") != Some(chunk_id.as_str()) {
         return Err(HydrationUnavailableV1::Invalid);
@@ -668,6 +713,20 @@ impl CodeIndexSearchDisplaySourceV1 {
     }
 }
 
+/// Whether `chunk` is a body-grain piece that can serve `occurrence` as
+/// code.
+fn serves_symbol_body(
+    chunk: &tracedecay_domain::CodeSearchChunkV1,
+    occurrence: &tracedecay_domain::SymbolOccurrenceId,
+) -> bool {
+    chunk.anchor.symbol_occurrence_id.as_ref() == Some(occurrence)
+        && matches!(
+            chunk.anchor.grain,
+            tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
+                | tracedecay_domain::CodeSearchChunkGrainV1::SymbolMember
+        )
+}
+
 /// The body-grain chunk that serves `occurrence` as code: `matched` when
 /// the lane matched one of its body pieces, otherwise its first body
 /// piece. A signature chunk is the opening line of that first piece, so a
@@ -677,23 +736,17 @@ fn symbol_body_chunk<'g>(
     occurrence: &tracedecay_domain::SymbolOccurrenceId,
     matched: Option<&'g tracedecay_domain::CodeSearchChunkV1>,
 ) -> Option<&'g tracedecay_domain::CodeSearchChunkV1> {
-    let serves = |chunk: &tracedecay_domain::CodeSearchChunkV1| {
-        chunk.anchor.symbol_occurrence_id.as_ref() == Some(occurrence)
-            && matches!(
-                chunk.anchor.grain,
-                tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
-                    | tracedecay_domain::CodeSearchChunkGrainV1::SymbolMember
-            )
-    };
-    matched.filter(|chunk| serves(chunk)).or_else(|| {
-        generation
-            .chunks()
-            .chunks()
-            .iter()
-            .map(AsRef::as_ref)
-            .filter(|chunk| serves(chunk))
-            .min_by_key(|chunk| chunk.anchor.source_span.start_byte)
-    })
+    matched
+        .filter(|chunk| serves_symbol_body(chunk, occurrence))
+        .or_else(|| {
+            generation
+                .chunks()
+                .chunks()
+                .iter()
+                .map(AsRef::as_ref)
+                .filter(|chunk| serves_symbol_body(chunk, occurrence))
+                .min_by_key(|chunk| chunk.anchor.source_span.start_byte)
+        })
 }
 
 fn published_chunk_window(

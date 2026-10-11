@@ -14,7 +14,7 @@ use tracedecay_domain::{
     UtcMicros, VectorWatermark, WorktreeId,
 };
 
-use super::super::code_index_search_display_binding;
+use super::super::{code_index_search_display_binding, code_index_text_search_display_binding};
 use tracedecay_code_index_runtime::code_index_scheduler::{
     CodeIndexWorktreeSchedulerV1, SharedCodeIndexBytePoolV1,
 };
@@ -552,4 +552,168 @@ fn production_symbol_candidate_binds_the_attributed_chunk_window() {
     let window = code_window.expect("symbol chunk window bound");
     assert_eq!(window.source_span, chunk.anchor.source_span);
     assert_eq!(window.sanitized_text, chunk.sanitized_text);
+}
+
+#[test]
+fn production_symbol_candidate_serves_the_matched_body_piece() {
+    let project = TempDir::new().expect("project");
+    git(project.path(), &["init", "-q", "-b", "main"]);
+    git(project.path(), &["config", "user.name", "TraceDecay Test"]);
+    git(
+        project.path(),
+        &["config", "user.email", "tracedecay@example.invalid"],
+    );
+    std::fs::create_dir_all(project.path().join("src")).expect("source directory");
+    // A symbol larger than MAX_CHUNK_TEXT_BYTES splits into fallback-window
+    // pieces, so it owns a signature chunk and several body pieces.
+    let mut lib_rs = String::from("pub fn chunk_target() -> u32 {\n    let mut total = 0u32;\n");
+    for index in 0..5000 {
+        lib_rs.push_str(&format!("    total += {index}u32;\n"));
+    }
+    lib_rs.push_str("    total\n}\n");
+    std::fs::write(project.path().join("src/lib.rs"), lib_rs).expect("source");
+    git(project.path(), &["add", "."]);
+    git(project.path(), &["commit", "-qm", "fixture"]);
+
+    let store = TempDir::new().expect("store");
+    let mut scheduler = CodeIndexWorktreeSchedulerV1::open(
+        tracedecay_domain::ProjectId::new("project.code-index-hydration").expect("valid project"),
+        project.path(),
+        store.path().to_path_buf(),
+        Arc::new(SharedCodeIndexBytePoolV1::default()),
+    )
+    .expect("scheduler");
+    scheduler.reconcile_now().expect("publish generation");
+    let latest = scheduler.latest_complete().expect("complete generation");
+    let generation = latest.generation();
+
+    let signature_chunk = generation
+        .chunks()
+        .chunks()
+        .iter()
+        .find(|chunk| {
+            chunk.anchor.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolSignature
+        })
+        .expect("signature chunk");
+    let symbol_occurrence = signature_chunk
+        .anchor
+        .symbol_occurrence_id
+        .clone()
+        .expect("signature names a symbol");
+    let mut body_pieces: Vec<_> = generation
+        .chunks()
+        .chunks()
+        .iter()
+        .filter(|chunk| {
+            chunk.anchor.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
+                && chunk.anchor.symbol_occurrence_id.as_ref() == Some(&symbol_occurrence)
+        })
+        .collect();
+    body_pieces.sort_by_key(|chunk| chunk.anchor.source_span.start_byte);
+    let matched_piece = body_pieces
+        .get(1)
+        .expect("oversized symbol splits into several body pieces");
+
+    let anchor = RetrievalAnchorId::new(format!("code-symbol:{}", symbol_occurrence.as_str()))
+        .expect("symbol anchor");
+    let freshness = tracedecay_query::retrieval::graph::production_code_index_freshness(
+        generation.manifest().seal.sealed_at,
+        ComponentRevision::new("policy.code-index.daemon.v1").expect("policy revision"),
+    )
+    .expect("freshness");
+    let chunk_hit = |chunk: &tracedecay_domain::CodeSearchChunkV1| OccurrenceProvenance {
+        source_occurrence_id: SourceOccurrenceId::new(format!(
+            "code-chunk:{}:{}",
+            generation.manifest().generation_id.as_str(),
+            chunk.id.as_str()
+        ))
+        .expect("chunk source occurrence"),
+        file_occurrence_id: Some(chunk.anchor.file_occurrence_id.clone()),
+        retriever_evidence_anchor: RetrievalAnchorId::new(format!(
+            "code-symbol:{}",
+            symbol_occurrence.as_str()
+        ))
+        .expect("symbol evidence"),
+        source_namespace: freshness.source_namespace.clone(),
+        repository_id: Some(generation.snapshot().repository.clone()),
+        session_or_thread_id: None,
+        logical_copy_cluster_id: None,
+        logical_copy_evidence_anchor: None,
+        evidence_role: tracedecay_domain::EvidenceRole::Primary,
+        freshness: freshness.clone(),
+    };
+    // Fusion orders occurrences by id, so the signature hit can precede
+    // the body piece the lane matched; arrange that order directly.
+    let candidate = RankedCandidate {
+        candidate: FusedCandidate {
+            anchor_id: anchor.clone(),
+            logical_evidence_id: LogicalEvidenceId::new(anchor.as_str().to_owned())
+                .expect("logical evidence"),
+            occurrences: vec![chunk_hit(signature_chunk), chunk_hit(matched_piece)],
+            exact_class: ExactClass::Approximate,
+            source_role: RetrievalSourceRoleV1::default(),
+            utility_micros: 1,
+            contributions: Vec::new(),
+            freshness: vec![freshness],
+            decisions: Vec::new(),
+        },
+        final_ordinal: 0,
+    };
+    let request = RetrievalRequest {
+        principal: PrincipalId::new("principal.symbol-hydration").expect("principal"),
+        scope: RetrievalScope {
+            privacy_domain: generation.manifest().privacy_domain.clone(),
+            root: SingleRootScopeV1 {
+                repository: generation.snapshot().repository.clone(),
+                worktree: generation.snapshot().worktree.clone(),
+                reference: generation.snapshot().reference.clone(),
+            },
+        },
+        temporal_mode: TemporalModeV1::Current,
+        snapshot: RetrievalSnapshot {
+            watermarks: VectorWatermark::default(),
+            freshness_digest: FreshnessVectorDigest::new(
+                generation.manifest().snapshot_digest.as_str(),
+            )
+            .expect("snapshot freshness"),
+            authorization_revision: AuthorizationRevision::new("authorization.symbol-hydration")
+                .expect("authorization revision"),
+            captured_at: generation.manifest().seal.sealed_at,
+        },
+        profile_id: FusionProfileId::new("profile.symbol-hydration").expect("profile"),
+        budget: RetrievalBudget {
+            max_candidates_per_lane: 1,
+            max_fused_candidates: 1,
+            max_hydrated_results: 1,
+            max_hydration_bytes: 65_536,
+            deadline_micros: None,
+        },
+    };
+
+    let display_paths =
+        tracedecay_code_index_runtime::code_index_executor::CodeIndexDisplayPathIndexV1::for_generation(generation)
+            .expect("display path index for the sealed generation");
+    let (display, _provenance) =
+        code_index_search_display_binding(generation, &display_paths, &request, &candidate)
+            .expect("frozen symbol hydration");
+    let site = display.site.expect("lineage site");
+    let tracedecay_query::code_search::CodeIndexSearchSiteV1::SymbolLines { code_window, .. } =
+        site
+    else {
+        panic!("symbol anchor must carry a lineage site, got {site:?}");
+    };
+    let window = code_window.expect("symbol chunk window bound");
+    assert_eq!(window.source_span, matched_piece.anchor.source_span);
+    assert_eq!(window.sanitized_text, matched_piece.sanitized_text);
+
+    let text = latest.text_generation_handle();
+    text.production_query_owners().expect("text serving owners");
+    let (display, _provenance) =
+        code_index_text_search_display_binding(&text, &request, &candidate)
+            .expect("text generation symbol hydration");
+    let site = display.site.expect("artifact site");
+    let tracedecay_query::code_search::CodeIndexSearchSiteV1::ArtifactWindow(window) = site else {
+        panic!("text lane must carry an artifact window, got {site:?}");
+    };
+    assert_eq!(window.source_span, matched_piece.anchor.source_span);
 }
