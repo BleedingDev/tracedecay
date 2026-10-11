@@ -21,7 +21,9 @@ use tracedecay_store::{
 };
 
 use tracedecay_runtime_core::db::engine::params;
-use tracedecay_runtime_core::db::{Database, DatabaseMemoryTransaction};
+use tracedecay_runtime_core::db::{
+    Database, DatabaseMemoryTransaction, MemoryGraphReconciliationInlinePassV1,
+};
 
 use super::envelope::finish_read_snapshot;
 use super::graph_manifest::{
@@ -122,6 +124,11 @@ pub(super) async fn project_memory_graph(
     let Some(inline_pass) = db.begin_inline_memory_graph_reconciliation_pass() else {
         return Err(FactStoreError::GraphUnavailable);
     };
+    // Shared so every detached blocking task this read spawns can keep the
+    // admission counted while it holds a graph operation or snapshot lease:
+    // a caller dropped mid-read releases only the frame's share, and the
+    // shutdown join still blocks until the last task releases its own.
+    let inline_pass = Arc::new(inline_pass);
     let fact_runtime =
         super::runtime::retained_fact_runtime(db)?.ok_or(FactStoreError::GraphUnavailable)?;
     super::runtime::validate_owner_binding(fact_runtime.binding(), &owner, OPERATION)?;
@@ -136,27 +143,37 @@ pub(super) async fn project_memory_graph(
     ensure_source_read_active(Some(read_control))?;
     // A settled owner's verified head already is the exact generation for
     // this source, so reading it skips the owner-wide source load and
-    // publication. A missing, mismatched, or unreadable head falls through to
-    // the reconciliation pass, which repairs it or reports the typed refusal.
+    // publication. A missing, mismatched, or repairably unreadable head falls
+    // through to the reconciliation pass, which repairs it or reports the
+    // typed refusal. A terminal head refusal (reset, cancellation) is the
+    // same typed refusal reconciliation would report after a full source
+    // load, so it is reported without paying for the repair it cannot run.
     let verified_head = verified_head_matching(
         db,
         &projection_identity,
         &expected_generation,
         &owner,
         read_control.clone(),
+        Some(Arc::clone(&inline_pass)),
     )
     .await;
-    let verified_snapshot = if let Ok(Some(snapshot)) = verified_head {
-        snapshot
-    } else {
-        ensure_not_cancelled(read_control)?;
-        let snapshot = reconcile_project_memory_graph_pass(db, Some(read_control)).await?;
-        if snapshot.projection() != &projection_identity
-            || snapshot.generation() != &expected_generation
-        {
-            return Err(FactStoreError::GraphConflict);
+    let verified_snapshot = match verified_head {
+        Ok(Some(snapshot)) => snapshot,
+        Err(
+            error @ (FactStoreError::GraphResetRequired { .. } | FactStoreError::GraphCancelled),
+        ) => return Err(error),
+        _ => {
+            ensure_not_cancelled(read_control)?;
+            let snapshot =
+                reconcile_project_memory_graph_pass(db, Some(read_control), Some(&inline_pass))
+                    .await?;
+            if snapshot.projection() != &projection_identity
+                || snapshot.generation() != &expected_generation
+            {
+                return Err(FactStoreError::GraphConflict);
+            }
+            snapshot
         }
-        snapshot
     };
 
     let max_relations = query.max_relations();
@@ -338,7 +355,7 @@ pub(super) fn schedule_project_memory_graph_reconciliation(
         let Some(db) = weak_db.upgrade() else {
             return true;
         };
-        match reconcile_project_memory_graph_pass(&db, None).await {
+        match reconcile_project_memory_graph_pass(&db, None, None).await {
             Ok(_) => true,
             Err(error) => {
                 tracing::warn!(
@@ -367,6 +384,11 @@ pub(super) fn schedule_project_memory_graph_reconciliation(
 /// One full reconciliation sweep: diff (canonical source load + manifest
 /// build) then apply (verified-manifest publication). The tracing span is the
 /// sweep's wall-time authority; per-node work is deliberately unmeasured.
+/// `inline_pass` is the calling read's inline admission, when one drives
+/// this pass: each detached blocking task below holds it so a dropped read
+/// cannot release the shutdown join while a task still owns a graph
+/// operation or snapshot lease. The scheduled worker and the post-write
+/// task pass `None`: their own join/admission already spans the whole pass.
 #[tracing::instrument(
     name = "runtime_core.memory_graph.reconcile_pass",
     level = "trace",
@@ -375,6 +397,7 @@ pub(super) fn schedule_project_memory_graph_reconciliation(
 async fn reconcile_project_memory_graph_pass(
     db: &Database,
     read_control: Option<&FactReadControl>,
+    inline_pass: Option<&Arc<MemoryGraphReconciliationInlinePassV1>>,
 ) -> FactStoreResult<tracedecay_graph_db::VerifiedGraphSnapshot> {
     let _pass = db
         .begin_project_memory_reconciliation_pass()
@@ -425,8 +448,10 @@ async fn reconcile_project_memory_graph_pass(
         .unwrap_or_else(|| FactReadControl::new(Arc::new(|| false)));
     ensure_source_read_active(read_control)?;
     let runtime = issue_memory_graph_operation(db)?;
+    let publish_admission = inline_pass.cloned();
     let snapshot = match tokio::task::spawn_blocking(move || {
         let _span = tracing::trace_span!("runtime_core.memory_graph.publish_apply").entered();
+        let _inline_pass = publish_admission;
         runtime
             .runtime()
             .reconcile_verified_manifest(&manifest, idempotency_key)
@@ -449,6 +474,7 @@ async fn reconcile_project_memory_graph_pass(
                     &expected_generation,
                     &owner,
                     head_read_control.clone(),
+                    inline_pass.cloned(),
                 )
                 .await?
             {
@@ -466,6 +492,7 @@ async fn reconcile_project_memory_graph_pass(
             &expected_generation,
             &owner,
             head_read_control.clone(),
+            inline_pass.cloned(),
         )
         .await?
         {
@@ -505,16 +532,23 @@ async fn finish_reconciliation_watermark(
     Ok(())
 }
 
+/// Reads the installed verified head when it is the exact expected
+/// generation. `inline_pass` is the calling read's inline admission, when
+/// one drives this lookup: it moves into the blocking task so a caller
+/// dropped mid-read cannot release the shutdown join while the detached
+/// head recovery still holds its graph operation or produced snapshot lease.
 async fn verified_head_matching(
     db: &Database,
     projection: &GraphProjectionIdentity,
     expected_generation: &tracedecay_graph_db::GraphGenerationId,
     owner: &FactOwnerV1,
     read_control: FactReadControl,
+    inline_pass: Option<Arc<MemoryGraphReconciliationInlinePassV1>>,
 ) -> FactStoreResult<Option<tracedecay_graph_db::VerifiedGraphSnapshot>> {
     let runtime = issue_memory_graph_operation(db)?;
     let projection_for_read = projection.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
+        let _inline_pass = inline_pass;
         runtime
             .runtime()
             .verified_snapshot(&projection_for_read, read_control)
@@ -544,7 +578,7 @@ pub(super) async fn publish_project_memory_graph_after_write(db: Database) {
         schedule_project_memory_graph_reconciliation(db);
         return;
     };
-    match reconcile_project_memory_graph_pass(&db, None).await {
+    match reconcile_project_memory_graph_pass(&db, None, None).await {
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(
