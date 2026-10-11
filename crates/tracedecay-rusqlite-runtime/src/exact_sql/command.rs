@@ -15,6 +15,7 @@ use std::{
 
 use rusqlite::{Connection, DropBehavior, ErrorCode, Transaction, TransactionBehavior};
 
+use super::clock;
 use super::guard::with_exact_sql_guard;
 use super::{
     EXACT_SQL_TRANSACTION_IDLE_LIMIT, EXACT_SQL_TRANSACTION_LIMIT, ExactSqlAttachment,
@@ -135,19 +136,6 @@ fn sqlite_busy_or_locked(error: &rusqlite::Error) -> bool {
             if matches!(error.code, ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
     )
 }
-
-/// Clock behind every transaction lease deadline: idle, absolute, renewal.
-///
-/// Production reads the monotonic wall clock. Tests may freeze and advance a
-/// writer-thread-local fake instead, so lease renewal is provable without
-/// sleeping through real lease periods.
-#[cfg(not(test))]
-fn lease_now() -> Instant {
-    Instant::now()
-}
-
-#[cfg(test)]
-use lease_clock::lease_now;
 
 /// Terminal state of one interactive transaction, shared with its caller.
 ///
@@ -346,20 +334,26 @@ pub(crate) fn run_writer_command(
                     // write and command behind it waits inside this span, so
                     // it, not SQLite execution, is what explains begin
                     // latency elsewhere while an interactive lease is open.
-                    Ok(transaction) if reply.try_send(Ok(())).is_ok() => Some({
-                        let _span =
-                            tracing::trace_span!("rusqlite.exact_sql.transaction").entered();
-                        run_transaction(
-                            transaction,
-                            receiver,
-                            before,
-                            shutdown_requested,
-                            &lease,
-                            authority,
-                            policy,
-                        )
-                    }),
-                    Ok(_) => None,
+                    Ok(transaction) => {
+                        // The lease starts before the caller learns it holds
+                        // the transaction, so no command it sends can predate
+                        // the deadlines that command is checked against.
+                        let opened_at = clock::now();
+                        reply.try_send(Ok(())).is_ok().then(|| {
+                            let _span =
+                                tracing::trace_span!("rusqlite.exact_sql.transaction").entered();
+                            run_transaction(
+                                transaction,
+                                opened_at,
+                                receiver,
+                                before,
+                                shutdown_requested,
+                                &lease,
+                                authority,
+                                policy,
+                            )
+                        })
+                    }
                     Err(error) => {
                         return DeferredReply::new(
                             reply,
@@ -472,6 +466,7 @@ fn release_rolled_back(
 #[allow(clippy::too_many_arguments)]
 fn run_transaction(
     transaction: Transaction<'_>,
+    opened_at: Instant,
     receiver: Receiver<TransactionCommand>,
     before: u64,
     shutdown_requested: &Arc<AtomicBool>,
@@ -481,8 +476,8 @@ fn run_transaction(
 ) -> TransactionCompletion {
     let mut attachments = Vec::new();
     let mut previous_attachment_limit = None;
-    let mut idle_deadline = lease_now() + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
-    let mut transaction_deadline = lease_now() + EXACT_SQL_TRANSACTION_LIMIT;
+    let mut idle_deadline = opened_at + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
+    let mut transaction_deadline = opened_at + EXACT_SQL_TRANSACTION_LIMIT;
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             return release_rolled_back(
@@ -493,7 +488,7 @@ fn run_transaction(
                 previous_attachment_limit,
             );
         }
-        let now = lease_now();
+        let now = clock::now();
         if now >= idle_deadline || now >= transaction_deadline {
             lease.expire();
             return release_rolled_back(
@@ -517,7 +512,7 @@ fn run_transaction(
         };
         match command {
             TransactionCommand::Attach { attachment, reply } => {
-                if lease_now() >= transaction_deadline {
+                if clock::now() >= transaction_deadline {
                     lease.expire();
                     let _ = reply.try_send(Err(ExactSqlError::TransactionExpired));
                     return release_rolled_back(
@@ -591,8 +586,8 @@ fn run_transaction(
                                 previous_attachment_limit,
                             );
                         }
+                        idle_deadline = clock::now() + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
                         let _ = reply.try_send(Ok(()));
-                        idle_deadline = lease_now() + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
                     }
                     Err(error) => {
                         let _ = reply.try_send(Err(error));
@@ -611,7 +606,7 @@ fn run_transaction(
                 execution_policy,
                 reply,
             } => {
-                if lease_now() >= transaction_deadline {
+                if clock::now() >= transaction_deadline {
                     lease.expire();
                     let _ = reply.try_send(Err(ExactSqlError::TransactionExpired));
                     return release_rolled_back(
@@ -709,7 +704,7 @@ fn run_transaction(
                     );
                 }
                 if execution_policy == ExecutionPolicy::Bounded
-                    && lease_now() >= transaction_deadline
+                    && clock::now() >= transaction_deadline
                 {
                     lease.expire();
                     let _ = reply.try_send(Err(ExactSqlError::TransactionExpired));
@@ -721,9 +716,7 @@ fn run_transaction(
                         previous_attachment_limit,
                     );
                 }
-                let succeeded = result.is_ok();
-                let _ = reply.try_send(result);
-                let renewed_at = lease_now();
+                let renewed_at = clock::now();
                 // The idle limit bounds a caller that sends nothing, so every
                 // completed round trip renews it. A statement that ran to its
                 // own execution deadline and then failed kept the writer busy
@@ -736,12 +729,15 @@ fn run_transaction(
                 // one fixed lease can carry, but it never stalls. Idleness,
                 // shutdown, and authority revocation still cancel it, and
                 // `Ordinary` never renews.
-                if succeeded && policy == TransactionPolicy::AuthorizedLongLease {
+                if result.is_ok() && policy == TransactionPolicy::AuthorizedLongLease {
                     transaction_deadline = renewed_at + EXACT_SQL_TRANSACTION_LIMIT;
                 }
+                // Renewed before the answer, so the caller's next command is
+                // never checked against the lease this round trip replaced.
+                let _ = reply.try_send(result);
             }
             TransactionCommand::Commit { reply } => {
-                if lease_now() >= transaction_deadline {
+                if clock::now() >= transaction_deadline {
                     lease.expire();
                     let _ = reply.try_send(Err(ExactSqlError::TransactionExpired));
                     return release_rolled_back(
@@ -856,32 +852,5 @@ impl TransactionCompletion {
             None => DeferredReply::none(),
         };
         (cleanup_error.map_or(Ok(()), Err), terminal)
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod lease_clock {
-    use std::{
-        cell::Cell,
-        time::{Duration, Instant},
-    };
-
-    thread_local! {
-        static FAKE_LEASE_NOW: Cell<Option<Instant>> = const { Cell::new(None) };
-    }
-
-    /// Real monotonic time until [`advance`] freezes this thread's clock.
-    pub(crate) fn lease_now() -> Instant {
-        FAKE_LEASE_NOW.with(Cell::get).unwrap_or_else(Instant::now)
-    }
-
-    /// Freezes this thread's lease clock `by` past its current reading.
-    ///
-    /// Only code already running on the writer thread, in practice an
-    /// [`super::ExactSqlWriteAuthority`] verification, can move the clock
-    /// the transaction loop reads.
-    pub(crate) fn advance(by: Duration) {
-        let advanced = lease_now() + by;
-        FAKE_LEASE_NOW.with(|fake| fake.set(Some(advanced)));
     }
 }

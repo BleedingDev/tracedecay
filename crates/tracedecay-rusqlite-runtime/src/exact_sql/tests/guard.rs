@@ -173,6 +173,8 @@ fn pinned_batch_allows_schema_install_ddl() {
 
 #[test]
 fn exact_sql_guard_restores_authorizer_after_panic() {
+    let clock = FakeClock::frozen();
+    clock.install();
     let connection = rusqlite::Connection::open_in_memory().unwrap();
     connection
         .authorizer(Some(crate::connection::authorize_writer))
@@ -195,7 +197,7 @@ fn exact_sql_guard_restores_authorizer_after_panic() {
     }));
 
     assert!(panic.is_err());
-    std::thread::sleep(EXACT_SQL_EXECUTION_LIMIT + Duration::from_millis(50));
+    clock.advance(EXACT_SQL_EXECUTION_LIMIT);
     let sum: i64 = connection
         .query_row(
             "WITH RECURSIVE n(value) AS (
