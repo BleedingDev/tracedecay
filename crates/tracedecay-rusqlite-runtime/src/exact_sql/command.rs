@@ -346,20 +346,26 @@ pub(crate) fn run_writer_command(
                     // write and command behind it waits inside this span, so
                     // it, not SQLite execution, is what explains begin
                     // latency elsewhere while an interactive lease is open.
-                    Ok(transaction) if reply.try_send(Ok(())).is_ok() => Some({
-                        let _span =
-                            tracing::trace_span!("rusqlite.exact_sql.transaction").entered();
-                        run_transaction(
-                            transaction,
-                            receiver,
-                            before,
-                            shutdown_requested,
-                            &lease,
-                            authority,
-                            policy,
-                        )
-                    }),
-                    Ok(_) => None,
+                    Ok(transaction) => {
+                        // The lease starts before the caller learns it holds
+                        // the transaction, so no command it sends can predate
+                        // the deadlines that command is checked against.
+                        let opened_at = lease_now();
+                        reply.try_send(Ok(())).is_ok().then(|| {
+                            let _span =
+                                tracing::trace_span!("rusqlite.exact_sql.transaction").entered();
+                            run_transaction(
+                                transaction,
+                                opened_at,
+                                receiver,
+                                before,
+                                shutdown_requested,
+                                &lease,
+                                authority,
+                                policy,
+                            )
+                        })
+                    }
                     Err(error) => {
                         return DeferredReply::new(
                             reply,
@@ -472,6 +478,7 @@ fn release_rolled_back(
 #[allow(clippy::too_many_arguments)]
 fn run_transaction(
     transaction: Transaction<'_>,
+    opened_at: Instant,
     receiver: Receiver<TransactionCommand>,
     before: u64,
     shutdown_requested: &Arc<AtomicBool>,
@@ -481,8 +488,8 @@ fn run_transaction(
 ) -> TransactionCompletion {
     let mut attachments = Vec::new();
     let mut previous_attachment_limit = None;
-    let mut idle_deadline = lease_now() + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
-    let mut transaction_deadline = lease_now() + EXACT_SQL_TRANSACTION_LIMIT;
+    let mut idle_deadline = opened_at + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
+    let mut transaction_deadline = opened_at + EXACT_SQL_TRANSACTION_LIMIT;
     loop {
         if shutdown_requested.load(Ordering::Acquire) {
             return release_rolled_back(
@@ -591,8 +598,8 @@ fn run_transaction(
                                 previous_attachment_limit,
                             );
                         }
-                        let _ = reply.try_send(Ok(()));
                         idle_deadline = lease_now() + EXACT_SQL_TRANSACTION_IDLE_LIMIT;
+                        let _ = reply.try_send(Ok(()));
                     }
                     Err(error) => {
                         let _ = reply.try_send(Err(error));
@@ -721,8 +728,6 @@ fn run_transaction(
                         previous_attachment_limit,
                     );
                 }
-                let succeeded = result.is_ok();
-                let _ = reply.try_send(result);
                 let renewed_at = lease_now();
                 // The idle limit bounds a caller that sends nothing, so every
                 // completed round trip renews it. A statement that ran to its
@@ -736,9 +741,12 @@ fn run_transaction(
                 // one fixed lease can carry, but it never stalls. Idleness,
                 // shutdown, and authority revocation still cancel it, and
                 // `Ordinary` never renews.
-                if succeeded && policy == TransactionPolicy::AuthorizedLongLease {
+                if result.is_ok() && policy == TransactionPolicy::AuthorizedLongLease {
                     transaction_deadline = renewed_at + EXACT_SQL_TRANSACTION_LIMIT;
                 }
+                // Renewed before the answer, so the caller's next command is
+                // never checked against the lease this round trip replaced.
+                let _ = reply.try_send(result);
             }
             TransactionCommand::Commit { reply } => {
                 if lease_now() >= transaction_deadline {
