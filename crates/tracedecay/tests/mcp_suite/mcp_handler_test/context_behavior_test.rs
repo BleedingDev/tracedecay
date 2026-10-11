@@ -351,17 +351,27 @@ async fn tracedecay_context_serves_sanitized_code_when_catalog_is_ready() {
         }),
     )
     .await;
-    assert_eq!(payload["coverage"]["graph"], "complete", "{payload}");
-    let code = code_identity(&payload);
-    assert_eq!(code["file"], "src/lib.rs", "{payload}");
-    assert_eq!(code["start_line"], 1, "{payload}");
-    assert_eq!(code["end_line"], 3, "{payload}");
-    let served = code["code"].as_str().expect("code text");
-    assert!(
-        served.starts_with("pub fn billing_token() -> &'static str {\n"),
+    assert_eq!(payload["task"], "billing_token");
+    assert_eq!(
+        payload["coverage"],
+        json!({
+            "exact": "complete",
+            "lexical": "complete",
+            "graph": "complete",
+            "recall": "full"
+        }),
         "{payload}"
     );
-    assert!(!served.contains(&secret), "raw secret served: {served}");
+    assert_eq!(
+        code_identity(&payload),
+        json!({
+            "file": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 3,
+            "code": "pub fn billing_token() -> &'static str {\n    \"[TraceDecay redacted: exact credential]\"\n}"
+        }),
+        "{payload}"
+    );
 
     fixture.harness.shutdown().await;
 }
@@ -381,8 +391,16 @@ async fn tracedecay_context_withholds_code_that_drifted_after_indexing() {
         "max_code_blocks": 1
     });
     let indexed = context_json(&server, request.clone()).await;
-    assert_eq!(indexed["coverage"]["graph"], "complete", "{indexed}");
-    assert_eq!(indexed["code"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        code_identity(&indexed),
+        json!({
+            "file": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 3,
+            "code": "pub fn invoice_total(cents: u32) -> u32 {\n    cents\n}"
+        }),
+        "{indexed}"
+    );
 
     fs::write(
         fixture.project_root.join("src/lib.rs"),
@@ -390,16 +408,19 @@ async fn tracedecay_context_withholds_code_that_drifted_after_indexing() {
     )
     .expect("drift billing lib.rs");
     let drifted = context_json(&server, request).await;
-    let served = drifted["code"]
-        .as_array()
-        .expect("code array")
-        .iter()
-        .filter_map(|block| block["code"].as_str())
-        .collect::<Vec<_>>();
-    assert!(
-        served.iter().all(|code| !code.contains("cents + 1")),
-        "unindexed bytes served as code: {drifted}"
+    assert_eq!(
+        search_identity(&drifted, "invoice_total"),
+        json!({
+            "name": "invoice_total",
+            "qualified_name": "src/lib.rs::invoice_total",
+            "kind": "function",
+            "file": "src/lib.rs",
+            "exact_class": "exact_message",
+            "rank": 1
+        }),
+        "{drifted}"
     );
+    assert_eq!(drifted["code"], json!([]), "{drifted}");
 
     fixture.harness.shutdown().await;
 }
