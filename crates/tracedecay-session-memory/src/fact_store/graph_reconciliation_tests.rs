@@ -842,46 +842,44 @@ async fn graph_read_preserves_reset_required_from_the_verified_graph() {
             reason,
         }) if reason == "verified profile-memory graph generation mismatch"
     ));
-    // A terminal head refusal is reported by the read itself: a repairing
-    // reconcile would retry the identical sealed-generation refusal after a
-    // full source load. `ResetRequired` must stay a typed owner-scoped
-    // refusal instead of collapsing into `GraphUnavailable` or an untyped
-    // storage error.
+    // The unrecoverable head sends the read to its repairing reconcile, which
+    // is where the runtime reports the reset. `ResetRequired` must stay a
+    // typed owner-scoped refusal instead of collapsing into `GraphUnavailable`
+    // or an untyped storage error.
     assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.publish_calls.load(Ordering::SeqCst), 0);
 }
 
+/// A head-read failure the reconcile pass cannot repair is reported without
+/// paying its owner-wide source load: the read's verified-head lookup
+/// surfaces the mount unavailability as-is.
 #[tokio::test]
-async fn graph_read_repairs_a_transient_head_failure_through_reconcile() {
-    let (_directory, database) = database("transient-head-failure").await;
+async fn graph_read_reports_a_head_failure_without_reconciling() {
+    let (_directory, database) = database("head-failure-no-reconcile").await;
     let runtime = bind_runtime(&database);
     let store = DatabaseFactStore::new(&database);
-    let seed = seed_high_level_fact(
+    seed_high_level_fact(
         &store,
         &runtime,
-        "transient-head-failure",
-        "A transient verified-head failure still reaches the repairing reconcile.",
+        "head-failure-no-reconcile",
+        "A verified-head failure reports without reaching the reconcile pass.",
     )
     .await;
     runtime.fail_snapshot_reads();
 
-    let page = super::graph::project_memory_graph(
+    let error = super::graph::project_memory_graph(
         &database,
         ProjectMemoryGraphQueryV1::new(FactOwnerV1::Profile, Vec::new(), 64)
-            .expect("transient head failure graph query"),
+            .expect("head failure graph query"),
         &FactReadControl::new(Arc::new(|| false)),
     )
     .await
-    .expect("a transient head failure falls through to the repairing reconcile");
+    .expect_err("an unreadable head reports its own typed refusal");
 
-    assert!(
-        page.facts()
-            .iter()
-            .any(|fact| fact.fact_id() == seed.target.fact_id())
-    );
+    assert!(matches!(error, FactStoreError::GraphUnavailable));
     assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.publish_calls.load(Ordering::SeqCst), 0);
 }
 
