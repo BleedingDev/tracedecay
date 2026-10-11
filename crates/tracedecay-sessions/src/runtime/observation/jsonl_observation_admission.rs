@@ -372,6 +372,12 @@ pub fn release_unpinned_shared_jsonl_pages() -> SharedJsonlPageReleaseV1 {
     let Ok(mut cache) = cache.try_lock() else {
         return SharedJsonlPageReleaseV1::default();
     };
+    release_unpinned_cached_jsonl_pages(&mut cache)
+}
+
+fn release_unpinned_cached_jsonl_pages(
+    cache: &mut SharedJsonlPageCache,
+) -> SharedJsonlPageReleaseV1 {
     let mut pages = 0_u64;
     let mut bytes = 0_u64;
     let mut index = 0;

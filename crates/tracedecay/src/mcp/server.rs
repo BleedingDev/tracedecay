@@ -104,10 +104,12 @@ pub(crate) const SERVER_INSTRUCTIONS: &str = concat!(
 
 pub(crate) fn initialize_result(
     instructions: &str,
+    requested_protocol: Option<&str>,
 ) -> std::result::Result<Value, tracedecay_project::product_runtime::ProductRuntimeError> {
     Ok(tracedecay_mcp::server::initialize_result(
         tracedecay_project::version::build_version()?,
         instructions,
+        requested_protocol,
     ))
 }
 
