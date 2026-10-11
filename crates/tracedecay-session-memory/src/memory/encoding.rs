@@ -1,29 +1,19 @@
 //! Deterministic FHRR encodings for memory facts, entities, and queries.
+//!
+//! Vectors hold only the real FHRR coefficients; every imaginary part is zero,
+//! so binding is the componentwise product and similarity is the cosine.
 
 use std::sync::LazyLock;
 
-use amari_holographic::{BindingAlgebra, FHRRAlgebra};
 use sha2::{Digest, Sha256};
 
-type Fhrr2048 = FHRRAlgebra<2048>;
-
 /// The role atoms are compile-time constants, but deriving each one costs 256
-/// SHA-256 blocks plus normalize+FHRR conversion. Both FHRR vectors are
-/// computed once and reused across every fact encoding.
-static ROLE_CONTENT_FHRR: LazyLock<Result<Fhrr2048, HolographicEncodingError>> =
-    LazyLock::new(|| {
-        to_fhrr(&HolographicEncoder::new().encode_atom(HolographicEncoder::ROLE_CONTENT))
-    });
-static ROLE_ENTITY_FHRR: LazyLock<Result<Fhrr2048, HolographicEncodingError>> =
-    LazyLock::new(|| {
-        to_fhrr(&HolographicEncoder::new().encode_atom(HolographicEncoder::ROLE_ENTITY))
-    });
-
-fn role_fhrr(
-    role: &'static LazyLock<Result<Fhrr2048, HolographicEncodingError>>,
-) -> Result<&'static Fhrr2048, HolographicEncodingError> {
-    role.as_ref().map_err(Clone::clone)
-}
+/// SHA-256 blocks plus normalization. Both are computed once and reused across
+/// every fact encoding.
+static ROLE_CONTENT: LazyLock<Vec<f64>> =
+    LazyLock::new(|| HolographicEncoder::new().encode_atom(HolographicEncoder::ROLE_CONTENT));
+static ROLE_ENTITY: LazyLock<Vec<f64>> =
+    LazyLock::new(|| HolographicEncoder::new().encode_atom(HolographicEncoder::ROLE_ENTITY));
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum HolographicEncodingError {
@@ -34,13 +24,15 @@ pub enum HolographicEncodingError {
 #[derive(Clone, Debug, Default)]
 pub struct HolographicEncoder;
 
-/// A query vector already converted to its FHRR form.
+/// A dimension-checked query vector with its norm computed once.
 ///
 /// Search scoring compares one query against every candidate fact; preparing
-/// the query once keeps the per-candidate similarity to a single fact-side
-/// conversion instead of re-converting the same 2048-dimension query vector
-/// for every candidate.
-pub struct HolographicQueryVector(Fhrr2048);
+/// the query once leaves only the fact-side norm and the dot product per
+/// candidate.
+pub struct HolographicQueryVector {
+    coefficients: Vec<f64>,
+    norm: f64,
+}
 
 impl HolographicEncoder {
     pub const DIMENSIONS: usize = 2048;
@@ -72,9 +64,7 @@ impl HolographicEncoder {
         content: &str,
         entities: &[String],
     ) -> Result<Vec<f64>, HolographicEncodingError> {
-        let content_role = role_fhrr(&ROLE_CONTENT_FHRR)?;
-        let content_value = to_fhrr(&self.encode_text(content)?)?;
-        let content_component = content_role.bind(&content_value).to_coefficients();
+        let content_component = bind(&ROLE_CONTENT, &self.encode_text(content)?);
         let mut entity_components = Vec::new();
 
         let mut normalized_entities: Vec<String> = entities
@@ -85,25 +75,27 @@ impl HolographicEncoder {
         normalized_entities.sort();
         normalized_entities.dedup();
 
-        let entity_role = role_fhrr(&ROLE_ENTITY_FHRR)?;
         for entity in normalized_entities {
-            let value = to_fhrr(&self.encode_text(&entity)?)?;
-            let bound = entity_role.bind(&value);
-            entity_components.push(bound.to_coefficients());
+            entity_components.push(bind(&ROLE_ENTITY, &self.encode_text(&entity)?));
         }
 
         average_coefficients(content_component, entity_components)
     }
 
     pub fn similarity(&self, left: &[f64], right: &[f64]) -> Result<f64, HolographicEncodingError> {
-        Ok(to_fhrr(left)?.similarity(&to_fhrr(right)?))
+        let query = self.prepare_query(left)?;
+        self.query_similarity(&query, right)
     }
 
     pub fn prepare_query(
         &self,
         coefficients: &[f64],
     ) -> Result<HolographicQueryVector, HolographicEncodingError> {
-        Ok(HolographicQueryVector(to_fhrr(coefficients)?))
+        ensure_dimensions(coefficients)?;
+        Ok(HolographicQueryVector {
+            coefficients: coefficients.to_vec(),
+            norm: norm(coefficients),
+        })
     }
 
     pub fn query_similarity(
@@ -111,7 +103,19 @@ impl HolographicEncoder {
         query: &HolographicQueryVector,
         fact_coefficients: &[f64],
     ) -> Result<f64, HolographicEncodingError> {
-        Ok(query.0.similarity(&to_fhrr(fact_coefficients)?))
+        ensure_dimensions(fact_coefficients)?;
+        let fact_norm = norm(fact_coefficients);
+        if query.norm < SIMILARITY_NORM_FLOOR || fact_norm < SIMILARITY_NORM_FLOOR {
+            return Ok(0.0);
+        }
+        // Positive-zero start: `Iterator::sum` starts at negative zero, which
+        // would flip the sign of a dot product made only of negative zeros.
+        let dot = query
+            .coefficients
+            .iter()
+            .zip(fact_coefficients)
+            .fold(0.0, |sum, (left, right)| sum + left * right);
+        Ok(dot / (query.norm * fact_norm))
     }
 }
 
@@ -172,21 +176,11 @@ fn average_coefficients(
     first: Vec<f64>,
     rest: impl IntoIterator<Item = Vec<f64>>,
 ) -> Result<Vec<f64>, HolographicEncodingError> {
-    if first.len() != HolographicEncoder::DIMENSIONS {
-        return Err(HolographicEncodingError::DimensionMismatch {
-            expected: HolographicEncoder::DIMENSIONS,
-            actual: first.len(),
-        });
-    }
+    ensure_dimensions(&first)?;
     let mut average = first;
     let mut count = 1.0;
     for vector in rest {
-        if vector.len() != HolographicEncoder::DIMENSIONS {
-            return Err(HolographicEncodingError::DimensionMismatch {
-                expected: HolographicEncoder::DIMENSIONS,
-                actual: vector.len(),
-            });
-        }
+        ensure_dimensions(&vector)?;
         count += 1.0;
         for (target, value) in average.iter_mut().zip(&vector) {
             *target += value;
@@ -214,19 +208,33 @@ fn normalize_coefficients(mut coefficients: Vec<f64>) -> Vec<f64> {
     coefficients
 }
 
-fn to_fhrr(coefficients: &[f64]) -> Result<Fhrr2048, HolographicEncodingError> {
-    if coefficients.len() != HolographicEncoder::DIMENSIONS {
-        return Err(HolographicEncodingError::DimensionMismatch {
+/// Vectors below this norm compare as orthogonal to everything.
+const SIMILARITY_NORM_FLOOR: f64 = 1e-10;
+
+/// FHRR binding of real phasors: the componentwise product.
+fn bind(role: &[f64], value: &[f64]) -> Vec<f64> {
+    role.iter()
+        .zip(value)
+        .map(|(role, value)| role * value)
+        .collect()
+}
+
+fn norm(coefficients: &[f64]) -> f64 {
+    coefficients
+        .iter()
+        .fold(0.0, |sum, coefficient| sum + coefficient * coefficient)
+        .sqrt()
+}
+
+fn ensure_dimensions(coefficients: &[f64]) -> Result<(), HolographicEncodingError> {
+    if coefficients.len() == HolographicEncoder::DIMENSIONS {
+        Ok(())
+    } else {
+        Err(HolographicEncodingError::DimensionMismatch {
             expected: HolographicEncoder::DIMENSIONS,
             actual: coefficients.len(),
-        });
+        })
     }
-    Fhrr2048::from_coefficients(coefficients).map_err(|_| {
-        HolographicEncodingError::DimensionMismatch {
-            expected: HolographicEncoder::DIMENSIONS,
-            actual: coefficients.len(),
-        }
-    })
 }
 
 #[cfg(test)]
