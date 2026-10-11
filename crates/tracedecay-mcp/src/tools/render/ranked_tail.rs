@@ -246,6 +246,20 @@ mod tests {
     }
 
     #[test]
+    fn short_weak_tail_stays_untrimmed_without_storing_a_handle() {
+        let root = tempfile::tempdir().expect("handle root");
+        let rows = page(&[2_000_000, 2_000_000, 2_000_000, 1_000_000, 1_000_000]);
+        let untrimmed = concat(&rows);
+
+        assert_eq!(ranked_rows_md(Some(root.path()), "store", &rows), untrimmed);
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("handle root").count(),
+            0,
+            "a marker larger than the omitted rows must not publish a handle"
+        );
+    }
+
+    #[test]
     fn trimmed_page_keeps_rows_exact_and_restores_the_cut_rows() {
         let root = tempfile::tempdir().expect("handle root");
         let rows = weak_tail_page();
