@@ -595,6 +595,10 @@ fn admit_windows_profile_environment(command: &mut Command, home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::io::Write as _;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::CommandExt as _;
     #[cfg(unix)]
     use tracedecay_runtime_core::test_executable::write_executable_script;
 
@@ -688,9 +692,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn an_executable_held_open_for_writing_is_refused_on_the_first_attempt() {
-        use std::io::Write as _;
-        use std::os::unix::process::CommandExt as _;
-
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("claude");
         write_fake_cli(&bin, "exit 0");
