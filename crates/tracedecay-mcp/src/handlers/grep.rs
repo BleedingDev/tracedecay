@@ -88,6 +88,7 @@ pub async fn compute_grep(
         fixed_strings: request.fixed_strings.unwrap_or(false),
         case_sensitive: request.case_sensitive.unwrap_or(false),
         path_glob: request.path_glob,
+        scope_prefix: scope_prefix.map(str::to_owned),
         context_lines,
         max_results,
     };
@@ -110,14 +111,7 @@ pub async fn compute_grep(
     )
     .await?;
 
-    // Scope filtering mirrors `tracedecay_search`: when the client pins a
-    // subtree, only hits under it are returned.
-    let mut hits = scan
-        .hits
-        .into_iter()
-        .map(grep_match)
-        .filter(|hit| tracedecay_domain::path_matches_scope(hit.file.as_str(), scope_prefix))
-        .collect::<Vec<_>>();
+    let mut hits = scan.hits.into_iter().map(grep_match).collect::<Vec<_>>();
     let truncated = scan.truncated || hits.len() > max_results;
     hits.truncate(max_results);
 
@@ -426,6 +420,7 @@ mod tests {
                 fixed_strings: false,
                 case_sensitive: true,
                 path_glob: path_glob.map(str::to_owned),
+                scope_prefix: None,
                 context_lines: 0,
                 max_results,
             },
