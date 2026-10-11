@@ -19,9 +19,9 @@ use tracedecay_store::{
     AnchoredObservationWrite, ObservationProjection, ObservationProjectionStore, ObservationStore,
     ObservationWrite, ProjectionSkipReason, ProjectionStoreError,
     SessionRefreshBeginOrJoinRequestV1, SessionRefreshCompletionRequestV1,
-    SessionRefreshFrontierV1, SessionRefreshProgressV1, SessionRefreshStore,
-    SessionRefreshTerminalStateV1, SessionRetrievalStore, SessionStoreError, SessionStoreResult,
-    SessionTemporalProjectionBatchV1,
+    SessionRefreshFrontierV1, SessionRefreshProgressV1, SessionRefreshReceiptRequestV1,
+    SessionRefreshStore, SessionRefreshTerminalStateV1, SessionRetrievalStore, SessionStoreError,
+    SessionStoreResult, SessionTemporalProjectionBatchV1,
 };
 use tracedecay_temporal_query::execution::ExecutionControl;
 
@@ -799,6 +799,122 @@ async fn terminal_receipt_rejects_corrupted_derived_evidence() {
         .await
         .expect_err("derived evidence corruption must invalidate the terminal receipt");
     assert!(matches!(error, SessionStoreError::Storage { .. }));
+}
+
+#[tokio::test]
+async fn grouped_completion_revalidates_evidence_after_staging() {
+    let tmp = TempDir::new().unwrap();
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let store = temporal_store(&runtime);
+    let session_id = fixture_session("session.projector.staged-evidence-corruption");
+    for ordinal in 0..3 {
+        let (observation, write) = fixture_observation(&session_id, ordinal, None, ordinal > 0);
+        Box::pin(persist_fixture(&runtime, observation, write)).await;
+    }
+    let begin = store
+        .begin_or_join_session_refresh(SessionRefreshBeginOrJoinRequestV1::new(
+            session_id.clone(),
+            SessionRefreshFrontierV1::new(3, 0).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let recovery = store
+        .session_refresh_recovery(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (progress, batch) = store
+        .materialize_session_temporal_refresh_batch_for_test(&recovery)
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .persist_session_refresh_projection_batch(progress.clone(), batch)
+        .await
+        .unwrap();
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .unwrap();
+    let access = SessionTemporalAccess::new(database);
+    let control = ExecutionControl::default();
+    let request = SessionRefreshCompletionRequestV1::new(
+        begin.operation_id().clone(),
+        session_id.clone(),
+        progress.frontier(),
+        *progress.coverage(),
+    )
+    .unwrap();
+    let crate::SessionRefreshCompletionStage::Ready {
+        request,
+        relation_projection,
+    } = access
+        .stage_session_refresh_completion(request, &control)
+        .await
+        .unwrap()
+    else {
+        panic!("fresh completion must be staged");
+    };
+    access
+        .record_relation_receipts_group(
+            std::slice::from_ref(relation_projection.as_ref()),
+            &control,
+        )
+        .await
+        .unwrap()
+        .remove(0)
+        .unwrap();
+    let snapshot = database.read_snapshot().await.unwrap();
+    let verified = access
+        .apply_candidate_relation_projection(&snapshot, &relation_projection, &control)
+        .await
+        .unwrap();
+    drop(snapshot);
+    let generation =
+        tracedecay_domain::SessionProjectionGenerationV1::new(verified.generation).unwrap();
+    let validation_snapshot = database.read_snapshot().await.unwrap();
+    super::validate_final_projection_receipt(
+        &validation_snapshot,
+        &session_id,
+        generation,
+        recovery.frozen_watermarks(),
+        &verified,
+        &control,
+    )
+    .await
+    .unwrap();
+    drop(validation_snapshot);
+
+    let transaction = database.begin_write_transaction().await.unwrap();
+    let changed = transaction.execute(
+        "UPDATE session_derived_evidence SET evidence_json = json_set(evidence_json, '$.corrupted', 1)
+         WHERE session_id = ?1 AND generation = ?2",
+        params![session_id.as_str(), i64::try_from(generation.value()).unwrap()],
+    ).await.unwrap();
+    assert!(
+        changed > 0,
+        "fixture must produce receipt-bound derived evidence"
+    );
+    transaction.commit().await.unwrap();
+
+    let error = access
+        .complete_session_refresh_group(vec![(request, verified)], control)
+        .await
+        .unwrap()
+        .remove(0)
+        .expect_err("staged validation must not authorize changed evidence at commit");
+    assert!(matches!(error, SessionStoreError::Storage { .. }));
+    assert!(
+        access
+            .session_refresh_receipt_result(SessionRefreshReceiptRequestV1::new(
+                begin.operation_id().clone(),
+                session_id
+            ))
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

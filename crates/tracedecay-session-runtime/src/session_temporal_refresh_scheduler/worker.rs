@@ -25,7 +25,6 @@ use super::wake::{
     PendingBeginRequestGuard, RecoverySelectionGuard, SessionTemporalRefreshRetryClass,
     SessionTemporalRefreshWakeState, TerminalAttemptGuard,
 };
-use tracedecay_domain::SessionProjectionGenerationV1;
 use tracedecay_global_db::{RegisteredGlobalDb, RegisteredGlobalDbLeaseV1};
 use tracedecay_runtime_core::db::engine::Error as EngineError;
 use tracedecay_session_temporal_store::{
@@ -33,7 +32,6 @@ use tracedecay_session_temporal_store::{
     SessionRefreshCompletionStage, SessionRefreshRecoveryV1, SessionRefreshRestartStateV1,
     SessionTemporalAccess, SessionTemporalStore, relations::SessionRelationProjection,
 };
-use tracedecay_store::SessionFrozenWatermarksV1;
 
 const HISTORY_IDLE_RECHECK_INTERVAL: Duration = Duration::from_mins(1);
 
@@ -764,8 +762,6 @@ struct StagedReadyCompletion<'a> {
     claim: ClaimedTerminalAttempt<'a>,
     request: SessionRefreshCompletionRequestV1,
     projection: SessionRelationProjection,
-    watermarks: SessionFrozenWatermarksV1,
-    verified: Option<SessionRelationProjection>,
 }
 
 pub async fn process_refresh_begin_requests<'a>(
@@ -930,13 +926,10 @@ async fn stage_ready_completion<'a>(
         Ok(Ok(SessionRefreshCompletionStage::Ready {
             request,
             relation_projection,
-            watermarks,
         })) => drain.staged_completions.push(StagedReadyCompletion {
             claim,
             request,
             projection: *relation_projection,
-            watermarks,
-            verified: None,
         }),
         Ok(Err(error)) => {
             reject_staged_completion(store, state, claim, error, report).await;
@@ -976,12 +969,6 @@ async fn reject_staged_completion<'a>(
     report.terminal_errors += 1;
 }
 
-fn grouped_deadline(policy: SessionTemporalRefreshPolicy, items: usize) -> std::time::Duration {
-    policy
-        .operation_deadline
-        .saturating_mul(items.max(1) as u32)
-}
-
 async fn commit_deferred_begins<'a>(
     access: &SessionTemporalAccess<'_, RegisteredGlobalDb>,
     state: &SessionTemporalRefreshWakeState,
@@ -996,9 +983,8 @@ async fn commit_deferred_begins<'a>(
         .into_iter()
         .map(|deferred| (deferred.item, deferred.prepared))
         .unzip();
-    let item_count = items.len();
     let outcomes = match tokio::time::timeout(
-        grouped_deadline(policy, item_count),
+        policy.operation_deadline,
         access.commit_session_refresh_begin_batch_group(items, state.completion_control()),
     )
     .await
@@ -1067,7 +1053,7 @@ async fn drain_staged_completions<'a>(
         .map(|item| item.projection.clone())
         .collect::<Vec<_>>();
     let receipt_outcomes = match tokio::time::timeout(
-        grouped_deadline(policy, projections.len()),
+        policy.operation_deadline,
         access.record_relation_receipts_group(&projections, &state.completion_control()),
     )
     .await
@@ -1118,7 +1104,7 @@ async fn drain_staged_completions<'a>(
             }
         };
     let mut applied = Vec::with_capacity(survivors.len());
-    for mut item in survivors {
+    for item in survivors {
         match tokio::time::timeout(
             policy.operation_deadline,
             access.apply_candidate_relation_projection(
@@ -1135,65 +1121,22 @@ async fn drain_staged_completions<'a>(
                 report.observe_retry(SessionTemporalRefreshRetryClass::Deadline);
             }
             Ok(Ok(verified)) => {
-                item.verified = Some(verified);
-                applied.push(item);
+                applied.push((item, verified));
             }
             Ok(Err(error)) => {
                 reject_staged_completion(store, state, item.claim, error, report).await;
             }
         }
     }
-    let mut validated = Vec::with_capacity(applied.len());
-    for item in applied {
-        let Some(verified) = item.verified.clone() else {
-            continue;
-        };
-        let generation = match SessionProjectionGenerationV1::new(verified.generation) {
-            Ok(generation) => generation,
-            Err(_) => {
-                let mut item = item;
-                item.claim.retain();
-                report.terminal_errors += 1;
-                continue;
-            }
-        };
-        match tokio::time::timeout(
-            policy.operation_deadline,
-            access.validate_staged_session_refresh_completion(
-                item.claim.recovery.session_id(),
-                generation,
-                &item.watermarks,
-                &verified,
-                &state.completion_control(),
-            ),
-        )
-        .await
-        {
-            Err(_) => {
-                report.last_error = Some("validation_deadline_exceeded".to_string());
-                report.deadline_errors += 1;
-                report.observe_retry(SessionTemporalRefreshRetryClass::Deadline);
-            }
-            Ok(Ok(())) => validated.push(item),
-            Ok(Err(error)) => {
-                reject_staged_completion(store, state, item.claim, error, report).await;
-            }
-        }
-    }
-    if validated.is_empty() {
+    if applied.is_empty() {
         return;
     }
-    let complete_items = validated
+    let complete_items = applied
         .iter()
-        .filter_map(|item| {
-            item.verified
-                .clone()
-                .map(|verified| (item.request.clone(), verified))
-        })
+        .map(|(item, verified)| (item.request.clone(), verified.clone()))
         .collect::<Vec<_>>();
-    let outcome_count = complete_items.len();
     let outcomes = match tokio::time::timeout(
-        grouped_deadline(policy, outcome_count),
+        policy.operation_deadline,
         access.complete_session_refresh_group(complete_items, state.completion_control()),
     )
     .await
@@ -1216,7 +1159,7 @@ async fn drain_staged_completions<'a>(
         }
         Ok(Ok(outcomes)) => outcomes,
     };
-    for (item, outcome) in validated.into_iter().zip(outcomes) {
+    for ((item, _), outcome) in applied.into_iter().zip(outcomes) {
         match outcome {
             Ok(_) => report.completed += 1,
             Err(error) => {

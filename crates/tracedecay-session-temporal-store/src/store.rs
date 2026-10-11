@@ -71,7 +71,6 @@ struct MaterializeReadyCompletion {
     session_id: tracedecay_domain::SessionId,
     request: SessionRefreshCompletionRequestV1,
     relation_projection: crate::relations::SessionRelationProjection,
-    watermarks: tracedecay_store::SessionFrozenWatermarksV1,
 }
 
 #[derive(Clone, Debug)]
@@ -307,7 +306,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 Option<(
                     tracedecay_domain::SessionId,
                     SessionRefreshCompletionRequestV1,
-                    tracedecay_store::SessionFrozenWatermarksV1,
                 )>,
             > = Vec::new();
             let mut projections: Vec<crate::relations::SessionRelationProjection> = Vec::new();
@@ -315,7 +313,7 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             for staged_finish in staged_finishes {
                 match staged_finish {
                     MaterializeCompletionStage::Ready(staged) => {
-                        ready.push(Some((staged.session_id, staged.request, staged.watermarks)));
+                        ready.push(Some((staged.session_id, staged.request)));
                         projections.push(staged.relation_projection);
                     }
                     MaterializeCompletionStage::Resume(session_id) => {
@@ -341,7 +339,7 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 })?;
                 for (index, outcome) in receipt_outcomes.iter().enumerate() {
                     if outcome.is_err()
-                        && let Some((session_id, _, _)) = ready[index].as_ref()
+                        && let Some((session_id, _)) = ready[index].as_ref()
                     {
                         resumes.push(session_id.clone());
                     }
@@ -366,58 +364,16 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 .buffered(8)
                 .collect::<Vec<_>>()
                 .await;
-                let mut validated = Vec::new();
                 for (&index, result) in apply_indices.iter().zip(applied) {
                     match result {
-                        Ok(verified) => validated.push((index, verified)),
-                        Err(_) => {
-                            if let Some((session_id, _, _)) = ready[index].as_ref() {
-                                resumes.push(session_id.clone());
-                            }
-                        }
-                    }
-                }
-                let validations =
-                    futures_util::stream::iter(validated.iter().map(|(index, verified)| {
-                        let entry = ready[*index].as_ref();
-                        async move {
-                            let Some((session_id, _, watermarks)) = entry else {
-                                return Err(SessionStoreError::InvalidStateTransition {
-                                    context: "test temporal fixture staged completion",
-                                });
-                            };
-                            let generation = tracedecay_domain::SessionProjectionGenerationV1::new(
-                                verified.generation,
-                            )
-                            .map_err(|_| {
-                                SessionStoreError::InvalidStateTransition {
-                                    context: "test temporal fixture candidate generation",
-                                }
-                            })?;
-                            self.access()
-                                .validate_staged_session_refresh_completion(
-                                    session_id,
-                                    generation,
-                                    watermarks,
-                                    verified,
-                                    &ExecutionControl::default(),
-                                )
-                                .await
-                        }
-                    }))
-                    .buffered(8)
-                    .collect::<Vec<_>>()
-                    .await;
-                for ((index, verified), validation) in validated.into_iter().zip(validations) {
-                    match validation {
-                        Ok(()) => {
-                            if let Some((session_id, request, _)) = ready[index].take() {
+                        Ok(verified) => {
+                            if let Some((session_id, request)) = ready[index].take() {
                                 complete_sessions.push(session_id);
                                 complete_items.push((request, verified));
                             }
                         }
                         Err(_) => {
-                            if let Some((session_id, _, _)) = ready[index].as_ref() {
+                            if let Some((session_id, _)) = ready[index].as_ref() {
                                 resumes.push(session_id.clone());
                             }
                         }
@@ -514,13 +470,11 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 crate::SessionRefreshCompletionStage::Ready {
                     request,
                     relation_projection,
-                    watermarks,
                 } => Ok(MaterializeCompletionStage::Ready(Box::new(
                     MaterializeReadyCompletion {
                         session_id: recovery.session_id().clone(),
                         request,
                         relation_projection: *relation_projection,
-                        watermarks,
                     },
                 ))),
             };

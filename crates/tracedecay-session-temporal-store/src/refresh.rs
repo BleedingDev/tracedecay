@@ -1137,21 +1137,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         )
         .await?;
 
-        let validation_snapshot = self
-            .read_snapshot()
-            .await
-            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
-        validate_final_projection_receipt(
-            &validation_snapshot,
-            request.session_id(),
-            binding.generation,
-            &binding.watermarks,
-            &relation_projection,
-            &execution_control,
-        )
-        .await?;
-        drop(validation_snapshot);
-
         let transaction = self
             .begin_write_transaction()
             .instrument(tracing::trace_span!("session_temporal.txn.begin"))
@@ -1310,7 +1295,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         Ok(SessionRefreshCompletionStage::Ready {
             request,
             relation_projection: Box::new(relation_projection),
-            watermarks: binding.watermarks,
         })
     }
 
@@ -1340,35 +1324,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             projection,
             execution_control,
             COMPLETE_REFRESH,
-        )
-        .await
-    }
-
-    /// `generation` is the candidate, not `watermarks.active_generation()`.
-    pub async fn validate_staged_session_refresh_completion(
-        &self,
-        session_id: &tracedecay_domain::SessionId,
-        generation: tracedecay_domain::SessionProjectionGenerationV1,
-        watermarks: &SessionFrozenWatermarksV1,
-        relation_projection: &SessionRelationProjection,
-        execution_control: &ExecutionControl,
-    ) -> SessionStoreResult<()> {
-        if generation.value() != relation_projection.generation {
-            return Err(SessionStoreError::InvalidStateTransition {
-                context: "staged completion candidate generation",
-            });
-        }
-        let validation_snapshot = self
-            .read_snapshot()
-            .await
-            .map_err(|error| storage(COMPLETE_REFRESH, error))?;
-        validate_final_projection_receipt(
-            &validation_snapshot,
-            session_id,
-            generation,
-            watermarks,
-            relation_projection,
-            execution_control,
         )
         .await
     }
@@ -3230,7 +3185,6 @@ pub enum SessionRefreshCompletionStage {
     Ready {
         request: SessionRefreshCompletionRequestV1,
         relation_projection: Box<SessionRelationProjection>,
-        watermarks: SessionFrozenWatermarksV1,
     },
 }
 
@@ -3260,6 +3214,15 @@ async fn complete_session_refresh_in_transaction(
         request.operation_id(),
         request.frontier(),
         request.coverage(),
+    )
+    .await?;
+    validate_final_projection_receipt(
+        transaction,
+        request.session_id(),
+        binding.generation,
+        &binding.watermarks,
+        relation_projection,
+        execution_control,
     )
     .await?;
     validate_candidate_frontier(
