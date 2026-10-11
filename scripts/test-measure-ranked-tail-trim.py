@@ -73,18 +73,25 @@ class StoredTails(unittest.TestCase):
     )
 
     def test_untrimmed_splices_the_stored_tail_back_in_place(self) -> None:
-        text, unresolved = trim.untrimmed(
+        text, dead = trim.untrimmed(
             self.PAGE,
             lambda handle: "- **a**\n- **b**\n" if handle == "rh_0123456789abcdef01234567" else None,
         )
         self.assertEqual(
-            (text, unresolved),
-            ("- **kept** (function, exact_message), rank 1 · utility 2000000\n- **a**\n- **b**\n", 0),
+            (text, dead),
+            ("- **kept** (function, exact_message), rank 1 · utility 2000000\n- **a**\n- **b**\n", []),
         )
 
-    def test_untrimmed_counts_markers_the_store_cannot_answer(self) -> None:
-        text, unresolved = trim.untrimmed(self.PAGE, lambda handle: None)
-        self.assertEqual((text, unresolved), (self.PAGE, 1))
+    def test_untrimmed_returns_markers_the_store_cannot_answer(self) -> None:
+        text, dead = trim.untrimmed(self.PAGE, lambda handle: None)
+        self.assertEqual(text, self.PAGE)
+        self.assertEqual([match.group("handle") for match in dead], ["rh_0123456789abcdef01234567"])
+
+    def test_unresolved_tail_recovers_rows_and_bytes_from_marker_metadata(self) -> None:
+        match = trim.TRIM_MARKER.search(self.PAGE)
+        rows, saved = trim.unresolved_tail(match)
+        self.assertEqual(rows, 2)
+        self.assertEqual(saved, 20 - len(match.group(0).encode()))
 
 
 class RenderedPages(unittest.TestCase):

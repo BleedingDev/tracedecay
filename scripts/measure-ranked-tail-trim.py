@@ -18,9 +18,10 @@ mattered. Two sources:
 
 A binary that already trims hides the tail behind a retrieval handle, so both
 sources splice each marker's stored rows back through `tracedecay_retrieve`
-before replaying the rule; markers the store can no longer answer (expired
-handles, sessions recorded under another project) count as
-`markers_unresolved`.
+before replaying the rule. A marker the store can no longer answer (expired
+handles, sessions recorded under another project) still proves its cut's row
+and byte counts from its own metadata and counts as `markers_unresolved`;
+only its row-use and truth outcomes stay unknown.
 
     scripts/measure-ranked-tail-trim.py --queries scripts/ranked-tail-trim-queries.json
     scripts/measure-ranked-tail-trim.py --branch master --providers claude
@@ -61,9 +62,9 @@ MIN_KEPT_ROWS = 3
 MIN_TRIMMED_ROWS = 2
 HANDLE = "rh_" + "0" * 24
 TRIM_MARKER = re.compile(
-    r"^- _Trimmed \d+ lower-ranked results \(ranks \d+-\d+, \d+ bytes\): "
+    r"^- _Trimmed \d+ lower-ranked results \(ranks (?P<first>\d+)-(?P<last>\d+), (?P<bytes>\d+) bytes\): "
     r"each scored at most half of this page's best utility \d+\. "
-    r"To restore them, call `tracedecay_retrieve` with handle `(rh_[0-9a-f]{24})` "
+    r"To restore them, call `tracedecay_retrieve` with handle `(?P<handle>rh_[0-9a-f]{24})` "
     r"\(pass the same `project_selector` if this call used one\)\._\n?",
     re.M,
 )
@@ -165,24 +166,29 @@ def restored_tail(client: "measure.TraceDecay", handle: str) -> str | None:
         return None
 
 
-def untrimmed(text: str, retrieve: Callable[[str], str | None]) -> tuple[str, int]:
+def unresolved_tail(match: re.Match) -> tuple[int, int]:
+    """(rows cut, bytes saved) a marker's own metadata proves for a dead handle."""
+    saved = int(match.group("bytes")) - len(match.group(0).encode())
+    return int(match.group("last")) - int(match.group("first")) + 1, saved
+
+
+def untrimmed(text: str, retrieve: Callable[[str], str | None]) -> tuple[str, list[re.Match]]:
     """The page with each trim marker's stored tail spliced back verbatim.
 
     Without this splice the replay sees only the kept rows, so it cannot
     verify the trim's savings or recall on output the binary already trimmed.
-    Returns the spliced page and the count of markers it could not resolve.
+    Returns the spliced page and the markers the store could not answer.
     """
-    unresolved = 0
+    dead: list[re.Match] = []
 
     def restore(match: re.Match) -> str:
-        tail = retrieve(match.group(1))
+        tail = retrieve(match.group("handle"))
         if tail is None:
-            nonlocal unresolved
-            unresolved += 1
+            dead.append(match)
             return match.group(0)
         return tail
 
-    return TRIM_MARKER.sub(restore, text), unresolved
+    return TRIM_MARKER.sub(restore, text), dead
 
 
 def used_later(row: Row, others: str, before: str, later: str) -> bool:
@@ -204,9 +210,13 @@ def replay(events: list, stats: Counter, retrieve: Callable[[str], str | None]) 
         if tool not in TOOLS:
             continue
         stats[f"{tool}:calls"] += 1
-        text, unresolved = untrimmed(event.text, retrieve)
-        stats[f"{tool}:markers_unresolved"] += unresolved
-        stats[f"{tool}:bytes"] += len(text.encode())
+        text, dead = untrimmed(event.text, retrieve)
+        dead_tails = [unresolved_tail(match) for match in dead]
+        stats[f"{tool}:markers_unresolved"] += len(dead)
+        stats[f"{tool}:bytes"] += len(text.encode()) + sum(saved for _, saved in dead_tails)
+        stats[f"{tool}:saved_bytes"] += sum(saved for _, saved in dead_tails)
+        stats[f"{tool}:trimmed_rows"] += sum(rows for rows, _ in dead_tails)
+        stats[f"{tool}:trimmed_calls"] += bool(dead)
         before, later, _ = measure.split_evidence(events, index, tool)
         for kept, cut, saved in trimmed(text, call.evidence):
             if not cut:
@@ -233,23 +243,25 @@ def run_queries(args: argparse.Namespace, stats: Counter) -> None:
     for item in json.loads(args.queries.read_text()):
         command = [args.binary, "tool", item["tool"], "--args", json.dumps(item["args"])]
         text = subprocess.run(command + ["--project", args.project or args.repo], capture_output=True, text=True, check=False).stdout
-        text, unresolved = untrimmed(text, lambda handle: restored_tail(client, handle))
+        text, dead = untrimmed(text, lambda handle: restored_tail(client, handle))
+        dead_tails = [unresolved_tail(match) for match in dead]
         truth = definitions(args.repo, item["truth"])
         blocks = trimmed(text, item["args"].get("query") or item["args"].get("task", ""))
         kept = {row.name for rows, _, _ in blocks for row in rows}
         cut = {row.name for _, rows, _ in blocks for row in rows}
         saved = sum(saved for _, _, saved in blocks)
+        dead_saved = sum(saved for _, saved in dead_tails)
         tool = item["tool"]
         stats[f"{tool}:calls"] += 1
-        stats[f"{tool}:bytes"] += len(text.encode())
-        stats[f"{tool}:markers_unresolved"] += unresolved
-        stats[f"{tool}:saved_bytes"] += saved
-        stats[f"{tool}:trimmed_calls"] += bool(saved)
-        stats[f"{tool}:trimmed_rows"] += sum(len(rows) for _, rows, _ in blocks)
+        stats[f"{tool}:bytes"] += len(text.encode()) + dead_saved
+        stats[f"{tool}:markers_unresolved"] += len(dead)
+        stats[f"{tool}:saved_bytes"] += saved + dead_saved
+        stats[f"{tool}:trimmed_calls"] += bool(saved or dead)
+        stats[f"{tool}:trimmed_rows"] += sum(len(rows) for _, rows, _ in blocks) + sum(rows for rows, _ in dead_tails)
         stats[f"{tool}:truth_on_page"] += len(truth & (kept | cut))
         stats[f"{tool}:truth_trimmed"] += len(truth & (cut - kept))
         print(
-            f"{json.dumps(item['args'])}: {len(text.encode())} -> {len(text.encode()) - saved} bytes, "
+            f"{json.dumps(item['args'])}: {len(text.encode()) + dead_saved} -> {len(text.encode()) - saved} bytes, "
             f"truth on page {sorted(truth & (kept | cut))}, trimmed {sorted(truth & (cut - kept))}",
             file=sys.stderr,
         )
