@@ -215,8 +215,10 @@ mod tests {
         let renewed_root = tempfile::tempdir().expect("renewed root");
         // One record keeps most of its lifetime; the other is near expiry, so
         // rendering renews it with a later expiry.
-        store_response_handle(fresh_root.path(), &cut, now - RESPONSE_HANDLE_TTL_SECS / 4)
-            .expect("seed fresh record");
+        let handle =
+            store_response_handle(fresh_root.path(), &cut, now - RESPONSE_HANDLE_TTL_SECS / 4)
+                .expect("seed fresh record")
+                .handle;
         store_response_handle(
             renewed_root.path(),
             &cut,
@@ -227,16 +229,13 @@ mod tests {
         let fresh = ranked_rows_md(Some(fresh_root.path()), &weak_tail_page());
         let renewed = ranked_rows_md(Some(renewed_root.path()), &weak_tail_page());
 
-        let expires_at = |root: &Path| match retrieve_response_handle(
-            root,
-            marker_handle(&fresh),
-            current_timestamp(),
-        )
-        .expect("handle lookup")
-        {
-            ResponseHandleLookup::Found(record) => record.expires_at,
-            _ => panic!("record is live"),
-        };
+        let expires_at =
+            |root: &Path| match retrieve_response_handle(root, &handle, current_timestamp())
+                .expect("handle lookup")
+            {
+                ResponseHandleLookup::Found(record) => record.expires_at,
+                _ => panic!("record is live"),
+            };
         assert!(
             expires_at(renewed_root.path()) > expires_at(fresh_root.path()),
             "the arrangement must actually renew one record"
