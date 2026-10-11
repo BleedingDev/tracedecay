@@ -100,8 +100,9 @@ impl ToolSurface {
     }
 
     /// For a call to a tool the host still sees as a stub: appends the full
-    /// input schema to an error result, and on the first such call puts the
-    /// schema on the list and announces `list_changed` so the host re-lists.
+    /// input schema to an error result or JSON-RPC refusal, and on the first
+    /// such call puts the schema on the list and announces `list_changed` so
+    /// the host re-lists.
     pub(super) fn hydrate_called_stub(
         &mut self,
         request: Option<&JsonRpcRequest>,
@@ -126,19 +127,25 @@ impl ToolSurface {
                 let Ok(mut message) = serde_json::from_str::<Value>(line) else {
                     continue;
                 };
-                if message.get("id") != request.id.as_ref()
-                    || message.pointer("/result/isError") != Some(&json!(true))
-                {
+                if message.get("id") != request.id.as_ref() {
                     continue;
                 }
-                if let Some(content) = message
-                    .pointer_mut("/result/content")
-                    .and_then(Value::as_array_mut)
+                if message.pointer("/result/isError") == Some(&json!(true)) {
+                    if let Some(content) = message
+                        .pointer_mut("/result/content")
+                        .and_then(Value::as_array_mut)
+                    {
+                        content.push(json!({
+                            "type": "text",
+                            "text": format!("Full input schema for {name}: {schema}"),
+                        }));
+                        *line = format!("{message}\n");
+                    }
+                } else if let Some(error) = message.get_mut("error").and_then(Value::as_object_mut)
+                    && let Some(text) = error.get("message").and_then(Value::as_str)
                 {
-                    content.push(json!({
-                        "type": "text",
-                        "text": format!("Full input schema for {name}: {schema}"),
-                    }));
+                    let text = format!("{text}\n\nFull input schema for {name}: {schema}");
+                    error.insert("message".to_owned(), json!(text));
                     *line = format!("{message}\n");
                 }
             }
@@ -341,6 +348,41 @@ mod tests {
             appended(&hydrate(&mut surface, "tracedecay_impact", true)),
             None,
             "a re-listed tool already carries its schema"
+        );
+    }
+
+    #[test]
+    fn a_json_rpc_refusal_carries_the_schema_until_the_host_relists() {
+        let refusal = || {
+            vec![format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": 3, "error": {
+                    "code": -32602,
+                    "message": "tool project route failed: missing field `node_id`",
+                }})
+            )]
+        };
+        let mut surface = ToolSurface::new(false);
+        served(&mut surface);
+        let mut responses = refusal();
+        surface.hydrate_called_stub(Some(&call("tracedecay_impact")), &mut responses);
+        assert_eq!(responses.len(), 2, "{responses:?}");
+        let refused: Value = serde_json::from_str(&responses[0]).expect("json");
+        let message = refused["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains("Full input schema for tracedecay_impact: ")
+                && message.contains(r#""node_id""#),
+            "{message}"
+        );
+        served(&mut surface);
+        let mut responses = refusal();
+        surface.hydrate_called_stub(Some(&call("tracedecay_impact")), &mut responses);
+        assert_eq!(responses.len(), 1, "announced once: {responses:?}");
+        let refused: Value = serde_json::from_str(&responses[0]).expect("json");
+        assert_eq!(
+            refused["error"]["message"],
+            json!("tool project route failed: missing field `node_id`"),
+            "a re-listed tool's refusal carries no schema"
         );
     }
 
