@@ -902,15 +902,20 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .map_err(|error| storage(PERSIST_REFRESH, error))?;
         let mut outcomes = Vec::with_capacity(items.len());
         for (index, item) in items.into_iter().enumerate() {
-            outcomes.push(
-                commit_begin_batch_item_in_transaction(
-                    &transaction,
-                    index,
-                    item,
-                    &execution_control,
-                )
-                .await,
-            );
+            match commit_begin_batch_item_in_transaction(
+                &transaction,
+                index,
+                item,
+                &execution_control,
+            )
+            .await
+            {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(boundary_error) => {
+                    return abort_grouped_transaction(transaction, boundary_error, PERSIST_REFRESH)
+                        .await;
+                }
+            }
         }
         transaction
             .commit()
@@ -1271,8 +1276,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                 .await
                 .map_err(|error| storage(COMPLETE_REFRESH, error))
             {
-                receipts.push(Err(error));
-                continue;
+                return abort_grouped_transaction(transaction, error, COMPLETE_REFRESH).await;
             }
             let receipt = complete_session_refresh_in_transaction(
                 &transaction,
@@ -1287,7 +1291,14 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                     .await
                 {
                     Ok(_) => Ok(receipt),
-                    Err(error) => Err(storage(COMPLETE_REFRESH, error)),
+                    Err(error) => {
+                        return abort_grouped_transaction(
+                            transaction,
+                            storage(COMPLETE_REFRESH, error),
+                            COMPLETE_REFRESH,
+                        )
+                        .await;
+                    }
                 },
                 Err(item_error) => {
                     let rollback = async {
@@ -1304,7 +1315,14 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                     .await;
                     match rollback {
                         Ok(()) => Err(item_error),
-                        Err(rollback_error) => Err(rollback_error),
+                        Err(rollback_error) => {
+                            return abort_grouped_transaction(
+                                transaction,
+                                rollback_error,
+                                COMPLETE_REFRESH,
+                            )
+                            .await;
+                        }
                     }
                 }
             };
@@ -3404,6 +3422,24 @@ async fn complete_session_refresh_in_transaction(
     Ok(SessionRefreshReceiptV1::completed(request, terminal_at))
 }
 
+/// A grouped commit whose savepoint boundary failed can no longer be
+/// trusted to isolate an item's writes: a failed RELEASE leaves the
+/// item's writes live inside the transaction, and a failed ROLLBACK TO
+/// leaves a refused item's partial writes live. Nothing in that
+/// transaction may commit, so the whole group rolls back unacknowledged.
+pub(super) async fn abort_grouped_transaction<T>(
+    transaction: impl SessionTemporalWriteTxn,
+    boundary_error: SessionStoreError,
+    operation: &'static str,
+) -> SessionStoreResult<T> {
+    transaction
+        .rollback()
+        .instrument(tracing::trace_span!("session_temporal.txn.rollback"))
+        .await
+        .map_err(|error| storage(operation, error))?;
+    Err(boundary_error)
+}
+
 /// Rolls an isolated begin-batch item back to its savepoint and releases
 /// it, leaving the rest of the grouped transaction untouched.
 async fn rollback_begin_item_savepoint(
@@ -3433,7 +3469,7 @@ async fn commit_begin_batch_item_in_transaction(
     index: usize,
     item: SessionRefreshBeginBatchItemV1,
     execution_control: &ExecutionControl,
-) -> SessionStoreResult<SessionRefreshBeginBatchOutcomeV1> {
+) -> SessionStoreResult<SessionStoreResult<SessionRefreshBeginBatchOutcomeV1>> {
     let savepoint = format!("refresh_begin_item_{index}");
     let SessionRefreshBeginBatchItemV1 {
         request,
@@ -3441,22 +3477,27 @@ async fn commit_begin_batch_item_in_transaction(
         progress,
         batch,
     } = item;
-    validate_progress_batch_identity(&progress, &batch)?;
+    if let Err(error) = validate_progress_batch_identity(&progress, &batch) {
+        return Ok(Err(error));
+    }
     let authoritative_validation_time = now_micros(PERSIST_REFRESH)?;
-    transaction
+    if let Err(error) = transaction
         .execute(&format!("SAVEPOINT {savepoint}"), ())
         .await
-        .map_err(|error| storage(PERSIST_REFRESH, error))?;
+        .map_err(|error| storage(PERSIST_REFRESH, error))
+    {
+        return Err(error);
+    }
     let (operation_id, binding) =
         match begin_session_refresh_in_transaction(transaction, request.clone(), accepted_at).await
         {
             Err(error) => {
                 rollback_begin_item_savepoint(transaction, &savepoint).await?;
-                return Err(error);
+                return Ok(Err(error));
             }
             Ok(SessionRefreshBeginTxnOutcome::Joined { .. }) => {
                 rollback_begin_item_savepoint(transaction, &savepoint).await?;
-                return Ok(SessionRefreshBeginBatchOutcomeV1::Joined);
+                return Ok(Ok(SessionRefreshBeginBatchOutcomeV1::Joined));
             }
             Ok(SessionRefreshBeginTxnOutcome::Started {
                 operation_id,
@@ -3472,7 +3513,7 @@ async fn commit_begin_batch_item_in_transaction(
             .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
             .await
             .map_err(|error| storage(PERSIST_REFRESH, error))?;
-        return Ok(SessionRefreshBeginBatchOutcomeV1::BeganOnly);
+        return Ok(Ok(SessionRefreshBeginBatchOutcomeV1::BeganOnly));
     }
     match persist_begin_batch_in_transaction(
         transaction,
@@ -3489,25 +3530,28 @@ async fn commit_begin_batch_item_in_transaction(
                 .execute(&format!("RELEASE SAVEPOINT {savepoint}"), ())
                 .await
                 .map_err(|error| storage(PERSIST_REFRESH, error))?;
-            Ok(SessionRefreshBeginBatchOutcomeV1::Persisted {
+            Ok(Ok(SessionRefreshBeginBatchOutcomeV1::Persisted {
                 progress: Box::new(progress),
                 receipt: Box::new(receipt),
-            })
+            }))
         }
-        Err(_) => {
+        Err(item_error) => {
             rollback_begin_item_savepoint(transaction, &savepoint).await?;
             // The refused batch rolled back alone; replay the begin so the
             // group still commits the durable running operation the next
             // pass retires — the same state a crash between the two
             // commits leaves behind on the independent path.
             let alone = format!("{savepoint}_alone");
-            transaction
+            if let Err(error) = transaction
                 .execute(&format!("SAVEPOINT {alone}"), ())
                 .await
-                .map_err(|error| storage(PERSIST_REFRESH, error))?;
+                .map_err(|error| storage(PERSIST_REFRESH, error))
+            {
+                return Ok(Err(error));
+            }
             let outcome =
                 begin_session_refresh_in_transaction(transaction, request, accepted_at).await;
-            match outcome {
+            Ok(match outcome {
                 Err(error) => {
                     rollback_begin_item_savepoint(transaction, &alone).await?;
                     Err(error)
@@ -3526,7 +3570,7 @@ async fn commit_begin_batch_item_in_transaction(
                         .map_err(|error| storage(PERSIST_REFRESH, error))?;
                     Ok(SessionRefreshBeginBatchOutcomeV1::Joined)
                 }
-            }
+            })
         }
     }
 }

@@ -82,3 +82,128 @@ impl<T: SessionTemporalExec> SessionTemporalExec for QueryCountingConnection<'_,
         SessionTemporalExec::execute_batch(self.inner, sql)
     }
 }
+
+/// Registered-database wrapper that fails `execute` on a chosen statement
+/// prefix. The real maintained transaction still runs underneath; only the
+/// one boundary statement errors so grouped-commit abort paths are covered
+/// through the production authority.
+pub(crate) struct FailingRegisteredDb<'a> {
+    inner: &'a tracedecay_global_db::RegisteredGlobalDb,
+    needle: &'static str,
+}
+
+impl<'a> FailingRegisteredDb<'a> {
+    pub(crate) fn new(
+        inner: &'a tracedecay_global_db::RegisteredGlobalDb,
+        needle: &'static str,
+    ) -> Self {
+        Self { inner, needle }
+    }
+}
+
+/// The write transaction `FailingRegisteredDb` opens: delegates every call
+/// except `execute`, which reports a runtime error for the chosen prefix.
+pub(crate) struct FailingWriteTxn<'a> {
+    inner: tracedecay_global_db::RegisteredGlobalDbWriteTransaction<'a>,
+    needle: &'static str,
+}
+
+impl SessionTemporalQuery for FailingWriteTxn<'_> {
+    fn query<P>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> impl Future<Output = Result<Rows, EngineError>> + Send
+    where
+        P: IntoParams + Send,
+    {
+        SessionTemporalQuery::query(&self.inner, sql, params)
+    }
+}
+
+impl SessionTemporalExec for FailingWriteTxn<'_> {
+    fn execute<P>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> impl Future<Output = Result<u64, EngineError>> + Send
+    where
+        P: IntoParams + Send,
+    {
+        let needle = self.needle;
+        async move {
+            if sql.starts_with(needle) {
+                return Err(EngineError::Runtime(format!("injected failure: {needle}")));
+            }
+            SessionTemporalExec::execute(&self.inner, sql, params).await
+        }
+    }
+
+    fn execute_batch(&self, sql: &str) -> impl Future<Output = Result<(), EngineError>> + Send {
+        SessionTemporalExec::execute_batch(&self.inner, sql)
+    }
+}
+
+impl crate::handle::SessionTemporalWriteTxn for FailingWriteTxn<'_> {
+    fn commit(self) -> impl Future<Output = Result<(), EngineError>> + Send {
+        crate::handle::SessionTemporalWriteTxn::commit(self.inner)
+    }
+
+    fn rollback(self) -> impl Future<Output = Result<(), EngineError>> + Send {
+        crate::handle::SessionTemporalWriteTxn::rollback(self.inner)
+    }
+}
+
+impl crate::handle::SessionTemporalRegisteredDb for FailingRegisteredDb<'_> {
+    type WriteTxn<'b>
+        = FailingWriteTxn<'b>
+    where
+        Self: 'b;
+
+    fn read_snapshot(
+        &self,
+    ) -> impl Future<
+        Output = Result<
+            tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
+            tracedecay_domain::errors::TraceDecayError,
+        >,
+    > + Send {
+        crate::handle::SessionTemporalRegisteredDb::read_snapshot(self.inner)
+    }
+
+    fn health_read_snapshot(
+        &self,
+    ) -> impl Future<
+        Output = Result<tracedecay_runtime_core::db::DatabaseEngineReadSnapshot, EngineError>,
+    > + Send {
+        crate::handle::SessionTemporalRegisteredDb::health_read_snapshot(self.inner)
+    }
+
+    fn begin_write_transaction(
+        &self,
+    ) -> impl Future<Output = Result<Self::WriteTxn<'_>, tracedecay_domain::errors::TraceDecayError>>
+    + Send {
+        let needle = self.needle;
+        async move {
+            crate::handle::SessionTemporalRegisteredDb::begin_write_transaction(self.inner)
+                .await
+                .map(|inner| FailingWriteTxn { inner, needle })
+        }
+    }
+
+    fn db_path(&self) -> &std::path::Path {
+        crate::handle::SessionTemporalRegisteredDb::db_path(self.inner)
+    }
+
+    fn session_relation_store(
+        &self,
+    ) -> Result<
+        (
+            crate::relations::SessionRelationScope,
+            crate::relations::SessionRelationGraphStore,
+        ),
+        tracedecay_domain::errors::TraceDecayError,
+    > {
+        crate::handle::SessionTemporalRegisteredDb::session_relation_store(self.inner)
+    }
+}

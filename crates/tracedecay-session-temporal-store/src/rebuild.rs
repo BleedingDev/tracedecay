@@ -133,8 +133,12 @@ pub(super) async fn record_relation_receipts_group(
             .execute(&format!("SAVEPOINT {savepoint}"), ())
             .await
         {
-            outcomes.push(Err(storage(operation, error)));
-            continue;
+            return crate::refresh::abort_grouped_transaction(
+                transaction,
+                storage(operation, error),
+                operation,
+            )
+            .await;
         }
         let outcome =
             record_relation_receipt(&transaction, projection, now_micros(operation)?.0).await;
@@ -144,7 +148,14 @@ pub(super) async fn record_relation_receipts_group(
                 .await
             {
                 Ok(_) => Ok(watermark),
-                Err(error) => Err(storage(operation, error)),
+                Err(error) => {
+                    return crate::refresh::abort_grouped_transaction(
+                        transaction,
+                        storage(operation, error),
+                        operation,
+                    )
+                    .await;
+                }
             },
             Err(item_error) => {
                 let rollback = async {
@@ -161,7 +172,14 @@ pub(super) async fn record_relation_receipts_group(
                 .await;
                 match rollback {
                     Ok(()) => Err(item_error),
-                    Err(rollback_error) => Err(rollback_error),
+                    Err(rollback_error) => {
+                        return crate::refresh::abort_grouped_transaction(
+                            transaction,
+                            rollback_error,
+                            operation,
+                        )
+                        .await;
+                    }
                 }
             }
         });

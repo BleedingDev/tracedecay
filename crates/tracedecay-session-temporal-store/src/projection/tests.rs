@@ -12,7 +12,7 @@ use tracedecay_domain::{
     ProjectionOutputOrdinalV1, ProviderId, RetentionClass, RetrievalAnchorId,
     RetrievalAnchorRecord, SanitizationReceiptId, SanitizationReceiptRefV1, SanitizationReceiptV1,
     SanitizerDispositionV1, SensitivityV1, SessionId, TemporalAssertionKindV1, TemporalValidityV1,
-    UtcMicros, derive_exact_observation_anchor_id,
+    UserProfileId, UtcMicros, derive_exact_observation_anchor_id,
 };
 use tracedecay_graph_db::NeverCancelled;
 use tracedecay_store::{
@@ -29,7 +29,8 @@ use super::super::refresh::SessionRefreshRestartStateV1;
 use super::materialize::*;
 use super::record_canonical_observation_effect;
 use crate::handle::SessionTemporalRegisteredDb;
-use crate::test_support::QueryCountingConnection;
+use crate::relations::{SessionRelationProjection, SessionRelationScope};
+use crate::test_support::{FailingRegisteredDb, QueryCountingConnection};
 use crate::{SessionTemporalAccess, SessionTemporalRefreshDiscoveryCursor, SessionTemporalStore};
 use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_global_db::tests::harness::{
@@ -3235,4 +3236,49 @@ async fn realistic_user_sessions_dbstat_names_dominant_bytes() {
         print_user_sessions_dbstat(&snapshot, family, n).await;
         previous_family = family;
     }
+}
+
+/// A savepoint failure inside a grouped receipt commit is a transaction
+/// boundary failure: the whole group rolls back and the call returns an
+/// error instead of acknowledging earlier items.
+#[tokio::test]
+async fn grouped_receipt_savepoint_failure_aborts_the_group() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .expect("profile registered database");
+    let scope = SessionRelationScope::profile_sessions(
+        UserProfileId::new("profile.savepoint-abort").expect("profile"),
+    );
+    let projections = ["session.savepoint-abort-a", "session.savepoint-abort-b"]
+        .iter()
+        .map(|name| SessionRelationProjection {
+            scope: scope.clone(),
+            session_id: fixture_session(name),
+            generation: 1,
+            summaries: Vec::new(),
+            logical_copies: Vec::new(),
+            thread_hierarchy: Vec::new(),
+            agent_hierarchy: Vec::new(),
+            parent_session_id: None,
+            workflow_agents: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let failing = FailingRegisteredDb::new(database, "SAVEPOINT relation_receipt_item_1");
+    let access = SessionTemporalAccess::new(&failing);
+    let result = access
+        .record_relation_receipts_group(&projections, &ExecutionControl::default())
+        .await;
+    assert!(
+        result.is_err(),
+        "savepoint failure must abort the grouped commit, got {result:?}"
+    );
+    assert_eq!(
+        count_effects(&runtime, "SELECT COUNT(*) FROM session_relation_receipts").await,
+        0,
+        "the aborted group must not leave the first item's receipt committed"
+    );
 }
