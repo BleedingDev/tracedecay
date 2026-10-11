@@ -54,6 +54,21 @@ def turn_start_response(message, thread_id):
     return turn_id
 
 
+def _receive_until(stdout, parse, label):
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        readable, _, _ = select.select([stdout], [], [], 0.25)
+        if not readable:
+            continue
+        line = stdout.readline()
+        if not line:
+            raise RuntimeError(f"app-server closed stdout while waiting for {label}")
+        value = parse(json.loads(line))
+        if value is not None:
+            return value
+    raise RuntimeError(f"timed out waiting for {label}")
+
+
 def run_app_server(binary, cwd):
     proc = subprocess.Popen(
         [binary, "app-server"],
@@ -72,33 +87,17 @@ def run_app_server(binary, cwd):
     def send(message):
         proc.stdin.write((json.dumps(message) + "\n").encode())
 
-    def receive_until(parse, label):
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(f"app-server exited while waiting for {label}")
-            readable, _, _ = select.select([proc.stdout], [], [], 0.25)
-            if not readable:
-                continue
-            line = proc.stdout.readline()
-            if not line:
-                raise RuntimeError(f"app-server closed stdout while waiting for {label}")
-            value = parse(json.loads(line))
-            if value is not None:
-                return value
-        raise RuntimeError(f"timed out waiting for {label}")
-
     try:
         send({"method": "initialize", "id": 0, "params": {
             "clientInfo": {"name": "tracedecay_native_launch_smoke", "version": "1"},
         }})
-        receive_until(lambda item: response_result(item, 0), "initialize response")
+        _receive_until(proc.stdout, lambda item: response_result(item, 0), "initialize response")
         send({"method": "initialized", "params": {}})
         send({"method": "thread/start", "id": 1, "params": {
             "ephemeral": True, "threadSource": "tracedecay_native_launch_smoke",
             "cwd": cwd, "approvalPolicy": "never", "sandbox": "read-only",
         }})
-        thread_id = receive_until(thread_start_response, "thread/start response")
+        thread_id = _receive_until(proc.stdout, thread_start_response, "thread/start response")
         send({"method": "turn/start", "id": 2, "params": {
             "threadId": thread_id,
             "input": [{"type": "text", "text": "Return only READY."}],
@@ -106,7 +105,7 @@ def run_app_server(binary, cwd):
             "approvalPolicy": "never",
             "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
         }})
-        receive_until(lambda item: turn_start_response(item, thread_id), "turn/start response")
+        _receive_until(proc.stdout, lambda item: turn_start_response(item, thread_id), "turn/start response")
         if proc.poll() is not None:
             raise RuntimeError("app-server exited before the signal could be delivered")
         os.killpg(proc.pid, signal.SIGKILL)
