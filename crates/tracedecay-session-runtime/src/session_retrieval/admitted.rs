@@ -98,7 +98,7 @@ pub type LcmSessionRawStatsFutureV1<'a> = Pin<
         dyn Future<
                 Output = Result<
                     Vec<tracedecay_lcm::types::LcmSessionRawStats>,
-                    tracedecay_domain::errors::TraceDecayError,
+                    SessionRetrievalUnavailable,
                 >,
             > + Send
             + 'a,
@@ -204,7 +204,7 @@ pub trait SessionApplicationRetrievalPortV1: Send + Sync {
         &'a self,
         _session_id: &'a str,
     ) -> LcmSessionRawStatsFutureV1<'a> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async { Err(SessionRetrievalUnavailable::service_not_configured()) })
     }
 
     /// The refresh worker's serving state for this root, current, still
@@ -453,15 +453,24 @@ impl SessionApplicationRetrievalPortV1 for DaemonSessionRetrievalService {
         session_id: &'a str,
     ) -> LcmSessionRawStatsFutureV1<'a> {
         Box::pin(async move {
-            let snapshot = self.database.read_snapshot().await?;
-            tracedecay_lcm::query::session_raw_stats(&snapshot, session_id)
-                .await
-                .map_err(
-                    |error| tracedecay_domain::errors::TraceDecayError::Database {
-                        message: error.to_string(),
-                        operation: "resolve LCM session raw stats".to_owned(),
-                    },
+            let result = async {
+                let snapshot = self.database.read_snapshot().await?;
+                tracedecay_lcm::query::session_raw_stats(&snapshot, session_id)
+                    .await
+                    .map_err(
+                        |error| tracedecay_domain::errors::TraceDecayError::Database {
+                            message: error.to_string(),
+                            operation: "resolve LCM session raw stats".to_owned(),
+                        },
+                    )
+            }
+            .await;
+            result.map_err(|error| {
+                tracing::warn!(%error, "LCM session raw statistics read failed");
+                SessionRetrievalUnavailable::without_worker(
+                    SessionRetrievalUnavailableReason::TemporalStoreReadFailed,
                 )
+            })
         })
     }
 }
