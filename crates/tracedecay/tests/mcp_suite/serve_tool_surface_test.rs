@@ -350,16 +350,10 @@ impl PlainMcpClient {
     }
 
     pub(crate) fn start_with_env(home: &Path, project: &Path, env: &[(&str, &str)]) -> Self {
-        let mut command = tracedecay_command_with_home(home);
-        command
-            .arg("serve")
-            .arg("--path")
-            .arg(project)
+        let mut child = serve_command(home, project, &[])
             .envs(env.iter().copied())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = command.spawn().expect("tracedecay serve should start");
+            .spawn()
+            .expect("tracedecay serve should start");
         let stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
         Self {
             process: TestChildProcess::new(child),

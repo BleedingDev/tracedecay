@@ -23,12 +23,14 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use tracedecay_domain::canonical_json_value;
 use tracedecay_domain::canonical_text::canonical_framed_sha256;
-use tracedecay_domain::errors::{Result, TraceDecayError};
+use tracedecay_domain::errors::Result;
 use tracedecay_mcp::JsonRpcRequest;
 use tracedecay_mcp::application_output::markdown::without_per_call_lines;
 use tracedecay_mcp::tools::response_trailers::{
     CODE_GRAPH_FRESHNESS_TRAILER_PREFIX, is_beside_result_block, is_code_graph_freshness_block,
 };
+
+use super::tool_surface::env_switch;
 
 /// Explicit env a host sets when each serve connection belongs to one agent.
 pub(super) const REPEAT_READ_POINTERS_ENV: &str = "TRACEDECAY_MCP_REPEAT_READ_POINTERS";
@@ -45,30 +47,6 @@ const DIGEST_DOMAIN: &[u8] = b"tracedecay.serve.repeat_read.v1";
 /// lost earlier result costs one more full repeat.
 const MIN_POINTER_BYTES: usize = 1024;
 const POINTER_PREFIX: &str = "tracedecay_repeat_read:";
-
-/// Reads an explicit serve on/off env. Unset, empty, `0`, and `false` are
-/// off; `1` and `true` are on; anything else is a configuration error rather
-/// than a silent default.
-fn env_switch(name: &str) -> Result<bool> {
-    parse_env_switch(name, std::env::var(name))
-}
-
-fn parse_env_switch(
-    name: &str,
-    value: std::result::Result<String, std::env::VarError>,
-) -> Result<bool> {
-    match value {
-        Err(std::env::VarError::NotPresent) => Ok(false),
-        Ok(value) if value.is_empty() || value == "0" || value == "false" => Ok(false),
-        Ok(value) if value == "1" || value == "true" => Ok(true),
-        Ok(value) => Err(TraceDecayError::Config {
-            message: format!("{name} must be \"1\", \"true\", \"0\", or \"false\", got {value:?}"),
-        }),
-        Err(std::env::VarError::NotUnicode(_)) => Err(TraceDecayError::Config {
-            message: format!("{name} must be \"1\", \"true\", \"0\", or \"false\""),
-        }),
-    }
-}
 
 /// What this session last received for one tool call.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,6 +72,8 @@ fn transition(previous: Option<&Served>, digest: &str, bytes: usize) -> Option<S
 /// One serve session's repeat-read ledger.
 #[derive(Debug, Default)]
 pub(super) struct RepeatReads {
+    // ponytail: unbounded per-session map of ~100 B entries keyed by distinct
+    // repeatable reads; add an LRU bound if serve RSS shows growth.
     served: HashMap<(String, String), Served>,
 }
 
@@ -221,6 +201,7 @@ fn replace_with_pointer(result: &mut Value, tool: &str, digest: &str, bytes: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::tool_surface::parse_env_switch;
 
     fn call(id: i64, tool: &str, arguments: &Value) -> JsonRpcRequest {
         JsonRpcRequest::decode(

@@ -743,7 +743,9 @@ fn responses_are_project_open_retryable(responses: &[String]) -> bool {
             .is_some_and(json_rpc_error_is_project_open_retryable)
 }
 
-/// Fits one daemon answer to this session's advertised schemas and repeat-read ledger.
+/// Sends one host request and fits the daemon's answer to this session's tool
+/// surface; a call to a stubbed tool also hydrates its full schema, and a
+/// repeated identical read answers with a pointer.
 async fn send_host_request(
     surface: &mut ToolSurface,
     repeat_reads: Option<&mut RepeatReads>,
