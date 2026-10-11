@@ -64,8 +64,6 @@ pub(super) struct WorktreeResidencyV1 {
     retained_parses: SharedRetainedParsePool,
     last_used: Mutex<Instant>,
     refresh_waits_for_memory: AtomicBool,
-    /// One waiter at a time retries park-release once the running owner pass
-    /// settles; that settle posts no cadence wake.
     park_release_after_pass_armed: AtomicBool,
 }
 
@@ -280,9 +278,6 @@ impl WorktreeResidencyV1 {
         owners.note_headroom();
     }
 
-    /// The worker can park while a retained text projection it carried across
-    /// passes still holds `reconcile_in_progress`. That task posts no wake when
-    /// it finishes, so retry this release once every running pass settles.
     fn arm_park_release_after_pass_settles(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
         if self
             .park_release_after_pass_armed

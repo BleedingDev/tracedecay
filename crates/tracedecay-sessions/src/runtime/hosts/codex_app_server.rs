@@ -1287,9 +1287,6 @@ mod tests {
         );
     }
 
-    /// A descendant that leaves the app-server's process group keeps stdout
-    /// open after the tree kill. The finished turn must still return instead
-    /// of waiting for that holder to exit.
     #[cfg(unix)]
     #[test]
     fn work_app_server_returns_while_an_escaped_descendant_holds_stdout() {
