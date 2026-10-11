@@ -776,10 +776,9 @@ async fn send_host_request(
             .await?;
     surface.rewrite(request.parsed.as_ref(), &mut responses);
     surface.hydrate_called_stub(request.parsed.as_ref(), &mut responses);
-    if let Some(repeat_reads) = repeat_reads {
-        repeat_reads.rewrite(request.parsed.as_ref(), &mut responses);
-    }
-    repeated_queries.rewrite(request.parsed.as_ref(), &mut responses);
+    let pointed = repeat_reads
+        .is_some_and(|repeat_reads| repeat_reads.rewrite(request.parsed.as_ref(), &mut responses));
+    repeated_queries.rewrite(request.parsed.as_ref(), &mut responses, pointed);
     Ok(responses)
 }
 
