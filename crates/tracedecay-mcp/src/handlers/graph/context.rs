@@ -15,7 +15,9 @@ use tracedecay_contracts::retrieval::{
     ContextStageV1, ContextSurfaceRequestV1, LexicalAnchorDropReasonV1, PrimitiveSymbolLocationV1,
 };
 use tracedecay_domain::errors::Result;
-use tracedecay_domain::{ExactClass, RankedCandidate, RelationEdgeKindV1, RetrieverKind};
+use tracedecay_domain::{
+    ExactClass, MAX_CHUNK_TEXT_BYTES, RankedCandidate, RelationEdgeKindV1, RetrieverKind,
+};
 use tracedecay_query::retrieval::lexical::{preferred_symbol_tokens, task_is_name_shaped};
 
 use crate::McpToolContext;
@@ -35,7 +37,9 @@ use super::primitive_surface::{
     search_coverage as primitive_search_coverage, symbol_location as primitive_symbol_location,
 };
 use super::search::execute_code_index_search;
-use super::search_evidence::{bind_verified_graph_to_search, race_primary_search_with_graph};
+use super::search_evidence::{
+    bind_verified_graph_to_search, graph_symbol_for_display, race_primary_search_with_graph,
+};
 use super::search_freshness::{
     ServedGenerationV1, lanes_under_scheduler_freshness, search_freshness,
     worktree_freshness_from_payload,
@@ -76,9 +80,12 @@ struct ContextGraphProjection {
     related: Vec<CodeGraphSymbolSummaryV1>,
     related_omission: Option<ContextRelatedOmissionV1>,
     code_blocks: Vec<ContextCodeBlockV1>,
+    /// Selected symbols whose attested window is only part of the
+    /// declaration.
+    oversized: Vec<CodeGraphSymbolSummaryV1>,
     touched_files: Vec<String>,
-    /// Selected symbols whose search display attested a code window.
-    /// Drives the code stage's admitted/truncated accounting so a
+    /// Selected symbols whose search display attested a whole-declaration
+    /// code window. Drives the code stage's admitted/truncated accounting so a
     /// catalog-ready projection uses the same eligibility as search
     /// hydration instead of raw selected-symbol count.
     code_sites: usize,
@@ -193,18 +200,15 @@ fn context_graph_projection(
         if scope_prefix.is_some_and(|prefix| !display.path.starts_with(prefix)) {
             continue;
         }
-        let candidates =
-            graph.resolve_qualified_name(&display.qualified_name, Some(&display.kind), 16)?;
-        for candidate in candidates {
-            if required_graph_file_path(&candidate)? == display.path.as_str()
-                && !selected.iter().any(|existing: &CodeGraphSymbolSummaryV1| {
-                    existing.occurrence == candidate.occurrence
-                })
-            {
-                selected.push(candidate);
-                selected_sites.push(display.site.clone());
-                break;
-            }
+        let Some(candidate) = graph_symbol_for_display(graph, display)? else {
+            continue;
+        };
+        if !selected
+            .iter()
+            .any(|existing: &CodeGraphSymbolSummaryV1| existing.occurrence == candidate.occurrence)
+        {
+            selected.push(candidate);
+            selected_sites.push(display.site.clone());
         }
     }
     let seeds = selected
@@ -233,6 +237,7 @@ fn context_graph_projection(
     all_symbols.extend(related.iter().cloned());
     let touched_files = graph_symbol_paths(&all_symbols)?;
     let mut code_blocks = Vec::new();
+    let mut oversized = Vec::new();
     let mut code_sites = 0_usize;
     if include_code {
         let mut sanitized_by_path = HashMap::<String, Option<String>>::new();
@@ -240,10 +245,22 @@ fn context_graph_projection(
             if site
                 .as_ref()
                 .and_then(tracedecay_query::code_search::CodeIndexSearchSiteV1::code_window)
-                .is_some()
+                .is_none()
             {
-                code_sites += 1;
+                continue;
             }
+            // Chunking splits a declaration over the chunk ceiling into
+            // several windows, none of which is the declaration.
+            if symbol
+                .binding
+                .as_ref()
+                .and_then(|binding| binding.source_span)
+                .is_some_and(|declaration| declaration.len() > MAX_CHUNK_TEXT_BYTES as u64)
+            {
+                oversized.push(symbol.clone());
+                continue;
+            }
+            code_sites += 1;
             if code_blocks.len() < max_code_blocks {
                 let file_path = required_graph_file_path(symbol)?;
                 if let Some((start_line, end_line, code)) =
@@ -265,6 +282,7 @@ fn context_graph_projection(
         related,
         related_omission,
         code_blocks,
+        oversized,
         touched_files,
         code_sites,
     })
@@ -736,6 +754,11 @@ where
         .iter()
         .map(primitive_symbol_location)
         .collect::<Result<Vec<_>>>()?;
+    let oversized_symbols = projection
+        .oversized
+        .iter()
+        .map(primitive_symbol_location)
+        .collect::<Result<Vec<_>>>()?;
     let plan = match (mode, graph.as_ref()) {
         (ContextModeV1::Plan, Some(graph)) => {
             Some(verified_plan_context(graph, &projection.selected)?)
@@ -789,6 +812,7 @@ where
         related_symbols,
         related_omission: projection.related_omission,
         code: projection.code_blocks,
+        oversized_symbols,
         coverage,
         memory_matches,
         memory_graph_coverage,
