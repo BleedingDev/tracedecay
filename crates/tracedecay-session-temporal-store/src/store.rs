@@ -488,11 +488,19 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                     futures_util::stream::iter(validated.iter().map(|(index, verified)| {
                         let (session_id, _, watermarks) = ready[*index].as_ref().unwrap();
                         async move {
+                            // The final receipt scan names the candidate
+                            // generation the refresh builds, not the base
+                            // generation the watermarks froze as active.
+                            let generation = tracedecay_domain::SessionProjectionGenerationV1::new(
+                                verified.generation,
+                            )
+                            .map_err(|_| {
+                                SessionStoreError::InvalidStateTransition {
+                                    context: "test temporal fixture candidate generation",
+                                }
+                            })?;
                             self.validate_staged_session_refresh_completion_for_test(
-                                session_id,
-                                watermarks.active_generation(),
-                                watermarks,
-                                verified,
+                                session_id, generation, watermarks, verified,
                             )
                             .await
                         }
