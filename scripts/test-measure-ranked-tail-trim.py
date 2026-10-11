@@ -35,12 +35,13 @@ SEARCH_PAGE = "".join(
         "  anchor_id: `code-symbol:weak_a`\n",
         "  Read source: `tracedecay_source_body` with `node_id: symbol.weak_a`\n",
         "- **code-symbol:weak_b** (approximate), rank 6 · utility 1000000\n",
+        "  Read source: `tracedecay_source_body` with `node_id: symbol.weak_b`\n",
         "\n",
         "next_cursor: none\n",
     ]
 )
 CONTEXT_ROWS = "".join(
-    f"- **m{rank}** (function), `src/lib.rs` · rank {rank} · utility {2000000 if rank <= 3 else 1000000}\n"
+    f"- **m{rank}** (function), `src/retrieval/ranked_context_matches.rs` · rank {rank} · utility {2000000 if rank <= 3 else 1000000}\n"
     for rank in range(1, 7)
 )
 
@@ -64,6 +65,14 @@ class SharedRuleCases(unittest.TestCase):
 
 
 class RenderedPages(unittest.TestCase):
+    def test_short_tail_saves_no_bytes_and_keeps_every_row(self) -> None:
+        text = "".join(
+            f"- **m{rank}** (fn) · rank {rank} · utility {2000000 if rank <= 3 else 1000000}\n"
+            for rank in range(1, 6)
+        )
+        ((kept, cut, saved),) = trim.trimmed(text, "unrelated")
+        self.assertEqual(([row.rank for row in kept], cut, saved), ([1, 2, 3, 4, 5], [], 0))
+
     def test_search_rows_keep_continuation_lines_and_anchor_routes(self) -> None:
         ((kept, cut, saved),) = trim.trimmed(SEARCH_PAGE, "unrelated")
         self.assertEqual([row.name for row in kept], ["strong", "also_strong", "third", "anchored"])
