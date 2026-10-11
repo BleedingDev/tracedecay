@@ -558,9 +558,7 @@ pub fn git_scope_filter_from_args(
 ) -> Result<GitScopeFilter, GitCorrelationError> {
     Ok(GitScopeFilter {
         branch: nonempty(branch).map(str::to_owned),
-        worktree: nonempty(worktree)
-            .map(canonical_worktree_key)
-            .transpose()?,
+        worktree: nonempty(worktree).map(canonical_worktree_key).transpose()?,
         commit: nonempty(commit).map(parse_commit_sha).transpose()?,
     })
 }

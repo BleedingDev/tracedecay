@@ -698,11 +698,9 @@ const NO_MATCH_MESSAGE: &str = "no sessions matched this git ref";
 /// name resolves to its long form), else the lexical form.
 fn stored_worktree(worktree: &str) -> String {
     match std::fs::canonicalize(Path::new(&normalize_worktree(worktree))) {
-        Ok(canonical) => normalize_worktree(
-            canonical
-                .to_str()
-                .expect("fixture paths are valid UTF-8"),
-        ),
+        Ok(canonical) => {
+            normalize_worktree(canonical.to_str().expect("fixture paths are valid UTF-8"))
+        }
         Err(_) => normalize_worktree(worktree),
     }
 }
