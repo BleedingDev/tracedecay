@@ -3440,13 +3440,10 @@ async fn commit_begin_batch_item_in_transaction(
             // The refused batch rolled back. Commit the begin alone, matching
             // a crash between the two commits.
             let alone = format!("{savepoint}_alone");
-            if let Err(error) = transaction
+            transaction
                 .execute(&format!("SAVEPOINT {alone}"), ())
                 .await
-                .map_err(|error| storage(PERSIST_REFRESH, error))
-            {
-                return Ok(Err(error));
-            }
+                .map_err(|error| storage(PERSIST_REFRESH, error))?;
             let outcome =
                 begin_session_refresh_in_transaction(transaction, request, accepted_at).await;
             Ok(match outcome {

@@ -84,15 +84,16 @@ impl<T: SessionTemporalExec> SessionTemporalExec for QueryCountingConnection<'_,
     }
 }
 
-/// Registered-database wrapper that fails the Nth `execute` whose SQL
-/// starts with `prefix`. The real maintained transaction still runs
-/// underneath; only that boundary statement errors so grouped-commit
-/// abort paths are covered through the production authority.
+/// Registered-database wrapper that fails chosen `execute`s: each
+/// `(prefix, fail_on_match)` entry errors the Nth and later statements
+/// whose SQL starts with that prefix. The real maintained transaction
+/// still runs underneath; only those boundary statements error so
+/// grouped-commit abort paths are covered through the production
+/// authority.
 pub(crate) struct FailingRegisteredDb<'a> {
     inner: &'a tracedecay_global_db::RegisteredGlobalDb,
-    prefix: &'static str,
-    fail_on_match: usize,
-    matches: Arc<AtomicUsize>,
+    plan: Vec<(&'static str, usize)>,
+    matches: Arc<Vec<AtomicUsize>>,
 }
 
 impl<'a> FailingRegisteredDb<'a> {
@@ -101,11 +102,17 @@ impl<'a> FailingRegisteredDb<'a> {
         prefix: &'static str,
         fail_on_match: usize,
     ) -> Self {
+        Self::fail_prefixed_executes(inner, &[(prefix, fail_on_match)])
+    }
+
+    pub(crate) fn fail_prefixed_executes(
+        inner: &'a tracedecay_global_db::RegisteredGlobalDb,
+        plan: &[(&'static str, usize)],
+    ) -> Self {
         Self {
             inner,
-            prefix,
-            fail_on_match,
-            matches: Arc::new(AtomicUsize::new(0)),
+            plan: plan.to_vec(),
+            matches: Arc::new(plan.iter().map(|_| AtomicUsize::new(0)).collect()),
         }
     }
 }
@@ -114,9 +121,8 @@ impl<'a> FailingRegisteredDb<'a> {
 /// except `execute`, which reports a runtime error on the chosen match.
 pub(crate) struct FailingWriteTxn<'a> {
     inner: tracedecay_global_db::RegisteredGlobalDbWriteTransaction<'a>,
-    prefix: &'static str,
-    fail_on_match: usize,
-    matches: Arc<AtomicUsize>,
+    plan: Vec<(&'static str, usize)>,
+    matches: Arc<Vec<AtomicUsize>>,
 }
 
 impl SessionTemporalQuery for FailingWriteTxn<'_> {
@@ -141,16 +147,17 @@ impl SessionTemporalExec for FailingWriteTxn<'_> {
     where
         P: IntoParams + Send,
     {
-        let prefix = self.prefix;
-        let fail_on_match = self.fail_on_match;
+        let plan = self.plan.clone();
         let matches = Arc::clone(&self.matches);
         async move {
-            if sql.starts_with(prefix)
-                && matches.fetch_add(1, Ordering::Relaxed) + 1 == fail_on_match
-            {
-                return Err(EngineError::Runtime(
-                    "injected savepoint failure".to_owned(),
-                ));
+            for (index, (prefix, fail_on_match)) in plan.iter().enumerate() {
+                if sql.starts_with(prefix)
+                    && matches[index].fetch_add(1, Ordering::Relaxed) + 1 >= *fail_on_match
+                {
+                    return Err(EngineError::Runtime(
+                        "injected savepoint failure".to_owned(),
+                    ));
+                }
             }
             SessionTemporalExec::execute(&self.inner, sql, params).await
         }
@@ -200,16 +207,14 @@ impl crate::handle::SessionTemporalRegisteredDb for FailingRegisteredDb<'_> {
         &self,
     ) -> impl Future<Output = Result<Self::WriteTxn<'_>, tracedecay_domain::errors::TraceDecayError>>
     + Send {
-        let prefix = self.prefix;
-        let fail_on_match = self.fail_on_match;
+        let plan = self.plan.clone();
         let matches = Arc::clone(&self.matches);
         async move {
             crate::handle::SessionTemporalRegisteredDb::begin_write_transaction(self.inner)
                 .await
                 .map(|inner| FailingWriteTxn {
                     inner,
-                    prefix,
-                    fail_on_match,
+                    plan,
                     matches,
                 })
         }

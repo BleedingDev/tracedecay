@@ -3309,3 +3309,101 @@ async fn fixture_receipt_state(
         .expect("receipt row")
         .map(|row| row.get::<String>(0).expect("state"))
 }
+
+/// A failed `{savepoint}_alone` create after a refused batch is the same
+/// transaction boundary failure as a failed base savepoint: the whole
+/// group rolls back, including an earlier item whose refused-batch
+/// fallback already committed a begin under its own savepoint.
+#[tokio::test]
+async fn grouped_begin_alone_savepoint_failure_aborts_the_group() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runtime = HostAdmissionTestRuntimeV1::profile(tmp.path())
+        .await
+        .unwrap();
+    let database = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .expect("profile registered database");
+    let store = temporal_store(&runtime);
+    let mut items = Vec::new();
+    for (ordinal, session_name) in ["session.savepoint-alone-a", "session.savepoint-alone-b"]
+        .into_iter()
+        .enumerate()
+    {
+        let session_id = fixture_session(session_name);
+        let (observation, write) = fixture_observation(&session_id, ordinal as u64, None, false);
+        Box::pin(persist_fixture(&runtime, observation, write)).await;
+        let request = SessionRefreshBeginOrJoinRequestV1::new(
+            session_id.clone(),
+            SessionRefreshFrontierV1::new(1, 0).unwrap(),
+        );
+        let crate::SessionRefreshBeginPlanV1::Prepared(recovery) = store
+            .plan_session_refresh_begin(request.clone())
+            .await
+            .expect("plan begin")
+        else {
+            panic!("fresh session must plan a prepared begin");
+        };
+        let (progress, batch) = store
+            .materialize_session_temporal_refresh_batch_for_test(&recovery)
+            .await
+            .expect("materialize batch")
+            .expect("fresh session has a first batch");
+        items.push(crate::SessionRefreshBeginBatchItemV1 {
+            request,
+            accepted_at: recovery.accepted_at(),
+            progress,
+            batch,
+        });
+    }
+    // Item 0's batch refuses at its receipt insert, so its durable begin
+    // commits under `refresh_begin_item_0_alone`. Item 1's batch refuses
+    // the same way, then its `_alone` create fails — a boundary failure
+    // that must abort the whole group rather than acknowledge item 0.
+    let failing = FailingRegisteredDb::fail_prefixed_executes(
+        database,
+        &[
+            ("INSERT INTO session_temporal_projection_receipts", 1),
+            ("SAVEPOINT refresh_begin_item_1_alone", 1),
+        ],
+    );
+    let access = SessionTemporalAccess::new(&failing);
+    let error = access
+        .commit_session_refresh_begin_batch_group(items, ExecutionControl::default())
+        .await
+        .expect_err("the failed _alone savepoint must abort the grouped commit");
+    assert_eq!(
+        error.to_string(),
+        "session-temporal storage operation persist session refresh progress failed: \
+         SQLite runtime failed: injected savepoint failure"
+    );
+    for item in ["session.savepoint-alone-a", "session.savepoint-alone-b"] {
+        assert_eq!(
+            fixture_refresh_state(&runtime, &fixture_session(item)).await,
+            None,
+            "the aborted group must not leave {item}'s begin committed"
+        );
+    }
+}
+
+async fn fixture_refresh_state(
+    runtime: &HostAdmissionTestRuntimeV1,
+    session_id: &SessionId,
+) -> Option<String> {
+    let snapshot = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .expect("profile registered database")
+        .read_snapshot()
+        .await
+        .expect("refresh snapshot");
+    let mut rows = snapshot
+        .query(
+            "SELECT state FROM session_refresh_operations WHERE session_id = ?1",
+            params![session_id.as_str()],
+        )
+        .await
+        .expect("refresh query");
+    rows.next()
+        .await
+        .expect("refresh row")
+        .map(|row| row.get::<String>(0).expect("state"))
+}
