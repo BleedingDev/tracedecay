@@ -522,6 +522,17 @@ jobs:
         shell: bash
         run: bazel test --config=ci //...
 
+      - name: Time each MCP suite test
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          bazel test --config=ci //crates/tracedecay:mcp_suite --nocache_test_results \
+            --test_timeout=3600 --test_env=RUSTC_BOOTSTRAP=1 \
+            --test_arg=-Zunstable-options --test_arg=--report-time || true
+          sed -nE 's/^test (.*) \.\.\. ([A-Za-z]+) <([0-9.]+)s>\r?$/\3 \2 \1/p' \
+            bazel-testlogs/crates/tracedecay/mcp_suite/test.log | sort -rn | head -150
+          grep -E '^test result' bazel-testlogs/crates/tracedecay/mcp_suite/test.log || true
+
       - name: Upload failed test diagnostics
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
