@@ -265,6 +265,7 @@ fn session_document(node_id: &str, payload_ref: &str) -> Value {
             "last_store_id": 2,
             "provider": "cursor",
             "raw_message_count": 2,
+            "unpublished_message_count": 0,
             "raw_messages": [
                 {
                     "content_preview": SOURCE_BODY,
@@ -338,6 +339,7 @@ fn summary_node_document(node_id: &str) -> Value {
             "last_store_id": 2,
             "provider": "cursor",
             "raw_message_count": 2,
+            "unpublished_message_count": 0,
             "raw_messages": [],
             "session_id": SESSION,
             "summary_node": {
@@ -428,6 +430,7 @@ fn external_payload_document(payload_ref: &str, content_hash: &str) -> Value {
             "last_store_id": 2,
             "provider": "cursor",
             "raw_message_count": 2,
+            "unpublished_message_count": 0,
             "raw_messages": [],
             "session_id": SESSION,
             "summary_node": null,
@@ -470,6 +473,7 @@ fn ghost_document() -> Value {
             "last_store_id": null,
             "provider": "cursor",
             "raw_message_count": 0,
+            "unpublished_message_count": 0,
             "raw_messages": [],
             "session_id": "ghost-session",
             "session_token_estimate": 0,
