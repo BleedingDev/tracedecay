@@ -3698,16 +3698,6 @@ impl LatestCodeTextGenerationV1 {
             .query_owners
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(owners);
-        // Query-owner install does not post a cadence wake. A worker that
-        // parked while this seat was still warming retries park-release here.
-        let hook = self
-            .parked_graph_release
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(hook) = hook {
-            hook();
-        }
         Ok(())
     }
 }

@@ -64,15 +64,9 @@ pub(super) struct WorktreeResidencyV1 {
     retained_parses: SharedRetainedParsePool,
     last_used: Mutex<Instant>,
     refresh_waits_for_memory: AtomicBool,
-    /// One-shot waiter that retries park-release after the in-flight
-    /// reconcile pass settles. The first Parked enter can still see
-    /// `busy()` on a slow host; without this retry the seated decode
-    /// stays until the next wake, which may never come.
-    park_release_after_reconcile_armed: AtomicBool,
-    /// One-shot bind of the text-owner park-release hook so query-owner
-    /// install, which finishes on a blocking task and posts no cadence
-    /// wake, retries this release once the text seat can serve.
-    park_release_after_query_owners_armed: AtomicBool,
+    /// One waiter at a time retries park-release once the running owner pass
+    /// settles; that settle posts no cadence wake.
+    park_release_after_pass_armed: AtomicBool,
 }
 
 pub(super) struct WorktreeResidencyPartsV1 {
@@ -101,8 +95,7 @@ impl WorktreeResidencyV1 {
             retained_parses: parts.retained_parses,
             last_used: Mutex::new(Instant::now()),
             refresh_waits_for_memory: AtomicBool::new(false),
-            park_release_after_reconcile_armed: AtomicBool::new(false),
-            park_release_after_query_owners_armed: AtomicBool::new(false),
+            park_release_after_pass_armed: AtomicBool::new(false),
         }
     }
 
@@ -173,20 +166,13 @@ impl WorktreeResidencyV1 {
     /// re-decode.
     pub(super) fn release_decode_when_parked(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
         if self.busy() {
-            self.arm_park_release_after_reconcile_settles(owners);
-            if !self
-                .serving_text()
-                .is_some_and(|text| text.query_owners_are_ready())
-            {
-                self.arm_park_release_after_query_owners_ready(owners);
-            }
+            self.arm_park_release_after_pass_settles(owners);
             return;
         }
         if !self
             .serving_text()
             .is_some_and(|text| text.query_owners_are_ready())
         {
-            self.arm_park_release_after_query_owners_ready(owners);
             return;
         }
         let mut released = Vec::new();
@@ -294,12 +280,12 @@ impl WorktreeResidencyV1 {
         owners.note_headroom();
     }
 
-    /// Reconcile can still be marked running on the first Parked enter.
-    /// Catalog-warm already retries; reconcile settle must too, or a parked
-    /// worktree keeps the seated decode until an unrelated wake.
-    fn arm_park_release_after_reconcile_settles(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
+    /// The worker can park while a retained text projection it carried across
+    /// passes still holds `reconcile_in_progress`. That task posts no wake when
+    /// it finishes, so retry this release once every running pass settles.
+    fn arm_park_release_after_pass_settles(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
         if self
-            .park_release_after_reconcile_armed
+            .park_release_after_pass_armed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
@@ -309,53 +295,16 @@ impl WorktreeResidencyV1 {
         let residency = Arc::downgrade(self);
         let owners = Arc::downgrade(owners);
         tokio::spawn(async move {
-            loop {
-                if !passes.borrow_and_update().running() {
-                    break;
-                }
-                if passes.changed().await.is_err() {
-                    return;
-                }
+            if passes.wait_for(|passes| !passes.running()).await.is_err() {
+                return;
             }
             if let (Some(residency), Some(owners)) = (residency.upgrade(), owners.upgrade()) {
                 residency
-                    .park_release_after_reconcile_armed
+                    .park_release_after_pass_armed
                     .store(false, Ordering::Release);
                 residency.release_decode_when_parked(&owners);
             }
         });
-    }
-
-    /// Query-owner install finishes on a blocking task and does not wake the
-    /// parked worker. Bind the text-owner hook so that install retries this
-    /// release; a late ready between the check and the bind is re-checked.
-    fn arm_park_release_after_query_owners_ready(self: &Arc<Self>, owners: &Arc<ResidentOwnersV1>) {
-        if self
-            .park_release_after_query_owners_armed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-        let Some(text) = self.serving_text() else {
-            self.park_release_after_query_owners_armed
-                .store(false, Ordering::Release);
-            return;
-        };
-        let residency = Arc::downgrade(self);
-        let owners = Arc::downgrade(owners);
-        let retry: ParkedGraphReleaseCallback = Arc::new(move || {
-            if let (Some(residency), Some(owners)) = (residency.upgrade(), owners.upgrade()) {
-                residency
-                    .park_release_after_query_owners_armed
-                    .store(false, Ordering::Release);
-                residency.release_decode_when_parked(&owners);
-            }
-        });
-        text.bind_parked_graph_release(Arc::clone(&retry));
-        if text.query_owners_are_ready() {
-            retry();
-        }
     }
 
     /// The first catalog warm finishes on a blocking task and does not wake

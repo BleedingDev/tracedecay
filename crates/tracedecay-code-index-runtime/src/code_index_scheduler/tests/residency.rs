@@ -78,6 +78,45 @@ fn rows(report: &ResidentOwnersReportV1) -> Vec<(ResidentOwnerKindV1, String, bo
         .collect()
 }
 
+/// Park-release runs after the worker publishes `Parked`, and its retries run
+/// from whichever task settles the blocker, so a parked report is eventual.
+async fn wait_for_no_decoded_generation(owners: &ResidentOwnersV1, awaited: &str) {
+    let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    loop {
+        let report = owners.report(Instant::now());
+        if decoded_kinds(&report).is_empty() {
+            return;
+        }
+        assert!(Instant::now() <= deadline, "{awaited}: {report:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn reseat(
+    registry: &CodeIndexSchedulerRegistryV1,
+    root: &Path,
+    seated: &super::super::LatestCompleteCodeIndexV1,
+) {
+    let mounted = registry.mounted.lock().await;
+    *mounted
+        .get(root)
+        .expect("mounted worktree")
+        .serving_generation
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seated.clone());
+}
+
+async fn seat_is_occupied(registry: &CodeIndexSchedulerRegistryV1, root: &Path) -> bool {
+    let mounted = registry.mounted.lock().await;
+    mounted
+        .get(root)
+        .expect("mounted worktree")
+        .serving_generation
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some()
+}
+
 /// Issue #3328: after the worker parks, the seated decode is a third copy of
 /// the generation the text artifact and catalog already serve. Drop it
 /// without waiting out the idle window; search must keep the same answers
@@ -94,12 +133,8 @@ async fn a_parked_worktree_releases_its_decode_and_search_still_answers() {
     )
     .await;
 
-    let parked = owners.report(Instant::now());
-    assert_eq!(
-        decoded_kinds(&parked),
-        [],
-        "a parked worktree must not keep a seated decode: {parked:?}"
-    );
+    wait_for_no_decoded_generation(&owners, "a parked worktree must not keep a seated decode")
+        .await;
 
     let without_decode = registry
         .execute_query_search(&scope, core_search_request("park_release_target"))
@@ -383,19 +418,6 @@ async fn a_parked_worktree_keeps_its_decode_while_the_text_owner_warms() {
     owners.release_idle(Instant::now() + IDLE_WINDOW);
 
     let mut seats = registry.subscribe_serving_seats();
-    async fn reseat(
-        registry: &CodeIndexSchedulerRegistryV1,
-        root: &Path,
-        seated: &super::super::LatestCompleteCodeIndexV1,
-    ) {
-        let mounted = registry.mounted.lock().await;
-        *mounted
-            .get(root)
-            .expect("mounted worktree")
-            .serving_generation
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(seated.clone());
-    }
     async fn install_text(
         registry: &CodeIndexSchedulerRegistryV1,
         root: &Path,
@@ -409,17 +431,6 @@ async fn a_parked_worktree_keeps_its_decode_while_the_text_owner_warms() {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(text);
     }
-    async fn seat_is_occupied(registry: &CodeIndexSchedulerRegistryV1, root: &Path) -> bool {
-        let mounted = registry.mounted.lock().await;
-        mounted
-            .get(root)
-            .expect("mounted worktree")
-            .serving_generation
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some()
-    }
-
     // A ready text owner lets the take proceed and publishes the seat write
     // on the registry-wide counter every subscriber watches.
     reseat(&registry, &root, &seated).await;
@@ -490,6 +501,54 @@ async fn a_parked_worktree_keeps_its_decode_while_the_text_owner_warms() {
         assert!(
             Instant::now() <= deadline,
             "a ready text owner frees the seat"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    registry.shutdown().await;
+}
+
+/// The worker can park while a retained text projection still holds the
+/// owner-pass count, and that task posts no cadence wake when it finishes.
+/// The parked seat must go back once the pass settles, not after the whole
+/// idle window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_worktree_releases_its_decode_once_a_running_pass_settles() {
+    let fixture = GitFixture::new(&[("src/lib.rs", "pub fn park_pass_target() -> u32 { 7 }\n")]);
+    let store = TempDir::new().expect("store root");
+    let owners = Arc::new(ResidentOwnersV1::new(IDLE_WINDOW));
+    let (registry, _scope) = mounted_text_query_worktree_at(
+        CodeIndexSchedulerRegistryV1::new(1).with_resident_owners(Arc::clone(&owners)),
+        fixture.path(),
+        store.path().to_path_buf(),
+    )
+    .await;
+    let root = canonical_existing_identity(fixture.path()).expect("canonical root");
+    assert!(registry.request_complete_generation(fixture.path()).await);
+    let seated = wait_for_live_complete_generation(&registry, fixture.path()).await;
+    wait_for_settled_owner(&registry, fixture.path()).await;
+    // Give back the complete-read latch so the parked release decides alone.
+    owners.release_idle(Instant::now() + IDLE_WINDOW);
+
+    let pass = registry
+        .hold_reconcile_pass_for_test(fixture.path())
+        .await
+        .expect("mounted worktree");
+    reseat(&registry, &root, &seated).await;
+    registry
+        .release_decode_when_parked_for_test(fixture.path())
+        .await;
+    assert!(
+        seat_is_occupied(&registry, &root).await,
+        "a running pass keeps the seat"
+    );
+
+    drop(pass);
+    let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
+    while seat_is_occupied(&registry, &root).await {
+        assert!(
+            Instant::now() <= deadline,
+            "a settled pass frees the parked seat without a wake"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -715,11 +774,11 @@ async fn eight_parked_worktrees_keep_no_decoded_generations() {
         scopes.push(scope);
     }
 
-    assert_eq!(
-        decoded_kinds(&owners.report(Instant::now())),
-        [],
-        "eight parked worktrees must not retain eight seated decodes"
-    );
+    wait_for_no_decoded_generation(
+        &owners,
+        "eight parked worktrees must not retain eight seated decodes",
+    )
+    .await;
 
     for (ordinal, (fixture, scope)) in fixtures.iter().zip(&scopes).enumerate() {
         let found = registry
