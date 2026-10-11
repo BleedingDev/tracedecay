@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 * **index:** release a parked worktree's seated decode once a running owner pass settles instead of holding it for the idle window ([#3347](https://github.com/ScriptedAlchemy/tracedecay/issues/3347))
+* **sessions:** return a finished Codex turn without waiting for a descendant that escaped the tree kill and still holds the app-server's stdout ([#3347](https://github.com/ScriptedAlchemy/tracedecay/issues/3347))
 
 ## [1.0.0-beta.83](https://github.com/ScriptedAlchemy/tracedecay/compare/v1.0.0-beta.82...v1.0.0-beta.83) (2026-10-11)
 
