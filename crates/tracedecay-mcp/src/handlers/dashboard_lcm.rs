@@ -29,7 +29,7 @@ use tracedecay_session_memory::context::ResolvedSessionIdentity;
 use tracedecay_session_runtime::session_retrieval::{
     LcmDescribeServiceCommand, LcmDescribeServiceOutcome, SessionApplicationRetrievalPortV1,
     SessionRetrievalPageView, SessionRetrievalServiceOutcome, SessionRetrievalStoreScope,
-    admitted_execution_limits,
+    SessionRetrievalUnavailableReason, admitted_execution_limits,
 };
 
 const SUMMARY_DESCRIBE_CONCURRENCY: usize = 8;
@@ -220,14 +220,23 @@ impl DashboardLcmReadAdapter {
                         "lcm_temporal_reset_required",
                     );
                 }
-                SessionRetrievalServiceOutcome::Unavailable(_) => {
+                SessionRetrievalServiceOutcome::Unavailable(unavailable) => {
                     // A session whose transcript never reached the temporal
                     // projection has no generation for the page read, so the
-                    // temporal authority reports unavailable rather than an
-                    // empty page. The raw store still answers the session's
-                    // measured counts when unpublished rows exist; a silent
-                    // or fully published raw store keeps the typed state.
-                    if let Some(session_id) = &session_request_id
+                    // temporal authority reports `TemporalStoreUnavailable`
+                    // with no worker state rather than an empty page. Only
+                    // that workerless miss reads the raw store for the
+                    // session's measured counts: every other reason — an
+                    // unconfigured service, a refused kernel read, a failed
+                    // store read, or a refresh worker that reports its own
+                    // state — keeps the typed unavailable instead of serving
+                    // counts past a genuine authority failure. A silent or
+                    // fully published raw store keeps the typed state too.
+                    if matches!(
+                        unavailable.reason,
+                        SessionRetrievalUnavailableReason::TemporalStoreUnavailable
+                    ) && unavailable.worker.is_none()
+                        && let Some(session_id) = &session_request_id
                         && let Ok(stats) = self
                             .retrieval
                             .lcm_session_raw_stats_admitted(session_id.as_str())
@@ -1348,7 +1357,9 @@ mod tests {
     async fn fully_unpublished_session_reports_counts_instead_of_absent() {
         let retrieval = StubSessionRetrieval {
             retrieve: SessionRetrievalServiceOutcome::Unavailable(
-                tracedecay_session_runtime::session_retrieval::SessionRetrievalUnavailable::service_not_configured(),
+                tracedecay_session_runtime::session_retrieval::SessionRetrievalUnavailable::without_worker(
+                    SessionRetrievalUnavailableReason::TemporalStoreUnavailable,
+                ),
             ),
             raw_stats: vec![tracedecay_lcm::types::LcmSessionRawStats {
                 provider: "cursor".to_owned(),
