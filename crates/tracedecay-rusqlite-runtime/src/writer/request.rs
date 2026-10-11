@@ -83,8 +83,6 @@ impl SharedReply {
             && leader.control().cancellation == follower.control().cancellation
     }
 
-    /// A request enqueued after this reply settled is a new submission for the
-    /// ledger to judge, not a duplicate of the operation that was in flight.
     pub(super) fn overlaps(&self, request: &AcceptedRequest) -> bool {
         self.lock()
             .settled
