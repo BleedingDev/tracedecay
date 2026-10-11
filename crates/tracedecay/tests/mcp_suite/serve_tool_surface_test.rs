@@ -123,9 +123,11 @@ impl ServedList {
 }
 
 fn plugin_agent_pins() -> BTreeSet<String> {
-    let agents = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugin/agents");
+    // Relative to the crate directory both Cargo and the Bazel launcher run
+    // from: a compile-time manifest path names the build's execroot instead.
+    let agents = Path::new("../../plugin/agents");
     let mut pins = BTreeSet::new();
-    for entry in std::fs::read_dir(&agents)
+    for entry in std::fs::read_dir(agents)
         .unwrap_or_else(|error| panic!("read {}: {error}", agents.display()))
     {
         let path = entry.expect("agent entry").path();
