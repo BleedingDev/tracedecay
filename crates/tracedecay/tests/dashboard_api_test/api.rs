@@ -1024,3 +1024,89 @@ fn lcm_large_session_pages_preserve_continuation_and_timeline_counts() {
         );
     });
 }
+
+#[test]
+fn lcm_session_page_reports_messages_the_temporal_projection_has_not_published() {
+    let runtime = create_runtime();
+    runtime.block_on(async {
+        let fixture = start_dashboard_fixture_without_memory().await;
+        let session_id = "session-dashboard-lagging";
+        let session = SessionRecord {
+            provider: "cursor".to_owned(),
+            session_id: session_id.to_owned(),
+            project_key: fixture.host_runtime.project_id().as_str().to_owned(),
+            project_path: fixture.project_root.display().to_string(),
+            title: Some("Lagging dashboard session".to_owned()),
+            started_at: Some(1_700_002_000),
+            ended_at: None,
+            transcript_path: None,
+            metadata_json: None,
+            parent_session_id: None,
+            is_subagent: false,
+            agent_id: None,
+            parent_tool_use_id: None,
+        };
+        assert!(
+            fixture
+                .host_runtime
+                .upsert_session_for_test(HostAdmissionScope::Project, &session)
+                .await
+                .unwrap()
+        );
+        let seed = |ordinal: u64| {
+            let message_id = format!("lagging-message-{ordinal}");
+            let fixture = &fixture;
+            async move {
+                fixture
+                    .host_runtime
+                    .seed_session_message_observations_for_test(&[
+                        tracedecay::dashboard::observation_seed::DashboardSessionMessageSeedV1 {
+                            project_id: fixture.host_runtime.project_id().as_str(),
+                            provider: "cursor",
+                            session_id,
+                            message_id: &message_id,
+                            role: "user",
+                            content: "A small canonical message.",
+                            model: None,
+                            timestamp: 1_700_002_000 + ordinal as i64,
+                            ordinal,
+                        },
+                    ])
+                    .await
+                    .unwrap();
+            }
+        };
+        for ordinal in 1..=3_u64 {
+            seed(ordinal).await;
+        }
+        fixture
+            .host_runtime
+            .materialize_session_temporal_refresh_for_test(session_id)
+            .await
+            .unwrap();
+        for ordinal in 4..=5_u64 {
+            seed(ordinal).await;
+        }
+        let agent = http_agent();
+        let (status, page) = get_json(
+            &agent,
+            &format!(
+                "{}/api/plugins/hermes-lcm/session/{session_id}?limit=100",
+                fixture.base_url
+            ),
+        );
+        assert_eq!(status, 200);
+        let messages = page["payload"]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "{page}");
+        assert!(page["payload"]["next_cursor"].is_null(), "{page}");
+        assert_eq!(page["payload"]["counts"]["message_count"], 5, "{page}");
+        assert_eq!(
+            page["payload"]["counts"]["unpublished_message_count"], 2,
+            "the count must say why the transcript ends short: {page}"
+        );
+        assert_eq!(page["coverage"]["completeness"], "partial", "{page}");
+        assert_eq!(page["coverage"]["examined"], 3, "{page}");
+        assert_eq!(page["coverage"]["omitted"], 2, "{page}");
+        assert_eq!(page["coverage"]["eligible"], 5, "{page}");
+    });
+}
