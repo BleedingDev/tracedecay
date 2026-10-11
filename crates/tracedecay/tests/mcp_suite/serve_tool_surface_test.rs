@@ -339,14 +339,19 @@ async fn plain_mcp_client_calls_a_stub_and_receives_its_schema() {
 
 /// One live `tracedecay serve` session driven line by line, the way a host
 /// reads frames as they arrive.
-struct PlainMcpClient {
+pub(crate) struct PlainMcpClient {
     process: TestChildProcess,
     stdout: BufReader<ChildStdout>,
 }
 
 impl PlainMcpClient {
     fn start(home: &Path, project: &Path) -> Self {
+        Self::start_with_env(home, project, &[])
+    }
+
+    pub(crate) fn start_with_env(home: &Path, project: &Path, env: &[(&str, &str)]) -> Self {
         let mut child = serve_command(home, project, &[])
+            .envs(env.iter().copied())
             .spawn()
             .expect("tracedecay serve should start");
         let stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
@@ -356,7 +361,7 @@ impl PlainMcpClient {
         }
     }
 
-    fn send(&mut self, message: &Value) {
+    pub(crate) fn send(&mut self, message: &Value) {
         let stdin = self
             .process
             .stdin_mut()
@@ -381,7 +386,7 @@ impl PlainMcpClient {
         frames
     }
 
-    fn request(&mut self, request: Value) -> Value {
+    pub(crate) fn request(&mut self, request: Value) -> Value {
         let id = request["id"].clone();
         self.send(&request);
         self.read_until(|frames| frames.iter().any(|frame| frame["id"] == id))
