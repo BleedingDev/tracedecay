@@ -17,7 +17,7 @@ use super::attribution::{
 use super::{
     CommitRelationFilter, CommitSessionRecord, CorrelationIndexHealth, CorrelationIndexPresence,
     GitCorrelationError, GitRefFilter, GitScopeFilter, SessionGitCorrelationHit, SessionGitSpan,
-    SessionsForQuery, SpanObservation, canonical_providers, commit_hits,
+    SessionsForQuery, SpanObservation, canonical_providers, canonical_worktree_key, commit_hits,
     commit_identities_with_producer_fallback, commit_record_matches_query, commit_record_order,
     digest_bytes, intersect_id_maps, normalize_worktree, parse_commit_sha, scope_session_ids,
     session_provider_identities, sessions_for_limit, span_hits, span_identities,
@@ -333,11 +333,28 @@ impl<'t, T: Executor + ?Sized> GitEvidenceWriter<'t, T> {
             return Ok(GitEvidenceWrite::default());
         }
         let GitEvidenceBatch {
-            observations,
-            spans: incoming_spans,
-            commits: incoming_commits,
+            mut observations,
+            spans: mut incoming_spans,
+            commits: mut incoming_commits,
             merge_gap_secs,
         } = batch;
+        // Resolve each distinct worktree spelling once per pass: a host may
+        // report an OS alias (8.3 short name, symlinked root) where git
+        // reports the canonical name, and the fold keys on one worktree.
+        // Stored rows resolve at load so an older alias heals on write.
+        let mut worktree_keys = HashMap::new();
+        for observation in &mut observations {
+            observation.worktree = keyed_worktree(&mut worktree_keys, &observation.worktree);
+        }
+        for span in &mut incoming_spans {
+            span.worktree = keyed_worktree(&mut worktree_keys, &span.worktree);
+        }
+        for record in &mut incoming_commits {
+            record.worktree = record
+                .worktree
+                .as_deref()
+                .map(|worktree| keyed_worktree(&mut worktree_keys, worktree));
+        }
         let session_ids = observations
             .iter()
             .map(|observation| observation.session_id.clone())
@@ -649,7 +666,27 @@ async fn load_session_rows(
             record,
         );
     }
+    let mut worktree_keys = HashMap::new();
+    for span in spans.values_mut() {
+        span.worktree = keyed_worktree(&mut worktree_keys, &span.worktree);
+    }
+    for record in commits.values_mut() {
+        record.worktree = record
+            .worktree
+            .as_deref()
+            .map(|worktree| keyed_worktree(&mut worktree_keys, worktree));
+    }
     Ok((spans, commits))
+}
+
+/// The worktree identity the fold keys on: one filesystem resolve per
+/// distinct lexical spelling per call, so hot correlation rows do not each
+/// pay a `canonicalize`.
+fn keyed_worktree(cache: &mut HashMap<String, String>, spelling: &str) -> String {
+    cache
+        .entry(normalize_worktree(spelling))
+        .or_insert_with(|| canonical_worktree_key(spelling))
+        .clone()
 }
 
 fn decode_record<T: serde::de::DeserializeOwned>(row: &Row) -> Result<T, GitCorrelationError> {
