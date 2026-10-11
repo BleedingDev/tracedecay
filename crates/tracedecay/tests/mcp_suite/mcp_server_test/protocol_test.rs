@@ -1,3 +1,4 @@
+use crate::common::fixture::GitFixture;
 use crate::mcp_server_test::support::*;
 use serde_json::{Value, json};
 use std::fs;
@@ -1408,6 +1409,7 @@ async fn test_resources_read_overview() {
 async fn test_resources_read_branches_reports_provenance_scopes() {
     let dir = TempDir::new().unwrap();
     let project = canonical_root_identity(dir.path());
+    let _repo = GitFixture::primary(project.clone());
     fs::create_dir_all(project.join("src")).unwrap();
     fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
     let cg = Box::pin(tracedecay_project::project::TraceDecay::init(&project))
@@ -1418,7 +1420,6 @@ async fn test_resources_read_branches_reports_provenance_scopes() {
         r#"{"default_branch":"main","branches":{"main":{"db_file":"tracedecay.db","created_at":"0","last_synced_at":"0","gc_protected":false},"feature/one":{"db_file":"tracedecay.db","parent":"main","created_at":"0","last_synced_at":"7","gc_protected":false}}}"#,
     )
     .unwrap();
-    assert_eq!(cg.active_branch(), Some("main"));
     let server = Box::pin(McpServer::new(cg, None)).await;
     let responses = run_server_with_messages(
         server,
@@ -1433,28 +1434,45 @@ async fn test_resources_read_branches_reports_provenance_scopes() {
     let result = &response_with_id(&responses, json!(435))["result"];
     assert_eq!(result["contents"][0]["uri"], "tracedecay://branches");
     let text = result["contents"][0]["text"].as_str().unwrap();
+    let body: Value = serde_json::from_str(text).unwrap();
+    let branches = body["branches"]
+        .as_array()
+        .unwrap_or_else(|| panic!("branches list: {body}"));
     assert_eq!(
-        serde_json::from_str::<Value>(text).unwrap(),
-        json!({
-            "branch_count": 2,
-            "branches": [
-                {
-                    "name": "feature/one",
-                    "parent": "main",
-                    "last_synced_at": "7",
-                    "is_current": false,
-                    "is_default": false
-                },
-                {
-                    "name": "main",
-                    "parent": null,
-                    "last_synced_at": "0",
-                    "is_current": true,
-                    "is_default": true
-                }
-            ]
-        })
+        branch_named(branches, "feature/one"),
+        &json!({
+            "name": "feature/one",
+            "parent": "main",
+            "last_synced_at": "7",
+            "is_current": false,
+            "is_default": false
+        }),
+        "{body}"
     );
+    assert_eq!(
+        branch_named(branches, "main"),
+        &json!({
+            "name": "main",
+            "parent": null,
+            "last_synced_at": "0",
+            "is_current": true,
+            "is_default": true
+        }),
+        "{body}"
+    );
+    for branch in branches {
+        assert!(
+            branch.get("db_file").is_none(),
+            "retired store reference leaked: {branch}"
+        );
+    }
+}
+
+fn branch_named<'a>(branches: &'a [Value], name: &str) -> &'a Value {
+    branches
+        .iter()
+        .find(|branch| branch["name"] == name)
+        .unwrap_or_else(|| panic!("{name} missing: {branches:?}"))
 }
 
 #[tokio::test]

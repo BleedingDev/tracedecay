@@ -385,7 +385,11 @@ impl McpServer {
         };
 
         let result = match method {
-            McpMethod::Initialize => Some(self.handle_initialize(id, request.client_info_name())),
+            McpMethod::Initialize => Some(self.handle_initialize(
+                id,
+                request.client_info_name(),
+                request.requested_protocol_version(),
+            )),
             // Some clients send the initialized notification with an id (or
             // via the alternate method name); both stay compatibility no-ops.
             // Hook events were consumed by the early notification dispatch
@@ -589,11 +593,12 @@ impl McpServer {
         &self,
         id: Value,
         client_name: Option<&str>,
+        requested_protocol: Option<&str>,
     ) -> JsonRpcResponse {
         if let Some(client_name) = client_name {
             *recover_lock(&self.client_name) = Some(client_name.to_owned());
         }
-        match initialize_result(SERVER_INSTRUCTIONS) {
+        match initialize_result(SERVER_INSTRUCTIONS, requested_protocol) {
             Ok(result) => JsonRpcResponse::success(id, result),
             Err(error) => JsonRpcResponse::error(id, ErrorCode::InternalError, error.to_string()),
         }
