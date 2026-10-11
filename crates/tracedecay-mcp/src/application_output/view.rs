@@ -623,6 +623,18 @@ mod tests {
         }
     }
 
+    fn visible_payload(operation: &str, payload: Option<&serde_json::Value>) -> String {
+        super::super::markdown::render(CanonicalHumanView {
+            heading: operation.to_owned(),
+            fields: vec![HumanField {
+                label: "Payload",
+                value: payload_field(operation, payload).expect("payload field"),
+            }],
+        })
+        .as_str()
+        .to_owned()
+    }
+
     fn code(label: &'static str, value: &str) -> HumanField {
         HumanField {
             label,
@@ -721,7 +733,7 @@ mod tests {
 
     #[test]
     fn source_body_preview_leads_with_location_and_bounded_source() {
-        let preview = payload_preview(
+        let preview = visible_payload(
             "source_body",
             Some(&json!({
                 "node_id": "symbol.example",
@@ -730,19 +742,20 @@ mod tests {
                 "end_line": 9,
                 "body": "pub fn answer() {\n    42\n}",
             })),
-        )
-        .unwrap();
+        );
 
         assert_eq!(
             preview,
-            "```text\nsrc/lib.rs:7-9\n```\n\n```text\npub fn answer() {\n    42\n}\n```\n"
+            "## source\\_body\n\n### Payload\n\n\
+             ```text\nsrc/lib.rs:7-9\n```\n\n\
+             ```text\npub fn answer() {\n    42\n}\n```\n"
         );
     }
 
     #[test]
     fn source_body_preview_omits_an_oversized_body_whole() {
         let body = format!("fn oversized() {{\n{}\n}}", "    do_work();\n".repeat(600));
-        let preview = payload_preview(
+        let preview = visible_payload(
             "source_body",
             Some(&json!({
                 "node_id": "symbol.oversized",
@@ -751,21 +764,20 @@ mod tests {
                 "end_line": 608,
                 "body": body,
             })),
-        )
-        .unwrap();
-
-        assert!(preview.contains("src/lib.rs:7-608"), "{preview}");
-        assert!(
-            !preview.contains("fn oversized()"),
-            "a partial symbol body was shown"
         );
-        assert!(preview.contains("complete typed result"), "{preview}");
+
+        assert_eq!(
+            preview,
+            "## source\\_body\n\n### Payload\n\n\
+             ```text\nsrc/lib.rs:7-608\n```\n\n\n\
+             … payload truncated after 30 characters; use --json for the complete typed result\n"
+        );
     }
 
     #[test]
     fn source_body_preview_keeps_embedded_fences_inside_the_whole_body() {
         let body = "fn markdown() {\n    let text = r#\"\n```rust\nfn example() {}\n```\n\"#;\n}";
-        let field = payload_field(
+        let preview = visible_payload(
             "source_body",
             Some(&json!({
                 "file": "src/lib.rs",
@@ -773,25 +785,14 @@ mod tests {
                 "end_line": 8,
                 "body": body,
             })),
-        )
-        .unwrap();
-
-        let HumanFieldValue::Markdown(preview) = field else {
-            panic!("source body must retain its generated Markdown fences");
-        };
-        let rendered = super::super::markdown::render(CanonicalHumanView {
-            heading: "source_body".to_owned(),
-            fields: vec![HumanField {
-                label: "Payload",
-                value: HumanFieldValue::Markdown(preview),
-            }],
-        });
-        assert!(
-            rendered
-                .as_str()
-                .contains(&format!("````text\n{body}\n````"))
         );
-        assert!(!rendered.as_str().contains("    ````text"));
+
+        assert_eq!(
+            preview,
+            "## source\\_body\n\n### Payload\n\n\
+             ```text\nsrc/lib.rs:1-8\n```\n\n\
+             ````text\nfn markdown() {\n    let text = r#\"\n```rust\nfn example() {}\n```\n\"#;\n}\n````\n"
+        );
     }
 
     #[test]
@@ -830,12 +831,15 @@ mod tests {
         .unwrap();
         let text = result.value["content"][0]["text"].as_str().unwrap();
 
-        assert!(text.len() <= tracedecay_mcp_catalog::MAX_RESPONSE_CHARS);
-        assert!(text.contains("src/lib.rs:1-3"), "{text}");
         assert!(
-            !text.contains("fn unicode()"),
-            "a partial Unicode body was shown"
+            text.starts_with("## source\\_body\n\n### Payload\n\n```text\nsrc/lib.rs:1-3\n```"),
+            "{text}"
         );
+        assert!(
+            !text.contains("fn unicode()") && !text.contains('💻'),
+            "a partial Unicode body was shown: {text}"
+        );
+        assert!(text.len() <= tracedecay_mcp_catalog::MAX_RESPONSE_CHARS);
         assert_eq!(
             result.structured_result().unwrap()["outcome"]["value"],
             payload
@@ -845,7 +849,7 @@ mod tests {
     #[test]
     fn implementation_preview_omits_an_oversized_body_whole() {
         let body = format!("fn oversized() {{\n{}\n}}", "    do_work();\n".repeat(600));
-        let preview = payload_preview(
+        let preview = visible_payload(
             "code_implementations",
             Some(&json!({
                 "items": [{
@@ -854,13 +858,13 @@ mod tests {
                 }],
                 "support_gaps": [],
             })),
-        )
-        .unwrap();
+        );
 
-        assert!(preview.contains("node_id=m"), "{preview}");
-        assert!(
-            !preview.contains("fn oversized()"),
-            "a partial implementation body was shown"
+        assert_eq!(
+            preview,
+            "## code\\_implementations\n\n### Payload\n\n\
+             ```text\nsrc/lib.rs::oversized (method) src/lib.rs:3 node_id=m\n```\n\n\n\
+             … payload truncated after 67 characters; use --json for the complete typed result\n"
         );
     }
 
@@ -868,7 +872,7 @@ mod tests {
     fn implementation_preview_keeps_complete_bodies_before_an_oversized_one() {
         let first = "fn small() {\n    1\n}";
         let oversized = format!("fn oversized() {{\n{}\n}}", "    do_work();\n".repeat(600));
-        let preview = payload_preview(
+        let preview = visible_payload(
             "code_implementations",
             Some(&json!({
                 "items": [
@@ -877,20 +881,16 @@ mod tests {
                 ],
                 "support_gaps": [],
             })),
-        )
-        .unwrap();
-
-        assert!(
-            preview.contains(&format!("```text\n{first}\n```")),
-            "{preview}"
         );
-        assert!(preview.contains("node_id=large"), "{preview}");
-        assert!(!preview.contains("fn oversized()"), "{preview}");
-        let shown = preview
-            .split_once("\n… payload truncated after ")
-            .unwrap()
-            .0;
-        assert!(preview.contains(&format!("after {} characters", shown.chars().count())));
+
+        assert_eq!(
+            preview,
+            "## code\\_implementations\n\n### Payload\n\n\
+             ```text\nsrc/lib.rs::small (method) src/lib.rs:3 node_id=small\n```\n\n\
+             ```text\nfn small() {\n    1\n}\n```\n\n\
+             ```text\nsrc/lib.rs::oversized (method) src/lib.rs:7 node_id=large\n```\n\n\n\
+             … payload truncated after 172 characters; use --json for the complete typed result\n"
+        );
     }
 
     fn symbol(node_id: &str, name: &str, kind: &str, line: u32) -> serde_json::Value {
@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn implementation_preview_carries_each_body_and_its_support_gaps() {
-        let preview = payload_preview(
+        let preview = visible_payload(
             "code_implementations",
             Some(&json!({
                 "items": [{
@@ -946,14 +946,14 @@ mod tests {
                 "support_gaps": [{"provider": null, "language": null, "reason": "partial"}],
                 "next_cursor": "cursor.next",
             })),
-        )
-        .unwrap();
+        );
 
         assert_eq!(
             preview,
-            "```text\nsrc/lib.rs::area (method) src/lib.rs:3 node_id=m\n```\n\n\
+            "## code\\_implementations\n\n### Payload\n\n\
+             ```text\nsrc/lib.rs::area (method) src/lib.rs:3 node_id=m\n```\n\n\
              ```text\nfn area() {\n    1\n}\n```\n\n\
-             ```text\nsupport gap: partial\n```"
+             ```text\nsupport gap: partial\n```\n"
         );
     }
 
@@ -1052,16 +1052,17 @@ mod tests {
         )
         .unwrap();
 
-        let printed = view
-            .fields
-            .iter()
-            .map(|field| match &field.value {
-                HumanFieldValue::Block(text)
-                | HumanFieldValue::Markdown(text)
-                | HumanFieldValue::Code(text)
-                | HumanFieldValue::Text(text) => text.matches(cursor).count(),
-            })
-            .sum::<usize>();
-        assert_eq!(printed, 1, "the continuation prints once: {view:?}");
+        let text = super::super::markdown::render(view).as_str().to_owned();
+        let Some((payload, rest)) = text.split_once("\n- Status:") else {
+            panic!("human view must name status: {text}");
+        };
+        assert!(
+            rest.contains(cursor),
+            "the continuation must remain visible: {text}"
+        );
+        assert!(
+            !payload.contains(cursor),
+            "the payload must not repeat the continuation: {text}"
+        );
     }
 }
