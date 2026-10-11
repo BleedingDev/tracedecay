@@ -280,6 +280,7 @@ impl<E: ReaderQueryExecutor> ReaderLease<E> {
     }
 
     fn start_snapshot(&mut self) -> Result<(), ReaderWorkerError> {
+        self.settle_deferred_end()?;
         if self.snapshot_active
             || !self
                 .checkout
@@ -298,6 +299,38 @@ impl<E: ReaderQueryExecutor> ReaderLease<E> {
         }
         self.snapshot_active = true;
         Ok(())
+    }
+
+    /// A previous snapshot whose rollback outran [`SNAPSHOT_END_GRACE`] still
+    /// holds this worker's checkpoint blocker; the next snapshot on the same
+    /// lease waits for that acknowledgement under the deferred-return bound.
+    fn settle_deferred_end(&mut self) -> Result<(), ReaderWorkerError> {
+        let Some(receive) = &self.checkout.deferred_end else {
+            return Ok(());
+        };
+        let error = match receive.recv_timeout(DEFERRED_SNAPSHOT_END_LIMIT) {
+            Ok(Ok(())) => {
+                self.checkout.deferred_end = None;
+                self.checkout
+                    .inner
+                    .checkpoint_blockers
+                    .finish(self.checkout.worker.id);
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                self.checkout.deferred_end = None;
+                error
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.checkout.deferred_end = None;
+                ReaderWorkerError::WorkerClosed
+            }
+            // Keeping the receiver makes checkout return finish the blocker
+            // only after the written-off worker answers or exits.
+            Err(RecvTimeoutError::Timeout) => ReaderWorkerError::WorkerClosed,
+        };
+        self.checkout.retire = true;
+        Err(error)
     }
 
     fn finish_snapshot(&mut self) {
