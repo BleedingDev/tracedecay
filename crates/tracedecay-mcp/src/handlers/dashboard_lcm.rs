@@ -1135,6 +1135,24 @@ mod tests {
 
     struct UnusedSessionRetrieval;
 
+    struct EmptyTemporalRetrieval;
+
+    impl SessionApplicationRetrievalPortV1 for EmptyTemporalRetrieval {
+        fn retrieve_admitted<'a>(
+            &'a self,
+            _context: &'a RequestContext,
+            _query: SessionTemporalQuery,
+        ) -> tracedecay_session_runtime::session_retrieval::SessionApplicationRetrievalFutureV1<'a>
+        {
+            Box::pin(async {
+                SessionRetrievalServiceOutcome::CompleteZero {
+                    temporal: tracedecay_session_runtime::session_retrieval::SessionTemporalMetadataView::default(),
+                    freshness: SessionDataFreshness::Fresh,
+                }
+            })
+        }
+    }
+
     impl SessionApplicationRetrievalPortV1 for UnusedSessionRetrieval {
         fn retrieve_admitted<'a>(
             &'a self,
@@ -1420,6 +1438,38 @@ mod tests {
         };
         assert_eq!(state, DashboardLcmReadStateV1::Absent);
         assert_eq!(reason, "lcm_session_absent");
+    }
+
+    #[tokio::test]
+    async fn unavailable_raw_authority_does_not_report_an_absent_session() {
+        let retrieval = EmptyTemporalRetrieval;
+        let unavailable = retrieval
+            .lcm_session_raw_stats_admitted("session.dashboard-unavailable")
+            .await
+            .expect_err("an unconfigured raw authority is not an empty store");
+        assert_eq!(
+            unavailable,
+            tracedecay_session_runtime::session_retrieval::SessionRetrievalUnavailable::service_not_configured(),
+        );
+        let adapter =
+            DashboardLcmReadAdapter::new(Arc::new(retrieval), dashboard_lcm_test_identity())
+                .expect("project dashboard adapter");
+        let outcome = adapter
+            .execute(
+                stub_control("dashboard-lcm-unavailable"),
+                Some("project.dashboard-lcm-test"),
+                DashboardLcmReadRequestV1::Session {
+                    session_id: "session.dashboard-unavailable".to_owned(),
+                    limit: 100,
+                    cursor: None,
+                },
+            )
+            .await;
+        let DashboardLcmReadOutcomeV1::NotReady { state, reason } = outcome else {
+            panic!("missing raw authority must remain unavailable");
+        };
+        assert_eq!(state, DashboardLcmReadStateV1::Unavailable);
+        assert_eq!(reason, "lcm_session_description_unavailable");
     }
 
     #[tokio::test]
