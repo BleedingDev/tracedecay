@@ -1109,9 +1109,13 @@ fn lcm_session_page_reports_messages_the_temporal_projection_has_not_published()
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             message_ids,
-            ["lagging-message-1", "lagging-message-2", "lagging-message-3"]
-                .into_iter()
-                .collect(),
+            [
+                "lagging-message-1",
+                "lagging-message-2",
+                "lagging-message-3"
+            ]
+            .into_iter()
+            .collect(),
             "the page must serve only the materialized turns: {page}"
         );
         assert!(
@@ -1127,5 +1131,79 @@ fn lcm_session_page_reports_messages_the_temporal_projection_has_not_published()
         assert_eq!(page["coverage"]["examined"], 3, "{page}");
         assert_eq!(page["coverage"]["omitted"], 2, "{page}");
         assert_eq!(page["coverage"]["eligible"], 5, "{page}");
+    });
+}
+
+#[test]
+fn lcm_session_page_reports_a_fully_unpublished_session_instead_of_absent() {
+    let runtime = create_runtime();
+    runtime.block_on(async {
+        let fixture = start_dashboard_fixture_without_memory().await;
+        let session_id = "session-dashboard-unpublished";
+        let session = SessionRecord {
+            provider: "cursor".to_owned(),
+            session_id: session_id.to_owned(),
+            project_key: fixture.host_runtime.project_id().as_str().to_owned(),
+            project_path: fixture.project_root.display().to_string(),
+            title: Some("Unpublished dashboard session".to_owned()),
+            started_at: Some(1_700_002_000),
+            ended_at: None,
+            transcript_path: None,
+            metadata_json: None,
+            parent_session_id: None,
+            is_subagent: false,
+            agent_id: None,
+            parent_tool_use_id: None,
+        };
+        assert!(
+            fixture
+                .host_runtime
+                .upsert_session_for_test(HostAdmissionScope::Project, &session)
+                .await
+                .unwrap()
+        );
+        // No temporal refresh is materialized for this session, so every
+        // stored message stays unpublished and the page serves no
+        // occurrence to measure a provider from.
+        for ordinal in 1..=3_u64 {
+            fixture
+                .host_runtime
+                .seed_session_message_observations_for_test(&[
+                    tracedecay::dashboard::observation_seed::DashboardSessionMessageSeedV1 {
+                        project_id: fixture.host_runtime.project_id().as_str(),
+                        provider: "cursor",
+                        session_id,
+                        message_id: &format!("unpublished-message-{ordinal}"),
+                        role: "user",
+                        content: "A small canonical message.",
+                        model: None,
+                        timestamp: 1_700_002_000 + ordinal as i64,
+                        ordinal,
+                    },
+                ])
+                .await
+                .unwrap();
+        }
+        let agent = http_agent();
+        let (status, page) = get_json(
+            &agent,
+            &format!(
+                "{}/api/plugins/hermes-lcm/session/{session_id}?limit=100",
+                fixture.base_url
+            ),
+        );
+        assert_eq!(status, 200, "{page}");
+        assert!(
+            page["payload"]["messages"].as_array().unwrap().is_empty(),
+            "{page}"
+        );
+        assert_eq!(page["payload"]["counts"]["message_count"], 3, "{page}");
+        assert_eq!(
+            page["payload"]["counts"]["unpublished_message_count"], 3,
+            "a session the projection never published still reports its raw count: {page}"
+        );
+        assert_eq!(page["coverage"]["completeness"], "partial", "{page}");
+        assert_eq!(page["coverage"]["omitted"], 3, "{page}");
+        assert_eq!(page["coverage"]["eligible"], 3, "{page}");
     });
 }

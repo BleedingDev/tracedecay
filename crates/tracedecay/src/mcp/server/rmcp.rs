@@ -791,16 +791,12 @@ mod tests {
         tracedecay_project::product_runtime::register_fixture_product_runtime();
         let initialized: InitializeResult = rmcp_response_result(JsonRpcResponse::success(
             json!(1),
-            crate::mcp::server::initialize_result(
-                "TraceDecay instructions",
-                Some("2024-11-05"),
-            )
-            .expect("fixture product runtime registered"),
+            crate::mcp::server::initialize_result("TraceDecay instructions", Some("2024-11-05"))
+                .expect("fixture product runtime registered"),
         ))
         .expect("rmcp must accept the server's own initialize result shape");
 
-        let observed =
-            serde_json::to_value(&initialized).expect("serialize initialized response");
+        let observed = serde_json::to_value(&initialized).expect("serialize initialized response");
         assert_eq!(observed["protocolVersion"], json!("2024-11-05"));
         assert_eq!(observed["instructions"], json!("TraceDecay instructions"));
         assert_eq!(observed["serverInfo"]["name"], json!("tracedecay"));
