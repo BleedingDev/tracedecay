@@ -8,8 +8,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::common;
-use crate::serve_harness::{init_project_with_file, profile_root};
-use crate::serve_tool_surface_test::PlainMcpClient;
+use crate::serve_harness::{ServeSession, init_project_with_file, profile_root, serve_command};
 
 const POINTER: &str = "tracedecay_repeat_read:";
 const REPEAT_READ_POINTERS_ENV: &str = "TRACEDECAY_MCP_REPEAT_READ_POINTERS";
@@ -64,7 +63,17 @@ fn json_body(response: &Value) -> Value {
         .unwrap_or_else(|| panic!("no JSON body in {response}"))
 }
 
-fn start(client: &mut PlainMcpClient) {
+fn start_client(
+    home: &std::path::Path,
+    project: &std::path::Path,
+    env: &[(&str, &str)],
+) -> ServeSession {
+    let mut command = serve_command(home, project, Some(project.as_os_str()));
+    command.envs(env.iter().copied());
+    ServeSession::start(command)
+}
+
+fn start(client: &mut ServeSession) {
     let initialize = client.request(json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -79,7 +88,7 @@ fn start(client: &mut PlainMcpClient) {
     client.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
 }
 
-fn wait_ready(client: &mut PlainMcpClient, id: i64) {
+fn wait_ready(client: &mut ServeSession, id: i64) {
     let status = client.request(call(
         id,
         "tracedecay_status",
@@ -96,7 +105,7 @@ fn wait_ready(client: &mut PlainMcpClient, id: i64) {
     );
 }
 
-fn exact_symbol(client: &mut PlainMcpClient, id: i64, name: &str) -> Value {
+fn exact_symbol(client: &mut ServeSession, id: i64, name: &str) -> Value {
     json_body(&client.request(call(
         id,
         "tracedecay_find_exact_symbol",
@@ -106,7 +115,7 @@ fn exact_symbol(client: &mut PlainMcpClient, id: i64, name: &str) -> Value {
 
 /// Polls an exact-symbol read, a different call from any the test repeats,
 /// until the daemon serves `name` from a raw worktree write.
-fn wait_until_indexed(client: &mut PlainMcpClient, name: &str) {
+fn wait_until_indexed(client: &mut ServeSession, name: &str) {
     let deadline = Instant::now() + Duration::from_secs(90);
     for id in 1_000.. {
         let found = exact_symbol(client, id, name);
@@ -141,7 +150,7 @@ fn configuration_payload(response: &Value, outcome: &str) -> Value {
         .clone()
 }
 
-fn set_query_hints(client: &mut PlainMcpClient, home: &std::path::Path, enabled: bool) {
+fn set_query_hints(client: &mut ServeSession, home: &std::path::Path, enabled: bool) {
     let current = client.request(call(
         100,
         "tracedecay_configuration_get",
@@ -175,7 +184,7 @@ async fn serve_query_hints_follow_profile_configuration_on_new_connections() {
     let home = TempDir::new().unwrap();
     let project = init_project_with_file(home.path(), &source("query_hint_marker")).await;
     let _daemon = common::spawn_tracedecay_daemon(home.path());
-    let mut original = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    let mut original = start_client(home.path(), project.path(), &[]);
     start(&mut original);
     wait_ready(&mut original, 2);
     let outline = json!({ "file": "src/lib.rs" });
@@ -189,7 +198,7 @@ async fn serve_query_hints_follow_profile_configuration_on_new_connections() {
     let unchanged = original.request(call(12, "tracedecay_source_outline", &outline));
     assert!(!text(&unchanged).contains(QUERY_HINT), "{unchanged}");
 
-    let mut enabled = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    let mut enabled = start_client(home.path(), project.path(), &[]);
     start(&mut enabled);
     wait_ready(&mut enabled, 2);
     let first = enabled.request(call(10, "tracedecay_source_outline", &outline));
@@ -215,7 +224,7 @@ async fn serve_query_hints_follow_profile_configuration_on_new_connections() {
     assert!(!is_pointer(&repeated), "{repeated}");
 
     set_query_hints(&mut enabled, home.path(), false);
-    let mut disabled = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    let mut disabled = start_client(home.path(), project.path(), &[]);
     start(&mut disabled);
     wait_ready(&mut disabled, 2);
     for id in [10, 11] {
@@ -230,7 +239,7 @@ async fn serve_points_repeat_reads_at_the_earlier_result_until_content_changes()
     let home = TempDir::new().unwrap();
     let project = init_project_with_file(home.path(), &source("repeat_read_marker")).await;
     let _daemon = common::spawn_tracedecay_daemon(home.path());
-    let mut client = PlainMcpClient::start_with_env(
+    let mut client = start_client(
         home.path(),
         project.path(),
         &[(REPEAT_READ_POINTERS_ENV, "1")],
@@ -305,7 +314,7 @@ async fn serve_without_the_pointer_env_answers_every_repeat_in_full() {
     let home = TempDir::new().unwrap();
     let project = init_project_with_file(home.path(), &source("repeat_read_default")).await;
     let _daemon = common::spawn_tracedecay_daemon(home.path());
-    let mut client = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    let mut client = start_client(home.path(), project.path(), &[]);
     start(&mut client);
     wait_ready(&mut client, 2);
     let outline = json!({ "file": "src/lib.rs" });
