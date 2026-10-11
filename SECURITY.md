@@ -99,7 +99,7 @@ The MCP server exposes **more than 70 tools**. The large majority are **read-onl
 - `tracedecay_str_replace`, `tracedecay_multi_str_replace`, anchored string replacement
 - `tracedecay_insert_at`, `tracedecay_insert_at_symbol`, anchored insertion
 - `tracedecay_replace_symbol`, replace a symbol's body
-- `tracedecay_ast_grep_rewrite`, structural rewrite via the external `ast-grep` binary
+- `tracedecay_ast_grep_rewrite`, structural rewrite via the in-process `ast-grep` engine
 
 **Local-state tools** (write only inside the active TraceDecay store, never your source):
 
