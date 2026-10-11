@@ -67,9 +67,14 @@ pub fn render(view: CanonicalHumanView) -> MarkdownView {
 
 /// `text` without its rendered per-call field lines, which differ on every
 /// call for the same answer. Every other byte, line terminators included, is
-/// kept. Lines inside fenced code are payload, such as a source body that
-/// itself holds a `- Request: ` line, so they are always kept.
+/// kept. Per-call fields exist only in canonical application views, the only
+/// renderers that emit `## ` heading lines; in any other text the same line
+/// shape is payload and every byte is kept. Lines inside fenced code are
+/// payload too, such as a source body that itself holds a `- Request: ` line.
 pub fn without_per_call_lines(text: &str) -> String {
+    if !text.starts_with("## ") && !text.contains("\n## ") {
+        return text.to_owned();
+    }
     let mut fence = MarkdownFence::default();
     text.split_inclusive('\n')
         .filter(|line| {
@@ -80,13 +85,20 @@ pub fn without_per_call_lines(text: &str) -> String {
         .collect()
 }
 
+/// Whether `line` is a rendered per-call field: a `Code` value renders its
+/// value as a single inline code span with escaped backticks, so a payload
+/// line like `- Request: a plain note` does not match.
 fn is_per_call_line(line: &str) -> bool {
-    line.strip_prefix("- ").is_some_and(|field| {
-        PER_CALL_FIELDS.iter().any(|label| {
-            field
-                .strip_prefix(label)
-                .is_some_and(|value| value.starts_with(": "))
-        })
+    let Some(field) = line.trim_end_matches(['\r', '\n']).strip_prefix("- ") else {
+        return false;
+    };
+    PER_CALL_FIELDS.iter().any(|label| {
+        field
+            .strip_prefix(label)
+            .and_then(|value| value.strip_prefix(": `"))
+            .is_some_and(|value| {
+                value.ends_with('`') && !value[..value.len() - 1].replace("\\`", "").contains('`')
+            })
     })
 }
 
@@ -174,6 +186,36 @@ mod tests {
             without_per_call_lines(rendered.as_str()),
             "## source\\_body\n\n### Payload\n\n    - Provenance: `in the source`\n\n### Body\n\n\
              ```text\r\n- Request: `in the source`\r\n```\r\n\n- Receipt operation: `read`\n"
+        );
+    }
+
+    #[test]
+    fn per_call_shaped_lines_in_other_views_are_kept() {
+        // `# Context for {task}` inserts the task verbatim, and its memory
+        // lines are `- ` bullets; none of it is a per-call field even when a
+        // line happens to carry a per-call label.
+        let context =
+            "# Context for explain `- Request: `\n- Request: `a fact about r1`\n- Trace: tail\n";
+        assert_eq!(without_per_call_lines(context), context);
+
+        let rendered = render(CanonicalHumanView {
+            heading: "context".to_owned(),
+            fields: vec![
+                HumanField {
+                    label: "Memory",
+                    value: HumanFieldValue::Markdown(
+                        "- Request: a plain note\n- Trace: tail\n".to_owned(),
+                    ),
+                },
+                HumanField {
+                    label: PROVENANCE_FIELD,
+                    value: HumanFieldValue::Code("request=r1".to_owned()),
+                },
+            ],
+        });
+        assert_eq!(
+            without_per_call_lines(rendered.as_str()),
+            "## context\n\n### Memory\n\n- Request: a plain note\n- Trace: tail\n\n"
         );
     }
 }
