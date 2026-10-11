@@ -1452,6 +1452,45 @@ mod auxiliary_scheduling_tests {
     }
 
     #[test]
+    fn conflicting_submission_after_settlement_is_queued_for_the_ledger() {
+        let telemetry = WriterTelemetry::default();
+        let mut queue = FairQueue::default();
+        let mut inflight = HashMap::new();
+        let (leader, leader_rx) =
+            accepted_request_with_reply("operation.settled-conflict", "key.leader");
+        assert!(enqueue(&mut queue, &mut inflight, leader, &telemetry));
+        let executing = queue.drain_fair().pop().expect("dequeued leader");
+        inflight.insert(executing.operation_id().clone(), executing.shared_reply());
+        let (concurrent, concurrent_rx) =
+            accepted_request_with_reply("operation.settled-conflict", "key.conflict");
+        assert!(!enqueue(&mut queue, &mut inflight, concurrent, &telemetry));
+        assert!(matches!(
+            concurrent_rx
+                .blocking_recv()
+                .expect("concurrent conflict reply"),
+            Err(tracedecay_store::StorageRuntimeErrorV1::DuplicateOperationInFlight { .. })
+        ));
+        let outcome = RuntimeSubmitOutcomeV1::Unavailable {
+            reason: UnavailableReasonV1::Faulted,
+        };
+        executing.settle(Ok(outcome.clone()));
+        assert_eq!(
+            leader_rx.blocking_recv().expect("leader reply"),
+            Ok(outcome)
+        );
+
+        let (later, mut later_rx) =
+            accepted_request_with_reply("operation.settled-conflict", "key.conflict");
+        assert!(enqueue(&mut queue, &mut inflight, later, &telemetry));
+        assert!(
+            later_rx.try_recv().is_err(),
+            "later submission is unsettled"
+        );
+        let queued = queue.drain_fair().pop().expect("later submission queued");
+        assert_eq!(queued.operation_id().as_str(), "operation.settled-conflict");
+    }
+
+    #[test]
     fn dwell_collects_a_compatible_arrival_before_dispatch() {
         let enqueued_at = Instant::now() + Duration::from_secs(1);
         let mut config = tracedecay_store::AdmissionConfigV1::default();
