@@ -401,7 +401,7 @@ mod tests {
         let fixture = RmcpWireFixture::start().await;
         let initialize_id = fixture.last_response()["id"].clone();
         let mut initialize_result =
-            crate::mcp::server::initialize_result(crate::mcp::server::SERVER_INSTRUCTIONS)
+            crate::mcp::server::initialize_result(crate::mcp::server::SERVER_INSTRUCTIONS, None)
                 .expect("initialize oracle");
         initialize_result["protocolVersion"] = json!("2025-11-25");
         initialize_result["_meta"]["tracedecayInitializeRoute"] = json!({
@@ -791,14 +791,14 @@ mod tests {
         tracedecay_project::product_runtime::register_fixture_product_runtime();
         let initialized: InitializeResult = rmcp_response_result(JsonRpcResponse::success(
             json!(1),
-            crate::mcp::server::initialize_result("TraceDecay instructions")
+            crate::mcp::server::initialize_result("TraceDecay instructions", None)
                 .expect("fixture product runtime registered"),
         ))
         .expect("rmcp must accept the server's own initialize result shape");
 
         assert_eq!(
-            serde_json::to_value(&initialized).expect("serialize initialized response")["protocolVersion"],
-            json!("2024-11-05")
+            initialized.protocol_version,
+            rmcp::model::ProtocolVersion::LATEST
         );
         assert!(initialized.capabilities.tools.is_some());
         assert!(initialized.capabilities.resources.is_some());
