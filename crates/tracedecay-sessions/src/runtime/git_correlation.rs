@@ -656,37 +656,31 @@ pub fn normalize_worktree(path: &str) -> String {
 /// Resolves one worktree spelling to the identity the store keys on: the
 /// canonical name when the path exists (8.3 short names, shell aliases and
 /// symlinked roots collapse), else the lexical cleanup above so a missing
-/// historical path keeps its recorded spelling. Each distinct spelling
-/// resolves once process-wide so evidence intake never re-runs a filesystem
-/// resolve per stored row or per apply.
-pub(crate) fn canonical_worktree_key(path: &str) -> String {
+/// historical path keeps its recorded spelling. Callers hold one resolve
+/// per distinct spelling inside the current operation only: a path created
+/// after an earlier miss, or a retargeted link, must resolve to its new
+/// identity on the next operation.
+pub(crate) fn canonical_worktree_key(path: &str) -> Result<String, error::GitCorrelationError> {
     let normalized = normalize_worktree(path);
     let candidate = std::path::Path::new(&normalized);
     // A relative string is left alone: `canonicalize` would resolve it
     // against the current drive, rekeying a missing path it never named.
     if !candidate.is_absolute() {
-        return normalized;
+        return Ok(normalized);
     }
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(key) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&normalized)
-    {
-        return key.clone();
+    match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
+        // `to_str` keeps the identity byte-exact: a canonical path outside
+        // UTF-8 keeps the caller's recorded spelling rather than a lossy
+        // replacement that would collide with a different directory.
+        Ok(canonical) => Ok(canonical
+            .to_str()
+            .map(normalize_worktree)
+            .unwrap_or(normalized)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(normalized),
+        Err(error) => Err(error::GitCorrelationError::Unavailable(format!(
+            "cannot resolve worktree identity for {normalized}: {error}"
+        ))),
     }
-    let resolved =
-        match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
-            Ok(canonical) => normalize_worktree(&canonical.to_string_lossy()),
-            Err(_) => normalized.clone(),
-        };
-    cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(normalized, resolved.clone());
-    resolved
 }
 
 pub fn observation_extends_span(first_ts: i64, last_ts: i64, ts: i64, gap_secs: i64) -> bool {
