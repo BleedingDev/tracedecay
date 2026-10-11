@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { FIXTURES, resolveFixture } from '../../../stories/fixtures/data.ts';
 import { fixtureEnvelope } from '../../test/fixtureEnvelope.ts';
+import { applicationSuccess } from '../../test/applicationEnvelope.ts';
 import { CostsPage } from './CostsPage.tsx';
 
 /** Every option the spend field handed its chart instance, in order. jsdom has
@@ -496,13 +497,9 @@ function savingsOverviewPayload(): Record<string, unknown> {
 }
 
 function workEnvelope(payload: unknown) {
-  return {
-    kind: 'success',
-    value: {
-      scope: resolvedWorkScope(),
-      outcome: { outcome: 'evidence', value: { payload } },
-    },
-  };
+  return applicationSuccess('operation.work.topology_metrics', payload, {
+    scope: resolvedWorkScope(),
+  });
 }
 
 /** Test equivalent of `ResolvedScope::compute_digest`: transparent domain ids

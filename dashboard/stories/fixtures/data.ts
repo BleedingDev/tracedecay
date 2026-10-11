@@ -18,11 +18,22 @@
  * page clock, so its captures are pixel-stable between runs.
  */
 import { topologyMeasurement, topologyMetricsModel } from '../../src/test/workTopologyMetricsFixture.ts';
+import { applicationSuccess } from '../../src/test/applicationEnvelope.ts';
+import type { ApplicationHttpOperationId } from '../../src/contracts/application.ts';
 
 const nowMs = Number(globalThis.process?.env?.['TD_FIXTURE_NOW_MS']) || Date.now();
 const nowSecs = Math.floor(nowMs / 1000);
 const nowMicros = nowMs * 1000;
 const DAY = 86_400;
+
+/** The resolved scope every story application envelope answers for. */
+const STORY_SCOPE = {
+  project_id: 'project.tracedecay',
+  repository_id: 'repository.tracedecay',
+  worktree_id: 'worktree.primary',
+  reference: null,
+  scope_digest: 'sha256:e174c69787e410a452c13540b131bf291d25017a21e37aebf7f26eeb8e77fbe5',
+};
 
 const PLAN26_OBSERVATORY_METRICS = [
   'adoption_eligible',
@@ -4660,32 +4671,32 @@ export const FIXTURES: Readonly<Record<string, unknown>> = {
   '/api/code-index/freshness': CODE_INDEX_FRESHNESS_FIXTURES.ready_absent,
   '/api/plugins/code-diagnostics': codeDiagnosticsSnapshot(),
   '/api/remote/status': remoteOperationalStatusEnvelope(),
-  // Work. The two mounted read routes. Unlike every other fixture here these
-  // are wrapped in the application's `HttpJsonEnvelope` rather than
-  // `DashboardEnvelopeV1`, because `mod.rs` nests the Work routes straight
-  // onto the application router. See `workApi.ts`, which walks that wrapper.
+  // Work. Unlike every other fixture here these are wrapped in the
+  // application's `HttpJsonEnvelope` rather than `DashboardEnvelopeV1`,
+  // because the Work routes are nested straight onto the application router.
+  // `workApi.ts` decodes that wrapper against each operation's binding.
   // The work-product graph read. Serves the Work projections and the Agents
   // workspace's handoff frontier and attempt failures.
-  '/api/work/views': workEnvelope(workGraphViewsPayload()),
+  '/api/work/views': workEnvelope('operation.work.views', workGraphViewsPayload()),
   // The Workflows workspace's standing read (`operation.workflow.
-  // list_definitions`), through the same application envelope walker.
-  '/api/application/workflow/list-definitions': workEnvelope(workflowDefinitionsPayload()),
+  // list_definitions`), through the same application envelope decoder.
+  '/api/application/workflow/list-definitions': workEnvelope('operation.workflow.list_definitions', workflowDefinitionsPayload()),
   // The selected identity's version track (`operation.workflow.
   // definition_history`). Fixtures resolve by path alone, so this answers the
   // `workflow.review-sweep` track whichever identity the page asks for; the
   // page marks rows naming another identity as ambiguous rather than folding
   // them in.
-  '/api/application/workflow/definition-history': workEnvelope(workflowHistoryPayload()),
+  '/api/application/workflow/definition-history': workEnvelope('operation.workflow.definition_history', workflowHistoryPayload()),
   // One exact run (`operation.workflow.get_run`) pinned to review-sweep v3,
   // mid-flight: the journal carries admission and the first two steps so the
   // lookup renders an elapsed figure, never a duration.
-  '/api/application/workflow/get-run': workEnvelope(workflowRunPayload()),
+  '/api/application/workflow/get-run': workEnvelope('operation.workflow.get_run', workflowRunPayload()),
   // Agents token frontier (`operation.handoff.list_task_handoffs`). Same
   // application envelope as Work/Workflow reads; payload is the generated
   // `ListTaskHandoffsResultV1`.
-  '/api/application/handoff/list-task': workEnvelope(listTaskHandoffsPayload()),
-  '/api/work/topology-metrics': workEnvelope(workTopologyMetricsPayload()),
-  '/api/feedback/proximity': workEnvelope(feedbackProximityPayload()),
+  '/api/application/handoff/list-task': workEnvelope('operation.handoff.list_task_handoffs', listTaskHandoffsPayload()),
+  '/api/work/topology-metrics': workEnvelope('operation.work.topology_metrics', workTopologyMetricsPayload()),
+  '/api/feedback/proximity': workEnvelope('operation.application.feedback_proximity', feedbackProximityPayload()),
 };
 
 /** Two registered workflow definitions with real step graphs, so the audited
@@ -5007,17 +5018,14 @@ function listTaskHandoffsPayload(): Record<string, unknown> {
  * with `DashboardEnvelopeV1`. `src/dashboard/mod.rs` nests them onto the
  * application router, so they carry the application's own `HttpJsonEnvelope`,
  * a `kind`/`value` union whose outcome packet holds the generated contract
- * under `payload`. `workApi.ts` walks exactly that structure and hands what it
- * finds to the generated schema, so a fixture that wrapped the payload any
- * other way would be refused as `unsupported_schema` and the audit would
- * screenshot a boundary plate for a surface that works.
+ * under `payload`. `workApi.ts` decodes it against the operation's binding and
+ * result contract, so a fixture that wrapped the payload any other way would
+ * be refused as `unsupported_schema` and the audit would screenshot a
+ * boundary plate for a surface that works.
  * ========================================================================== */
 
-/** The application envelope, in the shape `workPayload()` walks. */
-/** The application `HttpJsonEnvelope` success around one payload. Reads
- * answer as evidence; commands as effects. Both put the contract in the same
- * place, which is why `workApi.ts` checks the tag for presence and does not
- * branch on it. */
+/** The retained curator receipt's application envelope. `automation.ts`
+ * decodes it with its own response schema rather than `workApi.ts`. */
 function applicationEnvelope(spec: {
   binding: string;
   schema: string;
@@ -5031,26 +5039,21 @@ function applicationEnvelope(spec: {
       binding_id: spec.binding,
       contract: { schema_id: spec.schema, schema_revision: 1 },
       request_id: spec.request,
-      scope: {
-        project_id: 'project.tracedecay',
-        repository_id: 'repository.tracedecay',
-        worktree_id: 'worktree.primary',
-        reference: null,
-        scope_digest:
-          'sha256:e174c69787e410a452c13540b131bf291d25017a21e37aebf7f26eeb8e77fbe5',
-      },
+      scope: STORY_SCOPE,
       outcome: { outcome: spec.outcome, value: { payload: spec.payload } },
     },
   };
 }
 
-function workEnvelope(payload: unknown): Record<string, unknown> {
-  return applicationEnvelope({
-    binding: 'binding.http.work.fixture',
-    schema: 'schema.work.fixture.result',
-    request: 'request.work.fixture',
-    outcome: 'evidence',
-    payload,
+/** The canonical success envelope for `operation`, carrying its own binding,
+ * result contract and outcome family, as `workApi.ts` checks them. */
+function workEnvelope(
+  operation: ApplicationHttpOperationId,
+  payload: unknown,
+): Record<string, unknown> {
+  return applicationSuccess(operation, payload, {
+    scope: STORY_SCOPE,
+    requestId: `request.story.${operation}`,
   });
 }
 
