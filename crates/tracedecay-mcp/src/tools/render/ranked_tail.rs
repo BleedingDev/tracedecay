@@ -176,64 +176,71 @@ mod tests {
         after.split_once('`').expect("handle is quoted").0
     }
 
+    /// Shared with `scripts/test-measure-ranked-tail-trim.py`, so the
+    /// measurement script's copy of the rule answers the same cases.
+    #[derive(serde::Deserialize)]
+    struct RuleCases {
+        tail_start: Vec<TailStartCase>,
+        names_every_query_word: Vec<NameCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TailStartCase {
+        case: String,
+        query: String,
+        rows: Vec<CaseRow>,
+        start: Option<usize>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CaseRow {
+        utility: u64,
+        name: Option<String>,
+        #[serde(default)]
+        anchored: bool,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct NameCase {
+        name: String,
+        query: String,
+        answers: bool,
+    }
+
+    fn rule_cases() -> RuleCases {
+        serde_json::from_str(include_str!("ranked_tail_cases.json")).expect("rule cases")
+    }
+
     #[test]
     fn tail_start_cuts_only_a_worthwhile_suffix_of_weak_rows() {
-        let m = 1_000_000;
-        let mut anchored_weak = page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]);
-        anchored_weak[6].anchored = true;
-        let mut query_named_weak = page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]);
-        query_named_weak[5].name = "Exact_Class_rank".to_owned();
-        let cases: [(&str, Vec<RankedRow>, Option<usize>); 8] = [
-            (
-                "strong head, weak tail",
-                page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]),
-                Some(3),
-            ),
-            ("all equal", page(&[m; 10]), None),
-            ("all zero", page(&[0; 10]), None),
-            ("anchored weak row", anchored_weak, Some(7)),
-            (
-                "weak row naming every query word",
-                query_named_weak,
-                Some(6),
-            ),
-            (
-                "strong row after weak ones",
-                page(&[2 * m, m, m, 2 * m, m, m]),
-                Some(4),
-            ),
-            (
-                "one weak trailing row",
-                page(&[2 * m, 2 * m, 2 * m, 2 * m, 2 * m, m]),
-                None,
-            ),
-            ("fewer than four rows", page(&[2 * m, m, m]), None),
-        ];
-        for (case, rows, expected) in cases {
+        for case in rule_cases().tail_start {
+            let rows = case
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, case_row)| {
+                    let name = case_row.name.clone().unwrap_or(format!("r{index}"));
+                    row(index as u64 + 1, case_row.utility, case_row.anchored, &name)
+                })
+                .collect::<Vec<_>>();
             assert_eq!(
-                low_value_tail_start("exact class", &rows),
-                expected,
-                "{case}"
+                low_value_tail_start(&case.query, &rows),
+                case.start,
+                "{}",
+                case.case
             );
         }
     }
 
     #[test]
     fn a_name_answers_a_query_only_when_it_contains_every_word() {
-        let cases = [
-            ("exact_class_rank", "exact_class", true),
-            ("ExactClass", "exact_class", true),
-            ("store_response_handle", "store response handle", true),
-            ("store", "store response handle", false),
-            ("größe_überprüfen", "Größe", true),
-            ("store", "", false),
-            ("store", "!! ::", false),
-        ];
-        for (name, query, expected) in cases {
+        for case in rule_cases().names_every_query_word {
             assert_eq!(
-                names_every_query_word(name, query),
-                expected,
-                "{name} for {query:?}"
+                names_every_query_word(&case.name, &case.query),
+                case.answers,
+                "{} for {:?}",
+                case.name,
+                case.query
             );
         }
     }
