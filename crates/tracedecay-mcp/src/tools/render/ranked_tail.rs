@@ -7,12 +7,12 @@ use std::path::Path;
 use std::time::Instant;
 
 use tracedecay_runtime_core::tracedecay::current_timestamp;
+use tracedecay_session_memory::response_handles::response_handle_for;
 
 use super::prepare_truncated_response_handle;
 use crate::response_handles::{RESPONSE_RETRIEVE_TOOL, observe_response_truncation};
 
 const MIN_KEPT_ROWS: usize = 3;
-/// The marker line costs about one row, so cutting a single row saves nothing.
 const MIN_TRIMMED_ROWS: usize = 2;
 
 /// One rendered row of a ranked result page.
@@ -54,7 +54,7 @@ fn names_every_query_word(name: &str, query: &str) -> bool {
 /// Start of the longest suffix of rows that each score at most half the
 /// page's best utility and neither carry a caller anchor nor name every
 /// query word, or `None` when no worthwhile cut exists.
-fn low_value_tail_start(query: &str, rows: &[RankedRow]) -> Option<usize> {
+fn low_value_tail_start(query: &str, rows: &[RankedRow]) -> Option<(usize, u64)> {
     let best = rows
         .iter()
         .map(|row| row.utility_micros)
@@ -73,7 +73,7 @@ fn low_value_tail_start(query: &str, rows: &[RankedRow]) -> Option<usize> {
         .rposition(|row| !weak(row))
         .map_or(0, |last_strong| last_strong + 1)
         .max(MIN_KEPT_ROWS);
-    (rows.len().saturating_sub(start) >= MIN_TRIMMED_ROWS).then_some(start)
+    (rows.len().saturating_sub(start) >= MIN_TRIMMED_ROWS).then_some((start, best))
 }
 
 /// The rows as the page renders them, with the low-value tail replaced by
@@ -86,24 +86,25 @@ pub(crate) fn ranked_rows_md(
 ) -> String {
     let concat =
         |rows: &[RankedRow]| -> String { rows.iter().map(|row| row.markdown.as_str()).collect() };
-    let Some(start) = low_value_tail_start(query, rows) else {
+    let Some((start, best)) = low_value_tail_start(query, rows) else {
         return concat(rows);
     };
     let started = Instant::now();
     let (kept, cut) = rows.split_at(start);
     let cut_md = concat(cut);
-    let Some(record) = prepare_truncated_response_handle(response_handle_root, &cut_md).record
-    else {
+    let marker = trimmed_tail_marker(cut, best, &response_handle_for(&cut_md));
+    if marker.len() >= cut_md.len() {
         return concat(rows);
-    };
-    let best = rows
-        .iter()
-        .map(|row| row.utility_micros)
-        .max()
-        .unwrap_or_default();
+    }
+    if prepare_truncated_response_handle(response_handle_root, &cut_md)
+        .record
+        .is_none()
+    {
+        return concat(rows);
+    }
     let mut rendered = concat(kept);
     let untrimmed_bytes = rendered.len() + cut_md.len();
-    rendered.push_str(&trimmed_tail_marker(cut, best, &record.handle));
+    rendered.push_str(&marker);
     observe_response_truncation(
         untrimmed_bytes,
         rendered.len(),
@@ -224,7 +225,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(
-                low_value_tail_start(&case.query, &rows),
+                low_value_tail_start(&case.query, &rows).map(|(start, _)| start),
                 case.start,
                 "{}",
                 case.case
