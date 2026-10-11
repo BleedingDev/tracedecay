@@ -715,17 +715,7 @@ jobs:
       - name: Install reviewed npm
         run: npm install -g npm@12.0.2
 
-      # scripts/check-sdk-publish-workflow.py allows only SHA-pinned actions in
-      # this job, so the setup-pnpm composite action is inlined here.
-      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          cache: true
-          cache_dependency_path: |
-            pnpm-lock.yaml
-            Cargo.lock
-
-      - name: Install npm packages and Cargo sources
-        run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-pnpm
 
       - name: Verify generated contracts and SDK sources
         working-directory: dashboard
@@ -765,19 +755,14 @@ jobs:
           echo "5dbb86c71d07a1957f2e90734092dd6a58bdcd9ebc2d8d41ca1c6e6a21d364e1  npm-12.0.2.tgz" \
             | sha256sum -c -
 
-      - uses: bazel-contrib/setup-bazel@c5acdfb288317d0b5c0bbd7a396a3dc868bb0f86 # 0.19.0
-        with:
-          bazelisk-cache: true
-          repository-cache: true
-
-      # The conformance suite reads TRACEDECAY_TEST_BIN; Bazel builds the
+      # The conformance suite spawns target/debug/tracedecay; Bazel builds the
       # dashboard bundle the daemon embeds.
       - name: Build the real production daemon for conformance
-        run: |
-          set -euo pipefail
-          bazel build --config=ci //crates/tracedecay-cli:tracedecay
-          built="$(bazel cquery --config=ci --output=files //crates/tracedecay-cli:tracedecay 2>/dev/null)"
-          echo "TRACEDECAY_TEST_BIN=${GITHUB_WORKSPACE}/${built}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/build-cli
+        with:
+          config: ci
+          dest: target/debug
+          cache-key: sdk-conformance
 
       - name: Real-daemon conformance against the exact packed tarball
         working-directory: sdks/typescript
