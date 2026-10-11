@@ -342,7 +342,7 @@ fn production_chunk_candidate_hydrates_from_frozen_generation() {
             source_role: RetrievalSourceRoleV1::default(),
             utility_micros: 1,
             contributions: Vec::new(),
-            freshness: vec![freshness],
+            freshness: vec![freshness.clone()],
             decisions: Vec::new(),
         },
         final_ordinal: 0,
@@ -428,11 +428,8 @@ fn production_symbol_candidate_binds_the_attributed_chunk_window() {
         &["config", "user.email", "tracedecay@example.invalid"],
     );
     std::fs::create_dir_all(project.path().join("src")).expect("source directory");
-    std::fs::write(
-        project.path().join("src/lib.rs"),
-        "pub fn chunk_target() -> u32 { 7 }\n",
-    )
-    .expect("source");
+    const BODY: &str = "pub fn chunk_target() -> u32 {\n    7\n}\n";
+    std::fs::write(project.path().join("src/lib.rs"), BODY).expect("source");
     git(project.path(), &["add", "."]);
     git(project.path(), &["commit", "-qm", "fixture"]);
 
@@ -451,10 +448,7 @@ fn production_symbol_candidate_binds_the_attributed_chunk_window() {
         .chunks()
         .chunks()
         .iter()
-        .find(|chunk| {
-            chunk.anchor.symbol_occurrence_id.is_some()
-                && chunk.anchor.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
-        })
+        .find(|chunk| chunk.sanitized_text.as_str().contains("    7"))
         .expect("symbol body production chunk");
     let symbol_occurrence = chunk
         .anchor
@@ -501,7 +495,7 @@ fn production_symbol_candidate_binds_the_attributed_chunk_window() {
             source_role: RetrievalSourceRoleV1::default(),
             utility_micros: 1,
             contributions: Vec::new(),
-            freshness: vec![freshness],
+            freshness: vec![freshness.clone()],
             decisions: Vec::new(),
         },
         final_ordinal: 0,
@@ -550,8 +544,11 @@ fn production_symbol_candidate_binds_the_attributed_chunk_window() {
         panic!("symbol anchor must carry a lineage site, got {site:?}");
     };
     let window = code_window.expect("symbol chunk window bound");
-    assert_eq!(window.source_span, chunk.anchor.source_span);
-    assert_eq!(window.sanitized_text, chunk.sanitized_text);
+    assert_eq!(display.name, "chunk_target");
+    assert_eq!(display.qualified_name, "src/lib.rs::chunk_target");
+    assert_eq!(display.kind, "function");
+    assert_eq!(display.path, "src/lib.rs");
+    assert_eq!(window.sanitized_text.as_str(), BODY);
 }
 
 #[test]
@@ -564,13 +561,20 @@ fn production_symbol_candidate_serves_the_matched_body_piece() {
         &["config", "user.email", "tracedecay@example.invalid"],
     );
     std::fs::create_dir_all(project.path().join("src")).expect("source directory");
-    // A symbol larger than MAX_CHUNK_TEXT_BYTES splits into fallback-window
-    // pieces, so it owns a signature chunk and several body pieces.
-    let mut lib_rs = String::from("pub fn chunk_target() -> u32 {\n    let mut total = 0u32;\n");
-    for index in 0..5000 {
-        lib_rs.push_str(&format!("    total += {index}u32;\n"));
+    // A symbol larger than 64KiB splits into fallback-window pieces. Unique
+    // identifiers mark the opening window and a later piece so the binding
+    // can be checked by the text it serves, not by chunk metadata.
+    const FIRST_WINDOW: &str = "window_first_unique";
+    const MATCHED_WINDOW: &str = "window_matched_unique";
+    let mut lib_rs = format!("pub fn chunk_target() -> u32 {{\n    let {FIRST_WINDOW} = 1u32;\n");
+    while lib_rs.len() < 20_000 {
+        lib_rs.push_str("    let _pad = 1u32;\n");
     }
-    lib_rs.push_str("    total\n}\n");
+    lib_rs.push_str(&format!("    let {MATCHED_WINDOW} = 2u32;\n"));
+    while lib_rs.len() < 70_000 {
+        lib_rs.push_str("    let _pad = 2u32;\n");
+    }
+    lib_rs.push_str(&format!("    {FIRST_WINDOW}\n}}\n"));
     std::fs::write(project.path().join("src/lib.rs"), lib_rs).expect("source");
     git(project.path(), &["add", "."]);
     git(project.path(), &["commit", "-qm", "fixture"]);
@@ -591,28 +595,30 @@ fn production_symbol_candidate_serves_the_matched_body_piece() {
         .chunks()
         .chunks()
         .iter()
-        .find(|chunk| {
-            chunk.anchor.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolSignature
-        })
+        .find(|chunk| chunk.sanitized_text.as_str() == "pub fn chunk_target() -> u32 {")
         .expect("signature chunk");
     let symbol_occurrence = signature_chunk
         .anchor
         .symbol_occurrence_id
         .clone()
         .expect("signature names a symbol");
-    let mut body_pieces: Vec<_> = generation
+    let first_piece = generation
         .chunks()
         .chunks()
         .iter()
-        .filter(|chunk| {
-            chunk.anchor.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
-                && chunk.anchor.symbol_occurrence_id.as_ref() == Some(&symbol_occurrence)
+        .find(|chunk| {
+            chunk
+                .sanitized_text
+                .as_str()
+                .contains(&format!("let {FIRST_WINDOW}"))
         })
-        .collect();
-    body_pieces.sort_by_key(|chunk| chunk.anchor.source_span.start_byte);
-    let matched_piece = body_pieces
-        .get(1)
-        .expect("oversized symbol splits into several body pieces");
+        .expect("opening body piece");
+    let matched_piece = generation
+        .chunks()
+        .chunks()
+        .iter()
+        .find(|chunk| chunk.sanitized_text.as_str().contains(MATCHED_WINDOW))
+        .expect("later body piece");
 
     let anchor = RetrievalAnchorId::new(format!("code-symbol:{}", symbol_occurrence.as_str()))
         .expect("symbol anchor");
@@ -654,7 +660,7 @@ fn production_symbol_candidate_serves_the_matched_body_piece() {
             source_role: RetrievalSourceRoleV1::default(),
             utility_micros: 1,
             contributions: Vec::new(),
-            freshness: vec![freshness],
+            freshness: vec![freshness.clone()],
             decisions: Vec::new(),
         },
         final_ordinal: 0,
@@ -703,8 +709,47 @@ fn production_symbol_candidate_serves_the_matched_body_piece() {
         panic!("symbol anchor must carry a lineage site, got {site:?}");
     };
     let window = code_window.expect("symbol chunk window bound");
-    assert_eq!(window.source_span, matched_piece.anchor.source_span);
-    assert_eq!(window.sanitized_text, matched_piece.sanitized_text);
+    assert_eq!(display.name, "chunk_target");
+    assert_eq!(display.path, "src/lib.rs");
+    assert_eq!(
+        window.sanitized_text.as_str(),
+        matched_piece.sanitized_text.as_str()
+    );
+    assert!(
+        window.sanitized_text.as_str().contains(MATCHED_WINDOW),
+        "complete lane must serve the later piece"
+    );
+    assert!(
+        !window.sanitized_text.as_str().contains(FIRST_WINDOW),
+        "complete lane must not fall back to the opening piece"
+    );
+
+    let first_only = RankedCandidate {
+        candidate: FusedCandidate {
+            occurrences: vec![chunk_hit(first_piece)],
+            ..candidate.candidate.clone()
+        },
+        final_ordinal: 0,
+    };
+    let (first_display, _) =
+        code_index_search_display_binding(generation, &display_paths, &request, &first_only)
+            .expect("opening piece hydration");
+    let first_site = first_display.site.expect("opening lineage site");
+    let tracedecay_query::code_search::CodeIndexSearchSiteV1::SymbolLines {
+        code_window: Some(first_window),
+        ..
+    } = first_site
+    else {
+        panic!("opening piece must carry a lineage site, got {first_site:?}");
+    };
+    assert_eq!(
+        first_window.sanitized_text.as_str(),
+        first_piece.sanitized_text.as_str()
+    );
+    assert!(
+        first_window.sanitized_text.as_str().contains(FIRST_WINDOW),
+        "attributed opening piece must serve its own text"
+    );
 
     let text = latest.text_generation_handle();
     text.production_query_owners().expect("text serving owners");
@@ -715,5 +760,18 @@ fn production_symbol_candidate_serves_the_matched_body_piece() {
     let tracedecay_query::code_search::CodeIndexSearchSiteV1::ArtifactWindow(window) = site else {
         panic!("text lane must carry an artifact window, got {site:?}");
     };
-    assert_eq!(window.source_span, matched_piece.anchor.source_span);
+    assert_eq!(display.name, "chunk_target");
+    assert_eq!(display.path, "src/lib.rs");
+    assert_eq!(
+        window.sanitized_text.as_str(),
+        matched_piece.sanitized_text.as_str()
+    );
+    assert!(
+        window.sanitized_text.as_str().contains(MATCHED_WINDOW),
+        "text lane must serve the later piece"
+    );
+    assert!(
+        !window.sanitized_text.as_str().contains(FIRST_WINDOW),
+        "text lane must not fall back to the opening piece"
+    );
 }
