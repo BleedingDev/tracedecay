@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Bug Fixes
 
+* **session:** report HistoricalRetry from `lcm_load_session` while a foreign provider cursor is retrying, instead of a bare TemporalStoreUnavailable ([#3393](https://github.com/ScriptedAlchemy/tracedecay/issues/3393))
+* **session:** skip Claude workflow `journal.jsonl` during historical catch-up so real session transcripts occupy the source window; OpenCode snapshot records carry a content-derived generation and the batch generation folds database write state, so in-place row edits re-project ([#3393](https://github.com/ScriptedAlchemy/tracedecay/issues/3393))
 * **index:** skip empty or comment-only Python clone-body spans so one stub cannot fail chunk identity and park the worktree ([#3401](https://github.com/ScriptedAlchemy/tracedecay/issues/3401))
 * **sessions:** record a real `o200k_base` `token_count` and a `cut` marker on stored `tool_result` facts at ingest; `source_read` no longer writes chars/4 ([#3397](https://github.com/ScriptedAlchemy/tracedecay/issues/3397))
 * **cli:** give explicit upgrade lookups their own GitHub deadline so a 1s advisory budget cannot fail `tracedecay upgrade` ([#3371](https://github.com/ScriptedAlchemy/tracedecay/issues/3371))
