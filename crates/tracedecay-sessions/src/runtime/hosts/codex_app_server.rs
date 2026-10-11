@@ -1245,6 +1245,79 @@ mod tests {
         assert_eq!(launch_receipt.started_at(), None);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn work_app_server_cmd_launcher_completes_a_turn() {
+        // Real Windows Codex launches through a `.cmd` shim that execs its
+        // interpreter; the batch itself never parses stdin. Drive the shipped
+        // `cmd /D /C` path through that shape: the interpreter answers
+        // initialize, the `initialized` notification, thread/start, and
+        // turn/start in order, with stdin held open until turn/completed.
+        let _process_guard = APP_SERVER_PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temporary = tempfile::tempdir().expect("temporary app-server directory");
+        let executable = temporary.path().join("fake-codex.cmd");
+        let helper = temporary.path().join("fake-codex-helper.py");
+        std::fs::write(
+            &helper,
+            concat!(
+                "import sys\n",
+                "for line in sys.stdin:\n",
+                "    if '\"id\":0' in line:\n",
+                "        print('{\"id\":0,\"result\":{}}', flush=True)\n",
+                "    elif '\"id\":1' in line:\n",
+                "        print('{\"id\":1,\"result\":{\"thread\":{\"id\":\"cmd-thread\"}}}', flush=True)\n",
+                "    elif '\"id\":2' in line:\n",
+                "        print('{\"method\":\"item/completed\",\"params\":{\"item\":{\"content\":[{\"type\":\"output_text\",\"text\":\"cmd lifecycle result\"}]}}}', flush=True)\n",
+                "        print('{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"cmd-turn\"}}}', flush=True)\n",
+                "        sys.exit(0)\n",
+            ),
+        )
+        .expect("write helper interpreter");
+        let script = format!(
+            "@echo off\r\npython \"%~dp0fake-codex-helper.py\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+        );
+        std::fs::write(&executable, script).expect("write fake app-server");
+
+        // The spawn clears the environment before admitting caller values, so
+        // the interpreter inside the shim resolves only through the admitted
+        // PATH, as a real deployment's node inside `codex.cmd` does.
+        let mut admitted_environment = BTreeMap::new();
+        for key in ["PATH", "PATHEXT", "SYSTEMROOT", "WINDIR"] {
+            if let Some(value) = std::env::var_os(key) {
+                admitted_environment.insert(key.to_owned(), value);
+            }
+        }
+        let config = CodexAppServerSummaryConfig {
+            codex_bin: executable.to_string_lossy().into_owned(),
+            model: None,
+            timeout: Duration::from_secs(30),
+        };
+        let launch_receipt = CodexAppServerLaunchReceipt::default();
+        let summary = run_work_with_codex_app_server(
+            "Return a work result.",
+            &config,
+            "tracedecay_work_attempt",
+            CodexAppServerWorkExecution {
+                cancellation: &CodexAppServerCancellation::default(),
+                cwd: temporary.path(),
+                timeout: Duration::from_secs(30),
+                admitted_environment: &admitted_environment,
+                launch_receipt: &launch_receipt,
+                approval: WorkApprovalPolicy::Never,
+                filesystem: WorkFilesystemPolicy::ReadOnly,
+                egress: WorkEgressPolicy::Deny,
+            },
+        );
+
+        assert_eq!(
+            summary.map(|summary| summary.text),
+            Ok("cmd lifecycle result".to_owned())
+        );
+        assert!(launch_receipt.started_at().is_some());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn work_app_server_held_open_for_writing_is_refused_on_the_first_attempt() {
