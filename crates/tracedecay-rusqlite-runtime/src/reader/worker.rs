@@ -690,6 +690,10 @@ mod release_memory_tests {
     use super::*;
     use crate::reader::tests::{GateExecutor, Probe, TestStore, request};
 
+    /// How long a test waits on one command reply before failing instead of
+    /// hanging until Bazel's overall timeout.
+    const REPLY_BOUND: Duration = Duration::from_secs(60);
+
     /// Parks the worker inside its snapshot loop on a read whose end is
     /// already queued: it holds no retained snapshot, yet it is not back on
     /// its outer command channel either, the state a deferred snapshot end
@@ -714,7 +718,7 @@ mod release_memory_tests {
             }
         });
         assert!(
-            executor.entered.wait(Duration::from_secs(60)),
+            executor.entered.wait(REPLY_BOUND),
             "the read must be parked before its snapshot end is queued"
         );
         drop(spawned.client.begin_end().unwrap());
@@ -741,7 +745,10 @@ mod release_memory_tests {
 
         let (released, releasing) = release_in_background(&spawned.client);
         assert_eq!(
-            released.recv().unwrap().unwrap(),
+            released
+                .recv_timeout(REPLY_BOUND)
+                .expect("the release must answer while the read is parked")
+                .unwrap(),
             WorkerMemoryRelease::SnapshotBusy,
             "the release must not wait out a read the worker is still running"
         );
@@ -767,8 +774,14 @@ mod release_memory_tests {
 
         let (released, releasing) = release_in_background(&spawned.client);
         executor.release.set();
-        begun.recv().unwrap().unwrap();
-        let outcome = released.recv().unwrap().unwrap();
+        begun
+            .recv_timeout(REPLY_BOUND)
+            .expect("the queued begin must answer")
+            .unwrap();
+        let outcome = released
+            .recv_timeout(REPLY_BOUND)
+            .expect("the release must answer")
+            .unwrap();
         assert!(
             matches!(
                 outcome,
