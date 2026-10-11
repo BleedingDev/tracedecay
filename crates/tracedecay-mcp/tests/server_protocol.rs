@@ -32,14 +32,28 @@ fn protocol_owner_classifies_every_transport_method() {
 
 #[test]
 fn initialize_payload_uses_composed_product_metadata() {
-    let result = initialize_result("9.8.7", "transport instructions");
+    let result = initialize_result("9.8.7", "transport instructions", None);
 
-    assert_eq!(result["protocolVersion"], json!("2024-11-05"));
+    assert_eq!(result["protocolVersion"], json!("2025-11-25"));
     assert_eq!(result["serverInfo"]["name"], json!("tracedecay"));
     assert_eq!(result["serverInfo"]["version"], json!("9.8.7"));
     assert_eq!(result["instructions"], json!("transport instructions"));
     assert!(result["capabilities"]["tools"].is_object());
     assert!(result["capabilities"]["resources"].is_object());
+}
+
+#[test]
+fn initialize_agrees_to_a_supported_client_version_and_falls_back_to_the_newest() {
+    for (requested, agreed) in [
+        ("2024-11-05", "2024-11-05"),
+        ("2025-06-18", "2025-06-18"),
+        ("2025-11-25", "2025-11-25"),
+        ("2026-07-28", "2025-11-25"),
+        ("2099-01-01", "2025-11-25"),
+    ] {
+        let result = initialize_result("9.8.7", "transport instructions", Some(requested));
+        assert_eq!(result["protocolVersion"], json!(agreed), "{requested}");
+    }
 }
 
 #[test]
