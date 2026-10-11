@@ -637,7 +637,7 @@ impl CorrelationIndexPresence {
     }
 }
 
-pub fn normalize_worktree(path: &str) -> String {
+fn normalize_worktree_lexical(path: &str) -> String {
     let mut normalized = path.trim().replace('\\', "/");
     if let Some(stripped) = normalized.strip_prefix("//?/UNC/") {
         normalized = format!("//{stripped}");
@@ -649,6 +649,22 @@ pub fn normalize_worktree(path: &str) -> String {
     }
     while normalized.len() > 1 && normalized.ends_with('/') {
         normalized.pop();
+    }
+    normalized
+}
+
+pub fn normalize_worktree(path: &str) -> String {
+    let mut normalized = normalize_worktree_lexical(path);
+    // Lexical cleanup cannot reach OS-level aliases a host may report, such
+    // as 8.3 short names on Windows or a symlinked root: resolve them when
+    // the path exists so one physical worktree keys identically wherever
+    // its spelling was captured. `Path::is_absolute` also keeps non-native
+    // strings (e.g. `/repo` under Windows) away from drive-relative
+    // resolution.
+    if std::path::Path::new(&normalized).is_absolute()
+        && let Ok(resolved) = std::fs::canonicalize(&normalized)
+    {
+        normalized = normalize_worktree_lexical(&resolved.to_string_lossy());
     }
     normalized
 }
