@@ -693,3 +693,28 @@ fn a_changed_file_without_captured_bytes_is_refused() {
         CodeIndexProductionErrorV1::Input(CodeIndexInputErrorV1::MissingCapturedFile)
     ));
 }
+
+#[test]
+fn a_language_changed_file_without_captured_bytes_is_refused() {
+    let store = MemorySealedPublicationStoreV1::default();
+    let mut incremental = owner(&store);
+    let mut before = go_tree(GO_WRONG, GO_UTIL);
+    before.push(("config.h", "c", "// shared header\n"));
+    publish(&mut incremental, &before, 1_100_000);
+
+    let wrong =
+        "package calc\n\ntype Wrong struct{}\n\nfunc (Wrong) Add(a, b int) int { return a + b }\n";
+    let mut edited = go_tree(wrong, GO_UTIL);
+    edited.push(("config.h", "cpp", "// shared header\n"));
+    let error = match incremental.build_and_publish(
+        request_capturing(&edited, &["calc/wrong.go"], 1_200_000),
+        &UninterruptibleCodeIndexControlV1,
+    ) {
+        Ok(_) => panic!("a language change requires captured bytes despite equal content"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        CodeIndexProductionErrorV1::Input(CodeIndexInputErrorV1::MissingCapturedFile)
+    ));
+}

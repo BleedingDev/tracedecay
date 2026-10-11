@@ -226,8 +226,8 @@ impl SealedParentGenerationV1 {
     /// Carry an unchanged present file from the sealed parent into a
     /// successor that must build cold.
     ///
-    /// Digest equality is the reuse authority: a path whose content moved
-    /// is not carried, so a caller that omitted those bytes still fails
+    /// Content and language equality are the reuse authority: a path whose
+    /// content or parser changed is not carried, so omitted bytes still fail
     /// closed with [`super::CodeIndexInputErrorV1::MissingCapturedFile`].
     pub(super) fn carry_unchanged_file(
         &self,
@@ -245,6 +245,7 @@ impl SealedParentGenerationV1 {
         };
         if parent_file.content_digest != file.content_digest
             || parent_file.disposition != file.disposition
+            || parent_file.language != file.language
         {
             return Ok(None);
         }
