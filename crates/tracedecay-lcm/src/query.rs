@@ -26,7 +26,7 @@ use status::*;
 use super::types::LcmStoreTokenCoverage;
 use super::types::{
     LcmGrepOutcome, LcmLifecycleStatus, LcmPayloadCoverage, LcmPayloadCoverageState,
-    LcmPayloadGcStatus, LcmPayloadStatus, LcmRedactionStatus,
+    LcmPayloadGcStatus, LcmPayloadStatus, LcmRedactionStatus, LcmSessionRawStats,
 };
 use super::{
     LCM_COMPRESSION_BOUNDARY_COOLDOWN_SECONDS, LCM_DEFAULT_FRESH_TAIL_COUNT,

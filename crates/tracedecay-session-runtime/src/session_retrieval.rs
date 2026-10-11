@@ -118,8 +118,8 @@ mod admitted;
 mod contract;
 mod primitive;
 pub use admitted::{
-    LcmRawStoreIdsFutureV1, SessionApplicationRetrievalFutureV1, SessionApplicationRetrievalPortV1,
-    UnavailableSessionApplicationRetrievalV1,
+    LcmRawStoreIdsFutureV1, LcmSessionRawStatsFutureV1, SessionApplicationRetrievalFutureV1,
+    SessionApplicationRetrievalPortV1, UnavailableSessionApplicationRetrievalV1,
 };
 pub use contract::{
     LcmDescribeServiceCommand, LcmDescribeServiceFuture, LcmDescribeServiceOutcome,
