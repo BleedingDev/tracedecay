@@ -70,7 +70,7 @@ pub async fn run_serve(
     profile: &ProfileRoot,
     path_arg: Option<String>,
     timings: bool,
-    claude_code_tool_search: bool,
+    full_tool_list: bool,
 ) -> Result<()> {
     let original_cwd = std::env::current_dir().ok();
     let socket_path = tracedecay_daemon_control::default_socket_path(profile.data_dir())?;
@@ -100,7 +100,7 @@ pub async fn run_serve(
         &socket_path,
         &handshake,
         None,
-        claude_code_tool_search,
+        full_tool_list,
         repeated_query_hints,
     )
     .await

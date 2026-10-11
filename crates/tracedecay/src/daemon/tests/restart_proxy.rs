@@ -1125,7 +1125,7 @@ async fn disconnected_client_does_not_outlive_a_daemon_that_never_answers() {
             None,
             &mut transport,
             Some(std::time::Duration::from_millis(250)),
-            false,
+            super::super::tool_surface::ToolSurface::new(true),
             tokio::sync::watch::channel(false).1,
         )
         .await
@@ -1308,7 +1308,7 @@ async fn requests_through_proxy(
             None,
             &mut transport,
             None,
-            false,
+            super::super::tool_surface::ToolSurface::new(false),
             tokio::sync::watch::channel(repeated_query_hints).1,
         )
         .await
@@ -1385,51 +1385,56 @@ async fn repeated_query_hints_reach_the_host_only_when_enabled() {
     );
 }
 
-/// A `tracedecay_tool_search` is one of this session's `tools/call`s too:
-/// the proxy answers it from the catalog, but it must still count in the
-/// window and take a hint. Before the fix, searches bypassed the window, so
-/// repeated searches were never flagged and never aged earlier calls out.
+/// A call to a tool the host still sees as a stub is one of this session's
+/// `tools/call`s too: hydration composes with the window, and a repeat still
+/// takes a hint. Guard against the tool path this feature would otherwise
+/// bypass.
 #[cfg(unix)]
 #[tokio::test]
-async fn repeated_tool_searches_are_also_tracked_and_hinted() {
-    let catalog = |request: &Value| {
-        json!({
-            "jsonrpc": "2.0",
-            "id": request["id"],
-            "result": {"tools": [
-                {"name": "tracedecay_impact", "description": "Blast radius of a change.",
-                 "inputSchema": {"type": "object", "properties": {"node_id": {"type": "string"}}}},
-            ]}
-        })
+async fn repeated_stub_calls_are_also_tracked_and_hinted() {
+    let respond = |request: &Value| {
+        if request["method"] == json!("tools/list") {
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {"tools": [
+                    {"name": "tracedecay_impact", "description": "Blast radius of a change. More.",
+                     "inputSchema": {"type": "object", "properties": {"node_id": {"type": "string"}}}},
+                ]}
+            })
+        } else {
+            call_result(request)
+        }
     };
-    // Two identical searches; each costs the proxy one catalog fetch.
-    let requests = [1, 2]
-        .into_iter()
-        .map(|id| {
-            (
-                tool_call_request(id, "tracedecay_tool_search", json!({"query": "impact"})),
-                // The first search loads tracedecay_impact and announces it
-                // with notifications/tools/list_changed after its result.
-                if id == 1 { 2 } else { 1 },
-            )
-        })
-        .collect();
-    let (_written, received) = requests_through_proxy(true, 2, catalog, requests).await;
+    let requests = vec![
+        (json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), 1),
+        // The first stub call hydrates the tool and announces
+        // notifications/tools/list_changed after its result.
+        (
+            tool_call_request(2, "tracedecay_impact", json!({"node_id": "session"})),
+            2,
+        ),
+        (
+            tool_call_request(3, "tracedecay_impact", json!({"node_id": "session"})),
+            1,
+        ),
+    ];
+    let (_written, received) = requests_through_proxy(true, 3, respond, requests).await;
 
-    let notification: Value = serde_json::from_str(&received[1]).expect("notification json");
+    let notification: Value = serde_json::from_str(&received[2]).expect("notification json");
     assert_eq!(
         notification["method"],
         json!("notifications/tools/list_changed")
     );
 
-    let repeat: Value = serde_json::from_str(&received[2]).expect("response json");
+    let repeat: Value = serde_json::from_str(&received[3]).expect("response json");
     let content = repeat["result"]["content"].as_array().expect("content");
     let hint = content
         .last()
         .and_then(|block| block["text"].as_str())
         .unwrap_or_default();
     assert!(
-        hint.starts_with("tracedecay_repeated_query: this tracedecay_tool_search call shares 100%"),
+        hint.starts_with("tracedecay_repeated_query: this tracedecay_impact call shares 100%"),
         "{hint}"
     );
 }

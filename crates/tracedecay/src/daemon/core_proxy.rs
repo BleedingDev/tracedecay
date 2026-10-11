@@ -74,12 +74,14 @@ pub async fn should_proxy_serve_to_daemon(
     proxy_required_by_platform(false, socket_path.exists())
 }
 
+/// `full_tool_list` serves the daemon's catalog unchanged; otherwise tools the
+/// catalog does not mark always-loaded are listed as stubs.
 #[tracing::instrument(name = "daemon.engine.proxy.stdio", level = "trace", skip_all)]
 pub async fn proxy_stdio_to_daemon(
     socket_path: &Path,
     handshake: &DaemonHandshake,
     replay_line: Option<String>,
-    claude_code_tool_search: bool,
+    full_tool_list: bool,
     repeated_query_hints: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut transport = StdioTransport::new();
@@ -89,7 +91,7 @@ pub async fn proxy_stdio_to_daemon(
         replay_line,
         &mut transport,
         None,
-        claude_code_tool_search,
+        ToolSurface::new(full_tool_list),
         repeated_query_hints,
     )
     .await
@@ -142,7 +144,7 @@ pub async fn proxy_transport_to_daemon(
         replay_line,
         transport,
         None,
-        false,
+        ToolSurface::new(true),
         tokio::sync::watch::channel(false).1,
     )
     .await
@@ -157,7 +159,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
     replay_line: Option<String>,
     transport: &mut impl McpDuplexTransport,
     drain_bound: Option<Duration>,
-    claude_code_tool_search: bool,
+    surface: ToolSurface,
     repeated_query_hints: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let (mut reader, mut writer) = transport.split();
@@ -193,7 +195,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
         &mut eof_rx,
         &mut writer,
         drain_bound,
-        ToolSurface::from_serve(claude_code_tool_search)?,
+        surface,
         RepeatedQueries::new(repeated_query_hints),
     );
     let result = tokio::try_join!(read_host, proxy);
@@ -752,9 +754,9 @@ fn responses_are_project_open_retryable(responses: &[String]) -> bool {
             .is_some_and(json_rpc_error_is_project_open_retryable)
 }
 
-/// Sends one host request through this session's tool surface: search answers
-/// from the daemon catalog, `tools/list` follows the session advertisement,
-/// and a near-repeat of a recent tool call carries a hint.
+/// Sends one host request and fits the daemon's answer to this session's tool
+/// surface; a call to a stubbed tool also hydrates its full schema, and a
+/// near-repeat of a recent tool call carries a hint.
 async fn send_host_request(
     surface: &mut ToolSurface,
     repeated_queries: &mut RepeatedQueries,
@@ -763,41 +765,11 @@ async fn send_host_request(
     request: &DaemonProxyRequest<'_>,
     cancellation: &mut tokio::sync::watch::Receiver<Option<String>>,
 ) -> Result<Vec<String>> {
-    if let Some((id, query)) = surface.search_request(request.parsed.as_ref()) {
-        // The catalog lookup borrows the search's own id so a host
-        // cancellation forwarded verbatim matches this daemon request.
-        let catalog_line =
-            serde_json::json!({ "jsonrpc": "2.0", "id": id.clone(), "method": "tools/list" })
-                .to_string();
-        let catalog = DaemonProxyRequest::new(&catalog_line);
-        let listing = send_daemon_request_with_project_open_retry(
-            socket_path,
-            handshake,
-            &catalog,
-            cancellation,
-        )
-        .await?;
-        // A cancel during the fetch must settle without loading tools.
-        let mut responses = if cancellation.borrow().is_some() {
-            let response = JsonRpcResponse::error_with_data(
-                id,
-                ErrorCode::RequestCancelled,
-                "MCP request cancelled".to_owned(),
-                Some(serde_json::json!({ "reason_code": "request_cancelled" })),
-            );
-            vec![format!("{}\n", serde_json::to_string(&response)?)]
-        } else {
-            surface.answer_search(&id, &query, &listing)
-        };
-        // A search the proxy answers itself is still one of this session's
-        // tools/calls: it must count in the window and take a hint.
-        repeated_queries.rewrite(request.parsed.as_ref(), &mut responses);
-        return Ok(responses);
-    }
     let mut responses =
         send_daemon_request_with_project_open_retry(socket_path, handshake, request, cancellation)
             .await?;
     surface.rewrite(request.parsed.as_ref(), &mut responses);
+    surface.hydrate_called_stub(request.parsed.as_ref(), &mut responses);
     repeated_queries.rewrite(request.parsed.as_ref(), &mut responses);
     Ok(responses)
 }
