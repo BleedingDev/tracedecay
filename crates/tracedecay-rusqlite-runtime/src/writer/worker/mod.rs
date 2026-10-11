@@ -1497,7 +1497,10 @@ mod auxiliary_scheduling_tests {
 
     #[test]
     fn dwell_collects_a_compatible_arrival_before_dispatch() {
-        let enqueued_at = Instant::now() + Duration::from_secs(1);
+        // The dwell returns when the arrival fills the batch, not at the
+        // deadline. Open the window far enough ahead that a stalled test
+        // thread cannot outlive it before the dwell runs.
+        let enqueued_at = Instant::now() + Duration::from_secs(3600);
         let mut config = tracedecay_store::AdmissionConfigV1::default();
         config.foreground_batch.max_operations = 2;
         config.validate().expect("valid foreground batch limit");
