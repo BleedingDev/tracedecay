@@ -14,6 +14,7 @@ use tokio::time::{Duration, Instant};
 use super::binary_version;
 #[cfg(unix)]
 use super::connect_with_restart_grace;
+use super::repeat_reads::RepeatReads;
 use super::tool_surface::ToolSurface;
 use super::{
     DAEMON_TOOL_LIVENESS_POLL_INTERVAL, DaemonClientDeadline, DaemonHandshake,
@@ -191,6 +192,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
         &mut writer,
         drain_bound,
         surface,
+        RepeatReads::from_env()?,
     );
     let result = tokio::try_join!(read_host, proxy);
     drop(eof_tx);
@@ -316,6 +318,7 @@ async fn proxy_host_input_to_daemon(
     writer: &mut impl McpTransportWriter,
     drain_bound: Option<Duration>,
     mut surface: ToolSurface,
+    mut repeat_reads: Option<RepeatReads>,
 ) -> Result<()> {
     let mut routed_handshake = handshake.clone();
     let mut pending = VecDeque::new();
@@ -374,6 +377,7 @@ async fn proxy_host_input_to_daemon(
         let result = {
             let daemon_request = send_host_request(
                 &mut surface,
+                repeat_reads.as_mut(),
                 socket_path,
                 &routed_handshake,
                 &request,
@@ -740,9 +744,11 @@ fn responses_are_project_open_retryable(responses: &[String]) -> bool {
 }
 
 /// Sends one host request and fits the daemon's answer to this session's tool
-/// surface; a call to a stubbed tool also hydrates its full schema.
+/// surface; a call to a stubbed tool also hydrates its full schema, and a
+/// repeated identical read answers with a pointer.
 async fn send_host_request(
     surface: &mut ToolSurface,
+    repeat_reads: Option<&mut RepeatReads>,
     socket_path: &Path,
     handshake: &DaemonHandshake,
     request: &DaemonProxyRequest<'_>,
@@ -753,6 +759,9 @@ async fn send_host_request(
             .await?;
     surface.rewrite(request.parsed.as_ref(), &mut responses);
     surface.hydrate_called_stub(request.parsed.as_ref(), &mut responses);
+    if let Some(repeat_reads) = repeat_reads {
+        repeat_reads.rewrite(request.parsed.as_ref(), &mut responses);
+    }
     Ok(responses)
 }
 
