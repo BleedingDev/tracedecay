@@ -201,18 +201,23 @@ fn plugin_agent_pins() -> BTreeSet<String> {
 ///
 /// Writes one JSON-RPC line, then reads lines until the expected response or
 /// notification arrives, the same way a host that is not Claude Code would.
-struct PlainMcpClient {
+pub(crate) struct PlainMcpClient {
     process: TestChildProcess,
     stdout: BufReader<ChildStdout>,
 }
 
 impl PlainMcpClient {
     fn start(home: &Path, project: &Path) -> Self {
+        Self::start_with_env(home, project, &[])
+    }
+
+    pub(crate) fn start_with_env(home: &Path, project: &Path, env: &[(&str, &str)]) -> Self {
         let mut command = tracedecay_command_with_home(home);
         command
             .arg("serve")
             .arg("--path")
             .arg(project)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -224,7 +229,7 @@ impl PlainMcpClient {
         }
     }
 
-    fn send(&mut self, request: &Value) {
+    pub(crate) fn send(&mut self, request: &Value) {
         let stdin = self
             .process
             .stdin_mut()
@@ -266,7 +271,7 @@ impl PlainMcpClient {
         frames
     }
 
-    fn request(&mut self, request: Value) -> Value {
+    pub(crate) fn request(&mut self, request: Value) -> Value {
         let id = request["id"].clone();
         self.send(&request);
         let frames = self.wait_until(|frames| frames.iter().any(|frame| frame["id"] == id));
