@@ -30,6 +30,7 @@ use tracedecay_runtime_core::config::{GLOBAL_DB_PATH_ENV, ProfileRoot, USER_DATA
 use tracedecay_runtime_core::db::{Database, DatabaseAuthority, TestDatabaseRuntimeMode};
 use tracedecay_runtime_core::path_safety::canonical_existing_identity;
 use tracedecay_runtime_core::storage::PrivateStoreIo;
+#[cfg(not(windows))]
 use tracedecay_runtime_core::test_executable::write_executable_script;
 use tracedecay_sessions::admission::{HostAdmissionOutcome, HostAdmissionScope};
 use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
@@ -406,26 +407,69 @@ pub fn tempdir_or_panic() -> TempDir {
 }
 
 pub fn fake_codex_bin(temp: &Path) -> PathBuf {
-    // The configured executable is the Python script. Production spawn
-    // launches the host interpreter as the direct child (`python -u`), so
-    // stdin/stdout stay on that process. A `.cmd` wrapper left `cmd.exe`
-    // alive after Python exited while the parent still held stdin.
-    temp.join("codex.py")
+    temp.join(if cfg!(windows) { "codex.cmd" } else { "codex" })
 }
 
-pub fn install_fake_codex_launcher(script: &Path, bin: &Path) {
-    let body = fs::read_to_string(script).unwrap_or_else(|err| {
+#[cfg(windows)]
+pub fn install_fake_codex_launcher(_script: &Path, bin: &Path) {
+    fs::write(bin, windows_python_launcher("codex.py")).unwrap_or_else(|err| {
         panic!(
-            "failed to read fake codex script {}: {err}",
-            script.display()
-        )
-    });
-    write_executable_script(bin, body).unwrap_or_else(|err| {
-        panic!(
-            "failed to install fake codex script {}: {err}",
+            "failed to install fake codex launcher {}: {err}",
             bin.display()
         )
     });
+}
+
+#[cfg(not(windows))]
+pub fn install_fake_codex_launcher(script: &Path, bin: &Path) {
+    let script_name = script
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "fake codex script has no valid file name: {}",
+                script.display()
+            )
+        });
+    let launcher = format!(
+        "#!/bin/sh\n\
+         SCRIPT_DIR=$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\n\
+         exec python3 \"$SCRIPT_DIR/{script_name}\" \"$@\"\n"
+    );
+    write_executable_script(bin, launcher).unwrap_or_else(|err| {
+        panic!(
+            "failed to install fake codex launcher {} for {}: {err}",
+            bin.display(),
+            script.display()
+        )
+    });
+}
+
+pub fn windows_python_launcher(script_name: &str) -> String {
+    format!(
+        "@echo off\r\n\
+setlocal\r\n\
+if defined Python_ROOT_DIR if exist \"%Python_ROOT_DIR%\\python.exe\" (\r\n\
+  \"%Python_ROOT_DIR%\\python.exe\" \"%~dp0{script_name}\" %*\r\n\
+  exit /b %ERRORLEVEL%\r\n\
+)\r\n\
+if defined pythonLocation if exist \"%pythonLocation%\\python.exe\" (\r\n\
+  \"%pythonLocation%\\python.exe\" \"%~dp0{script_name}\" %*\r\n\
+  exit /b %ERRORLEVEL%\r\n\
+)\r\n\
+where python >nul 2>nul\r\n\
+if not errorlevel 1 (\r\n\
+  python \"%~dp0{script_name}\" %*\r\n\
+  exit /b %ERRORLEVEL%\r\n\
+)\r\n\
+where python3 >nul 2>nul\r\n\
+if not errorlevel 1 (\r\n\
+  python3 \"%~dp0{script_name}\" %*\r\n\
+  exit /b %ERRORLEVEL%\r\n\
+)\r\n\
+py -3 \"%~dp0{script_name}\" %*\r\n\
+exit /b %ERRORLEVEL%\r\n"
+    )
 }
 
 /// Small multi-thread runtime for `#[test]`-driven async dashboard fixtures.

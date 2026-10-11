@@ -167,7 +167,7 @@ fn write_fake_tracedecay_binaries(dir: &Path) -> std::io::Result<()> {
 /// On Windows CI, launching plain `python3` resolves through PATH shims on
 /// every spawn; `actions/setup-python` exports the real interpreter root in
 /// `Python_ROOT_DIR`/`pythonLocation` (same preference order as
-/// the Codex app-server `.py` spawn), so use that executable directly.
+/// `common::windows_python_launcher`), so use that executable directly.
 fn python_command() -> Command {
     static PYTHON: LazyLock<PathBuf> = LazyLock::new(|| {
         if cfg!(windows) {

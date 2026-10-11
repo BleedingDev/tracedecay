@@ -1046,9 +1046,7 @@ for line in sys.stdin:
             "params": {"delta": json.dumps(payload), "model": "dashboard-fake-model"}
         }), flush=True)
         print(json.dumps({"method": "turn/completed"}), flush=True)
-        # Stay on stdin until the parent drops it after turn/completed.
-        # Exiting here while stdin is still held is the Windows cmd.exe
-        # wrapper hang; the host-interpreter child should still wait for EOF.
+        break
 "#
         .replace(
             "__FACT_ID__",

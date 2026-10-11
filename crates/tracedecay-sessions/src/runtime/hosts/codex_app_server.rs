@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{BufReader, Write as IoWrite};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc, Mutex, OnceLock,
@@ -511,22 +511,12 @@ fn codex_app_server_command(codex_bin: &str) -> Command {
     command
 }
 
+#[cfg(windows)]
 fn command_for_codex_bin(codex_bin: &str) -> Command {
     let extension = Path::new(codex_bin)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase);
-    if matches!(extension.as_deref(), Some("py")) {
-        // A configured `.py` is the app-server itself. Spawn the host
-        // interpreter as the direct child so stdin/stdout stay on that
-        // process. A `.cmd` wrapper leaves `cmd.exe` alive after Python
-        // exits while the parent still holds stdin, so the turn never
-        // completes and settlement never publishes.
-        let mut command = Command::new(python_host_executable());
-        command.arg("-u").arg(codex_bin);
-        return command;
-    }
-    #[cfg(windows)]
     if matches!(extension.as_deref(), Some("bat" | "cmd")) {
         let mut command = Command::new("cmd");
         command.arg("/D").arg("/C").arg(codex_bin);
@@ -535,33 +525,9 @@ fn command_for_codex_bin(codex_bin: &str) -> Command {
     Command::new(codex_bin)
 }
 
-/// Interpreter used when the configured `codex` path is a `.py` script.
-///
-/// Preference matches Windows CI (`Python_ROOT_DIR`, `pythonLocation`) so
-/// the spawned child is the real executable, not a PATH shim.
-fn python_host_executable() -> PathBuf {
-    if cfg!(windows) {
-        for var in ["Python_ROOT_DIR", "pythonLocation"] {
-            if let Some(root) = std::env::var_os(var) {
-                let exe = Path::new(&root).join("python.exe");
-                if exe.is_file() {
-                    return exe;
-                }
-            }
-        }
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                for name in ["python.exe", "python3.exe"] {
-                    let exe = dir.join(name);
-                    if exe.is_file() {
-                        return exe;
-                    }
-                }
-            }
-        }
-        return PathBuf::from("py");
-    }
-    PathBuf::from("python3")
+#[cfg(not(windows))]
+fn command_for_codex_bin(codex_bin: &str) -> Command {
+    Command::new(codex_bin)
 }
 
 #[derive(Clone)]
@@ -1002,50 +968,6 @@ mod tests {
         assert_eq!(
             strip_reasoning_tags("before <thinking>hidden</thinking> after").trim(),
             "before  after"
-        );
-    }
-
-    #[test]
-    fn python_script_is_spawned_through_the_host_interpreter() {
-        let command = command_for_codex_bin("/tmp/fake-codex.py");
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, vec!["-u".to_owned(), "/tmp/fake-codex.py".to_owned()]);
-        assert_ne!(
-            command.get_program().to_string_lossy().as_ref(),
-            "/tmp/fake-codex.py",
-            "the configured .py must not be the direct child"
-        );
-    }
-
-    #[test]
-    fn non_python_bin_is_the_direct_child() {
-        let command = command_for_codex_bin("/usr/bin/codex");
-        assert_eq!(
-            command.get_program().to_string_lossy().as_ref(),
-            "/usr/bin/codex"
-        );
-        assert!(command.get_args().next().is_none());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_cmd_wrapper_still_goes_through_cmd() {
-        let command = command_for_codex_bin(r"C:\tools\codex.cmd");
-        assert_eq!(command.get_program().to_string_lossy().as_ref(), "cmd");
-        let args: Vec<_> = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            args,
-            vec![
-                "/D".to_owned(),
-                "/C".to_owned(),
-                r"C:\tools\codex.cmd".to_owned()
-            ]
         );
     }
 
