@@ -62,10 +62,8 @@ pub struct SessionTemporalCursorKeyProvider {
     authenticators: Vec<(SignedCursorKeyRefV1, InMemoryCursorAuthenticator)>,
 }
 
-/// Reads and fully validates the sole active cursor key: its id, version,
-/// and material are checked exactly as the provisioning transaction checks
-/// them, so callers that probe on a read snapshot never skip validation a
-/// writer-lane caller would have run.
+/// Reads the sole active cursor key, validating id, version, and material
+/// the same way provisioning does.
 pub(super) async fn read_active_session_cursor_key(
     connection: &impl crate::handle::SessionTemporalQuery,
 ) -> SessionStoreResult<Option<SignedCursorKeyRefV1>> {
@@ -121,17 +119,6 @@ pub(super) async fn read_active_session_cursor_key(
     }
     drop(active_rows);
     Ok(None)
-}
-
-/// Reports whether a valid active cursor key is already committed, so
-/// callers that only need its existence can probe on a read snapshot instead
-/// of opening a writer-lane transaction for a key they will not mint. The
-/// probe runs the same id/version/material validation as the provisioning
-/// transaction, so a corrupt key still fails rather than joining refreshes.
-pub(super) async fn session_cursor_key_is_active(
-    connection: &impl crate::handle::SessionTemporalQuery,
-) -> SessionStoreResult<bool> {
-    Ok(read_active_session_cursor_key(connection).await?.is_some())
 }
 
 pub(super) async fn ensure_active_session_cursor_key_in_transaction(

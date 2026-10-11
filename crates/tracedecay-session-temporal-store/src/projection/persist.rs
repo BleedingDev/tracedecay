@@ -202,10 +202,8 @@ pub(super) async fn persist_occurrences(
     batch: &SessionTemporalProjectionBatchV1,
     control: &ExecutionControl,
 ) -> SessionStoreResult<()> {
-    // The ensure_* statements merge each dimension row with MIN(), so one
-    // statement per distinct id carrying the batch-wide minimum is identical
-    // to one statement per occurrence. Collecting first keeps every value
-    // the interleaved per-occurrence calls would have submitted.
+    // `ensure_*` merges with `MIN()`, so one row per distinct id at the batch
+    // minimum matches one statement per occurrence.
     let generation = generation_i64(batch.generation(), PERSIST_OPERATION)?;
     let session_id = batch.session_id().as_str();
     let mut thread_rows = BTreeMap::<&str, (String, i64)>::new();
@@ -289,9 +287,7 @@ pub(super) async fn persist_occurrences(
         }
     }
 
-    // Dimension rows land in the same transaction as the occurrences, so
-    // issuing them after the inserts changes nothing observable; the shared
-    // commit publishes both atomically.
+    // Same transaction as the occurrence inserts, so order is not observable.
     for (thread_id, (grouping_json, created_at)) in thread_rows {
         checkpoint_relation_rebuild_control(control)?;
         ensure_thread(
@@ -325,9 +321,7 @@ pub(super) async fn persist_occurrences(
     Ok(())
 }
 
-/// One multi-row insert for every turn membership the batch projects; the
-/// rows are append-only and keyed per occurrence, so `INSERT OR IGNORE`
-/// preserves the per-row insert path's idempotence.
+/// Append-only per occurrence, so `INSERT OR IGNORE` matches the per-row inserts.
 async fn persist_turn_members(
     conn: &impl crate::handle::SessionTemporalExec,
     batch: &SessionTemporalProjectionBatchV1,

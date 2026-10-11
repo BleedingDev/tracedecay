@@ -710,18 +710,12 @@ impl PreparedSessionRefresh<'_> {
     }
 }
 
-/// A prepared begin whose first projected batch waits for the grouped
-/// commit the pass runs once all projections land — the same per-item
-/// outcome `apply_prepared_refresh_effect` reports, deferred so the
-/// pass's begins share one physical commit.
 struct DeferredPreparedBegin<'a> {
     prepared: PreparedSessionRefresh<'a>,
     item: SessionRefreshBeginBatchItemV1,
 }
 
-/// Terminal-attempt claim held across a staged completion's grouped
-/// phases: released on retryable or retired outcomes, retained when the
-/// durable outcome of the attempt is unknown.
+/// Released on drop unless `retain` is set.
 struct ClaimedTerminalAttempt<'a> {
     state: &'a SessionTemporalRefreshWakeState,
     recovery: SessionRefreshRecoveryV1,
@@ -750,9 +744,6 @@ impl Drop for ClaimedTerminalAttempt<'_> {
     }
 }
 
-/// A ready completion staged off the writer lane: reconstruction ran on
-/// a snapshot, and its receipt, apply, validation, and completion commit
-/// run in the grouped phases after the selection loop.
 struct StagedReadyCompletion<'a> {
     claim: ClaimedTerminalAttempt<'a>,
     request: SessionRefreshCompletionRequestV1,
@@ -858,8 +849,6 @@ pub async fn begin_admitted_session_refreshes<'a>(
     process_refresh_begin_requests(store, state, limit, report).await
 }
 
-/// Builds the terminal completion request a ready recovery names, or
-/// `None` when its durable progress cannot describe a completion.
 fn completion_request(
     recovery: &SessionRefreshRecoveryV1,
 ) -> Option<SessionRefreshCompletionRequestV1> {
@@ -877,8 +866,6 @@ fn completion_request(
     })
 }
 
-/// The shared handles one refresh pass threads through selection,
-/// projection, and the grouped commit phases.
 struct RefreshPassContext<'a> {
     database: &'a RegisteredGlobalDbLeaseV1,
     store: &'a SessionTemporalStore<'a, tracedecay_global_db::RegisteredGlobalDb>,
@@ -887,16 +874,11 @@ struct RefreshPassContext<'a> {
     policy: SessionTemporalRefreshPolicy,
 }
 
-/// The deferred begin and staged completion work the selection loop
-/// collects for the grouped phases that follow it.
 struct RefreshDrain<'a> {
     deferred_begins: Vec<DeferredPreparedBegin<'a>>,
     staged_completions: Vec<StagedReadyCompletion<'a>>,
 }
 
-/// Claims and stages one ready completion off the writer lane. Durable
-/// completions and errors resolve inline; staged work joins the grouped
-/// receipt/apply/validation/commit phases after the selection loop.
 async fn stage_ready_completion<'a>(
     access: &SessionTemporalAccess<'_, RegisteredGlobalDb>,
     store: &SessionTemporalStore<'_, tracedecay_global_db::RegisteredGlobalDb>,
@@ -946,11 +928,8 @@ async fn stage_ready_completion<'a>(
     }
 }
 
-/// Maps one staged completion's failed phase onto the same terminal
-/// outcomes the per-item completion path produced: retryable releases the
-/// claim for the next pass, deterministic refusals retire the operation
-/// through the durable failure path, and anything else retains the claim
-/// because the durable outcome of the attempt is unknown.
+/// Retryable errors release the claim. A deterministic refusal retires the
+/// operation. Any other error retains the claim.
 async fn reject_staged_completion<'a>(
     store: &SessionTemporalStore<'_, tracedecay_global_db::RegisteredGlobalDb>,
     state: &'a SessionTemporalRefreshWakeState,
@@ -983,17 +962,13 @@ async fn reject_staged_completion<'a>(
     report.terminal_errors += 1;
 }
 
-/// One grouped transaction's deadline: the same per-item worst case the
-/// sequential path allowed — `operation_deadline` per item.
+/// `operation_deadline` per item.
 fn grouped_deadline(policy: SessionTemporalRefreshPolicy, items: usize) -> std::time::Duration {
     policy
         .operation_deadline
         .saturating_mul(items.max(1) as u32)
 }
 
-/// Commits the pass's deferred begins in one grouped transaction,
-/// reporting the same per-item outcomes
-/// `apply_prepared_refresh_effect` produced inline.
 async fn commit_deferred_begins<'a>(
     access: &SessionTemporalAccess<'_, RegisteredGlobalDb>,
     state: &SessionTemporalRefreshWakeState,
@@ -1062,9 +1037,6 @@ async fn commit_deferred_begins<'a>(
     }
 }
 
-/// Drains the pass's staged completions through the grouped phases the
-/// canonical completion path runs per session — receipts, relation
-/// applies, receipt-frontier validation, then one completion commit.
 async fn drain_staged_completions<'a>(
     database: &RegisteredGlobalDbLeaseV1,
     access: &SessionTemporalAccess<'_, RegisteredGlobalDb>,

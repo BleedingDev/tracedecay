@@ -154,8 +154,7 @@ pub(crate) async fn write_relation_projection(
     write_relation_projection_on_snapshot(database, &snapshot, projection, cancellation).await
 }
 
-/// [`write_relation_projection`] against a caller-owned snapshot so batch
-/// appliers share one read lease for every receipt check.
+/// Receipt check against a caller-owned snapshot.
 pub(crate) async fn write_relation_projection_on_snapshot(
     database: &impl SessionTemporalRegisteredDb,
     snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,

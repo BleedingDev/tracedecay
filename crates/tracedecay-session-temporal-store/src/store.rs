@@ -39,17 +39,12 @@ pub struct SessionTemporalStore<'a, D: SessionTemporalRegisteredDb> {
     db: &'a D,
 }
 
-/// One pending refresh after the read-only staging half of the materialize
-/// pipeline: either a begin ready to fold into the grouped commit, or a
-/// session whose durable state the completion loop resumes from.
 #[cfg(any(test, feature = "test-helpers"))]
 enum StagedSessionRefreshBegin {
     Grouped(Box<StagedGroupedBegin>),
     Resume(tracedecay_domain::SessionId),
 }
 
-/// One begin folded into the grouped commit: the request, its durable
-/// recovery, and the projected first batch that commits with it.
 #[cfg(any(test, feature = "test-helpers"))]
 struct StagedGroupedBegin {
     request: SessionRefreshBeginOrJoinRequestV1,
@@ -58,7 +53,6 @@ struct StagedGroupedBegin {
     batch: SessionTemporalProjectionBatchV1,
 }
 
-/// How a staged session finishes once the grouped commit returns.
 #[cfg(any(test, feature = "test-helpers"))]
 enum StagedSessionRefreshPost {
     /// Index into the grouped commit's items/recoveries vectors.
@@ -66,10 +60,6 @@ enum StagedSessionRefreshPost {
     Resume(tracedecay_domain::SessionId),
 }
 
-/// How one staged begin completes after the grouped begin commit: a
-/// completion request with its rebuilt relation projection ready for the
-/// grouped complete commit, a session that resumes through the running
-/// loop, or nothing left to do.
 #[cfg(any(test, feature = "test-helpers"))]
 enum MaterializeCompletionStage {
     Ready(Box<MaterializeReadyCompletion>),
@@ -77,8 +67,6 @@ enum MaterializeCompletionStage {
     Done,
 }
 
-/// A completion staged off the writer lane, ready for the grouped
-/// receipt/apply/validation/commit phases.
 #[cfg(any(test, feature = "test-helpers"))]
 struct MaterializeReadyCompletion {
     session_id: tracedecay_domain::SessionId,
@@ -247,12 +235,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 .into_iter()
                 .filter(|request| pending.remove(request.session_id()))
                 .collect();
-            // Refresh pipelines are independent per session: plan each
-            // begin and project its first batch off the writer lane
-            // concurrently, then fold every staged begin into one grouped
-            // physical commit (each item isolated by its own savepoint and
-            // acknowledged only after the commit returns), then drive the
-            // per-session completions concurrently again.
             let staged =
                 futures_util::stream::iter(matched)
                     .map(|request| async move {
@@ -288,12 +270,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 self.commit_session_refresh_begin_batch_group(items, ExecutionControl::default())
                     .await?
             };
-            // Stage each completion — snapshot preconditions and the
-            // candidate relation rebuild — off the writer lane, then fold
-            // every staged completion into one grouped physical commit.
-            // Items the commit refuses resume through the durable
-            // running-refresh loop, the same state an independent refused
-            // commit left behind.
             let mut staging: Vec<
                 std::pin::Pin<
                     Box<
@@ -331,15 +307,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 .buffered(8)
                 .try_collect::<Vec<_>>()
                 .await?;
-            // Fold every staged reconstruction into one grouped receipt
-            // commit (per-item savepoints; the durable states sequential
-            // receipt commits would leave), apply each committed
-            // projection to the native relation graph concurrently off the
-            // writer lane, re-run the post-apply receipt scan per session,
-            // then fold every surviving completion into one grouped
-            // commit. Items refused at any point resume through the
-            // durable running-refresh loop, the same state an independent
-            // refused or crashed commit left behind.
             let mut ready: Vec<
                 Option<(
                     tracedecay_domain::SessionId,
@@ -495,9 +462,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
         Ok(())
     }
 
-    /// Plans one pending refresh begin and projects its first batch — the
-    /// read-only half of the materialize pipeline, so it can run
-    /// concurrently for a whole discovery page before the grouped commit.
     #[cfg(any(test, feature = "test-helpers"))]
     async fn stage_session_refresh_begin_for_test(
         &self,
@@ -523,14 +487,8 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
         ))
     }
 
-    /// Stages one completion after the grouped begin commit: the fused
-    /// commit already wrote this batch's projection receipt, so
-    /// progress.is_complete() here is exactly the state the recovery reader
-    /// would return ReadyToComplete for — build the completion request
-    /// from memory instead of paying a recovery snapshot plus its reload
-    /// queries, then prove the snapshot preconditions and rebuild the
-    /// candidate relations off the writer lane. Anything else resumes
-    /// from durable state the way the sequential path did.
+    /// A persisted complete batch already has its receipt, so the completion
+    /// request is built from that progress. Anything else resumes from durable state.
     #[cfg(any(test, feature = "test-helpers"))]
     async fn stage_materialize_completion_for_test(
         &self,

@@ -1,7 +1,3 @@
-//! Real-store regressions for the shared batch apply: per-item acknowledgement
-//! atomicity inside the shared commit, cancellation, and stale/absent receipt
-//! handling on the shared-snapshot path.
-
 use std::sync::Arc;
 
 use tempfile::tempdir;
@@ -92,8 +88,7 @@ async fn activate_generation(
         .expect("activate generation");
 }
 
-/// Seed a pending receipt (and, unless `with_journal` is false, its journal
-/// row) exactly as refresh planning publishes them.
+/// Matches the receipt rows refresh planning publishes.
 async fn seed_pending_receipt(
     database: &RegisteredGlobalDb,
     projection: &SessionRelationProjection,
@@ -199,9 +194,6 @@ impl tracedecay_graph_db::GraphCancellation for AlwaysCancelled {
     }
 }
 
-/// A failed acknowledgement must roll back its own partial mutation inside the
-/// shared commit without poisoning the other items: the failing receipt stays
-/// pending while the healthy one is applied and its journal drained.
 #[tokio::test]
 async fn failed_acknowledgement_rolls_back_only_its_own_mutation() {
     let directory = tempdir().expect("temporary session store");
@@ -261,8 +253,6 @@ async fn failed_acknowledgement_rolls_back_only_its_own_mutation() {
     );
 }
 
-/// Cancellation checked per item on the shared snapshot keeps every receipt
-/// pending and writes nothing.
 #[tokio::test]
 async fn cancelled_batch_leaves_every_receipt_pending() {
     let directory = tempdir().expect("temporary session store");
@@ -306,8 +296,6 @@ async fn cancelled_batch_leaves_every_receipt_pending() {
     );
 }
 
-/// A projection whose receipt row is absent from the shared snapshot fails its
-/// own outcome without writing or disturbing the batch.
 #[tokio::test]
 async fn missing_receipt_fails_only_that_item() {
     let directory = tempdir().expect("temporary session store");

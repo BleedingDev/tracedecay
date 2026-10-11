@@ -3238,9 +3238,6 @@ async fn realistic_user_sessions_dbstat_names_dominant_bytes() {
     }
 }
 
-/// A savepoint failure inside a grouped receipt commit is a transaction
-/// boundary failure: the whole group rolls back and the call returns an
-/// error instead of acknowledging earlier items.
 #[tokio::test]
 async fn grouped_receipt_savepoint_failure_aborts_the_group() {
     let tmp = tempfile::tempdir().expect("tempdir");

@@ -62,8 +62,7 @@ pub(super) async fn rebuild_candidate_session_relations(
     applied
 }
 
-/// Reconstructs the candidate relation projection on a read snapshot — the
-/// read-only half of the rebuild, safe to run off the writer lane.
+/// Read-only half of the candidate relation rebuild.
 pub(super) async fn reconstruct_candidate_session_relations(
     database: &impl SessionTemporalRegisteredDb,
     session_id: &tracedecay_domain::SessionId,
@@ -98,16 +97,7 @@ pub(super) async fn reconstruct_candidate_session_relations(
     Ok(reconstructed)
 }
 
-/// Records several sessions' pending relation receipts in one physical
-/// commit. Each item runs under its own savepoint — receipt rows and the
-/// effect journal are session-scoped, so an item cannot observe another
-/// item's uncommitted rows — and a refused item rolls back to its
-/// savepoint while the rest of the group still commits, exactly the
-/// durable states sequential commits would leave. Watermarks are handed
-/// back only after the single commit returns, so no receipt is
-/// acknowledged before durability. The graph apply stays per session
-/// afterwards, so the receipt still commits independently of the
-/// completion's outcome.
+/// One commit, one savepoint per session. Watermarks are returned only after commit.
 #[tracing::instrument(
     name = "session_temporal.txn.record_relation_receipts",
     level = "trace",
@@ -192,10 +182,7 @@ pub(super) async fn record_relation_receipts_group(
     Ok(outcomes)
 }
 
-/// Applies a recorded receipt's projection to the native relation graph
-/// and verifies the loaded graph preserves the canonical reconstruction.
-/// `snapshot` must postdate the receipt commit so the expected-receipt
-/// check observes the pending row.
+/// `snapshot` must postdate the receipt commit.
 pub(super) async fn apply_candidate_relation_projection(
     database: &impl SessionTemporalRegisteredDb,
     snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,

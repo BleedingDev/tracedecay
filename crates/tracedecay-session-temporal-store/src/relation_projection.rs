@@ -152,9 +152,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         }))
     }
 
-    /// Reads `session_id`'s active generation and the relation projection
-    /// its publication froze, seeding one when the journal holds none, and
-    /// checks the projection's identity and bounds.
     async fn load_active_relation_projection(
         &self,
         snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
@@ -206,9 +203,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         Ok((generation, projection))
     }
 
-    /// Applies every listed session's active relation projection through one
-    /// shared snapshot and acknowledgement transaction, for fixtures that
-    /// materialize a large corpus without concurrent publishers.
+    /// One shared snapshot and acknowledgement. For fixtures with no concurrent publishers.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn apply_active_session_relation_projections_for_test(
         &self,
@@ -241,13 +236,9 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .collect()
     }
 
-    /// Applies each pre-validated projection through one shared receipt-check
-    /// snapshot and one acknowledgement transaction, returning every item's
-    /// own outcome so callers keep per-candidate failure semantics. Each
-    /// acknowledgement runs under its own savepoint: a failed write or
-    /// acknowledgement rolls back that item's partial mutation and leaves its
-    /// receipt pending for the next recovery pass exactly as the serial apply
-    /// does, without poisoning the rest of the shared commit.
+    /// One receipt snapshot and one acknowledgement transaction. Each
+    /// acknowledgement has its own savepoint. A failed savepoint boundary
+    /// rolls the whole transaction back.
     pub(crate) async fn apply_session_relation_projection_items(
         &self,
         projections: &[SessionRelationProjection],
@@ -285,14 +276,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .instrument(tracing::trace_span!("session_temporal.txn.begin"))
             .await
             .map_err(|error| storage(RECONSTRUCT_OPERATION, error))?;
-        // Each acknowledgement runs inside its own savepoint so a failed
-        // acknowledge rolls back only that item's partial mutation; the
-        // per-session apply used to roll its whole transaction back, and a
-        // shared commit must not turn that rollback into a committed
-        // applied-without-journal receipt. Savepoint control itself is
-        // transaction-critical: when SAVEPOINT or RELEASE/ROLLBACK TO fails,
-        // the whole transaction rolls back rather than letting any partially
-        // mutated acknowledgement reach the shared commit.
         for index in acknowledge {
             if let Err(error) = transaction
                 .execute_batch("SAVEPOINT relation_projection_ack")
@@ -489,11 +472,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             }
             ready.push((processed - 1, projection));
         }
-        // One batched apply writes every candidate's projection under a
-        // shared receipt snapshot and acknowledges them in a single commit,
-        // instead of each candidate paying its own snapshot, replace
-        // transaction, and acknowledgement transaction. Per-candidate results
-        // keep the same settle semantics as the serial apply.
         let outcomes = self
             .apply_session_relation_projection_items(
                 &ready
