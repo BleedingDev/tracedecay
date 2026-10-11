@@ -94,4 +94,11 @@ fn index_bench_runs_the_committed_corpus_end_to_end() {
         increment_ms > 0,
         "incremental generation must report a duration"
     );
+    let spot_checked = report["spot_checked_queries"]
+        .as_u64()
+        .expect("spot-checked query count");
+    assert!(
+        spot_checked >= 3,
+        "incremental index must match a fresh full index on 3 or more queries, got {spot_checked}"
+    );
 }
