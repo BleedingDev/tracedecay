@@ -17,6 +17,14 @@ py_test(
     main = "test-measure-unused-tool-context.py",
 )
 
+py_test(
+    name = "work_provider_native_conformance_test",
+    size = "medium",
+    srcs = ["test-work-provider-native-conformance.py"],
+    data = ["work_provider_native_conformance.sh"],
+    main = "test-work-provider-native-conformance.py",
+)
+
 exports_files(
     [
         "bazel/rust_test.bzl",
