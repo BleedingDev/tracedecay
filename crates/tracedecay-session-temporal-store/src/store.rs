@@ -55,7 +55,6 @@ struct StagedGroupedBegin {
 
 #[cfg(any(test, feature = "test-helpers"))]
 enum StagedSessionRefreshPost {
-    /// Index into the grouped commit's items/recoveries vectors.
     Grouped(usize),
     Resume(tracedecay_domain::SessionId),
 }
@@ -171,9 +170,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             .await
     }
 
-    /// Commits several sessions' begin+first-batch folds in one physical
-    /// transaction; see
-    /// [`SessionTemporalAccess::commit_session_refresh_begin_batch_group`].
     pub async fn commit_session_refresh_begin_batch_group(
         &self,
         items: Vec<crate::SessionRefreshBeginBatchItemV1>,
@@ -390,9 +386,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                                     context: "test temporal fixture staged completion",
                                 });
                             };
-                            // The final receipt scan names the candidate
-                            // generation the refresh builds, not the base
-                            // generation the watermarks froze as active.
                             let generation = tracedecay_domain::SessionProjectionGenerationV1::new(
                                 verified.generation,
                             )
@@ -487,8 +480,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
         ))
     }
 
-    /// A persisted complete batch already has its receipt, so the completion
-    /// request is built from that progress. Anything else resumes from durable state.
     #[cfg(any(test, feature = "test-helpers"))]
     async fn stage_materialize_completion_for_test(
         &self,

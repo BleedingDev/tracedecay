@@ -183,7 +183,6 @@ pub enum SessionRefreshBeginPlanV1 {
     Joined,
 }
 
-/// One session inside [`SessionTemporalAccess::commit_session_refresh_begin_batch_group`].
 #[derive(Debug)]
 pub struct SessionRefreshBeginBatchItemV1 {
     pub request: SessionRefreshBeginOrJoinRequestV1,
@@ -381,12 +380,9 @@ async fn begin_session_refresh_in_transaction(
 
 enum SessionRefreshSnapshotPlan {
     Planned(SessionRefreshBeginPlanV1),
-    /// Missing cursor key, or no active generation this snapshot can mint.
     NeedsWrite,
 }
 
-/// Plans a begin from committed reads. The committing replay rejects a plan
-/// the durable state no longer matches.
 async fn plan_session_refresh_on_snapshot(
     conn: &impl crate::handle::SessionTemporalQuery,
     request: SessionRefreshBeginOrJoinRequestV1,
@@ -427,8 +423,6 @@ async fn plan_session_refresh_on_snapshot(
         match read_active_generation(conn, session_id).await? {
             Some(active) => (active.0, active.1, false),
             None => {
-                // Empty generation table: the commit mints generation 1 and the
-                // candidate is 2. Any other missing active row cannot be planned here.
                 if candidate_base.value() != 1 {
                     return Ok(SessionRefreshSnapshotPlan::NeedsWrite);
                 }
@@ -443,8 +437,6 @@ async fn plan_session_refresh_on_snapshot(
             }
         };
     let candidate_generation = if minted {
-        // The commit mints generation 1 first, so this candidate is 2 rather
-        // than the empty table's next-generation answer.
         SessionProjectionGenerationV1::new(2)?
     } else {
         candidate_base
@@ -603,8 +595,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         let session_id = request.session_id().clone();
         let coverage_request = request.coverage_request().clone();
         let refresh_key = request.refresh_key().cloned();
-        // A rolled-back mint would change the key the commit replay reads, so
-        // provision a missing key before planning.
         let key_snapshot = self
             .read_snapshot()
             .await
@@ -630,9 +620,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .read_snapshot()
             .await
             .map_err(|error| storage(BEGIN_REFRESH, error))?;
-        // A reset can arrive between the earlier probe and this snapshot;
-        // recheck on the snapshot so a concurrent reset still commits begin
-        // alone through the write path instead of planning against it.
         if !session_reset_is_pending(&snapshot, &session_id).await? {
             match plan_session_refresh_on_snapshot(
                 &snapshot,
@@ -843,9 +830,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         }
     }
 
-    /// One transaction, one savepoint per session. A refused batch rolls back
-    /// to its savepoint and the begin commits alone. Outcomes are returned
-    /// only after commit. A transaction-level error aborts the group.
     #[tracing::instrument(
         name = "session_temporal.txn.begin_refresh_batch_group",
         level = "trace",
@@ -1127,8 +1111,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             checkpoint_relation_rebuild_control(&execution_control)?;
             return Ok(receipt);
         }
-        // Fail a stale running operation before the rebuild. The finish
-        // transaction checks the same rows again.
         let binding = require_running_binding(
             &snapshot,
             request.session_id(),
@@ -1152,8 +1134,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         )
         .await?;
 
-        // The scan only reads. The finish transaction re-proves terminal
-        // progress and the candidate frontier.
         let validation_snapshot = self
             .read_snapshot()
             .await
@@ -1201,8 +1181,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         }
     }
 
-    /// One transaction, one savepoint per session. A failed revalidation
-    /// rolls that item back. Receipts are returned only after commit.
     #[tracing::instrument(
         name = "session_temporal.txn.complete_refresh_group",
         level = "trace",
@@ -1286,9 +1264,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         Ok(receipts)
     }
 
-    /// Proves the same snapshot preconditions as
-    /// `complete_session_refresh_result` and reconstructs the candidate
-    /// projection. Later phases re-prove what they commit.
     pub async fn stage_session_refresh_completion(
         &self,
         request: SessionRefreshCompletionRequestV1,
@@ -1336,8 +1311,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         })
     }
 
-    /// One commit for several sessions' pending relation receipts.
-    /// Watermarks are returned only after that commit.
     pub async fn record_relation_receipts_group(
         &self,
         projections: &[SessionRelationProjection],
@@ -1352,7 +1325,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         .await
     }
 
-    /// `snapshot` must postdate the receipt commit.
     pub async fn apply_candidate_relation_projection(
         &self,
         snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
@@ -3207,7 +3179,6 @@ fn decode_refresh_state(
     }
 }
 
-/// Batch persist shared by the single-item and grouped begin commits.
 async fn persist_begin_batch_in_transaction(
     transaction: &impl SessionTemporalWriteTxn,
     binding: &RefreshBinding,
@@ -3244,12 +3215,9 @@ async fn persist_begin_batch_in_transaction(
     Ok(receipt)
 }
 
-/// A completion whose snapshot preconditions are already proven.
 #[derive(Debug)]
 pub enum SessionRefreshCompletionStage {
-    /// The request is already satisfied.
     Durable(SessionRefreshReceiptV1),
-    /// Reconstruction is ready for the grouped receipt, apply, and completion commits.
     Ready {
         request: SessionRefreshCompletionRequestV1,
         relation_projection: Box<SessionRelationProjection>,
@@ -3257,7 +3225,6 @@ pub enum SessionRefreshCompletionStage {
     },
 }
 
-/// Commit-time proof and finish writes shared by the single-session and grouped paths.
 async fn complete_session_refresh_in_transaction(
     transaction: &impl SessionTemporalWriteTxn,
     request: SessionRefreshCompletionRequestV1,
@@ -3278,7 +3245,6 @@ async fn complete_session_refresh_in_transaction(
         COMPLETE_REFRESH,
     )
     .await?;
-    // Proven in this transaction, not on the snapshot taken before it.
     let progress = require_exact_terminal_progress(
         transaction,
         request.session_id(),
@@ -3337,7 +3303,6 @@ async fn complete_session_refresh_in_transaction(
     Ok(SessionRefreshReceiptV1::completed(request, terminal_at))
 }
 
-/// A failed savepoint boundary leaves item writes live, so the group rolls back unacknowledged.
 pub(super) async fn abort_grouped_transaction<T>(
     transaction: impl SessionTemporalWriteTxn,
     boundary_error: SessionStoreError,
@@ -3366,7 +3331,6 @@ async fn rollback_begin_item_savepoint(
     Ok(())
 }
 
-/// Replay and batch persist for one savepoint. A refused batch commits the begin alone.
 async fn commit_begin_batch_item_in_transaction(
     transaction: &impl SessionTemporalWriteTxn,
     index: usize,
@@ -3437,8 +3401,6 @@ async fn commit_begin_batch_item_in_transaction(
         }
         Err(_) => {
             rollback_begin_item_savepoint(transaction, &savepoint).await?;
-            // The refused batch rolled back. Commit the begin alone, matching
-            // a crash between the two commits.
             let alone = format!("{savepoint}_alone");
             transaction
                 .execute(&format!("SAVEPOINT {alone}"), ())

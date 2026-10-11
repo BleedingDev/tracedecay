@@ -715,7 +715,6 @@ struct DeferredPreparedBegin<'a> {
     item: SessionRefreshBeginBatchItemV1,
 }
 
-/// Released on drop unless `retain` is set.
 struct ClaimedTerminalAttempt<'a> {
     state: &'a SessionTemporalRefreshWakeState,
     recovery: SessionRefreshRecoveryV1,
@@ -928,8 +927,6 @@ async fn stage_ready_completion<'a>(
     }
 }
 
-/// Retryable errors release the claim. A deterministic refusal retires the
-/// operation. Any other error retains the claim.
 async fn reject_staged_completion<'a>(
     store: &SessionTemporalStore<'_, tracedecay_global_db::RegisteredGlobalDb>,
     state: &'a SessionTemporalRefreshWakeState,
@@ -962,7 +959,6 @@ async fn reject_staged_completion<'a>(
     report.terminal_errors += 1;
 }
 
-/// `operation_deadline` per item.
 fn grouped_deadline(policy: SessionTemporalRefreshPolicy, items: usize) -> std::time::Duration {
     policy
         .operation_deadline

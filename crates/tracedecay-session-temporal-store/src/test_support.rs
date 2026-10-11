@@ -84,12 +84,6 @@ impl<T: SessionTemporalExec> SessionTemporalExec for QueryCountingConnection<'_,
     }
 }
 
-/// Registered-database wrapper that fails chosen `execute`s: each
-/// `(prefix, fail_on_match)` entry errors the Nth and later statements
-/// whose SQL starts with that prefix. The real maintained transaction
-/// still runs underneath; only those boundary statements error so
-/// grouped-commit abort paths are covered through the production
-/// authority.
 pub(crate) struct FailingRegisteredDb<'a> {
     inner: &'a tracedecay_global_db::RegisteredGlobalDb,
     plan: Vec<(&'static str, usize)>,
@@ -117,8 +111,6 @@ impl<'a> FailingRegisteredDb<'a> {
     }
 }
 
-/// The write transaction `FailingRegisteredDb` opens: delegates every call
-/// except `execute`, which reports a runtime error on the chosen match.
 pub(crate) struct FailingWriteTxn<'a> {
     inner: tracedecay_global_db::RegisteredGlobalDbWriteTransaction<'a>,
     plan: Vec<(&'static str, usize)>,

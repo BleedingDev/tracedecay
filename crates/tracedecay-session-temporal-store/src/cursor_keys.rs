@@ -62,8 +62,6 @@ pub struct SessionTemporalCursorKeyProvider {
     authenticators: Vec<(SignedCursorKeyRefV1, InMemoryCursorAuthenticator)>,
 }
 
-/// Reads the sole active cursor key, validating id, version, and material
-/// the same way provisioning does.
 pub(super) async fn read_active_session_cursor_key(
     connection: &impl crate::handle::SessionTemporalQuery,
 ) -> SessionStoreResult<Option<SignedCursorKeyRefV1>> {

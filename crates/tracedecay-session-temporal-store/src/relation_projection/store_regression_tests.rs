@@ -88,7 +88,6 @@ async fn activate_generation(
         .expect("activate generation");
 }
 
-/// Matches the receipt rows refresh planning publishes.
 async fn seed_pending_receipt(
     database: &RegisteredGlobalDb,
     projection: &SessionRelationProjection,
@@ -211,8 +210,6 @@ async fn failed_acknowledgement_rolls_back_only_its_own_mutation() {
     let ok_projection = projection(&scope, &ok_session, 1);
     let bad_projection = projection(&scope, &bad_session, 1);
     seed_pending_receipt(database, &ok_projection, true).await;
-    // A pending receipt whose journal row vanished mid-pass: the UPDATE lands
-    // first, then the DELETE finds nothing and fails after mutating.
     seed_pending_receipt(database, &bad_projection, false).await;
 
     let projections = [bad_projection, ok_projection];
@@ -313,9 +310,6 @@ async fn missing_receipt_fails_only_that_item() {
     let ok_projection = projection(&scope, &ok_session, 1);
     let stale_projection = projection(&scope, &stale_session, 1);
     seed_pending_receipt(database, &ok_projection, true).await;
-    // No receipt/journal is seeded for the stale item: its snapshot receipt
-    // check reports unavailable instead of acknowledging against nothing.
-
     let projections = [stale_projection, ok_projection];
     let outcomes = SessionTemporalAccess::new(database)
         .apply_session_relation_projection_items(&projections, Arc::new(NeverCancelled))

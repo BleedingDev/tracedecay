@@ -203,7 +203,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         Ok((generation, projection))
     }
 
-    /// One shared snapshot and acknowledgement. For fixtures with no concurrent publishers.
     #[cfg(any(test, feature = "test-helpers"))]
     pub async fn apply_active_session_relation_projections_for_test(
         &self,
@@ -236,9 +235,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .collect()
     }
 
-    /// One receipt snapshot and one acknowledgement transaction. Each
-    /// acknowledgement has its own savepoint. A failed savepoint boundary
-    /// rolls the whole transaction back.
     pub(crate) async fn apply_session_relation_projection_items(
         &self,
         projections: &[SessionRelationProjection],

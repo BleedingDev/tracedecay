@@ -62,7 +62,6 @@ pub(super) async fn rebuild_candidate_session_relations(
     applied
 }
 
-/// Read-only half of the candidate relation rebuild.
 pub(super) async fn reconstruct_candidate_session_relations(
     database: &impl SessionTemporalRegisteredDb,
     session_id: &tracedecay_domain::SessionId,
@@ -97,7 +96,6 @@ pub(super) async fn reconstruct_candidate_session_relations(
     Ok(reconstructed)
 }
 
-/// One commit, one savepoint per session. Watermarks are returned only after commit.
 #[tracing::instrument(
     name = "session_temporal.txn.record_relation_receipts",
     level = "trace",
@@ -182,7 +180,6 @@ pub(super) async fn record_relation_receipts_group(
     Ok(outcomes)
 }
 
-/// `snapshot` must postdate the receipt commit.
 pub(super) async fn apply_candidate_relation_projection(
     database: &impl SessionTemporalRegisteredDb,
     snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,

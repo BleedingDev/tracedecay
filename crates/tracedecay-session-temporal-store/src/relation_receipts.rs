@@ -154,7 +154,6 @@ pub(crate) async fn write_relation_projection(
     write_relation_projection_on_snapshot(database, &snapshot, projection, cancellation).await
 }
 
-/// Receipt check against a caller-owned snapshot.
 pub(crate) async fn write_relation_projection_on_snapshot(
     database: &impl SessionTemporalRegisteredDb,
     snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
