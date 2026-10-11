@@ -8,7 +8,6 @@ use tracedecay_domain::{
 use tracedecay_graph_db::{GraphCancellation, GraphWatermark};
 use tracedecay_runtime_core::db::engine::params;
 use tracedecay_store::{SessionStoreError, SessionStoreResult};
-use tracing::Instrument as _;
 
 use super::operations::CanonicalPublicationManifest;
 use super::query::{generation_i64, storage, storage_message};
@@ -226,92 +225,36 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                     Arc::clone(&cancellation),
                 )
                 .await?;
+            super::relation_receipts::write_relation_projection_on_snapshot(
+                self.inner(),
+                &snapshot,
+                &projection,
+                Arc::clone(&cancellation),
+            )
+            .await?;
             projections.push(projection);
         }
         drop(snapshot);
-        self.apply_session_relation_projection_items(&projections, cancellation)
-            .await?
-            .into_iter()
-            .collect()
-    }
-
-    pub(crate) async fn apply_session_relation_projection_items(
-        &self,
-        projections: &[SessionRelationProjection],
-        cancellation: Arc<dyn GraphCancellation>,
-    ) -> SessionStoreResult<Vec<SessionStoreResult<()>>> {
-        let snapshot = self
-            .read_snapshot()
-            .await
-            .map_err(|error| storage(RECONSTRUCT_OPERATION, error))?;
-        let mut outcomes = Vec::with_capacity(projections.len());
-        let mut acknowledge = Vec::new();
-        for (index, projection) in projections.iter().enumerate() {
-            let outcome = match require_not_cancelled(&cancellation) {
-                Err(error) => Err(error),
-                Ok(()) => super::relation_receipts::write_relation_projection_on_snapshot(
-                    self.inner(),
-                    &snapshot,
-                    projection,
-                    Arc::clone(&cancellation),
-                )
-                .await
-                .map(|_| ()),
-            };
-            if outcome.is_ok() {
-                acknowledge.push(index);
-            }
-            outcomes.push(outcome);
-        }
-        drop(snapshot);
-        if acknowledge.is_empty() {
-            return Ok(outcomes);
-        }
         let transaction = self
             .begin_write_transaction()
-            .instrument(tracing::trace_span!("session_temporal.txn.begin"))
             .await
             .map_err(|error| storage(RECONSTRUCT_OPERATION, error))?;
-        for index in acknowledge {
-            if let Err(error) = transaction
-                .execute_batch("SAVEPOINT relation_projection_ack")
-                .await
+        for projection in &projections {
+            if let Err(error) =
+                super::relation_receipts::acknowledge_relation_receipt(&transaction, projection)
+                    .await
             {
                 transaction
                     .rollback()
-                    .instrument(tracing::trace_span!("session_temporal.txn.rollback"))
                     .await
                     .map_err(|rollback| storage(RECONSTRUCT_OPERATION, rollback))?;
-                return Err(storage(RECONSTRUCT_OPERATION, error));
-            }
-            let result = super::relation_receipts::acknowledge_relation_receipt(
-                &transaction,
-                &projections[index],
-            )
-            .await;
-            let savepoint = if result.is_ok() {
-                "RELEASE relation_projection_ack"
-            } else {
-                "ROLLBACK TO relation_projection_ack; RELEASE relation_projection_ack"
-            };
-            if let Err(error) = transaction.execute_batch(savepoint).await {
-                transaction
-                    .rollback()
-                    .instrument(tracing::trace_span!("session_temporal.txn.rollback"))
-                    .await
-                    .map_err(|rollback| storage(RECONSTRUCT_OPERATION, rollback))?;
-                return Err(storage(RECONSTRUCT_OPERATION, error));
-            }
-            if let Err(error) = result {
-                outcomes[index] = Err(error);
+                return Err(error);
             }
         }
         transaction
             .commit()
-            .instrument(tracing::trace_span!("session_temporal.txn.commit"))
             .await
-            .map_err(|error| storage(RECONSTRUCT_OPERATION, error))?;
-        Ok(outcomes)
+            .map_err(|error| storage(RECONSTRUCT_OPERATION, error))
     }
 
     #[tracing::instrument(
@@ -410,7 +353,6 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         pending.truncate(limit);
         let mut recovered = 0_usize;
         let mut processed = 0_usize;
-        let mut ready: Vec<(usize, SessionRelationProjection)> = Vec::new();
         for candidate in &pending {
             require_not_cancelled(&cancellation)?;
             processed = processed.saturating_add(1);
@@ -466,32 +408,22 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
                     .await?;
                 continue;
             }
-            ready.push((processed - 1, projection));
-        }
-        let outcomes = self
-            .apply_session_relation_projection_items(
-                &ready
-                    .iter()
-                    .map(|(_, projection)| projection.clone())
-                    .collect::<Vec<_>>(),
+            match super::relation_receipts::apply_relation_projection(
+                self.inner(),
+                &projection,
                 Arc::clone(&cancellation),
             )
-            .await?;
-        for ((candidate_index, _), outcome) in ready.into_iter().zip(outcomes) {
-            match outcome {
-                Ok(()) => recovered = recovered.saturating_add(1),
+            .await
+            {
+                Ok(_) => recovered = recovered.saturating_add(1),
                 Err(SessionStoreError::Cancelled) => return Err(SessionStoreError::Cancelled),
                 Err(SessionStoreError::DeadlineExceeded) => {
                     return Err(SessionStoreError::DeadlineExceeded);
                 }
                 Err(error) => {
                     let (failure_code, permanent) = relation_apply_failure_disposition(&error);
-                    self.settle_relation_recovery_failure(
-                        &pending[candidate_index],
-                        failure_code,
-                        permanent,
-                    )
-                    .await?;
+                    self.settle_relation_recovery_failure(candidate, failure_code, permanent)
+                        .await?;
                 }
             }
         }
@@ -1886,6 +1818,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod store_regression_tests;

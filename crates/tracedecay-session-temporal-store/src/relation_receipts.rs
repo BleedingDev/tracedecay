@@ -293,7 +293,7 @@ pub(crate) async fn relation_receipt_applied(
     Ok(state.as_deref() == Some("applied"))
 }
 
-pub(crate) async fn expected_receipt(
+async fn expected_receipt(
     conn: &impl crate::handle::SessionTemporalQuery,
     session_id: &SessionId,
     generation: SessionProjectionGenerationV1,
