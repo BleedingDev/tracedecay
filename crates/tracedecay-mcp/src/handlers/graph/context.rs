@@ -317,13 +317,15 @@ fn artifact_window_site(
     if slice != window.sanitized_text.as_str().as_bytes() {
         return None;
     }
+    // Body chunks absorb the blank lines that follow a declaration; the
+    // served block ends at its last non-blank byte.
+    let code = window.sanitized_text.as_str().trim_end();
+    if code.is_empty() {
+        return None;
+    }
     let start_line = line_number_at(source, start).saturating_sub(1);
-    let end_line = line_number_at(source, end.saturating_sub(1)).saturating_sub(1);
-    Some((
-        start_line,
-        end_line,
-        window.sanitized_text.as_str().to_owned(),
-    ))
+    let end_line = line_number_at(source, start + code.len() - 1).saturating_sub(1);
+    Some((start_line, end_line, code.to_owned()))
 }
 
 /// Verified code for `path` from the site's attested window, or `None`
@@ -989,6 +991,21 @@ mod tests {
         assert_eq!(start_line, 2);
         assert_eq!(end_line, 2);
         assert_eq!(code, admitted);
+
+        let body = "fn widget() -> u32 { 7 }\n\n";
+        let trailing = tracedecay_query::code_search::CodeIndexSearchWindowV1 {
+            source_span: tracedecay_domain::SourceSpan {
+                start_byte: window.source_span.start_byte,
+                end_byte: window.source_span.start_byte + body.len() as u64,
+            },
+            sanitized_text: tracedecay_domain::BoundedSanitizedText::new(body)
+                .expect("bounded sanitized text"),
+        };
+        let padded = format!("{source}\n");
+        assert_eq!(
+            artifact_window_site(&padded, &trailing),
+            Some((2, 2, admitted.to_owned()))
+        );
     }
 
     #[test]

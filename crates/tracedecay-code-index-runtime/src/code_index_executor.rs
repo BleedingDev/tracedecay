@@ -380,104 +380,95 @@ pub fn code_index_search_display_binding(
         return Err(HydrationUnavailableV1::Stale);
     }
     let anchor = candidate.candidate.anchor_id.as_str();
-    let (display, expected_source_occurrence) = if let Some(occurrence) =
-        anchor.strip_prefix("code-symbol:")
-    {
-        let symbol = generation
-            .symbols()
-            .symbols
-            .iter()
-            .find(|symbol| symbol.occurrence.as_str() == occurrence)
-            .ok_or(HydrationUnavailableV1::Invalid)?;
-        // Bind the chunk the candidate's validated provenance names —
-        // a multi-chunk symbol must serve the window the lane matched,
-        // not an arbitrary manifest entry. Occurrences without a
-        // provenance chunk (graph-lane symbol hits) fall back to the
-        // occurrence's earliest byte window, the declaration head.
-        // None when the manifest holds no chunk for the occurrence:
-        // the location stands, code reports unavailable.
-        let source_prefix = format!(
-            "code-chunk:{}:",
-            generation.manifest().generation_id.as_str()
-        );
-        let code_window = candidate
-            .candidate
-            .occurrences
-            .iter()
-            .filter_map(|p| occurrence_chunk_id(p, &source_prefix))
-            .find_map(|chunk_id| {
-                generation.chunks().chunks().iter().find(|chunk| {
-                    chunk.id.as_str() == chunk_id
-                        && chunk.anchor.symbol_occurrence_id.as_ref() == Some(&symbol.occurrence)
+    let (display, expected_source_occurrence) =
+        if let Some(occurrence) = anchor.strip_prefix("code-symbol:") {
+            let symbol = generation
+                .symbols()
+                .symbols
+                .iter()
+                .find(|symbol| symbol.occurrence.as_str() == occurrence)
+                .ok_or(HydrationUnavailableV1::Invalid)?;
+            // Bind the chunk the candidate's validated provenance names, so
+            // a multi-chunk symbol serves the window the lane matched rather
+            // than an arbitrary manifest entry. None when the manifest holds
+            // no body chunk for the occurrence: the location stands and code
+            // reports unavailable.
+            let source_prefix = format!(
+                "code-chunk:{}:",
+                generation.manifest().generation_id.as_str()
+            );
+            let matched = candidate
+                .candidate
+                .occurrences
+                .iter()
+                .filter_map(|p| occurrence_chunk_id(p, &source_prefix))
+                .find_map(|chunk_id| {
+                    generation
+                        .chunks()
+                        .chunks()
+                        .iter()
+                        .find(|chunk| chunk.id.as_str() == chunk_id)
                 })
-            })
-            .or_else(|| {
-                generation
-                    .chunks()
-                    .chunks()
-                    .iter()
-                    .filter(|chunk| {
-                        chunk.anchor.symbol_occurrence_id.as_ref() == Some(&symbol.occurrence)
-                    })
-                    .min_by_key(|chunk| chunk.anchor.source_span.start_byte)
-            })
-            .map(|chunk| published_chunk_window(chunk));
-        let display = code_index_symbol_display(symbol, display_paths, code_window)?;
-        (display, None)
-    } else if let Some(chunk_id) = anchor.strip_prefix("code-chunk:") {
-        let chunk_id = tracedecay_domain::CodeSearchChunkId::new(chunk_id.to_owned())
-            .map_err(|_| HydrationUnavailableV1::Invalid)?;
-        let chunk = generation
-            .chunks()
-            .chunk(&chunk_id)
-            .ok_or(HydrationUnavailableV1::Invalid)?;
-        // Membership in the published generation's chunk manifest is the
-        // serving binding. File-page generation_id is extraction provenance.
-        let chunk_window = published_chunk_window(chunk);
-        let display = match chunk.anchor.symbol_occurrence_id.as_ref() {
-            Some(occurrence) => {
-                let symbol = generation
-                    .symbols()
-                    .symbols
-                    .iter()
-                    .find(|symbol| symbol.occurrence == *occurrence)
-                    .ok_or(HydrationUnavailableV1::Invalid)?;
-                // The chunk's byte window verifies code serving while
-                // the lineage rows stay the symbol's location. Corrupt
-                // lineage lines leave only the chunk's own window.
-                code_index_symbol_display(symbol, display_paths, Some(chunk_window))?
-            }
-            None => {
-                let file = generation
-                    .snapshot()
-                    .files
-                    .iter()
-                    .find(|file| {
-                        file.file_occurrence_id == chunk.anchor.file_occurrence_id
-                            && file.disposition
-                                == tracedecay_domain::SnapshotFileDispositionV1::Present
-                    })
-                    .ok_or(HydrationUnavailableV1::Invalid)?;
-                code_search::CodeIndexSearchDisplayV1 {
-                    name: file
-                        .logical_path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or(file.logical_path.as_str())
-                        .to_owned(),
-                    qualified_name: file.logical_path.clone(),
-                    kind: "file".to_owned(),
-                    path: file.logical_path.clone(),
-                    site: Some(code_search::CodeIndexSearchSiteV1::ArtifactWindow(
-                        chunk_window,
-                    )),
+                .map(AsRef::as_ref);
+            let code_window = symbol_body_chunk(generation, &symbol.occurrence, matched)
+                .map(published_chunk_window);
+            let display = code_index_symbol_display(symbol, display_paths, code_window)?;
+            (display, None)
+        } else if let Some(chunk_id) = anchor.strip_prefix("code-chunk:") {
+            let chunk_id = tracedecay_domain::CodeSearchChunkId::new(chunk_id.to_owned())
+                .map_err(|_| HydrationUnavailableV1::Invalid)?;
+            let chunk = generation
+                .chunks()
+                .chunk(&chunk_id)
+                .ok_or(HydrationUnavailableV1::Invalid)?;
+            // Membership in the published generation's chunk manifest is the
+            // serving binding. File-page generation_id is extraction provenance.
+            let display = match chunk.anchor.symbol_occurrence_id.as_ref() {
+                Some(occurrence) => {
+                    let symbol = generation
+                        .symbols()
+                        .symbols
+                        .iter()
+                        .find(|symbol| symbol.occurrence == *occurrence)
+                        .ok_or(HydrationUnavailableV1::Invalid)?;
+                    // The body window verifies code serving while the lineage
+                    // rows stay the symbol's location. Corrupt lineage lines
+                    // leave only that window.
+                    let code_window = symbol_body_chunk(generation, occurrence, Some(chunk))
+                        .map(published_chunk_window);
+                    code_index_symbol_display(symbol, display_paths, code_window)?
                 }
-            }
+                None => {
+                    let file = generation
+                        .snapshot()
+                        .files
+                        .iter()
+                        .find(|file| {
+                            file.file_occurrence_id == chunk.anchor.file_occurrence_id
+                                && file.disposition
+                                    == tracedecay_domain::SnapshotFileDispositionV1::Present
+                        })
+                        .ok_or(HydrationUnavailableV1::Invalid)?;
+                    code_search::CodeIndexSearchDisplayV1 {
+                        name: file
+                            .logical_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(file.logical_path.as_str())
+                            .to_owned(),
+                        qualified_name: file.logical_path.clone(),
+                        kind: "file".to_owned(),
+                        path: file.logical_path.clone(),
+                        site: Some(code_search::CodeIndexSearchSiteV1::ArtifactWindow(
+                            published_chunk_window(chunk),
+                        )),
+                    }
+                }
+            };
+            (display, Some(format!("code-chunk:{}", chunk_id.as_str())))
+        } else {
+            return Err(HydrationUnavailableV1::Invalid);
         };
-        (display, Some(format!("code-chunk:{}", chunk_id.as_str())))
-    } else {
-        return Err(HydrationUnavailableV1::Invalid);
-    };
     let provenance = candidate
         .candidate
         .occurrences
@@ -585,12 +576,30 @@ pub fn code_index_text_search_display_binding(
         return Err(HydrationUnavailableV1::Invalid);
     }
 
-    let site = Some(code_search::CodeIndexSearchSiteV1::ArtifactWindow(
-        code_search::CodeIndexSearchWindowV1 {
+    // A signature chunk is the opening line of its symbol's first body
+    // piece; a name match serves that body, the declaration it opens.
+    let window = match (&occurrence.grain, &occurrence.parent_chunk) {
+        (tracedecay_domain::CodeSearchChunkGrainV1::SymbolSignature, Some(parent)) => {
+            let body = latest
+                .artifact_occurrence_by_chunk(parent)
+                .map_err(|_| HydrationUnavailableV1::AuthorityUnavailable)?;
+            if body.generation != occurrence.generation
+                || body.file != occurrence.file
+                || body.symbol != occurrence.symbol
+            {
+                return Err(HydrationUnavailableV1::Invalid);
+            }
+            code_search::CodeIndexSearchWindowV1 {
+                source_span: body.source_span,
+                sanitized_text: body.sanitized_text,
+            }
+        }
+        _ => code_search::CodeIndexSearchWindowV1 {
             source_span: occurrence.source_span,
             sanitized_text: occurrence.sanitized_text.clone(),
         },
-    ));
+    };
+    let site = Some(code_search::CodeIndexSearchSiteV1::ArtifactWindow(window));
     let display = match occurrence.symbol {
         Some(_) => code_search::CodeIndexSearchDisplayV1 {
             name: occurrence
@@ -657,6 +666,34 @@ impl CodeIndexSearchDisplaySourceV1 {
             }
         }
     }
+}
+
+/// The body-grain chunk that serves `occurrence` as code: `matched` when
+/// the lane matched one of its body pieces, otherwise its first body
+/// piece. A signature chunk is the opening line of that first piece, so a
+/// signature match serves the declaration it opens instead of one line.
+fn symbol_body_chunk<'g>(
+    generation: &'g crate::code_index::production::CodeIndexPublishedGenerationV1,
+    occurrence: &tracedecay_domain::SymbolOccurrenceId,
+    matched: Option<&'g tracedecay_domain::CodeSearchChunkV1>,
+) -> Option<&'g tracedecay_domain::CodeSearchChunkV1> {
+    let serves = |chunk: &tracedecay_domain::CodeSearchChunkV1| {
+        chunk.anchor.symbol_occurrence_id.as_ref() == Some(occurrence)
+            && matches!(
+                chunk.anchor.grain,
+                tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
+                    | tracedecay_domain::CodeSearchChunkGrainV1::SymbolMember
+            )
+    };
+    matched.filter(|chunk| serves(chunk)).or_else(|| {
+        generation
+            .chunks()
+            .chunks()
+            .iter()
+            .map(AsRef::as_ref)
+            .filter(|chunk| serves(chunk))
+            .min_by_key(|chunk| chunk.anchor.source_span.start_byte)
+    })
 }
 
 fn published_chunk_window(

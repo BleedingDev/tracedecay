@@ -451,8 +451,11 @@ fn production_symbol_candidate_binds_the_attributed_chunk_window() {
         .chunks()
         .chunks()
         .iter()
-        .find(|chunk| chunk.anchor.symbol_occurrence_id.is_some())
-        .expect("symbol-backed production chunk");
+        .find(|chunk| {
+            chunk.anchor.symbol_occurrence_id.is_some()
+                && chunk.anchor.grain == tracedecay_domain::CodeSearchChunkGrainV1::SymbolBody
+        })
+        .expect("symbol body production chunk");
     let symbol_occurrence = chunk
         .anchor
         .symbol_occurrence_id
