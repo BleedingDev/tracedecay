@@ -280,6 +280,7 @@ impl<E: ReaderQueryExecutor> ReaderLease<E> {
     }
 
     fn start_snapshot(&mut self) -> Result<(), ReaderWorkerError> {
+        self.settle_deferred_end()?;
         if self.snapshot_active
             || !self
                 .checkout
@@ -298,6 +299,38 @@ impl<E: ReaderQueryExecutor> ReaderLease<E> {
         }
         self.snapshot_active = true;
         Ok(())
+    }
+
+    /// A previous snapshot whose rollback outran [`SNAPSHOT_END_GRACE`] still
+    /// holds this worker's checkpoint blocker; the next snapshot on the same
+    /// lease waits for that acknowledgement under the deferred-return bound.
+    fn settle_deferred_end(&mut self) -> Result<(), ReaderWorkerError> {
+        let Some(receive) = &self.checkout.deferred_end else {
+            return Ok(());
+        };
+        let error = match receive.recv_timeout(DEFERRED_SNAPSHOT_END_LIMIT) {
+            Ok(Ok(())) => {
+                self.checkout.deferred_end = None;
+                self.checkout
+                    .inner
+                    .checkpoint_blockers
+                    .finish(self.checkout.worker.id);
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                self.checkout.deferred_end = None;
+                error
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                self.checkout.deferred_end = None;
+                ReaderWorkerError::WorkerClosed
+            }
+            // Keeping the receiver makes checkout return finish the blocker
+            // only after the written-off worker answers or exits.
+            Err(RecvTimeoutError::Timeout) => ReaderWorkerError::WorkerClosed,
+        };
+        self.checkout.retire = true;
+        Err(error)
     }
 
     fn finish_snapshot(&mut self) {
@@ -470,7 +503,8 @@ mod snapshot_return_tests {
     use std::thread;
     use std::time::Duration;
 
-    use tracedecay_store::OperationPriorityV1;
+    use rusqlite::Connection;
+    use tracedecay_store::{OperationPriorityV1, RuntimeReadResultV1};
 
     use crate::checkpoint::CheckpointBlockerSource;
     use crate::reader::ReaderPool;
@@ -582,5 +616,44 @@ mod snapshot_return_tests {
                 .is_clear()
         );
         drop(other);
+    }
+
+    #[test]
+    fn lease_begins_a_new_snapshot_after_a_deferred_end() {
+        let store = TestStore::new();
+        let pool = ReaderPool::start(store.locator(), two_reader_budget(), CountExecutor).unwrap();
+        let read = request(&store.binding, OperationPriorityV1::Foreground);
+        let probe = Probe::for_request(&read);
+        let mut lease = pool.acquire(&read, &probe, Duration::from_secs(2)).unwrap();
+        lease.start_snapshot().unwrap();
+
+        // The state `finish_snapshot` leaves when the rollback acknowledgement
+        // outruns its grace, without depending on the 5ms race.
+        let reader_id = lease.checkout.worker.id;
+        lease.checkout.deferred_end = Some(lease.checkout.worker.client.begin_end().unwrap());
+        lease.snapshot_active = false;
+        pool.inner.checkpoint_blockers.release(reader_id);
+
+        let mut snapshot = lease.begin_snapshot().unwrap();
+        assert_eq!(
+            snapshot.execute(read.clone(), &probe).unwrap().value(),
+            Some(&RuntimeReadResultV1::GraphQuickCheck { healthy: false })
+        );
+        Connection::open(pool.path())
+            .unwrap()
+            .execute("INSERT INTO markers(value) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(
+            snapshot.execute(read.clone(), &probe).unwrap().value(),
+            Some(&RuntimeReadResultV1::GraphQuickCheck { healthy: false }),
+            "the reused snapshot must stay on the view it opened"
+        );
+        drop(snapshot);
+
+        let mut next = lease.begin_snapshot().unwrap();
+        assert_eq!(
+            next.execute(read, &probe).unwrap().value(),
+            Some(&RuntimeReadResultV1::GraphQuickCheck { healthy: true })
+        );
     }
 }
