@@ -111,14 +111,14 @@ pub(super) async fn project_memory_graph(
     read_control: &FactReadControl,
 ) -> FactStoreResult<ProjectMemoryGraphPageV1> {
     let owner = query.owner().clone();
-    // This read reconciles and then reads through the same graph owner as the
-    // post-write pass, so it is admitted through the same coordinator. Daemon
-    // shutdown cancels admission and joins the admitted passes before the
-    // terminal owner closes that graph owner; an unadmitted read pass is
-    // invisible to that join and leaves its snapshot's graph client lease
-    // counted at `registry.reserve_close.leased`. A refused admission
-    // (shutdown or retirement in progress) is the same typed unavailability a
-    // caller already handles for an unmounted graph.
+    // This read verifies or reconciles, then reads through the same graph
+    // owner as the post-write pass, so it is admitted through the same
+    // coordinator. Daemon shutdown cancels admission and joins the admitted
+    // passes before the terminal owner closes that graph owner; an unadmitted
+    // read pass is invisible to that join and leaves its snapshot's graph
+    // client lease counted at `registry.reserve_close.leased`. A refused
+    // admission (shutdown or retirement in progress) is the same typed
+    // unavailability a caller already handles for an unmounted graph.
     let Some(inline_pass) = db.begin_inline_memory_graph_reconciliation_pass() else {
         return Err(FactStoreError::GraphUnavailable);
     };
@@ -134,12 +134,30 @@ pub(super) async fn project_memory_graph(
         expected_source_watermark(db, &owner, Some(read_control)).await?;
     let expected_generation = generation_for_watermark(&owner, &expected_watermark)?;
     ensure_source_read_active(Some(read_control))?;
-    let verified_snapshot = reconcile_project_memory_graph_pass(db, Some(read_control)).await?;
-    if verified_snapshot.projection() != &projection_identity
-        || verified_snapshot.generation() != &expected_generation
-    {
-        return Err(FactStoreError::GraphConflict);
-    }
+    // A settled owner's verified head already is the exact generation for
+    // this source, so reading it skips the owner-wide source load and
+    // publication. A missing, mismatched, or unreadable head falls through to
+    // the reconciliation pass, which repairs it or reports the typed refusal.
+    let verified_head = verified_head_matching(
+        db,
+        &projection_identity,
+        &expected_generation,
+        &owner,
+        read_control.clone(),
+    )
+    .await;
+    let verified_snapshot = if let Ok(Some(snapshot)) = verified_head {
+        snapshot
+    } else {
+        ensure_not_cancelled(read_control)?;
+        let snapshot = reconcile_project_memory_graph_pass(db, Some(read_control)).await?;
+        if snapshot.projection() != &projection_identity
+            || snapshot.generation() != &expected_generation
+        {
+            return Err(FactStoreError::GraphConflict);
+        }
+        snapshot
+    };
 
     let max_relations = query.max_relations();
     let roots = query.roots().to_vec();
@@ -402,6 +420,9 @@ async fn reconcile_project_memory_graph_pass(
                 format!("project memory reconciliation telemetry overflowed: {counter}"),
             )
         })?;
+    let head_read_control = read_control
+        .cloned()
+        .unwrap_or_else(|| FactReadControl::new(Arc::new(|| false)));
     ensure_source_read_active(read_control)?;
     let runtime = issue_memory_graph_operation(db)?;
     let snapshot = match tokio::task::spawn_blocking(move || {
@@ -422,8 +443,14 @@ async fn reconcile_project_memory_graph_pass(
             tracing::warn!(%error, "memory graph verified-manifest publication failed");
             let mapped = graph_error(&owner, error);
             if matches!(mapped, FactStoreError::GraphConflict)
-                && let Some(snapshot) =
-                    verified_head_matching(db, &projection, &expected_generation, &owner).await?
+                && let Some(snapshot) = verified_head_matching(
+                    db,
+                    &projection,
+                    &expected_generation,
+                    &owner,
+                    head_read_control.clone(),
+                )
+                .await?
             {
                 finish_reconciliation_watermark(db, &owner, watermark, source_stamp, read_control)
                     .await?;
@@ -433,8 +460,14 @@ async fn reconcile_project_memory_graph_pass(
         }
     };
     if snapshot.projection() != &projection || snapshot.generation() != &expected_generation {
-        if let Some(snapshot) =
-            verified_head_matching(db, &projection, &expected_generation, &owner).await?
+        if let Some(snapshot) = verified_head_matching(
+            db,
+            &projection,
+            &expected_generation,
+            &owner,
+            head_read_control.clone(),
+        )
+        .await?
         {
             finish_reconciliation_watermark(db, &owner, watermark, source_stamp, read_control)
                 .await?;
@@ -477,14 +510,14 @@ async fn verified_head_matching(
     projection: &GraphProjectionIdentity,
     expected_generation: &tracedecay_graph_db::GraphGenerationId,
     owner: &FactOwnerV1,
+    read_control: FactReadControl,
 ) -> FactStoreResult<Option<tracedecay_graph_db::VerifiedGraphSnapshot>> {
     let runtime = issue_memory_graph_operation(db)?;
     let projection_for_read = projection.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
-        runtime.runtime().verified_snapshot(
-            &projection_for_read,
-            FactReadControl::new(Arc::new(|| false)),
-        )
+        runtime
+            .runtime()
+            .verified_snapshot(&projection_for_read, read_control)
     })
     .await
     .map_err(|error| storage_error(OPERATION, error))?

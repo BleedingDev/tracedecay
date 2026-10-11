@@ -49,19 +49,19 @@ struct RecordingGraphRuntime {
     locator: VerifiedStoreLocatorV1,
     block_reconciliation: bool,
     /// Failure the verified-graph runtime reports for every generation access,
-    /// on both the reconcile and the snapshot-read entry points. The read path
-    /// reaches the verified graph through `reconcile_verified_manifest`, so a
-    /// fixture that failed only `verified_snapshot` would no longer exercise
-    /// the read path's error mapping at all.
+    /// on both the reconcile and the snapshot-read entry points. A read that
+    /// cannot use the verified head falls back to `reconcile_verified_manifest`,
+    /// so a fixture that failed only `verified_snapshot` would exercise the
+    /// fallback instead of the read path's error mapping.
     verified_error: Option<GraphDbError>,
     reconciliation_cancelled: AtomicBool,
     reconciliation_started: AtomicBool,
     reconciliation_finished: AtomicBool,
     reconciliation_observed: AtomicBool,
     reconciliation_notify: Notify,
-    hold_reconcile_armed: AtomicBool,
-    hold_reconcile_entered: AtomicBool,
-    hold_reconcile_release: AtomicBool,
+    hold_graph_access_armed: AtomicBool,
+    hold_graph_access_entered: AtomicBool,
+    hold_graph_access_release: AtomicBool,
     /// Last successfully reconciled snapshot, served back on the read path so
     /// `project_memory_graph` journeys run against settled generations.
     served_snapshot: Mutex<Option<VerifiedGraphSnapshot>>,
@@ -82,9 +82,9 @@ impl RecordingGraphRuntime {
             reconciliation_finished: AtomicBool::new(false),
             reconciliation_observed: AtomicBool::new(false),
             reconciliation_notify: Notify::new(),
-            hold_reconcile_armed: AtomicBool::new(false),
-            hold_reconcile_entered: AtomicBool::new(false),
-            hold_reconcile_release: AtomicBool::new(false),
+            hold_graph_access_armed: AtomicBool::new(false),
+            hold_graph_access_entered: AtomicBool::new(false),
+            hold_graph_access_release: AtomicBool::new(false),
             served_snapshot: Mutex::new(None),
             publish_calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
@@ -92,32 +92,54 @@ impl RecordingGraphRuntime {
         }
     }
 
-    /// Parks the next reconcile inside the verified-graph runtime until
-    /// [`Self::release_held_reconcile`], so a test can land a canonical
-    /// source mutation between a publication's source load and its
-    /// settlement decision.
-    fn arm_reconcile_hold(&self) {
-        self.hold_reconcile_armed.store(true, Ordering::Release);
+    /// Parks the next reconcile or verified-head read inside the
+    /// verified-graph runtime until [`Self::release_held_graph_access`], so a
+    /// test can land a canonical source mutation after that access captured
+    /// its generation and before the caller settles on it.
+    fn arm_graph_access_hold(&self) {
+        self.hold_graph_access_armed.store(true, Ordering::Release);
     }
 
-    fn release_held_reconcile(&self) {
-        self.hold_reconcile_release.store(true, Ordering::Release);
+    fn park_if_armed(&self) {
+        if !self.hold_graph_access_armed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.hold_graph_access_entered
+            .store(true, Ordering::Release);
+        self.reconciliation_notify.notify_one();
+        // Bounded: if the test panics before releasing the hold, this parked
+        // blocking-pool thread must fail loudly instead of spinning forever
+        // and hanging the runtime drop.
+        let hold_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !self.hold_graph_access_release.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < hold_deadline,
+                "held graph access was never released within 30s; \
+                 a test assertion likely failed while the hold was parked"
+            );
+            std::thread::yield_now();
+        }
     }
 
-    async fn wait_for_held_reconcile(&self) {
+    fn release_held_graph_access(&self) {
+        self.hold_graph_access_release
+            .store(true, Ordering::Release);
+    }
+
+    async fn wait_for_held_graph_access(&self) {
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let notified = self.reconciliation_notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
-                if self.hold_reconcile_entered.load(Ordering::Acquire) {
+                if self.hold_graph_access_entered.load(Ordering::Acquire) {
                     return;
                 }
                 notified.await;
             }
         })
         .await
-        .expect("armed publication never reached the verified-graph reconcile");
+        .expect("armed graph access never reached the verified-graph runtime");
     }
 
     fn blocking(database: &Database) -> Self {
@@ -171,22 +193,7 @@ impl VerifiedGraphRuntimePortV1 for RecordingGraphRuntime {
         if let Some(error) = &self.verified_error {
             return Err(error.clone());
         }
-        if self.hold_reconcile_armed.swap(false, Ordering::AcqRel) {
-            self.hold_reconcile_entered.store(true, Ordering::Release);
-            self.reconciliation_notify.notify_one();
-            // Bounded: if the test panics before releasing the hold, this
-            // parked blocking-pool thread must fail loudly instead of
-            // spinning forever and hanging the runtime drop.
-            let hold_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            while !self.hold_reconcile_release.load(Ordering::Acquire) {
-                assert!(
-                    std::time::Instant::now() < hold_deadline,
-                    "held reconcile was never released within 30s; \
-                     a test assertion likely failed while the hold was parked"
-                );
-                std::thread::yield_now();
-            }
-        }
+        self.park_if_armed();
         if self.block_reconciliation {
             self.reconciliation_started.store(true, Ordering::Release);
             self.reconciliation_observed.store(true, Ordering::Release);
@@ -219,11 +226,13 @@ impl VerifiedGraphRuntimePortV1 for RecordingGraphRuntime {
         if let Some(error) = &self.verified_error {
             return Err(error.clone());
         }
-        Ok(self
+        let head = self
             .served_snapshot
             .lock()
             .expect("read served snapshot")
-            .clone())
+            .clone();
+        self.park_if_armed();
+        Ok(head)
     }
 }
 
@@ -819,13 +828,73 @@ async fn graph_read_preserves_reset_required_from_the_verified_graph() {
             reason,
         }) if reason == "verified profile-memory graph generation mismatch"
     ));
-    // The read reaches the verified graph through its on-demand reconcile, so
-    // that is where the runtime reports the reset. `ResetRequired` must stay a
-    // typed owner-scoped refusal instead of collapsing into `GraphUnavailable`
-    // or an untyped storage error.
+    // The unreadable head sends the read to its repairing reconcile, which is
+    // where the runtime reports the reset. `ResetRequired` must stay a typed
+    // owner-scoped refusal instead of collapsing into `GraphUnavailable` or an
+    // untyped storage error.
+    assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 1);
     assert_eq!(runtime.publish_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn settled_graph_read_reuses_the_exact_head_and_repairs_a_missing_one() {
+    let (_directory, database) = database("settled-head-read").await;
+    let runtime = bind_runtime(&database);
+    let store = DatabaseFactStore::new(&database);
+    let seed = seed_high_level_fact(
+        &store,
+        &runtime,
+        "settled-head-read",
+        "A settled verified head serves graph reads without reconciling.",
+    )
+    .await;
+    let observer = database.project_memory_reconciliation_telemetry_observer();
+    let read_control = FactReadControl::new(Arc::new(|| false));
+    let read = || {
+        super::graph::project_memory_graph(
+            &database,
+            ProjectMemoryGraphQueryV1::new(FactOwnerV1::Profile, Vec::new(), 64)
+                .expect("settled head graph query"),
+            &read_control,
+        )
+    };
+    let settled = observer.snapshot();
+
+    let first = read().await.expect("first settled graph read");
+    let second = read().await.expect("repeated settled graph read");
+    assert_eq!(first, second);
+    assert!(
+        first
+            .facts()
+            .iter()
+            .any(|fact| fact.fact_id() == seed.target.fact_id())
+    );
+    let after_reads = observer.snapshot();
+    assert_no_reconciliation(&runtime);
+    assert_eq!(
+        after_reads.reconciliation_passes,
+        settled.reconciliation_passes
+    );
+    assert_eq!(after_reads.source_rows_loaded, settled.source_rows_loaded);
+    assert_eq!(
+        after_reads.publication_attempts,
+        settled.publication_attempts
+    );
+
+    *runtime
+        .served_snapshot
+        .lock()
+        .expect("drop the served head") = None;
+    let repaired = read()
+        .await
+        .expect("graph read after the head went missing");
+    assert_eq!(repaired, first);
+    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observer.snapshot().publication_attempts,
+        settled.publication_attempts + 1
+    );
 }
 
 async fn seed_large_payload_fact(store: &DatabaseFactStore<'_>, label: &str, index: i64) {
@@ -957,12 +1026,12 @@ async fn source_mutation_during_publication_conflicts_and_republishes() {
     // Park the next publication inside the verified-graph reconcile so a
     // canonical source mutation can land between its source load and its
     // settlement decision.
-    runtime.arm_reconcile_hold();
+    runtime.arm_graph_access_hold();
     let publisher_database = database.clone();
     let held_publisher = tokio::spawn(async move {
         super::graph::publish_project_memory_graph_after_write(publisher_database).await;
     });
-    runtime.wait_for_held_reconcile().await;
+    runtime.wait_for_held_graph_access().await;
     let held = observer.snapshot();
     assert_eq!(held.reconciliation_passes, start.reconciliation_passes + 1);
     assert!(
@@ -993,7 +1062,7 @@ async fn source_mutation_during_publication_conflicts_and_republishes() {
     // pass that republishes the mutated source. The tail is therefore
     // exactly two loads of the mutated source, the conflicted finish's
     // fallback reload plus the scheduled republication's own load.
-    runtime.release_held_reconcile();
+    runtime.release_held_graph_access();
     held_publisher
         .await
         .expect("held publication task completes");
@@ -1030,11 +1099,10 @@ async fn mid_read_source_mutation_never_serves_a_stale_page() {
     )
     .await;
 
-    // Park the read inside the on-demand reconcile it drives, after its source
-    // load captured the source watermark and before its settlement decision,
-    // so a canonical mutation lands while the read still holds the settled
-    // pre-mutation generation.
-    runtime.arm_reconcile_hold();
+    // Park the read inside its verified-head access, after it captured the
+    // settled generation and before it serves the page, so a canonical
+    // mutation lands while the read still holds the pre-mutation generation.
+    runtime.arm_graph_access_hold();
     let read_database = database.clone();
     let held_read = tokio::spawn(async move {
         super::graph::project_memory_graph(
@@ -1045,7 +1113,7 @@ async fn mid_read_source_mutation_never_serves_a_stale_page() {
         )
         .await
     });
-    runtime.wait_for_held_reconcile().await;
+    runtime.wait_for_held_graph_access().await;
 
     // Mutate the canonical source while the read is parked.
     let mutation = add_high_level_source_fact(
@@ -1056,7 +1124,7 @@ async fn mid_read_source_mutation_never_serves_a_stale_page() {
     .await;
     wait_for_reconciliation(&runtime).await;
 
-    runtime.release_held_reconcile();
+    runtime.release_held_graph_access();
     match held_read.await.expect("held graph read task completes") {
         Err(FactStoreError::GraphConflict) => {}
         Ok(page) => assert!(
