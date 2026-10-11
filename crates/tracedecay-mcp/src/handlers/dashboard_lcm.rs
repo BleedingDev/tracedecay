@@ -352,6 +352,7 @@ impl DashboardLcmReadAdapter {
                         partial_description_count.saturating_add(u64::from(partial));
                     DashboardLcmCanonicalStatsV1 {
                         message_count: description.raw_message_count,
+                        unpublished_message_count: description.unpublished_message_count,
                         summary_node_count: description.summary_node_count,
                         summary_token_count: None,
                         source_token_count: None,
@@ -395,7 +396,19 @@ impl DashboardLcmReadAdapter {
                 }
             }
         };
-        let total_omitted = omitted.saturating_add(partial_description_count);
+        let mut total_omitted = omitted.saturating_add(partial_description_count);
+        // The terminal page ends the transcript short of the counted messages
+        // by at least the unpublished ones. The retrieval and describe
+        // partiality can flag that same projection lag, so the measured count
+        // is never added to them: the larger omission stands.
+        if !canonical_page.has_more {
+            total_omitted = total_omitted.max(
+                canonical_page
+                    .stats
+                    .unpublished_message_count
+                    .unsigned_abs(),
+            );
+        }
         // A windowed page with a continuation cursor stays visibly partial
         // even when nothing was genuinely omitted (omitted stays 0): the
         // partiality is a state carried from the retrieval outcome, never
