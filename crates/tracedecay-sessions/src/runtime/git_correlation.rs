@@ -523,7 +523,7 @@ impl GitRefFilter {
         }
         match kind {
             "branch" => Ok(Self::Branch(value.to_owned())),
-            "worktree" => Ok(Self::Worktree(normalize_worktree(value))),
+            "worktree" => Ok(Self::Worktree(canonical_worktree_key(value)?)),
             "commit" => parse_commit_sha(value).map(Self::Commit),
             other => Err(GitCorrelationError::InvalidArgument(format!(
                 "git_ref must be one of branch, worktree, commit (got `{other}`)"
@@ -558,7 +558,9 @@ pub fn git_scope_filter_from_args(
 ) -> Result<GitScopeFilter, GitCorrelationError> {
     Ok(GitScopeFilter {
         branch: nonempty(branch).map(str::to_owned),
-        worktree: nonempty(worktree).map(normalize_worktree),
+        worktree: nonempty(worktree)
+            .map(canonical_worktree_key)
+            .transpose()?,
         commit: nonempty(commit).map(parse_commit_sha).transpose()?,
     })
 }
