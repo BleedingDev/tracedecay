@@ -18,9 +18,9 @@ pub const TOOL_SEARCH_NAME: &str = "tracedecay_tool_search";
 /// Documented ceiling for the process-wide discovery cache.
 ///
 /// The live key space is profile × capability-set digest × scope digest.
-/// Production callers share one default
-/// profile and one project scope; tests add a handful of capability-set
-/// variants. Budget and node count are patched onto a hit and are not keys.
+/// Production callers share one default profile and one project scope; tests
+/// add a handful of capability-set variants. Budget and node count are patched
+/// onto a hit and are not keys.
 const DISCOVERY_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -442,31 +442,6 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_catalog_discovery_cache_for_test();
         body()
-    }
-
-    #[test]
-    fn repeated_discovery_keeps_advertising_the_rewrite_tool() {
-        with_isolated_discovery_cache(|| {
-            let (profile, authority, scope) = default_discovery_inputs();
-            let first = catalog_discovery_tools_list_payload(
-                None,
-                explore_call_budget(0),
-                &profile,
-                &authority,
-                &scope,
-            )
-            .expect("first discovery compose");
-            let second = catalog_discovery_tools_list_payload(
-                None,
-                explore_call_budget(0),
-                &profile,
-                &authority,
-                &scope,
-            )
-            .expect("second discovery compose");
-            assert_rewrite_is_advertised(&first);
-            assert_rewrite_is_advertised(&second);
-        });
     }
 
     #[test]

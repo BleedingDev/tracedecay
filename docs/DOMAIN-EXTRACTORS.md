@@ -169,7 +169,7 @@ ast-grep uses a pattern language based on concrete code templates, where `$NAME`
 $OBJ.define($NAME, $VALUE)
 ```
 
-tracedecay already runs ast-grep in-process (the `ast-grep-core` crate over the bundled tree-sitter grammars) for `tracedecay_ast_grep_search` and `tracedecay_ast_grep_rewrite`. ast-grep is language-aware (the same pattern matches the correct AST nodes across formatting variants).
+tracedecay already runs ast-grep in-process for `tracedecay_ast_grep_search` and `tracedecay_ast_grep_rewrite`. ast-grep is language-aware (the same pattern matches the correct AST nodes across formatting variants).
 
 | | |
 |---|---|
