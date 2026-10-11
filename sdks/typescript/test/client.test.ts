@@ -1244,7 +1244,7 @@ describe("TraceDecayClient generated operation bindings", () => {
           payload: null,
           execution: {
             ...structuredClone(RECEIPT),
-            cancellation: { stage: "before_effect" },
+            cancellation: { stage: "before_effect", observed_at: 2 },
             termination,
           },
         },

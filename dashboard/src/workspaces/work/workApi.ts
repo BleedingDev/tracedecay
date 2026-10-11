@@ -129,12 +129,12 @@ function decodeProblem(
     return refused('unsupported_schema', 'the daemon returned a problem this build cannot read');
   }
   const problem = parsed.data.problem;
-  const preAdmission = bindingId === undefined;
+  const unnamedPreAdmission = bindingId === undefined && problem.terminality === 'pre_admission';
   const concealedDenial = problem.kind === 'not_found_or_not_authorized';
   const namesThisRoute = APPLICATION_HTTP_BINDINGS[route.operation].bindingIds.some(
     (id) => id === bindingId,
   );
-  const bindingAllowed = concealedDenial ? preAdmission : preAdmission || namesThisRoute;
+  const bindingAllowed = concealedDenial ? bindingId === undefined : unnamedPreAdmission || namesThisRoute;
   if (!bindingAllowed) {
     return refused('unsupported_schema', `the problem does not answer ${route.operation}`);
   }

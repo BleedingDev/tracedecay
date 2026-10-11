@@ -183,7 +183,7 @@ describe('a canonical success', () => {
     outcome.value.execution = {
       ...outcome.value.execution,
       termination: 'timed_out',
-      cancellation: { stage: 'before_effect' },
+      cancellation: { stage: 'before_effect', observed_at: 2 },
     };
     stub(200, envelope);
 
@@ -191,6 +191,26 @@ describe('a canonical success', () => {
 
     expect(result).toMatchObject({ outcome: 'refused', state: 'timed_out', termination: 'timed_out' });
     expect(workResultInvalidatesReads(result)).toBe(true);
+  });
+
+  it.each([
+    ['no deadline observation', null],
+    ['no observation timestamp', { stage: 'before_effect' }],
+    ['an unknown deadline stage', { stage: 'outside_the_contract', observed_at: 2 }],
+  ])('refuses a timed-out lifecycle effect with %s', async (_name, cancellation) => {
+    const route = { ...WORKFLOW_ACTIVATE_DEFINITION_ROUTE, request: z.unknown() };
+    const envelope = applicationSuccess('operation.workflow.activate_definition', null);
+    const outcome = envelope.value.outcome as { value: { execution: Record<string, unknown> } };
+    outcome.value.execution = {
+      ...outcome.value.execution,
+      termination: 'timed_out',
+      cancellation,
+    };
+    stub(200, envelope);
+    expect(await callWork(route, {}, '/api/application/workflow/activate-definition')).toMatchObject({
+      outcome: 'refused',
+      state: 'unsupported_schema',
+    });
   });
 
   it('refuses a problem served with a success status', async () => {
@@ -286,6 +306,15 @@ describe('a canonical problem', () => {
   it('reads a pre-admission problem, which names no binding', async () => {
     stub(503, applicationProblem('unavailable'));
     expect(await views()).toMatchObject({ outcome: 'refused', state: 'unavailable' });
+  });
+
+  it('refuses an admitted problem that names no route binding', async () => {
+    stub(503, applicationProblem('reset_required'));
+    expect(await views()).toMatchObject({
+      outcome: 'refused',
+      state: 'unsupported_schema',
+      detail: 'the problem does not answer operation.work.views',
+    });
   });
 
   it('refuses a problem record that does not satisfy the generated contract', async () => {
