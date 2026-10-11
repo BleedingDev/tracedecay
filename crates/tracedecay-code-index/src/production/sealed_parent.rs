@@ -223,6 +223,43 @@ impl SealedParentGenerationV1 {
         )
     }
 
+    /// Carry an unchanged present file from the sealed parent into a
+    /// successor that must build cold.
+    ///
+    /// Digest equality is the reuse authority: a path whose content moved
+    /// is not carried, so a caller that omitted those bytes still fails
+    /// closed with [`super::CodeIndexInputErrorV1::MissingCapturedFile`].
+    pub(super) fn carry_unchanged_file(
+        &self,
+        file: &SanitizedCodeFileV1,
+        generation_id: &CodeGenerationId,
+        snapshot_digest: &ManifestDigest,
+    ) -> Result<Option<Arc<FileGenerationArtifactsV1>>, CodeIndexProductionErrorV1> {
+        let Some(parent_file) = self
+            .snapshot()
+            .files
+            .iter()
+            .find(|parent| parent.logical_path == file.logical_path)
+        else {
+            return Ok(None);
+        };
+        if parent_file.content_digest != file.content_digest
+            || parent_file.disposition != file.disposition
+        {
+            return Ok(None);
+        }
+        let Some(descriptor) = self.file_segment(&file.logical_path) else {
+            return Ok(None);
+        };
+        self.decode_file(
+            descriptor,
+            &file.file_occurrence_id,
+            generation_id,
+            snapshot_digest,
+        )
+        .map(Some)
+    }
+
     pub(super) fn file_evidence(
         &self,
         file_key: u32,
