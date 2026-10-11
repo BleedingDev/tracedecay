@@ -733,3 +733,21 @@ fn query_commands_accept_json_output() {
         }
     ));
 }
+
+#[test]
+fn the_beta_83_claude_plugin_flag_serves_the_full_tool_list() {
+    for flag in ["--full-tool-list", "--claude-code-tool-search"] {
+        let cli = Cli::try_parse_from(["tracedecay", "serve", flag])
+            .unwrap_or_else(|error| panic!("{flag} must parse: {error}"));
+        assert!(
+            matches!(
+                cli.command,
+                Some(Commands::Serve {
+                    full_tool_list: true,
+                    ..
+                })
+            ),
+            "{flag} must select the full tool list"
+        );
+    }
+}

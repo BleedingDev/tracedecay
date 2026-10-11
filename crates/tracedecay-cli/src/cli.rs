@@ -479,7 +479,9 @@ pub enum Commands {
         /// List every tool with its full schema instead of stubbing the tools
         /// outside the always-loaded set. For hosts that defer tool schemas
         /// themselves, such as Claude Code.
-        #[arg(long)]
+        // The Claude plugin deployed by 1.0.0-beta.83 passes
+        // `--claude-code-tool-search`, which served the same full list.
+        #[arg(long, alias = "claude-code-tool-search")]
         full_tool_list: bool,
     },
     /// Manage the long-running TraceDecay daemon used by MCP clients
