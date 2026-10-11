@@ -1804,7 +1804,6 @@ function savingsPayload(): Record<string, unknown> {
       offline: true,
       model_count: 214,
     },
-    costs: costsReadModel(),
   };
 }
 
@@ -2039,107 +2038,6 @@ function savingsModelsPayload(range: string): Record<string, unknown> {
       by_provider: byProvider,
       by_provider_day: byProviderDay,
     },
-  };
-}
-
-/** The canonical Costs projection embedded by `savings_api::overview`.
- * Savings and exact project provider usage come from separate retained stores;
- * the composite read reuses one provider aggregate for every sibling panel. */
-function costsReadModel(): Record<string, unknown> {
-  const observedAtMicros = nowMicros;
-  const horizon = { since_micros: 0, until_micros: observedAtMicros };
-  const accountingWatermark = 'provider-usage:57704';
-  const savingsWatermark = 'savings:1784052117';
-  const known = (eligible: number) => ({
-    eligible,
-    observed: eligible,
-    completed: eligible,
-    censored: 0,
-    unknown: 0,
-    excluded: 0,
-    state: 'known',
-  });
-  const measurement = (
-    metric: string,
-    value: number | null,
-    unit: string,
-    denominator: string,
-    coverage: Record<string, unknown>,
-    source: string,
-    sourceRevision: string,
-    watermark: string,
-    unavailableReason: string | null,
-  ) => ({
-    descriptor_revision: 'provider-costs.v1',
-    metric,
-    value,
-    unit,
-    denominator,
-    denominator_value: coverage['eligible'],
-    coverage,
-    evidence_class: 'measurement',
-    provenance: {
-      source,
-      source_revision: sourceRevision,
-      projector_revision: 'costs-projector.v1',
-      watermark,
-    },
-    cohort: { descriptor_revision: `${denominator}.v1`, eligible_population: denominator },
-    temporal: { horizon, baseline_watermark: null, delta: null },
-    uncertainty:
-      value === null
-        ? { lower: null, upper: null, reason: unavailableReason }
-        : { lower: value, upper: value, reason: null },
-    calibration: null,
-    unavailable_reason: unavailableReason,
-  });
-  return {
-    authorized_scope_ref: 'all',
-    horizon,
-    watermark: `${accountingWatermark};${savingsWatermark}`,
-    observed_at_micros: observedAtMicros,
-    // The mounted route has no project scope for the latency projector, so
-    // its canonical latency cohort is unknown and the composite is not current.
-    current: false,
-    usage: [
-      measurement(
-        'provider_tokens',
-        683_965_063,
-        'tokens',
-        'provider_usage_observations',
-        known(57_704),
-        'provider_usage_observation',
-        'provider-usage-observation.v1',
-        accountingWatermark,
-        null,
-      ),
-      measurement(
-        'saved_tokens',
-        4_902_796_408,
-        'tokens',
-        'eligible_savings_calls',
-        known(147_230),
-        'savings_ledger',
-        'savings-ledger.v1',
-        savingsWatermark,
-        null,
-      ),
-    ],
-    estimated_cost: [
-      measurement(
-        'provider_cost',
-        8148.9744974,
-        'usd',
-        'priced_provider_usage_observations',
-        known(57_704),
-        'provider_usage_observation',
-        'provider-usage-observation.v1',
-        accountingWatermark,
-        null,
-      ),
-    ],
-    latency: [unavailableProviderLatency(horizon)],
-    pricing_revision: 'sha256:fixture-pricing',
   };
 }
 
