@@ -511,6 +511,11 @@ fn run<E: ReaderQueryExecutor>(
                         if run_snapshot(transaction, commands, executor, &admission) {
                             return;
                         }
+                        // Clear the flag before the sender: a release that
+                        // missed the sender queues on the outer channel and
+                        // must not read a stale `in_snapshot` for a worker
+                        // already back on its command loop.
+                        in_snapshot.store(false, Ordering::Release);
                     }
                     Err(error) => {
                         let _ = reply.send(Err(error));
@@ -519,7 +524,6 @@ fn run<E: ReaderQueryExecutor>(
                 *published
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-                in_snapshot.store(false, Ordering::Release);
             }
         }
     }
