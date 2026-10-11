@@ -970,6 +970,132 @@ mod tests {
         );
     }
 
+    fn skill_writer_ctx<'a>(
+        request: &'a AgentTaskRequest,
+        response: &'a AgentTaskResponse,
+        record: &'a AutomationRunLedgerRecord,
+        outcomes: &'a AutomationOutcomesSnapshot,
+    ) -> ArtifactPayloadContext<'a> {
+        ArtifactPayloadContext {
+            run_id: "run-outcomes",
+            task: AgentTaskKind::SkillWriter,
+            task_key: "skill_writer",
+            prompt_version: "skill_writer:v1",
+            policy: artifact_policy(AgentTaskKind::SkillWriter),
+            request,
+            response,
+            record,
+            outcomes,
+        }
+    }
+
+    fn generated_chain(ctx: &ArtifactPayloadContext<'_>) -> (Value, Value, Value) {
+        let refs = ArtifactRefs {
+            trace: json!({"kind": "traces"}),
+            feedback: json!({"kind": "feedback"}),
+            generated_evals: json!({"kind": "generated_evals"}),
+            validation_gate: json!({"kind": "validation_gate"}),
+            optimizer_diagnosis: json!({"kind": "optimizer_diagnosis"}),
+        };
+        let evals = generated_eval_payloads(ctx);
+        let gate = improvement_gate_payload(ctx, &evals);
+        (
+            generated_evals_payload(ctx, (&refs.trace, &refs.feedback), &evals),
+            validation_gate_payload(
+                ctx,
+                (&refs.trace, &refs.feedback, &refs.generated_evals),
+                &evals,
+                &gate,
+            ),
+            codex_handoff_payload(ctx, &refs, &evals, &gate),
+        )
+    }
+
+    #[test]
+    fn artifact_generation_never_reports_independent_evaluation_passed() {
+        let (request, response, mut record) = payload_fixture();
+        record.reviewed_count = 1;
+        record.accepted_count = 1;
+        record.applied_ops = Some(json!([{"skill_id": "accepted-skill"}]));
+        record.validation_report = Some(json!({"status": "applied"}));
+        let outcomes = AutomationOutcomesSnapshot::default();
+        let ctx = skill_writer_ctx(&request, &response, &record, &outcomes);
+
+        let (evals, gate, handoff) = generated_chain(&ctx);
+
+        assert_eq!(
+            evals.pointer("/record_integrity/status"),
+            Some(&json!("passed"))
+        );
+        assert_eq!(
+            evals.pointer("/independent_evaluation/status"),
+            Some(&json!("not_run"))
+        );
+        assert_eq!(
+            evals.pointer("/eval_definitions/0/harness/status"),
+            Some(&json!("not_run"))
+        );
+        assert_eq!(
+            gate.pointer("/improvement_gate/generated_evals_status"),
+            Some(&json!("not_run"))
+        );
+        assert_eq!(
+            gate.pointer("/improvement_gate/record_integrity_status"),
+            Some(&json!("passed"))
+        );
+        assert_eq!(
+            handoff.pointer("/independent_evaluation/status"),
+            Some(&json!("not_run"))
+        );
+        assert_eq!(
+            handoff.pointer("/readiness/independent_evaluation_status"),
+            Some(&json!("not_run"))
+        );
+        for payload in [&evals, &gate, &handoff] {
+            let text = serde_json::to_string(payload).unwrap();
+            assert!(!text.contains("replay"), "{text}");
+            assert!(!text.contains("cargo test"), "{text}");
+        }
+    }
+
+    #[test]
+    fn corrupt_recorded_counts_fail_integrity_not_behavioral_replay() {
+        let (request, response, mut record) = payload_fixture();
+        record.reviewed_count = 2;
+        record.accepted_count = 2;
+        record.applied_ops = Some(json!([{"skill_id": "only-one-receipt"}]));
+        record.validation_report = Some(json!({"status": "applied"}));
+        let outcomes = AutomationOutcomesSnapshot::default();
+        let ctx = skill_writer_ctx(&request, &response, &record, &outcomes);
+
+        let (evals, gate, handoff) = generated_chain(&ctx);
+
+        assert_eq!(
+            evals.pointer("/record_integrity/status"),
+            Some(&json!("failed"))
+        );
+        assert_eq!(
+            evals.pointer("/independent_evaluation/status"),
+            Some(&json!("not_run"))
+        );
+        assert_eq!(
+            gate.pointer("/improvement_gate/decision"),
+            Some(&json!("blocked_failed_record_integrity"))
+        );
+        assert_eq!(
+            gate.pointer("/improvement_gate/generated_evals_status"),
+            Some(&json!("not_run"))
+        );
+        assert_eq!(
+            gate.pointer("/task_validation/automatic_application/status"),
+            Some(&json!("applied"))
+        );
+        assert_eq!(
+            handoff.pointer("/machine_summary/next_stage"),
+            Some(&json!("repair_recorded_validation"))
+        );
+    }
+
     #[test]
     fn automatic_application_effect_reports_no_candidate_quarantine_and_partial_retry() {
         let (_, _, mut no_candidate) = payload_fixture();
