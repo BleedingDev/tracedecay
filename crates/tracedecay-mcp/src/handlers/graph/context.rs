@@ -37,7 +37,9 @@ use super::primitive_surface::{
     search_coverage as primitive_search_coverage, symbol_location as primitive_symbol_location,
 };
 use super::search::execute_code_index_search;
-use super::search_evidence::{bind_verified_graph_to_search, race_primary_search_with_graph};
+use super::search_evidence::{
+    bind_verified_graph_to_search, graph_symbol_for_display, race_primary_search_with_graph,
+};
 use super::search_freshness::{
     ServedGenerationV1, lanes_under_scheduler_freshness, search_freshness,
     worktree_freshness_from_payload,
@@ -198,17 +200,12 @@ fn context_graph_projection(
         if scope_prefix.is_some_and(|prefix| !display.path.starts_with(prefix)) {
             continue;
         }
-        // A file hit names no graph symbol.
-        let Some(occurrence) = display.occurrence.as_ref() else {
+        let Some(candidate) = graph_symbol_for_display(graph, display)? else {
             continue;
         };
-        let Some(candidate) = graph.symbol_summary(occurrence)? else {
-            continue;
-        };
-        if required_graph_file_path(&candidate)? == display.path.as_str()
-            && !selected
-                .iter()
-                .any(|existing: &CodeGraphSymbolSummaryV1| existing.occurrence == *occurrence)
+        if !selected
+            .iter()
+            .any(|existing: &CodeGraphSymbolSummaryV1| existing.occurrence == candidate.occurrence)
         {
             selected.push(candidate);
             selected_sites.push(display.site.clone());
