@@ -1,6 +1,6 @@
 //! Repeated identical reads in one `tracedecay serve` session: a pointer for
 //! an unchanged answer, the full new content after an edit, and full answers
-//! on a connection the host shares across agents.
+//! when the host has not marked the connection as one agent's.
 
 use std::time::{Duration, Instant};
 
@@ -12,7 +12,7 @@ use crate::serve_harness::init_project_with_file;
 use crate::serve_tool_surface_test::PlainMcpClient;
 
 const POINTER: &str = "tracedecay_repeat_read:";
-const SHARED_AGENT_CONNECTION_ENV: &str = "TRACEDECAY_MCP_SHARED_AGENT_CONNECTION";
+const REPEAT_READ_POINTERS_ENV: &str = "TRACEDECAY_MCP_REPEAT_READ_POINTERS";
 
 /// One function whose body alone is well over the pointer threshold, beside
 /// enough small functions that the file outline is too.
@@ -134,7 +134,11 @@ async fn serve_points_repeat_reads_at_the_earlier_result_until_content_changes()
     let home = TempDir::new().unwrap();
     let project = init_project_with_file(home.path(), &source("repeat_read_marker")).await;
     let _daemon = common::spawn_tracedecay_daemon(home.path());
-    let mut client = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    let mut client = PlainMcpClient::start_with_env(
+        home.path(),
+        project.path(),
+        &[(REPEAT_READ_POINTERS_ENV, "1")],
+    );
     start(&mut client);
     wait_ready(&mut client, 2);
 
@@ -201,26 +205,23 @@ async fn serve_points_repeat_reads_at_the_earlier_result_until_content_changes()
 }
 
 #[tokio::test]
-async fn serve_shared_across_agents_answers_every_repeat_in_full() {
+async fn serve_without_the_pointer_env_answers_every_repeat_in_full() {
     let home = TempDir::new().unwrap();
-    let project = init_project_with_file(home.path(), &source("repeat_read_shared")).await;
+    let project = init_project_with_file(home.path(), &source("repeat_read_default")).await;
     let _daemon = common::spawn_tracedecay_daemon(home.path());
-    let mut shared = PlainMcpClient::start_with_env(
-        home.path(),
-        project.path(),
-        &[(SHARED_AGENT_CONNECTION_ENV, "1")],
-    );
-    start(&mut shared);
-    wait_ready(&mut shared, 2);
+    let mut client = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    start(&mut client);
+    wait_ready(&mut client, 2);
     let outline = json!({ "file": "src/lib.rs" });
-    let first = shared.request(call(3, "tracedecay_source_outline", &outline));
-    let repeat = shared.request(call(4, "tracedecay_source_outline", &outline));
+    let first = client.request(call(3, "tracedecay_source_outline", &outline));
+    let repeat = client.request(call(4, "tracedecay_source_outline", &outline));
     assert!(
-        text(&first).contains("repeat_read_shared"),
+        text(&first).contains("repeat_read_default"),
         "the outline must answer: {first}"
     );
     assert!(
         !is_pointer(&repeat),
-        "a connection shared across agents must always answer in full: {repeat}"
+        "a host that did not mark its connection as one agent's must always get full answers, \
+         since it may share the connection across agents: {repeat}"
     );
 }

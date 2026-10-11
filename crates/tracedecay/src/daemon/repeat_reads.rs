@@ -10,10 +10,11 @@
 //! after a pointer is always served in full, which is how an agent that lost
 //! the earlier result gets it back.
 //!
-//! A host that multiplexes several agents over one connection (Claude Code
-//! subagents share their parent's `tracedecay serve`) sets
-//! [`SHARED_AGENT_CONNECTION_ENV`]: there a pointer could name content the
-//! calling agent never saw.
+//! The ledger is on only when the host sets [`REPEAT_READ_POINTERS_ENV`],
+//! because that is valid only where one connection serves one agent (Codex
+//! starts a serve per thread). A host that multiplexes several agents over one
+//! connection, as Claude Code does with its subagents, would get pointers to
+//! content the calling agent never saw.
 
 use std::collections::HashMap;
 
@@ -27,8 +28,8 @@ use tracedecay_mcp::tools::response_trailers::is_beside_result_block;
 
 use super::tool_surface::env_switch;
 
-/// Explicit env a host sets when several agents share one serve connection.
-pub(super) const SHARED_AGENT_CONNECTION_ENV: &str = "TRACEDECAY_MCP_SHARED_AGENT_CONNECTION";
+/// Explicit env a host sets when each serve connection belongs to one agent.
+pub(super) const REPEAT_READ_POINTERS_ENV: &str = "TRACEDECAY_MCP_REPEAT_READ_POINTERS";
 /// Reads that return file content or listings an agent re-requests.
 const REPEATABLE_READS: &[&str] = &[
     "tracedecay_context",
@@ -73,10 +74,10 @@ pub(super) struct RepeatReads {
 }
 
 impl RepeatReads {
-    /// The ledger for this session, or `None` when the host shares the
-    /// connection across agents.
+    /// The ledger for this session, or `None` unless the host marked the
+    /// connection as one agent's.
     pub(super) fn from_env() -> Result<Option<Self>> {
-        Ok((!env_switch(SHARED_AGENT_CONNECTION_ENV)?).then(Self::default))
+        Ok(env_switch(REPEAT_READ_POINTERS_ENV)?.then(Self::default))
     }
 
     /// Replaces the answer to a repeated identical read with a pointer, and
@@ -422,23 +423,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_agent_connection_env_is_an_explicit_switch() {
-        let parse =
-            |value: &str| parse_env_switch(SHARED_AGENT_CONNECTION_ENV, Ok(value.to_owned()));
+    fn repeat_read_pointers_env_is_an_explicit_switch() {
+        let parse = |value: &str| parse_env_switch(REPEAT_READ_POINTERS_ENV, Ok(value.to_owned()));
         assert!(matches!(parse("1"), Ok(true)));
         assert!(matches!(parse("true"), Ok(true)));
         assert!(matches!(parse("0"), Ok(false)));
         assert!(matches!(parse(""), Ok(false)));
         assert!(matches!(
             parse_env_switch(
-                SHARED_AGENT_CONNECTION_ENV,
+                REPEAT_READ_POINTERS_ENV,
                 Err(std::env::VarError::NotPresent)
             ),
             Ok(false)
         ));
         let error = parse("yes").expect_err("an unknown value must be refused");
         assert!(
-            error.to_string().contains(SHARED_AGENT_CONNECTION_ENV),
+            error.to_string().contains(REPEAT_READ_POINTERS_ENV),
             "{error}"
         );
     }

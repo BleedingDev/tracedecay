@@ -326,7 +326,11 @@ tools so Claude Code's native tool search can defer the rest, and replaces \
 initialize instructions with a short tool-category guide. Drop that flag \
 when using ANTHROPIC_BASE_URL proxies, Foundry, or \
 CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS, which disable Claude Code's native \
-tool search.";
+tool search. With TRACEDECAY_MCP_REPEAT_READ_POINTERS=1, a repeated identical \
+source, context, or file-listing read whose answer is unchanged returns a \
+short pointer to the earlier result, and repeating the call once more returns \
+it in full. Set it only for hosts that give each agent its own connection, as \
+the Codex install does.";
 
 pub(crate) const SERVE_AFTER_HELP: &str = "\
 Examples:
