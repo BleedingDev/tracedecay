@@ -10,6 +10,7 @@ use tracedecay_global_db::RegisteredGlobalDb;
 use tracedecay_global_db::tests::harness::{HostAdmissionScope, HostAdmissionTestRuntimeV1};
 use tracedecay_graph_db::NeverCancelled;
 use tracedecay_runtime_core::db::engine::params;
+use tracedecay_store::SessionStoreResult;
 
 use crate::SessionTemporalAccess;
 use crate::handle::SessionTemporalRegisteredDb;
@@ -141,7 +142,7 @@ async fn receipt_state(
     database: &RegisteredGlobalDb,
     session_id: &SessionId,
     generation: i64,
-) -> String {
+) -> Option<String> {
     let snapshot = database.read_snapshot().await.expect("read snapshot");
     let mut rows = snapshot
         .query(
@@ -151,34 +152,43 @@ async fn receipt_state(
         )
         .await
         .expect("receipt state");
-    rows.next()
-        .await
-        .expect("receipt row")
-        .expect("receipt exists")
-        .get::<String>(0)
-        .expect("state")
+    match rows.next().await.expect("receipt row") {
+        Some(row) => Some(row.get::<String>(0).expect("state")),
+        None => None,
+    }
 }
 
-async fn journal_rows(
+async fn journal_projection(
     database: &RegisteredGlobalDb,
     session_id: &SessionId,
     generation: i64,
-) -> i64 {
+) -> Option<String> {
     let snapshot = database.read_snapshot().await.expect("read snapshot");
     let mut rows = snapshot
         .query(
-            "SELECT COUNT(*) FROM session_relation_effect_journal
+            "SELECT projection_json FROM session_relation_effect_journal
              WHERE session_id = ?1 AND generation = ?2",
             params![session_id.as_str(), generation],
         )
         .await
-        .expect("journal count");
-    rows.next()
-        .await
-        .expect("journal count row")
-        .expect("journal count exists")
-        .get::<i64>(0)
-        .expect("count")
+        .expect("journal projection");
+    match rows.next().await.expect("journal row") {
+        Some(row) => Some(row.get::<String>(0).expect("projection json")),
+        None => None,
+    }
+}
+
+fn outcome_for<'a>(
+    projections: &'a [SessionRelationProjection],
+    outcomes: &'a [SessionStoreResult<()>],
+    session_id: &SessionId,
+) -> &'a SessionStoreResult<()> {
+    projections
+        .iter()
+        .zip(outcomes)
+        .find(|(projection, _)| projection.session_id == *session_id)
+        .map(|(_, outcome)| outcome)
+        .unwrap_or_else(|| panic!("missing per-item outcome for {session_id}"))
 }
 
 struct AlwaysCancelled;
@@ -213,28 +223,42 @@ async fn failed_acknowledgement_rolls_back_only_its_own_mutation() {
     // first, then the DELETE finds nothing and fails after mutating.
     seed_pending_receipt(database, &bad_projection, false).await;
 
+    let projections = [bad_projection, ok_projection];
     let outcomes = SessionTemporalAccess::new(database)
-        .apply_session_relation_projection_items(
-            &[bad_projection, ok_projection],
-            Arc::new(NeverCancelled),
-        )
+        .apply_session_relation_projection_items(&projections, Arc::new(NeverCancelled))
         .await
         .expect("batch apply");
 
-    assert!(outcomes[0].is_err(), "failing ack must surface an error");
-    assert!(
-        outcomes[1].is_ok(),
-        "a peer item's failure must not poison the healthy ack: {:?}",
-        outcomes[1]
-    );
     assert_eq!(
-        receipt_state(database, &bad_session, 1).await,
-        "pending",
+        outcome_for(&projections, &outcomes, &bad_session)
+            .as_ref()
+            .expect_err("missing-journal ack must refuse that item")
+            .to_string(),
+        "session temporal storage operation publish native session relation receipt failed: \
+         relation effect journal changed during native graph acknowledgement"
+    );
+    outcome_for(&projections, &outcomes, &ok_session)
+        .as_ref()
+        .expect("a peer item's failure must not poison the healthy ack");
+    assert_eq!(
+        receipt_state(database, &bad_session, 1).await.as_deref(),
+        Some("pending"),
         "failed acknowledgement must roll back its applied update"
     );
-    assert_eq!(journal_rows(database, &bad_session, 1).await, 0);
-    assert_eq!(receipt_state(database, &ok_session, 1).await, "applied");
-    assert_eq!(journal_rows(database, &ok_session, 1).await, 0);
+    assert_eq!(
+        journal_projection(database, &bad_session, 1).await,
+        None,
+        "a missing-journal failure must not invent a journal row"
+    );
+    assert_eq!(
+        receipt_state(database, &ok_session, 1).await.as_deref(),
+        Some("applied")
+    );
+    assert_eq!(
+        journal_projection(database, &ok_session, 1).await,
+        None,
+        "the healthy acknowledgement must drain its journal"
+    );
 }
 
 /// Cancellation checked per item on the shared snapshot keeps every receipt
@@ -252,16 +276,34 @@ async fn cancelled_batch_leaves_every_receipt_pending() {
     activate_generation(database, &session, 1).await;
     let projection = projection(&scope, &session, 1);
     seed_pending_receipt(database, &projection, true).await;
+    let journal_before = journal_projection(database, &session, 1).await;
+    assert!(
+        journal_before.is_some(),
+        "the seeded journal must exist before the cancelled apply"
+    );
 
+    let projections = [projection];
     let outcomes = SessionTemporalAccess::new(database)
-        .apply_session_relation_projection_items(&[projection], Arc::new(AlwaysCancelled))
+        .apply_session_relation_projection_items(&projections, Arc::new(AlwaysCancelled))
         .await
         .expect("cancelled batch apply");
 
-    assert_eq!(outcomes.len(), 1);
-    assert!(outcomes[0].is_err());
-    assert_eq!(receipt_state(database, &session, 1).await, "pending");
-    assert_eq!(journal_rows(database, &session, 1).await, 1);
+    assert_eq!(
+        outcome_for(&projections, &outcomes, &session)
+            .as_ref()
+            .expect_err("cancellation is a typed per-item refusal")
+            .to_string(),
+        "session temporal operation was cancelled"
+    );
+    assert_eq!(
+        receipt_state(database, &session, 1).await.as_deref(),
+        Some("pending")
+    );
+    assert_eq!(
+        journal_projection(database, &session, 1).await,
+        journal_before,
+        "cancellation must leave the seeded journal in place"
+    );
 }
 
 /// A projection whose receipt row is absent from the shared snapshot fails its
@@ -286,15 +328,40 @@ async fn missing_receipt_fails_only_that_item() {
     // No receipt/journal is seeded for the stale item: its snapshot receipt
     // check reports unavailable instead of acknowledging against nothing.
 
+    let projections = [stale_projection, ok_projection];
     let outcomes = SessionTemporalAccess::new(database)
-        .apply_session_relation_projection_items(
-            &[stale_projection, ok_projection],
-            Arc::new(NeverCancelled),
-        )
+        .apply_session_relation_projection_items(&projections, Arc::new(NeverCancelled))
         .await
         .expect("batch apply");
 
-    assert!(outcomes[0].is_err());
-    assert!(outcomes[1].is_ok());
-    assert_eq!(receipt_state(database, &ok_session, 1).await, "applied");
+    assert_eq!(
+        outcome_for(&projections, &outcomes, &stale_session)
+            .as_ref()
+            .expect_err("absent receipt must refuse that item")
+            .to_string(),
+        "session temporal storage operation publish native session relation receipt failed: \
+         relation receipt is unavailable"
+    );
+    outcome_for(&projections, &outcomes, &ok_session)
+        .as_ref()
+        .expect("an absent peer receipt must not poison the healthy ack");
+    assert_eq!(
+        receipt_state(database, &ok_session, 1).await.as_deref(),
+        Some("applied")
+    );
+    assert_eq!(
+        journal_projection(database, &ok_session, 1).await,
+        None,
+        "the healthy acknowledgement must drain its journal"
+    );
+    assert_eq!(
+        receipt_state(database, &stale_session, 1).await,
+        None,
+        "an absent receipt must stay absent"
+    );
+    assert_eq!(
+        journal_projection(database, &stale_session, 1).await,
+        None,
+        "an absent receipt must not invent a journal row"
+    );
 }

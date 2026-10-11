@@ -1,6 +1,7 @@
 //! Measurement helpers shared by this crate's unit tests.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tracedecay_runtime_core::db::engine::{
@@ -83,29 +84,39 @@ impl<T: SessionTemporalExec> SessionTemporalExec for QueryCountingConnection<'_,
     }
 }
 
-/// Registered-database wrapper that fails `execute` on a chosen statement
-/// prefix. The real maintained transaction still runs underneath; only the
-/// one boundary statement errors so grouped-commit abort paths are covered
-/// through the production authority.
+/// Registered-database wrapper that fails the Nth `execute` whose SQL
+/// starts with `prefix`. The real maintained transaction still runs
+/// underneath; only that boundary statement errors so grouped-commit
+/// abort paths are covered through the production authority.
 pub(crate) struct FailingRegisteredDb<'a> {
     inner: &'a tracedecay_global_db::RegisteredGlobalDb,
-    needle: &'static str,
+    prefix: &'static str,
+    fail_on_match: usize,
+    matches: Arc<AtomicUsize>,
 }
 
 impl<'a> FailingRegisteredDb<'a> {
-    pub(crate) fn new(
+    pub(crate) fn fail_nth_prefixed_execute(
         inner: &'a tracedecay_global_db::RegisteredGlobalDb,
-        needle: &'static str,
+        prefix: &'static str,
+        fail_on_match: usize,
     ) -> Self {
-        Self { inner, needle }
+        Self {
+            inner,
+            prefix,
+            fail_on_match,
+            matches: Arc::new(AtomicUsize::new(0)),
+        }
     }
 }
 
 /// The write transaction `FailingRegisteredDb` opens: delegates every call
-/// except `execute`, which reports a runtime error for the chosen prefix.
+/// except `execute`, which reports a runtime error on the chosen match.
 pub(crate) struct FailingWriteTxn<'a> {
     inner: tracedecay_global_db::RegisteredGlobalDbWriteTransaction<'a>,
-    needle: &'static str,
+    prefix: &'static str,
+    fail_on_match: usize,
+    matches: Arc<AtomicUsize>,
 }
 
 impl SessionTemporalQuery for FailingWriteTxn<'_> {
@@ -130,10 +141,16 @@ impl SessionTemporalExec for FailingWriteTxn<'_> {
     where
         P: IntoParams + Send,
     {
-        let needle = self.needle;
+        let prefix = self.prefix;
+        let fail_on_match = self.fail_on_match;
+        let matches = Arc::clone(&self.matches);
         async move {
-            if sql.starts_with(needle) {
-                return Err(EngineError::Runtime(format!("injected failure: {needle}")));
+            if sql.starts_with(prefix)
+                && matches.fetch_add(1, Ordering::Relaxed) + 1 == fail_on_match
+            {
+                return Err(EngineError::Runtime(
+                    "injected savepoint failure".to_owned(),
+                ));
             }
             SessionTemporalExec::execute(&self.inner, sql, params).await
         }
@@ -183,11 +200,18 @@ impl crate::handle::SessionTemporalRegisteredDb for FailingRegisteredDb<'_> {
         &self,
     ) -> impl Future<Output = Result<Self::WriteTxn<'_>, tracedecay_domain::errors::TraceDecayError>>
     + Send {
-        let needle = self.needle;
+        let prefix = self.prefix;
+        let fail_on_match = self.fail_on_match;
+        let matches = Arc::clone(&self.matches);
         async move {
             crate::handle::SessionTemporalRegisteredDb::begin_write_transaction(self.inner)
                 .await
-                .map(|inner| FailingWriteTxn { inner, needle })
+                .map(|inner| FailingWriteTxn {
+                    inner,
+                    prefix,
+                    fail_on_match,
+                    matches,
+                })
         }
     }
 

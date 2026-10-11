@@ -3267,18 +3267,48 @@ async fn grouped_receipt_savepoint_failure_aborts_the_group() {
             workflow_agents: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let failing = FailingRegisteredDb::new(database, "SAVEPOINT relation_receipt_item_1");
+    let failing = FailingRegisteredDb::fail_nth_prefixed_execute(database, "SAVEPOINT", 2);
     let access = SessionTemporalAccess::new(&failing);
-    let result = access
+    let error = access
         .record_relation_receipts_group(&projections, &ExecutionControl::default())
-        .await;
-    assert!(
-        result.is_err(),
-        "savepoint failure must abort the grouped commit, got {result:?}"
+        .await
+        .expect_err("savepoint failure must abort the grouped commit");
+    assert_eq!(
+        error.to_string(),
+        "session temporal storage operation complete session refresh failed: \
+         SQLite runtime failed: injected savepoint failure"
     );
     assert_eq!(
-        count_effects(&runtime, "SELECT COUNT(*) FROM session_relation_receipts").await,
-        0,
+        fixture_receipt_state(&runtime, &projections[0].session_id).await,
+        None,
         "the aborted group must not leave the first item's receipt committed"
     );
+    assert_eq!(
+        fixture_receipt_state(&runtime, &projections[1].session_id).await,
+        None,
+        "the aborted group must not leave a later item's receipt committed"
+    );
+}
+
+async fn fixture_receipt_state(
+    runtime: &HostAdmissionTestRuntimeV1,
+    session_id: &SessionId,
+) -> Option<String> {
+    let snapshot = runtime
+        .registered_database(HostAdmissionScope::Profile)
+        .expect("profile registered database")
+        .read_snapshot()
+        .await
+        .expect("receipt snapshot");
+    let mut rows = snapshot
+        .query(
+            "SELECT state FROM session_relation_receipts WHERE session_id = ?1",
+            params![session_id.as_str()],
+        )
+        .await
+        .expect("receipt query");
+    match rows.next().await.expect("receipt row") {
+        Some(row) => Some(row.get::<String>(0).expect("state")),
+        None => None,
+    }
 }
