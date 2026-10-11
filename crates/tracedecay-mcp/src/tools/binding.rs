@@ -1285,6 +1285,7 @@ mod tests {
         ("tracedecay_dead_code", BranchSensitivity::Sensitive),
         ("tracedecay_affected", BranchSensitivity::Sensitive),
         ("tracedecay_str_replace", BranchSensitivity::Sensitive),
+        ("tracedecay_ast_grep_rewrite", BranchSensitivity::Sensitive),
         ("tracedecay_health", BranchSensitivity::Sensitive),
         ("tracedecay_multi_root_execute", BranchSensitivity::Sensitive),
         ("tracedecay_code_symbol_search", BranchSensitivity::Sensitive),

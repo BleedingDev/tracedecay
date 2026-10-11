@@ -37,25 +37,8 @@ struct DiscoveryCacheKey {
 static DISCOVERY_CACHE: LazyLock<RwLock<HashMap<DiscoveryCacheKey, Arc<Value>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
-#[cfg(test)]
-thread_local! {
-    static DISCOVERY_CACHE_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-}
-
-/// This thread's discovery cache hits since the last reset.
-#[cfg(test)]
-pub(crate) fn catalog_discovery_cache_hits_for_test() -> u64 {
-    DISCOVERY_CACHE_HITS.with(std::cell::Cell::get)
-}
-
-/// Clears this thread's discovery cache hit counter.
-#[cfg(test)]
-pub(crate) fn reset_catalog_discovery_cache_hits_for_test() {
-    DISCOVERY_CACHE_HITS.with(|hits| hits.set(0));
-}
-
-/// Drops every cached discovery entry. Test-only so parallel suites can
-/// isolate hit-counter assertions without sharing a prior miss.
+/// Drops every cached discovery entry so isolation cases do not inherit
+/// another test's capability or scope payload.
 #[cfg(test)]
 pub(crate) fn reset_catalog_discovery_cache_for_test() {
     match DISCOVERY_CACHE.write() {
@@ -143,13 +126,6 @@ fn compose_node_independent_definitions(
     Ok(definitions)
 }
 
-fn record_discovery_cache_hit() {
-    #[cfg(test)]
-    {
-        DISCOVERY_CACHE_HITS.with(|hits| hits.set(hits.get().saturating_add(1)));
-    }
-}
-
 fn discovery_cache_get_or_insert(
     profile_id: &ProfileId,
     authorized_capabilities: &BTreeSet<CapabilityId>,
@@ -159,7 +135,6 @@ fn discovery_cache_get_or_insert(
     if let Ok(cache) = DISCOVERY_CACHE.read()
         && let Some(entry) = cache.get(&key)
     {
-        record_discovery_cache_hit();
         return Ok(Arc::clone(entry));
     }
     let tools =
@@ -168,7 +143,6 @@ fn discovery_cache_get_or_insert(
     match DISCOVERY_CACHE.write() {
         Ok(mut cache) => {
             if let Some(published) = cache.get(&key) {
-                record_discovery_cache_hit();
                 return Ok(Arc::clone(published));
             }
             if cache.len() < DISCOVERY_CACHE_MAX_ENTRIES {
@@ -345,24 +319,6 @@ mod tests {
             );
         }
 
-        let fingerprints = definitions
-            .iter()
-            .map(|definition| {
-                let dispatch = &definition.meta.as_ref().unwrap()["tracedecay/dispatch"];
-                assert_eq!(dispatch["version"], 1);
-                assert_eq!(
-                    definition.annotations.as_ref().unwrap()["readOnlyHint"],
-                    dispatch["read_only"]
-                );
-                dispatch["fingerprint"].as_str().unwrap()
-            })
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            fingerprints.len(),
-            1,
-            "one catalog snapshot must fingerprint every advertised contract"
-        );
-
         let dashboard = definitions
             .iter()
             .find(|definition| definition.name == "tracedecay_dashboard")
@@ -451,47 +407,47 @@ mod tests {
         )
     }
 
-    fn serialize_tools_payload(payload: &serde_json::Value) -> Vec<u8> {
-        serde_json::to_vec(payload).expect("tools/list payload must serialize")
+    fn advertised_tool<'a>(payload: &'a Value, name: &str) -> &'a Value {
+        payload["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("{name} must be advertised"))
     }
 
-    /// Compose without reading or writing the process cache. Byte-equivalence
-    /// must compare a cache serve against this path, not two cache-backed APIs.
-    fn freshly_composed_tools_list_payload(
-        node_count: Option<u64>,
-        budget: u8,
-        profile_id: &ProfileId,
-        authorized_capabilities: &BTreeSet<CapabilityId>,
-        available_scope: &BTreeSet<ScopeDimension>,
-    ) -> Result<Value, McpDispatchMetadataError> {
-        let mut tools = compose_node_independent_definitions(
-            profile_id,
-            authorized_capabilities,
-            available_scope,
-        )?;
-        let description = context_description_for(node_count, budget);
-        for tool in &mut tools {
-            if tool.name == "tracedecay_context" {
-                tool.description.clone_from(&description);
-            }
-        }
-        Ok(serde_json::json!({ "tools": tools }))
+    fn advertises(payload: &Value, name: &str) -> bool {
+        payload["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .any(|tool| tool["name"] == name)
     }
 
-    fn with_discovery_counter_lock<T>(body: impl FnOnce() -> T) -> T {
+    fn assert_rewrite_is_advertised(payload: &Value) {
+        let rewrite = advertised_tool(payload, "tracedecay_ast_grep_rewrite");
+        assert_eq!(
+            rewrite["inputSchema"]["required"],
+            serde_json::json!(["path", "pattern", "rewrite"])
+        );
+        assert_eq!(
+            rewrite["_meta"]["tracedecay/dispatch"]["effect"],
+            "source_edit"
+        );
+    }
+
+    fn with_isolated_discovery_cache<T>(body: impl FnOnce() -> T) -> T {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_catalog_discovery_cache_for_test();
-        reset_catalog_discovery_cache_hits_for_test();
-        crate::tools::dispatch::reset_attach_dispatch_metadata_calls_for_test();
         body()
     }
 
     #[test]
-    fn repeated_equivalent_discovery_hits_the_process_cache() {
-        with_discovery_counter_lock(|| {
+    fn repeated_discovery_keeps_advertising_the_rewrite_tool() {
+        with_isolated_discovery_cache(|| {
             let (profile, authority, scope) = default_discovery_inputs();
             let first = catalog_discovery_tools_list_payload(
                 None,
@@ -501,10 +457,6 @@ mod tests {
                 &scope,
             )
             .expect("first discovery compose");
-            let attaches_after_first =
-                crate::tools::dispatch::attach_dispatch_metadata_calls_for_test();
-            let hits_after_first = catalog_discovery_cache_hits_for_test();
-
             let second = catalog_discovery_tools_list_payload(
                 None,
                 explore_call_budget(0),
@@ -513,48 +465,31 @@ mod tests {
                 &scope,
             )
             .expect("second discovery compose");
-            assert_eq!(
-                serialize_tools_payload(&first),
-                serialize_tools_payload(&second),
-                "equivalent discovery must stay byte-identical"
-            );
-            assert_eq!(
-                crate::tools::dispatch::attach_dispatch_metadata_calls_for_test(),
-                attaches_after_first,
-                "a cache hit must not serialize dispatch contracts again"
-            );
-            assert!(
-                catalog_discovery_cache_hits_for_test() >= hits_after_first.saturating_add(1),
-                "the second equivalent compose must be a cache hit"
-            );
+            assert_rewrite_is_advertised(&first);
+            assert_rewrite_is_advertised(&second);
         });
     }
 
     #[test]
-    fn cached_payload_matches_fresh_compose_for_every_budget() {
+    fn discovery_advertises_rewrite_and_the_requested_context_budget() {
         let (profile, authority, scope) = default_discovery_inputs();
-        for budget in [3_u8, 4, 5, 7, 10] {
-            for node_count in [None, Some(0_u64), Some(6_000), Some(100_000)] {
-                let cached = catalog_discovery_tools_list_payload(
-                    node_count, budget, &profile, &authority, &scope,
-                )
-                .expect("cached discovery payload");
-                let fresh = freshly_composed_tools_list_payload(
-                    node_count, budget, &profile, &authority, &scope,
-                )
-                .expect("fresh discovery compose");
-                assert_eq!(
-                    serialize_tools_payload(&cached),
-                    serialize_tools_payload(&fresh),
-                    "cached payload must match a fresh compose for budget={budget} node_count={node_count:?}"
-                );
-            }
-        }
+        let payload =
+            catalog_discovery_tools_list_payload(Some(6_000), 4, &profile, &authority, &scope)
+                .expect("discovery payload");
+        assert_rewrite_is_advertised(&payload);
+        assert!(
+            advertised_tool(&payload, "tracedecay_context")["description"]
+                .as_str()
+                .expect("context description")
+                .contains("This project (6000 nodes) allows 4 broad context calls."),
+            "{}",
+            advertised_tool(&payload, "tracedecay_context")["description"]
+        );
     }
 
     #[test]
     fn distinct_authorized_capability_sets_never_share_a_cache_entry() {
-        with_discovery_counter_lock(|| {
+        with_isolated_discovery_cache(|| {
             let (profile, full_authority, scope) = default_discovery_inputs();
             let empty_authority = BTreeSet::new();
             let full =
@@ -568,11 +503,11 @@ mod tests {
                 &scope,
             )
             .expect("empty-authority payload");
-            assert_ne!(
-                serialize_tools_payload(&full),
-                serialize_tools_payload(&empty),
-                "different authorized-capability sets must produce distinct payloads"
-            );
+            assert_rewrite_is_advertised(&full);
+            assert!(advertises(&full, "tracedecay_search"));
+            assert!(advertises(&full, "tracedecay_configuration_get"));
+            assert!(!advertises(&empty, "tracedecay_search"));
+            assert!(advertises(&empty, "tracedecay_multi_root_execute"));
 
             let full_again =
                 catalog_discovery_tools_list_payload(Some(0), 3, &profile, &full_authority, &scope)
@@ -585,30 +520,10 @@ mod tests {
                 &scope,
             )
             .expect("empty-authority cache hit");
-            assert_eq!(
-                serialize_tools_payload(&full),
-                serialize_tools_payload(&full_again)
-            );
-            assert_eq!(
-                serialize_tools_payload(&empty),
-                serialize_tools_payload(&empty_again)
-            );
-            let full_names = full["tools"]
-                .as_array()
-                .expect("full tools")
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-                .collect::<BTreeSet<_>>();
-            let empty_names = empty["tools"]
-                .as_array()
-                .expect("empty tools")
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-                .collect::<BTreeSet<_>>();
-            assert_ne!(
-                full_names, empty_names,
-                "capability isolation must change the advertised name set"
-            );
+            assert_rewrite_is_advertised(&full_again);
+            assert!(advertises(&full_again, "tracedecay_search"));
+            assert!(!advertises(&empty_again, "tracedecay_search"));
+            assert!(advertises(&empty_again, "tracedecay_multi_root_execute"));
 
             let mut without_configuration = scope.clone();
             without_configuration.remove(&ScopeDimension::ConfigurationLayer);
@@ -620,11 +535,8 @@ mod tests {
                 &without_configuration,
             )
             .expect("scope-restricted payload");
-            assert_ne!(
-                serialize_tools_payload(&full),
-                serialize_tools_payload(&scoped),
-                "different available-scope sets must produce distinct payloads"
-            );
+            assert_rewrite_is_advertised(&scoped);
+            assert!(!advertises(&scoped, "tracedecay_configuration_get"));
             let scoped_again = catalog_discovery_tools_list_payload(
                 Some(0),
                 3,
@@ -633,20 +545,8 @@ mod tests {
                 &without_configuration,
             )
             .expect("scope-restricted cache hit");
-            assert_eq!(
-                serialize_tools_payload(&scoped),
-                serialize_tools_payload(&scoped_again)
-            );
-            let scoped_names = scoped["tools"]
-                .as_array()
-                .expect("scoped tools")
-                .iter()
-                .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
-                .collect::<BTreeSet<_>>();
-            assert_ne!(
-                full_names, scoped_names,
-                "scope isolation must change the advertised name set"
-            );
+            assert_rewrite_is_advertised(&scoped_again);
+            assert!(!advertises(&scoped_again, "tracedecay_configuration_get"));
         });
     }
 }

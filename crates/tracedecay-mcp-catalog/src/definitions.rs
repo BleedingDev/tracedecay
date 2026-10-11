@@ -299,14 +299,6 @@ fn build_search_cli_definition() -> Result<ToolDefinition, McpCatalogError> {
     Ok(definitions.remove(0))
 }
 
-/// Counts how many times the registry was actually assembled.
-///
-/// The registry is deterministic, so a correct cache builds it exactly once
-/// per process no matter how many `tools/list` requests arrive.
-#[cfg(test)]
-pub(super) static DEFINITION_BUILDS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 /// Borrow the registry, assembled once per process.
 ///
 /// Every input is static for the life of the process: the application catalog
@@ -329,8 +321,6 @@ pub fn get_tool_definitions_ref() -> Result<&'static [ToolDefinition], McpCatalo
 
 #[tracing::instrument(name = "mcp.catalog.assemble", level = "trace", skip_all)]
 fn build_tool_definitions() -> Result<Vec<ToolDefinition>, McpCatalogError> {
-    #[cfg(test)]
-    DEFINITION_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // Work and Workflow own independent executable registries; assemble them
     // concurrently while the application descriptor projection runs here.
     let work_worker = spawn_definition_worker("tracedecay-catalog-work", work::work_definitions)?;

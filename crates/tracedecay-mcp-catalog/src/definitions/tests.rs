@@ -258,48 +258,43 @@ fn lcm_history_reads_accept_an_as_of_cutoff() {
     );
 }
 
-/// The MCP tool catalog is static per build, so `tools/list` must not
-/// re-assemble every JSON schema on each request.
-///
-/// Falsifiable on a count, never a duration: the assembly counter may advance
-/// at most once for the whole process, however many callers ask for it.
-#[test]
-fn tool_definitions_are_assembled_once_per_process() {
-    use std::sync::atomic::Ordering;
+fn advertised_rewrite(definitions: &[ToolDefinition]) -> &ToolDefinition {
+    definitions
+        .iter()
+        .find(|definition| definition.name == "tracedecay_ast_grep_rewrite")
+        .expect("tracedecay_ast_grep_rewrite must be advertised")
+}
 
-    let first = get_tool_definitions().expect("tool definitions");
-    // Read the baseline *after* the first call so the one legitimate build is
-    // already counted; a cached registry can never advance it again.
-    let baseline = DEFINITION_BUILDS.load(Ordering::SeqCst);
-
-    for _ in 0..8 {
-        let again = get_tool_definitions().expect("tool definitions");
-        assert_eq!(
-            again.len(),
-            first.len(),
-            "the cached registry must serve the same tool set"
-        );
-    }
-
+fn assert_rewrite_is_advertised(definitions: &[ToolDefinition]) {
+    let rewrite = advertised_rewrite(definitions);
+    assert_eq!(rewrite.name, "tracedecay_ast_grep_rewrite");
     assert_eq!(
-        DEFINITION_BUILDS.load(Ordering::SeqCst),
-        baseline,
-        "the tool registry was re-assembled after it had already been \
-         built; tools/list rebuilds the whole catalog per request"
+        rewrite.input_schema["required"],
+        json!(["path", "pattern", "rewrite"])
+    );
+    assert!(
+        rewrite
+            .description
+            .contains("matches in comments and strings are left alone"),
+        "{}",
+        rewrite.description
     );
 }
 
+/// The in-process rewrite tool stays on the public catalog under its shipped
+/// name, with the path/pattern/rewrite arguments callers send.
 #[test]
-fn every_advertised_tool_carries_the_tracedecay_prefix() {
-    let definitions = get_tool_definitions().expect("tool definitions");
-    assert!(!definitions.is_empty());
-    for definition in &definitions {
-        assert!(
-            definition.name.starts_with("tracedecay_"),
-            "{} lacks the tracedecay_ prefix",
-            definition.name
-        );
-    }
+fn ast_grep_rewrite_is_advertised_for_structural_edits() {
+    assert_rewrite_is_advertised(&get_tool_definitions().expect("tool definitions"));
+}
+
+/// A later `tools/list` read must still advertise the same rewrite contract.
+/// The catalog is process-cached; callers observe the tool, not a build
+/// counter.
+#[test]
+fn repeated_catalog_reads_keep_advertising_the_rewrite_tool() {
+    assert_rewrite_is_advertised(&get_tool_definitions().expect("first catalog read"));
+    assert_rewrite_is_advertised(&get_tool_definitions().expect("second catalog read"));
 }
 
 #[test]

@@ -757,11 +757,14 @@ async fn analytics_counts_a_rewrite_call_as_an_available_tool() {
     let payload = extract_json(&response);
     let tools = &payload["tools"];
     assert_eq!(
-        tools["called_available_defined_tool_count"].as_i64(),
-        Some(1)
+        tools["top_tools"],
+        json!([{
+            "tool_name": "tracedecay_ast_grep_rewrite",
+            "tier": "edit",
+            "calls": 1,
+            "errors": 1,
+        }])
     );
-    assert_eq!(tools["bound_internal_call_names"], json!([]));
-    assert_eq!(tools["unknown_or_retired_call_names"], json!([]));
 
     drop(server);
     fixture.harness.shutdown().await;

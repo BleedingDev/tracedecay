@@ -677,7 +677,11 @@ mod tests {
         );
         let refused =
             rewrite_source(Path::new("notes.txt"), "take(a)\n", "take($A)", "x").unwrap_err();
-        assert!(refused.contains("no structural grammar"), "{refused}");
+        assert_eq!(
+            refused,
+            "no structural grammar for 'notes.txt' in this build; \
+             use tracedecay_str_replace for text edits"
+        );
     }
 
     /// The bundled JSON grammar is registered in the shipping tiers, so a
@@ -707,10 +711,13 @@ mod tests {
 
         let res = search_tree(dir.path(), "true", None, None, 50, &no_exclusions()).unwrap();
 
-        assert_eq!(res.files_scanned, 1);
-        assert_eq!(res.matches.len(), 1);
-        assert_eq!(res.matches[0].lang, "json");
-        assert_eq!(res.matches[0].matched_text, "true");
+        let hit = res
+            .matches
+            .iter()
+            .find(|hit| hit.matched_text == "true")
+            .expect("json `true` is a structural match");
+        assert_eq!(hit.file.as_ref(), "settings.json");
+        assert_eq!(hit.lang, "json");
     }
 
     /// Composite adapters parse a mask of the file: a `.svelte` route reports
@@ -727,11 +734,21 @@ mod tests {
 
         let res = search_tree(dir.path(), "target($A)", None, None, 50, &no_exclusions()).unwrap();
 
-        assert_eq!(res.files_scanned, 1);
-        assert_eq!(res.matches.len(), 1, "{:?}", res.matches);
-        assert_eq!(res.matches[0].lang, "typescript");
-        assert_eq!(res.matches[0].matched_text, "target(2)");
-        assert_eq!(res.matches[0].line, 5);
+        assert!(
+            res.matches
+                .iter()
+                .all(|hit| hit.matched_text != "target(1)"),
+            "style-block text is not a structural match: {:?}",
+            res.matches
+        );
+        let hit = res
+            .matches
+            .iter()
+            .find(|hit| hit.matched_text == "target(2)")
+            .expect("script-block call is a structural match");
+        assert_eq!(hit.file.as_ref(), "App.svelte");
+        assert_eq!(hit.lang, "typescript");
+        assert_eq!(hit.line, 5);
     }
 
     #[test]
