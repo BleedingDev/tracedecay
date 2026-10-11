@@ -88,7 +88,9 @@ async fn activate_generation(
         .expect("activate generation");
 }
 
-/// `with_journal: false` omits the journal row.
+/// `with_journal: false` leaves the receipt without its effect-journal row —
+/// the state a crash between journal write and acknowledgement leaves,
+/// which the ack must refuse rather than complete from memory.
 async fn seed_pending_receipt(
     database: &RegisteredGlobalDb,
     projection: &SessionRelationProjection,

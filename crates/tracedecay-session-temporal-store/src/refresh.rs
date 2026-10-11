@@ -3415,7 +3415,9 @@ async fn commit_begin_batch_item_in_transaction(
                 .execute(&format!("SAVEPOINT {alone}"), ())
                 .await
                 .map_err(|error| storage(PERSIST_REFRESH, error))?;
-            // A refused grouped batch still commits its begin alone.
+            // On the ungrouped path a crash between batch rollback and
+            // begin commit leaves exactly this durable begin, so replay
+            // must not depend on which path wrote it.
             let outcome =
                 begin_session_refresh_in_transaction(transaction, request, accepted_at).await;
             Ok(match outcome {
