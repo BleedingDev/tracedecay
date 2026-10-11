@@ -22,8 +22,14 @@ pub const REQUEST_COST_TRAILER_PREFIX: &str = "tracedecay_cost:";
 pub fn is_beside_result_block(text: &str) -> bool {
     let text = text.trim_start();
     text.starts_with(TOKEN_ACCOUNTING_FOOTER_PREFIX)
-        || text.starts_with(CODE_GRAPH_FRESHNESS_TRAILER_PREFIX)
+        || is_code_graph_freshness_block(text)
         || text.starts_with(REQUEST_COST_TRAILER_PREFIX)
+}
+
+/// Whether a content block is the stale `code_graph_freshness` trailer.
+pub fn is_code_graph_freshness_block(text: &str) -> bool {
+    text.trim_start()
+        .starts_with(CODE_GRAPH_FRESHNESS_TRAILER_PREFIX)
 }
 
 /// Token estimate for one rendered result: reading its touched files raw

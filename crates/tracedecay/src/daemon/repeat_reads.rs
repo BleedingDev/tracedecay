@@ -2,13 +2,15 @@
 //!
 //! The serve proxy lives exactly as long as one host MCP connection, so this
 //! ledger is per session without any daemon state. It digests the content
-//! blocks the daemon actually returned, skipping only trailer blocks and the
-//! renderer's per-call lines (request ids, timings). A pointer is sent only
-//! when this session already received those same bytes for the same tool and
-//! canonical arguments, so an edited file, a re-index, or output rendered
-//! differently from the same typed answer always arrives in full. The call
-//! after a pointer is always served in full, which is how an agent that lost
-//! the earlier result gets it back.
+//! blocks the daemon actually returned, skipping trailer blocks and the
+//! renderer's per-call lines (request ids, timings) but including whether a
+//! stale code-graph seat was served. A pointer is sent only when this session
+//! already received those same bytes for the same tool and canonical
+//! arguments, so an edited file, a re-index, a fresh/stale seat transition, or
+//! output rendered differently from the same typed answer always arrives in
+//! full. The call after a pointer is always served in full, which is how an
+//! agent that lost the earlier result gets it back, and a pointer keeps the
+//! stale-seat trailer so the warning is never hidden.
 //!
 //! The ledger is on only when the host sets [`REPEAT_READ_POINTERS_ENV`],
 //! because that is valid only where one connection serves one agent (Codex
@@ -24,7 +26,9 @@ use tracedecay_domain::canonical_text::canonical_framed_sha256;
 use tracedecay_domain::errors::Result;
 use tracedecay_mcp::JsonRpcRequest;
 use tracedecay_mcp::application_output::markdown::without_per_call_lines;
-use tracedecay_mcp::tools::response_trailers::is_beside_result_block;
+use tracedecay_mcp::tools::response_trailers::{
+    CODE_GRAPH_FRESHNESS_TRAILER_PREFIX, is_beside_result_block, is_code_graph_freshness_block,
+};
 
 use super::tool_surface::env_switch;
 
@@ -146,11 +150,17 @@ fn answer_digest(result: &Value) -> Option<(String, usize)> {
         .map(|block| block.get("text").and_then(Value::as_str))
         .collect::<Option<Vec<_>>>()?;
     let bytes = texts.iter().map(|text| text.len()).sum();
-    let answer = texts
+    let mut answer = texts
         .iter()
         .filter(|text| !is_beside_result_block(text))
         .map(|text| without_per_call_lines(text))
         .collect::<Vec<_>>();
+    // A stale-seat trailer is part of what was served, not per-call noise: its
+    // presence joins the digest so a fresh/stale transition is served in full,
+    // while its exact text stays out so one stale seat can still dedupe.
+    if texts.iter().any(|text| is_code_graph_freshness_block(text)) {
+        answer.push(CODE_GRAPH_FRESHNESS_TRAILER_PREFIX.to_owned());
+    }
     let parts = answer.iter().map(String::as_bytes).collect::<Vec<_>>();
     Some((canonical_framed_sha256(DIGEST_DOMAIN, &parts), bytes))
 }
@@ -167,10 +177,24 @@ fn replace_with_pointer(result: &mut Value, tool: &str, digest: &str, bytes: usi
          to receive the full content, for example if that earlier result is no longer in your \
          context."
     );
-    result.insert(
-        "content".to_owned(),
-        json!([{ "type": "text", "text": text }]),
-    );
+    // A stale-seat warning is live serving state, not part of the repeated
+    // body: it rides beside the pointer so the warning is never hidden.
+    let warnings = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(is_code_graph_freshness_block)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    content.extend(warnings);
+    result.insert("content".to_owned(), json!(content));
     result.remove("structuredContent");
 }
 
@@ -212,6 +236,26 @@ mod tests {
             "{}\n",
             json!({"jsonrpc": "2.0", "id": id, "result": result})
         )]
+    }
+
+    /// `answer` plus the stale-seat trailer the daemon appends, in its real
+    /// shape including the per-call `(sealed Ns ago)` age.
+    fn stale_answer(id: i64, payload: &str, sealed: &str) -> Vec<String> {
+        let mut response = answer(id, payload);
+        let mut message: Value = serde_json::from_str(&response[0]).expect("json");
+        message["result"]["content"]
+            .as_array_mut()
+            .expect("content")
+            .push(json!({
+                "type": "text",
+                "text": format!(
+                    "\ncode_graph_freshness: stale, serving the last complete generation \
+                     generation.fixture.7 (sealed {sealed} ago) while the code index rebuilds; \
+                     results may trail the live worktree"
+                ),
+            }));
+        response[0] = format!("{message}\n");
+        response
     }
 
     fn served(reads: &mut RepeatReads, request: &JsonRpcRequest, response: Vec<String>) -> Value {
@@ -259,6 +303,53 @@ mod tests {
                 .as_str()
                 .is_some_and(|text| text.contains(&big('x'))),
             "{third}"
+        );
+    }
+
+    #[test]
+    fn freshness_transitions_are_full_and_pointers_keep_the_warning() {
+        let mut reads = RepeatReads::default();
+        let args = json!({"path": "src"});
+        let tool = "tracedecay_files";
+        served(&mut reads, &call(1, tool, &args), answer(1, &big('x')));
+        let to_stale = served(
+            &mut reads,
+            &call(2, tool, &args),
+            stale_answer(2, &big('x'), "5s"),
+        );
+        assert!(
+            !is_pointer(&to_stale),
+            "fresh to stale must serve the warning in full: {to_stale}"
+        );
+        let repeat_stale = served(
+            &mut reads,
+            &call(3, tool, &args),
+            stale_answer(3, &big('x'), "9s"),
+        );
+        assert!(
+            is_pointer(&repeat_stale),
+            "the same stale answer still dedupes: {repeat_stale}"
+        );
+        let texts = repeat_stale["result"]["content"]
+            .as_array()
+            .expect("content");
+        assert!(
+            texts.iter().any(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("(sealed 9s ago)"))
+            }),
+            "a pointer carries this call's warning, not an old one: {repeat_stale}"
+        );
+        let back_to_fresh = served(&mut reads, &call(4, tool, &args), answer(4, &big('x')));
+        assert!(
+            !is_pointer(&back_to_fresh),
+            "stale to fresh must serve in full: {back_to_fresh}"
+        );
+        let repeat_fresh = served(&mut reads, &call(5, tool, &args), answer(5, &big('x')));
+        assert!(
+            is_pointer(&repeat_fresh),
+            "the fresh baseline still dedupes: {repeat_fresh}"
         );
     }
 
