@@ -1764,6 +1764,7 @@ pub async fn run_session_temporal_refresh_pass(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracedecay_domain::SessionId;
     use tracedecay_global_db::tests::harness::RegisteredGlobalDbHarness;
     use tracedecay_runtime_core::db::engine::params;
     use tracedecay_sessions::runtime::{SessionMessageRecord, SessionRecord};
@@ -1871,6 +1872,42 @@ mod tests {
         assert!(
             waited <= SLOW_ITEM_WORK * 17,
             "a pass of 16 slow items must not hold the worker for {waited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_completion_stays_claimable_by_the_next_pass() {
+        let harness = RegisteredGlobalDbHarness::open("refresh-timed-out-completion").await;
+        let store = SessionTemporalStore::new(harness.registered.as_ref());
+        store
+            .begin_or_join_session_refresh(SessionRefreshBeginOrJoinRequestV1::new(
+                SessionId::new("timed-out-completion").unwrap(),
+                SessionRefreshFrontierV1::new(0, 0).unwrap(),
+            ))
+            .await
+            .unwrap();
+        let recovery = store.running_session_refreshes().await.unwrap().remove(0);
+        let state = SessionTemporalRefreshWakeState::default();
+        assert!(state.claim_terminal_attempt(&recovery));
+        let mut report = SessionTemporalRefreshPassReport::default();
+
+        reject_staged_completion(
+            &store,
+            &state,
+            ClaimedTerminalAttempt::new(&state, recovery.clone()),
+            SessionStoreError::DeadlineExceeded,
+            &mut report,
+        )
+        .await;
+
+        assert_eq!(
+            report.retry_class,
+            Some(SessionTemporalRefreshRetryClass::Deadline)
+        );
+        assert_eq!(report.terminal_errors, 0);
+        assert!(
+            state.claim_terminal_attempt(&recovery),
+            "a completion that missed its deadline must be retried, not held as terminal"
         );
     }
 
