@@ -5,9 +5,11 @@ description: Find the supported TraceDecay operation for a code-intelligence, me
 
 # Discovering TraceDecay
 
-Use live tool descriptions and `tracedecay tool <name> --help` for available
-operations and arguments. Load a deferred schema when needed. This is capability
-discovery, not a prerequisite for ordinary reads, local edits, or clarification.
+Every TraceDecay tool is on tools/list. Tools outside the most-used set may be
+stubs with a short description and an open schema: call a stub by name, and a
+rejected call returns its full input schema. `tracedecay tool <name> --help`
+shows the same parameters. This is capability discovery, not a prerequisite for
+ordinary reads, local edits, or clarification.
 
 Choose by the missing evidence: exploration locates code; tracing follows call
 relationships; impact connects changes to dependents and tests; review evaluates
