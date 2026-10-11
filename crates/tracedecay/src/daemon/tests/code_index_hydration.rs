@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -570,11 +571,11 @@ fn production_symbol_candidate_serves_the_matched_body_piece() {
     while lib_rs.len() < 20_000 {
         lib_rs.push_str("    let _pad = 1u32;\n");
     }
-    lib_rs.push_str(&format!("    let {MATCHED_WINDOW} = 2u32;\n"));
+    writeln!(lib_rs, "    let {MATCHED_WINDOW} = 2u32;").expect("matched window fixture");
     while lib_rs.len() < 70_000 {
         lib_rs.push_str("    let _pad = 2u32;\n");
     }
-    lib_rs.push_str(&format!("    {FIRST_WINDOW}\n}}\n"));
+    write!(lib_rs, "    {FIRST_WINDOW}\n}}\n").expect("fixture closing body");
     std::fs::write(project.path().join("src/lib.rs"), lib_rs).expect("source");
     git(project.path(), &["add", "."]);
     git(project.path(), &["commit", "-qm", "fixture"]);
