@@ -1309,29 +1309,27 @@ mod tests {
         );
         write_executable_script(&executable, script).expect("write fake app-server");
 
-        let started = Instant::now();
         let summary = run_read_only_work(
             &executable,
             temporary.path(),
             Duration::from_secs(30),
             &CodexAppServerLaunchReceipt::default(),
         );
-        let elapsed = started.elapsed();
         let holder: i32 = std::fs::read_to_string(&holder_pid)
             .expect("the fake app-server started its stdout holder")
             .trim()
             .parse()
             .expect("holder pid");
+        assert_eq!(
+            unsafe { kill(holder, 0) },
+            0,
+            "the turn must return while the escaped descendant still holds stdout"
+        );
         unsafe { kill(holder, SIGKILL) };
 
         assert_eq!(
             summary.map(|summary| summary.text),
             Ok("work result".to_owned())
-        );
-        // The holder sleeps 60 s; waiting on its stdout would take that long.
-        assert!(
-            elapsed < Duration::from_secs(30),
-            "the turn must return while the escaped descendant still holds stdout, took {elapsed:?}"
         );
     }
 
