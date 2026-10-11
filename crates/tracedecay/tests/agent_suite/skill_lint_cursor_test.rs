@@ -337,15 +337,11 @@ fn cursor_commands_are_hygienic_and_reference_resolve() {
 }
 
 fn mcp_tool_names() -> BTreeSet<String> {
-    let mut names = get_tool_definitions()
+    get_tool_definitions()
         .expect("tool definitions")
         .into_iter()
         .map(|definition| definition.name)
-        .collect::<BTreeSet<_>>();
-    // Host-gated: filtered out of the definition list when the `ast-grep`
-    // CLI is absent, but still a real tool skills may reference.
-    names.insert("tracedecay_ast_grep_rewrite".to_string());
-    names
+        .collect()
 }
 
 fn assert_no_violations(rule_family: &str, violations: &[String]) {

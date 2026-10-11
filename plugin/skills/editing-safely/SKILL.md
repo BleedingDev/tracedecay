@@ -33,7 +33,8 @@ matches.
 
 For consolidation, compare candidate bodies and behavior directly; a similar
 name does not justify replacing an implementation.
-Structural rewrite (`tracedecay_ast_grep_rewrite`) uses external ast-grep where
-advertised; its availability is separate from in-process structural search.
+Structural rewrite (`tracedecay_ast_grep_rewrite`) runs in-process on the same
+bundled ast-grep engine and grammars as structural search, so it is always
+advertised.
 Verify the actual changed behavior and use `assessing-impact` for structural
 test selection.

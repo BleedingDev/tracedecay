@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn core_tools_are_cataloged_and_cover_always_load() {
-        let definitions = tracedecay_mcp::get_maximal_tool_definitions().expect("tool definitions");
+        let definitions = tracedecay_mcp::get_tool_definitions().expect("tool definitions");
         let catalog = definitions
             .iter()
             .map(|definition| definition.name.as_str())

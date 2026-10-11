@@ -1,8 +1,7 @@
 //! In-process structural (AST) search over the project working tree.
 //!
-//! This is the read-only sibling of the `ast_grep_rewrite` edit tool. Where the
-//! rewrite path shells out to the host `ast-grep` binary, structural *search*
-//! runs entirely in-process: the [`ast_grep_core`] pattern engine is generic
+//! This is the read-only sibling of the `ast_grep_rewrite` edit tool; both run
+//! entirely in-process: the [`ast_grep_core`] pattern engine is generic
 //! over a tree-sitter [`Language`], so we wire the repo's own bundled grammars
 //! (served by [`tracedecay_code_extraction::ts_provider`]) into its `Language` trait.
 //!
@@ -27,7 +26,7 @@ use ast_grep_core::matcher::PatternBuilder;
 use ast_grep_core::tree_sitter::{LanguageExt, StrDoc, TSLanguage};
 use ast_grep_core::{AstGrep, Language, Pattern, PatternError};
 
-use tracedecay_code_extraction::ts_provider;
+use tracedecay_code_extraction::{LanguageExtractor, LanguageRegistry, ts_provider};
 
 use crate::grep_search::MAX_INTERACTIVE_SOURCE_BYTES;
 use crate::source_walk::{forward_slash_relative, source_walk};
@@ -120,44 +119,54 @@ fn expando_for_key(key: &str) -> Option<char> {
         | "rust" | "swift" => Some('µ'),
         // C/C++ use an astral-plane char (any letter is a valid identifier start).
         "c" | "cpp" => Some('𐀀'),
-        // CSS / Nix use `_` (`$` is interpolation / at-rule syntax there).
-        "css" | "nix" => Some('_'),
+        // CSS / Nix / Zig use `_` (`$` is interpolation / sigil syntax there).
+        "css" | "nix" | "zig" => Some('_'),
         // Everything else (js/ts/tsx, java, scala, bash, lua, json, yaml,
         // markdown, dart, solidity, …) parses `$` fine, no expando.
         _ => None,
     }
 }
 
-/// Maps a file extension to a `ts_provider` language key. Returns `None` for
-/// extensions we do not confidently route; the caller then skips the file. The
-/// key is still validated against the compiled grammar tier via
-/// [`ts_provider::try_language`], so listing a key here that is not bundled is
-/// harmless (the file is skipped).
-fn lang_key_for_ext(ext: &str) -> Option<&'static str> {
-    Some(match ext {
-        "rs" => "rust",
-        "go" => "go",
-        "py" | "pyi" => "python",
-        "js" | "jsx" | "mjs" | "cjs" => "javascript",
-        "ts" | "mts" | "cts" => "typescript",
-        "tsx" => "tsx",
-        "java" => "java",
-        "kt" | "kts" => "kotlin",
-        "scala" | "sc" => "scala",
-        "c" | "h" => "c",
-        "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" => "cpp",
-        "cs" => "c_sharp",
-        "swift" => "swift",
-        "rb" => "ruby",
-        "php" => "php",
-        "lua" => "lua",
-        "sh" | "bash" => "bash",
-        "dart" => "dart",
-        "ex" | "exs" => "elixir",
-        "hs" => "haskell",
-        "nix" => "nix",
-        "css" => "css",
+/// How one file reaches a bundled grammar under language inference: the
+/// `ts_provider` key plus, when the canonical extractor dispatched it, that
+/// extractor. Its `prepare_parse_source` supplies the parse text so composite
+/// adapters (Svelte, Astro) are read the same way the index reads them;
+/// `None` means the grammar reads the file's own bytes.
+struct StructuralRoute<'r> {
+    key: String,
+    extractor: Option<&'r dyn LanguageExtractor>,
+}
+
+/// Resolves a file's structural grammar through the canonical extractor
+/// dispatch, so the set of routable extensions is exactly the set the index
+/// parses and new bundled languages become searchable and rewritable without
+/// a second table to keep in step. The grammar key is still validated against
+/// the compiled tier via [`ts_provider::try_language`], so a language whose
+/// grammar this build omits simply does not match (search skips the file,
+/// rewrite refuses it).
+///
+/// Extension variants no extractor claims but a bundled grammar still parses
+/// fall through to a small static table. Everything else returns `None`.
+fn structural_route<'r>(
+    registry: &'r LanguageRegistry,
+    rel_path: &str,
+) -> Option<StructuralRoute<'r>> {
+    if let Some(extractor) = registry.extractor_for_file(rel_path) {
+        return Some(StructuralRoute {
+            key: extractor.retained_grammar_key(rel_path),
+            extractor: Some(extractor),
+        });
+    }
+    let key = match rel_path.rsplit('.').next()? {
+        "mjs" | "cjs" => "javascript",
+        "mts" | "cts" => "typescript",
+        "pyi" => "python",
+        "c++" => "cpp",
         _ => return None,
+    };
+    Some(StructuralRoute {
+        key: key.to_owned(),
+        extractor: None,
     })
 }
 
@@ -315,6 +324,10 @@ where
     let walker = source_walk(project_root, path_glob, path_policy)
         .map_err(|error| AstGrepSearchError::InvalidGlob(error.glob))?;
 
+    // Language inference rides the canonical extractor dispatch; built once
+    // per sweep so per-file routing stays one hash probe.
+    let registry = lang.is_none().then(LanguageRegistry::new);
+
     let mut result = AstGrepSearchResult::default();
 
     for entry in walker {
@@ -328,20 +341,6 @@ where
         }
         let path = entry.path();
 
-        // An explicit language applies to every caller-selected file, including
-        // extensionless names such as Dockerfile. Without one, infer by suffix.
-        let key = match lang {
-            Some(explicit) => explicit,
-            None => match path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .and_then(lang_key_for_ext)
-            {
-                Some(k) => k,
-                None => continue,
-            },
-        };
-
         let Ok(rel) = path.strip_prefix(project_root) else {
             continue;
         };
@@ -349,6 +348,23 @@ where
         if !repository_path_matches_scope(rel_str.as_ref(), scope_prefix) {
             continue;
         }
+
+        // An explicit language applies to every caller-selected file, including
+        // extensionless names such as Dockerfile. Without one, the canonical
+        // extractor dispatch routes the file (or leaves it unexamined).
+        let route = match lang {
+            Some(explicit) => StructuralRoute {
+                key: explicit.to_string(),
+                extractor: None,
+            },
+            None => match registry
+                .as_ref()
+                .and_then(|registry| structural_route(registry, &rel_str))
+            {
+                Some(route) => route,
+                None => continue,
+            },
+        };
 
         let Ok(metadata) = entry.metadata() else {
             continue;
@@ -370,9 +386,17 @@ where
             continue;
         };
 
+        // The text the parser sees: the extractor's own prepared source, whose
+        // byte length and line breaks are contractually identical to the
+        // file's, so match ranges still index the original text.
+        let parse_source = route.extractor.map_or_else(
+            || Cow::Borrowed(source.as_str()),
+            |extractor| extractor.prepare_parse_source(&source),
+        );
+
         // Get-or-compile the pattern for this language.
-        let entry = cache.entry(key.to_string()).or_insert_with(|| {
-            match build_lang_pattern(key, pattern) {
+        let entry = cache.entry(route.key.clone()).or_insert_with(|| {
+            match build_lang_pattern(&route.key, pattern) {
                 Some(Ok(built)) => Some(built),
                 _ => None,
             }
@@ -381,17 +405,22 @@ where
             continue;
         };
 
+        let text = AstGrepFileText {
+            source: &source,
+            parse_source: &parse_source,
+        };
+        let file = AstGrepFileIdentity {
+            rel_str: &rel_str,
+            key: &route.key,
+        };
         let stop = if crate::observe::sample_hot_loop() {
             {
                 let _span = tracing::trace_span!("code_index_ast_grep_file").entered();
                 examine_ast_grep_file(
-                    &source,
+                    text,
                     td_lang,
                     compiled,
-                    AstGrepFileIdentity {
-                        rel_str: &rel_str,
-                        key,
-                    },
+                    file,
                     &mut result,
                     max_results,
                     &is_cancelled,
@@ -399,13 +428,10 @@ where
             }
         } else {
             examine_ast_grep_file(
-                &source,
+                text,
                 td_lang,
                 compiled,
-                AstGrepFileIdentity {
-                    rel_str: &rel_str,
-                    key,
-                },
+                file,
                 &mut result,
                 max_results,
                 &is_cancelled,
@@ -419,6 +445,58 @@ where
     Ok(result)
 }
 
+/// Rewrites every structural match of `pattern` in one file's `source` with
+/// the `rewrite` template, the language inferred from `path`'s extension.
+///
+/// `Ok(None)` means the pattern matched nothing. `Err` is the caller-facing
+/// reason no rewrite could run.
+#[tracing::instrument(name = "code_index.rewrite.ast_grep", level = "trace", skip_all)]
+pub fn rewrite_source(
+    path: &Path,
+    source: &str,
+    pattern: &str,
+    rewrite: &str,
+) -> Result<Option<String>, String> {
+    if pattern.trim().is_empty() {
+        return Err(AstGrepSearchError::EmptyPattern.to_string());
+    }
+    let refused = || {
+        format!(
+            "no structural grammar for '{}' in this build; use tracedecay_str_replace for text edits",
+            path.display()
+        )
+    };
+    let rel_str = forward_slash_relative(path);
+    let registry = LanguageRegistry::new();
+    let Some(route) = structural_route(&registry, &rel_str) else {
+        return Err(refused());
+    };
+    let Some((lang, compiled)) = build_lang_pattern(&route.key, pattern).transpose()? else {
+        return Err(refused());
+    };
+    let parse_source = route.extractor.map_or_else(
+        || Cow::Borrowed(source),
+        |extractor| extractor.prepare_parse_source(source),
+    );
+    let doc = StrDoc::try_new(parse_source.as_ref(), lang)
+        .map_err(|error| format!("failed to parse '{}': {error}", path.display()))?;
+    let edits = AstGrep::doc(doc).root().replace_all(&compiled, rewrite);
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let mut rewritten = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+    for edit in edits {
+        rewritten.extend_from_slice(&source.as_bytes()[cursor..edit.position]);
+        rewritten.extend_from_slice(&edit.inserted_text);
+        cursor = edit.position + edit.deleted_length;
+    }
+    rewritten.extend_from_slice(&source.as_bytes()[cursor..]);
+    String::from_utf8(rewritten)
+        .map(Some)
+        .map_err(|error| format!("structural rewrite produced invalid UTF-8: {error}"))
+}
+
 /// Which file a match is attributed to: its project-relative path and the
 /// language key. Both are only ever copied into the emitted match, and they
 /// always describe the same file, so they travel as one value.
@@ -428,8 +506,18 @@ struct AstGrepFileIdentity<'file> {
     key: &'file str,
 }
 
+/// The file's own bytes and the text the parser sees. They differ only for
+/// composite adapters whose `prepare_parse_source` masks non-code regions;
+/// byte offsets are contractually identical, so match ranges index `source`
+/// and display always reports the file's own text.
+#[derive(Clone, Copy)]
+struct AstGrepFileText<'file> {
+    source: &'file str,
+    parse_source: &'file str,
+}
+
 fn examine_ast_grep_file<C: Fn() -> bool>(
-    source: &str,
+    text: AstGrepFileText<'_>,
     td_lang: &TdLang,
     compiled: &Pattern,
     file: AstGrepFileIdentity<'_>,
@@ -438,7 +526,7 @@ fn examine_ast_grep_file<C: Fn() -> bool>(
     is_cancelled: &C,
 ) -> bool {
     result.files_scanned += 1;
-    let Ok(doc) = StrDoc::try_new(source, td_lang.clone()) else {
+    let Ok(doc) = StrDoc::try_new(text.parse_source, td_lang.clone()) else {
         return false;
     };
     let ast = AstGrep::doc(doc);
@@ -452,7 +540,7 @@ fn examine_ast_grep_file<C: Fn() -> bool>(
         let line0 = start.line();
         result.lines_examined = result.lines_examined.saturating_add(1);
         result.lines_visited = result.lines_visited.saturating_add(1);
-        let line_text = source_line_at_byte(source, range.start);
+        let line_text = source_line_at_byte(text.source, range.start);
         result.matches.push(AstGrepSearchMatch {
             file: Arc::clone(file.rel_str),
             start_byte: range.start,
@@ -460,7 +548,9 @@ fn examine_ast_grep_file<C: Fn() -> bool>(
             node_kind: node.kind().into_owned(),
             line: (line0 as u32) + 1,
             column: (start.column(&node) as u32) + 1,
-            matched_text: collapse_snippet(&node.text()),
+            matched_text: collapse_snippet(
+                text.source.get(range.start..range.end).unwrap_or_default(),
+            ),
             line_text,
             lang: file.key.to_string(),
         });
@@ -558,6 +648,107 @@ mod tests {
         assert_eq!(pre_process_pattern('µ', "f($$$)"), "f(µµµ)");
         assert_eq!(pre_process_pattern('µ', "f($1)"), "f($1)");
         assert_eq!(pre_process_pattern('µ', "f($_)"), "f(µ_)");
+    }
+
+    #[test]
+    fn rewrite_swaps_metavariables_in_code_and_leaves_comments_and_strings() {
+        let source = "fn f() {\n    take(a, 1);\n    take(\n        b,\n        2,\n    );\n}\n\
+                      // take(a, 1)\nconst S: &str = \"take(a, 1)\";\n";
+        let rewritten = rewrite_source(
+            Path::new("src/lib.rs"),
+            source,
+            "take($A, $B)",
+            "take($B, $A)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rewritten,
+            "fn f() {\n    take(1, a);\n    take(2, b);\n}\n\
+             // take(a, 1)\nconst S: &str = \"take(a, 1)\";\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_without_a_match_or_grammar_does_not_rewrite() {
+        assert_eq!(
+            rewrite_source(Path::new("a.rs"), "fn f() {}\n", "missing($A)", "x"),
+            Ok(None)
+        );
+        let refused =
+            rewrite_source(Path::new("notes.txt"), "take(a)\n", "take($A)", "x").unwrap_err();
+        assert_eq!(
+            refused,
+            "no structural grammar for 'notes.txt' in this build; \
+             use tracedecay_str_replace for text edits"
+        );
+    }
+
+    /// The bundled JSON grammar is registered in the shipping tiers, so a
+    /// `.json` file must rewrite structurally instead of being refused as
+    /// grammar-less.
+    #[test]
+    #[cfg(any(feature = "lite", feature = "lang-json"))]
+    fn rewrite_applies_structural_edits_in_json() {
+        let rewritten = rewrite_source(
+            Path::new("config/settings.json"),
+            "{\n  \"enabled\": true,\n  \"level\": 1\n}\n",
+            "true",
+            "false",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rewritten, "{\n  \"enabled\": false,\n  \"level\": 1\n}\n");
+    }
+
+    /// Inference routes every extension the index parses, including config
+    /// documents like `.json`.
+    #[test]
+    #[cfg(any(feature = "lite", feature = "lang-json"))]
+    fn inferred_language_search_scans_json_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "settings.json", "{\n  \"enabled\": true\n}\n");
+
+        let res = search_tree(dir.path(), "true", None, None, 50, &no_exclusions()).unwrap();
+
+        let hit = res
+            .matches
+            .iter()
+            .find(|hit| hit.matched_text == "true")
+            .expect("json `true` is a structural match");
+        assert_eq!(hit.file.as_ref(), "settings.json");
+        assert_eq!(hit.lang, "json");
+    }
+
+    /// Composite adapters parse a mask of the file: a `.svelte` route reports
+    /// only script-block matches, and display text still comes from the file's
+    /// own bytes at the same offsets.
+    #[test]
+    fn svelte_search_matches_only_inside_the_script_block() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "App.svelte",
+            "<style>\n  p { content: target(1); }\n</style>\n<script>\n  target(2);\n</script>\n",
+        );
+
+        let res = search_tree(dir.path(), "target($A)", None, None, 50, &no_exclusions()).unwrap();
+
+        assert!(
+            res.matches
+                .iter()
+                .all(|hit| hit.matched_text != "target(1)"),
+            "style-block text is not a structural match: {:?}",
+            res.matches
+        );
+        let hit = res
+            .matches
+            .iter()
+            .find(|hit| hit.matched_text == "target(2)")
+            .expect("script-block call is a structural match");
+        assert_eq!(hit.file.as_ref(), "App.svelte");
+        assert_eq!(hit.lang, "typescript");
+        assert_eq!(hit.line, 5);
     }
 
     #[test]
