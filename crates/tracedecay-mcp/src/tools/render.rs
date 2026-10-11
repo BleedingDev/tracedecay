@@ -20,6 +20,9 @@ use tracedecay_runtime_core::tracedecay::current_timestamp;
 
 pub use tracedecay_runtime_core::text::format_relative_time;
 
+mod ranked_tail;
+pub(crate) use ranked_tail::{RankedRow, ranked_rows_md};
+
 const MARKDOWN_TRUNCATION_RESERVED_CHARS: usize = 2_048;
 
 /// Agent-facing recovery text for a truncated response.
@@ -553,6 +556,12 @@ impl Md {
 
     pub fn empty_note(&mut self, text: &str) -> &mut Self {
         let _ = writeln!(self.buf, "_{text}_");
+        self
+    }
+
+    /// Appends already-rendered markdown verbatim.
+    pub fn raw(&mut self, markdown: &str) -> &mut Self {
+        self.buf.push_str(markdown);
         self
     }
 
