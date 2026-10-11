@@ -656,8 +656,9 @@ pub fn normalize_worktree(path: &str) -> String {
 /// Resolves one worktree spelling to the identity the store keys on: the
 /// canonical name when the path exists (8.3 short names, shell aliases and
 /// symlinked roots collapse), else the lexical cleanup above so a missing
-/// historical path keeps its recorded spelling. Used once per distinct
-/// spelling at evidence intake, not on stored rows.
+/// historical path keeps its recorded spelling. Each distinct spelling
+/// resolves once process-wide so evidence intake never re-runs a filesystem
+/// resolve per stored row or per apply.
 pub(crate) fn canonical_worktree_key(path: &str) -> String {
     let normalized = normalize_worktree(path);
     let candidate = std::path::Path::new(&normalized);
@@ -666,10 +667,26 @@ pub(crate) fn canonical_worktree_key(path: &str) -> String {
     if !candidate.is_absolute() {
         return normalized;
     }
-    match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
-        Ok(resolved) => normalize_worktree(&resolved.to_string_lossy()),
-        Err(_) => normalized,
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(key) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&normalized)
+    {
+        return key.clone();
     }
+    let resolved =
+        match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
+            Ok(canonical) => normalize_worktree(&canonical.to_string_lossy()),
+            Err(_) => normalized.clone(),
+        };
+    cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(normalized, resolved.clone());
+    resolved
 }
 
 pub fn observation_extends_span(first_ts: i64, last_ts: i64, ts: i64, gap_secs: i64) -> bool {

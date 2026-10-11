@@ -338,22 +338,19 @@ impl<'t, T: Executor + ?Sized> GitEvidenceWriter<'t, T> {
             commits: mut incoming_commits,
             merge_gap_secs,
         } = batch;
-        // Resolve each distinct worktree spelling once per pass: a host may
-        // report an OS alias (8.3 short name, symlinked root) where git
-        // reports the canonical name, and the fold keys on one worktree.
-        // Stored rows resolve at load so an older alias heals on write.
-        let mut worktree_keys = HashMap::new();
+        // Resolve each worktree spelling at intake: a host may report an
+        // OS alias (8.3 short name, symlinked root) where git reports the
+        // canonical name, and the fold keys on one worktree. Stored rows
+        // resolve at load so an older alias heals on write; each distinct
+        // spelling resolves once process-wide.
         for observation in &mut observations {
-            observation.worktree = keyed_worktree(&mut worktree_keys, &observation.worktree);
+            observation.worktree = canonical_worktree_key(&observation.worktree);
         }
         for span in &mut incoming_spans {
-            span.worktree = keyed_worktree(&mut worktree_keys, &span.worktree);
+            span.worktree = canonical_worktree_key(&span.worktree);
         }
         for record in &mut incoming_commits {
-            record.worktree = record
-                .worktree
-                .as_deref()
-                .map(|worktree| keyed_worktree(&mut worktree_keys, worktree));
+            record.worktree = record.worktree.as_deref().map(canonical_worktree_key);
         }
         let session_ids = observations
             .iter()
@@ -666,27 +663,13 @@ async fn load_session_rows(
             record,
         );
     }
-    let mut worktree_keys = HashMap::new();
     for span in spans.values_mut() {
-        span.worktree = keyed_worktree(&mut worktree_keys, &span.worktree);
+        span.worktree = canonical_worktree_key(&span.worktree);
     }
     for record in commits.values_mut() {
-        record.worktree = record
-            .worktree
-            .as_deref()
-            .map(|worktree| keyed_worktree(&mut worktree_keys, worktree));
+        record.worktree = record.worktree.as_deref().map(canonical_worktree_key);
     }
     Ok((spans, commits))
-}
-
-/// The worktree identity the fold keys on: one filesystem resolve per
-/// distinct lexical spelling per call, so hot correlation rows do not each
-/// pay a `canonicalize`.
-fn keyed_worktree(cache: &mut HashMap<String, String>, spelling: &str) -> String {
-    cache
-        .entry(normalize_worktree(spelling))
-        .or_insert_with(|| canonical_worktree_key(spelling))
-        .clone()
 }
 
 fn decode_record<T: serde::de::DeserializeOwned>(row: &Row) -> Result<T, GitCorrelationError> {
