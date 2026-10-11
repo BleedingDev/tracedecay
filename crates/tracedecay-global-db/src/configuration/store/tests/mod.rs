@@ -187,10 +187,9 @@ async fn retired_orphan_db_gc_days_key_converges_out_of_a_beta50_snapshot() {
     .await;
 }
 
-/// Every release through v1.0.0-beta.83 persisted `diagnostics.prewarm.v1`,
-/// which switched the retired compile-on-read cargo prewarm.
+/// Persisted prewarm settings converge through the retired-key authority.
 #[tokio::test]
-async fn retired_diagnostics_prewarm_key_converges_out_of_a_beta83_snapshot() {
+async fn retired_diagnostics_prewarm_key_converges_without_reset() {
     assert_retired_key_converges_out(
         "diagnostics.prewarm.v1",
         ConfigurationValueV1::Boolean(true),
