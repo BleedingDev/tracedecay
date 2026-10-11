@@ -8,23 +8,23 @@ set -euo pipefail
 
 dir=${1:?usage: check-dashboard-digests.sh DIR}
 shopt -s nullglob
-files=("$dir"/dashboard-sha256-*.txt)
-distinct=()
-for file in "${files[@]}"; do
+expected=""
+count=0
+for file in "$dir"/dashboard-sha256-*.txt; do
   # Windows Python writes CRLF.
   digest=$(tr -d '\r\n' <"$file")
   if [[ ! $digest =~ ^[0-9a-f]{64}$ ]]; then
     echo "${file##*/}: not a dashboard bundle digest: '${digest}'" >&2
     exit 1
   fi
-  [[ " ${distinct[*]} " == *" $digest "* ]] || distinct+=("$digest")
+  if [[ -n "$expected" && "$digest" != "$expected" ]]; then
+    echo "release targets embed different dashboard bundles:" >&2
+    for reported_file in "$dir"/dashboard-sha256-*.txt; do
+      echo "  ${reported_file##*/}: $(tr -d '\r\n' <"$reported_file")" >&2
+    done
+    exit 1
+  fi
+  expected="$digest"
+  count=$((count + 1))
 done
-
-if ((${#distinct[@]} > 1)); then
-  echo "release targets embed different dashboard bundles:" >&2
-  for file in "${files[@]}"; do
-    echo "  ${file##*/}: $(tr -d '\r\n' <"$file")" >&2
-  done
-  exit 1
-fi
-echo "${#files[@]} release targets embed dashboard ${distinct[0]:-none}"
+echo "$count release targets embed dashboard ${expected:-none}"
