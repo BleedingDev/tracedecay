@@ -3275,7 +3275,7 @@ async fn grouped_receipt_savepoint_failure_aborts_the_group() {
         .expect_err("savepoint failure must abort the grouped commit");
     assert_eq!(
         error.to_string(),
-        "session temporal storage operation complete session refresh failed: \
+        "session-temporal storage operation complete session refresh failed: \
          SQLite runtime failed: injected savepoint failure"
     );
     assert_eq!(

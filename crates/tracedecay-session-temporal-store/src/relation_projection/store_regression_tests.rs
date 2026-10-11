@@ -234,7 +234,7 @@ async fn failed_acknowledgement_rolls_back_only_its_own_mutation() {
             .as_ref()
             .expect_err("missing-journal ack must refuse that item")
             .to_string(),
-        "session temporal storage operation publish native session relation receipt failed: \
+        "session-temporal storage operation publish native session relation receipt failed: \
          relation effect journal changed during native graph acknowledgement"
     );
     outcome_for(&projections, &outcomes, &ok_session)
@@ -339,7 +339,7 @@ async fn missing_receipt_fails_only_that_item() {
             .as_ref()
             .expect_err("absent receipt must refuse that item")
             .to_string(),
-        "session temporal storage operation publish native session relation receipt failed: \
+        "session-temporal storage operation publish native session relation receipt failed: \
          relation receipt is unavailable"
     );
     outcome_for(&projections, &outcomes, &ok_session)
