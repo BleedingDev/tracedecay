@@ -26,6 +26,7 @@ exports_files(
         "check-github-hosted-runners.py",
         "test-check-github-hosted-runners.py",
         "test-gen-builds-default-alias.py",
+        "test-measure-ranked-tail-trim.py",
     ],
     visibility = ["//visibility:public"],
 )
