@@ -3384,13 +3384,10 @@ async fn commit_begin_batch_item_in_transaction(
         return Ok(Err(error));
     }
     let authoritative_validation_time = now_micros(PERSIST_REFRESH)?;
-    if let Err(error) = transaction
+    transaction
         .execute(&format!("SAVEPOINT {savepoint}"), ())
         .await
-        .map_err(|error| storage(PERSIST_REFRESH, error))
-    {
-        return Err(error);
-    }
+        .map_err(|error| storage(PERSIST_REFRESH, error))?;
     let (operation_id, binding) =
         match begin_session_refresh_in_transaction(transaction, request.clone(), accepted_at).await
         {

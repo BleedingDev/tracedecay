@@ -147,10 +147,10 @@ async fn receipt_state(
         )
         .await
         .expect("receipt state");
-    match rows.next().await.expect("receipt row") {
-        Some(row) => Some(row.get::<String>(0).expect("state")),
-        None => None,
-    }
+    rows.next()
+        .await
+        .expect("receipt row")
+        .map(|row| row.get::<String>(0).expect("state"))
 }
 
 async fn journal_projection(
@@ -167,10 +167,10 @@ async fn journal_projection(
         )
         .await
         .expect("journal projection");
-    match rows.next().await.expect("journal row") {
-        Some(row) => Some(row.get::<String>(0).expect("projection json")),
-        None => None,
-    }
+    rows.next()
+        .await
+        .expect("journal row")
+        .map(|row| row.get::<String>(0).expect("projection json"))
 }
 
 fn outcome_for<'a>(

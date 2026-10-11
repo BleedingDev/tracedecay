@@ -3304,8 +3304,8 @@ async fn fixture_receipt_state(
         )
         .await
         .expect("receipt query");
-    match rows.next().await.expect("receipt row") {
-        Some(row) => Some(row.get::<String>(0).expect("state")),
-        None => None,
-    }
+    rows.next()
+        .await
+        .expect("receipt row")
+        .map(|row| row.get::<String>(0).expect("state"))
 }
