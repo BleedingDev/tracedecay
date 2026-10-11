@@ -92,7 +92,7 @@ fail closed.
 
 ### MCP server tools
 
-The MCP server exposes **more than 70 tools** (one fewer when the optional `ast-grep` binary is not on `PATH`). The large majority are **read-only** analysis and query operations marked `readOnlyHint: true`. A small set mutate local state and are marked `readOnlyHint: false`:
+The MCP server exposes **more than 70 tools**. The large majority are **read-only** analysis and query operations marked `readOnlyHint: true`. A small set mutate local state and are marked `readOnlyHint: false`:
 
 **File-editing tools** (modify source files in your project):
 
