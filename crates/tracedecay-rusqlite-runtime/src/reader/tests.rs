@@ -62,19 +62,19 @@ impl ReaderQueryExecutor for CountExecutor {
 /// under the lock and notifies, `wait` parks on the condvar until the gate is
 /// set or the bound lapses.
 #[derive(Clone, Default)]
-struct Gate {
+pub(super) struct Gate {
     state: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl Gate {
-    fn set(&self) {
+    pub(super) fn set(&self) {
         let (set, changed) = &*self.state;
         *set.lock().unwrap() = true;
         changed.notify_all();
     }
 
     /// Returns whether the gate was set within the bound.
-    fn wait(&self, bound: Duration) -> bool {
+    pub(super) fn wait(&self, bound: Duration) -> bool {
         let (set, changed) = &*self.state;
         let (set, _) = changed
             .wait_timeout_while(set.lock().unwrap(), bound, |set| !*set)
@@ -105,9 +105,9 @@ impl ReaderQueryExecutor for SlowExecutor {
 /// test can assert ordering against a worker that is provably still running
 /// instead of racing a wall-clock bound.
 #[derive(Clone, Default)]
-struct GateExecutor {
-    entered: Gate,
-    release: Gate,
+pub(super) struct GateExecutor {
+    pub(super) entered: Gate,
+    pub(super) release: Gate,
     finished: Arc<AtomicU8>,
 }
 
