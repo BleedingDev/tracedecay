@@ -778,20 +778,12 @@ fn tracked_worktree_digest_changes_when_skip_worktree_bytes_change() {
     );
 }
 
-/// `File::open` is read-only (`GENERIC_READ`). Windows `SetFileTime` returns
-/// `ERROR_ACCESS_DENIED` unless the handle was opened with
-/// `FILE_WRITE_ATTRIBUTES`, which `fs::set_times` requests.
-fn set_worktree_mtime(path: &std::path::Path, mtime: std::time::SystemTime, label: &str) {
-    fs::set_times(path, fs::FileTimes::new().set_modified(mtime))
-        .unwrap_or_else(|error| panic!("{label}: {error}"));
-}
-
 #[test]
 fn tracked_worktree_digest_hidden_content_with_untrusted_ctime() {
     let (directory, runner) = committed_file("source.rs", b"original\n");
     let path = directory.path().join("source.rs");
     let mtime = std::time::SystemTime::now() - Duration::from_secs(30);
-    set_worktree_mtime(&path, mtime, "historical mtime");
+    fs::set_times(&path, fs::FileTimes::new().set_modified(mtime)).expect("historical mtime");
     for args in [
         vec!["config", "--local", "core.trustctime", "false"],
         vec!["add", "--", "source.rs"],
@@ -812,7 +804,7 @@ fn tracked_worktree_digest_hidden_content_with_untrusted_ctime() {
             .expect("canonical raw-byte manifest")
     );
     fs::write(&path, b"modified\n").expect("same-size edit");
-    set_worktree_mtime(&path, mtime, "restored mtime");
+    fs::set_times(&path, fs::FileTimes::new().set_modified(mtime)).expect("restored mtime");
     assert_git_diff_head_hides(directory.path(), "source.rs");
     assert_ne!(
         before,
