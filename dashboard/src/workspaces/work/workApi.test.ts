@@ -10,6 +10,7 @@ import {
 import { responseWithBodyPendingUntilAbort } from '../../test/pendingBody.ts';
 import { workGraphRead } from '../../test/workGraphFixture.ts';
 import { callWork, workResultInvalidatesReads, type WorkResult } from './workApi.ts';
+import { WORKFLOW_ACTIVATE_DEFINITION_ROUTE } from '../workflows/workflowRoutes.ts';
 import {
   WORK_MUTATE_GRAPH_ROUTE,
   WORK_PREPARE_GRAPH_MUTATION_ROUTE,
@@ -175,6 +176,23 @@ describe('a canonical success', () => {
     expect(await views()).toMatchObject({ outcome: 'refused', state: 'unavailable' });
   });
 
+  it('reads a lifecycle effect that timed out as timed out, and re-reads after it', async () => {
+    const route = { ...WORKFLOW_ACTIVATE_DEFINITION_ROUTE, request: z.unknown() };
+    const envelope = applicationSuccess('operation.workflow.activate_definition', null);
+    const outcome = envelope.value.outcome as { value: { execution: Record<string, unknown> } };
+    outcome.value.execution = {
+      ...outcome.value.execution,
+      termination: 'timed_out',
+      cancellation: { stage: 'before_effect' },
+    };
+    stub(200, envelope);
+
+    const result = await callWork(route, {}, '/api/application/workflow/activate-definition');
+
+    expect(result).toMatchObject({ outcome: 'refused', state: 'timed_out', termination: 'timed_out' });
+    expect(workResultInvalidatesReads(result)).toBe(true);
+  });
+
   it('refuses a problem served with a success status', async () => {
     stub(200, applicationProblem('unavailable', { binding: 'operation.work.views' }));
     expect(await views()).toMatchObject({ outcome: 'refused', state: 'unsupported_schema' });
@@ -273,6 +291,16 @@ describe('a canonical problem', () => {
   it('refuses a problem record that does not satisfy the generated contract', async () => {
     stub(503, { kind: 'problem', value: { problem: { kind: 'unavailable' } } });
     expect(await views()).toMatchObject({ outcome: 'refused', state: 'unsupported_schema' });
+  });
+
+  it('refuses a problem served with a status its kind does not map to', async () => {
+    stub(503, applicationProblem('conflict', { binding: 'operation.work.views' }));
+    expect(await views()).toMatchObject({ outcome: 'refused', state: 'unsupported_schema' });
+  });
+
+  it('refuses a partial effect that carries no committed receipt', async () => {
+    stub(409, applicationProblem('partial_effect', { binding: 'operation.work.prepare_graph_mutation' }));
+    expect(await prepare()).toMatchObject({ outcome: 'refused', state: 'unsupported_schema' });
   });
 });
 

@@ -84,6 +84,36 @@ export function applicationSuccess(
   };
 }
 
+/** What the daemon's own constructor attaches to each problem kind, so a
+ * fixture satisfies the canonical problem invariants unless a test overrides
+ * a field to break one. */
+const PROBLEM_DEFAULTS: Readonly<Record<ApplicationProblemKind, Partial<ApplicationProblemRecord>>> = {
+  invalid_request: { legal_actions: ['correct_request'] },
+  not_found_or_not_authorized: {},
+  conflict: { retry: 'after_revalidate', legal_actions: ['refresh'] },
+  stale: { retry: 'after_revalidate', legal_actions: ['refresh'] },
+  partial_effect: { terminality: 'admitted_terminal', legal_actions: ['reconcile'] },
+  unsupported: {},
+  unavailable: { unavailable_classification: 'authority' },
+  execution_failed: {
+    terminality: 'admitted_terminal',
+    execution_failure_classification: 'permanent',
+    legal_actions: ['contact_administrator'],
+  },
+  reset_required: { terminality: 'admitted_terminal', legal_actions: ['reset'] },
+  saturated: { retry: 'after_delay', retry_after_millis: 250, legal_actions: ['retry'] },
+  cancelled: { cancellation_stage: 'before_admission' },
+  timed_out: { cancellation_stage: 'before_admission' },
+};
+
+const RETRY_SCOPE = {
+  never: null,
+  same_request: 'same_request',
+  after_delay: 'same_request',
+  after_revalidate: 'fresh_request',
+  after_reconcile: 'same_operation',
+} as const;
+
 export function applicationProblem(
   kind: ApplicationProblemKind,
   options: {
@@ -91,20 +121,23 @@ export function applicationProblem(
     problem?: Partial<ApplicationProblemRecord>;
   } = {},
 ): { kind: 'problem'; value: Record<string, unknown> } {
-  const revalidate = kind === 'conflict' || kind === 'stale';
+  const fields = { ...PROBLEM_DEFAULTS[kind], ...options.problem };
+  const retry = fields.retry ?? 'never';
+  const withoutDiagnostic =
+    kind === 'not_found_or_not_authorized' || kind === 'cancelled' || kind === 'timed_out';
   const problem: ApplicationProblemRecord = {
     revision: 1,
     kind,
     code: `fixture.${kind}`,
     message: `fixture ${kind} problem`,
-    diagnostic: null,
+    diagnostic: withoutDiagnostic ? null : { code: `fixture.${kind}`, message: `fixture ${kind} problem` },
     detail: null,
     committed_receipt: null,
     owning_layer: 'application',
     terminality: 'pre_admission',
-    retryable: revalidate,
-    retry: revalidate ? 'after_revalidate' : 'never',
-    retry_scope: revalidate ? 'fresh_request' : null,
+    retryable: retry !== 'never',
+    retry,
+    retry_scope: RETRY_SCOPE[retry],
     retry_after_millis: null,
     cancellation_stage: null,
     unavailable_classification: null,
@@ -112,9 +145,9 @@ export function applicationProblem(
     request_id: 'request.fixture',
     trace_id: 'trace.fixture',
     details: [],
-    legal_actions: revalidate ? ['refresh'] : [],
+    legal_actions: [],
     coverage: null,
-    ...options.problem,
+    ...fields,
   };
   return {
     kind: 'problem',
