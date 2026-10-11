@@ -65,10 +65,10 @@ struct RecordingGraphRuntime {
     /// Last successfully reconciled snapshot, served back on the read path so
     /// `project_memory_graph` journeys run against settled generations.
     served_snapshot: Mutex<Option<VerifiedGraphSnapshot>>,
-    /// When set, `verified_snapshot` reports a transient unavailability while
-    /// `reconcile_verified_manifest` still succeeds, modeling a head read
-    /// failure the repairing reconcile can recover.
-    fail_snapshot_reads: AtomicBool,
+    /// Number of `verified_snapshot` calls that report a transient
+    /// unavailability while `reconcile_verified_manifest` still succeeds,
+    /// modeling head read failures the read can probe through or repair.
+    unavailable_snapshot_reads: AtomicUsize,
     publish_calls: AtomicUsize,
     reconcile_calls: AtomicUsize,
     snapshot_calls: AtomicUsize,
@@ -90,7 +90,7 @@ impl RecordingGraphRuntime {
             hold_graph_access_entered: AtomicBool::new(false),
             hold_graph_access_release: AtomicBool::new(false),
             served_snapshot: Mutex::new(None),
-            fail_snapshot_reads: AtomicBool::new(false),
+            unavailable_snapshot_reads: AtomicUsize::new(0),
             publish_calls: AtomicUsize::new(0),
             reconcile_calls: AtomicUsize::new(0),
             snapshot_calls: AtomicUsize::new(0),
@@ -147,8 +147,9 @@ impl RecordingGraphRuntime {
         .expect("armed graph access never reached the verified-graph runtime");
     }
 
-    fn fail_snapshot_reads(&self) {
-        self.fail_snapshot_reads.store(true, Ordering::Release);
+    fn fail_snapshot_reads(&self, reads: usize) {
+        self.unavailable_snapshot_reads
+            .store(reads, Ordering::Release);
     }
 
     fn blocking(database: &Database) -> Self {
@@ -232,7 +233,13 @@ impl VerifiedGraphRuntimePortV1 for RecordingGraphRuntime {
             return Err(GraphDbError::Cancelled);
         }
         self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
-        if self.fail_snapshot_reads.load(Ordering::Acquire) {
+        if self
+            .unavailable_snapshot_reads
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |reads| {
+                reads.checked_sub(1)
+            })
+            .is_ok()
+        {
             return Err(GraphDbError::unavailable(
                 "transient verified head read failure",
             ));
@@ -851,11 +858,11 @@ async fn graph_read_preserves_reset_required_from_the_verified_graph() {
     assert_eq!(runtime.publish_calls.load(Ordering::SeqCst), 0);
 }
 
-/// A head-read failure still reaches the repairing reconcile: publication's
-/// recovery paths can republish a head the lookup could not read, so the
-/// read recovers instead of reporting the lookup's unavailability.
+/// A transient head-read failure is probed once: when the retry reads the
+/// head, the read serves it directly instead of paying the reconciliation
+/// pass's owner-wide source load.
 #[tokio::test]
-async fn graph_read_repairs_a_transient_head_failure_through_reconcile() {
+async fn graph_read_retries_a_transient_head_failure_once() {
     let (_directory, database) = database("transient-head-failure").await;
     let runtime = bind_runtime(&database);
     let store = DatabaseFactStore::new(&database);
@@ -863,10 +870,10 @@ async fn graph_read_repairs_a_transient_head_failure_through_reconcile() {
         &store,
         &runtime,
         "transient-head-failure",
-        "A transient verified-head failure still reaches the repairing reconcile.",
+        "A transient verified-head failure is retried once before reconciling.",
     )
     .await;
-    runtime.fail_snapshot_reads();
+    runtime.fail_snapshot_reads(1);
 
     let page = super::graph::project_memory_graph(
         &database,
@@ -875,15 +882,47 @@ async fn graph_read_repairs_a_transient_head_failure_through_reconcile() {
         &FactReadControl::new(Arc::new(|| false)),
     )
     .await
-    .expect("a transient head failure falls through to the repairing reconcile");
+    .expect("a transient head failure is probed once and then served");
 
     assert!(
         page.facts()
             .iter()
             .any(|fact| fact.fact_id() == seed.target.fact_id())
     );
-    assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.publish_calls.load(Ordering::SeqCst), 0);
+}
+
+/// A head read whose authority stays unavailable through the probe refuses
+/// promptly: reconciliation would only pay its owner-wide source load for a
+/// mount that cannot answer graph work at all.
+#[tokio::test]
+async fn graph_read_refuses_a_persistently_unavailable_head() {
+    let (_directory, database) = database("persistent-head-unavailable").await;
+    let runtime = bind_runtime(&database);
+    let store = DatabaseFactStore::new(&database);
+    seed_high_level_fact(
+        &store,
+        &runtime,
+        "persistent-head-unavailable",
+        "A persistently unavailable head refuses without a source scan.",
+    )
+    .await;
+    runtime.fail_snapshot_reads(usize::MAX);
+
+    let error = super::graph::project_memory_graph(
+        &database,
+        ProjectMemoryGraphQueryV1::new(FactOwnerV1::Profile, Vec::new(), 64)
+            .expect("persistent head failure graph query"),
+        &FactReadControl::new(Arc::new(|| false)),
+    )
+    .await
+    .expect_err("a persistently unavailable head reports the typed refusal");
+
+    assert!(matches!(error, FactStoreError::GraphUnavailable));
+    assert_eq!(runtime.snapshot_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.reconcile_calls.load(Ordering::SeqCst), 0);
     assert_eq!(runtime.publish_calls.load(Ordering::SeqCst), 0);
 }
 

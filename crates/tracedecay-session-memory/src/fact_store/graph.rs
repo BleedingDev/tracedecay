@@ -146,37 +146,49 @@ pub(super) async fn project_memory_graph(
     // publication. A missing or mismatched head and the head states the
     // republish path repairs (reset, corrupt or diverged storage, CAS
     // conflict) fall through to the reconciliation pass, which repairs them
-    // or reports the typed refusal; an unavailable head likewise retries the
-    // publication path's second recovery and republish. Only failures of the
-    // caller's own context, which the pass cannot repair (cancelled, budget
-    // or deadline spent), report directly without an owner-wide source load.
-    let verified_head = verified_head_matching(
-        db,
-        &projection_identity,
-        &expected_generation,
-        &owner,
-        read_control.clone(),
-        Some(Arc::clone(&inline_pass)),
-    )
-    .await;
-    let verified_snapshot = match verified_head {
-        Ok(Some(snapshot)) => snapshot,
-        Err(
-            error @ (FactStoreError::GraphCancelled
-            | FactStoreError::GraphBudgetExhausted
-            | FactStoreError::GraphDeadlineExceeded),
-        ) => return Err(error),
-        _ => {
-            ensure_not_cancelled(read_control)?;
-            let snapshot =
-                reconcile_project_memory_graph_pass(db, Some(read_control), Some(&inline_pass))
-                    .await?;
-            if snapshot.projection() != &projection_identity
-                || snapshot.generation() != &expected_generation
-            {
-                return Err(FactStoreError::GraphConflict);
+    // or reports the typed refusal. Failures of the caller's own context
+    // (cancelled, budget or deadline spent) report directly, since the pass
+    // cannot repair them. An unavailable head is probed once more first:
+    // when the retry reads the head, the read serves it without the pass at
+    // all, while a second unavailable proves the graph authority itself is
+    // down — refuse promptly instead of paying the pass's owner-wide source
+    // load on every read while the mount cannot answer.
+    let mut unavailable_head_retries = 0u8;
+    let verified_snapshot = loop {
+        match verified_head_matching(
+            db,
+            &projection_identity,
+            &expected_generation,
+            &owner,
+            read_control.clone(),
+            Some(Arc::clone(&inline_pass)),
+        )
+        .await
+        {
+            Ok(Some(snapshot)) => break snapshot,
+            Err(
+                error @ (FactStoreError::GraphCancelled
+                | FactStoreError::GraphBudgetExhausted
+                | FactStoreError::GraphDeadlineExceeded),
+            ) => return Err(error),
+            Err(FactStoreError::GraphUnavailable) => {
+                unavailable_head_retries += 1;
+                if unavailable_head_retries >= 2 {
+                    return Err(FactStoreError::GraphUnavailable);
+                }
             }
-            snapshot
+            _ => {
+                ensure_not_cancelled(read_control)?;
+                let snapshot =
+                    reconcile_project_memory_graph_pass(db, Some(read_control), Some(&inline_pass))
+                        .await?;
+                if snapshot.projection() != &projection_identity
+                    || snapshot.generation() != &expected_generation
+                {
+                    return Err(FactStoreError::GraphConflict);
+                }
+                break snapshot;
+            }
         }
     };
 
