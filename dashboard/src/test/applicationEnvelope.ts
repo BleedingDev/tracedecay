@@ -8,13 +8,6 @@ import type {
   ResolvedScope,
 } from '../contracts/generated.ts';
 
-/**
- * The daemon's `HttpJsonEnvelope` around one payload, built from the
- * operation's generated binding contract so a fixture always answers the route
- * it is served for: its binding id, result contract, and the outcome family its
- * receipt contract admits (an effect for a durable effect, evidence otherwise).
- */
-
 export const FIXTURE_SCOPE: ResolvedScope = {
   project_id: 'project.work',
   repository_id: 'repository.work',
@@ -91,9 +84,6 @@ export function applicationSuccess(
   };
 }
 
-/** A canonical problem record for `kind`, with the retry and legal actions the
- * daemon's own constructors attach. `binding` is the operation the problem
- * answers; omit it for a concealed denial or a pre-admission problem. */
 export function applicationProblem(
   kind: ApplicationProblemKind,
   options: {

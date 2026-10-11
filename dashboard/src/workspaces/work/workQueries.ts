@@ -59,10 +59,6 @@ export function useWorkCommand<Request, Response>(
         ? callWork(route, request, scopedUrl(scope, route.path))
         : Promise.resolve(notWritable<Response>(writability.reason)),
     onSuccess: (result) => {
-      // Only a committed effect, or a refusal saying the graph moved, changes
-      // what a read would return. Invalidating on any other refusal would
-      // refetch on every rejected keystroke and, worse, make a denied command
-      // look like it had moved something.
       if (workResultInvalidatesReads(result)) {
         void client.invalidateQueries({ queryKey: ["work"] });
       }

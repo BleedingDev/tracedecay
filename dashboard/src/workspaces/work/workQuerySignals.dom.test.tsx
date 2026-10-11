@@ -1,11 +1,3 @@
-/**
- * Every application-route query hands React Query's abort signal to the wire.
- *
- * Cancelling a query (a scope change, an SSE invalidation, an unmount) must
- * abort its request and leave the cache entry empty. A query that dropped the
- * signal would keep reading the abandoned body and then cache whatever it made
- * of it, a refusal for a scope nobody is looking at any more.
- */
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';

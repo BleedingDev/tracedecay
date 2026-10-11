@@ -139,19 +139,8 @@ const CONTRACTS: Readonly<Record<string, ZodType<unknown>>> = {
   '/api/remote/status': DashboardEnvelopeV1Schema(RemoteOperationalStatusPayloadV1Schema),
 };
 
-/**
- * Routes that answer with the application's `HttpJsonEnvelope` instead of
- * `DashboardEnvelopeV1`, keyed by the gateway path each fixture is served at.
- *
- * The gate below decodes each fixture with the production adapter against the
- * route the page really calls, so a fixture that answers another binding,
- * result contract or outcome family fails here exactly as it would in the
- * browser.
- */
 const APPLICATION_ROUTES: Readonly<Record<string, WorkRoute<unknown, unknown>>> = Object.fromEntries(
   [
-    // The work-product graph read. Two workspaces derive from it: the Work
-    // projections, and the Agents handoff frontier and attempt failures.
     WORK_VIEWS_ROUTE,
     WORKFLOW_LIST_DEFINITIONS_ROUTE,
     WORKFLOW_DEFINITION_HISTORY_ROUTE,
@@ -292,9 +281,6 @@ describe('fixtures parse against the generated contract for their route', () => 
   it.each(Object.keys(APPLICATION_ROUTES))(
     'POST %s: application envelope, generated payload',
     async (pathname) => {
-      // The decode the browser performs. A wrapper the app cannot open is
-      // reported to the user as `unsupported_schema`, so a fixture that fails
-      // this assertion would have the audit screenshot a refusal plate.
       vi.stubGlobal('fetch', async () => Response.json(resolveFixture(pathname)));
       const route = { ...APPLICATION_ROUTES[pathname]!, request: z.unknown() };
       expect(await callWork(route, {}, pathname)).toMatchObject({ outcome: 'value' });

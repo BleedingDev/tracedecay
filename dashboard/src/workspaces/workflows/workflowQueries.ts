@@ -16,12 +16,6 @@ import {
   WORKFLOW_RETIRE_DEFINITION_ROUTE,
 } from './workflowRoutes.ts';
 
-/**
- * The reads and lifecycle commands behind the Workflows workspace. Every call
- * goes through the same application envelope decoder the Work surface uses
- * (`callWork`) and the same `scopedUrl` project-gateway rewrite.
- */
-
 function workflowQueryKey(scope: string, ...parts: readonly (string | number)[]) {
   return ['workflow', scope, ...parts] as const;
 }
@@ -105,11 +99,6 @@ function notWritable(reason: string): WorkResult<WorkflowDefinitionDisposition> 
   return { outcome: 'refused', state: 'locked', detail: reason };
 }
 
-/** One compare-and-swap lifecycle transition; resolves to the daemon's own
- * `WorkResult`, and re-reads the definitions list and the version track when
- * the transition committed or the daemon answered that the revision moved. A
- * scope the gateway serves read-only is refused here without
- * dispatching, exactly as Work commands are. */
 export function useWorkflowLifecycle() {
   const scope = useScope((state) => state.scope);
   const key = scopeKey(scope);

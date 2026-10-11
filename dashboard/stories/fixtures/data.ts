@@ -26,7 +26,6 @@ const nowSecs = Math.floor(nowMs / 1000);
 const nowMicros = nowMs * 1000;
 const DAY = 86_400;
 
-/** The resolved scope every story application envelope answers for. */
 const STORY_SCOPE = {
   project_id: 'project.tracedecay',
   repository_id: 'repository.tracedecay',
@@ -2624,7 +2623,7 @@ function automationOutcomesPayload(): Record<string, unknown> {
 /** `FactStoreCurateResultV1`: the admitted run's receipt; its terminal is the
  * run-ledger row for `run_id`. */
 function automaticCuratorReceiptPayload(): Record<string, unknown> {
-  return applicationEnvelope({
+  return curatorReceiptEnvelope({
     binding: 'binding.http.fact_store_curate.v1',
     schema: 'schema.application.retained.fact-store-curate.result',
     request: 'request.story.fact-store-curate',
@@ -4671,15 +4670,9 @@ export const FIXTURES: Readonly<Record<string, unknown>> = {
   '/api/code-index/freshness': CODE_INDEX_FRESHNESS_FIXTURES.ready_absent,
   '/api/plugins/code-diagnostics': codeDiagnosticsSnapshot(),
   '/api/remote/status': remoteOperationalStatusEnvelope(),
-  // Work. Unlike every other fixture here these are wrapped in the
-  // application's `HttpJsonEnvelope` rather than `DashboardEnvelopeV1`,
-  // because the Work routes are nested straight onto the application router.
-  // `workApi.ts` decodes that wrapper against each operation's binding.
   // The work-product graph read. Serves the Work projections and the Agents
   // workspace's handoff frontier and attempt failures.
   '/api/work/views': workEnvelope('operation.work.views', workGraphViewsPayload()),
-  // The Workflows workspace's standing read (`operation.workflow.
-  // list_definitions`), through the same application envelope decoder.
   '/api/application/workflow/list-definitions': workEnvelope('operation.workflow.list_definitions', workflowDefinitionsPayload()),
   // The selected identity's version track (`operation.workflow.
   // definition_history`). Fixtures resolve by path alone, so this answers the
@@ -5011,22 +5004,7 @@ function listTaskHandoffsPayload(): Record<string, unknown> {
   };
 }
 
-/* ==========================================================================
- * Work product graph (`/api/work/views`).
- *
- * The Work routes are the one family on this dashboard that does not answer
- * with `DashboardEnvelopeV1`. `src/dashboard/mod.rs` nests them onto the
- * application router, so they carry the application's own `HttpJsonEnvelope`,
- * a `kind`/`value` union whose outcome packet holds the generated contract
- * under `payload`. `workApi.ts` decodes it against the operation's binding and
- * result contract, so a fixture that wrapped the payload any other way would
- * be refused as `unsupported_schema` and the audit would screenshot a
- * boundary plate for a surface that works.
- * ========================================================================== */
-
-/** The retained curator receipt's application envelope. `automation.ts`
- * decodes it with its own response schema rather than `workApi.ts`. */
-function applicationEnvelope(spec: {
+function curatorReceiptEnvelope(spec: {
   binding: string;
   schema: string;
   request: string;
@@ -5045,8 +5023,6 @@ function applicationEnvelope(spec: {
   };
 }
 
-/** The canonical success envelope for `operation`, carrying its own binding,
- * result contract and outcome family, as `workApi.ts` checks them. */
 function workEnvelope(
   operation: ApplicationHttpOperationId,
   payload: unknown,

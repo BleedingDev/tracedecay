@@ -1,12 +1,3 @@
-/**
- * The application-route adapter, against the envelope the daemon really sends.
- *
- * Two things are guarded here. A refusal never becomes a read: every problem,
- * every envelope that answers a different binding or contract, and every
- * payload the generated schema rejects arrives as a stated reason. And a
- * daemon problem keeps its canonical meaning: stale is not conflict, and the
- * retry directive, legal actions and committed receipt reach the caller.
- */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
@@ -68,7 +59,6 @@ function prepare(): Promise<WorkResult<unknown>> {
   );
 }
 
-/** Rewrites one field of the success envelope's `value`. */
 function successWith(patch: (value: Record<string, unknown>) => Record<string, unknown>) {
   const envelope = applicationSuccess('operation.work.views', GRAPH);
   return { ...envelope, value: patch(envelope.value) };
@@ -103,7 +93,6 @@ describe('a canonical success', () => {
   });
 
   it('reads a durable command from its effect result', async () => {
-    // The receipt payload is not under test, only the effect wrapper around it.
     const route = { ...WORK_MUTATE_GRAPH_ROUTE, request: z.unknown(), response: z.unknown() };
     const receipt = { mutation: 'accept_task' };
     stub(200, applicationSuccess('operation.work.mutate_graph', receipt));
@@ -112,7 +101,6 @@ describe('a canonical success', () => {
       value: receipt,
     });
 
-    // The same receipt served as evidence is outside the durable-effect contract.
     const asEvidence = applicationSuccess('operation.work.views', receipt);
     stub(200, {
       ...asEvidence,

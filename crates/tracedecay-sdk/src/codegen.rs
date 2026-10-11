@@ -1,8 +1,3 @@
-//! Canonical SDK generator behind `src/bin/generate.rs`, which writes the
-//! checked-in Rust operation descriptors, the TypeScript SDK sources, and the
-//! dashboard's application envelope decoder. It is the single authority for
-//! all three surfaces.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write as _;
@@ -83,7 +78,6 @@ struct UnavailableOperation {
 /// Repository-relative path of the checked-in Rust operation descriptors.
 const RUST_OPERATIONS_PATH: &str = "crates/tracedecay-sdk/src/operations.rs";
 
-/// Repository-relative path of the dashboard's application envelope decoder.
 const DASHBOARD_APPLICATION_PATH: &str = "dashboard/src/contracts/application.ts";
 
 /// Write the checked-in Rust descriptors and the TypeScript SDK sources under
@@ -1045,12 +1039,6 @@ fn render_types() -> String {
     format!("{HEADER}{TYPES_SOURCE}")
 }
 
-/// The dashboard calls application routes through its own scoped gateway, so
-/// it cannot use the SDK client, and the 1.8 MB `operations.ts` is too large to
-/// bundle. It gets the SDK's envelope decoder verbatim plus, per operation id,
-/// the binding contract that decoder checks a response against. An operation
-/// the dashboard reaches through its own adapter (feedback reads) answers with
-/// its dashboard-surface binding, so `bindingIds` lists both.
 fn render_dashboard_application(
     operations: &[Operation],
     dashboard_bindings: &BTreeMap<String, Vec<String>>,
@@ -1093,8 +1081,6 @@ fn render_dashboard_application(
     Ok(out)
 }
 
-/// Each HTTP binding id mapped to the dashboard-surface bindings of the same
-/// capability, read from the catalog snapshot the transports dispatch through.
 fn canonical_dashboard_bindings() -> Result<BTreeMap<String, Vec<String>>, Box<dyn Error>> {
     let snapshot = tracedecay_contracts::catalog_composition::application_catalog_snapshot()?;
     let mut by_http_binding = BTreeMap::new();

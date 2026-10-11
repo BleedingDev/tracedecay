@@ -338,7 +338,6 @@ function readyEnvelope(payload: unknown) {
   return { ...TEMPORAL, domain_state: 'ready', payload };
 }
 
-/** The dashboard feedback router answers under its dashboard-surface binding. */
 function applicationEnvelope(payload: unknown) {
   return applicationSuccess('operation.application.feedback_proximity', payload, {
     bindingId: 'binding.dashboard.feedback_proximity.v1',
