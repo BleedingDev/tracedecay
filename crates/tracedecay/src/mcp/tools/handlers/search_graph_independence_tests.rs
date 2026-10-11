@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tracedecay_domain::{
     AuthorizationRevision, ExactClass, FusedCandidate, FusionProfileId, LogicalEvidenceId,
     PrincipalId, PublicRetrieverStatus, QueryFallbackSubpayload, RankedCandidate,
-    RetrievalAnchorId, RetrievalSourceRoleV1, RetrieverKind,
+    RetrievalAnchorId, RetrievalSourceRoleV1, RetrieverKind, SymbolOccurrenceId,
 };
 
 use super::dispatch_test_support::{
@@ -45,6 +45,10 @@ impl tracedecay_graph_query::VerifiedGraphQueryPort for YieldingUnavailableVerif
             ))
         })
     }
+}
+
+fn lexical_symbol_occurrence() -> SymbolOccurrenceId {
+    SymbolOccurrenceId::new(LEXICAL_SYMBOL_ID).expect("lexical symbol occurrence")
 }
 
 fn lexical_candidate() -> RankedCandidate {
@@ -123,6 +127,7 @@ fn completed_lexical_search_with(
             name: "LexicalWidget".to_owned(),
             qualified_name: "crate::LexicalWidget".to_owned(),
             kind: "function".to_owned(),
+            occurrence: Some(lexical_symbol_occurrence()),
             path: path.to_owned(),
             site,
         },
@@ -864,6 +869,7 @@ async fn tracedecay_context_excludes_file_hits_from_symbols_but_serves_their_win
                         name: "LexicalWidget".to_owned(),
                         qualified_name: "crate::LexicalWidget".to_owned(),
                         kind: "function".to_owned(),
+                        occurrence: Some(lexical_symbol_occurrence()),
                         path: "src/lib.rs".to_owned(),
                         site: Some(lexical_symbol_window(
                             0,
@@ -878,6 +884,7 @@ async fn tracedecay_context_excludes_file_hits_from_symbols_but_serves_their_win
                         name: "lib.rs".to_owned(),
                         qualified_name: "src/lib.rs".to_owned(),
                         kind: "file".to_owned(),
+                        occurrence: None,
                         path: "src/lib.rs".to_owned(),
                         site: Some(file_site),
                     },
