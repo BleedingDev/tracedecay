@@ -1,6 +1,18 @@
 load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("//scripts:bazel/rust_test.bzl", "rust_test")
 
+py_test(
+    name = "native_provider_startup_test",
+    size = "small",
+    srcs = [
+        "work_provider_native_smoke.py",
+        "test-work-provider-native-smoke.py",
+    ],
+    main = "test-work-provider-native-smoke.py",
+    imports = ["."],
+    legacy_create_init = 0,
+)
+
 py_binary(
     name = "measure_unused_tool_context",
     srcs = ["measure-unused-tool-context.py"],
@@ -15,14 +27,6 @@ py_test(
         "test-measure-unused-tool-context.py",
     ],
     main = "test-measure-unused-tool-context.py",
-)
-
-py_test(
-    name = "work_provider_native_conformance_test",
-    size = "medium",
-    srcs = ["test-work-provider-native-conformance.py"],
-    data = ["work_provider_native_conformance.sh"],
-    main = "test-work-provider-native-conformance.py",
 )
 
 exports_files(
