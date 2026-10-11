@@ -116,6 +116,7 @@ TEST_DATA = {
     ("tracedecay", "session_temporal"): ["benchmark_data/session-temporal/workload-v1.json"],
     ("tracedecay-agent-hosts", "unit_test"): ["//plugin:sources"],
     ("tracedecay-cli", "core_cli_suite"): [
+        "//:product_git_sha",
         ":build-support/source_provenance.rs",
         ":build-support/watched_input_file.rs",
     ],
