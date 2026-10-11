@@ -45,22 +45,35 @@ const ANTHROPIC_ALWAYS_LOAD: &str = "anthropic/alwaysLoad";
 
 impl ToolAdvertisement {
     fn from_env() -> Result<Self> {
-        match std::env::var(CLAUDE_CODE_TOOL_SEARCH_ENV) {
-            Err(std::env::VarError::NotPresent) => Ok(Self::Search),
-            Ok(value) if value.is_empty() || value == "0" || value == "false" => Ok(Self::Search),
-            Ok(value) if value == "1" || value == "true" => Ok(Self::ClaudeNativeFull),
-            Ok(value) => Err(TraceDecayError::Config {
-                message: format!(
-                    "{CLAUDE_CODE_TOOL_SEARCH_ENV} must be \"1\", \"true\", \"0\", or \"false\", \
-                     got {value:?}"
-                ),
-            }),
-            Err(std::env::VarError::NotUnicode(_)) => Err(TraceDecayError::Config {
-                message: format!(
-                    "{CLAUDE_CODE_TOOL_SEARCH_ENV} must be \"1\", \"true\", \"0\", or \"false\""
-                ),
-            }),
-        }
+        Ok(if env_switch(CLAUDE_CODE_TOOL_SEARCH_ENV)? {
+            Self::ClaudeNativeFull
+        } else {
+            Self::Search
+        })
+    }
+}
+
+/// Reads an explicit serve on/off env. Unset, empty, `0`, and `false` are
+/// off; `1` and `true` are on; anything else is a configuration error rather
+/// than a silent default.
+pub(super) fn env_switch(name: &str) -> Result<bool> {
+    parse_env_switch(name, std::env::var(name))
+}
+
+pub(super) fn parse_env_switch(
+    name: &str,
+    value: std::result::Result<String, std::env::VarError>,
+) -> Result<bool> {
+    match value {
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(value) if value.is_empty() || value == "0" || value == "false" => Ok(false),
+        Ok(value) if value == "1" || value == "true" => Ok(true),
+        Ok(value) => Err(TraceDecayError::Config {
+            message: format!("{name} must be \"1\", \"true\", \"0\", or \"false\", got {value:?}"),
+        }),
+        Err(std::env::VarError::NotUnicode(_)) => Err(TraceDecayError::Config {
+            message: format!("{name} must be \"1\", \"true\", \"0\", or \"false\""),
+        }),
     }
 }
 
