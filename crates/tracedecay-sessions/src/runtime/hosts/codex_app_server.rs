@@ -1275,9 +1275,8 @@ mod tests {
             ),
         )
         .expect("write helper interpreter");
-        let script = format!(
-            "@echo off\r\npython \"%~dp0fake-codex-helper.py\" %*\r\nexit /b %ERRORLEVEL%\r\n"
-        );
+        let script =
+            "@echo off\r\npython \"%~dp0fake-codex-helper.py\" %*\r\nexit /b %ERRORLEVEL%\r\n";
         std::fs::write(&executable, script).expect("write fake app-server");
 
         // The spawn clears the environment before admitting caller values, so
