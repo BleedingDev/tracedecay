@@ -468,64 +468,42 @@ fn display_unavailable_suffix(row: &Value) -> String {
 }
 
 fn render_search_md(value: &Value) -> String {
-    let items = if value.is_array() {
-        value.as_array()
-    } else {
-        value.get("results").and_then(Value::as_array)
-    };
     let mut md = Md::new();
     md.heading(2, "Search Results");
-    match items {
+    match value.get("results").and_then(Value::as_array) {
         Some(items) if !items.is_empty() => {
             for it in items {
-                if let Some(candidate) = it.get("candidate") {
-                    let anchor = render::field_str(candidate, "anchor_id");
-                    let exact_class = render::field_str(candidate, "exact_class");
-                    let utility = candidate
-                        .get("utility_micros")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default();
-                    let ordinal = it
-                        .get("final_ordinal")
-                        .and_then(Value::as_u64)
-                        .unwrap_or_default();
-                    let via = lexical_routing::result_route_suffix(it);
-                    if let Some(display) = it.get("display") {
-                        let name = render::field_str(display, "name");
-                        let kind = render::field_str(display, "kind");
-                        md.bullet(&format!(
-                            "**{name}** ({kind}, {exact_class}), rank {} · utility {utility}{via}",
-                            ordinal.saturating_add(1)
-                        ));
-                        md.line(&format!("  anchor_id: `{anchor}`"));
-                    } else {
-                        let omitted = display_unavailable_suffix(it);
-                        md.bullet(&format!(
-                            "**{anchor}** ({exact_class}), rank {} · utility {utility}{via}{omitted}",
-                            ordinal.saturating_add(1)
-                        ));
-                    }
-                    if let Some(node_id) = it.get("node_id").and_then(Value::as_str) {
-                        md.line(&format!(
-                            "  Read source: `tracedecay_source_body` with `node_id: {node_id}`"
-                        ));
-                    }
-                    continue;
-                }
-                let name = render::field_str(it, "name");
-                let kind = render::field_str(it, "kind");
-                let file = render::field_str(it, "file");
-                let line = render::field_i64(it, "line");
-                let id = render::field_str(it, "id");
-                let score = it.get("score").and_then(Value::as_f64).unwrap_or(0.0);
-                md.bullet(&format!(
-                    "**{name}** ({kind}), {file}:{line} · score {score:.1}"
-                ));
-                let sig = render::field_str(it, "signature");
-                if sig.is_empty() {
-                    md.line(&format!("  `{id}`"));
+                let candidate = &it["candidate"];
+                let anchor = render::field_str(candidate, "anchor_id");
+                let exact_class = render::field_str(candidate, "exact_class");
+                let utility = candidate
+                    .get("utility_micros")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let ordinal = it
+                    .get("final_ordinal")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default();
+                let via = lexical_routing::result_route_suffix(it);
+                if let Some(display) = it.get("display") {
+                    let name = render::field_str(display, "name");
+                    let kind = render::field_str(display, "kind");
+                    md.bullet(&format!(
+                        "**{name}** ({kind}, {exact_class}), rank {} · utility {utility}{via}",
+                        ordinal.saturating_add(1)
+                    ));
+                    md.line(&format!("  anchor_id: `{anchor}`"));
                 } else {
-                    md.line(&format!("  `{id}` · `{sig}`"));
+                    let omitted = display_unavailable_suffix(it);
+                    md.bullet(&format!(
+                        "**{anchor}** ({exact_class}), rank {} · utility {utility}{via}{omitted}",
+                        ordinal.saturating_add(1)
+                    ));
+                }
+                if let Some(node_id) = it.get("node_id").and_then(Value::as_str) {
+                    md.line(&format!(
+                        "  Read source: `tracedecay_source_body` with `node_id: {node_id}`"
+                    ));
                 }
             }
         }
