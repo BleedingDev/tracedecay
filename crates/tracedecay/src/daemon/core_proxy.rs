@@ -14,6 +14,7 @@ use tokio::time::{Duration, Instant};
 use super::binary_version;
 #[cfg(unix)]
 use super::connect_with_restart_grace;
+use super::repeated_queries::RepeatedQueries;
 use super::tool_surface::ToolSurface;
 use super::{
     DAEMON_TOOL_LIVENESS_POLL_INTERVAL, DaemonClientDeadline, DaemonHandshake,
@@ -79,6 +80,7 @@ pub async fn proxy_stdio_to_daemon(
     handshake: &DaemonHandshake,
     replay_line: Option<String>,
     claude_code_tool_search: bool,
+    repeated_query_hints: bool,
 ) -> Result<()> {
     let mut transport = StdioTransport::new();
     proxy_transport_to_daemon_with_drain_bound(
@@ -88,6 +90,7 @@ pub async fn proxy_stdio_to_daemon(
         &mut transport,
         None,
         claude_code_tool_search,
+        repeated_query_hints,
     )
     .await
 }
@@ -140,6 +143,7 @@ pub async fn proxy_transport_to_daemon(
         transport,
         None,
         false,
+        false,
     )
     .await
 }
@@ -154,6 +158,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
     transport: &mut impl McpDuplexTransport,
     drain_bound: Option<Duration>,
     claude_code_tool_search: bool,
+    repeated_query_hints: bool,
 ) -> Result<()> {
     let (mut reader, mut writer) = transport.split();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -189,6 +194,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
         &mut writer,
         drain_bound,
         ToolSurface::from_serve(claude_code_tool_search)?,
+        repeated_query_hints.then(RepeatedQueries::default),
     );
     let result = tokio::try_join!(read_host, proxy);
     drop(eof_tx);
@@ -314,6 +320,7 @@ async fn proxy_host_input_to_daemon(
     writer: &mut impl McpTransportWriter,
     drain_bound: Option<Duration>,
     mut surface: ToolSurface,
+    mut repeated_queries: Option<RepeatedQueries>,
 ) -> Result<()> {
     let mut routed_handshake = handshake.clone();
     let mut pending = VecDeque::new();
@@ -372,6 +379,7 @@ async fn proxy_host_input_to_daemon(
         let result = {
             let daemon_request = send_host_request(
                 &mut surface,
+                repeated_queries.as_mut(),
                 socket_path,
                 &routed_handshake,
                 &request,
@@ -738,9 +746,11 @@ fn responses_are_project_open_retryable(responses: &[String]) -> bool {
 }
 
 /// Sends one host request through this session's tool surface: search answers
-/// from the daemon catalog, and `tools/list` follows the session advertisement.
+/// from the daemon catalog, `tools/list` follows the session advertisement,
+/// and a near-repeat of a recent tool call carries a hint.
 async fn send_host_request(
     surface: &mut ToolSurface,
+    repeated_queries: Option<&mut RepeatedQueries>,
     socket_path: &Path,
     handshake: &DaemonHandshake,
     request: &DaemonProxyRequest<'_>,
@@ -776,6 +786,9 @@ async fn send_host_request(
         send_daemon_request_with_project_open_retry(socket_path, handshake, request, cancellation)
             .await?;
     surface.rewrite(request.parsed.as_ref(), &mut responses);
+    if let Some(repeated_queries) = repeated_queries {
+        repeated_queries.rewrite(request.parsed.as_ref(), &mut responses);
+    }
     Ok(responses)
 }
 

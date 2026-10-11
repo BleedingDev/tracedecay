@@ -1126,6 +1126,7 @@ async fn disconnected_client_does_not_outlive_a_daemon_that_never_answers() {
             &mut transport,
             Some(std::time::Duration::from_millis(250)),
             false,
+            false,
         )
         .await
     });
@@ -1219,4 +1220,128 @@ async fn batch_client_closing_stdin_immediately_still_receives_its_response() {
         .await
         .expect("proxy transport");
     await_test_task(daemon, "batch daemon task").await;
+}
+
+/// Answers `calls` proxied `tools/call` requests, one connection each, and
+/// returns the exact lines it wrote.
+#[cfg(unix)]
+async fn answer_tool_calls(
+    listener: tokio::net::UnixListener,
+    token: &str,
+    calls: usize,
+) -> Vec<String> {
+    let mut written = Vec::new();
+    for _ in 0..calls {
+        let (stream, _addr) = listener.accept().await.expect("accept proxied client");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        read_authenticated_handshake(&mut lines, token).await;
+        let request_line = lines
+            .next_line()
+            .await
+            .expect("read request")
+            .expect("request line");
+        let request: Value = serde_json::from_str(&request_line).expect("request json");
+        let response = serde_json::to_string(&json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [{"type": "text", "text": "no match for proxy window"}],
+                "structuredContent": {"matches": []},
+            }
+        }))
+        .expect("response json");
+        writer
+            .write_all(response.as_bytes())
+            .await
+            .expect("write response");
+        writer.write_all(b"\n").await.expect("write newline");
+        writer.shutdown().await.expect("shutdown fake daemon");
+        written.push(response);
+    }
+    written
+}
+
+/// Sends the same `tools/call` twice through one serve session and returns
+/// what the daemon wrote and what the host received.
+#[cfg(unix)]
+async fn repeated_tool_call_through_proxy(
+    repeated_query_hints: bool,
+) -> (Vec<String>, Vec<String>) {
+    let dir = TempDir::new().expect("temp dir");
+    let socket = dir.path().join("daemon.sock");
+    let authority = seed_socket_authority(&socket);
+    let token = authority.auth_token().to_string();
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon socket");
+    let daemon = tokio::spawn(async move { answer_tool_calls(listener, &token, 2).await });
+
+    let (mut transport, sender, mut receiver) = tracedecay_mcp::transport::ChannelTransport::new();
+    let proxy_socket = socket.clone();
+    let proxy = tokio::spawn(async move {
+        super::super::proxy_transport_to_daemon_with_drain_bound(
+            &proxy_socket,
+            &test_handshake_defaults(),
+            None,
+            &mut transport,
+            None,
+            false,
+            repeated_query_hints,
+        )
+        .await
+    });
+
+    let mut received = Vec::new();
+    for id in [1, 2] {
+        sender
+            .send(
+                serde_json::to_string(&json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {"name": "tracedecay_search", "arguments": {"query": "proxy window"}}
+                }))
+                .expect("request json"),
+            )
+            .expect("send request");
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("proxy response timed out")
+            .expect("proxy response");
+        received.push(response.trim_end().to_owned());
+    }
+    drop(sender);
+    await_test_task(proxy, "repeated query proxy task")
+        .await
+        .expect("proxy transport");
+    let written = await_test_task(daemon, "repeated query daemon task").await;
+    (written, received)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_query_hints_reach_the_host_only_when_enabled() {
+    let (written, received) = repeated_tool_call_through_proxy(false).await;
+    assert_eq!(
+        received, written,
+        "disabled hints must not touch a response"
+    );
+
+    let (written, received) = repeated_tool_call_through_proxy(true).await;
+    assert_eq!(
+        received[0], written[0],
+        "a first call has nothing to repeat"
+    );
+    let repeat: Value = serde_json::from_str(&received[1]).expect("response json");
+    let content = repeat["result"]["content"].as_array().expect("content");
+    assert_eq!(content.len(), 2, "{repeat}");
+    assert_eq!(content[0]["text"], json!("no match for proxy window"));
+    assert_eq!(
+        repeat["result"]["structuredContent"],
+        json!({"matches": []})
+    );
+    let hint = content[1]["text"].as_str().unwrap_or_default();
+    assert!(
+        hint.starts_with("tracedecay_repeated_query: this tracedecay_search call shares 100%"),
+        "{hint}"
+    );
 }
