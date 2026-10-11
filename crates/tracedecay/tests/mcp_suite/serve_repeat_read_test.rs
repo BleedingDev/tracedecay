@@ -235,6 +235,63 @@ async fn serve_query_hints_follow_profile_configuration_on_new_connections() {
 }
 
 #[tokio::test]
+async fn serve_pointer_and_query_hint_name_an_identical_repeat_once() {
+    let home = TempDir::new().unwrap();
+    let project = init_project_with_file(home.path(), &source("pointer_hint_marker")).await;
+    let _daemon = common::spawn_tracedecay_daemon(home.path());
+    let pointers = [(REPEAT_READ_POINTERS_ENV, "1")];
+    let mut setup = start_client(home.path(), project.path(), &pointers);
+    start(&mut setup);
+    wait_ready(&mut setup, 2);
+    set_query_hints(&mut setup, home.path(), true);
+
+    let mut client = start_client(home.path(), project.path(), &pointers);
+    start(&mut client);
+    wait_ready(&mut client, 2);
+    // Exact-symbol calls are not repeatable reads, so they observe the hint
+    // setting reaching serve without seeding the pointer ledger.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let probe = json!({ "name": "pointer_hint_marker", "format": "json" });
+    for id in 3.. {
+        let response = client.request(call(id, "tracedecay_find_exact_symbol", &probe));
+        if text(&response).contains(QUERY_HINT) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hint setting never reached serve: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let outline = json!({ "file": "src/lib.rs" });
+    let first = client.request(call(100, "tracedecay_source_outline", &outline));
+    assert!(
+        !is_pointer(&first) && text(&first).contains("pointer_hint_marker"),
+        "{first}"
+    );
+    let identical = client.request(call(101, "tracedecay_source_outline", &outline));
+    assert!(is_pointer(&identical), "{identical}");
+    assert_eq!(
+        text(&identical)
+            .matches("tracedecay_source_outline")
+            .count(),
+        1,
+        "only the pointer names the identical earlier call: {identical}"
+    );
+    assert!(!text(&identical).contains(QUERY_HINT), "{identical}");
+
+    let near = json!({ "file": "src/lib.rs", "format": "json" });
+    let near_repeat = client.request(call(102, "tracedecay_source_outline", &near));
+    assert!(!is_pointer(&near_repeat), "{near_repeat}");
+    assert_eq!(
+        text(&near_repeat).matches(QUERY_HINT).count(),
+        1,
+        "a near-identical repeat still gets its hint: {near_repeat}"
+    );
+}
+
+#[tokio::test]
 async fn serve_points_repeat_reads_at_the_earlier_result_until_content_changes() {
     let home = TempDir::new().unwrap();
     let project = init_project_with_file(home.path(), &source("repeat_read_marker")).await;
