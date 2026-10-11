@@ -127,26 +127,16 @@ fn expando_for_key(key: &str) -> Option<char> {
     }
 }
 
-/// How one file reaches a bundled grammar under language inference: the
-/// `ts_provider` key plus, when the canonical extractor dispatched it, that
-/// extractor. Its `prepare_parse_source` supplies the parse text so composite
-/// adapters (Svelte, Astro) are read the same way the index reads them;
-/// `None` means the grammar reads the file's own bytes.
+/// Grammar key, plus the extractor that prepared parse text.
+/// No extractor means the grammar reads the file's own bytes.
 struct StructuralRoute<'r> {
     key: String,
     extractor: Option<&'r dyn LanguageExtractor>,
 }
 
-/// Resolves a file's structural grammar through the canonical extractor
-/// dispatch, so the set of routable extensions is exactly the set the index
-/// parses and new bundled languages become searchable and rewritable without
-/// a second table to keep in step. The grammar key is still validated against
-/// the compiled tier via [`ts_provider::try_language`], so a language whose
-/// grammar this build omits simply does not match (search skips the file,
-/// rewrite refuses it).
-///
-/// Extension variants no extractor claims but a bundled grammar still parses
-/// fall through to a small static table. Everything else returns `None`.
+/// Extractor dispatch, then extensions no extractor claims (`mjs`, `pyi`,
+/// `c++`, …). [`ts_provider::try_language`] still decides whether this build
+/// has the grammar.
 fn structural_route<'r>(
     registry: &'r LanguageRegistry,
     rel_path: &str,
@@ -324,8 +314,7 @@ where
     let walker = source_walk(project_root, path_glob, path_policy)
         .map_err(|error| AstGrepSearchError::InvalidGlob(error.glob))?;
 
-    // Language inference rides the canonical extractor dispatch; built once
-    // per sweep so per-file routing stays one hash probe.
+    // One registry per sweep. An explicit language skips inference.
     let registry = lang.is_none().then(LanguageRegistry::new);
 
     let mut result = AstGrepSearchResult::default();
@@ -349,9 +338,8 @@ where
             continue;
         }
 
-        // An explicit language applies to every caller-selected file, including
-        // extensionless names such as Dockerfile. Without one, the canonical
-        // extractor dispatch routes the file (or leaves it unexamined).
+        // An explicit language applies to every selected file, including
+        // extensionless names such as Dockerfile.
         let route = match lang {
             Some(explicit) => StructuralRoute {
                 key: explicit.to_string(),
@@ -386,9 +374,7 @@ where
             continue;
         };
 
-        // The text the parser sees: the extractor's own prepared source, whose
-        // byte length and line breaks are contractually identical to the
-        // file's, so match ranges still index the original text.
+        // Prepared text keeps the file's offsets, so ranges index `source`.
         let parse_source = route.extractor.map_or_else(
             || Cow::Borrowed(source.as_str()),
             |extractor| extractor.prepare_parse_source(&source),
@@ -445,11 +431,8 @@ where
     Ok(result)
 }
 
-/// Rewrites every structural match of `pattern` in one file's `source` with
-/// the `rewrite` template, the language inferred from `path`'s extension.
-///
-/// `Ok(None)` means the pattern matched nothing. `Err` is the caller-facing
-/// reason no rewrite could run.
+/// `Ok(None)` when nothing matches. `Err` when `path` has no grammar or the
+/// pattern does not compile. The language is inferred from `path`.
 #[tracing::instrument(name = "code_index.rewrite.ast_grep", level = "trace", skip_all)]
 pub fn rewrite_source(
     path: &Path,
@@ -506,10 +489,7 @@ struct AstGrepFileIdentity<'file> {
     key: &'file str,
 }
 
-/// The file's own bytes and the text the parser sees. They differ only for
-/// composite adapters whose `prepare_parse_source` masks non-code regions;
-/// byte offsets are contractually identical, so match ranges index `source`
-/// and display always reports the file's own text.
+/// File bytes and parser input. Offsets match, so ranges index `source`.
 #[derive(Clone, Copy)]
 struct AstGrepFileText<'file> {
     source: &'file str,
@@ -684,9 +664,6 @@ mod tests {
         );
     }
 
-    /// The bundled JSON grammar is registered in the shipping tiers, so a
-    /// `.json` file must rewrite structurally instead of being refused as
-    /// grammar-less.
     #[test]
     #[cfg(any(feature = "lite", feature = "lang-json"))]
     fn rewrite_applies_structural_edits_in_json() {
@@ -701,8 +678,6 @@ mod tests {
         assert_eq!(rewritten, "{\n  \"enabled\": false,\n  \"level\": 1\n}\n");
     }
 
-    /// Inference routes every extension the index parses, including config
-    /// documents like `.json`.
     #[test]
     #[cfg(any(feature = "lite", feature = "lang-json"))]
     fn inferred_language_search_scans_json_files() {
@@ -720,9 +695,6 @@ mod tests {
         assert_eq!(hit.lang, "json");
     }
 
-    /// Composite adapters parse a mask of the file: a `.svelte` route reports
-    /// only script-block matches, and display text still comes from the file's
-    /// own bytes at the same offsets.
     #[test]
     fn svelte_search_matches_only_inside_the_script_block() {
         let dir = tempfile::tempdir().unwrap();

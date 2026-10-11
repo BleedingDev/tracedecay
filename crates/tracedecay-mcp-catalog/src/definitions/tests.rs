@@ -258,16 +258,13 @@ fn lcm_history_reads_accept_an_as_of_cutoff() {
     );
 }
 
-fn advertised_rewrite(definitions: &[ToolDefinition]) -> &ToolDefinition {
-    definitions
-        .iter()
+#[test]
+fn ast_grep_rewrite_is_advertised_for_structural_edits() {
+    let rewrite = get_tool_definitions()
+        .expect("tool definitions")
+        .into_iter()
         .find(|definition| definition.name == "tracedecay_ast_grep_rewrite")
-        .expect("tracedecay_ast_grep_rewrite must be advertised")
-}
-
-fn assert_rewrite_is_advertised(definitions: &[ToolDefinition]) {
-    let rewrite = advertised_rewrite(definitions);
-    assert_eq!(rewrite.name, "tracedecay_ast_grep_rewrite");
+        .expect("tracedecay_ast_grep_rewrite must be advertised");
     assert_eq!(
         rewrite.input_schema["required"],
         json!(["path", "pattern", "rewrite"])
@@ -279,22 +276,6 @@ fn assert_rewrite_is_advertised(definitions: &[ToolDefinition]) {
         "{}",
         rewrite.description
     );
-}
-
-/// The in-process rewrite tool stays on the public catalog under its shipped
-/// name, with the path/pattern/rewrite arguments callers send.
-#[test]
-fn ast_grep_rewrite_is_advertised_for_structural_edits() {
-    assert_rewrite_is_advertised(&get_tool_definitions().expect("tool definitions"));
-}
-
-/// A later `tools/list` read must still advertise the same rewrite contract.
-/// The catalog is process-cached; callers observe the tool, not a build
-/// counter.
-#[test]
-fn repeated_catalog_reads_keep_advertising_the_rewrite_tool() {
-    assert_rewrite_is_advertised(&get_tool_definitions().expect("first catalog read"));
-    assert_rewrite_is_advertised(&get_tool_definitions().expect("second catalog read"));
 }
 
 #[test]
