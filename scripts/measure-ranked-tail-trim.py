@@ -62,7 +62,7 @@ MIN_KEPT_ROWS = 3
 MIN_TRIMMED_ROWS = 2
 HANDLE = "rh_" + "0" * 24
 TRIM_MARKER = re.compile(
-    r"^- _Trimmed \d+ lower-ranked results \(ranks (?P<first>\d+)-(?P<last>\d+), (?P<bytes>\d+) bytes\): "
+    r"^- _Trimmed (?P<count>\d+) lower-ranked results \(ranks \d+-\d+, (?P<bytes>\d+) bytes\): "
     r"each scored at most half of this page's best utility \d+\. "
     r"To restore them, call `tracedecay_retrieve` with handle `(?P<handle>rh_[0-9a-f]{24})` "
     r"\(pass the same `project_selector` if this call used one\)\._\n?",
@@ -169,7 +169,7 @@ def restored_tail(client: "measure.TraceDecay", handle: str) -> str | None:
 def unresolved_tail(match: re.Match) -> tuple[int, int]:
     """(rows cut, bytes saved) a marker's own metadata proves for a dead handle."""
     saved = int(match.group("bytes")) - len(match.group(0).encode())
-    return int(match.group("last")) - int(match.group("first")) + 1, saved
+    return int(match.group("count")), saved
 
 
 def untrimmed(text: str, retrieve: Callable[[str], str | None]) -> tuple[str, list[re.Match]]:

@@ -67,7 +67,7 @@ class SharedRuleCases(unittest.TestCase):
 class StoredTails(unittest.TestCase):
     PAGE = (
         "- **kept** (function, exact_message), rank 1 · utility 2000000\n"
-        "- _Trimmed 2 lower-ranked results (ranks 4-5, 20 bytes): each scored at most half of "
+        "- _Trimmed 3 lower-ranked results (ranks 4-7, 20 bytes): each scored at most half of "
         "this page's best utility 2000000. To restore them, call `tracedecay_retrieve` with "
         "handle `rh_0123456789abcdef01234567` (pass the same `project_selector` if this call used one)._\n"
     )
@@ -90,7 +90,8 @@ class StoredTails(unittest.TestCase):
     def test_unresolved_tail_recovers_rows_and_bytes_from_marker_metadata(self) -> None:
         match = trim.TRIM_MARKER.search(self.PAGE)
         rows, saved = trim.unresolved_tail(match)
-        self.assertEqual(rows, 2)
+        # Sparse context ranks: the rank span 4-7 covers three cut rows.
+        self.assertEqual(rows, 3)
         self.assertEqual(saved, 20 - len(match.group(0).encode()))
 
 
