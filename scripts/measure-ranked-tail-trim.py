@@ -16,12 +16,20 @@ mattered. Two sources:
   agent-authored content; such a row is one the agent would have restored
   with `tracedecay_retrieve`.
 
+A binary that already trims hides the tail behind a retrieval handle, so both
+sources splice each marker's stored rows back through `tracedecay_retrieve`
+before replaying the rule. A marker the store can no longer answer (expired
+handles, sessions recorded under another project) still proves its cut's row
+and byte counts from its own metadata and counts as `markers_unresolved`;
+only its row-use and truth outcomes stay unknown.
+
     scripts/measure-ranked-tail-trim.py --queries scripts/ranked-tail-trim-queries.json
     scripts/measure-ranked-tail-trim.py --branch master --providers claude
 
 Rule replayed: the longest suffix of unprotected rows after the last row
 scoring above half the block's best utility, starting no earlier than row
-4, cut only when it holds 2+ rows. A row is kept when its name contains every
+4, cut only when it holds 2+ rows whose marker line would cost fewer bytes
+than the rows it replaces. A row is kept when its name contains every
 query word or a caller `anchor:` route ranked it; a context result with a
 `Lexical Anchors` section keeps every row. Stored sessions keep only the
 call's flattened argument values, so they replay with every argument value
@@ -38,6 +46,7 @@ import re
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -52,6 +61,13 @@ ROW = re.compile(r"^- \*\*(.+?)\*\* .*?(?:, | · )rank (\d+) · utility (\d+)")
 MIN_KEPT_ROWS = 3
 MIN_TRIMMED_ROWS = 2
 HANDLE = "rh_" + "0" * 24
+TRIM_MARKER = re.compile(
+    r"^- _Trimmed (?P<count>\d+) lower-ranked results \(ranks \d+-\d+, (?P<bytes>\d+) bytes\): "
+    r"each scored at most half of this page's best utility \d+\. "
+    r"To restore them, call `tracedecay_retrieve` with handle `(?P<handle>rh_[0-9a-f]{24})` "
+    r"\(pass the same `project_selector` if this call used one\)\._\n?",
+    re.M,
+)
 
 
 @dataclass
@@ -132,6 +148,49 @@ def trimmed(text: str, query: str) -> list[tuple[list[Row], list[Row], int]]:
     return blocks
 
 
+def restored_tail(client: "measure.TraceDecay", handle: str) -> str | None:
+    """Every page of a trim marker's stored tail, or None when the handle is gone."""
+    pieces = []
+    offset = 0
+    try:
+        while True:
+            page = client.call("tracedecay_retrieve", {"handle": handle, "offset": offset})
+            content = page.get("content")
+            if not isinstance(content, str):
+                return None
+            pieces.append(content)
+            offset = page.get("next_offset")
+            if offset is None:
+                return "".join(pieces)
+    except measure.ToolProblem:
+        return None
+
+
+def unresolved_tail(match: re.Match) -> tuple[int, int]:
+    """(rows cut, bytes saved) a marker's own metadata proves for a dead handle."""
+    saved = int(match.group("bytes")) - len(match.group(0).encode())
+    return int(match.group("count")), saved
+
+
+def untrimmed(text: str, retrieve: Callable[[str], str | None]) -> tuple[str, list[re.Match]]:
+    """The page with each trim marker's stored tail spliced back verbatim.
+
+    Without this splice the replay sees only the kept rows, so it cannot
+    verify the trim's savings or recall on output the binary already trimmed.
+    Returns the spliced page and the markers the store could not answer.
+    """
+    dead: list[re.Match] = []
+
+    def restore(match: re.Match) -> str:
+        tail = retrieve(match.group("handle"))
+        if tail is None:
+            dead.append(match)
+            return match.group(0)
+        return tail
+
+    return TRIM_MARKER.sub(restore, text), dead
+
+
 def used_later(row: Row, others: str, before: str, later: str) -> bool:
     """An anchor unique to this row (not boilerplate every row shares) occurs later."""
     return any(
@@ -141,7 +200,7 @@ def used_later(row: Row, others: str, before: str, later: str) -> bool:
     )
 
 
-def replay(events: list, stats: Counter) -> None:
+def replay(events: list, stats: Counter, retrieve: Callable[[str], str | None]) -> None:
     calls = {event.id: event for event in events if isinstance(event, measure.Call)}
     for index, event in enumerate(events):
         if not isinstance(event, measure.Result) or event.is_error or event.text is None:
@@ -151,9 +210,15 @@ def replay(events: list, stats: Counter) -> None:
         if tool not in TOOLS:
             continue
         stats[f"{tool}:calls"] += 1
-        stats[f"{tool}:bytes"] += len(event.text.encode())
+        text, dead = untrimmed(event.text, retrieve)
+        dead_tails = [unresolved_tail(match) for match in dead]
+        stats[f"{tool}:markers_unresolved"] += len(dead)
+        stats[f"{tool}:bytes"] += len(text.encode()) + sum(saved for _, saved in dead_tails)
+        stats[f"{tool}:saved_bytes"] += sum(saved for _, saved in dead_tails)
+        stats[f"{tool}:trimmed_rows"] += sum(rows for rows, _ in dead_tails)
+        stats[f"{tool}:trimmed_calls"] += bool(dead)
         before, later, _ = measure.split_evidence(events, index, tool)
-        for kept, cut, saved in trimmed(event.text, call.evidence):
+        for kept, cut, saved in trimmed(text, call.evidence):
             if not cut:
                 continue
             stats[f"{tool}:trimmed_calls"] += 1
@@ -174,24 +239,29 @@ def definitions(repo: str, fragment: str) -> set[str]:
 
 
 def run_queries(args: argparse.Namespace, stats: Counter) -> None:
+    client = measure.TraceDecay(args.binary, args.project or args.repo)
     for item in json.loads(args.queries.read_text()):
         command = [args.binary, "tool", item["tool"], "--args", json.dumps(item["args"])]
         text = subprocess.run(command + ["--project", args.project or args.repo], capture_output=True, text=True, check=False).stdout
+        text, dead = untrimmed(text, lambda handle: restored_tail(client, handle))
+        dead_tails = [unresolved_tail(match) for match in dead]
         truth = definitions(args.repo, item["truth"])
         blocks = trimmed(text, item["args"].get("query") or item["args"].get("task", ""))
         kept = {row.name for rows, _, _ in blocks for row in rows}
         cut = {row.name for _, rows, _ in blocks for row in rows}
         saved = sum(saved for _, _, saved in blocks)
+        dead_saved = sum(saved for _, saved in dead_tails)
         tool = item["tool"]
         stats[f"{tool}:calls"] += 1
-        stats[f"{tool}:bytes"] += len(text.encode())
-        stats[f"{tool}:saved_bytes"] += saved
-        stats[f"{tool}:trimmed_calls"] += bool(saved)
-        stats[f"{tool}:trimmed_rows"] += sum(len(rows) for _, rows, _ in blocks)
+        stats[f"{tool}:bytes"] += len(text.encode()) + dead_saved
+        stats[f"{tool}:markers_unresolved"] += len(dead)
+        stats[f"{tool}:saved_bytes"] += saved + dead_saved
+        stats[f"{tool}:trimmed_calls"] += bool(saved or dead)
+        stats[f"{tool}:trimmed_rows"] += sum(len(rows) for _, rows, _ in blocks) + sum(rows for rows, _ in dead_tails)
         stats[f"{tool}:truth_on_page"] += len(truth & (kept | cut))
         stats[f"{tool}:truth_trimmed"] += len(truth & (cut - kept))
         print(
-            f"{json.dumps(item['args'])}: {len(text.encode())} -> {len(text.encode()) - saved} bytes, "
+            f"{json.dumps(item['args'])}: {len(text.encode()) + dead_saved} -> {len(text.encode()) - saved} bytes, "
             f"truth on page {sorted(truth & (kept | cut))}, trimmed {sorted(truth & (cut - kept))}",
             file=sys.stderr,
         )
@@ -216,7 +286,7 @@ def run_sessions(args: argparse.Namespace, stats: Counter) -> None:
             continue
         stats["sessions_loaded"] += 1
         print(f"[{number}/{len(ordered)}] {provider} {len(messages)} messages", file=sys.stderr)
-        replay(measure.events_from_messages(messages), stats)
+        replay(measure.events_from_messages(messages), stats, lambda handle: restored_tail(client, handle))
 
 
 def main() -> int:
@@ -236,11 +306,11 @@ def main() -> int:
     stats: Counter = Counter()
     if args.queries:
         run_queries(args, stats)
-        columns = ("calls", "bytes", "saved_bytes", "trimmed_calls", "trimmed_rows", "truth_on_page", "truth_trimmed")
+        columns = ("calls", "bytes", "saved_bytes", "trimmed_calls", "trimmed_rows", "truth_on_page", "truth_trimmed", "markers_unresolved")
     else:
         run_sessions(args, stats)
         print(f"sessions loaded {stats['sessions_loaded']}, unreadable {stats['sessions_unreadable']}")
-        columns = ("calls", "bytes", "saved_bytes", "trimmed_calls", "trimmed_rows", "trimmed_rows_used")
+        columns = ("calls", "bytes", "saved_bytes", "trimmed_calls", "trimmed_rows", "trimmed_rows_used", "markers_unresolved")
     print("tool | " + " | ".join(columns) + " | tokens before -> after | saved %")
     for tool in TOOLS:
         get = lambda key: stats[f"{tool}:{key}"]
