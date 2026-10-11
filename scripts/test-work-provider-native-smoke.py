@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""Protocol tests against stand-ins; these never launch or certify a real provider."""
+"""Protocol refusal and OS-pipe tests; these never launch or certify a provider."""
 
 import contextlib
 import io
 import os
-import pathlib
-import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -17,23 +14,6 @@ def accepted_turn(**fields):
     return {"id": 2, "result": {"turn": {
         "id": "turn-one", "status": "inProgress", "items": [], "error": None, **fields,
     }}}
-
-
-# Answers each request with every frame in a single write, as a real server
-# may when a notification precedes its response.
-COALESCING_APP_SERVER = """
-import json, os, sys
-replies = {
-    0: [{"id": 0, "result": {}}],
-    1: [{"method": "thread/started", "params": {"thread": {"id": "thread-one"}}},
-        {"id": 1, "result": {"thread": {"id": "thread-one"}}}],
-    2: [{"method": "turn/started", "params": {"threadId": "thread-one"}},
-        {"id": 2, "result": {"turn": {"id": "turn-one", "status": "inProgress", "error": None}}}],
-}
-for line in sys.stdin:
-    frames = replies.get(json.loads(line).get("id"), [])
-    os.write(1, "".join(json.dumps(frame) + "\\n" for frame in frames).encode())
-"""
 
 
 class StartupResponses(unittest.TestCase):
@@ -95,17 +75,6 @@ class StartupResponses(unittest.TestCase):
         with self.assertRaises(ValueError):
             smoke.response_result({"id": 0, "error": {}}, 0)
 
-    def test_frames_delivered_in_one_pipe_write_are_all_read(self):
-        with tempfile.TemporaryDirectory() as stage:
-            provider = pathlib.Path(stage, "codex")
-            provider.with_suffix(".py").write_text(COALESCING_APP_SERVER)
-            provider.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{provider.with_suffix('.py')}' \"$@\"\n")
-            provider.chmod(0o755)
-            with patch.dict(os.environ, {"HOME": stage}), \
-                    contextlib.redirect_stdout(io.StringIO()) as output:
-                smoke.run_app_server(str(provider), stage)
-        self.assertIn("turn_start=accepted", output.getvalue())
-
     def test_no_opt_in_never_launches_a_provider(self):
         for opt_in in (None, "0", "true"):
             environment = {} if opt_in is None else {"TRACEDECAY_WORK_NATIVE_SMOKE": opt_in}
@@ -115,6 +84,32 @@ class StartupResponses(unittest.TestCase):
                 self.assertEqual(smoke.main(), 2)
                 launch.assert_not_called()
                 self.assertNotIn("PASS", output.getvalue())
+
+
+class PipeFrames(unittest.TestCase):
+    def test_frames_delivered_in_one_pipe_write_are_all_read(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb", buffering=0) as reader, \
+                os.fdopen(write_fd, "wb", buffering=0) as writer:
+            writer.write(
+                b'{"method":"thread/started","params":{}}\n'
+                b'{"id":1,"result":{"thread":{"id":"thread-one"}}}\n'
+                b'{"method":"turn/started","params":{}}\n'
+                b'{"id":2,"result":{"turn":{"id":"turn-one","status":"inProgress"}}}\n'
+            )
+            thread_id = smoke._receive_until(reader, smoke.thread_start_response, "thread/start response")
+            self.assertEqual(thread_id, "thread-one")
+            turn_id = smoke._receive_until(
+                reader, lambda item: smoke.turn_start_response(item, thread_id), "turn/start response",
+            )
+            self.assertEqual(turn_id, "turn-one")
+
+    def test_stdout_closure_is_a_failure_without_a_matching_response(self):
+        read_fd, write_fd = os.pipe()
+        with os.fdopen(read_fd, "rb", buffering=0) as reader:
+            os.close(write_fd)
+            with self.assertRaisesRegex(RuntimeError, "closed stdout while waiting for thread/start response"):
+                smoke._receive_until(reader, smoke.thread_start_response, "thread/start response")
 
 
 if __name__ == "__main__":
