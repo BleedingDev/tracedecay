@@ -1096,9 +1096,30 @@ fn lcm_session_page_reports_messages_the_temporal_projection_has_not_published()
             ),
         );
         assert_eq!(status, 200);
-        let messages = page["payload"]["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 3, "{page}");
-        assert!(page["payload"]["next_cursor"].is_null(), "{page}");
+        let messages = page["payload"]["messages"].as_array().unwrap_or_else(|| {
+            panic!("lagging session must serve the published transcript page: {page}")
+        });
+        let message_ids = messages
+            .iter()
+            .map(|message| {
+                message["message_id"].as_str().unwrap_or_else(|| {
+                    panic!("published transcript message must carry an id: {message}")
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            message_ids,
+            [
+                "lagging-message-1",
+                "lagging-message-2",
+                "lagging-message-3"
+            ],
+            "the page must serve only the materialized turns: {page}"
+        );
+        assert!(
+            page["payload"]["next_cursor"].is_null(),
+            "unpublished turns must not become another page: {page}"
+        );
         assert_eq!(page["payload"]["counts"]["message_count"], 5, "{page}");
         assert_eq!(
             page["payload"]["counts"]["unpublished_message_count"], 2,
