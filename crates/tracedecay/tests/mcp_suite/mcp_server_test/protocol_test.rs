@@ -1,3 +1,4 @@
+use crate::common::fixture::GitFixture;
 use crate::mcp_server_test::support::*;
 use serde_json::{Value, json};
 use std::fs;
@@ -1408,6 +1409,7 @@ async fn test_resources_read_overview() {
 async fn test_resources_read_branches_reports_provenance_scopes() {
     let dir = TempDir::new().unwrap();
     let project = canonical_root_identity(dir.path());
+    let _repo = GitFixture::primary(project.clone());
     fs::create_dir_all(project.join("src")).unwrap();
     fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
     let cg = Box::pin(tracedecay_project::project::TraceDecay::init(&project))
