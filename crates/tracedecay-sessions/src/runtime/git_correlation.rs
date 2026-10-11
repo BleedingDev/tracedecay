@@ -670,12 +670,17 @@ pub(crate) fn canonical_worktree_key(path: &str) -> Result<String, error::GitCor
     }
     match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
         // `to_str` keeps the identity byte-exact: a canonical path outside
-        // UTF-8 keeps the caller's recorded spelling rather than a lossy
-        // replacement that would collide with a different directory.
-        Ok(canonical) => Ok(canonical
+        // UTF-8 cannot be stored as this key's String, and silently keeping
+        // the caller's alias would key the fold on a different identity, so
+        // it is a typed failure instead of a successful fallback.
+        Ok(canonical) => canonical
             .to_str()
-            .map(normalize_worktree)
-            .unwrap_or(normalized)),
+            .map(|exact| Ok(normalize_worktree(exact)))
+            .unwrap_or_else(|| {
+                Err(error::GitCorrelationError::Unavailable(format!(
+                    "worktree identity for {normalized} resolves outside UTF-8"
+                )))
+            }),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(normalized),
         Err(error) => Err(error::GitCorrelationError::Unavailable(format!(
             "cannot resolve worktree identity for {normalized}: {error}"

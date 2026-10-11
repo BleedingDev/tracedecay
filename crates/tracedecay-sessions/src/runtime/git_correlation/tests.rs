@@ -162,6 +162,24 @@ fn canonical_worktree_key_reresolves_a_retargeted_link() {
 
 #[cfg(unix)]
 #[test]
+fn canonical_worktree_key_rejects_a_canonical_identity_outside_utf8() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    // A UTF-8 link name pointing into a non-UTF-8 directory: the resolved
+    // identity cannot be stored byte-exactly, so the spelling must fail
+    // typed rather than silently keep the caller's alias.
+    let target = root
+        .path()
+        .join(std::ffi::OsString::from_vec(b"non-\xff-utf8".to_vec()));
+    std::fs::create_dir(&target).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let spelling = normalize_worktree(&link.to_string_lossy());
+    assert!(canonical_worktree_key(&spelling).is_err());
+}
+
+#[cfg(unix)]
+#[test]
 fn canonical_worktree_key_reports_non_not_found_failures() {
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("file.txt");
