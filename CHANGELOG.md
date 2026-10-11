@@ -15,9 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * **index:** retry park-release when reconcile or query-owner warm finishes after the worker parks, so a seated decode cannot remain the only servable generation ([#3347](https://github.com/ScriptedAlchemy/tracedecay/issues/3347))
 * **sessions:** spawn a configured Codex `.py` through the host interpreter so stdin/stdout stay on that process ([#3347](https://github.com/ScriptedAlchemy/tracedecay/issues/3347))
+* **sessions:** record a real `o200k_base` `token_count` and a `cut` marker on stored `tool_result` facts at ingest; `source_read` no longer writes chars/4 ([#3397](https://github.com/ScriptedAlchemy/tracedecay/issues/3397))
 * **cli:** give explicit upgrade lookups their own GitHub deadline so a 1s advisory budget cannot fail `tracedecay upgrade` ([#3371](https://github.com/ScriptedAlchemy/tracedecay/issues/3371))
 * **git:** settle `git_hunks` within its existing deadline while preserving exact worktree identity and releasing the real index lock on cancellation ([#3360](https://github.com/ScriptedAlchemy/tracedecay/issues/3360))
 * **grep:** admit interactive source scans on their own worker pool so background verification cannot hold the indexing CPU FIFO across the 10s source-search deadline ([#3359](https://github.com/ScriptedAlchemy/tracedecay/issues/3359))
+* **storage:** return inserted IDs from the inserting statement with `INSERT ... RETURNING` and delete the shared last-insert-ID API, so a caller can no longer read another write's ID or one left by a rolled-back write ([#3403](https://github.com/ScriptedAlchemy/tracedecay/pull/3403))
+* **storage:** count in-flight reader opens against the background lease ceiling so parallel background opens cannot take the foreground reader reservation ([#3403](https://github.com/ScriptedAlchemy/tracedecay/pull/3403))
 
 ### Performance Improvements
 
