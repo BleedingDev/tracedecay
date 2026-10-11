@@ -144,8 +144,7 @@ fn tools_list_cost(stdout: &[u8], id: i64) -> ToolsListCost {
 }
 
 fn old_full_list_cost() -> ToolsListCost {
-    let definitions =
-        tracedecay_mcp::get_maximal_tool_definitions().expect("the advertised tool catalog");
+    let definitions = tracedecay_mcp::get_tool_definitions().expect("the advertised tool catalog");
     let tools = serde_json::to_value(&definitions).expect("catalog serializes");
     let result = json!({ "tools": tools });
     let compact = serde_json::to_string(&result).expect("old full list serializes");
