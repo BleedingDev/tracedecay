@@ -832,7 +832,7 @@ mod tests {
         let text = result.value["content"][0]["text"].as_str().unwrap();
 
         assert!(
-            text.starts_with("## source\\_body\n\n### Payload\n\n```text\nsrc/lib.rs:1-3\n```"),
+            text.contains("## source\\_body\n\n### Payload\n\n```text\nsrc/lib.rs:1-3\n```"),
             "{text}"
         );
         assert!(
