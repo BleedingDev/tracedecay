@@ -503,7 +503,8 @@ mod snapshot_return_tests {
     use std::thread;
     use std::time::Duration;
 
-    use tracedecay_store::OperationPriorityV1;
+    use rusqlite::Connection;
+    use tracedecay_store::{OperationPriorityV1, RuntimeReadResultV1};
 
     use crate::checkpoint::CheckpointBlockerSource;
     use crate::reader::ReaderPool;
@@ -624,27 +625,35 @@ mod snapshot_return_tests {
         let read = request(&store.binding, OperationPriorityV1::Foreground);
         let probe = Probe::for_request(&read);
         let mut lease = pool.acquire(&read, &probe, Duration::from_secs(2)).unwrap();
-        let reader_id = lease.checkout.worker.id;
         lease.start_snapshot().unwrap();
 
         // The state `finish_snapshot` leaves when the rollback acknowledgement
         // outruns its grace, without depending on the 5ms race.
+        let reader_id = lease.checkout.worker.id;
         lease.checkout.deferred_end = Some(lease.checkout.worker.client.begin_end().unwrap());
         lease.snapshot_active = false;
         pool.inner.checkpoint_blockers.release(reader_id);
 
         let mut snapshot = lease.begin_snapshot().unwrap();
-        snapshot.execute(read.clone(), &probe).unwrap();
         assert_eq!(
-            pool.inner.checkpoint_blockers.checkpoint_blockers().count(),
-            1
+            snapshot.execute(read.clone(), &probe).unwrap().value(),
+            Some(&RuntimeReadResultV1::GraphQuickCheck { healthy: false })
+        );
+        Connection::open(pool.path())
+            .unwrap()
+            .execute("INSERT INTO markers(value) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(
+            snapshot.execute(read.clone(), &probe).unwrap().value(),
+            Some(&RuntimeReadResultV1::GraphQuickCheck { healthy: false }),
+            "the reused snapshot must stay on the view it opened"
         );
         drop(snapshot);
-        assert!(
-            pool.inner
-                .checkpoint_blockers
-                .checkpoint_blockers()
-                .is_clear()
+
+        let mut next = lease.begin_snapshot().unwrap();
+        assert_eq!(
+            next.execute(read, &probe).unwrap().value(),
+            Some(&RuntimeReadResultV1::GraphQuickCheck { healthy: true })
         );
     }
 }
