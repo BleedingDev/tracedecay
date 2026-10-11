@@ -180,6 +180,7 @@ pub(super) async fn record_relation_receipts_group(
     Ok(outcomes)
 }
 
+/// `snapshot` already contains the pending receipt.
 pub(super) async fn apply_candidate_relation_projection(
     database: &impl SessionTemporalRegisteredDb,
     snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,

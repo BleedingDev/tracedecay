@@ -380,6 +380,7 @@ async fn begin_session_refresh_in_transaction(
 
 enum SessionRefreshSnapshotPlan {
     Planned(SessionRefreshBeginPlanV1),
+    /// No cursor key, or generation rows with none active.
     NeedsWrite,
 }
 
@@ -437,6 +438,7 @@ async fn plan_session_refresh_on_snapshot(
             }
         };
     let candidate_generation = if minted {
+        // An empty generation table plans candidate 2; the commit mints generation 1 first.
         SessionProjectionGenerationV1::new(2)?
     } else {
         candidate_base
@@ -603,6 +605,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
             .await?
             .is_some();
         drop(key_snapshot);
+        // A missing cursor key is provisioned before the snapshot plan.
         if !key_active {
             let transaction = self
                 .begin_write_transaction()
@@ -1341,6 +1344,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         .await
     }
 
+    /// `generation` is the candidate, not `watermarks.active_generation()`.
     pub async fn validate_staged_session_refresh_completion(
         &self,
         session_id: &tracedecay_domain::SessionId,
@@ -1349,6 +1353,11 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
         relation_projection: &SessionRelationProjection,
         execution_control: &ExecutionControl,
     ) -> SessionStoreResult<()> {
+        if generation.value() != relation_projection.generation {
+            return Err(SessionStoreError::InvalidStateTransition {
+                context: "staged completion candidate generation",
+            });
+        }
         let validation_snapshot = self
             .read_snapshot()
             .await
@@ -3406,6 +3415,7 @@ async fn commit_begin_batch_item_in_transaction(
                 .execute(&format!("SAVEPOINT {alone}"), ())
                 .await
                 .map_err(|error| storage(PERSIST_REFRESH, error))?;
+            // A refused grouped batch still commits its begin alone.
             let outcome =
                 begin_session_refresh_in_transaction(transaction, request, accepted_at).await;
             Ok(match outcome {

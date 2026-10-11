@@ -88,6 +88,7 @@ async fn activate_generation(
         .expect("activate generation");
 }
 
+/// `with_journal: false` omits the journal row.
 async fn seed_pending_receipt(
     database: &RegisteredGlobalDb,
     projection: &SessionRelationProjection,
