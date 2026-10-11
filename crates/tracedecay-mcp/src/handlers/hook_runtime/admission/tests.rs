@@ -148,6 +148,48 @@ fn redelivered_producer_event_with_pending_work_is_an_exact_duplicate() {
     assert_eq!(pending_work(data_root.path()).len(), 0);
 }
 
+/// A long-lived daemon admits for more project/host pairs over its lifetime
+/// than it holds ledgers open at once.
+#[test]
+fn admission_ledgers_cycle_past_the_open_bound_without_restart() {
+    let now = hook_now();
+    let envelope = admission_test_envelope(35, 7);
+    let roots = (0..MAX_OPEN_HOOK_V2_ADMISSION_LEDGERS + 8)
+        .map(|_| tempfile::tempdir().unwrap())
+        .collect::<Vec<_>>();
+    for (pair, root) in roots.iter().enumerate() {
+        let staged = stage_hook_v2_admission(root.path(), &envelope, Some(&envelope), now)
+            .unwrap_or_else(|| panic!("project/host pair {pair} must admit without restart"));
+        staged.commit.wait().unwrap();
+        assert_eq!(
+            staged.receipt.decision,
+            tracedecay_hooks::HookAdmissionDecisionV1::Admitted
+        );
+    }
+
+    let first = roots[0].path();
+    assert_eq!(
+        record_hook_v2_admission(first, &envelope, now)
+            .unwrap()
+            .decision,
+        tracedecay_hooks::HookAdmissionDecisionV1::ExactDuplicate
+    );
+    assert_eq!(
+        record_hook_v2_admission(first, &admission_test_envelope(35, 8), now)
+            .unwrap()
+            .decision,
+        tracedecay_hooks::HookAdmissionDecisionV1::Conflict
+    );
+    restart_ledger(first);
+    assert_eq!(pending_work(first), vec![envelope.clone()]);
+    restart_ledger(first);
+    assert!(
+        complete_hook_v2_pending_work(first, &envelope),
+        "a released ledger reopens to record completion"
+    );
+    assert_eq!(pending_work(first).len(), 0);
+}
+
 #[test]
 fn pre_ledger_pending_work_is_refused_for_reset_not_adopted() {
     let data_root = tempfile::tempdir().unwrap();
