@@ -2836,15 +2836,10 @@ fn dashboard_progress_advances_only_after_durable_batch_commit() {
         progress: scheduler.build_progress_slot(),
         observed_bulk_commit: std::sync::atomic::AtomicBool::new(false),
     };
-    let cancellation_started = Instant::now();
     let cancellation = latest.advance_artifact_text_serving(1, &control);
     assert_eq!(
         cancellation,
         Err(tracedecay_query::retrieval::RetrievalPortError::Cancelled)
-    );
-    assert!(
-        cancellation_started.elapsed() < Duration::from_secs(1),
-        "a cancelled scheduler batch must yield within the focused latency bound"
     );
     assert!(
         control

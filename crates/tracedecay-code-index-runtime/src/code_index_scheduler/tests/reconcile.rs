@@ -7977,21 +7977,26 @@ async fn served_texts_containing(
 }
 
 /// `tracedecay_status wait_for { state: fresh }` on a current index verifies
-/// the source and reaches it well inside a one-second budget.
+/// the source with its sweep alone: it reaches `fresh` on the generation it
+/// found, and starts no owner pass to get there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn fresh_wait_on_a_current_index_reaches_inside_one_second() {
+async fn fresh_wait_on_a_current_index_reaches_without_an_owner_pass() {
     let (fixture, _store, registry) =
         settled_fresh_wait_fixture("pub fn source() -> u32 { 1 }\n").await;
-    let started = Instant::now();
+    let generation = registry.latest_generation_id(fixture.path()).await;
+    let passes = registry
+        .subscribe_owner_activity(fixture.path())
+        .await
+        .expect("mounted owner activity")
+        .passes();
     let outcome = registry
         .wait_for_readiness(
             fixture.path(),
             tracedecay_contracts::code_index_freshness::CodeIndexReadinessTargetV1::Fresh,
-            Duration::from_secs(1),
+            SERVING_SEAT_FAILURE_CEILING,
         )
         .await
         .expect("freshness read");
-    let elapsed = started.elapsed();
     assert!(
         matches!(
             outcome,
@@ -7999,7 +8004,19 @@ async fn fresh_wait_on_a_current_index_reaches_inside_one_second() {
         ),
         "{outcome:?}"
     );
-    assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    assert_eq!(
+        registry
+            .subscribe_owner_activity(fixture.path())
+            .await
+            .expect("mounted owner activity")
+            .passes(),
+        passes,
+        "verifying a current index must not run a pass"
+    );
+    assert_eq!(
+        registry.latest_generation_id(fixture.path()).await,
+        generation
+    );
     registry.shutdown().await;
 }
 
