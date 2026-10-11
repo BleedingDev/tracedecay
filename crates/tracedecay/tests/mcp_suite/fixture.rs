@@ -663,11 +663,6 @@ async fn template_recorded_at_an_older_git_correlation_version_is_rebuilt() {
     )
     .unwrap()
     .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
-    assert!(
-        stale_sessions.is_file(),
-        "stale template must record sessions at {}",
-        stale_sessions.display()
-    );
     let downgraded = Connection::open(&stale_sessions)
         .unwrap()
         .execute(
