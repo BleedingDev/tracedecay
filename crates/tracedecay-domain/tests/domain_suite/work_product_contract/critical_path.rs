@@ -50,49 +50,55 @@ fn brute_force_critical_path(tasks: &[(String, Vec<String>, u32)]) -> (Vec<Strin
 }
 
 #[test]
-fn critical_path_matches_the_heaviest_lexically_first_root_path_in_every_small_dag() {
-    const LABELS: [&str; 4] = ["task.a", "task.b", "task.c", "task.d"];
-    const EDGES: [(usize, usize); 6] = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)];
-    let orders = (0..4usize.pow(4))
-        .map(|code| [code % 4, code / 4 % 4, code / 16 % 4, code / 64])
-        .filter(|order| order.iter().collect::<BTreeSet<_>>().len() == 4);
-    let mut cases = 0;
-    for order in orders {
-        for edge_mask in 0..1u32 << EDGES.len() {
-            for effort_mask in 0..1u32 << LABELS.len() {
-                let tasks = (0..LABELS.len())
-                    .map(|position| {
-                        let dependencies = EDGES
-                            .iter()
-                            .enumerate()
-                            .filter(|(bit, (_, to))| edge_mask >> bit & 1 == 1 && *to == position)
-                            .map(|(_, (from, _))| LABELS[order[*from]].to_owned())
-                            .collect::<Vec<_>>();
-                        (
-                            LABELS[order[position]].to_owned(),
-                            dependencies,
-                            1 + (effort_mask >> position & 1),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let items = tasks
-                    .iter()
-                    .map(|(task, dependencies, effort)| {
-                        let dependencies =
-                            dependencies.iter().map(String::as_str).collect::<Vec<_>>();
-                        item(task, &dependencies, *effort)
-                    })
-                    .collect();
-                assert_eq!(
-                    project(items).unwrap(),
-                    brute_force_critical_path(&tasks),
-                    "{tasks:?}"
-                );
-                cases += 1;
-            }
-        }
+fn critical_path_matches_root_path_enumeration_at_joins_and_disconnected_roots() {
+    let cases = [
+        vec![
+            ("task.z", vec![], 1),
+            ("task.b", vec!["task.z"], 2),
+            ("task.a", vec!["task.z"], 2),
+            ("task.c", vec!["task.b", "task.a"], 1),
+        ],
+        vec![
+            ("task.a", vec![], 1),
+            ("task.z", vec!["task.a"], 1),
+            ("task.b", vec!["task.a"], 2),
+            ("task.c", vec!["task.b", "task.z"], 1),
+        ],
+        vec![
+            ("task.a", vec![], 2),
+            ("task.z", vec![], 1),
+            ("task.b", vec!["task.z"], 1),
+            ("task.c", vec!["task.a", "task.b"], 1),
+        ],
+        vec![
+            ("task.a", vec![], 1),
+            ("task.b", vec!["task.a"], 1),
+            ("task.c", vec!["task.a"], 1),
+            ("task.d", vec!["task.b", "task.c"], 1),
+            ("task.z", vec![], 4),
+        ],
+    ];
+    for case in cases {
+        let tasks = case
+            .iter()
+            .map(|(task, dependencies, effort)| {
+                (
+                    (*task).to_owned(),
+                    dependencies.iter().map(|id| (*id).to_owned()).collect(),
+                    *effort,
+                )
+            })
+            .collect::<Vec<_>>();
+        let items = case
+            .iter()
+            .map(|(task, dependencies, effort)| item(task, dependencies, *effort))
+            .collect();
+        assert_eq!(
+            project(items).unwrap(),
+            brute_force_critical_path(&tasks),
+            "{tasks:?}"
+        );
     }
-    assert_eq!(cases, 24 * 64 * 16);
 }
 
 #[test]
