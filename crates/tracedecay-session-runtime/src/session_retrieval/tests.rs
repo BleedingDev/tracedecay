@@ -879,6 +879,7 @@ fn complete_page_with_typed_omission_becomes_partial_and_keeps_coverage() {
         page,
         freshness,
         omitted,
+        ..
     } = complete_page_outcome(page, SessionDataFreshness::Fresh, 1)
     else {
         panic!("complete page with an omission must become partial");
@@ -1006,6 +1007,7 @@ fn zero_item_partial_lcm_retrieval_remains_partial_instead_of_deleted() {
             items: Vec::new(),
             freshness,
             omitted: 5,
+            record_omitted: 5,
         },
         RetrievalGrainV1::Summary,
         SessionTemporalMetadataView::default(),
@@ -1016,6 +1018,7 @@ fn zero_item_partial_lcm_retrieval_remains_partial_instead_of_deleted() {
             items: Vec::new(),
             freshness,
             omitted: 5,
+            record_omitted: 5,
         },
         RetrievalGrainV1::Summary,
         SessionTemporalMetadataView::default(),
@@ -1857,6 +1860,7 @@ async fn small_lookup_reads_a_session_larger_than_the_response_budget() {
             page,
             freshness: SessionDataFreshness::Fresh,
             omitted,
+            ..
         } if omitted == cohort_window => page,
         other => panic!("large session must return a bounded hydrated page: {other:?}"),
     };
