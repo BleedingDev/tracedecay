@@ -57,7 +57,6 @@ use tracedecay_api::{
     is_http_application_operation_exposed,
 };
 use tracedecay_contracts::catalog_composition::build_application_catalog_snapshot;
-use tracedecay_runtime_core::ast_grep::{AST_GREP_BIN_ENV, ast_grep_command};
 use tracedecay_session_memory::event_lane::ActivityFamilyV1;
 use tracedecay_tool_catalog::{
     ApplicationSurfaceOperation, BindingSurface, CapabilityManifestV1, CatalogSnapshotV1,
@@ -192,9 +191,7 @@ impl MountFixture {
         );
         common::initialize_tracedecay_cli_project(&home, &project);
 
-        let daemon = common::spawn_tracedecay_daemon_with(&home, |command| {
-            command.env(AST_GREP_BIN_ENV, ast_grep_command().get_program());
-        });
+        let daemon = common::spawn_tracedecay_daemon_with(&home, |_| {});
         let authority = wait_for_http_authority(&common::daemon_authority_path(&profile));
 
         let context = run_ok(
@@ -244,11 +241,7 @@ impl MountFixture {
 
 fn isolated_command(home: &Path) -> Command {
     let mut command = common::tracedecay_command_with_home(home);
-    // Isolated children retain only system PATH entries. Pass the executable
-    // selected by the shared resolver, including npm's native Windows binary.
-    command
-        .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
-        .env(AST_GREP_BIN_ENV, ast_grep_command().get_program());
+    command.env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1");
     command
 }
 
