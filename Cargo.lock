@@ -6331,7 +6331,6 @@ dependencies = [
  "tracedecay-api",
  "tracedecay-contracts",
  "tracedecay-daemon-protocol",
- "tracedecay-runtime-core",
  "tracedecay-sessions",
  "tracedecay-tool-catalog",
  "tracing",

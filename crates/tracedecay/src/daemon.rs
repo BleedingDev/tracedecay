@@ -52,7 +52,7 @@ use tracedecay_mcp::transport::ReplayTransport;
 use tracedecay_mcp::{
     BrokerStreamTransport, ErrorCode, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpTransport,
 };
-use tracedecay_mcp::{ToolRegistryMode, explore_call_budget, project_catalog_discovery_scope};
+use tracedecay_mcp::{explore_call_budget, project_catalog_discovery_scope};
 use tracedecay_runtime_core::cancellation::CancellationToken;
 
 /// Human-facing detail fragment for a still-warming project/profile owner.
@@ -312,7 +312,8 @@ use tracedecay_code_index_runtime::code_index_executor::{
 };
 #[cfg(test)]
 use tracedecay_code_index_runtime::code_index_executor::{
-    code_index_search_display_binding, mcp_search_request_termination,
+    code_index_search_display_binding, code_index_text_search_display_binding,
+    mcp_search_request_termination,
 };
 #[cfg(test)]
 use tracedecay_code_index_runtime::code_index_task_support::code_index_scope_unavailable;

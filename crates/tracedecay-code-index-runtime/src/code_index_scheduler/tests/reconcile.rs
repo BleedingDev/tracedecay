@@ -4119,18 +4119,26 @@ async fn raw_edit_during_text_projection_is_stale_after_seat_and_reconciles_with
     );
 
     drop(admission);
+    // With no complete-generation demand the parked worker gives the
+    // successor's seated decode straight back, so wait for the successor
+    // generation first. Demanding earlier would wake the pass this test
+    // expects the write alone to cause.
+    let successor = wait_for_generation_change(
+        &registry,
+        fixture.path(),
+        &seated.generation.manifest().generation_id,
+    )
+    .await;
     let reconciled = wait_until_serving_seat(
         &registry,
         fixture.path(),
         Duration::from_secs(10),
         || async {
+            registry.request_complete_generation(fixture.path()).await;
             registry
                 .latest_complete_serving_for_test(fixture.path())
                 .await
-                .filter(|latest| {
-                    latest.generation.manifest().generation_id
-                        != seated.generation.manifest().generation_id
-                })
+                .filter(|latest| latest.generation.manifest().generation_id == successor)
         },
     )
     .await;
