@@ -76,7 +76,7 @@ use tracedecay_mcp::tool_errors::{mark_semantic_tool_error, tool_result_problem}
 use tracedecay_mcp::tools::binding::tool_dispatches_registered_project_reader;
 use tracedecay_mcp::tools::response_trailers::{account_tool_result, is_beside_result_block};
 use tracedecay_mcp::{
-    RESERVED_FLAGS_FOOTER, ToolDefinition, ToolResult, cli_tool_definition,
+    ALWAYS_LOAD_META, RESERVED_FLAGS_FOOTER, ToolDefinition, ToolResult, cli_tool_definition,
     get_tool_definitions_ref, render_tool_cli_help, short_tool_name,
 };
 use tracedecay_tool_catalog::{ApplicationSurfaceOperation, BindingSurface};
@@ -1413,7 +1413,7 @@ fn print_tool_list(defs: &[ToolDefinition]) {
         let is_always = def
             .meta
             .as_ref()
-            .and_then(|m| m.get("anthropic/alwaysLoad"))
+            .and_then(|m| m.get(ALWAYS_LOAD_META))
             .and_then(Value::as_bool)
             .unwrap_or(false);
         if is_always {

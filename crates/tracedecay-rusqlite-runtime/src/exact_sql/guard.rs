@@ -18,6 +18,7 @@ use rusqlite::{
     hooks::{AuthAction, Authorization},
 };
 
+use super::clock;
 use super::{
     EXACT_SQL_EXECUTION_LIMIT, EXACT_SQL_PROGRESS_INTERVAL_OPS, ExactSqlError,
     ExactSqlWriteAuthority, ExactSqlWriteIntent, sqlite_error,
@@ -64,7 +65,7 @@ where
         }))
         .map_err(|error| sqlite_error("install transaction-control guard", error))?;
     let deadline = if enforce_statement_limit {
-        let operation_deadline = Instant::now() + EXACT_SQL_EXECUTION_LIMIT;
+        let operation_deadline = clock::now() + EXACT_SQL_EXECUTION_LIMIT;
         Some(
             execution_deadline
                 .map(|deadline| deadline.min(operation_deadline))
@@ -81,7 +82,7 @@ where
             if shutdown_requested
                 .as_ref()
                 .is_some_and(|shutdown| shutdown.load(Ordering::Acquire))
-                || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                || deadline.is_some_and(|deadline| clock::now() >= deadline)
             {
                 return true;
             }

@@ -523,9 +523,10 @@ mod tests {
     use tracedecay_contracts::retrieval::{
         CodeGraphReadFreshnessV1, ContextCodeBlockV1, ContextExtensionPointV1, ContextModeV1,
         ContextPlanV1, ContextResultV1, ContextRetrievalPlanV1, ContextRetrievalRouteV1,
-        ContextStageV1, PrimitiveFreshnessStateV1, PrimitiveLaneCompleteV1, PrimitiveLaneStatusV1,
-        PrimitiveRecallV1, PrimitiveSearchCoverageV1, PrimitiveSearchFreshnessV1,
-        PrimitiveSymbolLocationV1, ServedCodeGraphGenerationV1, TodoMarkerV1, TodosResultV1,
+        ContextSearchMatchV1, ContextStageV1, PrimitiveFreshnessStateV1, PrimitiveLaneCompleteV1,
+        PrimitiveLaneStatusV1, PrimitiveRecallV1, PrimitiveSearchCoverageV1,
+        PrimitiveSearchFreshnessV1, PrimitiveSymbolLocationV1, ServedCodeGraphGenerationV1,
+        TodoMarkerV1, TodosResultV1,
     };
     use tracedecay_contracts::{ContextMemoryAnalyticsV1, InvocationAnalyticsV1};
     use tracedecay_domain::UtcMicros;
@@ -796,6 +797,57 @@ mod tests {
         );
         assert!(payload.get("context_memory").is_none(), "{payload}");
         assert!(payload.get("analytics").is_none(), "{payload}");
+    }
+
+    #[test]
+    fn json_context_returns_every_search_match_without_storing_a_trimmed_tail() {
+        let mut context = plan_context();
+        context.symbols = Vec::new();
+        context.search_matches = (1..=10)
+            .map(|rank| ContextSearchMatchV1 {
+                anchor_id: format!("code-symbol:m{rank}"),
+                name: format!("m{rank}"),
+                qualified_name: format!("crate::m{rank}"),
+                kind: "function".to_owned(),
+                file: "src/lib.rs".to_owned(),
+                exact_class: "exact_message".to_owned(),
+                rank,
+                utility_micros: if rank <= 3 { 2_000_000 } else { 1_000_000 },
+            })
+            .collect();
+        let root = tempfile::tempdir().expect("response handles");
+        let render = |args: Value| {
+            let completion = GraphToolCompletionV1 {
+                result: GraphToolResultV1::Context(Box::new(context.clone())),
+                touched_files: Vec::new(),
+                code_graph: None,
+                analytics: None,
+                cost: None,
+            };
+            texts(&render_graph_tool(Some(root.path()), &args, completion).expect("context"))
+                .join("")
+        };
+        let stored_handles = || std::fs::read_dir(root.path()).expect("handle root").count();
+
+        let payload: Value =
+            serde_json::from_str(&render(json!({"format": "json"}))).expect("json");
+        assert_eq!(payload["search_matches"].as_array().map(Vec::len), Some(10));
+        assert_eq!(
+            stored_handles(),
+            0,
+            "a JSON call must not store a trimmed tail"
+        );
+
+        let markdown = render(json!({}));
+        assert!(
+            markdown.contains("- _Trimmed 7 lower-ranked results"),
+            "{markdown}"
+        );
+        assert_ne!(
+            stored_handles(),
+            0,
+            "the markdown trim stores its tail here"
+        );
     }
 
     fn fresh_worktree_seat() -> ServedCodeGraphGenerationV1 {
