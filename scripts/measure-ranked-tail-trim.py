@@ -125,6 +125,9 @@ def trimmed(text: str, query: str) -> list[tuple[list[Row], list[Row], int]]:
             continue
         cut = rows[start:]
         saved = sum(len(row.text.encode()) for row in cut) - len(marker(cut, max(r.utility for r in rows)).encode())
+        if saved <= 0:
+            blocks.append((rows, [], 0))
+            continue
         blocks.append((rows[:start], cut, saved))
     return blocks
 

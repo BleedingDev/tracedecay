@@ -745,7 +745,9 @@ mod tests {
         let results = (0..10)
             .map(|ordinal| {
                 let utility = if ordinal < 3 { 2_000_000 } else { 1_000_000 };
-                ranked_row(ordinal, utility, ordinal == 6)
+                let mut row = ranked_row(ordinal, utility, ordinal == 6);
+                row.node_id = Some(format!("symbol.f{ordinal}"));
+                row
             })
             .collect();
         let result = SearchResultV1::Complete(SearchCompleteV1 {
