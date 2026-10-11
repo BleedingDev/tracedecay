@@ -78,8 +78,8 @@ fn rows(report: &ResidentOwnersReportV1) -> Vec<(ResidentOwnerKindV1, String, bo
         .collect()
 }
 
-/// Park-release runs after the worker publishes `Parked`, and its retries run
-/// from whichever task settles the blocker, so a parked report is eventual.
+/// A park-release deferred behind a running pass lands when that pass
+/// settles, after the worker already reports `Parked`.
 async fn wait_for_no_decoded_generation(owners: &ResidentOwnersV1, awaited: &str) {
     let deadline = Instant::now() + SERVING_SEAT_FAILURE_CEILING;
     loop {
