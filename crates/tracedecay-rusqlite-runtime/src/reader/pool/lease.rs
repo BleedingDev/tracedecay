@@ -583,4 +583,35 @@ mod snapshot_return_tests {
         );
         drop(other);
     }
+
+    #[test]
+    fn lease_begins_a_new_snapshot_after_a_deferred_end() {
+        let store = TestStore::new();
+        let pool = ReaderPool::start(store.locator(), two_reader_budget(), CountExecutor).unwrap();
+        let read = request(&store.binding, OperationPriorityV1::Foreground);
+        let probe = Probe::for_request(&read);
+        let mut lease = pool.acquire(&read, &probe, Duration::from_secs(2)).unwrap();
+        let reader_id = lease.checkout.worker.id;
+        lease.start_snapshot().unwrap();
+
+        // The state `finish_snapshot` leaves when the rollback acknowledgement
+        // outruns its grace, without depending on the 5ms race.
+        lease.checkout.deferred_end = Some(lease.checkout.worker.client.begin_end().unwrap());
+        lease.snapshot_active = false;
+        pool.inner.checkpoint_blockers.release(reader_id);
+
+        let mut snapshot = lease.begin_snapshot().unwrap();
+        snapshot.execute(read.clone(), &probe).unwrap();
+        assert_eq!(
+            pool.inner.checkpoint_blockers.checkpoint_blockers().count(),
+            1
+        );
+        drop(snapshot);
+        assert!(
+            pool.inner
+                .checkpoint_blockers
+                .checkpoint_blockers()
+                .is_clear()
+        );
+    }
 }
