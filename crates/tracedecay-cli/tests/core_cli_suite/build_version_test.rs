@@ -32,11 +32,10 @@ fn reported_version() -> String {
         .to_string()
 }
 
+/// The workspace root above the CLI package directory, where Cargo and the
+/// Bazel launcher start this suite.
 fn checkout() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("the CLI crate should live under the workspace crates directory")
+    Path::new("../..")
 }
 
 /// The full sha embedded in the reported version, after pinning the
