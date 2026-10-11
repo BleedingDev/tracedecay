@@ -362,14 +362,33 @@ fn serve_site_code(
     artifact_window_site(source, window)
 }
 
+/// Lineage attests the declaration's rows. A window must cover those rows
+/// and their non-whitespace bytes; equal line numbers alone do not prove
+/// that a window ending halfway through a one-line body is complete.
+fn whole_symbol_window_site(
+    source: &str,
+    window: &tracedecay_query::code_search::CodeIndexSearchWindowV1,
+    declaration_start: u32,
+    declaration_end: u32,
+) -> Option<(u32, u32, String)> {
+    let block = artifact_window_site(source, window)?;
+    if block.0 > declaration_start || block.1 < declaration_end {
+        return None;
+    }
+    let start = usize::try_from(window.source_span.start_byte).ok()?;
+    let end = start.checked_add(block.2.len())?;
+    let before = source.get(..start)?.rsplit('\n').next()?;
+    let after = source.get(end..)?.split('\n').next()?;
+    (before.trim().is_empty() && after.trim().is_empty()).then_some(block)
+}
+
 /// Symbols and code from search matches when the graph catalog cannot
 /// resolve them. Locations and code come only from the site the serving
-/// lane attested for each match — lineage declaration rows for a
-/// symbol's location, and a byte-verified window (chunk or artifact)
-/// for code — never from a text scan that could name a comment, import,
-/// or call site. A site that cannot be resolved reports typed
-/// unavailable fields instead of invented coordinates, and a file hit
-/// names no symbol location at all.
+/// lane attested for each match: lineage rows attest declaration extent,
+/// and a byte-verified window must cover it before serving symbol code.
+/// An artifact window alone supplies only file code. Missing declaration
+/// authority reports unavailable fields rather than window coordinates,
+/// and a file hit names no symbol location.
 fn hydrate_context_from_search_matches(
     ctx: &McpToolContext<'_>,
     search_matches: &[ContextSearchMatchV1],
@@ -395,17 +414,30 @@ fn hydrate_context_from_search_matches(
         {
             code_sites += 1;
         }
-        // Location and code resolve separately: lineage lines stand even
-        // when the source cannot be re-read, while a byte window attests
-        // both only when its bytes still verify.
+        // A byte window alone attests no declaration extent. Keep lexical
+        // matches visible while that authority is unavailable, without
+        // presenting a body piece as the whole symbol.
         let needs_code = include_code && code_blocks.len() < max_code_blocks;
-        let needs_line_mapping = search_match.kind != "file"
-            && matches!(
-                site,
+        let verified_window = if needs_code {
+            match site {
+                Some(tracedecay_query::code_search::CodeIndexSearchSiteV1::SymbolLines {
+                    start_line,
+                    end_line,
+                    code_window: Some(window),
+                }) => sanitized_by_path
+                    .entry(search_match.file.clone())
+                    .or_insert_with(|| sanitized_match_source(ctx, &search_match.file))
+                    .as_deref()
+                    .and_then(|source| {
+                        whole_symbol_window_site(source, window, *start_line, *end_line)
+                    }),
                 Some(tracedecay_query::code_search::CodeIndexSearchSiteV1::ArtifactWindow(_))
-            );
-        let verified_window = if needs_code || needs_line_mapping {
-            serve_site_code(ctx, &search_match.file, site, &mut sanitized_by_path)
+                    if search_match.kind == "file" =>
+                {
+                    serve_site_code(ctx, &search_match.file, site, &mut sanitized_by_path)
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -418,12 +450,8 @@ fn hydrate_context_from_search_matches(
             }) => {
                 attested_lines = Some((*start_line, *end_line));
             }
-            Some(tracedecay_query::code_search::CodeIndexSearchSiteV1::ArtifactWindow(_)) => {
-                if let Some((start_line, end_line, _)) = verified_window.as_ref() {
-                    attested_lines = Some((*start_line, *end_line));
-                }
-            }
-            None => {}
+            Some(tracedecay_query::code_search::CodeIndexSearchSiteV1::ArtifactWindow(_))
+            | None => {}
         }
         let served_code = include_code.then_some(verified_window).flatten();
         let node_id = search_match.anchor_id.clone();
@@ -1064,5 +1092,37 @@ mod tests {
             sanitized_text: text,
         };
         assert_eq!(artifact_window_site(source, &empty), None);
+    }
+
+    #[test]
+    fn whole_symbol_window_refuses_body_pieces_and_source_drift() {
+        let source = "pub fn widget() {\n    work();\n}\n";
+        let window = |text: &str| tracedecay_query::code_search::CodeIndexSearchWindowV1 {
+            source_span: tracedecay_domain::SourceSpan {
+                start_byte: 0,
+                end_byte: text.len() as u64,
+            },
+            sanitized_text: tracedecay_domain::BoundedSanitizedText::new(text)
+                .expect("bounded fixture text"),
+        };
+        let opening_piece = window("pub fn widget() {\n");
+        assert_eq!(whole_symbol_window_site(source, &opening_piece, 0, 2), None);
+
+        let one_line = "pub fn widget() { work(); }\n";
+        let partial_line = window("pub fn widget() { work();");
+        assert_eq!(
+            whole_symbol_window_site(one_line, &partial_line, 0, 0),
+            None
+        );
+
+        let complete = window(source);
+        assert_eq!(
+            whole_symbol_window_site(source, &complete, 0, 2),
+            Some((0, 2, source.trim_end().to_owned()))
+        );
+        assert_eq!(
+            whole_symbol_window_site("pub fn widget() {\n    fail();\n}\n", &complete, 0, 2),
+            None
+        );
     }
 }
