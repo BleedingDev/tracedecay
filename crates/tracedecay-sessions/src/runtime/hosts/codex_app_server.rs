@@ -1245,6 +1245,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn work_app_server_held_open_for_writing_is_refused_on_the_first_attempt() {
+        use std::io::Read as _;
+
         let _process_guard = APP_SERVER_PROCESS_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1255,32 +1257,39 @@ mod tests {
             .append(true)
             .open(&executable)
             .expect("hold the fake app-server open for writing");
-        let launch_receipt = CodexAppServerLaunchReceipt::default();
+        let codex_bin = executable.to_string_lossy().into_owned();
+        let (mut attempts, attempt_marker) = std::io::pipe().expect("attempt pipe");
+        let mut command = codex_app_server_command(&codex_bin);
+        // Every exec attempt forks a child that writes one byte here first, so
+        // the bytes read back count the attempts the spawn made.
+        unsafe {
+            command.pre_exec(move || {
+                let _ = (&attempt_marker).write(&[1]);
+                Ok(())
+            });
+        }
 
-        let started = Instant::now();
-        let error = run_read_only_work(
-            &executable,
-            temporary.path(),
-            Duration::from_secs(1),
-            &launch_receipt,
-        )
-        .expect_err("Linux refuses to exec a file that is open for writing");
-        let elapsed = started.elapsed();
+        let error = spawn_codex_app_server(&mut command, &codex_bin)
+            .expect_err("Linux refuses to exec a file that is open for writing");
+        drop(command);
+        let mut marks = Vec::new();
+        attempts
+            .read_to_end(&mut marks)
+            .expect("read attempt marks");
 
         assert_eq!(
             error,
             CodexAppServerError {
                 class: AgentTaskFailureClass::Unavailable,
                 message: format!(
-                    "failed to start `{}` app-server: Text file busy (os error 26)",
-                    executable.display()
+                    "failed to start `{codex_bin}` app-server: Text file busy (os error 26)"
                 ),
             }
         );
-        assert_eq!(launch_receipt.started_at(), None);
-        assert!(
-            elapsed < Duration::from_millis(80),
-            "the refusal must not wait for the writer to go away: {elapsed:?}"
+        assert_eq!(
+            marks.len(),
+            1,
+            "the refusal must come from the first exec attempt, not a retry"
         );
     }
 
