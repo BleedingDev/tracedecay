@@ -1,6 +1,7 @@
 //! Canonical SDK generator behind `src/bin/generate.rs`, which writes the
-//! checked-in Rust operation descriptors and TypeScript SDK sources. It is the
-//! single authority for both surfaces.
+//! checked-in Rust operation descriptors, the TypeScript SDK sources, and the
+//! dashboard's application envelope decoder. It is the single authority for
+//! all three surfaces.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -15,7 +16,7 @@ use tracedecay_contracts::retained_surfaces::{
 };
 use tracedecay_contracts::{APPLICATION_REQUEST_ID_HEADER, sdk_executable_binding_registry};
 use tracedecay_tool_catalog::{
-    CancellationContract, CancellationPoint, DeadlineBehavior, EffectClass,
+    BindingSurface, CancellationContract, CancellationPoint, DeadlineBehavior, EffectClass,
     ExecutableUnavailableDispositionV1, IdempotencyContract, ReceiptContract,
     ReconciliationContract, SdkExecutableBindingAvailabilityV1, SdkExecutableBindingRegistryV1,
     SdkExecutableBindingV1, SdkTransportBindingV1, TerminalState,
@@ -82,6 +83,9 @@ struct UnavailableOperation {
 /// Repository-relative path of the checked-in Rust operation descriptors.
 const RUST_OPERATIONS_PATH: &str = "crates/tracedecay-sdk/src/operations.rs";
 
+/// Repository-relative path of the dashboard's application envelope decoder.
+const DASHBOARD_APPLICATION_PATH: &str = "dashboard/src/contracts/application.ts";
+
 /// Write the checked-in Rust descriptors and the TypeScript SDK sources under
 /// `<root>`.
 pub fn write_sdk_sources(root: &Path) -> Result<(), Box<dyn Error>> {
@@ -95,8 +99,14 @@ pub fn write_sdk_sources(root: &Path) -> Result<(), Box<dyn Error>> {
     let types = render_types();
     let typescript_operations = render_operations(&operations, &unavailable)?;
     let index = render_index();
+    let dashboard_application =
+        render_dashboard_application(&operations, &canonical_dashboard_bindings()?)?;
 
     write(&root.join(RUST_OPERATIONS_PATH), &rust_operations)?;
+    write(
+        &root.join(DASHBOARD_APPLICATION_PATH),
+        &dashboard_application,
+    )?;
     write(&destination.join("types.ts"), &types)?;
     write(&destination.join("operations.ts"), &typescript_operations)?;
     write(&destination.join("index.ts"), &index)?;
@@ -1032,9 +1042,86 @@ fn render_rust_operations(
 }
 
 fn render_types() -> String {
-    format!(
-        "{HEADER}{}",
-        r##"export type UnknownValue = string & {};
+    format!("{HEADER}{TYPES_SOURCE}")
+}
+
+/// The dashboard calls application routes through its own scoped gateway, so
+/// it cannot use the SDK client, and the 1.8 MB `operations.ts` is too large to
+/// bundle. It gets the SDK's envelope decoder verbatim plus, per operation id,
+/// the binding contract that decoder checks a response against. An operation
+/// the dashboard reaches through its own adapter (feedback reads) answers with
+/// its dashboard-surface binding, so `bindingIds` lists both.
+fn render_dashboard_application(
+    operations: &[Operation],
+    dashboard_bindings: &BTreeMap<String, Vec<String>>,
+) -> Result<String, Box<dyn Error>> {
+    let mut out = format!("{HEADER}{TYPES_SOURCE}");
+    out.push_str(
+        "\nexport interface ApplicationHttpBinding { readonly bindingIds: readonly [string, ...string[]]; readonly resultSchema: { readonly schemaId: string; readonly revision: number }; readonly terminalStates: readonly string[]; readonly cancellation: CanonicalCancellation; readonly receipt: \"operation\" | \"durable_effect\"; readonly reconciliation: \"not_required\" | \"required\" }\n\
+         export const APPLICATION_HTTP_BINDINGS = {\n",
+    );
+    for operation in operations {
+        if !matches!(operation.transport, OperationTransport::Http { .. }) {
+            continue;
+        }
+        let mut binding_ids = vec![operation.binding.clone()];
+        binding_ids.extend(
+            dashboard_bindings
+                .get(&operation.binding)
+                .into_iter()
+                .flatten()
+                .cloned(),
+        );
+        emit!(
+            out,
+            "  {}: {{ bindingIds: {}, resultSchema: {{ schemaId: {}, revision: {} }}, terminalStates: {}, cancellation: {}, receipt: {}, reconciliation: {} }},",
+            quote(&operation.operation_id),
+            serde_json::to_string(&binding_ids)?,
+            quote(&operation.result_schema.id),
+            operation.result_schema.revision,
+            serde_json::to_string(&operation.terminal_states)?,
+            serde_json::to_string(&operation.cancellation)?,
+            serde_json::to_string(&operation.receipt)?,
+            serde_json::to_string(&operation.reconciliation)?,
+        );
+    }
+    out.push_str(
+        "} as const satisfies Readonly<Record<string, ApplicationHttpBinding>>;\n\
+         export type ApplicationHttpOperationId = keyof typeof APPLICATION_HTTP_BINDINGS;\n\
+         export function decodeApplicationHttpSuccess<T>(operationId: ApplicationHttpOperationId, value: unknown, decode: Decoder<T>): HttpSuccessEnvelope<T> { const binding: ApplicationHttpBinding = APPLICATION_HTTP_BINDINGS[operationId]; const answered = typeof value === \"object\" && value !== null ? (value as { binding_id?: unknown }).binding_id : undefined; const bindingId = binding.bindingIds.find((candidate) => candidate === answered) ?? binding.bindingIds[0]; return decodeHttpSuccessEnvelope(value, bindingId, binding.resultSchema.schemaId, binding.resultSchema.revision, binding.terminalStates, binding.cancellation, binding.receipt, binding.reconciliation, decode); }\n",
+    );
+    Ok(out)
+}
+
+/// Each HTTP binding id mapped to the dashboard-surface bindings of the same
+/// capability, read from the catalog snapshot the transports dispatch through.
+fn canonical_dashboard_bindings() -> Result<BTreeMap<String, Vec<String>>, Box<dyn Error>> {
+    let snapshot = tracedecay_contracts::catalog_composition::application_catalog_snapshot()?;
+    let mut by_http_binding = BTreeMap::new();
+    for capability in snapshot.capabilities() {
+        let surface_bindings = capability
+            .binding_ids()
+            .iter()
+            .filter_map(|binding_id| snapshot.binding(binding_id))
+            .collect::<Vec<_>>();
+        let dashboard = surface_bindings
+            .iter()
+            .filter(|binding| binding.surface() == BindingSurface::Dashboard)
+            .map(|binding| binding.binding_id().as_str().to_owned())
+            .collect::<Vec<_>>();
+        if dashboard.is_empty() {
+            continue;
+        }
+        for binding in surface_bindings {
+            if binding.surface() == BindingSurface::Http {
+                by_http_binding.insert(binding.binding_id().as_str().to_owned(), dashboard.clone());
+            }
+        }
+    }
+    Ok(by_http_binding)
+}
+
+const TYPES_SOURCE: &str = r##"export type UnknownValue = string & {};
 export type RetryDirective = "never" | "same_request" | "after_delay" | "after_revalidate" | "after_reconcile" | UnknownValue;
 export type LegalAction = "correct_request" | "reauthorize" | "refresh" | "retry" | "reconcile" | "reset" | "contact_administrator" | UnknownValue;
 export type OperationTermination = "completed" | "cancelled" | "timed_out" | "failed" | "unavailable" | "partial" | "effect_unknown" | UnknownValue;
@@ -1103,9 +1190,7 @@ function pageCursor(value: unknown): PageCursor { const result = record(value, "
 function page(value: unknown): PageState { const result = record(value, "outcome.value.page"); identifier(result.sort_contract_id, "page.sort_contract_id", 192); const revision = unsignedInteger(result.sort_revision, "page.sort_revision"); if (revision < 1) throw new TypeError("malformed canonical envelope: page sort_revision must be positive"); const total = result.total === null ? null : unsignedInteger(result.total, "page.total"); const returned = unsignedInteger(result.returned, "page.returned"); if (total !== null && returned > total) throw new TypeError("malformed canonical envelope: page returned exceeds total"); if (result.cursor !== null) pageCursor(result.cursor); if (result.expires_at !== null) safeInteger(result.expires_at, "page.expires_at"); return result as PageState; }
 function outcome<T>(kind: string, value: unknown, legalTerminations: readonly string[], cancellationContract: CanonicalCancellation, receiptContract: "operation" | "durable_effect", reconciliationContract: "not_required" | "required", decode: Decoder<T>): EvidencePacket<T> | PreviewResult<T> | EffectResult<T> { const result = record(value, "outcome.value"); if (!("payload" in result)) throw new TypeError("malformed canonical envelope: outcome.value.payload is required"); const lifecycleShapeIsLegal = (receiptContract === "durable_effect" && reconciliationContract === "required" && kind === "effect") || (receiptContract === "operation" && reconciliationContract === "not_required" && (kind === "evidence" || kind === "preview")); if (!lifecycleShapeIsLegal) throw new TypeError(`malformed canonical envelope: outcome ${kind} is outside the operation receipt contract`); receipt(result.execution, legalTerminations, cancellationContract); if (kind === "evidence") { record(result.temporal, "temporal"); record(result.authority, "authority"); array(result.evidence_authorities, "evidence_authorities"); record(result.coverage, "coverage"); array(result.omissions, "omissions"); array(result.scores, "scores"); array(result.contributions, "contributions"); page(result.page); } else if (kind === "preview") { string(result.preview_id, "preview_id"); string(result.preview_digest, "preview_digest"); string(result.effect_class, "effect_class"); record(result.authority, "authority"); string(result.expected_state, "expected_state"); } else if (kind === "effect") { string(result.effect_id, "effect_id"); string(result.effect_class, "effect_class"); string(result.idempotency_key, "idempotency_key"); record(result.authority, "authority"); string(result.expected_state, "expected_state"); string(result.reconciliation, "reconciliation"); record(result.receipt, "receipt"); } else throw new TypeError(`malformed canonical envelope: unsupported outcome ${kind}`); return { ...result, payload: result.payload === null ? null : decode(result.payload) } as unknown as EvidencePacket<T> | PreviewResult<T> | EffectResult<T>; }
 export function decodeHttpSuccessEnvelope<T>(value: unknown, binding: string, schema: string, revision: number, legalTerminations: readonly string[], cancellationContract: CanonicalCancellation, receiptContract: "operation" | "durable_effect", reconciliationContract: "not_required" | "required", decode: Decoder<T>): HttpSuccessEnvelope<T> { const envelope = record(value, "success envelope"); if (string(envelope.binding_id, "binding_id") !== binding) throw new TypeError("malformed canonical envelope: binding mismatch"); const contract = record(envelope.contract, "contract"); if (string(contract.schema_id, "contract.schema_id") !== schema || number(contract.schema_revision, "contract.schema_revision") !== revision) throw new TypeError("malformed canonical envelope: result contract mismatch"); string(envelope.request_id, "request_id"); record(envelope.scope, "scope"); const outer = record(envelope.outcome, "outcome"); const kind = string(outer.outcome, "outcome.outcome"); return { ...envelope, outcome: { ...outer, outcome: kind, value: outcome(kind, outer.value, legalTerminations, cancellationContract, receiptContract, reconciliationContract, decode) } } as unknown as HttpSuccessEnvelope<T>; }
-"##
-    )
-}
+"##;
 
 fn render_index() -> String {
     format!(
@@ -1129,7 +1214,7 @@ fn quote(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::error::Error;
 
     use serde_json::{Value, json};
@@ -1224,6 +1309,29 @@ mod tests {
             render_schema_type(&schema).unwrap(),
             "readonly (readonly [string, string])[]"
         );
+    }
+
+    #[test]
+    fn dashboard_bindings_carry_each_http_operations_contract_and_skip_mcp_tools() {
+        let http = read_operation("views", json!({}), json!({}));
+        let mut mcp = read_operation("tool_only", json!({}), json!({}));
+        mcp.transport = OperationTransport::McpTool {
+            tool_name: "tool_only".to_owned(),
+        };
+
+        let dashboard = BTreeMap::from([(
+            "binding.http.test.views".to_owned(),
+            vec!["binding.dashboard.views.v1".to_owned()],
+        )]);
+
+        let generated =
+            super::render_dashboard_application(&[http, mcp], &dashboard).expect("rendered");
+
+        assert!(generated.contains(super::TYPES_SOURCE));
+        assert!(generated.contains(
+            "  \"operation.test.views\": { bindingIds: [\"binding.http.test.views\",\"binding.dashboard.views.v1\"], resultSchema: { schemaId: \"schema.test.views.result\", revision: 1 }, terminalStates: [\"completed\"], cancellation: {\"mode\":\"not_cancellable\"}, receipt: \"operation\", reconciliation: \"not_required\" },"
+        ));
+        assert!(!generated.contains("operation.test.tool_only"));
     }
 
     #[test]
