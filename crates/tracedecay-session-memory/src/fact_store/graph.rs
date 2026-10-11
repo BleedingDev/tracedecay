@@ -146,9 +146,10 @@ pub(super) async fn project_memory_graph(
     // publication. A missing or mismatched head and the head states the
     // republish path repairs (reset, corrupt or diverged storage, CAS
     // conflict) fall through to the reconciliation pass, which repairs them
-    // or reports the typed refusal. A head-read failure the pass cannot
-    // repair (mount unavailable, cancelled, budget or deadline spent)
-    // reports directly instead of paying an owner-wide source load.
+    // or reports the typed refusal; an unavailable head likewise retries the
+    // publication path's second recovery and republish. Only failures of the
+    // caller's own context, which the pass cannot repair (cancelled, budget
+    // or deadline spent), report directly without an owner-wide source load.
     let verified_head = verified_head_matching(
         db,
         &projection_identity,
@@ -161,8 +162,7 @@ pub(super) async fn project_memory_graph(
     let verified_snapshot = match verified_head {
         Ok(Some(snapshot)) => snapshot,
         Err(
-            error @ (FactStoreError::GraphUnavailable
-            | FactStoreError::GraphCancelled
+            error @ (FactStoreError::GraphCancelled
             | FactStoreError::GraphBudgetExhausted
             | FactStoreError::GraphDeadlineExceeded),
         ) => return Err(error),
