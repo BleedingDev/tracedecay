@@ -44,13 +44,18 @@ pub struct SessionTemporalStore<'a, D: SessionTemporalRegisteredDb> {
 /// session whose durable state the completion loop resumes from.
 #[cfg(any(test, feature = "test-helpers"))]
 enum StagedSessionRefreshBegin {
-    Grouped {
-        request: SessionRefreshBeginOrJoinRequestV1,
-        recovery: Box<SessionRefreshRecoveryV1>,
-        progress: SessionRefreshProgressV1,
-        batch: SessionTemporalProjectionBatchV1,
-    },
+    Grouped(Box<StagedGroupedBegin>),
     Resume(tracedecay_domain::SessionId),
+}
+
+/// One begin folded into the grouped commit: the request, its durable
+/// recovery, and the projected first batch that commits with it.
+#[cfg(any(test, feature = "test-helpers"))]
+struct StagedGroupedBegin {
+    request: SessionRefreshBeginOrJoinRequestV1,
+    recovery: Box<SessionRefreshRecoveryV1>,
+    progress: SessionRefreshProgressV1,
+    batch: SessionTemporalProjectionBatchV1,
 }
 
 /// How a staged session finishes once the grouped commit returns.
@@ -67,14 +72,19 @@ enum StagedSessionRefreshPost {
 /// loop, or nothing left to do.
 #[cfg(any(test, feature = "test-helpers"))]
 enum MaterializeCompletionStage {
-    Ready {
-        session_id: tracedecay_domain::SessionId,
-        request: SessionRefreshCompletionRequestV1,
-        relation_projection: crate::relations::SessionRelationProjection,
-        watermarks: tracedecay_store::SessionFrozenWatermarksV1,
-    },
+    Ready(Box<MaterializeReadyCompletion>),
     Resume(tracedecay_domain::SessionId),
     Done,
+}
+
+/// A completion staged off the writer lane, ready for the grouped
+/// receipt/apply/validation/commit phases.
+#[cfg(any(test, feature = "test-helpers"))]
+struct MaterializeReadyCompletion {
+    session_id: tracedecay_domain::SessionId,
+    request: SessionRefreshCompletionRequestV1,
+    relation_projection: crate::relations::SessionRelationProjection,
+    watermarks: tracedecay_store::SessionFrozenWatermarksV1,
 }
 
 #[derive(Clone, Debug)]
@@ -186,83 +196,6 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             .await
     }
 
-    /// Stages one refresh completion for the grouped commit; see
-    /// [`SessionTemporalAccess::stage_session_refresh_completion`].
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn stage_session_refresh_completion_for_test(
-        &self,
-        request: SessionRefreshCompletionRequestV1,
-    ) -> SessionStoreResult<crate::SessionRefreshCompletionStage> {
-        self.access()
-            .stage_session_refresh_completion(request, &ExecutionControl::default())
-            .await
-    }
-
-    /// Commits several sessions' refresh completions in one physical
-    /// transaction; see
-    /// [`SessionTemporalAccess::complete_session_refresh_group`].
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn complete_session_refresh_group_for_test(
-        &self,
-        items: Vec<(
-            SessionRefreshCompletionRequestV1,
-            crate::relations::SessionRelationProjection,
-        )>,
-    ) -> SessionStoreResult<Vec<SessionStoreResult<tracedecay_store::SessionRefreshReceiptV1>>>
-    {
-        self.access()
-            .complete_session_refresh_group(items, ExecutionControl::default())
-            .await
-    }
-
-    /// Records several sessions' pending relation receipts in one
-    /// physical commit; see
-    /// [`SessionTemporalAccess::record_relation_receipts_group`].
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn record_relation_receipts_group_for_test(
-        &self,
-        projections: &[crate::relations::SessionRelationProjection],
-    ) -> SessionStoreResult<Vec<SessionStoreResult<tracedecay_graph_db::GraphWatermark>>> {
-        self.access()
-            .record_relation_receipts_group(projections, &ExecutionControl::default())
-            .await
-    }
-
-    /// Applies one staged completion's projection to the native relation
-    /// graph and verifies the loaded graph; see
-    /// [`SessionTemporalAccess::apply_candidate_relation_projection`].
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn apply_candidate_relation_projection_for_test(
-        &self,
-        snapshot: &tracedecay_runtime_core::db::DatabaseEngineReadSnapshot,
-        projection: &crate::relations::SessionRelationProjection,
-    ) -> SessionStoreResult<crate::relations::SessionRelationProjection> {
-        self.access()
-            .apply_candidate_relation_projection(snapshot, projection, &ExecutionControl::default())
-            .await
-    }
-
-    /// Runs the post-apply final-receipt scan for one staged completion;
-    /// see [`SessionTemporalAccess::validate_staged_session_refresh_completion`].
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn validate_staged_session_refresh_completion_for_test(
-        &self,
-        session_id: &tracedecay_domain::SessionId,
-        generation: tracedecay_domain::SessionProjectionGenerationV1,
-        watermarks: &tracedecay_store::SessionFrozenWatermarksV1,
-        projection: &crate::relations::SessionRelationProjection,
-    ) -> SessionStoreResult<()> {
-        self.access()
-            .validate_staged_session_refresh_completion(
-                session_id,
-                generation,
-                watermarks,
-                projection,
-                &ExecutionControl::default(),
-            )
-            .await
-    }
-
     pub async fn session_refresh_recovery(
         &self,
         session_id: &tracedecay_domain::SessionId,
@@ -333,20 +266,15 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             let mut post = Vec::with_capacity(staged.len());
             for staged_begin in staged {
                 match staged_begin {
-                    StagedSessionRefreshBegin::Grouped {
-                        request,
-                        recovery,
-                        progress,
-                        batch,
-                    } => {
-                        let accepted_at = recovery.accepted_at();
+                    StagedSessionRefreshBegin::Grouped(begin) => {
+                        let accepted_at = begin.recovery.accepted_at();
                         post.push(StagedSessionRefreshPost::Grouped(recoveries.len()));
-                        recoveries.push(recovery);
+                        recoveries.push(begin.recovery);
                         items.push(SessionRefreshBeginBatchItemV1 {
-                            request,
+                            request: begin.request,
                             accepted_at,
-                            progress,
-                            batch,
+                            progress: begin.progress,
+                            batch: begin.batch,
                         });
                     }
                     StagedSessionRefreshBegin::Resume(session_id) => {
@@ -423,14 +351,9 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             let mut resumes = Vec::new();
             for staged_finish in staged_finishes {
                 match staged_finish {
-                    MaterializeCompletionStage::Ready {
-                        session_id,
-                        request,
-                        relation_projection,
-                        watermarks,
-                    } => {
-                        ready.push(Some((session_id, request, watermarks)));
-                        projections.push(relation_projection);
+                    MaterializeCompletionStage::Ready(staged) => {
+                        ready.push(Some((staged.session_id, staged.request, staged.watermarks)));
+                        projections.push(staged.relation_projection);
                     }
                     MaterializeCompletionStage::Resume(session_id) => {
                         resumes.push(session_id);
@@ -441,7 +364,8 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             let receipt_outcomes = if projections.is_empty() {
                 Vec::new()
             } else {
-                self.record_relation_receipts_group_for_test(&projections)
+                self.access()
+                    .record_relation_receipts_group(&projections, &ExecutionControl::default())
                     .await?
             };
             let mut complete_items = Vec::new();
@@ -453,8 +377,10 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                     }
                 })?;
                 for (index, outcome) in receipt_outcomes.iter().enumerate() {
-                    if outcome.is_err() {
-                        resumes.push(ready[index].as_ref().unwrap().0.clone());
+                    if outcome.is_err()
+                        && let Some((session_id, _, _)) = ready[index].as_ref()
+                    {
+                        resumes.push(session_id.clone());
                     }
                 }
                 let apply_indices: Vec<usize> = receipt_outcomes
@@ -465,11 +391,13 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 let applied = futures_util::stream::iter(apply_indices.iter().map(|&index| {
                     let projection = &projections[index];
                     async move {
-                        self.apply_candidate_relation_projection_for_test(
-                            apply_snapshot,
-                            projection,
-                        )
-                        .await
+                        self.access()
+                            .apply_candidate_relation_projection(
+                                apply_snapshot,
+                                projection,
+                                &ExecutionControl::default(),
+                            )
+                            .await
                     }
                 }))
                 .buffered(8)
@@ -480,14 +408,21 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                     match result {
                         Ok(verified) => validated.push((index, verified)),
                         Err(_) => {
-                            resumes.push(ready[index].as_ref().unwrap().0.clone());
+                            if let Some((session_id, _, _)) = ready[index].as_ref() {
+                                resumes.push(session_id.clone());
+                            }
                         }
                     }
                 }
                 let validations =
                     futures_util::stream::iter(validated.iter().map(|(index, verified)| {
-                        let (session_id, _, watermarks) = ready[*index].as_ref().unwrap();
+                        let entry = ready[*index].as_ref();
                         async move {
+                            let Some((session_id, _, watermarks)) = entry else {
+                                return Err(SessionStoreError::InvalidStateTransition {
+                                    context: "test temporal fixture staged completion",
+                                });
+                            };
                             // The final receipt scan names the candidate
                             // generation the refresh builds, not the base
                             // generation the watermarks froze as active.
@@ -499,10 +434,15 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                                     context: "test temporal fixture candidate generation",
                                 }
                             })?;
-                            self.validate_staged_session_refresh_completion_for_test(
-                                session_id, generation, watermarks, verified,
-                            )
-                            .await
+                            self.access()
+                                .validate_staged_session_refresh_completion(
+                                    session_id,
+                                    generation,
+                                    watermarks,
+                                    verified,
+                                    &ExecutionControl::default(),
+                                )
+                                .await
                         }
                     }))
                     .buffered(8)
@@ -511,12 +451,15 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
                 for ((index, verified), validation) in validated.into_iter().zip(validations) {
                     match validation {
                         Ok(()) => {
-                            let (session_id, request, _) = ready[index].take().unwrap();
-                            complete_sessions.push(session_id);
-                            complete_items.push((request, verified));
+                            if let Some((session_id, request, _)) = ready[index].take() {
+                                complete_sessions.push(session_id);
+                                complete_items.push((request, verified));
+                            }
                         }
                         Err(_) => {
-                            resumes.push(ready[index].as_ref().unwrap().0.clone());
+                            if let Some((session_id, _, _)) = ready[index].as_ref() {
+                                resumes.push(session_id.clone());
+                            }
                         }
                     }
                 }
@@ -524,7 +467,8 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
             let receipts = if complete_items.is_empty() {
                 Vec::new()
             } else {
-                self.complete_session_refresh_group_for_test(complete_items)
+                self.access()
+                    .complete_session_refresh_group(complete_items, ExecutionControl::default())
                     .await?
             };
             for (session_id, receipt) in complete_sessions.into_iter().zip(receipts) {
@@ -561,18 +505,18 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
     ) -> SessionStoreResult<StagedSessionRefreshBegin> {
         if let crate::SessionRefreshBeginPlanV1::Prepared(recovery) =
             self.plan_session_refresh_begin(request.clone()).await?
-        {
-            if let Some((progress, batch)) = self
+            && let Some((progress, batch)) = self
                 .materialize_session_temporal_refresh_batch_for_test(&recovery)
                 .await?
-            {
-                return Ok(StagedSessionRefreshBegin::Grouped {
+        {
+            return Ok(StagedSessionRefreshBegin::Grouped(Box::new(
+                StagedGroupedBegin {
                     request,
                     recovery,
                     progress,
                     batch,
-                });
-            }
+                },
+            )));
         }
         Ok(StagedSessionRefreshBegin::Resume(
             request.session_id().clone(),
@@ -593,40 +537,44 @@ impl<'a, D: SessionTemporalRegisteredDb + Sync> SessionTemporalStore<'a, D> {
         recovery: &SessionRefreshRecoveryV1,
         outcome: SessionRefreshBeginBatchOutcomeV1,
     ) -> SessionStoreResult<MaterializeCompletionStage> {
-        if let SessionRefreshBeginBatchOutcomeV1::Persisted { progress, .. } = outcome {
-            if progress.frontier().is_complete() && progress.committed_batches() > 0 {
-                let mut completion = SessionRefreshCompletionRequestV1::new(
-                    recovery.operation_id().clone(),
-                    recovery.session_id().clone(),
-                    progress.frontier(),
-                    *progress.coverage(),
-                )?;
-                if let Some(source_coverage) = progress.source_coverage().cloned().or_else(|| {
-                    recovery
-                        .source_coverage(progress.frontier().committed_through())
-                        .ok()
-                }) {
-                    completion = completion.with_source_coverage(source_coverage);
+        if let SessionRefreshBeginBatchOutcomeV1::Persisted { progress, .. } = outcome
+            && progress.frontier().is_complete()
+            && progress.committed_batches() > 0
+        {
+            let mut completion = SessionRefreshCompletionRequestV1::new(
+                recovery.operation_id().clone(),
+                recovery.session_id().clone(),
+                progress.frontier(),
+                *progress.coverage(),
+            )?;
+            if let Some(source_coverage) = progress.source_coverage().cloned().or_else(|| {
+                recovery
+                    .source_coverage(progress.frontier().committed_through())
+                    .ok()
+            }) {
+                completion = completion.with_source_coverage(source_coverage);
+            }
+            return match self
+                .access()
+                .stage_session_refresh_completion(completion, &ExecutionControl::default())
+                .await?
+            {
+                crate::SessionRefreshCompletionStage::Durable(_) => {
+                    Ok(MaterializeCompletionStage::Done)
                 }
-                return match self
-                    .stage_session_refresh_completion_for_test(completion)
-                    .await?
-                {
-                    crate::SessionRefreshCompletionStage::Durable(_) => {
-                        Ok(MaterializeCompletionStage::Done)
-                    }
-                    crate::SessionRefreshCompletionStage::Ready {
-                        request,
-                        relation_projection,
-                        watermarks,
-                    } => Ok(MaterializeCompletionStage::Ready {
+                crate::SessionRefreshCompletionStage::Ready {
+                    request,
+                    relation_projection,
+                    watermarks,
+                } => Ok(MaterializeCompletionStage::Ready(Box::new(
+                    MaterializeReadyCompletion {
                         session_id: recovery.session_id().clone(),
                         request,
-                        relation_projection,
+                        relation_projection: *relation_projection,
                         watermarks,
-                    }),
-                };
-            }
+                    },
+                ))),
+            };
         }
         Ok(MaterializeCompletionStage::Resume(
             recovery.session_id().clone(),

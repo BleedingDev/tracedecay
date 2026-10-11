@@ -447,7 +447,7 @@ async fn plan_session_refresh_on_snapshot(
                 // candidate becomes generation 2. Any other absent-active
                 // state (rows exist but none active) still needs the
                 // writer lane to decide.
-                if u64::from(candidate_base.value()) != 1 {
+                if candidate_base.value() != 1 {
                     return Ok(SessionRefreshSnapshotPlan::NeedsWrite);
                 }
                 let generation = SessionProjectionGenerationV1::new(1)?;
@@ -1387,7 +1387,7 @@ impl<D: SessionTemporalRegisteredDb + Sync> SessionTemporalAccess<'_, D> {
 
         Ok(SessionRefreshCompletionStage::Ready {
             request,
-            relation_projection,
+            relation_projection: Box::new(relation_projection),
             watermarks: binding.watermarks,
         })
     }
@@ -3328,7 +3328,7 @@ pub enum SessionRefreshCompletionStage {
         /// The completion request to replay in the grouped commit.
         request: SessionRefreshCompletionRequestV1,
         /// The relation projection reconstructed for this session.
-        relation_projection: SessionRelationProjection,
+        relation_projection: Box<SessionRelationProjection>,
         /// The running binding's frozen watermarks, carried for the
         /// post-apply final-receipt scan.
         watermarks: SessionFrozenWatermarksV1,
@@ -3535,7 +3535,7 @@ async fn commit_begin_batch_item_in_transaction(
                 receipt: Box::new(receipt),
             }))
         }
-        Err(item_error) => {
+        Err(_) => {
             rollback_begin_item_savepoint(transaction, &savepoint).await?;
             // The refused batch rolled back alone; replay the begin so the
             // group still commits the durable running operation the next
