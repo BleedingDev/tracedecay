@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tempfile::TempDir;
+use tracedecay_code_index::graph_projection::{
+    CodeGraphCatalogReleaseV1, CodeGraphReadinessRequirement,
+};
 use tracedecay_code_index_runtime::CodeGraphSeatRuntimePortV1;
 use tracedecay_code_index_runtime::code_index_executor::code_index_search_executor;
 use tracedecay_code_index_runtime::code_index_scheduler::{
@@ -1984,6 +1987,90 @@ async fn first_index_serves_graph_reads_without_decoding_the_generation() {
         .shutdown_memory_graph_reconciliation_tasks()
         .await
         .expect("join graph reconciliation tasks");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admitted_graph_read_retains_only_the_catalog_it_requires() {
+    let fixture = GitFixture::new(ALPHA_LIB_V1);
+    let store = TempDir::new().expect("store root");
+    let mount = PersistentGraphMountV1::mount(
+        CodeIndexSchedulerRegistryV1::new(1),
+        &fixture,
+        &store,
+        "graph read catalog retention",
+    )
+    .await;
+    let context = graph_request_context(mount.scope.clone(), "catalog-retention");
+    let port = project_code_graph_projection_read_port(
+        mount.registry.clone(),
+        fixture.path().into(),
+        mount.scope.clone(),
+    );
+    let read = port
+        .open(CodeGraphReadRequest::from_context(&context, now_micros()))
+        .await
+        .expect("admit catalog read");
+    assert_eq!(read.scope(), &mount.scope);
+    assert_eq!(read.generation(), &mount.generation_id);
+    assert_eq!(read.freshness(), CodeGraphReadFreshnessV1::Current);
+    let graph = Arc::clone(read.store());
+    assert_eq!(
+        graph.release_interactive_catalog(),
+        CodeGraphCatalogReleaseV1::Busy,
+        "admission must retain the catalog before the reader opens"
+    );
+    let cloned = read.clone();
+    drop(read);
+    assert_eq!(
+        graph.release_interactive_catalog(),
+        CodeGraphCatalogReleaseV1::Busy
+    );
+    let reader = cloned
+        .reader(&context, now_micros())
+        .expect("admitted reader");
+    let page = reader
+        .symbols_page(None, 16, request_graph_cancellation(&context))
+        .expect("the retained catalog serves the admitted read");
+    assert!(page.symbols.iter().any(|symbol| {
+        symbol
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.simple_name == "alpha")
+    }));
+    drop(cloned);
+    assert_eq!(
+        graph.release_interactive_catalog(),
+        CodeGraphCatalogReleaseV1::Busy
+    );
+    drop(reader);
+    assert!(matches!(
+        graph.release_interactive_catalog(),
+        CodeGraphCatalogReleaseV1::Released { .. }
+    ));
+
+    graph
+        .warm_interactive_catalog_with_cancellation(
+            None,
+            Arc::new(tracedecay_graph_db::NeverCancelled),
+        )
+        .expect("restore the catalog before an engine-only read");
+    let read = port
+        .open(
+            CodeGraphReadRequest::from_context(&context, now_micros())
+                .with_readiness(CodeGraphReadinessRequirement::Engine),
+        )
+        .await
+        .expect("admit engine-only read");
+    assert!(
+        matches!(
+            graph.release_interactive_catalog(),
+            CodeGraphCatalogReleaseV1::Released { .. }
+        ),
+        "an engine-only read must not retain the catalog"
+    );
+    drop(read);
+    drop(graph);
+    mount.shutdown().await;
 }
 
 /// A worktree mounted the way the daemon mounts it, on the persistent graph
