@@ -2858,7 +2858,7 @@ pub(in crate::runtime) async fn admit_jsonl_observations<State: Clone>(
 /// A cursor compare-and-swap lost to a peer that owns the same
 /// `(source, scope)` cursor. Retryable by construction; whether it is a
 /// failure at all depends on what the winner already covered.
-fn is_lost_cursor_cas(outcome: &HostAdmissionOutcome) -> bool {
+pub(in crate::runtime) fn is_lost_cursor_cas(outcome: &HostAdmissionOutcome) -> bool {
     outcome.reason_code == Some("cursor_conflict")
 }
 
