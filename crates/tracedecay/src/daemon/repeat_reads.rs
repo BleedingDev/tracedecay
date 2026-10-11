@@ -133,7 +133,8 @@ fn call_key(request: &JsonRpcRequest) -> Option<(&Value, (String, String))> {
 }
 
 /// The digest of a successful all-text answer without its trailer blocks and
-/// per-call lines, and the content text bytes a pointer would replace.
+/// per-call lines, and the content text bytes a pointer would replace. Line
+/// terminators stay in the digest so a line-ending-only edit is served in full.
 fn answer_digest(result: &Value) -> Option<(String, usize)> {
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
         return None;
@@ -149,10 +150,9 @@ fn answer_digest(result: &Value) -> Option<(String, usize)> {
         .iter()
         .filter(|text| !is_beside_result_block(text))
         .map(|text| {
-            text.lines()
+            text.split_inclusive('\n')
                 .filter(|line| !is_per_call_line(line))
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect::<String>()
         })
         .collect::<Vec<_>>();
     let parts = answer.iter().map(String::as_bytes).collect::<Vec<_>>();
@@ -293,6 +293,36 @@ mod tests {
         assert!(
             !is_pointer(&restored),
             "a full render must never point at a trimmed one: {restored}"
+        );
+    }
+
+    #[test]
+    fn a_line_ending_only_change_is_served_in_full() {
+        let mut reads = RepeatReads::default();
+        let args = json!({"file": "src/lib.rs", "start": 1, "end": 40});
+        let tool = "tracedecay_source_lines";
+        // Raw file text as the whole content block, so the final newline is
+        // the block's last byte.
+        let raw = |id: i64, text: String| {
+            let result = json!({"content": [
+                {"type": "text", "text": text},
+                {"type": "text", "text": format!("\ntracedecay_cost: wall_us={id}")},
+            ]});
+            vec![format!(
+                "{}\n",
+                json!({"jsonrpc": "2.0", "id": id, "result": result})
+            )]
+        };
+        let lf = format!("{}\n{}", big('x'), big('y'));
+        let crlf = format!("{}\r\n{}", big('x'), big('y'));
+        served(&mut reads, &call(1, tool, &args), raw(1, lf.clone()));
+        let to_crlf = served(&mut reads, &call(2, tool, &args), raw(2, crlf));
+        assert!(!is_pointer(&to_crlf), "LF to CRLF: {to_crlf}");
+        served(&mut reads, &call(3, tool, &args), raw(3, lf.clone()));
+        let with_newline = served(&mut reads, &call(4, tool, &args), raw(4, format!("{lf}\n")));
+        assert!(
+            !is_pointer(&with_newline),
+            "added final newline: {with_newline}"
         );
     }
 
