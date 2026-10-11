@@ -1109,9 +1109,13 @@ fn lcm_session_page_reports_messages_the_temporal_projection_has_not_published()
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             message_ids,
-            ["lagging-message-1", "lagging-message-2", "lagging-message-3"]
-                .into_iter()
-                .collect(),
+            [
+                "lagging-message-1",
+                "lagging-message-2",
+                "lagging-message-3"
+            ]
+            .into_iter()
+            .collect(),
             "the page must serve only the materialized turns: {page}"
         );
         assert!(
