@@ -23,7 +23,6 @@ fn bootstrap_tools_list_payload(node_count: Option<u64>, budget: u8) -> Result<s
         &profile_id,
         &authority,
         &project_catalog_discovery_scope(),
-        ToolRegistryMode::HostAvailable,
     )
     .map_err(|error| TraceDecayError::Config {
         message: format!("MCP bootstrap catalog is unavailable: {error}"),

@@ -643,7 +643,6 @@ impl McpServer {
                 &profile_id,
                 &authority,
                 &project_catalog_discovery_scope(),
-                ToolRegistryMode::HostAvailable,
             )
         };
         match match_result {
