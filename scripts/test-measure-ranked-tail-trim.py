@@ -64,6 +64,29 @@ class SharedRuleCases(unittest.TestCase):
                 self.assertEqual(trim.names_every_query_word(case["name"], case["query"]), case["answers"])
 
 
+class StoredTails(unittest.TestCase):
+    PAGE = (
+        "- **kept** (function, exact_message), rank 1 · utility 2000000\n"
+        "- _Trimmed 2 lower-ranked results (ranks 4-5, 20 bytes): each scored at most half of "
+        "this page's best utility 2000000. To restore them, call `tracedecay_retrieve` with "
+        "handle `rh_0123456789abcdef01234567` (pass the same `project_selector` if this call used one)._\n"
+    )
+
+    def test_untrimmed_splices_the_stored_tail_back_in_place(self) -> None:
+        text, unresolved = trim.untrimmed(
+            self.PAGE,
+            lambda handle: "- **a**\n- **b**\n" if handle == "rh_0123456789abcdef01234567" else None,
+        )
+        self.assertEqual(
+            (text, unresolved),
+            ("- **kept** (function, exact_message), rank 1 · utility 2000000\n- **a**\n- **b**\n", 0),
+        )
+
+    def test_untrimmed_counts_markers_the_store_cannot_answer(self) -> None:
+        text, unresolved = trim.untrimmed(self.PAGE, lambda handle: None)
+        self.assertEqual((text, unresolved), (self.PAGE, 1))
+
+
 class RenderedPages(unittest.TestCase):
     def test_short_tail_saves_no_bytes_and_keeps_every_row(self) -> None:
         text = "".join(
