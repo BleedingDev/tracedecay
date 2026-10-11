@@ -8,11 +8,14 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::common;
-use crate::serve_harness::init_project_with_file;
+use crate::serve_harness::{init_project_with_file, profile_root};
 use crate::serve_tool_surface_test::PlainMcpClient;
 
 const POINTER: &str = "tracedecay_repeat_read:";
 const REPEAT_READ_POINTERS_ENV: &str = "TRACEDECAY_MCP_REPEAT_READ_POINTERS";
+const QUERY_HINT: &str = "tracedecay_repeated_query:";
+const QUERY_HINT_SETTING: &str =
+    tracedecay_domain::configuration::USER_REPEATED_QUERY_HINTS_SETTING_KEY;
 
 /// One function whose body alone is well over the pointer threshold, beside
 /// enough small functions that the file outline is too.
@@ -127,6 +130,99 @@ fn provenance(response: &Value) -> String {
         .find(|line| line.contains("Provenance:"))
         .unwrap_or_else(|| panic!("source_body must render provenance: {response}"))
         .to_owned()
+}
+
+fn configuration_payload(response: &Value, outcome: &str) -> Value {
+    let envelope = json_body(response);
+    assert_eq!(envelope["outcome"]["outcome"], outcome, "{response}");
+    envelope
+        .pointer("/outcome/value/payload")
+        .unwrap_or_else(|| panic!("configuration omitted its payload: {response}"))
+        .clone()
+}
+
+fn set_query_hints(client: &mut PlainMcpClient, home: &std::path::Path, enabled: bool) {
+    let current = client.request(call(
+        100,
+        "tracedecay_configuration_get",
+        &json!({ "key": QUERY_HINT_SETTING, "format": "json" }),
+    ));
+    let current = configuration_payload(&current, "evidence");
+    assert_eq!(
+        current["effective_value"],
+        json!({ "kind": "boolean", "value": !enabled }),
+        "{current}"
+    );
+    let profile = tracedecay_daemon_identity::profile_identity::load_existing(&profile_root(home))
+        .expect("the isolated daemon established its profile identity");
+    let changed = client.request(call(
+        101,
+        "tracedecay_configuration_set",
+        &json!({
+            "layer": { "kind": "user_profile", "profile_id": profile.profile_id() },
+            "key": QUERY_HINT_SETTING,
+            "format": "json",
+            "value": { "kind": "boolean", "value": enabled },
+            "expected_revision": current["revision_id"],
+            "idempotency_key": format!("configuration.idempotency.query-hints.{enabled}"),
+        }),
+    ));
+    configuration_payload(&changed, "effect");
+}
+
+#[tokio::test]
+async fn serve_query_hints_follow_profile_configuration_on_new_connections() {
+    let home = TempDir::new().unwrap();
+    let project = init_project_with_file(home.path(), &source("query_hint_marker")).await;
+    let _daemon = common::spawn_tracedecay_daemon(home.path());
+    let mut original = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    start(&mut original);
+    wait_ready(&mut original, 2);
+    let outline = json!({ "file": "src/lib.rs" });
+    for id in [10, 11] {
+        let response = original.request(call(id, "tracedecay_source_outline", &outline));
+        assert!(text(&response).contains("query_hint_marker"), "{response}");
+        assert!(!text(&response).contains(QUERY_HINT), "{response}");
+    }
+
+    set_query_hints(&mut original, home.path(), true);
+    let unchanged = original.request(call(12, "tracedecay_source_outline", &outline));
+    assert!(!text(&unchanged).contains(QUERY_HINT), "{unchanged}");
+
+    let mut enabled = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    start(&mut enabled);
+    wait_ready(&mut enabled, 2);
+    let first = enabled.request(call(10, "tracedecay_source_outline", &outline));
+    assert!(!text(&first).contains(QUERY_HINT), "{first}");
+    // MCP startup does not wait for the optional profile read. Observe the
+    // setting taking effect under its existing configuration-read deadline.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut id = 11;
+    let repeated = loop {
+        let response = enabled.request(call(id, "tracedecay_source_outline", &outline));
+        if text(&response).contains(QUERY_HINT) {
+            break response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hint setting never reached serve: {response}"
+        );
+        id += 1;
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(text(&repeated).contains("query_hint_marker"), "{repeated}");
+    assert_eq!(text(&repeated).matches(QUERY_HINT).count(), 1, "{repeated}");
+    assert!(!is_pointer(&repeated), "{repeated}");
+
+    set_query_hints(&mut enabled, home.path(), false);
+    let mut disabled = PlainMcpClient::start_with_env(home.path(), project.path(), &[]);
+    start(&mut disabled);
+    wait_ready(&mut disabled, 2);
+    for id in [10, 11] {
+        let response = disabled.request(call(id, "tracedecay_source_outline", &outline));
+        assert!(text(&response).contains("query_hint_marker"), "{response}");
+        assert!(!text(&response).contains(QUERY_HINT), "{response}");
+    }
 }
 
 #[tokio::test]
