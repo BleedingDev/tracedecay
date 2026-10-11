@@ -60,16 +60,17 @@ def run_app_server(binary, cwd):
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        # Unbuffered stdout reads one frame per readline(). A buffered reader
+        # would keep later frames from the same pipe write where select()
+        # cannot see them.
+        bufsize=0,
         env={"HOME": os.environ["HOME"], "PATH": os.environ["PATH"]},
         cwd=cwd,
         start_new_session=True,
     )
 
     def send(message):
-        proc.stdin.write(json.dumps(message) + "\n")
-        proc.stdin.flush()
+        proc.stdin.write((json.dumps(message) + "\n").encode())
 
     def receive_until(parse, label):
         deadline = time.monotonic() + 15

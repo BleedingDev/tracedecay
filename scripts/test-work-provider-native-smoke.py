@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
-"""Protocol refusal tests; these never launch or certify a provider."""
+"""Protocol tests against stand-ins; these never launch or certify a real provider."""
 
 import contextlib
 import io
+import os
+import pathlib
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -13,6 +17,23 @@ def accepted_turn(**fields):
     return {"id": 2, "result": {"turn": {
         "id": "turn-one", "status": "inProgress", "items": [], "error": None, **fields,
     }}}
+
+
+# Answers each request with every frame in a single write, as a real server
+# may when a notification precedes its response.
+COALESCING_APP_SERVER = """
+import json, os, sys
+replies = {
+    0: [{"id": 0, "result": {}}],
+    1: [{"method": "thread/started", "params": {"thread": {"id": "thread-one"}}},
+        {"id": 1, "result": {"thread": {"id": "thread-one"}}}],
+    2: [{"method": "turn/started", "params": {"threadId": "thread-one"}},
+        {"id": 2, "result": {"turn": {"id": "turn-one", "status": "inProgress", "error": None}}}],
+}
+for line in sys.stdin:
+    frames = replies.get(json.loads(line).get("id"), [])
+    os.write(1, "".join(json.dumps(frame) + "\\n" for frame in frames).encode())
+"""
 
 
 class StartupResponses(unittest.TestCase):
@@ -73,6 +94,17 @@ class StartupResponses(unittest.TestCase):
                 smoke.thread_start_response(response)
         with self.assertRaises(ValueError):
             smoke.response_result({"id": 0, "error": {}}, 0)
+
+    def test_frames_delivered_in_one_pipe_write_are_all_read(self):
+        with tempfile.TemporaryDirectory() as stage:
+            provider = pathlib.Path(stage, "codex")
+            provider.with_suffix(".py").write_text(COALESCING_APP_SERVER)
+            provider.write_text(f"#!/bin/sh\nexec '{sys.executable}' '{provider.with_suffix('.py')}' \"$@\"\n")
+            provider.chmod(0o755)
+            with patch.dict(os.environ, {"HOME": stage}), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                smoke.run_app_server(str(provider), stage)
+        self.assertIn("turn_start=accepted", output.getvalue())
 
     def test_no_opt_in_never_launches_a_provider(self):
         for opt_in in (None, "0", "true"):
