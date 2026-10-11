@@ -404,7 +404,13 @@ pub(crate) fn render_search(
         format!(
             "{}{}",
             freshness_lines(freshness),
-            render_search_md(response_handle_root, &value)
+            render_search_md(
+                response_handle_root,
+                args.get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                &value
+            )
         )
     });
     Ok(match result {
@@ -471,8 +477,7 @@ fn display_unavailable_suffix(row: &Value) -> String {
         .unwrap_or_default()
 }
 
-/// One result row with its rendered markdown. Exact-tier and caller-anchored
-/// rows are protected: the anchor receipt promises those rows are on the page.
+/// One result row with its rendered markdown.
 fn ranked_search_row(it: &Value) -> RankedRow {
     let candidate = &it["candidate"];
     let anchor = render::field_str(candidate, "anchor_id");
@@ -488,8 +493,10 @@ fn ranked_search_row(it: &Value) -> RankedRow {
         .saturating_add(1);
     let via = lexical_routing::result_route_suffix(it);
     let mut md = Md::new();
+    let name = it
+        .get("display")
+        .map_or(anchor, |display| render::field_str(display, "name"));
     if let Some(display) = it.get("display") {
-        let name = render::field_str(display, "name");
         let kind = render::field_str(display, "kind");
         md.bullet(&format!(
             "**{name}** ({kind}, {exact_class}), rank {rank} · utility {utility}{via}"
@@ -509,18 +516,19 @@ fn ranked_search_row(it: &Value) -> RankedRow {
     RankedRow {
         rank,
         utility_micros: utility,
-        protected: exact_class != "approximate" || lexical_routing::ranked_by_anchor(it),
+        name: name.to_owned(),
+        anchored: lexical_routing::ranked_by_anchor(it),
         markdown: md.render(),
     }
 }
 
-fn render_search_md(response_handle_root: Option<&Path>, value: &Value) -> String {
+fn render_search_md(response_handle_root: Option<&Path>, query: &str, value: &Value) -> String {
     let mut md = Md::new();
     md.heading(2, "Search Results");
     match value.get("results").and_then(Value::as_array) {
         Some(items) if !items.is_empty() => {
             let rows = items.iter().map(ranked_search_row).collect::<Vec<_>>();
-            md.raw(&ranked_rows_md(response_handle_root, &rows));
+            md.raw(&ranked_rows_md(response_handle_root, query, &rows));
         }
         _ => {
             md.empty_note("No matching symbols.");
@@ -627,8 +635,8 @@ mod tests {
         with["coverage"] = coverage;
 
         assert_eq!(
-            render_search_md(None, &with),
-            render_search_md(None, &without),
+            render_search_md(None, "", &with),
+            render_search_md(None, "", &without),
             "warm coverage must be additive metadata, never rendered output"
         );
     }
@@ -650,7 +658,7 @@ mod tests {
             if !display.is_null() {
                 result["display"] = display;
             }
-            let rendered = render_search_md(None, &json!({"results": [result]}));
+            let rendered = render_search_md(None, "", &json!({"results": [result]}));
             assert!(rendered.contains(&format!(
                 "Read source: `tracedecay_source_body` with `node_id: {node_id}`"
             )));
@@ -658,6 +666,7 @@ mod tests {
         }
         let chunk = render_search_md(
             None,
+            "",
             &json!({"results": [{
                 "candidate": {"anchor_id": "code-chunk:chunk.fixture"}
             }]}),
@@ -669,6 +678,7 @@ mod tests {
     fn search_renders_the_typed_reason_a_row_has_no_display() {
         let rendered = render_search_md(
             None,
+            "",
             &json!({"results": [
                 {
                     "candidate": {"anchor_id": "code-symbol:a", "exact_class": "approximate", "utility_micros": 7},
@@ -703,7 +713,7 @@ mod tests {
                 "anchor_id": format!("code-symbol:{name}"),
                 "logical_evidence_id": format!("evidence.{name}"),
                 "occurrences": [],
-                "exact_class": "approximate",
+                "exact_class": "exact_message",
                 "utility_micros": utility,
                 "contributions": [],
                 "freshness": [],
@@ -776,6 +786,13 @@ mod tests {
         assert!(
             markdown.contains("- _Trimmed 3 lower-ranked results (ranks 8-10, "),
             "{markdown}"
+        );
+
+        let named = text(json!({"query": "F7"}));
+        assert!(named.contains("**f7**"), "{named}");
+        assert!(
+            named.contains("- _Trimmed 2 lower-ranked results (ranks 9-10, "),
+            "{named}"
         );
 
         let json: Value = serde_json::from_str(&text(json!({"format": "json"}))).expect("json");

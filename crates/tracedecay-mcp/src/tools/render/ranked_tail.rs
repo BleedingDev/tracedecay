@@ -22,22 +22,49 @@ pub(crate) struct RankedRow {
     /// The retrieval kernel's fixed-point utility; integer, so the cut is
     /// exact and repeated calls return identical bytes.
     pub utility_micros: u64,
-    /// Exact-tier and caller-anchored rows are promised on the page.
-    pub protected: bool,
+    /// The row's display name, matched against the query words.
+    pub name: String,
+    /// A caller `lexical_anchors` route ranked this row, and the anchor
+    /// receipt promises its sites are on the page.
+    pub anchored: bool,
     /// The exact bytes the untrimmed page emits for this row.
     pub markdown: String,
 }
 
-/// Start of the longest suffix of unprotected rows that each score at most
-/// half the page's best utility, or `None` when no worthwhile cut exists.
-fn low_value_tail_start(rows: &[RankedRow]) -> Option<usize> {
+/// True when the name contains every word of the query, compared as
+/// lowercase alphanumerics, so `exact_class_rank` and `ExactClass` both
+/// answer `exact_class`, and `store_response_handle` answers
+/// `store response handle` while a bare `store` field does not.
+fn names_every_query_word(name: &str, query: &str) -> bool {
+    let fold = |text: &str| -> String {
+        text.chars()
+            .filter(|c| c.is_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let name = fold(name);
+    let words = query
+        .split_whitespace()
+        .map(fold)
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    !words.is_empty() && words.iter().all(|word| name.contains(word.as_str()))
+}
+
+/// Start of the longest suffix of rows that each score at most half the
+/// page's best utility and neither carry a caller anchor nor name every
+/// query word, or `None` when no worthwhile cut exists.
+fn low_value_tail_start(query: &str, rows: &[RankedRow]) -> Option<usize> {
     let best = rows
         .iter()
         .map(|row| row.utility_micros)
         .max()
         .filter(|best| *best > 0)?;
-    let weak =
-        |row: &RankedRow| !row.protected && u128::from(row.utility_micros) * 2 <= u128::from(best);
+    let weak = |row: &RankedRow| {
+        !row.anchored
+            && u128::from(row.utility_micros) * 2 <= u128::from(best)
+            && !names_every_query_word(&row.name, query)
+    };
     // Ordering ranks exact tier and source role ahead of utility, so a strong
     // row can follow weak ones; cutting only after the last strong row never
     // drops a strong row and keeps the cut ranks contiguous.
@@ -52,10 +79,14 @@ fn low_value_tail_start(rows: &[RankedRow]) -> Option<usize> {
 /// The rows as the page renders them, with the low-value tail replaced by
 /// one marker line naming its retrieval handle. Fails open to every row when
 /// the handle cannot be stored.
-pub(crate) fn ranked_rows_md(response_handle_root: Option<&Path>, rows: &[RankedRow]) -> String {
+pub(crate) fn ranked_rows_md(
+    response_handle_root: Option<&Path>,
+    query: &str,
+    rows: &[RankedRow],
+) -> String {
     let concat =
         |rows: &[RankedRow]| -> String { rows.iter().map(|row| row.markdown.as_str()).collect() };
-    let Some(start) = low_value_tail_start(rows) else {
+    let Some(start) = low_value_tail_start(query, rows) else {
         return concat(rows);
     };
     let started = Instant::now();
@@ -107,11 +138,12 @@ mod tests {
         store_response_handle,
     };
 
-    fn row(rank: u64, utility_micros: u64, protected: bool, name: &str) -> RankedRow {
+    fn row(rank: u64, utility_micros: u64, anchored: bool, name: &str) -> RankedRow {
         RankedRow {
             rank,
             utility_micros,
-            protected,
+            name: name.to_owned(),
+            anchored,
             markdown: format!("- **{name}** rank {rank}\n  anchor_id: `code-symbol:{name}`\n"),
         }
     }
@@ -147,9 +179,11 @@ mod tests {
     #[test]
     fn tail_start_cuts_only_a_worthwhile_suffix_of_weak_rows() {
         let m = 1_000_000;
-        let mut protected_weak = page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]);
-        protected_weak[6].protected = true;
-        let cases: [(&str, Vec<RankedRow>, Option<usize>); 7] = [
+        let mut anchored_weak = page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]);
+        anchored_weak[6].anchored = true;
+        let mut query_named_weak = page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]);
+        query_named_weak[5].name = "Exact_Class_rank".to_owned();
+        let cases: [(&str, Vec<RankedRow>, Option<usize>); 8] = [
             (
                 "strong head, weak tail",
                 page(&[2 * m, 2 * m, 2 * m, m, m, m, m, m, m, m]),
@@ -157,7 +191,12 @@ mod tests {
             ),
             ("all equal", page(&[m; 10]), None),
             ("all zero", page(&[0; 10]), None),
-            ("protected weak row", protected_weak, Some(7)),
+            ("anchored weak row", anchored_weak, Some(7)),
+            (
+                "weak row naming every query word",
+                query_named_weak,
+                Some(6),
+            ),
             (
                 "strong row after weak ones",
                 page(&[2 * m, m, m, 2 * m, m, m]),
@@ -171,7 +210,31 @@ mod tests {
             ("fewer than four rows", page(&[2 * m, m, m]), None),
         ];
         for (case, rows, expected) in cases {
-            assert_eq!(low_value_tail_start(&rows), expected, "{case}");
+            assert_eq!(
+                low_value_tail_start("exact class", &rows),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_answers_a_query_only_when_it_contains_every_word() {
+        let cases = [
+            ("exact_class_rank", "exact_class", true),
+            ("ExactClass", "exact_class", true),
+            ("store_response_handle", "store response handle", true),
+            ("store", "store response handle", false),
+            ("größe_überprüfen", "Größe", true),
+            ("store", "", false),
+            ("store", "!! ::", false),
+        ];
+        for (name, query, expected) in cases {
+            assert_eq!(
+                names_every_query_word(name, query),
+                expected,
+                "{name} for {query:?}"
+            );
         }
     }
 
@@ -182,7 +245,7 @@ mod tests {
         let kept = concat(&rows[..3]);
         let cut = concat(&rows[3..]);
 
-        let rendered = ranked_rows_md(Some(root.path()), &weak_tail_page());
+        let rendered = ranked_rows_md(Some(root.path()), "store", &weak_tail_page());
 
         let marker = rendered
             .strip_prefix(kept.as_str())
@@ -226,8 +289,8 @@ mod tests {
         )
         .expect("seed expiring record");
 
-        let fresh = ranked_rows_md(Some(fresh_root.path()), &weak_tail_page());
-        let renewed = ranked_rows_md(Some(renewed_root.path()), &weak_tail_page());
+        let fresh = ranked_rows_md(Some(fresh_root.path()), "store", &weak_tail_page());
+        let renewed = ranked_rows_md(Some(renewed_root.path()), "store", &weak_tail_page());
 
         let expires_at =
             |root: &Path| match retrieve_response_handle(root, &handle, current_timestamp())
@@ -251,9 +314,9 @@ mod tests {
         let untrimmed = concat(&weak_tail_page());
 
         assert_eq!(
-            ranked_rows_md(Some(&file_root), &weak_tail_page()),
+            ranked_rows_md(Some(&file_root), "store", &weak_tail_page()),
             untrimmed
         );
-        assert_eq!(ranked_rows_md(None, &weak_tail_page()), untrimmed);
+        assert_eq!(ranked_rows_md(None, "store", &weak_tail_page()), untrimmed);
     }
 }

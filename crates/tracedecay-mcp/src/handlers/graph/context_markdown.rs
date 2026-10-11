@@ -59,6 +59,7 @@ pub(crate) fn render_context(
         append_context_search_matches(
             &mut output,
             response_handle_root,
+            &result.task,
             &result.search_matches,
             !result.lexical_anchors.is_empty(),
         );
@@ -159,6 +160,7 @@ fn context_markdown(
 fn append_context_search_matches(
     output: &mut String,
     response_handle_root: Option<&Path>,
+    task: &str,
     matches: &[ContextSearchMatchV1],
     anchored: bool,
 ) {
@@ -171,7 +173,8 @@ fn append_context_search_matches(
         .map(|search_match| RankedRow {
             rank: u64::from(search_match.rank),
             utility_micros: search_match.utility_micros,
-            protected: anchored || search_match.exact_class != "approximate",
+            name: search_match.name.clone(),
+            anchored,
             markdown: format!(
                 "- **{}** ({}), `{}` · rank {} · utility {}\n",
                 search_match.name,
@@ -182,7 +185,7 @@ fn append_context_search_matches(
             ),
         })
         .collect::<Vec<_>>();
-    output.push_str(&ranked_rows_md(response_handle_root, &rows));
+    output.push_str(&ranked_rows_md(response_handle_root, task, &rows));
 }
 
 /// Every caller anchor's outcome, so an anchor that matched nothing is never
@@ -344,7 +347,7 @@ mod tests {
                 qualified_name: format!("crate::m{rank}"),
                 kind: "function".to_owned(),
                 file: "src/lib.rs".to_owned(),
-                exact_class: "approximate".to_owned(),
+                exact_class: "exact_message".to_owned(),
                 rank,
                 utility_micros: if rank <= 3 { 2_000_000 } else { 1_000_000 },
             })
@@ -355,7 +358,13 @@ mod tests {
     fn search_matches_trim_the_weak_tail_unless_caller_anchors_ran() {
         let root = tempfile::tempdir().expect("handle root");
         let mut trimmed = String::new();
-        append_context_search_matches(&mut trimmed, Some(root.path()), &search_matches(), false);
+        append_context_search_matches(
+            &mut trimmed,
+            Some(root.path()),
+            "where is m1 defined",
+            &search_matches(),
+            false,
+        );
         let (kept, marker) = trimmed
             .split_once("- _Trimmed 7 lower-ranked results (ranks 4-10, ")
             .expect("weak tail is trimmed");
@@ -369,7 +378,13 @@ mod tests {
         assert!(marker.contains("tracedecay_retrieve"), "{marker}");
 
         let mut anchored = String::new();
-        append_context_search_matches(&mut anchored, Some(root.path()), &search_matches(), true);
+        append_context_search_matches(
+            &mut anchored,
+            Some(root.path()),
+            "where is m1 defined",
+            &search_matches(),
+            true,
+        );
         assert!(!anchored.contains("Trimmed"), "{anchored}");
         assert!(
             anchored.contains("· rank 10 · utility 1000000\n"),
