@@ -653,6 +653,25 @@ pub fn normalize_worktree(path: &str) -> String {
     normalized
 }
 
+/// Resolves one worktree spelling to the identity the store keys on: the
+/// canonical name when the path exists (8.3 short names, shell aliases and
+/// symlinked roots collapse), else the lexical cleanup above so a missing
+/// historical path keeps its recorded spelling. Used once per distinct
+/// spelling at evidence intake, not on stored rows.
+pub(crate) fn canonical_worktree_key(path: &str) -> String {
+    let normalized = normalize_worktree(path);
+    let candidate = std::path::Path::new(&normalized);
+    // A relative string is left alone: `canonicalize` would resolve it
+    // against the current drive, rekeying a missing path it never named.
+    if !candidate.is_absolute() {
+        return normalized;
+    }
+    match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
+        Ok(resolved) => normalize_worktree(&resolved.to_string_lossy()),
+        Err(_) => normalized,
+    }
+}
+
 pub fn observation_extends_span(first_ts: i64, last_ts: i64, ts: i64, gap_secs: i64) -> bool {
     ts >= first_ts.saturating_sub(gap_secs) && ts <= last_ts.saturating_add(gap_secs)
 }
