@@ -182,7 +182,9 @@ pub(crate) async fn write_improvement_artifacts(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::super::outcomes::automation_outcomes_path;
-    use super::super::run_ledger::{AutomationRunStatus, AutomationTrigger};
+    use super::super::run_ledger::{
+        AutomationRunStatus, AutomationTrigger, read_run_artifact_payload,
+    };
     use super::*;
 
     fn artifact_record(run_id: &str) -> AutomationRunLedgerRecord {
@@ -228,8 +230,6 @@ mod tests {
 
     #[tokio::test]
     async fn schema_v1_six_kind_chain_stays_readable() {
-        use super::super::run_ledger::read_run_artifact_payload;
-
         let temp = tempfile::TempDir::new().unwrap();
         let run_id = "legacy-v1-chain";
         let legacy_evals = serde_json::json!({

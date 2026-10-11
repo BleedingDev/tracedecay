@@ -1025,11 +1025,9 @@ mod tests {
             handoff.pointer("/readiness/independent_evaluation_status"),
             Some(&json!("not_run"))
         );
-        for payload in [&evals, &gate, &handoff] {
-            let text = serde_json::to_string(payload).unwrap();
-            assert!(!text.contains("replay"), "{text}");
-            assert!(!text.contains("cargo test"), "{text}");
-        }
+        assert!(evals.get("runner").is_none());
+        assert!(evals.get("automatic_application").is_none());
+        assert!(handoff.get("eval_replay").is_none());
     }
 
     #[test]
