@@ -602,6 +602,33 @@ pub(in crate::daemon) async fn write_doctor_runtime_response(
     .await
 }
 
+async fn project_open_status_response(
+    handshake: &DaemonHandshake,
+    store_administration: &super::StoreAdministration,
+    project_open: &ProjectOpenStatusV1,
+    stalled_failure: Option<&super::ProjectOpenFailure>,
+    id: serde_json::Value,
+) -> Result<JsonRpcResponse> {
+    if project_open.state == ProjectOpenStatusStateV1::Stalled {
+        let error = stalled_failure.map_or_else(
+            || super::stalled_project_open_error(project_open),
+            super::ProjectOpenFailure::to_error,
+        );
+        return Ok(super::project_open_handshake::project_open_error_response(
+            id, &error,
+        ));
+    }
+    let reset_required_stores = Box::pin(store_administration.session_runtime_registry())
+        .await?
+        .reset_required_stores();
+    let result = doctor_runtime_tool_result(project_open_status_value(
+        handshake,
+        project_open,
+        &reset_required_stores,
+    ));
+    Ok(JsonRpcResponse::success(id, result))
+}
+
 /// Serve a Doctor runtime request from the daemon core while the routed
 /// project owner has not published its Doctor report. Both broker paths share
 /// this route; only the cached-server fetch differs, so the caller supplies it
@@ -642,31 +669,15 @@ where
             }
         }
         drop(setup_activity);
-        if project_open.state == ProjectOpenStatusStateV1::Stalled {
-            let error = status.stalled_failure.as_ref().map_or_else(
-                || super::stalled_project_open_error(project_open),
-                super::ProjectOpenFailure::to_error,
-            );
-            Box::pin(write_json_rpc_response(
-                transport,
-                &super::project_open_handshake::project_open_error_response(id, &error),
-            ))
-            .await?;
-            return Ok(None);
-        }
-        let reset_required_stores = Box::pin(store_administration.session_runtime_registry())
-            .await?
-            .reset_required_stores();
-        let result = doctor_runtime_tool_result(project_open_status_value(
+        let response = Box::pin(project_open_status_response(
             handshake,
+            store_administration,
             project_open,
-            &reset_required_stores,
-        ));
-        Box::pin(write_json_rpc_response(
-            transport,
-            &JsonRpcResponse::success(id, result),
+            status.stalled_failure.as_ref(),
+            id,
         ))
         .await?;
+        Box::pin(write_json_rpc_response(transport, &response)).await?;
         return Ok(None);
     }
     let Some(request) = doctor_runtime_request(first_request.parsed()) else {
