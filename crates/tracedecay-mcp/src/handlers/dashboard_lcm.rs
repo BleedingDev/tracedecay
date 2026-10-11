@@ -118,7 +118,10 @@ impl DashboardLcmReadAdapter {
         let mut cursor = initial_cursor(&request);
         let mut seen_cursors = BTreeSet::new();
         let mut aggregate_results = Vec::new();
-        let mut aggregate_omitted = 0_u64;
+        // Genuine record omissions accumulate separately from the folded
+        // `omitted` count, which also carries the freshness lag flag; the
+        // flag names projection distance, not records.
+        let mut aggregate_record_omitted = 0_u64;
         // The freshness lag flag rides inside each page's `omitted` count
         // but names the same projection gap the unpublished raw count
         // measures exactly, so it is tracked apart from genuine record
@@ -161,7 +164,7 @@ impl DashboardLcmReadAdapter {
                     "lcm_dashboard_request_invalid",
                 );
             };
-            let (page, omitted, paged_partial) = match tracing::Instrument::instrument(
+            let (page, record_omitted, paged_partial) = match tracing::Instrument::instrument(
                 self.retrieval
                     .retrieve_admitted_with_cancellation(&context, &cancellation, query),
                 tracing::trace_span!("mcp.lcm.retrieve"),
@@ -179,12 +182,13 @@ impl DashboardLcmReadAdapter {
                 ),
                 SessionRetrievalServiceOutcome::Partial {
                     page,
-                    omitted,
                     freshness,
+                    record_omitted,
+                    ..
                 } => {
                     aggregate_lag_omitted =
                         aggregate_lag_omitted.saturating_add(session_freshness_lag(freshness));
-                    (page, omitted, true)
+                    (page, record_omitted, true)
                 }
                 SessionRetrievalServiceOutcome::Stale { .. } => {
                     return not_ready(
@@ -275,7 +279,7 @@ impl DashboardLcmReadAdapter {
                 }
             };
             aggregate_pages = aggregate_pages.saturating_add(1);
-            aggregate_omitted = aggregate_omitted.saturating_add(omitted);
+            aggregate_record_omitted = aggregate_record_omitted.saturating_add(record_omitted);
             if !aggregate {
                 window_partial |= paged_partial;
             }
@@ -290,7 +294,7 @@ impl DashboardLcmReadAdapter {
                 // but this aggregate view is deliberately bounded. Preserve a
                 // truthful partial state instead of turning a read into
                 // unbounded background work.
-                aggregate_omitted = aggregate_omitted.saturating_add(1);
+                aggregate_record_omitted = aggregate_record_omitted.saturating_add(1);
                 break temporal;
             }
             let Some(next_cursor) = next_cursor else {
@@ -308,7 +312,7 @@ impl DashboardLcmReadAdapter {
             results: aggregate_results,
             temporal,
         };
-        let omitted = aggregate_omitted;
+        let record_omitted = aggregate_record_omitted;
 
         // Summary-node hydration drops are genuinely distinct records and
         // always add; the session describe's own omissions are tracked
@@ -489,20 +493,18 @@ impl DashboardLcmReadAdapter {
                 }
             }
         };
-        // `omitted` folds the freshness lag flag into the same count as
-        // genuine record omissions (hydration drops, coverage and context
-        // gaps), so the flag is tracked apart. On the terminal page the
-        // flag, the session describe's hydration drops, and the
-        // unpublished raw count all measure the same projection gap: an
-        // unpublished row always fails describe hydration (it has no
-        // published occurrence anchor), so describe omissions already
+        // `record_omitted` is the retrieval authority's genuine missing-
+        // record count with the freshness lag flag already kept out. On the
+        // terminal page the flag, the session describe's hydration drops,
+        // and the unpublished raw count all measure the same projection
+        // gap: an unpublished row always fails describe hydration (it has
+        // no published occurrence anchor), so describe omissions already
         // contain the unpublished rows. Only the largest of the three
         // stands; the page's record omissions and dropped summary nodes
         // count different missing records and always add. A windowed page
         // instead keeps the flag on top: its partiality is pagination, not
         // proof of missing records, and there is no terminal count to
         // deduplicate against.
-        let record_omitted = omitted.saturating_sub(aggregate_lag_omitted);
         let total_omitted = if canonical_page.has_more {
             record_omitted
                 .saturating_add(summary_omitted)
@@ -1306,6 +1308,7 @@ mod tests {
                 },
                 freshness: SessionDataFreshness::Fresh,
                 omitted: 1,
+                record_omitted: 1,
             },
             raw_stats: Vec::new(),
             describe: LcmDescribeServiceOutcome::Partial {
