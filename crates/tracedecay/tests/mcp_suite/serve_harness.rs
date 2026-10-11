@@ -134,6 +134,52 @@ pub fn run_serve_runtime(
     )
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn readiness_reissues_the_owner_wait_after_a_warming_refusal() {
+    let home = TempDir::new().unwrap();
+    let project = init_project_with_file(home.path(), "pub fn warming_marker() {}\n").await;
+    let hold = home.path().join("hold-project-sessions");
+    fs::write(&hold, b"hold").unwrap();
+    let entered = PathBuf::from(format!("{}.entered", hold.display()));
+    let _daemon = crate::common::spawn_tracedecay_daemon_with(home.path(), |command| {
+        command.env("TRACEDECAY_TEST_HOLD_AFTER_PROJECT_SESSIONS", &hold);
+    });
+    let release = std::thread::spawn(move || {
+        crate::common::poll_until(
+            Instant::now() + Duration::from_secs(30),
+            Duration::from_millis(20),
+            || entered.is_file().then_some(()),
+            || "the project open never reached the session-store hold".to_owned(),
+        );
+        // The real serve grace is 15 seconds. Keep the owner mounted but
+        // warming past that boundary, then release the same pending open.
+        std::thread::sleep(Duration::from_secs(17));
+        fs::remove_file(hold).unwrap();
+    });
+    let output = run_serve_runtime(home.path(), project.path(), None, json!({}));
+    release.join().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let frames: Vec<Value> = String::from_utf8(output.stdout.clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        frames.iter().any(|frame| {
+            frame["id"] == "project-ready"
+                && frame["error"]["data"]["reason_code"] == "project_warming"
+                && frame["error"]["data"]["retryable"] == true
+        }),
+        "the held open must actually exercise the typed retry: {frames:?}"
+    );
+    assert_eq!(
+        runtime_project_root(&output.stdout, 2),
+        canonical_existing_path(project.path()).to_string_lossy(),
+        "the call after readiness must use the same held project's actual runtime"
+    );
+}
+
 /// One live `tracedecay serve` session driven as an MCP stdio host drives
 /// it: write one JSON-RPC line, then read lines until the expected response
 /// or notification arrives. Every frame read stays in the transcript that
