@@ -1,7 +1,6 @@
 use std::pin::pin;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::task::{Context, Poll, Waker};
-use std::time::Duration;
 
 use tracedecay_store::{
     AdmissionConfigV1, BatchBudgetV1, OperationPriorityV1, QueueBudgetV1, RuntimeSubmitOutcomeV1,
@@ -61,7 +60,7 @@ fn saturation_is_immediate_while_reserved_health_work_remains_admissible() {
         let first_probe = TestProbe::fixed(&first);
         let first_task = tokio::spawn(async move { first_writer.submit(first, first_probe).await });
         tokio::task::yield_now().await;
-        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        entered_rx.recv().unwrap();
 
         let overflow = request(
             binding,
