@@ -1,6 +1,7 @@
 //! Compact human-view contract for CLI and MCP presenters.
 
 use super::view::{CanonicalHumanView, HumanFieldValue, PER_CALL_FIELDS};
+use crate::tools::render::MarkdownFence;
 
 /// Presentation-ready human output.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,10 +65,22 @@ pub fn render(view: CanonicalHumanView) -> MarkdownView {
     MarkdownView::new(text)
 }
 
-/// Whether `line` of a rendered view is a per-call field, which differs on
-/// every call for the same answer. Payload lines are indented, so no payload
-/// line can match.
-pub fn is_per_call_line(line: &str) -> bool {
+/// `text` without its rendered per-call field lines, which differ on every
+/// call for the same answer. Every other byte, line terminators included, is
+/// kept. Lines inside fenced code are payload, such as a source body that
+/// itself holds a `- Request: ` line, so they are always kept.
+pub fn without_per_call_lines(text: &str) -> String {
+    let mut fence = MarkdownFence::default();
+    text.split_inclusive('\n')
+        .filter(|line| {
+            let fenced = fence.is_open();
+            fence.observe(line);
+            fenced || !is_per_call_line(line)
+        })
+        .collect()
+}
+
+fn is_per_call_line(line: &str) -> bool {
     line.strip_prefix("- ").is_some_and(|field| {
         PER_CALL_FIELDS.iter().any(|label| {
             field
@@ -92,7 +105,7 @@ mod tests {
         CanonicalHumanView, HumanField, HumanFieldValue, PROVENANCE_FIELD, RECEIPT_FIELD,
         REQUEST_FIELD, TRACE_FIELD,
     };
-    use super::{is_per_call_line, render};
+    use super::{render, without_per_call_lines};
 
     #[test]
     fn canonical_markdown_golden_formats_only_the_supplied_view() {
@@ -130,6 +143,12 @@ mod tests {
                     value: HumanFieldValue::Block("- Provenance: `in the source`".to_owned()),
                 },
                 HumanField {
+                    label: "Body",
+                    value: HumanFieldValue::Markdown(
+                        "```text\r\n- Request: `in the source`\r\n```\r\n".to_owned(),
+                    ),
+                },
+                HumanField {
                     label: PROVENANCE_FIELD,
                     value: HumanFieldValue::Code("request=r1; elapsed_us=9".to_owned()),
                 },
@@ -151,22 +170,10 @@ mod tests {
                 },
             ],
         });
-        let kept = rendered
-            .as_str()
-            .lines()
-            .filter(|line| !is_per_call_line(line))
-            .collect::<Vec<_>>();
         assert_eq!(
-            kept,
-            [
-                "## source\\_body",
-                "",
-                "### Payload",
-                "",
-                "    - Provenance: `in the source`",
-                "",
-                "- Receipt operation: `read`",
-            ]
+            without_per_call_lines(rendered.as_str()),
+            "## source\\_body\n\n### Payload\n\n    - Provenance: `in the source`\n\n### Body\n\n\
+             ```text\r\n- Request: `in the source`\r\n```\r\n\n- Receipt operation: `read`\n"
         );
     }
 }

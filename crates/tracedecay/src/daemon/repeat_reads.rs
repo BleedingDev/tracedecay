@@ -23,7 +23,7 @@ use tracedecay_domain::canonical_json_value;
 use tracedecay_domain::canonical_text::canonical_framed_sha256;
 use tracedecay_domain::errors::Result;
 use tracedecay_mcp::JsonRpcRequest;
-use tracedecay_mcp::application_output::markdown::is_per_call_line;
+use tracedecay_mcp::application_output::markdown::without_per_call_lines;
 use tracedecay_mcp::tools::response_trailers::is_beside_result_block;
 
 use super::tool_surface::env_switch;
@@ -134,8 +134,7 @@ fn call_key(request: &JsonRpcRequest) -> Option<(&Value, (String, String))> {
 }
 
 /// The digest of a successful all-text answer without its trailer blocks and
-/// per-call lines, and the content text bytes a pointer would replace. Line
-/// terminators stay in the digest so a line-ending-only edit is served in full.
+/// per-call lines, and the content text bytes a pointer would replace.
 fn answer_digest(result: &Value) -> Option<(String, usize)> {
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
         return None;
@@ -150,11 +149,7 @@ fn answer_digest(result: &Value) -> Option<(String, usize)> {
     let answer = texts
         .iter()
         .filter(|text| !is_beside_result_block(text))
-        .map(|text| {
-            text.split_inclusive('\n')
-                .filter(|line| !is_per_call_line(line))
-                .collect::<String>()
-        })
+        .map(|text| without_per_call_lines(text))
         .collect::<Vec<_>>();
     let parts = answer.iter().map(String::as_bytes).collect::<Vec<_>>();
     Some((canonical_framed_sha256(DIGEST_DOMAIN, &parts), bytes))
