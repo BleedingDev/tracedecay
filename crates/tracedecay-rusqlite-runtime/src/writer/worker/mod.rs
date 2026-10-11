@@ -1452,6 +1452,48 @@ mod auxiliary_scheduling_tests {
     }
 
     #[test]
+    fn conflicting_submission_after_settlement_is_queued_for_the_ledger() {
+        let telemetry = WriterTelemetry::default();
+        let mut queue = FairQueue::default();
+        let mut inflight = HashMap::new();
+        let (leader, mut leader_rx) =
+            accepted_request_with_reply("operation.settled-conflict", "key.leader");
+        let _ = enqueue(&mut queue, &mut inflight, leader, &telemetry);
+        let executing = queue.drain_fair().pop().expect("dequeued leader");
+        inflight.insert(executing.operation_id().clone(), executing.shared_reply());
+        let (concurrent, mut concurrent_rx) =
+            accepted_request_with_reply("operation.settled-conflict", "key.conflict");
+        let _ = enqueue(&mut queue, &mut inflight, concurrent, &telemetry);
+        assert_eq!(
+            concurrent_rx.try_recv().expect("concurrent conflict reply"),
+            Err(
+                tracedecay_store::StorageRuntimeErrorV1::DuplicateOperationInFlight {
+                    operation_id: "operation.settled-conflict".to_owned(),
+                }
+            )
+        );
+        let leader_outcome = RuntimeSubmitOutcomeV1::Unavailable {
+            reason: UnavailableReasonV1::Faulted,
+        };
+        executing.settle(Ok(leader_outcome.clone()));
+        assert_eq!(
+            leader_rx.try_recv().expect("leader reply"),
+            Ok(leader_outcome)
+        );
+
+        let (later, mut later_rx) =
+            accepted_request_with_reply("operation.settled-conflict", "key.conflict");
+        let _ = enqueue(&mut queue, &mut inflight, later, &telemetry);
+        let later_outcome = RuntimeSubmitOutcomeV1::Unavailable {
+            reason: UnavailableReasonV1::Closed,
+        };
+        if let Some(admitted) = queue.drain_fair().pop() {
+            admitted.settle(Ok(later_outcome.clone()));
+        }
+        assert_eq!(later_rx.try_recv().expect("later reply"), Ok(later_outcome));
+    }
+
+    #[test]
     fn dwell_collects_a_compatible_arrival_before_dispatch() {
         let enqueued_at = Instant::now() + Duration::from_secs(1);
         let mut config = tracedecay_store::AdmissionConfigV1::default();

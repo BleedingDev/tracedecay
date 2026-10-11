@@ -83,13 +83,13 @@ impl SharedReply {
             && leader.control().cancellation == follower.control().cancellation
     }
 
-    pub(super) fn can_attach(&self, follower: &AcceptedRequest) -> bool {
-        self.matches(follower)
-            && self
-                .lock()
-                .settled
-                .as_ref()
-                .is_none_or(|settled| follower.enqueued_at <= settled.at)
+    /// A request enqueued after this reply settled is a new submission for the
+    /// ledger to judge, not a duplicate of the operation that was in flight.
+    pub(super) fn overlaps(&self, request: &AcceptedRequest) -> bool {
+        self.lock()
+            .settled
+            .as_ref()
+            .is_none_or(|settled| request.enqueued_at <= settled.at)
     }
 
     fn take_leader(&self) -> Option<oneshot::Sender<RequestResult>> {
