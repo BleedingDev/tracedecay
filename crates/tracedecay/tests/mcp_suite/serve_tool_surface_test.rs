@@ -2,9 +2,9 @@
 //! that every tool stays callable from a plain MCP stdio client.
 
 use std::collections::BTreeSet;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
-use std::process::{ChildStdout, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use tracedecay_tokenizer::count_ordinary_tokens;
 
 use crate::common::{self, TestChildProcess, tracedecay_command_with_home};
-use crate::serve_harness::{init_project_with_file, json_rpc_response};
+use crate::serve_harness::{ServeSession, init_project_with_file, json_rpc_response};
 
 const LIST_CHANGED: &str = "notifications/tools/list_changed";
 const ALWAYS_LOAD: &str = "anthropic/alwaysLoad";
@@ -263,11 +263,12 @@ async fn plain_mcp_client_calls_a_stub_and_receives_its_schema() {
     let home = TempDir::new().unwrap();
     let project = init_project_with_file(home.path(), "pub fn plain_mcp_stdio_marker() {}\n").await;
     let _daemon = common::spawn_tracedecay_daemon(home.path());
-    let mut client = PlainMcpClient::start(home.path(), project.path());
+    let mut client = ServeSession::start(serve_command(home.path(), project.path(), &[]));
 
     let initialized = client.request(initialize());
     assert!(initialized.get("error").is_none(), "{initialized}");
     client.send(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }));
+    client.await_project_ready();
 
     let first = client.request(tools_list(2));
     let runtime = tool_named(
@@ -284,7 +285,7 @@ async fn plain_mcp_client_calls_a_stub_and_receives_its_schema() {
         "tracedecay_runtime",
         &json!({ "format": "json" }),
     ));
-    let frames = client.read_until(|frames| {
+    let frames = client.wait_until(|frames| {
         frames.iter().any(|frame| frame["id"] == 3)
             && frames.iter().any(|frame| frame["method"] == LIST_CHANGED)
     });
@@ -335,63 +336,4 @@ async fn plain_mcp_client_calls_a_stub_and_receives_its_schema() {
         third["result"]["tools"].as_array().expect("tools"),
         "tracedecay_impact",
     )));
-}
-
-/// One live `tracedecay serve` session driven line by line, the way a host
-/// reads frames as they arrive.
-pub(crate) struct PlainMcpClient {
-    process: TestChildProcess,
-    stdout: BufReader<ChildStdout>,
-}
-
-impl PlainMcpClient {
-    fn start(home: &Path, project: &Path) -> Self {
-        Self::start_with_env(home, project, &[])
-    }
-
-    pub(crate) fn start_with_env(home: &Path, project: &Path, env: &[(&str, &str)]) -> Self {
-        let mut child = serve_command(home, project, &[])
-            .envs(env.iter().copied())
-            .spawn()
-            .expect("tracedecay serve should start");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout should be piped"));
-        Self {
-            process: TestChildProcess::new(child),
-            stdout,
-        }
-    }
-
-    pub(crate) fn send(&mut self, message: &Value) {
-        let stdin = self
-            .process
-            .stdin_mut()
-            .expect("stdin should stay open for the session");
-        writeln!(stdin, "{message}").expect("write MCP request");
-        stdin.flush().expect("flush MCP request");
-    }
-
-    fn read_until(&mut self, mut done: impl FnMut(&[Value]) -> bool) -> Vec<Value> {
-        let mut frames = Vec::new();
-        while !done(&frames) {
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line).expect("read MCP frame");
-            assert!(
-                read > 0,
-                "serve closed stdout early; frames so far: {frames:?}"
-            );
-            if let Ok(frame) = serde_json::from_str(line.trim()) {
-                frames.push(frame);
-            }
-        }
-        frames
-    }
-
-    pub(crate) fn request(&mut self, request: Value) -> Value {
-        let id = request["id"].clone();
-        self.send(&request);
-        self.read_until(|frames| frames.iter().any(|frame| frame["id"] == id))
-            .into_iter()
-            .find(|frame| frame["id"] == id)
-            .expect("response id")
-    }
 }
