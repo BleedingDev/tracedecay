@@ -1458,12 +1458,12 @@ mod auxiliary_scheduling_tests {
         let mut inflight = HashMap::new();
         let (leader, mut leader_rx) =
             accepted_request_with_reply("operation.settled-conflict", "key.leader");
-        let _ = enqueue(&mut queue, &mut inflight, leader, &telemetry);
+        assert!(enqueue(&mut queue, &mut inflight, leader, &telemetry));
         let executing = queue.drain_fair().pop().expect("dequeued leader");
         inflight.insert(executing.operation_id().clone(), executing.shared_reply());
         let (concurrent, mut concurrent_rx) =
             accepted_request_with_reply("operation.settled-conflict", "key.conflict");
-        let _ = enqueue(&mut queue, &mut inflight, concurrent, &telemetry);
+        assert!(!enqueue(&mut queue, &mut inflight, concurrent, &telemetry));
         assert_eq!(
             concurrent_rx.try_recv().expect("concurrent conflict reply"),
             Err(
@@ -1483,13 +1483,15 @@ mod auxiliary_scheduling_tests {
 
         let (later, mut later_rx) =
             accepted_request_with_reply("operation.settled-conflict", "key.conflict");
-        let _ = enqueue(&mut queue, &mut inflight, later, &telemetry);
+        assert!(enqueue(&mut queue, &mut inflight, later, &telemetry));
         let later_outcome = RuntimeSubmitOutcomeV1::Unavailable {
             reason: UnavailableReasonV1::Closed,
         };
-        if let Some(admitted) = queue.drain_fair().pop() {
-            admitted.settle(Ok(later_outcome.clone()));
-        }
+        queue
+            .drain_fair()
+            .pop()
+            .expect("later conflict queued")
+            .settle(Ok(later_outcome.clone()));
         assert_eq!(later_rx.try_recv().expect("later reply"), Ok(later_outcome));
     }
 
