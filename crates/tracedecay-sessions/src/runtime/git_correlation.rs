@@ -656,19 +656,30 @@ pub fn normalize_worktree(path: &str) -> String {
 /// Resolves one worktree spelling to the identity the store keys on: the
 /// canonical name when the path exists (8.3 short names, shell aliases and
 /// symlinked roots collapse), else the lexical cleanup above so a missing
-/// historical path keeps its recorded spelling. Used once per distinct
-/// spelling at evidence intake, not on stored rows.
-pub(crate) fn canonical_worktree_key(path: &str) -> String {
+/// historical path keeps its recorded spelling. Callers hold one resolve
+/// per distinct spelling inside the current operation only: a path created
+/// after an earlier miss, or a retargeted link, must resolve to its new
+/// identity on the next operation.
+pub(crate) fn canonical_worktree_key(path: &str) -> Result<String, error::GitCorrelationError> {
     let normalized = normalize_worktree(path);
     let candidate = std::path::Path::new(&normalized);
     // A relative string is left alone: `canonicalize` would resolve it
     // against the current drive, rekeying a missing path it never named.
     if !candidate.is_absolute() {
-        return normalized;
+        return Ok(normalized);
     }
     match tracedecay_runtime_core::path_safety::canonical_existing_identity(candidate) {
-        Ok(resolved) => normalize_worktree(&resolved.to_string_lossy()),
-        Err(_) => normalized,
+        // `to_str` keeps the identity byte-exact: a canonical path outside
+        // UTF-8 keeps the caller's recorded spelling rather than a lossy
+        // replacement that would collide with a different directory.
+        Ok(canonical) => Ok(canonical
+            .to_str()
+            .map(normalize_worktree)
+            .unwrap_or(normalized)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(normalized),
+        Err(error) => Err(error::GitCorrelationError::Unavailable(format!(
+            "cannot resolve worktree identity for {normalized}: {error}"
+        ))),
     }
 }
 
