@@ -480,8 +480,12 @@ async fn idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones() {
     .expect("JSONL payload");
     encoded.push(b'\n');
 
+    // Every test in this binary shares the process-wide page cache, so a
+    // concurrent ingest can capacity-evict any unpinned page. Hold a setup pin
+    // until the cache guard below excludes those evictions.
     let unpinned_path = temp.path().join("unpinned.jsonl");
     std::fs::write(&unpinned_path, &encoded).expect("unpinned JSONL");
+    let setup_pin = super::pin_shared_jsonl_paths(std::slice::from_ref(&unpinned_path));
     let (unpinned, _) = super::shared_jsonl_page(
         &unpinned_path,
         StoredCursor::default(),
@@ -509,14 +513,23 @@ async fn idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones() {
     .await
     .expect("pinned page");
 
-    let before = {
-        let cache = super::SHARED_JSONL_PAGE_CACHE
-            .get()
-            .expect("shared page cache")
-            .lock()
-            .await;
-        cache.retained_bytes
+    let mut cache = super::SHARED_JSONL_PAGE_CACHE
+        .get()
+        .expect("shared page cache")
+        .lock()
+        .await;
+    assert_eq!(
+        super::release_unpinned_shared_jsonl_pages(),
+        super::SharedJsonlPageReleaseV1::default(),
+        "idle release must skip a contended cache rather than wait"
+    );
+    drop(setup_pin);
+    let cached = |cache: &super::SharedJsonlPageCache, path: &Path| {
+        let path = std::fs::canonicalize(path).expect("canonical fixture");
+        cache.pages.iter().any(|page| page.key.path == path)
     };
+    assert!(cached(&cache, &unpinned_path) && cached(&cache, &pinned_path));
+    let before = cache.retained_bytes;
     assert!(
         before
             >= unpinned
@@ -525,7 +538,7 @@ async fn idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones() {
         "ingest left prepared pages in the cache: {before}"
     );
 
-    let released = super::release_unpinned_shared_jsonl_pages();
+    let released = super::release_unpinned_cached_jsonl_pages(&mut cache);
     eprintln!(
         "JSONL_HEAP_PROOF before={before} released_pages={} released_bytes={} unpinned={}",
         released.pages, released.bytes, unpinned.retained_bytes
@@ -534,26 +547,18 @@ async fn idle_release_drops_unpinned_prepared_pages_and_keeps_pinned_ones() {
         released.pages >= 1 && released.bytes >= unpinned.retained_bytes,
         "idle release must drop the unpinned prepared page: {released:?}"
     );
-
-    let after = {
-        let cache = super::SHARED_JSONL_PAGE_CACHE
-            .get()
-            .expect("shared page cache")
-            .lock()
-            .await;
-        (
-            cache.retained_bytes,
-            cache
-                .pages
-                .iter()
-                .any(|page| page.key.path == std::fs::canonicalize(&pinned_path).unwrap()),
-        )
-    };
-    assert!(after.1, "a pinned in-flight page must survive idle release");
     assert!(
-        after.0 < before,
-        "idle release must shrink retained cache bytes from {before} to {}",
-        after.0
+        !cached(&cache, &unpinned_path),
+        "idle release must drop the unpinned prepared page"
+    );
+    assert!(
+        cached(&cache, &pinned_path),
+        "a pinned in-flight page must survive idle release"
+    );
+    assert_eq!(
+        cache.retained_bytes,
+        before - released.bytes,
+        "idle release must shrink retained cache bytes by what it released"
     );
 }
 
