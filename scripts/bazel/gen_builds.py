@@ -1225,11 +1225,6 @@ def main():
                 "rust_test(",
                 f'    name = "{test_name}",',
                 test_size_attr(test_name),
-                # rustc writes the trailing `failures:` section only at
-                # process end. This suite can fill a Windows large timeout
-                # before that section exists; stream panics as tests run.
-                '    env = {"TRACEDECAY_TEST_NOCAPTURE": "1"},'
-                if name == "tracedecay" and test_name == "mcp_suite" else None,
                 # Cargo metadata distinguishes opt-in measurements from default tests.
                 '    tags = ["manual"],'
                 if manual_benchmark else None,
