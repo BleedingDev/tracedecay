@@ -1,6 +1,6 @@
 //! Compact human-view contract for CLI and MCP presenters.
 
-use super::view::{CanonicalHumanView, HumanFieldValue};
+use super::view::{CanonicalHumanView, HumanFieldValue, PER_CALL_FIELDS};
 
 /// Presentation-ready human output.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -64,6 +64,19 @@ pub fn render(view: CanonicalHumanView) -> MarkdownView {
     MarkdownView::new(text)
 }
 
+/// Whether `line` of a rendered view is a per-call field, which differs on
+/// every call for the same answer. Payload lines are indented, so no payload
+/// line can match.
+pub fn is_per_call_line(line: &str) -> bool {
+    line.strip_prefix("- ").is_some_and(|field| {
+        PER_CALL_FIELDS.iter().any(|label| {
+            field
+                .strip_prefix(label)
+                .is_some_and(|value| value.starts_with(": "))
+        })
+    })
+}
+
 fn escape_text(value: &str) -> String {
     value
         .replace('\\', "\\\\")
@@ -75,8 +88,11 @@ fn escape_text(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::view::{CanonicalHumanView, HumanField, HumanFieldValue};
-    use super::render;
+    use super::super::view::{
+        CanonicalHumanView, HumanField, HumanFieldValue, PROVENANCE_FIELD, RECEIPT_FIELD,
+        REQUEST_FIELD, TRACE_FIELD,
+    };
+    use super::{is_per_call_line, render};
 
     #[test]
     fn canonical_markdown_golden_formats_only_the_supplied_view() {
@@ -101,6 +117,56 @@ mod tests {
         assert_eq!(
             rendered.as_str(),
             "## feedback\\_list\n\n### Payload\n\n    src/lib.rs:1-1\n    fn main() {}\n\n- Status: `problem`\n- Message: Retry \\*after\\* refresh"
+        );
+    }
+
+    #[test]
+    fn per_call_lines_are_only_the_per_call_fields() {
+        let rendered = render(CanonicalHumanView {
+            heading: "source_body".to_owned(),
+            fields: vec![
+                HumanField {
+                    label: "Payload",
+                    value: HumanFieldValue::Block("- Provenance: `in the source`".to_owned()),
+                },
+                HumanField {
+                    label: PROVENANCE_FIELD,
+                    value: HumanFieldValue::Code("request=r1; elapsed_us=9".to_owned()),
+                },
+                HumanField {
+                    label: RECEIPT_FIELD,
+                    value: HumanFieldValue::Code("started=1, ended=2".to_owned()),
+                },
+                HumanField {
+                    label: "Receipt operation",
+                    value: HumanFieldValue::Code("read".to_owned()),
+                },
+                HumanField {
+                    label: REQUEST_FIELD,
+                    value: HumanFieldValue::Code("r1".to_owned()),
+                },
+                HumanField {
+                    label: TRACE_FIELD,
+                    value: HumanFieldValue::Code("t1".to_owned()),
+                },
+            ],
+        });
+        let kept = rendered
+            .as_str()
+            .lines()
+            .filter(|line| !is_per_call_line(line))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kept,
+            [
+                "## source\\_body",
+                "",
+                "### Payload",
+                "",
+                "    - Provenance: `in the source`",
+                "",
+                "- Receipt operation: `read`",
+            ]
         );
     }
 }
