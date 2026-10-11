@@ -619,7 +619,10 @@ async fn changing_a_schema_column_constant_does_not_reuse_the_template() {
         .join("home")
         .join(".tracedecay")
         .join("global.db");
-    let connection = Connection::open(&global_db).unwrap();
+    // The template name carries two digests, so on Windows this path passes
+    // MAX_PATH; SQLite opens it only in the extended-length spelling that
+    // `canonicalize` returns, as the store runtime keeps for such paths.
+    let connection = Connection::open(global_db.canonicalize().unwrap()).unwrap();
     let mut statement = connection
         .prepare("SELECT name FROM pragma_table_info('graph_scopes') ORDER BY cid")
         .unwrap();
