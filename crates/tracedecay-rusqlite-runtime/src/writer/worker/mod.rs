@@ -1456,50 +1456,41 @@ mod auxiliary_scheduling_tests {
         let telemetry = WriterTelemetry::default();
         let mut queue = FairQueue::default();
         let mut inflight = HashMap::new();
-        let (leader, leader_rx) =
+        let (leader, mut leader_rx) =
             accepted_request_with_reply("operation.settled-conflict", "key.leader");
         let _ = enqueue(&mut queue, &mut inflight, leader, &telemetry);
         let executing = queue.drain_fair().pop().expect("dequeued leader");
         inflight.insert(executing.operation_id().clone(), executing.shared_reply());
-        let (concurrent, concurrent_rx) =
+        let (concurrent, mut concurrent_rx) =
             accepted_request_with_reply("operation.settled-conflict", "key.conflict");
         let _ = enqueue(&mut queue, &mut inflight, concurrent, &telemetry);
-        assert!(matches!(
-            concurrent_rx
-                .blocking_recv()
-                .expect("concurrent conflict reply"),
-            Err(tracedecay_store::StorageRuntimeErrorV1::DuplicateOperationInFlight {
-                operation_id
-            }) if operation_id == "operation.settled-conflict"
-        ));
+        assert_eq!(
+            concurrent_rx.try_recv().expect("concurrent conflict reply"),
+            Err(
+                tracedecay_store::StorageRuntimeErrorV1::DuplicateOperationInFlight {
+                    operation_id: "operation.settled-conflict".to_owned(),
+                }
+            )
+        );
         let leader_outcome = RuntimeSubmitOutcomeV1::Unavailable {
             reason: UnavailableReasonV1::Faulted,
         };
         executing.settle(Ok(leader_outcome.clone()));
         assert_eq!(
-            leader_rx.blocking_recv().expect("leader reply"),
+            leader_rx.try_recv().expect("leader reply"),
             Ok(leader_outcome)
         );
 
-        // After the in-flight hub has settled, a conflicting resubmit is a
-        // new ledger submission. The caller must observe that later
-        // settlement, not DuplicateOperationInFlight and not the leader's
-        // already-published outcome.
-        let (later, later_rx) =
+        let (later, mut later_rx) =
             accepted_request_with_reply("operation.settled-conflict", "key.conflict");
         let _ = enqueue(&mut queue, &mut inflight, later, &telemetry);
         let later_outcome = RuntimeSubmitOutcomeV1::Unavailable {
             reason: UnavailableReasonV1::Closed,
         };
-        queue
-            .drain_fair()
-            .pop()
-            .expect("later submission queued")
-            .settle(Ok(later_outcome.clone()));
-        assert_eq!(
-            later_rx.blocking_recv().expect("later reply"),
-            Ok(later_outcome)
-        );
+        if let Some(admitted) = queue.drain_fair().pop() {
+            admitted.settle(Ok(later_outcome.clone()));
+        }
+        assert_eq!(later_rx.try_recv().expect("later reply"), Ok(later_outcome));
     }
 
     #[test]
