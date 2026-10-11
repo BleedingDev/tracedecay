@@ -329,9 +329,7 @@ async fn proxy_host_input_to_daemon(
     }
 
     loop {
-        while let Ok(line) = input.try_recv() {
-            pending.push_back(line);
-        }
+        drain_host_input(input, &mut pending);
         if *eof.borrow() && pending.is_empty() {
             return Ok(());
         }
@@ -344,9 +342,7 @@ async fn proxy_host_input_to_daemon(
                             message: format!("host EOF monitor closed unexpectedly: {error}"),
                         })?;
                         if *eof.borrow() {
-                            while let Ok(line) = input.try_recv() {
-                                pending.push_back(line);
-                            }
+                            drain_host_input(input, &mut pending);
                             if pending.is_empty() {
                                 return Ok(());
                             }
@@ -371,6 +367,7 @@ async fn proxy_host_input_to_daemon(
             &mut routed_handshake,
             request.parsed.as_ref(),
         );
+        repeated_queries.reset_for_initialize(request.parsed.as_ref());
 
         let (cancellation_tx, mut cancellation_rx) = tokio::sync::watch::channel(None);
         for queued in std::mem::take(&mut pending) {
@@ -427,6 +424,16 @@ async fn proxy_host_input_to_daemon(
         };
         let metadata = write_proxy_request_result(&request, result, writer).await?;
         apply_proxy_initialize_metadata(&mut routed_handshake, metadata);
+    }
+}
+
+/// Queues every already-received host line behind the in-flight request.
+fn drain_host_input(
+    input: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    pending: &mut VecDeque<String>,
+) {
+    while let Ok(line) = input.try_recv() {
+        pending.push_back(line);
     }
 }
 
@@ -771,16 +778,21 @@ async fn send_host_request(
         )
         .await?;
         // A cancel during the fetch must settle without loading tools.
-        if cancellation.borrow().is_some() {
+        let mut responses = if cancellation.borrow().is_some() {
             let response = JsonRpcResponse::error_with_data(
                 id,
                 ErrorCode::RequestCancelled,
                 "MCP request cancelled".to_owned(),
                 Some(serde_json::json!({ "reason_code": "request_cancelled" })),
             );
-            return Ok(vec![format!("{}\n", serde_json::to_string(&response)?)]);
-        }
-        return Ok(surface.answer_search(&id, &query, &listing));
+            vec![format!("{}\n", serde_json::to_string(&response)?)]
+        } else {
+            surface.answer_search(&id, &query, &listing)
+        };
+        // A search the proxy answers itself is still one of this session's
+        // tools/calls: it must count in the window and take a hint.
+        repeated_queries.rewrite(request.parsed.as_ref(), &mut responses);
+        return Ok(responses);
     }
     let mut responses =
         send_daemon_request_with_project_open_retry(socket_path, handshake, request, cancellation)

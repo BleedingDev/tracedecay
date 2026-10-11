@@ -127,6 +127,15 @@ impl RepeatedQueries {
             if message.get("id") != Some(id) {
                 continue;
             }
+            // A failed call is not an unanswered query: its result already
+            // reports the failure, so a hint would misreport it.
+            if message
+                .pointer("/result/isError")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return;
+            }
             if let Some(content) = message
                 .pointer_mut("/result/content")
                 .and_then(Value::as_array_mut)
@@ -135,6 +144,15 @@ impl RepeatedQueries {
                 *line = format!("{message}\n");
             }
             return;
+        }
+    }
+
+    /// An `initialize` re-opens this session, possibly under a new project
+    /// route; calls from the previous route must not flag the first queries
+    /// of the next.
+    pub(super) fn reset_for_initialize(&mut self, request: Option<&JsonRpcRequest>) {
+        if request.is_some_and(|request| request.method == "initialize") {
+            self.recent.clear();
         }
     }
 
@@ -450,6 +468,63 @@ mod tests {
         assert_eq!(
             words.iter().map(String::as_str).collect::<Vec<_>>(),
             expected
+        );
+    }
+
+    #[test]
+    fn a_failed_call_is_recorded_but_its_error_result_is_never_rewritten() {
+        let mut queries = enabled();
+        let args = json!({"query": "failing search"});
+        let failed = |id| {
+            vec![format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": "boom"}],
+                        "isError": true,
+                    },
+                })
+            )]
+        };
+        let mut first = failed(1);
+        queries.rewrite(Some(&call(1, "tracedecay_search", &args)), &mut first);
+        assert_eq!(first, failed(1));
+
+        let mut repeat = failed(2);
+        queries.rewrite(Some(&call(2, "tracedecay_search", &args)), &mut repeat);
+        assert_eq!(repeat, failed(2), "an isError result is never rewritten");
+
+        let answered = served(&mut queries, &call(3, "tracedecay_search", &args), 3);
+        assert!(
+            hints(&answered)[0].contains("1 call earlier"),
+            "a failed call still counts as a recent call: {answered:?}"
+        );
+    }
+
+    #[test]
+    fn an_initialize_clears_the_window_but_other_requests_do_not() {
+        let mut queries = enabled();
+        let args = json!({"query": "first project query"});
+        served(&mut queries, &call(1, "tracedecay_search", &args), 1);
+
+        let initialize =
+            JsonRpcRequest::decode(r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{}}"#)
+                .expect("request");
+        queries.reset_for_initialize(Some(&initialize));
+
+        let after = served(&mut queries, &call(3, "tracedecay_search", &args), 3);
+        assert_eq!(after, answer(3), "calls before initialize are forgotten");
+
+        served(&mut queries, &call(4, "tracedecay_search", &args), 4);
+        let ping =
+            JsonRpcRequest::decode(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#).expect("request");
+        queries.reset_for_initialize(Some(&ping));
+        let repeat = served(&mut queries, &call(6, "tracedecay_search", &args), 6);
+        assert!(
+            hints(&repeat)[0].contains("1 call earlier"),
+            "a non-initialize request does not clear the window: {repeat:?}"
         );
     }
 

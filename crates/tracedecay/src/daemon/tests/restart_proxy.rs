@@ -1222,13 +1222,38 @@ async fn batch_client_closing_stdin_immediately_still_receives_its_response() {
     await_test_task(daemon, "batch daemon task").await;
 }
 
-/// Answers `calls` proxied `tools/call` requests, one connection each, and
-/// returns the exact lines it wrote.
+/// A `tools/call` result body for the fake daemon.
 #[cfg(unix)]
-async fn answer_tool_calls(
+fn call_result(request: &Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request["id"],
+        "result": {
+            "content": [{"type": "text", "text": "no match for proxy window"}],
+            "structuredContent": {"matches": []},
+        }
+    })
+}
+
+/// A `tools/call` request for the fake host.
+#[cfg(unix)]
+fn tool_call_request(id: i64, tool: &str, arguments: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments}
+    })
+}
+
+/// Answers `calls` proxied requests, one connection each, mapping each
+/// request through `respond`, and returns the exact lines it wrote.
+#[cfg(unix)]
+async fn answer_proxy_requests(
     listener: tokio::net::UnixListener,
     token: &str,
     calls: usize,
+    respond: impl Fn(&Value) -> Value + Send + 'static,
 ) -> Vec<String> {
     let mut written = Vec::new();
     for _ in 0..calls {
@@ -1242,15 +1267,7 @@ async fn answer_tool_calls(
             .expect("read request")
             .expect("request line");
         let request: Value = serde_json::from_str(&request_line).expect("request json");
-        let response = serde_json::to_string(&json!({
-            "jsonrpc": "2.0",
-            "id": request["id"],
-            "result": {
-                "content": [{"type": "text", "text": "no match for proxy window"}],
-                "structuredContent": {"matches": []},
-            }
-        }))
-        .expect("response json");
+        let response = serde_json::to_string(&respond(&request)).expect("response json");
         writer
             .write_all(response.as_bytes())
             .await
@@ -1262,18 +1279,25 @@ async fn answer_tool_calls(
     written
 }
 
-/// Sends the same `tools/call` twice through one serve session and returns
-/// what the daemon wrote and what the host received.
+/// Sends each `(request, lines)` pair through one serve session, reading
+/// `lines` host response lines per request while the fake daemon answers
+/// `daemon_calls` connections with `respond`. Returns what the daemon wrote
+/// and what the host received.
 #[cfg(unix)]
-async fn repeated_tool_call_through_proxy(
+async fn requests_through_proxy(
     repeated_query_hints: bool,
+    daemon_calls: usize,
+    respond: impl Fn(&Value) -> Value + Send + 'static,
+    requests: Vec<(Value, usize)>,
 ) -> (Vec<String>, Vec<String>) {
     let dir = TempDir::new().expect("temp dir");
     let socket = dir.path().join("daemon.sock");
     let authority = seed_socket_authority(&socket);
     let token = authority.auth_token().to_string();
     let listener = tokio::net::UnixListener::bind(&socket).expect("bind fake daemon socket");
-    let daemon = tokio::spawn(async move { answer_tool_calls(listener, &token, 2).await });
+    let daemon = tokio::spawn(async move {
+        answer_proxy_requests(listener, &token, daemon_calls, respond).await
+    });
 
     let (mut transport, sender, mut receiver) = tracedecay_mcp::transport::ChannelTransport::new();
     let proxy_socket = socket.clone();
@@ -1291,23 +1315,15 @@ async fn repeated_tool_call_through_proxy(
     });
 
     let mut received = Vec::new();
-    for id in [1, 2] {
-        sender
-            .send(
-                serde_json::to_string(&json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": "tools/call",
-                    "params": {"name": "tracedecay_search", "arguments": {"query": "proxy window"}}
-                }))
-                .expect("request json"),
-            )
-            .expect("send request");
-        let response = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
-            .await
-            .expect("proxy response timed out")
-            .expect("proxy response");
-        received.push(response.trim_end().to_owned());
+    for (request, lines) in requests {
+        sender.send(request.to_string()).expect("send request");
+        for _ in 0..lines {
+            let response = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+                .await
+                .expect("proxy response timed out")
+                .expect("proxy response");
+            received.push(response.trim_end().to_owned());
+        }
     }
     drop(sender);
     await_test_task(proxy, "repeated query proxy task")
@@ -1315,6 +1331,29 @@ async fn repeated_tool_call_through_proxy(
         .expect("proxy transport");
     let written = await_test_task(daemon, "repeated query daemon task").await;
     (written, received)
+}
+
+/// Sends the same `tools/call` twice through one serve session and returns
+/// what the daemon wrote and what the host received.
+#[cfg(unix)]
+async fn repeated_tool_call_through_proxy(
+    repeated_query_hints: bool,
+) -> (Vec<String>, Vec<String>) {
+    requests_through_proxy(
+        repeated_query_hints,
+        2,
+        call_result,
+        [1, 2]
+            .into_iter()
+            .map(|id| {
+                (
+                    tool_call_request(id, "tracedecay_search", json!({"query": "proxy window"})),
+                    1,
+                )
+            })
+            .collect(),
+    )
+    .await
 }
 
 #[cfg(unix)]
@@ -1343,5 +1382,181 @@ async fn repeated_query_hints_reach_the_host_only_when_enabled() {
     assert!(
         hint.starts_with("tracedecay_repeated_query: this tracedecay_search call shares 100%"),
         "{hint}"
+    );
+}
+
+/// A `tracedecay_tool_search` is one of this session's `tools/call`s too:
+/// the proxy answers it from the catalog, but it must still count in the
+/// window and take a hint. Before the fix, searches bypassed the window, so
+/// repeated searches were never flagged and never aged earlier calls out.
+#[cfg(unix)]
+#[tokio::test]
+async fn repeated_tool_searches_are_also_tracked_and_hinted() {
+    let catalog = |request: &Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"tools": [
+                {"name": "tracedecay_impact", "description": "Blast radius of a change.",
+                 "inputSchema": {"type": "object", "properties": {"node_id": {"type": "string"}}}},
+            ]}
+        })
+    };
+    // Two identical searches; each costs the proxy one catalog fetch.
+    let requests = [1, 2]
+        .into_iter()
+        .map(|id| {
+            (
+                tool_call_request(id, "tracedecay_tool_search", json!({"query": "impact"})),
+                // The first search loads tracedecay_impact and announces it
+                // with notifications/tools/list_changed after its result.
+                if id == 1 { 2 } else { 1 },
+            )
+        })
+        .collect();
+    let (_written, received) = requests_through_proxy(true, 2, catalog, requests).await;
+
+    let notification: Value = serde_json::from_str(&received[1]).expect("notification json");
+    assert_eq!(
+        notification["method"],
+        json!("notifications/tools/list_changed")
+    );
+
+    let repeat: Value = serde_json::from_str(&received[2]).expect("response json");
+    let content = repeat["result"]["content"].as_array().expect("content");
+    let hint = content
+        .last()
+        .and_then(|block| block["text"].as_str())
+        .unwrap_or_default();
+    assert!(
+        hint.starts_with("tracedecay_repeated_query: this tracedecay_tool_search call shares 100%"),
+        "{hint}"
+    );
+}
+
+/// `initialize` can re-route this session to another project. Calls from the
+/// previous route must not flag the first queries of the next: the window
+/// clears on the initialize request.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_initialize_forgets_the_calls_before_it() {
+    let respond = |request: &Value| {
+        if request["method"] == json!("initialize") {
+            json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "serverInfo": {"name": "tracedecay", "version": "test"},
+                    "_meta": {"tracedecayInitializeRoute": {
+                        "projectPath": "/elsewhere/project",
+                        "allowInit": false,
+                    }},
+                }
+            })
+        } else {
+            call_result(request)
+        }
+    };
+    let search = || tool_call_request(0, "tracedecay_search", json!({"query": "proxy window"}));
+    let mut requests = vec![
+        (
+            {
+                let mut request = search();
+                request["id"] = json!(1);
+                request
+            },
+            1,
+        ),
+        (
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "test-host", "version": "0"},
+                }
+            }),
+            1,
+        ),
+        (
+            {
+                let mut request = search();
+                request["id"] = json!(3);
+                request
+            },
+            1,
+        ),
+        (
+            {
+                let mut request = search();
+                request["id"] = json!(4);
+                request
+            },
+            1,
+        ),
+    ];
+    let (written, received) = requests_through_proxy(true, 4, respond, requests.split_off(0)).await;
+
+    assert_eq!(
+        received[0], written[0],
+        "a first call has nothing to repeat"
+    );
+    assert_eq!(
+        received[2], written[2],
+        "the new project's first call must not repeat the old project's calls"
+    );
+    let repeat: Value = serde_json::from_str(&received[3]).expect("response json");
+    let content = repeat["result"]["content"].as_array().expect("content");
+    let hint = content
+        .last()
+        .and_then(|block| block["text"].as_str())
+        .unwrap_or_default();
+    assert!(
+        hint.contains("tracedecay_search call 1 call earlier"),
+        "calls after initialize still count: {hint}"
+    );
+}
+
+/// A tool result with `isError: true` already reports the failure; appending
+/// a repeat hint would misreport it. The failed call still counts in the
+/// window, matching how JSON-RPC error responses are treated.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_tool_call_gets_no_hint_but_still_counts() {
+    let respond = |request: &Value| {
+        let mut result = call_result(request);
+        if request["id"] == json!(2) {
+            result["result"]["isError"] = json!(true);
+        }
+        result
+    };
+    let requests = [1, 2, 3]
+        .into_iter()
+        .map(|id| {
+            (
+                tool_call_request(id, "tracedecay_search", json!({"query": "proxy window"})),
+                1,
+            )
+        })
+        .collect();
+    let (written, received) = requests_through_proxy(true, 3, respond, requests).await;
+
+    assert_eq!(
+        received[1], written[1],
+        "an isError result is never rewritten"
+    );
+    let repeat: Value = serde_json::from_str(&received[2]).expect("response json");
+    let content = repeat["result"]["content"].as_array().expect("content");
+    let hint = content
+        .last()
+        .and_then(|block| block["text"].as_str())
+        .unwrap_or_default();
+    assert!(
+        hint.contains("tracedecay_search call 1 call earlier"),
+        "the failed call still counts as a recent call: {hint}"
     );
 }
