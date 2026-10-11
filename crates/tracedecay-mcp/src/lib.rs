@@ -103,6 +103,7 @@ pub use tool_errors::{
     reset_required_detail, reset_required_remedy, semantic_failure_reason, serialize_response_line,
     tool_error_response, tool_result_has_semantic_error,
 };
+pub use tools::catalog_discovery::TOOL_SEARCH_NAME;
 pub use tools::render::format_relative_time;
 pub use tools::{
     RESERVED_FLAGS_FOOTER, ToolResult, render_tool_cli_help, resolve_property_schema,

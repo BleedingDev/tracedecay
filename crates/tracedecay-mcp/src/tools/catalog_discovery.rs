@@ -1,8 +1,4 @@
-//! Live `tools/list` filtering against the root application-surface catalog.
-//!
-//! Catalog assembly lives in `tracedecay-mcp`. These wrappers stay in the
-//! composition root because they name `application_surface` and attach
-//! dispatch metadata from the daemon-coupled binding table.
+//! Live `tools/list` filtering against the application-surface catalog.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, RwLock};
@@ -15,6 +11,9 @@ use sha2::{Digest, Sha256};
 use tracedecay_tool_catalog::{CapabilityId, FeatureId, ProfileId, ScopeDimension};
 
 use super::dispatch::McpDispatchMetadataError;
+
+/// The stdio proxy's session-scoped discovery tool, outside the daemon catalog.
+pub const TOOL_SEARCH_NAME: &str = "tracedecay_tool_search";
 
 /// Documented ceiling for the process-wide discovery cache.
 ///
