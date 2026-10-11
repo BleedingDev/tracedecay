@@ -301,36 +301,35 @@ impl<E: ReaderQueryExecutor> ReaderLease<E> {
         Ok(())
     }
 
-    /// A previous snapshot whose rollback outran [`SNAPSHOT_END_GRACE`] still
-    /// holds this worker's checkpoint blocker; the next snapshot on the same
-    /// lease waits for that acknowledgement under the deferred-return bound.
     fn settle_deferred_end(&mut self) -> Result<(), ReaderWorkerError> {
-        let Some(receive) = &self.checkout.deferred_end else {
+        let Some(receive) = self.checkout.deferred_end.take() else {
             return Ok(());
         };
         let error = match receive.recv_timeout(DEFERRED_SNAPSHOT_END_LIMIT) {
             Ok(Ok(())) => {
-                self.checkout.deferred_end = None;
                 self.checkout
                     .inner
                     .checkpoint_blockers
                     .finish(self.checkout.worker.id);
                 return Ok(());
             }
-            Ok(Err(error)) => {
-                self.checkout.deferred_end = None;
-                error
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                self.checkout.deferred_end = None;
+            Ok(Err(error)) => error,
+            Err(RecvTimeoutError::Disconnected) => ReaderWorkerError::WorkerClosed,
+            Err(RecvTimeoutError::Timeout) => {
+                self.checkout.deferred_end = Some(receive);
                 ReaderWorkerError::WorkerClosed
             }
-            // Keeping the receiver makes checkout return finish the blocker
-            // only after the written-off worker answers or exits.
-            Err(RecvTimeoutError::Timeout) => ReaderWorkerError::WorkerClosed,
         };
         self.checkout.retire = true;
         Err(error)
+    }
+
+    fn defer_snapshot_end(&mut self, receive: Receiver<Result<(), ReaderWorkerError>>) {
+        self.checkout
+            .inner
+            .checkpoint_blockers
+            .release(self.checkout.worker.id);
+        self.checkout.deferred_end = Some(receive);
     }
 
     fn finish_snapshot(&mut self) {
@@ -354,13 +353,7 @@ impl<E: ReaderQueryExecutor> ReaderLease<E> {
             Ok(Err(_)) | Err(RecvTimeoutError::Disconnected) => {
                 self.checkout.retire = true;
             }
-            Err(RecvTimeoutError::Timeout) => {
-                self.checkout
-                    .inner
-                    .checkpoint_blockers
-                    .release(self.checkout.worker.id);
-                self.checkout.deferred_end = Some(receive);
-            }
+            Err(RecvTimeoutError::Timeout) => self.defer_snapshot_end(receive),
         }
     }
 }
@@ -626,13 +619,9 @@ mod snapshot_return_tests {
         let probe = Probe::for_request(&read);
         let mut lease = pool.acquire(&read, &probe, Duration::from_secs(2)).unwrap();
         lease.start_snapshot().unwrap();
-
-        // The state `finish_snapshot` leaves when the rollback acknowledgement
-        // outruns its grace, without depending on the 5ms race.
-        let reader_id = lease.checkout.worker.id;
-        lease.checkout.deferred_end = Some(lease.checkout.worker.client.begin_end().unwrap());
+        let receive = lease.checkout.worker.client.begin_end().unwrap();
         lease.snapshot_active = false;
-        pool.inner.checkpoint_blockers.release(reader_id);
+        lease.defer_snapshot_end(receive);
 
         let mut snapshot = lease.begin_snapshot().unwrap();
         assert_eq!(
