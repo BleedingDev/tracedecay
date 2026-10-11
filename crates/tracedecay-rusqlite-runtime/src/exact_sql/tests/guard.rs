@@ -24,18 +24,7 @@ fn queued_write_rechecks_authority_on_actor_dequeue() {
 
     allowed.store(false, Ordering::Release);
     transaction.rollback().unwrap();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .unwrap();
-    let error = runtime
-        .block_on(async {
-            tokio::time::timeout(Duration::from_secs(1), receive.recv())
-                .await
-                .unwrap()
-                .unwrap()
-        })
-        .unwrap_err();
+    let error = receive.recv_blocking().unwrap().unwrap_err();
 
     assert!(matches!(error, ExactSqlError::AuthorityDenied(_)));
     let rows = holder
