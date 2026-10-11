@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use tracedecay_domain::{
     CodeGenerationId, CodeGenerationManifestV1, FileOccurrenceId, ManifestDigest,
-    SanitizedCodeSnapshotV1,
+    SanitizedCodeFileV1, SanitizedCodeSnapshotV1,
 };
 
 use super::file_evidence_rows::PersistedFileEvidenceV1;
