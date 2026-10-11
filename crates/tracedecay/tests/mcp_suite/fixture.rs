@@ -663,7 +663,10 @@ async fn template_recorded_at_an_older_git_correlation_version_is_rebuilt() {
     )
     .unwrap()
     .join(tracedecay_runtime_core::storage::SESSIONS_DB_FILENAME);
-    let downgraded = Connection::open(&stale_sessions)
+    // The template name carries two digests, so on Windows this path passes
+    // MAX_PATH; SQLite opens it only in the extended-length spelling that
+    // `canonicalize` returns, as the store runtime keeps for such paths.
+    let downgraded = Connection::open(stale_sessions.canonicalize().unwrap())
         .unwrap()
         .execute(
             "UPDATE session_schema_migrations SET version = ?1 WHERE name = 'git_correlation'",
