@@ -1126,7 +1126,7 @@ async fn disconnected_client_does_not_outlive_a_daemon_that_never_answers() {
             &mut transport,
             Some(std::time::Duration::from_millis(250)),
             false,
-            false,
+            tokio::sync::watch::channel(false).1,
         )
         .await
     });
@@ -1285,7 +1285,7 @@ async fn repeated_tool_call_through_proxy(
             &mut transport,
             None,
             false,
-            repeated_query_hints,
+            tokio::sync::watch::channel(repeated_query_hints).1,
         )
         .await
     });

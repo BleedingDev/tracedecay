@@ -81,14 +81,21 @@ pub async fn run_serve(
         ));
     }
     let handshake = proxy_serve_handshake(profile, path_arg, original_cwd.as_deref(), timings)?;
-    // An experimental advisory setting must never take MCP down, for example
-    // when serve and the daemon disagree on the configuration surface.
-    let repeated_query_hints = crate::commands::repeated_query_hints_enabled(profile)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "repeated-query hints are off: setting read failed");
-            false
-        });
+    // The setting is read beside the proxy, not before it: an experimental
+    // advisory must never delay or take down MCP, for example on a loaded
+    // daemon or when serve and the daemon disagree on the configuration surface.
+    let (hints_enabled, repeated_query_hints) = tokio::sync::watch::channel(false);
+    let hints_profile = profile.clone();
+    tokio::spawn(async move {
+        match crate::commands::repeated_query_hints_enabled(&hints_profile).await {
+            Ok(enabled) => {
+                hints_enabled.send_replace(enabled);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "repeated-query hints are off: setting read failed");
+            }
+        }
+    });
     tracedecay::daemon::proxy_stdio_to_daemon(
         &socket_path,
         &handshake,

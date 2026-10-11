@@ -12,6 +12,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use serde_json::{Value, json};
+use tokio::sync::watch;
 use tracedecay_domain::canonical_json_value;
 use tracedecay_domain::configuration::USER_REPEATED_QUERY_HINTS_SETTING_KEY;
 use tracedecay_mcp::JsonRpcRequest;
@@ -92,15 +93,27 @@ impl fmt::Display for Hint {
 }
 
 /// One serve session's window of recent tool calls.
-#[derive(Default)]
 pub(super) struct RepeatedQueries {
+    /// The profile setting. Serve reads it beside the proxy rather than before
+    /// it, so it can turn on after the session starts.
+    enabled: watch::Receiver<bool>,
     recent: VecDeque<RecentCall>,
 }
 
 impl RepeatedQueries {
-    /// Records a `tools/call` and appends a hint to its result when it nearly
-    /// repeats a recent call to the same tool.
+    pub(super) fn new(enabled: watch::Receiver<bool>) -> Self {
+        Self {
+            enabled,
+            recent: VecDeque::new(),
+        }
+    }
+
+    /// While enabled, records a `tools/call` and appends a hint to its result
+    /// when it nearly repeats a recent call to the same tool.
     pub(super) fn rewrite(&mut self, request: Option<&JsonRpcRequest>, responses: &mut [String]) {
+        if !*self.enabled.borrow() {
+            return;
+        }
         let Some((id, tool, arguments)) = request.and_then(tool_call) else {
             return;
         };
@@ -202,6 +215,10 @@ fn query_words(arguments: &Value) -> BTreeSet<String> {
 mod tests {
     use super::*;
 
+    fn enabled() -> RepeatedQueries {
+        RepeatedQueries::new(watch::channel(true).1)
+    }
+
     fn call(id: i64, tool: &str, arguments: &Value) -> JsonRpcRequest {
         JsonRpcRequest::decode(
             &json!({
@@ -250,7 +267,7 @@ mod tests {
 
     #[test]
     fn an_identical_repeat_appends_one_hint_after_the_unchanged_result() {
-        let mut queries = RepeatedQueries::default();
+        let mut queries = enabled();
         let args = json!({"query": "where is the proxy", "limit": 5});
         let first = served(&mut queries, &call(1, "tracedecay_search", &args), 1);
         assert_eq!(first, answer(1));
@@ -299,10 +316,31 @@ mod tests {
     }
 
     #[test]
+    fn calls_are_neither_hinted_nor_recorded_until_the_setting_turns_on() {
+        let (setting, enabled) = watch::channel(false);
+        let mut queries = RepeatedQueries::new(enabled);
+        let args = json!({"query": "where is the proxy"});
+        for id in [1, 2] {
+            let response = served(&mut queries, &call(id, "tracedecay_search", &args), id);
+            assert_eq!(
+                response,
+                answer(id),
+                "disabled hints must not touch a response"
+            );
+        }
+
+        setting.send_replace(true);
+        let first = served(&mut queries, &call(3, "tracedecay_search", &args), 3);
+        assert_eq!(first, answer(3), "calls made while off are not recorded");
+        let repeat = served(&mut queries, &call(4, "tracedecay_search", &args), 4);
+        assert!(hints(&repeat)[0].contains("1 call earlier"), "{repeat:?}");
+    }
+
+    #[test]
     fn a_repeat_is_flagged_within_the_window_and_forgotten_past_it() {
         let search = json!({"query": "proxy session window"});
         for (intervening, expect_hint) in [(5, true), (6, false)] {
-            let mut queries = RepeatedQueries::default();
+            let mut queries = enabled();
             served(&mut queries, &call(0, "tracedecay_search", &search), 0);
             for id in 1..=intervening {
                 let other = json!({"pattern": format!("other{id}")});
@@ -328,7 +366,7 @@ mod tests {
             ("a b", "a b c", true),
             ("a b c d", "a b c d e", true),
         ] {
-            let mut queries = RepeatedQueries::default();
+            let mut queries = enabled();
             let tool = "tracedecay_search";
             served(&mut queries, &call(1, tool, &json!({"query": earlier})), 1);
             let response = served(&mut queries, &call(2, tool, &json!({"query": later})), 2);
@@ -342,7 +380,7 @@ mod tests {
 
     #[test]
     fn the_closest_earlier_call_is_named_and_ties_name_the_most_recent() {
-        let mut queries = RepeatedQueries::default();
+        let mut queries = enabled();
         let tool = "tracedecay_search";
         served(
             &mut queries,
@@ -380,7 +418,7 @@ mod tests {
 
     #[test]
     fn a_different_tool_or_an_empty_query_is_never_flagged() {
-        let mut queries = RepeatedQueries::default();
+        let mut queries = enabled();
         let args = json!({"query": "same words here"});
         served(&mut queries, &call(1, "tracedecay_search", &args), 1);
         let other_tool = served(&mut queries, &call(2, "tracedecay_context", &args), 2);
@@ -417,7 +455,7 @@ mod tests {
 
     #[test]
     fn errors_and_other_methods_pass_through_but_calls_are_still_recorded() {
-        let mut queries = RepeatedQueries::default();
+        let mut queries = enabled();
         let args = json!({"query": "failing search"});
         let mut rpc_error = vec![format!(
             "{}\n",
@@ -453,7 +491,7 @@ mod tests {
 
     #[test]
     fn long_earlier_arguments_are_quoted_truncated_on_a_char_boundary() {
-        let mut queries = RepeatedQueries::default();
+        let mut queries = enabled();
         let args = json!({"query": "é".repeat(300)});
         served(&mut queries, &call(1, "tracedecay_search", &args), 1);
         let response = served(&mut queries, &call(2, "tracedecay_search", &args), 2);
