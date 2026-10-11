@@ -133,8 +133,15 @@ elif method == "tools/call":
                 "type": "text",
                 "text": "daemon diagnostic authority is unavailable",
             }}],
+            "structuredContent": {{"problem": {{"kind": "unavailable"}}}},
         }}))
         raise SystemExit(2)
+    elif tool == "definitely_not_a_tool":
+        print(json.dumps({{
+            "isError": True,
+            "content": [{{"type": "text", "text": "unknown tool"}}],
+            "structuredContent": {{"problem": {{"code": "unknown_tool"}}}},
+        }}))
     else:
         raise SystemExit(1)
 else:
