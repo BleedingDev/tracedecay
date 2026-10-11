@@ -15,6 +15,7 @@ use super::binary_version;
 #[cfg(unix)]
 use super::connect_with_restart_grace;
 use super::repeat_reads::RepeatReads;
+use super::repeated_queries::RepeatedQueries;
 use super::tool_surface::ToolSurface;
 use super::{
     DAEMON_TOOL_LIVENESS_POLL_INTERVAL, DaemonClientDeadline, DaemonHandshake,
@@ -82,6 +83,7 @@ pub async fn proxy_stdio_to_daemon(
     handshake: &DaemonHandshake,
     replay_line: Option<String>,
     full_tool_list: bool,
+    repeated_query_hints: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let mut transport = StdioTransport::new();
     proxy_transport_to_daemon_with_drain_bound(
@@ -91,6 +93,7 @@ pub async fn proxy_stdio_to_daemon(
         &mut transport,
         None,
         ToolSurface::new(full_tool_list),
+        repeated_query_hints,
     )
     .await
 }
@@ -143,6 +146,7 @@ pub async fn proxy_transport_to_daemon(
         transport,
         None,
         ToolSurface::new(true),
+        tokio::sync::watch::channel(false).1,
     )
     .await
 }
@@ -157,6 +161,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
     transport: &mut impl McpDuplexTransport,
     drain_bound: Option<Duration>,
     surface: ToolSurface,
+    repeated_query_hints: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let (mut reader, mut writer) = transport.split();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -193,6 +198,7 @@ pub(crate) async fn proxy_transport_to_daemon_with_drain_bound(
         drain_bound,
         surface,
         RepeatReads::from_env()?,
+        RepeatedQueries::new(repeated_query_hints),
     );
     let result = tokio::try_join!(read_host, proxy);
     drop(eof_tx);
@@ -319,6 +325,7 @@ async fn proxy_host_input_to_daemon(
     drain_bound: Option<Duration>,
     mut surface: ToolSurface,
     mut repeat_reads: Option<RepeatReads>,
+    mut repeated_queries: RepeatedQueries,
 ) -> Result<()> {
     let mut routed_handshake = handshake.clone();
     let mut pending = VecDeque::new();
@@ -327,9 +334,7 @@ async fn proxy_host_input_to_daemon(
     }
 
     loop {
-        while let Ok(line) = input.try_recv() {
-            pending.push_back(line);
-        }
+        drain_host_input(input, &mut pending);
         if *eof.borrow() && pending.is_empty() {
             return Ok(());
         }
@@ -342,9 +347,7 @@ async fn proxy_host_input_to_daemon(
                             message: format!("host EOF monitor closed unexpectedly: {error}"),
                         })?;
                         if *eof.borrow() {
-                            while let Ok(line) = input.try_recv() {
-                                pending.push_back(line);
-                            }
+                            drain_host_input(input, &mut pending);
                             if pending.is_empty() {
                                 return Ok(());
                             }
@@ -369,6 +372,7 @@ async fn proxy_host_input_to_daemon(
             &mut routed_handshake,
             request.parsed.as_ref(),
         );
+        repeated_queries.reset_for_initialize(request.parsed.as_ref());
 
         let (cancellation_tx, mut cancellation_rx) = tokio::sync::watch::channel(None);
         for queued in std::mem::take(&mut pending) {
@@ -378,6 +382,7 @@ async fn proxy_host_input_to_daemon(
             let daemon_request = send_host_request(
                 &mut surface,
                 repeat_reads.as_mut(),
+                &mut repeated_queries,
                 socket_path,
                 &routed_handshake,
                 &request,
@@ -425,6 +430,16 @@ async fn proxy_host_input_to_daemon(
         };
         let metadata = write_proxy_request_result(&request, result, writer).await?;
         apply_proxy_initialize_metadata(&mut routed_handshake, metadata);
+    }
+}
+
+/// Queues every already-received host line behind the in-flight request.
+fn drain_host_input(
+    input: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+    pending: &mut VecDeque<String>,
+) {
+    while let Ok(line) = input.try_recv() {
+        pending.push_back(line);
     }
 }
 
@@ -743,12 +758,11 @@ fn responses_are_project_open_retryable(responses: &[String]) -> bool {
             .is_some_and(json_rpc_error_is_project_open_retryable)
 }
 
-/// Sends one host request and fits the daemon's answer to this session's tool
-/// surface; a call to a stubbed tool also hydrates its full schema, and a
-/// repeated identical read answers with a pointer.
+/// Fits the response to this session's schema surface, read ledger and optional query hints.
 async fn send_host_request(
     surface: &mut ToolSurface,
     repeat_reads: Option<&mut RepeatReads>,
+    repeated_queries: &mut RepeatedQueries,
     socket_path: &Path,
     handshake: &DaemonHandshake,
     request: &DaemonProxyRequest<'_>,
@@ -762,6 +776,7 @@ async fn send_host_request(
     if let Some(repeat_reads) = repeat_reads {
         repeat_reads.rewrite(request.parsed.as_ref(), &mut responses);
     }
+    repeated_queries.rewrite(request.parsed.as_ref(), &mut responses);
     Ok(responses)
 }
 
