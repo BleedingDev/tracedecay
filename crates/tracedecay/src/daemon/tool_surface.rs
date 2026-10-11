@@ -23,7 +23,7 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 use tracedecay_domain::canonical_text::sha256_hex;
 use tracedecay_domain::errors::{Result, TraceDecayError};
-use tracedecay_mcp::JsonRpcRequest;
+use tracedecay_mcp::{JsonRpcRequest, TOOL_SEARCH_NAME};
 use tracedecay_runtime_core::logging::log_daemon_event;
 
 /// How one serve session advertises tools that are not in the core set.
@@ -91,8 +91,6 @@ pub(super) const CORE_TOOL_NAMES: &[&str] = &[
     "tracedecay_test_map",
 ];
 
-/// The proxy-served tool that finds and loads tools outside the core set.
-pub(super) const TOOL_SEARCH_NAME: &str = "tracedecay_tool_search";
 /// Matches loaded per search, so one broad query cannot re-inflate the list.
 const MAX_LOADED_PER_SEARCH: usize = 8;
 const TOOL_LIST_CHANGED: &str = "notifications/tools/list_changed";
@@ -507,7 +505,7 @@ mod tests {
 
     #[test]
     fn core_tools_are_cataloged_and_cover_always_load() {
-        let definitions = tracedecay_mcp::get_maximal_tool_definitions().expect("tool definitions");
+        let definitions = tracedecay_mcp::get_tool_definitions().expect("tool definitions");
         let catalog = definitions
             .iter()
             .map(|definition| definition.name.as_str())
