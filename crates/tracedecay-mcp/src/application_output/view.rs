@@ -8,9 +8,12 @@ use tracedecay_contracts::{
 };
 use tracedecay_tool_catalog::BindingId;
 
+use crate::tools::render::{Md, whole_markdown_prefix};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HumanFieldValue {
     Block(String),
+    Markdown(String),
     Code(String),
     Text(String),
 }
@@ -41,10 +44,7 @@ impl CanonicalHumanView {
         match result {
             Ok(envelope) => match &envelope.outcome {
                 ApplicationOutcome::Evidence(packet) => {
-                    view.block(
-                        "Payload",
-                        payload_preview(operation, packet.payload.as_ref())?,
-                    );
+                    view.payload(operation, packet.payload.as_ref())?;
                     view.code("Status", evidence_status(packet.execution.termination)?);
                     view.push_evidence_summary(packet)?;
                     view.push_provenance(
@@ -55,10 +55,7 @@ impl CanonicalHumanView {
                     )?;
                 }
                 ApplicationOutcome::Preview(preview) => {
-                    view.block(
-                        "Payload",
-                        payload_preview(operation, preview.payload.as_ref())?,
-                    );
+                    view.payload(operation, preview.payload.as_ref())?;
                     view.code("Status", "success");
                     view.code("Operation", operation);
                     view.code("Binding", binding_id.as_str());
@@ -80,10 +77,7 @@ impl CanonicalHumanView {
                     view.push_receipt(&preview.execution)?;
                 }
                 ApplicationOutcome::Effect(effect) => {
-                    view.block(
-                        "Payload",
-                        payload_preview(operation, effect.payload.as_ref())?,
-                    );
+                    view.payload(operation, effect.payload.as_ref())?;
                     view.code("Status", "success");
                     view.code("Operation", operation);
                     view.code("Binding", binding_id.as_str());
@@ -109,7 +103,7 @@ impl CanonicalHumanView {
                     view.code("Receipt actor", scalar(&effect.receipt.actor)?);
                 }
                 ApplicationOutcome::Result(payload) => {
-                    view.block("Payload", payload_preview(operation, Some(payload))?);
+                    view.payload(operation, Some(payload))?;
                     view.code("Status", "success");
                     view.code("Operation", operation);
                     view.code("Binding", binding_id.as_str());
@@ -357,11 +351,12 @@ impl CanonicalHumanView {
         });
     }
 
-    fn block(&mut self, label: &'static str, value: impl Into<String>) {
+    fn payload(&mut self, operation: &str, payload: Option<&Value>) -> serde_json::Result<()> {
         self.fields.push(HumanField {
-            label,
-            value: HumanFieldValue::Block(value.into()),
+            label: "Payload",
+            value: payload_preview(operation, payload)?,
         });
+        Ok(())
     }
 
     fn text(&mut self, label: &'static str, value: impl Into<String>) {
@@ -408,11 +403,14 @@ fn list_or_none(values: &[String]) -> String {
 
 const MAX_HUMAN_PAYLOAD_CHARS: usize = 6_000;
 
-fn payload_preview(operation: &str, payload: Option<&Value>) -> serde_json::Result<String> {
+fn payload_preview(
+    operation: &str,
+    payload: Option<&Value>,
+) -> serde_json::Result<HumanFieldValue> {
     let Some(payload) = payload else {
-        return Ok("none".to_owned());
+        return Ok(HumanFieldValue::Block("none".to_owned()));
     };
-    let rendered = if operation == "source_body"
+    let (rendered, markdown) = if operation == "source_body"
         && let Value::Object(fields) = payload
         && let (Some(file), Some(start_line), Some(end_line), Some(body)) = (
             fields.get("file").and_then(Value::as_str),
@@ -420,16 +418,27 @@ fn payload_preview(operation: &str, payload: Option<&Value>) -> serde_json::Resu
             fields.get("end_line").and_then(Value::as_u64),
             fields.get("body").and_then(Value::as_str),
         ) {
-        format!("{file}:{start_line}-{end_line}\n{body}")
-    } else if let Some(rendered) = code_graph_page_preview(operation, payload) {
+        let mut rendered = Md::new();
         rendered
+            .code("text", &format!("{file}:{start_line}-{end_line}"))
+            .blank()
+            .code("text", body);
+        (rendered.render(), true)
+    } else if let Some(rendered) = code_graph_page_preview(operation, payload) {
+        (rendered, operation == "code_implementations")
     } else {
-        match payload {
+        let rendered = match payload {
             Value::String(value) => value.clone(),
             _ => serde_json::to_string_pretty(payload)?,
-        }
+        };
+        (rendered, false)
     };
-    Ok(bounded_payload(rendered))
+    let rendered = bounded_payload(rendered, markdown);
+    Ok(if markdown {
+        HumanFieldValue::Markdown(rendered)
+    } else {
+        HumanFieldValue::Block(rendered)
+    })
 }
 
 /// One line per symbol for the code-graph navigation pages, with the type
@@ -454,10 +463,24 @@ fn code_graph_page_preview(operation: &str, payload: &Value) -> Option<String> {
         push_hierarchy_roots(items, &mut rendered)?;
     } else {
         for item in items {
-            push_symbol_entry(item, &mut rendered)?;
+            if operation == "code_implementations" {
+                push_implementation_entry(item, &mut rendered)?;
+            } else {
+                push_symbol_entry(item, &mut rendered)?;
+            }
         }
     }
-    push_page_trailer(payload, &mut rendered)?;
+    if operation == "code_implementations" {
+        let mut trailer = String::new();
+        push_page_trailer(payload, &mut trailer)?;
+        if !trailer.is_empty() {
+            let mut markdown = Md::new();
+            markdown.code("text", trailer.trim_end());
+            rendered.push_str(&markdown.render());
+        }
+    } else {
+        push_page_trailer(payload, &mut rendered)?;
+    }
     Some(rendered.trim_end().to_owned())
 }
 
@@ -475,7 +498,7 @@ fn push_hierarchy_roots(items: &[Value], rendered: &mut String) -> Option<()> {
 }
 
 /// One relation, implementation, or signature match: its symbol line, the
-/// traversal annotations, then its signature and body when present.
+/// traversal annotations, then its signature when present.
 fn push_symbol_entry(item: &Value, rendered: &mut String) -> Option<()> {
     let symbol = item.get("symbol").unwrap_or(item);
     rendered.push_str(&symbol_line(symbol)?);
@@ -491,14 +514,18 @@ fn push_symbol_entry(item: &Value, rendered: &mut String) -> Option<()> {
     if let Some(signature) = symbol.get("signature").and_then(Value::as_str) {
         writeln!(rendered, "  {signature}").ok()?;
     }
-    for line in item
-        .get("body")
-        .and_then(Value::as_str)
-        .into_iter()
-        .flat_map(str::lines)
-    {
-        writeln!(rendered, "  | {line}").ok()?;
+    Some(())
+}
+
+fn push_implementation_entry(item: &Value, rendered: &mut String) -> Option<()> {
+    let mut symbol = String::new();
+    push_symbol_entry(item, &mut symbol)?;
+    let mut markdown = Md::new();
+    markdown.code("text", symbol.trim_end()).blank();
+    if let Some(body) = item.get("body").and_then(Value::as_str) {
+        markdown.code("text", body).blank();
     }
+    rendered.push_str(&markdown.render());
     Some(())
 }
 
@@ -555,13 +582,18 @@ fn symbol_line(symbol: &Value) -> Option<String> {
     ))
 }
 
-fn bounded_payload(rendered: String) -> String {
+fn bounded_payload(rendered: String, markdown: bool) -> String {
     let Some((end, _)) = rendered.char_indices().nth(MAX_HUMAN_PAYLOAD_CHARS) else {
         return rendered;
     };
-    format!(
-        "{}\n… payload truncated after {MAX_HUMAN_PAYLOAD_CHARS} characters; use --json for the complete typed result",
+    let preview = if markdown {
+        whole_markdown_prefix(&rendered, end)
+    } else {
         &rendered[..end]
+    };
+    format!(
+        "{preview}\n… payload truncated after {} characters; use --json for the complete typed result",
+        preview.chars().count()
     )
 }
 
@@ -573,12 +605,23 @@ mod tests {
         Deadline, EvidenceCoverage, EvidenceDomain, OperationBudgetUsage, OperationReceipt,
         OperationTermination,
     };
+    use tracedecay_daemon_protocol::RequestedOutputFormat;
     use tracedecay_domain::UtcMicros;
 
     use super::{
         BindingId, CanonicalHumanView, HumanField, HumanFieldValue, evidence_status,
-        payload_preview,
+        payload_preview as payload_field,
     };
+
+    fn payload_preview(
+        operation: &str,
+        payload: Option<&serde_json::Value>,
+    ) -> serde_json::Result<String> {
+        match payload_field(operation, payload)? {
+            HumanFieldValue::Block(value) | HumanFieldValue::Markdown(value) => Ok(value),
+            field => panic!("unexpected payload field: {field:?}"),
+        }
+    }
 
     fn code(label: &'static str, value: &str) -> HumanField {
         HumanField {
@@ -640,10 +683,8 @@ mod tests {
             termination: OperationTermination::Partial,
         })
         .unwrap();
-        view.block(
-            "Payload",
-            payload_preview("feedback_list", Some(&json!({"items": [1, 2]}))).unwrap(),
-        );
+        view.payload("feedback_list", Some(&json!({"items": [1, 2]})))
+            .unwrap();
 
         assert_eq!(view.heading, "feedback_list");
         assert_eq!(
@@ -692,7 +733,164 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(preview, "src/lib.rs:7-9\npub fn answer() {\n    42\n}");
+        assert_eq!(
+            preview,
+            "```text\nsrc/lib.rs:7-9\n```\n\n```text\npub fn answer() {\n    42\n}\n```\n"
+        );
+    }
+
+    #[test]
+    fn source_body_preview_omits_an_oversized_body_whole() {
+        let body = format!("fn oversized() {{\n{}\n}}", "    do_work();\n".repeat(600));
+        let preview = payload_preview(
+            "source_body",
+            Some(&json!({
+                "node_id": "symbol.oversized",
+                "file": "src/lib.rs",
+                "start_line": 7,
+                "end_line": 608,
+                "body": body,
+            })),
+        )
+        .unwrap();
+
+        assert!(preview.contains("src/lib.rs:7-608"), "{preview}");
+        assert!(
+            !preview.contains("fn oversized()"),
+            "a partial symbol body was shown"
+        );
+        assert!(preview.contains("complete typed result"), "{preview}");
+    }
+
+    #[test]
+    fn source_body_preview_keeps_embedded_fences_inside_the_whole_body() {
+        let body = "fn markdown() {\n    let text = r#\"\n```rust\nfn example() {}\n```\n\"#;\n}";
+        let field = payload_field(
+            "source_body",
+            Some(&json!({
+                "file": "src/lib.rs",
+                "start_line": 1,
+                "end_line": 8,
+                "body": body,
+            })),
+        )
+        .unwrap();
+
+        let HumanFieldValue::Markdown(preview) = field else {
+            panic!("source body must retain its generated Markdown fences");
+        };
+        let rendered = super::super::markdown::render(CanonicalHumanView {
+            heading: "source_body".to_owned(),
+            fields: vec![HumanField {
+                label: "Payload",
+                value: HumanFieldValue::Markdown(preview),
+            }],
+        });
+        assert!(
+            rendered
+                .as_str()
+                .contains(&format!("````text\n{body}\n````"))
+        );
+        assert!(!rendered.as_str().contains("    ````text"));
+    }
+
+    #[test]
+    fn final_response_omits_a_large_unicode_body_and_preserves_the_typed_result() {
+        let body = format!("fn unicode() {{\n    \"{}\";\n}}", "💻".repeat(4_000));
+        let payload = json!({
+            "node_id": "symbol.unicode",
+            "file": "src/lib.rs",
+            "start_line": 1,
+            "end_line": 3,
+            "body": body,
+        });
+        let envelope = serde_json::from_value(json!({
+            "contract": {
+                "schema_id": "schema.application.primitive.source-body.result",
+                "schema_revision": 1,
+            },
+            "request_id": "request.cli.source_body.0",
+            "scope": {
+                "project_id": "proj_a5b3d7e3ebe14ca7",
+                "reference": "refs/heads/master",
+                "repository_id": "repository.daemon.source",
+                "scope_digest": format!("sha256:{}", "8".repeat(64)),
+                "worktree_id": "worktree.daemon.source",
+            },
+            "outcome": {"outcome": "result", "value": payload},
+        }))
+        .unwrap();
+        let result = super::super::tool_result::render_application_result(
+            None,
+            "source_body",
+            &BindingId::new("binding.cli.source_body.v1").unwrap(),
+            &Ok(envelope),
+            RequestedOutputFormat::Markdown,
+        )
+        .unwrap();
+        let text = result.value["content"][0]["text"].as_str().unwrap();
+
+        assert!(text.len() <= tracedecay_mcp_catalog::MAX_RESPONSE_CHARS);
+        assert!(text.contains("src/lib.rs:1-3"), "{text}");
+        assert!(
+            !text.contains("fn unicode()"),
+            "a partial Unicode body was shown"
+        );
+        assert_eq!(
+            result.structured_result().unwrap()["outcome"]["value"],
+            payload
+        );
+    }
+
+    #[test]
+    fn implementation_preview_omits_an_oversized_body_whole() {
+        let body = format!("fn oversized() {{\n{}\n}}", "    do_work();\n".repeat(600));
+        let preview = payload_preview(
+            "code_implementations",
+            Some(&json!({
+                "items": [{
+                    "symbol": symbol("m", "oversized", "method", 3),
+                    "body": body,
+                }],
+                "support_gaps": [],
+            })),
+        )
+        .unwrap();
+
+        assert!(preview.contains("node_id=m"), "{preview}");
+        assert!(
+            !preview.contains("fn oversized()"),
+            "a partial implementation body was shown"
+        );
+    }
+
+    #[test]
+    fn implementation_preview_keeps_complete_bodies_before_an_oversized_one() {
+        let first = "fn small() {\n    1\n}";
+        let oversized = format!("fn oversized() {{\n{}\n}}", "    do_work();\n".repeat(600));
+        let preview = payload_preview(
+            "code_implementations",
+            Some(&json!({
+                "items": [
+                    {"symbol": symbol("small", "small", "method", 3), "body": first},
+                    {"symbol": symbol("large", "oversized", "method", 7), "body": oversized},
+                ],
+                "support_gaps": [],
+            })),
+        )
+        .unwrap();
+
+        assert!(
+            preview.contains(&format!("```text\n{first}\n```")),
+            "{preview}"
+        );
+        assert!(preview.contains("node_id=large"), "{preview}");
+        assert!(!preview.contains("fn oversized()"), "{preview}");
+        let shown = preview
+            .split_once("\n… payload truncated after ")
+            .unwrap()
+            .0;
+        assert!(preview.contains(&format!("after {} characters", shown.chars().count())));
     }
 
     fn symbol(node_id: &str, name: &str, kind: &str, line: u32) -> serde_json::Value {
@@ -753,8 +951,9 @@ mod tests {
 
         assert_eq!(
             preview,
-            "src/lib.rs::area (method) src/lib.rs:3 node_id=m\n  | fn area() {\n  |     1\n  | }\n\
-             support gap: partial"
+            "```text\nsrc/lib.rs::area (method) src/lib.rs:3 node_id=m\n```\n\n\
+             ```text\nfn area() {\n    1\n}\n```\n\n\
+             ```text\nsupport gap: partial\n```"
         );
     }
 
@@ -858,6 +1057,7 @@ mod tests {
             .iter()
             .map(|field| match &field.value {
                 HumanFieldValue::Block(text)
+                | HumanFieldValue::Markdown(text)
                 | HumanFieldValue::Code(text)
                 | HumanFieldValue::Text(text) => text.matches(cursor).count(),
             })
