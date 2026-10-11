@@ -8,9 +8,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::{
-    ToolDefinition, ToolRegistryMode, ast_grep_available, context_description,
-    context_warming_description, get_maximal_tool_definitions,
-    retain_host_available_tool_definitions,
+    ToolDefinition, context_description, context_warming_description, get_tool_definitions,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -20,8 +18,8 @@ use super::dispatch::McpDispatchMetadataError;
 
 /// Documented ceiling for the process-wide discovery cache.
 ///
-/// The live key space is profile × capability-set digest × scope digest ×
-/// registry mode × host ast-grep gate. Production callers share one default
+/// The live key space is profile × capability-set digest × scope digest.
+/// Production callers share one default
 /// profile and one project scope; tests add a handful of capability-set
 /// variants. Budget and node count are patched onto a hit and are not keys.
 const DISCOVERY_CACHE_MAX_ENTRIES: usize = 32;
@@ -31,8 +29,6 @@ struct DiscoveryCacheKey {
     profile_digest: [u8; 32],
     capabilities_digest: [u8; 32],
     scopes_digest: [u8; 32],
-    registry_mode: u8,
-    host_ast_grep: bool,
 }
 
 /// Only the serialized `{"tools": [...]}` payload is cached: every
@@ -85,12 +81,7 @@ fn discovery_cache_key(
     profile_id: &ProfileId,
     authorized_capabilities: &BTreeSet<CapabilityId>,
     available_scope: &BTreeSet<ScopeDimension>,
-    registry_mode: ToolRegistryMode,
 ) -> DiscoveryCacheKey {
-    let registry_mode = match registry_mode {
-        ToolRegistryMode::HostAvailable => 1,
-        ToolRegistryMode::DeterministicMaximal => 2,
-    };
     DiscoveryCacheKey {
         profile_digest: digest_strings([profile_id.as_str()]),
         capabilities_digest: digest_strings(
@@ -110,18 +101,15 @@ fn discovery_cache_key(
                 ScopeDimension::Resource => "resource",
             }
         })),
-        registry_mode,
-        host_ast_grep: ast_grep_available(),
     }
 }
 
-/// Node-independent compose: maximal definitions, host gate, catalog filter,
-/// and dispatch-contract metadata. Context descriptions are patched on serve.
+/// Node-independent compose: tool definitions, catalog filter, and
+/// dispatch-contract metadata. Context descriptions are patched on serve.
 fn compose_node_independent_definitions(
     profile_id: &ProfileId,
     authorized_capabilities: &BTreeSet<CapabilityId>,
     available_scope: &BTreeSet<ScopeDimension>,
-    registry_mode: ToolRegistryMode,
 ) -> Result<Vec<ToolDefinition>, McpDispatchMetadataError> {
     let catalog =
         tracedecay_daemon_service::application_surface::application_surface_catalog_ref()?;
@@ -144,11 +132,7 @@ fn compose_node_independent_definitions(
         .filter(|binding| binding.surface() == tracedecay_tool_catalog::BindingSurface::Mcp)
         .map(|binding| format!("tracedecay_{}", binding.operation().as_str()))
         .collect::<BTreeSet<_>>();
-    let mut definitions = get_maximal_tool_definitions()?;
-    if registry_mode == ToolRegistryMode::HostAvailable {
-        retain_host_available_tool_definitions(&mut definitions);
-    }
-    let mut definitions = definitions
+    let mut definitions = get_tool_definitions()?
         .into_iter()
         .filter(|definition| {
             !catalog_operations.contains(&definition.name)
@@ -170,26 +154,16 @@ fn discovery_cache_get_or_insert(
     profile_id: &ProfileId,
     authorized_capabilities: &BTreeSet<CapabilityId>,
     available_scope: &BTreeSet<ScopeDimension>,
-    registry_mode: ToolRegistryMode,
 ) -> Result<Arc<Value>, McpDispatchMetadataError> {
-    let key = discovery_cache_key(
-        profile_id,
-        authorized_capabilities,
-        available_scope,
-        registry_mode,
-    );
+    let key = discovery_cache_key(profile_id, authorized_capabilities, available_scope);
     if let Ok(cache) = DISCOVERY_CACHE.read()
         && let Some(entry) = cache.get(&key)
     {
         record_discovery_cache_hit();
         return Ok(Arc::clone(entry));
     }
-    let tools = compose_node_independent_definitions(
-        profile_id,
-        authorized_capabilities,
-        available_scope,
-        registry_mode,
-    )?;
+    let tools =
+        compose_node_independent_definitions(profile_id, authorized_capabilities, available_scope)?;
     let entry = Arc::new(serde_json::json!({ "tools": tools }));
     match DISCOVERY_CACHE.write() {
         Ok(mut cache) => {
@@ -251,7 +225,6 @@ pub fn get_catalog_filtered_tool_definitions_with_budget(
     profile_id: &ProfileId,
     authorized_capabilities: &BTreeSet<CapabilityId>,
     available_scope: &BTreeSet<ScopeDimension>,
-    registry_mode: ToolRegistryMode,
 ) -> Result<Vec<ToolDefinition>, McpDispatchMetadataError> {
     let mut payload = catalog_discovery_tools_list_payload(
         Some(node_count),
@@ -259,7 +232,6 @@ pub fn get_catalog_filtered_tool_definitions_with_budget(
         profile_id,
         authorized_capabilities,
         available_scope,
-        registry_mode,
     )?;
     let tools = payload.get_mut("tools").map(Value::take).ok_or_else(|| {
         McpDispatchMetadataError::Initialization(
@@ -284,14 +256,9 @@ pub fn catalog_discovery_tools_list_payload(
     profile_id: &ProfileId,
     authorized_capabilities: &BTreeSet<CapabilityId>,
     available_scope: &BTreeSet<ScopeDimension>,
-    registry_mode: ToolRegistryMode,
 ) -> Result<Value, McpDispatchMetadataError> {
-    let entry = discovery_cache_get_or_insert(
-        profile_id,
-        authorized_capabilities,
-        available_scope,
-        registry_mode,
-    )?;
+    let entry =
+        discovery_cache_get_or_insert(profile_id, authorized_capabilities, available_scope)?;
     let mut payload = (*entry).clone();
     patch_context_description_in_payload(
         &mut payload,
@@ -316,7 +283,7 @@ mod tests {
     use crate::{explore_call_budget, project_catalog_discovery_scope};
 
     #[test]
-    fn catalog_filtered_discovery_uses_the_deterministic_maximal_registry() {
+    fn catalog_filtered_discovery_advertises_dispatch_contracts() {
         let profile_id = ProfileId::new(tracedecay_contracts::APPLICATION_DEFAULT_PROFILE_ID)
             .expect("default profile");
         let definitions = get_catalog_filtered_tool_definitions_with_budget(
@@ -325,7 +292,6 @@ mod tests {
             &profile_id,
             &default_catalog_discovery_authority().expect("default discovery authority"),
             &project_catalog_discovery_scope(),
-            ToolRegistryMode::DeterministicMaximal,
         )
         .expect("catalog-filtered definitions");
 
@@ -454,7 +420,6 @@ mod tests {
             &profile,
             &BTreeSet::new(),
             &project_catalog_discovery_scope(),
-            ToolRegistryMode::HostAvailable,
         )
         .unwrap();
 
@@ -498,13 +463,11 @@ mod tests {
         profile_id: &ProfileId,
         authorized_capabilities: &BTreeSet<CapabilityId>,
         available_scope: &BTreeSet<ScopeDimension>,
-        registry_mode: ToolRegistryMode,
     ) -> Result<Value, McpDispatchMetadataError> {
         let mut tools = compose_node_independent_definitions(
             profile_id,
             authorized_capabilities,
             available_scope,
-            registry_mode,
         )?;
         let description = context_description_for(node_count, budget);
         for tool in &mut tools {
@@ -536,7 +499,6 @@ mod tests {
                 &profile,
                 &authority,
                 &scope,
-                ToolRegistryMode::HostAvailable,
             )
             .expect("first discovery compose");
             let attaches_after_first =
@@ -549,7 +511,6 @@ mod tests {
                 &profile,
                 &authority,
                 &scope,
-                ToolRegistryMode::HostAvailable,
             )
             .expect("second discovery compose");
             assert_eq!(
@@ -570,28 +531,23 @@ mod tests {
     }
 
     #[test]
-    fn cached_payload_matches_fresh_compose_for_every_mode_and_budget() {
+    fn cached_payload_matches_fresh_compose_for_every_budget() {
         let (profile, authority, scope) = default_discovery_inputs();
-        for mode in [
-            ToolRegistryMode::DeterministicMaximal,
-            ToolRegistryMode::HostAvailable,
-        ] {
-            for budget in [3_u8, 4, 5, 7, 10] {
-                for node_count in [None, Some(0_u64), Some(6_000), Some(100_000)] {
-                    let cached = catalog_discovery_tools_list_payload(
-                        node_count, budget, &profile, &authority, &scope, mode,
-                    )
-                    .expect("cached discovery payload");
-                    let fresh = freshly_composed_tools_list_payload(
-                        node_count, budget, &profile, &authority, &scope, mode,
-                    )
-                    .expect("fresh discovery compose");
-                    assert_eq!(
-                        serialize_tools_payload(&cached),
-                        serialize_tools_payload(&fresh),
-                        "cached payload must match a fresh compose for mode={mode:?} budget={budget} node_count={node_count:?}"
-                    );
-                }
+        for budget in [3_u8, 4, 5, 7, 10] {
+            for node_count in [None, Some(0_u64), Some(6_000), Some(100_000)] {
+                let cached = catalog_discovery_tools_list_payload(
+                    node_count, budget, &profile, &authority, &scope,
+                )
+                .expect("cached discovery payload");
+                let fresh = freshly_composed_tools_list_payload(
+                    node_count, budget, &profile, &authority, &scope,
+                )
+                .expect("fresh discovery compose");
+                assert_eq!(
+                    serialize_tools_payload(&cached),
+                    serialize_tools_payload(&fresh),
+                    "cached payload must match a fresh compose for budget={budget} node_count={node_count:?}"
+                );
             }
         }
     }
@@ -601,22 +557,15 @@ mod tests {
         with_discovery_counter_lock(|| {
             let (profile, full_authority, scope) = default_discovery_inputs();
             let empty_authority = BTreeSet::new();
-            let full = catalog_discovery_tools_list_payload(
-                Some(0),
-                3,
-                &profile,
-                &full_authority,
-                &scope,
-                ToolRegistryMode::DeterministicMaximal,
-            )
-            .expect("full-authority payload");
+            let full =
+                catalog_discovery_tools_list_payload(Some(0), 3, &profile, &full_authority, &scope)
+                    .expect("full-authority payload");
             let empty = catalog_discovery_tools_list_payload(
                 Some(0),
                 3,
                 &profile,
                 &empty_authority,
                 &scope,
-                ToolRegistryMode::DeterministicMaximal,
             )
             .expect("empty-authority payload");
             assert_ne!(
@@ -625,22 +574,15 @@ mod tests {
                 "different authorized-capability sets must produce distinct payloads"
             );
 
-            let full_again = catalog_discovery_tools_list_payload(
-                Some(0),
-                3,
-                &profile,
-                &full_authority,
-                &scope,
-                ToolRegistryMode::DeterministicMaximal,
-            )
-            .expect("full-authority cache hit");
+            let full_again =
+                catalog_discovery_tools_list_payload(Some(0), 3, &profile, &full_authority, &scope)
+                    .expect("full-authority cache hit");
             let empty_again = catalog_discovery_tools_list_payload(
                 Some(0),
                 3,
                 &profile,
                 &empty_authority,
                 &scope,
-                ToolRegistryMode::DeterministicMaximal,
             )
             .expect("empty-authority cache hit");
             assert_eq!(
@@ -676,7 +618,6 @@ mod tests {
                 &profile,
                 &full_authority,
                 &without_configuration,
-                ToolRegistryMode::DeterministicMaximal,
             )
             .expect("scope-restricted payload");
             assert_ne!(
@@ -690,7 +631,6 @@ mod tests {
                 &profile,
                 &full_authority,
                 &without_configuration,
-                ToolRegistryMode::DeterministicMaximal,
             )
             .expect("scope-restricted cache hit");
             assert_eq!(

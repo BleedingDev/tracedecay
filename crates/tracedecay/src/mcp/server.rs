@@ -51,7 +51,7 @@ use tracedecay_domain::HostIntegrationIdV1;
 use tracedecay_mcp::hook_events::{self, HookEventPlan};
 use tracedecay_mcp::tools::catalog_discovery::default_catalog_discovery_authority;
 use tracedecay_mcp::{
-    ErrorCode, JsonRpcRequest, JsonRpcResponse, ToolRegistryMode, explore_call_budget,
+    ErrorCode, JsonRpcRequest, JsonRpcResponse, explore_call_budget,
     project_catalog_discovery_scope,
 };
 use tracedecay_session_memory::session::SessionRefreshServicePort;

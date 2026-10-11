@@ -419,6 +419,53 @@ where
     Ok(result)
 }
 
+/// Rewrites every structural match of `pattern` in one file's `source` with
+/// the `rewrite` template, the language inferred from `path`'s extension.
+///
+/// `Ok(None)` means the pattern matched nothing. `Err` is the caller-facing
+/// reason no rewrite could run.
+#[tracing::instrument(name = "code_index.rewrite.ast_grep", level = "trace", skip_all)]
+pub fn rewrite_source(
+    path: &Path,
+    source: &str,
+    pattern: &str,
+    rewrite: &str,
+) -> Result<Option<String>, String> {
+    if pattern.trim().is_empty() {
+        return Err(AstGrepSearchError::EmptyPattern.to_string());
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    let Some((lang, compiled)) = lang_key_for_ext(extension)
+        .and_then(|key| build_lang_pattern(key, pattern))
+        .transpose()?
+    else {
+        return Err(format!(
+            "no structural grammar for '{}' in this build; use tracedecay_str_replace for text edits",
+            path.display()
+        ));
+    };
+    let doc = StrDoc::try_new(source, lang)
+        .map_err(|error| format!("failed to parse '{}': {error}", path.display()))?;
+    let edits = AstGrep::doc(doc).root().replace_all(&compiled, rewrite);
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let mut rewritten = Vec::with_capacity(source.len());
+    let mut cursor = 0;
+    for edit in edits {
+        rewritten.extend_from_slice(&source.as_bytes()[cursor..edit.position]);
+        rewritten.extend_from_slice(&edit.inserted_text);
+        cursor = edit.position + edit.deleted_length;
+    }
+    rewritten.extend_from_slice(&source.as_bytes()[cursor..]);
+    String::from_utf8(rewritten)
+        .map(Some)
+        .map_err(|error| format!("structural rewrite produced invalid UTF-8: {error}"))
+}
+
 /// Which file a match is attributed to: its project-relative path and the
 /// language key. Both are only ever copied into the emitted match, and they
 /// always describe the same file, so they travel as one value.
@@ -558,6 +605,36 @@ mod tests {
         assert_eq!(pre_process_pattern('µ', "f($$$)"), "f(µµµ)");
         assert_eq!(pre_process_pattern('µ', "f($1)"), "f($1)");
         assert_eq!(pre_process_pattern('µ', "f($_)"), "f(µ_)");
+    }
+
+    #[test]
+    fn rewrite_swaps_metavariables_in_code_and_leaves_comments_and_strings() {
+        let source = "fn f() {\n    take(a, 1);\n    take(\n        b,\n        2,\n    );\n}\n\
+                      // take(a, 1)\nconst S: &str = \"take(a, 1)\";\n";
+        let rewritten = rewrite_source(
+            Path::new("src/lib.rs"),
+            source,
+            "take($A, $B)",
+            "take($B, $A)",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            rewritten,
+            "fn f() {\n    take(1, a);\n    take(2, b);\n}\n\
+             // take(a, 1)\nconst S: &str = \"take(a, 1)\";\n"
+        );
+    }
+
+    #[test]
+    fn rewrite_without_a_match_or_grammar_does_not_rewrite() {
+        assert_eq!(
+            rewrite_source(Path::new("a.rs"), "fn f() {}\n", "missing($A)", "x"),
+            Ok(None)
+        );
+        let refused =
+            rewrite_source(Path::new("notes.txt"), "take(a)\n", "take($A)", "x").unwrap_err();
+        assert!(refused.contains("no structural grammar"), "{refused}");
     }
 
     #[test]

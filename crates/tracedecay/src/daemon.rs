@@ -52,7 +52,7 @@ use tracedecay_mcp::transport::ReplayTransport;
 use tracedecay_mcp::{
     BrokerStreamTransport, ErrorCode, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpTransport,
 };
-use tracedecay_mcp::{ToolRegistryMode, explore_call_budget, project_catalog_discovery_scope};
+use tracedecay_mcp::{explore_call_budget, project_catalog_discovery_scope};
 use tracedecay_runtime_core::cancellation::CancellationToken;
 
 /// Human-facing detail fragment for a still-warming project/profile owner.
