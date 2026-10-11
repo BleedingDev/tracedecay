@@ -783,7 +783,10 @@ fn tracked_worktree_digest_hidden_content_with_untrusted_ctime() {
     let (directory, runner) = committed_file("source.rs", b"original\n");
     let path = directory.path().join("source.rs");
     let mtime = std::time::SystemTime::now() - Duration::from_secs(30);
-    fs::File::open(&path)
+    // Windows sets file times only through a handle with write access.
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
         .expect("source file")
         .set_modified(mtime)
         .expect("historical mtime");
@@ -807,7 +810,9 @@ fn tracked_worktree_digest_hidden_content_with_untrusted_ctime() {
             .expect("canonical raw-byte manifest")
     );
     fs::write(&path, b"modified\n").expect("same-size edit");
-    fs::File::open(&path)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
         .expect("edited file")
         .set_modified(mtime)
         .expect("restored mtime");
