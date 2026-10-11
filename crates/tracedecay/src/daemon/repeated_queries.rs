@@ -6,7 +6,9 @@
 //! to the same tool among the last [`WINDOW`] calls by more than 60% (Jaccard)
 //! gets one advisory text block appended to its result. The hint never blocks
 //! a call, never changes existing content, and is on only when the profile
-//! setting [`USER_REPEATED_QUERY_HINTS_SETTING_KEY`] is true.
+//! setting [`USER_REPEATED_QUERY_HINTS_SETTING_KEY`] is true. A call already
+//! answered with a repeat-read pointer names its identical earlier call there,
+//! so its hint considers only earlier calls with different arguments.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
@@ -109,15 +111,21 @@ impl RepeatedQueries {
     }
 
     /// While enabled, records a `tools/call` and appends a hint to its result
-    /// when it nearly repeats a recent call to the same tool.
-    pub(super) fn rewrite(&mut self, request: Option<&JsonRpcRequest>, responses: &mut [String]) {
+    /// when it nearly repeats a recent call to the same tool; `pointed` says
+    /// the result is a pointer to the identical earlier call.
+    pub(super) fn rewrite(
+        &mut self,
+        request: Option<&JsonRpcRequest>,
+        responses: &mut [String],
+        pointed: bool,
+    ) {
         if !*self.enabled.borrow() {
             return;
         }
         let Some((id, tool, arguments)) = request.and_then(tool_call) else {
             return;
         };
-        let Some(hint) = self.observe(tool, arguments) else {
+        let Some(hint) = self.observe(tool, arguments, pointed) else {
             return;
         };
         for line in responses.iter_mut() {
@@ -156,7 +164,7 @@ impl RepeatedQueries {
         }
     }
 
-    fn observe(&mut self, tool: &str, arguments: &Value) -> Option<Hint> {
+    fn observe(&mut self, tool: &str, arguments: &Value, pointed: bool) -> Option<Hint> {
         let call = RecentCall {
             tool: tool.to_owned(),
             words: query_words(arguments),
@@ -164,7 +172,7 @@ impl RepeatedQueries {
         };
         let mut best: Option<(usize, &RecentCall, Overlap)> = None;
         for (calls_back, earlier) in (1..).zip(self.recent.iter().rev()) {
-            if earlier.tool != call.tool {
+            if earlier.tool != call.tool || (pointed && earlier.arguments == call.arguments) {
                 continue;
             }
             let overlap = Overlap::between(&earlier.words, &call.words);
@@ -267,7 +275,7 @@ mod tests {
     /// Runs one call through the session and returns the response lines.
     fn served(queries: &mut RepeatedQueries, request: &JsonRpcRequest, id: i64) -> Vec<String> {
         let mut response = answer(id);
-        queries.rewrite(Some(request), &mut response);
+        queries.rewrite(Some(request), &mut response, false);
         response
     }
 
@@ -331,6 +339,33 @@ mod tests {
             hints(&immediate)[0].contains("tracedecay_search call 1 call earlier"),
             "{immediate:?}"
         );
+    }
+
+    #[test]
+    fn a_pointed_call_is_hinted_only_about_calls_with_other_arguments() {
+        let mut queries = enabled();
+        let tool = "tracedecay_source_body";
+        let identical = json!({"query": "a b c d"});
+        served(&mut queries, &call(1, tool, &identical), 1);
+        let mut pointed = answer(2);
+        queries.rewrite(Some(&call(2, tool, &identical)), &mut pointed, true);
+        assert_eq!(
+            pointed,
+            answer(2),
+            "the pointer already names the identical earlier call"
+        );
+
+        served(
+            &mut queries,
+            &call(3, tool, &json!({"query": "a b c d e"})),
+            3,
+        );
+        let mut pointed = answer(4);
+        queries.rewrite(Some(&call(4, tool, &identical)), &mut pointed, true);
+        let hint = &hints(&pointed)[0];
+        assert!(hint.contains("80%"), "{hint}");
+        assert!(hint.contains("1 call earlier"), "{hint}");
+        assert!(hint.contains(r#"{"query":"a b c d e"}"#), "{hint}");
     }
 
     #[test]
@@ -489,11 +524,19 @@ mod tests {
             )]
         };
         let mut first = failed(1);
-        queries.rewrite(Some(&call(1, "tracedecay_search", &args)), &mut first);
+        queries.rewrite(
+            Some(&call(1, "tracedecay_search", &args)),
+            &mut first,
+            false,
+        );
         assert_eq!(first, failed(1));
 
         let mut repeat = failed(2);
-        queries.rewrite(Some(&call(2, "tracedecay_search", &args)), &mut repeat);
+        queries.rewrite(
+            Some(&call(2, "tracedecay_search", &args)),
+            &mut repeat,
+            false,
+        );
         assert_eq!(repeat, failed(2), "an isError result is never rewritten");
 
         let answered = served(&mut queries, &call(3, "tracedecay_search", &args), 3);
@@ -537,7 +580,11 @@ mod tests {
             json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32603, "message": "boom"}})
         )];
         let before = rpc_error.clone();
-        queries.rewrite(Some(&call(1, "tracedecay_search", &args)), &mut rpc_error);
+        queries.rewrite(
+            Some(&call(1, "tracedecay_search", &args)),
+            &mut rpc_error,
+            false,
+        );
         assert_eq!(rpc_error, before);
 
         let mut repeated_error = vec![before[0].replace("\"id\":1", "\"id\":2")];
@@ -545,6 +592,7 @@ mod tests {
         queries.rewrite(
             Some(&call(2, "tracedecay_search", &args)),
             &mut repeated_error,
+            false,
         );
         assert_eq!(
             repeated_error, before,
@@ -554,7 +602,7 @@ mod tests {
         let list = JsonRpcRequest::decode(r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#)
             .expect("request");
         let mut listing = answer(3);
-        queries.rewrite(Some(&list), &mut listing);
+        queries.rewrite(Some(&list), &mut listing, false);
         assert_eq!(listing, answer(3));
 
         let after_errors = served(&mut queries, &call(4, "tracedecay_search", &args), 4);

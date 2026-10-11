@@ -85,10 +85,14 @@ impl RepeatReads {
     }
 
     /// Replaces the answer to a repeated identical read with a pointer, and
-    /// records what this session received.
-    pub(super) fn rewrite(&mut self, request: Option<&JsonRpcRequest>, responses: &mut [String]) {
+    /// records what this session received. Returns whether it sent a pointer.
+    pub(super) fn rewrite(
+        &mut self,
+        request: Option<&JsonRpcRequest>,
+        responses: &mut [String],
+    ) -> bool {
         let Some((id, key)) = request.and_then(call_key) else {
-            return;
+            return false;
         };
         for line in responses.iter_mut() {
             let Ok(mut message) = serde_json::from_str::<Value>(line) else {
@@ -98,10 +102,10 @@ impl RepeatReads {
                 continue;
             }
             let Some(result) = message.get_mut("result") else {
-                return;
+                return false;
             };
             let Some((digest, bytes)) = answer_digest(result) else {
-                return;
+                return false;
             };
             let next = transition(self.served.get(&key), &digest, bytes);
             let pointer = next == Some(Served::Pointer);
@@ -117,8 +121,9 @@ impl RepeatReads {
                 replace_with_pointer(result, &key.0, &digest, bytes);
                 *line = format!("{message}\n");
             }
-            return;
+            return pointer;
         }
+        false
     }
 }
 
@@ -260,8 +265,10 @@ mod tests {
 
     fn served(reads: &mut RepeatReads, request: &JsonRpcRequest, response: Vec<String>) -> Value {
         let mut response = response;
-        reads.rewrite(Some(request), &mut response);
-        serde_json::from_str(&response[0]).expect("json")
+        let pointed = reads.rewrite(Some(request), &mut response);
+        let message = serde_json::from_str(&response[0]).expect("json");
+        assert_eq!(pointed, is_pointer(&message), "{message}");
+        message
     }
 
     fn is_pointer(message: &Value) -> bool {
