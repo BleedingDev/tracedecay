@@ -113,8 +113,10 @@ runs:
         node <<'JS'
         const fs = require('node:fs');
         const runnerRc = fs.readFileSync(process.env.RUNNER_BAZELRC, 'utf8');
+        // .bazelrc's --announce_rc would print these credential-bearing
+        // options; the user rc loads after it, so this override wins.
         for (const rc of JSON.parse(process.env.BAZELRC_PATHS)) {
-          fs.appendFileSync(rc, `\n${runnerRc}\n`);
+          fs.appendFileSync(rc, `\n${runnerRc}\ncommon --noannounce_rc\n`);
         }
         fs.rmSync(process.env.RUNNER_BAZELRC);
         JS
