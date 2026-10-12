@@ -75,6 +75,13 @@ exports_files(
     visibility = ["//visibility:public"],
 )
 
+py_binary(
+    name = "ncm_worker_bundle_builder",
+    srcs = ["product/ncm/build-worker-bundle.py"],
+    main = "product/ncm/build-worker-bundle.py",
+    visibility = ["//product/ncm:__pkg__"],
+)
+
 write_file(
     name = "ncm_worker_bundle_test_runner",
     out = "ncm_worker_bundle_test.sh",

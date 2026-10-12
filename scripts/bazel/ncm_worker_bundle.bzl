@@ -10,7 +10,7 @@ def _ncm_worker_bundle_impl(ctx):
     manifest = ctx.actions.declare_file("worker-bundle/worker-manifest.json")
     model_manifest = ctx.actions.declare_file("worker-bundle/model-acquisition-manifest.json")
     ctx.actions.run(
-        executable = ctx.executable._builder,
+        executable = ctx.attr._builder[DefaultInfo].files_to_run,
         arguments = [
             "--worker",
             ctx.file.worker.path,
@@ -45,8 +45,7 @@ ncm_worker_bundle = rule(
         "reference_manifest": attr.label(allow_single_file = True, mandatory = True),
         "model_manifest": attr.label(allow_single_file = True, mandatory = True),
         "_builder": attr.label(
-            default = "//scripts:product/ncm/build-worker-bundle.py",
-            allow_single_file = True,
+            default = "//scripts:ncm_worker_bundle_builder",
             executable = True,
             cfg = "exec",
         ),
