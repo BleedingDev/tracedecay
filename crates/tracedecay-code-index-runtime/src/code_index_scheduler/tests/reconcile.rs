@@ -1939,17 +1939,54 @@ fn linked_worktrees_share_identity_for_identical_content_and_never_serve_diverge
     second_scheduler.notify_path(linked.join("src/lib.rs"));
     second_scheduler.notify_path(linked.join("src/renamed.rs"));
     let before_rename = registry.byte_pool_stats();
+    // An ordinary refresh carries unchanged sealed-parent files without a
+    // physical-pool lookup. Full capture exercises that pool for both files.
     published(
         second_scheduler
-            .reconcile_now()
+            .reconcile_now_with_capture(|scheduler, control| {
+                scheduler
+                    .capture_authoritative_snapshot_without_active_generation_reuse(Some(control))
+            })
             .expect("renamed linked-worktree publish"),
     );
-    // A rename adds and removes a path, so the successor builds whole: the
-    // untouched `src/other.rs` reuses its own artifact, the renamed file none.
     assert_eq!(
         registry.byte_pool_stats().parse_chunk_reused,
         before_rename.parse_chunk_reused + 1,
         "same content at a new logical path must not reuse path-bound parse/chunk artifacts"
+    );
+    let renamed = second_scheduler
+        .latest_complete()
+        .expect("renamed linked generation")
+        .generation;
+    assert_eq!(
+        renamed
+            .snapshot()
+            .files
+            .iter()
+            .map(|file| file.logical_path.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["src/other.rs", "src/renamed.rs"]),
+        "the renamed generation must not retain the old logical path"
+    );
+    let occurrence_at = |generation: &CodeIndexPublishedGenerationV1, path: &str| {
+        generation
+            .snapshot()
+            .files
+            .iter()
+            .find(|file| file.logical_path == path)
+            .expect("published source path")
+            .file_occurrence_id
+            .clone()
+    };
+    assert_eq!(
+        occurrence_at(&diverged, "src/other.rs"),
+        occurrence_at(&renamed, "src/other.rs"),
+        "the unchanged file keeps its occurrence identity"
+    );
+    assert_ne!(
+        occurrence_at(&diverged, "src/lib.rs"),
+        occurrence_at(&renamed, "src/renamed.rs"),
+        "the renamed file receives a path-bound occurrence identity"
     );
 }
 
