@@ -1027,9 +1027,10 @@ impl MemoryProvider for AdversarialProviderV1 {
     }
 
     fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        // Count the contact before publishing the in-flight entry to waiters.
+        let contact = self.invocations.fetch_add(1, Ordering::AcqRel);
         self.in_flight.enter();
         let _in_flight = InFlightGuard(Arc::clone(&self.in_flight));
-        let contact = self.invocations.fetch_add(1, Ordering::AcqRel);
         let misbehaviour = self
             .invoke_script
             .at(usize::try_from(contact).unwrap_or(usize::MAX));
