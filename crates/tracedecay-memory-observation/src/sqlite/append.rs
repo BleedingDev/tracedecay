@@ -21,7 +21,7 @@
 //!
 //! [`ObservationDispatchPortV1::replay_cursor`]: crate::ObservationDispatchPortV1::replay_cursor
 
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::envelope::{AdmittedObservationV1, WithheldAdmissionV1};
 use crate::error::ObservationJournalError;
@@ -592,11 +592,11 @@ fn reject_non_message(
 }
 
 fn read_pressure(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     lane: &ObservationLaneKeyV1,
     policy: &crate::retention::RetentionPolicyV1,
 ) -> Result<QueuePressureV1, ObservationJournalError> {
-    let (items, bytes, oldest): (i64, i64, Option<i64>) = transaction.query_row(
+    let (items, bytes, oldest): (i64, i64, Option<i64>) = connection.query_row(
         SELECT_PRESSURE,
         params![
             lane.provider_id.as_str(),
@@ -782,7 +782,9 @@ impl ObservationDispatchPortV1 for SqliteObservationJournal {
     ) -> Result<QueuePressureV1, ObservationJournalError> {
         lane.validate()?;
         let policy = *self.policy();
-        self.with_transaction(|transaction| read_pressure(transaction, lane, &policy))
+        // The aggregate has its own read snapshot; reserving the writer here
+        // would park foreground admission behind unrelated WAL writes.
+        self.with_connection(|connection| read_pressure(connection, lane, &policy))
     }
 }
 

@@ -9,7 +9,7 @@ mod support;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 
 use support::{
     Builder, DAY, INSTANCE, LEASE, PROVIDER, PROVIDER_RECEIPT_DIGEST, SECOND, T0, TestResult,
@@ -21,12 +21,88 @@ use tracedecay_memory_observation::{
     AppendOutcomeV1, AttemptOutcomeV1, DeliveryReceiptIdV1, DeliveryStateV1, ForgetSourceKeyV1,
     ForgetSourceRequestV1, JournalInspectionFilterV1, ObservationCommittedEffectV1,
     ObservationDispatchPortV1, ObservationJournalError, ObservationJournalReaderV1,
-    ObservationOutcomeV1, ObservationRetentionPortV1, ProviderTargetV1, ReplayDispositionV1,
-    SourceSequenceV1,
+    ObservationOutcomeV1, ObservationRetentionPortV1, ProviderTargetV1, QueuePressureV1,
+    ReplayDispositionV1, SourceSequenceV1,
 };
 use tracedecay_memory_provider_api::{OwnedProviderId, WithheldReason};
 
 const MIRROR: &str = "tracedecay.mirror";
+
+#[test]
+fn pressure_reads_committed_rows_while_another_connection_holds_the_wal_writer() -> TestResult {
+    let directory = tempfile::tempdir()?;
+    let path = directory.path().join("journal.sqlite3");
+    let store = journal(&path)?;
+    let acknowledged = Builder::at_sequence(1).build()?;
+    let leased = Builder {
+        admitted_at: T0 + SECOND,
+        ..Builder::at_sequence(2)
+    }
+    .build()?;
+    let pending = Builder {
+        admitted_at: T0 + 2 * SECOND,
+        ..Builder::at_sequence(3)
+    }
+    .build()?;
+    let other_registration = Builder {
+        registration_revision: 5,
+        ..Builder::at_sequence(1)
+    }
+    .build()?;
+    for admitted in [&acknowledged, &leased, &pending, &other_registration] {
+        assert!(matches!(
+            store.append_admitted(admitted)?,
+            AppendOutcomeV1::Appended { .. }
+        ));
+    }
+    let deliveries = store.lease_pending(&lease_request(T0 + 2 * SECOND, 2))?;
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0].observation_id, acknowledged.observation_id);
+    assert_eq!(deliveries[1].observation_id, leased.observation_id);
+    assert!(matches!(
+        store.record_attempt(&applied_receipt(&deliveries[0], T0 + 2 * SECOND))?,
+        AttemptOutcomeV1::Recorded {
+            state: DeliveryStateV1::Acknowledged,
+            ..
+        }
+    ));
+
+    let expected = QueuePressureV1 {
+        queue_items: 2,
+        queue_bytes: leased.queue_bytes() + pending.queue_bytes(),
+        oldest_admitted_at_unix_micros: Some(leased.admitted_at_unix_micros),
+        max_queue_items: store.policy().max_queue_items,
+        max_queue_bytes: store.policy().max_queue_bytes,
+    };
+    let before = store.inspect(&Default::default())?;
+    let mut writer = Connection::open(&path)?;
+    let mode: String = writer.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    assert_eq!(mode, "wal");
+    let schema_before: i64 = writer.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+    let transaction = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    assert_eq!(
+        transaction.execute(
+            "UPDATE tdmem_observation_delivery_v1 SET queue_bytes = queue_bytes + 100 \
+             WHERE idempotency_key = ?1",
+            params![pending.idempotency_key.as_str()],
+        )?,
+        1
+    );
+
+    // WAL readers must see the committed queue without acquiring this
+    // connection's writer reservation or exposing its uncommitted change.
+    assert_eq!(store.lane_pressure(&support::lane()?)?, expected);
+    assert_eq!(store.queue_pressure(&support::target()?)?, expected);
+    assert!(!transaction.is_autocommit());
+    assert_eq!(store.inspect(&Default::default())?, before);
+    transaction.rollback()?;
+
+    let schema_after: i64 = writer.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+    assert_eq!(schema_after, schema_before);
+    assert_eq!(store.inspect(&Default::default())?, before);
+    assert_eq!(store.lane_pressure(&support::lane()?)?, expected);
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Finding 1 — the attempt number is consumed by the claim.

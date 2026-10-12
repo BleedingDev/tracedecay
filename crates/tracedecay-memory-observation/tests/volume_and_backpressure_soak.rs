@@ -243,6 +243,7 @@ impl VirtualClock {
 struct SoakAdmission<'a> {
     lane: ObservationLaneKeyV1,
     clock: &'a VirtualClock,
+    decision_micros: Cell<i64>,
 }
 
 impl ObservationAdmissionAdapterV1 for SoakAdmission<'_> {
@@ -263,6 +264,7 @@ impl ObservationAdmissionAdapterV1 for SoakAdmission<'_> {
         record: &SourceRecordV1<Self::Record>,
         _control: &Self::Control,
     ) -> Result<AdmissionDecisionV1, Self::Error> {
+        let started = Instant::now();
         let sequence = record.source_sequence.0;
         let admitted_at = self.clock.now();
         let admitted = Builder {
@@ -277,6 +279,8 @@ impl ObservationAdmissionAdapterV1 for SoakAdmission<'_> {
         }
         .build()
         .map_err(|error| SoakError(error.to_string()))?;
+        self.decision_micros
+            .set(i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX));
         Ok(AdmissionDecisionV1::Admit(Box::new(admitted)))
     }
 }
@@ -444,6 +448,32 @@ struct SoakMetrics {
     sheds_by_age: u64,
     max_shed_repeats: u64,
     foreground_micros: Vec<i64>,
+    foreground_peak: Option<ForegroundAdmissionMeasurement>,
+}
+
+#[derive(Debug)]
+struct ForegroundAdmissionMeasurement {
+    sequence: u64,
+    elapsed_micros: i64,
+    decision_micros: i64,
+    queue_items: u64,
+    queue_bytes: u64,
+    appended: u32,
+}
+
+impl Display for ForegroundAdmissionMeasurement {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "sequence={} elapsed={}us decision={}us queue_items={} queue_bytes={} appended={}",
+            self.sequence,
+            self.elapsed_micros,
+            self.decision_micros,
+            self.queue_items,
+            self.queue_bytes,
+            self.appended,
+        )
+    }
 }
 
 impl SoakMetrics {
@@ -646,6 +676,7 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
     let admission = SoakAdmission {
         lane: lane.clone(),
         clock: &clock,
+        decision_micros: Cell::new(0),
     };
     let provider = SlowButAliveProvider {
         clock: &clock,
@@ -703,10 +734,25 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
                 source_event_revision: 0,
                 record: (),
             };
+            admission.decision_micros.set(0);
             let started = Instant::now();
             let report = ingress.ingest(&resume, &[record])?;
             let elapsed = i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
             metrics.foreground_micros.push(elapsed);
+            if metrics
+                .foreground_peak
+                .as_ref()
+                .is_none_or(|peak| elapsed > peak.elapsed_micros)
+            {
+                metrics.foreground_peak = Some(ForegroundAdmissionMeasurement {
+                    sequence,
+                    elapsed_micros: elapsed,
+                    decision_micros: admission.decision_micros.get(),
+                    queue_items: pressure.queue_items,
+                    queue_bytes: pressure.queue_bytes,
+                    appended: report.appended,
+                });
+            }
             // Exactly what a mounted host does with the measurement: hand it
             // back to the gate, so a degrading admission path becomes a shed
             // trigger instead of an invisible cost.
@@ -922,7 +968,15 @@ fn volume_soak_keeps_the_queue_bounded_drops_nothing_and_never_starves() -> Test
     assert!(
         foreground_max <= FOREGROUND_HARD_BUDGET_MICROS,
         "one foreground admission took {foreground_max} micros, past the \
-         {FOREGROUND_HARD_BUDGET_MICROS} micros hard budget",
+         {FOREGROUND_HARD_BUDGET_MICROS} micros hard budget; \
+         records={records} measurements={} p50={}us p99={}us peak={}",
+        metrics.foreground_micros.len(),
+        metrics.foreground_percentile(500),
+        metrics.foreground_percentile(990),
+        metrics
+            .foreground_peak
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), ToString::to_string),
     );
 
     // ---- disk growth stays proportional to what was stored.
