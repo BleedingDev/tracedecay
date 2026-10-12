@@ -1,0 +1,169 @@
+name: Depot pilot
+run-name: Depot pilot for ${{ github.sha }}
+
+# Temporary: measures one Linux root-b and one native Windows journey on 8-core
+# Depot runners with Depot's remote Bazel cache. Push the PR head to
+# ci/depot-pilot for the cold run, then rerun the finished workflow once on
+# fresh runners for the warm confirmation. Remove after the CI cutover.
+on:
+  push:
+    branches: [ci/depot-pilot]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: depot-pilot
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Scoped to the 8-core pilot; .bazelrc keeps --jobs=4 until measured.
+  # Test results are never served from the cache, so every test executes.
+  PILOT_FLAGS: --config=ci --jobs=8 --nocache_test_results
+
+jobs:
+  linux-root-b:
+    name: Pilot Linux (root-b)
+    runs-on: depot-ubuntu-24.04-8
+    timeout-minutes: 240
+    env:
+      CARGO_BAZEL_TIMEOUT: "3600"
+      TARGETS: >-
+        --
+        //crates/tracedecay/...
+        -//crates/tracedecay:mcp_suite
+        -//crates/tracedecay:dashboard_api_test
+        -//crates/tracedecay:daemon_suite
+        -//crates/tracedecay:storage_suite
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Record runner resources
+        run: |
+          nproc
+          free -m
+          df -h / "$HOME"
+
+      - uses: ./.github/actions/setup-bazel
+        id: bazel
+        with:
+          cache-key: ci-linux-test-v2
+          test-tools: "true"
+
+      - name: Require the Depot remote cache
+        run: test "${{ steps.bazel.outputs.remote-cache }}" = "true"
+
+      - name: Build root suite binaries
+        run: |
+          set -o pipefail
+          read -ra flags <<<"$PILOT_FLAGS"
+          read -ra targets <<<"$TARGETS"
+          bazel build "${flags[@]}" "${targets[@]}" 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Test this shard
+        run: |
+          set -o pipefail
+          read -ra flags <<<"$PILOT_FLAGS"
+          read -ra targets <<<"$TARGETS"
+          bazel test "${flags[@]}" "${targets[@]}" 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Summarize cache and timing
+        if: always()
+        run: |
+          for phase in build test; do
+            echo "### $phase"
+            grep -hE 'processes: |Elapsed time|Executed [0-9]+ out of' "$RUNNER_TEMP/$phase.log" || true
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          free -m
+          df -h / "$HOME"
+
+      - name: Upload failed test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: depot-pilot-logs-linux-attempt-${{ github.run_attempt }}
+          path: |
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
+
+  windows:
+    name: Pilot Windows
+    runs-on: depot-windows-2025-8
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Tune Windows runner for build and test I/O
+        uses: ./.github/actions/tune-windows-runner
+        with:
+          redirect-temp: "true"
+
+      - name: Record runner resources and required tools
+        shell: bash
+        run: |
+          echo "workspace=$GITHUB_WORKSPACE cpus=$NUMBER_OF_PROCESSORS"
+          df -h "$GITHUB_WORKSPACE" || true
+          bash --version | head -1
+          python --version
+          git --version
+          git config --show-origin core.symlinks || true
+
+      - uses: ./.github/actions/setup-bazel
+        id: bazel
+        with:
+          cache-key: ci-windows-test
+          test-tools: "true"
+
+      - name: Require the Depot remote cache
+        shell: bash
+        run: test "${{ steps.bazel.outputs.remote-cache }}" = "true"
+
+      # The PR-time Windows check: MSVC compile through the Clippy aspect.
+      - name: Compile the Windows workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          read -ra flags <<<"$PILOT_FLAGS"
+          bazel build "${flags[@]}" \
+            --aspects=@rules_rust//rust:defs.bzl%rust_clippy_aspect \
+            --output_groups=clippy_checks \
+            --@rules_rust//rust/settings:clippy_flag=-Aclippy::all \
+            //... 2>&1 | tee "$RUNNER_TEMP/check.log"
+
+      - name: Build the workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          read -ra flags <<<"$PILOT_FLAGS"
+          bazel build "${flags[@]}" //... 2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Test the workspace
+        shell: bash
+        run: |
+          set -o pipefail
+          read -ra flags <<<"$PILOT_FLAGS"
+          bazel test "${flags[@]}" //... 2>&1 | tee "$RUNNER_TEMP/test.log"
+
+      - name: Summarize cache and timing
+        if: always()
+        shell: bash
+        run: |
+          for phase in check build test; do
+            echo "### $phase"
+            grep -hE 'processes: |Elapsed time|Executed [0-9]+ out of' "$RUNNER_TEMP/$phase.log" || true
+          done | tee -a "$GITHUB_STEP_SUMMARY"
+          df -h "$GITHUB_WORKSPACE" || true
+
+      - name: Upload failed test diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: depot-pilot-logs-windows-attempt-${{ github.run_attempt }}
+          path: |
+            bazel-testlogs/**/test.log
+            bazel-testlogs/**/test.xml
