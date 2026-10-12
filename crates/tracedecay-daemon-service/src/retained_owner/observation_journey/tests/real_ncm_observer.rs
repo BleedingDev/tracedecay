@@ -1138,15 +1138,16 @@ async fn unavailable_ncm_worker_refuses_admission_and_preserves_canonical_commit
     else {
         panic!("unavailable worker must fail at the typed admission boundary");
     };
-    let Some(AdmissionAdapterError::Readiness {
-        source:
-            ObservationJourneyError::SupervisedReadiness(SupervisedReadinessError::Unavailable {
-                kind,
-                terminal_code,
-                ..
-            }),
+    let Some(AdmissionAdapterError::Readiness { source, .. }) =
+        cause.cause().downcast_ref::<AdmissionAdapterError>()
+    else {
+        panic!("admission must retain the supervised readiness refusal");
+    };
+    let ObservationJourneyError::SupervisedReadiness(SupervisedReadinessError::Unavailable {
+        kind,
+        terminal_code,
         ..
-    }) = cause.cause().downcast_ref::<AdmissionAdapterError>()
+    }) = source.as_ref()
     else {
         panic!("admission must retain the supervised readiness refusal");
     };

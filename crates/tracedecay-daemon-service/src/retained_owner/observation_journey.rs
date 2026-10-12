@@ -1004,7 +1004,7 @@ enum AdmissionAdapterError {
         source_event_id: String,
         /// Underlying refusal.
         #[source]
-        source: ObservationJourneyError,
+        source: Box<ObservationJourneyError>,
     },
     #[error("canonical observation {source_event_id} has an invalid envelope: {detail}")]
     InvalidCanonicalEnvelope {
@@ -1054,7 +1054,7 @@ enum AdmissionAdapterError {
         source_event_id: String,
         /// Underlying refusal.
         #[source]
-        source: ObservationJourneyError,
+        source: Box<ObservationJourneyError>,
     },
 }
 
@@ -1115,7 +1115,7 @@ impl CanonicalObservationAdmissionAdapterV1 {
             )
             .map_err(|source| AdmissionAdapterError::ExactScope {
                 source_event_id: source_event_id.clone(),
-                source,
+                source: Box::new(source),
             })?,
         };
 
@@ -1359,7 +1359,7 @@ impl CanonicalObservationAdmissionAdapterV1 {
                 )
                 .map_err(|source| AdmissionAdapterError::Readiness {
                     source_event_id: source_event_id.clone(),
-                    source,
+                    source: Box::new(source),
                 })?;
                 let admitted_at_unix_micros = tracedecay_contracts::now_micros().0;
                 let occurred_at_unix_micros = settlement.settled_at_unix_micros;
@@ -4235,16 +4235,17 @@ impl ProjectObservationJourneyV1 {
                     let terminal = match &error {
                         ObservationRuntimeError::Admission { cause, .. } => {
                             match cause.cause().downcast_ref::<AdmissionAdapterError>() {
-                                Some(AdmissionAdapterError::Readiness {
-                                    source:
+                                Some(AdmissionAdapterError::Readiness { source, .. }) => {
+                                    match source.as_ref() {
                                         ObservationJourneyError::SupervisedReadiness(
                                             SupervisedReadinessError::RequestTerminal {
                                                 terminal_code,
                                                 ..
                                             },
-                                        ),
-                                    ..
-                                }) => Some(*terminal_code),
+                                        ) => Some(*terminal_code),
+                                        _ => None,
+                                    }
+                                }
                                 _ => None,
                             }
                         }
@@ -5613,15 +5614,15 @@ pub(crate) fn replay_recoverability(error: &ObservationJourneyError) -> ReplayRe
         ObservationJourneyError::Ingress(ObservationRuntimeError::Admission { cause, .. })
             if matches!(
                 cause.cause().downcast_ref::<AdmissionAdapterError>(),
-                Some(AdmissionAdapterError::Readiness {
-                    source: ObservationJourneyError::SupervisedReadiness(
+                Some(AdmissionAdapterError::Readiness { source, .. }) if matches!(
+                    source.as_ref(),
+                    ObservationJourneyError::SupervisedReadiness(
                         SupervisedReadinessError::Unavailable {
                             terminal_code: Some(TerminalCode::StaleIdentity),
                             ..
                         }
-                    ),
-                    ..
-                })
+                    )
+                )
             ) =>
         {
             ReplayRecoverabilityV1::Retryable
@@ -5853,6 +5854,7 @@ mod tests {
     /// build the very same mount, and kills it in a child process at every
     /// boundary between the host's canonical commit and the provider's durable
     /// acknowledgement.
+    #[cfg(unix)]
     mod crash_restart_fuzz;
     mod provider_history;
     #[cfg(unix)]
@@ -9816,7 +9818,7 @@ mod tests {
                 if let Some(source) = self.refusal.lock().unwrap().take() {
                     return Err(AdmissionAdapterError::Readiness {
                         source_event_id: record.source_event_id.clone(),
-                        source: ObservationJourneyError::SupervisedReadiness(source),
+                        source: Box::new(ObservationJourneyError::SupervisedReadiness(source)),
                     });
                 }
                 self.canonical.decide(record, control)
@@ -9899,13 +9901,14 @@ mod tests {
                             ObservationRuntimeError::Admission { ref cause, .. }
                         )) if matches!(
                             cause.cause().downcast_ref::<AdmissionAdapterError>(),
-                            Some(AdmissionAdapterError::Readiness {
-                                source: ObservationJourneyError::SupervisedReadiness(
+                            Some(AdmissionAdapterError::Readiness { source, .. }) if matches!(
+                                source.as_ref(),
+                                ObservationJourneyError::SupervisedReadiness(
                                     SupervisedReadinessError::Unavailable {
                                         terminal_code: Some(actual), ..
                                     }
-                                ), ..
-                            }) if *actual == terminal_code
+                                ) if *actual == terminal_code
+                            )
                         )
                     ));
                 }
@@ -11564,7 +11567,7 @@ mod tests {
                 source_sequence: 1,
                 cause: AdapterFailureV1::new(AdmissionAdapterError::Readiness {
                     source_event_id: "record.stale-handshake".to_owned(),
-                    source: ObservationJourneyError::SupervisedReadiness(readiness),
+                    source: Box::new(ObservationJourneyError::SupervisedReadiness(readiness)),
                 }),
             });
             let expected = if terminal_code == Some(TerminalCode::StaleIdentity) {
