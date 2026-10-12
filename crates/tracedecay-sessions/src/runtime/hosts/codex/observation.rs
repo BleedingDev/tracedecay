@@ -39,6 +39,8 @@ use tracedecay_runtime_core::resident_memory::ProcessSharedMemoryReservationV1;
 use tracedecay_runtime_core::storage::enrolled_project_roots;
 
 #[cfg(test)]
+mod forked_session_tests;
+#[cfg(test)]
 mod meta_cache_tests;
 #[cfg(test)]
 mod retired_source_tests;

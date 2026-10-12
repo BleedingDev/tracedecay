@@ -237,6 +237,15 @@ fn normalize_codex_record(
         .and_then(Value::as_str)
         .ok_or(ObservationRecordParseErrorV1::NormalizationFailed)?;
     let payload = native.get("payload").unwrap_or(native);
+    // Forked rollouts start with the child's header, then may copy ancestor
+    // headers. Those records cannot assert the child's ancestry or lifecycle.
+    let is_current_session_meta = native_kind == "session_meta"
+        && payload
+            .get("id")
+            .or_else(|| payload.get("session_id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .is_none_or(|id| id == native_thread_id.unwrap_or(session_id));
     let timestamp = timestamp_from_record(native);
     let mut relations = CanonicalObservationRelationsV1::new(
         SessionId::new(session_id)
@@ -268,7 +277,7 @@ fn normalize_codex_record(
         .unwrap_or_else(|| stable_record_id.clone());
         relations = relations.with_message_id(message_id);
     }
-    if native_kind == "session_meta" {
+    if is_current_session_meta {
         relations = append_codex_session_meta_agent_relations(relations, payload, native_thread_id);
     }
     let mut facts = Vec::new();
@@ -293,7 +302,7 @@ fn normalize_codex_record(
         });
     }
     match native_kind {
-        "session_meta" => {
+        "session_meta" if is_current_session_meta => {
             facts.push(CanonicalObservationFactV1::Boundary {
                 boundary_kind: CanonicalBoundaryKindV1::SessionStart,
             });
