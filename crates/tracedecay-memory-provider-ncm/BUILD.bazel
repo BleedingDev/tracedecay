@@ -68,7 +68,7 @@ rust_test(
     rustc_flags = perf_rustc_flags(1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
     runfiles_env = {"TRACEDECAY_NCM_WORKER": "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test"},
 )
 
@@ -84,7 +84,7 @@ rust_test(
     rustc_flags = perf_rustc_flags(1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
     runfiles_env = {"TRACEDECAY_NCM_WORKER": "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test"},
 )
 
@@ -100,7 +100,7 @@ rust_test(
     rustc_flags = perf_rustc_flags(1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
     runfiles_env = {"TRACEDECAY_NCM_WORKER": "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test"},
 )
 
@@ -116,7 +116,7 @@ rust_test(
     rustc_flags = perf_rustc_flags(1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
     runfiles_env = {"TRACEDECAY_NCM_WORKER": "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test"},
 )
 
@@ -132,7 +132,7 @@ rust_test(
     rustc_flags = perf_rustc_flags(1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
     runfiles_env = {"TRACEDECAY_NCM_WORKER": "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test"},
 )
 
@@ -148,7 +148,7 @@ rust_test(
     rustc_flags = perf_rustc_flags(1),
     crate_features = ["default", "rust-backend", "test-helpers", "test-transport"],
     compile_data = glob(["tests/**","assets/**","fixtures/**","data/**","resources/**","vendor/**"], allow_empty = True),
-    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True),
+    data = glob(["tests/**", "assets/**", "fixtures/**", "data/**", "resources/**", "vendor/**"], allow_empty = True) + ["//tests:fixtures"],
     runfiles_env = {"TRACEDECAY_NCM_WORKER": "//crates/tracedecay-memory-ncm-runtime:tracedecay-ncm-worker__test"},
 )
 
