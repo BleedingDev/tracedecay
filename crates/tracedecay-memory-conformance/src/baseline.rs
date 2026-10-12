@@ -3453,10 +3453,13 @@ fn candidate_entry(
 
 #[cfg(test)]
 mod checkout_scope_tests {
+    use std::error::Error;
+
     use super::*;
 
     #[test]
-    fn baseline_checkout_matching_requires_five_fields_and_empty_session_metadata() {
+    fn baseline_checkout_matching_requires_five_fields_and_empty_session_metadata()
+    -> Result<(), Box<dyn Error>> {
         let request = OwnedExactScope::new(
             "profile",
             "project",
@@ -3465,14 +3468,13 @@ mod checkout_scope_tests {
             "branch",
             "session-b",
             format!("sha256:{}", "b".repeat(64)),
-        )
-        .expect("scope");
+        )?;
         let identity = json!({
             "scope_binding": "checkout_observations", "profile_id": "profile", "project_id": "project",
             "repository_identity": "repository", "worktree_identity": "worktree", "branch_identity": "branch",
             "agent_session_id": "", "resolved_scope_digest": "",
         });
-        let identity = identity.as_object().expect("identity");
+        let identity = identity.as_object().ok_or("identity must be an object")?;
         assert!(candidate_scope_matches(identity, &request));
         for field in [
             "profile_id",
@@ -3497,5 +3499,6 @@ mod checkout_scope_tests {
         let mut unknown = identity.clone();
         unknown.insert("scope_binding".to_owned(), json!("unknown_checkout"));
         assert!(!candidate_scope_matches(&unknown, &request));
+        Ok(())
     }
 }

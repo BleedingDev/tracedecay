@@ -100,8 +100,6 @@ pub(crate) struct ResolvedCanonicalControlObservationV1 {
     pub(crate) source: AuthorizedRetainedControlSourceV1,
     pub(crate) admitted: Box<tracedecay_memory_observation::AdmittedObservationV1>,
     pub(crate) receipt: tracedecay_memory_observation::ObservationDeliveryReceiptV1,
-    /// Derived by the very helper the original Observe dispatcher used.
-    pub(crate) operation_id: String,
 }
 
 impl ProviderControlAuthorityV1 {
@@ -380,15 +378,11 @@ impl ProviderControlAuthorityV1 {
                 &operation.cancellation(),
                 deadline,
             )
-            .map_err(|error| {
-                operation
-                    .snapshot()
-                    .err()
-                    .map(ProviderHistoryErrorV1::Control)
-                    .unwrap_or_else(|| {
-                        let _ = error;
-                        ProviderHistoryErrorV1::Ineligible("settled canonical delivery evidence")
-                    })
+            .map_err(|_| {
+                operation.snapshot().err().map_or(
+                    ProviderHistoryErrorV1::Ineligible("settled canonical delivery evidence"),
+                    ProviderHistoryErrorV1::Control,
+                )
             })?;
             if !settled {
                 return Err(ProviderHistoryErrorV1::Ineligible(
@@ -412,15 +406,10 @@ impl ProviderControlAuthorityV1 {
                 ));
             };
             check(&operation)?;
-            let operation_id = super::super::observation_journey::delivery_operation_id(
-                &receipt.observation_id,
-                receipt.attempt_number,
-            );
             Ok(ResolvedCanonicalControlObservationV1 {
                 source,
                 admitted,
-                receipt,
-                operation_id,
+                receipt: *receipt,
             })
         });
         bounded_read(control, work, "canonical settled observation worker").await?
@@ -662,7 +651,7 @@ impl ProviderControlAuthorityV1 {
 
     /// Source-only controls cannot choose a destination from historical session
     /// rows. The canonical hook ledger has no current live-session authority.
-    pub(crate) async fn current_destination_scope(
+    pub(crate) fn current_destination_scope(
         self: &Arc<Self>,
         canonical_provider_id: &str,
         control: &OperationControl,
@@ -863,6 +852,18 @@ fn existing_regular_file(path: &Path) -> Result<bool> {
     }
 }
 
+fn control_journal_error(error: ObservationJournalError) -> ProviderHistoryErrorV1 {
+    match error {
+        ObservationJournalError::BudgetExhausted { .. } => {
+            ProviderHistoryErrorV1::Control(TerminalCode::DeadlineExceeded)
+        }
+        ObservationJournalError::OperationCancelled { .. } => {
+            ProviderHistoryErrorV1::Control(TerminalCode::Cancelled)
+        }
+        _ => ProviderHistoryErrorV1::Unavailable("canonical source journal evidence"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,17 +897,5 @@ mod tests {
         assert!(!existing_regular_file(&missing).unwrap());
         assert!(!missing.exists());
         assert!(existing_regular_file(temporary.path()).is_err());
-    }
-}
-
-fn control_journal_error(error: ObservationJournalError) -> ProviderHistoryErrorV1 {
-    match error {
-        ObservationJournalError::BudgetExhausted { .. } => {
-            ProviderHistoryErrorV1::Control(TerminalCode::DeadlineExceeded)
-        }
-        ObservationJournalError::OperationCancelled { .. } => {
-            ProviderHistoryErrorV1::Control(TerminalCode::Cancelled)
-        }
-        _ => ProviderHistoryErrorV1::Unavailable("canonical source journal evidence"),
     }
 }

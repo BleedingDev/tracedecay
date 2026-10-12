@@ -6,9 +6,8 @@
 //!
 //! The always-on cases cover confirmation, exact project targeting, pending
 //! journal refusal, digest-guarded recovery, and configuration revision drift.
-//! The worker artifact journey is arm64 macOS-only because the product's
-//! verifier intentionally admits only the pinned production target and is
-//! ignored unless the real release worker is supplied through
+//! The worker artifact journey exercises the arm64 macOS release and is
+//! ignored unless that real release worker is supplied through
 //! `TRACEDECAY_NCM_WORKER`.
 
 use std::fs;
@@ -20,6 +19,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+use tracedecay_contracts::{ApplicationEnvelope, ApplicationOutcome, ResolvedSetting};
 use tracedecay_daemon_identity::authority::current_record;
 use tracedecay_daemon_protocol::BrokerStream;
 use tracedecay_runtime_core::config::ProfileRoot;
@@ -225,17 +225,21 @@ impl NcmJourney {
     }
 
     fn configuration_revision(&self) -> String {
-        let observed = self.tool_value("tracedecay_configuration_observed_state", &json!({}));
-        let mut revisions = Vec::new();
-        collect_string_field(&observed, "desired_revision_id", &mut revisions);
-        revisions.sort();
-        revisions.dedup();
-        assert_eq!(
-            revisions.len(),
-            1,
-            "configuration components must agree on one revision: {observed}"
-        );
-        revisions.remove(0)
+        let envelope: ApplicationEnvelope<ResolvedSetting> =
+            serde_json::from_value(self.tool_value(
+                "tracedecay_configuration_get",
+                &json!({ "key": NCM_SETTING }),
+            ))
+            .expect("typed canonical NCM configuration setting");
+        let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
+            panic!("configuration read must return evidence");
+        };
+        evidence
+            .payload
+            .expect("configuration setting payload")
+            .revision_id
+            .as_str()
+            .to_owned()
     }
 
     fn set_observer(&self, project_id: &str, document: String) {
@@ -542,14 +546,17 @@ fn ncm_lifecycle_is_opt_in_and_scope_is_exact() {
     let update = journey.ncm_output(true, "update", &scoped_options(&journey.project, true));
     assert!(!update.status.success());
     let update_stderr = String::from_utf8_lossy(&update.stderr);
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    if initial["platform_supported"]
+        .as_bool()
+        .expect("worker platform capability")
+    {
         assert!(
             update_stderr.contains("NCM is disabled; use `ncm install`"),
             "update cannot implicitly opt in\nstderr:\n{update_stderr}"
         );
     } else {
         assert!(
-            update_stderr.contains("supported only on arm64 macOS"),
+            update_stderr.contains("NCM worker unsupported on"),
             "unsupported targets must fail closed before NCM mutation\nstderr:\n{update_stderr}"
         );
     }
@@ -1093,6 +1100,7 @@ fn scoped_options(project: &Path, json: bool) -> Vec<String> {
     options
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn install_options(project: &Path, worker: &Path, state_root: &Path) -> Vec<String> {
     let mut options = scoped_options(project, true);
     options.extend(strings(&[
@@ -1230,26 +1238,4 @@ fn join_content_text(result: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n\n");
     (!text.is_empty()).then_some(text)
-}
-
-fn collect_string_field(value: &Value, field: &str, out: &mut Vec<String>) {
-    match value {
-        Value::Object(members) => {
-            for (key, member) in members {
-                if key == field
-                    && let Some(text) = member.as_str()
-                {
-                    out.push(text.to_owned());
-                } else {
-                    collect_string_field(member, field, out);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_string_field(item, field, out);
-            }
-        }
-        _ => {}
-    }
 }

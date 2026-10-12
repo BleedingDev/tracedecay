@@ -44,9 +44,11 @@ const CHECKPOINT_BUSY_TIMEOUT_MILLIS: u64 = 250;
 const LOCK_POLL_MICROS: u64 = 200;
 
 #[cfg(debug_assertions)]
-struct ReceiptPersistHookV1(
-    Arc<dyn Fn(&crate::receipt::ObservationDeliveryReceiptV1, bool) + Send + Sync>,
-);
+type ReceiptPersistCallbackV1 =
+    dyn Fn(&crate::receipt::ObservationDeliveryReceiptV1, bool) + Send + Sync;
+
+#[cfg(debug_assertions)]
+struct ReceiptPersistHookV1(Arc<ReceiptPersistCallbackV1>);
 
 #[cfg(debug_assertions)]
 impl std::fmt::Debug for ReceiptPersistHookV1 {

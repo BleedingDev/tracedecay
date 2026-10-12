@@ -2669,11 +2669,10 @@ fn padded_object(padding: usize) -> Vec<u8> {
 
 #[test]
 fn snapshot_restore_request_is_measured_against_snapshot_bytes() {
-    // A restored snapshot travels inside the SnapshotRestore request, so that
-    // one operation is admitted against `snapshot_bytes`, mirroring how a
-    // SnapshotExport reply is admitted. Every other request keeps
-    // `request_bytes`, and a snapshot above `snapshot_bytes` still fails
-    // closed before dispatch.
+    // SnapshotRestore uses `snapshot_bytes` before checking restore authority.
+    // This empty object must reach the authority refusal without dispatching.
+    // Every other request keeps `request_bytes`, and a snapshot above
+    // `snapshot_bytes` still fails at the byte gate.
     let surface = Arc::new(MockSurface::new(
         NCM_PROVIDER_ID,
         &["snapshot.restore.v1"],
@@ -2690,11 +2689,14 @@ fn snapshot_restore_request_is_measured_against_snapshot_bytes() {
     let reply = provider.invoke(&restore);
     assert_eq!(
         reply.terminal.terminal_code(),
-        TerminalCode::Success,
-        "restore within snapshot_bytes refused: {:?}",
-        reply.terminal.diagnostic_id()
+        TerminalCode::ProviderUnavailable,
+        "restore within snapshot_bytes must pass byte validation: {reply:?}"
     );
-    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        reply.terminal.diagnostic_id(),
+        Some("ncm.current_advisory_admission_refused")
+    );
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
 
     let mut observe = ready_call(&provider, ProviderOperation::Observe);
     observe.payload = canonical_payload(ProviderOperation::Observe, &between);
@@ -2705,7 +2707,7 @@ fn snapshot_restore_request_is_measured_against_snapshot_bytes() {
         reply.terminal.diagnostic_id(),
         Some("ncm.request_payload_or_extension_invalid")
     );
-    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
 
     let above = padded_object(70_000);
     assert!(u64::try_from(above.len()).expect("len") > negotiated.snapshot_bytes);
@@ -2717,7 +2719,7 @@ fn snapshot_restore_request_is_measured_against_snapshot_bytes() {
         reply.terminal.diagnostic_id(),
         Some("ncm.request_payload_or_extension_invalid")
     );
-    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 1);
+    assert_eq!(surface.invoke_calls.load(Ordering::Relaxed), 0);
 }
 
 fn canonical_message_payload(content: serde_json::Value) -> serde_json::Value {

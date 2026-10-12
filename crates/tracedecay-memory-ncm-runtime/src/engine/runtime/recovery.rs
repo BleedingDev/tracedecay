@@ -1271,7 +1271,7 @@ pub(crate) fn validate_pending_deletion_fence(
             }
             | DurableOperation::DeleteBySource {
                 deleted_record_ids, ..
-            } => deleted_record_ids.iter().copied().collect::<Vec<_>>(),
+            } => deleted_record_ids.to_vec(),
             _ => Vec::new(),
         })
         .collect::<BTreeSet<_>>();

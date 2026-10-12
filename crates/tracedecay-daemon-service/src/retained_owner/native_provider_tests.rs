@@ -1,6 +1,6 @@
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
-//! Native is upstream TraceDecay memory inside the provider host. These tests
+//! Native is upstream `TraceDecay` memory inside the provider host. These tests
 //! prove it is observationally identical to the upstream tools it wraps:
 //! fact recall equals `tracedecay_fact_store_{search,probe,related,reason}`
 //! (same ids, order, and `score_millionths`), and session recall issues the
@@ -467,7 +467,7 @@ async fn native_declares_only_health_and_recall() {
     let capabilities = descriptor
         .capabilities
         .iter()
-        .map(|capability| capability.as_str())
+        .map(OwnedVersionedId::as_str)
         .collect::<Vec<_>>();
     assert_eq!(capabilities, vec!["provider.health.v1", "recall.query.v1"]);
     assert_eq!(descriptor.state_generation, 0);

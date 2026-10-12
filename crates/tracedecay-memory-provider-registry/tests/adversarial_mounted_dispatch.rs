@@ -368,6 +368,7 @@ async fn a_recall_outcome_naming_another_request_is_refused() {
 /// Candidates forged onto another worktree, another repository, or a
 /// superseded resolution of this checkout are denied with typed reasons, and
 /// the content they tried to smuggle never appears in product output.
+/// Native's facts-only grants refuse the exact binding before digest comparison.
 #[tokio::test]
 async fn forged_scope_candidates_are_denied_and_never_reach_product_output() {
     let provider = double(
@@ -411,7 +412,7 @@ async fn forged_scope_candidates_are_denied_and_never_reach_product_output() {
         vec![
             ("cross-worktree", "scope_mismatch"),
             ("cross-repository", "scope_mismatch"),
-            ("superseded-resolution", "stale_identity"),
+            ("superseded-resolution", "scope_binding_unauthorized"),
         ]
     );
     assert!(

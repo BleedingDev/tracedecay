@@ -533,7 +533,7 @@ mod goal_event_tests {
                 "HEAD",
             ],
         ] {
-            let status = std::process::Command::new(&git)
+            let status = std::process::Command::new(git)
                 .args(&args)
                 .current_dir(&primary)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")

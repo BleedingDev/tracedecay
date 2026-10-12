@@ -446,7 +446,7 @@ impl RegisteredGlobalDb {
     /// disposition and redaction authority without exposing a database client.
     pub fn retrieval_anchor_disposition_store(
         &self,
-    ) -> impl tracedecay_store::RetrievalAnchorDispositionStore + Send + Sync + 'static {
+    ) -> impl tracedecay_store::RetrievalAnchorDispositionStore + 'static {
         self.database.clone()
     }
 

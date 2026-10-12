@@ -1599,7 +1599,6 @@ fn finish_pack(
         }),
     };
     let rendered = render_pack(
-        policy.render_form,
         host_items,
         lane,
         canonical_history_replay,
@@ -2208,7 +2207,6 @@ fn receipt_markdown_line(receipt: &ContextPackReceiptV1) -> String {
 
 /// Renders one pack to the exact text the agent receives.
 fn render_pack(
-    form: ContextPackRenderFormV1,
     host_items: &[HostContextItemV1],
     lane: &AdvisoryLaneV1,
     canonical_history_replay: Option<&PreparedCanonicalHistoryReplayV1<'_>>,
@@ -2217,7 +2215,7 @@ fn render_pack(
     advisory_items: &[ContextPackItemV1],
     receipt: &ContextPackReceiptV1,
 ) -> RenderedPack {
-    match form {
+    match receipt.render_form {
         ContextPackRenderFormV1::Markdown => {
             // Host evidence is rendered in the order it was supplied, so a
             // host answer split into attributed items reassembles exactly.

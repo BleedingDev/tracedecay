@@ -827,21 +827,20 @@ fn reconstruct_recall_inner(
         .min(MAX_RECALL_CANDIDATES) as usize;
     let max_content = budgets["maximum_candidate_content_bytes"].as_u64()?;
     let max_total = budgets["maximum_total_content_bytes"].as_u64()?;
+    let diagnostics = RecallDiagnostics {
+        call,
+        instance,
+        request: &request,
+        admission,
+        state_generation: reply.state_generation,
+        diagnostic_key,
+        max_candidates,
+        max_total,
+    };
     if let Some(sink) = diagnostic_sink {
         emit_recall_diagnostic(
             Some(sink),
-            diagnostic_for_worker(
-                call,
-                instance,
-                &request,
-                &worker,
-                rows,
-                max_candidates,
-                max_total,
-                admission,
-                reply.state_generation,
-                diagnostic_key,
-            ),
+            diagnostic_for_worker(&diagnostics, &worker, rows),
         );
     }
     let mut candidates = Vec::new();
@@ -1046,17 +1045,11 @@ fn reconstruct_recall_inner(
         emit_recall_diagnostic(
             Some(sink),
             diagnostic_for_reconstructed(
-                call,
-                instance,
-                &request,
+                &diagnostics,
                 &value,
-                max_candidates,
-                max_total,
-                admission,
                 worker["common_recall"]["scanned_items"]
                     .as_u64()
                     .unwrap_or(0),
-                reply.state_generation,
                 if partial {
                     NcmRecallDiagnosticStage::PartialReply
                 } else {
@@ -1065,7 +1058,6 @@ fn reconstruct_recall_inner(
                 excluded,
                 truncated_items,
                 unknown,
-                diagnostic_key,
             ),
         );
     }
@@ -1101,6 +1093,17 @@ const RECALL_DIAGNOSTIC_QUERY_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic
 const RECALL_DIAGNOSTIC_EXACT_SCOPE_DOMAIN: &[u8] =
     b"tracedecay.ncm.recall-diagnostic.exact-scope.v1\0";
 const RECALL_DIAGNOSTIC_INSTANCE_DOMAIN: &[u8] = b"tracedecay.ncm.recall-diagnostic.instance.v1\0";
+
+struct RecallDiagnostics<'a> {
+    call: &'a ProviderCall,
+    instance: &'a str,
+    request: &'a Value,
+    admission: Option<&'a CurrentAdvisoryAdmission>,
+    state_generation: u64,
+    diagnostic_key: Option<&'a [u8; 32]>,
+    max_candidates: usize,
+    max_total: u64,
+}
 
 struct RecallDiagnosticAccumulator {
     history_source_count: u64,
@@ -1173,18 +1176,22 @@ impl RecallDiagnosticAccumulator {
 
     fn finish(
         self,
-        call: &ProviderCall,
-        instance: &str,
-        request: &Value,
+        diagnostics: &RecallDiagnostics<'_>,
         stage: NcmRecallDiagnosticStage,
-        state_generation: u64,
-        diagnostic_key: Option<&[u8; 32]>,
-        max_candidates: usize,
-        max_total: u64,
         excluded_count: u64,
         truncated_count: u64,
         unknown_count: u64,
     ) -> NcmRecallDiagnosticEvent {
+        let RecallDiagnostics {
+            call,
+            instance,
+            request,
+            state_generation,
+            diagnostic_key,
+            max_candidates,
+            max_total,
+            ..
+        } = *diagnostics;
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         let remaining_candidate_slots = u64::try_from(max_candidates)
             .unwrap_or(u64::MAX)
@@ -1331,17 +1338,21 @@ fn retained_worker_validity(
 }
 
 fn worker_budgeted_content_bytes(
-    call: &ProviderCall,
-    request: &Value,
+    diagnostics: &RecallDiagnostics<'_>,
     row: &Value,
     score_upper_bound: Option<f64>,
-    max_candidates: usize,
     max_content: u64,
-    max_total: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
     accepted_candidates: usize,
     accepted_content_bytes: u64,
 ) -> Option<usize> {
+    let RecallDiagnostics {
+        call,
+        request,
+        admission,
+        max_candidates,
+        max_total,
+        ..
+    } = *diagnostics;
     if accepted_candidates >= max_candidates || accepted_content_bytes >= max_total {
         return Some(0);
     }
@@ -1425,17 +1436,17 @@ fn diagnostic_history_source_count(admission: Option<&CurrentAdvisoryAdmission>)
 }
 
 fn diagnostic_for_worker(
-    call: &ProviderCall,
-    instance: &str,
-    request: &Value,
+    diagnostics: &RecallDiagnostics<'_>,
     worker: &Value,
     rows: &[Value],
-    max_candidates: usize,
-    max_total: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
-    state_generation: u64,
-    diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
+    let RecallDiagnostics {
+        request,
+        admission,
+        max_candidates,
+        max_total,
+        ..
+    } = *diagnostics;
     let mut summary = RecallDiagnosticAccumulator::new();
     summary.history_source_count = diagnostic_history_source_count(admission);
     summary.scanned_items = worker["common_recall"]["scanned_items"]
@@ -1456,14 +1467,10 @@ fn diagnostic_for_worker(
         // saturated, later rows need no decoding at all.
         let budgeted_content_bytes = if budget_available && score_upper_bound.is_some() {
             worker_budgeted_content_bytes(
-                call,
-                request,
+                diagnostics,
                 row,
                 score_upper_bound,
-                max_candidates,
                 max_content,
-                max_total,
-                admission,
                 budgeted_candidates,
                 budgeted_total,
             )
@@ -1485,14 +1492,8 @@ fn diagnostic_for_worker(
         );
     }
     summary.finish(
-        call,
-        instance,
-        request,
+        diagnostics,
         NcmRecallDiagnosticStage::Worker,
-        state_generation,
-        diagnostic_key,
-        max_candidates,
-        max_total,
         worker["common_recall"]["excluded_items"]
             .as_u64()
             .unwrap_or(0),
@@ -1512,23 +1513,16 @@ fn diagnostic_for_worker(
 }
 
 fn diagnostic_for_reconstructed(
-    call: &ProviderCall,
-    instance: &str,
-    request: &Value,
+    diagnostics: &RecallDiagnostics<'_>,
     value: &Value,
-    max_candidates: usize,
-    max_total: u64,
-    admission: Option<&CurrentAdvisoryAdmission>,
     scanned_items: u64,
-    state_generation: u64,
     stage: NcmRecallDiagnosticStage,
     excluded_count: u64,
     truncated_count: u64,
     unknown_count: u64,
-    diagnostic_key: Option<&[u8; 32]>,
 ) -> NcmRecallDiagnosticEvent {
     let mut summary = RecallDiagnosticAccumulator::new();
-    summary.history_source_count = diagnostic_history_source_count(admission);
+    summary.history_source_count = diagnostic_history_source_count(diagnostics.admission);
     summary.scanned_items = scanned_items;
     if let Some(candidates) = value["candidates"].as_array() {
         for (index, candidate) in candidates.iter().enumerate() {
@@ -1543,14 +1537,8 @@ fn diagnostic_for_reconstructed(
         }
     }
     summary.finish(
-        call,
-        instance,
-        request,
+        diagnostics,
         stage,
-        state_generation,
-        diagnostic_key,
-        max_candidates,
-        max_total,
         excluded_count,
         truncated_count,
         unknown_count,
@@ -1575,14 +1563,17 @@ fn diagnostic_for_reconstruction_failure(
     let mut summary = RecallDiagnosticAccumulator::new();
     summary.history_source_count = diagnostic_history_source_count(admission);
     summary.finish(
-        call,
-        instance,
-        &request,
+        &RecallDiagnostics {
+            call,
+            instance,
+            request: &request,
+            admission,
+            state_generation,
+            diagnostic_key,
+            max_candidates,
+            max_total,
+        },
         NcmRecallDiagnosticStage::ReconstructionFailure,
-        state_generation,
-        diagnostic_key,
-        max_candidates,
-        max_total,
         0,
         0,
         0,
@@ -1640,14 +1631,17 @@ fn diagnostic_for_control_terminal(
     let mut summary = RecallDiagnosticAccumulator::new();
     summary.history_source_count = diagnostic_history_source_count(admission);
     summary.finish(
-        call,
-        instance,
-        &request,
+        &RecallDiagnostics {
+            call,
+            instance,
+            request: &request,
+            admission,
+            state_generation,
+            diagnostic_key,
+            max_candidates,
+            max_total,
+        },
         stage,
-        state_generation,
-        diagnostic_key,
-        max_candidates,
-        max_total,
         0,
         0,
         0,
@@ -1655,7 +1649,7 @@ fn diagnostic_for_control_terminal(
 }
 
 enum RetainedSource {
-    Original(SourceAttribution),
+    Original(Box<SourceAttribution>),
     Current {
         observation_id: String,
         source_key: String,
@@ -1706,7 +1700,7 @@ fn retained_source(
         {
             return None;
         }
-        return Some(RetainedSource::Original(source));
+        return Some(RetainedSource::Original(Box::new(source)));
     }
     validate_current_source_binding(
         &namespace,
@@ -1768,10 +1762,30 @@ mod recall_diagnostic_tests {
     struct RecordingSink(Mutex<Vec<NcmRecallDiagnosticEvent>>);
 
     const DIAGNOSTIC_KEY: [u8; 32] = [0xa5; 32];
+
     // Independent Python hashlib/hmac computation for DIAGNOSTIC_KEY, the
     // diagnostic-session namespace, and the query domain/value below.
     const EXPECTED_QUERY_HMAC: &str =
         "e29bafe7d4f7c2f22380f931bc8e3381989c5d46b53178dee215ba7cc5d661e1";
+
+    fn diagnostics<'a>(
+        call: &'a ProviderCall,
+        request: &'a Value,
+        max_candidates: usize,
+        max_total: u64,
+        diagnostic_key: Option<&'a [u8; 32]>,
+    ) -> RecallDiagnostics<'a> {
+        RecallDiagnostics {
+            call,
+            instance: "private-provider-instance",
+            request,
+            admission: None,
+            state_generation: 7,
+            diagnostic_key,
+            max_candidates,
+            max_total,
+        }
+    }
 
     impl NcmRecallDiagnosticSink for RecordingSink {
         fn record(&self, event: NcmRecallDiagnosticEvent) {
@@ -2249,16 +2263,9 @@ mod recall_diagnostic_tests {
             }
         });
         let raw = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 8192, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            8192,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         let reconstructed = json!({
             "candidates": [
@@ -2267,20 +2274,13 @@ mod recall_diagnostic_tests {
             ]
         });
         let post = diagnostic_for_reconstructed(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 8192, Some(&DIAGNOSTIC_KEY)),
             &reconstructed,
-            4,
-            8192,
-            None,
             0,
-            7,
             NcmRecallDiagnosticStage::Reconstructed,
             0,
             0,
             0,
-            Some(&DIAGNOSTIC_KEY),
         );
         let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
         emit_recall_diagnostic(Some(sink.as_ref()), raw.clone());
@@ -2319,16 +2319,9 @@ mod recall_diagnostic_tests {
         let rows = vec![worker_row(&call, 91_000_007, "private content marker", 0.5)];
         let worker = json!({"common_recall":{"candidates":rows,"excluded_items":1,"truncated_items":2,"unknown_items":3,"score_upper_bound":1.0}});
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 8192, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            8192,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         let debug = format!("{event:?}");
         for private_value in [
@@ -2387,28 +2380,14 @@ mod recall_diagnostic_tests {
             0.5
         )],"score_upper_bound":1.0}});
         let event_a = diagnostic_for_worker(
-            &call_a,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call_a, &request, 4, 8192, Some(&DIAGNOSTIC_KEY)),
             &worker_a,
             worker_a["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            8192,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         let event_b = diagnostic_for_worker(
-            &call_b,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call_b, &request, 4, 8192, Some(&DIAGNOSTIC_KEY)),
             &worker_b,
             worker_b["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            8192,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         assert_ne!(event_a.namespace_sha256, event_b.namespace_sha256);
         assert_ne!(event_a.request_id_sha256, event_b.request_id_sha256);
@@ -2440,16 +2419,9 @@ mod recall_diagnostic_tests {
         let rows = vec![worker_row(&call, 17, "private content marker", 0.5)];
         let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 8192, None),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            8192,
-            None,
-            7,
-            None,
         );
         assert!(event.request_id_sha256.is_none());
         assert!(event.operation_id_sha256.is_none());
@@ -2495,16 +2467,9 @@ mod recall_diagnostic_tests {
         let rows = vec![worker_row(&call, 18, "private content marker", 0.5)];
         let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 8192, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            8192,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         let namespace = NcmNamespace::from_exact_scope(&call.exact_scope);
         assert_eq!(event.namespace_sha256.as_deref(), Some(namespace.as_str()));
@@ -2557,16 +2522,9 @@ mod recall_diagnostic_tests {
         let rows = vec![worker_row(&call, 19, content, 0.5)];
         let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 2, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            2,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         assert_eq!(event.candidate_content_bytes, [content.len() as u64]);
         assert_eq!(event.remaining_content_bytes, 1);
@@ -2631,16 +2589,9 @@ mod recall_diagnostic_tests {
             }
         });
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 4, 64, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            4,
-            64,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         assert_eq!(event.candidate_content_bytes, [128, 128, 4]);
         assert_eq!(
@@ -2670,16 +2621,9 @@ mod recall_diagnostic_tests {
         rows.push(worker_row(&call, 17, "kept", 0.8));
         let worker = json!({"common_recall":{"candidates":rows,"score_upper_bound":1.0}});
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 1, 64, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            1,
-            64,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         assert_eq!(event.candidate_count, 18);
         assert_eq!(event.candidate_ranks.len(), 16);
@@ -2712,16 +2656,9 @@ mod recall_diagnostic_tests {
             }
         });
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 1, 64, Some(&DIAGNOSTIC_KEY)),
             &worker,
             worker["common_recall"]["candidates"].as_array().unwrap(),
-            1,
-            64,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         assert_eq!(event.candidate_count, 3);
         assert_eq!(event.remaining_candidate_slots, 0);
@@ -2734,18 +2671,11 @@ mod recall_diagnostic_tests {
             }
         });
         let event = diagnostic_for_worker(
-            &call,
-            "private-provider-instance",
-            &request,
+            &diagnostics(&call, &request, 1, 64, Some(&DIAGNOSTIC_KEY)),
             &invalid_upper_bound,
             invalid_upper_bound["common_recall"]["candidates"]
                 .as_array()
                 .unwrap(),
-            1,
-            64,
-            None,
-            7,
-            Some(&DIAGNOSTIC_KEY),
         );
         assert_eq!(event.remaining_candidate_slots, 1);
         assert_eq!(event.remaining_content_bytes, 64);

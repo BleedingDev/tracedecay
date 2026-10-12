@@ -42,7 +42,7 @@
 //!
 //! # Native never observes
 //!
-//! TraceDecay Native is upstream memory: facts through the owner-bound memory
+//! `TraceDecay` Native is upstream memory: facts through the owner-bound memory
 //! application and sessions through the message-search kernel, both already
 //! fed by the one upstream capture path. Native declares no observation
 //! capability, so production never mounts a Native journey; journeys exist
@@ -90,8 +90,6 @@ use tracedecay_memory_observation::{
     SqliteObservationJournal, TerminalIdentityMismatchV1, WakeOutcomeV1, WithheldAdmissionV1,
     extensions_digest,
 };
-#[cfg(test)]
-use tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID;
 use tracedecay_memory_provider_registry::{
     ApiError, BoundedCallRefusalV1, BoundedProviderCallV1, CancellationToken, CanonicalPayload,
     CompositionLifecycleError, FabricError, HandshakeRequest, HandshakeRequestParts,
@@ -119,7 +117,8 @@ const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
 /// contained under, inside the canonical store layout. The host creates it and
 /// grants each admitted namespace a capability rooted beneath it; a provider
 /// never names a path outside it.
-pub(crate) const PROVIDER_STATE_DIR_NAME: &str = "provider-state";
+#[cfg(test)]
+const PROVIDER_STATE_DIR_NAME: &str = "provider-state";
 
 /// The observation kind and inner payload contract this journey admits for the
 /// host event class `host.session_message_committed.v1`, from the provider
@@ -134,7 +133,7 @@ const SESSION_COMMIT_POINT_ID: &str = "session_observation_store.commit";
 /// sequence per project observation store.
 const SESSION_SOURCE_STREAM: &str = "session_observation_store";
 
-/// Bounded page size for canonical replay. The store caps replay at 1_000.
+/// Bounded page size for canonical replay. The store caps replay at `1_000`.
 const REPLAY_PAGE_ITEMS: usize = 128;
 
 /// Bounded startup replay budget. Convergence continues on the live replay
@@ -828,19 +827,6 @@ impl UntrustedRecallMetadataV1 {
             Self::Withheld { reason, .. } => Some(*reason),
         }
     }
-
-    /// Digest of the provider's original label, admitted or not.
-    ///
-    /// Both arms carry it, so a caller that substitutes a host-minted stand-in
-    /// for a label it will not render can derive that stand-in from the
-    /// provider's own bytes without keeping a copy of them.
-    pub(super) fn source_sha256(&self) -> &str {
-        match self {
-            Self::Admitted { source_sha256, .. } | Self::Withheld { source_sha256, .. } => {
-                source_sha256
-            }
-        }
-    }
 }
 
 /// Binds the actual canonical session through the shared control-scope
@@ -1212,13 +1198,13 @@ impl CanonicalObservationAdmissionAdapterV1 {
                 source,
             })?;
 
-        if matches!(admission, ObservationAdmission::Admitted { .. }) {
-            if let Some(error) = shape_error {
-                return Err(AdmissionAdapterError::InvalidCanonicalEnvelope {
-                    source_event_id,
-                    detail: error.to_string(),
-                });
-            }
+        if matches!(admission, ObservationAdmission::Admitted { .. })
+            && let Some(error) = shape_error
+        {
+            return Err(AdmissionAdapterError::InvalidCanonicalEnvelope {
+                source_event_id,
+                detail: error.to_string(),
+            });
         }
         let admission = match admission {
             ObservationAdmission::Admitted { .. } if unknown_eligibility => {
@@ -1586,7 +1572,7 @@ pub(crate) fn validate_history_delivery_evidence(
         }
         match state {
             DeliveryStateV1::Pending | DeliveryStateV1::Leased | DeliveryStateV1::EffectUnknown => {
-                settled = false
+                settled = false;
             }
             DeliveryStateV1::Acknowledged | DeliveryStateV1::DuplicateAcknowledged => {
                 let receipt = receipt.ok_or(ProviderHistoryErrorV1::ClaimMismatch(
@@ -1658,7 +1644,7 @@ fn envelope_shape_survived(sanitized: &Value, observation_kind: &str) -> bool {
             .is_some_and(|payload| !payload.is_null())
 }
 
-/// Mints a UUIDv7 observation identity from real entropy.
+/// Mints a `UUIDv7` observation identity from real entropy.
 ///
 /// The stamp is the admission instant; the ten trailing bytes come from the
 /// operating system. Feeding a counter here would collide on the journal's
@@ -2020,6 +2006,7 @@ impl DeliveryRefusalWindowV1 {
         self.total.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     async fn wait_for(
         &self,
         within: Duration,
@@ -2651,6 +2638,7 @@ impl CensusTransitionV1 {
         self.async_changed.notify_waiters();
     }
 
+    #[cfg(test)]
     fn wait_until<T>(
         &self,
         within: Duration,
@@ -2866,6 +2854,7 @@ impl ThreadBoundedProviderCallV1 {
     /// resulting census. The condition is checked before waiting and again at
     /// the terminal deadline, so neither an early transition nor the final one
     /// can be missed.
+    #[cfg(test)]
     fn wait_for_census(
         &self,
         within: Duration,
@@ -2991,7 +2980,7 @@ impl ThreadBoundedProviderCallV1 {
                         answer,
                     );
                 }
-                Ok(Err(_)) => {
+                Ok(Err(())) => {
                     // Shutdown owns classification once it has fired, even if
                     // the contained worker reports its panic on the same edge.
                     // The worker already diagnosed the crash independently of
@@ -3224,7 +3213,7 @@ pub(crate) struct ReplayBoundsV1<'a> {
 #[derive(Debug)]
 pub(crate) enum RecordOutcomeV1 {
     /// Admission returned, with whatever it decided.
-    Reported(IngressBatchReportV1),
+    Reported(Box<IngressBatchReportV1>),
     /// Admission did not return inside the caller's budget.
     DeadlineExceeded,
 }
@@ -3426,7 +3415,7 @@ impl ProviderInstanceStateV1 {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*state {
             ProviderInstanceAvailabilityV1::Ready(instance) => Some(instance.clone()),
             ProviderInstanceAvailabilityV1::Pending { .. }
@@ -3448,7 +3437,7 @@ impl ProviderInstanceStateV1 {
         if let ProviderInstanceAvailabilityV1::Ready(previous) = &mut *state
             && previous.as_str() != instance
         {
-            *previous = instance.to_owned();
+            instance.clone_into(previous);
             self.notify_changed();
         }
     }
@@ -3458,7 +3447,7 @@ impl ProviderInstanceStateV1 {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         matches!(&*state, ProviderInstanceAvailabilityV1::Ready(_))
     }
 
@@ -3467,7 +3456,7 @@ impl ProviderInstanceStateV1 {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         matches!(&*state, ProviderInstanceAvailabilityV1::Pending { .. })
     }
 
@@ -3476,7 +3465,7 @@ impl ProviderInstanceStateV1 {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &*state {
             ProviderInstanceAvailabilityV1::Pending {
                 retry_at,
@@ -3518,7 +3507,7 @@ impl ProviderInstanceStateV1 {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (attempts, first_attempt_at) = match &*state {
             ProviderInstanceAvailabilityV1::InFlight {
                 attempts,
@@ -3596,7 +3585,7 @@ impl ProviderInstanceStateV1 {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *state = ProviderInstanceAvailabilityV1::Unavailable;
         self.notify_changed();
     }
@@ -3608,7 +3597,7 @@ impl ProviderInstanceStateV1 {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         loop {
             if stopping.is_cancelled() {
                 return false;
@@ -3638,7 +3627,7 @@ impl ProviderInstanceStateV1 {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         matches!(&*state, ProviderInstanceAvailabilityV1::Unavailable)
     }
 }
@@ -3691,24 +3680,6 @@ impl ProjectObservationJourneyV1 {
     /// The caller records intent here before attempting provider control.
     pub(crate) fn history_journal(&self) -> Arc<SqliteObservationJournal> {
         Arc::clone(&self.journal)
-    }
-
-    /// Each exact destination/policy has independent durable scan progress.
-    pub(crate) async fn history_replay_watermark(
-        &self,
-        destination: &OwnedExactScope,
-        policy_revision: u64,
-    ) -> Result<u64, ObservationJourneyError> {
-        let source_stream = history_source_stream(destination, policy_revision)
-            .map_err(ObservationJourneyError::Journal)?;
-        let journal = Arc::clone(&self.journal);
-        tokio::task::spawn_blocking(move || {
-            journal.maximum_replay_sequence(SourceAuthorityV1::HostSession, &source_stream)
-        })
-        .await
-        .map_err(ObservationJourneyError::IngestTask)?
-        .map(|position| position.map_or(0, |position| position.0))
-        .map_err(ObservationJourneyError::Journal)
     }
 
     /// Waits for actual durable full-effect receipts for every granted source.
@@ -3915,7 +3886,7 @@ impl ProjectObservationJourneyV1 {
                 .ingest_record_with_adapter(record, Arc::clone(&adapter), bounds)
                 .await?
             {
-                RecordOutcomeV1::Reported(report) => report,
+                RecordOutcomeV1::Reported(report) => *report,
                 RecordOutcomeV1::DeadlineExceeded => {
                     return Err(ObservationJourneyError::DeadlineExceeded { admitted });
                 }
@@ -3981,12 +3952,14 @@ impl ProjectObservationJourneyV1 {
     /// provider is costing the host right now, this says *why* the host is
     /// refusing what the provider does. Bounded by
     /// [`DELIVERY_REFUSAL_HISTORY`].
+    #[cfg(test)]
     pub(crate) fn recent_delivery_refusals(&self) -> Vec<DeliveryRefusalV1> {
         self.delivery_refusals.recent()
     }
 
     /// Every delivery this lane has refused since it was mounted, including
     /// the ones already aged out of [`Self::recent_delivery_refusals`].
+    #[cfg(test)]
     pub(crate) fn delivery_refusals_total(&self) -> u64 {
         self.delivery_refusals.total()
     }
@@ -4044,7 +4017,7 @@ impl ProjectObservationJourneyV1 {
                 check_replay_bounds(bounds, admitted)?;
                 let record = self.source_record(stored)?;
                 let report = match self.ingest_record(record, bounds).await? {
-                    RecordOutcomeV1::Reported(report) => report,
+                    RecordOutcomeV1::Reported(report) => *report,
                     RecordOutcomeV1::DeadlineExceeded => {
                         // The record did not return inside the caller's own
                         // budget. Nothing was committed for it that the
@@ -4253,7 +4226,7 @@ impl ProjectObservationJourneyV1 {
         }
         match joined {
             Ok(joined) => match joined.map_err(ObservationJourneyError::IngestTask)? {
-                Ok(report) => Ok(RecordOutcomeV1::Reported(report)),
+                Ok(report) => Ok(RecordOutcomeV1::Reported(Box::new(report))),
                 Err(error) => {
                     // This terminal belongs to host admission control, before
                     // the record could commit. Provider refusals retain their
@@ -4514,6 +4487,7 @@ impl ProjectObservationJourneyV1 {
 
     /// The typed journal refusal the most recent replay pass stopped on, when
     /// that is what it stopped on.
+    #[cfg(test)]
     pub(crate) fn halted_on(&self) -> Option<IngressHaltV1> {
         match self.stalled_on() {
             Some(LiveReplayStallV1::Halted(halt)) => Some(halt),
@@ -4641,7 +4615,7 @@ impl ProjectObservationJourneyV1 {
                 () = self.stopping.cancelled() => {
                     return Err(ObservationJourneyError::Cancelled { admitted: 0 });
                 }
-                _ = &mut changed => {}
+                () = &mut changed => {}
                 () = tokio::time::sleep(remaining.min(Duration::from_millis(25))) => {}
             }
         }
@@ -5020,10 +4994,10 @@ impl ProjectObservationJourneyV1 {
                     if let Some(proof) = instance_proof.as_ref() {
                         if !provider_instance_id.take_proof_attempt(Instant::now()) {
                             if provider_instance_id.is_pending() {
-                                if !provider_instance_id.wait_until_retry_or_stop(&stopping) {
-                                    if stopping.is_cancelled() {
-                                        break;
-                                    }
+                                if !provider_instance_id.wait_until_retry_or_stop(&stopping)
+                                    && stopping.is_cancelled()
+                                {
+                                    break;
                                 }
                                 continue;
                             }
@@ -5091,7 +5065,7 @@ impl ProjectObservationJourneyV1 {
                     if runtime.wait_for_work(delivery_park) == WakeOutcomeV1::ShutdownRequested {
                         break;
                     }
-                    // Only a proved instance or the existing Native instance
+                    // Only a proved instance or the admitted static instance
                     // can authorize per-attempt lease identity.
                     if let Some(leased_instance_id) = provider_instance_id.get() {
                         let now = tracedecay_contracts::now_micros().0;
@@ -5368,6 +5342,7 @@ pub(crate) struct ObservationJourneyMountInputsV1 {
 /// function without an authoritative resolved scope and an enabled composition.
 /// Readiness is proved separately for each canonical record's own source-session
 /// scope before admission and again immediately before delivery.
+#[cfg(test)]
 pub(crate) fn mount_project_observation_journey(
     inputs: ObservationJourneyMountInputsV1,
 ) -> Result<Arc<ProjectObservationJourneyV1>, ObservationJourneyError> {
@@ -5592,209 +5567,6 @@ where
     Ok(pass)
 }
 
-/// Journal inspection for the host journeys mounted beside this module.
-///
-/// The durable journal is *this* mount's dependency, never a journey's: a
-/// journey asks what settled through the opaque view below instead of naming
-/// the journal crate itself, so ownership of the journal — and of the store
-/// handle a second reader opens on it — stays with the module that mounts it.
-///
-/// The indirection softens nothing. Every field a journey compares is carried
-/// across verbatim from the journal crate's own inspection row — observation
-/// and idempotency identity, payload digest, exact scope, source position,
-/// attempt count, content presence, and the delivery state in the enum's own
-/// canonical wire spelling — and a refused inspection, or a page that did not
-/// fit, still fails loudly rather than reading as an empty journal.
-#[cfg(all(test, feature = "memory-provider-host"))]
-mod journey_journal_inspection {
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    use tracedecay_memory_observation::{
-        DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
-        ObservationJournalReaderV1, SqliteObservationJournal,
-    };
-
-    use super::ObservationJourneyPolicyV1;
-
-    /// One page of inspection is more than a host journey can ever produce, so
-    /// a full page means the reader, not the journey, is what changed.
-    const INSPECTION_PAGE_LIMIT: u32 = 100;
-
-    /// How long [`JourneyJournalV1::await_settlement`] waits. A journey runs a
-    /// bounded background delivery worker, so this is a convergence bound and
-    /// never a sleep: the wait ends as soon as every row is terminal.
-    const SETTLEMENT_BUDGET: Duration = Duration::from_secs(30);
-
-    /// How often the settlement wait re-reads the journal. It only bounds how
-    /// promptly a *satisfied* condition is noticed; the condition itself, never
-    /// this interval, is what a journey's assertions rest on.
-    const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
-    /// The canonical wire spelling of the state an accepted delivery settles
-    /// in, taken from the journal crate's own enum. A renamed or re-encoded
-    /// state fails to compile here instead of silently never matching.
-    pub(super) const ACKNOWLEDGED_DELIVERY_STATE: &str = DeliveryStateV1::Acknowledged.as_wire();
-
-    /// A second, read-only handle on the journal a mounted journey owns.
-    pub(super) struct JourneyJournalV1(SqliteObservationJournal);
-
-    /// One journalled delivery, as a host journey sees it.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    pub(super) struct JourneyJournalRowV1 {
-        /// Observation identity.
-        pub(super) observation_id: String,
-        /// Content-derived idempotency key.
-        pub(super) idempotency_key: String,
-        /// Digest of the sanitized canonical payload.
-        pub(super) payload_sha256: String,
-        /// Digest of the exact coding scope this delivery is bound to.
-        pub(super) exact_scope_sha256: String,
-        /// Observation kind identity.
-        pub(super) observation_kind: String,
-        /// Position in the source stream.
-        pub(super) source_sequence: u64,
-        /// Attempts recorded so far.
-        pub(super) attempt_number: u32,
-        /// Whether the row's content bytes are still present.
-        pub(super) content_present: bool,
-        /// Delivery state, in its canonical wire spelling.
-        pub(super) state: &'static str,
-        /// Whether that state ends delivery.
-        pub(super) terminal: bool,
-    }
-
-    impl JourneyJournalRowV1 {
-        fn of(row: &JournalInspectionRowV1) -> Self {
-            Self {
-                observation_id: row.observation_id.as_str().to_owned(),
-                idempotency_key: row.idempotency_key.as_str().to_owned(),
-                payload_sha256: row.payload_sha256.clone(),
-                exact_scope_sha256: row.exact_scope_sha256.clone(),
-                observation_kind: row.observation_kind.clone(),
-                source_sequence: row.source_sequence.0,
-                attempt_number: row.attempt_number,
-                content_present: row.content_present,
-                state: row.state.as_wire(),
-                terminal: row.state.is_terminal(),
-            }
-        }
-    }
-
-    /// Opens a second, read-only handle on the journal at `journal_path`.
-    ///
-    /// Once per journey, not once per poll: opening the store re-applies its
-    /// schema inside a write transaction, and a reader that did that every
-    /// hundred milliseconds would contend with the delivery worker it is meant
-    /// to be observing. One handle in WAL mode still sees every later commit.
-    pub(super) fn open_journal(journal_path: &Path) -> JourneyJournalV1 {
-        JourneyJournalV1(
-            SqliteObservationJournal::open(
-                journal_path,
-                ObservationJourneyPolicyV1::project_default().retention,
-            )
-            .expect("the durable observation journal must open through its own store API"),
-        )
-    }
-
-    impl JourneyJournalV1 {
-        /// Every delivery the journal holds, read through the journal crate's
-        /// own inspection surface.
-        ///
-        /// The journal's schema is that crate's business: nothing here names a
-        /// table or a column, so a schema change cannot leave a journey
-        /// silently reading nothing.
-        pub(super) fn rows(&self) -> Vec<JourneyJournalRowV1> {
-            let page = self
-                .0
-                .inspect(&JournalInspectionFilterV1 {
-                    limit: INSPECTION_PAGE_LIMIT,
-                    ..JournalInspectionFilterV1::default()
-                })
-                .expect("the durable observation journal must answer an inspection");
-            assert!(
-                page.next_cursor.is_none(),
-                "a host journey cannot produce more than {INSPECTION_PAGE_LIMIT} deliveries; \
-                 {} rows were reported",
-                page.total_rows
-            );
-            page.rows.iter().map(JourneyJournalRowV1::of).collect()
-        }
-
-        /// Waits, bounded, until the journal holds at least `minimum_rows`
-        /// deliveries and every one of them is terminal, and returns them the
-        /// moment it does.
-        ///
-        /// The deadline is a failure, never a result: a wait that runs out
-        /// reports the rows it last observed instead of handing a caller a
-        /// half-settled journal to assert against.
-        pub(super) async fn await_settlement(
-            &self,
-            minimum_rows: usize,
-        ) -> Vec<JourneyJournalRowV1> {
-            let deadline = Instant::now() + SETTLEMENT_BUDGET;
-            loop {
-                let rows = self.rows();
-                if rows.len() >= minimum_rows && rows.iter().all(|row| row.terminal) {
-                    return rows;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "the durable observation journal never settled {minimum_rows} deliveries \
-                     within {SETTLEMENT_BUDGET:?}; last observed {:?}",
-                    journal_digest(&rows)
-                );
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-        }
-    }
-
-    /// The row identity a replayed source must reproduce exactly: who the
-    /// observation is, what content it carries, and how many attempts it cost.
-    ///
-    /// Comparing this set — not a length — is what makes the idempotency claim
-    /// real: a journal that dropped one row and admitted a different one has
-    /// the same length and a different set.
-    pub(super) fn journal_row_identities(
-        rows: &[JourneyJournalRowV1],
-    ) -> Vec<(String, String, String, u32)> {
-        let mut identities = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.idempotency_key.clone(),
-                    row.observation_id.clone(),
-                    row.payload_sha256.clone(),
-                    row.attempt_number,
-                )
-            })
-            .collect::<Vec<_>>();
-        identities.sort();
-        identities
-    }
-
-    /// A compact, sorted description of the journal for a failed assertion, so
-    /// a deadline failure names what it actually saw.
-    pub(super) fn journal_digest(rows: &[JourneyJournalRowV1]) -> Vec<String> {
-        let mut digest = rows
-            .iter()
-            .map(|row| {
-                format!(
-                    "{}|{}|{}|attempt={}|seq={}|content_present={}",
-                    row.observation_kind,
-                    row.exact_scope_sha256,
-                    row.state,
-                    row.attempt_number,
-                    row.source_sequence,
-                    row.content_present,
-                )
-            })
-            .collect::<Vec<_>>();
-        digest.sort();
-        digest
-    }
-}
-
 /// Whether a startup replay refusal is one a later pass can clear.
 ///
 /// The rule is fail-closed: a refusal counts as retryable only when the store
@@ -5865,10 +5637,9 @@ pub(crate) fn replay_recoverability(error: &ObservationJourneyError) -> ReplayRe
     }
 }
 
-/// The whole product-owned mount sequence behind one call, so the composition
-/// root holds a single seam: mount the journey, run the authoritative startup
-/// replay under the project-open cancellation, then start the bounded live
-/// replay edge over the same store.
+/// Runs the retained mount, startup replay, and delivery activation for journey
+/// fixtures under the same cancellation used by project open. Production uses
+/// these operations directly around its publication boundary.
 ///
 /// Cancellation during startup replay is returned typed as
 /// [`ObservationJourneyError::Cancelled`]; the journey is dropped with the
@@ -5890,6 +5661,7 @@ pub(crate) fn replay_recoverability(error: &ObservationJourneyError) -> ReplayRe
 /// project open fails with the reason instead of starting degraded in silence.
 ///
 /// Mount and live-replay-start failures are returned typed.
+#[cfg(test)]
 pub(crate) async fn mount_and_replay<S>(
     inputs: ObservationJourneyMountInputsV1,
     observation_store: S,
@@ -6027,6 +5799,7 @@ mod tests {
     #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 
     use std::collections::BTreeSet;
+    use std::fmt::Write as _;
     use std::sync::LazyLock;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -6048,9 +5821,9 @@ mod tests {
         AppendOutcomeV1, DeliveryStateV1, JournalInspectionFilterV1, ObservationJournalReaderV1,
     };
     use tracedecay_memory_provider_registry::{
-        CommittedEffectEvidence, EnabledProviderMode, FabricConfig, FallbackDirective,
-        HandshakeResponse, NativeMemoryApplicationPort, NativeProviderActivation,
-        ProviderDescriptor, ProviderReply, TerminalRecord,
+        CommittedEffectEvidence, FabricConfig, FallbackDirective, HandshakeResponse,
+        MemoryProviderV1, ObserverProviderRegistration, ProviderDescriptor, ProviderReply,
+        SelectedProviderActivationV1, TerminalRecord,
     };
     use tracedecay_sessions::admission::HostAdmissionScope;
     use tracedecay_sessions::runtime::hosts::codex::try_admit_codex_jsonl_observations_for_project_with_admission;
@@ -6064,6 +5837,9 @@ mod tests {
     use super::*;
     use tracedecay_global_db::GlobalDbObservationStore;
     use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+
+    const JOURNEY_PROVIDER_ID: &str = "tracedecay.journey-fixture";
+    const JOURNEY_PROVIDER_INSTANCE_ID: &str = "tracedecay.journey-fixture.instance.v1";
 
     const READY_RECEIPT: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const PROVIDER_RECEIPT: &str =
@@ -6082,8 +5858,8 @@ mod tests {
     #[cfg(unix)]
     mod real_ncm_observer;
 
-    /// The host's bounded-execution boundary, judged on its own accounting
-    /// rather than through a journey.
+    // The host's bounded-execution boundary, judged on its own accounting
+    // rather than through a journey.
     mod bounded_provider_call {
         //! What the boundary publishes about the workers it owns.
         //!
@@ -6560,9 +6336,9 @@ mod tests {
         }
     }
 
-    /// The adversarial provider harness against this mount. It
-    /// lives beside the journey's own suite because it judges the same journal
-    /// rows, driven by a provider double that misbehaves on demand.
+    // The adversarial provider harness against this mount. It
+    // lives beside the journey's own suite because it judges the same journal
+    // rows, driven by a provider double that misbehaves on demand.
     mod adversarial_mounted_journey {
         //! The adversarial provider harness against the **mounted observation
         //! journey**.
@@ -6571,8 +6347,8 @@ mod tests {
         //! misbehaving provider through the registry's own dispatch and recall ports.
         //! What it cannot reach is the durable half of the story: the journal row.
         //! This module closes that gap. Every test here mounts the *production*
-        //! journey (`mount_project_observation_journey`, the function the composition
-        //! root calls) over a provider double that misbehaves on demand, admits a real
+        //! journey through its retained constructor and delivery worker, using
+        //! a provider double that misbehaves on demand, admits a real
         //! canonical observation through the real replay path, and then asserts three
         //! things together:
         //!
@@ -6609,9 +6385,9 @@ mod tests {
         use super::*;
 
         /// State namespace the double reports at handshake. It has to sit under the
-        /// Native provider's own admitted prefix or readiness is refused before a
+        /// observer's own admitted prefix or readiness is refused before a
         /// single delivery — which would prove nothing about delivery.
-        const ADVERSARIAL_STATE_NAMESPACE: &str = "tracedecay.native.adversarial";
+        const ADVERSARIAL_STATE_NAMESPACE: &str = "tracedecay.journey-fixture.adversarial";
 
         /// How long a settlement wait may run before the test reports the journal
         /// snapshot instead of a bare timeout.
@@ -6628,43 +6404,7 @@ mod tests {
         /// test can then wait for the late answer it must not accept.
         const IGNORED_CANCELLATION_BLOCK_MILLIS: u64 = 1_500;
 
-        // ---------------------------------------------------------------------------
-        // The double on the Native application port
-        // ---------------------------------------------------------------------------
-
-        /// Presents the provider-neutral double on the Native application port, which
-        /// is the only port the composition can build. Every host layer — supervised
-        /// readiness, the recovery gate, the fabric, the journal — therefore runs
-        /// exactly as it does in the daemon.
-        struct AdversarialNativePortV1 {
-            inner: Arc<AdversarialProviderV1>,
-        }
-
-        impl AdversarialNativePortV1 {
-            fn new(inner: Arc<AdversarialProviderV1>) -> Self {
-                Self { inner }
-            }
-        }
-
-        impl NativeMemoryApplicationPort for AdversarialNativePortV1 {
-            fn descriptor(&self) -> ProviderDescriptor {
-                MemoryProviderV1::descriptor(self.inner.as_ref())
-            }
-
-            fn handshake(&self, request: &HandshakeRequest) -> HandshakeResponse {
-                MemoryProviderV1::handshake(self.inner.as_ref(), request)
-            }
-
-            fn health(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-
-            fn recall(&self, call: &ProviderCall) -> ProviderReply {
-                MemoryProviderV1::invoke(self.inner.as_ref(), call)
-            }
-        }
-
-        /// The descriptor the double registers under: the Native identity, the host's
+        /// The descriptor the double registers under: its observer identity, the host's
         /// own limits, and the implementation identity the durable recovery record
         /// compares against.
         /// The state generation a freshly mounted adversarial double reports.
@@ -6679,7 +6419,7 @@ mod tests {
 
         fn adversarial_descriptor() -> ProviderDescriptor {
             ProviderDescriptor::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+                OwnedProviderId::new(JOURNEY_PROVIDER_ID).expect("journey provider"),
                 "0".repeat(64),
                 "adversarial-journey-v1",
                 ADVERSARIAL_STATE_GENERATION,
@@ -6717,8 +6457,7 @@ mod tests {
         ) -> Arc<AdversarialProviderV1> {
             Arc::new(AdversarialProviderV1::new(AdversarialProviderInputsV1 {
                 descriptor: adversarial_descriptor(),
-                provider_instance_id: crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID
-                    .to_owned(),
+                provider_instance_id: JOURNEY_PROVIDER_INSTANCE_ID.to_owned(),
                 state_namespace: ADVERSARIAL_STATE_NAMESPACE.to_owned(),
                 ready_receipt_sha256: READY_RECEIPT.to_owned(),
                 handshake_script: AdversarialScriptV1::always(HandshakeMisbehaviourV1::Compliant),
@@ -6816,14 +6555,12 @@ mod tests {
             let journal_root = temp.path().join("journey");
             std::fs::create_dir_all(&journal_root).expect("journal root");
             let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-                composition: composition(Arc::new(AdversarialNativePortV1::new(Arc::clone(
-                    provider,
-                )))),
+                composition: composition(Arc::clone(provider) as Arc<dyn MemoryProviderV1>),
                 profile_id,
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                    .expect("native mount metadata"),
+                provider: test_observation_mount(&(journal_root), 1)
+                    .expect("observer mount metadata"),
                 store_data_root: journal_root,
                 policy,
             })
@@ -7435,14 +7172,16 @@ mod tests {
             wait_for_census(&fixture, baseline).await;
         }
 
-        /// A reply padded past the negotiated response ceiling is refused, leaves no
-        /// receipt, and the row is redelivered to the compliant retry.
+        /// A reply padded past the negotiated response ceiling is refused with
+        /// unknown-effect evidence, and the row is redelivered to the compliant retry.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn an_oversized_delivery_reply_is_refused_and_the_row_is_redelivered() {
+            let padding_bytes = usize::try_from(adversarial_descriptor().limits.response_bytes)
+                .expect("response limit fits this host")
+                .checked_add(1)
+                .expect("oversized fixture fits this host");
             let provider = journey_double(AdversarialScriptV1::then(
-                vec![MisbehaviourV1::OversizedReply {
-                    padding_bytes: 200_000,
-                }],
+                vec![MisbehaviourV1::OversizedReply { padding_bytes }],
                 MisbehaviourV1::Compliant,
             ));
             let temp = TempDir::new().expect("temporary journey root");
@@ -8168,16 +7907,18 @@ mod tests {
         exact_scope: OwnedExactScope,
     }
 
-    struct JourneyNativePort {
+    type HealthHook = dyn Fn(&ProviderCall) -> ProviderReply + Send + Sync;
+
+    struct JourneyObservationProvider {
         descriptor: ProviderDescriptor,
         observe_calls: AtomicUsize,
         delivered: Mutex<Vec<DeliveredObservation>>,
         handshake_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
         observe_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
-        health_hook: Mutex<Option<Box<dyn Fn(&ProviderCall) -> ProviderReply + Send + Sync>>>,
+        health_hook: Mutex<Option<Box<HealthHook>>>,
     }
 
-    impl JourneyNativePort {
+    impl JourneyObservationProvider {
         fn new() -> Self {
             Self::with_state_generation(0)
         }
@@ -8195,7 +7936,7 @@ mod tests {
                 OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
             ]);
             let descriptor = ProviderDescriptor::new(
-                OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+                OwnedProviderId::new(JOURNEY_PROVIDER_ID).expect("journey provider"),
                 "0".repeat(64),
                 "journey-test-v1",
                 state_generation,
@@ -8232,12 +7973,49 @@ mod tests {
             *self.health_hook.lock().unwrap() = Some(Box::new(hook));
         }
 
+        fn observe(&self, call: &ProviderCall) -> ProviderReply {
+            self.observe_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(hook) = self.observe_hook.lock().unwrap().as_ref() {
+                hook();
+            }
+            self.delivered.lock().unwrap().push(DeliveredObservation {
+                bytes: call.payload.bytes.clone(),
+                exact_scope: call.exact_scope.clone(),
+            });
+            // The descriptor is fixed for this incarnation. Reporting an advance
+            // would become a regression at the next readiness handshake.
+            ProviderReply {
+                terminal: TerminalRecord::new(
+                    ProviderOperation::Observe,
+                    call.provider_id.clone(),
+                    TerminalCode::Success,
+                    CommittedEffectEvidence::committed(
+                        call.expected_state_generation,
+                        call.expected_state_generation,
+                        vec!["observation:journey-test".to_owned()],
+                        PROVIDER_RECEIPT,
+                        EFFECT_DIGEST,
+                    )
+                    .expect("committed effect"),
+                    FallbackDirective::forbidden(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
+                    None,
+                )
+                .expect("observation terminal"),
+                payload: Some(call.payload.clone()),
+                warnings: Vec::new(),
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
+            }
+        }
+
         fn unexpected<T>() -> T {
             panic!("journey test reached an unrelated provider operation")
         }
     }
 
-    impl NativeMemoryApplicationPort for JourneyNativePort {
+    impl MemoryProviderV1 for JourneyObservationProvider {
         fn descriptor(&self) -> ProviderDescriptor {
             self.descriptor.clone()
         }
@@ -8259,12 +8037,10 @@ mod tests {
                 )
                 .expect("handshake terminal"),
                 descriptor: Some(self.descriptor.clone()),
-                provider_instance_id: Some(
-                    super::super::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
-                ),
-                // Inside the namespace the mount admits for the Native
+                provider_instance_id: Some(JOURNEY_PROVIDER_INSTANCE_ID.to_owned()),
+                // Inside the namespace the mount admits for the observer
                 // provider; a namespace outside it is a readiness refusal.
-                state_namespace: Some("tracedecay.native.journey-test".to_owned()),
+                state_namespace: Some("tracedecay.journey-fixture.journey-test".to_owned()),
                 accepted_scope: Some(request.exact_scope.clone()),
                 effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
                 ready_receipt_sha256: Some(READY_RECEIPT.to_owned()),
@@ -8272,15 +8048,15 @@ mod tests {
             }
         }
 
-        fn health(&self, call: &ProviderCall) -> ProviderReply {
-            match self.health_hook.lock().unwrap().as_ref() {
-                Some(hook) => hook(call),
-                None => Self::unexpected(),
+        fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+            match call.operation {
+                ProviderOperation::Observe => self.observe(call),
+                ProviderOperation::Health => match self.health_hook.lock().unwrap().as_ref() {
+                    Some(hook) => hook(call),
+                    None => Self::unexpected(),
+                },
+                _ => Self::unexpected(),
             }
-        }
-
-        fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-            Self::unexpected()
         }
     }
 
@@ -8505,67 +8281,85 @@ mod tests {
     }
 
     impl ObservationStore for SettledRecordsPort {
-        async fn persist_observation(
+        fn persist_observation(
             &self,
             _write: AnchoredObservationWrite,
-        ) -> ObservationStoreResult<ObservationPersistOutcome> {
-            Err(read_only_observation_store_error("persist_observation"))
+        ) -> impl std::future::Future<Output = ObservationStoreResult<ObservationPersistOutcome>> + Send
+        {
+            async move { Err(read_only_observation_store_error("persist_observation")) }
         }
 
-        async fn persist_observations(
+        fn persist_observations(
             &self,
             _writes: Vec<AnchoredObservationWrite>,
-        ) -> ObservationStoreResult<Vec<ObservationBatchPersistOutcome>> {
-            Err(read_only_observation_store_error("persist_observations"))
+        ) -> impl std::future::Future<
+            Output = ObservationStoreResult<Vec<ObservationBatchPersistOutcome>>,
+        > + Send {
+            async move { Err(read_only_observation_store_error("persist_observations")) }
         }
 
-        async fn get_source_cursor(
+        fn get_source_cursor(
             &self,
             _source: &ObservationSourceIdentityV1,
             _scope: &ObservationScopeV1,
-        ) -> ObservationStoreResult<Option<ObservationSourceCursorV1>> {
-            Err(read_only_observation_store_error("get_source_cursor"))
+        ) -> impl std::future::Future<
+            Output = ObservationStoreResult<Option<ObservationSourceCursorV1>>,
+        > + Send {
+            async move { Err(read_only_observation_store_error("get_source_cursor")) }
         }
 
-        async fn committed_source_cursors(
+        fn committed_source_cursors(
             &self,
             _source: &ObservationSourceIdentityV1,
             _scope: &ObservationScopeV1,
-        ) -> ObservationStoreResult<Vec<ObservationSourceCursorV1>> {
-            Err(read_only_observation_store_error(
-                "committed_source_cursors",
-            ))
+        ) -> impl std::future::Future<
+            Output = ObservationStoreResult<Vec<ObservationSourceCursorV1>>,
+        > + Send {
+            async move {
+                Err(read_only_observation_store_error(
+                    "committed_source_cursors",
+                ))
+            }
         }
 
-        async fn advance_source_cursor(
+        fn advance_source_cursor(
             &self,
             _advance: ObservationCursorAdvance,
-        ) -> ObservationStoreResult<CursorAdvanceOutcome> {
-            Err(read_only_observation_store_error("advance_source_cursor"))
+        ) -> impl std::future::Future<Output = ObservationStoreResult<CursorAdvanceOutcome>> + Send
+        {
+            async move { Err(read_only_observation_store_error("advance_source_cursor")) }
         }
 
-        async fn get_observation(
+        fn get_observation(
             &self,
             observation_id: &CanonicalObservationIdV1,
-        ) -> Result<Option<StoredObservation>, ObservationStoreError> {
-            Ok(self
-                .records
-                .iter()
-                .find(|record| record.observation().observation_id() == observation_id)
-                .cloned())
+        ) -> impl std::future::Future<
+            Output = Result<Option<StoredObservation>, ObservationStoreError>,
+        > + Send {
+            async move {
+                Ok(self
+                    .records
+                    .iter()
+                    .find(|record| record.observation().observation_id() == observation_id)
+                    .cloned())
+            }
         }
 
-        async fn replay_observations(
+        fn replay_observations(
             &self,
             request: ObservationReplayRequest,
-        ) -> Result<Vec<StoredObservation>, ObservationStoreError> {
-            Ok(self
-                .records
-                .iter()
-                .filter(|record| record.sequence() > request.after_sequence())
-                .take(request.limit())
-                .cloned()
-                .collect())
+        ) -> impl std::future::Future<
+            Output = Result<Vec<StoredObservation>, ObservationStoreError>,
+        > + Send {
+            async move {
+                Ok(self
+                    .records
+                    .iter()
+                    .filter(|record| record.sequence() > request.after_sequence())
+                    .take(request.limit())
+                    .cloned()
+                    .collect())
+            }
         }
     }
 
@@ -8642,21 +8436,40 @@ mod tests {
         }
     }
 
-    fn composition(
-        port: Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>,
-    ) -> Arc<ProjectMemoryProviderComposition> {
+    fn composition(port: Arc<dyn MemoryProviderV1>) -> Arc<ProjectMemoryProviderComposition> {
         Arc::new(
-            ProjectMemoryProviderComposition::compose(NativeProviderActivation::Enabled {
-                fabric_config: FabricConfig {
-                    max_registered_providers: 1,
-                    max_in_flight: 1,
+            ProjectMemoryProviderComposition::compose_selected(
+                SelectedProviderActivationV1::ObserversOnly {
+                    fabric_config: FabricConfig {
+                        max_registered_providers: 1,
+                        max_in_flight: 1,
+                    },
                 },
-                port,
-                registration_revision: 1,
-                mode: EnabledProviderMode::Observer,
-            })
+                vec![ObserverProviderRegistration {
+                    provider: port,
+                    registration_revision: 1,
+                }],
+            )
             .expect("provider composition"),
         )
+    }
+
+    fn test_observation_mount(
+        data_root: &Path,
+        registration_revision: u64,
+    ) -> Result<ObservationProviderMountV1, ApiError> {
+        Ok(ObservationProviderMountV1 {
+            provider_id: OwnedProviderId::new(JOURNEY_PROVIDER_ID)?,
+            registration_revision,
+            provider_instance_id: Some(JOURNEY_PROVIDER_INSTANCE_ID.to_owned()),
+            instance_proof: None,
+            host_limits: super::super::native_provider::native_provider_limits(),
+            state_root: data_root.join(PROVIDER_STATE_DIR_NAME),
+            journal_file_name: JOURNAL_FILE_NAME,
+            state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
+                JOURNEY_PROVIDER_ID.to_owned(),
+            ),
+        })
     }
 
     /// Diagnostic snapshot of the journal so a failed wait explains itself
@@ -8729,15 +8542,15 @@ mod tests {
         .await;
         match settled {
             Ok(settled) => settled,
-            Err(_) => panic!(
-                "observation delivery never settled; {}",
+            Err(error) => panic!(
+                "observation delivery never settled: {error}; {}",
                 journal_snapshot(journal_path)
             ),
         }
     }
 
-    /// Mounts the production journey over one caller-supplied incarnation,
-    /// exactly as the composition root does.
+    /// Mounts the retained journey constructor and delivery worker over one
+    /// caller-supplied observer incarnation.
     ///
     /// Restart-recovery tests need to move the provider state identity the
     /// journal compares against, which means owning the port the mount runs
@@ -8755,7 +8568,7 @@ mod tests {
         temp: &TempDir,
         project: &str,
         profile: &str,
-        port: Arc<JourneyNativePort>,
+        port: Arc<JourneyObservationProvider>,
     ) -> RecoveryJourneyFixture {
         let project_id = ProjectId::new(project).expect("project id");
         let runtime = HostAdmissionTestRuntimeV1::project(
@@ -8778,8 +8591,7 @@ mod tests {
             profile_id: profile_id.clone(),
             scope: resolved_scope.clone(),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                .expect("native mount metadata"),
+            provider: test_observation_mount(&(journal_root), 1).expect("observer mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -8845,7 +8657,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mounted_delivery_declares_the_state_generation_recovery_verified() {
         let temp = TempDir::new().expect("temporary journey root");
-        let port = Arc::new(JourneyNativePort::with_state_generation(5));
+        let port = Arc::new(JourneyObservationProvider::with_state_generation(5));
         let fixture = mount_journey_over_port(
             &temp,
             "project.observation-recovery-generation",
@@ -8906,7 +8718,7 @@ mod tests {
         use tracedecay_memory_conformance::ReleaseLatchV1;
 
         let temp = TempDir::new().expect("temporary journey root");
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObservationProvider::new());
         let fixture = mount_journey_over_port(
             &temp,
             "project.observation-readiness-cancellation",
@@ -9009,7 +8821,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_moved_provider_identity_refuses_mounted_delivery_before_the_provider_call() {
         let temp = TempDir::new().expect("temporary journey root");
-        let port = Arc::new(JourneyNativePort::with_state_generation(5));
+        let port = Arc::new(JourneyObservationProvider::with_state_generation(5));
         let fixture = mount_journey_over_port(
             &temp,
             "project.observation-recovery-identity",
@@ -9041,7 +8853,7 @@ mod tests {
                          automatic_repair_attempts, updated_at_micros) \
                      VALUES (?1, 1, 'host_session', ?2, ?3, ?4, 'journey-test-v1', 5, 0, 0, 1)",
                     rusqlite::params![
-                        NATIVE_PROVIDER_ID,
+                        JOURNEY_PROVIDER_ID,
                         exact_scope.exact_scope_sha256(),
                         SESSION_SOURCE_STREAM,
                         "1".repeat(64),
@@ -9077,8 +8889,8 @@ mod tests {
         .await;
         let (attempts, defect) = match refused {
             Ok(refused) => refused,
-            Err(_) => panic!(
-                "the mounted recovery gate never refused: {}",
+            Err(error) => panic!(
+                "the mounted recovery gate never refused: {error}; {}",
                 journal_snapshot(journey.journal_path())
             ),
         };
@@ -9125,7 +8937,7 @@ mod tests {
     struct HygieneJourneyFixture {
         _runtime: HostAdmissionTestRuntimeV1,
         store: GlobalDbObservationStore,
-        port: Arc<JourneyNativePort>,
+        port: Arc<JourneyObservationProvider>,
         journey: Arc<ProjectObservationJourneyV1>,
         project_id: ProjectId,
         /// The journal root this fixture's journey was mounted over, so a test
@@ -9148,16 +8960,12 @@ mod tests {
         /// hands it.
         fn reopen(&self) -> Arc<ProjectObservationJourneyV1> {
             mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-                composition: composition(Arc::clone(&self.port)
-                    as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+                composition: composition(Arc::clone(&self.port) as Arc<dyn MemoryProviderV1>),
                 profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
                 scope: scope(self.project_id.clone()),
                 authoritative_project_id: self.project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(
-                    &(self.journal_root.clone()),
-                    1,
-                )
-                .expect("native mount metadata"),
+                provider: test_observation_mount(&(self.journal_root.clone()), 1)
+                    .expect("observer mount metadata"),
                 store_data_root: self.journal_root.clone(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             })
@@ -9256,7 +9064,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(fixture.port.observe_calls.load(Ordering::Relaxed), 2);
+        let expected_scope = exact_scope_for_session(
+            &UserProfileId::new("profile.observation-hygiene").unwrap(),
+            &scope(fixture.project_id.clone()),
+            session.as_str(),
+        )
+        .unwrap();
         for delivered in fixture.port.delivered.lock().unwrap().iter() {
+            assert_eq!(delivered.exact_scope, expected_scope);
             let payload: Value = serde_json::from_slice(&delivered.bytes).unwrap();
             // Only message facts enter the provider copy, including mixed-fact records.
             let text = serde_json::to_string(&payload).unwrap();
@@ -9388,7 +9203,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
-    /// A required Native activation must keep a restarted project behind the
+    /// A required observation recipient keeps a restarted project behind the
     /// publication fence while a durable observation is still pending. The
     /// provider-side delivery list stands in for the immediate recall that
     /// follows publication: it must contain the restarted observation before
@@ -9399,6 +9214,25 @@ mod tests {
 
         let temp = TempDir::new().expect("temporary journey root");
         let fixture = mount_hygiene_fixture(&temp, "project.restart-publication-barrier").await;
+        let failures = fixture
+            .journey
+            .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
+        let mount_inputs = || ObservationJourneyMountInputsV1 {
+            composition: composition(Arc::clone(&fixture.port) as Arc<dyn MemoryProviderV1>),
+            profile_id: fixture.journey.adapter.context.profile_id.clone(),
+            scope: fixture.journey.adapter.context.scope.clone(),
+            authoritative_project_id: fixture.project_id.clone(),
+            provider: test_observation_mount(&fixture.journal_root, 1)
+                .expect("observer mount metadata"),
+            store_data_root: fixture.journal_root.clone(),
+            policy: ObservationJourneyPolicyV1::project_default(),
+        };
+        let cancellation = HostCancellationToken::new();
+        let seeded = mount_observer_dormant(mount_inputs(), &cancellation)
+            .await
+            .expect("dormant seed journey");
         let session = SessionId::new("session.restart-publication-barrier").expect("session id");
         let record = settled_record(
             1,
@@ -9412,19 +9246,21 @@ mod tests {
         // First life admits the canonical row with no worker, leaving the
         // durable delivery pending exactly where a crash or stop can leave it.
         let pass = run_startup_replay(
-            fixture.journey.as_ref(),
+            seeded.as_ref(),
             &SettledRecordsPort::single(record.clone()),
-            &HostCancellationToken::new(),
+            &cancellation,
         )
         .await
         .expect("seed startup replay");
         assert_eq!(pass.admitted, 1);
-        let pending_path = fixture.journey.journal_path().to_owned();
+        let pending_path = seeded.journal_path().to_owned();
         assert!(!journal_snapshot(&pending_path).contains("acknowledged"));
-        fixture
-            .journey
+        assert_eq!(fixture.port.observe_calls.load(Ordering::Acquire), 0);
+        let failures = seeded
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
             .await;
+        assert!(failures.is_empty(), "{failures:?}");
+        drop(seeded);
 
         let entered = ReleaseLatchV1::new();
         let release = ReleaseLatchV1::new();
@@ -9435,8 +9271,9 @@ mod tests {
             release_provider.wait();
         });
 
-        let reopened = fixture.reopen();
-        let cancellation = HostCancellationToken::new();
+        let reopened = mount_observer_dormant(mount_inputs(), &cancellation)
+            .await
+            .expect("dormant restarted journey");
         let activation_cancellation = cancellation.clone();
         let mut activation = tokio::spawn(async move {
             activate_required_with_startup_replay_and_delivery_settled(
@@ -9481,8 +9318,8 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
     }
 
-    /// Mounts the production journey against a real registered project store
-    /// and a real journal, exactly as the composition root does, without the
+    /// Mounts the retained journey constructor against a real registered project
+    /// store and a real journal, without the
     /// bounded live replay task so admission counts are deterministic: direct
     /// canonical replay is the authoritative path either way.
     async fn mount_hygiene_fixture(temp: &TempDir, project: &str) -> HygieneJourneyFixture {
@@ -9498,17 +9335,16 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database")
             .observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObservationProvider::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let journey = mount_project_observation_journey(ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port)
-                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+            composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.observation-hygiene").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
-                .expect("native mount metadata"),
+            provider: test_observation_mount(&(journal_root.clone()), 1)
+                .expect("observer mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         })
@@ -9710,7 +9546,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn codex_turn_context_settles_before_native_readiness_refusal_and_durable_restart() {
+    async fn codex_turn_context_withholding_allows_following_message_and_durable_restart() {
         let temp = TempDir::new().unwrap();
         let fixture = mount_hygiene_fixture(&temp, "project.codex-unknown-replay").await;
         let project_root = std::fs::canonicalize(temp.path().join("project")).unwrap();
@@ -9743,10 +9579,10 @@ mod tests {
         ];
         std::fs::write(
             &transcript,
-            records
-                .iter()
-                .map(|record| format!("{record}\n"))
-                .collect::<String>(),
+            records.iter().fold(String::new(), |mut output, record| {
+                writeln!(output, "{record}").expect("write JSON record");
+                output
+            }),
         )
         .unwrap();
         let progress = try_admit_codex_jsonl_observations_for_project_with_admission(
@@ -9778,28 +9614,33 @@ mod tests {
             .expect("the following message was durably admitted");
         let following_id = following.observation().observation_id().clone();
         assert!(unknown.sequence() < following.sequence());
-        let error = run_startup_replay(
-            fixture.journey.as_ref(),
-            &fixture.store,
-            &HostCancellationToken::new(),
-        )
-        .await
-        .expect_err(
-            "Native has no observation.accept capability; the following message must be refused",
-        );
-        assert!(
-            matches!(&error, ObservationJourneyError::Ingress(ObservationRuntimeError::Admission { cause, .. })
-            if matches!(cause.cause().downcast_ref::<AdmissionAdapterError>(),
-                Some(AdmissionAdapterError::Readiness { source_event_id, .. })
-                    if source_event_id == following_id.as_str())),
-            "{error}"
+        assert_eq!(
+            run_startup_replay(
+                fixture.journey.as_ref(),
+                &fixture.store,
+                &HostCancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .admitted,
+            1
         );
         assert_eq!(
-            fixture.journey.replay_watermark().await.unwrap(),
-            unknown.sequence()
+            wait_for_settlement(fixture.journey.journal_path()).await,
+            ("acknowledged".to_owned(), 1)
         );
-        assert_eq!(fixture.port.observe_calls.load(Ordering::Acquire), 0);
-        assert!(fixture.port.delivered.lock().unwrap().is_empty());
+        {
+            let delivered = fixture.port.delivered.lock().unwrap();
+            assert_eq!(delivered.len(), 1);
+            let envelope: Value = serde_json::from_slice(&delivered[0].bytes).unwrap();
+            assert_eq!(
+                envelope["source_identity"]["canonical_observation_id"],
+                following_id.as_str()
+            );
+            assert!(envelope.to_string().contains(message));
+            assert!(!envelope.to_string().contains("turn_context"));
+            assert!(!envelope.to_string().contains(unknown_id.as_str()));
+        }
         assert_eq!(
             fixture
                 .store
@@ -9813,7 +9654,7 @@ mod tests {
         );
         let before = journal_snapshot(fixture.journey.journal_path());
         assert!(
-            before.starts_with("journal=0 delivery=0 withheld=1 receipts=0 cursors=1 "),
+            before.starts_with("journal=1 delivery=1 withheld=1 receipts=1 cursors=1 "),
             "{before}"
         );
         {
@@ -9847,27 +9688,19 @@ mod tests {
                 .is_empty()
         );
         let reopened = fixture.reopen();
-        let error = run_startup_replay(
-            reopened.as_ref(),
-            &fixture.store,
-            &HostCancellationToken::new(),
-        )
-        .await
-        .expect_err("restart must keep Native's actual readiness refusal");
-        assert!(
-            matches!(&error, ObservationJourneyError::Ingress(ObservationRuntimeError::Admission { cause, .. })
-            if matches!(cause.cause().downcast_ref::<AdmissionAdapterError>(),
-                Some(AdmissionAdapterError::Readiness { source_event_id, .. })
-                    if source_event_id == following_id.as_str())),
-            "{error}"
+        assert_eq!(
+            run_startup_replay(
+                reopened.as_ref(),
+                &fixture.store,
+                &HostCancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .admitted,
+            0
         );
         assert_eq!(journal_snapshot(reopened.journal_path()), before);
-        assert_eq!(
-            reopened.replay_watermark().await.unwrap(),
-            unknown.sequence()
-        );
-        assert_eq!(fixture.port.observe_calls.load(Ordering::Acquire), 0);
-        assert!(fixture.port.delivered.lock().unwrap().is_empty());
+        assert_eq!(fixture.port.observe_calls.load(Ordering::Acquire), 1);
         assert!(
             reopened
                 .shutdown(tokio::time::Instant::now() + Duration::from_secs(2))
@@ -10954,8 +10787,8 @@ mod tests {
         .await;
         match purged {
             Ok(state) => state,
-            Err(_) => panic!(
-                "the mounted retention sweep never purged the expired row; {}",
+            Err(error) => panic!(
+                "the mounted retention sweep never purged the expired row: {error}; {}",
                 journal_snapshot(journal_path)
             ),
         }
@@ -10979,17 +10812,16 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database");
         let store = database.observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObservationProvider::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         let inputs = || ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port)
-                as Arc<dyn tracedecay_memory_provider_registry::NativeMemoryApplicationPort>),
+            composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.observation-retention").expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
-                .expect("native mount metadata"),
+            provider: test_observation_mount(&(journal_root.clone()), 1)
+                .expect("observer mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
@@ -11088,70 +10920,84 @@ mod tests {
     }
 
     impl ObservationStore for RefusingReplayPort {
-        async fn persist_observation(
+        fn persist_observation(
             &self,
             _write: AnchoredObservationWrite,
-        ) -> ObservationStoreResult<ObservationPersistOutcome> {
-            Err(read_only_observation_store_error("persist_observation"))
+        ) -> impl std::future::Future<Output = ObservationStoreResult<ObservationPersistOutcome>> + Send
+        {
+            async move { Err(read_only_observation_store_error("persist_observation")) }
         }
 
-        async fn persist_observations(
+        fn persist_observations(
             &self,
             _writes: Vec<AnchoredObservationWrite>,
-        ) -> ObservationStoreResult<Vec<ObservationBatchPersistOutcome>> {
-            Err(read_only_observation_store_error("persist_observations"))
+        ) -> impl std::future::Future<
+            Output = ObservationStoreResult<Vec<ObservationBatchPersistOutcome>>,
+        > + Send {
+            async move { Err(read_only_observation_store_error("persist_observations")) }
         }
 
-        async fn get_source_cursor(
+        fn get_source_cursor(
             &self,
             _source: &ObservationSourceIdentityV1,
             _scope: &ObservationScopeV1,
-        ) -> ObservationStoreResult<Option<ObservationSourceCursorV1>> {
-            Err(read_only_observation_store_error("get_source_cursor"))
+        ) -> impl std::future::Future<
+            Output = ObservationStoreResult<Option<ObservationSourceCursorV1>>,
+        > + Send {
+            async move { Err(read_only_observation_store_error("get_source_cursor")) }
         }
 
-        async fn committed_source_cursors(
+        fn committed_source_cursors(
             &self,
             _source: &ObservationSourceIdentityV1,
             _scope: &ObservationScopeV1,
-        ) -> ObservationStoreResult<Vec<ObservationSourceCursorV1>> {
-            Err(read_only_observation_store_error(
-                "committed_source_cursors",
-            ))
+        ) -> impl std::future::Future<
+            Output = ObservationStoreResult<Vec<ObservationSourceCursorV1>>,
+        > + Send {
+            async move {
+                Err(read_only_observation_store_error(
+                    "committed_source_cursors",
+                ))
+            }
         }
 
-        async fn advance_source_cursor(
+        fn advance_source_cursor(
             &self,
             _advance: ObservationCursorAdvance,
-        ) -> ObservationStoreResult<CursorAdvanceOutcome> {
-            Err(read_only_observation_store_error("advance_source_cursor"))
+        ) -> impl std::future::Future<Output = ObservationStoreResult<CursorAdvanceOutcome>> + Send
+        {
+            async move { Err(read_only_observation_store_error("advance_source_cursor")) }
         }
 
-        async fn get_observation(
+        fn get_observation(
             &self,
             _observation_id: &CanonicalObservationIdV1,
-        ) -> ObservationStoreResult<Option<StoredObservation>> {
-            Ok(None)
+        ) -> impl std::future::Future<Output = ObservationStoreResult<Option<StoredObservation>>> + Send
+        {
+            async move { Ok(None) }
         }
 
-        async fn replay_observations(
+        fn replay_observations(
             &self,
             request: ObservationReplayRequest,
-        ) -> ObservationStoreResult<Vec<StoredObservation>> {
-            let next = match self.refusals.lock() {
-                Ok(mut slot) => slot.pop(),
-                Err(poisoned) => poisoned.into_inner().pop(),
-            };
-            if let Some(error) = next {
-                return Err(error);
+        ) -> impl std::future::Future<Output = ObservationStoreResult<Vec<StoredObservation>>> + Send
+        {
+            async move {
+                let next = match self.refusals.lock() {
+                    Ok(mut slot) => slot.pop(),
+                    Err(poisoned) => poisoned.into_inner().pop(),
+                };
+                if let Some(error) = next {
+                    return Err(error);
+                }
+                Ok(self
+                    .then
+                    .iter()
+                    .filter(|record| record.sequence() > request.after_sequence())
+                    .take(request.limit())
+                    .cloned()
+                    .collect())
             }
-            Ok(self
-                .then
-                .iter()
-                .filter(|record| record.sequence() > request.after_sequence())
-                .take(request.limit())
-                .cloned()
-                .collect())
         }
     }
 
@@ -11172,13 +11018,12 @@ mod tests {
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).expect("journal root");
         ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::new(JourneyNativePort::new())),
+            composition: composition(Arc::new(JourneyObservationProvider::new())),
             profile_id: UserProfileId::new("profile.observation-startup-classification")
                 .expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::retained_owner::native_observation_mount(&(journal_root), 1)
-                .expect("native mount metadata"),
+            provider: test_observation_mount(&(journal_root), 1).expect("observer mount metadata"),
             store_data_root: journal_root,
             policy: ObservationJourneyPolicyV1::project_default(),
         }
@@ -11475,7 +11320,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn optional_instance_bootstrap_does_not_block_native_and_drains_restart_pending_rows() {
+    async fn optional_instance_bootstrap_does_not_block_ready_journey_and_drains_restart_pending_rows()
+     {
         let temp = TempDir::new().unwrap();
         let project = "project.observation-startup-classification";
         let project_id = ProjectId::new(project).unwrap();
@@ -11538,28 +11384,28 @@ mod tests {
         .unwrap();
         assert!(observer.provider_instance_id.get().is_none());
 
-        let native_root = TempDir::new().unwrap();
-        let native = mount_and_replay(
-            classification_mount_inputs(&native_root, project),
+        let ready_root = TempDir::new().unwrap();
+        let ready = mount_and_replay(
+            classification_mount_inputs(&ready_root, project),
             store(),
             &HostCancellationToken::new(),
         )
         .await
         .unwrap();
         assert_eq!(
-            wait_for_settlement(native.journal_path()).await,
+            wait_for_settlement(ready.journal_path()).await,
             ("acknowledged".to_owned(), 1)
         );
         assert!(
             observer.provider_instance_id.get().is_none(),
-            "Native settled while observer proof was held"
+            "an independent ready journey settled while observer proof was held"
         );
         release.store(true, Ordering::Release);
         assert_eq!(
             wait_for_settlement(&pending_path).await,
             ("acknowledged".to_owned(), 1)
         );
-        native
+        ready
             .shutdown(tokio::time::Instant::now() + Duration::from_secs(5))
             .await;
         observer
@@ -12032,16 +11878,16 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database");
         let store = database.observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObservationProvider::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).unwrap();
         let inputs = || ObservationJourneyMountInputsV1 {
-            composition: composition(Arc::clone(&port) as Arc<dyn NativeMemoryApplicationPort>),
+            composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new("profile.mount-off-worker").unwrap(),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id.clone(),
-            provider: crate::retained_owner::native_observation_mount(&(journal_root.clone()), 1)
-                .expect("native mount metadata"),
+            provider: test_observation_mount(&(journal_root.clone()), 1)
+                .expect("observer mount metadata"),
             store_data_root: journal_root.clone(),
             policy: ObservationJourneyPolicyV1::project_default(),
         };
@@ -12125,20 +11971,17 @@ mod tests {
             .registered_database_arc(HostAdmissionScope::Project)
             .expect("project database");
         let store = database.observation_store();
-        let port = Arc::new(JourneyNativePort::new());
+        let port = Arc::new(JourneyObservationProvider::new());
         let journal_root = temp.path().join("journey");
         std::fs::create_dir_all(&journal_root).unwrap();
         let journey = mount_and_replay(
             ObservationJourneyMountInputsV1 {
-                composition: composition(Arc::clone(&port) as Arc<dyn NativeMemoryApplicationPort>),
+                composition: composition(Arc::clone(&port) as Arc<dyn MemoryProviderV1>),
                 profile_id: UserProfileId::new("profile.shutdown-off-worker").unwrap(),
                 scope: scope(project_id.clone()),
                 authoritative_project_id: project_id.clone(),
-                provider: crate::retained_owner::native_observation_mount(
-                    &(journal_root.clone()),
-                    1,
-                )
-                .expect("native mount metadata"),
+                provider: test_observation_mount(&(journal_root.clone()), 1)
+                    .expect("observer mount metadata"),
                 store_data_root: journal_root.clone(),
                 policy: ObservationJourneyPolicyV1::project_default(),
             },

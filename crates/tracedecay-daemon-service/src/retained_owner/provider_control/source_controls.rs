@@ -174,7 +174,7 @@ enum PreparedCorrectionV1<'request> {
     Metadata(Value),
     Replacement {
         selector: &'request ProviderControlSourceSelectorV1,
-        source: AuthorizedControlSourceV1,
+        source: Box<AuthorizedControlSourceV1>,
         observation: CanonicalPayload,
     },
     RestrictScope {
@@ -296,7 +296,7 @@ async fn prepare_correction<'request>(
             let observation = resolved.admitted.payload.clone();
             Ok(PreparedCorrectionV1::Replacement {
                 selector: replacement_source,
-                source,
+                source: Box::new(source),
                 observation,
             })
         }
@@ -757,8 +757,8 @@ fn deletion_failure(
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "provider_result_unconfirmed".to_owned());
-    result.result =
-        ProviderControlOperationResultV1::DeleteBySource(Some(ProviderDeleteBySourceResultV1 {
+    result.result = ProviderControlOperationResultV1::DeleteBySource(Some(Box::new(
+        ProviderDeleteBySourceResultV1 {
             source: request.source.clone(),
             target: target.clone(),
             mode: request.mode,
@@ -766,7 +766,8 @@ fn deletion_failure(
             intent: intent.clone(),
             host_snapshot_cleanup: projection::host_snapshot_cleanup(cleanup),
             erasure: ProviderControlErasureV1::Pending { reason_code },
-        }));
+        },
+    )));
     result
         .validate_for(public)
         .map_err(|_| binding("committed intent pending result"))?;
@@ -785,7 +786,7 @@ fn accepted_failure(
     let failure = normalize_caught_failure(invocation, failure);
     CompletedProviderControlV1 {
         result: outcome::result_after_failure(invocation.request, state, identity, &failure.stage),
-        host_receipt: failure.host_receipt,
+        host_receipt: failure.host_receipt.map(|receipt| *receipt),
     }
 }
 
@@ -795,10 +796,7 @@ fn normalize_caught_failure(
 ) -> ControlFailureV1 {
     // These failures become a typed completed outcome before the enclosing
     // executor sees them; preserve its first observed caller/deadline cause.
-    match invocation.normalize_control_refusal::<()>(Err(failure)) {
-        Err(failure) => failure,
-        Ok(()) => unreachable!("normalizing a failure cannot produce success"),
-    }
+    invocation.normalize_control_failure(failure)
 }
 
 async fn refresh_source(

@@ -3,7 +3,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use tracedecay_contracts::memory::CognitiveRecallTemporalMode;
+use tracedecay_contracts::memory::{CognitiveRecallTemporalMode, CognitiveRecallTemporalQuery};
 use tracedecay_contracts::retained_surfaces::{
     FactCategoryV1, FactSearchGraphCoverageV1, FactSearchGraphDegradationV1, FactSearchHitV1,
 };
@@ -195,7 +195,7 @@ pub(super) fn context_memory_options(request: &ContextSurfaceRequestV1) -> Conte
     let temporal_coverage = request
         .temporal_query
         .as_ref()
-        .map(|query| query.mode())
+        .map(CognitiveRecallTemporalQuery::mode)
         .filter(|mode| include_memory && *mode != CognitiveRecallTemporalMode::Current)
         .map(
             |requested_mode| ContextMemoryTemporalCoverageV1::WithheldCurrentOnly {

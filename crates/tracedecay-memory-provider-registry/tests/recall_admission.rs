@@ -1308,10 +1308,13 @@ fn real_fabric_route_admits_only_exact_scope_current_candidates() -> Result<(), 
     let response = registry.handshake(&handshake())?;
     let temporal = current_query();
     let call = recall_call(&response, &temporal);
+    let authorized = registry
+        .recall_scope_bindings(&call.provider_id)
+        .expect("native bindings recorded at registration");
 
     let reply = registry.invoke_active(&call)?;
     assert_eq!(reply.terminal.terminal_code(), TerminalCode::Success);
-    let admission = admit_recall_reply(&call, &temporal, 8, &authorized_native(), &reply)?;
+    let admission = admit_recall_reply(&call, &temporal, 8, authorized, &reply)?;
 
     let admitted: Vec<_> = admission
         .admitted
@@ -1341,18 +1344,18 @@ fn real_fabric_route_admits_only_exact_scope_current_candidates() -> Result<(), 
                     field: ScopeField::RepositoryIdentity
                 }
             ),
-            ("stale-exact-scope", RecallDenialReason::StaleIdentity),
+            (
+                "stale-exact-scope",
+                RecallDenialReason::ScopeBindingUnauthorized {
+                    binding: ScopeBinding::ExactCodingScope
+                }
+            ),
         ]
     );
+    assert_eq!(admission.report.authorized_scope_bindings, *authorized);
     assert_eq!(
         admission.report.authorized_scope_bindings,
-        *registry
-            .recall_scope_bindings(&call.provider_id)
-            .expect("native bindings recorded at registration")
-    );
-    assert_eq!(
-        admission.report.authorized_scope_bindings,
-        authorized_native()
+        authorized_facts_only()
     );
     for entry in &admission.admitted {
         assert_eq!(entry.scope_binding(), ScopeBinding::ProjectFacts);
@@ -1369,7 +1372,7 @@ fn real_fabric_route_admits_only_exact_scope_current_candidates() -> Result<(), 
 
     // The budget the host admitted binds the outcome.
     assert_eq!(
-        admit_recall_reply(&call, &temporal, 3, &authorized_native(), &reply).err(),
+        admit_recall_reply(&call, &temporal, 3, authorized, &reply).err(),
         Some(RecallAdmissionError::CandidateBudgetExceeded {
             returned: 6,
             maximum: 3
@@ -1390,7 +1393,7 @@ fn unattributable_outcomes_and_failed_terminals_are_typed_errors_not_empty_succe
     let call = recall_call(&response, &temporal);
     let reply = registry.invoke_active(&call)?;
     assert_eq!(
-        admit_recall_reply(&call, &temporal, 8, &authorized_native(), &reply).err(),
+        admit_recall_reply(&call, &temporal, 8, &authorized_all_scopes(), &reply).err(),
         Some(RecallAdmissionError::OutcomeBinding {
             field: "request_identity"
         })
@@ -1404,7 +1407,7 @@ fn unattributable_outcomes_and_failed_terminals_are_typed_errors_not_empty_succe
     let call = recall_call(&response, &temporal);
     let reply = registry.invoke_active(&call)?;
     assert_eq!(
-        admit_recall_reply(&call, &temporal, 8, &authorized_native(), &reply).err(),
+        admit_recall_reply(&call, &temporal, 8, &authorized_all_scopes(), &reply).err(),
         Some(RecallAdmissionError::TerminalNotSuccessful {
             terminal_code: TerminalCode::ProviderUnavailable
         })
@@ -1431,7 +1434,7 @@ fn admit_native(
         &admitted_scope(),
         "request",
         &current_query(),
-        &authorized_native(),
+        &authorized_all_scopes(),
         candidates,
     )?;
     Ok(admission
@@ -1524,7 +1527,7 @@ fn project_facts_candidate_with_empty_optionals_is_admitted() -> Result<(), Box<
         &admitted_scope(),
         "request",
         &current_query(),
-        &authorized_native(),
+        &authorized_all_scopes(),
         vec![
             candidate("project-fact", scope, current_validity()),
             candidate(
@@ -1554,7 +1557,7 @@ fn project_facts_candidate_with_empty_optionals_is_admitted() -> Result<(), Box<
     );
     assert_eq!(
         admission.report.authorized_scope_bindings,
-        authorized_native()
+        authorized_all_scopes()
     );
     Ok(())
 }
@@ -1568,7 +1571,7 @@ fn project_facts_candidate_from_another_worktree_of_the_same_project_is_denied()
         &admitted_scope(),
         "request",
         &current_query(),
-        &authorized_native(),
+        &authorized_all_scopes(),
         vec![candidate("other-worktree", scope, current_validity())],
     )?;
     assert!(admission.admitted.is_empty());
@@ -1766,7 +1769,7 @@ fn profile_facts_candidate_binds_only_the_profile() -> Result<(), Box<dyn Error>
         &admitted_scope(),
         "request",
         &current_query(),
-        &authorized_native(),
+        &authorized_all_scopes(),
         vec![
             candidate("profile-fact", profile_only, current_validity()),
             candidate("with-project", with_project, current_validity()),
@@ -1851,15 +1854,11 @@ fn project_facts_candidate_from_a_foreign_project_or_profile_is_denied()
 /// A staged session observation may only be admitted under
 /// `exact_coding_scope` or `checkout_observations`, whatever else its provider is authorized for.
 ///
-/// The real defect this catches is provider-wide authorization being read as
-/// per-candidate authorization. Native is authorized for `exact_coding_scope`,
-/// `project_facts`, and `profile_facts`, so nothing in binding authorization
-/// alone stops a provider-local staged row from claiming `project_facts` —
-/// and that binding makes the checkout fields optional and *forbids* the
-/// session identity and the resolved scope digest, so the row would be
-/// admitted in another checkout or branch than the one it was observed in. The class-to-binding policy denies it
-/// before any field is compared, which is why the mutated candidates below
-/// carry a scope that would otherwise pass.
+/// The fixture authorizes all four scopes so binding authorization alone
+/// cannot reject a staged row claiming an owner-fact binding. Those bindings
+/// omit required checkout identity, letting the row reach another checkout.
+/// The class-to-binding policy rejects that claim before field comparison,
+/// even when the claimed scope would otherwise pass.
 #[test]
 fn a_staged_session_observation_cannot_be_admitted_as_project_or_profile_facts()
 -> Result<(), Box<dyn Error>> {
@@ -1890,7 +1889,7 @@ fn a_staged_session_observation_cannot_be_admitted_as_project_or_profile_facts()
             &current_query(),
             // Native's own authorization set: the binding itself is allowed,
             // so only the class policy can refuse this candidate.
-            &authorized_native(),
+            &authorized_all_scopes(),
             vec![decode(value)],
         )?;
         assert!(admission.admitted.is_empty(), "{:?}", admission.admitted);
@@ -1920,7 +1919,7 @@ fn a_staged_session_observation_cannot_be_admitted_as_project_or_profile_facts()
         &admitted_scope(),
         "request",
         &current_query(),
-        &authorized_native(),
+        &authorized_all_scopes(),
         vec![decode(value)],
     )?;
     assert_eq!(admission.admitted.len(), 1);
@@ -1963,12 +1962,12 @@ fn checkout_observations_cross_sessions_only_under_a_checkout_binding() -> Resul
     assert!(!declared.authorizes(ScopeBinding::CheckoutObservations));
     assert!(declared.authorizes(ScopeBinding::ProjectFacts));
     assert!(declared.authorizes(ScopeBinding::ProfileFacts));
-    let native = authorized_native();
+    let authorized = authorized_all_scopes();
     let admitted = admit_recall_candidates(
         &request,
         "request-next",
         &current_query(),
-        &native,
+        &authorized,
         vec![decode(candidate.clone())],
     )?;
     assert_eq!(admitted.admitted.len(), 1);
@@ -2015,7 +2014,7 @@ fn checkout_observations_cross_sessions_only_under_a_checkout_binding() -> Resul
         &request,
         "request-next",
         &current_query(),
-        &native,
+        &authorized,
         vec![decode(exact)],
     )?;
     assert_eq!(
@@ -2048,7 +2047,7 @@ fn checkout_observation_requires_each_checkout_identity_and_forbids_session_clai
                 &origin,
                 "request",
                 &current_query(),
-                &authorized_native(),
+                &authorized_all_scopes(),
                 vec![decode(candidate)],
             )?;
             assert!(refused.admitted.is_empty());
@@ -2078,7 +2077,7 @@ fn checkout_observation_requires_each_checkout_identity_and_forbids_session_clai
             &origin,
             "request",
             &current_query(),
-            &authorized_native(),
+            &authorized_all_scopes(),
             vec![decode(candidate)],
         )?;
         assert_eq!(
@@ -2095,7 +2094,7 @@ fn checkout_observation_requires_each_checkout_identity_and_forbids_session_clai
             &origin,
             "request",
             &current_query(),
-            &authorized_native(),
+            &authorized_all_scopes(),
             vec![decode(malformed)],
         )?;
         assert_eq!(

@@ -574,9 +574,7 @@ impl WorkerClient {
             retained_identity_digest,
             snapshot_files.as_ref(),
         )?;
-        if let Err(error) = self.reserve_bytes(frame_bytes) {
-            return Err(error);
-        }
+        self.reserve_bytes(frame_bytes)?;
         let (response_tx, response_rx) = mpsc::sync_channel(1);
         let expires = Instant::now()
             .checked_add(deadline)
@@ -656,10 +654,7 @@ impl WorkerClient {
             snapshot_files.as_ref(),
             retention_reservation.reservation.as_ref(),
         );
-        let retained = match retention {
-            Ok(retained) => retained,
-            Err(error) => return Err(error),
-        };
+        let retained = retention?;
         if retained
             && matches!(
                 &result,
@@ -1351,11 +1346,7 @@ impl WorkerClient {
         let prefix = format!("retained-{}-{}-{serial}", std::process::id(), request.id);
         let send_file = directory.join(format!("{prefix}.json"));
         let backup_file = directory.join(format!("{prefix}.backup.json"));
-        if let Err(error) =
-            write_snapshot_file(&directory, &send_file, bytes, &format!("{prefix}.tmp"))
-        {
-            return Err(error);
-        }
+        write_snapshot_file(&directory, &send_file, bytes, &format!("{prefix}.tmp"))?;
         if let Err(error) = write_snapshot_file(
             &directory,
             &backup_file,

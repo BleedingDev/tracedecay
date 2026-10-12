@@ -350,6 +350,13 @@ fn legacy_trace(
     result(selected.into_iter().collect(), 1)
 }
 
+struct DeliveryReceiptPage {
+    items: Vec<Value>,
+    partial: bool,
+    cursor: Option<u64>,
+    scanned: u64,
+}
+
 fn delivery_receipt(
     namespace: &str,
     handle: &NamespaceHandle,
@@ -359,7 +366,7 @@ fn delivery_receipt(
 ) -> EngineReply {
     let generation = handle.commit_seq;
     let corrupt = || EngineReply::new(Outcome::Corrupt, generation, Value::Null);
-    let result = (|| -> Result<Option<(Vec<Value>, bool, Option<u64>, u64)>, EngineReply> {
+    let result = (|| -> Result<Option<DeliveryReceiptPage>, EngineReply> {
         let Some(key) = payload["delivery_key"].as_str() else {
             return Ok(None);
         };
@@ -546,12 +553,26 @@ fn delivery_receipt(
         if rows.is_empty() {
             partial = true;
         }
-        Ok(Some((rows, partial, next_cursor, scanned)))
+        Ok(Some(DeliveryReceiptPage {
+            items: rows,
+            partial,
+            cursor: next_cursor,
+            scanned,
+        }))
     })();
     match result {
         Ok(result) => {
-            let (items, partial, cursor, scanned) =
-                result.unwrap_or_else(|| (Vec::new(), true, None, 0));
+            let DeliveryReceiptPage {
+                items,
+                partial,
+                cursor,
+                scanned,
+            } = result.unwrap_or_else(|| DeliveryReceiptPage {
+                items: Vec::new(),
+                partial: true,
+                cursor: None,
+                scanned: 0,
+            });
             EngineReply::new(
                 Outcome::Success,
                 generation,

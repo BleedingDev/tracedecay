@@ -1,4 +1,6 @@
 //! Current canonical evidence remains distinct from original live-event proof.
+use std::future::Future;
+
 use super::*;
 use crate::retained_owner::provider_history::{
     HistoryIdentityBridgeV1, HookOriginReaderV1, MountedOriginalObservationAuthorityV1,
@@ -118,7 +120,7 @@ impl RepositoryFixture {
     }
     fn journal(&self) -> SqliteObservationJournal {
         SqliteObservationJournal::open(
-            &self.temp.path().join("history.sqlite"),
+            self.temp.path().join("history.sqlite"),
             ObservationJourneyPolicyV1::project_default().retention,
         )
         .unwrap()
@@ -320,43 +322,48 @@ impl CurrentObservationFixture {
 
 struct ActiveDispositions;
 impl RetrievalAnchorDispositionStore for ActiveDispositions {
-    async fn append_disposition(
+    fn append_disposition(
         &self,
         _: RetrievalAnchorDispositionRecordV1,
-    ) -> RetrievalAnchorStoreResult<AnchorDispositionAppendOutcomeV1> {
-        panic!("read-only fixture")
+    ) -> impl Future<Output = RetrievalAnchorStoreResult<AnchorDispositionAppendOutcomeV1>> + Send
+    {
+        async { panic!("read-only fixture") }
     }
-    async fn publish_derivative(
+    fn publish_derivative(
         &self,
         _: RetrievalAnchorDerivativeV1,
-    ) -> RetrievalAnchorStoreResult<AnchorDispositionAppendOutcomeV1> {
-        panic!("read-only fixture")
+    ) -> impl Future<Output = RetrievalAnchorStoreResult<AnchorDispositionAppendOutcomeV1>> + Send
+    {
+        async { panic!("read-only fixture") }
     }
-    async fn current_disposition(
+    fn current_disposition(
         &self,
         _: &RetrievalAnchorId,
         _: &FactOwnerV1,
-    ) -> RetrievalAnchorStoreResult<Option<RetrievalAnchorDispositionRecordV1>> {
-        Ok(None)
+    ) -> impl Future<Output = RetrievalAnchorStoreResult<Option<RetrievalAnchorDispositionRecordV1>>>
+    + Send {
+        std::future::ready(Ok(None))
     }
-    async fn tombstone(
+    fn tombstone(
         &self,
         _: &RetrievalAnchorId,
         _: &FactOwnerV1,
-    ) -> RetrievalAnchorStoreResult<Option<RetrievalAnchorTombstoneV1>> {
-        panic!("read-only fixture")
+    ) -> impl Future<Output = RetrievalAnchorStoreResult<Option<RetrievalAnchorTombstoneV1>>> + Send
+    {
+        async { panic!("read-only fixture") }
     }
-    async fn derivatives(
+    fn derivatives(
         &self,
         _: &RetrievalAnchorId,
         _: &FactOwnerV1,
-    ) -> RetrievalAnchorStoreResult<Vec<RetrievalAnchorDerivativeV1>> {
-        panic!("read-only fixture")
+    ) -> impl Future<Output = RetrievalAnchorStoreResult<Vec<RetrievalAnchorDerivativeV1>>> + Send
+    {
+        async { panic!("read-only fixture") }
     }
 }
 
-#[tokio::test]
-async fn ingestion_capture_cannot_authorize_recent_or_replayed_original_history() {
+#[test]
+fn ingestion_capture_cannot_authorize_recent_or_replayed_original_history() {
     let fixture = RepositoryFixture::new();
     let bridge = Arc::new(fixture.bridge());
     let identity = Arc::new(HookOriginReaderV1::new(
@@ -385,13 +392,7 @@ async fn ingestion_capture_cannot_authorize_recent_or_replayed_original_history(
     };
     let destination = bridge.destination("session.destination").unwrap();
     assert!(matches!(
-        reader.select_recent_page(&destination, 1, &control()).await,
-        Err(ProviderHistoryErrorV1::Unavailable(
-            ORIGINAL_PROVENANCE_UNAVAILABLE
-        ))
-    ));
-    assert!(matches!(
-        reader.select_page(&destination, 0, 1, &control()).await,
+        reader.select_recent_page(&destination, 1, &control()),
         Err(ProviderHistoryErrorV1::Unavailable(
             ORIGINAL_PROVENANCE_UNAVAILABLE
         ))
@@ -400,12 +401,12 @@ async fn ingestion_capture_cannot_authorize_recent_or_replayed_original_history(
         records.records[0].observation().payload(),
         &canonical_payload
     );
-    assert!(
+    assert_eq!(
         journal
             .inspect(&JournalInspectionFilterV1::default())
             .unwrap()
-            .rows
-            .is_empty()
+            .rows,
+        Vec::new()
     );
 }
 
@@ -477,7 +478,7 @@ async fn absent_original_authority_refuses_history_before_canonical_reads() {
     .unwrap()
     .unwrap();
     admitted.verify_for(&call).unwrap();
-    assert!(admitted.history_sources.is_empty());
+    assert_eq!(admitted.history_sources, Vec::new());
     assert!(matches!(
         authority.reader(),
         Err(ProviderHistoryErrorV1::Unavailable(

@@ -1,6 +1,7 @@
 //! Real NCM delivery, provider-local durability, and current-session isolation.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -95,7 +96,7 @@ fn construct_ncm_observer(
     state_root: PathBuf,
     registration_revision: u64,
 ) -> Result<NcmObserverFixture, String> {
-    let admitted_state_root = StateRoot::new(state_root).map_err(|error| error.to_string())?;
+    let admitted_state_root = StateRoot::new(state_root)?;
     let mount_state_root = admitted_state_root.path().to_path_buf();
     let worker_owner = Arc::new(
         RustNcmWorkerOwner::new(RustNcmConfig {
@@ -286,14 +287,11 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
         json!({"timestamp":"2026-09-04T12:00:02Z", "type":"event_msg",
             "payload":{"type":"agent_message","message":codex_text}}),
     ];
-    std::fs::write(
-        &transcript,
-        codex_records
-            .iter()
-            .map(|record| format!("{record}\n"))
-            .collect::<String>(),
-    )
-    .unwrap();
+    let mut transcript_text = String::new();
+    for record in &codex_records {
+        writeln!(&mut transcript_text, "{record}").unwrap();
+    }
+    std::fs::write(&transcript, transcript_text).unwrap();
     let progress = try_admit_codex_jsonl_observations_for_project_with_admission(
         &transcript,
         &project_root,
@@ -747,7 +745,7 @@ async fn real_ncm_current_delivery_survives_remount_and_isolates_sessions() {
             1
         );
     }
-    assert!(seed.journal.lease_pending(&request).unwrap().is_empty());
+    assert_eq!(seed.journal.lease_pending(&request).unwrap(), Vec::new());
     assert_eq!(
         seed.journal
             .attempt_orphans_for(&exhausted_row.observation_id)
@@ -909,7 +907,7 @@ fn assert_current_capsule(
         .stable_memory_ref
         .clone()
         .expect("authenticated persisted NCM capsule identity");
-    assert!(!stable_memory_ref.is_empty());
+    assert_ne!(stable_memory_ref, "");
     assert_eq!(candidate.trace_refs, vec![stable_memory_ref.clone()]);
     CurrentCapsuleIdentity {
         stable_memory_ref,
@@ -1317,7 +1315,7 @@ fn real_ncm_admitted_recall(
     )
     .expect("admit NCM recall outcome");
     assert_eq!(admitted.report.admitted_count, outcome.candidates.len());
-    assert!(admitted.report.denied.is_empty());
+    assert_eq!(admitted.report.denied, Vec::new());
     outcome
 }
 
@@ -1426,7 +1424,7 @@ fn ncm_delivery_diagnostics(journal: &SqliteObservationJournal) -> serde_json::V
                 "provider_receipt_present": receipt.provider_receipt_digest.is_some(),
             })).collect::<Vec<_>>(),
             "refused_terminal_codes": refusals.iter().map(|refusal|
-                TerminalCode::from_wire(&refusal.terminal_code).map(TerminalCode::as_wire).unwrap_or("unrecognized")
+                TerminalCode::from_wire(&refusal.terminal_code).map_or("unrecognized", TerminalCode::as_wire)
             ).collect::<Vec<_>>(),
         })
     }).collect::<Vec<_>>();

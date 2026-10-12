@@ -16,9 +16,9 @@
 //!
 //! Process death is injected at the two seams the *composition root itself*
 //! hands the journey — the canonical observation store it replays from, and
-//! the Native application port the provider composition dispatches to. Both
+//! the observer provider the composition dispatches to. Both
 //! are production arguments, not test hooks: the mount takes an
-//! `ObservationStore` by value and a `NativeMemoryApplicationPort`
+//! `ObservationStore` by value and a registered `MemoryProviderV1`
 //! inside the composition, exactly as the daemon does. The journey itself is
 //! untouched, and no `#[cfg(test)]` seam is compiled into it.
 //!
@@ -66,6 +66,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
+use std::future::Future;
 use std::io::{Read, Write as _};
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -76,6 +77,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
+
+use tracedecay_memory_provider_registry::MemoryProviderV1;
 
 use super::*;
 
@@ -123,7 +126,7 @@ const SOAK_LANES: usize = 6;
 /// The soak tier's wall-clock ceiling. A window that cannot finish inside it
 /// fails with the seeds it never reached, so the tier can never quietly become
 /// a shorter one.
-const SOAK_BUDGET: Duration = Duration::from_secs(1_800);
+const SOAK_BUDGET: Duration = Duration::from_mins(30);
 
 /// Where the seed windows start. Fixed forever: moving it would silently
 /// retire the coverage these tiers are asserted to have. The soak window is a
@@ -368,76 +371,84 @@ impl FuzzCanonicalPortV1 {
 }
 
 impl ObservationStore for FuzzCanonicalPortV1 {
-    async fn persist_observation(
+    fn persist_observation(
         &self,
         _write: AnchoredObservationWrite,
-    ) -> ObservationStoreResult<ObservationPersistOutcome> {
-        Err(read_only_observation_store_error("persist_observation"))
+    ) -> impl Future<Output = ObservationStoreResult<ObservationPersistOutcome>> + Send {
+        async move { Err(read_only_observation_store_error("persist_observation")) }
     }
 
-    async fn persist_observations(
+    fn persist_observations(
         &self,
         _writes: Vec<AnchoredObservationWrite>,
-    ) -> ObservationStoreResult<Vec<ObservationBatchPersistOutcome>> {
-        Err(read_only_observation_store_error("persist_observations"))
+    ) -> impl Future<Output = ObservationStoreResult<Vec<ObservationBatchPersistOutcome>>> + Send
+    {
+        async move { Err(read_only_observation_store_error("persist_observations")) }
     }
 
-    async fn get_source_cursor(
+    fn get_source_cursor(
         &self,
         _source: &ObservationSourceIdentityV1,
         _scope: &ObservationScopeV1,
-    ) -> ObservationStoreResult<Option<ObservationSourceCursorV1>> {
-        Err(read_only_observation_store_error("get_source_cursor"))
+    ) -> impl Future<Output = ObservationStoreResult<Option<ObservationSourceCursorV1>>> + Send
+    {
+        async move { Err(read_only_observation_store_error("get_source_cursor")) }
     }
 
-    async fn committed_source_cursors(
+    fn committed_source_cursors(
         &self,
         _source: &ObservationSourceIdentityV1,
         _scope: &ObservationScopeV1,
-    ) -> ObservationStoreResult<Vec<ObservationSourceCursorV1>> {
-        Err(read_only_observation_store_error(
-            "committed_source_cursors",
-        ))
+    ) -> impl Future<Output = ObservationStoreResult<Vec<ObservationSourceCursorV1>>> + Send {
+        async move {
+            Err(read_only_observation_store_error(
+                "committed_source_cursors",
+            ))
+        }
     }
 
-    async fn advance_source_cursor(
+    fn advance_source_cursor(
         &self,
         _advance: ObservationCursorAdvance,
-    ) -> ObservationStoreResult<CursorAdvanceOutcome> {
-        Err(read_only_observation_store_error("advance_source_cursor"))
+    ) -> impl Future<Output = ObservationStoreResult<CursorAdvanceOutcome>> + Send {
+        async move { Err(read_only_observation_store_error("advance_source_cursor")) }
     }
 
-    async fn get_observation(
+    fn get_observation(
         &self,
         observation_id: &CanonicalObservationIdV1,
-    ) -> ObservationStoreResult<Option<StoredObservation>> {
-        Ok(self
-            .records
-            .iter()
-            .find(|record| record.observation().observation_id() == observation_id)
-            .cloned())
+    ) -> impl Future<Output = ObservationStoreResult<Option<StoredObservation>>> + Send {
+        async move {
+            Ok(self
+                .records
+                .iter()
+                .find(|record| record.observation().observation_id() == observation_id)
+                .cloned())
+        }
     }
 
-    async fn replay_observations(
+    fn replay_observations(
         &self,
         request: ObservationReplayRequest,
-    ) -> ObservationStoreResult<Vec<StoredObservation>> {
-        let page: Vec<StoredObservation> = self
-            .records
-            .iter()
-            .filter(|record| record.sequence() > request.after_sequence())
-            .take(request.limit())
-            .cloned()
-            .collect();
-        // The target is the next record this pass would admit, and it is still
-        // only in the canonical store: dying here is dying between the host's
-        // commit and the journal write.
-        self.hooks.check_verified(
-            HookPointV1::BeforeJournalWrite,
-            |target| page.first().map(StoredObservation::sequence) == Some(target),
-            |target| !self.journalled(target),
-        );
-        Ok(page)
+    ) -> impl Future<Output = ObservationStoreResult<Vec<StoredObservation>>> + Send {
+        async move {
+            let page: Vec<StoredObservation> = self
+                .records
+                .iter()
+                .filter(|record| record.sequence() > request.after_sequence())
+                .take(request.limit())
+                .cloned()
+                .collect();
+            // The target is the next record this pass would admit, and it is still
+            // only in the canonical store: dying here is dying between the host's
+            // commit and the journal write.
+            self.hooks.check_verified(
+                HookPointV1::BeforeJournalWrite,
+                |target| page.first().map(StoredObservation::sequence) == Some(target),
+                |target| !self.journalled(target),
+            );
+            Ok(page)
+        }
     }
 }
 
@@ -491,10 +502,10 @@ fn write_refusals(path: &Path, positions: &BTreeSet<u64>) {
     file.sync_all().expect("refusal policy fsync");
 }
 
-/// The Native application port the composition dispatches to: a provider with
+/// The observer implementation the composition dispatches to: a provider with
 /// a durable, deduplicating ledger, a permanent refusal set, and four of the
 /// six boundaries.
-struct FuzzNativePortV1 {
+struct FuzzObservationProviderV1 {
     descriptor: ProviderDescriptor,
     ledger: ProviderLedgerV1,
     refused: BTreeSet<u64>,
@@ -506,7 +517,7 @@ struct FuzzNativePortV1 {
     entries: PathBuf,
 }
 
-impl FuzzNativePortV1 {
+impl FuzzObservationProviderV1 {
     fn new(paths: &JourneyPathsV1, hooks: Arc<HooksV1>, entries: PathBuf) -> Self {
         let capabilities = BTreeSet::from([
             OwnedVersionedId::new("provider.health.v1").expect("health capability"),
@@ -514,7 +525,7 @@ impl FuzzNativePortV1 {
             OwnedVersionedId::new("recall.query.v1").expect("recall capability"),
         ]);
         let descriptor = ProviderDescriptor::new(
-            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("native provider"),
+            OwnedProviderId::new(JOURNEY_PROVIDER_ID).expect("observation provider"),
             "0".repeat(64),
             "crash-fuzz-v1",
             0,
@@ -533,10 +544,6 @@ impl FuzzNativePortV1 {
         }
     }
 
-    fn unexpected<T>() -> T {
-        panic!("the crash fuzzer reached an unrelated provider operation")
-    }
-
     /// The canonical position these bytes carry. The payload is the sanitized
     /// provider envelope, so the position is read out of the delivered bytes
     /// rather than from anything this process remembered.
@@ -551,7 +558,7 @@ impl FuzzNativePortV1 {
     }
 }
 
-impl NativeMemoryApplicationPort for FuzzNativePortV1 {
+impl MemoryProviderV1 for FuzzObservationProviderV1 {
     fn descriptor(&self) -> ProviderDescriptor {
         self.descriptor.clone()
     }
@@ -582,10 +589,8 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
             )
             .expect("handshake terminal"),
             descriptor: Some(self.descriptor.clone()),
-            provider_instance_id: Some(
-                crate::retained_owner::native_provider::PROVIDER_INSTANCE_ID.to_owned(),
-            ),
-            state_namespace: Some("tracedecay.native.crash-fuzz".to_owned()),
+            provider_instance_id: Some(JOURNEY_PROVIDER_INSTANCE_ID.to_owned()),
+            state_namespace: Some("tracedecay.journey-fixture.crash-fuzz".to_owned()),
             accepted_scope: Some(request.exact_scope.clone()),
             effective_limits: Some(request.host_limits.minimum(self.descriptor.limits)),
             ready_receipt_sha256: Some(READY_RECEIPT.to_owned()),
@@ -593,12 +598,110 @@ impl NativeMemoryApplicationPort for FuzzNativePortV1 {
         }
     }
 
-    fn health(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
-    }
+    fn invoke(&self, call: &ProviderCall) -> ProviderReply {
+        assert_eq!(call.operation, ProviderOperation::Observe);
+        let sequence = self.position_of(call);
+        let key = call
+            .idempotency_key
+            .clone()
+            .expect("an observation call carries an idempotency key");
 
-    fn recall(&self, _call: &ProviderCall) -> ProviderReply {
-        Self::unexpected()
+        // Durable, fsync'd, and taken under the same gate the
+        // never-entered boundary seals: after this line no life can claim the
+        // provider was not asked about this row, and before it no entry can
+        // slip past a seal that has already been taken.
+        self.hooks.record_entry(&self.entries, &key);
+
+        // The row is leased, the provider has been entered, and it has not
+        // touched its ledger.
+        self.hooks
+            .check(HookPointV1::AtProviderEntry, |target| sequence == target);
+
+        if self.refused.contains(&sequence) {
+            return ProviderReply {
+                terminal: TerminalRecord::new(
+                    ProviderOperation::Observe,
+                    call.provider_id.clone(),
+                    TerminalCode::ContractViolation,
+                    CommittedEffectEvidence::none(Some(call.expected_state_generation)),
+                    FallbackDirective::forbidden(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
+                    Some("observation-refused-by-contract".to_owned()),
+                )
+                .expect("refusal terminal"),
+                payload: None,
+                warnings: Vec::new(),
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
+            };
+        }
+
+        if self.ledger.holds(&key) {
+            // The provider recognises its own key. This is the path a
+            // redelivery after a lost answer must take, and the only reason
+            // redelivery is safe at all.
+            return ProviderReply {
+                terminal: TerminalRecord::new(
+                    ProviderOperation::Observe,
+                    call.provider_id.clone(),
+                    TerminalCode::Success,
+                    CommittedEffectEvidence::duplicate(
+                        call.expected_state_generation,
+                        key.clone(),
+                        call.operation_id.clone(),
+                        PROVIDER_RECEIPT,
+                    )
+                    .expect("duplicate evidence"),
+                    FallbackDirective::forbidden(),
+                    call.operation_id.clone(),
+                    call.exact_scope.exact_scope_sha256(),
+                    None,
+                )
+                .expect("duplicate terminal"),
+                payload: Some(call.payload.clone()),
+                warnings: Vec::new(),
+                extensions: call.extensions.clone(),
+                state_generation: call.expected_state_generation,
+            };
+        }
+
+        self.ledger.commit(&key);
+        // The effect is durable and the answer does not exist yet.
+        self.hooks
+            .check(HookPointV1::AfterEffectBeforeAnswer, |target| {
+                sequence == target
+            });
+
+        let reply = ProviderReply {
+            terminal: TerminalRecord::new(
+                ProviderOperation::Observe,
+                call.provider_id.clone(),
+                TerminalCode::Success,
+                CommittedEffectEvidence::committed(
+                    call.expected_state_generation,
+                    call.expected_state_generation,
+                    vec![format!("observation:{sequence}")],
+                    PROVIDER_RECEIPT,
+                    EFFECT_DIGEST,
+                )
+                .expect("committed effect"),
+                FallbackDirective::forbidden(),
+                call.operation_id.clone(),
+                call.exact_scope.exact_scope_sha256(),
+                None,
+            )
+            .expect("observation terminal"),
+            payload: Some(call.payload.clone()),
+            warnings: Vec::new(),
+            extensions: call.extensions.clone(),
+            state_generation: call.expected_state_generation,
+        };
+        // The answer above is complete. The provider records that fact, then
+        // returns normally. The host-owned journal observer takes the crash
+        // boundary later, at entry to `record_attempt`.
+        self.hooks.seal_answer(sequence, &self.answers, &key);
+        reply
     }
 }
 
@@ -819,11 +922,11 @@ impl HooksV1 {
         // Durable first, then the signal: the arrival the parent verifies after
         // the kill is already on disk when the kill is issued.
         append_line(&self.marker, name);
-        if let Ok(mut slot) = self.signal.lock() {
-            if let Some(stream) = slot.as_mut() {
-                let _ = stream.write_all(b"1");
-                let _ = stream.flush();
-            }
+        if let Ok(mut slot) = self.signal.lock()
+            && let Some(stream) = slot.as_mut()
+        {
+            let _ = stream.write_all(b"1");
+            let _ = stream.flush();
         }
         park_forever()
     }
@@ -1029,20 +1132,21 @@ async fn mount_life(
 ) -> Arc<ProjectObservationJourneyV1> {
     fs::create_dir_all(&paths.root).expect("journal root");
     let project_id = ProjectId::new(PROJECT).expect("project id");
-    let port = Arc::new(FuzzNativePortV1::new(paths, Arc::clone(&hooks), entries));
+    let port = Arc::new(FuzzObservationProviderV1::new(
+        paths,
+        Arc::clone(&hooks),
+        entries,
+    ));
     let committed = CanonicalStreamV1::new(paths.canonical.clone()).committed();
     let store = FuzzCanonicalPortV1::over(paths, &committed, hooks);
     mount_and_replay(
         ObservationJourneyMountInputsV1 {
-            composition: composition(port as Arc<dyn NativeMemoryApplicationPort>),
+            composition: composition(port as Arc<dyn MemoryProviderV1>),
             profile_id: UserProfileId::new(PROFILE).expect("profile id"),
             scope: scope(project_id.clone()),
             authoritative_project_id: project_id,
-            provider: crate::retained_owner::native_observation_mount(
-                &(paths.root.clone()),
-                REGISTRATION_REVISION,
-            )
-            .expect("native mount metadata"),
+            provider: test_observation_mount(&paths.root, REGISTRATION_REVISION)
+                .expect("observation mount metadata"),
             store_data_root: paths.root.clone(),
             policy: fuzz_policy(),
         },
@@ -1313,7 +1417,7 @@ fn prove_boundary(
             if !acknowledging_receipt_exists(&paths.journal, target) {
                 return refuse("the journal holds no acknowledging receipt for it".to_owned());
             }
-            if !acknowledged_watermark(&paths.journal).is_some_and(|position| position >= target) {
+            if acknowledged_watermark(&paths.journal).is_none_or(|position| position < target) {
                 return refuse("the acknowledged watermark never reached it".to_owned());
             }
         }
@@ -2251,10 +2355,7 @@ async fn mounted_crash_restart_soak_holds_every_invariant_across_the_soak_window
     ))
     .expect("soak lanes")
     .max(1);
-    let budget = Duration::from_secs(env_u64(
-        SOAK_BUDGET_ENV,
-        u64::try_from(SOAK_BUDGET.as_secs()).expect("soak budget"),
-    ));
+    let budget = Duration::from_secs(env_u64(SOAK_BUDGET_ENV, SOAK_BUDGET.as_secs()));
     let deadline = Instant::now() + budget;
 
     let mut pending = seeds.into_iter();
@@ -2313,10 +2414,10 @@ async fn mounted_crash_restart_soak_holds_every_invariant_across_the_soak_window
                         Err(_) => {
                             running.abort_all();
                             while let Some(joined) = running.join_next().await {
-                                if let Err(error) = joined {
-                                    if !error.is_cancelled() {
-                                        cleanup_failures.push(format!("task abort: {error}"));
-                                    }
+                                if let Err(error) = joined
+                                    && !error.is_cancelled()
+                                {
+                                    cleanup_failures.push(format!("task abort: {error}"));
                                 }
                             }
                             break;

@@ -36,9 +36,8 @@ use tracedecay_memory_provider_registry::{
     NativeProviderActivation, ObserverProviderRegistration, PinnedDegradationPolicy,
     ProjectCognitiveRecallPortV1, ProjectMemoryProviderComposition, ProviderMode,
     ProviderReadiness, RecallAdmissionAuditError, RecallAdmissionError, RecallAdmissionObserver,
-    RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason, RecallScopeBindingsV1,
-    RecallSelectionPolicyV1, RegistryError, RoutingError, ScopeBinding, ScopeField,
-    UnknownValidityPolicy,
+    RecallAdmissionReport, RecallBudgetsV1, RecallDenialReason, RecallSelectionPolicyV1,
+    RegistryError, RoutingError, ScopeBinding, ScopeField, UnknownValidityPolicy,
 };
 
 /// Host-side scope binding standing in for the composition root: profile and
@@ -523,18 +522,15 @@ async fn port_admits_only_exact_scope_current_candidates_and_reports_denials() {
                     field: ScopeField::RepositoryIdentity
                 }
             ),
-            ("stale-exact-scope", RecallDenialReason::StaleIdentity),
+            (
+                "stale-exact-scope",
+                RecallDenialReason::ScopeBindingUnauthorized {
+                    binding: ScopeBinding::ExactCodingScope,
+                },
+            ),
         ]
     );
-    assert_eq!(
-        report.authorized_scope_bindings,
-        RecallScopeBindingsV1::new([
-            ScopeBinding::ExactCodingScope,
-            ScopeBinding::CheckoutObservations,
-            ScopeBinding::ProjectFacts,
-            ScopeBinding::ProfileFacts
-        ])
-    );
+    assert_eq!(report.authorized_scope_bindings, authorized_facts_only());
     assert_eq!(report.request_id, "request.recall-port");
     let expected_scope = TestScopeBinding
         .bind_exact_scope(&scope)
@@ -1973,13 +1969,19 @@ async fn selected_inline_outcome_preserves_actual_admitted_original_sources() {
             .candidate_overrides
             .insert(id.to_owned(), observation_candidate_fields(&source, &exact));
     }
-    let port = mount(
-        compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+    let port = mount_routed(
+        compose_profile_fixture(fixture, true).0,
         Arc::new(LedgerObserver::default()),
+        budgets(),
+        routing(PROFILE_RECORDING_PROVIDER_ID, 31, FallbackRule::Forbidden),
     )
     .expect("mounted port");
     let outcome = port
-        .recall_admitted(request(scope, 60_000_000, false), &live_signal())
+        .recall_admitted_with_history(
+            request(scope, 60_000_000, false),
+            &live_signal(),
+            Some(dispatched_history_fixture(&exact, &source)),
+        )
         .await
         .expect("recall");
     let ids: Vec<_> = outcome
@@ -2013,6 +2015,17 @@ async fn buggy_provider_exclusions_are_denied_before_normalization_and_selection
     let scope = resolved_scope(Some("refs/heads/recall-port"));
     let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
     let source = canonical_observation_source(&exact);
+    let mut survivor_source = canonical_observation_source(&exact);
+    survivor_source["source"]["observation_id"] = serde_json::json!("observation-survivor");
+    survivor_source["source"]["source_key"] = serde_json::json!("survivor-source-key");
+    survivor_source["source"]["content_sha256"] =
+        serde_json::json!(sha256_hex(b"distinct surviving content"));
+    survivor_source["source_sequence"] = serde_json::json!(8);
+    let mut history = dispatched_history_fixture(&exact, &source);
+    history["sources"]
+        .as_array_mut()
+        .unwrap()
+        .push(dispatched_history_fixture(&exact, &survivor_source)["sources"][0].clone());
     let full_content = format!(
         "{} excluded full content tail",
         "long source content ".repeat(100)
@@ -2056,16 +2069,25 @@ async fn buggy_provider_exclusions_are_denied_before_normalization_and_selection
         fixture
             .candidate_overrides
             .insert("aa-denied".to_owned(), fields);
-        let port = mount(
-            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+        fixture.candidate_overrides.insert(
+            "zz-survivor".to_owned(),
+            observation_candidate_fields(&survivor_source, &exact),
+        );
+        let port = mount_routed(
+            compose_profile_fixture(fixture, true).0,
             Arc::new(LedgerObserver::default()),
+            budgets(),
+            routing(PROFILE_RECORDING_PROVIDER_ID, 31, FallbackRule::Forbidden),
         )
         .unwrap()
         .with_selection_policy(RecallSelectionPolicyV1::new(1).unwrap());
         let request = request(scope.clone(), 60_000_000, false)
             .with_exclusions(exclusions)
             .unwrap();
-        let outcome = port.recall_admitted(request, &live_signal()).await.unwrap();
+        let outcome = port
+            .recall_admitted_with_history(request, &live_signal(), Some(history.clone()))
+            .await
+            .unwrap();
         assert_eq!(outcome.result.candidates().len(), 1, "{field}");
         assert_eq!(
             outcome.result.candidates()[0].candidate_id(),
@@ -2097,7 +2119,20 @@ async fn buggy_provider_exclusions_are_denied_before_normalization_and_selection
             outcome.selection.unwrap().budget_excluded.is_empty(),
             "{field}"
         );
-        assert!(outcome.original_sources.is_empty(), "{field}");
+        assert_eq!(
+            outcome
+                .original_sources
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["zz-survivor"],
+            "{field}"
+        );
+        assert_eq!(
+            serde_json::to_value(&outcome.original_sources["zz-survivor"]).unwrap(),
+            serde_json::json!([survivor_source.clone()]),
+            "{field}"
+        );
     }
 }
 
@@ -2109,6 +2144,10 @@ async fn typed_sources_preserve_unavailable_redacted_and_legacy_fact_provenance(
     let source = canonical_observation_source(&exact);
     for state in ["unavailable", "redacted", "legacy_fact"] {
         let mut fields = observation_candidate_fields(&source, &exact);
+        // Native facts retain their own provenance; attached observation
+        // sources cannot substitute for that authority in any provenance state.
+        fields["memory_class"] = serde_json::json!("project");
+        fields["exact_scope_identity"] = project_facts_candidate_value(&exact);
         let expected = match state {
             "unavailable" => {
                 fields["provenance"]["state"] = serde_json::json!("unavailable");
@@ -2120,8 +2159,6 @@ async fn typed_sources_preserve_unavailable_redacted_and_legacy_fact_provenance(
                 CognitiveRecallProvenance::redacted("source redacted").unwrap()
             }
             "legacy_fact" => {
-                fields["memory_class"] = serde_json::json!("project");
-                fields["exact_scope_identity"] = project_facts_candidate_value(&exact);
                 fields["provenance"]["origin_refs"] = serde_json::json!(["record:foreign-fact"]);
                 CognitiveRecallProvenance::available("record:foreign-fact").unwrap()
             }
@@ -2200,13 +2237,19 @@ async fn contradictory_observation_claims_cannot_borrow_legitimate_typed_sources
         fixture
             .candidate_overrides
             .insert("claim".to_owned(), fields);
-        let port = mount(
-            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+        let port = mount_routed(
+            compose_profile_fixture(fixture, true).0,
             Arc::new(LedgerObserver::default()),
+            budgets(),
+            routing(PROFILE_RECORDING_PROVIDER_ID, 31, FallbackRule::Forbidden),
         )
         .unwrap();
         let outcome = port
-            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
+            .recall_admitted_with_history(
+                request(scope.clone(), 60_000_000, false),
+                &live_signal(),
+                Some(dispatched_history_fixture(&exact, &source)),
+            )
             .await
             .unwrap();
         assert!(outcome.result.candidates().is_empty(), "{defect}");
@@ -2225,21 +2268,18 @@ async fn contradictory_observation_claims_cannot_borrow_legitimate_typed_sources
 }
 
 #[tokio::test]
-async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_sources() {
+async fn declared_observation_reference_formats_bind_to_their_actual_sources() {
     let scope = resolved_scope(Some("refs/heads/recall-port"));
     let exact = TestScopeBinding.bind_exact_scope(&scope).unwrap();
-    for format in ["native", "ncm_observation", "ncm_stable"] {
+    for format in ["source_key", "observation_record", "stable_record"] {
         let mut source = canonical_observation_source(&exact);
-        if format == "ncm_stable" {
+        if format == "stable_record" {
             source["source"]["stable_record_id"] = serde_json::json!("stable-original");
         }
         let mut fields = observation_candidate_fields(&source, &exact);
-        if format == "native" {
-            fields["provenance"]["origin_refs"] = serde_json::json!([
-                "native-stage:original",
-                "operation:delivery",
-                "request:delivery"
-            ]);
+        if format == "source_key" {
+            fields["provenance"]["origin_refs"] =
+                serde_json::json!(["source-key", "operation:delivery", "request:delivery"]);
             fields["provenance"]["source_refs"] = serde_json::json!(["source-key"]);
         }
         let mut fixture = RecallFixturePort::new();
@@ -2248,13 +2288,19 @@ async fn native_and_ncm_declared_observation_formats_bind_to_their_actual_source
         fixture
             .candidate_overrides
             .insert("claim".to_owned(), fields);
-        let port = mount(
-            compose_mode(Arc::new(fixture), EnabledProviderMode::Active),
+        let port = mount_routed(
+            compose_profile_fixture(fixture, true).0,
             Arc::new(LedgerObserver::default()),
+            budgets(),
+            routing(PROFILE_RECORDING_PROVIDER_ID, 31, FallbackRule::Forbidden),
         )
         .unwrap();
         let outcome = port
-            .recall_admitted(request(scope.clone(), 60_000_000, false), &live_signal())
+            .recall_admitted_with_history(
+                request(scope.clone(), 60_000_000, false),
+                &live_signal(),
+                Some(dispatched_history_fixture(&exact, &source)),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -2382,7 +2428,7 @@ fn compose_profile_fixture(
                         registration_revision: 31,
                         mode: EnabledProviderMode::Active,
                         execution_shape: ProviderExecutionShapeV1::HostAuthoredInProcess,
-                        recall_scope_bindings: authorized_native(),
+                        recall_scope_bindings: authorized_all_scopes(),
                         lifecycle: ProviderLifecycleOwnershipV1::CompositionBound,
                     },
                 },

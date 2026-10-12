@@ -110,9 +110,9 @@ pub(crate) fn decode_hex(value: &str) -> Option<Vec<u8>> {
     }
     let bytes = value.as_bytes();
     let mut output = Vec::with_capacity(value.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let high = nibble(pair[0])?;
-        let low = nibble(pair[1])?;
+    for &[high, low] in bytes.as_chunks::<2>().0 {
+        let high = nibble(high)?;
+        let low = nibble(low)?;
         output.push((high << 4) | low);
     }
     Some(output)

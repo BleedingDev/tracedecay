@@ -7,7 +7,7 @@ use std::sync::{Arc, Weak};
 
 use tracedecay_contracts::ApplicationProblem;
 use tracedecay_contracts::ResolvedScope;
-use tracedecay_contracts::graph_tool::GraphToolResultV1;
+use tracedecay_contracts::graph_tool::{GraphToolCompletionV1, GraphToolResultV1};
 use tracedecay_contracts::retrieval::{HookCompactionResultV1, HookRuntimeResultV1};
 use tracedecay_daemon_service::{
     DaemonInvocationService, GraphToolFuture, GraphToolInvocationV1, ProjectGraphToolPortV1,
@@ -19,6 +19,7 @@ use tracedecay_mcp::server::join_hook_ingest_refresh;
 use tracedecay_mcp::tools::binding::{BranchSensitivity, tool_branch_sensitivity};
 use tracedecay_project::project::TraceDecay;
 use tracedecay_runtime_core::branch::BranchMemo;
+use tracedecay_sessions::serving::SessionRefreshWorkerPort;
 use tracedecay_tool_catalog::{ApplicationSurfaceOperation, OwnerStoresV1};
 
 use super::McpServer;
@@ -76,7 +77,7 @@ impl McpServer {
     async fn compute_graph_tool(
         &self,
         invocation: GraphToolInvocationV1,
-    ) -> Result<tracedecay_contracts::graph_tool::GraphToolCompletionV1> {
+    ) -> Result<GraphToolCompletionV1> {
         let (cg, live_branch) = self.reopen_if_branch_drifted_memoized().await;
         self.probe_before_graph_read(invocation.operation, &cg, &live_branch);
         let server_stats = match invocation.operation {
@@ -158,13 +159,20 @@ impl McpServer {
             options,
         );
         // This server's profile owns every transcript a hook action ingests.
-        let mut completion = match self.profile.clone() {
+        let completion = match self.profile.clone() {
             Some(profile) => {
                 tracedecay_sessions::runtime::with_transcript_source_profile(profile, computed)
                     .await
             }
             None => computed.await,
         }?;
+        self.settle_graph_tool_completion(completion).await
+    }
+
+    async fn settle_graph_tool_completion(
+        &self,
+        mut completion: GraphToolCompletionV1,
+    ) -> Result<GraphToolCompletionV1> {
         if let GraphToolResultV1::HookRuntime(HookRuntimeResultV1::IngestTranscript(ingest)) =
             &completion.result
         {
@@ -187,10 +195,10 @@ impl McpServer {
                 && !self
                     .project_session_refresh_wake
                     .as_deref()
-                    .is_some_and(|wake| wake.wake())
+                    .is_some_and(<dyn SessionRefreshWorkerPort>::wake)
             {
-                *status = "unavailable".to_owned();
-                *reason = "session_refresh_worker_unavailable".to_owned();
+                "unavailable".clone_into(status);
+                "session_refresh_worker_unavailable".clone_into(reason);
             }
         }
         Ok(completion)

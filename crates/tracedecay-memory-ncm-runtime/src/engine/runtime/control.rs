@@ -60,12 +60,14 @@ impl NcmEngine {
             let mut reply = crate::privacy::delete_sources(
                 self,
                 namespace,
-                &sources,
-                key,
-                deadline,
-                before,
-                bindings.as_deref(),
-                Some(canonical_input),
+                crate::privacy::DeleteSourcesRequest {
+                    sources: &sources,
+                    idempotency_key: key,
+                    deadline,
+                    expected_generation: before,
+                    bindings: bindings.as_deref(),
+                    canonical_input: Some(canonical_input),
+                },
             );
             if reply.outcome == Outcome::Success {
                 let matched = reply.payload["deleted_records"].as_u64().unwrap_or(0);
@@ -111,12 +113,11 @@ impl NcmEngine {
             Ok(digest) => digest,
             Err(reason) => return invalid(&reason, 0),
         };
-        if let Some(capsule) = payload.get("feedback_delivery_capsule") {
-            if action != "feedback"
-                || validate_feedback_delivery(namespace, key, &digest, capsule).is_err()
-            {
-                return invalid("invalid feedback delivery admission", 0);
-            }
+        if let Some(capsule) = payload.get("feedback_delivery_capsule")
+            && (action != "feedback"
+                || validate_feedback_delivery(namespace, key, &digest, capsule).is_err())
+        {
+            return invalid("invalid feedback delivery admission", 0);
         }
         if deadline.remaining_ms == 0 {
             return EngineReply::new(Outcome::Cancelled, 0, Value::Null);
@@ -149,13 +150,12 @@ impl NcmEngine {
                 Ok(None) => {}
                 Err(reply) => return reply,
             }
-            if let Some(request) = &replacement {
-                if let Err(error) = handle
+            if let Some(request) = &replacement
+                && let Err(error) = handle
                     .store
                     .ensure_source_provenance_not_revoked(&request.source, &request.provenance)
-                {
-                    return store_reply(error, handle.commit_seq);
-                }
+            {
+                return store_reply(error, handle.commit_seq);
             }
         }
         let embeddings = if let Some(request) = &replacement {
@@ -978,11 +978,10 @@ pub(super) fn commit_common(
         }
     }
     for operation in &operations {
-        if let DurableOperation::Correction { superseded, .. } = operation {
-            if let Err(error) = mutation.mark_capsule_status(*superseded, CapsuleStatus::Superseded)
-            {
-                return store_reply(error, handle.commit_seq);
-            }
+        if let DurableOperation::Correction { superseded, .. } = operation
+            && let Err(error) = mutation.mark_capsule_status(*superseded, CapsuleStatus::Superseded)
+        {
+            return store_reply(error, handle.commit_seq);
         }
     }
     if let Err(error) = mutation.set_meta(&meta_for_kernel(

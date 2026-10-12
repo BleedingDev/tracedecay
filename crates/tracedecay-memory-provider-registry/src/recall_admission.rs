@@ -839,16 +839,15 @@ pub(crate) fn build_recall_request_payload_with_capabilities(
                 detail: "exclusions violate the admitted application bounds",
             })?;
     }
-    if let Some(grant) = history_grant {
-        if !grant.is_object()
+    if let Some(grant) = history_grant
+        && (!grant.is_object()
             || grant.get("policy_revision").and_then(Value::as_u64) != Some(parts.policy_revision)
-            || grant.get("destination_scope") != Some(&scope_wire_value(&parts.exact_scope))
-        {
-            return Err(RecallAdmissionError::InvalidTemporalQuery {
-                field: "history_grant",
-                detail: "history grant must bind the request policy and exact destination",
-            });
-        }
+            || grant.get("destination_scope") != Some(&scope_wire_value(&parts.exact_scope)))
+    {
+        return Err(RecallAdmissionError::InvalidTemporalQuery {
+            field: "history_grant",
+            detail: "history grant must bind the request policy and exact destination",
+        });
     }
     if parts.policy_revision == 0 {
         return Err(RecallAdmissionError::InvalidTemporalQuery {

@@ -13,40 +13,6 @@ use super::{
     native_provider, observation_journey, provider_control, provider_history,
 };
 
-/// Builds Native-identity observation mount metadata for journey fixtures.
-/// Production never mounts a Native observation journey: Native observes
-/// nothing, so this exists only for the journey tests' provider fixtures.
-#[cfg(test)]
-pub(crate) fn native_observation_mount(
-    data_root: &std::path::Path,
-    registration_revision: u64,
-) -> tracedecay_domain::errors::Result<
-    tracedecay_memory_provider_registry::ObservationProviderMountV1,
-> {
-    use tracedecay_domain::errors::TraceDecayError;
-    use tracedecay_memory_provider_registry::{
-        NATIVE_PROVIDER_ID, ObservationProviderMountV1, ObservationStateNamespacePolicyV1,
-        OwnedProviderId,
-    };
-
-    Ok(ObservationProviderMountV1 {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).map_err(|error| {
-            TraceDecayError::Config {
-                message: format!("invalid Native observation identity: {error}"),
-            }
-        })?,
-        registration_revision,
-        provider_instance_id: Some(native_provider::PROVIDER_INSTANCE_ID.to_owned()),
-        instance_proof: None,
-        host_limits: native_provider::native_provider_limits(),
-        state_root: data_root.join(observation_journey::PROVIDER_STATE_DIR_NAME),
-        journal_file_name: "memory-observation-journal-v1.sqlite3",
-        state_namespace_policy: ObservationStateNamespacePolicyV1::Prefix(
-            NATIVE_PROVIDER_ID.to_owned(),
-        ),
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Project memory-provider host composition
 // ---------------------------------------------------------------------------
@@ -161,7 +127,7 @@ impl ProjectMemoryProviderHostMountV1 {
                 .map_err(str::to_owned)?;
         }
         if let Some(mount) = self.native_session_retrieval_mount.as_ref() {
-            mount.bind(retrieval).map_err(|error| error.to_owned())?;
+            mount.bind(retrieval).map_err(str::to_owned)?;
         }
         Ok(())
     }
@@ -210,10 +176,6 @@ impl ProjectCognitiveRecallMountV1 {
         CognitiveRecallMountError,
     > {
         self.inner.port_for_session(canonical_session_id)
-    }
-
-    pub(crate) fn inner(&self) -> Arc<cognitive_recall::ProjectCognitiveRecallMountV1> {
-        Arc::clone(&self.inner)
     }
 }
 
@@ -363,9 +325,7 @@ impl ProjectMemoryProviderFullMountV1 {
                 .await
                 .map(|_| ())
             } else {
-                journey
-                    .start_observer_with_live_replay(observation_store.clone())
-                    .map(|_| ())
+                journey.start_observer_with_live_replay(observation_store.clone())
             };
             if let Err(error) = activation {
                 if requirement
@@ -727,15 +687,13 @@ pub async fn mount_project_memory_provider_full(
             .cognitive_recall_mount
             .as_ref()
             .filter(|recall| recall.inner.routing().active_provider() == &provider.provider_id)
-        {
-            if let Err(error) = recall
+            && let Err(error) = recall
                 .inner
                 .bind_selected_history(authority, Arc::clone(&journey))
-            {
-                fail_partial_provider_mount!(format!(
-                    "provider recall history binding refused: {error}"
-                ));
-            }
+        {
+            fail_partial_provider_mount!(format!(
+                "provider recall history binding refused: {error}"
+            ));
         }
         if configured.activation
             == tracedecay_memory_provider_registry::ObservationMountActivationV1::BeforePublication
@@ -824,7 +782,6 @@ pub async fn mount_project_memory_provider_full(
     let provider_control_mount = provider_control::project_provider_control_port(
         provider_control::ProviderControlMountInputsV1 {
             authority,
-            composition: Arc::clone(&host.composition),
             journeys: journeys
                 .iter()
                 .map(|journey| Arc::clone(&journey.inner))
@@ -832,10 +789,7 @@ pub async fn mount_project_memory_provider_full(
             profile_id: inputs.profile_id,
             mounted_scope: inputs.scope,
             authoritative_project_id: inputs.authoritative_project_id,
-            project_root: inputs.canonical_project_path,
             configuration_digest: inputs.configuration_digest,
-            canonical_session_db: inputs.session_db.clone(),
-            canonical_dispositions: Arc::new(inputs.graph.db().clone()),
         },
     );
     Ok(Arc::new(ProjectMemoryProviderFullMountV1 {

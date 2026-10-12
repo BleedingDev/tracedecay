@@ -73,7 +73,7 @@ pub fn authorized_exact() -> RecallScopeBindingsV1 {
 /// The complete binding vocabulary a host may authorize: exact, checkout,
 /// project, and profile bindings. Admission rules are exercised against it
 /// independently of any one provider's declaration.
-pub fn authorized_native() -> RecallScopeBindingsV1 {
+pub fn authorized_all_scopes() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([
         ScopeBinding::ExactCodingScope,
         ScopeBinding::CheckoutObservations,
@@ -85,8 +85,8 @@ pub fn authorized_native() -> RecallScopeBindingsV1 {
 /// A facts-only authorization set: a provider the host authorized for owner
 /// facts and nothing else.
 ///
-/// This is the set that proves binding refusal precedes field comparison; it
-/// is deliberately not Native's own registration record.
+/// This matches Native's registration and proves binding refusal precedes
+/// field comparison.
 pub fn authorized_facts_only() -> RecallScopeBindingsV1 {
     RecallScopeBindingsV1::new([ScopeBinding::ProjectFacts, ScopeBinding::ProfileFacts])
 }
@@ -329,11 +329,8 @@ impl RecallFixturePort {
 
     fn mixed_outcome_value(&self, call: &ProviderCall) -> Value {
         let scope = scope_value(&call.exact_scope);
-        // Candidates attest what the Native adapter attests for project-owned
-        // facts. The host also records Native as authorized for
-        // `exact_coding_scope`, which its staged session observations use, so
-        // an exact-scope candidate here is judged on its fields rather than
-        // refused on the binding.
+        // Native's registered grants authorize project and profile facts.
+        // These candidates attest project-owned facts under those grants.
         let candidate_scope = project_facts_candidate_value(&call.exact_scope);
         let foreign_worktree = {
             let mut foreign = candidate_scope.clone();
@@ -345,11 +342,9 @@ impl RecallFixturePort {
             foreign["repository_identity"] = json!("repository-other");
             foreign
         };
-        // A full exact-scope attestation whose every identity field matches
-        // except the resolved-scope digest: it belongs to an earlier
-        // resolution of this checkout, so it is stale rather than in scope.
-        // This is the shape a staged observation carries after the scope is
-        // re-resolved, and it must not be admitted.
+        // This forged exact-scope attestation carries a stale digest. Native's
+        // facts-only registration refuses the binding before comparing that
+        // digest; direct exact-scope tests exercise the stale-identity rule.
         let stale_exact_scope = {
             let mut exact = exact_scope_candidate_value(&call.exact_scope);
             exact["resolved_scope_digest"] = json!(STALE_SCOPE_DIGEST);

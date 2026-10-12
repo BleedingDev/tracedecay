@@ -1154,10 +1154,9 @@ impl NcmProviderAdapter {
                                 surface_call,
                                 reply.state_generation,
                             )
+                            && let Some(object) = value.as_object_mut()
                         {
-                            if let Some(object) = value.as_object_mut() {
-                                object.remove("resume_cursor");
-                            }
+                            object.remove("resume_cursor");
                         }
                         value.is_object()
                             && !json_has_exact_scope_identity(&value)

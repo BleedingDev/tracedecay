@@ -10,12 +10,12 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tracedecay_contracts::{RequestContext, retained_surfaces::*};
-use tracedecay_domain::research::UtcMicros;
+use tracedecay_domain::{canonical_text::sha256_hex, encode_lowercase_hex, research::UtcMicros};
 use tracedecay_memory_provider_registry::{
     CanonicalPayload, CommittedEffectState, CurrentSourceDisposition, FallbackDirective,
     LifecycleTarget, LifecycleTargetReference, OriginalSourceIdentity, OwnedExactScope,
-    OwnedProviderId, ProviderCall, ProviderLimits, ProviderOperation, ProviderReply,
-    SourceAttribution, SourceDisposition, TerminalCode,
+    OwnedProviderId, OwnedVersionedId, ProviderCall, ProviderLimits, ProviderOperation,
+    ProviderReply, SourceAttribution, SourceDisposition, TerminalCode,
 };
 
 use super::super::{
@@ -97,7 +97,6 @@ pub(super) enum InspectionEvidenceV1<'a> {
         operation_id: &'a str,
         idempotency_key: &'a str,
     },
-    SnapshotMetadata(RetainedSnapshotV1<'a>),
     CapabilityStatus,
 }
 
@@ -545,15 +544,17 @@ fn project(
                 },
                 Some(value) => deletion_erasure(value, call, reply, &query)?,
             };
-            ProviderControlOperationResultV1::DeleteBySource(Some(ProviderDeleteBySourceResultV1 {
-                source: public.source.clone(),
-                target: public_target(source)?,
-                mode: public.mode,
-                include_snapshots: public.include_snapshots,
-                intent: intent.clone(),
-                host_snapshot_cleanup: host_snapshot_cleanup(cleanup),
-                erasure,
-            }))
+            ProviderControlOperationResultV1::DeleteBySource(Some(Box::new(
+                ProviderDeleteBySourceResultV1 {
+                    source: public.source.clone(),
+                    target: public_target(source)?,
+                    mode: public.mode,
+                    include_snapshots: public.include_snapshots,
+                    intent: intent.clone(),
+                    host_snapshot_cleanup: host_snapshot_cleanup(cleanup),
+                    erasure,
+                },
+            )))
         }
         (ProviderControlRequestV1::Health(public), HostControlEvidence::Health) => {
             eq_field(
@@ -1509,7 +1510,7 @@ fn validate_capabilities(
     let registered: BTreeSet<_> = dispatch
         .registered_capabilities
         .iter()
-        .map(|capability| capability.as_str())
+        .map(OwnedVersionedId::as_str)
         .collect();
     require(
         actual.len() == states.len()
@@ -1574,16 +1575,6 @@ fn validate_inspection_selector(
             )?;
             json!({"operation_id":operation_id,"idempotency_key":idempotency_key})
         }
-        (
-            ProviderControlInspectionSelectorV1::SnapshotMetadata { snapshot_ref },
-            InspectionEvidenceV1::SnapshotMetadata(retained),
-        ) => {
-            require(
-                snapshot_ref == retained.snapshot_ref,
-                "snapshot metadata selector",
-            )?;
-            json!({"snapshot_id":string(field(&payload(retained.carrier)?, "identity")?, "snapshot_id")?})
-        }
         _ => return Err("inspection host evidence"),
     };
     require(selected == &expected, "inspection selected query")
@@ -1608,7 +1599,6 @@ fn validate_inspection_target(
         },
         InspectionEvidenceV1::StateSummary
         | InspectionEvidenceV1::MaintenanceReceipt { .. }
-        | InspectionEvidenceV1::SnapshotMetadata(_)
         | InspectionEvidenceV1::CapabilityStatus => None,
     };
     match expected {
@@ -1826,16 +1816,6 @@ fn project_inspection(
             )?;
             ProviderControlInspectionItemsV1::MaintenanceReceipt(data)
         }
-        InspectionEvidenceV1::SnapshotMetadata(retained) => {
-            let identity = snapshot(*retained, dispatch)?;
-            let data: Vec<ProviderControlSnapshotIdentityV1> =
-                decode(&Value::Array(raw.clone()), "snapshot metadata items")?;
-            require(
-                data.iter().all(|item| item == &identity),
-                "snapshot metadata retained carrier",
-            )?;
-            ProviderControlInspectionItemsV1::SnapshotMetadata(data)
-        }
     };
     Ok(ProviderInspectionResultV1 {
         selection: public.selection.clone(),
@@ -2020,10 +2000,7 @@ fn limits_digest(limits: ProviderLimits) -> String {
     ] {
         hash.update(value.to_be_bytes());
     }
-    hash.finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    encode_lowercase_hex(&hash.finalize())
 }
 fn payload(value: &CanonicalPayload) -> ProjectionResult<Value> {
     value.validate().map_err(|_| "canonical payload digest")?;
@@ -2088,10 +2065,7 @@ fn decode_selected<T: DeserializeOwned>(
     decode(&Value::Object(object), "typed operation fields")
 }
 fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    sha256_hex(bytes)
 }
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
@@ -2572,7 +2546,7 @@ mod tests {
             field: "reply boundary",
             actual_reply: &actual,
         };
-        assert!(std::ptr::eq(rejection.actual_reply, &actual));
+        assert!(std::ptr::eq(rejection.actual_reply, &raw const actual));
         assert!(!format!("{rejection:?}").contains("sensitive-provider-content"));
         assert_eq!(
             rejection.actual_reply.terminal.diagnostic_id(),
@@ -2630,7 +2604,7 @@ mod tests {
             eq_timestamp(
                 &json!({"at":"2026-01-01T01:00:00+01:00"}),
                 "at",
-                UtcMicros(1767225600000000)
+                UtcMicros(1_767_225_600_000_000)
             )
             .is_ok()
         );
@@ -2781,7 +2755,7 @@ mod tests {
             },
             "target": retained,
             "maximum_items": 1,
-            "maximum_bytes": 131072,
+            "maximum_bytes": 131_072,
             "redaction_policy_revision": 1,
             "cursor": null
         });

@@ -348,12 +348,16 @@ mod tests {
         let record = record();
         let reply = reply(TerminalCode::Success)?;
         assert_eq!(
-            receipt_verdict(&[record.clone()], &json!({"items":[item()]}), &reply),
+            receipt_verdict(
+                std::slice::from_ref(&record),
+                &json!({"items":[item()]}),
+                &reply
+            ),
             CompatibilityVerdict::Passed
         );
         assert_eq!(
             receipt_verdict(
-                &[record.clone()],
+                std::slice::from_ref(&record),
                 &json!({"items":[],"coverage":"partial"}),
                 &reply
             ),
@@ -369,7 +373,11 @@ mod tests {
             let mut forged = item();
             forged[field] = json!("forged");
             assert_eq!(
-                receipt_verdict(&[record.clone()], &json!({"items":[forged]}), &reply),
+                receipt_verdict(
+                    std::slice::from_ref(&record),
+                    &json!({"items":[forged]}),
+                    &reply
+                ),
                 CompatibilityVerdict::Failed,
                 "{field}"
             );
@@ -391,7 +399,7 @@ mod tests {
         let mut reply = reply(TerminalCode::Success)?;
         let empty = json!({"items":[],"coverage":"complete","warnings":[]});
         assert_eq!(
-            receipt_verdict(&[record.clone()], &empty, &reply),
+            receipt_verdict(std::slice::from_ref(&record), &empty, &reply),
             CompatibilityVerdict::Failed
         );
         for value in [
@@ -399,7 +407,7 @@ mod tests {
             json!({"items":[],"warnings":["original identifiers unavailable"]}),
         ] {
             assert_eq!(
-                receipt_verdict(&[record.clone()], &value, &reply),
+                receipt_verdict(std::slice::from_ref(&record), &value, &reply),
                 CompatibilityVerdict::Degraded
             );
         }
@@ -407,7 +415,7 @@ mod tests {
             .warnings
             .push("original identifiers unavailable".into());
         assert_eq!(
-            receipt_verdict(&[record.clone()], &empty, &reply),
+            receipt_verdict(std::slice::from_ref(&record), &empty, &reply),
             CompatibilityVerdict::Degraded
         );
         for forged in [
@@ -416,7 +424,7 @@ mod tests {
         ] {
             assert_eq!(
                 receipt_verdict(
-                    &[record.clone()],
+                    std::slice::from_ref(&record),
                     &json!({"items":[forged],"coverage":"partial"}),
                     &reply
                 ),
@@ -448,10 +456,14 @@ mod tests {
     }
 
     #[test]
-    fn actual_record_and_receipt_changes_fail_even_when_public_items_are_omitted() {
+    fn actual_record_and_receipt_changes_fail_even_when_public_items_are_omitted()
+    -> Result<(), serde_json::Error> {
         for before in [record(), caller_only()] {
             let after = durable(&before);
-            assert!(durable_errors(&[before.clone()], &[after.clone()]).is_empty());
+            assert!(
+                durable_errors(std::slice::from_ref(&before), std::slice::from_ref(&after))
+                    .is_empty()
+            );
             for field in [
                 "stable_memory_ref",
                 "immutable_record_sha256",
@@ -460,21 +472,22 @@ mod tests {
                 "retained_operation_id",
                 "retained_idempotency_key",
             ] {
-                let mut value = serde_json::to_value(&after).expect("evidence");
+                let mut value = serde_json::to_value(&after)?;
                 value[field] = json!(if field.contains("sha256") {
                     "e".repeat(64)
                 } else {
                     "forged".into()
                 });
-                let changed = serde_json::from_value(value).expect("typed change");
+                let changed = serde_json::from_value(value)?;
                 assert!(
-                    !durable_errors(&[before.clone()], &[changed]).is_empty(),
+                    !durable_errors(std::slice::from_ref(&before), &[changed]).is_empty(),
                     "{field}"
                 );
             }
-            assert!(!durable_errors(&[before.clone()], &[]).is_empty());
+            assert!(!durable_errors(std::slice::from_ref(&before), &[]).is_empty());
             assert!(!durable_errors(&[before], &[after.clone(), after]).is_empty());
         }
+        Ok(())
     }
 
     #[test]

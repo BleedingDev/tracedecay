@@ -4,18 +4,20 @@ use crate::dashboard_api_support::*;
 use serde_json::{Value, json};
 
 fn wait_for_query(agent: &ureq::Agent, base_url: &str, run_id: &str) -> Value {
+    let mut last_status = None;
     for _ in 0..100 {
         let (status, body) = get_json(agent, &format!("{base_url}/api/explorer/queries/{run_id}"));
         assert_eq!(status, 200, "query status should resolve: {body}");
         if matches!(
             body["payload"]["state"].as_str(),
-            Some("completed" | "partial" | "cancelled" | "error")
+            Some("completed" | "partial" | "cancelled" | "error" | "timed_out")
         ) {
             return body;
         }
+        last_status = Some(body);
         std::thread::sleep(Duration::from_millis(10));
     }
-    panic!("explorer query {run_id} did not reach a terminal state");
+    panic!("explorer query {run_id} did not reach a terminal state; last status: {last_status:?}");
 }
 
 #[test]

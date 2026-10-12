@@ -178,7 +178,11 @@ pub(super) async fn inspection(
                     let stable = source_reference(&source.target)?;
                     json!({"idempotency_key": delivery_key.as_deref(), "stable_memory_ref": stable})
                 }
-                _ => unreachable!("source inspection selection"),
+                _ => {
+                    return Err(ControlFailureV1::new(
+                        ControlFailureStageV1::InvalidBinding("source inspection selection"),
+                    ));
+                }
             };
             let source_evidence = source.projection_evidence(selector)?;
             let target = matches!(
@@ -219,14 +223,23 @@ pub(super) async fn inspection(
                     InspectionEvidenceV1::Trace(resolved)
                 }
                 ProviderControlInspectionSelectorV1::DeliveryReceipt { .. } => {
+                    let Some(idempotency_key) = delivery_key.as_deref() else {
+                        return Err(ControlFailureV1::new(ControlFailureStageV1::Projection {
+                            field: "settled delivery identity",
+                            dispatched,
+                        }));
+                    };
                     InspectionEvidenceV1::DeliveryReceipt {
                         source: resolved,
-                        idempotency_key: delivery_key
-                            .as_deref()
-                            .expect("resolved settled delivery"),
+                        idempotency_key,
                     }
                 }
-                _ => unreachable!("source inspection selection"),
+                _ => {
+                    return Err(ControlFailureV1::new(ControlFailureStageV1::Projection {
+                        field: "source inspection selection",
+                        dispatched,
+                    }));
+                }
             };
             port.project(
                 invocation,

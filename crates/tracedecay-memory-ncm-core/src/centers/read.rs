@@ -65,6 +65,17 @@ impl Default for CompoundWeights {
     }
 }
 
+/// Scoring weights and selection bounds for a compound center read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompoundReadParams {
+    /// Semantic, context, and terrain score contributions.
+    pub weights: CompoundWeights,
+    /// Maximum number of admitted centers returned.
+    pub top_k: usize,
+    /// Maximum number of ranked centers considered before admission.
+    pub candidate_k: usize,
+}
+
 /// Inspectable contribution from one selected center.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CenterReadTrace {
@@ -165,9 +176,11 @@ impl MemoryCenters {
             query,
             context,
             terrain,
-            weights,
-            top_k,
-            top_k,
+            CompoundReadParams {
+                weights,
+                top_k,
+                candidate_k: top_k,
+            },
             false,
             |_, _, _| true,
         )
@@ -192,9 +205,11 @@ impl MemoryCenters {
             query,
             context,
             terrain,
-            weights,
-            candidate_k,
-            candidate_k,
+            CompoundReadParams {
+                weights,
+                top_k: candidate_k,
+                candidate_k,
+            },
             true,
             |_, _, _| true,
         )
@@ -202,9 +217,9 @@ impl MemoryCenters {
 
     /// Reads a bounded, intensity-ranked candidate set with center admission.
     ///
-    /// `candidate_k` is the maximum number of ranked centers considered. The
-    /// callback runs before the final `top_k` truncation and receives the exact
-    /// slot, the center's retained support IDs, and its raw
+    /// `params.candidate_k` is the maximum number of ranked centers considered.
+    /// The callback runs before the final `params.top_k` truncation and receives
+    /// the exact slot, the center's retained support IDs, and its raw
     /// intensity-weighted activation. It is intended for record-aware callers
     /// that must reject stale, deleted, excluded, or otherwise unadmitted
     /// support before consuming the result bound.
@@ -213,24 +228,13 @@ impl MemoryCenters {
         query: &[f32],
         context: Option<&[f32]>,
         terrain: Option<&[f32]>,
-        weights: CompoundWeights,
-        top_k: usize,
-        candidate_k: usize,
+        params: CompoundReadParams,
         admitted: F,
     ) -> Result<ReadResult, CoreError>
     where
         F: FnMut(CenterSlot, &[RecordId], f32) -> bool,
     {
-        self.read_compound_internal(
-            query,
-            context,
-            terrain,
-            weights,
-            top_k,
-            candidate_k,
-            true,
-            admitted,
-        )
+        self.read_compound_internal(query, context, terrain, params, true, admitted)
     }
 
     fn read_compound_internal<F>(
@@ -238,15 +242,18 @@ impl MemoryCenters {
         query: &[f32],
         context: Option<&[f32]>,
         terrain: Option<&[f32]>,
-        weights: CompoundWeights,
-        top_k: usize,
-        candidate_k: usize,
+        params: CompoundReadParams,
         rank_by_activation: bool,
         mut admitted: F,
     ) -> Result<ReadResult, CoreError>
     where
         F: FnMut(CenterSlot, &[RecordId], f32) -> bool,
     {
+        let CompoundReadParams {
+            weights,
+            top_k,
+            candidate_k,
+        } = params;
         self.validate_read_layout()?;
         validate_dimension(query, self.config.d_key, "center read query")?;
         validate_finite(query, "center read query")?;

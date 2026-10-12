@@ -1,58 +1,50 @@
 #![cfg(all(feature = "test-transport", feature = "memory-provider-host"))]
 
-//! Root-boundary production Claude host memory journey.
+//! Production Claude transcript import and default Native memory retrieval.
 //!
-//! The production composition harness belongs to the root crate because it
-//! assembles the daemon project server. Keeping this journey at that boundary
-//! preserves the shipped transcript import, Native observation settlement,
-//! Claude hook route publication, and later context recall without making the
-//! daemon-service crate depend upward on its composition root.
-//!
-//! Hook causality remains covered by
-//! crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs,
-//! which invokes the shipped Claude lifecycle binaries with real host payloads.
+//! The root composition owns the daemon project server, canonical session
+//! stores, and MCP transport. This journey uses that composition to import real
+//! host records, replay the import, publish the Claude session route, and recall
+//! canonical messages and facts through shipped tools.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tracedecay::daemon::ProductionProjectCompositionHarnessV1;
+use tracedecay_configuration::config::PinnedRuntimeConfiguration;
+use tracedecay_contracts::retained_surfaces::{
+    FactCommitOwnerV1, FactProjectionV1, FactSearchGraphCoverageV1, FactStoreAddCommitV1,
+    FactStoreAddRequestV1, FactStoreAddResultV1, FactV1, LcmLoadSessionRequestV1,
+    LcmLoadSessionResultV1, LcmMessageV1, MemoryScopeV1, MessageSearchRequestV1,
+    MessageSearchResultV1, RetainedOutcomeStatusV1, RetainedProjectSelectorV1,
+};
+use tracedecay_contracts::retrieval::{
+    AdminCliSessionSyncV1, AdminCliSurfaceRequestV1, ContextResultV1, ContextSurfaceRequestV1,
+};
+use tracedecay_contracts::session_sync::SessionSyncSourceV1;
+use tracedecay_contracts::{
+    ApplicationProblem, ApplicationProblemRecord, ApplicationUnavailableClassV1, LegalAction,
+    OperationTermination, RetryScope,
+};
 use tracedecay_domain::configuration::{
-    ConfigurationIdempotencyKey, ConfigurationLayerIdV1, ConfigurationRevisionId,
-    ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderRecallRoutingV1, SettingKey,
+    MemoryProviderKindV1, MemoryProviderNcmObserverV1, MemoryProviderParticipationV1,
+    MemoryProviderSelectionV1,
 };
-use tracedecay_domain::{ProjectId, UserProfileId};
-use tracedecay_memory_observation::{
-    DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1, ObservationJournalReaderV1,
-    RetentionPolicyV1, SqliteObservationJournal,
-};
+use tracedecay_domain::{HostIntegrationIdV1, ProjectId, TemporalModeV1};
 
-const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
-const SESSION_MESSAGE_OBSERVATION_KIND: &str = "session.message_committed.v1";
-const ACKNOWLEDGED_DELIVERY_STATE: &str = DeliveryStateV1::Acknowledged.as_wire();
-const ADVISORY_RECALL_MAXIMUM_CANDIDATES: usize = 5;
-
-/// The Claude Code session id the whole journey is bound to. It is the host's
-/// own identity: the hook route publishes it, the transcript carries it, and
-/// the later context call names it.
 const CLAUDE_SESSION: &str = "claude-memory-journey-session";
-
-/// A term that appears in every transcript record, so a recall that answers at
-/// all has something to answer with.
+const USER_MESSAGE_ID: &str = "journey-uuid-1";
+const ASSISTANT_MESSAGE_ID: &str = "journey-uuid-2";
+const USER_CONTENT: &str = "how does the quicksilver transport probe decide its retry budget?";
+const ASSISTANT_CONTENT: &str =
+    "the quicksilver transport probe reads its retry budget from the pinned deadline";
 const JOURNEY_TERM: &str = "quicksilver";
-
-/// The assistant message's final phrase, proving recall returns the complete
-/// committed content rather than only its matching prefix.
 const TAIL_SENTINEL: &str = "pinned deadline";
-
-/// How many deliveries this journey's transcript must produce: the observation
-/// journey admits one `session.message_committed.v1` per committed session
-/// message, and [`write_claude_transcript`] writes exactly one user record and
-/// one assistant record.
-const EXPECTED_SESSION_MESSAGE_ROWS: usize = 2;
+const RECALL_LIMIT: usize = 5;
+const EXPECTED_MESSAGES: usize = 2;
 
 fn git(root: &Path, arguments: &[&str]) {
     let program = tracedecay_runtime_core::git::try_git_program()
@@ -65,8 +57,6 @@ fn git(root: &Path, arguments: &[&str]) {
     assert!(status.success(), "git {arguments:?} failed");
 }
 
-/// A real git project: the composition refuses to resolve an exact scope
-/// without a repository, a worktree, and a checked-out reference.
 fn initialize_project(project: &Path) {
     std::fs::create_dir_all(project).expect("project root");
     git(project, &["init", "-q", "-b", "main"]);
@@ -82,44 +72,6 @@ fn initialize_project(project: &Path) {
     git(project, &["commit", "-q", "-m", "initial"]);
 }
 
-/// The source edit the Claude Code session itself makes while it runs: the
-/// agent read the quicksilver probe, then changed it.
-///
-/// It is committed between the dormant composition and the restarted one for
-/// a reason that is worth stating plainly. The upstream in-process
-/// composition harness only observes a published code index on a *second*
-/// `open` when the verified source changed in between: with a byte-identical
-/// checkout the restarted scheduler neither republishes a complete generation
-/// nor reports the typed generation-empty state, so
-/// `wait_for_production_composition_code_index`
-/// (`crates/tracedecay/src/daemon/production_harness.rs:833-870`) exhausts its
-/// 20-second budget and `open` fails with `production-composition code index
-/// did not publish`. That is an upstream defect, not a product one -- it also
-/// fails two pre-existing upstream journeys
-/// (`configuration_idempotency_journey_test::
-/// user_profile_configuration_batch_has_cli_dashboard_parity_after_restart`
-/// and `...::configuration_set_has_cli_mcp_http_sdk_parity_and_replays_after_restart`)
-/// and it reproduces with no memory-provider gate and no transcript at all.
-///
-/// Committing a real edit here is therefore not a workaround bolted onto the
-/// journey: it is what the host session under test actually does, and it is
-/// the shape of restart the harness can observe.
-fn commit_claude_session_source_edit(project: &Path) {
-    std::fs::write(
-        project.join("src/lib.rs"),
-        "/// Quicksilver transport probe.\n\
-         ///\n\
-         /// The retry budget is read from the pinned deadline.\n\
-         pub fn quicksilver_probe() -> u8 { 11 }\n",
-    )
-    .expect("the Claude session's own source edit");
-    git(project, &["add", "."]);
-    git(project, &["commit", "-q", "-m", "quicksilver retry budget"]);
-}
-
-/// Writes the transcript Claude Code itself writes, into the transcript home
-/// the composition pins for this isolation root. A transcript written under
-/// the ambient `$HOME` is invisible to the composed daemon.
 fn write_claude_transcript(transcript_home: &Path, project: &Path) {
     let directory = transcript_home.join(".claude/projects/-claude-memory-journey");
     std::fs::create_dir_all(&directory).expect("transcript directory");
@@ -129,28 +81,25 @@ fn write_claude_transcript(transcript_home: &Path, project: &Path) {
             "type": "user",
             "cwd": cwd,
             "sessionId": CLAUDE_SESSION,
-            "uuid": "journey-uuid-1",
+            "uuid": USER_MESSAGE_ID,
             "timestamp": "2026-02-01T00:00:00.000Z",
             "message": {
                 "role": "user",
-                "content": format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?"),
+                "content": USER_CONTENT,
             },
         }),
         json!({
             "type": "assistant",
             "cwd": cwd,
             "sessionId": CLAUDE_SESSION,
-            "uuid": "journey-uuid-2",
-            "parentUuid": "journey-uuid-1",
+            "uuid": ASSISTANT_MESSAGE_ID,
+            "parentUuid": USER_MESSAGE_ID,
             "timestamp": "2026-02-01T00:00:01.000Z",
             "message": {
                 "id": "msg_journey_2",
                 "role": "assistant",
                 "model": "claude-opus-4-8",
-                "content": [{
-                    "type": "text",
-                    "text": format!("the {JOURNEY_TERM} transport probe reads its retry budget from the pinned deadline"),
-                }],
+                "content": [{"type": "text", "text": ASSISTANT_CONTENT}],
             },
         }),
     ];
@@ -166,151 +115,215 @@ fn write_claude_transcript(transcript_home: &Path, project: &Path) {
     .expect("write Claude transcript");
 }
 
-/// The tool payload of a successful MCP `tools/call`, panicking on a protocol
-/// error so a refusal can never read as an empty answer.
-fn tool_text(response: &tracedecay_mcp::transport::JsonRpcResponse, tool_name: &str) -> String {
-    let result = response
-        .result
-        .as_ref()
-        .unwrap_or_else(|| panic!("{tool_name} JSON-RPC error: {:?}", response.error));
-    result["content"]
+async fn tool_document(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+    tool: &str,
+    arguments: Value,
+) -> Value {
+    let result = tool_result(harness, project, tool, arguments).await;
+    parse_tool_document(&result, tool)
+}
+
+async fn tool_result(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+    tool: &str,
+    arguments: Value,
+) -> Value {
+    let response = harness
+        .call_tool(project, tool, arguments)
+        .await
+        .unwrap_or_else(|error| panic!("{tool} invocation failed: {error}"));
+    assert!(
+        response.error.is_none(),
+        "{tool} JSON-RPC error: {response:?}"
+    );
+    response.result.expect("MCP tool result")
+}
+
+fn parse_tool_document(result: &Value, tool: &str) -> Value {
+    assert_ne!(result["isError"], true, "{tool} failed: {result}");
+    let text = result["content"]
         .as_array()
         .and_then(|content| content.first())
         .and_then(|item| item["text"].as_str())
-        .unwrap_or_else(|| panic!("{tool_name} produced no text content: {result}"))
-        .to_owned()
+        .unwrap_or_else(|| panic!("{tool} produced no text content: {result}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|error| panic!("{tool} returned invalid JSON: {error}: {text}"))
 }
 
-async fn current_revision(
+async fn fresh_session_tool_document(
     harness: &ProductionProjectCompositionHarnessV1,
     project: &Path,
-) -> ConfigurationRevisionId {
-    harness
-        .server(project)
-        .expect("project server")
-        .cg()
+    tool: &str,
+    arguments: Value,
+    deadline: Instant,
+) -> Value {
+    let mut last_problem = None;
+    loop {
+        let result = tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            tool_result(harness, project, tool, arguments.clone()),
+        )
         .await
-        .configuration_runtime()
-        .client()
-        .current()
-        .await
-        .expect("current configuration")
-        .revision_id()
-        .clone()
+        .unwrap_or_else(|_| {
+            panic!("{tool} exhausted its fresh-read budget; last problem: {last_problem:?}")
+        });
+        if result["isError"] != true {
+            return parse_tool_document(&result, tool);
+        }
+        let wire = tracedecay_mcp::tool_errors::tool_result_problem(&result)
+            .unwrap_or_else(|| panic!("{tool} failed without a canonical problem: {result}"));
+        let problem: ApplicationProblemRecord = serde_json::from_value(wire.clone())
+            .expect("the fresh-read refusal is a valid canonical problem record");
+        assert_eq!(
+            problem.code, "application.retained.authority-unavailable",
+            "{tool} refused: {problem:?}"
+        );
+        assert!(
+            matches!(
+                problem.source(),
+                ApplicationProblem::Unavailable {
+                    classification: ApplicationUnavailableClassV1::Authority,
+                    ..
+                }
+            ),
+            "{tool} refused: {problem:?}"
+        );
+        assert_eq!(problem.retry_scope, Some(RetryScope::SameRequest));
+        assert_eq!(problem.legal_actions, [LegalAction::Retry]);
+        let delay = problem
+            .pre_admission_retry_delay()
+            .unwrap_or_else(|| panic!("{tool} cannot retry this refusal: {problem:?}"));
+        assert!(
+            delay < deadline.saturating_duration_since(Instant::now()),
+            "{tool} exhausted its fresh-read budget: {problem:?}"
+        );
+        last_problem = Some(problem);
+        tokio::time::sleep(delay).await;
+    }
 }
 
-async fn project_identity(
+fn tool_payload(document: Value) -> Value {
+    document
+        .pointer("/outcome/value/payload")
+        .cloned()
+        .unwrap_or(document)
+}
+
+fn json_tool_arguments(request: impl Serialize) -> Value {
+    let mut arguments = serde_json::to_value(request).expect("canonical tool request serializes");
+    arguments
+        .as_object_mut()
+        .expect("canonical tool request is an object")
+        .insert("format".to_owned(), json!("json"));
+    arguments
+}
+
+async fn assert_default_native_configuration(
     harness: &ProductionProjectCompositionHarnessV1,
     project: &Path,
-) -> (ProjectId, UserProfileId) {
+) -> ProjectId {
     let graph = harness.server(project).expect("project server").cg().await;
-    let project_id = graph
-        .configuration_runtime()
-        .configuration_target()
-        .project_id
-        .clone();
-    let profile_id = graph
-        .configuration_runtime()
-        .registered_database()
-        .binding()
-        .shard_id
-        .profile_id
-        .clone();
-    (project_id, profile_id)
-}
-
-/// Turns one canonical configuration setting on through the shipped
-/// `tracedecay_configuration_set` MCP surface — the operator path, not a
-/// direct store write.
-async fn configuration_set(
-    harness: &ProductionProjectCompositionHarnessV1,
-    project: &Path,
-    layer: ConfigurationLayerIdV1,
-    key: &str,
-    value: ConfigurationValueV1,
-    idempotency: &str,
-) {
-    let expected_revision = current_revision(harness, project).await;
-    let request = tracedecay_contracts::ConfigurationSetRequestV1 {
-        layer,
-        key: SettingKey::new(key).expect("canonical setting key"),
-        value,
-        expected_revision: expected_revision.clone(),
-        idempotency_key: ConfigurationIdempotencyKey::new(idempotency)
-            .expect("configuration idempotency key"),
-    };
-    // The request carries exactly the wire fields `ConfigurationSetRequestV1`
-    // declares; it rejects unknown members, so no rendering hint may ride
-    // along with it.
-    let arguments = serde_json::to_value(&request).expect("configuration set request");
-    let response = harness
-        .call_tool(project, "tracedecay_configuration_set", arguments)
+    let runtime = graph.configuration_runtime();
+    let observed = runtime
+        .observed_runtime_configuration()
         .await
-        .expect("configuration set tool call");
-    assert!(
-        response.error.is_none(),
-        "the operator gate must reach the configuration surface: {response:?}"
+        .expect("durable runtime activation is readable")
+        .expect("the production composition recorded its configuration pin");
+    let pin = PinnedRuntimeConfiguration::new(
+        runtime.configuration_target().clone(),
+        observed.revision_id,
+        observed.snapshot,
+    )
+    .expect("the observed configuration decodes through the production authority");
+    let config = pin.config();
+    assert!(config.memory_provider_native_enabled);
+    assert_eq!(
+        config.memory_provider_ncm_observer,
+        MemoryProviderNcmObserverV1::Disabled {}
     );
-    let result = response
-        .result
-        .as_ref()
-        .expect("configuration set tool result");
-    assert_ne!(
-        result["isError"], true,
-        "the operator gate must settle as a durable configuration effect: {result}"
+    let selection = MemoryProviderSelectionV1::resolve(
+        config.memory_provider_native_enabled,
+        &config.memory_provider_ncm_observer,
+        &config.memory_provider_recall_routing,
+    )
+    .expect("the observed provider selection is valid");
+    assert_eq!(
+        selection.active_provider(),
+        Some(MemoryProviderKindV1::Native)
     );
-    assert_ne!(
-        current_revision(harness, project).await,
-        expected_revision,
-        "committing {key} must advance the canonical configuration revision"
-    );
+    assert_eq!(selection.native, MemoryProviderParticipationV1::Active);
+    assert_eq!(selection.ncm, MemoryProviderParticipationV1::Disabled);
+    pin.target().project_id.clone()
 }
 
-/// Runs the shipped project transcript import — the same
-/// `SessionSyncCommandV1::ImportTranscripts` pass the daemon's session-sync
-/// worker runs — and returns how many session messages it committed.
 async fn import_project_transcripts(
     harness: &ProductionProjectCompositionHarnessV1,
     project: &Path,
-) -> Value {
-    let response = harness
-        .call_tool(
+) -> AdminCliSessionSyncV1 {
+    let document = tool_document(
+        harness,
+        project,
+        "tracedecay_admin_cli",
+        json_tool_arguments(AdminCliSurfaceRequestV1::SessionsImport {}),
+    )
+    .await;
+    let mut outcome: AdminCliSessionSyncV1 =
+        serde_json::from_value(tool_payload(document)).expect("typed transcript import admission");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let idempotency_key = match &outcome {
+            AdminCliSessionSyncV1::Complete {
+                source,
+                termination,
+                failure_codes,
+                ..
+            } => {
+                assert_eq!(*source, SessionSyncSourceV1::ImportTranscripts);
+                assert_eq!(*termination, OperationTermination::Partial);
+                assert!(
+                    failure_codes.is_empty(),
+                    "transcript import failed: {outcome:?}"
+                );
+                return outcome;
+            }
+            AdminCliSessionSyncV1::Accepted {
+                idempotency_key, ..
+            }
+            | AdminCliSessionSyncV1::Joined {
+                idempotency_key, ..
+            } => idempotency_key.clone(),
+            _ => panic!("transcript import did not complete: {outcome:?}"),
+        };
+        assert!(
+            Instant::now() < deadline,
+            "transcript import did not settle: {outcome:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let document = tool_document(
+            harness,
             project,
             "tracedecay_admin_cli",
-            json!({ "action": "sessions_import", "format": "json" }),
+            json_tool_arguments(AdminCliSurfaceRequestV1::SessionsSyncStatus {
+                idempotency_key: idempotency_key.as_str().to_owned(),
+            }),
         )
-        .await
-        .expect("transcript import tool call");
-    let text = tool_text(&response, "tracedecay_admin_cli");
-    serde_json::from_str(&text).unwrap_or(Value::Null)
+        .await;
+        outcome =
+            serde_json::from_value(tool_payload(document)).expect("typed transcript import status");
+    }
 }
 
-/// Publishes this host session's workspace route the shipped way: the
-/// acknowledged `tracedecay/hookEvent` request a Claude Code lifecycle hook
-/// sends the daemon, carrying the session's structural identity and workspace.
-///
-/// This is a *precondition* of the recall below, not an extra claim. A
-/// registered-project reader whose arguments carry an explicit session or
-/// thread identity fails closed when that identity has no registered private
-/// project route (`crates/tracedecay/src/mcp/server/requests/tool_dispatch.rs`,
-/// `route_tool_arguments`) -- deliberately, so one host's session can never
-/// inherit the workspace another connection happened to open. The recall is
-/// bound to `CLAUDE_SESSION` by exactly that explicit identity
-/// (`cognitive_recall::advisory_session_binding`), so the route a real Claude
-/// Code session publishes must exist before the call, and
-/// `McpServer::update_hook_workspace_route` is the only thing that publishes
-/// one.
-///
-/// It commits nothing: a `sessionStart` event plans a branch sync
-/// (`hook_events::plan_session_start_hook_event`), so the journey's only
-/// commit driver is still the administrative transcript import above, and this
-/// module's "no hook causality" claim is untouched.
+/// Send the real hook protocol through the maintained MCP connection and
+/// require one correlated acknowledgement for this exact Claude session route.
 async fn publish_claude_host_session_route(
     harness: &ProductionProjectCompositionHarnessV1,
     project: &Path,
 ) {
     let event = tracedecay_hooks::DaemonHookEvent::session_start(
-        tracedecay_hooks::HookAgent::Claude,
+        HostIntegrationIdV1::Claude,
         project.to_path_buf(),
     )
     .with_route(Some(tracedecay_hooks::HookRouteMetadata {
@@ -327,460 +340,328 @@ async fn publish_claude_host_session_route(
         method: tracedecay_hooks::HOOK_EVENT_METHOD.to_owned(),
         params: Some(serde_json::to_value(event).expect("the hook event serializes")),
     };
-    let response = harness
-        .server(project)
-        .expect("project server")
-        .handle_request(&request)
+    let (mut transport, sender, mut responses) = tracedecay_mcp::transport::ChannelTransport::new();
+    sender
+        .send(serde_json::to_string(&request).expect("the hook request serializes"))
+        .expect("the hook request is queued");
+    drop(sender);
+    let server = harness.server(project).expect("project server");
+    Box::pin(server.run_connection(&mut transport))
         .await
-        .expect("the acknowledged hook request returns after route publication");
+        .expect("the hook connection completes");
+    drop(transport);
+    let mut acknowledgement = None;
+    while let Some(line) = responses.recv().await {
+        let response: tracedecay_mcp::JsonRpcResponse =
+            serde_json::from_str(line.trim()).expect("the hook response is valid JSON-RPC");
+        if response.id == request_id {
+            assert!(
+                acknowledgement.replace(response).is_none(),
+                "the hook request receives exactly one acknowledgement"
+            );
+        }
+    }
+    let response = acknowledgement.expect("the hook acknowledgement correlates to its request");
     assert_eq!(response.id, request_id);
     assert!(
         response.error.is_none(),
         "hook acknowledgement failed: {response:?}"
     );
-    assert_eq!(response.result, Some(json!({ "processed": true })));
+    assert_eq!(response.result, Some(json!({})));
 }
 
-/// The advisory provider-memory lane of one `tracedecay_context` answer, or
-/// `None` when the answer carries no lane at all.
-async fn context_advisory_lane(
+async fn search_claude_messages(
     harness: &ProductionProjectCompositionHarnessV1,
-    project: &Path,
-    task: &str,
-    session: Option<&str>,
-) -> (Value, Option<Value>) {
-    let mut arguments = json!({ "task": task, "format": "json" });
-    if let Some(session) = session {
-        arguments["_meta"] = json!({ "session_id": session });
-    }
-    let response = harness
-        .call_tool(project, "tracedecay_context", arguments)
-        .await
-        .expect("context tool call");
-    let text = tool_text(&response, "tracedecay_context");
-    let parsed: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-    let lane = parsed
-        .get("advisory_provider_memory")
-        .filter(|value| !value.is_null())
-        .cloned();
-    (parsed, lane)
-}
-
-/// Turns both memory-provider gates on for this project through the shipped
-/// `tracedecay_configuration_set` surface. Both settings are project-scoped
-/// and `DaemonRestart`: a composition that is already open keeps the mounts it
-/// opened with, so the daemon must be restarted before they take effect.
-async fn enable_memory_provider_host(
-    harness: &ProductionProjectCompositionHarnessV1,
-    project: &Path,
-) {
-    let (project_id, _) = project_identity(harness, project).await;
-    let layer = ConfigurationLayerIdV1::Project { project_id };
-    configuration_set(
-        harness,
-        project,
-        layer.clone(),
-        MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
-        ConfigurationValueV1::Boolean(true),
-        "configuration.idempotency.claude-journey-host",
-    )
-    .await;
-    configuration_set(
-        harness,
-        project,
-        layer,
-        MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
-        ConfigurationValueV1::Text(
-            String::from_utf8(
-                tracedecay_domain::canonical_json_bytes(&MemoryProviderRecallRoutingV1 {
-                    active_provider: Some(
-                        tracedecay_memory_provider_registry::NATIVE_PROVIDER_ID.to_owned(),
-                    ),
-                    ..MemoryProviderRecallRoutingV1::default()
-                })
-                .expect("canonical routing document"),
-            )
-            .expect("canonical routing text is UTF-8"),
-        ),
-        "configuration.idempotency.claude-journey-routing",
-    )
-    .await;
-}
-
-/// Restarts the daemon on this project with both provider gates committed: the
-/// dormant composition commits them, stops, and the composition that comes
-/// back has the provider host mounted.
-async fn composition_with_memory_provider_host(
-    isolation: &Path,
-    project: &Path,
-) -> ProductionProjectCompositionHarnessV1 {
-    let dormant = ProductionProjectCompositionHarnessV1::open(isolation, [project.to_path_buf()])
-        .await
-        .expect("dormant production composition");
-    enable_memory_provider_host(&dormant, project).await;
-    dormant.shutdown().await;
-    // The session's own source edit lands before the daemon comes back; see
-    // `commit_claude_session_source_edit`.
-    commit_claude_session_source_edit(project);
-
-    ProductionProjectCompositionHarnessV1::open(isolation, [project.to_path_buf()])
-        .await
-        .expect("production composition with the memory provider host mounted")
-}
-
-/// Rebuilds the provider-qualified session identity with the same public
-/// domain-separated framing used by the mounted observation journey.
-fn provider_agent_session_id(
-    profile_id: &UserProfileId,
-    scope: &tracedecay_contracts::ResolvedScope,
-    canonical_session_id: &str,
-) -> String {
-    const DOMAIN: &[u8] = b"tracedecay.memory-provider.agent-session-binding.v1\0";
-    const PREFIX: &str = "tdmem-agent-session.v1.";
-    let mut digest = Sha256::new();
-    digest.update(DOMAIN);
-    for value in [
-        profile_id.as_str().as_bytes(),
-        scope.project_id.as_str().as_bytes(),
-        scope.repository_id.as_str().as_bytes(),
-        scope.worktree_id.as_str().as_bytes(),
-        scope
-            .reference
-            .as_ref()
-            .map_or(&b""[..], |reference| reference.as_str().as_bytes()),
-        scope.scope_digest.as_str().as_bytes(),
-        canonical_session_id.as_bytes(),
-    ] {
-        digest.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-        digest.update(value);
-    }
-    format!("{PREFIX}{}", hex::encode(digest.finalize()))
-}
-
-/// Computes the exact scope digest from the authoritative resolved project
-/// scope and the mounted profile identity. The test may inspect this public
-/// contract, but it never derives scope from a path or from journal storage.
-fn expected_exact_scope_sha256(
     project: &Path,
     project_id: &ProjectId,
-    profile_id: &UserProfileId,
-) -> String {
-    let scope = tracedecay_code_index_runtime::resolved_scope_for_project(project, project_id)
-        .expect("authoritative resolved scope");
-    let reference = scope
-        .reference
-        .as_ref()
-        .expect("authoritative scope reference");
-    tracedecay_memory_provider_registry::OwnedExactScope::new(
-        profile_id.as_str(),
-        scope.project_id.as_str(),
-        scope.repository_id.as_str(),
-        scope.worktree_id.as_str(),
-        reference.as_str(),
-        provider_agent_session_id(profile_id, &scope, CLAUDE_SESSION),
-        scope.scope_digest.as_str(),
-    )
-    .expect("exact scope for the Claude host session")
-    .exact_scope_sha256()
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct JourneyJournalRowV1 {
-    observation_id: String,
-    idempotency_key: String,
-    payload_sha256: String,
-    exact_scope_sha256: String,
-    observation_kind: String,
-    source_sequence: u64,
-    attempt_number: u32,
-    content_present: bool,
-    state: &'static str,
-    terminal: bool,
-}
-
-impl JourneyJournalRowV1 {
-    fn of(row: &JournalInspectionRowV1) -> Self {
-        Self {
-            observation_id: row.observation_id.as_str().to_owned(),
-            idempotency_key: row.idempotency_key.as_str().to_owned(),
-            payload_sha256: row.payload_sha256.clone(),
-            exact_scope_sha256: row.exact_scope_sha256.clone(),
-            observation_kind: row.observation_kind.clone(),
-            source_sequence: row.source_sequence.0,
-            attempt_number: row.attempt_number,
-            content_present: row.content_present,
-            state: row.state.as_wire(),
-            terminal: row.state.is_terminal(),
-        }
-    }
-}
-
-struct JourneyJournalV1(SqliteObservationJournal);
-
-fn inspection_retention_policy() -> RetentionPolicyV1 {
-    RetentionPolicyV1 {
-        ephemeral_max_age_micros: 3_600_000_000,
-        session_max_age_micros: 86_400_000_000,
-        project_max_age_micros: 2_592_000_000_000,
-        profile_max_age_micros: 2_592_000_000_000,
-        receipt_retention_micros: 604_800_000_000,
-        max_queue_items: 10_000,
-        max_queue_bytes: 64 * 1_048_576,
-        max_attempts: 8,
-        backoff_base_micros: 1_000_000,
-        backoff_max_micros: 300_000_000,
-        sweep_batch_rows: 512,
-    }
-}
-
-fn open_journal(journal_path: &Path) -> JourneyJournalV1 {
-    JourneyJournalV1(
-        SqliteObservationJournal::open(journal_path, inspection_retention_policy())
-            .expect("the durable observation journal must open through its own store API"),
-    )
-}
-
-impl JourneyJournalV1 {
-    fn rows(&self) -> Vec<JourneyJournalRowV1> {
-        let page = self
-            .0
-            .inspect(&JournalInspectionFilterV1 {
-                limit: 100,
-                ..JournalInspectionFilterV1::default()
-            })
-            .expect("the durable observation journal must answer an inspection");
+    deadline: Instant,
+) -> MessageSearchResultV1 {
+    loop {
+        let document = fresh_session_tool_document(
+            harness,
+            project,
+            "tracedecay_message_search",
+            json_tool_arguments(MessageSearchRequestV1 {
+                query: Some(JOURNEY_TERM.to_owned()),
+                provider: Some("claude".to_owned()),
+                project_selector: Some(RetainedProjectSelectorV1 {
+                    project_id: project_id.clone(),
+                }),
+                include_subagents: Some(false),
+                require_fresh: Some(true),
+                limit: Some(u64::try_from(RECALL_LIMIT).expect("fixture recall limit")),
+                ..MessageSearchRequestV1::default()
+            }),
+            deadline,
+        )
+        .await;
+        let result: MessageSearchResultV1 =
+            serde_json::from_value(tool_payload(document)).expect("typed canonical message search");
         assert!(
-            page.next_cursor.is_none(),
-            "this Claude journey must fit in one bounded journal inspection page"
+            result.error.is_none(),
+            "canonical message search failed: {result:?}"
         );
-        page.rows.iter().map(JourneyJournalRowV1::of).collect()
-    }
-
-    async fn await_settlement(&self, minimum_rows: usize) -> Vec<JourneyJournalRowV1> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            let rows = self.rows();
-            if rows.len() >= minimum_rows && rows.iter().all(|row| row.terminal) {
-                return rows;
+        if result.outcome == RetainedOutcomeStatusV1::Complete
+            && result.count == Some(EXPECTED_MESSAGES)
+        {
+            assert_eq!(result.status, RetainedOutcomeStatusV1::Ok);
+            assert!(result.require_fresh);
+            assert!(!result.refresh_required);
+            assert_eq!(result.provider, "claude");
+            assert_eq!(result.requested_provider.as_deref(), Some("claude"));
+            assert_eq!(result.store_scope.as_deref(), Some("project"));
+            let hits = result
+                .results
+                .as_ref()
+                .expect("complete message search has hits");
+            assert_eq!(hits.len(), EXPECTED_MESSAGES);
+            assert!(hits.len() <= RECALL_LIMIT);
+            for (message_id, role, content) in [
+                (USER_MESSAGE_ID, "user", USER_CONTENT),
+                (ASSISTANT_MESSAGE_ID, "assistant", ASSISTANT_CONTENT),
+            ] {
+                let matches = hits
+                    .iter()
+                    .filter(|hit| hit.message.message_id == message_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    matches.len(),
+                    1,
+                    "each captured Claude record has one canonical identity"
+                );
+                let hit = matches[0];
+                assert_eq!(hit.session.provider, "claude");
+                assert_eq!(hit.session.session_id, CLAUDE_SESSION);
+                assert_eq!(hit.message.provider, "claude");
+                assert_eq!(hit.message.session_id, CLAUDE_SESSION);
+                assert_eq!(hit.message.role, role);
+                assert_eq!(hit.message.text, content);
+                if let Some(owner) = &hit.project_id {
+                    assert_eq!(owner, project_id.as_str());
+                }
             }
             assert!(
-                Instant::now() < deadline,
-                "the durable observation journal never settled {minimum_rows} deliveries within 30s: {:?}",
-                journal_digest(&rows)
+                hits.iter()
+                    .any(|hit| hit.message.text.ends_with(TAIL_SENTINEL))
             );
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            return result;
         }
+        assert!(
+            matches!(
+                result.outcome,
+                RetainedOutcomeStatusV1::Complete
+                    | RetainedOutcomeStatusV1::CompleteZero
+                    | RetainedOutcomeStatusV1::Partial
+                    | RetainedOutcomeStatusV1::Stale
+            ),
+            "canonical message search refused: {result:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the captured Claude records did not become fresh: {result:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-fn journal_row_identities(rows: &[JourneyJournalRowV1]) -> Vec<(String, String, String, u32)> {
-    let mut identities = rows
-        .iter()
-        .map(|row| {
-            (
-                row.idempotency_key.clone(),
-                row.observation_id.clone(),
-                row.payload_sha256.clone(),
-                row.attempt_number,
-            )
-        })
-        .collect::<Vec<_>>();
-    identities.sort();
-    identities
+async fn load_claude_messages(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+    deadline: Instant,
+) -> Vec<LcmMessageV1> {
+    let document = fresh_session_tool_document(
+        harness,
+        project,
+        "tracedecay_lcm_load_session",
+        json_tool_arguments(LcmLoadSessionRequestV1 {
+            provider: Some("claude".to_owned()),
+            session_id: CLAUDE_SESSION.to_owned(),
+            cursor: None,
+            temporal_mode: Some(TemporalModeV1::Current),
+            limit: Some(u64::try_from(RECALL_LIMIT).expect("fixture recall limit")),
+            role: None,
+            roles: None,
+            start_time: None,
+            end_time: None,
+            content_offset: None,
+            content_limit: None,
+        }),
+        deadline,
+    )
+    .await;
+    let result: LcmLoadSessionResultV1 =
+        serde_json::from_value(tool_payload(document)).expect("typed canonical LCM retrieval");
+    assert_eq!(result.status, RetainedOutcomeStatusV1::Ok);
+    assert!(
+        result.error.is_none(),
+        "canonical LCM retrieval failed: {result:?}"
+    );
+    assert_eq!(result.provider.as_deref(), Some("claude"));
+    assert_eq!(result.session_id.as_deref(), Some(CLAUDE_SESSION));
+    assert_eq!(result.omitted, Some(0));
+    assert!(
+        result
+            .temporal
+            .as_ref()
+            .expect("LCM temporal authority")
+            .next_cursor
+            .is_none()
+    );
+    let mut messages = result.messages;
+    assert_eq!(messages.len(), EXPECTED_MESSAGES);
+    assert!(messages.len() <= RECALL_LIMIT);
+    messages.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+    for (message, (message_id, role, content)) in messages.iter().zip([
+        (USER_MESSAGE_ID, "user", USER_CONTENT),
+        (ASSISTANT_MESSAGE_ID, "assistant", ASSISTANT_CONTENT),
+    ]) {
+        assert_eq!(message.provider, "claude");
+        assert_eq!(message.session_id, CLAUDE_SESSION);
+        assert_eq!(message.message_id, message_id);
+        assert_eq!(message.role, role);
+        assert_eq!(message.content, content);
+        assert!(!message.content_range.truncated);
+        assert_eq!(message.content_range.offset, 0);
+        let chars = u64::try_from(content.chars().count()).expect("fixture content length");
+        assert_eq!(message.content_range.returned_chars, chars);
+        assert_eq!(message.content_range.total_chars, chars);
+    }
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.ends_with(TAIL_SENTINEL))
+    );
+    messages
 }
 
-fn journal_digest(rows: &[JourneyJournalRowV1]) -> Vec<String> {
-    let mut digest = rows
-        .iter()
-        .map(|row| {
-            format!(
-                "{}|{}|{}|attempt={}|seq={}|content_present={}",
-                row.observation_kind,
-                row.exact_scope_sha256,
-                row.state,
-                row.attempt_number,
-                row.source_sequence,
-                row.content_present,
-            )
-        })
-        .collect::<Vec<_>>();
-    digest.sort();
-    digest
+async fn add_project_fact(
+    harness: &ProductionProjectCompositionHarnessV1,
+    project: &Path,
+    project_id: &ProjectId,
+) -> FactV1 {
+    let document = tool_document(
+        harness,
+        project,
+        "tracedecay_fact_store_add",
+        json_tool_arguments(FactStoreAddRequestV1 {
+            content: ASSISTANT_CONTENT.to_owned(),
+            memory_scope: Some(MemoryScopeV1::Project),
+            category: None,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            trust: Some(0.91),
+            source_label: Some("claude-memory-journey".to_owned()),
+            metadata: None,
+            project_selector: Some(RetainedProjectSelectorV1 {
+                project_id: project_id.clone(),
+            }),
+        }),
+    )
+    .await;
+    assert_eq!(document["outcome"]["outcome"], "effect");
+    let effect = &document["outcome"]["value"];
+    assert_eq!(effect["reconciliation"], "reconciled");
+    assert_eq!(effect["execution"]["termination"], "completed");
+    assert_eq!(effect["receipt"]["outcome"], "completed");
+    let outcome: FactStoreAddResultV1 =
+        serde_json::from_value(tool_payload(document)).expect("typed canonical fact commit");
+    let FactStoreAddResultV1::Committed {
+        result: FactStoreAddCommitV1::Added { fact, commit },
+    } = outcome
+    else {
+        panic!("the isolated project must commit a new canonical fact: {outcome:?}");
+    };
+    let FactProjectionV1::Available { fact } = fact else {
+        panic!("the committed canonical fact must be readable: {fact:?}");
+    };
+    let owner = FactCommitOwnerV1::Project {
+        project_id: project_id.clone(),
+    };
+    assert_eq!(fact.owner, owner);
+    assert_eq!(commit.owner, owner);
+    assert_eq!(commit.fact_id, fact.fact_id);
+    assert_eq!(fact.content, ASSISTANT_CONTENT);
+    assert_eq!(fact.source_label.as_deref(), Some("claude-memory-journey"));
+    assert!(!commit.committed_event_ids.is_empty());
+    *fact
 }
 
-/// Every Claude Code session message this project commits settles in the
-/// durable observation journal against Native exactly once, under this
-/// project's authoritative exact scope, and a later `tracedecay_context` call
-/// naming the same host session recalls it inside the advisory lane's own
-/// candidate budget, de-duplicated.
-///
-/// Real defect this catches: an observation journey that admits the same
-/// committed message twice, binds it to a scope other than the resolved
-/// worktree scope, retries an already-accepted delivery, or lets recall
-/// answer with unbounded or duplicated candidates.
-///
-/// The commit here is driven by the shipped administrative transcript import,
-/// so this test claims settlement and recall -- not hook causality. The
-/// causal proof that real `tracedecay hook-claude-session-start` and
-/// `tracedecay hook-stop` invocations are what put the messages in the journal
-/// is the subprocess journey in
-/// `crates/tracedecay-cli/tests/product_memory_provider_claude_host_journey.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_committed_claude_session_message_settles_once_and_a_later_context_call_recalls_it_bounded()
- {
+async fn default_native_recalls_canonical_claude_messages_and_project_facts_after_import_replay() {
     let isolation = TempDir::new().expect("journey isolation");
-    let project: PathBuf = isolation.path().join("project");
+    let project = isolation.path().join("project");
     initialize_project(&project);
-
     let transcript_home =
         ProductionProjectCompositionHarnessV1::transcript_source_home(isolation.path())
             .expect("the composition pins its own transcript source home");
     write_claude_transcript(&transcript_home, &project);
-
-    let harness = composition_with_memory_provider_host(isolation.path(), &project).await;
-    let (project_id, profile_id) = project_identity(&harness, &project).await;
-    let data_root = harness
-        .project_data_root(&project)
+    let harness = ProductionProjectCompositionHarnessV1::open(isolation.path(), [project.clone()])
         .await
-        .expect("project data root");
-    let journal_path = data_root.join(JOURNAL_FILE_NAME);
-    assert!(
-        journal_path.exists(),
-        "an enabled composition must mount the durable observation journal at {}",
-        journal_path.display()
-    );
-    let journal = open_journal(&journal_path);
-
-    // 1. The shipped transcript import commits the host's session messages as
-    //    canonical observations for this project. Its own reported outcome is
-    //    the evidence, not a test-only counter: a route that refused would say
-    //    so here rather than leaving an empty store to be mistaken for one
-    //    that had nothing to import.
-    let imported = import_project_transcripts(&harness, &project).await;
-    assert_ne!(
-        imported,
-        Value::Null,
-        "the shipped transcript import must report a typed outcome"
-    );
-
-    // 2. The mounted journey admits every committed message and settles it
-    //    against Native exactly once.
-    let rows = journal
-        .await_settlement(EXPECTED_SESSION_MESSAGE_ROWS)
-        .await;
-    assert_eq!(
-        rows.len(),
-        EXPECTED_SESSION_MESSAGE_ROWS,
-        "the transcript's two committed session messages must produce exactly two deliveries: \
-         {:?}",
-        journal_digest(&rows)
-    );
-    let expected_scope = expected_exact_scope_sha256(&project, &project_id, &profile_id);
-    for row in &rows {
-        assert_eq!(
-            row.observation_kind, SESSION_MESSAGE_OBSERVATION_KIND,
-            "the journey admits exactly the session-message observation kind"
-        );
-        assert_eq!(
-            row.exact_scope_sha256, expected_scope,
-            "every journal row must carry this project's exact worktree-bound scope"
-        );
-        assert_eq!(
-            row.state, ACKNOWLEDGED_DELIVERY_STATE,
-            "Native accepts session messages, so the row settles acknowledged"
-        );
-        assert_eq!(
-            row.attempt_number, 1,
-            "an accepted observation is delivered once, never retried"
-        );
-        assert!(
-            row.content_present,
-            "a settled delivery still holds its content until retention takes it: {:?}",
-            journal_digest(&rows)
-        );
-    }
-    // Two *distinct* messages, not the same one journalled twice: the source
-    // positions the journey admitted must differ.
-    let mut sequences = rows
-        .iter()
-        .map(|row| row.source_sequence)
-        .collect::<Vec<_>>();
-    sequences.sort_unstable();
-    sequences.dedup();
-    assert_eq!(
-        sequences.len(),
-        EXPECTED_SESSION_MESSAGE_ROWS,
-        "each committed message occupies its own source position: {:?}",
-        journal_digest(&rows)
-    );
-
-    // 3. Re-running the same import is idempotent: the journal holds the same
-    //    rows, by identity, because the idempotency key is content-derived.
-    //    The import call is synchronous, so anything it admitted is already in
-    //    the journal by the time it returns.
-    let settled = journal_row_identities(&rows);
-    let _ = import_project_transcripts(&harness, &project).await;
-    let replayed = journal
-        .await_settlement(EXPECTED_SESSION_MESSAGE_ROWS)
-        .await;
-    assert_eq!(
-        journal_row_identities(&replayed),
-        settled,
-        "replaying the same transcript must reproduce exactly the same deliveries, by \
-         observation identity, payload digest and attempt count: {:?}",
-        journal_digest(&replayed)
-    );
-
-    // 4. The host publishes this session's workspace route, exactly as a
-    //    Claude Code lifecycle hook does. Without it the next call's explicit
-    //    session identity has no registered private project route and the
-    //    daemon refuses it, which is the guard working, not the journey.
+        .expect("the real production project composition opens");
+    let project_id = assert_default_native_configuration(&harness, &project).await;
+    import_project_transcripts(&harness, &project).await;
     publish_claude_host_session_route(&harness, &project).await;
+    let capture_deadline = Instant::now() + Duration::from_secs(30);
+    let searched = search_claude_messages(&harness, &project, &project_id, capture_deadline).await;
+    let captured = load_claude_messages(&harness, &project, capture_deadline).await;
 
-    // 5. A later context call naming the same host session receives the
-    //    advisory provider-memory lane, bounded by the lane's own budget.
-    let (answer, lane) = context_advisory_lane(
+    import_project_transcripts(&harness, &project).await;
+    let replay_deadline = Instant::now() + Duration::from_secs(30);
+    assert_eq!(
+        load_claude_messages(&harness, &project, replay_deadline).await,
+        captured,
+        "import replay preserves both canonical record identities and complete content"
+    );
+    let replayed_search =
+        search_claude_messages(&harness, &project, &project_id, replay_deadline).await;
+    assert_eq!(replayed_search.results, searched.results);
+
+    let fact = add_project_fact(&harness, &project, &project_id).await;
+    let document = tool_document(
         &harness,
         &project,
-        &format!("how does the {JOURNEY_TERM} transport probe decide its retry budget?"),
-        Some(CLAUDE_SESSION),
+        "tracedecay_context",
+        json_tool_arguments(ContextSurfaceRequestV1 {
+            task: USER_CONTENT.to_owned(),
+            max_nodes: None,
+            include_code: None,
+            max_code_blocks: None,
+            mode: None,
+            include_memory: None,
+            memory_limit: Some(u32::try_from(RECALL_LIMIT).expect("fixture recall limit")),
+            memory_min_trust: None,
+            temporal_query: None,
+            exclusions: None,
+            lexical_anchors: None,
+            prefer_symbol: None,
+            budget_tokens: None,
+        }),
     )
     .await;
-    let lane = lane
-        .unwrap_or_else(|| panic!("an active provider must contribute an advisory lane: {answer}"));
-    assert_eq!(
-        lane["state"], "answered",
-        "the advisory lane must answer rather than report a refusal: {lane}"
-    );
-    let candidates = lane["candidates"].as_array().cloned().unwrap_or_default();
+    let payload = tool_payload(document);
     assert!(
-        !candidates.is_empty(),
-        "the observed Claude session must be recallable: {lane}"
+        payload.get("advisory_provider_memory").is_none(),
+        "default Native uses canonical memory_matches: {payload}"
     );
+    let context: ContextResultV1 =
+        serde_json::from_value(payload).expect("typed Native context result");
     assert!(
-        candidates.len() <= ADVISORY_RECALL_MAXIMUM_CANDIDATES,
-        "the advisory lane is bounded by its own candidate budget: {lane}"
+        context.memory_matches_error.is_none(),
+        "Native recall failed: {context:?}"
     );
-    let mut provenance = candidates
+    assert!(!context.memory_matches.is_empty());
+    assert!(context.memory_matches.len() <= RECALL_LIMIT);
+    assert!(matches!(
+        context.memory_graph_coverage,
+        Some(FactSearchGraphCoverageV1::Complete { .. })
+    ));
+    let recalled = context
+        .memory_matches
         .iter()
-        .map(|candidate| candidate["provenance"].to_string())
-        .collect::<Vec<_>>();
-    let total = provenance.len();
-    provenance.sort();
-    provenance.dedup();
-    assert_eq!(
-        provenance.len(),
-        total,
-        "recall candidates must be de-duplicated: {lane}"
-    );
-    assert!(
-        candidates.iter().any(|candidate| {
-            candidate["content"].as_str().is_some_and(|content| {
-                content.contains(JOURNEY_TERM) && content.contains(TAIL_SENTINEL)
-            })
-        }),
-        "the advisory lane must recall the assistant message whole, tail included: {lane}"
-    );
-
+        .find(|hit| hit.fact.fact_id == fact.fact_id)
+        .expect("default Native context recalls the actual committed project fact");
+    assert_eq!(recalled.fact.owner, fact.owner);
+    assert_eq!(recalled.fact.content, ASSISTANT_CONTENT);
+    assert!(recalled.fact.content.ends_with(TAIL_SENTINEL));
     harness.shutdown().await;
 }

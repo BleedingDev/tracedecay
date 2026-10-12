@@ -1,13 +1,13 @@
 //! Live Hermes provider journey through the shipped CLI and generated plugin.
 //!
 //! The test installs Hermes into an isolated HOME, starts a real TraceDecay
-//! daemon, registers a real git project, enables one configured provider
-//! through the operator configuration surface, and then runs the installed
-//! Python provider. The provider's project-scoped `ingest_transcript` call,
+//! daemon, registers a real git project, and runs the installed Python
+//! provider against default Native memory or an opt-in real NCM worker.
+//! The provider's project-scoped `ingest_transcript` call,
 //! its asynchronous `turnCompleted`/`turnIngested` callbacks, and the
 //! installed context-engine callback are therefore exercised as Hermes invokes
-//! them. The project observation journal and a later context recall are the
-//! assertions that the full route settled.
+//! them. Native is verified through canonical messages and project facts;
+//! NCM is verified through its observation journal and provider receipts.
 //!
 //! The repository does not ship a stock Hermes runtime, so the Python fixture
 //! uses the generated plugin's public `register(ctx)` contract with a faithful
@@ -20,24 +20,47 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[path = "support/tracedecay_exe.rs"]
+mod tracedecay_exe;
+use tracedecay_exe::tracedecay_exe;
+
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tracedecay::daemon::tool_json_payload;
+use tracedecay_contracts::retained_surfaces::{
+    FactCommitOwnerV1, FactProjectionV1, FactSearchGraphCoverageV1, FactStoreAddCommitV1,
+    FactStoreAddResultV1, FactV1, LcmLoadSessionResultV1, LcmMessageV1, MessageSearchResultV1,
+    RetainedOutcomeStatusV1,
+};
+use tracedecay_contracts::retrieval::ContextResultV1;
+use tracedecay_contracts::{
+    ApplicationEnvelope, ApplicationOutcome, ApplicationProblem, ApplicationProblemRecord,
+    ApplicationUnavailableClassV1, ResolvedSetting,
+};
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
 use tracedecay_daemon_protocol::BrokerStream;
+use tracedecay_domain::ProjectId;
 use tracedecay_domain::configuration::{
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
-    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
+    ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MemoryProviderKindV1, MemoryProviderNcmObserverV1, MemoryProviderParticipationV1,
     MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
-    MemoryProviderRecallRoutingV1,
+    MemoryProviderRecallRoutingV1, MemoryProviderSelectionV1,
 };
 use tracedecay_memory_observation::{
     AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
     ObservationCommittedEffectV1, ObservationJournalReaderV1, ObservationOutcomeV1,
     RetentionPolicyV1, SqliteObservationJournal,
 };
+use tracedecay_runtime_core::test_executable::link_or_copy_executable;
 
 const SESSION_ID: &str = "hermes-cli-project-journey";
+const FOREIGN_SESSION_ID: &str = "hermes-cli-foreign-project-control";
 const PROJECT_TERM: &str = "quartz";
+const USER_CONTENT: &str = "Hermes captured a quartz crystal workspace observation from the user.";
+const ASSISTANT_CONTENT: &str =
+    "Hermes recorded the quartz crystal project decision for the assistant.";
+const RECALL_LIMIT: usize = 10;
 const RECALL_QUERY: &str = "Which crystal themed workspace note did Hermes capture?";
 const FOREIGN_RECALL_QUERY: &str = "Which crystal themed workspace note did Hermes capture?";
 const JOURNAL_FILE_NAME: &str = "memory-observation-journal-v1.sqlite3";
@@ -130,7 +153,9 @@ impl HermesJourney {
             std::iter::once(self.bin_dir.clone()).chain(std::env::split_paths(&inherited_path)),
         )
         .expect("isolated PATH");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tracedecay"));
+        // Bazel disables accounting for unit tests. This real daemon journey
+        // keeps production accounting inside its isolated profile.
+        let mut command = Command::new(tracedecay_exe());
         command
             .args(args)
             .current_dir(project)
@@ -139,6 +164,7 @@ impl HermesJourney {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("TRACEDECAY_DATA_DIR", &self.profile)
             .env("TRACEDECAY_GLOBAL_DB", self.profile.join("global.db"))
+            .env_remove("TRACEDECAY_DISABLE_GLOBAL_DB")
             .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
             .env("PATH", path)
             .stdin(Stdio::null())
@@ -199,8 +225,7 @@ impl HermesJourney {
 
     fn project_id_at(&self, project: &Path) -> String {
         let bytes = run_ok(
-            &mut self
-                .cli_at(project, &["projects", "context"])
+            self.cli_at(project, &["projects", "context"])
                 .arg(project)
                 .arg("--json"),
             "projects context",
@@ -212,22 +237,27 @@ impl HermesJourney {
             .to_owned()
     }
 
-    fn configuration_revision(&self) -> String {
-        let value = self.tool_result("tracedecay_configuration_observed_state", &json!({}));
-        let mut revisions = Vec::new();
-        collect_string_field(&value, "desired_revision_id", &mut revisions);
-        revisions.sort();
-        revisions.dedup();
-        assert_eq!(
-            revisions.len(),
-            1,
-            "one canonical configuration revision: {value}"
-        );
-        revisions.remove(0)
+    fn configuration_setting(&self, key: &str) -> ResolvedSetting {
+        let result = self.tool_result("tracedecay_configuration_get", &json!({ "key": key }));
+        let document = tool_json_payload(&result, "tracedecay_configuration_get")
+            .expect("canonical configuration JSON payload");
+        let envelope: ApplicationEnvelope<ResolvedSetting> =
+            serde_json::from_value(document).expect("typed canonical configuration setting");
+        let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
+            panic!("configuration read must return evidence");
+        };
+        evidence.payload.expect("configuration setting payload")
+    }
+
+    fn configuration_revision(&self, key: &str) -> String {
+        self.configuration_setting(key)
+            .revision_id
+            .as_str()
+            .to_owned()
     }
 
     fn configuration_set(&self, project_id: &str, key: &str, value: Value, idempotency_key: &str) {
-        let expected_revision = self.configuration_revision();
+        let expected_revision = self.configuration_revision(key);
         self.tool_result(
             "tracedecay_configuration_set",
             &json!({
@@ -239,7 +269,7 @@ impl HermesJourney {
             }),
         );
         assert_ne!(
-            self.configuration_revision(),
+            self.configuration_revision(key),
             expected_revision,
             "configuration write must advance revision"
         );
@@ -354,7 +384,8 @@ impl HermesJourney {
             "tracedecay_context",
             &json!({ "task": task, "format": "json", "_meta": { "session_id": SESSION_ID } }),
         );
-        content_json(&result).unwrap_or(result)
+        tool_json_payload(&result, "tracedecay_context")
+            .expect("canonical Hermes context JSON payload")
     }
 
     fn analytics_diagnostics(&self) -> Value {
@@ -387,7 +418,7 @@ impl HermesJourney {
             .arg(script)
             .arg(plugin)
             .arg(&self.project)
-            .arg(env!("CARGO_BIN_EXE_tracedecay"))
+            .arg(tracedecay_exe())
             .arg(mode)
             .current_dir(&self.project)
             .env("HOME", self.home.path())
@@ -395,6 +426,7 @@ impl HermesJourney {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("TRACEDECAY_DATA_DIR", &self.profile)
             .env("TRACEDECAY_GLOBAL_DB", self.profile.join("global.db"))
+            .env_remove("TRACEDECAY_DISABLE_GLOBAL_DB")
             .env("TRACEDECAY_TEST_ALLOW_INCOMPLETE_HOLDER_SCAN", "1")
             .env(
                 "TRACEDECAY_HERMES_REPLAY_TIMESTAMP_NS",
@@ -504,7 +536,63 @@ impl Drop for HermesJourney {
 
 #[test]
 fn installed_hermes_provider_scopes_native_observations_and_recall_to_the_project() {
-    assert_hermes_provider_journey(ActiveProvider::Native);
+    let mut journey = HermesJourney::new(ActiveProvider::Native);
+    journey.install_hermes_plugin();
+    journey.start_daemon();
+    journey.init_project();
+    journey.init_project_at(&journey.foreign_project);
+    let project_id = journey.project_id();
+    journey.assert_default_native_configuration();
+    journey.assert_native_baseline();
+
+    let timestamp_ns = replay_timestamp_ns();
+    let original = journey.run_provider_fixture("original", timestamp_ns);
+    assert_original_fixture(&original);
+    let original_ids = fixture_message_ids(&original);
+    let searched = journey.await_native_message_search_at(&journey.project, 2);
+    assert_native_search_messages(&searched, &journey.project, &project_id, &original_ids);
+    let captured = journey.native_messages_at(&journey.project);
+    assert_native_loaded_messages(&captured, &original_ids);
+
+    let replay = journey.run_provider_fixture("replay", timestamp_ns);
+    assert_fixture_replay(&replay);
+    assert_eq!(fixture_message_ids(&replay), original_ids);
+    let replayed = journey.await_native_message_search_at(&journey.project, 2);
+    assert_eq!(replayed.results, searched.results);
+    assert_eq!(
+        journey.native_messages_at(&journey.project),
+        captured,
+        "a fresh Hermes provider replay preserves every canonical message field"
+    );
+
+    let fact = journey.add_native_project_fact(&project_id);
+    assert_native_fact_recall(&journey.native_context_at(&journey.project), &fact);
+    journey.stop_daemon();
+    journey.start_daemon();
+    journey.assert_default_native_configuration();
+    let reopened = journey.await_native_message_search_at(&journey.project, 2);
+    assert_eq!(reopened.results, searched.results);
+    assert_eq!(
+        journey.native_messages_at(&journey.project),
+        captured,
+        "a real daemon restart preserves complete canonical Hermes messages"
+    );
+    assert_native_fact_recall(&journey.native_context_at(&journey.project), &fact);
+
+    journey.await_native_message_search_at(&journey.foreign_project, 0);
+    assert!(
+        journey
+            .native_messages_at(&journey.foreign_project)
+            .is_empty(),
+        "foreign-project LCM cannot read the primary Hermes session"
+    );
+    let foreign = journey.native_context_at(&journey.foreign_project);
+    assert!(
+        foreign.memory_matches.is_empty(),
+        "foreign Native recall cannot read the primary project fact: {foreign:?}"
+    );
+    journey.assert_no_native_provider_journal();
+    journey.assert_hook_analytics();
 }
 
 /// The real worker/model path is deliberately opt-in: CI and ordinary test
@@ -659,34 +747,403 @@ fn assert_hermes_provider_journey(active_provider: ActiveProvider) {
     let answer = journey.context(RECALL_QUERY);
     assert_answered_recall(&answer, active_provider);
 
-    // Keep the existing hook analytics assertion as a separate route proof:
-    // the provider callbacks carry the resolved project and leave evidence in
-    // this project's analytics store, while the foreign context above cannot
-    // see that route.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let diagnostics = journey.analytics_diagnostics();
-        if diagnostics["hook_call_count"].as_i64().unwrap_or_default() > 0
-            && diagnostics["by_event_kind"]
-                .as_array()
-                .is_some_and(|events| {
-                    events.iter().any(|event| {
-                        event["event_kind"] == "hook_route"
-                            && event["count"].as_i64().unwrap_or_default() > 0
-                    })
-                })
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "Hermes project callback did not leave project-scoped hook analytics: {diagnostics}"
-        );
-        std::thread::sleep(JOURNAL_POLL_INTERVAL);
-    }
+    journey.assert_hook_analytics();
 }
 
 impl HermesJourney {
+    fn assert_default_native_configuration(&self) {
+        let native = self.configuration_setting(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY);
+        assert!(native.findings.is_empty());
+        assert_eq!(native.effective_value, ConfigurationValueV1::Boolean(true));
+        let ncm = self.configuration_setting(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY);
+        assert!(ncm.findings.is_empty());
+        let ConfigurationValueV1::Text(ncm) = ncm.effective_value else {
+            panic!("NCM observer configuration must be canonical JSON text");
+        };
+        let ncm: MemoryProviderNcmObserverV1 =
+            serde_json::from_str(&ncm).expect("typed NCM observer configuration");
+        assert_eq!(ncm, MemoryProviderNcmObserverV1::Disabled {});
+        let routing = self.configuration_setting(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY);
+        assert!(routing.findings.is_empty());
+        let ConfigurationValueV1::Text(routing) = routing.effective_value else {
+            panic!("provider routing configuration must be canonical JSON text");
+        };
+        let routing: MemoryProviderRecallRoutingV1 =
+            serde_json::from_str(&routing).expect("typed provider routing configuration");
+        assert_eq!(
+            routing,
+            MemoryProviderRecallRoutingV1 {
+                active_provider: Some(NATIVE_PROVIDER_ID.to_owned()),
+                fallback: None,
+                degradation: None,
+            }
+        );
+        let selection = MemoryProviderSelectionV1::resolve(true, &ncm, &routing)
+            .expect("default provider selection is valid");
+        assert_eq!(
+            selection.active_provider(),
+            Some(MemoryProviderKindV1::Native)
+        );
+        assert_eq!(selection.native, MemoryProviderParticipationV1::Active);
+        assert_eq!(selection.ncm, MemoryProviderParticipationV1::Disabled);
+    }
+
+    fn canonical_tool_payload_at(&self, project: &Path, name: &str, args: &Value) -> Value {
+        let result = self.tool_result_at(project, name, args);
+        let document = tool_json_payload(&result, name).unwrap_or_else(|error| {
+            panic!("{name} returned no canonical JSON payload: {error}: {result}")
+        });
+        document
+            .pointer("/outcome/value/payload")
+            .cloned()
+            .unwrap_or(document)
+    }
+
+    fn native_retained_read_payload_at(
+        &self,
+        project: &Path,
+        name: &str,
+        args: &Value,
+        deadline: Instant,
+    ) -> Value {
+        let project_argument = project.to_string_lossy().to_string();
+        let arguments = args.to_string();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                remaining.as_millis() > 0,
+                "{name} exhausted its settlement budget"
+            );
+            let output = self
+                .cli_at(
+                    project,
+                    &[
+                        "tool",
+                        "--project",
+                        &project_argument,
+                        name,
+                        "--args",
+                        &arguments,
+                        "--json",
+                    ],
+                )
+                .env(
+                    "TRACEDECAY_TOOL_DEADLINE_MS",
+                    remaining.as_millis().to_string(),
+                )
+                .output()
+                .unwrap_or_else(|error| panic!("{name} could not run: {error}"));
+            let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+                panic!(
+                    "{name} returned invalid JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+            if !output.status.success() || result["isError"] == true {
+                let problem = tracedecay_mcp::tool_errors::tool_result_problem(&result)
+                    .unwrap_or_else(|| panic!("{name} failed without a typed refusal: {result}"));
+                let problem: ApplicationProblemRecord = serde_json::from_value(problem.clone())
+                    .expect("validated retained read problem");
+                assert_eq!(
+                    problem.code, "application.retained.authority-unavailable",
+                    "{name} failed outside authority convergence: {problem:?}"
+                );
+                assert!(
+                    matches!(
+                        problem.source(),
+                        ApplicationProblem::Unavailable {
+                            classification: ApplicationUnavailableClassV1::Authority,
+                            ..
+                        }
+                    ),
+                    "{name} refused outside the retained authority: {problem:?}"
+                );
+                // Fresh session reads can precede historical convergence. Only
+                // the owner's declared pre-admission delay permits another read.
+                let delay = problem
+                    .pre_admission_retry_delay()
+                    .unwrap_or_else(|| panic!("{name} returned a terminal refusal: {problem:?}"));
+                assert!(
+                    delay < deadline.saturating_duration_since(Instant::now()),
+                    "{name} authority did not settle within its budget: {problem:?}"
+                );
+                std::thread::sleep(delay);
+                continue;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{name} exceeded its settlement budget"
+            );
+            let document = tool_json_payload(&result, name).unwrap_or_else(|error| {
+                panic!("{name} returned no canonical JSON payload: {error}: {result}")
+            });
+            return document
+                .pointer("/outcome/value/payload")
+                .cloned()
+                .unwrap_or(document);
+        }
+    }
+
+    fn request_session_at(&self, project: &Path) -> &'static str {
+        if project == self.project.as_path() {
+            SESSION_ID
+        } else {
+            FOREIGN_SESSION_ID
+        }
+    }
+
+    fn native_context_at(&self, project: &Path) -> ContextResultV1 {
+        let payload = self.canonical_tool_payload_at(
+            project,
+            "tracedecay_context",
+            &json!({
+                "task": USER_CONTENT,
+                "memory_limit": RECALL_LIMIT,
+                "format": "json",
+                "_meta": { "session_id": self.request_session_at(project) },
+            }),
+        );
+        assert!(
+            payload.get("advisory_provider_memory").is_none(),
+            "default Native uses canonical memory_matches: {payload}"
+        );
+        let context: ContextResultV1 =
+            serde_json::from_value(payload).expect("typed Native context result");
+        assert!(
+            context.memory_matches_error.is_none(),
+            "Native recall failed: {context:?}"
+        );
+        assert!(matches!(
+            context.memory_graph_coverage,
+            Some(FactSearchGraphCoverageV1::Complete { .. })
+        ));
+        context
+    }
+
+    fn await_native_message_search_at(
+        &self,
+        project: &Path,
+        expected_count: usize,
+    ) -> MessageSearchResultV1 {
+        let deadline = Instant::now() + SETTLEMENT_BUDGET;
+        let expected_outcome = if expected_count == 0 {
+            RetainedOutcomeStatusV1::Unavailable
+        } else {
+            RetainedOutcomeStatusV1::Complete
+        };
+        loop {
+            let payload = self.native_retained_read_payload_at(
+                project,
+                "tracedecay_message_search",
+                &json!({
+                    "query": PROJECT_TERM,
+                    "provider": HERMES_CANONICAL_PROVIDER_ID,
+                    "include_subagents": false,
+                    "require_fresh": true,
+                    "limit": RECALL_LIMIT,
+                    "format": "json",
+                }),
+                deadline,
+            );
+            let result: MessageSearchResultV1 =
+                serde_json::from_value(payload).expect("typed canonical Hermes message search");
+            assert!(
+                result.error.is_none(),
+                "Hermes message search failed: {result:?}"
+            );
+            let store_empty = result.status == RetainedOutcomeStatusV1::Unavailable
+                && result.outcome == RetainedOutcomeStatusV1::Unavailable
+                && result.count == Some(0)
+                && result.results.as_ref().is_some_and(Vec::is_empty)
+                && result.next_action.as_ref().is_some_and(|next| {
+                    next.kind == "import" && next.tool == "tracedecay sessions import"
+                });
+            if result.outcome == expected_outcome && result.count == Some(expected_count) {
+                if expected_count == 0 {
+                    assert!(
+                        store_empty,
+                        "the empty mounted store must report its import authority: {result:?}"
+                    );
+                } else {
+                    assert_eq!(result.status, RetainedOutcomeStatusV1::Ok);
+                }
+                assert!(result.require_fresh);
+                assert!(!result.refresh_required);
+                assert_eq!(result.provider, HERMES_CANONICAL_PROVIDER_ID);
+                assert_eq!(
+                    result.requested_provider.as_deref(),
+                    Some(HERMES_CANONICAL_PROVIDER_ID)
+                );
+                assert_eq!(result.store_scope.as_deref(), Some("project"));
+                assert_eq!(
+                    result
+                        .results
+                        .as_ref()
+                        .expect("canonical search results")
+                        .len(),
+                    expected_count
+                );
+                return result;
+            }
+            assert!(
+                matches!(
+                    result.outcome,
+                    RetainedOutcomeStatusV1::Complete
+                        | RetainedOutcomeStatusV1::CompleteZero
+                        | RetainedOutcomeStatusV1::Partial
+                        | RetainedOutcomeStatusV1::Stale
+                ) || store_empty,
+                "Hermes message search refused: {result:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "Hermes canonical messages did not settle: {result:?}"
+            );
+            std::thread::sleep(JOURNAL_POLL_INTERVAL);
+        }
+    }
+
+    fn native_messages_at(&self, project: &Path) -> Vec<LcmMessageV1> {
+        let deadline = Instant::now() + SETTLEMENT_BUDGET;
+        loop {
+            let payload = self.native_retained_read_payload_at(
+                project,
+                "tracedecay_lcm_load_session",
+                &json!({
+                    "provider": HERMES_CANONICAL_PROVIDER_ID,
+                    "session_id": SESSION_ID,
+                    "limit": RECALL_LIMIT,
+                    "temporal_mode": { "kind": "current" },
+                    "format": "json",
+                }),
+                deadline,
+            );
+            let result: LcmLoadSessionResultV1 =
+                serde_json::from_value(payload).expect("typed canonical Hermes LCM retrieval");
+            assert!(
+                result.error.is_none(),
+                "Hermes LCM retrieval failed: {result:?}"
+            );
+            if result.status == RetainedOutcomeStatusV1::Ok {
+                assert_eq!(
+                    result.provider.as_deref(),
+                    Some(HERMES_CANONICAL_PROVIDER_ID)
+                );
+                assert_eq!(result.session_id.as_deref(), Some(SESSION_ID));
+                assert_eq!(result.omitted, Some(0));
+                let temporal = result.temporal.as_ref().expect("LCM temporal authority");
+                assert!(temporal.next_cursor.is_none());
+                assert_eq!(temporal.coverage.hidden, 0);
+                assert_eq!(temporal.coverage.unknown, 0);
+                assert_eq!(temporal.coverage.redacted, 0);
+                if project == self.foreign_project.as_path() {
+                    assert_eq!(temporal.coverage.visible, 0);
+                }
+                let mut messages = result.messages;
+                messages.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+                return messages;
+            }
+            assert!(
+                matches!(
+                    result.status,
+                    RetainedOutcomeStatusV1::Stale | RetainedOutcomeStatusV1::Partial
+                ),
+                "Hermes LCM retrieval refused: {result:?}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "Hermes LCM retrieval did not settle: {result:?}"
+            );
+            std::thread::sleep(JOURNAL_POLL_INTERVAL);
+        }
+    }
+
+    fn add_native_project_fact(&self, project_id: &str) -> FactV1 {
+        let payload = self.canonical_tool_payload_at(
+            &self.project,
+            "tracedecay_fact_store_add",
+            &json!({
+                "content": ASSISTANT_CONTENT,
+                "memory_scope": "project",
+                "trust": 0.91,
+                "source_label": "hermes-memory-journey",
+                "format": "json",
+            }),
+        );
+        let outcome: FactStoreAddResultV1 =
+            serde_json::from_value(payload).expect("typed canonical Hermes fact commit");
+        let FactStoreAddResultV1::Committed {
+            result: FactStoreAddCommitV1::Added { fact, commit },
+        } = outcome
+        else {
+            panic!("the isolated Hermes project must commit a new canonical fact: {outcome:?}");
+        };
+        let FactProjectionV1::Available { fact } = fact else {
+            panic!("the committed Hermes project fact must be readable: {fact:?}");
+        };
+        let owner = FactCommitOwnerV1::Project {
+            project_id: ProjectId::new(project_id.to_owned()).expect("canonical Hermes project id"),
+        };
+        assert_eq!(fact.owner, owner);
+        assert_eq!(commit.owner, owner);
+        assert_eq!(commit.fact_id, fact.fact_id);
+        assert_eq!(fact.content, ASSISTANT_CONTENT);
+        assert_eq!(fact.source_label.as_deref(), Some("hermes-memory-journey"));
+        assert!(!commit.committed_event_ids.is_empty());
+        *fact
+    }
+
+    fn assert_no_native_provider_journal(&self) {
+        assert!(
+            find_file(&self.profile, JOURNAL_FILE_NAME).is_none(),
+            "default Native must not mount a configurable-provider observation journal"
+        );
+        assert!(
+            find_file(&self.profile, NCM_JOURNAL_FILE_NAME).is_none(),
+            "default Native must not mount a disabled NCM observer journal"
+        );
+    }
+
+    fn assert_native_baseline(&self) {
+        assert!(
+            self.native_context_at(&self.project)
+                .memory_matches
+                .is_empty()
+        );
+        assert!(self.native_messages_at(&self.project).is_empty());
+        assert!(self.native_messages_at(&self.foreign_project).is_empty());
+        // A store with no transcripts names its missing import authority;
+        // complete-zero coverage is proved by canonical LCM above.
+        self.await_native_message_search_at(&self.project, 0);
+        self.await_native_message_search_at(&self.foreign_project, 0);
+        self.assert_no_native_provider_journal();
+    }
+
+    fn assert_hook_analytics(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let diagnostics = self.analytics_diagnostics();
+            if diagnostics["hook_call_count"].as_i64().unwrap_or_default() > 0
+                && diagnostics["by_event_kind"]
+                    .as_array()
+                    .is_some_and(|events| {
+                        events.iter().any(|event| {
+                            event["event_kind"] == "hook_route"
+                                && event["count"].as_i64().unwrap_or_default() > 0
+                        })
+                    })
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Hermes project callback did not leave project-scoped hook analytics: {diagnostics}"
+            );
+            std::thread::sleep(JOURNAL_POLL_INTERVAL);
+        }
+    }
+
     fn assert_baseline(&self) {
         // The first context call mounts the configured provider before Hermes
         // writes evidence, so the empty journal is an unambiguous baseline.
@@ -727,6 +1184,97 @@ fn assert_fixture_replay(fixture: &Value) {
         .expect("fixture reports exact original message ids");
     assert_eq!(ids.len(), 2);
     assert!(ids.iter().all(Value::is_string));
+}
+
+fn fixture_message_ids(fixture: &Value) -> [String; 2] {
+    let ids = fixture["replay"]["message_ids"]
+        .as_array()
+        .expect("Hermes fixture reports canonical message ids");
+    assert_eq!(ids.len(), 2);
+    let ids = [
+        ids[0].as_str().expect("user message id").to_owned(),
+        ids[1].as_str().expect("assistant message id").to_owned(),
+    ];
+    assert_ne!(ids[0], ids[1]);
+    ids
+}
+
+fn assert_native_search_messages(
+    searched: &MessageSearchResultV1,
+    project: &Path,
+    project_id: &str,
+    message_ids: &[String; 2],
+) {
+    let hits = searched.results.as_ref().expect("fresh Hermes search hits");
+    assert_eq!(hits.len(), 2);
+    let project = fs::canonicalize(project).expect("canonical Hermes project root");
+    let project = project.to_str().expect("Hermes project path is UTF-8");
+    for (message_id, role, content) in [
+        (&message_ids[0], "user", USER_CONTENT),
+        (&message_ids[1], "assistant", ASSISTANT_CONTENT),
+    ] {
+        let matches = hits
+            .iter()
+            .filter(|hit| &hit.message.message_id == message_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matches.len(),
+            1,
+            "each Hermes message has one canonical identity"
+        );
+        let hit = matches[0];
+        assert_eq!(hit.session.provider, HERMES_CANONICAL_PROVIDER_ID);
+        assert_eq!(hit.session.session_id, SESSION_ID);
+        assert_eq!(hit.session.project_path, project);
+        assert_eq!(hit.message.provider, HERMES_CANONICAL_PROVIDER_ID);
+        assert_eq!(hit.message.session_id, SESSION_ID);
+        assert_eq!(hit.message.role, role);
+        assert_eq!(hit.message.text, content);
+        if let Some(owner) = &hit.project_id {
+            assert_eq!(owner, project_id);
+        }
+        if let Some(root) = &hit.root {
+            assert_eq!(root, project);
+        }
+    }
+}
+
+fn assert_native_loaded_messages(messages: &[LcmMessageV1], message_ids: &[String; 2]) {
+    assert_eq!(
+        messages.len(),
+        2,
+        "one canonical user and one assistant message"
+    );
+    for (message, (message_id, role, content)) in messages.iter().zip([
+        (&message_ids[0], "user", USER_CONTENT),
+        (&message_ids[1], "assistant", ASSISTANT_CONTENT),
+    ]) {
+        assert_eq!(message.provider, HERMES_CANONICAL_PROVIDER_ID);
+        assert_eq!(message.session_id, SESSION_ID);
+        assert_eq!(&message.message_id, message_id);
+        assert_eq!(message.role, role);
+        assert_eq!(message.content, content);
+        assert!(!message.content_range.truncated);
+        assert_eq!(message.content_range.offset, 0);
+        let chars = u64::try_from(content.chars().count()).expect("Hermes fixture content length");
+        assert_eq!(message.content_range.returned_chars, chars);
+        assert_eq!(message.content_range.total_chars, chars);
+    }
+}
+
+fn assert_native_fact_recall(context: &ContextResultV1, fact: &FactV1) {
+    assert!(context.memory_matches.len() <= RECALL_LIMIT);
+    let recalled = context
+        .memory_matches
+        .iter()
+        .find(|hit| hit.fact.fact_id == fact.fact_id)
+        .expect("default Native context recalls the committed Hermes project fact");
+    assert_eq!(recalled.fact.owner, fact.owner);
+    assert_eq!(recalled.fact.content, ASSISTANT_CONTENT);
+    assert_eq!(
+        recalled.fact.source_label.as_deref(),
+        Some("hermes-memory-journey")
+    );
 }
 
 fn assert_settled_rows(rows: &[JournalInspectionRowV1], provider: ActiveProvider) {
@@ -993,16 +1541,7 @@ fn install_binary_shim(bin_dir: &Path) {
     } else {
         "tracedecay"
     });
-    if fs::hard_link(env!("CARGO_BIN_EXE_tracedecay"), &shim).is_err() {
-        fs::copy(env!("CARGO_BIN_EXE_tracedecay"), &shim).expect("stage binary");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(&shim).expect("shim metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(shim, permissions).expect("shim executable");
-    }
+    link_or_copy_executable(tracedecay_exe(), &shim).expect("stage binary");
 }
 
 fn initialize_project(project: &Path, package_name: &str, source: &str) {
@@ -1120,45 +1659,6 @@ fn find_file(root: &Path, name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn content_json(result: &Value) -> Option<Value> {
-    let blocks = result.get("content")?.as_array()?;
-    let text = blocks
-        .iter()
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .map(|text| {
-            text.lines()
-                .take_while(|line| !line.trim_start().starts_with("tracedecay_metrics:"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    serde_json::from_str(&text).ok()
-}
-
-fn collect_string_field(value: &Value, field: &str, output: &mut Vec<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, member) in map {
-                if key == field {
-                    if let Some(text) = member.as_str() {
-                        output.push(text.to_owned());
-                    }
-                } else {
-                    collect_string_field(member, field, output);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_string_field(item, field, output);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Structured provider settings are stored as the repository's exact

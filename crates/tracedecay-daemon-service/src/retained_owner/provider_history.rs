@@ -131,13 +131,13 @@ impl PhysicalPathIdentityV1 {
         }
         #[cfg(unix)]
         {
-            return Ok((
+            Ok((
                 Self {
                     device: metadata.dev(),
                     inode: metadata.ino(),
                 },
                 file,
-            ));
+            ))
         }
         #[cfg(windows)]
         {
@@ -153,13 +153,13 @@ impl PhysicalPathIdentityV1 {
             let file_index = Some(information.file_index)
                 .filter(|value| *value != 0 && *value != u64::MAX)
                 .ok_or(ProviderHistoryErrorV1::Unavailable(subject))?;
-            return Ok((
+            Ok((
                 Self {
                     volume_serial_number,
                     file_index,
                 },
                 file,
-            ));
+            ))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -397,17 +397,6 @@ impl MountedOriginalObservationAuthorityV1 {
             self.reader.as_ref(),
             profile_id,
             mounted_scope,
-            registered_shard,
-        )
-    }
-
-    pub(crate) fn validate_registered_mount(
-        &self,
-        registered_shard: &StoreShardIdV1,
-    ) -> HistoryResult<()> {
-        self.validate_mount(
-            &self.bridge.profile_id,
-            &self.bridge.scope,
             registered_shard,
         )
     }
@@ -760,7 +749,10 @@ impl HistoryIdentityBridgeV1 {
             || destination.repository_identity != scope.repository_id.as_str()
             || destination.worktree_identity != scope.worktree_id.as_str()
             || Some(destination.branch_identity.as_str())
-                != scope.reference.as_ref().map(|v| v.as_str())
+                != scope
+                    .reference
+                    .as_ref()
+                    .map(tracedecay_domain::RefId::as_str)
             || destination.resolved_scope_digest != scope.scope_digest.as_str()
         {
             return Err(ProviderHistoryErrorV1::Ineligible("destination checkout"));
@@ -788,7 +780,6 @@ impl HistoryIdentityBridgeV1 {
 pub(crate) struct ProviderHistoryPageV1 {
     pub(crate) records: Vec<StoredObservation>,
     pub(crate) grant: Option<HistoryGrant>,
-    pub(crate) last_scanned_sequence: u64,
     pub(crate) scanned: usize,
     pub(crate) withheld: usize,
     pub(crate) unknown_revision: usize,
@@ -1068,7 +1059,10 @@ where
             || destination.repository_identity != scope.repository_id.as_str()
             || destination.worktree_identity != scope.worktree_id.as_str()
             || Some(destination.branch_identity.as_str())
-                != scope.reference.as_ref().map(|v| v.as_str())
+                != scope
+                    .reference
+                    .as_ref()
+                    .map(tracedecay_domain::RefId::as_str)
             || destination.resolved_scope_digest != scope.scope_digest.as_str()
         {
             return Err(ProviderHistoryErrorV1::Ineligible("destination checkout"));
@@ -1165,7 +1159,7 @@ where
                     || admitted.observation_id.as_str() != call.request_id
                     || call
                         .sanitization()
-                        .map(|receipt| receipt.to_json())
+                        .map(tracedecay_memory_provider_registry::PayloadSanitizationReceipt::to_json)
                         .as_deref()
                         != Some(&admitted.sanitization.receipt_json)
                 {
@@ -1603,7 +1597,7 @@ where
 {
     /// Recent historical coverage requires original source authority. Neither
     /// ingestion-time captures nor the durable enqueue cursor can supply it.
-    pub(crate) async fn select_recent_page(
+    pub(crate) fn select_recent_page(
         &self,
         destination: &OwnedExactScope,
         limit: usize,
@@ -1620,155 +1614,6 @@ where
         Err(ProviderHistoryErrorV1::Unavailable(
             ORIGINAL_PROVENANCE_UNAVAILABLE,
         ))
-    }
-
-    pub(crate) async fn select_page(
-        &self,
-        destination: &OwnedExactScope,
-        after_sequence: u64,
-        limit: usize,
-        control: &tracedecay_memory_provider_registry::OperationControl,
-    ) -> HistoryResult<ProviderHistoryPageV1> {
-        self.select_page_with_upper_bound(destination, after_sequence, None, limit, control)
-            .await
-    }
-
-    /// Upper bound is frozen by the preceding sequence-only window read. Rows
-    /// committed later must not enter coverage, grants or downstream enqueue.
-    pub(crate) async fn select_window_page(
-        &self,
-        destination: &OwnedExactScope,
-        after_sequence: u64,
-        through_sequence: u64,
-        limit: usize,
-        control: &tracedecay_memory_provider_registry::OperationControl,
-    ) -> HistoryResult<ProviderHistoryPageV1> {
-        if through_sequence < after_sequence {
-            return Err(ProviderHistoryErrorV1::ClaimMismatch(
-                "canonical recent window bounds",
-            ));
-        }
-        self.select_page_with_upper_bound(
-            destination,
-            after_sequence,
-            Some(through_sequence),
-            limit,
-            control,
-        )
-        .await
-    }
-
-    async fn select_page_with_upper_bound(
-        &self,
-        destination: &OwnedExactScope,
-        after_sequence: u64,
-        through_sequence: Option<u64>,
-        limit: usize,
-        control: &tracedecay_memory_provider_registry::OperationControl,
-    ) -> HistoryResult<ProviderHistoryPageV1> {
-        self.check_control(control)?;
-        self.bridge.revalidate()?;
-        self.bridge.validate_destination(destination)?;
-        if self.policy_revision == 0 || limit == 0 || limit > MAX_HISTORY_PAGE {
-            return Err(ProviderHistoryErrorV1::Ineligible(
-                "history page bound or policy",
-            ));
-        }
-        let request = ObservationReplayRequest::new(after_sequence, limit)
-            .map_err(|_| ProviderHistoryErrorV1::Ineligible("canonical page bound"))?;
-        let page = bounded_read(
-            control,
-            self.observations.replay_observations(request),
-            "canonical replay",
-        )
-        .await?;
-        // This is deliberately before counting, origin probing, projection,
-        // grant construction, or retaining any record for journal enqueue.
-        let page: Vec<_> = page
-            .into_iter()
-            .filter(|stored| through_sequence.is_none_or(|through| stored.sequence() <= through))
-            .collect();
-        let has_more = page.len() == limit
-            && through_sequence.is_none_or(|through| {
-                page.last()
-                    .is_some_and(|stored| stored.sequence() < through)
-            });
-        let mut result = ProviderHistoryPageV1 {
-            records: Vec::new(),
-            grant: None,
-            last_scanned_sequence: after_sequence,
-            scanned: page.len(),
-            withheld: 0,
-            unknown_revision: 0,
-            has_more,
-            has_older: false,
-        };
-        let mut sources = Vec::new();
-        for stored in page {
-            self.check_control(control)?;
-            result.last_scanned_sequence = stored.sequence();
-            match self.project_source(&stored, destination, control).await {
-                Ok(source) if retained_history_source(source.current_disposition.state) => {
-                    result.unknown_revision +=
-                        usize::from(source.attribution.source.source_revision.is_none());
-                    sources.push(source);
-                }
-                Ok(_) | Err(ProviderHistoryErrorV1::Ineligible(_)) => result.withheld += 1,
-                Err(error) => return Err(error),
-            }
-            result.records.push(stored);
-        }
-        self.check_control(control)?;
-        self.bridge.revalidate()?;
-        if !sources.is_empty() {
-            result.grant = Some(self.grant(destination, sources)?);
-        }
-        Ok(result)
-    }
-
-    /// Directly authorizes one retained source by its canonical key. No claimed
-    /// grant is constructed from ledger data to bootstrap this authority.
-    pub(crate) async fn authorize_retained_source(
-        &self,
-        destination: &OwnedExactScope,
-        expected: &SourceAttribution,
-        control: &tracedecay_memory_provider_registry::OperationControl,
-        include_unavailable: bool,
-    ) -> HistoryResult<HistoryGrant> {
-        self.check_control(control)?;
-        if self.policy_revision == 0 {
-            return Err(ProviderHistoryErrorV1::ClaimMismatch(
-                "history policy revision",
-            ));
-        }
-        expected
-            .validate()
-            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("retained source attribution"))?;
-        self.bridge.authorize_control_scope(destination, control)?;
-        let id = CanonicalObservationIdV1::new(expected.source.observation_id.clone())
-            .map_err(|_| ProviderHistoryErrorV1::ClaimMismatch("canonical observation id"))?;
-        let stored = bounded_read(
-            control,
-            self.observations.get_observation(&id),
-            "canonical observation",
-        )
-        .await?
-        .ok_or(ProviderHistoryErrorV1::Ineligible(
-            "canonical observation missing",
-        ))?;
-        let actual = self.project_source(&stored, destination, control).await?;
-        if actual.attribution != *expected {
-            return Err(ProviderHistoryErrorV1::ClaimMismatch(
-                "original source attribution",
-            ));
-        }
-        if !include_unavailable && !retained_history_source(actual.current_disposition.state) {
-            return Err(ProviderHistoryErrorV1::Ineligible(
-                "current source disposition",
-            ));
-        }
-        self.bridge.authorize_control_scope(destination, control)?;
-        self.grant(destination, vec![actual])
     }
 
     /// Re-resolves one opaque control locator through the canonical sequence
@@ -2547,6 +2392,28 @@ pub(crate) async fn bounded_read<T, E>(
     }
 }
 
+impl MountedOriginalObservationAuthorityV1 {
+    /// The registered session row has already been read from the admitted
+    /// project store. Bind its session identity to this exact mounted namespace
+    /// without claiming original-event provenance. The owning registered shard
+    /// supplies project identity, including linked-worktree project aliases.
+    pub(crate) fn authorize_registered_canonical_session(
+        &self,
+        session_id: &str,
+        destination: &OwnedExactScope,
+        control: &tracedecay_memory_provider_registry::OperationControl,
+    ) -> HistoryResult<()> {
+        self.reader.validate_bound_data_root()?;
+        self.bridge.authorize_control_scope(destination, control)?;
+        if self.bridge.destination(session_id)? != *destination {
+            return Err(ProviderHistoryErrorV1::Ineligible(
+                "canonical session namespace",
+            ));
+        }
+        self.bridge.authorize_control_scope(destination, control)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3085,27 +2952,5 @@ mod tests {
             admitted.payload.sha256,
             hex::encode(Sha256::digest(&payload_bytes))
         );
-    }
-}
-
-impl MountedOriginalObservationAuthorityV1 {
-    /// The registered session row has already been read from the admitted
-    /// project store. Bind its session identity to this exact mounted namespace
-    /// without claiming original-event provenance. The owning registered shard
-    /// supplies project identity, including linked-worktree project aliases.
-    pub(crate) fn authorize_registered_canonical_session(
-        &self,
-        session_id: &str,
-        destination: &OwnedExactScope,
-        control: &tracedecay_memory_provider_registry::OperationControl,
-    ) -> HistoryResult<()> {
-        self.reader.validate_bound_data_root()?;
-        self.bridge.authorize_control_scope(destination, control)?;
-        if self.bridge.destination(session_id)? != *destination {
-            return Err(ProviderHistoryErrorV1::Ineligible(
-                "canonical session namespace",
-            ));
-        }
-        self.bridge.authorize_control_scope(destination, control)
     }
 }

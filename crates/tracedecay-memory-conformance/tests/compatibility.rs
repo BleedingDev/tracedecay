@@ -556,7 +556,7 @@ fn canonical_dispatch_rejects_wrong_contract_and_bad_digest_even_without_semanti
         &ControlledFactory(controlled_provider(json!({}))?),
         &scope,
         1,
-        &[program.clone()],
+        std::slice::from_ref(&program),
     );
     assert_eq!(control.denominators.passed, 1, "{:?}", control.results);
     for mutation in [
@@ -568,8 +568,12 @@ fn canonical_dispatch_rejects_wrong_contract_and_bad_digest_even_without_semanti
             mutation,
         ));
         let provider: Arc<dyn MemoryProvider> = adversary.clone();
-        let rejected =
-            run_compatibility_program(&ControlledFactory(provider), &scope, 1, &[program.clone()]);
+        let rejected = run_compatibility_program(
+            &ControlledFactory(provider),
+            &scope,
+            1,
+            std::slice::from_ref(&program),
+        );
         assert_eq!(rejected.denominators.failed, 1, "{:?}", rejected.results);
         assert_eq!(adversary.exhibited(), 1);
     }
@@ -616,7 +620,7 @@ fn unchanged_positive_recall_rejects_forged_effective_validity_and_temporal_clai
         &ControlledFactory(controlled_provider(value.clone())?),
         &scope,
         1,
-        &[program.clone()],
+        std::slice::from_ref(&program),
     );
     assert_eq!(control.denominators.passed, 1, "{:?}", control.results);
     for mutation in [
@@ -628,8 +632,12 @@ fn unchanged_positive_recall_rejects_forged_effective_validity_and_temporal_clai
             mutation,
         ));
         let provider: Arc<dyn MemoryProvider> = adversary.clone();
-        let rejected =
-            run_compatibility_program(&ControlledFactory(provider), &scope, 1, &[program.clone()]);
+        let rejected = run_compatibility_program(
+            &ControlledFactory(provider),
+            &scope,
+            1,
+            std::slice::from_ref(&program),
+        );
         assert_eq!(rejected.denominators.failed, 1, "{:?}", rejected.results);
         assert_eq!(adversary.exhibited(), 1);
     }
@@ -910,7 +918,7 @@ fn unchanged_program_rejects_exclusions_dropped_before_search() -> Result<(), Bo
         &ControlledFactory(search_provider(candidates.clone())?),
         &scope,
         1,
-        &[program.clone()],
+        std::slice::from_ref(&program),
     );
     assert_eq!(control.denominators.passed, 2, "{:?}", control.results);
     let adversary = Arc::new(CommonProfileAdversary::new(
@@ -964,7 +972,7 @@ fn unchanged_as_of_assertion_rejects_current_substitution() -> Result<(), Box<dy
         &ControlledFactory(search_provider(candidates.clone())?),
         &scope,
         1,
-        &[program.clone()],
+        std::slice::from_ref(&program),
     );
     assert_eq!(control.denominators.passed, 1, "{:?}", control.results);
     let adversary = Arc::new(CommonProfileAdversary::new(

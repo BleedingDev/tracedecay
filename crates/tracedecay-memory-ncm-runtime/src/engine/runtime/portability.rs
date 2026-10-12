@@ -208,12 +208,14 @@ impl NcmEngine {
                     crate::privacy::delete_sources(
                         self,
                         namespace,
-                        &sources,
-                        &fence_key,
-                        remaining_deadline(deadline, started),
-                        generation,
-                        Some(&bindings),
-                        None,
+                        crate::privacy::DeleteSourcesRequest {
+                            sources: &sources,
+                            idempotency_key: &fence_key,
+                            deadline: remaining_deadline(deadline, started),
+                            expected_generation: generation,
+                            bindings: Some(&bindings),
+                            canonical_input: None,
+                        },
                     )
                 } else {
                     self.delete_by_source(
@@ -755,10 +757,10 @@ fn public_replay_no_change(
     started: Instant,
 ) -> Option<EngineReply> {
     page.page_delivery_capsule.as_ref()?;
-    if let Some(handle) = handle.as_deref() {
-        if let Err(reply) = read_live(handle) {
-            return Some(reply);
-        }
+    if let Some(handle) = handle.as_deref()
+        && let Err(reply) = read_live(handle)
+    {
+        return Some(reply);
     }
     let mut output = page.output();
     for item in &page.items {
@@ -1481,7 +1483,7 @@ fn capsule_matches_replay_observation(
         integrity_digest: String::new(),
         idempotency_key: None,
     };
-    validate_event_payload_digest(&event, &durable, &[capsule.clone()]).is_ok()
+    validate_event_payload_digest(&event, &durable, std::slice::from_ref(capsule)).is_ok()
 }
 
 fn validate_replay_item_receipt(
@@ -1752,10 +1754,10 @@ fn validate_replay_page_receipt(
         } else {
             None
         };
-        if let Some(legacy) = value.get("legacy_source") {
-            if opaque(legacy).is_none() || legacy == &value["source"] {
-                return Err(corrupt());
-            }
+        if let Some(legacy) = value.get("legacy_source")
+            && (opaque(legacy).is_none() || legacy == &value["source"])
+        {
+            return Err(corrupt());
         }
         identities.push(ReplayPageItem {
             identity: ReplayIdentity {
@@ -1979,10 +1981,9 @@ fn has_exact_fields(
     optional: &[&str],
 ) -> bool {
     required.iter().all(|field| object.contains_key(*field))
-        && object.keys().all(|field| {
-            required.iter().any(|required| field.as_str() == *required)
-                || optional.iter().any(|optional| field.as_str() == *optional)
-        })
+        && object
+            .keys()
+            .all(|field| required.contains(&field.as_str()) || optional.contains(&field.as_str()))
 }
 
 /// Decodes the adapter's delivery capsule. The operation identity is retained
@@ -2216,14 +2217,14 @@ impl ReplayPage {
                 let binding =
                     crate::source_binding::read(namespace, &request.source, &request.provenance)
                         .map_err(|_| fail())?;
-                if let Some(legacy) = &item.legacy_source {
-                    if !binding.as_ref().is_some_and(|binding| {
+                if let Some(legacy) = &item.legacy_source
+                    && !binding.as_ref().is_some_and(|binding| {
                         !binding.is_legacy
                             && binding.legacy_source_id.0 == *legacy
                             && binding.full_source_id.as_ref() == Some(&request.source)
-                    }) {
-                        return Err(fail());
-                    }
+                    })
+                {
+                    return Err(fail());
                 }
                 if request.idempotency_key != item.delivery_key
                     || request.source.0 != item.source
@@ -2437,15 +2438,14 @@ fn lookup_item_replay(
     request: Option<&ObserveRequest>,
     digest: &str,
 ) -> Result<Option<EngineReply>, EngineReply> {
-    if let Some(request) = request {
-        if let Some(legacy) = legacy_request(handle.store.namespace(), request)
+    if let Some(request) = request
+        && let Some(legacy) = legacy_request(handle.store.namespace(), request)
             .map_err(|reason| invalid(&reason, handle.commit_seq))?
-        {
-            let legacy_digest =
-                item_digest(item, &legacy).map_err(|reason| invalid(&reason, handle.commit_seq))?;
-            if legacy_item_matches(handle, item, request, &legacy_digest)? {
-                return lookup_replay(handle, &item.delivery_key, &legacy_digest);
-            }
+    {
+        let legacy_digest =
+            item_digest(item, &legacy).map_err(|reason| invalid(&reason, handle.commit_seq))?;
+        if legacy_item_matches(handle, item, request, &legacy_digest)? {
+            return lookup_replay(handle, &item.delivery_key, &legacy_digest);
         }
     }
     lookup_replay(handle, &item.delivery_key, digest)

@@ -170,10 +170,9 @@ fn restore_fixture_identities(
             duplicate_of_candidate_id,
             ..
         } = &mut item.host_decision
+            && let Some(candidate_id) = reverse.get(duplicate_of_candidate_id.as_str())
         {
-            if let Some(candidate_id) = reverse.get(duplicate_of_candidate_id.as_str()) {
-                *duplicate_of_candidate_id = (*candidate_id).to_owned();
-            }
+            *duplicate_of_candidate_id = (*candidate_id).to_owned();
         }
         if let Some(detail) = item.host_reason_detail.as_mut()
             && let Some(retained) = detail.strip_prefix("duplicate_of=")

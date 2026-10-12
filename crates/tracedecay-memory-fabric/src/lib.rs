@@ -1499,7 +1499,7 @@ mod rejection_tests {
             )?,
             FallbackDirective::forbidden(),
             "foreign-operation",
-            &call.exact_scope.exact_scope_sha256(),
+            call.exact_scope.exact_scope_sha256(),
             None,
         )?;
         let error = FabricError::ResponseOperationMismatch {

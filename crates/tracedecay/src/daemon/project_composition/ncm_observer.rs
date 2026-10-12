@@ -55,41 +55,32 @@ pub(in crate::daemon) enum NcmObserverConstructionError {
 /// builds; the environment gate keeps it dormant even in a test-enabled
 /// binary. The key is generated in this daemon generation, retained only by
 /// the adapter, and never logged or written to the provider state root.
+#[cfg(feature = "test-transport")]
 fn attach_recall_diagnostic_sink(
     provider: NcmProviderAdapter,
 ) -> Result<NcmProviderAdapter, NcmObserverConstructionError> {
-    #[cfg(feature = "test-transport")]
+    if std::env::var("TRACEDECAY_TEST_NCM_RECALL_DIAGNOSTICS")
+        .ok()
+        .as_deref()
+        != Some("1")
     {
-        if std::env::var("TRACEDECAY_TEST_NCM_RECALL_DIAGNOSTICS")
-            .ok()
-            .as_deref()
-            != Some("1")
-        {
-            return Ok(provider);
-        }
-
-        static DIAGNOSTIC_KEY: OnceLock<
-            Result<tracedecay_memory_provider_ncm::NcmRecallDiagnosticKey, String>,
-        > = OnceLock::new();
-        let key = DIAGNOSTIC_KEY
-            .get_or_init(|| {
-                let mut bytes = [0_u8; 32];
-                getrandom::getrandom(&mut bytes)
-                    .map(|()| tracedecay_memory_provider_ncm::NcmRecallDiagnosticKey::new(bytes))
-                    .map_err(|error| error.to_string())
-            })
-            .clone()
-            .map_err(NcmObserverConstructionError::DiagnosticEntropyUnavailable)?;
-        return Ok(provider.with_recall_diagnostic_sink(
-            Arc::new(NcmRecallDiagnosticLogSink::default()),
-            Some(key),
-        ));
+        return Ok(provider);
     }
 
-    #[cfg(not(feature = "test-transport"))]
-    {
-        Ok(provider)
-    }
+    static DIAGNOSTIC_KEY: OnceLock<
+        Result<tracedecay_memory_provider_ncm::NcmRecallDiagnosticKey, String>,
+    > = OnceLock::new();
+    let key = DIAGNOSTIC_KEY
+        .get_or_init(|| {
+            let mut bytes = [0_u8; 32];
+            getrandom::getrandom(&mut bytes)
+                .map(|()| tracedecay_memory_provider_ncm::NcmRecallDiagnosticKey::new(bytes))
+                .map_err(|error| error.to_string())
+        })
+        .clone()
+        .map_err(NcmObserverConstructionError::DiagnosticEntropyUnavailable)?;
+    Ok(provider
+        .with_recall_diagnostic_sink(Arc::new(NcmRecallDiagnosticLogSink::default()), Some(key)))
 }
 
 /// Stderr sink used only by the exact opt-in host journey. Every field is a
@@ -261,6 +252,7 @@ pub(in crate::daemon) fn construct_ncm_registration_with_authority(
         Arc::new(NcmInstanceProof(Arc::clone(&surface))) as Arc<dyn ObservationInstanceProofV1>
     );
     let provider = NcmProviderAdapter::new(surface)?;
+    #[cfg(feature = "test-transport")]
     let provider = attach_recall_diagnostic_sink(provider)?;
     let provider = Arc::new(match authority {
         Some(authority) => provider.with_admission_authority(authority),

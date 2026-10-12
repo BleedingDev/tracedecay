@@ -1170,12 +1170,12 @@ fn cache_snapshot(
             "invalid cached model revision".to_owned(),
         ));
     }
-    if let Some(expected_revision) = expected_revision {
-        if revision != expected_revision {
-            return Err(EncoderError::ArtifactMismatch(format!(
-                "cached model revision {revision} differs from pinned Xenova revision"
-            )));
-        }
+    if let Some(expected_revision) = expected_revision
+        && revision != expected_revision
+    {
+        return Err(EncoderError::ArtifactMismatch(format!(
+            "cached model revision {revision} differs from pinned Xenova revision"
+        )));
     }
     let snapshots_path = repository_path.join("snapshots");
     let snapshots = open_directory_nofollow(&repository, OsStr::new("snapshots"), &snapshots_path)?;
@@ -1205,7 +1205,7 @@ fn manifest_from_snapshot(
             .ok_or_else(|| {
                 EncoderError::ArtifactMismatch(format!("pinned manifest lacks {relative}"))
             })?;
-        let bytes = read_snapshot_file(&snapshot, relative, expected_file.bytes)?;
+        let bytes = read_snapshot_file(snapshot, relative, expected_file.bytes)?;
         files.push(EncoderFile {
             path: relative.to_owned(),
             sha256: digest_bytes(&bytes),
@@ -1641,7 +1641,7 @@ fn atomically_replace_file(
             )));
         }
         return directory
-            .rename(&temporary_name, &directory, &file_name)
+            .rename(&temporary_name, directory, file_name)
             .map_err(|error| {
                 let _ = directory.remove_file(&temporary_name);
                 EncoderError::Inference(format!(

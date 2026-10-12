@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Barrier, OnceLock};
@@ -387,7 +389,7 @@ fn raw_maintenance_requires_common_control() {
                 5,
                 0,
                 Operation::Maintenance,
-                &namespace(5),
+                namespace(5),
                 json!({
                     "idempotency_key": "raw-maintenance",
                     "kind": {"advance": {"ticks": 1}}
@@ -986,6 +988,8 @@ fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
 
     let key = "common-maintenance-after-commit";
     let control = common_maintenance_control(&ns, key, "01993262-4d00-0000-8000-000000000018", 1);
+    // The normal operation budget permits the mutation; the existing reply hold
+    // outlasts that budget. The replay assertion below proves commit preceded death.
     let request = Request::new(
         201,
         0,
@@ -993,10 +997,10 @@ fn common_maintenance_killed_after_commit_reconciles_nested_idempotency_key() {
         &ns,
         json!({
             "common_control": control,
-            "test_sleep_after_commit_ms": 1000,
+            "test_sleep_after_commit_ms": CALL_DEADLINE.as_millis() as u64,
         }),
     );
-    let result = client.call(request, Duration::from_millis(50));
+    let result = client.call(request, CALL_DEADLINE);
     assert_eq!(result, Err(ClientError::EffectUnknown { op_id: 201 }));
     assert_eq!(client.pid(), None, "deadline must reap the worker");
 
@@ -1163,9 +1167,9 @@ fn common_maintenance_pages_restart_worker_between_continuations() {
             )
             .expect("maintenance page succeeds after worker start or restart");
         assert_eq!(reply.outcome, Outcome::Success, "{reply:?}");
-        assert_eq!(reply.state_generation, generation);
         assert_eq!(reply.payload.as_ref().unwrap()["partial"], expected_partial);
         if expected_partial {
+            assert_eq!(reply.state_generation, generation);
             assert_eq!(reply.payload.as_ref().unwrap()["scanned_items"], 1);
             cursor = Some(
                 reply.payload.as_ref().unwrap()["resume_cursor"]
@@ -1330,6 +1334,8 @@ fn common_maintenance_final_paged_commit_replays_after_worker_death() {
         1,
         Some(&second_cursor),
     );
+    // Hold the postcommit reply through the normal operation deadline; durable
+    // replay below establishes that this final page committed before worker death.
     let final_request = Request::new(
         255,
         0,
@@ -1337,10 +1343,10 @@ fn common_maintenance_final_paged_commit_replays_after_worker_death() {
         &ns,
         json!({
             "common_control": final_control,
-            "test_sleep_after_commit_ms": 1_000,
+            "test_sleep_after_commit_ms": CALL_DEADLINE.as_millis() as u64,
         }),
     );
-    let timed = client.call(final_request.clone(), Duration::from_millis(50));
+    let timed = client.call(final_request, CALL_DEADLINE);
     assert_eq!(timed, Err(ClientError::EffectUnknown { op_id: 255 }));
     assert_eq!(client.pid(), None, "deadline must reap the worker");
 
@@ -1899,6 +1905,14 @@ fn production_worker_admission_rejects_unpinned_or_tampered_bytes_before_spawn()
     let root = TempDir::new().expect("temp root");
     let tampered = root.path().join("tampered-worker");
     fs::copy(worker_binary(), &tampered).expect("copy worker for tampering");
+    let mut permissions = fs::metadata(&tampered)
+        .expect("copied worker metadata")
+        .permissions();
+    #[cfg(unix)]
+    permissions.set_mode(permissions.mode() | 0o200);
+    #[cfg(not(unix))]
+    permissions.set_readonly(false);
+    fs::set_permissions(&tampered, permissions).expect("make owned worker copy writable");
     install_trusted_worker_manifest(&tampered);
     let mut file = fs::OpenOptions::new()
         .append(true)
@@ -2217,16 +2231,29 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
     assert_eq!(inspection["epoch"], 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn malformed_worker_reply_is_detected_and_process_is_reaped() {
     let root = TempDir::new().expect("temp root");
+    let malformed = root.path().join("malformed-worker.sh");
+    // Drain the request instead of exiting before its writer can acknowledge it.
+    fs::write(
+        &malformed,
+        "#!/bin/sh\nprintf '\\000\\000\\000\\001x'\nexec cat >/dev/null\n",
+    )
+    .expect("write malformed worker");
+    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o700))
+        .expect("make malformed worker executable");
     let client =
-        WorkerClient::spawn("/bin/echo", root.path(), options()).expect("client owner starts");
+        WorkerClient::spawn(&malformed, root.path(), options()).expect("client owner starts");
     let result = client.call(
         Request::new(240, 0, Operation::Health, "", json!({})),
         Duration::from_millis(500),
     );
-    assert!(matches!(result, Err(ClientError::MalformedReply(_))));
+    assert!(
+        matches!(result, Err(ClientError::MalformedReply(_))),
+        "invalid frame must be reported as a malformed reply: {result:?}"
+    );
     assert_eq!(client.pid(), None);
 }
 

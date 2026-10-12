@@ -268,6 +268,7 @@ fn typed_result(response: &DaemonInvocationResponse) -> ProviderControlResultV1 
             ApplicationOutcome::Evidence(packet) => packet.payload.as_ref(),
             ApplicationOutcome::Effect(effect) => effect.payload.as_ref(),
             ApplicationOutcome::Preview(_) => None,
+            ApplicationOutcome::Result(_) => None,
         },
         DaemonInvocationOutcome::RetainedApplicationProblem { problem, .. } => {
             panic!(

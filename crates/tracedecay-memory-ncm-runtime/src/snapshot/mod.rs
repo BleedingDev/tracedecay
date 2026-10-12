@@ -372,30 +372,36 @@ pub fn restore_from_file(
         engine,
         namespace,
         idempotency_key,
-        snapshot_file,
-        byte_length,
-        content_sha256,
+        SnapshotFile {
+            path: snapshot_file,
+            byte_length,
+            content_sha256,
+        },
         &[],
         deadline,
     )
+}
+
+pub(crate) struct SnapshotFile<'a> {
+    pub path: &'a Path,
+    pub byte_length: u64,
+    pub content_sha256: &'a str,
 }
 
 pub(crate) fn restore_from_file_with_revocations(
     engine: &NcmEngine,
     namespace: &str,
     idempotency_key: &str,
-    snapshot_file: &Path,
-    byte_length: u64,
-    content_sha256: &str,
+    snapshot_file: SnapshotFile<'_>,
     blocked_sources: &[SourceId],
     deadline: Deadline,
 ) -> EngineReply {
     let bytes = match read_transport_file(
         &engine.root,
         namespace,
-        snapshot_file,
-        byte_length,
-        content_sha256,
+        snapshot_file.path,
+        snapshot_file.byte_length,
+        snapshot_file.content_sha256,
     ) {
         Ok(bytes) => bytes,
         Err(reason) => return rejected(&reason),
@@ -702,21 +708,19 @@ pub(crate) fn restore_with_revocations(
             Ok(binding) => binding,
             Err(reason) => return corrupt_reply(current_seq, &reason),
         };
-        if let Some(binding) = &binding {
-            if binding.is_legacy
-                && match &binding.full_source_id {
-                    Some(full) => revoked.contains(full),
-                    None => !revoked.is_empty(),
-                }
-            {
-                return EngineReply::rejected(
-                    RejectReason::InvalidRequest(
-                        "legacy snapshot source cannot cross current full-source revocation"
-                            .to_owned(),
-                    ),
-                    current_seq,
-                );
+        if let Some(binding) = &binding
+            && binding.is_legacy
+            && match &binding.full_source_id {
+                Some(full) => revoked.contains(full),
+                None => !revoked.is_empty(),
             }
+        {
+            return EngineReply::rejected(
+                RejectReason::InvalidRequest(
+                    "legacy snapshot source cannot cross current full-source revocation".to_owned(),
+                ),
+                current_seq,
+            );
         }
         if revoked.contains(&capsule.source_id)
             || binding
@@ -2234,8 +2238,10 @@ fn populate_stage(
         &staged_event_tick_deltas,
         &staged_event_tick_resets,
         kernel,
-        snapshot_content_sha256,
-        checkpoint_sequence,
+        SnapshotJournalAnchor {
+            content_sha256: snapshot_content_sha256,
+            checkpoint_sequence,
+        },
     )?;
     for revocation in revocations {
         tx.execute(
@@ -2355,6 +2361,11 @@ fn durable_operation_tick_delta(operation: &DurableOperation) -> u64 {
     }
 }
 
+struct SnapshotJournalAnchor<'a> {
+    content_sha256: &'a str,
+    checkpoint_sequence: u64,
+}
+
 fn fill_snapshot_journal_gaps(
     tx: &rusqlite::Transaction<'_>,
     terminal_seq: u64,
@@ -2362,8 +2373,7 @@ fn fill_snapshot_journal_gaps(
     occupied_deltas: &BTreeMap<u64, u64>,
     occupied_tick_resets: &BTreeMap<u64, u64>,
     kernel: &NcmKernel,
-    snapshot_content_sha256: &str,
-    checkpoint_sequence: u64,
+    anchor: SnapshotJournalAnchor<'_>,
 ) -> Result<(), EngineReply> {
     // Check the worst-case missing count before walking the occupied keys.
     // Walking the sorted key list, rather than probing every sequence up to an
@@ -2429,8 +2439,7 @@ fn fill_snapshot_journal_gaps(
                 next_sequence,
                 &mut previous_tick,
                 target_tick,
-                snapshot_content_sha256,
-                checkpoint_sequence,
+                &anchor,
                 &sha256_hex(&kernel.state_digest()),
             )?;
             for gap_sequence in first_missing..next_sequence {
@@ -2477,8 +2486,7 @@ fn fill_snapshot_journal_gaps(
             end,
             &mut previous_tick,
             kernel.scheduler.tick.0,
-            snapshot_content_sha256,
-            checkpoint_sequence,
+            &anchor,
             &sha256_hex(&kernel.state_digest()),
         )?;
         for gap_sequence in sequence..end {
@@ -2494,8 +2502,7 @@ fn insert_snapshot_gap_run(
     end_sequence: u64,
     previous_tick: &mut u64,
     target_tick: u64,
-    snapshot_content_sha256: &str,
-    checkpoint_sequence: u64,
+    anchor: &SnapshotJournalAnchor<'_>,
     state_digest: &str,
 ) -> Result<(), EngineReply> {
     let count = end_sequence
@@ -2533,8 +2540,8 @@ fn insert_snapshot_gap_run(
         "version": 1,
         "first_sequence": first_sequence,
         "end_sequence": end_sequence,
-        "checkpoint_sequence": checkpoint_sequence,
-        "snapshot_content_sha256": snapshot_content_sha256,
+        "checkpoint_sequence": anchor.checkpoint_sequence,
+        "snapshot_content_sha256": anchor.content_sha256,
         "terminal_state_digest": state_digest,
     });
     for (offset, sequence) in (first_sequence..end_sequence).enumerate() {

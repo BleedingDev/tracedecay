@@ -37,20 +37,15 @@ use crate::{FabricError, MemoryFabric, ProviderMode};
 
 /// Host-configured rule for whether a provider's fallback directive may be
 /// honoured at all.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum FallbackRule {
     /// No fallback, whatever a provider terminal suggests. This is the
     /// product default.
+    #[default]
     Forbidden,
     /// Fallback is permitted only when the provider terminal carries exactly
     /// this pinned policy and the target is a registered active provider.
     ExplicitPinned(PinnedFallbackPolicy),
-}
-
-impl Default for FallbackRule {
-    fn default() -> Self {
-        Self::Forbidden
-    }
 }
 
 /// Typed causes that a host may explicitly permit as a recall degradation.

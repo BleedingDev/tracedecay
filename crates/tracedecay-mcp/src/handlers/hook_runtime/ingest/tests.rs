@@ -43,7 +43,7 @@ fn compaction_cursor_conflict_defers_without_masking_other_admission_failures() 
     assert_eq!(status, "pending");
     assert_eq!(reason, "canonical_transcript_pending");
     assert_eq!(summary_nodes_created, 0);
-    assert!(summary_node_ids.is_empty());
+    assert_eq!(summary_node_ids.len(), 0);
     assert!(relation_projection_status.is_none());
 
     for (reason, retryable) in [

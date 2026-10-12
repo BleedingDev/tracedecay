@@ -2066,12 +2066,8 @@ fn decode_f32_values(bytes: Vec<u8>, expected: usize) -> rusqlite::Result<Vec<f3
         return Err(rusqlite::Error::InvalidQuery);
     }
     let mut values = Vec::with_capacity(expected);
-    for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
-        let value = f32::from_le_bytes(
-            chunk
-                .try_into()
-                .map_err(|_| rusqlite::Error::InvalidQuery)?,
-        );
+    for chunk in bytes.as_chunks::<{ std::mem::size_of::<f32>() }>().0 {
+        let value = f32::from_le_bytes(*chunk);
         if !value.is_finite() {
             return Err(rusqlite::Error::InvalidQuery);
         }

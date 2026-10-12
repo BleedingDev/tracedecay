@@ -1,6 +1,6 @@
 //! Project-owned Native application port.
 //!
-//! `tracedecay.native` is upstream TraceDecay memory inside the provider host.
+//! `tracedecay.native` is upstream `TraceDecay` memory inside the provider host.
 //! Native owns no store, schema, score domain, ranking, validity logic,
 //! staging, cursor format, or promotion path. Each recall is one call into one
 //! upstream authority plus a lossless envelope mapping:
@@ -38,14 +38,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracedecay_contracts::retained_surfaces::{
     FactCommitOwnerV1, FactReadOptionsV1, FactSearchHitV1, FactStoreSearchRequestV1, MemoryScopeV1,
+    MessageSearchRequestV1,
 };
 use tracedecay_contracts::{
     CancellationSignal, CapabilityGrantId, CapabilityGrantSnapshot, Deadline, DisclosureClass,
     RequestContext, RequestId, RetainedSurfaceExecutionErrorV1, now_micros,
 };
 use tracedecay_domain::{
-    ActorId, CursorBindingMismatchV1, FactOwnerV1, RetrievalGrainV1, SessionId, TemporalModeV1,
-    UtcMicros, canonical_sha256,
+    ActorId, CursorBindingMismatchV1, FactOwnerV1, UtcMicros, canonical_sha256,
 };
 use tracedecay_memory_provider_registry::{
     ApiError, CanonicalPayload, CommittedEffectEvidence, FallbackDirective, HandshakeRequest,
@@ -55,21 +55,15 @@ use tracedecay_memory_provider_registry::{
 };
 use tracedecay_session_memory::fact_store::DatabaseFactStore;
 use tracedecay_session_memory::memory::MemoryApplication;
-use tracedecay_session_memory::session::{
-    SessionDataFreshness, SessionFreshnessPolicy, SessionRetrievalScope, SessionTemporalQuery,
-};
+use tracedecay_session_memory::session::{SessionDataFreshness, SessionTemporalQuery};
+use tracedecay_session_runtime::retained::session::message_search_temporal_query;
 use tracedecay_session_runtime::session_retrieval::{
     APPLICATION_RETRIEVAL_MAX_BYTES, SessionApplicationRetrievalPortV1, SessionRetrievalPageView,
-    SessionRetrievalServiceOutcome, SessionTemporalMetadataView, admitted_execution_limits,
+    SessionRetrievalServiceOutcome, SessionTemporalMetadataView,
 };
 use tracedecay_sessions::runtime::SessionMessageSearchResult;
 use tracedecay_store::{FactReadControl, ProjectMemoryFactSearchKindV1};
 use tracedecay_store_runtime::retained_memory::MemoryTargetAccessV1;
-use tracedecay_temporal_query::context::ContextBudget;
-use tracedecay_temporal_query::ranking::DiversityLimits;
-use tracedecay_temporal_query::snapshot::{
-    TemporalCandidateFilterV1, TemporalMessageTypeFilterV1, TemporalSessionScopeFilterV1,
-};
 
 use super::memory_mapping;
 use super::native_authority::NativeSessionRetrievalMountV1;
@@ -125,9 +119,7 @@ const FACT_SCORE_DOMAIN: &str = "tracedecay.memory.fact_search.score_millionths.
 /// Upstream message-search score domain: the kernel's normalized score.
 const SESSION_SCORE_DOMAIN: &str = "tracedecay.session.message_search.score.v1";
 
-/// Upstream `tracedecay_message_search` anchor and filter identity.
-const MESSAGE_SEARCH_ROOT_SESSION_ID: &str = "session.message-search.root";
-const MESSAGE_SEARCH_FILTER_DOMAIN: &str = "tracedecay.daemon.retained.message-search.filter.v1";
+/// Upstream `tracedecay_message_search` page-size ceiling.
 const MESSAGE_SEARCH_MAX_LIMIT: u64 = 50;
 
 /// Construction failures for the project-owned Native application port.
@@ -751,9 +743,9 @@ fn parse_native_recall_request(
         return Err(NativeReadFailure::RecallHistoryGrantUnsupported);
     }
     validate_recall_text(&request.objective, 8_192)
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+        .map_err(|()| NativeReadFailure::RecallInvalidRequest)?;
     validate_recall_text(&request.query, 32_768)
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+        .map_err(|()| NativeReadFailure::RecallInvalidRequest)?;
     validate_recall_temporal(&request.temporal_query)?;
     validate_recall_budgets(&request.budgets)?;
     validate_recall_exclusions(&request.exclusions)?;
@@ -802,7 +794,8 @@ fn validate_recall_temporal(
         return Err(NativeReadFailure::RecallInvalidRequest);
     }
     if let Some(cursor) = temporal.cursor.as_deref() {
-        validate_recall_text(cursor, 8_192).map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
+        validate_recall_text(cursor, 8_192)
+            .map_err(|()| NativeReadFailure::RecallInvalidRequest)?;
     }
     match temporal.mode.as_str() {
         "current" | "history" => {
@@ -954,7 +947,7 @@ fn parse_digits(value: &[u8]) -> Option<u32> {
 
 fn days_in_month(year: u32, month: u32) -> u32 {
     match month {
-        2 if year % 400 == 0 || year % 4 == 0 && year % 100 != 0 => 29,
+        2 if year.is_multiple_of(400) || year.is_multiple_of(4) && !year.is_multiple_of(100) => 29,
         2 => 28,
         4 | 6 | 9 | 11 => 30,
         _ => 31,
@@ -1195,7 +1188,7 @@ impl NativeReadActor {
         let join = thread::Builder::new()
             .name(ACTOR_THREAD_NAME.to_owned())
             .spawn(move || {
-                native_read_actor_main(receiver, cg, project_root, runtime, session_retrieval)
+                native_read_actor_main(receiver, cg, project_root, runtime, session_retrieval);
             })
             .map_err(NativeMemoryApplicationPortBuildError::ActorThread)?;
         Ok(Self {
@@ -1227,7 +1220,7 @@ impl NativeReadActor {
         };
         match sender.try_send(command) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
                 return Err(NativeReadFailure::ProviderUnavailable);
             }
         }
@@ -1586,7 +1579,8 @@ fn native_fact_read_control(control: &OperationControl) -> FactReadControl {
 
 /// Maps one upstream `FactSearchHitV1` into a provider candidate. The hit is
 /// carried unchanged; the native score is `score_millionths` written as the
-/// exact decimal it denotes.
+/// exact decimal it denotes. Projection time and source revision identify
+/// observed lineage, not a content-validity interval.
 fn fact_candidate(
     call: &ProviderCall,
     fact_hit: &NativeFactHit,
@@ -1647,7 +1641,7 @@ fn fact_candidate(
             "superseded_by": Value::Null,
             "revoked_at": Value::Null,
             "source_revision": fact.last_event_id.as_str(),
-            "temporal_state": "current",
+            "temporal_state": "unknown",
         },
         "provenance": {
             "state": "available",
@@ -1698,62 +1692,19 @@ fn owner_scope_value(call: &ProviderCall, binding: &str, project: bool) -> Value
 // Session lane
 // ---------------------------------------------------------------------------
 
-/// The default `tracedecay_message_search` query, shaped exactly as the
-/// upstream retained session port shapes it: one logical message per hit,
-/// current mode, every session in the authorized project root, no summaries,
-/// default diversity, the admitted application byte ceiling with a
-/// `bytes / 4` token budget, stored data allowed, and admitted execution
-/// limits for the requested page size.
+/// Uses the upstream message-search compiler with its default filters.
 fn message_search_query(
     query: &str,
     cursor: Option<String>,
     limit: usize,
 ) -> Result<SessionTemporalQuery, NativeReadFailure> {
-    let semantic_filter = TemporalCandidateFilterV1 {
-        project_key: None,
-        parent_session_id: None,
-        source: None,
-        include_summaries: false,
-        session_scope: TemporalSessionScopeFilterV1::All,
-        message_type: TemporalMessageTypeFilterV1::All,
-        roles: Vec::new(),
-        start_time: None,
-        end_time: None,
-        git_branch: None,
-        git_worktree: None,
-        git_commit: None,
-        workflow_run: None,
-        workflow_agent: None,
-        goals: false,
-    };
-    let filter_digest = canonical_sha256(&(MESSAGE_SEARCH_FILTER_DOMAIN, &semantic_filter))
-        .map_err(|_| NativeReadFailure::RecallInvalidRequest)?;
-    let session_id = SessionId::new(MESSAGE_SEARCH_ROOT_SESSION_ID)
-        .map_err(|_| NativeReadFailure::ProviderUnavailable)?;
-    SessionTemporalQuery::new(
-        session_id,
-        None,
-        query,
+    let request = MessageSearchRequestV1 {
+        query: Some(query.to_owned()),
         cursor,
-        TemporalModeV1::Current,
-        RetrievalGrainV1::LogicalMessage,
-        limit,
-        DiversityLimits::default(),
-        ContextBudget {
-            max_bytes: APPLICATION_RETRIEVAL_MAX_BYTES,
-            max_tokens: APPLICATION_RETRIEVAL_MAX_BYTES / 4,
-            estimator_version: "words-v1".to_owned(),
-        },
-    )
-    .map(|query| {
-        query
-            .with_retrieval_scope(SessionRetrievalScope::AllSessionsInAuthorizedRoot)
-            .with_freshness_policy(SessionFreshnessPolicy::AllowStored)
-            .with_compatibility_filter_digest(filter_digest.as_str().to_owned())
-            .with_semantic_filter(semantic_filter)
-            .with_execution_limits(admitted_execution_limits(limit))
-    })
-    .map_err(|_| NativeReadFailure::RecallInvalidRequest)
+        limit: Some(u64::try_from(limit).map_err(|_| NativeReadFailure::RecallInvalidRequest)?),
+        ..MessageSearchRequestV1::default()
+    };
+    message_search_temporal_query(&request).map_err(map_retained_error)
 }
 
 /// Reads session history through the upstream message-search kernel and maps
@@ -1933,7 +1884,8 @@ fn session_temporal_value(temporal: &SessionTemporalMetadataView) -> Value {
 
 /// Maps one upstream message-search hit. The kernel score is its normalized
 /// micro-score divided by one million, so writing it with six decimals is
-/// the exact value, not a rescaling.
+/// the exact value, not a rescaling. A message timestamp records an
+/// observation, not a content-validity interval.
 fn session_message_candidate(
     call: &ProviderCall,
     result: &SessionMessageSearchResult,
@@ -1995,7 +1947,7 @@ fn session_message_candidate(
             "superseded_by": Value::Null,
             "revoked_at": Value::Null,
             "source_revision": Value::Null,
-            "temporal_state": "current",
+            "temporal_state": "unknown",
         },
         "provenance": {
             "state": "available",

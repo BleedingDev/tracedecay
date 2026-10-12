@@ -3,7 +3,7 @@
 
 use serde::Deserialize;
 use tracedecay_memory_ncm_core::centers::MemoryCenters;
-use tracedecay_memory_ncm_core::centers::read::{CompoundWeights, ReadParams};
+use tracedecay_memory_ncm_core::centers::read::{CompoundReadParams, CompoundWeights, ReadParams};
 use tracedecay_memory_ncm_core::types::{
     AFFECT_DIM, CONTEXT_DIM, LayerConfig, NcmConfig, RecordId, TERRAIN_DIM, VALUE_DIM,
 };
@@ -472,9 +472,11 @@ fn admitted_candidate_scan_reaches_rank_seventeen_after_ineligible_centers() {
             &[1.0, 0.0],
             None,
             None,
-            CompoundWeights::default(),
-            1,
-            17,
+            CompoundReadParams {
+                weights: CompoundWeights::default(),
+                top_k: 1,
+                candidate_k: 17,
+            },
             |slot, support, activation| {
                 slot.index == 16 && !support.is_empty() && activation >= 0.0
             },

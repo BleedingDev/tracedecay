@@ -48,8 +48,6 @@ pub(crate) mod provider_control;
 pub(crate) mod provider_history;
 #[cfg(feature = "memory-provider-host")]
 mod provider_host;
-#[cfg(all(feature = "memory-provider-host", test))]
-pub(crate) use provider_host::native_observation_mount;
 #[cfg(feature = "memory-provider-host")]
 pub use provider_host::{
     NativeApplicationPortInterpositionV1, NcmRegistrationFactoryV1, ProjectAdvisoryRecallCallV1,

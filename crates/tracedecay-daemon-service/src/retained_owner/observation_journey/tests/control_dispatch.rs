@@ -31,7 +31,7 @@ fn health_request(
     control: OperationControl,
 ) -> JourneyControlDispatchRequestV1 {
     JourneyControlDispatchRequestV1 {
-        provider_id: OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
+        provider_id: OwnedProviderId::new(JOURNEY_PROVIDER_ID).expect("journey provider"),
         registration_revision: 1,
         exact_scope: exact_scope_for_session(
             &fixture.profile_id,
@@ -54,7 +54,7 @@ fn health_request(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_cancels_an_in_flight_control_and_retains_its_worker_until_return() {
     let temp = TempDir::new().expect("temporary journey root");
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObservationProvider::new());
     let fixture = mount_journey_over_port(
         &temp,
         "project.control-shutdown",
@@ -157,7 +157,7 @@ async fn shutdown_cancels_an_in_flight_control_and_retains_its_worker_until_retu
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn injected_headers_and_oversized_bodies_are_refused_before_provider_contact() {
     let temp = TempDir::new().expect("temporary journey root");
-    let port = Arc::new(JourneyNativePort::new());
+    let port = Arc::new(JourneyObservationProvider::new());
     let fixture = mount_journey_over_port(
         &temp,
         "project.control-preflight",
@@ -239,7 +239,7 @@ async fn injected_headers_and_oversized_bodies_are_refused_before_provider_conta
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_health_header_uses_actual_guard_call_and_original_control() {
     let temp = TempDir::new().expect("temporary journey root");
-    let port = Arc::new(JourneyNativePort::with_state_generation(5));
+    let port = Arc::new(JourneyObservationProvider::with_state_generation(5));
     let fixture = mount_journey_over_port(
         &temp,
         "project.control-header",
@@ -340,7 +340,7 @@ async fn canonical_health_header_uses_actual_guard_call_and_original_control() {
         dispatched.call.payload.bytes,
         canonical_payload_bytes(&payload).expect("canonical bytes")
     );
-    assert!(dispatched.call.extensions.is_empty());
+    assert_eq!(dispatched.call.extensions, Vec::new());
     assert!(!original_control.cancellation().is_cancelled());
     let failures = fixture
         .journey
@@ -354,7 +354,7 @@ fn witnessed_committed_control_answer_survives_caller_cancellation_and_journey_s
     let original_reply = ProviderReply {
         terminal: TerminalRecord::new(
             ProviderOperation::Feedback,
-            OwnedProviderId::new(NATIVE_PROVIDER_ID).expect("original provider"),
+            OwnedProviderId::new(JOURNEY_PROVIDER_ID).expect("journey provider"),
             TerminalCode::Success,
             CommittedEffectEvidence::committed(
                 5,

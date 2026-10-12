@@ -849,7 +849,7 @@ mod tests {
         );
         for result in [&markdown, &json] {
             let contribution = result.context_memory_contribution().unwrap();
-            assert!(contribution.facts().is_empty());
+            assert_eq!(contribution.facts().len(), 0);
             assert_eq!(contribution.temporal_coverage(), Some(&coverage));
         }
     }

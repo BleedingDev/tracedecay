@@ -1095,7 +1095,7 @@ pub struct ProviderReplayResultV1 {
 pub enum ProviderControlOperationResultV1 {
     Feedback(Option<ProviderFeedbackResultV1>),
     Correction(Option<ProviderCorrectionResultV1>),
-    DeleteBySource(Option<ProviderDeleteBySourceResultV1>),
+    DeleteBySource(Option<Box<ProviderDeleteBySourceResultV1>>),
     Health(Option<ProviderHealthResultV1>),
     Inspection(Option<ProviderInspectionResultV1>),
     Maintenance(Option<ProviderMaintenanceResultV1>),
@@ -2046,15 +2046,15 @@ impl ProviderControlResultV1 {
             ProviderControlErasureV1::Failed { postcondition, .. } => postcondition.as_ref(),
             ProviderControlErasureV1::Pending { .. } => None,
         };
-        if self.effect.state == ProviderControlEffectStateV1::None {
-            if let Some(postcondition) = postcondition {
-                require(
-                    postcondition.removed_effects == 0
-                        && postcondition.anonymized_effects == 0
-                        && postcondition.snapshots_rewritten == 0,
-                    "provider no-effect deletion counts",
-                )?;
-            }
+        if self.effect.state == ProviderControlEffectStateV1::None
+            && let Some(postcondition) = postcondition
+        {
+            require(
+                postcondition.removed_effects == 0
+                    && postcondition.anonymized_effects == 0
+                    && postcondition.snapshots_rewritten == 0,
+                "provider no-effect deletion counts",
+            )?;
         }
         match &data.erasure {
             ProviderControlErasureV1::Pending { reason_code } => {
@@ -2651,6 +2651,10 @@ mod tests {
         result
             .validate_for(&request)
             .expect("actual removal independent from provider availability");
+        assert_eq!(
+            serde_json::to_value(&result.result).expect("deletion wire result"),
+            raw["result"]
+        );
         let ProviderControlOperationResultV1::DeleteBySource(Some(data)) = result.result else {
             panic!("deletion")
         };

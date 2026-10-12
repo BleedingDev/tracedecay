@@ -133,9 +133,7 @@ pub fn uninstall(root: &StateRoot) -> Result<(), EncoderError> {
 
     let mut journal = journal;
     journal.phase = Phase::BackedUp;
-    if let Err(error) = write_journal_at(&root_directory, root.path(), &journal) {
-        return Err(error);
-    }
+    write_journal_at(&root_directory, root.path(), &journal)?;
 
     journal.phase = Phase::Published;
     write_journal_at(&root_directory, root.path(), &journal)?;
@@ -279,7 +277,6 @@ fn install_or_update(
                 journal,
                 &staging_path,
                 &staging_directory,
-                &backup_name,
                 &acquisition,
                 &manifest,
             )?;
@@ -453,12 +450,14 @@ fn publish_candidate(
     mut journal: LifecycleJournal,
     staging_path: &Path,
     staging_directory: &Dir,
-    backup_name: &str,
     acquisition: &ModelAcquisitionManifest,
     manifest: &PinnedEncoder,
 ) -> Result<(), EncoderError> {
     let staging_name = staging_path.file_name().ok_or_else(|| {
         EncoderError::ArtifactMismatch("staged model root has no directory name".to_owned())
+    })?;
+    let backup_name = journal.backup_name.as_deref().ok_or_else(|| {
+        EncoderError::ArtifactMismatch("publication journal has no backup name".to_owned())
     })?;
     let models_path = root.models_dir();
     let backup_path = root.path().join(backup_name);
@@ -481,18 +480,17 @@ fn publish_candidate(
         OsStr::new("models"),
         root_directory,
         OsStr::new(backup_name),
-    ) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            return rollback_after_publish_failure(
-                root,
-                root_directory,
-                &journal,
-                staging_name,
-                &models_path,
-                manifest,
-                io_error("move previous model tree to backup", &models_path, error),
-            );
-        }
+    ) && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return rollback_after_publish_failure(
+            root,
+            root_directory,
+            &journal,
+            staging_name,
+            &models_path,
+            manifest,
+            io_error("move previous model tree to backup", &models_path, error),
+        );
     }
     sync_directory(root_directory, root.path())?;
     journal.phase = Phase::BackedUp;
@@ -502,7 +500,7 @@ fn publish_candidate(
     // staging capability so a swapped path cannot redirect publication.
     let candidate_path = staging_path.join(CANDIDATE_DIRECTORY);
     let staged_digest = digest_optional_entry(
-        &staging_directory,
+        staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         &candidate_path,
     )?
@@ -522,7 +520,7 @@ fn publish_candidate(
     }
     validate_candidate_structure(&candidate_path, manifest)?;
     let verified_staged_digest = digest_optional_entry(
-        &staging_directory,
+        staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         &candidate_path,
     )?
@@ -541,7 +539,7 @@ fn publish_candidate(
         );
     }
     if let Err(error) = tracedecay_private_fs::capability_dir::rename_noreplace(
-        &staging_directory,
+        staging_directory,
         OsStr::new(CANDIDATE_DIRECTORY),
         root_directory,
         OsStr::new("models"),

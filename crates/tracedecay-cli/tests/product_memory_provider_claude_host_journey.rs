@@ -19,7 +19,7 @@
 //! that). After startup import and projection complete, the fixture opens an
 //! empty Claude transcript or metadata-only Codex rollout and runs SessionStart
 //! to establish the live baseline. It then appends the first turn and proves
-//! the journal stays empty across a bounded settling window before Stop.
+//! captured canonical messages stay unchanged before Stop.
 //! Background history reconciliation remains enabled.
 //!
 //! The ignored real-NCM variants select NCM independently with Native advisory
@@ -32,12 +32,11 @@
 //! * an operator can reach the provider host through the shipped CLI: the
 //!   `memory-provider-host` feature is a real CLI feature, so the binary under
 //!   test contains the mount (`required-features` on this target);
-//! * Claude Code and Codex lifecycle hook invocations commit their session's
-//!   messages as canonical project observations, which the mounted observation
-//!   journey then settles against the routed provider exactly once;
-//! * a later ordinary `tracedecay_context` call carries the advisory
-//!   provider-memory lane, bounded and de-duplicated, naming the provider the
-//!   project's own routing policy pinned.
+//! * Claude Code and Codex lifecycle hooks commit exact canonical session
+//!   messages without duplicating them on replay or daemon restart;
+//! * default Native returns durable project facts through ordinary context's
+//!   canonical `memory_matches`, with complete content and project isolation.
+//!   The optional NCM journeys exercise its independently routed advisory lane.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,15 +51,29 @@ use std::time::{Duration, Instant};
 #[path = "product_memory_provider_claude_host_journey/provider_control_journeys.rs"]
 mod provider_control_journeys;
 
+#[path = "support/tracedecay_exe.rs"]
+mod tracedecay_exe;
+use tracedecay_exe::tracedecay_exe;
+
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tracedecay_contracts::retained_surfaces::{
+    FactCommitOwnerV1, FactProjectionV1, FactSearchGraphCoverageV1, FactStoreAddCommitV1,
+    FactStoreAddResultV1, FactV1, LcmLoadSessionResultV1, LcmMessageV1, MessageSearchHitV1,
+    MessageSearchResultV1, RetainedOutcomeStatusV1, TemporalFreshnessV1,
+};
+use tracedecay_contracts::retrieval::ContextResultV1;
+use tracedecay_contracts::{
+    ApplicationEnvelope, ApplicationOutcome, ApplicationProblem, ApplicationProblemRecord,
+    ApplicationUnavailableClassV1, ResolvedSetting,
+};
 use tracedecay_daemon_identity::authority::DaemonAuthorityRecord;
 use tracedecay_daemon_protocol::BrokerStream;
 use tracedecay_domain::configuration::{
-    MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY, MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
-    MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY, MemoryProviderNcmObserverV1,
-    MemoryProviderRecallDegradationCauseV1, MemoryProviderRecallDegradationV1,
-    MemoryProviderRecallRoutingV1,
+    ConfigurationValueV1, MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY,
+    MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY, MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY,
+    MemoryProviderNcmObserverV1, MemoryProviderRecallDegradationCauseV1,
+    MemoryProviderRecallDegradationV1, MemoryProviderRecallRoutingV1,
 };
 use tracedecay_domain::{
     CanonicalMessageRoleV1, CanonicalObservationEnvelopeV1, CanonicalObservationEvidenceV1,
@@ -69,11 +82,15 @@ use tracedecay_domain::{
     ObservationSourceGenerationV1, ObservationSourceIdentityV1, ObservationSourceRangeV1,
     ProjectId, ProviderId, RetentionClass, SessionId,
 };
+use tracedecay_mcp::jsonrpc::JsonRpcRequest;
+use tracedecay_mcp::server::attach_stateless_request_context;
 use tracedecay_memory_observation::{
     AdmittedObservationV1, DeliveryStateV1, JournalInspectionFilterV1, JournalInspectionRowV1,
     ObservationCommittedEffectV1, ObservationDeliveryReceiptV1, ObservationJournalReaderV1,
     ObservationOutcomeV1, RetentionPolicyV1, SqliteObservationJournal,
 };
+use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_runtime_core::test_executable::link_or_copy_executable;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::observation::{
     CaptureObservationOutcome, CaptureObservationRequest, ObservationApplication,
@@ -263,7 +280,7 @@ impl ClaudeHostJourney {
     }
 
     fn cli(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tracedecay"));
+        let mut command = Command::new(tracedecay_exe());
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(
             std::iter::once(self.bin_dir.clone()).chain(std::env::split_paths(&inherited_path)),
@@ -568,9 +585,7 @@ impl ClaudeHostJourney {
             .expect("canonical fixture runtime");
         runtime.block_on(async move {
             let host_runtime =
-                tracedecay::test_support::host_admission::HostAdmissionTestRuntimeV1::project(
-                    &profile, &project, project_id,
-                )
+                HostAdmissionTestRuntimeV1::project(&profile, &project, project_id)
                 .await
                 .expect("open registered canonical fixture authority");
             let store = host_runtime
@@ -718,12 +733,15 @@ impl ClaudeHostJourney {
             now.0
                 .saturating_add(i64::try_from(remaining.as_micros()).unwrap_or(i64::MAX)),
         );
-        let request = json!({
-            "jsonrpc": "2.0", "id": request_id, "method": "tools/call",
-            "params": {"name": "tracedecay_admin_cli", "arguments": {
-                "action": "sessions_sync_status", "idempotency_key": key,
-            }, "_meta": tracedecay_mcp::tool_call_deadline_meta(expires_at)},
-        });
+        let mut request = JsonRpcRequest {
+            jsonrpc: "2.0".to_owned(),
+            id: Some(request_id.clone()),
+            method: "tools/call".to_owned(),
+            params: Some(json!({"name": "tracedecay_admin_cli", "arguments": {
+                "action": "sessions_sync_status", "idempotency_key": key, "format": "json",
+            }, "_meta": tracedecay_mcp::tool_call_deadline_meta(expires_at)})),
+        };
+        attach_stateless_request_context(&mut request);
         let phase = std::cell::Cell::new("connect");
         runtime.block_on(async {
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
@@ -768,15 +786,20 @@ impl ClaudeHostJourney {
                 assert_eq!(response["id"], request_id, "status response correlation");
                 assert!(
                     response.get("error").is_none_or(Value::is_null),
-                    "status RPC must succeed"
+                    "status RPC must succeed: {response}"
                 );
                 let result = response
                     .get("result")
                     .filter(|result| result.is_object())
                     .expect("status tool result");
-                assert_ne!(result["isError"], true, "status tool must succeed");
+                assert_ne!(
+                    result["isError"], true,
+                    "status tool must succeed: {result}"
+                );
                 let payload = tracedecay::daemon::tool_json_payload(result, "tracedecay_admin_cli")
-                    .expect("status tool JSON payload");
+                    .unwrap_or_else(|error| {
+                        panic!("status tool JSON payload failed: {error}; result: {result}")
+                    });
                 phase.set("close");
                 writer.shutdown().await.expect("close status transport");
                 payload
@@ -939,29 +962,26 @@ impl ClaudeHostJourney {
         (decoded, stdout)
     }
 
-    /// The configuration revision every component agrees on, which the
-    /// revision-CAS write below must present.
-    fn configuration_revision(&self) -> String {
-        let observed = self.tool_result("tracedecay_configuration_observed_state", &json!({}));
-        let mut revisions = Vec::new();
-        collect_string_field(&observed, "desired_revision_id", &mut revisions);
-        assert!(
-            !revisions.is_empty(),
-            "configuration observed state must report a desired revision: {observed}"
-        );
-        revisions.sort();
-        revisions.dedup();
-        assert_eq!(
-            revisions.len(),
-            1,
-            "configuration components must agree on one desired revision: {observed}"
-        );
-        revisions.remove(0)
+    /// The setting's canonical revision accepted by the next mutation CAS.
+    fn configuration_revision(&self, key: &str) -> String {
+        let envelope: ApplicationEnvelope<ResolvedSetting> = serde_json::from_value(
+            self.tool("tracedecay_configuration_get", &json!({ "key": key })),
+        )
+        .expect("typed canonical configuration setting");
+        let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
+            panic!("configuration read must return evidence");
+        };
+        evidence
+            .payload
+            .expect("configuration setting payload")
+            .revision_id
+            .as_str()
+            .to_owned()
     }
 
     /// Commits one project-layer setting through the shipped operator surface.
     fn configuration_set(&self, project_id: &str, key: &str, value: Value, idempotency: &str) {
-        let expected_revision = self.configuration_revision();
+        let expected_revision = self.configuration_revision(key);
         // A refusal exits nonzero, so reaching the next line already means the
         // operator write settled.
         let _ = self.tool_result(
@@ -975,7 +995,7 @@ impl ClaudeHostJourney {
             }),
         );
         assert_ne!(
-            self.configuration_revision(),
+            self.configuration_revision(key),
             expected_revision,
             "committing {key} must advance the canonical configuration revision"
         );
@@ -1756,17 +1776,7 @@ fn install_binary_shim(bin_dir: &Path) {
     } else {
         "tracedecay"
     });
-    if fs::hard_link(env!("CARGO_BIN_EXE_tracedecay"), &shim).is_err() {
-        fs::copy(env!("CARGO_BIN_EXE_tracedecay"), &shim).expect("stage the shipped binary");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(&shim).expect("shim metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&shim, permissions).expect("shim is executable");
-    }
+    link_or_copy_executable(tracedecay_exe(), &shim).expect("stage the shipped binary");
 }
 
 /// A real git project: the composition refuses to resolve an exact scope
@@ -1915,32 +1925,6 @@ fn join_content_text(result: &Value) -> Option<String> {
     }
     let text = texts.join("\n\n");
     (!text.is_empty()).then_some(text)
-}
-
-/// Every string value stored under `field`, anywhere in the document. Typed
-/// application-surface envelopes nest their payload differently per operation,
-/// and this journey only needs the daemon's own reported value, not the shape
-/// it happened to be wrapped in.
-fn collect_string_field(value: &Value, field: &str, out: &mut Vec<String>) {
-    match value {
-        Value::Object(members) => {
-            for (key, member) in members {
-                if key == field
-                    && let Some(text) = member.as_str()
-                {
-                    out.push(text.to_owned());
-                } else {
-                    collect_string_field(member, field, out);
-                }
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                collect_string_field(item, field, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// The advisory provider-memory lane of one `tracedecay_context` answer, or
@@ -2130,24 +2114,24 @@ fn journey_task() -> String {
 
 /// The shipped SessionStart establishes a live baseline before source messages
 /// are written. The first Stop commits the first turn; a later Stop commits the
-/// second. Each Stop is replayed to prove delivery idempotency, and ordinary
-/// `tracedecay_context` calls must recall the complete messages.
+/// second. Message search and LCM recall their complete canonical messages;
+/// ordinary context recalls a committed project fact through memory_matches.
 ///
-/// The unchanged-journal windows before capture distinguish these live hook
+/// The unchanged-message windows before capture distinguish these live hook
 /// deliveries from startup import. After a daemon restart, a different session
 /// runs its own SessionStart before recalling the same original evidence.
 #[test]
-fn the_shipped_claude_session_start_and_stop_hooks_commit_observations_and_a_later_context_call_carries_the_advisory_lane()
- {
+fn default_native_claude_hooks_preserve_canonical_messages_and_fact_recall_across_restart() {
     assert_host_memory_journey(false);
 }
 
 /// Two native Codex Stop events, including a replay of each, must commit the
-/// rollout through the real daemon/provider and supply later context. The
-/// shared assertions retain the no-importer control, exact delivery identities,
-/// provenance deduplication, and whole-message tail check for both hosts.
+/// rollout through the real daemon for message search and LCM retrieval. A
+/// committed project fact must survive restart and appear in context. The
+/// shared assertions retain the no-importer control, exact canonical identities,
+/// replay, project isolation, and whole-message tail check for both hosts.
 #[test]
-fn the_shipped_codex_stop_hook_commits_observations_and_later_context_recalls_them() {
+fn default_native_codex_hooks_preserve_canonical_messages_and_fact_recall_across_restart() {
     assert_host_memory_journey(true);
 }
 
@@ -2313,7 +2297,789 @@ fn assert_ncm_to_native_rollback_journey(codex: bool) {
 }
 
 fn assert_host_memory_journey(codex: bool) {
-    assert_host_memory_journey_with_provider(codex, ActiveProvider::Native, false);
+    let mut journey = ClaudeHostJourney::allocate(
+        TempDir::new().expect("isolated Native home"),
+        codex,
+        ActiveProvider::Native,
+        false,
+    );
+    journey.start_daemon();
+    journey.initialize_registered_project();
+    assert_default_native_settings(&journey);
+    let baseline = native_context(&journey, &journey.project);
+    assert!(baseline.memory_matches.is_empty());
+    await_native_startup_history(&journey);
+
+    journey.initialize_session_transcript(journey.session_id());
+    assert_native_hook_succeeds(
+        journey.run_session_start_event(journey.session_id(), &journey.transcript_path()),
+        "SessionStart",
+    );
+    let expected = native_host_messages(codex);
+    await_native_message_search(&journey, &journey.project, &[]);
+    assert!(native_lcm_messages(&journey, &journey.project, &[]).is_empty());
+    append_native_host_turn(&journey, &expected[..ROWS_PER_TURN], 1);
+    assert_native_messages_unchanged_without_stop(&journey, &[]);
+    assert_native_hook_succeeds(journey.run_first_stop_hook(), "first Stop");
+    let first_search =
+        await_native_message_search(&journey, &journey.project, &expected[..ROWS_PER_TURN]);
+    let first = native_lcm_messages(&journey, &journey.project, &expected[..ROWS_PER_TURN]);
+    assert_native_hook_succeeds(journey.run_first_stop_hook(), "first Stop replay");
+    assert_eq!(
+        await_native_message_search(&journey, &journey.project, &expected[..ROWS_PER_TURN]),
+        first_search,
+        "replayed Stop preserves canonical search identities and content"
+    );
+    assert_eq!(
+        native_lcm_messages(&journey, &journey.project, &expected[..ROWS_PER_TURN]),
+        first,
+        "replayed Stop preserves the full stored messages"
+    );
+
+    append_native_host_turn(&journey, &expected[ROWS_PER_TURN..], 3);
+    assert_native_messages_unchanged_without_stop(&journey, &expected[..ROWS_PER_TURN]);
+    assert_native_hook_succeeds(journey.run_stop_hook(), "second Stop");
+    let searched = await_native_message_search(&journey, &journey.project, &expected);
+    let stored = native_lcm_messages(&journey, &journey.project, &expected);
+    assert_native_hook_succeeds(journey.run_stop_hook(), "second Stop replay");
+    assert_eq!(
+        await_native_message_search(&journey, &journey.project, &expected),
+        searched
+    );
+    assert_eq!(
+        native_lcm_messages(&journey, &journey.project, &expected),
+        stored
+    );
+    assert!(
+        stored
+            .iter()
+            .any(|message| message.content.ends_with(TAIL_SENTINEL))
+    );
+
+    let fact = add_native_project_fact(&journey, &expected[3].content);
+    assert_native_fact_recalled(&journey, &fact);
+    let foreign = journey.home.path().join("foreign-project");
+    initialize_project(&foreign);
+    run_ok(
+        journey.cli(&["init"]).current_dir(&foreign),
+        "register foreign project",
+    );
+    await_native_message_search(&journey, &foreign, &[]);
+    assert!(native_lcm_messages(&journey, &foreign, &[]).is_empty());
+    assert!(native_context(&journey, &foreign).memory_matches.is_empty());
+
+    journey.stop_daemon();
+    journey.start_daemon();
+    let next_session = if codex {
+        "codex-cli-native-next"
+    } else {
+        "claude-cli-native-next"
+    };
+    journey.initialize_session_transcript(next_session);
+    assert_native_hook_succeeds(
+        journey.run_session_start_event(
+            next_session,
+            &journey.transcript_path_for_session(next_session),
+        ),
+        "SessionStart after restart",
+    );
+    assert_eq!(
+        await_native_message_search(&journey, &journey.project, &expected),
+        searched,
+        "daemon restart preserves exact session, message, project, and content identity"
+    );
+    assert_eq!(
+        native_lcm_messages(&journey, &journey.project, &expected),
+        stored
+    );
+    assert_native_fact_recalled(&journey, &fact);
+    assert!(
+        journey.journal_for(false).is_none(),
+        "Native uses the canonical retained stores"
+    );
+    assert!(
+        journey.journal_for(true).is_none(),
+        "default Native never mounts NCM"
+    );
+}
+
+#[derive(Debug)]
+struct NativeHostMessage {
+    id: String,
+    role: &'static str,
+    content: String,
+    timestamp: &'static str,
+}
+
+fn native_host_messages(codex: bool) -> Vec<NativeHostMessage> {
+    [
+        ("user", journey_task(), "2026-02-01T00:00:00.000Z"),
+        ("assistant", format!("the {JOURNEY_TERM} transport probe reads its retry budget from the pinned deadline"), "2026-02-01T00:00:01.000Z"),
+        ("user", format!("what did the {JOURNEY_TERM} retry budget change actually record?"), "2026-02-01T00:05:00.000Z"),
+        ("assistant", format!("the {JOURNEY_TERM} transport probe records its retry budget change in three places: the pinned deadline it reads at construction, the attempt ledger it advances on every refused delivery, and the operator-visible note the session leaves behind, which ends with {TAIL_SENTINEL}"), "2026-02-01T00:05:01.000Z"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (role, content, timestamp))| NativeHostMessage {
+        id: format!("{}-{}", if codex { "cli-native-item" } else { "cli-journey-uuid" }, index + 1),
+        role,
+        content,
+        timestamp,
+    })
+    .collect()
+}
+
+fn append_native_host_turn(
+    journey: &ClaudeHostJourney,
+    messages: &[NativeHostMessage],
+    first_uuid: u32,
+) {
+    let turn = if journey.codex {
+        // Current completed-item records carry native identities; no test-side
+        // reconstruction of the normalizer's legacy record digest is needed.
+        messages.iter().map(|message| {
+            let mut item = json!({
+                "type": if message.role == "user" { "UserMessage" } else { "AgentMessage" },
+                "id": message.id,
+                "content": [{"type": "Text", "text": message.content}],
+            });
+            if message.role == "assistant" {
+                item["phase"] = json!("final_answer");
+            }
+            json!({"timestamp": message.timestamp, "type": "event_msg", "payload": {"type": "item_completed", "item": item}}).to_string() + "\n"
+        }).collect::<String>()
+    } else {
+        journey.claude_turn(
+            first_uuid,
+            messages[0].timestamp,
+            messages[1].timestamp,
+            &messages[0].content,
+            &messages[1].content,
+        )
+    };
+    let mut transcript = fs::OpenOptions::new()
+        .append(true)
+        .open(journey.transcript_path())
+        .expect("open native host transcript");
+    transcript
+        .write_all(turn.as_bytes())
+        .expect("append native host turn");
+}
+
+fn assert_native_hook_succeeds(output: Output, event: &str) {
+    assert!(
+        output.status.success(),
+        "{event} failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn native_tool_document(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    name: &str,
+    arguments: &Value,
+) -> Value {
+    native_tool_document_until(
+        journey,
+        project,
+        name,
+        arguments,
+        Instant::now() + SETTLEMENT_BUDGET,
+    )
+}
+
+fn native_tool_document_until(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    name: &str,
+    arguments: &Value,
+    deadline: Instant,
+) -> Value {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "Native tool {name} at {} exceeded its settlement deadline",
+            project.display()
+        );
+        let output = journey
+            .cli(&[
+                "tool",
+                "--project",
+                &project.to_string_lossy(),
+                name,
+                "--args",
+                &arguments.to_string(),
+                "--json",
+            ])
+            .current_dir(project)
+            .env(
+                "TRACEDECAY_TOOL_DEADLINE_MS",
+                remaining.as_millis().max(1).to_string(),
+            )
+            .output()
+            .expect("shipped Native CLI runs");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "Native tool {name} at {} returned invalid JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+                project.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        if !output.status.success() {
+            if matches!(
+                name,
+                "tracedecay_message_search" | "tracedecay_lcm_load_session"
+            ) {
+                let wire = tracedecay_mcp::tool_errors::tool_result_problem(&result)
+                    .expect("retained read refusal must carry its canonical problem");
+                let problem: ApplicationProblemRecord =
+                    serde_json::from_value(wire.clone()).expect("typed retained read refusal");
+                if problem.code == "application.retained.authority-unavailable"
+                    && matches!(
+                        problem.source(),
+                        ApplicationProblem::Unavailable {
+                            classification: ApplicationUnavailableClassV1::Authority,
+                            ..
+                        }
+                    )
+                    && let Some(delay) = problem.pre_admission_retry_delay()
+                {
+                    assert!(
+                        !delay.is_zero()
+                            && delay < deadline.saturating_duration_since(Instant::now()),
+                        "Native read authority did not become available: {problem:?}"
+                    );
+                    // Poll the same project and business arguments through a
+                    // new CLI invocation after the declared admission delay.
+                    std::thread::sleep(delay);
+                    continue;
+                }
+            }
+            panic!(
+                "Native tool {name} at {} failed with {}\nstdout:\n{}\nstderr:\n{}",
+                project.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_ne!(result["isError"], true, "Native tool failed: {result}");
+        assert!(
+            Instant::now() < deadline,
+            "Native tool {name} at {} exceeded its settlement deadline",
+            project.display()
+        );
+        // `tool --json` carries the complete typed answer separately from
+        // its presentation blocks, which may contain a truncation handle.
+        let structured = result.get("structuredContent").unwrap_or_else(|| {
+            panic!(
+                "Native tool {name} at {} omitted its canonical structured result: {result}",
+                project.display()
+            )
+        });
+        assert!(
+            structured.is_object(),
+            "Native tool {name} returned an invalid structured result: {result}"
+        );
+        return structured.clone();
+    }
+}
+
+fn native_tool_payload(document: Value) -> Value {
+    document
+        .pointer("/outcome/value/payload")
+        .cloned()
+        .unwrap_or(document)
+}
+
+fn assert_default_native_settings(journey: &ClaudeHostJourney) {
+    let setting = |key| {
+        let envelope: ApplicationEnvelope<ResolvedSetting> = serde_json::from_value(
+            journey.tool("tracedecay_configuration_get", &json!({"key": key})),
+        )
+        .expect("canonical default setting");
+        let ApplicationOutcome::Evidence(evidence) = envelope.outcome else {
+            panic!("default setting must return evidence")
+        };
+        evidence
+            .payload
+            .expect("default setting payload")
+            .effective_value
+    };
+    assert_eq!(
+        setting(MEMORY_PROVIDER_NATIVE_ENABLED_SETTING_KEY),
+        ConfigurationValueV1::Boolean(true)
+    );
+    let ConfigurationValueV1::Text(observer) = setting(MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY)
+    else {
+        panic!("NCM setting must be its canonical document")
+    };
+    assert_eq!(
+        serde_json::from_str::<MemoryProviderNcmObserverV1>(&observer).expect("NCM default"),
+        MemoryProviderNcmObserverV1::Disabled {}
+    );
+    let ConfigurationValueV1::Text(routing) = setting(MEMORY_PROVIDER_RECALL_ROUTING_SETTING_KEY)
+    else {
+        panic!("routing setting must be its canonical document")
+    };
+    let routing: MemoryProviderRecallRoutingV1 =
+        serde_json::from_str(&routing).expect("default routing");
+    assert_eq!(
+        routing.active_provider.as_deref(),
+        Some(CONFIGURED_PROVIDER_ID)
+    );
+    assert!(routing.fallback.is_none());
+    assert!(routing.degradation.is_none());
+}
+
+fn await_native_startup_history(journey: &ClaudeHostJourney) {
+    let authority: DaemonAuthorityRecord = serde_json::from_slice(
+        &fs::read(daemon_authority_path(&journey.profile)).expect("current daemon authority"),
+    )
+    .expect("canonical daemon authority");
+    let key = format!(
+        "session-sync.startup.{}.{}",
+        authority.process_run_id,
+        journey.project_id()
+    );
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("startup status runtime");
+    loop {
+        let outcome = journey.startup_sync_status(&runtime, &key, deadline);
+        match outcome["status"].as_str().expect("startup sync status") {
+            "complete" => {
+                assert!(
+                    matches!(
+                        outcome["termination"].as_str(),
+                        Some("completed" | "partial")
+                    ),
+                    "startup import failed: {outcome}"
+                );
+                assert!(
+                    outcome["failure_codes"]
+                        .as_array()
+                        .expect("startup failure codes")
+                        .is_empty(),
+                    "startup import failed: {outcome}"
+                );
+                // A Partial receipt can truthfully schedule background work.
+                // The fresh canonical reads below prove actual convergence.
+                return;
+            }
+            "accepted" | "joined" => {}
+            "unavailable"
+                if matches!(
+                    outcome["reason_code"].as_str(),
+                    Some("session_sync_authority_unavailable" | "session_sync_operation_not_found")
+                ) => {}
+            _ => panic!("startup import refused: {outcome}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "startup import did not settle: {outcome}"
+        );
+        std::thread::sleep(JOURNAL_POLL_INTERVAL);
+    }
+}
+
+fn native_message_search(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    require_fresh: bool,
+    deadline: Instant,
+) -> MessageSearchResultV1 {
+    serde_json::from_value(native_tool_payload(native_tool_document_until(
+        journey,
+        project,
+        "tracedecay_message_search",
+        &json!({
+            "query": JOURNEY_TERM,
+            "provider": if journey.codex { "codex" } else { "claude" },
+            "include_subagents": false,
+            "require_fresh": require_fresh,
+            "limit": 5,
+            "format": "json",
+        }),
+        deadline,
+    )))
+    .expect("typed canonical message search")
+}
+
+fn assert_native_search_hits(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    result: &MessageSearchResultV1,
+    expected: &[NativeHostMessage],
+) -> Vec<MessageSearchHitV1> {
+    assert!(
+        result.error.is_none(),
+        "canonical message search failed: {result:?}"
+    );
+    assert_eq!(result.count, Some(expected.len()));
+    if expected.is_empty() {
+        // An empty mounted store is a typed unavailable source with an import
+        // action, rather than a fabricated successful query miss.
+        assert_eq!(
+            result.outcome,
+            RetainedOutcomeStatusV1::Unavailable,
+            "empty source has no settled import authority: {result:?}"
+        );
+        assert_eq!(result.status, RetainedOutcomeStatusV1::Unavailable);
+        let next = result
+            .next_action
+            .as_ref()
+            .expect("empty-source import authority");
+        assert_eq!(next.kind, "import");
+        assert_eq!(next.tool, "tracedecay sessions import");
+    } else {
+        assert_eq!(result.outcome, RetainedOutcomeStatusV1::Complete);
+        assert_eq!(result.status, RetainedOutcomeStatusV1::Ok);
+    }
+    assert!(!result.refresh_required);
+    let provider = if journey.codex { "codex" } else { "claude" };
+    assert_eq!(result.provider, provider);
+    assert_eq!(result.requested_provider.as_deref(), Some(provider));
+    assert_eq!(result.store_scope.as_deref(), Some("project"));
+    let mut hits = result
+        .results
+        .clone()
+        .expect("complete search has typed hits");
+    assert_eq!(hits.len(), expected.len());
+    assert!(hits.len() <= 5);
+    hits.sort_by(|left, right| left.message.message_id.cmp(&right.message.message_id));
+    let project = fs::canonicalize(project).expect("canonical project root");
+    let project_id = journey.project_id();
+    for (hit, expected) in hits.iter().zip(expected) {
+        assert_eq!(hit.session.provider, provider);
+        assert_eq!(hit.session.session_id, journey.session_id());
+        assert_eq!(hit.session.project_key, project_id);
+        if journey.codex {
+            assert_eq!(Path::new(&hit.session.project_path), project);
+        } else {
+            // Claude's canonical projection stores its registered project ID
+            // in both identity fields and keeps native paths in row metadata.
+            assert_eq!(hit.session.project_path, project_id);
+            let metadata: Value = serde_json::from_str(
+                hit.session
+                    .metadata_json
+                    .as_deref()
+                    .expect("Claude native location metadata"),
+            )
+            .expect("canonical Claude location metadata");
+            assert_eq!(
+                metadata["claude_session_cwd"],
+                project.to_string_lossy().as_ref()
+            );
+            assert_eq!(
+                metadata["claude_session_worktree"],
+                project.to_string_lossy().as_ref()
+            );
+        }
+        assert_eq!(hit.message.provider, provider);
+        assert_eq!(hit.message.session_id, journey.session_id());
+        assert_eq!(hit.message.message_id, expected.id);
+        assert_eq!(hit.message.role, expected.role);
+        assert_eq!(hit.message.text, expected.content);
+        if let Some(owner) = &hit.project_id {
+            assert_eq!(owner, &project_id);
+        }
+    }
+    hits
+}
+
+fn await_native_message_search(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    expected: &[NativeHostMessage],
+) -> Vec<MessageSearchHitV1> {
+    let deadline = Instant::now() + SETTLEMENT_BUDGET;
+    loop {
+        let result = native_message_search(journey, project, true, deadline);
+        assert!(
+            result.error.is_none(),
+            "canonical message search failed: {result:?}"
+        );
+        assert!(result.require_fresh);
+        let expected_outcome = if expected.is_empty() {
+            RetainedOutcomeStatusV1::Unavailable
+        } else {
+            RetainedOutcomeStatusV1::Complete
+        };
+        if result.outcome == expected_outcome
+            && result.count == Some(expected.len())
+            && !result.refresh_required
+        {
+            return assert_native_search_hits(journey, project, &result, expected);
+        }
+        if result.outcome == RetainedOutcomeStatusV1::Unavailable {
+            // A hook may acknowledge before its captured records project.
+            // Only the exact empty-source state is eligible to converge.
+            assert_native_search_hits(journey, project, &result, &[]);
+        } else {
+            assert!(
+                matches!(
+                    result.outcome,
+                    RetainedOutcomeStatusV1::Complete
+                        | RetainedOutcomeStatusV1::CompleteZero
+                        | RetainedOutcomeStatusV1::Partial
+                        | RetainedOutcomeStatusV1::Stale
+                ),
+                "canonical message search refused: {result:?}"
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "captured messages did not become fresh: {result:?}"
+        );
+        std::thread::sleep(JOURNAL_POLL_INTERVAL);
+    }
+}
+
+fn assert_native_messages_unchanged_without_stop(
+    journey: &ClaudeHostJourney,
+    expected: &[NativeHostMessage],
+) {
+    let observation_until = Instant::now() + QUIESCENCE_WINDOW;
+    loop {
+        if Instant::now() >= observation_until {
+            return;
+        }
+        // Read the currently captured evidence without requiring a fresh
+        // frontier; acquisition remains the lifecycle hook's responsibility.
+        // The observation window controls when probes start. Each probe keeps
+        // the existing settlement budget, including its paired LCM proof.
+        let deadline = Instant::now() + SETTLEMENT_BUDGET;
+        let result = native_message_search(journey, &journey.project, false, deadline);
+        assert!(!result.require_fresh);
+        if matches!(
+            result.outcome,
+            RetainedOutcomeStatusV1::Stale | RetainedOutcomeStatusV1::Partial
+        ) {
+            // An incomplete historical frontier cannot prove absence. Keep
+            // its stored observation pending and inspect exact session content
+            // through LCM before asserting the no-Stop control.
+            assert_eq!(result.status, result.outcome);
+            assert!(result.error.is_none(), "stored search failed: {result:?}");
+            assert_eq!(result.count, Some(0));
+            assert!(
+                result
+                    .results
+                    .as_ref()
+                    .expect("stored search rows")
+                    .is_empty()
+            );
+            let provider = if journey.codex { "codex" } else { "claude" };
+            assert_eq!(result.provider, provider);
+            assert_eq!(result.requested_provider.as_deref(), Some(provider));
+            assert_eq!(result.store_scope.as_deref(), Some("project"));
+            assert!(!result.refresh_required);
+            assert!(result.next_action.is_none());
+            let temporal = result.temporal.as_ref().expect("stored temporal authority");
+            match (&result.outcome, &temporal.freshness) {
+                (RetainedOutcomeStatusV1::Stale, Some(TemporalFreshnessV1::Stored { .. })) => {
+                    assert!(result.omitted.is_none());
+                }
+                (
+                    RetainedOutcomeStatusV1::Partial,
+                    Some(TemporalFreshnessV1::Partial { generation_lag }),
+                ) => assert_eq!(result.omitted, Some((*generation_lag).max(1))),
+                _ => panic!("pending search must retain its exact freshness: {result:?}"),
+            }
+            assert!(temporal.next_cursor.is_none());
+            assert!(temporal.anchors.is_empty());
+            assert!(temporal.source_coverage.is_empty());
+            assert!(temporal.omissions.is_empty());
+            assert!(temporal.coverage_omissions.is_empty());
+            native_lcm_messages_until(journey, &journey.project, expected, deadline);
+        } else {
+            assert_native_search_hits(journey, &journey.project, &result, expected);
+        }
+        if Instant::now() >= observation_until {
+            return;
+        }
+        std::thread::sleep(JOURNAL_POLL_INTERVAL);
+    }
+}
+
+fn native_lcm_messages(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    expected: &[NativeHostMessage],
+) -> Vec<LcmMessageV1> {
+    native_lcm_messages_until(
+        journey,
+        project,
+        expected,
+        Instant::now() + SETTLEMENT_BUDGET,
+    )
+}
+
+fn native_lcm_messages_until(
+    journey: &ClaudeHostJourney,
+    project: &Path,
+    expected: &[NativeHostMessage],
+    deadline: Instant,
+) -> Vec<LcmMessageV1> {
+    let result = loop {
+        let result: LcmLoadSessionResultV1 = serde_json::from_value(native_tool_payload(native_tool_document_until(journey, project, "tracedecay_lcm_load_session", &json!({
+            "provider": if journey.codex { "codex" } else { "claude" }, "session_id": journey.session_id(), "limit": 5, "temporal_mode": {"kind": "current"}, "format": "json",
+        }), deadline))).expect("typed canonical LCM retrieval");
+        assert!(result.error.is_none(), "LCM retrieval failed: {result:?}");
+        if result.status == RetainedOutcomeStatusV1::Ok && result.messages.len() == expected.len() {
+            break result;
+        }
+        assert!(
+            result.messages.len() <= expected.len(),
+            "LCM leaked or duplicated canonical records: {result:?}"
+        );
+        assert!(
+            matches!(
+                result.status,
+                RetainedOutcomeStatusV1::Ok
+                    | RetainedOutcomeStatusV1::Stale
+                    | RetainedOutcomeStatusV1::Partial
+            ),
+            "LCM retrieval refused: {result:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "LCM retrieval did not settle at {}: {result:?}",
+            project.display()
+        );
+        std::thread::sleep(JOURNAL_POLL_INTERVAL);
+    };
+    assert_eq!(result.status, RetainedOutcomeStatusV1::Ok);
+    assert!(result.error.is_none(), "LCM retrieval failed: {result:?}");
+    assert_eq!(
+        result.provider.as_deref(),
+        Some(if journey.codex { "codex" } else { "claude" })
+    );
+    assert_eq!(result.session_id.as_deref(), Some(journey.session_id()));
+    assert_eq!(result.omitted, Some(0));
+    let temporal = result.temporal.as_ref().expect("LCM temporal authority");
+    assert!(temporal.next_cursor.is_none());
+    assert_eq!(
+        temporal.coverage.visible,
+        u64::try_from(expected.len()).expect("fixture message count")
+    );
+    assert_eq!(temporal.coverage.hidden, 0);
+    assert_eq!(temporal.coverage.unknown, 0);
+    assert_eq!(temporal.coverage.redacted, 0);
+    let mut messages = result.messages;
+    messages.sort_by(|left, right| left.message_id.cmp(&right.message_id));
+    assert_eq!(messages.len(), expected.len());
+    for (message, expected) in messages.iter().zip(expected) {
+        assert_eq!(
+            message.provider,
+            if journey.codex { "codex" } else { "claude" }
+        );
+        assert_eq!(message.session_id, journey.session_id());
+        assert_eq!(message.message_id, expected.id);
+        assert_eq!(message.role, expected.role);
+        assert_eq!(message.content, expected.content);
+        assert!(!message.content_range.truncated);
+        assert_eq!(message.content_range.offset, 0);
+        let chars =
+            u64::try_from(expected.content.chars().count()).expect("fixture content length");
+        assert_eq!(message.content_range.returned_chars, chars);
+        assert_eq!(message.content_range.total_chars, chars);
+    }
+    messages
+}
+
+fn add_native_project_fact(journey: &ClaudeHostJourney, content: &str) -> FactV1 {
+    let document = native_tool_document(
+        journey,
+        &journey.project,
+        "tracedecay_fact_store_add",
+        &json!({"content": content, "memory_scope": "project", "trust": 0.91, "source_label": "native-host-memory-journey", "format": "json"}),
+    );
+    assert_eq!(document["outcome"]["outcome"], "effect");
+    assert_eq!(document["outcome"]["value"]["reconciliation"], "reconciled");
+    assert_eq!(
+        document["outcome"]["value"]["execution"]["termination"],
+        "completed"
+    );
+    assert_eq!(
+        document["outcome"]["value"]["receipt"]["outcome"],
+        "completed"
+    );
+    let result: FactStoreAddResultV1 =
+        serde_json::from_value(native_tool_payload(document)).expect("typed canonical fact commit");
+    let FactStoreAddResultV1::Committed {
+        result: FactStoreAddCommitV1::Added { fact, commit },
+    } = result
+    else {
+        panic!("isolated project must commit a new fact: {result:?}")
+    };
+    let FactProjectionV1::Available { fact } = fact else {
+        panic!("committed fact must be readable: {fact:?}")
+    };
+    let owner = FactCommitOwnerV1::Project {
+        project_id: ProjectId::new(journey.project_id()).expect("registered project identity"),
+    };
+    assert_eq!(fact.owner, owner);
+    assert_eq!(commit.owner, owner);
+    assert_eq!(commit.fact_id, fact.fact_id);
+    assert_eq!(fact.content, content);
+    assert_eq!(
+        fact.source_label.as_deref(),
+        Some("native-host-memory-journey")
+    );
+    assert!(!commit.committed_event_ids.is_empty());
+    *fact
+}
+
+fn native_context(journey: &ClaudeHostJourney, project: &Path) -> ContextResultV1 {
+    let payload = native_tool_payload(native_tool_document(
+        journey,
+        project,
+        "tracedecay_context",
+        &json!({"task": journey_task(), "memory_limit": 5, "format": "json"}),
+    ));
+    assert!(
+        payload.get("advisory_provider_memory").is_none(),
+        "default Native returns canonical facts: {payload}"
+    );
+    let result: ContextResultV1 = serde_json::from_value(payload).expect("typed Native context");
+    assert!(
+        result.memory_matches_error.is_none(),
+        "Native memory recall failed: {result:?}"
+    );
+    assert!(result.memory_matches.len() <= 5);
+    result
+}
+
+fn assert_native_fact_recalled(journey: &ClaudeHostJourney, fact: &FactV1) {
+    let context = native_context(journey, &journey.project);
+    assert!(
+        matches!(
+            context.memory_graph_coverage,
+            Some(FactSearchGraphCoverageV1::Complete { .. })
+        ),
+        "Native graph coverage must be complete: {context:?}"
+    );
+    let recalled = context
+        .memory_matches
+        .iter()
+        .filter(|hit| hit.fact.fact_id == fact.fact_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recalled.len(),
+        1,
+        "Native context must recall the committed durable fact exactly once: {context:?}"
+    );
+    assert_eq!(recalled[0].fact.owner, fact.owner);
+    assert_eq!(recalled[0].fact.content, fact.content);
+    assert!(recalled[0].fact.content.ends_with(TAIL_SENTINEL));
 }
 
 fn assert_host_memory_journey_with_observer(codex: bool, ncm_observer: bool) {
@@ -2809,9 +3575,7 @@ fn capture_revision_fixture_source(
             let admitted = journal
                 .read_admitted_observation_by_idempotency(&row.idempotency_key)
                 .expect("read revision fixture admission");
-            let Some(admitted) = admitted else {
-                return None;
-            };
+            let admitted = admitted?;
             (admitted.source.source_event_id == fixture_observation_id.as_str())
                 .then_some((row, admitted))
         })

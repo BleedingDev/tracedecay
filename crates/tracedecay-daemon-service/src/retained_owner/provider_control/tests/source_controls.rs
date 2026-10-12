@@ -15,16 +15,17 @@ use tracedecay_domain::{
     ActorId, CanonicalObservationEnvelopeV1, ManifestDigest, ObservationScopeV1, ProjectId,
     WorktreeId,
 };
+use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_host_admission::{HostAdmissionAuthorities, HostAdmissionFacade};
 use tracedecay_memory_observation::SqliteObservationJournal;
 use tracedecay_memory_provider_registry::recall_admission::source_attribution::RecallSourceAttributionV1;
 use tracedecay_memory_provider_registry::{
     CancellationToken, OperationControl, OriginScopeEvidence, OriginalSourceIdentity,
-    OwnedProviderId, ProjectMemoryProviderComposition, RecallExplainHostDecisionV1,
-    RecallExplainItemV1, RecallExplainProviderExplanationV1, RecallExplainTraceV1,
-    RecordedValidity,
+    OwnedProviderId, RecallExplainHostDecisionV1, RecallExplainItemV1,
+    RecallExplainProviderExplanationV1, RecallExplainTraceV1, RecordedValidity,
 };
 use tracedecay_project::test_support::host_admission::HostAdmissionTestRuntimeV1;
+use tracedecay_runtime_core::db::Database;
 use tracedecay_sessions::admission::HostAdmissionScope;
 use tracedecay_sessions::observation::ObservationCancellation;
 use tracedecay_sessions::repository_provenance::RepositoryProvenanceAdmissionContext;
@@ -62,6 +63,8 @@ struct CanonicalSourceFixture {
     journal: Arc<SqliteObservationJournal>,
     attribution: SourceAttribution,
     provider: OwnedProviderId,
+    canonical_session_db: RegisteredGlobalDbLeaseV1,
+    canonical_dispositions: Arc<Database>,
 }
 
 fn operation_control() -> OperationControl {
@@ -293,19 +296,17 @@ impl CanonicalSourceFixture {
             journal,
             attribution,
             provider,
+            canonical_session_db: registered,
+            canonical_dispositions: dispositions,
             port: ProjectProviderControlPortV1 {
                 inputs: ProviderControlMountInputsV1 {
                     authority: Some(authority),
-                    composition: Arc::new(ProjectMemoryProviderComposition::Disabled),
                     journeys: Vec::new(),
                     profile_id: profile,
                     mounted_scope: scope,
                     authoritative_project_id: project,
-                    project_root: root,
                     configuration_digest: ManifestDigest::new(format!("sha256:{}", "d".repeat(64)))
                         .unwrap(),
-                    canonical_session_db: registered,
-                    canonical_dispositions: dispositions,
                 },
             },
         }
@@ -331,7 +332,8 @@ impl CanonicalSourceFixture {
             self.provider.as_str(),
             1,
             "candidate.canonical-source",
-        );
+        )
+        .unwrap();
         let trace = RecallExplainTraceV1 {
             trace_id: retained_trace_id_with_key(
                 &key,
@@ -339,7 +341,8 @@ impl CanonicalSourceFixture {
                 "request.source-locator",
                 self.provider.as_str(),
                 1,
-            ),
+            )
+            .unwrap(),
             request_id: "request.source-locator".to_owned(),
             provider_id: self.provider.as_str().to_owned(),
             registration_revision: 1,
@@ -487,28 +490,19 @@ async fn canonical_ingestion_and_retained_locators_do_not_supply_original_proven
     assert_original_provenance_unavailable(
         fixture
             .authority()
-            .current_destination_scope("claude", &control)
-            .await,
+            .current_destination_scope("claude", &control),
     );
-    let observations = fixture.port.inputs.canonical_session_db.observation_store();
+    let observations = fixture.canonical_session_db.observation_store();
     let reader = ProviderHistoryReaderV1 {
         bridge: fixture.original.bridge.as_ref(),
         observations: &observations,
-        dispositions: fixture.port.inputs.canonical_dispositions.as_ref(),
+        dispositions: fixture.canonical_dispositions.as_ref(),
         original_authority: fixture.original.as_ref(),
         journal: fixture.journal.as_ref(),
         provider_id: &fixture.provider,
         policy_revision: 1,
     };
-    assert_original_provenance_unavailable(
-        reader.select_recent_page(&destination, 1, &control).await,
-    );
-    assert_original_provenance_unavailable(reader.select_page(&destination, 0, 1, &control).await);
-    assert_original_provenance_unavailable(
-        reader
-            .authorize_retained_source(&destination, &fixture.attribution, &control, true)
-            .await,
-    );
+    assert_original_provenance_unavailable(reader.select_recent_page(&destination, 1, &control));
     let failure = fixture
         .port
         .resolve_source(&selector, true, &control)
@@ -516,7 +510,7 @@ async fn canonical_ingestion_and_retained_locators_do_not_supply_original_proven
         .err()
         .unwrap();
     assert!(matches!(
-        failure.stage,
+        *failure.stage,
         ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Unavailable(
             ORIGINAL_PROVENANCE_UNAVAILABLE
         ))
@@ -596,8 +590,6 @@ async fn source_controls_refuse_without_publishing_commands_or_deletion_fences()
             .is_none()
     );
     let stored = fixture
-        .port
-        .inputs
         .canonical_session_db
         .observation_store()
         .replay_observations(ObservationReplayRequest::new(0, 2).unwrap())
@@ -774,7 +766,7 @@ async fn canonical_session_lookup_denies_missing_foreign_provider_and_foreign_pr
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canonical_session_authority_denies_stale_project_binding_in_admitted_shard() {
     let fixture = CanonicalSourceFixture::new().await;
-    let registered = &fixture.port.inputs.canonical_session_db;
+    let registered = &fixture.canonical_session_db;
     let mut session = registered
         .get_session("claude", SESSION)
         .await

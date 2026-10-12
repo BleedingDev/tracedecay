@@ -215,7 +215,7 @@ fn decode_source_delivery(
     Ok(SourceDeliveryEvidenceV1::Retained {
         admitted: Box::new(admitted),
         state,
-        receipt,
+        receipt: receipt.map(Box::new),
     })
 }
 

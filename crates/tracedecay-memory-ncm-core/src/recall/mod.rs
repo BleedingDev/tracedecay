@@ -1,7 +1,7 @@
 //! Read-only, record-aware recall with explicit provenance and admission policy.
 
 use crate::centers::MemoryCenters;
-use crate::centers::read::{CompoundWeights, ReadResult};
+use crate::centers::read::{CompoundReadParams, CompoundWeights, ReadResult};
 use crate::numeric::{minkowski, validate_finite};
 use crate::records::{Record, RecordState, RecordTable, Support};
 use crate::types::{CenterSlot, CoreError, RecordId, SourceId};
@@ -190,13 +190,16 @@ pub fn recall(
         terrain: terrain_part,
         ..CompoundWeights::default()
     };
+    let read_params = CompoundReadParams {
+        weights,
+        top_k: center_candidate_limit,
+        candidate_k: center_candidate_limit,
+    };
     let stm_read = stm.read_compound_with_admission(
         query_key_stm,
         Some(query_ctx),
         None,
-        weights,
-        center_candidate_limit,
-        center_candidate_limit,
+        read_params,
         |slot, center_support, activation| {
             admits_center(
                 slot,
@@ -212,9 +215,7 @@ pub fn recall(
         query_key_ltm,
         Some(query_ctx),
         None,
-        weights,
-        center_candidate_limit,
-        center_candidate_limit,
+        read_params,
         |slot, center_support, activation| {
             admits_center(
                 slot,

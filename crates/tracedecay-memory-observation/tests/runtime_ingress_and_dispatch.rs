@@ -1054,8 +1054,6 @@ fn shutdown_cancels_an_in_flight_attempt_within_the_bound_and_records_receipt() 
     assert_eq!(after.leased, 0);
     assert_eq!(state_of(&store, 1)?, DeliveryStateV1::Pending);
 
-    drop(delivery);
-    drop(provider);
     drop(wake);
     drop(store);
 

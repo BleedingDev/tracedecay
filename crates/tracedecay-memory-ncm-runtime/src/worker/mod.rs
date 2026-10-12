@@ -302,9 +302,11 @@ fn dispatch(engine: &NcmEngine, request: Request, options: ServeOptions) -> Engi
                             engine,
                             &request.namespace,
                             &payload.idempotency_key,
-                            &snapshot_file,
-                            byte_length,
-                            &content_sha256,
+                            crate::snapshot::SnapshotFile {
+                                path: &snapshot_file,
+                                byte_length,
+                                content_sha256: &content_sha256,
+                            },
                             &blocked_sources,
                             deadline,
                         ))

@@ -46,62 +46,19 @@ use session_database_admission::{join_independent_session_opens, log_session_dat
 pub(super) type ProjectMemoryProviderActivation =
     tracedecay_domain::configuration::MemoryProviderSelectionV1;
 
-#[cfg(all(test, feature = "memory-provider-host"))]
-pub(super) use tracedecay_daemon_service::retained_owner::NativeApplicationPortInterpositionV1;
-
-/// How one project open obtains its provider participation.
 #[cfg(feature = "memory-provider-host")]
-#[derive(Clone)]
-pub(super) enum ProjectMemoryProviderActivationSelector {
-    /// Read the authoritative runtime configuration for this open.
-    FromRuntimeConfiguration,
-    /// Read the same configuration, then decorate the real Native port in a
-    /// test harness before the service registers it.
-    #[cfg(all(test, feature = "memory-provider-host"))]
-    FromRuntimeConfigurationWithNativePortInterposition(NativeApplicationPortInterpositionV1),
-}
-
-#[cfg(feature = "memory-provider-host")]
-impl std::fmt::Debug for ProjectMemoryProviderActivationSelector {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::FromRuntimeConfiguration => formatter.write_str("FromRuntimeConfiguration"),
-            #[cfg(all(test, feature = "memory-provider-host"))]
-            Self::FromRuntimeConfigurationWithNativePortInterposition(_) => {
-                formatter.write_str("FromRuntimeConfigurationWithNativePortInterposition(..)")
-            }
-        }
-    }
-}
-
-#[cfg(feature = "memory-provider-host")]
-impl ProjectMemoryProviderActivationSelector {
-    fn resolve(
-        self,
-        runtime_configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
-    ) -> Result<ProjectMemoryProviderActivation> {
-        let config = runtime_configuration.config();
-        tracedecay_domain::configuration::MemoryProviderSelectionV1::resolve(
-            config.memory_provider_native_enabled,
-            &config.memory_provider_ncm_observer,
-            &config.memory_provider_recall_routing,
-        )
-        .map_err(|error| TraceDecayError::Config {
-            message: error.to_string(),
-        })
-    }
-
-    #[cfg(all(test, feature = "memory-provider-host"))]
-    fn native_application_port_interposition(
-        &self,
-    ) -> Option<NativeApplicationPortInterpositionV1> {
-        match self {
-            Self::FromRuntimeConfiguration => None,
-            Self::FromRuntimeConfigurationWithNativePortInterposition(interposition) => {
-                Some(Arc::clone(interposition))
-            }
-        }
-    }
+fn project_memory_provider_activation(
+    runtime_configuration: &tracedecay_configuration::config::PinnedRuntimeConfiguration,
+) -> Result<ProjectMemoryProviderActivation> {
+    let config = runtime_configuration.config();
+    tracedecay_domain::configuration::MemoryProviderSelectionV1::resolve(
+        config.memory_provider_native_enabled,
+        &config.memory_provider_ncm_observer,
+        &config.memory_provider_recall_routing,
+    )
+    .map_err(|error| TraceDecayError::Config {
+        message: error.to_string(),
+    })
 }
 
 pub(super) struct ProductionProjectComposition {
@@ -362,8 +319,6 @@ struct ProjectOpenInputs<'a> {
     /// Start of this open attempt. `project_open_phase` events report elapsed
     /// time from here unless they name a narrower phase start.
     started: Instant,
-    #[cfg(feature = "memory-provider-host")]
-    activation: ProjectMemoryProviderActivationSelector,
     #[cfg(test)]
     project_open_attempts: Option<&'a Arc<AtomicUsize>>,
 }
@@ -381,7 +336,7 @@ struct ProjectOpenInputs<'a> {
 #[tracing::instrument(name = "daemon.project.compose.server", level = "trace", skip_all)]
 #[allow(
     clippy::too_many_arguments,
-    reason = "This composition entry delegates to the configured provider selector and project-open state machine."
+    reason = "This composition entry delegates to the project-open state machine."
 )]
 pub(super) async fn production_project_server(
     store_administration: &StoreAdministration,
@@ -394,60 +349,6 @@ pub(super) async fn production_project_server(
     cancellation: &CancellationToken,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
-    #[cfg(feature = "memory-provider-host")]
-    {
-        production_project_server_inner(
-            store_administration,
-            project_open_gates,
-            invocation,
-            http_application_registry,
-            canonical_project_path,
-            handshake,
-            runtime,
-            cancellation,
-            ProjectMemoryProviderActivationSelector::FromRuntimeConfiguration,
-            #[cfg(test)]
-            project_open_attempts,
-        )
-        .await
-    }
-    #[cfg(not(feature = "memory-provider-host"))]
-    {
-        production_project_server_inner(
-            store_administration,
-            project_open_gates,
-            invocation,
-            http_application_registry,
-            canonical_project_path,
-            handshake,
-            runtime,
-            cancellation,
-            #[cfg(test)]
-            project_open_attempts,
-        )
-        .await
-    }
-}
-
-/// Test harness entry that keeps the production configuration decision while
-/// allowing a caller-owned decorator around the real Native application port.
-#[cfg(feature = "memory-provider-host")]
-#[allow(
-    clippy::too_many_arguments,
-    reason = "The explicit selector is a test-only composition seam matching the production open entry."
-)]
-pub(super) async fn production_project_server_with_activation(
-    store_administration: &StoreAdministration,
-    project_open_gates: &tokio::sync::Mutex<ProjectOpenGates>,
-    invocation: &DaemonInvocationState,
-    http_application_registry: &http_application::DaemonHttpApplicationRegistry,
-    canonical_project_path: &Path,
-    handshake: &DaemonHandshake,
-    runtime: ProductionProjectCompositionRuntime,
-    cancellation: &CancellationToken,
-    activation: ProjectMemoryProviderActivationSelector,
-    #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
-) -> Result<ProductionProjectComposition> {
     production_project_server_inner(
         store_administration,
         project_open_gates,
@@ -457,7 +358,6 @@ pub(super) async fn production_project_server_with_activation(
         handshake,
         runtime,
         cancellation,
-        activation,
         #[cfg(test)]
         project_open_attempts,
     )
@@ -482,7 +382,6 @@ async fn production_project_server_inner(
     handshake: &DaemonHandshake,
     runtime: ProductionProjectCompositionRuntime,
     cancellation: &CancellationToken,
-    #[cfg(feature = "memory-provider-host")] activation: ProjectMemoryProviderActivationSelector,
     #[cfg(test)] project_open_attempts: Option<&Arc<AtomicUsize>>,
 ) -> Result<ProductionProjectComposition> {
     let inputs = ProjectOpenInputs {
@@ -495,8 +394,6 @@ async fn production_project_server_inner(
         runtime: &runtime,
         cancellation,
         started: Instant::now(),
-        #[cfg(feature = "memory-provider-host")]
-        activation,
         #[cfg(test)]
         project_open_attempts,
     };
@@ -523,37 +420,13 @@ async fn production_project_server_inner(
         if inserted {
             let activation =
                 Box::pin(inputs.activate_core_route(&opened, &core, &resolved)).await?;
-            let upgrade =
-                match Box::pin(inputs.construct_full_server(&opened, &core, &resolved)).await {
-                    Ok(PublishedFullServer { server, pending }) => {
-                        #[cfg(feature = "memory-provider-host")]
-                        let provider_full_mount = Arc::clone(&pending.provider_full_mount);
-                        match Box::pin(inputs.finish_full_server(
-                            &opened,
-                            &core,
-                            &activation,
-                            &resolved,
-                            &server,
-                            pending,
-                        ))
-                        .await
-                        {
-                            Ok(()) => Ok(server),
-                            Err(error) => {
-                                // Dropping the provider bundle alone does not
-                                // stop an already-started observation worker.
-                                #[cfg(feature = "memory-provider-host")]
-                                shutdown_failed_provider_full_mount(
-                                    &provider_full_mount,
-                                    canonical_project_path,
-                                )
-                                .await;
-                                Err((error, Some(server)))
-                            }
-                        }
-                    }
-                    Err(error) => Err((error, None)),
-                };
+            let upgrade = Box::pin(inputs.construct_and_finish_full_server(
+                &opened,
+                &core,
+                &activation,
+                &resolved,
+            ))
+            .await;
             match upgrade {
                 Ok(full_server) => resolved = full_server,
                 Err((error, published_full_server)) => {
@@ -843,6 +716,42 @@ fn provider_full_upgrade_unavailable(detail: impl Into<String>) -> TraceDecayErr
 }
 
 impl ProjectOpenInputs<'_> {
+    /// Finish the full server or return the candidate that needs retirement.
+    /// An observation worker must stop before its failed candidate is released.
+    async fn construct_and_finish_full_server(
+        &self,
+        opened: &OpenedProjectGraph,
+        core: &ComposedCoreServer,
+        activation: &CoreRouteActivation,
+        resolved: &Arc<crate::mcp::McpServer>,
+    ) -> std::result::Result<
+        Arc<crate::mcp::McpServer>,
+        (TraceDecayError, Option<Arc<crate::mcp::McpServer>>),
+    > {
+        let PublishedFullServer { server, pending } =
+            Box::pin(self.construct_full_server(opened, core, resolved))
+                .await
+                .map_err(|error| (error, None))?;
+        #[cfg(feature = "memory-provider-host")]
+        let provider_full_mount = Arc::clone(&pending.provider_full_mount);
+        match Box::pin(
+            self.finish_full_server(opened, core, activation, resolved, &server, pending),
+        )
+        .await
+        {
+            Ok(()) => Ok(server),
+            Err(error) => {
+                #[cfg(feature = "memory-provider-host")]
+                shutdown_failed_provider_full_mount(
+                    &provider_full_mount,
+                    self.canonical_project_path,
+                )
+                .await;
+                Err((error, Some(server)))
+            }
+        }
+    }
+
     fn log_phase(&self, phase: &str, detail: Option<(&str, String)>, since: Instant) {
         log_project_open_phase(self.canonical_project_path, phase, detail, since);
     }
@@ -1092,7 +1001,7 @@ impl ProjectOpenInputs<'_> {
             *project_database_is_read_only,
         )?;
         #[cfg(feature = "memory-provider-host")]
-        let memory_provider_activation = self.activation.clone().resolve(runtime_configuration)?;
+        let memory_provider_activation = project_memory_provider_activation(runtime_configuration)?;
         let code_index_mount = code_index_activation_mount(CodeIndexActivationMountInputs {
             invocation: self.invocation.clone(),
             project_id: code_index.project_id.clone(),
@@ -1203,11 +1112,6 @@ impl ProjectOpenInputs<'_> {
                         .memory_provider_recall_routing
                         .clone(),
                     ncm_registration_factory: Some(ncm_registration_factory),
-                    #[cfg(all(test, feature = "memory-provider-host"))]
-                    native_port_interposition: self
-                        .activation
-                        .native_application_port_interposition(),
-                    #[cfg(all(not(test), feature = "memory-provider-host"))]
                     native_port_interposition: None,
                 },
             )
@@ -1738,12 +1642,13 @@ impl ProjectOpenInputs<'_> {
                 context.with_observation_journey_mount(journey)
             })
             .with_provider_control_mount(provider_full_mount.provider_control_mount());
-        if let Err(error) = project_open_cancellation_checkpoint(self.cancellation) {
-            #[cfg(feature = "memory-provider-host")]
+        let cancellation_checkpoint = project_open_cancellation_checkpoint(self.cancellation);
+        #[cfg(feature = "memory-provider-host")]
+        if cancellation_checkpoint.is_err() {
             shutdown_failed_provider_full_mount(&provider_full_mount, self.canonical_project_path)
                 .await;
-            return Err(error);
         }
+        cancellation_checkpoint?;
         let full_construction_started = Instant::now();
         let full_candidate = crate::mcp::McpServer::new_with_context(full_context).await;
         #[cfg(feature = "memory-provider-host")]

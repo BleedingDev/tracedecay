@@ -1840,14 +1840,12 @@ fn worker_error_reply(
     error: &WorkerCallError,
 ) -> ProviderReply {
     match error {
-        WorkerCallError::IncarnationChanged { .. } => {
-            return pre_dispatch_reply(
-                provider,
-                call,
-                TerminalCode::StaleIdentity,
-                "ncm.rust.worker_incarnation_changed",
-            );
-        }
+        WorkerCallError::IncarnationChanged { .. } => pre_dispatch_reply(
+            provider,
+            call,
+            TerminalCode::StaleIdentity,
+            "ncm.rust.worker_incarnation_changed",
+        ),
         WorkerCallError::Client(error @ ClientError::EffectUnknown { .. })
             if call.operation.mutates_provider_state() =>
         {
@@ -1856,7 +1854,7 @@ fn worker_error_reply(
             let effect = CommittedEffectEvidence::unknown(receipt, action).unwrap_or_else(|_| {
                 CommittedEffectEvidence::unknown_from_reconciliation_digest([0; 32])
             });
-            return ProviderReply {
+            ProviderReply {
                 terminal: surface_terminal(
                     provider,
                     call.operation,
@@ -1870,16 +1868,14 @@ fn worker_error_reply(
                 warnings: Vec::new(),
                 extensions: Vec::new(),
                 state_generation: call.expected_state_generation,
-            };
+            }
         }
-        WorkerCallError::Client(error) => {
-            return pre_dispatch_reply(
-                provider,
-                call,
-                client_terminal_code(error),
-                client_diagnostic(error),
-            );
-        }
+        WorkerCallError::Client(error) => pre_dispatch_reply(
+            provider,
+            call,
+            client_terminal_code(error),
+            client_diagnostic(error),
+        ),
     }
 }
 
@@ -2636,13 +2632,11 @@ fn worker_receipt(operation: ProviderOperation, reply: &Reply) -> String {
         ProviderOperation::DeleteBySource
             | ProviderOperation::Maintenance
             | ProviderOperation::SnapshotRestore
-    ) {
-        if let Some(basis) = payload.get("_retained_receipt").cloned() {
-            if let Some(original_generation) = basis["generation"].as_u64() {
-                generation = original_generation;
-                payload = basis["payload"].clone();
-            }
-        }
+    ) && let Some(basis) = payload.get("_retained_receipt").cloned()
+        && let Some(original_generation) = basis["generation"].as_u64()
+    {
+        generation = original_generation;
+        payload = basis["payload"].clone();
     }
     if let Some(object) = payload.as_object_mut() {
         object.remove("replayed");

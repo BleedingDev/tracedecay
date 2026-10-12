@@ -4,7 +4,6 @@
 //! authority, a replacement scope, or a provider common request header.
 
 use std::future::Future;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -19,13 +18,10 @@ use tracedecay_contracts::{
     RetainedSurfaceExecutionErrorV1, RetainedSurfaceExecutionFutureV1,
 };
 use tracedecay_domain::{ManifestDigest, ProjectId, UserProfileId, canonical_json_bytes};
-use tracedecay_global_db::RegisteredGlobalDbLeaseV1;
 use tracedecay_memory_provider_registry::{
     GrantedHistorySource, HistoryGrant, LifecycleTarget, LifecycleTargetReference,
-    OperationControl, OwnedProviderId, ProjectMemoryProviderComposition, ProviderOperation,
-    TerminalCode,
+    OperationControl, OwnedProviderId, ProviderOperation, TerminalCode,
 };
-use tracedecay_runtime_core::db::Database;
 
 use super::cognitive_recall::{
     RecallAdmissionLedgerV1,
@@ -60,15 +56,11 @@ pub(super) type ControlResult<T> = Result<T, ControlFailureV1>;
 /// Actual mounted project authorities, assembled once during full project open.
 pub(crate) struct ProviderControlMountInputsV1 {
     pub(crate) authority: Option<Arc<ProviderControlAuthorityV1>>,
-    pub(crate) composition: Arc<ProjectMemoryProviderComposition>,
     pub(crate) journeys: Vec<Arc<ProjectObservationJourneyV1>>,
     pub(crate) profile_id: UserProfileId,
     pub(crate) mounted_scope: ResolvedScope,
     pub(crate) authoritative_project_id: ProjectId,
-    pub(crate) project_root: PathBuf,
     pub(crate) configuration_digest: ManifestDigest,
-    pub(crate) canonical_session_db: RegisteredGlobalDbLeaseV1,
-    pub(crate) canonical_dispositions: Arc<Database>,
 }
 
 pub(super) struct ProjectProviderControlPortV1 {
@@ -81,7 +73,7 @@ pub(crate) fn project_provider_control_port(
     Arc::new(ProjectProviderControlPortV1 { inputs })
 }
 
-/// Provider-only attempts get a UUIDv7. Durable source commands instead pass
+/// Provider-only attempts get a `UUIDv7`. Durable source commands instead pass
 /// their accepted command identity unchanged into dispatch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ControlOperationIdentityV1 {
@@ -96,8 +88,8 @@ pub(super) struct CompletedProviderControlV1 {
 }
 
 pub(super) struct ControlFailureV1 {
-    pub(super) stage: ControlFailureStageV1,
-    pub(super) host_receipt: Option<EffectReceipt>,
+    pub(super) stage: Box<ControlFailureStageV1>,
+    pub(super) host_receipt: Option<Box<EffectReceipt>>,
 }
 
 /// Preserve post-contact evidence until the outer outcome owner interprets it.
@@ -144,7 +136,7 @@ pub(super) enum ControlFailureStageV1 {
 
 impl std::fmt::Debug for ControlFailureV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stage = match &self.stage {
+        let stage = match self.stage.as_ref() {
             ControlFailureStageV1::Request(_) => "request",
             ControlFailureStageV1::Attribution(_) => "attribution",
             ControlFailureStageV1::Authority(_) => "authority",
@@ -159,9 +151,27 @@ impl std::fmt::Debug for ControlFailureV1 {
             ControlFailureStageV1::PortabilityArtifact { .. } => "portability_artifact",
             ControlFailureStageV1::Projection { .. } => "projection",
         };
-        formatter
-            .debug_struct("ControlFailureV1")
-            .field("stage", &stage)
+        let mut debug = formatter.debug_struct("ControlFailureV1");
+        debug.field("stage", &stage);
+        match self.stage.as_ref() {
+            ControlFailureStageV1::InvalidBinding(detail)
+            | ControlFailureStageV1::MissingAuthority(detail)
+            | ControlFailureStageV1::BlockingRead(detail)
+            | ControlFailureStageV1::HostIntentUnknown { detail, .. } => {
+                debug.field("detail", detail);
+            }
+            ControlFailureStageV1::Offline { reason, .. } => {
+                debug.field("reason", reason);
+            }
+            ControlFailureStageV1::Projection { field, .. } => {
+                debug.field("field", field);
+            }
+            ControlFailureStageV1::PortabilityArtifact { error, .. } => {
+                debug.field("artifact_error", error);
+            }
+            _ => {}
+        }
+        debug
             .field("has_host_receipt", &self.host_receipt.is_some())
             .finish()
     }
@@ -170,14 +180,9 @@ impl std::fmt::Debug for ControlFailureV1 {
 impl ControlFailureV1 {
     pub(super) fn new(stage: ControlFailureStageV1) -> Self {
         Self {
-            stage,
+            stage: Box::new(stage),
             host_receipt: None,
         }
-    }
-
-    pub(super) fn with_host_receipt(mut self, receipt: EffectReceipt) -> Self {
-        self.host_receipt = Some(receipt);
-        self
     }
 }
 
@@ -219,7 +224,7 @@ impl AuthorizedControlSourceV1 {
         Ok(source)
     }
 
-    pub(super) fn projection_evidence<'a>(
+    fn projection_evidence<'a>(
         &'a self,
         selector: &'a ProviderControlSourceSelectorV1,
     ) -> ControlResult<projection::ResolvedControlSourceV1<'a>> {
@@ -241,7 +246,7 @@ enum ControlStopCauseV1 {
 }
 
 /// One authenticated request's controls. The monotonic deadline is fixed once;
-/// every clone of OperationControl shares the original elapsed budget and token.
+/// every clone of `OperationControl` shares the original elapsed budget and token.
 pub(super) struct ControlInvocationV1<'a, 'context> {
     pub(super) context: &'a RetainedSurfaceExecutionContextV1<'context>,
     pub(super) request: &'a ProviderControlRequestV1,
@@ -337,38 +342,36 @@ impl<'a, 'context> ControlInvocationV1<'a, 'context> {
     }
 
     fn normalize_control_refusal<T>(&self, result: ControlResult<T>) -> ControlResult<T> {
+        result.map_err(|failure| self.normalize_control_failure(failure))
+    }
+
+    fn normalize_control_failure(&self, mut failure: ControlFailureV1) -> ControlFailureV1 {
         if self.stop_cause.load(Ordering::Acquire) != ControlStopCauseV1::Deadline as u8 {
-            return result;
+            return failure;
         }
-        result.map_err(|mut failure| {
-            // OperationControl checks its cancellation token first. A host
-            // deadline uses that token to stop work, but remains a timeout.
-            // Change only explicit control refusals, preserving all receipts,
-            // actual provider replies, and possible post-contact effects.
-            let code = match &mut failure.stage {
-                ControlFailureStageV1::Control(code)
-                | ControlFailureStageV1::Attribution(RecallControlAttributionErrorV1::Control(
-                    code,
-                ))
-                | ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(code)) => {
-                    Some(code)
-                }
-                ControlFailureStageV1::Dispatch {
-                    error:
-                        JourneyControlDispatchErrorV1::NotDispatched(
-                            JourneyControlNotDispatchedV1::Control(code),
-                        ),
-                    ..
-                } => Some(code),
-                _ => None,
-            };
-            if let Some(code) = code {
-                if *code == TerminalCode::Cancelled {
-                    *code = TerminalCode::DeadlineExceeded;
-                }
-            }
-            failure
-        })
+        // OperationControl checks its cancellation token first. A host
+        // deadline uses that token to stop work, but remains a timeout.
+        // Change only explicit control refusals, preserving all receipts,
+        // actual provider replies, and possible post-contact effects.
+        let code = match failure.stage.as_mut() {
+            ControlFailureStageV1::Control(code)
+            | ControlFailureStageV1::Attribution(RecallControlAttributionErrorV1::Control(code))
+            | ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(code)) => Some(code),
+            ControlFailureStageV1::Dispatch {
+                error:
+                    JourneyControlDispatchErrorV1::NotDispatched(
+                        JourneyControlNotDispatchedV1::Control(code),
+                    ),
+                ..
+            } => Some(code),
+            _ => None,
+        };
+        if let Some(code) = code
+            && *code == TerminalCode::Cancelled
+        {
+            *code = TerminalCode::DeadlineExceeded;
+        }
+        failure
     }
 
     pub(super) fn check(&self) -> ControlResult<()> {
@@ -686,13 +689,10 @@ impl ProjectProviderControlPortV1 {
             .await?;
         let granted = source.granted_source()?;
         validate_source_grant_binding(&source)?;
-        let current_scope = self
-            .authority()?
-            .current_destination_scope(
-                granted.attribution.source.canonical_provider_id.as_str(),
-                &invocation.control,
-            )
-            .await?;
+        let current_scope = self.authority()?.current_destination_scope(
+            granted.attribution.source.canonical_provider_id.as_str(),
+            &invocation.control,
+        )?;
         if current_scope != source.authorized.grant.destination_scope {
             return Err(ControlFailureV1::new(
                 ControlFailureStageV1::InvalidBinding("current source delivery scope"),
@@ -708,19 +708,6 @@ impl ProjectProviderControlPortV1 {
         source: &AuthorizedControlSourceV1,
     ) -> ControlResult<()> {
         require_same_producer_scope(&expected.retained, &source.authorized.retained.scope)
-    }
-
-    pub(super) fn unavailable_for(
-        &self,
-        invocation: &ControlInvocationV1<'_, '_>,
-        state: &ResolvedControlStateV1,
-        reason: &'static str,
-    ) -> ControlFailureV1 {
-        ControlFailureV1::new(ControlFailureStageV1::Offline {
-            state: state.retained.clone(),
-            identity: invocation.identity.clone(),
-            reason,
-        })
     }
 
     pub(super) async fn dispatch(
@@ -754,7 +741,7 @@ impl ProjectProviderControlPortV1 {
         history_grant: Option<HistoryGrant>,
     ) -> ControlResult<JourneyControlDispatchReplyV1> {
         self.validate_invocation(invocation)?;
-        let Some(journey) = state.journey.as_ref().cloned() else {
+        let Some(journey) = state.journey.clone() else {
             return Err(ControlFailureV1::new(ControlFailureStageV1::Offline {
                 state: state.retained.clone(),
                 identity: identity.clone(),
@@ -803,7 +790,7 @@ impl ProjectProviderControlPortV1 {
             .await
     }
 
-    pub(super) fn project(
+    fn project(
         &self,
         invocation: &ControlInvocationV1<'_, '_>,
         dispatched: JourneyControlDispatchReplyV1,
@@ -1146,6 +1133,10 @@ mod tests {
             entered_tx.send(()).unwrap();
             settle_rx.await.unwrap();
             assert!(invocation.control.cancellation().is_cancelled());
+            assert_eq!(
+                invocation.control.snapshot().unwrap_err(),
+                TerminalCode::Cancelled
+            );
             Ok("actual settled result")
         });
         let cancel = async {
@@ -1165,13 +1156,10 @@ mod tests {
             )),
         ));
         assert!(matches!(
-            refusal,
-            Err(ControlFailureV1 {
-                stage: ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
-                    TerminalCode::Cancelled
-                )),
-                ..
-            })
+            *refusal.unwrap_err().stage,
+            ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
+                TerminalCode::Cancelled
+            ))
         ));
     }
 
@@ -1201,7 +1189,7 @@ mod tests {
                 settle_rx.await.unwrap();
                 assert_eq!(
                     invocation.control.snapshot().unwrap_err(),
-                    TerminalCode::Cancelled
+                    TerminalCode::DeadlineExceeded
                 );
                 settled.store(true, Ordering::Release);
                 if refuse {
@@ -1228,23 +1216,17 @@ mod tests {
             assert!(settled.load(Ordering::Acquire));
             if refuse {
                 assert!(matches!(
-                    result,
-                    Err(ControlFailureV1 {
-                        stage: ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
-                            TerminalCode::DeadlineExceeded
-                        )),
-                        ..
-                    })
+                    *result.unwrap_err().stage,
+                    ControlFailureStageV1::Authority(ProviderHistoryErrorV1::Control(
+                        TerminalCode::DeadlineExceeded
+                    ))
                 ));
             } else {
                 assert_eq!(result.unwrap(), "actual settled result");
             }
             assert!(matches!(
-                invocation.check(),
-                Err(ControlFailureV1 {
-                    stage: ControlFailureStageV1::Control(TerminalCode::DeadlineExceeded),
-                    ..
-                })
+                *invocation.check().unwrap_err().stage,
+                ControlFailureStageV1::Control(TerminalCode::DeadlineExceeded)
             ));
         }
     }
@@ -1264,13 +1246,11 @@ mod tests {
             observed_at: tracedecay_contracts::now_micros(),
         };
         assert!(matches!(
-            ControlInvocationV1::new(&context, &request),
-            Err(ControlFailureV1 {
-                stage: ControlFailureStageV1::InvalidBinding(
-                    "admitted grant and cancellation identity"
-                ),
-                ..
-            })
+            *ControlInvocationV1::new(&context, &request)
+                .err()
+                .unwrap()
+                .stage,
+            ControlFailureStageV1::InvalidBinding("admitted grant and cancellation identity")
         ));
     }
 }

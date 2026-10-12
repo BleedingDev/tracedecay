@@ -380,7 +380,7 @@ fn enabled_mode_injects_native_with_configured_revision_mode_and_limits()
             (mode == EnabledProviderMode::Active).then_some(NATIVE_PROVIDER_ID)
         );
         assert_eq!(
-            is_mountable_active_provider(&registry, NATIVE_PROVIDER_ID),
+            is_mountable_active_provider(registry, NATIVE_PROVIDER_ID),
             mode == EnabledProviderMode::Active
         );
         assert!(port.descriptor_calls.load(Ordering::Relaxed) >= 2);

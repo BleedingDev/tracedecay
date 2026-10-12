@@ -67,6 +67,7 @@ pub(crate) enum FeedbackAssertionPublicationV1 {
 pub(crate) enum HostSourceCommandErrorV1 {
     #[error("invalid host source command: {0}")]
     Invalid(&'static str),
+    #[cfg(test)]
     #[error("retained host source command is missing")]
     Missing,
     #[error("source command request identity is already bound to a different command")]
@@ -107,6 +108,7 @@ impl AcceptedFeedbackAssertionV1 {
         &self.0.idempotency_key
     }
 
+    #[cfg(test)]
     pub(crate) fn accepted_at(&self) -> UtcMicros {
         self.0.accepted_at
     }
@@ -143,7 +145,7 @@ struct FeedbackAssertionBindingV1 {
 
 /// A source target's original scope and source are retained in full in
 /// `original_attribution`, after exact equality is checked against the resolved
-/// LifecycleTarget. The delivery scope remains separate. The historical
+/// `LifecycleTarget`. The delivery scope remains separate. The historical
 /// `stable_memory_ref` field carries either a stable provider reference or an
 /// opaque retained locator; `reference_kind` is omitted for legacy/stable
 /// records so their durable bytes remain unchanged.
@@ -489,7 +491,7 @@ impl StoredSourceCommandV1 {
 
 impl RecallAdmissionLedgerV1 {
     /// Execute on the controller's existing blocking pool using its original
-    /// live OperationControl, after current source/target authorization.
+    /// live `OperationControl`, after current source/target authorization.
     pub(crate) fn accept_feedback_assertion(
         &self,
         context: &RequestContext,
@@ -540,6 +542,7 @@ impl RecallAdmissionLedgerV1 {
         )?)
     }
 
+    #[cfg(test)]
     pub(crate) fn retained_feedback_assertion(
         &self,
         context: &RequestContext,
@@ -552,6 +555,7 @@ impl RecallAdmissionLedgerV1 {
         )?)
     }
 
+    #[cfg(test)]
     pub(crate) fn retained_deletion_command(
         &self,
         context: &RequestContext,
@@ -564,6 +568,7 @@ impl RecallAdmissionLedgerV1 {
         )?)
     }
 
+    #[cfg(test)]
     fn retained_source_command(
         &self,
         context: &RequestContext,
@@ -754,7 +759,7 @@ pub(super) fn check_quota(
 /// expansion before deriving a raw provider-payload budget.
 ///
 /// The caller holds the root admission lock throughout calculation/publication,
-/// or reacquires it and calls check_quota with the final encoded length before
+/// or reacquires it and calls `check_quota` with the final encoded length before
 /// publication. This is the same bounded quota scan, not a cached reservation.
 pub(super) fn available_artifact_bytes(
     root: &Path,
@@ -1472,7 +1477,8 @@ mod tests {
         let accepted = accept(&root, original.clone()).unwrap();
         let path = receipt_path(&root, &original.lookup_key().unwrap());
         let retained = std::fs::read(&path).unwrap();
-        let edits: Vec<Box<dyn Fn(&mut FeedbackAssertionBindingV1)>> = vec![
+        type FeedbackEdit = Box<dyn Fn(&mut FeedbackAssertionBindingV1)>;
+        let edits: Vec<FeedbackEdit> = vec![
             Box::new(|b| b.request.signal = ProviderControlFeedbackSignalV1::Harmful),
             Box::new(|b| b.request.weight = "1".to_owned()),
             Box::new(|b| b.request.evidence_refs.push("evidence.task.2".to_owned())),
@@ -1484,7 +1490,7 @@ mod tests {
             Box::new(|b| b.target.stable_memory_ref = "memory.other".to_owned()),
             Box::new(|b| b.target.original_attribution.source_sequence += 1),
             Box::new(|b| {
-                b.target.original_attribution.ingested_at = timestamp(1_700_000_001_000_000_457)
+                b.target.original_attribution.ingested_at = timestamp(1_700_000_001_000_000_457);
             }),
         ];
         for edit in edits {
@@ -1808,9 +1814,8 @@ mod tests {
         );
         // This unit test exercises the receipt gate, not the controller's real
         // dispatch integration; that integration must use this same and_then gate.
-        let gated = stopped.map(|accepted| {
+        let gated = stopped.inspect(|_| {
             dispatched.fetch_add(1, Ordering::SeqCst);
-            accepted
         });
         assert!(gated.is_err());
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
@@ -2101,11 +2106,12 @@ mod tests {
         let root = temporary.path().join(ROOT_NAME);
         let original = deletion_binding();
         let accepted = accept_deletion(&root, original.clone()).unwrap();
-        let changes: Vec<Box<dyn Fn(&mut DeletionCommandBindingV1)>> = vec![
+        type DeletionEdit = Box<dyn Fn(&mut DeletionCommandBindingV1)>;
+        let changes: Vec<DeletionEdit> = vec![
             Box::new(|command| command.request.expected_fence_revision += 1),
             Box::new(|command| command.request.include_snapshots = false),
             Box::new(|command| {
-                command.request.mode = tracedecay_contracts::retained_surfaces::ProviderControlDeletionModeV1::RemoveInfluence
+                command.request.mode = tracedecay_contracts::retained_surfaces::ProviderControlDeletionModeV1::RemoveInfluence;
             }),
             Box::new(|command| command.target.stable_memory_ref = "memory.another".to_owned()),
             Box::new(|command| command.target.original_attribution.source_sequence += 1),
@@ -2256,7 +2262,7 @@ mod tests {
             Err(HostSourceCommandErrorV1::Control(TerminalCode::Cancelled))
         ));
         assert_eq!(
-            std::fs::read(&root.join(".orphan-stage.tmp")).unwrap(),
+            std::fs::read(root.join(".orphan-stage.tmp")).unwrap(),
             vec![1; 17]
         );
     }

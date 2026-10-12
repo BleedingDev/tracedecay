@@ -19,7 +19,9 @@ use tracedecay_tool_catalog::{
     ScopeDimension,
 };
 #[cfg(test)]
-use tracedecay_tool_catalog::{BindingSurface, CapabilityManifestV1, CatalogContributionV1};
+use tracedecay_tool_catalog::{
+    BindingSurface, CapabilityManifestV1, CatalogContributionV1, SurfaceBindingV1,
+};
 
 use crate::McpCatalogError;
 use crate::ToolDefinition;
@@ -567,7 +569,7 @@ fn retained_capability_for_operation(
             binding.surface() == BindingSurface::Mcp
                 && binding.operation().as_str() == operation.as_str()
         })
-        .map(|binding| binding.capability_id())?;
+        .map(SurfaceBindingV1::capability_id)?;
     contribution
         .capabilities()
         .iter()

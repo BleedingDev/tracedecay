@@ -49,7 +49,7 @@ impl RecallLocatorKeyV1 {
         Ok(Self(Arc::new(Zeroizing::new(material))))
     }
 
-    #[cfg(any(test, feature = "test-helpers"))]
+    #[cfg(test)]
     pub(crate) fn for_test() -> Self {
         Self::from_material(vec![0xA5; 32]).expect("fixed recall locator test key")
     }
@@ -276,7 +276,7 @@ impl PreparedRecallControlMetadataV1 {
                 &trace.request_id,
                 &trace.provider_id,
                 trace.registration_revision,
-            )
+            )?
         {
             return Err(invalid("trace identity"));
         }
@@ -302,7 +302,7 @@ impl PreparedRecallControlMetadataV1 {
             &trace.provider_id,
             trace.registration_revision,
             delivery_scope_json.as_bytes(),
-        );
+        )?;
         let mut rows = BTreeMap::new();
         let mut candidates = BTreeSet::new();
         for (rank, item) in trace.items.iter().enumerate() {
@@ -374,7 +374,7 @@ impl PreparedRecallControlMetadataV1 {
             trace.registration_revision,
             &delivery_scope_json,
             &metadata_mac_rows(&rows),
-        );
+        )?;
         Ok(Self {
             trace_ref,
             delivery_scope_json,
@@ -428,27 +428,25 @@ impl PreparedRecallControlMetadataV1 {
         scope_sha256: &str,
         trace: &RecallExplainTraceV1,
         locator_key: &RecallLocatorKeyV1,
-    ) -> bool {
+    ) -> Result<bool> {
         if self.trace_ref.exact_scope_sha256 != scope_sha256
             || self.trace_ref.trace_id != trace.trace_id
         {
-            return false;
+            return Ok(false);
         }
         if trace.requested_count != trace.items.len()
             || trace.registration_revision == 0
             || trace.registration_revision > i64::MAX as u64
         {
-            return false;
+            return Ok(false);
         }
-        let Ok(scope) = decode_scope_envelope(
+        let scope = decode_scope_envelope(
             &self.delivery_scope_json,
             &trace.provider_id,
             trace.registration_revision,
-        ) else {
-            return false;
-        };
+        )?;
         if scope.exact_scope_sha256() != self.trace_ref.exact_scope_sha256 {
-            return false;
+            return Ok(false);
         }
         if self.scope_binding_mac
             != retained_scope_binding_mac(
@@ -458,9 +456,9 @@ impl PreparedRecallControlMetadataV1 {
                 &trace.provider_id,
                 trace.registration_revision,
                 self.delivery_scope_json.as_bytes(),
-            )
+            )?
         {
-            return false;
+            return Ok(false);
         }
         let mut candidates = BTreeSet::new();
         for (rank, item) in trace.items.iter().enumerate() {
@@ -468,7 +466,7 @@ impl PreparedRecallControlMetadataV1 {
                 || item.stage != item.host_decision.stage()
                 || !candidates.insert(item.candidate_id.as_str())
             {
-                return false;
+                return Ok(false);
             }
             let Some(row) = self.rows.get(&rank) else {
                 if eligible_stage(item.stage) {
@@ -479,17 +477,14 @@ impl PreparedRecallControlMetadataV1 {
                 }
                 continue;
             };
-            if row.candidate_id != item.candidate_id
-                || !eligible_stage(item.stage)
-                || row.binding.validated(None).is_err()
-                || serde_json::to_string(&row.binding.original_sources)
-                    .ok()
-                    .as_deref()
-                    != Some(row.original_sources_json.as_str())
-            {
-                return false;
+            if row.candidate_id != item.candidate_id || !eligible_stage(item.stage) {
+                return Ok(false);
             }
-            let Ok(expected_mac) = binding_mac(
+            row.binding.validated(None)?;
+            if serde_json::to_string(&row.binding.original_sources)? != row.original_sources_json {
+                return Ok(false);
+            }
+            let expected_mac = binding_mac(
                 locator_key,
                 &trace.provider_id,
                 trace.registration_revision,
@@ -497,11 +492,9 @@ impl PreparedRecallControlMetadataV1 {
                 rank,
                 &row.candidate_id,
                 &row.binding,
-            ) else {
-                return false;
-            };
+            )?;
             if expected_mac != row.control_binding_mac {
-                return false;
+                return Ok(false);
             }
         }
         if self.rows.keys().any(|rank| {
@@ -510,21 +503,19 @@ impl PreparedRecallControlMetadataV1 {
                 .get(*rank)
                 .is_none_or(|item| !eligible_stage(item.stage))
         }) {
-            return false;
+            return Ok(false);
         }
-        let Ok(bytes) = serde_json::to_vec(&(
+        let bytes = serde_json::to_vec(&(
             "recall-control-metadata-v1",
             &trace.provider_id,
             trace.registration_revision,
             &self.delivery_scope_json,
             &self.rows,
-        )) else {
-            return false;
-        };
+        ))?;
         if tracedecay_domain::canonical_text::sha256_hex(&bytes) != self.metadata_sha256 {
-            return false;
+            return Ok(false);
         }
-        self.control_metadata_mac
+        Ok(self.control_metadata_mac
             == retained_control_metadata_mac_from_parts(
                 locator_key,
                 &self.trace_ref.exact_scope_sha256,
@@ -533,7 +524,7 @@ impl PreparedRecallControlMetadataV1 {
                 trace.registration_revision,
                 &self.delivery_scope_json,
                 &metadata_mac_rows(&self.rows),
-            )
+            )?)
     }
 }
 
@@ -843,7 +834,7 @@ fn validate_retained_control_items_on_connection(
             provider_rank,
             &candidate_id,
             &item_bytes,
-        );
+        )?;
         if expected_item_mac != item_mac {
             return Err(invalid("retained item mac"));
         }
@@ -921,7 +912,7 @@ fn validate_retained_control_items_on_connection(
         scope.registration_revision,
         &delivery_scope_json,
         &metadata_rows,
-    ) != control_metadata_mac
+    )? != control_metadata_mac
     {
         return Err(invalid("retained control metadata mac"));
     }
@@ -967,7 +958,7 @@ fn validate_retained_trace_identity_on_connection(
         &request_id,
         &provider_id,
         registration_revision,
-    );
+    )?;
     if expected != trace.trace_id() {
         return Err(invalid("retained trace identity"));
     }
@@ -1008,7 +999,7 @@ fn decode_scope(
         provider_id.as_str(),
         registration_revision,
         scope_json.as_bytes(),
-    );
+    )?;
     if expected_scope_binding_mac != scope_binding_mac {
         return Err(invalid("retained scope binding mac"));
     }
@@ -1091,7 +1082,7 @@ fn decode_source(
         provider_rank,
         &candidate_id,
         &serde_json::to_vec(&item_value)?,
-    );
+    )?;
     if expected_item_mac != item_mac {
         return Err(invalid("retained item mac"));
     }
@@ -1186,11 +1177,11 @@ fn binding_mac(
         candidate_id,
         binding,
     ))?;
-    Ok(hmac_hex(
+    hmac_hex(
         locator_key,
         b"tracedecay.recall-control-binding-mac.v1",
         &[&bytes],
-    ))
+    )
 }
 
 /// Redacts all provider/source locators before control metadata can enter the
@@ -1235,25 +1226,6 @@ fn redact_control_binding(
         stable_memory_ref,
         original_sources,
     })
-}
-
-#[cfg(test)]
-pub(crate) fn redact_retained_source_attribution(
-    trace: &RecallControlTraceRefV1,
-    registration_revision: u64,
-    provider_rank: usize,
-    candidate_id: &str,
-    source: &RecallSourceAttributionV1,
-) -> Result<RecallSourceAttributionV1> {
-    redact_retained_source_attribution_with_key(
-        &RecallLocatorKeyV1::for_test(),
-        "tracedecay.native",
-        trace,
-        registration_revision,
-        provider_rank,
-        candidate_id,
-        source,
-    )
 }
 
 pub(crate) fn redact_retained_source_attribution_with_key(
@@ -1430,7 +1402,7 @@ fn opaque_control_digest(
 ) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
     let rank = (provider_rank as u64).to_be_bytes();
-    Ok(hmac_hex(
+    hmac_hex(
         locator_key,
         b"tracedecay.recall-control-opaque-locator.v2",
         &[
@@ -1443,17 +1415,17 @@ fn opaque_control_digest(
             field.as_bytes(),
             value.as_bytes(),
         ],
-    ))
+    )
 }
 
-fn hmac_hex(locator_key: &RecallLocatorKeyV1, domain: &[u8], fields: &[&[u8]]) -> String {
+fn hmac_hex(locator_key: &RecallLocatorKeyV1, domain: &[u8], fields: &[&[u8]]) -> Result<String> {
     let mut mac = Hmac::<Sha256>::new_from_slice(locator_key.bytes())
-        .expect("RecallLocatorKeyV1 validates the HMAC key length");
+        .map_err(|_| invalid("recall locator HMAC key"))?;
     update_length_delimited(&mut mac, domain);
     for field in fields {
         update_length_delimited(&mut mac, field);
     }
-    hex::encode(mac.finalize().into_bytes())
+    Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 /// Keyed commitment over bytes retained in the explain ledger. Every
@@ -1467,7 +1439,7 @@ pub(crate) fn retained_trace_bytes_mac(
     provider_id: &str,
     registration_revision: u64,
     trace_bytes: &[u8],
-) -> String {
+) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
     hmac_hex(
         locator_key,
@@ -1491,7 +1463,7 @@ pub(crate) fn retained_item_bytes_mac(
     provider_rank: usize,
     candidate_id: &str,
     item_bytes: &[u8],
-) -> String {
+) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
     let rank = (provider_rank as u64).to_be_bytes();
     hmac_hex(
@@ -1516,7 +1488,7 @@ pub(crate) fn retained_scope_binding_mac(
     provider_id: &str,
     registration_revision: u64,
     scope_bytes: &[u8],
-) -> String {
+) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
     hmac_hex(
         locator_key,
@@ -1539,7 +1511,7 @@ pub(crate) fn retained_control_metadata_mac_from_parts(
     registration_revision: u64,
     delivery_scope_json: &str,
     rows: &BTreeMap<usize, (String, String, String, String)>,
-) -> String {
+) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
     let bytes = serde_json::to_vec(&(
         "recall-control-metadata-mac-v1",
@@ -1549,8 +1521,7 @@ pub(crate) fn retained_control_metadata_mac_from_parts(
         trace_id,
         delivery_scope_json,
         rows,
-    ))
-    .expect("retained control metadata uses bounded serializable fields");
+    ))?;
     hmac_hex(
         locator_key,
         b"tracedecay.retained-recall-control-metadata.v1",
@@ -1639,8 +1610,7 @@ pub(crate) fn validate_opaque_retained_source(source: &RecallSourceAttributionV1
         exact_scope_identity,
         authority_ref,
     } = &source.origin_scope
-    {
-        if !is_opaque_locator(
+        && (!is_opaque_locator(
             &exact_scope_identity.profile_id,
             RETAINED_SOURCE_LOCATOR_PREFIX,
         ) || !is_opaque_locator(
@@ -1662,10 +1632,9 @@ pub(crate) fn validate_opaque_retained_source(source: &RecallSourceAttributionV1
             .resolved_scope_digest
             .strip_prefix("sha256:")
             .is_some_and(is_opaque_digest)
-            || !is_opaque_locator(authority_ref, RETAINED_SOURCE_LOCATOR_PREFIX)
-        {
-            return Err(invalid("retained source scope is not opaque"));
-        }
+            || !is_opaque_locator(authority_ref, RETAINED_SOURCE_LOCATOR_PREFIX))
+    {
+        return Err(invalid("retained source scope is not opaque"));
     }
     Ok(())
 }
@@ -1814,7 +1783,7 @@ pub(crate) fn retained_trace_id_with_key(
     request_id: &str,
     provider_id: &str,
     registration_revision: u64,
-) -> String {
+) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
     hmac_hex(
         locator_key,
@@ -1838,9 +1807,9 @@ pub(crate) fn retained_candidate_identity_alias_for_context(
     provider_id: &str,
     registration_revision: u64,
     candidate_id: &str,
-) -> String {
+) -> Result<String> {
     let revision = registration_revision.to_be_bytes();
-    format!(
+    Ok(format!(
         "{RETAINED_CANDIDATE_ID_PREFIX}{}",
         hmac_hex(
             locator_key,
@@ -1852,15 +1821,15 @@ pub(crate) fn retained_candidate_identity_alias_for_context(
                 &revision,
                 candidate_id.as_bytes(),
             ],
-        )
-    )
+        )?
+    ))
 }
 
 pub(crate) fn retained_candidate_identity_alias_for_report(
     report: &tracedecay_memory_provider_registry::RecallAdmissionReport,
     locator_key: &RecallLocatorKeyV1,
     candidate_id: &str,
-) -> String {
+) -> Result<String> {
     let provider_id = report.provider_id.as_deref().unwrap_or("provider.unknown");
     retained_candidate_identity_alias_for_context(
         locator_key,
@@ -1877,7 +1846,7 @@ pub(crate) fn retained_candidate_identity_alias_for_report(
 pub(crate) fn retained_candidate_identity_aliases_for_report(
     report: &tracedecay_memory_provider_registry::RecallAdmissionReport,
     locator_key: &RecallLocatorKeyV1,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>> {
     let raw_ids = report
         .received_candidate_ids
         .iter()
@@ -1886,7 +1855,7 @@ pub(crate) fn retained_candidate_identity_aliases_for_report(
     let mut retained_ids = BTreeSet::new();
     let mut aliases = BTreeMap::new();
     for candidate_id in &report.received_candidate_ids {
-        let base = retained_candidate_identity_alias_for_report(report, locator_key, candidate_id);
+        let base = retained_candidate_identity_alias_for_report(report, locator_key, candidate_id)?;
         let mut retained = base.clone();
         let mut suffix = 0usize;
         while raw_ids.contains(retained.as_str()) || retained_ids.contains(retained.as_str()) {
@@ -1896,7 +1865,7 @@ pub(crate) fn retained_candidate_identity_aliases_for_report(
         retained_ids.insert(retained.clone());
         aliases.insert(candidate_id.clone(), retained);
     }
-    aliases
+    Ok(aliases)
 }
 
 /// Opaque stable reference retained alongside an admission denial. This uses
@@ -1907,10 +1876,10 @@ pub(crate) fn opaque_denial_stable_memory_ref(
     locator_key: &RecallLocatorKeyV1,
     retained_candidate_id: &str,
     stable_memory_ref: &str,
-) -> String {
+) -> Result<String> {
     let provider_id = report.provider_id.as_deref().unwrap_or("provider.unknown");
     let revision = report.registration_revision.unwrap_or(0).to_be_bytes();
-    format!(
+    Ok(format!(
         "{RETAINED_MEMORY_REF_PREFIX}{}",
         hmac_hex(
             locator_key,
@@ -1924,8 +1893,8 @@ pub(crate) fn opaque_denial_stable_memory_ref(
                 b"stable_memory_ref",
                 stable_memory_ref.as_bytes(),
             ],
-        )
-    )
+        )?
+    ))
 }
 
 /// Retained candidate ids must already be host projections. A missing alias is
@@ -2030,6 +1999,7 @@ mod tests {
             7,
             candidate_id,
         )
+        .unwrap()
     }
 
     fn trace() -> RecallExplainTraceV1 {
@@ -2041,7 +2011,8 @@ mod tests {
                 "request.test",
                 "tracedecay.native",
                 7,
-            ),
+            )
+            .unwrap(),
             request_id: "request.test".to_owned(),
             provider_id: "tracedecay.native".to_owned(),
             registration_revision: 7,
@@ -2169,11 +2140,11 @@ mod tests {
         assert!(
             PreparedRecallControlMetadataV1::prepare(&malformed, &scope(), &bindings()).is_err()
         );
-        assert!(!metadata.matches_trace(
-            &"f".repeat(64),
-            &trace(),
-            &RecallLocatorKeyV1::for_test(),
-        ));
+        assert!(
+            !metadata
+                .matches_trace(&"f".repeat(64), &trace(), &RecallLocatorKeyV1::for_test(),)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2186,7 +2157,8 @@ mod tests {
             "request.secret-looking-id",
             "provider.native",
             7,
-        );
+        )
+        .unwrap();
         assert_eq!(first.len(), 64);
         assert!(
             first
@@ -2202,10 +2174,12 @@ mod tests {
                 "provider.native",
                 7,
             )
+            .unwrap()
         );
         assert_ne!(
             first,
             retained_trace_id_with_key(&key, &scope, "request.other", "provider.native", 7,)
+                .unwrap()
         );
         assert_ne!(
             first,
@@ -2216,6 +2190,7 @@ mod tests {
                 "provider.native",
                 7,
             )
+            .unwrap()
         );
     }
 
@@ -2315,7 +2290,8 @@ mod tests {
             &second_trace.request_id,
             &second_trace.provider_id,
             second_trace.registration_revision,
-        );
+        )
+        .unwrap();
         let first_metadata =
             PreparedRecallControlMetadataV1::prepare(&first_trace, &first_scope, &bindings())
                 .unwrap();
@@ -2542,7 +2518,8 @@ mod tests {
             &legacy.request_id,
             &legacy.provider_id,
             legacy.registration_revision,
-        );
+        )
+        .unwrap();
         ledger
             .retain_explain_trace(&scope().exact_scope_sha256(), &legacy)
             .unwrap();

@@ -422,7 +422,7 @@ fn deterministic_constructor_produces_unit_keys_and_zero_strength_is_ignored() {
     let first = MemoryCenters::new(config(3), 29).expect("bank initializes");
     let second = MemoryCenters::new(config(3), 29).expect("bank initializes");
     assert_eq!(first.keys, second.keys);
-    for key in first.keys.chunks_exact(2) {
+    for key in first.keys.as_chunks::<2>().0 {
         let norm = (key[0] * key[0] + key[1] * key[1]).sqrt();
         assert!((norm - 1.0).abs() < 1e-6);
     }

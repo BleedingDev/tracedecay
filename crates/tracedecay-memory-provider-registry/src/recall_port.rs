@@ -287,7 +287,7 @@ pub enum CognitiveRecallPortError {
     )]
     DegradationNotAllowed {
         /// Provider identity the host selected or that actually answered.
-        provider: CognitiveRecallProviderIdentity,
+        provider: Box<CognitiveRecallProviderIdentity>,
         /// Typed degradation the port would otherwise have returned.
         degradation: CognitiveRecallDegradation,
         /// Exact configured rule decision that refused the degradation.
@@ -1419,7 +1419,7 @@ impl ProjectCognitiveRecallPortV1 {
             }
             DegradationDecision::Declined(reason) => {
                 Err(CognitiveRecallPortError::DegradationNotAllowed {
-                    provider: provider.clone(),
+                    provider: Box::new(provider.clone()),
                     degradation,
                     reason,
                 })

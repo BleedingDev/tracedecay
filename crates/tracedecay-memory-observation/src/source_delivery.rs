@@ -25,7 +25,7 @@ pub enum SourceDeliveryEvidenceV1 {
         /// Actual durable state; enqueue progress never substitutes for it.
         state: DeliveryStateV1,
         /// Validated latest receipt, absent before an attempt has settled.
-        receipt: Option<ObservationDeliveryReceiptV1>,
+        receipt: Option<Box<ObservationDeliveryReceiptV1>>,
     },
     /// Content was purged; retained delivery metadata cannot authorize its use.
     Purged {

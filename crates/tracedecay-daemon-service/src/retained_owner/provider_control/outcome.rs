@@ -153,7 +153,7 @@ pub(super) fn deletion_intent_receipt(
 }
 
 /// Used only with independently resolved state and an existing operation ID.
-/// No fake ProviderReply or readiness receipt is constructed for offline work.
+/// No fake `ProviderReply` or readiness receipt is constructed for offline work.
 pub(super) fn result_after_failure(
     request: &ProviderControlRequestV1,
     state: &RetainedRecallControlScopeV1,
@@ -227,7 +227,7 @@ fn completed_failure(
         stage,
         host_receipt,
     } = failure;
-    let result = match &stage {
+    let result = match stage.as_ref() {
         ControlFailureStageV1::Offline {
             state, identity, ..
         }
@@ -251,11 +251,11 @@ fn completed_failure(
             };
             result_after_failure(request, &state, &identity, &stage)
         }
-        _ => return Err(pre_dispatch_error(stage)),
+        _ => return Err(pre_dispatch_error(*stage)),
     };
     Ok(CompletedProviderControlV1 {
         result,
-        host_receipt,
+        host_receipt: host_receipt.map(|receipt| *receipt),
     })
 }
 
@@ -278,7 +278,9 @@ fn pre_dispatch_error(stage: ControlFailureStageV1) -> RetainedSurfaceExecutionE
                 RetainedSurfaceExecutionErrorV1::NotFoundOrNotAuthorized
             }
             ProviderHistoryErrorV1::Control(code) => pre_dispatch_control(code),
-            error => RetainedSurfaceExecutionErrorV1::unavailable(error.to_string()),
+            error @ ProviderHistoryErrorV1::Unavailable(_) => {
+                RetainedSurfaceExecutionErrorV1::unavailable(error.to_string())
+            }
         },
         ControlFailureStageV1::Control(code) => pre_dispatch_control(code),
         ControlFailureStageV1::InvalidBinding(_) => {
@@ -512,12 +514,12 @@ fn effect_outcome(
             return Err(invalid_field("host intent effect operation"));
         }
         receipt.validate().map_err(invalid_outcome)?;
-        if let ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result {
-            if deletion.intent.host_receipt != receipt {
-                return Err(invalid_field(
-                    "deletion inner and outer host intent receipts",
-                ));
-            }
+        if let ProviderControlOperationResultV1::DeleteBySource(Some(deletion)) = &result.result
+            && deletion.intent.host_receipt != receipt
+        {
+            return Err(invalid_field(
+                "deletion inner and outer host intent receipts",
+            ));
         }
         receipt
     } else {
@@ -945,19 +947,22 @@ mod tests {
     };
 
     fn state() -> RetainedRecallControlScopeV1 {
+        let mut delivery_scope = OwnedExactScope::new(
+            "profile.control",
+            "project.control",
+            "repository.control",
+            "worktree.control",
+            "refs/heads/main",
+            "session.control",
+            format!("sha256:{}", "f".repeat(64)),
+        )
+        .unwrap();
+        delivery_scope.agent_session_id = projection::scope(&delivery_scope)
+            .agent_session_id_for_canonical_session("session.control");
         RetainedRecallControlScopeV1 {
             provider_id: OwnedProviderId::new("tracedecay.native").unwrap(),
             registration_revision: 7,
-            delivery_scope: OwnedExactScope::new(
-                "profile.control",
-                "project.control",
-                "repository.control",
-                "worktree.control",
-                "refs/heads/main",
-                "session.control",
-                format!("sha256:{}", "f".repeat(64)),
-            )
-            .unwrap(),
+            delivery_scope,
         }
     }
 
@@ -1315,16 +1320,16 @@ mod tests {
     #[test]
     fn partial_maintenance_page_is_surface_with_cursor_until_continuation_finishes() {
         let mut result = unchanged_result();
-        result.terminal = ProviderControlTerminalV1::Partial;
+        result.terminal = ProviderControlTerminalV1::PartialEffect;
         result.effect = ProviderControlEffectV1 {
             state: ProviderControlEffectStateV1::Partial,
-            committed_boundary: Some("item.16".to_owned()),
+            committed_boundary: Some("item.10".to_owned()),
             state_generation_before: Some(5),
             state_generation_after: Some(6),
-            committed_item_refs: vec!["item.16".to_owned()],
-            uncommitted_item_refs: vec!["item.17".to_owned()],
+            committed_item_refs: vec!["item.10".to_owned()],
+            uncommitted_item_refs: vec!["item.11".to_owned()],
             provider_receipt_digest: Some("c".repeat(64)),
-            reconciliation_action: Some("resume_from_item.16".to_owned()),
+            reconciliation_action: Some("resume_from_item.10".to_owned()),
             verification_digest: Some("e".repeat(64)),
             duplicate_of_idempotency_key: None,
             duplicate_of_operation_id: None,
@@ -1332,11 +1337,11 @@ mod tests {
         let ProviderControlOperationResultV1::Maintenance(Some(data)) = &mut result.result else {
             unreachable!()
         };
-        data.scanned_items = 16;
+        data.scanned_items = 10;
         data.changed_items = 1;
         data.state_changed = Some(true);
         data.partial = true;
-        data.resume_cursor = Some("ncm-maintenance:6:compact:17".to_owned());
+        data.resume_cursor = Some("ncm-maintenance:6:compact:11".to_owned());
         data.receipt.state_generation_after = 6;
 
         let output = assembled(result);
@@ -1350,7 +1355,7 @@ mod tests {
         };
         assert_eq!(
             data.resume_cursor.as_deref(),
-            Some("ncm-maintenance:6:compact:17")
+            Some("ncm-maintenance:6:compact:11")
         );
         assert!(data.partial);
 
@@ -1363,7 +1368,7 @@ mod tests {
             committed_boundary: None,
             state_generation_before: Some(5),
             state_generation_after: Some(6),
-            committed_item_refs: vec!["item.17".to_owned()],
+            committed_item_refs: vec!["item.11".to_owned()],
             uncommitted_item_refs: Vec::new(),
             provider_receipt_digest: Some("c".repeat(64)),
             reconciliation_action: None,
@@ -1476,7 +1481,7 @@ mod tests {
                     .cursor
                     .as_ref()
                     .and_then(|cursor| cursor.as_opaque())
-                    .map(|cursor| cursor.as_str()),
+                    .map(tracedecay_contracts::OpaqueCursor::as_str),
                 cursor.as_deref()
             );
             assert_eq!(

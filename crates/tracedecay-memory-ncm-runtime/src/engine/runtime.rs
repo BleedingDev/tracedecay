@@ -434,15 +434,14 @@ impl NcmEngine {
                     handle.fenced = true;
                 }
                 if handle.fenced {
-                    if recover_privacy {
-                        if let Some(resumed) =
+                    if recover_privacy
+                        && let Some(resumed) =
                             crate::privacy::resume_pending_rebuild(&mut handle.store, &self.config)?
-                        {
-                            handle.commit_seq = resumed.meta.commit_seq;
-                            handle.epoch = resumed.meta.epoch;
-                            util::publish(handle, resumed.kernel)?;
-                            handle.fenced = false;
-                        }
+                    {
+                        handle.commit_seq = resumed.meta.commit_seq;
+                        handle.epoch = resumed.meta.epoch;
+                        util::publish(handle, resumed.kernel)?;
+                        handle.fenced = false;
                     }
                     if handle.fenced
                         && handle

@@ -30,6 +30,16 @@ pub struct DeleteRequest {
     pub deadline: Deadline,
 }
 
+/// A source set and its admitted deletion identity and preconditions.
+pub(crate) struct DeleteSourcesRequest<'a> {
+    pub(crate) sources: &'a [SourceId],
+    pub(crate) idempotency_key: &'a str,
+    pub(crate) deadline: Deadline,
+    pub(crate) expected_generation: u64,
+    pub(crate) bindings: Option<&'a [crate::source_binding::DeletionSourceBinding]>,
+    pub(crate) canonical_input: Option<Value>,
+}
+
 /// Deterministic accounting for one sanitized reconstruction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SanitizedReplayReport {
@@ -63,19 +73,21 @@ pub fn delete_by_source(
 pub(crate) fn delete_sources(
     engine: &NcmEngine,
     namespace: &str,
-    sources: &[SourceId],
-    key: &str,
-    deadline: Deadline,
-    expected_generation: u64,
-    bindings: Option<&[crate::source_binding::DeletionSourceBinding]>,
-    canonical_input: Option<Value>,
+    request: DeleteSourcesRequest<'_>,
 ) -> EngineReply {
-    if let Some(bindings) = bindings {
-        if let Err(reason) =
+    let DeleteSourcesRequest {
+        sources,
+        idempotency_key,
+        deadline,
+        expected_generation,
+        bindings,
+        canonical_input,
+    } = request;
+    if let Some(bindings) = bindings
+        && let Err(reason) =
             crate::source_binding::DeletionSourceBinding::validate_set(bindings, sources)
-        {
-            return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0);
-        }
+    {
+        return EngineReply::rejected(RejectReason::InvalidRequest(reason), 0);
     }
     let Some(first) = sources.first() else {
         return EngineReply::rejected(
@@ -96,7 +108,7 @@ pub(crate) fn delete_sources(
         engine,
         namespace,
         DeleteRequest {
-            idempotency_key: key.to_owned(),
+            idempotency_key: idempotency_key.to_owned(),
             source: first.clone(),
             deadline,
         },
@@ -173,15 +185,15 @@ fn delete_sources_inner(
                     Err(reply) => return reply,
                 }
             }
-            if matches!(reply.outcome, Outcome::Success) {
-                if let Err(reply) = validate_completed_deletion_replay(
+            if matches!(reply.outcome, Outcome::Success)
+                && let Err(reply) = validate_completed_deletion_replay(
                     handle,
                     &request.idempotency_key,
                     &payload_sha256,
                     &sources,
-                ) {
-                    return reply;
-                }
+                )
+            {
+                return reply;
             }
             return reply;
         }
@@ -383,15 +395,8 @@ fn delete_sources_inner(
     };
     finish_rebuild(
         handle,
-        request.source,
-        target_epoch,
-        request.idempotency_key,
-        payload_sha256,
-        Some(canonical_input),
+        pending,
         report,
-        deleted_records,
-        persisted_sources,
-        revoked_ids,
         Some(engine),
         request.deadline,
         started,
@@ -428,19 +433,7 @@ pub(crate) fn resume_pending_rebuild(
         return Ok(None);
     };
     let report = sanitized_replay(store, config, &pending, None)?;
-    let (kernel, meta, _) = finish_store_rebuild(
-        store,
-        pending.source,
-        pending.sources,
-        pending.target_epoch,
-        pending.idempotency_key,
-        pending.payload_sha256,
-        pending.canonical_input,
-        report,
-        pending.deleted_records,
-        pending.deleted_record_ids,
-        None,
-    )?;
+    let (kernel, meta, _) = finish_store_rebuild(store, pending, report, None)?;
     Ok(Some(ResumedRebuild { kernel, meta }))
 }
 
@@ -649,38 +642,19 @@ fn validate_compacting_completion_fence(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish_rebuild(
     handle: &mut NamespaceHandle,
-    source: SourceId,
-    target_epoch: u64,
-    idempotency_key: String,
-    payload_sha256: String,
-    canonical_input: Option<Value>,
+    pending: PendingDeletionFence,
     report: ReplayResult,
-    deleted_records: u64,
-    sources: Vec<SourceId>,
-    deleted_record_ids: Vec<RecordId>,
     engine: Option<&NcmEngine>,
     deadline: Deadline,
     started: Instant,
 ) -> EngineReply {
-    let (kernel, meta, reply) = match finish_store_rebuild(
-        &mut handle.store,
-        source,
-        sources,
-        target_epoch,
-        idempotency_key,
-        payload_sha256,
-        canonical_input,
-        report,
-        deleted_records,
-        deleted_record_ids,
-        engine,
-    ) {
-        Ok(result) => result,
-        Err(reply) => return reply,
-    };
+    let (kernel, meta, reply) =
+        match finish_store_rebuild(&mut handle.store, pending, report, engine) {
+            Ok(result) => result,
+            Err(reply) => return reply,
+        };
     handle.commit_seq = meta.commit_seq;
     handle.epoch = meta.epoch;
     // The durable rebuild is complete, but publication is still an
@@ -732,17 +706,21 @@ fn finish_rebuild(
 
 fn finish_store_rebuild(
     store: &mut NamespaceStore,
-    source: SourceId,
-    sources: Vec<SourceId>,
-    target_epoch: u64,
-    idempotency_key: String,
-    payload_sha256: String,
-    canonical_input: Option<Value>,
+    pending: PendingDeletionFence,
     report: ReplayResult,
-    deleted_records: u64,
-    deleted_record_ids: Vec<RecordId>,
     engine: Option<&NcmEngine>,
 ) -> Result<(NcmKernel, StoreMeta, EngineReply), EngineReply> {
+    let PendingDeletionFence {
+        source,
+        sources,
+        target_epoch,
+        idempotency_key,
+        payload_sha256,
+        canonical_input,
+        deleted_records,
+        deleted_record_ids,
+        ..
+    } = pending;
     let prior_meta = store.meta().map_err(|error| store_reply(error, 0))?;
     let pending_seq = prior_meta
         .commit_seq
@@ -1589,7 +1567,6 @@ fn legacy_deletion_request_shape(
     let expected_sources = Value::Array(
         expected_sources
             .iter()
-            .cloned()
             .map(|source| json!(source))
             .collect(),
     );
@@ -1739,7 +1716,6 @@ fn validate_completed_deletion_replay(
         deleted_record_ids,
         payload_sha256: operation_payload_sha256,
         canonical_input: _,
-        ..
     } = &durable.operation
     else {
         return Err(corrupt_reply(
@@ -1991,16 +1967,15 @@ fn validate_historical_revocation_authority(
                 "revocation authority completion does not match its fence",
             ));
         }
-        if original_sources.contains(&row.source_id) {
-            if row.epoch < original_epoch
+        if original_sources.contains(&row.source_id)
+            && (row.epoch < original_epoch
                 || (row.epoch == original_epoch && row.seq != original_fence_seq)
-                || (row.epoch > original_epoch && row.seq <= original_fence_seq)
-            {
-                return Err(corrupt_reply(
-                    handle.commit_seq,
-                    "completed deletion revocation authority regressed",
-                ));
-            }
+                || (row.epoch > original_epoch && row.seq <= original_fence_seq))
+        {
+            return Err(corrupt_reply(
+                handle.commit_seq,
+                "completed deletion revocation authority regressed",
+            ));
         }
     }
     for source in original_sources {
@@ -2082,7 +2057,7 @@ fn durable_receipt(
     idempotency_key: Option<&str>,
 ) -> Result<String, EngineReply> {
     let state_digest = sha256_hex(&kernel.state_digest());
-    let integrity_digest = durable_integrity_digest(&reply, &operation, &state_digest)
+    let integrity_digest = durable_integrity_digest(reply, &operation, &state_digest)
         .map_err(|reason: String| corrupt_reply(reply.state_generation, &reason))?;
     serde_json::to_string(&DurableReceipt {
         reply: reply.clone(),
@@ -2137,13 +2112,7 @@ pub(crate) fn deletion_request_input(
         object.remove("idempotency_key");
         object.insert(
             "sources".to_owned(),
-            Value::Array(
-                sources
-                    .iter()
-                    .cloned()
-                    .map(|source| json!(source))
-                    .collect(),
-            ),
+            Value::Array(sources.iter().map(|source| json!(source)).collect()),
         );
         object.insert(
             "expected_generation".to_owned(),

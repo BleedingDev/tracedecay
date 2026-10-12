@@ -665,8 +665,12 @@ async fn handle_install_or_update(
     )?;
     let (_before_document, before_observer) =
         read_observer(profile, &resolved.project_path).await?;
-    let before_configuration_revision =
-        crate::commands::current_configuration_revision(profile, &resolved.project_path).await?;
+    let before_configuration_revision = crate::commands::current_configuration_revision(
+        profile,
+        &resolved.project_path,
+        MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    )
+    .await?;
     let before_document = observer_document(&before_observer)?;
     let before_enabled = matches!(before_observer, MemoryProviderNcmObserverV1::Enabled { .. });
     if matches!(operation, NcmControlOperation::Update) && !before_enabled {
@@ -744,7 +748,7 @@ async fn handle_install_or_update(
         "worker_sha256={}|worker_manifest_sha256={}|model_manifest_sha256={}|state_root={}",
         artifact.sha256(),
         manifest_digest,
-        &source_model_manifest.digest,
+        source_model_manifest.digest,
         state_root.display(),
     );
     let operation_id = operation_id_for_identity(
@@ -818,7 +822,8 @@ async fn handle_install_or_update(
     // are the same snapshots used by guarded cleanup, so this check cannot
     // turn a changed installation into an idempotent success.
     let committed_same_update = if matches!(operation, NcmControlOperation::Update) {
-        match &before_observer {
+        matches!(
+            &before_observer,
             MemoryProviderNcmObserverV1::Enabled {
                 worker_binary: configured_worker,
                 state_root: configured_state_root,
@@ -834,12 +839,8 @@ async fn handle_install_or_update(
                     artifact.sha256(),
                     &manifest_digest,
                     source_model_manifest.digest.as_str(),
-                ) =>
-            {
-                true
-            }
-            _ => false,
-        }
+                )
+        )
     } else {
         false
     };
@@ -928,14 +929,12 @@ async fn handle_install_or_update(
     };
     write_journal(&paths, &journal)?;
     if !reuse_existing_target {
-        if let Err(error) = publish_worker(
+        publish_worker(
             &worker_path,
             manifest_bytes,
             &source_model_manifest.bytes,
             artifact.path(),
-        ) {
-            return Err(error);
-        }
+        )?;
     }
     let mut journal = journal;
     journal.phase = NcmJournalPhase::Staged;
@@ -1019,8 +1018,12 @@ async fn handle_uninstall(profile: &ProfileRoot, scope: NcmScopeArgs, json: bool
     )?;
     let (_before_document, before_observer) =
         read_observer(profile, &resolved.project_path).await?;
-    let before_configuration_revision =
-        crate::commands::current_configuration_revision(profile, &resolved.project_path).await?;
+    let before_configuration_revision = crate::commands::current_configuration_revision(
+        profile,
+        &resolved.project_path,
+        MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    )
+    .await?;
     let before_document = observer_document(&before_observer)?;
     let MemoryProviderNcmObserverV1::Enabled {
         worker_binary,
@@ -1935,8 +1938,12 @@ async fn set_observer_if_unchanged(
     expected_revision: Option<&str>,
     observer: &MemoryProviderNcmObserverV1,
 ) -> Result<Option<tracedecay_contracts::EffectReceipt>> {
-    let observed_revision =
-        crate::commands::current_configuration_revision(profile, &resolved.project_path).await?;
+    let observed_revision = crate::commands::current_configuration_revision(
+        profile,
+        &resolved.project_path,
+        MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    )
+    .await?;
     let (_current_document, current) = read_observer(profile, &resolved.project_path).await?;
     let current_document = observer_document(&current)?;
     if current_document != expected_document {
@@ -1944,8 +1951,12 @@ async fn set_observer_if_unchanged(
             "NCM configuration changed during the pending control transaction",
         ));
     }
-    let confirmed_revision =
-        crate::commands::current_configuration_revision(profile, &resolved.project_path).await?;
+    let confirmed_revision = crate::commands::current_configuration_revision(
+        profile,
+        &resolved.project_path,
+        MEMORY_PROVIDER_NCM_OBSERVER_SETTING_KEY,
+    )
+    .await?;
     if observed_revision != confirmed_revision {
         return Err(config_error(
             "NCM configuration changed during the pending control transaction",
@@ -3448,8 +3459,7 @@ fn ensure_supported_platform() -> Result<()> {
         Ok(())
     } else {
         Err(config_error(format!(
-            "NCM lifecycle is supported only on arm64 macOS; {}",
-            capability
+            "NCM lifecycle is unavailable: {capability}"
         )))
     }
 }
@@ -3532,15 +3542,15 @@ fn tracedecay_cli_configuration_receipt(receipt: Option<&tracedecay_contracts::E
 #[cfg(test)]
 mod tests {
     use super::{
-        CONTROL_SCHEMA_VERSION, ControlPaths, MODEL_ACQUISITION_MANIFEST_NAME, NcmControlJournalV1,
-        NcmControlOperation, NcmControlReceiptV1, NcmJournalPhase, NcmScopeArgs,
-        RECEIPT_FILE_PREFIX, RECEIPT_FILE_SUFFIX, TRUSTED_MODEL_ACQUISITION_MANIFEST,
-        WORKER_MANIFEST_NAME, WORKER_NAME, before_observer_bundle_is_available,
-        cleanup_previous_control_worker, control_paths_for_profile, daemon_endpoint_is_reachable,
-        daemon_profile_has_live_owner, latest_receipt, new_operation_id, now_unix,
-        operation_id_for_identity, publish_worker, read_verified_model_acquisition_manifest,
-        refuse_pending_journal, remove_control_worker_bundle, remove_guarded,
-        require_absolute_path, sha256_hex, validate_journal, write_receipt,
+        ControlPaths, MODEL_ACQUISITION_MANIFEST_NAME, NcmControlJournalV1, NcmControlOperation,
+        NcmJournalPhase, NcmScopeArgs, RECEIPT_FILE_PREFIX, RECEIPT_FILE_SUFFIX,
+        TRUSTED_MODEL_ACQUISITION_MANIFEST, WORKER_MANIFEST_NAME, WORKER_NAME,
+        before_observer_bundle_is_available, cleanup_previous_control_worker,
+        daemon_endpoint_is_reachable, daemon_profile_has_live_owner, latest_receipt,
+        new_operation_id, now_unix, observer_document, operation_id_for_identity, publish_worker,
+        read_verified_model_acquisition_manifest, refuse_pending_journal,
+        remove_control_worker_bundle, remove_guarded, require_absolute_path, sha256_hex,
+        validate_journal, validate_journal_document_binding,
     };
     use std::fs;
     use std::io::Write;
@@ -3921,6 +3931,11 @@ mod tests {
             backup_root: backup_root.clone(),
             journal: control_root.join("control-journal-v1.json"),
         };
+        let before_observer = MemoryProviderNcmObserverV1::Enabled {
+            worker_binary: worker_parent.join(WORKER_NAME),
+            state_root: root.path().join("state"),
+        };
+        let after_observer = MemoryProviderNcmObserverV1::Disabled {};
         let journal = NcmControlJournalV1 {
             schema_version: 1,
             operation_id: operation_id.to_owned(),
@@ -3933,8 +3948,9 @@ mod tests {
             model_manifest_path: worker_parent.join(MODEL_ACQUISITION_MANIFEST_NAME),
             state_root: Some(root.path().join("state")),
             before_configuration_revision: "configuration.revision.test".to_owned(),
-            before_document: String::new(),
-            after_document: String::new(),
+            before_document: observer_document(&before_observer)
+                .expect("enabled observer document"),
+            after_document: observer_document(&after_observer).expect("disabled observer document"),
             before_worker_digest: None,
             before_manifest_digest: None,
             before_model_manifest_digest: Some(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST)),
@@ -3950,6 +3966,8 @@ mod tests {
             ),
         };
         validate_journal(&journal, &paths).expect("bound journal is accepted");
+        validate_journal_document_binding(&journal, &before_observer, &after_observer)
+            .expect("uninstall retains its configured worker and state identity");
 
         let mut independent_uninstall = journal.clone();
         independent_uninstall.operation_id = "44444444444444444444444444444444".to_owned();
@@ -3960,6 +3978,12 @@ mod tests {
         );
         validate_journal(&independent_uninstall, &paths)
             .expect("uninstall operation id need not equal install worker directory");
+        validate_journal_document_binding(
+            &independent_uninstall,
+            &before_observer,
+            &after_observer,
+        )
+        .expect("independent uninstall still binds the configured worker");
 
         let mut mismatched_worker = journal.clone();
         let mismatched_parent = worker_root.join("another-operation");
@@ -3967,7 +3991,51 @@ mod tests {
         mismatched_worker.manifest_path = mismatched_parent.join(WORKER_MANIFEST_NAME);
         mismatched_worker.model_manifest_path =
             mismatched_parent.join(MODEL_ACQUISITION_MANIFEST_NAME);
-        assert!(validate_journal(&mismatched_worker, &paths).is_err());
+        assert!(
+            validate_journal_document_binding(
+                &mismatched_worker,
+                &before_observer,
+                &after_observer,
+            )
+            .is_err()
+        );
+
+        for operation in [NcmControlOperation::Install, NcmControlOperation::Update] {
+            let staged_before = if matches!(operation, NcmControlOperation::Install) {
+                MemoryProviderNcmObserverV1::Disabled {}
+            } else {
+                MemoryProviderNcmObserverV1::Enabled {
+                    worker_binary: worker_root.join("previous-operation").join(WORKER_NAME),
+                    state_root: root.path().join("state"),
+                }
+            };
+            let mut staged = NcmControlJournalV1 {
+                operation,
+                before_document: observer_document(&staged_before)
+                    .expect("staged previous observer document"),
+                after_document: observer_document(&before_observer)
+                    .expect("staged observer document"),
+                before_model_manifest_digest: None,
+                before_model_manifest_backup: None,
+                after_worker_digest: Some(sha256_hex(b"worker")),
+                after_manifest_digest: Some(sha256_hex(b"manifest")),
+                after_model_manifest_digest: Some(sha256_hex(TRUSTED_MODEL_ACQUISITION_MANIFEST)),
+                ..journal.clone()
+            };
+            validate_journal(&staged, &paths).expect("complete staged worker journal is accepted");
+            validate_journal_document_binding(&staged, &staged_before, &before_observer)
+                .expect("staged worker retains its configuration binding");
+            staged
+                .worker_path
+                .clone_from(&mismatched_worker.worker_path);
+            staged
+                .manifest_path
+                .clone_from(&mismatched_worker.manifest_path);
+            staged
+                .model_manifest_path
+                .clone_from(&mismatched_worker.model_manifest_path);
+            assert!(validate_journal(&staged, &paths).is_err());
+        }
 
         let mut escaped = journal.clone();
         escaped.operation_id = "../escaped".to_owned();

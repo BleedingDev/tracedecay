@@ -139,6 +139,7 @@ impl From<HostSourceCommandErrorV1> for PortabilityErrorV1 {
     fn from(error: HostSourceCommandErrorV1) -> Self {
         match error {
             HostSourceCommandErrorV1::Invalid(field) => Self::Invalid(field),
+            #[cfg(test)]
             HostSourceCommandErrorV1::Missing => Self::Missing,
             HostSourceCommandErrorV1::Conflict => Self::Corrupt("immutable artifact conflict"),
             HostSourceCommandErrorV1::Corrupt(field) => Self::Corrupt(field),
@@ -332,7 +333,7 @@ fn require_digest(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn reference_key<'a>(kind: ArtifactKindV1, reference: &'a str) -> Result<&'a str> {
+fn reference_key(kind: ArtifactKindV1, reference: &str) -> Result<&str> {
     let key = reference
         .strip_prefix(kind.prefix())
         .ok_or(PortabilityErrorV1::Invalid("artifact reference kind"))?;
@@ -811,13 +812,10 @@ fn settled_replay(
         deadline,
     )
     .map_err(|_| {
-        control
-            .snapshot()
-            .err()
-            .map(PortabilityErrorV1::Control)
-            .unwrap_or(PortabilityErrorV1::Corrupt(
-                "settled replay delivery evidence",
-            ))
+        control.snapshot().err().map_or(
+            PortabilityErrorV1::Corrupt("settled replay delivery evidence"),
+            PortabilityErrorV1::Control,
+        )
     })? {
         return Err(PortabilityErrorV1::Invalid(
             "replay source delivery is unsettled",
@@ -1292,7 +1290,7 @@ pub(super) async fn snapshot_export(
             ));
         }
         Err(failure) => {
-            let error = match failure.stage {
+            let error = match *failure.stage {
                 ControlFailureStageV1::Control(code) => PortabilityErrorV1::Control(code),
                 _ => PortabilityErrorV1::Invalid("post-contact artifact control"),
             };
@@ -1671,7 +1669,7 @@ pub(crate) fn cleanup_source_snapshots(
                     continue;
                 }
             };
-            if !cleanup_matches(&header, &target, &source.retained.scope, &digest)? {
+            if !cleanup_matches(&header, target, &source.retained.scope, &digest)? {
                 continue;
             }
             result.matched_count += 1;
@@ -1712,34 +1710,6 @@ pub(crate) fn cleanup_source_snapshots(
         };
     }
     result
-}
-
-/// Seeds storage fixtures from real granted source inventory. Production
-/// publication/binding checks are reused; no provider reply is manufactured.
-#[cfg(test)]
-pub(crate) fn seed_snapshot_artifact_for_test(
-    ledger: &RecallAdmissionLedgerV1,
-    scope: &RetainedRecallControlScopeV1,
-    sources: &[GrantedHistorySource],
-    snapshot: &Value,
-    control: &OperationControl,
-) -> Result<String> {
-    checkpoint(control)?;
-    let decoded: SnapshotCarrierV1 = serde_json::from_value(snapshot.clone())
-        .map_err(|_| PortabilityErrorV1::Invalid("snapshot fixture carrier"))?;
-    let candidate = prepare_artifact(
-        ArtifactKindV1::Snapshot,
-        scope,
-        full_sources(sources)?,
-        carrier(ArtifactKindV1::Snapshot, snapshot)?,
-        Some(decoded.identity),
-        Vec::new(),
-    )?;
-    decode_snapshot(&candidate)?;
-    let root = root_for(ledger)?;
-    prepare_root(&root, control)?;
-    let _lock = acquire_admission_lock(&root, control)?;
-    Ok(retain_artifact(&root, candidate, control)?.reference)
 }
 
 #[cfg(test)]
@@ -1854,10 +1824,13 @@ mod tests {
         for index in 0..MAX_ARTIFACT_FILES - 1 {
             write_private(&root.join(format!("retained-stage-{index}")), b"stage");
         }
-        assert!(matches!(
-            available_artifact_bytes(&root, QUOTA, &operation),
-            Err(HostSourceCommandErrorV1::CapacityExceeded),
-        ));
+        // Fixture publication is separate from this retry's admission budget.
+        let operation = control();
+        let capacity = available_artifact_bytes(&root, QUOTA, &operation);
+        assert!(
+            matches!(capacity, Err(HostSourceCommandErrorV1::CapacityExceeded)),
+            "the full artifact namespace must refuse a new artifact: {capacity:?}",
+        );
         assert_eq!(
             retain_artifact(&root, snapshot(), &operation)
                 .unwrap()

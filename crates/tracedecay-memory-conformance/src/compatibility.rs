@@ -1895,7 +1895,9 @@ fn candidate_matches(
         && candidate
             .pointer("/provenance/original_sources")
             .and_then(Value::as_array)
-            .is_some_and(|sources| sources == &[expected.attribution.clone()])
+            .is_some_and(|sources| {
+                sources.as_slice() == std::slice::from_ref(&expected.attribution)
+            })
         && candidate.pointer("/validity/source_revision")
             == expected.attribution.pointer("/source/source_revision")
         && candidate_validity_matches(candidate, expected, previous)

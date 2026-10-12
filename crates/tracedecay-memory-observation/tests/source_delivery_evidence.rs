@@ -65,7 +65,7 @@ fn exact_source_reads_distinguish_missing_pending_leased_unknown_and_durable_ack
     );
     store.record_attempt(&unknown)?;
     assert!(
-        matches!(read(&store, &admitted)?, SourceDeliveryEvidenceV1::Retained { state: DeliveryStateV1::EffectUnknown, receipt: Some(actual), .. } if actual == unknown)
+        matches!(read(&store, &admitted)?, SourceDeliveryEvidenceV1::Retained { state: DeliveryStateV1::EffectUnknown, receipt: Some(actual), .. } if *actual == unknown)
     );
     let leased = store
         .lease_pending(&lease_request(T0 + support::MINUTE, 1))?
@@ -75,7 +75,7 @@ fn exact_source_reads_distinguish_missing_pending_leased_unknown_and_durable_ack
     drop(store);
     let reopened = journal(&path)?;
     assert!(
-        matches!(read(&reopened, &admitted)?, SourceDeliveryEvidenceV1::Retained { state: DeliveryStateV1::Acknowledged, admitted: actual, receipt: Some(actual_receipt) } if *actual == admitted && actual_receipt == receipt)
+        matches!(read(&reopened, &admitted)?, SourceDeliveryEvidenceV1::Retained { state: DeliveryStateV1::Acknowledged, admitted: actual, receipt: Some(actual_receipt) } if *actual == admitted && *actual_receipt == receipt)
     );
     Ok(())
 }
@@ -206,7 +206,7 @@ fn exact_source_duplicate_receipts_survive_restart_and_purged_content_stays_unav
     drop(store);
     let store = journal(&path)?;
     assert!(
-        matches!(read(&store, &admitted)?, SourceDeliveryEvidenceV1::Retained { state: DeliveryStateV1::DuplicateAcknowledged, receipt: Some(actual), .. } if actual == receipt)
+        matches!(read(&store, &admitted)?, SourceDeliveryEvidenceV1::Retained { state: DeliveryStateV1::DuplicateAcknowledged, receipt: Some(actual), .. } if *actual == receipt)
     );
     store.forget_source(&ForgetSourceRequestV1 {
         forget_source_key: admitted.privacy.forget_source_key.clone(),
