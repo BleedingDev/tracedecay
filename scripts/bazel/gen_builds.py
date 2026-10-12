@@ -1158,7 +1158,7 @@ def main():
                 out += [
                     "cargo_build_script(",
                     '    name = "build_script_build_host",',
-                    '    crate_name = "build_script_build",',
+                    '    crate_name = "build_script_build_host",',
                     '    crate_root = "build.rs",',
                     "    srcs = " + srcs + ",",
                     "    deps = all_crate_deps(build = True, build_proc_macro = True) + [" + q(build_edges) + "],",
