@@ -5,6 +5,9 @@ self-hosted-runner:
   labels:
     - ubuntu-26.04
     - ubuntu-26.04-arm
+    # Depot managed runners in the ultramodernjs organization.
+    - depot-ubuntu-24.04-8
+    - depot-windows-2025-8
 # actionlint 1.7.12 (latest) does not know concurrency `queue: max`, which
 # GitHub accepts and pr-run-cleanup.yml needs so every close event runs.
 paths:

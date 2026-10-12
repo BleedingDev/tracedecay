@@ -6,6 +6,8 @@ description: >
   master and may also save within a PR's merge-ref scope for later pushes to
   that same PR. Bazelisk and repository caches are saved only on master.
   With `test-tools`, also installs the host tools the test suites spawn.
+  Runners that ship a remote cache in the user Bazel configuration (Depot)
+  keep it and skip the disk-cache archive.
 
 inputs:
   cache-key:
@@ -28,6 +30,9 @@ outputs:
   disk-cache-key:
     description: Run-specific save key returned by the cache restore action.
     value: ${{ steps.disk-cache.outputs.cache-primary-key }}
+  remote-cache:
+    description: "`true` when the runner's own remote Bazel cache is in use."
+    value: ${{ steps.disk-cache-config.outputs.remote-cache }}
 
 runs:
   using: composite
@@ -40,13 +45,35 @@ runs:
       env:
         CACHE_NAME: ${{ inputs.cache-key }}
         EXTRA_RESTORE_KEYS: ${{ inputs.extra-restore-keys }}
+        RUNNER_BAZELRC: ${{ runner.temp }}/runner.bazelrc
       run: |
         node <<'JS'
         const fs = require('node:fs');
         const os = require('node:os');
+        // A short output base on the workspace drive: D: on GitHub images.
+        const drive = (process.env.GITHUB_WORKSPACE || 'D:').slice(0, 2).toUpperCase();
+        const outputBase = process.platform === 'win32' ? `${drive}/b` : '';
         const path = process.platform === 'win32'
-          ? 'D:/b-disk'
+          ? `${outputBase}-disk`
           : `${os.homedir().replace(/\\/g, '/')}/.cache/bazel-disk`;
+        // setup-bazel truncates the user bazelrc. Keep a runner-provided
+        // remote cache (Depot writes its endpoint and credentials there) in
+        // a private file and mask its headers; never echo the contents.
+        const rcPaths = [...new Set([os.homedir(), process.env.HOME]
+          .filter(Boolean)
+          .map((home) => `${home.replace(/\\/g, '/')}/.bazelrc`))];
+        const runnerRc = rcPaths
+          .filter((rc) => fs.existsSync(rc))
+          .map((rc) => fs.readFileSync(rc, 'utf8'))
+          .find((text) => /--remote_cache=/.test(text));
+        if (runnerRc) {
+          for (const [, value] of runnerRc.matchAll(/--remote_header=[^=\s]+=(.+)$/gm)) {
+            for (const secret of [value, ...value.split(/[\s"']+/)]) {
+              if (secret.trim().length >= 8) console.log(`::add-mask::${secret.trim()}`);
+            }
+          }
+          fs.writeFileSync(process.env.RUNNER_BAZELRC, runnerRc, { mode: 0o600 });
+        }
         const names = [process.env.CACHE_NAME, ...(process.env.EXTRA_RESTORE_KEYS || '')
           .split(',')
           .map((name) => name.trim())
@@ -55,7 +82,9 @@ runs:
           `setup-bazel-1-${process.platform}-${os.arch()}-disk-${name}-`);
         fs.appendFileSync(
           process.env.GITHUB_OUTPUT,
-          `path=${path}\nprefix=${prefixes[0]}\nrestore-keys<<EOF\n${prefixes.join('\n')}\nEOF\n`,
+          `path=${path}\nprefix=${prefixes[0]}\nrestore-keys<<EOF\n${prefixes.join('\n')}\nEOF\n`
+            + `output-base=${outputBase}\nremote-cache=${Boolean(runnerRc)}\n`
+            + `bazelrc-paths=${JSON.stringify(rcPaths)}\n`,
         );
         JS
 
@@ -64,18 +93,37 @@ runs:
         bazelisk-cache: true
         repository-cache: true
         disk-cache: false
+        # A remote cache replaces the multi-GB disk-cache archive.
         bazelrc: >-
-          build --disk_cache=${{ steps.disk-cache-config.outputs.path }}
+          ${{ steps.disk-cache-config.outputs.remote-cache != 'true'
+          && format('build --disk_cache={0}', steps.disk-cache-config.outputs.path) || '' }}
         cache-save: ${{ github.ref == 'refs/heads/master' }}
         # Windows build-script runfiles nest each vendored crate's sources
         # under its repository name twice; a short output base (default
         # D:/_bazel) keeps MSVC's header paths under MAX_PATH.
-        output-base: ${{ runner.os == 'Windows' && 'D:/b' || '' }}
+        output-base: ${{ steps.disk-cache-config.outputs.output-base }}
+
+    - name: Restore the runner's remote cache configuration
+      if: steps.disk-cache-config.outputs.remote-cache == 'true'
+      shell: bash
+      env:
+        RUNNER_BAZELRC: ${{ runner.temp }}/runner.bazelrc
+        BAZELRC_PATHS: ${{ steps.disk-cache-config.outputs.bazelrc-paths }}
+      run: |
+        node <<'JS'
+        const fs = require('node:fs');
+        const runnerRc = fs.readFileSync(process.env.RUNNER_BAZELRC, 'utf8');
+        for (const rc of JSON.parse(process.env.BAZELRC_PATHS)) {
+          fs.appendFileSync(rc, `\n${runnerRc}\n`);
+        }
+        fs.rmSync(process.env.RUNNER_BAZELRC);
+        JS
 
     # Bazel validates action contents itself. A fresh save key retains new
     # source-build outputs even when MODULE.bazel and BUILD files are unchanged.
     - name: Restore compiled action cache
       id: disk-cache
+      if: steps.disk-cache-config.outputs.remote-cache != 'true'
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.disk-cache-config.outputs.path }}

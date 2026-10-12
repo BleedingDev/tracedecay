@@ -314,7 +314,7 @@ jobs:
     name: Test Linux (${{ matrix.shard }})
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 240
     env:
       CARGO_BAZEL_TIMEOUT: "3600"
@@ -499,7 +499,7 @@ jobs:
     name: Windows checks
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: windows-latest
+    runs-on: ${{ vars.DEPOT_WINDOWS_RUNNER || 'windows-latest' }}
     timeout-minutes: 330
     steps:
       # Full history: the search-quality workload fixture pins a
@@ -566,7 +566,7 @@ jobs:
     # disk cache (proc-macros, build scripts, grammar cc, matching rlibs)
     # when this job's own prefix misses. ARM isolated Clippy from that
     # cache and paid a cold 55–61m `//...` on recent PRs.
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -621,7 +621,7 @@ jobs:
     name: Shipped CLI build (x86_64-linux)
     needs: [scope-gate, gates]
     if: ${{ needs.scope-gate.outputs.run-heavy == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.DEPOT_LINUX_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
