@@ -707,7 +707,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[cfg(unix)]
-    use super::{MAX_TEST_RUN_OUTPUT_BYTES, TestRunStream};
+    use super::{
+        MAX_TEST_RUN_OUTPUT_BYTES, PROCESS_POLL_INTERVAL, ProcessOutcome, TestRunStream,
+        configure_command, terminate_and_reap, wait_for_process,
+    };
     use super::{
         TestProfile, TestRunControl, TestRunFailure, TestRunOutput, cargo_test_build_args,
         run_bounded_test_command, run_cargo_tests,
@@ -717,8 +720,8 @@ mod tests {
     const FIXTURE_MARKER: &str = "TRACEDECAY_TEST_RUNNER_FIXTURE_MARKER";
     const LIMITED_OUTPUT_BYTES: usize = 96 * 1024;
 
-    /// Budget for provisioning a cargo fixture (cold compile plus test
-    /// discovery) before the phase whose execution deadline is under test.
+    /// Budget for provisioning a fixture (cold compile, test discovery, or
+    /// process-tree startup) before its execution deadline is under test.
     ///
     /// Cold compilation of even a tiny fixture on a fresh Windows runner can
     /// exceed the execution deadline the exact-test cases assert against, so
@@ -1199,13 +1202,94 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("temp");
         let marker = temp.path().join("child.pid");
         let mut command = fixture_command(&marker, "parent_idle");
+        configure_command(&mut command);
+        let mut child = command.spawn().expect("fixture parent");
+        let process_group = child.id();
+        let control = TestRunControl::default();
+        control.register(process_group);
+
+        // Loading both fixture processes must finish before the deadline can
+        // exercise termination of a complete, running process tree.
+        let provisioning_deadline = Instant::now() + FIXTURE_PROVISION_BUDGET;
+        let readiness = loop {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    break Err(format!("fixture parent exited before readiness: {status}"));
+                }
+                Err(error) => break Err(format!("fixture parent status: {error}")),
+            }
+            if marker.exists() {
+                let pid = fs::read_to_string(&marker)
+                    .map_err(|error| format!("fixture descendant marker: {error}"))
+                    .and_then(|pid| {
+                        pid.trim()
+                            .parse::<u32>()
+                            .map_err(|error| format!("fixture descendant pid: {error}"))
+                    });
+                match pid {
+                    Ok(pid) if pid > 0 && i32::try_from(pid).is_ok() && process_is_live(pid) => {
+                        break Ok(());
+                    }
+                    Ok(pid) => break Err(format!("fixture descendant {pid} is not live")),
+                    Err(failure) => break Err(failure),
+                }
+            }
+            if Instant::now() >= provisioning_deadline {
+                break Err(format!(
+                    "fixture descendant did not become ready within {FIXTURE_PROVISION_BUDGET:?}"
+                ));
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL);
+        };
+        if let Err(failure) = readiness {
+            terminate_and_reap(&mut child, process_group);
+            control.unregister(process_group);
+            panic!("{failure}");
+        }
+
+        let outcome = wait_for_process(
+            &mut child,
+            process_group,
+            Instant::now() + Duration::from_millis(50),
+            &control,
+        );
+        if matches!(&outcome, ProcessOutcome::Completed(_)) {
+            terminate_and_reap(&mut child, process_group);
+        }
+        control.unregister(process_group);
+        drop(child.stdout.take());
+        drop(child.stderr.take());
+        assert!(matches!(outcome, ProcessOutcome::TimedOut));
+        assert!(child.try_wait().expect("fixture parent wait").is_some());
+        assert_process_reaped(process_group, "fixture parent");
+        assert_reaped(&marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_command_reports_deadline_with_partial_output() {
+        let temp = tempfile::TempDir::new().expect("temp");
+        let marker = temp.path().join("child.pid");
+        let mut command = fixture_command(&marker, "child_idle");
         let result = run_bounded_test_command(
             &mut command,
             Duration::from_millis(50),
             &TestRunControl::default(),
         );
-        assert!(matches!(result, Err(TestRunFailure::Timeout { .. })));
-        assert_reaped(&marker);
+        assert!(
+            matches!(
+                &result,
+                Err(TestRunFailure::Timeout {
+                    partial: Some(TestRunOutput {
+                        exit_code: None,
+                        ..
+                    }),
+                    ..
+                })
+            ),
+            "the command deadline must retain partial output in its typed timeout: {result:?}"
+        );
     }
 
     #[cfg(unix)]
