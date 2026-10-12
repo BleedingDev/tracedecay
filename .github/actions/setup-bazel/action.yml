@@ -59,21 +59,44 @@ runs:
         // setup-bazel truncates the user bazelrc. Keep a runner-provided
         // remote cache (Depot writes its endpoint and credentials there) in
         // a private file and mask its headers; never echo the contents.
+        // Without one, use Depot's documented per-job DEPOT_CACHE_TOKEN.
+        const hasRemote = (rc) => fs.existsSync(rc) && /--remote_cache=/.test(fs.readFileSync(rc, 'utf8'));
         const rcPaths = [...new Set([os.homedir(), process.env.HOME]
           .filter(Boolean)
           .map((home) => `${home.replace(/\\/g, '/')}/.bazelrc`))];
-        const runnerRc = rcPaths
-          .filter((rc) => fs.existsSync(rc))
-          .map((rc) => fs.readFileSync(rc, 'utf8'))
-          .find((text) => /--remote_cache=/.test(text));
-        if (runnerRc) {
-          for (const [, value] of runnerRc.matchAll(/--remote_header=[^=\s]+=(.+)$/gm)) {
+        const userRc = rcPaths.find(hasRemote);
+        // Bazel reads the system rc itself and setup-bazel leaves it intact.
+        const systemRc = process.platform === 'win32'
+          ? `${(process.env.ProgramData || 'C:/ProgramData').replace(/\\/g, '/')}/bazel.bazelrc`
+          : '/etc/bazel.bazelrc';
+        const token = process.env.DEPOT_CACHE_TOKEN;
+        if (token) console.log(`::add-mask::${token}`);
+        let source = 'none';
+        let runnerRc;
+        if (userRc) {
+          source = userRc;
+          runnerRc = fs.readFileSync(userRc, 'utf8');
+        } else if (hasRemote(systemRc)) {
+          source = systemRc;
+          runnerRc = '';
+        } else if (token) {
+          source = 'DEPOT_CACHE_TOKEN';
+          runnerRc = 'build --remote_cache=https://cache.depot.dev\n'
+            + `build --remote_header=authorization=${token}\n`;
+        }
+        for (const text of [runnerRc, hasRemote(systemRc) && fs.readFileSync(systemRc, 'utf8')]) {
+          for (const [, value] of (text || '').matchAll(/--remote_header=[^=\s]+=(.+)$/gm)) {
             for (const secret of [value, ...value.split(/[\s"']+/)]) {
               if (secret.trim().length >= 8) console.log(`::add-mask::${secret.trim()}`);
             }
           }
+        }
+        if (runnerRc !== undefined) {
           fs.writeFileSync(process.env.RUNNER_BAZELRC, runnerRc, { mode: 0o600 });
         }
+        console.log(`Remote Bazel cache source: ${source}; user rc candidates: ${rcPaths.join(', ')}; `
+          + `system rc ${fs.existsSync(systemRc) ? 'present' : 'absent'}; `
+          + `DEPOT_CACHE_TOKEN ${token ? 'set' : 'unset'}`);
         const names = [process.env.CACHE_NAME, ...(process.env.EXTRA_RESTORE_KEYS || '')
           .split(',')
           .map((name) => name.trim())
@@ -83,7 +106,7 @@ runs:
         fs.appendFileSync(
           process.env.GITHUB_OUTPUT,
           `path=${path}\nprefix=${prefixes[0]}\nrestore-keys<<EOF\n${prefixes.join('\n')}\nEOF\n`
-            + `output-base=${outputBase}\nremote-cache=${Boolean(runnerRc)}\n`
+            + `output-base=${outputBase}\nremote-cache=${runnerRc !== undefined}\n`
             + `bazelrc-paths=${JSON.stringify(rcPaths)}\n`,
         );
         JS
