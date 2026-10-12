@@ -4,6 +4,8 @@
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::fs;
+#[cfg(unix)]
+use std::io::Cursor;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +27,8 @@ use tracedecay_memory_ncm_runtime::wire::{
     self, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, Operation, PROTOCOL_IDENTITY, PROTOCOL_VERSION,
     Reply, Request,
 };
+#[cfg(unix)]
+use tracedecay_memory_ncm_runtime::worker::{ServeOptions, serve_with_options};
 use tracedecay_memory_ncm_runtime::worker_artifact::{
     WORKER_EXECUTABLE_NAME, WORKER_MANIFEST_NAME, current_target_triple, trusted_worker_manifest,
 };
@@ -2233,19 +2237,73 @@ fn recall_after_worker_restart_reproves_namespace_and_recovers_privacy_fence() {
 
 #[cfg(unix)]
 #[test]
+#[ignore = "subprocess fixture for malformed worker reply tests"]
+fn malformed_reply_worker_fixture() {
+    let root = std::env::var_os("TRACEDECAY_NCM_MALFORMED_FIXTURE_ROOT")
+        .expect("malformed worker fixture requires its isolated state root");
+    let engine = Arc::new(NcmEngine::new(
+        StateRoot::new(root).expect("fixture state root"),
+        Arc::new(HashEncoder::new()),
+        Default::default(),
+    ));
+    let mut input = std::io::stdin().lock();
+    // The launcher keeps libtest progress on stderr and the worker wire on fd 3.
+    let mut output = fs::File::options()
+        .write(true)
+        .open("/dev/fd/3")
+        .expect("worker reply descriptor");
+    let readiness = wire::read_request(&mut input)
+        .expect("read readiness frame")
+        .expect("readiness request");
+    assert_eq!(readiness.op, Operation::Health);
+    serve_with_options(
+        Cursor::new(wire::encode_request(&readiness).expect("encode readiness")),
+        &mut output,
+        engine,
+        ServeOptions {
+            allow_test_delays: false,
+            encoder_ready: true,
+            allow_legacy_identity: true,
+        },
+    )
+    .expect("serve actual readiness reply");
+    let request = wire::read_request(&mut input)
+        .expect("read bounded health frame")
+        .expect("bounded health request");
+    assert_eq!(request.op, Operation::Health);
+    output
+        .write_all(&[0, 0, 0, 1, b'x'])
+        .expect("write malformed JSON frame");
+    output.flush().expect("flush malformed reply");
+    std::io::copy(&mut input, &mut std::io::sink()).expect("drain until client retires worker");
+}
+
+#[cfg(unix)]
+#[test]
 fn malformed_worker_reply_is_detected_and_process_is_reaped() {
     let root = TempDir::new().expect("temp root");
-    let malformed = root.path().join("malformed-worker.sh");
-    // Drain the request instead of exiting before its writer can acknowledge it.
-    fs::write(
-        &malformed,
-        "#!/bin/sh\nprintf '\\000\\000\\000\\001x'\nexec cat >/dev/null\n",
+    std::os::unix::fs::symlink(
+        std::env::current_exe().expect("current test executable"),
+        root.path().join("test-runner"),
     )
-    .expect("write malformed worker");
-    fs::set_permissions(&malformed, fs::Permissions::from_mode(0o700))
-        .expect("make malformed worker executable");
+    .expect("link this test's fixture runner");
+    let malformed = PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR").expect("Bazel crate runfiles directory"),
+    )
+    .join("tests/fixtures/malformed-worker.sh");
+    assert!(malformed.is_absolute());
+    assert!(malformed.is_file());
     let client =
         WorkerClient::spawn(&malformed, root.path(), options()).expect("client owner starts");
+    let ready = client
+        .call(
+            Request::new(239, 0, Operation::Health, "", json!({})),
+            CALL_DEADLINE,
+        )
+        .expect("actual worker health succeeds before malformed reply");
+    assert_eq!(ready.outcome, Outcome::Success);
+    let pid = client.pid().expect("ready worker PID");
+    assert!(process_exists(pid));
     let result = client.call(
         Request::new(240, 0, Operation::Health, "", json!({})),
         Duration::from_millis(500),
@@ -2255,6 +2313,7 @@ fn malformed_worker_reply_is_detected_and_process_is_reaped() {
         "invalid frame must be reported as a malformed reply: {result:?}"
     );
     assert_eq!(client.pid(), None);
+    assert!(!process_exists(pid), "malformed worker must be reaped");
 }
 
 #[cfg(unix)]

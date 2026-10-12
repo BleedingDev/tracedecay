@@ -9,6 +9,8 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
 /// The logical worker name recorded in the NCM worker manifest.
@@ -261,9 +263,22 @@ fn stage_verified_file(
     tracedecay_private_fs::make_private_directory(staging.path())
         .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
     let staged_path = staging.path().join(WORKER_EXECUTABLE_NAME);
-    let mut staged = tracedecay_private_fs::create_private_file(&staged_path)
-        .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
-    let identity = measure_open_worker(file, bytes, &mut staged)?;
+    #[cfg(target_os = "linux")]
+    let (staged, identity) = {
+        let staged = copy_worker_with_private_writer(file, &staged_path)?;
+        let copied = staged
+            .try_clone()
+            .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
+        let identity = measure_open_worker(copied, bytes, std::io::sink())?;
+        (staged, identity)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (staged, identity) = {
+        let mut staged = tracedecay_private_fs::create_private_file(&staged_path)
+            .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
+        let identity = measure_open_worker(file, bytes, &mut staged)?;
+        (staged, identity)
+    };
     if identity.sha256 != target.sha256 {
         return Err(WorkerIntegrityError::DigestMismatch {
             expected: target.sha256.clone(),
@@ -281,6 +296,53 @@ fn stage_verified_file(
         manifest: Vec::new(),
         manifest_digest: String::new(),
     })
+}
+
+#[cfg(target_os = "linux")]
+fn copy_worker_with_private_writer(
+    source: File,
+    destination: &Path,
+) -> Result<File, WorkerIntegrityError> {
+    // A concurrent fork can inherit a writable descriptor even with CLOEXEC.
+    // Linux then refuses to execute that inode until the unrelated child execs.
+    // Keep the only writer in a single-threaded child and reap it before the
+    // parent opens the copied bytes read-only for verification and sealing.
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"umask 077; set -C; exec /bin/cat > "$1""#,
+            "tracedecay-worker-stage",
+        ])
+        .arg(destination)
+        .stdin(Stdio::from(source))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?;
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let kill = child.kill();
+            let reap = child.wait();
+            return Err(WorkerIntegrityError::Staging(format!(
+                "wait for private worker copy: {error}; kill: {kill:?}; reap: {reap:?}"
+            )));
+        }
+    };
+    if !status.success() {
+        return Err(WorkerIntegrityError::Staging(format!(
+            "private worker copy exited with {status}"
+        )));
+    }
+    let copied = open_worker_binary(destination)?;
+    if !copied
+        .metadata()
+        .map_err(|error| WorkerIntegrityError::Staging(error.to_string()))?
+        .is_file()
+    {
+        return Err(WorkerIntegrityError::NotRegularFile);
+    }
+    Ok(copied)
 }
 
 pub(crate) fn worker_artifact_identity(
@@ -868,6 +930,58 @@ mod tests {
             .expect("execute staged worker");
         assert!(output.status.success(), "staged worker failed: {output:?}");
         assert_eq!(output.stdout, b"verified");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_worker_writer_returns_read_only_exact_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TempDir::new().expect("fixture root");
+        let source = root.path().join("source");
+        let destination = root.path().join("worker '$1; untouched'");
+        let bytes = b"verified worker bytes";
+        fs::write(&source, bytes).expect("write source");
+
+        let mut copied = copy_worker_with_private_writer(
+            File::open(&source).expect("open source"),
+            &destination,
+        )
+        .expect("copy private worker");
+        assert_eq!(fs::read(&destination).expect("read copied bytes"), bytes);
+        assert_eq!(
+            copied
+                .metadata()
+                .expect("copied metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        copied
+            .write_all(b"replacement")
+            .expect_err("parent must never retain a writable launch descriptor");
+        assert_eq!(fs::read(&destination).expect("read unchanged copy"), bytes);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn private_worker_writer_refuses_existing_destination_without_mutation() {
+        let root = TempDir::new().expect("fixture root");
+        let source = root.path().join("source");
+        let destination = root.path().join("worker");
+        fs::write(&source, b"new worker bytes").expect("write source");
+        fs::write(&destination, b"existing bytes").expect("write destination");
+
+        let result = copy_worker_with_private_writer(
+            File::open(&source).expect("open source"),
+            &destination,
+        );
+        assert!(matches!(result, Err(WorkerIntegrityError::Staging(_))));
+        assert_eq!(
+            fs::read(&destination).expect("read existing destination"),
+            b"existing bytes"
+        );
     }
 
     #[cfg(unix)]

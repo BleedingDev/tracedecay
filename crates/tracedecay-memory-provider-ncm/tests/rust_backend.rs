@@ -2688,7 +2688,8 @@ mod enabled {
         use std::fs::{self, File};
         use std::io::{Cursor, Read, Write};
         use std::net::{TcpListener, TcpStream};
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
         use std::process::{Command, Stdio};
         use std::sync::{Arc, mpsc};
         use std::thread;
@@ -2775,17 +2776,15 @@ mod enabled {
             )
             .unwrap();
             symlink(std::env::current_exe().unwrap(), root.0.join("test-runner")).unwrap();
-            let launcher = root.0.join("controlled-worker");
-            fs::write(
-                &launcher,
-                "#!/bin/sh\n\
-                 test \"$1\" = --state-root || exit 2\n\
-                 export TRACEDECAY_NCM_CANCELLATION_FIXTURE_ROOT=\"$2\"\n\
-                 exec \"$(dirname \"$0\")/test-runner\" --exact \
-                 enabled::cancellation::worker_fixture --ignored --nocapture 3>&1 1>&2\n",
+            // Execute a declared, immutable runfile: writing a launcher in
+            // concurrently spawning tests can leave its inode write-open in
+            // another child and make exec fail with ETXTBSY on Linux.
+            let launcher = PathBuf::from(
+                std::env::var_os("CARGO_MANIFEST_DIR").expect("Bazel crate runfiles directory"),
             )
-            .unwrap();
-            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700)).unwrap();
+            .join("tests/fixtures/cancellation-worker.sh");
+            assert!(launcher.is_absolute());
+            assert!(launcher.is_file());
             let surface = Arc::new(
                 RustNcmSurface::new(RustNcmConfig {
                     worker_binary: launcher,
