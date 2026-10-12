@@ -14,7 +14,9 @@ mod schema;
 mod source_delivery;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+#[cfg(debug_assertions)]
+use std::sync::Arc;
+use std::sync::{Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, Transaction, TransactionBehavior};
