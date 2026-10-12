@@ -5,6 +5,7 @@ use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
 use crate::configuration::FreshConfigurationStoreEvidence;
 use crate::registered::RefusedAuthorityV1;
 use crate::schema_contract::{
+    RootOccurrenceIndexOrder, classify_session_temporal_schema_contract,
     starts_with_ignore_ascii_case, validate_session_graph_publication_schema_contract,
     validate_session_temporal_schema_contract,
 };
@@ -36,6 +37,9 @@ const TEMPORAL_FTS_SHADOW_TABLES: &[&str] = &[
 pub(crate) enum SessionTemporalSchemaAdmission {
     /// The persisted schema and its objects exactly match the final contract.
     Current,
+    /// Every contract matches except the exact previously shipped ascending
+    /// root index, which can be rebuilt without changing retained records.
+    AscendingRootOccurrenceIndex,
     /// The registered store is proven empty and may receive the final contract.
     Fresh,
     /// An earlier version whose authority holds no rows, as in a store that
@@ -57,8 +61,17 @@ pub(crate) async fn require_admissible_session_temporal_schema(
         .map_err(|error| session_temporal_reset_required(error.to_string()))?;
     match version {
         Some(SESSION_TEMPORAL_SCHEMA_VERSION) => {
-            validate_current_session_temporal_schema(conn).await?;
-            Ok(Ok(SessionTemporalSchemaAdmission::Current))
+            let root_order =
+                classify_session_temporal_schema_contract(conn, &temporal_contract_tables())
+                    .await
+                    .map_err(|error| session_temporal_reset_required(error.to_string()))?;
+            validate_temporal_namespace_and_fts(conn).await?;
+            Ok(Ok(match root_order {
+                RootOccurrenceIndexOrder::Current => SessionTemporalSchemaAdmission::Current,
+                RootOccurrenceIndexOrder::Ascending => {
+                    SessionTemporalSchemaAdmission::AscendingRootOccurrenceIndex
+                }
+            }))
         }
         Some(version)
             if version < SESSION_TEMPORAL_SCHEMA_VERSION
@@ -81,15 +94,18 @@ pub(crate) async fn require_admissible_session_temporal_schema(
 pub(super) async fn validate_current_session_temporal_schema(
     conn: &impl QueryExecutor,
 ) -> tracedecay_domain::errors::Result<()> {
-    let tables = TEMPORAL_TABLE_COLUMNS
-        .iter()
-        .map(|(table, _)| *table)
-        .filter(|table| !table.ends_with("_fts"))
-        .collect::<Vec<_>>();
-    validate_session_temporal_schema_contract(conn, &tables)
+    validate_session_temporal_schema_contract(conn, &temporal_contract_tables())
         .await
         .map_err(|error| session_temporal_reset_required(error.to_string()))?;
     validate_temporal_namespace_and_fts(conn).await
+}
+
+fn temporal_contract_tables() -> Vec<&'static str> {
+    TEMPORAL_TABLE_COLUMNS
+        .iter()
+        .map(|(table, _)| *table)
+        .filter(|table| !table.ends_with("_fts"))
+        .collect()
 }
 
 async fn validate_temporal_namespace_and_fts(

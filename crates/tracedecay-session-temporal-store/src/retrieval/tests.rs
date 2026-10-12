@@ -1786,12 +1786,6 @@ async fn candidate_queries_return_live_rows_and_use_schema_indexes() {
             .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
         "root scope browse must take its leading keyset order from the index: {root_scope_plan:?}"
     );
-    // `ORDER BY knowledge_at DESC, session_id, occurrence_id` mixes directions
-    // against an all-ascending index, so SQLite can only walk the leading
-    // keyset column from the index and must sort the trailing terms inside each
-    // `knowledge_at` group. The live contract is that the leading column is
-    // never sorted: a plain `USE TEMP B-TREE FOR ORDER BY` would mean the whole
-    // root window was materialized before the LIMIT.
     assert!(
         root_time_plan
             .iter()
@@ -1994,8 +1988,8 @@ async fn root_scope_browse_pages_from_the_occurrence_index_on_a_large_history() 
     assert!(
         repaired_plan
             .iter()
-            .all(|detail| !detail.contains("USE TEMP B-TREE FOR ORDER BY")),
-        "large-history root scope must not materialize the project before LIMIT: {repaired_plan:?}"
+            .all(|detail| !detail.contains("USE TEMP B-TREE")),
+        "large-history root scope must not sort the project before LIMIT: {repaired_plan:?}"
     );
 
     let mut legacy_explain = connection
@@ -2020,6 +2014,7 @@ async fn root_scope_browse_pages_from_the_occurrence_index_on_a_large_history() 
         "the generation-first browse is the measured full-window sort: {legacy_plan:?}"
     );
 
+    let legacy_before = connection.reader_telemetry_snapshot();
     let started = Instant::now();
     let mut rows = connection
         .query(LEGACY_GENERATION_FIRST_ROOT_SCOPE_QUERY, params.clone())
@@ -2030,7 +2025,9 @@ async fn root_scope_browse_pages_from_the_occurrence_index_on_a_large_history() 
         legacy.push(row.get::<String>(0).expect("occurrence id"));
     }
     let legacy_elapsed = started.elapsed();
+    let legacy_after = connection.reader_telemetry_snapshot();
 
+    let repaired_before = connection.reader_telemetry_snapshot();
     let started = Instant::now();
     let mut rows = connection
         .query(ROOT_SCOPE_CANDIDATE_QUERY, params)
@@ -2041,6 +2038,30 @@ async fn root_scope_browse_pages_from_the_occurrence_index_on_a_large_history() 
         repaired.push(row.get::<String>(0).expect("occurrence id"));
     }
     let repaired_elapsed = started.elapsed();
+    let repaired_after = connection.reader_telemetry_snapshot();
+    let legacy_work = (
+        legacy_after.execution_micros - legacy_before.execution_micros,
+        legacy_after.wait_micros - legacy_before.wait_micros,
+        legacy_after.sqlite_vm.vm_steps - legacy_before.sqlite_vm.vm_steps,
+        legacy_after.sqlite_vm.fullscan_steps - legacy_before.sqlite_vm.fullscan_steps,
+        legacy_after.sqlite_vm.sort_steps - legacy_before.sqlite_vm.sort_steps,
+    );
+    let repaired_work = (
+        repaired_after.execution_micros - repaired_before.execution_micros,
+        repaired_after.wait_micros - repaired_before.wait_micros,
+        repaired_after.sqlite_vm.vm_steps - repaired_before.sqlite_vm.vm_steps,
+        repaired_after.sqlite_vm.fullscan_steps - repaired_before.sqlite_vm.fullscan_steps,
+        repaired_after.sqlite_vm.sort_steps - repaired_before.sqlite_vm.sort_steps,
+    );
+    let diagnostics = format!(
+        "query work (worker_us, reader_wait_us, vm_steps, fullscan_steps, sorts): \
+         generation-first={legacy_work:?}, indexed={repaired_work:?}; \
+         generation-first plan={legacy_plan:?}; indexed plan={repaired_plan:?}"
+    );
+    println!(
+        "root scope browse: indexed={repaired_elapsed:?}, \
+         generation-first={legacy_elapsed:?}; {diagnostics}"
+    );
     assert_eq!(repaired.len(), PAGE as usize, "{repaired:?}");
     assert_eq!(
         repaired.first().map(String::as_str),
@@ -2048,9 +2069,22 @@ async fn root_scope_browse_pages_from_the_occurrence_index_on_a_large_history() 
         "newest occurrence must be first: {repaired:?}"
     );
     assert_eq!(legacy, repaired, "both shapes must return the same page");
+    let (_, _, legacy_vm_steps, _, _) = legacy_work;
+    let (_, _, repaired_vm_steps, _, repaired_sorts) = repaired_work;
+    assert_eq!(
+        repaired_sorts, 0,
+        "indexed browse must emit its page without a sorter; {diagnostics}"
+    );
+    // Allow session setup plus one page, using the full-history query's work per row.
+    let indexed_work_bound =
+        legacy_vm_steps * (SESSION_COUNT as u64 + PAGE as u64) / OCCURRENCE_COUNT as u64;
+    assert!(
+        repaired_vm_steps > 0 && repaired_vm_steps < indexed_work_bound,
+        "indexed browse work must be bounded by session setup and one page; {diagnostics}"
+    );
     assert!(
         repaired_elapsed.as_millis() < 1_000,
-        "indexed browse must stay on a bounded page, not a full-window sort ({repaired_elapsed:?}; generation-first {legacy_elapsed:?})"
+        "indexed browse must stay on a bounded page, not a full-window sort ({repaired_elapsed:?}; generation-first {legacy_elapsed:?}); {diagnostics}"
     );
 }
 
@@ -2822,7 +2856,7 @@ async fn root_pagination_restart_provider_filter_and_session_parity_are_stable()
                 ROOT_TIME_CANDIDATE_QUERY,
                 vec![
                     SqlValue::Text("user".to_string()),
-                    provider,
+                    provider.clone(),
                     SqlValue::Integer(0),
                     SqlValue::Integer(10),
                     SqlValue::Integer(cursor.0),
@@ -2842,6 +2876,30 @@ async fn root_pagination_restart_provider_filter_and_session_parity_are_stable()
         while let Some(row) = rows.next().await.unwrap() {
             values.push((row.get(5).unwrap(), row.get(0).unwrap()));
         }
+        let mut browse_rows = conn
+            .query(
+                ROOT_SCOPE_CANDIDATE_QUERY,
+                vec![
+                    SqlValue::Text("user".to_string()),
+                    provider,
+                    SqlValue::Integer(cursor.0),
+                    SqlValue::Text(cursor.1.to_string()),
+                    SqlValue::Text(cursor.2.to_string()),
+                    SqlValue::Integer(128),
+                    SqlValue::Integer(128),
+                    SqlValue::Integer(128),
+                    SqlValue::Integer(1_024),
+                    SqlValue::Integer(1_024),
+                    SqlValue::Integer(limit),
+                ],
+            )
+            .await
+            .unwrap();
+        let mut browse = Vec::<(String, String)>::new();
+        while let Some(row) = browse_rows.next().await.unwrap() {
+            browse.push((row.get(5).unwrap(), row.get(0).unwrap()));
+        }
+        assert_eq!(browse, values, "browse must preserve root window ordering");
         values
     }
 

@@ -1681,8 +1681,19 @@ pub(super) struct Index {
     pub(super) columns: &'static [&'static str],
 }
 
-pub(super) const INDEX_DESCENDING_COLUMNS: &[(&str, &[&str])] =
-    &[("idx_code_projects_last_seen_project", &["last_seen_at"])];
+pub(super) const ROOT_OCCURRENCE_INDEX_NAME: &str = "idx_session_occurrences_root_generation_order";
+pub(super) const ROOT_OCCURRENCE_INDEX: Index = Index {
+    table: "session_occurrences",
+    name: Some(ROOT_OCCURRENCE_INDEX_NAME),
+    unique: false,
+    origin: "c",
+    columns: &["knowledge_at", "session_id", "occurrence_id", "generation"],
+};
+
+pub(super) const INDEX_DESCENDING_COLUMNS: &[(&str, &[&str])] = &[
+    ("idx_code_projects_last_seen_project", &["last_seen_at"]),
+    (ROOT_OCCURRENCE_INDEX_NAME, &["knowledge_at"]),
+];
 pub(super) const INDEX_EXPRESSION_COLUMN: &str = "<expression>";
 
 pub(super) const INDEXES: &[Index] = &[
@@ -2113,13 +2124,7 @@ pub(super) const INDEXES: &[Index] = &[
         origin: "c",
         columns: &["session_id", "knowledge_at", "occurrence_id", "generation"],
     },
-    Index {
-        table: "session_occurrences",
-        name: Some("idx_session_occurrences_root_generation_order"),
-        unique: false,
-        origin: "c",
-        columns: &["knowledge_at", "session_id", "occurrence_id", "generation"],
-    },
+    ROOT_OCCURRENCE_INDEX,
     Index {
         table: "session_occurrences",
         name: Some("idx_session_occurrences_session_time"),

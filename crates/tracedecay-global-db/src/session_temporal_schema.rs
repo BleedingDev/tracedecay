@@ -10,13 +10,18 @@ pub(crate) use admission::{
     SessionTemporalSchemaAdmission, require_admissible_session_temporal_schema,
 };
 use admission::{
-    authority_holds_no_rows, validate_temporal_fts_contracts, validate_temporal_fts_match,
+    authority_holds_no_rows, validate_current_session_temporal_schema,
+    validate_temporal_fts_contracts, validate_temporal_fts_match,
 };
 
 const OPERATION: &str = "initialize session temporal schema";
 const MIGRATION_NAME: &str = "session-temporal";
 const SESSION_TEMPORAL_AUTHORITY: &str = "session temporal";
 pub(crate) use tracedecay_session_temporal_store::SESSION_TEMPORAL_SCHEMA_VERSION;
+
+const ROOT_OCCURRENCE_INDEX_DDL: &str = "
+    CREATE INDEX IF NOT EXISTS idx_session_occurrences_root_generation_order
+        ON session_occurrences(knowledge_at DESC, session_id, occurrence_id, generation);";
 
 const TEMPORAL_FTS_CONTRACTS: &[(&str, &str)] = &[
     (
@@ -453,8 +458,6 @@ const TEMPORAL_SCHEMA_DDL: &str = r"
         ON session_occurrences(session_id, generation);
     CREATE INDEX IF NOT EXISTS idx_session_occurrences_generation_order
         ON session_occurrences(session_id, knowledge_at, occurrence_id, generation);
-    CREATE INDEX IF NOT EXISTS idx_session_occurrences_root_generation_order
-        ON session_occurrences(knowledge_at, session_id, occurrence_id, generation);
     CREATE INDEX IF NOT EXISTS idx_session_occurrences_session_time
         ON session_occurrences(session_id, knowledge_at);
     CREATE INDEX IF NOT EXISTS idx_session_occurrences_source_order
@@ -693,6 +696,9 @@ pub(crate) async fn install_session_temporal_schema(
     conn.execute_batch(TEMPORAL_SCHEMA_DDL)
         .await
         .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    conn.execute_batch(ROOT_OCCURRENCE_INDEX_DDL)
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
     conn.execute_batch(tracedecay_rusqlite_runtime::repository::GRAPH_PUBLICATION_SCHEMA_V1)
         .await
         .map_err(|error| global_db_operation_error(OPERATION, error))?;
@@ -708,6 +714,31 @@ pub(crate) async fn install_session_temporal_schema(
     .await
     .map_err(|error| global_db_operation_error(OPERATION, error))?;
     Ok(())
+}
+
+/// The caller owns the schema transaction, so a cancelled or failed rebuild
+/// retains the prior index together with every durable row and marker.
+pub(crate) async fn rebuild_ascending_root_occurrence_index(
+    conn: &impl Executor,
+) -> tracedecay_domain::errors::Result<()> {
+    match require_admissible_session_temporal_schema(conn, None).await? {
+        Ok(SessionTemporalSchemaAdmission::AscendingRootOccurrenceIndex) => {}
+        // Another admission may already have completed the same rebuild.
+        Ok(SessionTemporalSchemaAdmission::Current) => return Ok(()),
+        Ok(_) => {
+            return Err(admission::session_temporal_reset_required(
+                "the temporal schema changed before its root index rebuild",
+            ));
+        }
+        Err(refused) => return Err(refused.error()),
+    }
+    conn.execute_batch("DROP INDEX idx_session_occurrences_root_generation_order;")
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    conn.execute_batch(ROOT_OCCURRENCE_INDEX_DDL)
+        .await
+        .map_err(|error| global_db_operation_error(OPERATION, error))?;
+    validate_current_session_temporal_schema(conn).await
 }
 
 async fn validate_temporal_table_shapes(

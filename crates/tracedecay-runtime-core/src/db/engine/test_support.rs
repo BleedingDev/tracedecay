@@ -4,7 +4,7 @@ use rusqlite::Savepoint;
 use sha2::{Digest, Sha256};
 use tracedecay_domain::LocatorDigest;
 use tracedecay_rusqlite_runtime::{
-    ExistingWriterLocator, PersistentWriter, StorageOperationExecutor,
+    ExistingWriterLocator, PersistentWriter, ReaderAdmissionSnapshot, StorageOperationExecutor,
     exact_sql::{ExactSqlError, ExactSqlHandle, ExactSqlWriteAuthority, ExactSqlWriteIntent},
     reader::{ExistingReaderLocator, ReaderPool, ReaderQueryExecutor},
 };
@@ -17,11 +17,16 @@ use super::{Connection, Executor, IntoParams, QueryExecutor, Result as EngineRes
 
 pub struct TestConnection {
     connection: Connection,
-    _readers: ReaderPool<NoReads>,
+    readers: ReaderPool<NoReads>,
     _writer: PersistentWriter,
 }
 
 impl TestConnection {
+    /// Canonical timing and SQLite-work counters for this fixture's readers.
+    pub fn reader_telemetry_snapshot(&self) -> ReaderAdmissionSnapshot {
+        self.readers.telemetry_snapshot()
+    }
+
     pub fn open(path: &Path) -> Self {
         Self::open_inner(path, Some(Arc::new(AllowTestWrites)))
     }
@@ -94,7 +99,7 @@ impl TestConnection {
         let connection = Connection::attach(handle);
         Self {
             connection,
-            _readers: readers,
+            readers,
             _writer: writer,
         }
     }

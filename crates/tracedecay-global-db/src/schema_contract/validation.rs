@@ -6,7 +6,7 @@ use tracedecay_runtime_core::db::engine::{QueryExecutor, params};
 use super::super::{global_db_operation_error, global_db_operation_message};
 use super::definitions::{
     Column, INDEX_DESCENDING_COLUMNS, INDEX_EXPRESSION_COLUMN, INDEXES, Index,
-    REGISTRY_TABLE_NAMES, TABLES, Table,
+    REGISTRY_TABLE_NAMES, ROOT_OCCURRENCE_INDEX, ROOT_OCCURRENCE_INDEX_NAME, TABLES, Table,
 };
 use super::pragma::{
     ActualColumn, ActualForeignKey, ActualIndex, ActualTableMetadata, read_table_metadata,
@@ -14,6 +14,13 @@ use super::pragma::{
 use super::{normalize_trigger_sql, starts_with_ignore_ascii_case};
 
 const OPERATION: &str = "validate global database authority schema";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootOccurrenceIndexOrder {
+    Current,
+    /// The prior persisted root index orders every key ascending.
+    Ascending,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct GraphPublicationSchemaObject {
@@ -207,7 +214,11 @@ fn foreign_keys_match(actual: &[ActualForeignKey], contract: &Table) -> bool {
         })
 }
 
-fn index_matches(actual: &ActualIndex, expected: &Index) -> bool {
+fn index_matches(
+    actual: &ActualIndex,
+    expected: &Index,
+    root_order: RootOccurrenceIndexOrder,
+) -> bool {
     let expected_partial = expected.name.is_some_and(|name| {
         name.eq_ignore_ascii_case("idx_session_temporal_generations_one_active")
             || name.eq_ignore_ascii_case("idx_session_refresh_operations_one_running")
@@ -224,6 +235,9 @@ fn index_matches(actual: &ActualIndex, expected: &Index) -> bool {
         return false;
     }
     let descending = expected.name.and_then(|name| {
+        if root_order == RootOccurrenceIndexOrder::Ascending && name == ROOT_OCCURRENCE_INDEX_NAME {
+            return None;
+        }
         INDEX_DESCENDING_COLUMNS
             .iter()
             .find(|(index, _)| index.eq_ignore_ascii_case(name))
@@ -298,15 +312,14 @@ fn validate_indexes_for_table(
     table_contract: &Table,
     expected: &[&Index],
     actual: &[ActualIndex],
+    root_order: RootOccurrenceIndexOrder,
 ) -> tracedecay_domain::errors::Result<()> {
     let table = table_contract.name;
     let mut matched_actual = vec![false; actual.len()];
     for contract in expected {
-        let Some(actual_index) = actual
-            .iter()
-            .enumerate()
-            .position(|(index, actual)| !matched_actual[index] && index_matches(actual, contract))
-        else {
+        let Some(actual_index) = actual.iter().enumerate().position(|(index, actual)| {
+            !matched_actual[index] && index_matches(actual, contract, root_order)
+        }) else {
             return Err(global_db_operation_message(
                 OPERATION,
                 format!(
@@ -435,13 +448,25 @@ async fn validate_tables_and_indexes(
     tables: &[Table],
 ) -> tracedecay_domain::errors::Result<()> {
     let contracts = tables.iter().collect::<Vec<_>>();
-    validate_contracts(conn, &contracts).await
+    validate_contracts(conn, &contracts, false)
+        .await
+        .map(|_| ())
 }
 
 async fn validate_named_tables_and_indexes(
     conn: &impl QueryExecutor,
     table_names: &[&str],
 ) -> tracedecay_domain::errors::Result<()> {
+    validate_named_tables_and_indexes_with_root_order(conn, table_names, false)
+        .await
+        .map(|_| ())
+}
+
+async fn validate_named_tables_and_indexes_with_root_order(
+    conn: &impl QueryExecutor,
+    table_names: &[&str],
+    recognize_ascending_root_index: bool,
+) -> tracedecay_domain::errors::Result<RootOccurrenceIndexOrder> {
     let mut contracts = Vec::with_capacity(table_names.len());
     for table_name in table_names {
         let contract = TABLES
@@ -455,18 +480,35 @@ async fn validate_named_tables_and_indexes(
             })?;
         contracts.push(contract);
     }
-    validate_contracts(conn, &contracts).await
+    validate_contracts(conn, &contracts, recognize_ascending_root_index).await
 }
 
 async fn validate_contracts(
     conn: &impl QueryExecutor,
     contracts: &[&Table],
-) -> tracedecay_domain::errors::Result<()> {
+    recognize_ascending_root_index: bool,
+) -> tracedecay_domain::errors::Result<RootOccurrenceIndexOrder> {
     let table_names = contracts
         .iter()
         .map(|contract| contract.name)
         .collect::<Vec<_>>();
     let metadata = read_table_metadata(conn, &table_names).await?;
+    let root_order = if recognize_ascending_root_index
+        && metadata
+            .get(ROOT_OCCURRENCE_INDEX.table)
+            .is_some_and(|table| {
+                table.indexes.iter().any(|actual| {
+                    index_matches(
+                        actual,
+                        &ROOT_OCCURRENCE_INDEX,
+                        RootOccurrenceIndexOrder::Ascending,
+                    )
+                })
+            }) {
+        RootOccurrenceIndexOrder::Ascending
+    } else {
+        RootOccurrenceIndexOrder::Current
+    };
     for contract in contracts {
         let actual = metadata.get(contract.name).ok_or_else(|| {
             global_db_operation_message(
@@ -479,9 +521,10 @@ async fn validate_contracts(
             contract,
             &contract_indexes_for_table(contract.name),
             &actual.indexes,
+            root_order,
         )?;
     }
-    Ok(())
+    Ok(root_order)
 }
 
 pub async fn validate_session_temporal_schema_contract(
@@ -489,6 +532,13 @@ pub async fn validate_session_temporal_schema_contract(
     table_names: &[&str],
 ) -> tracedecay_domain::errors::Result<()> {
     validate_named_tables_and_indexes(conn, table_names).await
+}
+
+pub(crate) async fn classify_session_temporal_schema_contract(
+    conn: &impl QueryExecutor,
+    table_names: &[&str],
+) -> tracedecay_domain::errors::Result<RootOccurrenceIndexOrder> {
+    validate_named_tables_and_indexes_with_root_order(conn, table_names, true).await
 }
 
 pub async fn validate_session_graph_publication_schema_contract(
