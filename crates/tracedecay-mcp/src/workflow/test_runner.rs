@@ -556,7 +556,6 @@ fn terminate_and_reap(child: &mut Child, process_group: u32) {
     {
         let _ = child.kill();
         let _ = child.wait();
-        return;
     }
     #[cfg(unix)]
     {

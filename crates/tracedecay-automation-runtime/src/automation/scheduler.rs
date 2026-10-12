@@ -1472,7 +1472,7 @@ fn process_state(pid: u32) -> ProcessState {
     }
     #[cfg(windows)]
     {
-        return windows_process_state(pid);
+        windows_process_state(pid)
     }
     #[cfg(not(any(unix, windows)))]
     ProcessState::Unknown

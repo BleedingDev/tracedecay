@@ -1,6 +1,8 @@
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    #[cfg(windows)]
+    use super::paths_and_io::open_lock_file;
     use super::*;
     use serde_json::Value;
     use std::sync::{Arc, Barrier};
