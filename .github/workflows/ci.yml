@@ -476,8 +476,9 @@ jobs:
       # Matrix shards share github.job, so they would race the same save key.
       # One writer keeps the 10 GiB Actions cache from holding several copies
       # that would evict this prefix (observed: 6.9 GiB workspace-only save).
+      # PR merge-ref caches let later pushes to the same PR reuse this build.
       - name: Save compiled Bazel actions
-        if: always() && !cancelled() && github.ref == 'refs/heads/master' && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
+        if: always() && !cancelled() && (github.ref == 'refs/heads/master' || github.event_name == 'pull_request') && matrix.shard == 'root-b' && steps.bazel.outputs.disk-cache-key != ''
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ steps.bazel.outputs.disk-cache-path }}

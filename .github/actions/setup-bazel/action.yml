@@ -1,12 +1,11 @@
 name: Set up Bazel
 description: >
   Installs Bazel through the pinned bazelisk with its repository cache, and a
-  disk cache named by `cache-key` that only master saves: other refs restore
-  master's entry, and their own saves would be multi-GB copies that ordinary
-  master and PR runs cannot reuse. Jobs with the same configuration and
-  runner image share a restore prefix; master callers save fresh
-  action outputs after the build, including failed tests. With `test-tools`,
-  also installs the host tools the test suites spawn.
+  disk cache named by `cache-key`. Jobs with the same configuration and
+  runner image share a restore prefix. Callers retain compiled actions on
+  master and may also save within a PR's merge-ref scope for later pushes to
+  that same PR. Bazelisk and repository caches are saved only on master.
+  With `test-tools`, also installs the host tools the test suites spawn.
 
 inputs:
   cache-key:
@@ -75,7 +74,7 @@ runs:
 
     # Bazel validates action contents itself. A fresh save key retains new
     # source-build outputs even when MODULE.bazel and BUILD files are unchanged.
-    - name: Restore master action cache
+    - name: Restore compiled action cache
       id: disk-cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
