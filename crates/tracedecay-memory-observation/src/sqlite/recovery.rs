@@ -45,6 +45,8 @@ WHERE excluded.acknowledged_sequence >
       COALESCE(tdmem_observation_recovery_v1.acknowledged_sequence, -1)
 "#;
 
+// Source sequences are nonnegative, so -1 starts the first page. A range
+// predicate lets the source index seek past the already acknowledged history.
 const SELECT_ACKNOWLEDGED_SUFFIX: &str = r#"
 SELECT j.source_sequence, j.observation_id,
        (SELECT MAX(r.finished_at_micros)
@@ -54,7 +56,7 @@ SELECT j.source_sequence, j.observation_id,
 FROM tdmem_observation_journal_v1 j
 WHERE j.provider_id = ?1 AND j.registration_revision = ?2 AND j.source_authority = ?3
   AND j.exact_scope_sha256 = ?4 AND j.source_stream = ?5
-  AND (?6 IS NULL OR j.source_sequence > ?6)
+  AND j.source_sequence > COALESCE(?6, -1)
 ORDER BY j.source_sequence
 LIMIT ?7
 "#;
@@ -458,5 +460,117 @@ impl ObservationRecoveryPortV1 for SqliteObservationJournal {
             )?;
             read_u32(attempts, "automatic_repair_attempts")
         })
+    }
+}
+
+#[cfg(test)]
+mod acknowledged_suffix_tests {
+    use rusqlite::{Connection, Error, ErrorCode, StatementStatus, params};
+
+    use super::SELECT_ACKNOWLEDGED_SUFFIX;
+    use crate::sqlite::schema;
+
+    type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
+    type SuffixRow = (i64, String, Option<i64>);
+
+    fn acknowledged_fixture(count: i64) -> TestResult<Connection> {
+        let mut connection = Connection::open_in_memory()?;
+        schema::initialize(&mut connection)?;
+        let transaction = connection.transaction()?;
+        {
+            let mut journal = transaction.prepare(
+                "INSERT INTO tdmem_observation_journal_v1 (
+                    idempotency_key, observation_id, exact_scope_sha256, provider_id,
+                    provider_instance_id, registration_revision, ready_receipt_digest,
+                    source_authority, source_stream, source_event_id, source_event_revision,
+                    source_event_sha256, source_sequence, settlement_receipt_json,
+                    exact_scope_json, observation_kind, payload_contract, payload_sha256,
+                    payload_bytes, payload_byte_len, extensions_digest, extensions_json,
+                    provenance_origin, provenance_sha256, privacy_classification,
+                    retention_class, redaction_revision, content_policy_revision,
+                    forget_source_key, expires_at_micros, occurred_at_micros,
+                    admitted_at_micros, deadline_micros, request_id, envelope_sha256,
+                    sanitization_receipt_id, sanitizer_revision, source_payload_sha256,
+                    sanitization_receipt_json
+                 ) VALUES (
+                    'key-' || ?1, 'observation-' || ?1, 'scope', 'provider', 'instance', 4,
+                    'digest', 'host_session', 'stream', 'event-' || ?1, 0, 'digest', ?1,
+                    '{}', '{}', 'session_message', 'payload', 'digest', X'00', 1,
+                    'digest', '[]', 'agent', 'digest', 'internal', 'session', 1, 1,
+                    'forget:stream', 1000000, ?1, ?1, 1000000, 'request-' || ?1,
+                    'digest', 'sanitization-' || ?1, 'revision', 'digest', '{}'
+                 )",
+            )?;
+            let mut receipt = transaction.prepare(
+                "INSERT INTO tdmem_observation_receipt_v1 (
+                    observation_id, attempt_number, receipt_id, idempotency_key,
+                    payload_sha256, extensions_digest, provider_id, registration_revision,
+                    outcome, committed_effect, provider_effect_summary_json,
+                    started_at_micros, finished_at_micros, warnings_json
+                 ) VALUES (
+                    'observation-' || ?1, 1, 'receipt-' || ?1, 'key-' || ?1,
+                    'digest', 'digest', 'provider', 4, 'applied', 'applied', '{}',
+                    ?1, ?1, '[]'
+                 )",
+            )?;
+            for sequence in 0..count {
+                journal.execute(params![sequence])?;
+                receipt.execute(params![sequence])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(connection)
+    }
+
+    fn read_suffix(
+        connection: &Connection,
+        cursor: Option<i64>,
+    ) -> TestResult<(Vec<SuffixRow>, i32)> {
+        let mut statement = connection.prepare(SELECT_ACKNOWLEDGED_SUFFIX)?;
+        let rows = statement
+            .query_map(
+                params!["provider", 4, "host_session", "scope", "stream", cursor, 8],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?
+            .collect::<Result<Vec<SuffixRow>, _>>()?;
+        let steps = statement.get_status(StatementStatus::VmStep);
+        Ok((rows, steps))
+    }
+
+    #[test]
+    fn acknowledged_suffix_reads_do_not_scan_the_retained_prefix() -> TestResult<()> {
+        let small = acknowledged_fixture(32)?;
+        let large = acknowledged_fixture(4096)?;
+        let (small_page, small_steps) = read_suffix(&small, Some(23))?;
+        let (large_page, large_steps) = read_suffix(&large, Some(4087))?;
+        for (page, start) in [(&small_page, 24), (&large_page, 4088)] {
+            assert_eq!(page.len(), 8);
+            for (row, sequence) in page.iter().zip(start..start + 8) {
+                assert_eq!(row.0, sequence);
+                assert_eq!(row.1, format!("observation-{sequence}"));
+                assert_eq!(row.2, Some(sequence));
+            }
+        }
+        assert!(small_steps > 0);
+        assert!(
+            large_steps <= small_steps.saturating_mul(2),
+            "reading eight suffix rows took {large_steps} VM steps after 4088 retained rows \
+             against {small_steps} steps after 24 retained rows"
+        );
+
+        let (first_page, _) = read_suffix(&large, None)?;
+        assert_eq!(
+            first_page.iter().map(|row| row.0).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+        let Err(Error::SqliteFailure(error, _)) = large.execute(
+            "UPDATE tdmem_observation_journal_v1 SET source_sequence = -1 \
+             WHERE source_sequence = 0",
+            [],
+        ) else {
+            return Err("the journal schema must reject negative source sequences".into());
+        };
+        assert_eq!(error.code, ErrorCode::ConstraintViolation);
+        Ok(())
     }
 }
