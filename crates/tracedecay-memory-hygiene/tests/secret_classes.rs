@@ -124,6 +124,25 @@ fn high_entropy_token_is_rejected_because_no_exact_span_is_provable() {
 }
 
 #[test]
+fn hyphenated_tokens_preserve_whole_token_and_component_secret_detection() {
+    let prefix = "Qm9vZ2llV29vZ2llMTIzNDU2Nzg5MGFiY2RlZmdoaWprbG1ub3A4OTc2NTQzMjE";
+    for content in [
+        // Repeated suffix bytes dilute the complete token below the entropy
+        // threshold, so its high-entropy component must be probed separately.
+        format!("{prefix}-sha256-{}", "a".repeat(64)),
+        // Both components are shorter than the detector's minimum length;
+        // this secret can only be proven by retaining the whole-token scan.
+        "AbCdEfGhIjKlMnOpQrStUvWxYz01234-56789aBcDeFgHiJkLmNoPqRsTuVwXy".to_owned(),
+    ] {
+        assert_withheld(
+            &json!({ "note": content }),
+            WithheldReason::SecretRejected,
+            HygieneClass::HighEntropyToken,
+        );
+    }
+}
+
+#[test]
 fn credential_material_inside_an_object_key_is_rejected_without_echoing_the_key() {
     let key = concat!("AKIA", "4S27TQXBVCZ5MJ6L");
     let payload = json!({ key: "value" });

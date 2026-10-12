@@ -1314,7 +1314,7 @@ mod tests {
 
     #[test]
     fn structural_digest_source_metadata_is_admitted_with_full_envelope_receipt()
-    -> Result<(), HygieneError> {
+    -> Result<(), Box<dyn std::error::Error>> {
         let envelope = history_envelope_with_structural_source_id();
         let trusted_source = trusted_source()?;
         let canonical = canonical_payload_bytes(&envelope)?;
@@ -1322,7 +1322,7 @@ mod tests {
         let ObservationAdmission::Admitted { sanitized, receipt } = ObservationSanitizer::new()?
             .admit_observation_with_trusted_history_source(&envelope, &[], &trusted_source)?
         else {
-            panic!("innocent message and structural source metadata must be admitted");
+            return Err("innocent message and structural source metadata must be admitted".into());
         };
         assert_eq!(sanitized, envelope);
         assert_eq!(canonical_payload_bytes(&sanitized)?, canonical);

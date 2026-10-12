@@ -72,7 +72,7 @@
   },
   "reject_floor_signals": {
     "reason": "The shared credential corpus is reached through detect_secret_like, which reports only the FIRST pattern that matched a string. A string carrying a credential-like assignment and a live issuer token therefore reports whichever pattern the catalogue happens to order first, and attributing that single reason to the whole string is how a payload that must be withheld ends up merely redacted. Admission runs an independent multi-signal pass: the declared direct signals are checked against the whole string, and the shared detector is re-probed over bounded candidate substrings so a class the first answer hid is still proven. The pass may only ADD reject-floor classes; it never lowers a class the shared corpus already proved, it stores no matched byte, and an exhausted probe budget classifies as detector_unavailable so the pipeline fails closed.",
-    "candidate_separators": ["=", ":"],
+    "candidate_separators": ["=", ":", "-"],
     "minimum_credential_run_length": 16,
     "entropy_candidate_minimum_length": 36,
     "maximum_detector_probes_per_payload": 2048,
