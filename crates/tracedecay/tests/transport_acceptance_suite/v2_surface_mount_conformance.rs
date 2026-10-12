@@ -157,6 +157,7 @@ struct MountFixture {
     base_url: String,
     origin: String,
     authorization: String,
+    daemon_log: PathBuf,
     // Field order is drop order: the daemon child must be reaped before the
     // temporary home it writes into is removed.
     _daemon: common::DaemonProcess,
@@ -191,7 +192,8 @@ impl MountFixture {
         );
         common::initialize_tracedecay_cli_project(&home, &project);
 
-        let daemon = common::spawn_tracedecay_daemon_with(&home, |_| {});
+        let daemon_log = home.join("daemon.log");
+        let daemon = common::spawn_tracedecay_daemon_logged(&home, &daemon_log, |_| {});
         let authority = wait_for_http_authority(&common::daemon_authority_path(&profile));
 
         let context = run_ok(
@@ -224,6 +226,7 @@ impl MountFixture {
             base_url: format!("http://{endpoint}"),
             origin: format!("http://{endpoint}"),
             authorization: format!("Bearer {token}"),
+            daemon_log,
             _daemon: daemon,
             _home_dir: home_dir,
         }
@@ -236,6 +239,16 @@ impl MountFixture {
             "{}/projects/{}{}",
             self.base_url, self.project_id, route_path
         )
+    }
+
+    fn daemon_diagnostics(&self) -> String {
+        match fs::read(&self.daemon_log) {
+            Ok(log) => String::from_utf8_lossy(&log).into_owned(),
+            Err(error) => format!(
+                "could not read daemon log {}: {error}",
+                self.daemon_log.display()
+            ),
+        }
     }
 }
 
@@ -282,14 +295,26 @@ struct DashboardProbe {
 
 impl DashboardProbe {
     fn start(fixture: &MountFixture) -> Self {
-        let stdout = run_ok(
-            isolated_command(&fixture.home)
-                .args(["dashboard", "--port", "0", "--path"])
-                .arg(&fixture.project)
-                .current_dir(&fixture.project),
-            "tracedecay dashboard",
+        let output = isolated_command(&fixture.home)
+            .args(["dashboard", "--port", "0", "--path"])
+            .arg(&fixture.project)
+            .current_dir(&fixture.project)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "tracedecay dashboard could not run: {error}\ncaptured daemon stderr:\n{}",
+                    fixture.daemon_diagnostics()
+                )
+            });
+        assert!(
+            output.status.success(),
+            "tracedecay dashboard failed with {}\nstdout:\n{}\nstderr:\n{}\ncaptured daemon stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+            fixture.daemon_diagnostics(),
         );
-        let stdout = String::from_utf8_lossy(&stdout);
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let url = stdout
             .split_whitespace()
             .find(|token| token.starts_with("http://"))
