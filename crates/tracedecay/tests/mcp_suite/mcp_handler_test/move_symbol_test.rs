@@ -652,6 +652,11 @@ async fn test_move_symbol_aliases_to_source_refuse() {
             unix_fs::symlink(&source, &alias).unwrap();
         }
         let cg = init_test_project(project).await;
+        let server = cg
+            .harness
+            .server(&cg.project_root)
+            .expect("production project server");
+        warm_code_index_search(&server, "compute_grand_total").await;
 
         let before = fs::read_to_string(&source).unwrap();
         let result = handle_tool_call(
