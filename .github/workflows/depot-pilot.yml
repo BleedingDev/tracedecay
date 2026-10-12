@@ -55,6 +55,7 @@ jobs:
         with:
           cache-key: ci-linux-test-v2
           test-tools: "true"
+          save-download-caches: "true"
 
       - name: Require the Depot remote cache
         run: test "${{ steps.bazel.outputs.remote-cache }}" = "true"
@@ -123,6 +124,7 @@ jobs:
         id: bazel
         with:
           cache-key: ci-windows-test
+          save-download-caches: "true"
 
       - name: Require the Depot remote cache
         shell: bash

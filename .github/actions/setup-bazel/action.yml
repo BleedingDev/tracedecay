@@ -22,6 +22,13 @@ inputs:
   test-tools:
     description: Also install rust-analyzer and node for `bazel test`.
     default: "false"
+  save-download-caches:
+    description: >
+      Also save the bazelisk and repository caches off master when the
+      runner's remote cache is in use. Depot keeps these in its own cache
+      store, which cannot read the GitHub-stored master entries; one
+      designated job per platform sets this.
+    default: "false"
 
 outputs:
   disk-cache-path:
@@ -120,7 +127,10 @@ runs:
         bazelrc: >-
           ${{ steps.disk-cache-config.outputs.remote-cache != 'true'
           && format('build --disk_cache={0}', steps.disk-cache-config.outputs.path) || '' }}
-        cache-save: ${{ github.ref == 'refs/heads/master' }}
+        cache-save: >-
+          ${{ github.ref == 'refs/heads/master'
+          || (inputs.save-download-caches == 'true'
+          && steps.disk-cache-config.outputs.remote-cache == 'true') }}
         # Windows build-script runfiles nest each vendored crate's sources
         # under its repository name twice; a short output base (default
         # D:/_bazel) keeps MSVC's header paths under MAX_PATH.

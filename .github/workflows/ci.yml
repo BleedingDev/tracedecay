@@ -454,6 +454,7 @@ jobs:
           # Prefer v2; keep legacy prefixes as restore fallbacks if still present.
           extra-restore-keys: ci-linux-test,ci-linux-workspace-test
           test-tools: "true"
+          save-download-caches: ${{ matrix.shard == 'root-b' }}
 
       # Root suites exercise latency-sensitive daemon journeys. Finish their
       # compilation before testing so compiler work cannot consume that budget.
@@ -519,6 +520,7 @@ jobs:
         with:
           cache-key: ci-windows-test
           test-tools: ${{ needs.scope-gate.outputs.run-os }}
+          save-download-caches: "true"
 
       # Check the shipped MSVC target without linking test executables or
       # applying Linux's Clippy warning policy to this compiler-only check.
